@@ -1,22 +1,25 @@
 //! Non-activating floating keycap panel and its active-only main-runloop timer.
 
-use objc2::runtime::AnyObject;
-use objc2::{class, msg_send};
+use objc2::runtime::{AnyObject, Sel};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::cell::RefCell;
 use std::collections::HashMap;
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::state::{
     estimated_stream_width, Badge, BadgeKind, BADGE_GAP, BADGE_HORIZONTAL_PADDING,
     PANEL_SIDE_PADDING,
 };
+use crate::config::KeystrokeDisplayPosition;
 use crate::event_tap;
-use crate::ffi::MainThreadSlot;
 use crate::ffi::{
-    hex_to_cg_color, layer_set_background, layer_set_border, make_nsstring, release_obj, CFRelease,
+    class_addMethod, hex_to_cg_color, layer_set_background, layer_set_border, make_nsstring,
+    objc_allocateClassPair, objc_registerClassPair, release_obj, CFRelease,
 };
+use crate::ffi::{MainThreadSlot, StaticClass};
 
 const PANEL_H: f64 = 54.0;
 const PANEL_BOTTOM_MARGIN: f64 = 18.0;
@@ -26,6 +29,12 @@ const PANEL_TIMER_INTERVAL: f64 = 0.016;
 const MAX_MEASUREMENTS: usize = 512;
 const MAX_TEXT_CENTROID_OFFSET: f64 = 2.0;
 const KEYCAP_FILL_ALPHA: u32 = 0xCC;
+const GRIP_WIDTH: f64 = 10.0;
+const GRIP_HEIGHT: f64 = 40.0;
+const GRIP_MARK_WIDTH: f64 = 3.0;
+const GRIP_MARK_HEIGHT: f64 = 3.0;
+const GRIP_MARK_GAP: f64 = 3.0;
+const DRAG_THRESHOLD: f64 = 4.0;
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -38,11 +47,45 @@ struct PanelState {
     timer: Option<event_tap::CFRunLoopTimerRef>,
     visible: bool,
     fade_deadline: Option<Instant>,
-    target_frame: Option<(NSRect, NSRect)>,
+    target_frame: Option<ScreenGeometry>,
     badge_container: Option<*mut AnyObject>,
+    grip_view: Option<*mut AnyObject>,
+    grip_cursor: GripCursor,
+    drag: Option<GripDrag>,
     last_badges: Vec<Badge>,
     last_palette: Option<crate::theme::UiPalette>,
     measurements: HashMap<String, f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct ScreenGeometry {
+    frame: NSRect,
+    visible_frame: NSRect,
+}
+
+impl Default for ScreenGeometry {
+    fn default() -> Self {
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0));
+        Self {
+            frame: bounds,
+            visible_frame: bounds,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum GripCursor {
+    #[default]
+    None,
+    Open,
+    Closed,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct GripDrag {
+    mouse_down: NSPoint,
+    initial_frame: NSRect,
+    moved: bool,
 }
 
 thread_local! {
@@ -111,36 +154,304 @@ pub(super) fn fade_pending() -> bool {
     PANEL.with(|panel| panel.borrow().fade_deadline.is_some())
 }
 
-pub(super) fn target_screen_width(follow_frontmost: bool) -> f64 {
+pub(super) fn target_screen_width(
+    follow_frontmost: bool,
+    position: Option<KeystrokeDisplayPosition>,
+) -> f64 {
     crate::debug_assert_main_thread();
-    unsafe { target_screen(follow_frontmost).0.size.width.max(1.0) }
+    let screens = unsafe { screen_geometries() };
+    let target = target_screen_index(follow_frontmost, &screens);
+    let selected = screen_for_saved_origin(position, &screens).unwrap_or(target);
+    screens
+        .get(selected)
+        .map_or(1.0, |screen| screen.frame.size.width.max(1.0))
 }
 
-pub(super) fn render(badges: &[Badge], visible: bool, follow_frontmost: bool) {
+pub(super) fn drag_active() -> bool {
+    crate::debug_assert_main_thread();
+    PANEL.with(|panel| panel.borrow().drag.is_some())
+}
+
+pub(super) fn cursor_inside_visible_panel(point: NSPoint) -> Option<bool> {
+    crate::debug_assert_main_thread();
+    PANEL.with(|panel| {
+        let state = panel.borrow();
+        if !state.visible {
+            return None;
+        }
+        let window = state.panel?;
+        let visible: bool = unsafe { msg_send![window, isVisible] };
+        if !visible {
+            return None;
+        }
+        let frame: NSRect = unsafe { msg_send![window, frame] };
+        Some(contains(frame, point))
+    })
+}
+
+unsafe fn grip_view_class() -> *mut AnyObject {
+    static GRIP_VIEW_CLASS: OnceLock<StaticClass> = OnceLock::new();
+    GRIP_VIEW_CLASS
+        .get_or_init(|| {
+            let name = CString::new("OhMyTabKeystrokeDisplayGripView").unwrap();
+            let superclass = class!(NSView) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            if cls.is_null() {
+                return StaticClass(class!(NSView));
+            }
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                grip_mouse_down as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseDragged:),
+                grip_mouse_dragged as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseUp:),
+                grip_mouse_up as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            StaticClass(cls as *const objc2::runtime::AnyClass)
+        })
+        .0 as *mut AnyObject
+}
+
+extern "C" fn grip_mouse_down(_view: *mut c_void, _cmd: Sel, event: *mut c_void) {
+    crate::callback_guard::void("keystroke_display_grip_mouse_down", || unsafe {
+        let click_count: isize = msg_send![event as *mut AnyObject, clickCount];
+        if let Some(point) = current_cursor_appkit_point() {
+            begin_grip_interaction(point, click_count, Instant::now());
+        }
+    });
+}
+
+extern "C" fn grip_mouse_dragged(_view: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    crate::callback_guard::void("keystroke_display_grip_mouse_dragged", || {
+        if let Some(point) = current_cursor_appkit_point() {
+            drag_grip_to(point, Instant::now());
+        }
+    });
+}
+
+extern "C" fn grip_mouse_up(_view: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    crate::callback_guard::void("keystroke_display_grip_mouse_up", finish_grip_interaction);
+}
+
+fn begin_grip_interaction(point: NSPoint, click_count: isize, now: Instant) {
+    crate::debug_assert_main_thread();
+    let reset = PANEL.with(|panel| {
+        let mut state = panel.borrow_mut();
+        let Some(window) = state.panel else {
+            return false;
+        };
+        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let local_grip = grip_frame();
+        let global_grip = NSRect::new(
+            NSPoint::new(
+                frame.origin.x + local_grip.origin.x,
+                frame.origin.y + local_grip.origin.y,
+            ),
+            local_grip.size,
+        );
+        if !contains(global_grip, point) {
+            return false;
+        }
+        state.fade_deadline = None;
+        state.visible = true;
+        unsafe {
+            set_alpha_immediately(window, 1.0);
+            let _: () = msg_send![window, setIgnoresMouseEvents: false];
+        }
+        if click_count >= 2 {
+            state.drag = None;
+            set_grip_cursor(&mut state, GripCursor::None);
+            true
+        } else {
+            state.drag = Some(GripDrag {
+                mouse_down: point,
+                initial_frame: frame,
+                moved: false,
+            });
+            set_grip_cursor(&mut state, GripCursor::Closed);
+            super::note_panel_activity(now);
+            false
+        }
+    });
+    if reset {
+        update_config_position(None);
+        reposition_to_default();
+    }
+}
+
+fn drag_grip_to(point: NSPoint, now: Instant) {
+    crate::debug_assert_main_thread();
+    super::note_panel_activity(now);
+    PANEL.with(|panel| {
+        let mut state = panel.borrow_mut();
+        let Some(mut drag) = state.drag else {
+            return;
+        };
+        let dx = point.x - drag.mouse_down.x;
+        let dy = point.y - drag.mouse_down.y;
+        if !drag.moved && dx.hypot(dy) < DRAG_THRESHOLD {
+            return;
+        }
+        drag.moved = true;
+        state.drag = Some(drag);
+        if let Some(window) = state.panel {
+            let frame = NSRect::new(
+                NSPoint::new(
+                    drag.initial_frame.origin.x + dx,
+                    drag.initial_frame.origin.y + dy,
+                ),
+                drag.initial_frame.size,
+            );
+            unsafe {
+                let _: () = msg_send![window, setFrame: frame, display: true];
+            }
+        }
+    });
+}
+
+fn finish_grip_interaction() {
+    crate::debug_assert_main_thread();
+    let position = PANEL.with(|panel| {
+        let mut state = panel.borrow_mut();
+        let drag = state.drag.take();
+        let position = if drag.is_some_and(|drag| drag.moved) {
+            state.panel.map(|window| unsafe {
+                let frame: NSRect = msg_send![window, frame];
+                KeystrokeDisplayPosition {
+                    x: frame.origin.x,
+                    y: frame.origin.y,
+                }
+            })
+        } else {
+            None
+        };
+        set_grip_mouse_state(&mut state, false, GripCursor::None);
+        position
+    });
+    if let Some(position) = position {
+        update_config_position(Some(position));
+        let config = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .keystroke_display
+            .clone();
+        let screens = unsafe { screen_geometries() };
+        let target = target_screen_index(config.follow_frontmost_screen, &screens);
+        let selected = screen_for_saved_origin(Some(position), &screens).unwrap_or(target);
+        if let Some(screen) = screens.get(selected).copied() {
+            PANEL.with(|panel| panel.borrow_mut().target_frame = Some(screen));
+        }
+    }
+}
+
+fn update_config_position(position: Option<KeystrokeDisplayPosition>) {
+    let updated = if let Ok(mut config) = crate::config::CONFIG.write() {
+        config.keystroke_display.position = position;
+        true
+    } else {
+        false
+    };
+    if updated {
+        crate::config::schedule_config_persist();
+    }
+}
+
+fn reposition_to_default() {
+    let config = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .keystroke_display
+        .clone();
+    let screens = unsafe { screen_geometries() };
+    if screens.is_empty() {
+        return;
+    }
+    let target = target_screen_index(config.follow_frontmost_screen, &screens);
+    let screen = screens[target];
+    PANEL.with(|panel| {
+        let mut state = panel.borrow_mut();
+        state.target_frame = Some(screen);
+        if let Some(window) = state.panel {
+            unsafe {
+                let frame: NSRect = msg_send![window, frame];
+                let default_frame = default_bottom_center_frame(screen.visible_frame, frame.size);
+                let _: () = msg_send![window, setFrame: default_frame, display: true];
+            }
+        }
+    });
+}
+
+pub(super) fn render(
+    badges: &[Badge],
+    visible: bool,
+    follow_frontmost: bool,
+    position: Option<KeystrokeDisplayPosition>,
+    now: Instant,
+    cursor_point: Option<NSPoint>,
+) -> Option<bool> {
     crate::debug_assert_main_thread();
     PANEL.with(|panel| {
         let mut state = panel.borrow_mut();
+        if !visible && state.drag.is_some() {
+            state.fade_deadline = None;
+            state.visible = true;
+            if let Some(panel) = state.panel {
+                unsafe {
+                    set_alpha_immediately(panel, 1.0);
+                    let _: () = msg_send![panel, orderFront: std::ptr::null::<AnyObject>()];
+                }
+            }
+            update_grip_tracking(&mut state, cursor_point);
+            return None;
+        }
         if visible && !badges.is_empty() {
             let reopened = !state.visible;
-            let (screen_frame, visible_frame) = if reopened {
-                let target = unsafe { target_screen(follow_frontmost) };
-                state.target_frame = Some(target);
+            let screens = if reopened {
+                unsafe { screen_geometries() }
+            } else {
+                Vec::new()
+            };
+            let geometry = if reopened {
+                let target_index = target_screen_index(follow_frontmost, &screens);
+                let screen_index = screen_for_saved_origin(position, &screens)
+                    .unwrap_or(target_index)
+                    .min(screens.len().saturating_sub(1));
+                screens
+                    .get(screen_index)
+                    .copied()
+                    .or(state.target_frame)
+                    .unwrap_or_default()
+            } else if let Some(target) = state.target_frame {
                 target
             } else {
-                if let Some(target) = state.target_frame {
-                    target
-                } else {
-                    let target = unsafe { target_screen(follow_frontmost) };
-                    state.target_frame = Some(target);
-                    target
-                }
+                let screens = unsafe { screen_geometries() };
+                let target_index = target_screen_index(follow_frontmost, &screens);
+                let screen_index = screen_for_saved_origin(position, &screens)
+                    .unwrap_or(target_index)
+                    .min(screens.len().saturating_sub(1));
+                screens.get(screen_index).copied().unwrap_or_default()
             };
+            let screen_frame = geometry.frame;
+            state.target_frame = Some(geometry);
             let panel = if let Some(panel) = state.panel {
                 panel
             } else {
-                let (panel, badge_container) = unsafe { create_panel() };
+                let (panel, badge_container, grip_view) = unsafe { create_panel() };
                 state.panel = Some(panel);
                 state.badge_container = Some(badge_container);
+                state.grip_view = Some(grip_view);
                 panel
             };
             let badge_container = state
@@ -171,13 +482,15 @@ pub(super) fn render(badges: &[Badge], visible: bool, follow_frontmost: bool) {
             }
             desired = estimated_stream_width(widths.iter().copied());
             let panel_w = desired.min(max_width).max(max_width.min(64.0));
-            let frame = NSRect::new(
-                NSPoint::new(
-                    visible_frame.origin.x + (visible_frame.size.width - panel_w) / 2.0,
-                    visible_frame.origin.y + PANEL_BOTTOM_MARGIN,
-                ),
-                NSSize::new(panel_w, PANEL_H),
-            );
+            let size = NSSize::new(panel_w, PANEL_H);
+            let frame = unsafe {
+                if !reopened || state.drag.is_some() {
+                    let current: NSRect = msg_send![panel, frame];
+                    NSRect::new(current.origin, size)
+                } else {
+                    resolve_panel_frame(position, &[geometry], 0, size).1
+                }
+            };
             unsafe {
                 if reopened {
                     state.last_badges.clear();
@@ -185,6 +498,10 @@ pub(super) fn render(badges: &[Badge], visible: bool, follow_frontmost: bool) {
                     let _: () = msg_send![panel, orderFront: std::ptr::null::<AnyObject>()];
                 }
                 let _: () = msg_send![panel, setFrame: frame, display: true];
+                if let Some(grip_view) = state.grip_view {
+                    let _: () = msg_send![grip_view, setFrame: grip_frame()];
+                    update_grip_marker(grip_view);
+                }
                 let palette = crate::theme::ui_palette();
                 if state.last_badges != badges || state.last_palette != Some(palette) {
                     rebuild_badges(
@@ -200,12 +517,18 @@ pub(super) fn render(badges: &[Badge], visible: bool, follow_frontmost: bool) {
                 let _ = state.fade_deadline.take();
             }
             state.visible = true;
-            state.target_frame = Some((screen_frame, visible_frame));
+            state.target_frame = Some(geometry);
+            update_grip_tracking(&mut state, cursor_point);
+            if reopened {
+                cursor_point.map(|point| contains(frame, point))
+            } else {
+                None
+            }
         } else {
             if state.visible {
                 state.visible = false;
                 state.last_badges.clear();
-                state.fade_deadline = Some(Instant::now() + HIDE_FADE);
+                state.fade_deadline = Some(now + HIDE_FADE);
                 if let Some(panel) = state.panel {
                     unsafe {
                         let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
@@ -231,9 +554,13 @@ pub(super) fn render(badges: &[Badge], visible: bool, follow_frontmost: bool) {
                 }
                 state.fade_deadline = None;
                 state.target_frame = None;
+                set_grip_mouse_state(&mut state, false, GripCursor::None);
+            } else {
+                update_grip_tracking(&mut state, cursor_point);
             }
+            None
         }
-    });
+    })
 }
 
 pub(super) fn reset() {
@@ -250,6 +577,8 @@ pub(super) fn reset() {
         state.visible = false;
         state.fade_deadline = None;
         state.target_frame = None;
+        state.drag = None;
+        set_grip_mouse_state(&mut state, false, GripCursor::None);
         state.last_badges.clear();
         state.last_palette = None;
         state.measurements.clear();
@@ -266,14 +595,20 @@ pub(super) fn smoke_runner() -> bool {
     )
     .as_deref()
         == Some("q");
+    let initial_position = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .keystroke_display
+        .position;
     let badge = Badge {
         text: "⌘Q".into(),
         kind: BadgeKind::Chord,
         repeats: 2,
     };
-    render(&[badge], true, false);
-    render(&[], false, false);
-    render(
+    let smoke_now = Instant::now();
+    let _ = render(&[badge], true, false, initial_position, smoke_now, None);
+    let _ = render(&[], false, false, initial_position, smoke_now, None);
+    let _ = render(
         &[Badge {
             text: "⌘Q".into(),
             kind: BadgeKind::Chord,
@@ -281,6 +616,9 @@ pub(super) fn smoke_runner() -> bool {
         }],
         true,
         false,
+        initial_position,
+        smoke_now,
+        None,
     );
     let cjk_badges = [
         Badge {
@@ -294,7 +632,7 @@ pub(super) fn smoke_runner() -> bool {
             repeats: 12,
         },
     ];
-    render(&cjk_badges, true, false);
+    let _ = render(&cjk_badges, true, false, initial_position, smoke_now, None);
     let badge_container = PANEL.with(|panel| panel.borrow().badge_container);
     let centroid_offsets =
         badge_container.and_then(|content| unsafe { text_centroid_offsets(content, &cjk_badges) });
@@ -306,14 +644,19 @@ pub(super) fn smoke_runner() -> bool {
     };
     let valid = PANEL.with(|panel| {
         let state = panel.borrow();
-        let (Some(panel), Some(badge_container)) = (state.panel, state.badge_container) else {
+        let (Some(panel), Some(badge_container), Some(grip_view)) =
+            (state.panel, state.badge_container, state.grip_view)
+        else {
             return false;
         };
         unsafe {
             let visible: bool = msg_send![panel, isVisible];
             let frame: NSRect = msg_send![panel, frame];
             let alpha: f64 = msg_send![panel, alphaValue];
-            let screen_width = target_screen(false).0.size.width;
+            let grip_frame: NSRect = msg_send![grip_view, frame];
+            let screen_width = screen_geometries()
+                .first()
+                .map_or(frame.size.width * 2.0, |screen| screen.frame.size.width);
             let views: *mut AnyObject = msg_send![badge_container, subviews];
             let count: usize = msg_send![views, count];
             let mut badges_fit = count == cjk_badges.len();
@@ -333,6 +676,8 @@ pub(super) fn smoke_runner() -> bool {
             }
             visible
                 && alpha >= 0.99
+                && grip_frame.origin.x.abs() < 0.01
+                && (grip_frame.origin.y - (PANEL_H - GRIP_HEIGHT) / 2.0).abs() < 0.01
                 && frame.size.width <= screen_width * 0.5 + 0.5
                 && typical_glyph_advances
                 && option_q_is_unmodified
@@ -346,8 +691,110 @@ pub(super) fn smoke_runner() -> bool {
                 && badges_fit
         }
     });
+    let grip_valid = smoke_grip_interaction(initial_position);
+    update_config_position(initial_position);
+    let config_restored = crate::config::flush_config_sync().is_ok();
     reset();
-    valid
+    valid && grip_valid && config_restored
+}
+
+fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -> bool {
+    let Some((start_frame, grip_center)) = panel_frame_and_grip_center() else {
+        return false;
+    };
+    let now = Instant::now();
+    begin_grip_interaction(grip_center, 1, now);
+    drag_grip_to(
+        NSPoint::new(grip_center.x + 18.0, grip_center.y + 11.0),
+        now + Duration::from_millis(5),
+    );
+    finish_grip_interaction();
+    let moved_and_saved = PANEL.with(|panel| {
+        let state = panel.borrow();
+        let Some(window) = state.panel else {
+            return false;
+        };
+        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let saved = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .keystroke_display
+            .position;
+        (frame.origin.x - start_frame.origin.x - 18.0).abs() < 0.5
+            && (frame.origin.y - start_frame.origin.y - 11.0).abs() < 0.5
+            && saved.is_some_and(|saved| {
+                (saved.x - frame.origin.x).abs() < 0.5 && (saved.y - frame.origin.y).abs() < 0.5
+            })
+    });
+
+    let Some((_, first_click_point)) = panel_frame_and_grip_center() else {
+        update_config_position(original_position);
+        return false;
+    };
+    let frame_after_drag = panel_frame_and_grip_center().map(|(frame, _)| frame);
+    let click_time = now + Duration::from_millis(10);
+    begin_grip_interaction(first_click_point, 1, click_time);
+    drag_grip_to(
+        NSPoint::new(first_click_point.x + 2.0, first_click_point.y + 1.0),
+        click_time + Duration::from_millis(5),
+    );
+    finish_grip_interaction();
+    let Some((frame_before_reset, second_click_point)) = panel_frame_and_grip_center() else {
+        update_config_position(original_position);
+        return false;
+    };
+    begin_grip_interaction(
+        second_click_point,
+        2,
+        click_time + Duration::from_millis(100),
+    );
+    finish_grip_interaction();
+    let reset_to_default = PANEL.with(|panel| {
+        let state = panel.borrow();
+        let Some(window) = state.panel else {
+            return false;
+        };
+        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let ignores_mouse_events: bool = unsafe { msg_send![window, ignoresMouseEvents] };
+        let config = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .keystroke_display
+            .clone();
+        let screens = unsafe { screen_geometries() };
+        let target_index = target_screen_index(config.follow_frontmost_screen, &screens);
+        let expected = screens
+            .get(target_index)
+            .map(|screen| default_bottom_center_frame(screen.visible_frame, frame.size));
+        config.position.is_none()
+            && ignores_mouse_events
+            && frame_after_drag.is_some_and(|dragged| {
+                (frame_before_reset.origin.x - dragged.origin.x).abs() < 0.5
+                    && (frame_before_reset.origin.y - dragged.origin.y).abs() < 0.5
+            })
+            && expected.is_some_and(|expected| {
+                (frame.origin.x - expected.origin.x).abs() < 0.5
+                    && (frame.origin.y - expected.origin.y).abs() < 0.5
+            })
+            && (frame_before_reset.origin.x - frame.origin.x).abs() > 0.0
+    });
+    moved_and_saved && reset_to_default
+}
+
+fn panel_frame_and_grip_center() -> Option<(NSRect, NSPoint)> {
+    PANEL.with(|panel| {
+        let state = panel.borrow();
+        let window = state.panel?;
+        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let grip = grip_frame();
+        Some((
+            frame,
+            NSPoint::new(
+                frame.origin.x + grip.origin.x + grip.size.width / 2.0,
+                frame.origin.y + grip.origin.y + grip.size.height / 2.0,
+            ),
+        ))
+    })
 }
 
 unsafe fn text_centroid_offsets(
@@ -432,7 +879,7 @@ unsafe fn text_centroid_offsets(
     Some(offsets)
 }
 
-unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject) {
+unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
     let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
@@ -462,9 +909,138 @@ unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject) {
     let _: () = msg_send![badge_container, setWantsLayer: true];
     let _: () = msg_send![badge_container, setAutoresizingMask: 18u64];
     let _: () = msg_send![backdrop.content_parent, addSubview: badge_container];
+    let grip_view: *mut AnyObject = msg_send![grip_view_class(), alloc];
+    let grip_view: *mut AnyObject = msg_send![grip_view, initWithFrame: grip_frame()];
+    let _: () = msg_send![grip_view, setWantsLayer: true];
+    let grip_layer: *mut AnyObject = msg_send![grip_view, layer];
+    layer_set_background(grip_layer, hex_to_cg_color(0x00000000));
+    for _ in 0..3 {
+        let mark: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let mark: *mut AnyObject = msg_send![mark, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(GRIP_MARK_WIDTH, GRIP_MARK_HEIGHT))];
+        let _: () = msg_send![mark, setWantsLayer: true];
+        let mark_layer: *mut AnyObject = msg_send![mark, layer];
+        let _: () = msg_send![mark_layer, setCornerRadius: (GRIP_MARK_HEIGHT / 2.0)];
+        let _: () = msg_send![grip_view, addSubview: mark];
+        release_obj(mark);
+    }
+    let _: () = msg_send![backdrop.content_parent, addSubview: grip_view];
+    update_grip_marker(grip_view);
     *PANEL_BACKDROP.lock().unwrap() = Some(backdrop);
     release_obj(badge_container);
-    (panel, badge_container)
+    release_obj(grip_view);
+    (panel, badge_container, grip_view)
+}
+
+fn grip_frame() -> NSRect {
+    NSRect::new(
+        NSPoint::new(0.0, (PANEL_H - GRIP_HEIGHT) / 2.0),
+        NSSize::new(GRIP_WIDTH, GRIP_HEIGHT),
+    )
+}
+
+unsafe fn update_grip_marker(grip_view: *mut AnyObject) {
+    let marks: *mut AnyObject = msg_send![grip_view, subviews];
+    let count: usize = msg_send![marks, count];
+    let total_height = 3.0 * GRIP_MARK_HEIGHT + 2.0 * GRIP_MARK_GAP;
+    let x = (GRIP_WIDTH - GRIP_MARK_WIDTH) / 2.0;
+    let start_y = (GRIP_HEIGHT - total_height) / 2.0;
+    let mark_color = hex_to_cg_color(crate::theme::ui_palette().secondary_text);
+    for index in 0..count.min(3) {
+        let mark: *mut AnyObject = msg_send![marks, objectAtIndex: index as isize];
+        let _: () = msg_send![mark, setFrame: NSRect::new(
+            NSPoint::new(x, start_y + index as f64 * (GRIP_MARK_HEIGHT + GRIP_MARK_GAP)),
+            NSSize::new(GRIP_MARK_WIDTH, GRIP_MARK_HEIGHT)
+        )];
+        let layer: *mut AnyObject = msg_send![mark, layer];
+        layer_set_background(layer, mark_color);
+    }
+}
+
+fn update_grip_tracking(state: &mut PanelState, cursor_point: Option<NSPoint>) {
+    if state.drag.is_some() {
+        set_grip_mouse_state(state, true, GripCursor::Closed);
+        return;
+    }
+    let panel_active = state.visible || state.fade_deadline.is_some();
+    let inside_grip = if panel_active {
+        cursor_point.is_some_and(|point| {
+            state.panel.is_some_and(|window| unsafe {
+                let frame: NSRect = msg_send![window, frame];
+                let local = grip_frame();
+                contains(
+                    NSRect::new(
+                        NSPoint::new(
+                            frame.origin.x + local.origin.x,
+                            frame.origin.y + local.origin.y,
+                        ),
+                        local.size,
+                    ),
+                    point,
+                )
+            })
+        })
+    } else {
+        false
+    };
+    set_grip_mouse_state(
+        state,
+        inside_grip,
+        if inside_grip {
+            GripCursor::Open
+        } else {
+            GripCursor::None
+        },
+    );
+}
+
+fn set_grip_mouse_state(state: &mut PanelState, receive_events: bool, cursor: GripCursor) {
+    // NSWindow input is window-wide, so polling opens it only over the grip and a mouse-down
+    // keeps it open for the duration of the captured drag.
+    if let Some(panel) = state.panel {
+        unsafe {
+            let _: () = msg_send![panel, setIgnoresMouseEvents: !receive_events];
+        }
+    }
+    set_grip_cursor(state, cursor);
+}
+
+fn set_grip_cursor(state: &mut PanelState, cursor: GripCursor) {
+    if state.grip_cursor == cursor {
+        return;
+    }
+    unsafe {
+        if state.grip_cursor != GripCursor::None {
+            let _: () = msg_send![class!(NSCursor), pop];
+        }
+        if cursor != GripCursor::None {
+            let cursor_object: *mut AnyObject = match cursor {
+                GripCursor::Open => msg_send![class!(NSCursor), openHandCursor],
+                GripCursor::Closed => msg_send![class!(NSCursor), closedHandCursor],
+                GripCursor::None => std::ptr::null_mut(),
+            };
+            if !cursor_object.is_null() {
+                let _: () = msg_send![cursor_object, push];
+            }
+        }
+    }
+    state.grip_cursor = cursor;
+}
+
+pub(super) fn current_cursor_appkit_point() -> Option<NSPoint> {
+    unsafe {
+        let event = event_tap::CGEventCreate(std::ptr::null());
+        if event.is_null() {
+            return None;
+        }
+        let point = event_tap::CGEventGetLocation(event);
+        CFRelease(event as *const c_void);
+        let screens = screen_geometries();
+        let primary = screens.first()?.frame;
+        Some(NSPoint::new(
+            point.x,
+            primary.origin.y + primary.size.height - point.y,
+        ))
+    }
 }
 
 fn installed_backdrop() -> Option<crate::glass::InstalledBackdrop> {
@@ -667,36 +1243,110 @@ fn badge_labels(badges: &[Badge]) -> Vec<String> {
         .collect()
 }
 
-unsafe fn target_screen(follow_frontmost: bool) -> (NSRect, NSRect) {
+unsafe fn screen_geometries() -> Vec<ScreenGeometry> {
     let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-    let count: usize = msg_send![screens, count];
-    let main: *mut AnyObject = if count > 0 {
-        msg_send![screens, objectAtIndex: 0isize]
-    } else {
-        msg_send![class!(NSScreen), mainScreen]
-    };
-    let main_frame: NSRect = msg_send![main, frame];
-    if follow_frontmost {
-        if let Some(bounds) = frontmost_window_bounds() {
-            let (x, y, width, height) = bounds;
-            if width > 0.0 && height > 0.0 {
-                let appkit_center = NSPoint::new(
-                    x + width / 2.0,
-                    main_frame.origin.y + main_frame.size.height - (y + height / 2.0),
-                );
-                for index in 0..count {
-                    let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index as isize];
-                    let frame: NSRect = msg_send![screen, frame];
-                    if contains(frame, appkit_center) {
-                        let visible: NSRect = msg_send![screen, visibleFrame];
-                        return (frame, visible);
-                    }
-                }
-            }
-        }
+    if screens.is_null() {
+        return Vec::new();
     }
-    let visible: NSRect = msg_send![main, visibleFrame];
-    (main_frame, visible)
+    let count: usize = msg_send![screens, count];
+    if count > 0 {
+        return (0..count)
+            .map(|index| {
+                let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index as isize];
+                ScreenGeometry {
+                    frame: msg_send![screen, frame],
+                    visible_frame: msg_send![screen, visibleFrame],
+                }
+            })
+            .collect();
+    }
+
+    let main: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+    if main.is_null() {
+        return Vec::new();
+    }
+    vec![ScreenGeometry {
+        frame: msg_send![main, frame],
+        visible_frame: msg_send![main, visibleFrame],
+    }]
+}
+
+fn target_screen_index(follow_frontmost: bool, screens: &[ScreenGeometry]) -> usize {
+    if screens.is_empty() || !follow_frontmost {
+        return 0;
+    }
+    let primary = screens[0].frame;
+    let Some((x, y, width, height)) = frontmost_window_bounds() else {
+        return 0;
+    };
+    if width <= 0.0 || height <= 0.0 {
+        return 0;
+    }
+    let appkit_center = NSPoint::new(
+        x + width / 2.0,
+        primary.origin.y + primary.size.height - (y + height / 2.0),
+    );
+    screens
+        .iter()
+        .position(|screen| contains(screen.frame, appkit_center))
+        .unwrap_or(0)
+}
+
+fn screen_for_saved_origin(
+    position: Option<KeystrokeDisplayPosition>,
+    screens: &[ScreenGeometry],
+) -> Option<usize> {
+    let position = position?;
+    if !position.x.is_finite() || !position.y.is_finite() {
+        return None;
+    }
+    let point = NSPoint::new(position.x, position.y);
+    screens
+        .iter()
+        .position(|screen| contains(screen.frame, point))
+}
+
+fn clamp_origin_to_visible(origin: NSPoint, size: NSSize, visible: NSRect) -> NSPoint {
+    let max_x = (visible.origin.x + visible.size.width - size.width).max(visible.origin.x);
+    let max_y = (visible.origin.y + visible.size.height - size.height).max(visible.origin.y);
+    NSPoint::new(
+        origin.x.max(visible.origin.x).min(max_x),
+        origin.y.max(visible.origin.y).min(max_y),
+    )
+}
+
+fn default_bottom_center_frame(visible: NSRect, size: NSSize) -> NSRect {
+    let origin = NSPoint::new(
+        visible.origin.x + (visible.size.width - size.width) / 2.0,
+        visible.origin.y + PANEL_BOTTOM_MARGIN,
+    );
+    NSRect::new(clamp_origin_to_visible(origin, size, visible), size)
+}
+
+fn resolve_panel_frame(
+    position: Option<KeystrokeDisplayPosition>,
+    screens: &[ScreenGeometry],
+    target_index: usize,
+    size: NSSize,
+) -> (usize, NSRect) {
+    if screens.is_empty() {
+        return (0, NSRect::new(NSPoint::new(0.0, 0.0), size));
+    }
+    let target_index = target_index.min(screens.len().saturating_sub(1));
+    let Some(screen_index) = screen_for_saved_origin(position, screens) else {
+        return (
+            target_index,
+            default_bottom_center_frame(screens[target_index].visible_frame, size),
+        );
+    };
+    let position = position.expect("a saved position selected a screen");
+    let screen = screens[screen_index];
+    let origin = clamp_origin_to_visible(
+        NSPoint::new(position.x, position.y),
+        size,
+        screen.visible_frame,
+    );
+    (screen_index, NSRect::new(origin, size))
 }
 
 fn frontmost_window_bounds() -> Option<(f64, f64, f64, f64)> {
@@ -722,7 +1372,9 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{keycap_fill, KEYCAP_FILL_ALPHA};
+    use super::{keycap_fill, resolve_panel_frame, ScreenGeometry, KEYCAP_FILL_ALPHA};
+    use crate::config::KeystrokeDisplayPosition;
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
     fn keycap_fills_use_eighty_percent_alpha_and_preserve_theme_rgb() {
@@ -731,5 +1383,57 @@ mod tests {
             assert_eq!(fill & 0xFFFF_FF00, source & 0xFFFF_FF00);
             assert_eq!(fill & 0xFF, KEYCAP_FILL_ALPHA);
         }
+    }
+
+    fn virtual_screens() -> [ScreenGeometry; 2] {
+        [
+            ScreenGeometry {
+                frame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1000.0, 800.0)),
+                visible_frame: NSRect::new(NSPoint::new(0.0, 20.0), NSSize::new(1000.0, 760.0)),
+            },
+            ScreenGeometry {
+                frame: NSRect::new(NSPoint::new(-1280.0, 0.0), NSSize::new(1280.0, 900.0)),
+                visible_frame: NSRect::new(NSPoint::new(-1280.0, 20.0), NSSize::new(1280.0, 860.0)),
+            },
+        ]
+    }
+
+    #[test]
+    fn saved_origin_stays_on_its_screen_and_clamps_to_its_visible_frame() {
+        let (screen_index, frame) = resolve_panel_frame(
+            Some(KeystrokeDisplayPosition { x: 950.0, y: 790.0 }),
+            &virtual_screens(),
+            1,
+            NSSize::new(300.0, 54.0),
+        );
+        assert_eq!(screen_index, 0);
+        assert_eq!(frame.origin, NSPoint::new(700.0, 726.0));
+    }
+
+    #[test]
+    fn offscreen_saved_origin_uses_follow_target_without_mutating_config() {
+        let saved = Some(KeystrokeDisplayPosition {
+            x: 5000.0,
+            y: 100.0,
+        });
+        let (screen_index, frame) =
+            resolve_panel_frame(saved, &virtual_screens(), 1, NSSize::new(300.0, 54.0));
+        assert_eq!(screen_index, 1);
+        assert_eq!(frame.origin, NSPoint::new(-790.0, 38.0));
+        assert_eq!(
+            saved,
+            Some(KeystrokeDisplayPosition {
+                x: 5000.0,
+                y: 100.0
+            })
+        );
+    }
+
+    #[test]
+    fn absent_saved_origin_uses_bottom_center_of_follow_target() {
+        let (screen_index, frame) =
+            resolve_panel_frame(None, &virtual_screens(), 1, NSSize::new(300.0, 54.0));
+        assert_eq!(screen_index, 1);
+        assert_eq!(frame.origin, NSPoint::new(-790.0, 38.0));
     }
 }

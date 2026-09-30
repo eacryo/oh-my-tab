@@ -396,6 +396,7 @@ windows_activation_mode_invalid = 'windows.activation_mode: "{value}" is not one
 clipboard_picker_position_invalid = 'clipboard.picker_position: "{value}" is not one of mouse, main'
 keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" is not one of all, shortcuts, commands'
 keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" is not one of session, hid'
+keystroke_display_position_invalid = 'keystroke_display.position.{field}: "{value}" must be finite'
 
 [onboarding]
 window_title = "Welcome"

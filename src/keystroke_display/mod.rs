@@ -10,8 +10,10 @@ use std::time::Instant;
 
 use crate::config::{Config, KeystrokeDisplaySection};
 use crate::event_tap::TapThreadControl;
+use hover::PanelHoverProtection;
 use state::{BadgeKind, DisplayMode, KeyGlyph, StateMachine};
 
+mod hover;
 pub(crate) mod mapping;
 mod panel;
 mod secure;
@@ -40,6 +42,7 @@ static EVENT_QUEUE: OnceLock<Mutex<VecDeque<Input>>> = OnceLock::new();
 
 thread_local! {
     static STATE: RefCell<StateMachine> = RefCell::new(StateMachine::default());
+    static PANEL_HOVER: RefCell<PanelHoverProtection> = RefCell::new(PanelHoverProtection::default());
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -162,6 +165,8 @@ fn process_tick() -> bool {
         }
     }
     let now = Instant::now();
+    let cursor_point = panel::current_cursor_appkit_point();
+    let cursor_inside_panel = cursor_point.and_then(panel::cursor_inside_visible_panel);
     let mut became_secure = false;
     let (badges, visible, changed, follow_frontmost) = STATE.with(|state| {
         let mut state = state.borrow_mut();
@@ -170,12 +175,24 @@ fn process_tick() -> bool {
         for input in events {
             changed |= state.apply(input, mode, now);
         }
+        if state.panel_visible() {
+            if let Some(inside) = cursor_inside_panel {
+                let activity =
+                    PANEL_HOVER.with(|hover| hover.borrow_mut().observe(true, inside, now));
+                if let Some(activity_at) = activity {
+                    state.note_activity(activity_at);
+                }
+            }
+        }
         changed |= state.tick(now);
         became_secure = !was_secure && state.secure_paused();
         let follow = config.follow_frontmost_screen;
         let visible = state.panel_visible();
+        if !visible {
+            PANEL_HOVER.with(|hover| hover.borrow_mut().reset());
+        }
         if visible {
-            let max_width = panel::target_screen_width(follow) * 0.5;
+            let max_width = panel::target_screen_width(follow, config.position) * 0.5;
             changed |= state.trim_to_width(max_width);
         }
         (state.badges().to_vec(), visible, changed, follow)
@@ -188,15 +205,33 @@ fn process_tick() -> bool {
         reset_on_main();
         return false;
     }
-    panel::render(&badges, visible, follow_frontmost);
+    let first_hover_sample = panel::render(
+        &badges,
+        visible,
+        follow_frontmost,
+        config.position,
+        now,
+        cursor_point,
+    );
+    if let Some(inside) = first_hover_sample {
+        let activity = PANEL_HOVER.with(|hover| hover.borrow_mut().observe(true, inside, now));
+        if let Some(activity_at) = activity {
+            note_panel_activity(activity_at);
+        }
+    }
     if changed {
         crate::e2e_state::record("keystroke_display");
     }
-    let keep_timer = visible || panel::fade_pending();
+    let keep_timer = visible || panel::fade_pending() || panel::drag_active();
     if !keep_timer {
         panel::stop_timer();
     }
     keep_timer
+}
+
+pub(super) fn note_panel_activity(now: Instant) {
+    crate::debug_assert_main_thread();
+    STATE.with(|state| state.borrow_mut().note_activity(now));
 }
 
 pub(super) fn timer_fired() {
@@ -207,6 +242,7 @@ fn reset_on_main() {
     crate::debug_assert_main_thread();
     panel::reset();
     STATE.with(|state| *state.borrow_mut() = StateMachine::default());
+    PANEL_HOVER.with(|hover| hover.borrow_mut().reset());
     if crate::e2e_state::is_enabled() {
         crate::e2e_state::record("keystroke_display");
     }

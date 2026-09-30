@@ -7,7 +7,7 @@ use crate::event_tap::keyboard;
 const SHORTCUT_MODIFIERS: u64 =
     keyboard::FLAG_COMMAND | keyboard::FLAG_OPTION | keyboard::FLAG_SHIFT | keyboard::FLAG_CONTROL;
 const MODIFIER_ONLY_FADE: Duration = Duration::from_millis(600);
-const IDLE_FADE: Duration = Duration::from_millis(1800);
+pub(super) const IDLE_FADE: Duration = Duration::from_millis(1800);
 const TEXT_RUN_LIMIT: usize = 40;
 pub(crate) const BADGE_GAP: f64 = 6.0;
 pub(crate) const PANEL_SIDE_PADDING: f64 = 12.0;
@@ -255,6 +255,12 @@ impl StateMachine {
 
     pub(crate) fn panel_visible(&self) -> bool {
         !self.badges.is_empty()
+    }
+
+    pub(crate) fn note_activity(&mut self, now: Instant) {
+        if !self.secure && !self.badges.is_empty() {
+            self.deadline = Some(now + IDLE_FADE);
+        }
     }
 
     pub(crate) fn secure_paused(&self) -> bool {
@@ -988,5 +994,19 @@ mod tests {
         assert_eq!(state.deadline(), Some(now + IDLE_FADE));
         assert!(!state.tick(now + IDLE_FADE - Duration::from_millis(1)));
         assert!(state.tick(now + IDLE_FADE));
+    }
+
+    #[test]
+    fn panel_activity_extends_idle_deadline_with_virtual_time() {
+        let now = Instant::now();
+        let activity = now + Duration::from_millis(900);
+        let mut state = StateMachine::default();
+        state.apply(down(123, 0, ""), DisplayMode::All, now);
+        state.note_activity(activity);
+        assert_eq!(state.deadline(), Some(activity + IDLE_FADE));
+        assert!(!state.tick(now + IDLE_FADE));
+        assert!(state.panel_visible());
+        assert!(state.tick(activity + IDLE_FADE));
+        assert!(!state.panel_visible());
     }
 }

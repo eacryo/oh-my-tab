@@ -2727,10 +2727,12 @@ pub fn run() {
             let _: () = msg_send![nsapp, finishLaunching];
             let ok = keystroke_display::smoke_panel_runner();
             if !ok {
-                eprintln!("[smoke-keystroke-display-panel] panel glass structure or sizing failed");
+                eprintln!(
+                    "[smoke-keystroke-display-panel] panel glass, sizing, or grip behavior failed"
+                );
                 std::process::exit(1);
             }
-            log_info!("[smoke-keystroke-display-panel] glass structure and panel sizing passed");
+            log_info!("[smoke-keystroke-display-panel] glass, sizing, and grip behavior passed");
             std::process::exit(0);
         }
     }

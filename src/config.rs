@@ -32,6 +32,20 @@ pub struct KeystrokeDisplaySection {
     pub mode: String,
     pub tap_level: String,
     pub follow_frontmost_screen: bool,
+    pub position: Option<KeystrokeDisplayPosition>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct KeystrokeDisplayPosition {
+    pub x: f64,
+    pub y: f64,
+}
+
+impl Default for KeystrokeDisplayPosition {
+    fn default() -> Self {
+        Self { x: 0.0, y: 0.0 }
+    }
 }
 
 impl Default for KeystrokeDisplaySection {
@@ -41,6 +55,7 @@ impl Default for KeystrokeDisplaySection {
             mode: "all".into(),
             tap_level: "session".into(),
             follow_frontmost_screen: true,
+            position: None,
         }
     }
 }
@@ -887,6 +902,19 @@ impl Config {
                 &[("value", &self.keystroke_display.tap_level)],
             ));
         }
+        if let Some(position) = self.keystroke_display.position {
+            for (axis, value) in [("x", position.x), ("y", position.y)] {
+                if !value.is_finite() {
+                    errs.push(format!(
+                        "keystroke_display.position.{axis}: {}",
+                        tf(
+                            "errors.keystroke_display_position_invalid",
+                            &[("field", axis), ("value", &value.to_string())]
+                        )
+                    ));
+                }
+            }
+        }
 
         if !(1..=100).contains(&self.clipboard.max_entries) {
             errs.push(tf(
@@ -1135,6 +1163,12 @@ impl Config {
                 .any(|e| e.starts_with("keystroke_display.tap_level"))
             {
                 self.keystroke_display.tap_level = other.keystroke_display.tap_level;
+            }
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("keystroke_display.position."))
+            {
+                self.keystroke_display.position = other.keystroke_display.position;
             }
         }
 
@@ -2220,6 +2254,35 @@ mod tests {
         assert!(!merged.keystroke_display.follow_frontmost_screen);
         assert_eq!(merged.keystroke_display.mode, "shortcuts");
         assert_eq!(merged.keystroke_display.tap_level, "session");
+    }
+
+    #[test]
+    fn keystroke_display_position_roundtrips_and_invalid_position_falls_back_per_field() {
+        let mut loaded = Config::default();
+        loaded.keystroke_display.enabled = true;
+        loaded.keystroke_display.position = Some(KeystrokeDisplayPosition {
+            x: -1200.5,
+            y: 88.0,
+        });
+        let serialized = toml::to_string(&loaded).unwrap();
+        let (roundtripped, errors, _) = parse_config_content(&serialized).unwrap();
+        assert!(errors.is_empty());
+        assert_eq!(
+            roundtripped.keystroke_display.position,
+            loaded.keystroke_display.position
+        );
+
+        loaded.keystroke_display.position = Some(KeystrokeDisplayPosition {
+            x: f64::INFINITY,
+            y: 88.0,
+        });
+        let errors = loaded.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("keystroke_display.position.x"));
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert!(merged.keystroke_display.enabled);
+        assert_eq!(merged.keystroke_display.position, None);
     }
 
     #[test]

@@ -397,6 +397,7 @@ windows_activation_mode_invalid = 'windows.activation_mode: "{value}" 不是 hov
 clipboard_picker_position_invalid = 'clipboard.picker_position: "{value}" 不是 mouse、main 之一'
 keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" 只能是 all、shortcuts 或 commands'
 keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" 只能是 session 或 hid'
+keystroke_display_position_invalid = 'keystroke_display.position.{field}: "{value}" 必须是有限数值'
 
 [onboarding]
 window_title = "欢迎使用"
