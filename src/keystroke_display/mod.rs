@@ -20,6 +20,10 @@ mod tap;
 
 pub(crate) use state::Input;
 
+pub(crate) unsafe fn apply_glass_properties() {
+    panel::apply_glass_properties();
+}
+
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);

@@ -50,7 +50,7 @@ use crate::hash::fnv1a64;
 use crate::i18n::{t, t_count, tf};
 use crate::theme::resolved_is_dark;
 use crate::{log_debug, log_info};
-use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use serde::{Deserialize, Serialize};
@@ -225,8 +225,6 @@ const CLEAR_CONFIRM_CARD_H: f64 = CLEAR_CONFIRM_CARD_PAD_Y * 2.0 + CLEAR_CONFIRM
 const CLEAR_CONFIRM_BUTTON_FONT_SIZE: f64 = 11.0;
 const CLEAR_CONFIRM_SHELL_DURATION: f64 = 0.46;
 const CLEAR_CONFIRM_CONTENT_DURATION: f64 = 0.36;
-/// the glass panel's corner radius (16px).
-const CORNER_R: f64 = 16.0;
 /// the row highlight's corner radius (8px).
 const SEL_TILE_R: f64 = 8.0;
 /// inset 9px top/bottom).
@@ -260,9 +258,6 @@ const DETAIL_PAD: f64 = 12.0;
 const DETAIL_TOOLBAR_H: f64 = 36.0;
 const DETAIL_FOOTER_H: f64 = 42.0;
 const DETAIL_CHROME_H: f64 = DETAIL_TOOLBAR_H + DETAIL_FOOTER_H;
-/// AppKit darkens Liquid Glass in the passive detail window. A 55% overlay of the current
-/// glass tint compensates it back to the picker's unselected base surface.
-const DETAIL_INACTIVE_GLASS_COMPENSATION_A: u32 = 0x8D;
 /// Fixed outer width shared by text, code, and image details to prevent horizontal jumps.
 const DETAIL_MAX_W: f64 = 640.0;
 /// Code details use the same fixed width; with soft wrap off, native horizontal scrolling shows

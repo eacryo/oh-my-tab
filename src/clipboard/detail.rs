@@ -429,27 +429,15 @@ pub(super) fn copy_detail_selection() {
 /// During the settings live preview, update only the glass views and detail compensation layer;
 /// do not rebuild clipboard content.
 pub(crate) unsafe fn apply_glass_properties() {
-    let style = match crate::config::effective_glass_style().as_str() {
-        "clear" => 1i64,
-        _ => 0i64,
-    };
-    let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
-    let tint = crate::ffi::hex_to_ns_color(tint_hex);
-    if let Some(glass) = *PICKER_GLASS.lock().unwrap() {
-        let _: () = msg_send![glass.0, setStyle: style];
-        let _: () = msg_send![glass.0, setTintColor: tint];
-    }
-    if let Some(glass) = *DETAIL_GLASS.lock().unwrap() {
-        let _: () = msg_send![glass.0, setStyle: style];
-        let _: () = msg_send![glass.0, setTintColor: tint];
-    }
-    if let Some(fill_layer) = *DETAIL_GLASS_FILL_LAYER.lock().unwrap() {
-        let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
-        crate::ffi::layer_set_background(
-            fill_layer.0,
-            crate::ffi::hex_to_cg_color(compensation_hex),
-        );
-    }
+    let picker_glass = *PICKER_GLASS.lock().unwrap();
+    crate::glass::apply_live_properties(picker_glass, None, None);
+    let detail_glass = *DETAIL_GLASS.lock().unwrap();
+    let compensation_layer = *DETAIL_GLASS_FILL_LAYER.lock().unwrap();
+    crate::glass::apply_live_properties(
+        detail_glass,
+        compensation_layer,
+        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+    );
 }
 
 /// Apply the active light/dark appearance to already-created clipboard panels.
@@ -523,62 +511,16 @@ pub(super) unsafe fn ensure_picker_window() {
     // The glass carries its own depth; the window shadow is redundant (same as the overlay).
     let _: () = msg_send![window, setHasShadow: false];
 
-    // macOS <26 → NSVisualEffectView(withinWindow + Dark material)
-    // Glass backdrop (Liquid Glass), same as the switcher overlay:
-    // macOS 26+ -> NSGlassEffectView (new public API, built-in blur)
-    // macOS <26  -> NSVisualEffectView (withinWindow + Dark material).
-    let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
-    // the parent view the container is added into.
-    let content_parent: *mut AnyObject;
-
-    if is_macos_26 {
-        let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
-        let glass: *mut AnyObject = msg_send![glass_cls, alloc];
-        let glass: *mut AnyObject =
-            msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        // Fixed small corner radius for this small panel (not the config's big one).
-        let radius = CORNER_R;
-        let _: () = msg_send![glass, setCornerRadius: radius];
-        let style_i: i64 = match crate::config::effective_glass_style().as_str() {
-            "clear" => 1,
-            _ => 0,
-        };
-        let _: () = msg_send![glass, setStyle: style_i];
-        let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
-        let tint = crate::ffi::hex_to_ns_color(tint_hex);
-        let _: () = msg_send![glass, setTintColor: tint];
-        let _: () = msg_send![glass, setAutoresizingMask: 18u64];
-        let _: () = msg_send![window, setContentView: glass];
-        // NSGlassEffectView.contentView may be nil initially - create our own.
-        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let inner: *mut AnyObject =
-            msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
-        let _: () = msg_send![glass, setContentView: inner];
-        // Hard-clip the backdrop blur into the corner radius (same trick as the overlay).
-        let _: () = msg_send![glass, setWantsLayer: true];
-        let glass_layer: *mut AnyObject = msg_send![glass, layer];
-        if !glass_layer.is_null() {
-            let _: () = msg_send![glass_layer, setCornerRadius: radius];
-            let _: () = msg_send![glass_layer, setMasksToBounds: true];
-        }
-        *PICKER_GLASS.lock().unwrap() = Some(ObjPtr::new(glass));
-        content_parent = inner;
-    } else {
-        let content: *mut AnyObject = msg_send![window, contentView];
-        let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let ve: *mut AnyObject =
-            msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        // withinWindow blending + Dark material (same as the switcher overlay).
-        let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
-        let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
-        let _: () = msg_send![ve, setState: 1u64]; // Active
-        let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-        let _: () = msg_send![content, addSubview: ve];
-        content_parent = ve;
-    }
-
-    *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(content_parent));
+    // Share the rounded 26+ Glass / pre-26 dark visual-effect backdrop with the other panels.
+    let backdrop = crate::glass::install_backdrop(
+        window,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
+        crate::glass::PANEL_CORNER_RADIUS,
+        None,
+    );
+    *PICKER_GLASS.lock().unwrap() = backdrop.glass;
+    *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(backdrop.content_parent));
+    let content_parent = backdrop.content_parent;
 
     // Container (receives key events; flipped so rows stack top-down, newest on top).
     let container = {

@@ -753,74 +753,16 @@ unsafe fn ensure_detail_window() {
     let _: () = msg_send![window, setBackgroundColor: clear];
     let _: () = msg_send![window, setHasShadow: false];
 
-    // Glass backdrop (Liquid Glass), same as the picker.
-    let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
-
-    let content_parent: *mut AnyObject;
-    if is_macos_26 {
-        let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
-        let glass: *mut AnyObject = msg_send![glass_cls, alloc];
-        let glass: *mut AnyObject =
-            msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        // NSGlassEffectView's corner radius participates in the glass-material rendering, so
-        // it must match the picker. Its own layer hard-clips afterward to prevent blur leaks.
-        let _: () = msg_send![glass, setCornerRadius: CORNER_R];
-        let style_i: i64 = match crate::config::effective_glass_style().as_str() {
-            "clear" => 1,
-            _ => 0,
-        };
-        let _: () = msg_send![glass, setStyle: style_i];
-        let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
-        let tint = crate::ffi::hex_to_ns_color(tint_hex);
-        let _: () = msg_send![glass, setTintColor: tint];
-        let _: () = msg_send![glass, setAutoresizingMask: 18u64];
-        // Use the picker's contentView hierarchy directly. An extra clip container changes
-        // Liquid Glass compositing and makes it resemble a selected row's darker backdrop.
-        let _: () = msg_send![window, setContentView: glass];
-        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let inner: *mut AnyObject =
-            msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
-        // The detail panel cannot become key, so the system darkens its Glass. Reuse the same
-        // configured tint with a higher alpha as base-surface compensation, never the selected
-        // row's dark tile.
-        let fill: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let fill: *mut AnyObject = msg_send![
-            fill,
-            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
-        ];
-        let _: () = msg_send![fill, setWantsLayer: true];
-        let fill_layer: *mut AnyObject = msg_send![fill, layer];
-        let compensation_hex = (tint_hex & 0xFFFF_FF00) | DETAIL_INACTIVE_GLASS_COMPENSATION_A;
-        crate::ffi::layer_set_background(fill_layer, crate::ffi::hex_to_cg_color(compensation_hex));
-        *DETAIL_GLASS_FILL_LAYER.lock().unwrap() = Some(ObjPtr::new(fill_layer));
-        let _: () = msg_send![fill, setAutoresizingMask: 18u64];
-        let _: () = msg_send![inner, addSubview: fill];
-        release_obj(fill);
-        let _: () = msg_send![glass, setContentView: inner];
-        // Same hard clipping as the picker: the glass material owns the corner while the
-        // layer only prevents blur from leaking beyond it.
-        let _: () = msg_send![glass, setWantsLayer: true];
-        let glass_layer: *mut AnyObject = msg_send![glass, layer];
-        if !glass_layer.is_null() {
-            let _: () = msg_send![glass_layer, setCornerRadius: CORNER_R];
-            let _: () = msg_send![glass_layer, setMasksToBounds: true];
-        }
-        *DETAIL_GLASS.lock().unwrap() = Some(ObjPtr::new(glass));
-        release_obj(glass);
-        content_parent = inner;
-    } else {
-        let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let ve: *mut AnyObject =
-            msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-        let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
-        let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
-        let _: () = msg_send![ve, setState: 1u64]; // Active
-        let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-        let content: *mut AnyObject = msg_send![window, contentView];
-        let _: () = msg_send![content, addSubview: ve];
-        content_parent = ve;
-    }
+    // This passive detail panel uses the shared backdrop and its inactive-window compensation.
+    let backdrop = crate::glass::install_backdrop(
+        window,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
+        crate::glass::PANEL_CORNER_RADIUS,
+        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+    );
+    *DETAIL_GLASS.lock().unwrap() = backdrop.glass;
+    *DETAIL_GLASS_FILL_LAYER.lock().unwrap() = backdrop.compensation_layer;
+    let content_parent = backdrop.content_parent;
 
     // The content container is flipped and top-aligned. Detail text is selectable, and an
     // ordinary image click must not dismiss the panel either; Esc/←/→ or list actions close it.

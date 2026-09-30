@@ -13,6 +13,7 @@ use super::state::{
     PANEL_SIDE_PADDING,
 };
 use crate::event_tap;
+use crate::ffi::MainThreadSlot;
 use crate::ffi::{
     hex_to_cg_color, layer_set_background, layer_set_border, make_nsstring, release_obj, CFRelease,
 };
@@ -24,6 +25,7 @@ const HIDE_FADE: Duration = Duration::from_millis(200);
 const PANEL_TIMER_INTERVAL: f64 = 0.016;
 const MAX_MEASUREMENTS: usize = 512;
 const MAX_TEXT_CENTROID_OFFSET: f64 = 2.0;
+const KEYCAP_FILL_ALPHA: u32 = 0xCC;
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -37,6 +39,7 @@ struct PanelState {
     visible: bool,
     fade_deadline: Option<Instant>,
     target_frame: Option<(NSRect, NSRect)>,
+    badge_container: Option<*mut AnyObject>,
     last_badges: Vec<Badge>,
     last_palette: Option<crate::theme::UiPalette>,
     measurements: HashMap<String, f64>,
@@ -45,6 +48,9 @@ struct PanelState {
 thread_local! {
     static PANEL: RefCell<PanelState> = RefCell::new(PanelState::default());
 }
+
+static PANEL_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
+    MainThreadSlot::new(None);
 
 unsafe extern "C" fn timer_callback(_timer: event_tap::CFRunLoopTimerRef, _info: *mut c_void) {
     crate::callback_guard::void("keystroke_display_timer", super::timer_fired);
@@ -129,7 +135,17 @@ pub(super) fn render(badges: &[Badge], visible: bool, follow_frontmost: bool) {
                     target
                 }
             };
-            let panel = *state.panel.get_or_insert_with(|| unsafe { create_panel() });
+            let panel = if let Some(panel) = state.panel {
+                panel
+            } else {
+                let (panel, badge_container) = unsafe { create_panel() };
+                state.panel = Some(panel);
+                state.badge_container = Some(badge_container);
+                panel
+            };
+            let badge_container = state
+                .badge_container
+                .expect("a created keystroke panel has a badge container");
             let labels = badge_labels(badges);
             let mut widths = Vec::with_capacity(badges.len());
             for (badge, text) in badges.iter().zip(&labels) {
@@ -169,12 +185,15 @@ pub(super) fn render(badges: &[Badge], visible: bool, follow_frontmost: bool) {
                     let _: () = msg_send![panel, orderFront: std::ptr::null::<AnyObject>()];
                 }
                 let _: () = msg_send![panel, setFrame: frame, display: true];
-                let content: *mut AnyObject = msg_send![panel, contentView];
-                let layer: *mut AnyObject = msg_send![content, layer];
                 let palette = crate::theme::ui_palette();
                 if state.last_badges != badges || state.last_palette != Some(palette) {
-                    layer_set_background(layer, hex_to_cg_color(palette.window_bg));
-                    rebuild_badges(panel, shown_badges, shown_labels, &widths, panel_w);
+                    rebuild_badges(
+                        badge_container,
+                        shown_badges,
+                        shown_labels,
+                        &widths,
+                        panel_w,
+                    );
                     state.last_badges = badges.to_vec();
                     state.last_palette = Some(palette);
                 }
@@ -276,12 +295,9 @@ pub(super) fn smoke_runner() -> bool {
         },
     ];
     render(&cjk_badges, true, false);
-    let centroid_offsets = PANEL.with(|panel| {
-        let state = panel.borrow();
-        state
-            .panel
-            .and_then(|panel| unsafe { text_centroid_offsets(panel, &cjk_badges) })
-    });
+    let badge_container = PANEL.with(|panel| panel.borrow().badge_container);
+    let centroid_offsets =
+        badge_container.and_then(|content| unsafe { text_centroid_offsets(content, &cjk_badges) });
     eprintln!("[keystroke-display-smoke] text-centroid-offsets-pt={centroid_offsets:?}");
     let typical_glyph_advances = unsafe {
         let cjk = measure_text_width("中");
@@ -290,7 +306,7 @@ pub(super) fn smoke_runner() -> bool {
     };
     let valid = PANEL.with(|panel| {
         let state = panel.borrow();
-        let Some(panel) = state.panel else {
+        let (Some(panel), Some(badge_container)) = (state.panel, state.badge_container) else {
             return false;
         };
         unsafe {
@@ -298,8 +314,7 @@ pub(super) fn smoke_runner() -> bool {
             let frame: NSRect = msg_send![panel, frame];
             let alpha: f64 = msg_send![panel, alphaValue];
             let screen_width = target_screen(false).0.size.width;
-            let content: *mut AnyObject = msg_send![panel, contentView];
-            let views: *mut AnyObject = msg_send![content, subviews];
+            let views: *mut AnyObject = msg_send![badge_container, subviews];
             let count: usize = msg_send![views, count];
             let mut badges_fit = count == cjk_badges.len();
             for (index, badge) in cjk_badges.iter().enumerate() {
@@ -321,6 +336,7 @@ pub(super) fn smoke_runner() -> bool {
                 && frame.size.width <= screen_width * 0.5 + 0.5
                 && typical_glyph_advances
                 && option_q_is_unmodified
+                && backdrop_structure_valid(panel, badge_container)
                 && centroid_offsets.as_ref().is_some_and(|offsets| {
                     offsets.len() == cjk_badges.len()
                         && offsets.iter().all(|(offset, pixels)| {
@@ -335,10 +351,9 @@ pub(super) fn smoke_runner() -> bool {
 }
 
 unsafe fn text_centroid_offsets(
-    panel: *mut AnyObject,
+    content: *mut AnyObject,
     badges: &[Badge],
 ) -> Option<Vec<(f64, usize)>> {
-    let content: *mut AnyObject = msg_send![panel, contentView];
     let bounds: NSRect = msg_send![content, bounds];
     let bitmap: *mut AnyObject = msg_send![content, bitmapImageRepForCachingDisplayInRect: bounds];
     if bitmap.is_null() {
@@ -417,7 +432,7 @@ unsafe fn text_centroid_offsets(
     Some(offsets)
 }
 
-unsafe fn create_panel() -> *mut AnyObject {
+unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject) {
     let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
@@ -435,12 +450,90 @@ unsafe fn create_panel() -> *mut AnyObject {
     let _: () = msg_send![panel, setCollectionBehavior: ((1u64 << 0) | (1u64 << 6) | (1u64 << 8))];
     let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
     let _: () = msg_send![panel, setBackgroundColor: clear];
-    let content: *mut AnyObject = msg_send![panel, contentView];
-    let _: () = msg_send![content, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![content, layer];
-    let _: () = msg_send![layer, setCornerRadius: 13.0f64];
-    layer_set_background(layer, hex_to_cg_color(0x202024E8));
-    panel
+    let local_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(64.0, PANEL_H));
+    let backdrop = crate::glass::install_backdrop(
+        panel,
+        local_frame,
+        crate::glass::PANEL_CORNER_RADIUS,
+        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+    );
+    let badge_container: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let badge_container: *mut AnyObject = msg_send![badge_container, initWithFrame: local_frame];
+    let _: () = msg_send![badge_container, setWantsLayer: true];
+    let _: () = msg_send![badge_container, setAutoresizingMask: 18u64];
+    let _: () = msg_send![backdrop.content_parent, addSubview: badge_container];
+    *PANEL_BACKDROP.lock().unwrap() = Some(backdrop);
+    release_obj(badge_container);
+    (panel, badge_container)
+}
+
+fn installed_backdrop() -> Option<crate::glass::InstalledBackdrop> {
+    *PANEL_BACKDROP.lock().unwrap()
+}
+
+unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut AnyObject) -> bool {
+    let Some(backdrop) = installed_backdrop() else {
+        return false;
+    };
+    if let Some(glass) = backdrop.glass {
+        let Some(glass_class) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") else {
+            return false;
+        };
+        let root: *mut AnyObject = msg_send![panel, contentView];
+        let is_glass: bool = msg_send![root, isKindOfClass: glass_class];
+        let radius: f64 = msg_send![glass.0, cornerRadius];
+        let inner: *mut AnyObject = msg_send![glass.0, contentView];
+        let Some(fill) = backdrop.compensation_view else {
+            return false;
+        };
+        let fill_layer = backdrop.compensation_layer;
+        let Some(fill_layer) = fill_layer else {
+            return false;
+        };
+        let fill_is_child = view_contains_subview(inner, fill.0);
+        let badges_are_child = view_contains_subview(inner, badge_container);
+        is_glass
+            && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
+            && !inner.is_null()
+            && fill_is_child
+            && badges_are_child
+            && !fill_layer.0.is_null()
+    } else {
+        let Some(effect) = backdrop.effect_view else {
+            return false;
+        };
+        let Some(effect_class) = objc2::runtime::AnyClass::get(c"NSVisualEffectView") else {
+            return false;
+        };
+        let root: *mut AnyObject = msg_send![panel, contentView];
+        let is_effect: bool = msg_send![effect.0, isKindOfClass: effect_class];
+        let effect_layer: *mut AnyObject = msg_send![effect.0, layer];
+        let radius: f64 = msg_send![effect_layer, cornerRadius];
+        is_effect
+            && view_contains_subview(root, effect.0)
+            && view_contains_subview(effect.0, badge_container)
+            && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
+    }
+}
+
+unsafe fn view_contains_subview(parent: *mut AnyObject, candidate: *mut AnyObject) -> bool {
+    let subviews: *mut AnyObject = msg_send![parent, subviews];
+    let count: usize = msg_send![subviews, count];
+    (0..count).any(|index| {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        child == candidate
+    })
+}
+
+pub(super) unsafe fn apply_glass_properties() {
+    let Some(backdrop) = installed_backdrop() else {
+        return;
+    };
+    crate::glass::apply_live_properties(
+        backdrop.glass,
+        backdrop.compensation_layer,
+        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+    );
 }
 
 unsafe fn set_alpha_immediately(panel: *mut AnyObject, alpha: f64) {
@@ -487,13 +580,12 @@ fn badge_display_text(label: &str, repeats: u32) -> String {
 }
 
 unsafe fn rebuild_badges(
-    panel: *mut AnyObject,
+    content: *mut AnyObject,
     badges: &[Badge],
     labels: &[String],
     widths: &[f64],
     panel_width: f64,
 ) {
-    let content: *mut AnyObject = msg_send![panel, contentView];
     let old: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![old, count];
     for index in (0..count).rev() {
@@ -515,8 +607,14 @@ unsafe fn rebuild_badges(
             if badge.kind == BadgeKind::Modifier || badge.kind == BadgeKind::Indicator {
                 (0x0A84FF38, 0x0A84FFB0, 0xF8F9FAFF)
             } else {
-                (palette.card_bg, palette.card_border, palette.primary_text)
+                (
+                    keycap_fill(palette.card_bg),
+                    palette.card_border,
+                    palette.primary_text,
+                )
             };
+        // Dark text stays readable on light capsules and white text on dark ones at 90% alpha;
+        // the glass shows through subtly without changing either theme's tuned RGB values.
         layer_set_background(layer, hex_to_cg_color(background));
         layer_set_border(layer, hex_to_cg_color(border));
 
@@ -550,6 +648,10 @@ unsafe fn rebuild_badges(
         release_obj(badge_view);
         x += *width + BADGE_GAP;
     }
+}
+
+fn keycap_fill(color: u32) -> u32 {
+    (color & 0xFFFF_FF00) | KEYCAP_FILL_ALPHA
 }
 
 fn badge_labels(badges: &[Badge]) -> Vec<String> {
@@ -616,4 +718,18 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
         && point.x <= frame.origin.x + frame.size.width
         && point.y >= frame.origin.y
         && point.y <= frame.origin.y + frame.size.height
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{keycap_fill, KEYCAP_FILL_ALPHA};
+
+    #[test]
+    fn keycap_fills_use_eighty_percent_alpha_and_preserve_theme_rgb() {
+        for source in [0x2C2C2EEA, 0xFFFFFFD1] {
+            let fill = keycap_fill(source);
+            assert_eq!(fill & 0xFFFF_FF00, source & 0xFFFF_FF00);
+            assert_eq!(fill & 0xFF, KEYCAP_FILL_ALPHA);
+        }
+    }
 }

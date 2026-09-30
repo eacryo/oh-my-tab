@@ -9,6 +9,7 @@ mod e2e_state;
 mod event_monitor;
 mod event_tap;
 mod ffi;
+mod glass;
 mod hash;
 mod i18n;
 mod icon_cache;
@@ -2695,10 +2696,10 @@ pub fn run() {
             let _: () = msg_send![nsapp, finishLaunching];
             let ok = keystroke_display::smoke_panel_runner();
             if !ok {
-                eprintln!("[smoke-keystroke-display-panel] panel creation or sizing failed");
+                eprintln!("[smoke-keystroke-display-panel] panel glass structure or sizing failed");
                 std::process::exit(1);
             }
-            log_info!("[smoke-keystroke-display-panel] panel creation and sizing passed");
+            log_info!("[smoke-keystroke-display-panel] glass structure and panel sizing passed");
             std::process::exit(0);
         }
     }

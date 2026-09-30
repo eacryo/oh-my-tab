@@ -445,6 +445,7 @@ pub(crate) fn apply_glass_preview() {
     unsafe {
         crate::overlay::apply_glass_properties();
         crate::clipboard::apply_glass_properties();
+        crate::keystroke_display::apply_glass_properties();
         update_settings_preview_views();
     }
 }
