@@ -17,7 +17,10 @@ use crate::config::KeystrokeDisplayPosition;
 use crate::event_tap;
 use crate::ffi::{
     class_addMethod, hex_to_cg_color, layer_set_background, layer_set_border, make_nsstring,
-    objc_allocateClassPair, objc_registerClassPair, release_obj, CFRelease,
+    objc_allocateClassPair, objc_registerClassPair, release_obj, AXUIElementCopyAttributeValue,
+    AXUIElementCopyParameterizedAttributeValue, AXUIElementCreateApplication,
+    AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetType, AXValueGetValue, CFRelease,
+    CFStringCreateWithCString, CGRect,
 };
 use crate::ffi::{MainThreadSlot, StaticClass};
 
@@ -50,6 +53,7 @@ struct PanelState {
     visible: bool,
     fade_deadline: Option<Instant>,
     target_frame: Option<ScreenGeometry>,
+    pending_target_frame: Option<ScreenGeometry>,
     badge_container: Option<*mut AnyObject>,
     grip_view: Option<*mut AnyObject>,
     grip_cursor: GripCursor,
@@ -157,13 +161,29 @@ pub(super) fn fade_pending() -> bool {
 }
 
 pub(super) fn target_screen_width(
-    follow_frontmost: bool,
+    display_position: &str,
     position: Option<KeystrokeDisplayPosition>,
 ) -> f64 {
     crate::debug_assert_main_thread();
     let screens = unsafe { screen_geometries() };
-    let target = target_screen_index(follow_frontmost, &screens);
-    let selected = screen_for_saved_origin(position, &screens).unwrap_or(target);
+    let current = PANEL.with(|panel| {
+        let state = panel.borrow();
+        (state.visible || state.drag.is_some())
+            .then_some(state.target_frame)
+            .flatten()
+    });
+    let selected = current
+        .and_then(|frame| screens.iter().position(|screen| *screen == frame))
+        .or_else(|| screen_for_saved_origin(position, &screens))
+        .unwrap_or_else(|| target_screen_index_live(display_position, &screens));
+    if let Some(screen) = screens.get(selected).copied() {
+        PANEL.with(|panel| {
+            let mut state = panel.borrow_mut();
+            if !state.visible && state.drag.is_none() {
+                state.pending_target_frame = Some(screen);
+            }
+        });
+    }
     screens
         .get(selected)
         .map_or(1.0, |screen| screen.frame.size.width.max(1.0))
@@ -350,8 +370,8 @@ fn finish_grip_interaction() {
             .keystroke_display
             .clone();
         let screens = unsafe { screen_geometries() };
-        let target = target_screen_index(config.follow_frontmost_screen, &screens);
-        let selected = screen_for_saved_origin(Some(position), &screens).unwrap_or(target);
+        let selected = screen_for_saved_origin(Some(position), &screens)
+            .unwrap_or_else(|| target_screen_index_live(&config.display_position, &screens));
         if let Some(screen) = screens.get(selected).copied() {
             PANEL.with(|panel| panel.borrow_mut().target_frame = Some(screen));
         }
@@ -380,7 +400,7 @@ fn reposition_to_default() {
     if screens.is_empty() {
         return;
     }
-    let target = target_screen_index(config.follow_frontmost_screen, &screens);
+    let target = target_screen_index_live(&config.display_position, &screens);
     let screen = screens[target];
     PANEL.with(|panel| {
         let mut state = panel.borrow_mut();
@@ -398,7 +418,7 @@ fn reposition_to_default() {
 pub(super) fn render(
     badges: &[Badge],
     visible: bool,
-    follow_frontmost: bool,
+    display_position: &str,
     position: Option<KeystrokeDisplayPosition>,
     now: Instant,
     cursor_point: Option<NSPoint>,
@@ -426,20 +446,23 @@ pub(super) fn render(
                 Vec::new()
             };
             let geometry = if reopened {
-                let target_index = target_screen_index(follow_frontmost, &screens);
-                let screen_index = screen_for_saved_origin(position, &screens)
-                    .unwrap_or(target_index)
-                    .min(screens.len().saturating_sub(1));
-                screens
-                    .get(screen_index)
-                    .copied()
+                state
+                    .pending_target_frame
+                    .take()
+                    .filter(|pending| screens.contains(pending))
+                    .or_else(|| {
+                        let screen_index = screen_for_saved_origin(position, &screens)
+                            .unwrap_or_else(|| target_screen_index_live(display_position, &screens))
+                            .min(screens.len().saturating_sub(1));
+                        screens.get(screen_index).copied()
+                    })
                     .or(state.target_frame)
                     .unwrap_or_default()
             } else if let Some(target) = state.target_frame {
                 target
             } else {
                 let screens = unsafe { screen_geometries() };
-                let target_index = target_screen_index(follow_frontmost, &screens);
+                let target_index = target_screen_index_live(display_position, &screens);
                 let screen_index = screen_for_saved_origin(position, &screens)
                     .unwrap_or(target_index)
                     .min(screens.len().saturating_sub(1));
@@ -601,6 +624,7 @@ pub(super) fn reset() {
         state.visible = false;
         state.fade_deadline = None;
         state.target_frame = None;
+        state.pending_target_frame = None;
         state.drag = None;
         set_grip_mouse_state(&mut state, false, GripCursor::None);
         state.last_badges.clear();
@@ -630,8 +654,8 @@ pub(super) fn smoke_runner() -> bool {
         repeats: 2,
     };
     let smoke_now = Instant::now();
-    let _ = render(&[badge], true, false, initial_position, smoke_now, None);
-    let _ = render(&[], false, false, initial_position, smoke_now, None);
+    let _ = render(&[badge], true, "main", initial_position, smoke_now, None);
+    let _ = render(&[], false, "main", initial_position, smoke_now, None);
     let _ = render(
         &[Badge {
             text: "⌘Q".into(),
@@ -639,7 +663,7 @@ pub(super) fn smoke_runner() -> bool {
             repeats: 2,
         }],
         true,
-        false,
+        "main",
         initial_position,
         smoke_now,
         None,
@@ -656,7 +680,7 @@ pub(super) fn smoke_runner() -> bool {
             repeats: 12,
         },
     ];
-    let _ = render(&cjk_badges, true, false, initial_position, smoke_now, None);
+    let _ = render(&cjk_badges, true, "main", initial_position, smoke_now, None);
     let badge_container = PANEL.with(|panel| panel.borrow().badge_container);
     let centroid_offsets =
         badge_container.and_then(|content| unsafe { text_centroid_offsets(content, &cjk_badges) });
@@ -786,7 +810,7 @@ fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -
             .keystroke_display
             .clone();
         let screens = unsafe { screen_geometries() };
-        let target_index = target_screen_index(config.follow_frontmost_screen, &screens);
+        let target_index = target_screen_index_live(&config.display_position, &screens);
         let expected = screens
             .get(target_index)
             .map(|screen| default_bottom_center_frame(screen.visible_frame, frame.size));
@@ -1197,20 +1221,19 @@ unsafe fn rebuild_badges(
         let layer: *mut AnyObject = msg_send![badge_view, layer];
         let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-        let (background, border, text_color) =
-            if badge.kind == BadgeKind::Modifier || badge.kind == BadgeKind::Indicator {
-                (
-                    palette.keycap_accent_bg,
-                    palette.keycap_accent_border,
-                    palette.keycap_accent_text,
-                )
-            } else {
-                (
-                    keycap_fill(palette.card_bg),
-                    palette.card_border,
-                    palette.primary_text,
-                )
-            };
+        let (background, border, text_color) = if uses_accent_fill(badge.kind) {
+            (
+                palette.keycap_accent_bg,
+                palette.keycap_accent_border,
+                palette.keycap_accent_text,
+            )
+        } else {
+            (
+                keycap_fill(palette.card_bg),
+                palette.card_border,
+                palette.primary_text,
+            )
+        };
         // Dark text stays readable on light capsules and white text on dark ones at 90% alpha;
         // the glass shows through subtly without changing either theme's tuned RGB values.
         layer_set_background(layer, hex_to_cg_color(background));
@@ -1245,6 +1268,10 @@ unsafe fn rebuild_badges(
         release_obj(badge_view);
         x += *width + BADGE_GAP;
     }
+}
+
+fn uses_accent_fill(kind: BadgeKind) -> bool {
+    matches!(kind, BadgeKind::Modifier | BadgeKind::Indicator)
 }
 
 fn keycap_fill(color: u32) -> u32 {
@@ -1292,25 +1319,186 @@ unsafe fn screen_geometries() -> Vec<ScreenGeometry> {
     }]
 }
 
-fn target_screen_index(follow_frontmost: bool, screens: &[ScreenGeometry]) -> usize {
-    if screens.is_empty() || !follow_frontmost {
+fn target_screen_index(
+    display_position: &str,
+    screens: &[ScreenGeometry],
+    caret_point: Option<NSPoint>,
+    window_point: Option<NSPoint>,
+) -> usize {
+    if screens.is_empty() || display_position == "main" {
         return 0;
     }
-    let primary = screens[0].frame;
-    let Some((x, y, width, height)) = frontmost_window_bounds() else {
-        return 0;
+    let screen_for_point = |point: Option<NSPoint>| {
+        point.and_then(|point| {
+            screens
+                .iter()
+                .position(|screen| contains(screen.frame, point))
+        })
     };
-    if width <= 0.0 || height <= 0.0 {
+    let screen = if display_position == "caret" {
+        screen_for_point(caret_point).or_else(|| screen_for_point(window_point))
+    } else {
+        screen_for_point(window_point)
+    };
+    screen.unwrap_or(0)
+}
+
+fn target_screen_index_live(display_position: &str, screens: &[ScreenGeometry]) -> usize {
+    if display_position == "main" {
         return 0;
     }
-    let appkit_center = NSPoint::new(
-        x + width / 2.0,
-        primary.origin.y + primary.size.height - (y + height / 2.0),
-    );
-    screens
-        .iter()
-        .position(|screen| contains(screen.frame, appkit_center))
-        .unwrap_or(0)
+    let caret_point = (display_position == "caret")
+        .then(insertion_caret_appkit_point)
+        .flatten();
+    target_screen_index(
+        display_position,
+        screens,
+        caret_point,
+        frontmost_window_center(screens),
+    )
+}
+
+#[repr(C)]
+struct AxTextRange {
+    location: isize,
+    length: isize,
+}
+
+fn insertion_caret_appkit_point() -> Option<NSPoint> {
+    let pid = crate::ffi::frontmost_app_info().1;
+    if pid <= 0 {
+        return None;
+    }
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        // This synchronous lookup runs only when the panel opens; bound waits on unresponsive apps.
+        let _ = AXUIElementSetMessagingTimeout(app, 0.05);
+        let Some(focused_key) = ax_string("AXFocusedUIElement") else {
+            CFRelease(app);
+            return None;
+        };
+        let mut focused = std::ptr::null();
+        let focused_result = AXUIElementCopyAttributeValue(app, focused_key, &mut focused);
+        CFRelease(focused_key);
+        if focused_result != crate::ffi::K_AX_SUCCESS || focused.is_null() {
+            CFRelease(app);
+            return None;
+        }
+        let _ = AXUIElementSetMessagingTimeout(focused, 0.05);
+
+        let Some(range_key) = ax_string("AXSelectedTextRange") else {
+            CFRelease(focused);
+            CFRelease(app);
+            return None;
+        };
+        let mut selected_range = std::ptr::null();
+        let range_result = AXUIElementCopyAttributeValue(focused, range_key, &mut selected_range);
+        CFRelease(range_key);
+        let range = if range_result == crate::ffi::K_AX_SUCCESS
+            && !selected_range.is_null()
+            && AXValueGetType(selected_range) == 4
+        {
+            let mut range = AxTextRange {
+                location: 0,
+                length: 0,
+            };
+            AXValueGetValue(
+                selected_range,
+                4,
+                &mut range as *mut AxTextRange as *mut c_void,
+            )
+            .then_some(range)
+        } else {
+            None
+        };
+        let point = if let Some(range) = range {
+            let insertion_range = AxTextRange {
+                location: range.location,
+                length: 0,
+            };
+            let insertion_range_value =
+                AXValueCreate(4, &insertion_range as *const AxTextRange as *const c_void);
+            let bounds_key = ax_string("AXBoundsForRange");
+            match (insertion_range_value.is_null(), bounds_key) {
+                (false, Some(bounds_key)) => {
+                    let mut bounds_value = std::ptr::null();
+                    let result = AXUIElementCopyParameterizedAttributeValue(
+                        focused,
+                        bounds_key,
+                        insertion_range_value,
+                        &mut bounds_value,
+                    );
+                    CFRelease(bounds_key);
+                    CFRelease(insertion_range_value);
+                    if result == crate::ffi::K_AX_SUCCESS
+                        && !bounds_value.is_null()
+                        && AXValueGetType(bounds_value) == 3
+                    {
+                        let mut bounds = CGRect {
+                            x: 0.0,
+                            y: 0.0,
+                            w: 0.0,
+                            h: 0.0,
+                        };
+                        let valid = AXValueGetValue(
+                            bounds_value,
+                            3,
+                            &mut bounds as *mut CGRect as *mut c_void,
+                        );
+                        CFRelease(bounds_value);
+                        let screens = screen_geometries();
+                        let primary = screens.first().map(|screen| screen.frame);
+                        (valid
+                            && bounds.x.is_finite()
+                            && bounds.y.is_finite()
+                            && bounds.w.is_finite()
+                            && bounds.h.is_finite()
+                            && bounds.h >= 0.0)
+                            .then_some(primary)
+                            .flatten()
+                            .map(|primary| {
+                                NSPoint::new(
+                                    bounds.x + bounds.w / 2.0,
+                                    primary.origin.y + primary.size.height
+                                        - (bounds.y + bounds.h / 2.0),
+                                )
+                            })
+                    } else {
+                        if !bounds_value.is_null() {
+                            CFRelease(bounds_value);
+                        }
+                        None
+                    }
+                }
+                (range_is_null, bounds_key) => {
+                    if !range_is_null {
+                        CFRelease(insertion_range_value);
+                    }
+                    if let Some(bounds_key) = bounds_key {
+                        CFRelease(bounds_key);
+                    }
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        if !selected_range.is_null() {
+            CFRelease(selected_range);
+        }
+        CFRelease(focused);
+        CFRelease(app);
+        point
+    }
+}
+
+unsafe fn ax_string(value: &str) -> Option<*const c_void> {
+    let value = CString::new(value).ok()?;
+    let string = CFStringCreateWithCString(std::ptr::null(), value.as_ptr(), 0x08000100);
+    (!string.is_null()).then_some(string)
 }
 
 fn screen_for_saved_origin(
@@ -1379,7 +1567,8 @@ fn resolve_panel_frame(
     (screen_index, NSRect::new(origin, size))
 }
 
-fn frontmost_window_bounds() -> Option<(f64, f64, f64, f64)> {
+fn frontmost_window_center(screens: &[ScreenGeometry]) -> Option<NSPoint> {
+    let primary = screens.first()?.frame;
     let (_, front_pid) = crate::ffi::frontmost_app_info();
     crate::with_tab_state(|state| {
         let state = state.as_ref()?;
@@ -1389,7 +1578,13 @@ fn frontmost_window_bounds() -> Option<(f64, f64, f64, f64)> {
             .find(|window| window.pid == front_pid && window.is_active)
             .or_else(|| state.windows.iter().find(|window| window.pid == front_pid))
             .or_else(|| state.windows.iter().find(|window| window.is_active))
-            .map(|window| window.bounds)
+            .map(|window| {
+                let (x, y, width, height) = window.bounds;
+                NSPoint::new(
+                    x + width / 2.0,
+                    primary.origin.y + primary.size.height - (y + height / 2.0),
+                )
+            })
     })
 }
 
@@ -1403,10 +1598,11 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        keycap_fill, resize_frame_preserving_center, resolve_panel_frame, ScreenGeometry,
-        KEYCAP_FILL_ALPHA,
+        keycap_fill, resize_frame_preserving_center, resolve_panel_frame, target_screen_index,
+        uses_accent_fill, ScreenGeometry, KEYCAP_FILL_ALPHA,
     };
     use crate::config::KeystrokeDisplayPosition;
+    use crate::keystroke_display::state::BadgeKind;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
@@ -1416,6 +1612,13 @@ mod tests {
             assert_eq!(fill & 0xFFFF_FF00, source & 0xFFFF_FF00);
             assert_eq!(fill & 0xFF, KEYCAP_FILL_ALPHA);
         }
+    }
+
+    #[test]
+    fn released_modifier_badges_use_the_neutral_keycap_fill() {
+        assert!(uses_accent_fill(BadgeKind::Modifier));
+        assert!(!uses_accent_fill(BadgeKind::ModifierReleased));
+        assert!(uses_accent_fill(BadgeKind::Indicator));
     }
 
     #[test]
@@ -1434,6 +1637,36 @@ mod tests {
                 visible_frame: NSRect::new(NSPoint::new(-1280.0, 20.0), NSSize::new(1280.0, 860.0)),
             },
         ]
+    }
+
+    #[test]
+    fn display_position_uses_main_or_insertion_caret_screen_with_window_fallback() {
+        let screens = virtual_screens();
+        let main_point = Some(NSPoint::new(200.0, 200.0));
+        let secondary_point = Some(NSPoint::new(-600.0, 300.0));
+
+        assert_eq!(
+            target_screen_index("main", &screens, secondary_point, secondary_point),
+            0
+        );
+        assert_eq!(
+            target_screen_index("caret", &screens, secondary_point, main_point),
+            1
+        );
+        assert_eq!(
+            target_screen_index("caret", &screens, None, secondary_point),
+            1
+        );
+        assert_eq!(
+            target_screen_index(
+                "caret",
+                &screens,
+                Some(NSPoint::new(5000.0, 5000.0)),
+                secondary_point
+            ),
+            1
+        );
+        assert_eq!(target_screen_index("caret", &screens, None, main_point), 0);
     }
 
     #[test]

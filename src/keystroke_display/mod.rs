@@ -168,7 +168,7 @@ fn process_tick() -> bool {
     let cursor_point = panel::current_cursor_appkit_point();
     let cursor_inside_panel = cursor_point.and_then(panel::cursor_inside_visible_panel);
     let mut became_secure = false;
-    let (badges, visible, changed, follow_frontmost) = STATE.with(|state| {
+    let (badges, visible, changed, display_position) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let was_secure = state.secure_paused();
         let mut changed = false;
@@ -186,16 +186,16 @@ fn process_tick() -> bool {
         }
         changed |= state.tick(now);
         became_secure = !was_secure && state.secure_paused();
-        let follow = config.follow_frontmost_screen;
+        let display_position = config.display_position.clone();
         let visible = state.panel_visible();
         if !visible {
             PANEL_HOVER.with(|hover| hover.borrow_mut().reset());
         }
         if visible {
-            let max_width = panel::target_screen_width(follow, config.position) * 0.5;
+            let max_width = panel::target_screen_width(&display_position, config.position) * 0.5;
             changed |= state.trim_to_width(max_width);
         }
-        (state.badges().to_vec(), visible, changed, follow)
+        (state.badges().to_vec(), visible, changed, display_position)
     });
 
     if became_secure {
@@ -208,7 +208,7 @@ fn process_tick() -> bool {
     let first_hover_sample = panel::render(
         &badges,
         visible,
-        follow_frontmost,
+        &display_position,
         config.position,
         now,
         cursor_point,
@@ -405,6 +405,7 @@ pub(crate) fn e2e_snapshot() -> E2eSnapshot {
                 },
                 kind: match badge.kind {
                     BadgeKind::Modifier => "modifier",
+                    BadgeKind::ModifierReleased => "modifier_released",
                     BadgeKind::Chord => "chord",
                     BadgeKind::TextRun => "text_run",
                     BadgeKind::Indicator => "indicator",

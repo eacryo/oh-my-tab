@@ -47,6 +47,7 @@ const SCROLL_MODE_LABEL_KEYS: [&str; 3] = [
     "settings.scroll_mode_smooth",
 ];
 const SCROLL_MODE_VALUES: [&str; 3] = ["default", "line", "smooth"];
+const KEYSTROKE_DISPLAY_POSITION_VALUES: [&str; 2] = ["main", "caret"];
 #[cfg(any(debug_assertions, feature = "dev-long-text"))]
 const LOCALE_VALUES: [&str; 5] = [
     "auto",
@@ -194,7 +195,7 @@ pub(super) struct SettingsUi {
     keystroke_display_enabled: *mut AnyObject,
     keystroke_display_mode: *mut AnyObject,
     keystroke_display_tap_level: *mut AnyObject,
-    keystroke_display_follow_screen: *mut AnyObject,
+    keystroke_display_position: *mut AnyObject,
     log_level: *mut AnyObject, // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // launch at login
     reverse_scroll: *mut AnyObject, // reverse scrolling
@@ -1071,9 +1072,9 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.keystroke_display.tap_level
     );
     changed!(
-        "keystroke_display.follow_frontmost_screen",
-        old.keystroke_display.follow_frontmost_screen,
-        new.keystroke_display.follow_frontmost_screen
+        "keystroke_display.display_position",
+        old.keystroke_display.display_position,
+        new.keystroke_display.display_position
     );
     changed!("i18n.locale", old.i18n.locale, new.i18n.locale);
     changed!("windows.enabled", old.windows.enabled, new.windows.enabled);
@@ -1303,13 +1304,13 @@ fn load_settings_from(cfg: &Config) {
                 0
             };
             let _: () = msg_send![ui.keystroke_display_tap_level, selectItemAtIndex: tap_idx];
+            let display_position_idx = KEYSTROKE_DISPLAY_POSITION_VALUES
+                .iter()
+                .position(|mode| *mode == cfg.keystroke_display.display_position)
+                .unwrap_or(1) as isize;
             let _: () = msg_send![
-                ui.keystroke_display_follow_screen,
-                setState: if cfg.keystroke_display.follow_frontmost_screen {
-                    1isize
-                } else {
-                    0isize
-                }
+                ui.keystroke_display_position,
+                selectItemAtIndex: display_position_idx
             ];
             // locale: select the item matching CONFIG.i18n.locale; fall back to index 0 (auto).
             let loc_idx: isize = LOCALE_VALUES

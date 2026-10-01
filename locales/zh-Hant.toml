@@ -96,7 +96,9 @@ keystroke_display_mode_commands = "Command 快捷鍵"
 row_keystroke_display_tap_level = "輸入來源"
 keystroke_display_tap_session = "工作階段（包含重新映射的按鍵）"
 keystroke_display_tap_hid = "硬體（實體按鍵）"
-row_keystroke_display_follow_screen = "跟隨最前方視窗所在的螢幕"
+row_keystroke_display_position = "顯示位置"
+keystroke_display_position_main = "始終顯示在主螢幕"
+keystroke_display_position_caret = "跟隨輸入游標所在螢幕"
 tooltip_windows_disabled = "請先啟用應用切換浮窗。"
 header_logging = "日誌"
 row_theme = "主題"
@@ -409,6 +411,7 @@ clipboard_shortcut_invalid = '"{value}" 不是有效的快速鍵組合'
 clipboard_shortcut_conflict = "此按鍵組合與內建快速鍵衝突。"
 keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" 只能是 all、shortcuts 或 commands'
 keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" 只能是 session 或 hid'
+keystroke_display_position_mode_invalid = 'keystroke_display.display_position: "{value}" 只能是 main 或 caret'
 keystroke_display_position_invalid = 'keystroke_display.position.{field}: "{value}" 必須是有限數值'
 
 [onboarding]

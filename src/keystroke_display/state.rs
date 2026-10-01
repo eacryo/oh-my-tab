@@ -113,6 +113,7 @@ impl DisplayMode {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BadgeKind {
     Modifier,
+    ModifierReleased,
     Chord,
     TextRun,
     Indicator,
@@ -320,19 +321,25 @@ impl StateMachine {
         let new_visible_flags = flags & visible_mask;
         let is_caps_lock = keycode == keyboard::VK_CAPS_LOCK && added != 0;
 
-        if added != 0 && mode.accepts(flags) {
-            let text = crate::keystroke_display::mapping::modifier_glyphs(flags & visible_mask);
+        if new_visible_flags != 0 && mode.accepts(flags) {
+            let text = crate::keystroke_display::mapping::modifier_glyphs(new_visible_flags);
             if !text.is_empty() {
                 if let Some(index) = self.modifier_badge {
                     if let Some(badge) = self.badges.get_mut(index) {
-                        if badge.kind == BadgeKind::Modifier {
+                        if matches!(
+                            badge.kind,
+                            BadgeKind::Modifier | BadgeKind::ModifierReleased
+                        ) {
                             badge.text = text;
+                            badge.kind = BadgeKind::Modifier;
                         }
                     }
                 } else {
                     self.modifier_badge = Some(self.push_badge(text, BadgeKind::Modifier));
                 }
-                self.last_key = None;
+                if added != 0 {
+                    self.last_key = None;
+                }
                 self.deadline = None;
             }
         }
@@ -347,11 +354,10 @@ impl StateMachine {
             }
         } else if new_visible_flags == 0 {
             if let Some(index) = self.modifier_badge {
-                if self
-                    .badges
-                    .get(index)
-                    .is_some_and(|badge| badge.kind == BadgeKind::Modifier)
-                {
+                if let Some(badge) = self.badges.get_mut(index) {
+                    if badge.kind == BadgeKind::Modifier {
+                        badge.kind = BadgeKind::ModifierReleased;
+                    }
                     self.deadline = Some(now + MODIFIER_ONLY_FADE);
                 }
             }
@@ -393,7 +399,10 @@ impl StateMachine {
             let group_glyph = text.clone();
             let index = if let Some(index) = self.modifier_badge.take() {
                 if let Some(badge) = self.badges.get_mut(index) {
-                    if badge.kind == BadgeKind::Modifier {
+                    if matches!(
+                        badge.kind,
+                        BadgeKind::Modifier | BadgeKind::ModifierReleased
+                    ) {
                         badge.text = text;
                         badge.kind = BadgeKind::Chord;
                         badge.repeats = 1;
@@ -943,6 +952,37 @@ mod tests {
         assert!(!state.tick(now + MODIFIER_ONLY_FADE));
         assert!(state.tick(now + Duration::from_millis(605)));
         assert!(!state.panel_visible());
+    }
+
+    #[test]
+    fn modifier_badge_tracks_held_modifiers_and_loses_accent_on_release() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        state.apply(flags(keyboard::FLAG_COMMAND, 55), DisplayMode::All, now);
+        state.apply(
+            flags(keyboard::FLAG_COMMAND | keyboard::FLAG_SHIFT, 56),
+            DisplayMode::All,
+            now + Duration::from_millis(10),
+        );
+        assert_eq!(state.badges()[0].text, "⌘⇧");
+        assert_eq!(state.badges()[0].kind, BadgeKind::Modifier);
+
+        state.apply(
+            flags(keyboard::FLAG_COMMAND, 56),
+            DisplayMode::All,
+            now + Duration::from_millis(20),
+        );
+        assert_eq!(state.badges()[0].text, "⌘");
+        assert_eq!(state.badges()[0].kind, BadgeKind::Modifier);
+
+        state.apply(
+            flags(0, 55),
+            DisplayMode::All,
+            now + Duration::from_millis(30),
+        );
+        assert_eq!(state.badges()[0].text, "⌘");
+        assert_eq!(state.badges()[0].kind, BadgeKind::ModifierReleased);
+        assert_eq!(state.deadline(), Some(now + Duration::from_millis(630)));
     }
 
     #[test]

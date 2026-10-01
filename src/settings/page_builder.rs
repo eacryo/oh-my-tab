@@ -406,19 +406,39 @@ pub(super) unsafe fn build_keystroke_display_page(
     .1;
     bind_control(target, ui.keystroke_display_tap_level);
 
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(keystroke_display_view, y, described_row_h, content_w);
-    ui.keystroke_display_follow_screen = SettingsRow::tall_before_control(
+    let display_position_labels = [
+        t("settings.keystroke_display_position_main"),
+        t("settings.keystroke_display_position_caret"),
+    ];
+    let display_position_refs: Vec<&str> =
+        display_position_labels.iter().map(|s| s.as_str()).collect();
+    let display_position_metrics =
+        SettingsSelect::metrics(ctrl_w, &display_position_refs, row_h, described_row_h);
+    let y = canvas.next_row(display_position_metrics.row_h);
+    SettingsRow::separator_above_row(
+        keystroke_display_view,
+        y,
+        display_position_metrics.row_h,
+        content_w,
+    );
+    ui.keystroke_display_position = SettingsRow::tall_with_height(
         keystroke_display_view,
         label_x,
         y,
-        ctrl_x,
-        super::SETTINGS_CONTROL_LABEL_GAP,
-        &t("settings.row_keystroke_display_follow_screen"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+        label_w,
+        display_position_metrics.row_h,
+        &t("settings.row_keystroke_display_position"),
+        SettingsControl::popup(
+            ctrl_x,
+            y + (display_position_metrics.row_h - display_position_metrics.control_h) / 2.0,
+            ctrl_w,
+            display_position_metrics.control_h,
+            &display_position_refs,
+            1,
+        ),
     )
     .1;
-    bind_control(target, ui.keystroke_display_follow_screen);
+    bind_control(target, ui.keystroke_display_position);
     canvas.card(&t("settings.header_keystroke_display"));
 
     let content_bottom = canvas.finish();

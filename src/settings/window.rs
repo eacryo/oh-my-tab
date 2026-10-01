@@ -1541,7 +1541,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         cfg.keystroke_display.enabled = true;
         cfg.keystroke_display.mode = "commands".into();
         cfg.keystroke_display.tap_level = "hid".into();
-        cfg.keystroke_display.follow_frontmost_screen = true;
+        cfg.keystroke_display.display_position = "caret".into();
         if let Ok(mut current) = CONFIG.write() {
             *current = cfg.clone();
         }
@@ -1558,7 +1558,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 ui.keystroke_display_enabled,
                 ui.keystroke_display_mode,
                 ui.keystroke_display_tap_level,
-                ui.keystroke_display_follow_screen,
+                ui.keystroke_display_position,
             ]
             .into_iter()
             .all(|control| {
@@ -1578,7 +1578,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 msg_send![ui.keystroke_display_enabled, state],
                 msg_send![ui.keystroke_display_mode, indexOfSelectedItem],
                 msg_send![ui.keystroke_display_tap_level, indexOfSelectedItem],
-                msg_send![ui.keystroke_display_follow_screen, state],
+                msg_send![ui.keystroke_display_position, indexOfSelectedItem],
                 controls_on_keystroke_page,
             ))
         });
@@ -1587,7 +1587,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         refreshed_cfg.keystroke_display.enabled = false;
         refreshed_cfg.keystroke_display.mode = "shortcuts".into();
         refreshed_cfg.keystroke_display.tap_level = "session".into();
-        refreshed_cfg.keystroke_display.follow_frontmost_screen = false;
+        refreshed_cfg.keystroke_display.display_position = "main".into();
         if let Ok(mut current) = CONFIG.write() {
             *current = refreshed_cfg;
         }
@@ -1598,7 +1598,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 msg_send![ui.keystroke_display_enabled, state],
                 msg_send![ui.keystroke_display_mode, indexOfSelectedItem],
                 msg_send![ui.keystroke_display_tap_level, indexOfSelectedItem],
-                msg_send![ui.keystroke_display_follow_screen, state],
+                msg_send![ui.keystroke_display_position, indexOfSelectedItem],
             ))
         });
         hide_settings();
@@ -2204,7 +2204,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             keystroke_display_enabled: std::ptr::null_mut(),
             keystroke_display_mode: std::ptr::null_mut(),
             keystroke_display_tap_level: std::ptr::null_mut(),
-            keystroke_display_follow_screen: std::ptr::null_mut(),
+            keystroke_display_position: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),

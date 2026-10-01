@@ -31,8 +31,37 @@ pub struct KeystrokeDisplaySection {
     pub enabled: bool,
     pub mode: String,
     pub tap_level: String,
-    pub follow_frontmost_screen: bool,
+    // The old boolean is accepted on load: true becomes caret-following (with a focused-window
+    // fallback), false remains pinned to the main display.
+    #[serde(
+        default = "default_keystroke_display_position",
+        alias = "follow_frontmost_screen",
+        deserialize_with = "deserialize_keystroke_display_position"
+    )]
+    pub display_position: String,
     pub position: Option<KeystrokeDisplayPosition>,
+}
+
+fn default_keystroke_display_position() -> String {
+    "caret".into()
+}
+
+fn deserialize_keystroke_display_position<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum PositionSetting {
+        Mode(String),
+        LegacyFollowWindow(bool),
+    }
+
+    Ok(match PositionSetting::deserialize(deserializer)? {
+        PositionSetting::Mode(mode) => mode,
+        PositionSetting::LegacyFollowWindow(true) => "caret".into(),
+        PositionSetting::LegacyFollowWindow(false) => "main".into(),
+    })
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq)]
@@ -54,7 +83,7 @@ impl Default for KeystrokeDisplaySection {
             enabled: false,
             mode: "all".into(),
             tap_level: "session".into(),
-            follow_frontmost_screen: true,
+            display_position: default_keystroke_display_position(),
             position: None,
         }
     }
@@ -903,6 +932,12 @@ impl Config {
                 &[("value", &self.keystroke_display.tap_level)],
             ));
         }
+        if !["main", "caret"].contains(&self.keystroke_display.display_position.as_str()) {
+            errs.push(tf(
+                "errors.keystroke_display_position_mode_invalid",
+                &[("value", &self.keystroke_display.display_position)],
+            ));
+        }
         if let Some(position) = self.keystroke_display.position {
             for (axis, value) in [("x", position.x), ("y", position.y)] {
                 if !value.is_finite() {
@@ -1168,8 +1203,12 @@ impl Config {
             self.keystroke_display = other.keystroke_display;
         } else {
             self.keystroke_display.enabled = other.keystroke_display.enabled;
-            self.keystroke_display.follow_frontmost_screen =
-                other.keystroke_display.follow_frontmost_screen;
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("keystroke_display.display_position"))
+            {
+                self.keystroke_display.display_position = other.keystroke_display.display_position;
+            }
             if !errs.iter().any(|e| e.starts_with("keystroke_display.mode")) {
                 self.keystroke_display.mode = other.keystroke_display.mode;
             }
@@ -2307,11 +2346,11 @@ mod tests {
         assert!(!defaults.keystroke_display.enabled);
         assert_eq!(defaults.keystroke_display.mode, "all");
         assert_eq!(defaults.keystroke_display.tap_level, "session");
-        assert!(defaults.keystroke_display.follow_frontmost_screen);
+        assert_eq!(defaults.keystroke_display.display_position, "caret");
 
         let mut loaded = defaults.clone();
         loaded.keystroke_display.enabled = true;
-        loaded.keystroke_display.follow_frontmost_screen = false;
+        loaded.keystroke_display.display_position = "main".into();
         loaded.keystroke_display.mode = "shortcuts".into();
         loaded.keystroke_display.tap_level = "invalid".into();
         let errors = loaded.validate();
@@ -2321,9 +2360,32 @@ mod tests {
         let mut merged = defaults.clone();
         merged.merge_valid(loaded, &errors);
         assert!(merged.keystroke_display.enabled);
-        assert!(!merged.keystroke_display.follow_frontmost_screen);
+        assert_eq!(merged.keystroke_display.display_position, "main");
         assert_eq!(merged.keystroke_display.mode, "shortcuts");
         assert_eq!(merged.keystroke_display.tap_level, "session");
+    }
+
+    #[test]
+    fn keystroke_display_position_migrates_legacy_boolean_and_validates_modes() {
+        let follows_window: Config =
+            toml::from_str("[keystroke_display]\nfollow_frontmost_screen = true\n").unwrap();
+        assert_eq!(follows_window.keystroke_display.display_position, "caret");
+        let serialized = toml::to_string(&follows_window).unwrap();
+        assert!(serialized.contains("display_position = \"caret\""));
+        assert!(!serialized.contains("follow_frontmost_screen"));
+        let stays_on_main: Config =
+            toml::from_str("[keystroke_display]\nfollow_frontmost_screen = false\n").unwrap();
+        assert_eq!(stays_on_main.keystroke_display.display_position, "main");
+
+        let mut invalid = Config::default();
+        invalid.keystroke_display.display_position = "pointer".into();
+        let errors = invalid.validate();
+        assert!(errors
+            .iter()
+            .any(|error| error.starts_with("keystroke_display.display_position")));
+        let mut merged = Config::default();
+        merged.merge_valid(invalid, &errors);
+        assert_eq!(merged.keystroke_display.display_position, "caret");
     }
 
     #[test]

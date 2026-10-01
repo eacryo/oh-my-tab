@@ -31,7 +31,7 @@ pub(super) enum ControlField {
     KeystrokeDisplayEnabled,
     KeystrokeDisplayMode,
     KeystrokeDisplayTapLevel,
-    KeystrokeDisplayFollowScreen,
+    KeystrokeDisplayPosition,
     MouseEnabled,
     ReverseScroll,
     ScrollMode,
@@ -121,8 +121,8 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             })
             .or_else(|| {
                 m(
-                    u.keystroke_display_follow_screen,
-                    ControlField::KeystrokeDisplayFollowScreen,
+                    u.keystroke_display_position,
+                    ControlField::KeystrokeDisplayPosition,
                 )
             })
             .or_else(|| m(u.enable_mouse, ControlField::MouseEnabled))
@@ -557,9 +557,14 @@ fn apply_control_field(field: ControlField) {
                     cfg.keystroke_display.tap_level =
                         if idx == 1 { "hid" } else { "session" }.into();
                 }
-                ControlField::KeystrokeDisplayFollowScreen => {
-                    let state: isize = msg_send![u.keystroke_display_follow_screen, state];
-                    cfg.keystroke_display.follow_frontmost_screen = state == 1;
+                ControlField::KeystrokeDisplayPosition => {
+                    let index: isize = msg_send![u.keystroke_display_position, indexOfSelectedItem];
+                    cfg.keystroke_display.display_position =
+                        super::KEYSTROKE_DISPLAY_POSITION_VALUES
+                            .get(index.max(0) as usize)
+                            .copied()
+                            .unwrap_or("caret")
+                            .into();
                 }
                 ControlField::MouseEnabled => {
                     let state: isize = msg_send![u.enable_mouse, state];
@@ -1428,13 +1433,13 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 0
             };
             let _: () = msg_send![u.keystroke_display_tap_level, selectItemAtIndex: tap_idx];
+            let display_position_idx = super::KEYSTROKE_DISPLAY_POSITION_VALUES
+                .iter()
+                .position(|mode| *mode == cfg.keystroke_display.display_position)
+                .unwrap_or(1) as isize;
             let _: () = msg_send![
-                u.keystroke_display_follow_screen,
-                setState: if cfg.keystroke_display.follow_frontmost_screen {
-                    1isize
-                } else {
-                    0isize
-                }
+                u.keystroke_display_position,
+                selectItemAtIndex: display_position_idx
             ];
 
             let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };

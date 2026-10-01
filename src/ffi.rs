@@ -126,6 +126,12 @@ extern "C" {
         attribute: *const c_void,
         value: *mut *const c_void,
     ) -> AXError;
+    pub(crate) fn AXUIElementCopyParameterizedAttributeValue(
+        element: AXUIElementRef,
+        attribute: *const c_void,
+        parameter: *const c_void,
+        value: *mut *const c_void,
+    ) -> AXError;
     /// Reads several attributes in one IPC round trip. With empty options and no stopOnError the
     /// call ALWAYS returns an array: a slot the app could not answer holds an
     /// `kAXValueAXErrorType` AXValue placeholder, which callers must read as "did not answer"
