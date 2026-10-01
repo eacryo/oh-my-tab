@@ -16,4 +16,8 @@ pub(crate) fn apply_theme_and_locale_refresh() {
     crate::overlay::apply_theme();
     crate::overlay::refresh_highlight();
     crate::overlay::update_status_label();
+    // The guide re-renders its current step with the new palette and re-asserts the
+    // window appearance; a no-op when the guide is not on screen.
+    crate::onboarding::apply_window_appearance();
+    crate::onboarding::rerender_if_visible();
 }

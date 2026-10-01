@@ -17,7 +17,7 @@
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
-use objc2_foundation::{NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use std::ffi::c_void;
 
 use crate::config::{schedule_config_persist, Config, CONFIG};
@@ -507,6 +507,7 @@ unsafe fn ensure_window() {
     // Closing must not release it: the pointer stays in the static slot for reuse (same
     // convention as the settings window).
     let _: () = msg_send![window, setReleasedWhenClosed: false];
+    apply_window_appearance();
     let _: () = msg_send![window, center];
     let content: *mut AnyObject = msg_send![window, contentView];
     *CONTENT.lock().unwrap() = Some(ObjPtr::new(content));
@@ -515,6 +516,30 @@ unsafe fn ensure_window() {
 
 /// Removes every subview of the content view (each step rebuilds its content, like the clipboard
 /// picker does).
+/// Apply the app's resolved theme to the guide window. Without this the window inherits
+/// the SYSTEM appearance while the step content is painted from the app's resolved
+/// palette, so a config-forced theme diverging from the system shows a light window with
+/// dark content (or the reverse). Called at window creation, on every step render, and
+/// from the global theme refresh.
+pub(crate) fn apply_window_appearance() {
+    crate::debug_assert_main_thread();
+    let Some(window) = *WINDOW.lock().unwrap() else {
+        return;
+    };
+    unsafe {
+        let name = make_nsstring(if crate::theme::resolved_is_dark() {
+            "NSAppearanceNameDarkAqua"
+        } else {
+            "NSAppearanceNameAqua"
+        });
+        let appearance: *mut AnyObject = msg_send![class!(NSAppearance), appearanceNamed: name];
+        release_obj(name);
+        if !appearance.is_null() {
+            let _: () = msg_send![window.0, setAppearance: appearance];
+        }
+    }
+}
+
 unsafe fn clear_content(content: *mut AnyObject) {
     let subviews: *mut AnyObject = msg_send![content, subviews];
     if subviews.is_null() {
@@ -580,35 +605,11 @@ unsafe fn add_menu_icon_label(
         return;
     };
 
-    let png_bytes: &[u8] = include_bytes!("../assets/statusbar-icon.png");
-    let data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: png_bytes.as_ptr() as *const c_void,
-        length: png_bytes.len()
-    ];
-    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let image: *mut AnyObject = msg_send![image, initWithData: data];
-    if image.is_null() {
+    let Some(icon_text) = inline_icon_attachment_run(style) else {
         let fallback = text.replace("{icon}", &t("onboarding.app_fallback_name"));
         add_label(content, &fallback, x, y, w, h, style);
         return;
-    }
-
-    let is_template = true;
-    let _: () = msg_send![image, setTemplate: is_template];
-    let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
-    let attachment: *mut AnyObject = msg_send![attachment, init];
-    let _: () = msg_send![attachment, setImage: image];
-    let _: () = msg_send![
-        attachment,
-        setBounds: NSRect::new(NSPoint::new(0.0, -2.0), NSSize::new(17.0, 14.0))
-    ];
-    let icon_text: *mut AnyObject = msg_send![
-        class!(NSAttributedString),
-        attributedStringWithAttachment: attachment
-    ];
-    release_obj(attachment);
-    release_obj(image);
+    };
 
     let attributed: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
     let empty = make_nsstring("");
@@ -626,6 +627,7 @@ unsafe fn add_menu_icon_label(
         }
     }
     let _: () = msg_send![attributed, appendAttributedString: icon_text];
+    release_obj(icon_text);
     if !after_icon.is_empty() {
         let value = make_nsstring(after_icon);
         let attributed_part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
@@ -664,6 +666,102 @@ unsafe fn add_menu_icon_label(
     release_obj(field);
 }
 
+/// One-character attributed run holding the menu-bar icon attachment, baked in the
+/// label's exact color and cropped to the glyph. Two asset facts drive the geometry
+/// (measured alpha bounding box of `statusbar-icon.png`, 162x128): the glyph occupies
+/// only (39,22)-(124,107) — about 24% dead margin per side — and TextKit 1 does NOT tint
+/// template attachment images with the foreground-color attribute (that only works for
+/// text glyphs), so a raw template draws its black pixels verbatim, dark-on-dark in dark
+/// mode. The builder therefore draws only the glyph box into a square image and composites
+/// the tint there (same SourceAtop trick as the overlay's grayed_image).
+/// `None` when the bundled icon fails to load.
+unsafe fn inline_icon_attachment_run(style: LabelStyle) -> Option<*mut AnyObject> {
+    // Glyph box in the asset's point coordinates; y is flipped (bottom-left origin).
+    const GLYPH_RECT: NSRect = NSRect::new(NSPoint::new(39.0, 21.0), NSSize::new(85.0, 85.0));
+    /// The rendered icon side, equal to the body text size so the mark reads as part of
+    /// the sentence instead of a shrunken footnote.
+    const ICON_SIDE: f64 = crate::theme::FONT_CONTROL;
+
+    let png_bytes: &[u8] = include_bytes!("../assets/statusbar-icon.png");
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: png_bytes.as_ptr() as *const c_void,
+        length: png_bytes.len()
+    ];
+    let original: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let original: *mut AnyObject = msg_send![original, initWithData: data];
+    if original.is_null() {
+        return None;
+    }
+    let tinted: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let tinted: *mut AnyObject =
+        msg_send![tinted, initWithSize: NSSize::new(GLYPH_RECT.size.width, GLYPH_RECT.size.height)];
+    if tinted.is_null() {
+        release_obj(original);
+        return None;
+    }
+    let _: () = msg_send![tinted, lockFocus];
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), GLYPH_RECT.size);
+    let _: () = msg_send![
+        original,
+        drawInRect: rect,
+        fromRect: GLYPH_RECT,
+        operation: 2isize, // SourceOver
+        fraction: 1.0f64
+    ];
+    // SourceAtop (= 5): the fill lands only where the icon already has alpha.
+    let ctx: *mut AnyObject = msg_send![class!(NSGraphicsContext), currentContext];
+    let _: () = msg_send![ctx, setCompositingOperation: 5isize];
+    let fill = hex_to_ns_color(style.color.resolve());
+    let _: () = msg_send![fill, setFill];
+    let _: () = msg_send![class!(NSBezierPath), fillRect: rect];
+    let _: () = msg_send![ctx, setCompositingOperation: 2isize];
+    let _: () = msg_send![tinted, unlockFocus];
+    release_obj(original);
+
+    let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
+    let attachment: *mut AnyObject = msg_send![attachment, init];
+    let _: () = msg_send![attachment, setImage: tinted];
+    let _: () = msg_send![
+        attachment,
+        setBounds: NSRect::new(NSPoint::new(0.0, -2.0), NSSize::new(ICON_SIDE, ICON_SIDE))
+    ];
+    let icon_text: *mut AnyObject = msg_send![
+        class!(NSAttributedString),
+        attributedStringWithAttachment: attachment
+    ];
+    // `attributedStringWithAttachment:` is a convenience constructor: the object is
+    // autoreleased (+0), so it must NOT be released here.
+    release_obj(attachment);
+    release_obj(tinted);
+
+    // Keep the font attribute for line metrics; the color attribute is belt-and-braces
+    // for any AppKit path that does honor it.
+    let icon_len: usize = msg_send![icon_text, length];
+    let mutable_icon: *mut AnyObject = msg_send![icon_text, mutableCopy];
+    // mutableCopy is +1; the autoreleased original must not be released again.
+    let icon_color = hex_to_ns_color(style.color.resolve());
+    let icon_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: style.size, weight: style.weight];
+    let color_key = make_nsstring("NSColor");
+    let font_key = make_nsstring("NSFont");
+    let _: () = msg_send![
+        mutable_icon,
+        addAttribute: color_key,
+        value: icon_color,
+        range: NSRange::new(0, icon_len)
+    ];
+    let _: () = msg_send![
+        mutable_icon,
+        addAttribute: font_key,
+        value: icon_font,
+        range: NSRange::new(0, icon_len)
+    ];
+    release_obj(color_key);
+    release_obj(font_key);
+    Some(mutable_icon)
+}
+
 unsafe fn add_button(
     content: *mut AnyObject,
     title: &str,
@@ -697,6 +795,13 @@ unsafe fn add_button(
     crate::settings::widgets::configure_settings_button_wrapping(button, w, 3);
     let _: () = msg_send![content, addSubview: button];
     release_obj(button);
+}
+
+/// Re-render the visible step (theme/palette change fan-out); no-op when hidden.
+pub(crate) fn rerender_if_visible() {
+    if is_visible() {
+        render_current_step();
+    }
 }
 
 fn render_current_step() {
@@ -760,8 +865,10 @@ fn render_current_step() {
     }
     *LAST_SIGNATURE.lock().unwrap() = Some(permission_signature(&state));
     // The window may be closed: make sure it is frontmost after rendering (an accessory app must
-    // activate explicitly).
+    // activate explicitly). The appearance is re-asserted here so a theme change while the
+    // guide is open reaches the reused window together with the re-rendered step content.
     unsafe {
+        apply_window_appearance();
         if let Some(window) = *WINDOW.lock().unwrap() {
             let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![app, activateIgnoringOtherApps: true];
@@ -1841,6 +1948,63 @@ mod tests {
             supported,
             "NSButton must support the onboarding text button tint API"
         );
+    }
+
+    /// The inline menu-icon run must carry an explicit foreground color and a NON-template
+    /// image: TextKit 1 does not tint template attachment images, so a raw template asset
+    /// draws its black pixels verbatim (dark-on-dark in dark mode). The bake-in in
+    /// `inline_icon_attachment_run` is the fix; this test pins both guards.
+    #[test]
+    fn inline_icon_run_is_tinted_with_the_label_color() {
+        // Image drawing and the conveniences inside need an autorelease pool; the test
+        // thread has none of the app's runloop plumbing.
+        let pool: *mut AnyObject = unsafe { msg_send![class!(NSAutoreleasePool), new] };
+        let run = unsafe { inline_icon_attachment_run(BODY_STYLE) };
+        let Some(run) = run else {
+            unsafe {
+                let _: () = msg_send![pool, drain];
+            }
+            panic!("the bundled statusbar icon must load");
+        };
+        unsafe {
+            let length: usize = msg_send![run, length];
+            assert_eq!(length, 1, "the attachment run holds exactly one character");
+
+            let attachment_key = make_nsstring("NSAttachment");
+            let mut attachment_range = NSRange::new(0, 0);
+            let attachment: *mut AnyObject = msg_send![
+                run,
+                attribute: attachment_key,
+                atIndex: 0usize,
+                effectiveRange: &mut attachment_range
+            ];
+            release_obj(attachment_key);
+            assert!(!attachment.is_null(), "the run must carry the attachment");
+            let image: *mut AnyObject = msg_send![attachment, image];
+            assert!(!image.is_null());
+            let is_template: bool = msg_send![image, isTemplate];
+            assert!(
+                !is_template,
+                "the icon image must be pre-tinted, not a template"
+            );
+
+            let color_key = make_nsstring("NSColor");
+            let mut range = NSRange::new(0, 0);
+            let color: *mut AnyObject = msg_send![
+                run,
+                attribute: color_key,
+                atIndex: 0usize,
+                effectiveRange: &mut range
+            ];
+            release_obj(color_key);
+            assert!(!color.is_null(), "the icon run must carry NSColor");
+            assert_eq!(range.location, 0);
+            assert_eq!(range.length, 1, "the color must cover the whole run");
+            let expected = hex_to_ns_color(BODY_STYLE.color.resolve());
+            let equal: bool = msg_send![color, isEqual: expected];
+            assert!(equal, "the icon tint must equal the label text color");
+            let _: () = msg_send![pool, drain];
+        }
     }
 
     /// Embedded locale sources for the layout checks below; the assertions run over all three
