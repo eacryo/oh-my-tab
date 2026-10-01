@@ -26,6 +26,7 @@ mod pointer_locator;
 mod quick_actions;
 mod restart;
 mod runtime_config;
+mod scroll_indicator_math;
 mod scroller;
 mod settings;
 mod single_instance;

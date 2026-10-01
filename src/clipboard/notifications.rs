@@ -476,25 +476,26 @@ pub(super) fn scroll_indicator_geometry(
     offset: f64,
     corner_reserve: f64,
 ) -> Option<(f64, f64)> {
-    let track_start = SCROLL_INDICATOR_EDGE;
-    let track_end = visible - SCROLL_INDICATOR_EDGE - corner_reserve;
-    if track_end <= track_start || document <= visible {
-        return None;
-    }
     // Keep the track end outside the lower-right safe corner; drawing and dragging must use
     // this same track mapping.
-    let track_len = track_end - track_start;
-    let knob_len = (visible * visible / document)
-        .max(SCROLL_INDICATOR_MIN_LEN)
-        .min(track_len);
+    let track_start = SCROLL_INDICATOR_EDGE;
+    let track_len = visible - (SCROLL_INDICATOR_EDGE * 2.0) - corner_reserve;
     let max_offset = document - visible;
-    let travel = track_len - knob_len;
-    let progress = if max_offset > 0.0 {
-        (offset / max_offset).clamp(0.0, 1.0)
-    } else {
-        0.0
-    };
-    Some((track_start + progress * travel, knob_len))
+    let knob_len = crate::scroll_indicator_math::thumb_length(
+        track_len,
+        visible,
+        document,
+        SCROLL_INDICATOR_MIN_LEN,
+    );
+    let placement = crate::scroll_indicator_math::thumb_placement(
+        track_start,
+        track_len,
+        knob_len,
+        offset,
+        max_offset,
+        crate::scroll_indicator_math::ThumbDirection::Forward,
+    )?;
+    Some((placement.position, knob_len))
 }
 
 /// Draw a centered 6pt visible capsule inside the 10pt transparent hit view; the parent view
@@ -728,9 +729,14 @@ extern "C" fn scroll_indicator_mouse_dragged(_self: *mut c_void, _cmd: Sel, even
         ];
         let horizontal = matches!(drag.target, ScrollTarget::DetailHorizontal);
         let axis = if horizontal { point.x } else { point.y };
-        let offset = (drag.start_offset
-            + (axis - drag.start_axis) * drag.max_offset / drag.thumb_travel)
-            .clamp(0.0, drag.max_offset);
+        let offset = crate::scroll_indicator_math::drag_offset(
+            drag.start_offset,
+            drag.start_axis,
+            axis,
+            drag.max_offset,
+            drag.thumb_travel,
+            crate::scroll_indicator_math::ThumbDirection::Forward,
+        );
         let clip: *mut AnyObject = msg_send![scroll, contentView];
         let bounds: NSRect = msg_send![clip, bounds];
         let origin = if horizontal {

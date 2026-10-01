@@ -530,19 +530,29 @@ pub(crate) fn thumbnail_scroller_geometry(
     if !track_h.is_finite() || !max_offset.is_finite() || max_offset <= f64::EPSILON {
         return None;
     }
-    let track_h = track_h - THUMB_SCROLLBAR_EDGE * 2.0;
-    if track_h <= 0.0 {
+    let track_len = track_h - THUMB_SCROLLBAR_EDGE * 2.0;
+    if track_len <= 0.0 {
         return None;
     }
-    let knob_h =
-        (track_h * track_h / (track_h + max_offset)).clamp(THUMB_SCROLLBAR_MIN_KNOB_H, track_h);
-    let thumb_travel = (track_h - knob_h).max(0.0);
-    let progress = (offset / max_offset).clamp(0.0, 1.0);
-    Some(ThumbnailScrollerGeometry {
-        // AppKit coordinates grow upward: offset 0 is the visual top of the content.
-        knob_y: THUMB_SCROLLBAR_EDGE + (1.0 - progress) * thumb_travel,
+    let knob_h = crate::scroll_indicator_math::thumb_length(
+        track_len,
+        track_h,
+        track_h + max_offset,
+        THUMB_SCROLLBAR_MIN_KNOB_H,
+    );
+    let placement = crate::scroll_indicator_math::thumb_placement(
+        THUMB_SCROLLBAR_EDGE,
+        track_len,
         knob_h,
-        thumb_travel,
+        offset,
+        max_offset,
+        // AppKit coordinates grow upward: offset 0 is the visual top of the content.
+        crate::scroll_indicator_math::ThumbDirection::Reverse,
+    )?;
+    Some(ThumbnailScrollerGeometry {
+        knob_y: placement.position,
+        knob_h,
+        thumb_travel: placement.travel,
     })
 }
 
@@ -592,10 +602,14 @@ pub(super) fn thumbnail_scroll_offset_for_drag(
     max_offset: f64,
     thumb_travel: f64,
 ) -> f64 {
-    if max_offset <= 0.0 || thumb_travel <= 0.0 {
-        return start_offset.clamp(0.0, max_offset.max(0.0));
-    }
-    (start_offset + (start_y - current_y) * max_offset / thumb_travel).clamp(0.0, max_offset)
+    crate::scroll_indicator_math::drag_offset(
+        start_offset,
+        start_y,
+        current_y,
+        max_offset,
+        thumb_travel,
+        crate::scroll_indicator_math::ThumbDirection::Reverse,
+    )
 }
 
 /// Draw only the scrollbar capsule; the transparent indicator view owns hit testing and explicit dragging.

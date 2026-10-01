@@ -884,6 +884,16 @@ mod tests {
         let expected_end = visible - SCROLL_INDICATOR_EDGE - SCROLL_INDICATOR_CORNER_RESERVE;
         assert!((end - expected_end).abs() < f64::EPSILON);
     }
+    #[test]
+    fn detail_scroll_thumb_length_uses_the_shared_proportion() {
+        // Phase 2 unified the thumb length on `usable_track * visible / total`. Here the track is
+        // `200 - 2*edge`, so the thumb is `192 * 200 / 1000` rather than the old `200^2 / 1000`.
+        let (_, length) = scroll_indicator_geometry(200.0, 1000.0, 0.0, 0.0)
+            .expect("overflowing detail content must produce a thumb");
+        let track = 200.0 - SCROLL_INDICATOR_EDGE * 2.0;
+        let expected = track * 200.0 / 1000.0;
+        assert!((length - expected).abs() < 1e-9);
+    }
     //  Truth table for the hi-res detail freshness predicate: swap into the UI only when
     //  the panel is visible AND the selected entry is the job's entry; everything else
     //  (panel closed / navigated away / no selection) drops the result.

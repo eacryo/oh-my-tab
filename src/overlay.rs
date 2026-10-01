@@ -888,6 +888,17 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_scroller_thumb_length_uses_the_shared_proportion() {
+        // Phase 2 unified the thumb length on `usable_track * visible / total`. Here the track is
+        // `200 - 2*edge` and the total is `track_h + max_offset`, so the thumb is `156 * 200 / 250`
+        // rather than the old `156^2 / 206`.
+        let geometry = thumbnail_scroller_geometry(200.0, 50.0, 0.0).unwrap();
+        let track = 200.0 - 22.0 * 2.0;
+        let expected = track * 200.0 / (200.0 + 50.0);
+        assert!((geometry.knob_h - expected).abs() < 1e-9);
+    }
+
+    #[test]
     fn thumbnail_scroller_geometry_rejects_no_overflow() {
         assert!(thumbnail_scroller_geometry(100.0, 0.0, 0.0).is_none());
         assert!(thumbnail_scroller_geometry(0.0, 10.0, 0.0).is_none());
