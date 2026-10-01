@@ -127,10 +127,10 @@ unsafe fn mouse_event_tap_callback_inner(
     event: CGEventRef,
     user_info: *mut c_void,
 ) -> CGEventRef {
-    if crate::input_monitor::handle_disabled_event(event_type, "mouse") {
+    if crate::input_monitor::handle_disabled_event(event_type, "mouse", mouse_tap_stopping()) {
         return event;
     }
-    if STOP_REQUESTED.load(Ordering::SeqCst) || !crate::input_monitor::taps_allowed() {
+    if mouse_tap_stopping() || !crate::input_monitor::taps_allowed() {
         return event;
     }
     let flags: CGEventFlags = CGEventGetFlags(event);

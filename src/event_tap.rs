@@ -99,6 +99,15 @@ impl TapThreadControl {
         &self.stop_requested
     }
 
+    /// Whether a deliberate stop has been requested for this tap. Callers pass this to
+    /// `input_monitor::handle_disabled_event` so a self-inflicted disable is not mistaken for the
+    /// OS/security disable that is terminal for the process. A restart clears the flag only in
+    /// `prepare_start`, after the previous tap thread has been joined, so a late pseudo-event from
+    /// the old thread can never be observed with the flag already reset.
+    pub(crate) fn is_stopping(&self) -> bool {
+        self.stop_requested.load(Ordering::SeqCst)
+    }
+
     pub(crate) fn stop(&self) {
         self.stop_requested.store(true, Ordering::SeqCst);
         let active = self.active.0.lock().unwrap();

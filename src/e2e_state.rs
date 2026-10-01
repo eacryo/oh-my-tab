@@ -479,6 +479,13 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         crate::ffi::has_accessibility_permission(),
         crate::thumbnail::capture_allowed()
     ));
+    // Stopping any service must never latch the terminal disable; A2 asserts this stays false
+    // after toggling a feature off (a self-inflicted `CGEventTapEnable(false)` pseudo-event).
+    json.push_str(&format!(
+        "  \"taps\": {{\"user_input_disabled\": {}, \"allowed\": {}}},\n",
+        crate::input_monitor::user_input_disabled(),
+        crate::input_monitor::taps_allowed()
+    ));
     json.push_str(&format!(
         "  \"selected_sidebar\": {},\n",
         crate::settings::e2e_selected_sidebar()

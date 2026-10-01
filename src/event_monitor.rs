@@ -89,7 +89,7 @@ unsafe extern "C" fn event_tap_callback(
     event: crate::event_tap::CGEventRef,
     _user_info: *mut c_void,
 ) -> crate::event_tap::CGEventRef {
-    if crate::input_monitor::handle_disabled_event(event_type, "kbd") {
+    if crate::input_monitor::handle_disabled_event(event_type, "kbd", TAP_CONTROL.is_stopping()) {
         return event;
     }
     if !crate::input_monitor::taps_allowed() {

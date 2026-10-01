@@ -10,8 +10,11 @@ unsafe extern "C" fn callback(
     event: event_tap::CGEventRef,
     _user_info: *mut c_void,
 ) -> event_tap::CGEventRef {
-    if crate::input_monitor::handle_disabled_event(event_type, "keystroke-display")
-        || !crate::input_monitor::taps_allowed()
+    if crate::input_monitor::handle_disabled_event(
+        event_type,
+        "keystroke-display",
+        super::tap_control().is_stopping(),
+    ) || !crate::input_monitor::taps_allowed()
         || !super::is_active()
     {
         return event;

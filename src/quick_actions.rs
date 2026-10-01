@@ -103,7 +103,7 @@ unsafe extern "C" fn quick_actions_tap_callback(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
-    if crate::input_monitor::handle_disabled_event(event_type, "quick") {
+    if crate::input_monitor::handle_disabled_event(event_type, "quick", TAP_CONTROL.is_stopping()) {
         return event;
     }
     if !crate::input_monitor::taps_allowed() {

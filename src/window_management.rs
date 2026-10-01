@@ -1744,7 +1744,8 @@ unsafe extern "C" fn window_control_tap_callback(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
-    if crate::input_monitor::handle_disabled_event(event_type, "winctl") {
+    if crate::input_monitor::handle_disabled_event(event_type, "winctl", TAP_CONTROL.is_stopping())
+    {
         return event;
     }
     if !crate::input_monitor::taps_allowed() {

@@ -348,7 +348,7 @@ pub(crate) fn cancel_recording_from_main() {
         *REC_MODS.lock().unwrap() = 0;
         REC_DESC.lock().unwrap().clear();
         REC_COMPLETED_DESC.lock().unwrap().clear();
-        REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+        REC_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
         crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
         disable_rec_tap();
         if let Some(rl) = *REC_RUNLOOP.0.lock().unwrap() {
@@ -379,7 +379,7 @@ pub(super) unsafe fn finish_recording(success: bool) {
         String::new()
     };
     REC_DESC.lock().unwrap().clear();
-    REC_CANCEL.store(true, std::sync::atomic::Ordering::Relaxed);
+    REC_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
     crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
     // Disable the tap before stopping the loop: disabling takes effect immediately,
     // eliminating the exit-window swallowing.
@@ -418,7 +418,11 @@ unsafe fn recording_tap_callback_inner(
     event: CGEventRef,
     _user_info: *mut c_void,
 ) -> CGEventRef {
-    if crate::input_monitor::handle_disabled_event(event_type, "rec") {
+    if crate::input_monitor::handle_disabled_event(
+        event_type,
+        "rec",
+        REC_CANCEL.load(std::sync::atomic::Ordering::SeqCst),
+    ) {
         return event;
     }
     if !crate::input_monitor::taps_allowed() {
@@ -552,7 +556,7 @@ pub(crate) extern "C" fn handle_panel_record_trigger(
     REC_DESC.lock().unwrap().clear();
     *REC_MODE.lock().unwrap() = RecMode::PanelTrigger;
     *REC_STAGE.lock().unwrap() = RecStage::WaitingButton;
-    REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
     // Disable the panel OK while recording.
     unsafe {
@@ -582,7 +586,7 @@ pub(crate) extern "C" fn handle_panel_record_combo(
     REC_DESC.lock().unwrap().clear();
     *REC_MODE.lock().unwrap() = RecMode::PanelCombo;
     *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
-    REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
     unsafe {
         if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
@@ -1034,7 +1038,7 @@ pub(crate) extern "C" fn handle_clipboard_shortcut_record(
     *REC_MODS.lock().unwrap() = 0;
     *REC_MODE.lock().unwrap() = RecMode::ClipboardShortcut;
     *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
-    REC_CANCEL.store(false, std::sync::atomic::Ordering::Relaxed);
+    REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
     crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
     super::set_clipboard_shortcut_recording_ui(true, None);
     log_debug!("[settings] clipboard shortcut recording started");
