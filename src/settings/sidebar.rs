@@ -10,6 +10,10 @@ pub(super) struct SettingsSidebarGeometry {
     pub(super) card_radius: f64,
 }
 
+pub(super) const SOLID_SIDEBAR_IDENTIFIER: &str = "settings-sidebar-solid-surface";
+const SIDEBAR_APP_TITLE_BOTTOM_INSET: f64 = 78.0;
+const SIDEBAR_NAV_GAP_AFTER_TITLE: f64 = 32.0;
+
 pub(super) unsafe fn build_settings_sidebar(
     content: *mut AnyObject,
     geometry: SettingsSidebarGeometry,
@@ -24,55 +28,31 @@ pub(super) unsafe fn build_settings_sidebar(
         card_w,
         card_radius,
     } = geometry;
-    // macOS 26+ uses NSGlassEffectView (Liquid Glass, system default tint);
-    // older macOS uses NSVisualEffectView with the sidebar material (classic frosted look).
-    // The glass material supplies the subtle separation from the content pane.
     let card_h = content_h - card_margin * 2.0;
-    let sidebar_content: *mut AnyObject;
-    let sidebar_view: *mut AnyObject = if AnyClass::get(c"NSGlassEffectView").is_some() {
-        let cls = AnyClass::get(c"NSGlassEffectView").unwrap();
-        let g: *mut AnyObject = msg_send![cls, alloc];
-        let g: *mut AnyObject = msg_send![g, initWithFrame: NSRect::new(NSPoint::new(card_margin, card_margin), NSSize::new(card_w, card_h))];
-        let _: () = msg_send![g, setStyle: 0i64]; // NSGlassEffectViewStyleRegular
-        let _: () = msg_send![g, setCornerRadius: card_radius];
-        // AppKit only guarantees Liquid Glass composition for the assigned contentView.
-        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let inner: *mut AnyObject = msg_send![
-            inner,
-            initWithFrame: NSRect::new(
-                NSPoint::new(0.0, 0.0),
-                NSSize::new(card_w, card_h)
-            )
-        ];
-        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
-        let _: () = msg_send![g, setContentView: inner];
-        sidebar_content = inner;
-        g
-    } else {
-        let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(card_margin, card_margin), NSSize::new(card_w, card_h))];
-        let _: () = msg_send![ve, setMaterial: 8u64]; // NSVisualEffectMaterialSidebar
-        let _: () = msg_send![ve, setBlendingMode: 0u64]; // BehindWindow
-        let _: () = msg_send![ve, setState: 1u64]; // Active
-        let _: () = msg_send![ve, setWantsLayer: true];
-        let ve_layer: *mut AnyObject = msg_send![ve, layer];
-        if !ve_layer.is_null() {
-            let _: () = msg_send![ve_layer, setCornerRadius: card_radius];
-            let _: () = msg_send![ve_layer, setMasksToBounds: true];
-        }
-        sidebar_content = ve;
-        ve
-    };
-    // Keep the navigation pane a distinct light-gray surface, while the detail pane uses the
-    // window background. This mirrors the HTML reference's two-pane split without an inset
-    // border around the whole settings area.
+    let sidebar_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let sidebar_view: *mut AnyObject = msg_send![
+        sidebar_view,
+        initWithFrame: NSRect::new(
+            NSPoint::new(card_margin, card_margin),
+            NSSize::new(card_w, card_h)
+        )
+    ];
+    let identifier = make_nsstring(SOLID_SIDEBAR_IDENTIFIER);
+    let _: () = msg_send![sidebar_view, setIdentifier: identifier];
+    release_obj(identifier);
+    let _: () = msg_send![sidebar_view, setWantsLayer: true];
+    // A plain layer keeps sidebar_bg as a solid color instead of compositing it through system glass.
     let sidebar_layer: *mut AnyObject = msg_send![sidebar_view, layer];
     if !sidebar_layer.is_null() {
+        let _: () = msg_send![sidebar_layer, setCornerRadius: card_radius];
+        let _: () = msg_send![sidebar_layer, setMasksToBounds: true];
+        let _: () = msg_send![sidebar_layer, setOpaque: true];
         layer_set_background(
             sidebar_layer,
             crate::ffi::hex_to_cg_color(palette.sidebar_bg),
         );
     }
+    let sidebar_content = sidebar_view;
     // Adaptive: left-anchored, height stretches with the window.
     let _: () = msg_send![sidebar_view, setAutoresizingMask: 20u64];
     let _: () = msg_send![content, addSubview: sidebar_view];
@@ -99,10 +79,10 @@ pub(super) unsafe fn build_settings_sidebar(
     let _: () = msg_send![content, addSubview: sidebar_divider];
     release_obj(sidebar_divider);
 
-    // The right detail pane has its own white surface, directly beside the gray sidebar.
-    // The custom class adds the HTML `.main` radial highlight (82% 0%) over the flat fill.
+    // The right detail pane has a flat token-colored surface (no radial highlight), directly
+    // beside the gray sidebar.
     let main_background: *mut AnyObject =
-        msg_send![widgets::settings_pane_highlight_view_class(), alloc];
+        msg_send![widgets::settings_pane_surface_view_class(), alloc];
     let main_background: *mut AnyObject = msg_send![
         main_background,
         initWithFrame: NSRect::new(
@@ -134,7 +114,7 @@ pub(super) unsafe fn build_settings_sidebar(
             // height so it follows the HTML sidebar's compact top padding instead of being
             // pushed down by the toolbar's contentLayoutRect inset.
             // Title 20pt/700 matches the HTML `.brand-title` (font-size:20px; weight:700).
-            NSPoint::new(24.0, content_h - 78.0),
+            NSPoint::new(24.0, content_h - SIDEBAR_APP_TITLE_BOTTOM_INSET),
             NSSize::new(card_w - 48.0, 26.0)
         )
     ];
@@ -142,7 +122,8 @@ pub(super) unsafe fn build_settings_sidebar(
     let _: () = msg_send![app_title, setBezeled: false];
     let _: () = msg_send![app_title, setDrawsBackground: false];
     let _: () = msg_send![app_title, setEditable: false];
-    let app_title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 20.0f64];
+    let app_title_font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
     let _: () = msg_send![app_title, setFont: app_title_font];
     let app_title_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![app_title, setTextColor: app_title_color];
@@ -151,41 +132,21 @@ pub(super) unsafe fn build_settings_sidebar(
     let _: () = msg_send![app_title, setAutoresizingMask: 12u64];
     let _: () = msg_send![sidebar_content, addSubview: app_title];
     release_obj(app_title);
-    let app_subtitle: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let app_subtitle: *mut AnyObject = msg_send![
-        app_subtitle,
-        initWithFrame: NSRect::new(
-            NSPoint::new(24.0, content_h - 102.0),
-            NSSize::new(card_w - 48.0, 18.0)
-        )
-    ];
-    set_field(app_subtitle, t("settings.window_title"));
-    let _: () = msg_send![app_subtitle, setBezeled: false];
-    let _: () = msg_send![app_subtitle, setDrawsBackground: false];
-    let _: () = msg_send![app_subtitle, setEditable: false];
-    let app_subtitle_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
-    let _: () = msg_send![app_subtitle, setFont: app_subtitle_font];
-    let app_subtitle_color = settings_text_color(SettingsTextRole::Muted);
-    let _: () = msg_send![app_subtitle, setTextColor: app_subtitle_color];
-    let _: () = msg_send![app_subtitle, setAutoresizingMask: 12u64];
-    let _: () = msg_send![sidebar_content, addSubview: app_subtitle];
-    release_obj(app_subtitle);
-
     // Highlight background for the selected sidebar row (layer-backed NSView, theme-aware color);
     // added before the buttons so button titles draw on top of it.
     // Card-local layout: 12pt inner margins. The buttons stay close to the traffic lights;
     // btn_y0 is anchored to the full sidebar height rather than the toolbar-inset height.
-    let btn_w = card_w - 28.0;
+    let btn_w = card_w - 24.0;
     let btn_h = SettingsSidebar::row_height(btn_w);
     // Sidebar navigation is also anchored to the full-height sidebar. Using layout_h here
     // includes the toolbar inset a second time and leaves a large blank gap above the title.
-    let btn_y0 = content_h - card_margin - 112.0 - btn_h;
+    let btn_y0 = content_h - SIDEBAR_APP_TITLE_BOTTOM_INSET - SIDEBAR_NAV_GAP_AFTER_TITLE - btn_h;
     let highlight: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(14.0, btn_y0), NSSize::new(btn_w, btn_h))];
+    let highlight: *mut AnyObject = msg_send![highlight, initWithFrame: NSRect::new(NSPoint::new(12.0, btn_y0), NSSize::new(btn_w, btn_h))];
     let _: () = msg_send![highlight, setAutoresizingMask: 12u64]; // top- and left-anchored
     let _: () = msg_send![highlight, setWantsLayer: true];
     let hl_layer: *mut AnyObject = msg_send![highlight, layer];
-    let _: () = msg_send![hl_layer, setCornerRadius: 10.0f64];
+    let _: () = msg_send![hl_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
     // Selection highlight uses the system accent color (controlAccentColor), matching the
     // NSSwitch's on-state blue (same as LinearMouse's sidebar selection highlight).
     // The redesign uses a soft accent wash for the active row rather than a solid blue fill.
@@ -196,7 +157,7 @@ pub(super) unsafe fn build_settings_sidebar(
 
     // Sidebar buttons are created in page-index order; each tag selects the matching content view.
     let sidebar_buttons =
-        SettingsSidebar::build(sidebar_content, target, 14.0, btn_y0, btn_w, btn_h);
+        SettingsSidebar::build(sidebar_content, target, 12.0, btn_y0, btn_w, btn_h);
     [
         &mut ui.sidebar_general,
         &mut ui.sidebar_switcher,

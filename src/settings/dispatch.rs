@@ -1493,6 +1493,44 @@ pub(super) fn ensure_selected_device() {
 /// UI only (items + selection); SELECTED_DEVICE state calibration is handled by
 /// ensure_selected_device. Called by load_settings_values (refreshed on each settings open to
 /// reflect hot-plug changes).
+pub(super) fn device_display_name(device: &crate::mouse::device::DeviceIdentity) -> String {
+    if (device.vendor_id, device.product_id) == crate::mouse::device::VIRTUAL_DEVICE_KEY {
+        crate::i18n::tf(
+            "settings.virtual_mouse_label",
+            &[("name", device.name.as_str())],
+        )
+    } else {
+        device.name.clone()
+    }
+}
+
+pub(super) fn device_info_caption(device: Option<&crate::mouse::device::DeviceIdentity>) -> String {
+    let Some(device) = device else {
+        return t("settings.no_device_detected");
+    };
+    if (device.vendor_id, device.product_id) == crate::mouse::device::VIRTUAL_DEVICE_KEY {
+        t("settings.virtual_mouse_caption")
+    } else {
+        tf(
+            "settings.device_hardware_id",
+            &[
+                ("vendor", &format!("{:04X}", device.vendor_id)),
+                ("product", &format!("{:04X}", device.product_id)),
+            ],
+        )
+    }
+}
+
+pub(super) fn device_info_caption_for_key(key: Option<crate::mouse::device::DeviceKey>) -> String {
+    let connected = crate::mouse::device::connected_devices();
+    let device = key.and_then(|key| {
+        connected
+            .iter()
+            .find(|device| (device.vendor_id, device.product_id) == key)
+    });
+    device_info_caption(device)
+}
+
 pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     let connected = crate::mouse::device::connected_devices();
     let cur = current_selected_device();
@@ -1502,20 +1540,7 @@ pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     let mut keys: Vec<crate::mouse::device::DeviceKey> = Vec::new();
     for d in &connected {
         let key = (d.vendor_id, d.product_id);
-        if key == crate::mouse::device::VIRTUAL_DEVICE_KEY {
-            // The virtual pointer has no VID/PID worth showing (0xffffffff means nothing), so its
-            // label reads "<injector name> (virtual mouse)", marking that this profile governs the
-            // pointer a software KVM injects.
-            items.push(crate::i18n::tf(
-                "settings.virtual_mouse_label",
-                &[("name", d.name.as_str())],
-            ));
-        } else {
-            items.push(format!(
-                "{} ({:#x}:{:#x})",
-                d.name, d.vendor_id, d.product_id
-            ));
-        }
+        items.push(device_display_name(d));
         keys.push(key);
     }
 
@@ -1539,6 +1564,13 @@ pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
         let ns = make_nsstring(&t("settings.no_device_detected"));
         let _: () = msg_send![ui.device_indicator, addItemWithTitle: ns];
         CFRelease(ns as *const c_void);
+    }
+    let caption = keys
+        .get(sel_idx)
+        .map(|key| device_info_caption_for_key(Some(*key)))
+        .unwrap_or_else(|| device_info_caption(None));
+    if !ui.device_info_caption.is_null() {
+        set_field(ui.device_info_caption, &caption);
     }
     let _: () = msg_send![ui.device_indicator, setEnabled: !keys.is_empty()];
 
@@ -1582,6 +1614,9 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
     unsafe {
         with_settings_ui(|ui_guard| {
             if let Some(u) = ui_guard.as_mut() {
+                if !u.device_info_caption.is_null() {
+                    set_field(u.device_info_caption, device_info_caption_for_key(new_dev));
+                }
                 fill_mouse_device_controls(u, &resolved);
                 // Keep the user's current enable_mouse state; only recompute freeze + visibility.
                 update_mouse_controls_enabled(u);
@@ -1608,10 +1643,6 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
     let btn = sender as *mut AnyObject;
     let tag: isize = unsafe { msg_send![btn, tag] };
     select_sidebar(tag as usize);
-    unsafe {
-        // Keep an invisible origin at the clicked row so the next adjacent hover can glide from it.
-        widgets::prime_sidebar_hover_after_selection(btn);
-    }
 }
 
 /// The settings "export logs" button: copy the active log file to a user-chosen

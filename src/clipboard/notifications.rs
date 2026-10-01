@@ -517,7 +517,6 @@ pub(super) unsafe fn update_scroll_indicator_visual(
         let ind_bg: *mut AnyObject =
             msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
         crate::ffi::layer_set_background(visual, crate::ffi::ns_color_to_cg(ind_bg));
-        let _: () = msg_send![visual, setCornerRadius: SCROLL_INDICATOR_R];
         let _: () = msg_send![parent_layer, addSublayer: visual];
         visual
     } else {
@@ -535,6 +534,13 @@ pub(super) unsafe fn update_scroll_indicator_visual(
         )
     };
     let _: () = msg_send![visual_layer, setFrame: frame];
+    // CALayer does not clamp a too-large corner radius: RADIUS_FULL would render a square.
+    // Cap to half the indicator's bounds so it stays a pill in both orientations.
+    let _: () = msg_send![visual_layer, setCornerRadius: crate::theme::rounded_inset_radius(
+        crate::theme::RADIUS_FULL,
+        frame.size.width,
+        frame.size.height,
+    )];
 }
 
 /// Update the scroll indicator's position/length: shown while the content overflows
@@ -1041,43 +1047,32 @@ pub(super) fn clear_history_confirmation_layout(anchor: NSRect) -> (NSRect, [NSR
     (surface, buttons)
 }
 
-unsafe fn clear_confirmation_reduce_motion() -> bool {
-    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-    !workspace.is_null()
-        && msg_send![workspace, respondsToSelector: sel!(accessibilityDisplayShouldReduceMotion)]
-        && msg_send![workspace, accessibilityDisplayShouldReduceMotion]
-}
-
-#[allow(clippy::too_many_arguments)]
-unsafe fn clear_confirmation_spring_value(
+unsafe fn clear_confirmation_add_animation(
     layer: *mut AnyObject,
     key_path: &str,
     from: *mut AnyObject,
     to: *mut AnyObject,
     duration: f64,
-    stiffness: f64,
-    damping: f64,
     animation_key: &str,
 ) {
     let path = make_nsstring(key_path);
-    let animation: *mut AnyObject =
-        msg_send![class!(CASpringAnimation), animationWithKeyPath: path];
+    let animation: *mut AnyObject = msg_send![class!(CABasicAnimation), animationWithKeyPath: path];
     CFRelease(path as *const c_void);
     let _: () = msg_send![animation, setFromValue: from];
     let _: () = msg_send![animation, setToValue: to];
-    let _: () = msg_send![animation, setMass: 1.0f64];
-    let _: () = msg_send![animation, setStiffness: stiffness];
-    let _: () = msg_send![animation, setDamping: damping];
-    let _: () = msg_send![animation, setInitialVelocity: 0.0f64];
     let _: () = msg_send![animation, setDuration: duration];
+    let timing = crate::theme::ease_standard_timing_function();
+    if !timing.is_null() {
+        let _: () = msg_send![animation, setTimingFunction: timing];
+    }
     let key = make_nsstring(animation_key);
     let _: () = msg_send![layer, addAnimation: animation, forKey: key];
     CFRelease(key as *const c_void);
 }
 
-unsafe fn clear_confirmation_spring_frame(view: *mut AnyObject, target: NSRect) {
+unsafe fn clear_confirmation_animate_frame(view: *mut AnyObject, target: NSRect) {
     let layer: *mut AnyObject = msg_send![view, layer];
-    if layer.is_null() {
+    if layer.is_null() || crate::theme::reduce_motion_enabled() {
         let _: () = msg_send![view, setFrame: target];
         return;
     }
@@ -1109,14 +1104,12 @@ unsafe fn clear_confirmation_spring_frame(view: *mut AnyObject, target: NSRect) 
             "clipboard-clear-shell-position",
         ),
     ] {
-        clear_confirmation_spring_value(
+        clear_confirmation_add_animation(
             layer,
             path,
             from,
             to,
-            CLEAR_CONFIRM_SHELL_DURATION,
-            160.0,
-            24.0,
+            crate::theme::ANIMATION_DURATION_MEDIUM,
             key,
         );
     }
@@ -1143,18 +1136,19 @@ unsafe fn clear_confirmation_animate_opacity(view: *mut AnyObject, visible: bool
     let _: () = msg_send![class!(CATransaction), commit];
     let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from];
     let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: target];
-    clear_confirmation_spring_value(
+    if crate::theme::reduce_motion_enabled() {
+        return;
+    }
+    clear_confirmation_add_animation(
         layer,
         "opacity",
         from_value,
         to_value,
         if visible {
-            CLEAR_CONFIRM_CONTENT_DURATION
+            crate::theme::ANIMATION_DURATION_MEDIUM
         } else {
-            0.16
+            crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
         },
-        if visible { 266.0 } else { 350.0 },
-        if visible { 30.0 } else { 36.0 },
         "clipboard-clear-opacity",
     );
 }
@@ -1163,6 +1157,15 @@ unsafe fn clear_confirmation_animate_content_open(button: *mut AnyObject) {
     clear_confirmation_animate_opacity(button, true);
     let layer: *mut AnyObject = msg_send![button, layer];
     if layer.is_null() {
+        return;
+    }
+    if crate::theme::reduce_motion_enabled() {
+        for (path, value) in [("transform.translation.y", 0.0), ("transform.scale", 1.0)] {
+            let key_path = make_nsstring(path);
+            let number: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: value];
+            let _: () = msg_send![layer, setValue: number, forKeyPath: key_path];
+            CFRelease(key_path as *const c_void);
+        }
         return;
     }
     // Match the settings control's content entrance: a small upward offset and scale
@@ -1189,14 +1192,12 @@ unsafe fn clear_confirmation_animate_content_open(button: *mut AnyObject) {
         let _: () = msg_send![layer, setValue: to_value, forKeyPath: key_path];
         let _: () = msg_send![class!(CATransaction), commit];
         CFRelease(key_path as *const c_void);
-        clear_confirmation_spring_value(
+        clear_confirmation_add_animation(
             layer,
             path,
             from_value,
             to_value,
-            CLEAR_CONFIRM_CONTENT_DURATION,
-            266.0,
-            30.0,
+            crate::theme::ANIMATION_DURATION_MEDIUM,
             key,
         );
     }
@@ -1225,7 +1226,7 @@ pub(super) fn set_clear_history_confirmation_expanded(expanded: bool) {
         let expanded_frame: NSRect =
             msg_send![header, convertRect: expanded_in_header, toView: parent];
         let collapsed_frame: NSRect = msg_send![header, convertRect: anchor, toView: parent];
-        let animated = !clear_confirmation_reduce_motion();
+        let animated = !crate::theme::reduce_motion_enabled();
         let target = observer();
         let _: () = msg_send![
             class!(NSObject),
@@ -1281,7 +1282,7 @@ pub(super) fn set_clear_history_confirmation_expanded(expanded: bool) {
             }
         }
         if animated {
-            clear_confirmation_spring_frame(
+            clear_confirmation_animate_frame(
                 views.surface.0,
                 if expanded {
                     expanded_frame
@@ -1299,7 +1300,7 @@ pub(super) fn set_clear_history_confirmation_expanded(expanded: bool) {
                 target,
                 performSelector: sel!(finishClearHistoryCollapse:),
                 withObject: std::ptr::null::<AnyObject>(),
-                afterDelay: CLEAR_CONFIRM_SHELL_DURATION
+                afterDelay: crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
             ];
         } else {
             let _: () = msg_send![views.surface.0, setHidden: true];

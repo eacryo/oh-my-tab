@@ -194,6 +194,7 @@ extern "C" {
     pub(crate) fn CGImageGetWidth(image: *const c_void) -> usize;
     pub(crate) fn CGImageGetHeight(image: *const c_void) -> usize;
     pub(crate) fn CGColorSpaceCreateDeviceRGB() -> *const c_void;
+    pub(crate) fn CGColorGetAlpha(color: *const c_void) -> f64;
     pub(crate) fn CGBitmapContextCreate(
         data: *mut c_void,
         width: usize,
@@ -206,31 +207,6 @@ extern "C" {
     pub(crate) fn CGContextDrawImage(ctx: *mut c_void, rect: CGRect, image: *const c_void);
     pub(crate) fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
     pub(crate) fn CGBitmapContextGetData(ctx: *mut c_void) -> *mut c_void;
-
-    pub(crate) fn CGGradientCreateWithColorComponents(
-        space: *const c_void,
-        components: *const f64,
-        locations: *const f64,
-        count: usize,
-    ) -> *const c_void;
-    pub(crate) fn CGGradientRelease(gradient: *const c_void);
-    pub(crate) fn CGContextDrawRadialGradient(
-        ctx: *mut c_void,
-        gradient: *const c_void,
-        start_center: CGPoint,
-        start_radius: f64,
-        end_center: CGPoint,
-        end_radius: f64,
-        options: u32,
-    );
-}
-
-/// CoreGraphics CGPoint (flat two-f64 layout matching CGRect's convention).
-#[repr(C)]
-#[derive(Clone, Copy)]
-pub(crate) struct CGPoint {
-    pub(crate) x: f64,
-    pub(crate) y: f64,
 }
 
 /// CoreGraphics CGRect (C ABI: {origin:(x,y), size:(w,h)} -- four contiguous f64;
@@ -657,6 +633,17 @@ pub(crate) unsafe fn layer_set_background(layer: *mut AnyObject, cg: *mut c_void
     type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     f(layer as *mut c_void, sel, cg);
+}
+
+/// Read CALayer.backgroundColor as a CGColorRef without objc2's object-pointer signature check.
+pub(crate) unsafe fn layer_background_color(layer: *mut AnyObject) -> *mut c_void {
+    let sel = sel!(backgroundColor);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel) -> *mut c_void;
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel)
 }
 
 /// Set CALayer.borderColor using raw objc_msgSend (CGColorRef, not NSColor*).

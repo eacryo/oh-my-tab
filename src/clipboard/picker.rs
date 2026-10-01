@@ -258,12 +258,32 @@ unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
     let _: () = msg_send![transform_animation, setToValue: to_x_value];
     let _: () = msg_send![
         transform_animation,
-        setDuration: DETAIL_PANEL_ANIMATION_DURATION
+        setDuration: if opening {
+            crate::theme::ANIMATION_DURATION_MEDIUM
+        } else {
+            crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
+        }
     ];
+    let timing = crate::theme::ease_standard_timing_function();
+    if !timing.is_null() {
+        let _: () = msg_send![transform_animation, setTimingFunction: timing];
+    }
 
     let from_opacity_value: *mut AnyObject =
         msg_send![class!(NSNumber), numberWithFloat: from_opacity];
     let to_opacity_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithFloat: to_opacity];
+    if crate::theme::reduce_motion_enabled() {
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+        let _: () = msg_send![layer, setValue: to_x_value, forKeyPath: transform_key];
+        let _: () = msg_send![layer, setOpacity: to_opacity];
+        let _: () = msg_send![class!(CATransaction), commit];
+        CFRelease(transform_key as *const c_void);
+        CFRelease(opacity_key as *const c_void);
+        CFRelease(transform_animation_key as *const c_void);
+        CFRelease(opacity_animation_key as *const c_void);
+        return;
+    }
     let opacity_animation: *mut AnyObject = msg_send![
         class!(CABasicAnimation),
         animationWithKeyPath: opacity_key
@@ -272,8 +292,16 @@ unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
     let _: () = msg_send![opacity_animation, setToValue: to_opacity_value];
     let _: () = msg_send![
         opacity_animation,
-        setDuration: DETAIL_PANEL_ANIMATION_DURATION
+        setDuration: if opening {
+            crate::theme::ANIMATION_DURATION_MEDIUM
+        } else {
+            crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
+        }
     ];
+    let timing = crate::theme::ease_standard_timing_function();
+    if !timing.is_null() {
+        let _: () = msg_send![opacity_animation, setTimingFunction: timing];
+    }
 
     // Commit final model values before adding explicit animations so the layer does not snap
     // back to its starting point when Core Animation removes them.
@@ -298,6 +326,14 @@ unsafe fn animate_detail_open(
     target_picker_frame: NSRect,
     target_detail_frame: NSRect,
 ) {
+    if crate::theme::reduce_motion_enabled() {
+        let _: () = msg_send![picker_window, setFrame: target_picker_frame, display: true];
+        let _: () = msg_send![detail_window, setFrame: target_detail_frame, display: true];
+        let _: () = msg_send![detail_window, setAlphaValue: 1.0f64];
+        let _: () = msg_send![detail_window, orderFrontRegardless];
+        animate_detail_content(detail_content, true);
+        return;
+    }
     let collapsed_frame = NSRect::new(
         target_detail_frame.origin,
         NSSize::new(1.0, target_detail_frame.size.height),
@@ -308,14 +344,11 @@ unsafe fn animate_detail_open(
 
     let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
     let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: DETAIL_PANEL_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeOut");
-    let timing: *mut AnyObject =
-        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    let _: () = msg_send![context, setDuration: crate::theme::ANIMATION_DURATION_MEDIUM];
+    let timing = crate::theme::ease_standard_timing_function();
     if !timing.is_null() {
         let _: () = msg_send![context, setTimingFunction: timing];
     }
-    CFRelease(timing_name as *const c_void);
 
     let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
     let _: () = msg_send![picker_animator, setFrame: target_picker_frame, display: true];
@@ -340,16 +373,30 @@ unsafe fn animate_detail_close(
         NSSize::new(1.0, current_detail_frame.size.height),
     );
 
+    if crate::theme::reduce_motion_enabled() {
+        if let Some(frame) = restored_picker_frame {
+            let _: () = msg_send![picker_window, setFrame: frame, display: true];
+        }
+        let _: () = msg_send![detail_window, setFrame: collapsed_frame, display: false];
+        let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
+        animate_detail_content(detail_content, false);
+        detail_finish_close(
+            detail_window as *mut c_void,
+            sel!(finishDetailClose:),
+            std::ptr::null_mut(),
+        );
+        return;
+    }
+
     let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
     let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: DETAIL_PANEL_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeInEaseOut");
-    let timing: *mut AnyObject =
-        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    let exit_duration =
+        crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM);
+    let _: () = msg_send![context, setDuration: exit_duration];
+    let timing = crate::theme::ease_standard_timing_function();
     if !timing.is_null() {
         let _: () = msg_send![context, setTimingFunction: timing];
     }
-    CFRelease(timing_name as *const c_void);
 
     if let Some(frame) = restored_picker_frame {
         let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
@@ -365,7 +412,7 @@ unsafe fn animate_detail_close(
         detail_window,
         performSelector: sel!(finishDetailClose:),
         withObject: std::ptr::null::<AnyObject>(),
-        afterDelay: DETAIL_PANEL_ANIMATION_DURATION
+        afterDelay: exit_duration
     ];
 }
 
@@ -1046,7 +1093,8 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
         NSPoint::new(x - 6.0 - 70.0, label_y),
         NSSize::new(70.0, LABEL_H)
     )];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.5f64];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
@@ -1117,7 +1165,7 @@ unsafe fn add_detail_save_as_button(content: *mut AnyObject, width: f64, is_imag
     let _: () = msg_send![button, setAction: sel!(detailSaveAs:)];
     let _: () = msg_send![button, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![button, layer];
-    let _: () = msg_send![layer, setCornerRadius: 6.0f64];
+    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
     let icon = make_detail_save_icon(0.34);
     let _: () = msg_send![button, setImage: icon];
     let _: () = msg_send![button, setImagePosition: 1u64]; // NSImageOnly
@@ -1219,7 +1267,8 @@ unsafe fn add_detail_chrome(
             NSPoint::new(width - 250.0, height - DETAIL_FOOTER_H + 12.0),
             NSSize::new(235.0, 18.0)
         )];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let color: *mut AnyObject =
             msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
         let _: () = msg_send![stats, setFont: font];
@@ -1567,7 +1616,7 @@ unsafe fn soft_wrap_glyphs() -> &'static SoftWrapGlyphs {
         let font_key = make_nsstring("NSFont");
         let color_key = make_nsstring("NSColor");
         let font: *mut AnyObject =
-            msg_send![class!(NSFont), monospacedSystemFontOfSize: 10.0f64, weight: 0.0f64];
+            msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_REGULAR];
         let color: *mut AnyObject =
             msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.36f64];
         let _: () = msg_send![attrs, setObject: font, forKey: font_key];

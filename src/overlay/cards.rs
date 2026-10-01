@@ -18,7 +18,8 @@ unsafe fn grayed_image(orig: *mut AnyObject, size: NSSize) -> *mut AnyObject {
     // outside the icon.
     let ctx: *mut AnyObject = msg_send![class!(NSGraphicsContext), currentContext];
     let _: () = msg_send![ctx, setCompositingOperation: 5isize];
-    let gray = hex_to_ns_color(0x808080AA);
+    let palette = crate::theme::ui_palette();
+    let gray = hex_to_ns_color(palette.disabled_text & 0xFFFF_FF00 | 0xAA);
     let _: () = msg_send![gray, setFill];
     let _: () = msg_send![class!(NSBezierPath), fillRect: rect];
     let _: () = msg_send![ctx, setCompositingOperation: 2isize]; // restore SourceOver
@@ -126,12 +127,15 @@ unsafe fn add_preview_icon_fallback(
         let lv: *mut AnyObject = msg_send![lv, initWithFrame: frame];
         let _: () = msg_send![lv, setWantsLayer: true];
         let ll: *mut AnyObject = msg_send![lv, layer];
-        let _: () = msg_send![ll, setCornerRadius: 12.0f64];
+        let _: () = msg_send![ll, setCornerRadius: crate::theme::RADIUS_CARD];
         let _: () = msg_send![ll, setMasksToBounds: true];
         layer_set_background(ll, hex_to_cg_color(colors.icon_inner_bg));
         let init_char = w.app_name.chars().next().unwrap_or('?').to_string();
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 24.0f64, weight: 0.4f64];
+        let font: *mut AnyObject = msg_send![
+            class!(NSFont),
+            systemFontOfSize: crate::theme::FONT_PAGE_TITLE,
+            weight: crate::theme::FONT_WEIGHT_BOLD
+        ];
         let label = make_centered_label(
             &init_char,
             font,
@@ -147,9 +151,13 @@ unsafe fn add_preview_icon_fallback(
             let dim: *mut AnyObject = msg_send![dim, initWithFrame: frame];
             let _: () = msg_send![dim, setWantsLayer: true];
             let dl: *mut AnyObject = msg_send![dim, layer];
-            let _: () = msg_send![dl, setCornerRadius: 12.0f64];
+            let _: () = msg_send![dl, setCornerRadius: crate::theme::RADIUS_CARD];
             let _: () = msg_send![dl, setMasksToBounds: true];
-            layer_set_background(dl, hex_to_cg_color(0x808080AA));
+            let palette = crate::theme::ui_palette();
+            layer_set_background(
+                dl,
+                hex_to_cg_color(palette.disabled_text & 0xFFFF_FF00 | 0xAA),
+            );
             let _: () = msg_send![lv, addSubview: dim];
             release_obj(dim);
         }
@@ -195,12 +203,15 @@ unsafe fn add_visibility_badge_if_needed(
         let _: () = msg_send![icon, setWantsLayer: true];
         let _: () = msg_send![icon, setImage: symbol];
         let _: () = msg_send![icon, setImageScaling: 3u64];
-        let _: () = msg_send![icon, setContentTintColor: hex_to_ns_color(0xFFFFFFFF)];
+        let palette = crate::theme::ui_palette();
+        let _: () = msg_send![icon, setContentTintColor: hex_to_ns_color(palette.accent_text)];
         let icon_layer: *mut AnyObject = msg_send![icon, layer];
-        layer_set_shadow_color(icon_layer, hex_to_cg_color(0x000000B3));
-        let _: () = msg_send![icon_layer, setShadowOpacity: 0.85f32];
-        let _: () = msg_send![icon_layer, setShadowRadius: 2.0f64];
-        let _: () = msg_send![icon_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
+        layer_set_shadow_color(icon_layer, hex_to_cg_color(palette.symbol_shadow));
+        let _: () =
+            msg_send![icon_layer, setShadowOpacity: crate::theme::OVERLAY_SYMBOL_SHADOW_OPACITY];
+        let _: () =
+            msg_send![icon_layer, setShadowRadius: crate::theme::OVERLAY_SYMBOL_SHADOW_RADIUS];
+        let _: () = msg_send![icon_layer, setShadowOffset: NSSize::new(0.0, crate::theme::OVERLAY_SYMBOL_SHADOW_OFFSET_Y)];
         let _: () = msg_send![container, addSubview: icon];
         release_obj(icon);
     }
@@ -284,6 +295,8 @@ pub(crate) fn create_card_view(
         // smaller than the base, and the internal geometry MUST be laid out from
         // that actual height or masksToBounds clips the caption away (verified).
         let use_new = crate::theme::thumbnails_enabled();
+        let card_radius = crate::theme::overlay_card_radius();
+        let radii = crate::theme::overlay_radii(card_radius, THUMB_PAD);
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h));
         let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
         let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
@@ -291,8 +304,7 @@ pub(crate) fn create_card_view(
         // Enable layer for selection border
         let _: () = msg_send![view, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![view, layer];
-        // 16px radius for the new layout (.item), legacy keeps 14.
-        let _: () = msg_send![layer, setCornerRadius: if use_new { 16.0f64 } else { 14.0f64 }];
+        let _: () = msg_send![layer, setCornerRadius: radii.card];
         // masksToBounds MUST be false: the selected-state shadow draws OUTSIDE the
         // card bounds and clipping would swallow it entirely. Children (preview /
         // caption / close button) are all inset from the card edges and stay inside
@@ -317,16 +329,17 @@ pub(crate) fn create_card_view(
             // card's outer [-2,0] band. It is added before caption/preview content;
             // masksToBounds=false keeps the outer ring visible. refresh_highlight owns
             // visibility and theme color.
+            let ring_inset = crate::theme::OVERLAY_RING_INSET;
             let ring_frame = NSRect::new(
-                NSPoint::new(-2.0, -2.0),
-                NSSize::new(card_width + 4.0, card_h + 4.0),
+                NSPoint::new(-ring_inset, -ring_inset),
+                NSSize::new(card_width + ring_inset * 2.0, card_h + ring_inset * 2.0),
             );
             let ring: *mut AnyObject = msg_send![class!(NSImageView), alloc];
             let ring: *mut AnyObject = msg_send![ring, initWithFrame: ring_frame];
             let _: () = msg_send![ring, setTag: THUMB_SELECTION_RING_TAG];
             let _: () = msg_send![ring, setWantsLayer: true];
             let ring_layer: *mut AnyObject = msg_send![ring, layer];
-            let _: () = msg_send![ring_layer, setCornerRadius: 18.0f64];
+            let _: () = msg_send![ring_layer, setCornerRadius: radii.selection_ring];
             let _: () = msg_send![ring_layer, setMasksToBounds: false];
             let _: () = msg_send![ring_layer, setBorderWidth: 2.0f64];
             layer_set_border(
@@ -340,7 +353,7 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![view, addSubview: ring];
             release_obj(ring);
 
-            let caption_h = thumb_caption_h();
+            let caption_h = thumb_caption_h_for_card(card_h);
             let preview_h = thumb_preview_h(card_h);
             let caption_y = card_h - THUMB_PAD - caption_h;
 
@@ -365,7 +378,11 @@ pub(crate) fn create_card_view(
             let mini: *mut AnyObject = msg_send![mini, initWithFrame: mini_frame];
             let _: () = msg_send![mini, setWantsLayer: true];
             let ml: *mut AnyObject = msg_send![mini, layer];
-            let _: () = msg_send![ml, setCornerRadius: 5.0f64];
+            let _: () = msg_send![ml, setCornerRadius: crate::theme::rounded_inset_radius(
+                radii.thumbnail_icon,
+                mini_sz,
+                mini_sz,
+            )];
             let _: () = msg_send![ml, setMasksToBounds: true];
             match mini_img {
                 Some(img) => {
@@ -376,7 +393,11 @@ pub(crate) fn create_card_view(
                 None => {
                     layer_set_background(ml, hex_to_cg_color(colors.icon_inner_bg));
                     let init_char = w.app_name.chars().next().unwrap_or('?').to_string();
-                    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: (10.0 * text_scale()).clamp(8.0, 16.0), weight: 0.5f64];
+                    let font: *mut AnyObject = msg_send![
+                        class!(NSFont),
+                        systemFontOfSize: crate::theme::FONT_CAPTION,
+                        weight: crate::theme::FONT_WEIGHT_BOLD
+                    ];
                     let label = make_centered_label(
                         &init_char,
                         font,
@@ -433,10 +454,8 @@ pub(crate) fn create_card_view(
             let _: () = msg_send![container, setTag: THUMB_PREVIEW_TAG];
             let _: () = msg_send![container, setWantsLayer: true];
             let cl: *mut AnyObject = msg_send![container, layer];
-            // Preview corner radius of 4pt: the preview is a shrunken window (~1/8
-            // scale), where a real macOS window corner (Tahoe 16pt / Sequoia 10pt)
-            // equates to ~2pt; use 4pt as the clipping radius.
-            let _: () = msg_send![cl, setCornerRadius: 4.0f64];
+            // Captured window pixels keep square corners inside the rounded card.
+            let _: () = msg_send![cl, setCornerRadius: radii.thumbnail_preview];
             let _: () = msg_send![cl, setMasksToBounds: true];
             // Keep the preview container transparent and borderless so leftover space below a
             // thumbnail shows the switcher's glass background directly.
@@ -500,14 +519,17 @@ pub(crate) fn create_card_view(
                 let _: () = msg_send![letter_view, setWantsLayer: true];
                 let _: () = msg_send![letter_view, setTag: ICON_VIEW_TAG];
                 let ll: *mut AnyObject = msg_send![letter_view, layer];
-                let _: () = msg_send![ll, setCornerRadius: 14.0f64];
+                let _: () = msg_send![ll, setCornerRadius: crate::theme::RADIUS_CARD];
                 let _: () = msg_send![ll, setMasksToBounds: true];
                 let bg_color = hex_to_cg_color(colors.icon_inner_bg);
                 layer_set_background(ll, bg_color);
 
                 let init = w.app_name.chars().next().unwrap_or('?').to_string();
-                let font: *mut AnyObject =
-                    msg_send![class!(NSFont), systemFontOfSize: 28.0f64, weight: 0.4f64];
+                let font: *mut AnyObject = msg_send![
+                    class!(NSFont),
+                    systemFontOfSize: crate::theme::FONT_PAGE_TITLE,
+                    weight: crate::theme::FONT_WEIGHT_BOLD
+                ];
                 let text_color = hex_to_ns_color(colors.icon_text);
                 let label = make_centered_label(&init, font, text_color, 0.0, letter_sq, letter_sq);
                 let _: () = msg_send![letter_view, addSubview: label];
@@ -520,9 +542,13 @@ pub(crate) fn create_card_view(
                     let dim: *mut AnyObject = msg_send![dim, initWithFrame: letter_frame];
                     let _: () = msg_send![dim, setWantsLayer: true];
                     let dl: *mut AnyObject = msg_send![dim, layer];
-                    let _: () = msg_send![dl, setCornerRadius: 14.0f64];
+                    let _: () = msg_send![dl, setCornerRadius: crate::theme::RADIUS_CARD];
                     let _: () = msg_send![dl, setMasksToBounds: true];
-                    layer_set_background(dl, hex_to_cg_color(0x808080AA));
+                    let palette = crate::theme::ui_palette();
+                    layer_set_background(
+                        dl,
+                        hex_to_cg_color(palette.disabled_text & 0xFFFF_FF00 | 0xAA),
+                    );
                     let _: () = msg_send![view, addSubview: dim];
                     release_obj(dim);
                 }
@@ -532,9 +558,8 @@ pub(crate) fn create_card_view(
             let text_gap: f64 = 6.0;
             // Primary line = window title, secondary = app name: title 12px medium
             // (win_title), app name 10px regular (app_name).
-            let text_scale = text_scale();
-            let primary_line_h = 18.0 * text_scale;
-            let secondary_line_h = 16.0 * text_scale;
+            let primary_line_h = card_title_font_size() * 1.2;
+            let secondary_line_h = card_app_name_font_size() * 1.35;
             let primary_bottom = icon_bottom - text_gap - primary_line_h;
             // Secondary line: 16px tall at the bottom.
             let secondary_bottom = primary_bottom - 2.0 - secondary_line_h;
@@ -589,7 +614,7 @@ pub(crate) fn create_card_view(
         // only the position follows the layout: caption-row right edge (centered)
         // in thumbnail mode, top-right corner in legacy. ---
         let (btn_frame, btn_radius, btn_font_sz) = if use_new {
-            let caption_h = thumb_caption_h();
+            let caption_h = thumb_caption_h_for_card(card_h);
             let caption_y = card_h - THUMB_PAD - caption_h;
             (
                 NSRect::new(
@@ -599,8 +624,8 @@ pub(crate) fn create_card_view(
                     ),
                     NSSize::new(20.0, 20.0),
                 ),
-                6.0f64,
-                12.0f64,
+                radii.close_button,
+                crate::theme::FONT_CAPTION,
             )
         } else {
             (
@@ -608,8 +633,8 @@ pub(crate) fn create_card_view(
                     NSPoint::new(card_width - 27.0, card_h - 27.0),
                     NSSize::new(20.0, 20.0),
                 ),
-                6.0f64,
-                12.0f64,
+                radii.close_button,
+                crate::theme::FONT_CAPTION,
             )
         };
         let btn = make_close_button(btn_frame, btn_font_sz, btn_radius);

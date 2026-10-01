@@ -114,11 +114,11 @@ const NSPASTEBOARD_TYPE_HEIC: &str = "public.heic";
 const NSPASTEBOARD_TYPE_BMP: &str = "com.microsoft.bmp";
 /// The pasteboard TIFF type (the generic macOS fallback, same as NSPasteboardTypeTIFF).
 const NSPASTEBOARD_TYPE_TIFF: &str = "public.tiff";
-/// The image rows' thumbnail box (45x38, radius 6, faint fill + inner ring, mirroring the
+/// The image rows' thumbnail box (72x44, control radius, faint fill + inner ring, mirroring the
 /// HTML mockup).
 const THUMB_W: f64 = 72.0;
 const THUMB_H: f64 = 44.0;
-const THUMB_R: f64 = 6.0;
+const THUMB_R: f64 = crate::theme::RADIUS_CONTROL;
 /// gap between the app icon and the thumb in the canvas.
 /// keycode used when synthesizing Cmd+V.
 const VK_V: u16 = keyboard::VK_V;
@@ -143,7 +143,7 @@ const META_FOOTER_H: f64 = 17.0;
 /// actual line box from exceeding the estimate.
 const DETAIL_LINE_H: f64 = 18.0;
 /// NSTextView's vertical textContainerInset applies at both the top and bottom. Detail text
-/// reuses the list's 11pt top inset, so sizing must include both sides; otherwise exactly
+/// reuses the list's 12pt top inset, so sizing must include both sides; otherwise exactly
 /// two lines overflow and incorrectly show a scrollbar.
 const DETAIL_TEXT_INSET_H: f64 = ROW_PAD_TOP * 2.0;
 /// Conservative fallback units for detail-text height estimation. List content no longer uses
@@ -152,11 +152,11 @@ const DETAIL_TEXT_INSET_H: f64 = ROW_PAD_TOP * 2.0;
 const LINE_MAX_UNITS: usize = 60;
 /// the list's side padding (8px).
 const PAD_X: f64 = 8.0;
-/// The row's padding (the new mockup's 11 11 8 13).
-const ROW_PAD_TOP: f64 = 11.0;
-const ROW_PAD_R: f64 = 11.0;
+/// The row's padding, aligned to the spacing scale.
+const ROW_PAD_TOP: f64 = 12.0;
+const ROW_PAD_R: f64 = 12.0;
 const ROW_PAD_BOT: f64 = 8.0;
-const ROW_PAD_L: f64 = 13.0;
+const ROW_PAD_L: f64 = 12.0;
 /// the search bar's inner padding (12px).
 const SEARCH_PAD_IN: f64 = 12.0;
 /// The reserved search-icon column (the mockup's `.search-icon { width: 22px }`).
@@ -164,73 +164,70 @@ const SEARCH_ICON_W: f64 = 22.0;
 /// The extra clear × size when a query exists.
 const SEARCH_CLEAR_W: f64 = 18.0;
 /// Shared query font size for both editing and unfocused states.
-const SEARCH_FONT_SIZE: f64 = 14.0;
+const SEARCH_FONT_SIZE: f64 = crate::theme::FONT_CONTROL;
 /// The meta line's source-app icon size (the new mockup's .app-icon 13px).
 const META_ICON: f64 = 13.0;
-/// The per-row action buttons' size (the new mockup's 23x21, gap 2).
-const ACTION_BTN: f64 = 23.0;
-const ACTION_H: f64 = 21.0;
-const ACTION_GAP: f64 = 2.0;
+/// The per-row action buttons meet the shared 28pt minimum hit target.
+const ACTION_BTN: f64 = 28.0;
+const ACTION_H: f64 = 28.0;
+const ACTION_GAP: f64 = 4.0;
 /// Detail SVG-style icon canvas (16px in mockup).
 const DETAIL_ACTION_ICON: f64 = 16.0;
 /// the actions strip's width.
 const ACTIONS_W: f64 = ACTION_BTN * 3.0 + ACTION_GAP * 2.0;
-/// the time-group header zone height (27px).
-const GROUP_H: f64 = 27.0;
-/// the group label's top offset (vertically centered).
-const GROUP_LABEL_PAD: f64 = 7.0;
+/// The time-group header zone height.
+const GROUP_H: f64 = 28.0;
+/// The group label's top offset (vertically centered).
+const GROUP_LABEL_PAD: f64 = 8.0;
 /// The header strip: the search zone's top padding (the new mockup's 12px).
 const TOP_PAD_Y: f64 = 12.0;
 /// the search bar's height (the new mockup's 40px).
 const SEARCH_H: f64 = 40.0;
-/// the search bar's side padding (14px).
-const SEARCH_PAD_X: f64 = 14.0;
-/// the search bar's corner radius (the new mockup's 9px).
-const SEARCH_R: f64 = 9.0;
-/// Corner close button on the picker's header: the switcher card's × (20pt, radius 6, 12pt glyph).
-const PICKER_CLOSE_BTN_SIZE: f64 = 20.0;
-const PICKER_CLOSE_BTN_R: f64 = 6.0;
+/// The search bar's side padding.
+const SEARCH_PAD_X: f64 = 16.0;
+/// The search bar uses the shared control radius.
+const SEARCH_R: f64 = crate::theme::RADIUS_CONTROL;
+/// Corner close button on the picker's header: a 28pt hit target with a 12pt glyph.
+const PICKER_CLOSE_BTN_SIZE: f64 = 28.0;
+const PICKER_CLOSE_BTN_R: f64 = crate::theme::RADIUS_CONTROL;
 const PICKER_CLOSE_BTN_FONT: f64 = 12.0;
 /// Gap between the search field's right edge and the corner close button.
 const PICKER_CLOSE_BTN_GAP: f64 = 8.0;
-/// the gap under the search bar (the new mockup's 6px).
-const SEARCH_GAP_Y: f64 = 6.0;
+/// The gap under the search bar.
+const SEARCH_GAP_Y: f64 = 8.0;
 /// the filters row's height (the new mockup's 36px).
 const FILTERS_H: f64 = 36.0;
-/// the filters row's side padding (20px).
-const FILTERS_PAD_X: f64 = 20.0;
-/// the gap between filter items (17px).
-const FILTER_GAP: f64 = 17.0;
+/// The filters row's side padding.
+const FILTERS_PAD_X: f64 = 16.0;
+/// The gap between filter items.
+const FILTER_GAP: f64 = 16.0;
 /// Fixed underline dimensions and animation duration; tab changes move its center only.
 const FILTER_UNDERLINE_W: f64 = 16.0;
 const FILTER_UNDERLINE_H: f64 = 2.0;
-const FILTER_UNDERLINE_ANIMATION_DURATION: f64 = 0.20;
 /// the footer's height (43px).
-const FOOTER_H: f64 = 43.0;
+const FOOTER_H: f64 = 44.0;
 /// the window's bottom padding.
 const PAD_Y: f64 = 12.0;
 /// the footer's side padding (16px).
 const FOOTER_PAD_X: f64 = 16.0;
 /// the footer shortcut groups' spacing.
 const FOOTER_GROUP_GAP: f64 = 16.0;
-/// The list's top offset inside the document (mockup 2px).
-const CLEAR_BTN_GAP: f64 = 2.0;
+/// The list's top offset inside the document.
+const CLEAR_BTN_GAP: f64 = 4.0;
 /// Fixed geometry for the clear-confirmation card; two text actions share one horizontal baseline.
-const CLEAR_CONFIRM_BUTTON_H: f64 = 24.0;
+const CLEAR_CONFIRM_BUTTON_H: f64 = 32.0;
 const CLEAR_CONFIRM_BUTTON_PAD_X: f64 = 8.0;
-const CLEAR_CONFIRM_GAP: f64 = 10.0;
+const CLEAR_CONFIRM_GAP: f64 = 8.0;
 const CLEAR_CONFIRM_CARD_PAD_X: f64 = 8.0;
-const CLEAR_CONFIRM_CARD_PAD_Y: f64 = 6.0;
+const CLEAR_CONFIRM_CARD_PAD_Y: f64 = 8.0;
 const CLEAR_CONFIRM_CARD_H: f64 = CLEAR_CONFIRM_CARD_PAD_Y * 2.0 + CLEAR_CONFIRM_BUTTON_H;
-const CLEAR_CONFIRM_BUTTON_FONT_SIZE: f64 = 11.0;
-const CLEAR_CONFIRM_SHELL_DURATION: f64 = 0.46;
-const CLEAR_CONFIRM_CONTENT_DURATION: f64 = 0.36;
-/// the row highlight's corner radius (8px).
-const SEL_TILE_R: f64 = 8.0;
-/// inset 9px top/bottom).
+const CLEAR_CONFIRM_BUTTON_FONT_SIZE: f64 = crate::theme::FONT_CAPTION;
+/// The row highlight shares the control radius.
+const SEL_TILE_R: f64 = crate::theme::RADIUS_CONTROL;
+/// inset from the selected row's top and bottom edges.
 const SEL_BAR_W: f64 = 2.0;
 const SEL_BAR_X: f64 = 1.0;
-const SEL_BAR_INSET_Y: f64 = 10.0;
+const SEL_BAR_INSET_Y: f64 = 8.0;
 /// Resolve the shared settings/overlay palette for clipboard surfaces and controls.
 fn clipboard_palette() -> crate::theme::UiPalette {
     crate::theme::ui_palette()
@@ -241,13 +238,11 @@ const SCROLL_INDICATOR_W: f64 = 6.0;
 /// the visible capsule width.
 const SCROLL_INDICATOR_HIT_W: f64 = 10.0;
 /// empty inset at each scrollbar track edge.
-const SCROLL_INDICATOR_EDGE: f64 = 3.0;
+const SCROLL_INDICATOR_EDGE: f64 = 4.0;
 /// The detail view always reserves a lower-right safe corner, even when only one scrollbar exists.
 const SCROLL_INDICATOR_CORNER_GAP: f64 = 2.0;
 /// Lower-right safe-corner reserve = the other scrollbar's hit width plus the visual gap.
 const SCROLL_INDICATOR_CORNER_RESERVE: f64 = SCROLL_INDICATOR_HIT_W + SCROLL_INDICATOR_CORNER_GAP;
-/// visible scrollbar capsule radius (matching its 6pt width).
-const SCROLL_INDICATOR_R: f64 = 3.0;
 /// minimum indicator length (too short is unreadable).
 const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 /// gap between the picker and the detail panel.
@@ -256,7 +251,7 @@ const DETAIL_GAP: f64 = 8.0;
 const DETAIL_PAD: f64 = 12.0;
 /// Heights of the detail toolbar and source/statistics footer.
 const DETAIL_TOOLBAR_H: f64 = 36.0;
-const DETAIL_FOOTER_H: f64 = 42.0;
+const DETAIL_FOOTER_H: f64 = 44.0;
 const DETAIL_CHROME_H: f64 = DETAIL_TOOLBAR_H + DETAIL_FOOTER_H;
 /// Fixed outer width shared by text, code, and image details to prevent horizontal jumps.
 const DETAIL_MAX_W: f64 = 640.0;
@@ -277,9 +272,8 @@ const DETAIL_IMAGE_MAX_W: f64 = DETAIL_MAX_W - DETAIL_PAD * 2.0;
 /// still keeps only the 480px thumbnail).
 const DETAIL_PREVIEW_MAX_DIM: f64 = 1280.0;
 /// Open/close duration for the detail panel; scoped to the clipboard detail window.
-const DETAIL_PANEL_ANIMATION_DURATION: f64 = 0.24;
 /// Initial horizontal content offset while the panel expands from left to right.
-const DETAIL_CONTENT_ANIMATION_OFFSET: f64 = 10.0;
+const DETAIL_CONTENT_ANIMATION_OFFSET: f64 = 8.0;
 /// history, newest first.
 static CLIP_HISTORY: LazyLock<Mutex<Vec<ClipEntry>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 /// Clipboard ledger for the memory sampler. Original image bytes live in the disk cache and
@@ -629,7 +623,8 @@ unsafe fn rebuild_search_hint() {
     // the icon run.
     let icon_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let icon_attrs: *mut AnyObject = msg_send![icon_attrs, init];
-    let icon_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 18.0f64];
+    let icon_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
     let icon_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
@@ -649,7 +644,8 @@ unsafe fn rebuild_search_hint() {
     let ph_text_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let ph_text_attrs: *mut AnyObject = msg_send![ph_text_attrs, init];
     let font_key = make_nsstring("NSFont");
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![ph_text_attrs, setObject: font, forKey: font_key];
     CFRelease(font_key as *const c_void);
     let color_key = make_nsstring("NSColor");
@@ -2083,7 +2079,10 @@ mod tests {
         // The empty-state minimum matches a full window containing three same-group records,
         // including the first group's header.
         let min_h = picker_min_height();
-        assert_eq!(min_h, 410.0);
+        assert_eq!(
+            min_h,
+            header_strip_h() + super::GROUP_H + super::ROW_H * 3.0 + FOOTER_H + super::PAD_Y
+        );
         let min_list_h = min_h - header_strip_h() - FOOTER_H;
         assert_eq!(empty_state_doc_height(min_list_h - 20.0), min_list_h);
         // When a category filters to no results, the picker can remain tall; the hint document

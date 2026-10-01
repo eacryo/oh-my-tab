@@ -88,7 +88,8 @@ unsafe fn menu_title_width(title: &str) -> f64 {
     let _: () = msg_send![field, setStringValue: title_ns];
     CFRelease(title_ns as *const c_void);
     let _: () = msg_send![field, setUsesSingleLineMode: true];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![field, setFont: font];
     let cell: *mut AnyObject = msg_send![field, cell];
     let size: NSSize = if cell.is_null() {

@@ -2,6 +2,31 @@
 
 use super::*;
 
+const GLASS_TINT_WELL_W: f64 = 52.0;
+const GLASS_TINT_WELL_GAP: f64 = 8.0;
+
+pub(super) struct GlassTintControl {
+    pub(super) container: *mut AnyObject,
+    pub(super) well: *mut AnyObject,
+    pub(super) hex_caption: *mut AnyObject,
+}
+
+fn glass_tint_control_frames(width: f64, height: f64) -> (NSRect, NSRect) {
+    let well_x = (width - GLASS_TINT_WELL_W).max(0.0);
+    let caption_w = (well_x - GLASS_TINT_WELL_GAP).max(0.0);
+    (
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(caption_w, height)),
+        NSRect::new(
+            NSPoint::new(well_x, 0.0),
+            NSSize::new(GLASS_TINT_WELL_W.min(width), height),
+        ),
+    )
+}
+
+fn display_glass_tint_hex(value: &str) -> String {
+    format!("#{}", value.trim_start_matches('#').to_ascii_uppercase())
+}
+
 pub(super) fn color_component_to_byte(component: f64) -> u8 {
     (component.clamp(0.0, 1.0) * 255.0).round() as u8
 }
@@ -41,11 +66,36 @@ pub(super) unsafe fn make_color_well(
     h: f64,
     value: &str,
     target: *mut AnyObject,
-) -> *mut AnyObject {
+) -> GlassTintControl {
+    let container: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let container: *mut AnyObject = msg_send![
+        container,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    let (caption_frame, well_frame) = glass_tint_control_frames(w, h);
+    let caption_value = display_glass_tint_hex(value);
+    let caption = widgets::make_value_label(
+        caption_frame.origin.x,
+        caption_frame.origin.y,
+        caption_frame.size.width,
+        caption_frame.size.height,
+        &caption_value,
+    );
+    let font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: crate::theme::FONT_CAPTION,
+        weight: crate::theme::FONT_WEIGHT_REGULAR
+    ];
+    let _: () = msg_send![caption, setFont: font];
+    widgets::apply_settings_text_role(caption, widgets::SettingsTextRole::Muted);
+    let _: () = msg_send![caption, setAlignment: 2isize]; // NSTextAlignmentRight
+    let _: () = msg_send![container, addSubview: caption];
+    crate::ffi::release_obj(caption);
+
     let well: *mut AnyObject = msg_send![glass_tint_well_class(), alloc];
     let well: *mut AnyObject = msg_send![
         well,
-        initWithFrame: NSRect::new(NSPoint::new(x + w - 52.0, y), NSSize::new(52.0, h))
+        initWithFrame: well_frame
     ];
     let _: () = msg_send![well, setColorWellStyle: 0isize]; // NSColorWellStyleDefault
     let _: () = msg_send![well, setBordered: true];
@@ -59,7 +109,13 @@ pub(super) unsafe fn make_color_well(
     let color = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(value));
     let _: () = msg_send![well, setColor: color];
     let _: () = msg_send![well, setAutoresizingMask: 0u64];
-    well
+    let _: () = msg_send![container, addSubview: well];
+    crate::ffi::release_obj(well);
+    GlassTintControl {
+        container,
+        well,
+        hex_caption: caption,
+    }
 }
 
 /// Pure: center the settings window + color panel as one horizontal group, with the panel on
@@ -195,6 +251,27 @@ pub(super) unsafe fn make_glass_preview(
     h: f64,
     switcher: bool,
 ) -> *mut AnyObject {
+    let palette = settings_palette();
+    let stage_color = crate::theme::settings_preview_stage_color(palette.dark);
+    crate::e2e_state::set_settings_preview_colors(stage_color, palette.card_bg);
+    let stage: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let stage: *mut AnyObject = msg_send![
+        stage,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    let _: () = msg_send![stage, setWantsLayer: true];
+    let stage_layer: *mut AnyObject = msg_send![stage, layer];
+    if !stage_layer.is_null() {
+        crate::ffi::layer_set_background(stage_layer, crate::ffi::hex_to_cg_color(stage_color));
+        let _: () = msg_send![stage_layer, setCornerRadius: crate::theme::RADIUS_CARD];
+        let _: () = msg_send![stage_layer, setMasksToBounds: true];
+    }
+    let stage_id = make_nsstring("settings-preview-stage");
+    let _: () = msg_send![stage, setAccessibilityIdentifier: stage_id];
+    CFRelease(stage_id as *const c_void);
+    let _: () = msg_send![parent, addSubview: stage];
+    release_obj(stage);
+
     let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
     let content_parent: *mut AnyObject;
     let glass: *mut AnyObject;
@@ -205,7 +282,7 @@ pub(super) unsafe fn make_glass_preview(
             view,
             initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
         ];
-        let _: () = msg_send![glass, setCornerRadius: 12.0f64];
+        let _: () = msg_send![glass, setCornerRadius: crate::theme::RADIUS_CARD];
         let style = if crate::config::effective_glass_style() == "clear" {
             1i64
         } else {
@@ -219,7 +296,7 @@ pub(super) unsafe fn make_glass_preview(
         let _: () = msg_send![glass, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![glass, layer];
         if !layer.is_null() {
-            let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+            let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CARD];
             let _: () = msg_send![layer, setMasksToBounds: true];
         }
         let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -246,12 +323,23 @@ pub(super) unsafe fn make_glass_preview(
     release_obj(glass);
 
     if switcher {
+        let tile_color = if palette.dark {
+            crate::theme::PREVIEW_TILE_DARK
+        } else {
+            crate::theme::PREVIEW_TILE_LIGHT
+        };
+        let tile_border = if palette.dark {
+            crate::theme::PREVIEW_TILE_BORDER_DARK
+        } else {
+            crate::theme::PREVIEW_TILE_BORDER_LIGHT
+        };
         let tile_w = ((w - 42.0) / 2.0).max(56.0);
         add_preview_tile(
             content_parent,
             NSRect::new(NSPoint::new(14.0, 19.0), NSSize::new(tile_w, 52.0)),
-            0xFFFFFF78,
-            10.0,
+            tile_color,
+            crate::theme::RADIUS_CONTROL,
+            tile_border,
         );
         add_preview_tile(
             content_parent,
@@ -259,30 +347,83 @@ pub(super) unsafe fn make_glass_preview(
                 NSPoint::new(w - 14.0 - tile_w, 19.0),
                 NSSize::new(tile_w, 52.0),
             ),
-            0xFFFFFF90,
-            10.0,
+            tile_color,
+            crate::theme::RADIUS_CONTROL,
+            tile_border,
         );
     } else {
+        let tile_border = if palette.dark {
+            crate::theme::PREVIEW_TILE_BORDER_DARK
+        } else {
+            crate::theme::PREVIEW_TILE_BORDER_LIGHT
+        };
         add_preview_tile(
             content_parent,
             NSRect::new(NSPoint::new(12.0, h - 22.0), NSSize::new(w - 24.0, 10.0)),
-            0xFFFFFF70,
-            5.0,
+            if palette.dark {
+                crate::theme::PREVIEW_TILE_DARK
+            } else {
+                crate::theme::PREVIEW_TILE_LIGHT
+            },
+            crate::theme::RADIUS_CONTROL,
+            tile_border,
         );
         add_preview_tile(
             content_parent,
             NSRect::new(NSPoint::new(12.0, 25.0), NSSize::new(w - 24.0, 12.0)),
-            0xFFFFFF62,
-            5.0,
+            if palette.dark {
+                crate::theme::PREVIEW_TILE_DARK_SECONDARY
+            } else {
+                crate::theme::PREVIEW_TILE_LIGHT_SECONDARY
+            },
+            crate::theme::RADIUS_CONTROL,
+            tile_border,
         );
         add_preview_tile(
             content_parent,
             NSRect::new(NSPoint::new(12.0, 9.0), NSSize::new(w - 42.0, 8.0)),
-            0xFFFFFF48,
-            4.0,
+            if palette.dark {
+                crate::theme::PREVIEW_TILE_DARK_TERTIARY
+            } else {
+                crate::theme::PREVIEW_TILE_LIGHT_TERTIARY
+            },
+            crate::theme::RADIUS_CONTROL,
+            tile_border,
         );
     }
     glass
+}
+
+pub(super) unsafe fn preview_stage_is_present(preview: *mut AnyObject) -> bool {
+    if preview.is_null() {
+        return false;
+    }
+    let parent: *mut AnyObject = msg_send![preview, superview];
+    let siblings: *mut AnyObject = msg_send![parent, subviews];
+    if siblings.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![siblings, count];
+    for index in 0..count {
+        let sibling: *mut AnyObject = msg_send![siblings, objectAtIndex: index];
+        let identifier: *mut AnyObject = msg_send![sibling, accessibilityIdentifier];
+        if crate::ffi::nsstring_to_rust(identifier) != "settings-preview-stage" {
+            continue;
+        }
+        let stage_frame: NSRect = msg_send![sibling, frame];
+        let preview_frame: NSRect = msg_send![preview, frame];
+        let layer: *mut AnyObject = msg_send![sibling, layer];
+        let radius: f64 = msg_send![layer, cornerRadius];
+        if (stage_frame.origin.x - preview_frame.origin.x).abs() <= 0.5
+            && (stage_frame.origin.y - preview_frame.origin.y).abs() <= 0.5
+            && (stage_frame.size.width - preview_frame.size.width).abs() <= 0.5
+            && (stage_frame.size.height - preview_frame.size.height).abs() <= 0.5
+            && (radius - crate::theme::RADIUS_CARD).abs() <= 0.5
+        {
+            return true;
+        }
+    }
+    false
 }
 
 pub(super) unsafe fn add_preview_tile(
@@ -290,6 +431,7 @@ pub(super) unsafe fn add_preview_tile(
     frame: NSRect,
     color_hex: u32,
     radius: f64,
+    border_hex: u32,
 ) {
     let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
     let tile: *mut AnyObject = msg_send![tile, initWithFrame: frame];
@@ -298,7 +440,7 @@ pub(super) unsafe fn add_preview_tile(
     if !layer.is_null() {
         let _: () = msg_send![layer, setCornerRadius: radius];
         crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(color_hex));
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(0x0000000Au32));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(border_hex));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
     }
     let _: () = msg_send![parent, addSubview: tile];
@@ -324,7 +466,8 @@ pub(super) unsafe fn add_preview_caption(
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let color = settings_text_color(SettingsTextRole::Secondary);
-    let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 11.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), messageFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![parent, addSubview: label];
@@ -460,20 +603,30 @@ unsafe fn update_glass_tint_from_color(color: *mut AnyObject, sync_well: bool) {
     let Some(hex) = ns_color_to_hex(color) else {
         return;
     };
-    if sync_well {
-        super::with_settings_ui(|ui| {
-            if let Some(ui) = ui.as_ref() {
+    super::with_settings_ui(|ui| {
+        if let Some(ui) = ui.as_ref() {
+            if sync_well {
                 GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
                 let _: () = msg_send![ui.glass_tint, setColor: color];
                 GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
             }
-        });
-    }
+            set_glass_tint_hex_caption(ui.glass_tint_hex, &hex);
+        }
+    });
     if let Ok(mut w) = crate::config::CONFIG.write() {
         w.appearance.glass_tint = hex;
     }
     crate::config::schedule_config_persist();
     apply_glass_preview();
+}
+
+unsafe fn set_glass_tint_hex_caption(caption: *mut AnyObject, value: &str) {
+    if caption.is_null() {
+        return;
+    }
+    let text = crate::ffi::make_nsstring(&display_glass_tint_hex(value));
+    let _: () = msg_send![caption, setStringValue: text];
+    crate::ffi::CFRelease(text as *const c_void);
 }
 
 pub(crate) extern "C" fn on_glass_tint_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
@@ -508,6 +661,7 @@ pub(crate) extern "C" fn on_glass_tint_reset(_self: *mut c_void, _cmd: Sel, _sen
         super::with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
                 let _: () = msg_send![ui.glass_tint, setColor: color];
+                set_glass_tint_hex_caption(ui.glass_tint_hex, &default_hex);
             }
         });
         let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
@@ -519,5 +673,25 @@ pub(crate) extern "C" fn on_glass_tint_reset(_self: *mut c_void, _cmd: Sel, _sen
         }
         crate::config::persist_config_now();
         apply_glass_preview();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{display_glass_tint_hex, glass_tint_control_frames};
+
+    #[test]
+    fn glass_tint_caption_formats_user_color_as_hex() {
+        assert_eq!(display_glass_tint_hex("0a84ffcc"), "#0A84FFCC");
+        assert_eq!(display_glass_tint_hex("#aabbccdd"), "#AABBCCDD");
+    }
+
+    #[test]
+    fn glass_tint_caption_and_swatch_fit_the_control_column() {
+        let (caption, well) = glass_tint_control_frames(200.0, 32.0);
+        assert_eq!(caption.origin.x, 0.0);
+        assert_eq!(caption.size.width + 8.0, well.origin.x);
+        assert_eq!(well.origin.x + well.size.width, 200.0);
+        assert_eq!(caption.size.height, well.size.height);
     }
 }

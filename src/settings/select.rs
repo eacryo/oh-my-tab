@@ -13,15 +13,8 @@ struct SettingsSelectState {
     /// settings_select_open).
     popup: usize,
     open: bool,
-}
-
-fn settings_select_needs_wrap(
-    natural_width: f64,
-    available_width: f64,
-    has_explicit_newline: bool,
-) -> bool {
-    has_explicit_newline
-        || (natural_width.is_finite() && natural_width > available_width.max(1.0) + 0.5)
+    /// Keyboard focus; drives the §10 inset accent ring.
+    focused: bool,
 }
 
 fn settings_select_centered_text_geometry(control_height: f64, measured_height: f64) -> (f64, f64) {
@@ -43,6 +36,14 @@ static SETTINGS_SELECT_ARROW_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
 static SETTINGS_SELECT_ITEM_LABEL_VIEWS: LazyLock<Mutex<HashMap<usize, usize>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 static ACTIVE_SETTINGS_SELECT: Mutex<Option<usize>> = Mutex::new(None);
+
+pub(super) fn is_registered_select_label(view: *mut AnyObject) -> bool {
+    SETTINGS_SELECT_LABEL_VIEWS
+        .lock()
+        .unwrap()
+        .values()
+        .any(|label| *label == view as usize)
+}
 
 struct SettingsSelectClass(*mut AnyObject);
 unsafe impl Send for SettingsSelectClass {}
@@ -86,11 +87,9 @@ unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
     // so long values can otherwise paint underneath the arrow.
     let bounds: NSRect = msg_send![button, bounds];
     let label_frame = NSRect::new(
-        // Use the complete control height: the cell centers single-line values, while the
-        // remaining height is available for a wrapped second line.
-        NSPoint::new(12.0, 0.0),
+        NSPoint::new(16.0, 0.0),
         NSSize::new(
-            (bounds.size.width - 12.0 - 16.0 - 8.0 - 12.0).max(1.0),
+            (bounds.size.width - 16.0 - 12.0 - 8.0 - 12.0).max(1.0),
             bounds.size.height.max(1.0),
         ),
     );
@@ -108,9 +107,9 @@ unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
         let _: () = msg_send![label, setEditable: false];
         let _: () = msg_send![label, setSelectable: false];
         let _: () = msg_send![label, setAlignment: 0isize]; // NSTextAlignmentLeft
-        let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
         if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-            let _: () = msg_send![label, setMaximumNumberOfLines: 0isize];
+            let _: () = msg_send![label, setMaximumNumberOfLines: 1isize];
         }
         let _: () = msg_send![label, setAutoresizingMask: 2u64]; // width sizable
         let _: () = msg_send![button, addSubview: label];
@@ -126,14 +125,15 @@ unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
     let _: () = msg_send![label, setFrame: label_frame];
     let title_ns = make_nsstring(title);
     let _: () = msg_send![label, setStringValue: title_ns];
+    let _: () = msg_send![button, setToolTip: title_ns];
+    let _: () = msg_send![button, setAccessibilityValue: title_ns];
     CFRelease(title_ns as *const c_void);
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setPreferredMaxLayoutWidth: label_frame.size.width];
 
-    // AppKit's single-line cell has the correct baseline, while its multi-line cell is top-biased.
-    // Use the cell's unconstrained natural width to decide whether wrapping is needed; fittingSize
-    // is already constrained by preferredMaxLayoutWidth and cannot make that decision reliably.
+    // Keep values on one line; long localized names truncate instead of changing row height.
     let _: () = msg_send![label, setUsesSingleLineMode: true];
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
         let _: () = msg_send![label, setMaximumNumberOfLines: 1isize];
@@ -144,44 +144,16 @@ unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
     } else {
         msg_send![cell, cellSize]
     };
-    let needs_wrap = settings_select_needs_wrap(
-        natural_size.width,
-        label_frame.size.width,
-        title.contains('\n'),
-    );
-
-    if !needs_wrap {
-        // A fixed baseline alone does not center a child NSTextField whose frame spans the whole
-        // button. Shrink the field to the natural line height and center that frame explicitly.
-        let mut centered_frame = label_frame;
-        let (text_y, text_height) =
-            settings_select_centered_text_geometry(bounds.size.height, natural_size.height);
-        centered_frame.origin.y = text_y;
-        centered_frame.size.height = text_height;
-        let _: () = msg_send![label, setFrame: centered_frame];
-    } else {
-        let _: () = msg_send![label, setUsesSingleLineMode: false];
-        if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-            let _: () = msg_send![label, setMaximumNumberOfLines: 0isize];
-        }
-        let wrapped_size: NSSize = msg_send![
-            label,
-            sizeThatFits: NSSize::new(label_frame.size.width, 10_000.0)
-        ];
-        // Fit the multi-line label to its measured height so its text block is centered as a unit.
-        let mut centered_frame = label_frame;
-        let (text_y, text_height) = settings_select_centered_text_geometry(
-            bounds.size.height,
-            wrapped_size.height.max(natural_size.height),
-        );
-        centered_frame.origin.y = text_y;
-        centered_frame.size.height = text_height;
-        let _: () = msg_send![label, setFrame: centered_frame];
-    }
+    let mut centered_frame = label_frame;
+    let (text_y, text_height) =
+        settings_select_centered_text_geometry(bounds.size.height, natural_size.height);
+    centered_frame.origin.y = text_y;
+    centered_frame.size.height = text_height;
+    let _: () = msg_send![label, setFrame: centered_frame];
     let empty_title = make_nsstring("");
     let _: () = msg_send![button, setTitle: empty_title];
     CFRelease(empty_title as *const c_void);
-    // The native title is kept empty; its visible value is the wrapped label above.
+    // The native title is kept empty; its visible value is the single-line label above.
 }
 
 unsafe fn settings_select_set_label_color(button: *mut AnyObject, color: *mut AnyObject) {
@@ -198,19 +170,11 @@ unsafe fn settings_select_set_label_color(button: *mut AnyObject, color: *mut An
 
 /// Select surfaces deliberately use opaque colors; only the surrounding settings window remains
 fn settings_select_surface_color(palette: UiPalette) -> u32 {
-    if palette.dark {
-        0x151515FF
-    } else {
-        0xFCFCFCFF
-    }
+    palette.card_bg
 }
 
 fn settings_select_item_active_color(palette: UiPalette) -> u32 {
-    if palette.dark {
-        0x1C1C1CFF
-    } else {
-        0xF5F5F5FF
-    }
+    palette.hover_bg
 }
 
 /// Update the trigger surface and arrow without changing the selected value.
@@ -308,21 +272,23 @@ unsafe fn settings_select_apply_visual(button: *mut AnyObject, open: bool) {
             };
             let from_value: *mut AnyObject =
                 msg_send![class!(NSNumber), numberWithDouble: from_angle];
-            let animation: *mut AnyObject = msg_send![
-                class!(CASpringAnimation),
-                animationWithKeyPath: key_path
-            ];
-            let _: () = msg_send![animation, setFromValue: from_value];
-            let _: () = msg_send![animation, setToValue: target_value];
-            let _: () = msg_send![animation, setMass: 1.0f64];
-            let _: () = msg_send![animation, setStiffness: 300.0f64];
-            let _: () = msg_send![animation, setDamping: 25.0f64];
-            let _: () = msg_send![animation, setInitialVelocity: 0.0f64];
-            let duration: f64 = msg_send![animation, settlingDuration];
-            let _: () = msg_send![animation, setDuration: duration.max(0.32)];
-            let animation_key = make_nsstring("settings-select-arrow-rotation");
-            let _: () = msg_send![arrow_layer, addAnimation: animation, forKey: animation_key];
-            CFRelease(animation_key as *const c_void);
+            if !crate::theme::reduce_motion_enabled() {
+                let animation: *mut AnyObject = msg_send![
+                    class!(CABasicAnimation),
+                    animationWithKeyPath: key_path
+                ];
+                let _: () = msg_send![animation, setFromValue: from_value];
+                let _: () = msg_send![animation, setToValue: target_value];
+                let _: () =
+                    msg_send![animation, setDuration: crate::theme::ANIMATION_DURATION_FAST];
+                let timing = crate::theme::ease_standard_timing_function();
+                if !timing.is_null() {
+                    let _: () = msg_send![animation, setTimingFunction: timing];
+                }
+                let animation_key = make_nsstring("settings-select-arrow-rotation");
+                let _: () = msg_send![arrow_layer, addAnimation: animation, forKey: animation_key];
+                CFRelease(animation_key as *const c_void);
+            }
         }
         CFRelease(key_path as *const c_void);
     }
@@ -340,17 +306,28 @@ unsafe fn settings_select_apply_visual(button: *mut AnyObject, open: bool) {
     if !layer.is_null() {
         let background = settings_select_surface_color(palette);
         crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-        let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![layer, setCornerRadius: 12.0f64];
+        let focused = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(button as usize))
+            .map(|state| state.focused)
+            .unwrap_or(false);
+        if focused {
+            // Keyboard focus uses the documented 2pt inset accent ring (§10); the CALayer border
+            // draws inside the bounds, so this is an inset ring.
+            crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.accent));
+            let _: () = msg_send![layer, setBorderWidth: 2.0f64];
+        } else {
+            crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
+            let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+        }
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
 }
 
-/// The option rows inside a panel. They normally sit directly on the panel; when the list does not
-/// fit they are nested one level deeper inside a scroll view (see settings_select_open), so the
-/// cleanup paths (cancelling reveal animations, dropping label registrations) must descend that
-/// level or they miss every row.
+/// The option rows live directly on the panel or inside its scroll view; cleanup must descend
+/// that extra level to release every label registration.
 unsafe fn settings_select_item_views(panel: *mut AnyObject) -> Vec<*mut AnyObject> {
     let mut out = Vec::new();
     if panel.is_null() {
@@ -390,17 +367,6 @@ unsafe fn settings_select_item_views(panel: *mut AnyObject) -> Vec<*mut AnyObjec
     out
 }
 
-unsafe fn settings_select_cancel_item_reveals(panel: *mut AnyObject) {
-    for item in settings_select_item_views(panel) {
-        let _: () = msg_send![
-            class!(NSObject),
-            cancelPreviousPerformRequestsWithTarget: item,
-            selector: sel!(reveal),
-            object: std::ptr::null::<AnyObject>()
-        ];
-    }
-}
-
 unsafe fn settings_select_close(button: *mut AnyObject) {
     let panel = {
         let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
@@ -411,44 +377,11 @@ unsafe fn settings_select_close(button: *mut AnyObject) {
         state.panel as *mut AnyObject
     };
     if !panel.is_null() {
-        settings_select_cancel_item_reveals(panel);
-        let panel_layer: *mut AnyObject = msg_send![panel, layer];
-        if !panel_layer.is_null() {
-            let presentation: *mut AnyObject = msg_send![panel_layer, presentationLayer];
-            // CALayer.opacity is a CGFloat on macOS, which is f32 in this objc2 ABI.
-            let from_opacity: f32 = if presentation.is_null() {
-                msg_send![panel_layer, opacity]
-            } else {
-                msg_send![presentation, opacity]
-            };
-            let open_key = make_nsstring("settings-select-open");
-            let _: () = msg_send![panel_layer, removeAnimationForKey: open_key];
-            CFRelease(open_key as *const c_void);
-            // Commit the hidden end state to the model layer before adding the fade. This avoids
-            // a one-frame return to opacity 1 when Core Animation removes the animation.
-            let _: () = msg_send![panel_layer, setOpacity: 0.0f32];
-            let key_path = make_nsstring("opacity");
-            let animation: *mut AnyObject = msg_send![
-                class!(CABasicAnimation),
-                animationWithKeyPath: key_path
-            ];
-            CFRelease(key_path as *const c_void);
-            let from: *mut AnyObject =
-                msg_send![class!(NSNumber), numberWithFloat: from_opacity.clamp(0.0, 1.0)];
-            let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithFloat: 0.0f32];
-            let _: () = msg_send![animation, setFromValue: from];
-            let _: () = msg_send![animation, setToValue: to];
-            let _: () = msg_send![animation, setDuration: 0.16f64];
-            let animation_key = make_nsstring("settings-select-close");
-            let _: () = msg_send![panel_layer, addAnimation: animation, forKey: animation_key];
-            CFRelease(animation_key as *const c_void);
-        }
-        let _: () = msg_send![
-            button,
-            performSelector: sel!(finishClose:),
-            withObject: panel,
-            afterDelay: 0.16f64
-        ];
+        settings_select_finish_close(
+            button as *mut c_void,
+            sel!(finishClose:),
+            panel as *mut c_void,
+        );
     }
     if ACTIVE_SETTINGS_SELECT
         .lock()
@@ -679,30 +612,6 @@ extern "C" fn settings_select_item_mouse_exited(this: *mut c_void, _cmd: Sel, _e
     }
 }
 
-extern "C" fn settings_select_item_reveal(this: *mut c_void, _cmd: Sel, _object: *mut c_void) {
-    unsafe {
-        let item = this as *mut AnyObject;
-        let _: () = msg_send![item, setAlphaValue: 1.0f64];
-        let layer: *mut AnyObject = msg_send![item, layer];
-        if !layer.is_null() {
-            let key_path = make_nsstring("opacity");
-            let animation: *mut AnyObject = msg_send![
-                class!(CABasicAnimation),
-                animationWithKeyPath: key_path
-            ];
-            CFRelease(key_path as *const c_void);
-            let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
-            let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
-            let _: () = msg_send![animation, setFromValue: from];
-            let _: () = msg_send![animation, setToValue: to];
-            let _: () = msg_send![animation, setDuration: 0.16f64];
-            let animation_key = make_nsstring("settings-select-item-reveal");
-            let _: () = msg_send![layer, addAnimation: animation, forKey: animation_key];
-            CFRelease(animation_key as *const c_void);
-        }
-    }
-}
-
 unsafe fn settings_select_remove_item_labels(panel: *mut AnyObject) {
     let mut labels = SETTINGS_SELECT_ITEM_LABEL_VIEWS.lock().unwrap();
     for item in settings_select_item_views(panel) {
@@ -738,12 +647,6 @@ fn settings_select_item_class() -> *mut AnyObject {
                 sel!(mouseExited:),
                 settings_select_item_mouse_exited as *mut c_void,
                 types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(reveal),
-                settings_select_item_reveal as *mut c_void,
-                CString::new("v@:").unwrap().as_ptr(),
             );
             class_addMethod(
                 cls,
@@ -783,7 +686,8 @@ unsafe fn settings_select_make_item(
     let _: () = msg_send![item, setTitle: title_ns];
     CFRelease(title_ns as *const c_void);
     let _: () = msg_send![item, setAlignment: 0isize]; // NSTextAlignmentLeft
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![item, setFont: font];
     let _: () = msg_send![item, setTag: index as isize];
     let _: () = msg_send![item, setTarget: select];
@@ -855,7 +759,7 @@ unsafe fn settings_select_make_item(
     let _: () = msg_send![item, setWantsLayer: true];
     let item_layer: *mut AnyObject = msg_send![item, layer];
     if !item_layer.is_null() {
-        let _: () = msg_send![item_layer, setCornerRadius: 8.0f64];
+        let _: () = msg_send![item_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![item_layer, setMasksToBounds: true];
     }
     settings_select_item_apply_background(item, false);
@@ -879,14 +783,7 @@ unsafe fn settings_select_make_item(
     let _: () = msg_send![item, addTrackingArea: tracking];
     release_obj(tracking);
     let _: () = msg_send![panel, addSubview: item];
-    let _: () = msg_send![item, setAlphaValue: 0.0f64];
-    let reveal_delay = 0.05 + index as f64 * 0.035;
-    let _: () = msg_send![
-        item,
-        performSelector: sel!(reveal),
-        withObject: std::ptr::null::<AnyObject>(),
-        afterDelay: reveal_delay
-    ];
+    let _: () = msg_send![item, setAlphaValue: 1.0f64];
     release_obj(item);
 }
 
@@ -1056,14 +953,19 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
             crate::ffi::hex_to_cg_color(palette.card_border),
         );
         let _: () = msg_send![panel_layer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![panel_layer, setCornerRadius: 12.0f64];
+        let _: () = msg_send![panel_layer, setCornerRadius: crate::theme::RADIUS_PANEL];
         // Keep the panel's shadow outside its bounds; option rows already clip themselves to
         let _: () = msg_send![panel_layer, setMasksToBounds: false];
-        let shadow_color = crate::ffi::hex_to_cg_color(0x000000FF);
+        if !crate::theme::reduce_motion_enabled() {
+            let _: () = msg_send![panel_layer, setOpacity: 0.0f32];
+        }
+        let shadow_color = crate::ffi::hex_to_cg_color(crate::theme::ELEVATION_MED_SHADOW_COLOR);
         crate::ffi::layer_set_shadow_color(panel_layer, shadow_color);
-        let _: () = msg_send![panel_layer, setShadowOpacity: 0.12f32];
-        let _: () = msg_send![panel_layer, setShadowRadius: 8.0f64];
-        let _: () = msg_send![panel_layer, setShadowOffset: NSSize::new(0.0, -4.0)];
+        let _: () =
+            msg_send![panel_layer, setShadowOpacity: crate::theme::ELEVATION_MED_SHADOW_OPACITY];
+        let _: () =
+            msg_send![panel_layer, setShadowRadius: crate::theme::ELEVATION_MED_SHADOW_RADIUS];
+        let _: () = msg_send![panel_layer, setShadowOffset: NSSize::new(0.0, crate::theme::ELEVATION_MED_SHADOW_OFFSET_Y)];
     }
 
     // Where the rows hang: directly on the panel when they fit, otherwise inside a scroll view
@@ -1175,47 +1077,45 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
         let _: bool = msg_send![window, makeFirstResponder: button];
     }
 
-    // The reference unfolds with opacity rather than scaling the whole panel, keeping text and
     if !panel_layer.is_null() {
-        let _: () = msg_send![panel_layer, setOpacity: 0.0f32];
-        let key_path = make_nsstring("opacity");
-        let animation: *mut AnyObject = msg_send![
-            class!(CABasicAnimation),
-            animationWithKeyPath: key_path
-        ];
-        CFRelease(key_path as *const c_void);
-        let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
-        let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
-        let _: () = msg_send![animation, setFromValue: from];
-        let _: () = msg_send![animation, setToValue: to];
-        let _: () = msg_send![animation, setDuration: 0.18f64];
         let _: () = msg_send![panel_layer, setOpacity: 1.0f32];
-        let animation_key = make_nsstring("settings-select-open");
-        let _: () = msg_send![panel_layer, addAnimation: animation, forKey: animation_key];
-        CFRelease(animation_key as *const c_void);
-
-        // Separate the panel from the trigger with a short spring translation, matching the
-        // reference's attached-then-detached unfold without scaling the panel contents.
-        let key_path = make_nsstring("transform.translation.y");
-        let spring: *mut AnyObject = msg_send![
-            class!(CASpringAnimation),
-            animationWithKeyPath: key_path
-        ];
-        CFRelease(key_path as *const c_void);
-        let from_y = if geometry.opens_above { -8.0 } else { 8.0 };
-        let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_y];
-        let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
-        let _: () = msg_send![spring, setFromValue: from];
-        let _: () = msg_send![spring, setToValue: to];
-        let _: () = msg_send![spring, setMass: 1.0f64];
-        let _: () = msg_send![spring, setStiffness: 260.0f64];
-        let _: () = msg_send![spring, setDamping: 24.0f64];
-        let _: () = msg_send![spring, setInitialVelocity: 0.0f64];
-        let duration: f64 = msg_send![spring, settlingDuration];
-        let _: () = msg_send![spring, setDuration: duration.max(0.32)];
-        let animation_key = make_nsstring("settings-select-open-translation");
-        let _: () = msg_send![panel_layer, addAnimation: spring, forKey: animation_key];
-        CFRelease(animation_key as *const c_void);
+        if !crate::theme::reduce_motion_enabled() {
+            let from_y = if geometry.opens_above { -8.0 } else { 8.0 };
+            let translation = make_nsstring("transform.translation.y");
+            let to_y_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
+            let _: () = msg_send![panel_layer, setValue: to_y_value, forKeyPath: translation];
+            for (path, from, to, key) in [
+                ("opacity", 0.0, 1.0, "settings-select-open-opacity"),
+                (
+                    "transform.translation.y",
+                    from_y,
+                    0.0,
+                    "settings-select-open-translation",
+                ),
+            ] {
+                let key_path = make_nsstring(path);
+                let animation: *mut AnyObject = msg_send![
+                    class!(CABasicAnimation),
+                    animationWithKeyPath: key_path
+                ];
+                CFRelease(key_path as *const c_void);
+                let from_value: *mut AnyObject =
+                    msg_send![class!(NSNumber), numberWithDouble: from];
+                let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: to];
+                let _: () = msg_send![animation, setFromValue: from_value];
+                let _: () = msg_send![animation, setToValue: to_value];
+                let _: () =
+                    msg_send![animation, setDuration: crate::theme::ANIMATION_DURATION_MEDIUM];
+                let timing = crate::theme::ease_standard_timing_function();
+                if !timing.is_null() {
+                    let _: () = msg_send![animation, setTimingFunction: timing];
+                }
+                let animation_key = make_nsstring(key);
+                let _: () = msg_send![panel_layer, addAnimation: animation, forKey: animation_key];
+                CFRelease(animation_key as *const c_void);
+            }
+            CFRelease(translation as *const c_void);
+        }
     }
 }
 
@@ -1342,6 +1242,53 @@ extern "C" fn settings_select_key_down(this: *mut c_void, _cmd: Sel, event: *mut
 
 extern "C" fn settings_select_accepts_first_responder(_this: *mut c_void, _cmd: Sel) -> bool {
     true
+}
+
+/// Apply the focus flag and repaint the trigger surface without changing its selected value.
+fn settings_select_set_focused(key: usize, focused: bool) {
+    let open = {
+        let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+        match states.get_mut(&key) {
+            Some(state) => {
+                state.focused = focused;
+                state.open
+            }
+            None => return,
+        }
+    };
+    unsafe { settings_select_apply_visual(key as *mut AnyObject, open) };
+}
+
+extern "C" fn settings_select_become_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(becomeFirstResponder));
+        if accepted {
+            settings_select_set_focused(this as usize, true);
+        }
+        accepted
+    }
+}
+
+extern "C" fn settings_select_resign_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(resignFirstResponder));
+        if accepted {
+            settings_select_set_focused(this as usize, false);
+        }
+        accepted
+    }
 }
 
 extern "C" fn settings_select_index(this: *mut c_void, _cmd: Sel) -> isize {
@@ -1495,6 +1442,18 @@ fn settings_select_class() -> *mut AnyObject {
                 settings_select_accepts_first_responder as *mut c_void,
                 types_bool.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(becomeFirstResponder),
+                settings_select_become_first_responder as *mut c_void,
+                types_bool.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(resignFirstResponder),
+                settings_select_resign_first_responder as *mut c_void,
+                types_bool.as_ptr(),
+            );
             let types_index = CString::new("q@:").unwrap();
             class_addMethod(
                 cls,
@@ -1549,9 +1508,13 @@ pub(super) unsafe fn make_popup(
     let _: () = msg_send![popup, setButtonType: 0isize];
     let _: () = msg_send![popup, setBordered: false];
     let _: () = msg_send![popup, setAlignment: 0isize]; // NSTextAlignmentLeft
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![popup, setFont: font];
     let _: () = msg_send![popup, setFocusRingType: 1isize]; // NSFocusRingTypeNone
+    let role = make_nsstring("AXPopUpButton");
+    let _: () = msg_send![popup, setAccessibilityRole: role];
+    CFRelease(role as *const c_void);
     let _: () = msg_send![popup, setWantsLayer: true];
     SETTINGS_SELECT_STATES.lock().unwrap().insert(
         popup as usize,
@@ -1562,6 +1525,7 @@ pub(super) unsafe fn make_popup(
             panel: 0,
             popup: 0,
             open: false,
+            focused: false,
         },
     );
     let _: () = msg_send![popup, setEnabled: true];
@@ -1598,7 +1562,8 @@ pub(super) unsafe fn settings_select_required_control_height(
         let _: () = msg_send![field, setMaximumNumberOfLines: 0isize];
     }
     let _: () = msg_send![field, setPreferredMaxLayoutWidth: label_width];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![field, setFont: font];
 
     let mut required_height = minimum_height.max(1.0);
@@ -1628,8 +1593,8 @@ unsafe fn settings_select_required_option_row_height(width: f64, items: &[String
 #[cfg(test)]
 mod tests {
     use super::{
-        settings_select_centered_text_geometry, settings_select_needs_wrap,
-        settings_select_panel_geometry,
+        settings_select_centered_text_geometry, settings_select_item_active_color,
+        settings_select_panel_geometry, settings_select_surface_color,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -1641,18 +1606,26 @@ mod tests {
     }
 
     #[test]
-    fn settings_select_centers_single_line_and_wraps_only_when_needed() {
-        assert!(!settings_select_needs_wrap(98.0, 152.0, false));
-        assert!(settings_select_needs_wrap(175.0, 152.0, false));
-        assert!(settings_select_needs_wrap(40.0, 152.0, true));
+    fn settings_select_centers_single_line_inside_the_control() {
         assert_eq!(
-            settings_select_centered_text_geometry(34.0, 16.0),
-            (9.0, 16.0)
+            settings_select_centered_text_geometry(32.0, 16.0),
+            (8.0, 16.0)
         );
         assert_eq!(
-            settings_select_centered_text_geometry(34.0, 32.0),
-            (1.0, 32.0)
+            settings_select_centered_text_geometry(32.0, 32.0),
+            (0.0, 32.0)
         );
+    }
+
+    #[test]
+    fn settings_select_uses_shared_surface_and_hover_palette_roles() {
+        for palette in [
+            crate::theme::ui_palette_for_mode(false),
+            crate::theme::ui_palette_for_mode(true),
+        ] {
+            assert_eq!(settings_select_surface_color(palette), palette.card_bg);
+            assert_eq!(settings_select_item_active_color(palette), palette.hover_bg);
+        }
     }
 
     #[test]

@@ -32,7 +32,8 @@ pub(super) fn select_sidebar(idx: usize) {
     let idx = if idx >= SETTINGS_PAGE_COUNT { 0 } else { idx };
     // Dismiss the previous page's disabled hint so the bubble cannot remain across tabs.
     unsafe { tooltip::SettingsTooltip::dismiss() };
-    let previous_idx = SIDEBAR_SELECTED.swap(idx, Ordering::SeqCst);
+    unsafe { widgets::clear_sidebar_hover() };
+    SIDEBAR_SELECTED.swap(idx, Ordering::SeqCst);
     unsafe {
         with_settings_ui(|ui| {
             let ui = match ui.as_ref() {
@@ -61,15 +62,7 @@ pub(super) fn select_sidebar(idx: usize) {
             ];
             // align the highlight to the selected button's frame
             let frame: NSRect = msg_send![buttons[idx], frame];
-            // When the pointer is already over the target tab, the hover background is in place;
-            // clicking only synchronizes selection instead of replaying a conspicuous glide.
-            // Keyboard and non-hovered selection changes keep the full spring.
-            let target_is_hovered = widgets::sidebar_button_is_hovered(buttons[idx]);
-            SettingsSidebar::move_highlight(
-                ui.sidebar_highlight,
-                frame,
-                previous_idx != idx && !target_is_hovered,
-            );
+            SettingsSidebar::move_highlight(ui.sidebar_highlight, frame);
             // Selected items use an accent-colored bold title; unselected items use the system label color.
             let titles = [
                 t("settings.sidebar_general"),
@@ -463,7 +456,7 @@ fn show_settings_inner(
         // Always reopen in the collapsed state so no unfinished confirmation lingers (both cards).
         collapse_restore_confirmations(false);
         // A window order-out is not guaranteed to deliver mouseExited for its tracking areas;
-        // clear the shared hover state before reusing the settings window.
+        // clear the active row fill before reusing the settings window.
         widgets::clear_sidebar_hover();
         load_settings_values();
         // Normal opens return to General; seamless refreshes preserve the current page.
@@ -573,8 +566,8 @@ pub(super) fn hide_settings() {
     let window_and_well = with_settings_ui(|ui| ui.as_ref().map(|u| (u.window, u.glass_tint)));
     unsafe {
         if let Some((window, well)) = window_and_well {
-            // orderOut can bypass the sidebar tracking-area exit callback, so do not leave the
-            // shared hover pill pointing at a row while the window is hidden.
+            // orderOut can bypass the sidebar tracking-area exit callback, so clear any active
+            // row fill while the window is hidden.
             widgets::clear_sidebar_hover();
             // Release the settings lock before closing the color panel; its notification callback
             // re-enters SETTINGS_UI.
@@ -686,6 +679,169 @@ fn page_restored(before: &AboutPanelSnapshot, after: &AboutPanelSnapshot) -> boo
             .all(|(before, after)| (after - before).abs() <= 1.0)
 }
 
+unsafe fn settings_style_tree_is_valid(view: *mut AnyObject, inside_control: bool) -> bool {
+    if view.is_null() {
+        return true;
+    }
+    let is_control: bool = msg_send![view, isKindOfClass: class!(NSControl)];
+    let is_text_field: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+    let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+    let is_slider: bool = msg_send![view, isKindOfClass: class!(NSSlider)];
+    if is_slider {
+        let ticks: isize = msg_send![view, numberOfTickMarks];
+        if ticks != 0 {
+            log_info!("[smoke-settings-layout] slider has {ticks} tick marks");
+            return false;
+        }
+    }
+    let draws_text = if is_text_field {
+        let text: *mut AnyObject = msg_send![view, stringValue];
+        let editable: bool = msg_send![view, isEditable];
+        !editable && !crate::ffi::nsstring_to_rust(text).is_empty()
+    } else if is_button {
+        let title: *mut AnyObject = msg_send![view, title];
+        !crate::ffi::nsstring_to_rust(title).is_empty()
+    } else {
+        false
+    };
+    if draws_text && (!inside_control || super::select::is_registered_select_label(view)) {
+        let responds_to_font: bool = msg_send![view, respondsToSelector: sel!(font)];
+        if responds_to_font {
+            let font: *mut AnyObject = msg_send![view, font];
+            if !font.is_null() {
+                let size: f64 = msg_send![font, pointSize];
+                let allowed = [
+                    crate::theme::FONT_CAPTION,
+                    crate::theme::FONT_CONTROL,
+                    crate::theme::FONT_SIDEBAR_TITLE,
+                    crate::theme::FONT_PAGE_TITLE,
+                ]
+                .into_iter()
+                .any(|token| (size - token).abs() <= 0.1);
+                if !allowed {
+                    let tag = if is_control {
+                        msg_send![view, tag]
+                    } else {
+                        -1isize
+                    };
+                    let value = if is_text_field {
+                        let string: *mut AnyObject = msg_send![view, stringValue];
+                        crate::ffi::nsstring_to_rust(string)
+                    } else if is_button {
+                        let title: *mut AnyObject = msg_send![view, title];
+                        crate::ffi::nsstring_to_rust(title)
+                    } else {
+                        String::new()
+                    };
+                    let frame: NSRect = msg_send![view, frame];
+                    log_info!("[smoke-settings-layout] unexpected font size {size:.2}, control={is_control}, text={is_text_field}, button={is_button}, tag={tag}, value={value:?}, frame={frame:?}");
+                    return false;
+                }
+            }
+        }
+    }
+    let identifier: *mut AnyObject = msg_send![view, identifier];
+    if !identifier.is_null()
+        && crate::ffi::nsstring_to_rust(identifier) == widgets::SETTINGS_CARD_STYLE_IDENTIFIER
+    {
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if layer.is_null() {
+            return false;
+        }
+        let opacity: f32 = msg_send![layer, shadowOpacity];
+        if opacity > 0.0 {
+            log_info!("[smoke-settings-layout] settings card has shadow opacity={opacity:.3}");
+            return false;
+        }
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if subviews.is_null() {
+        return true;
+    }
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if !settings_style_tree_is_valid(child, inside_control || is_control) {
+            return false;
+        }
+    }
+    true
+}
+
+unsafe fn settings_about_icon_is_aligned(view: *mut AnyObject) -> bool {
+    if view.is_null() {
+        return false;
+    }
+    let identifier: *mut AnyObject = msg_send![view, identifier];
+    if crate::ffi::nsstring_to_rust(identifier) == ABOUT_APP_ICON_IDENTIFIER {
+        let is_image_view: bool = msg_send![view, isKindOfClass: class!(NSImageView)];
+        let image: *mut AnyObject = msg_send![view, image];
+        let frame: NSRect = msg_send![view, frame];
+        let slot: *mut AnyObject = msg_send![view, superview];
+        if slot.is_null() {
+            return false;
+        }
+        let slot_frame: NSRect = msg_send![slot, frame];
+        let visible_leading_x = slot_frame.origin.x + frame.origin.x;
+        return is_image_view
+            && !image.is_null()
+            && frame.size.width > 0.0
+            && frame.size.height > 0.0
+            && (visible_leading_x - ABOUT_HEADER_CONTENT_LEADING_X).abs() <= 0.5;
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if subviews.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![subviews, count];
+    (0..count).any(|index| {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        settings_about_icon_is_aligned(child)
+    })
+}
+
+unsafe fn settings_about_title_is_product_name(view: *mut AnyObject) -> bool {
+    if view.is_null() {
+        return false;
+    }
+    if msg_send![view, isKindOfClass: class!(NSTextField)] {
+        let value: *mut AnyObject = msg_send![view, stringValue];
+        if crate::ffi::nsstring_to_rust(value) == "Oh My Tab" {
+            return true;
+        }
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if subviews.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![subviews, count];
+    (0..count).any(|index| {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        settings_about_title_is_product_name(child)
+    })
+}
+
+unsafe fn settings_sidebar_has_redundant_heading(view: *mut AnyObject) -> bool {
+    if view.is_null() {
+        return false;
+    }
+    if msg_send![view, isKindOfClass: class!(NSTextField)] {
+        let value: *mut AnyObject = msg_send![view, stringValue];
+        if crate::ffi::nsstring_to_rust(value) == t("settings.window_title") {
+            return true;
+        }
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if subviews.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![subviews, count];
+    (0..count).any(|index| {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        settings_sidebar_has_redundant_heading(child)
+    })
+}
+
 /// Whether the expanded update card and its host sit inside the page document with the page's bottom
 /// padding, and the document covers the card's top edge (i.e. the whole card can be scrolled to).
 unsafe fn update_card_inside_document() -> bool {
@@ -764,8 +920,37 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
 /// This is used by the ignored macOS smoke test; it deliberately exercises the same window
 /// builder as the interactive app instead of constructing a simplified test-only hierarchy.
 pub(crate) fn settings_layout_smoke_runner() -> bool {
+    const UPDATE_CARD_EXPANSION_REQUEST: f64 = 640.0;
+    // The page layout reserves part of the requested host height for the row and bottom padding;
+    // keep the existing 500pt document-growth floor and request enough content height to clear it.
+    const MIN_UPDATE_DOCUMENT_GROWTH: f64 = 500.0;
     unsafe {
+        log_info!("[smoke-settings-layout] opening settings");
         show_settings();
+        log_info!("[smoke-settings-layout] settings opened");
+        let glass_tint_caption_ok = with_settings_ui(|ui| {
+            let Some(ui) = ui.as_ref() else {
+                return false;
+            };
+            if ui.glass_tint_hex.is_null() {
+                return false;
+            }
+            let caption: *mut AnyObject = msg_send![ui.glass_tint_hex, stringValue];
+            if caption.is_null() {
+                return false;
+            }
+            let caption_len: usize = msg_send![caption, length];
+            if caption_len != 9 {
+                return false;
+            }
+            let first: u16 = msg_send![caption, characterAtIndex: 0usize];
+            first == b'#' as u16
+        });
+        if !glass_tint_caption_ok {
+            log_info!("[smoke-settings-layout] glass tint hex caption missing");
+            hide_settings();
+            return false;
+        }
         // Regression guard for the guide's "Open App Settings" crash (2026-09-28): the settings
         // window becoming key delivers the scroller notification synchronously from inside
         // `with_settings_ui`, and the resync re-entered the borrow ("RefCell already borrowed" ->
@@ -812,6 +997,57 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         }) else {
             return false;
         };
+        let sidebar_heading_absent = with_settings_ui(|ui| {
+            let Some(ui) = ui.as_ref() else {
+                return false;
+            };
+            let sidebar_content: *mut AnyObject = msg_send![ui.sidebar_general, superview];
+            !sidebar_content.is_null() && !settings_sidebar_has_redundant_heading(sidebar_content)
+        });
+        if !sidebar_heading_absent {
+            log_info!("[smoke-settings-layout] redundant sidebar heading is still present");
+            hide_settings();
+            return false;
+        }
+        if !settings_about_icon_is_aligned(pages[SETTINGS_ABOUT_PAGE_INDEX]) {
+            log_info!("[smoke-settings-layout] About app icon is missing or misaligned");
+            hide_settings();
+            return false;
+        }
+        if !settings_about_title_is_product_name(pages[SETTINGS_ABOUT_PAGE_INDEX]) {
+            log_info!("[smoke-settings-layout] About title is not the product name");
+            hide_settings();
+            return false;
+        }
+        if pages
+            .iter()
+            .any(|page| !settings_style_tree_is_valid(*page, false))
+        {
+            log_info!(
+                "[smoke-settings-layout] font tokens, slider ticks, or card elevation are invalid"
+            );
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] style tree passed");
+        let preview_ok = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            let contrast = crate::theme::settings_preview_contrast(crate::theme::ui_palette());
+            let switcher_stage =
+                glass_preview::preview_stage_is_present(ui.glass_preview_switcher);
+            let clipboard_stage =
+                glass_preview::preview_stage_is_present(ui.glass_preview_clipboard);
+            if contrast < 3.0 || !switcher_stage || !clipboard_stage {
+                log_info!("[smoke-settings-layout] preview checks: contrast={contrast:.2}, switcher_stage={switcher_stage}, clipboard_stage={clipboard_stage}");
+            }
+            Some(contrast >= 3.0 && switcher_stage && clipboard_stage)
+        })
+        .unwrap_or(false);
+        if !preview_ok {
+            log_info!("[smoke-settings-layout] preview stage is missing or below 3:1 contrast");
+            hide_settings();
+            return false;
+        }
         let sidebar_layout_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let buttons = [
@@ -829,6 +1065,14 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             }
             let parent: *mut AnyObject = msg_send![buttons[0], superview];
             if parent.is_null() {
+                return Some(false);
+            }
+            let selected = SIDEBAR_SELECTED.load(Ordering::SeqCst);
+            let hover_probe = buttons.iter().copied().find(|button| {
+                let tag: isize = msg_send![*button, tag];
+                tag >= 0 && tag as usize != selected
+            });
+            if !hover_probe.is_some_and(|button| widgets::sidebar_hover_style_smoke(button)) {
                 return Some(false);
             }
             let bounds: NSRect = msg_send![parent, bounds];
@@ -975,23 +1219,39 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
-        if !root.is_null() && AnyClass::get(c"NSGlassEffectView").is_some() {
-            let children: *mut AnyObject = msg_send![root, subviews];
-            let child_count: usize = msg_send![children, count];
-            let mut glass_content_ok = false;
-            for index in 0..child_count {
-                let child: *mut AnyObject = msg_send![children, objectAtIndex: index as isize];
-                if msg_send![child, isKindOfClass: class!(NSGlassEffectView)] {
-                    let glass_content: *mut AnyObject = msg_send![child, contentView];
-                    glass_content_ok = !glass_content.is_null();
-                    break;
-                }
+        let children: *mut AnyObject = msg_send![root, subviews];
+        let child_count: usize = msg_send![children, count];
+        let mut solid_sidebar_ok = false;
+        for index in 0..child_count {
+            let child: *mut AnyObject = msg_send![children, objectAtIndex: index as isize];
+            let identifier: *mut AnyObject = msg_send![child, identifier];
+            if crate::ffi::nsstring_to_rust(identifier) != sidebar::SOLID_SIDEBAR_IDENTIFIER {
+                continue;
             }
-            if !glass_content_ok {
-                log_info!("[smoke-settings-layout] Liquid Glass sidebar has no contentView");
-                hide_settings();
-                return false;
-            }
+            let is_glass = AnyClass::get(c"NSGlassEffectView")
+                .is_some_and(|class| msg_send![child, isKindOfClass: class]);
+            let is_visual_effect = AnyClass::get(c"NSVisualEffectView")
+                .is_some_and(|class| msg_send![child, isKindOfClass: class]);
+            let layer: *mut AnyObject = msg_send![child, layer];
+            let background = if layer.is_null() {
+                std::ptr::null_mut()
+            } else {
+                crate::ffi::layer_background_color(layer)
+            };
+            let opaque: bool = if layer.is_null() {
+                false
+            } else {
+                msg_send![layer, isOpaque]
+            };
+            let color_is_opaque =
+                !background.is_null() && crate::ffi::CGColorGetAlpha(background) >= 0.999;
+            solid_sidebar_ok = !is_glass && !is_visual_effect && opaque && color_is_opaque;
+            break;
+        }
+        if !solid_sidebar_ok {
+            log_info!("[smoke-settings-layout] sidebar is not using an opaque solid surface");
+            hide_settings();
+            return false;
         }
         let names = [
             "general",
@@ -1009,6 +1269,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             scroll_page_to_top(*page);
             debug_validate_settings_page(*page, names[index]);
         }
+        log_info!("[smoke-settings-layout] all pages passed");
         // Inline update content (release notes) expands the About page's Updates card. The page
         // document must grow with the card, otherwise the bottom of the notes is cut off and cannot
         // be scrolled to; the shared validator checks the expanded page against its document.
@@ -1023,7 +1284,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         select_sidebar(SETTINGS_ABOUT_PAGE_INDEX);
         let compact_state = update_flow_state();
         let compact = about_panel_snapshot();
-        crate::settings::expand_update_section(600.0);
+        crate::settings::expand_update_section(UPDATE_CARD_EXPANSION_REQUEST);
         let _: () = msg_send![window, layoutIfNeeded];
         let expanded_state = update_flow_state();
         let expanded = about_panel_snapshot();
@@ -1041,7 +1302,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         let _: () = msg_send![window, setFrame: taller, display: true];
         let _: () = msg_send![window, layoutIfNeeded];
         let tall_compact = about_panel_snapshot();
-        crate::settings::expand_update_section(600.0);
+        crate::settings::expand_update_section(UPDATE_CARD_EXPANSION_REQUEST);
         let _: () = msg_send![window, layoutIfNeeded];
         let tall_expanded = about_panel_snapshot();
         let second_inside = update_card_inside_document();
@@ -1055,7 +1316,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         let offsets =
             with_settings_ui(|ui| ui.as_ref().map(|ui| capture_settings_scroll_offsets(ui)))
                 .unwrap_or([NSPoint::new(0.0, 0.0); SETTINGS_PAGE_COUNT]);
-        crate::settings::expand_update_section(600.0);
+        crate::settings::expand_update_section(UPDATE_CARD_EXPANSION_REQUEST);
         let _: () = msg_send![window, layoutIfNeeded];
         let reopened_before = about_panel_snapshot();
         show_settings_preserving(frame, SETTINGS_ABOUT_PAGE_INDEX, offsets);
@@ -1103,12 +1364,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             ("inside", first_inside && second_inside && third_inside),
             (
                 "expand_grows",
-                expanded.document_height > compact.document_height + 500.0,
+                expanded.document_height > compact.document_height + MIN_UPDATE_DOCUMENT_GROWTH,
             ),
             ("collapse_restored", page_restored(&compact, &collapsed)),
             (
                 "tall_expand_grows",
-                tall_expanded.document_height > tall_compact.document_height + 500.0,
+                tall_expanded.document_height
+                    > tall_compact.document_height + MIN_UPDATE_DOCUMENT_GROWTH,
             ),
             (
                 "tall_collapse_restored",
@@ -1126,20 +1388,20 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 "collapse_exact",
                 (collapsed_state.document_height - compact_state.document_height).abs() <= 0.5,
             ),
-            // The card follows the host's bottom edge with the shared card inset (10pt), exactly
+            // The card follows the host's bottom edge with the shared card inset (8pt), exactly
             // like every other card follows its last row.
             (
                 "card_hugs_host",
-                (expanded_state.card_rect_bottom_from_host_bottom + 4.0).abs() <= 0.5
-                    && (collapsed_state.card_rect_bottom_from_host_bottom + 4.0).abs() <= 0.5,
+                (expanded_state.card_rect_bottom_from_host_bottom + 8.0).abs() <= 0.5
+                    && (collapsed_state.card_rect_bottom_from_host_bottom + 8.0).abs() <= 0.5,
             ),
             // The Update divider belongs to the check-button row (the boundary above the button), so
-            // it keeps its distance to the row above it in every state: the switch sits 16pt above it.
+            // it keeps its distance to the row above it in every state after the spacing-token update.
             (
                 "divider_glued_to_row_above",
                 [&compact_state, &expanded_state, &collapsed_state]
                     .iter()
-                    .all(|state| (state.divider_from_row_above + 16.0).abs() <= 0.5),
+                    .all(|state| (state.divider_from_row_above + 15.0).abs() <= 0.5),
             ),
             // Visibility belongs to the owners: the collapsed page shows the check button and hides
             // the update host, the running flow replaces the button with the host, and collapsing
@@ -1192,6 +1454,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
+        log_info!("[smoke-settings-layout] update flow passed");
         hide_settings();
         true
     }
@@ -1852,6 +2115,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
+            glass_tint_hex: std::ptr::null_mut(),
             glass_preview_switcher: std::ptr::null_mut(),
             glass_preview_clipboard: std::ptr::null_mut(),
             corner_radius: std::ptr::null_mut(),
@@ -1935,6 +2199,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             mapping_enabled: std::ptr::null_mut(),
             mapping_empty: std::ptr::null_mut(),
             device_indicator: std::ptr::null_mut(),
+            device_info_caption: std::ptr::null_mut(),
             restore_defaults: RestoreDefaultsControl::empty(),
             page_restores: std::array::from_fn(|_| RestoreDefaultsControl::empty()),
             page_canvases: std::array::from_fn(|_| PageCanvas::empty()),
@@ -1945,7 +2210,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             update_host: std::ptr::null_mut(),
             update_host_window: std::ptr::null_mut(),
             update_card: std::ptr::null_mut(),
-            update_card_shadow: std::ptr::null_mut(),
             update_divider: std::ptr::null_mut(),
             update_card_expanded: false,
         };

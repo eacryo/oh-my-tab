@@ -27,6 +27,8 @@ static CURRENT_SPACE_IS_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 static SPACE_MEMBERSHIP_SOURCE: AtomicU8 = AtomicU8::new(0);
 static SPACE_IN_TRANSITION: AtomicBool = AtomicBool::new(false);
 static SPACE_TRANSITION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
+static SETTINGS_PREVIEW_STAGE: AtomicU64 = AtomicU64::new(0);
+static SETTINGS_PREVIEW_CARD: AtomicU64 = AtomicU64::new(0);
 static SMOOTH_PHASES: [AtomicU64; 6] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -101,6 +103,13 @@ pub(crate) fn set_space_transition(in_transition: bool, deadline_unix_ms: u64) {
     if is_enabled() {
         SPACE_TRANSITION_DEADLINE_MS.store(deadline_unix_ms, Ordering::Relaxed);
         SPACE_IN_TRANSITION.store(in_transition, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn set_settings_preview_colors(stage: u32, card: u32) {
+    if is_enabled() {
+        SETTINGS_PREVIEW_STAGE.store(stage as u64, Ordering::Relaxed);
+        SETTINGS_PREVIEW_CARD.store(card as u64, Ordering::Relaxed);
     }
 }
 
@@ -397,6 +406,11 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     json.push_str(&format!(
         "  \"settings_window_visible\": {},\n",
         crate::settings::settings_window_is_visible()
+    ));
+    json.push_str(&format!(
+        "  \"settings_preview\": {{\"stage\": \"#{:08x}\", \"card\": \"#{:08x}\"}},\n",
+        SETTINGS_PREVIEW_STAGE.load(Ordering::Relaxed),
+        SETTINGS_PREVIEW_CARD.load(Ordering::Relaxed),
     ));
     json.push_str(&format!(
         "  \"smooth_scroll\": {{\"ticks\": {}, \"touch_began\": {}, \"touch_changed\": {}, \"touch_ended\": {}, \"momentum_began\": {}, \"momentum_changed\": {}, \"momentum_ended\": {}}},\n",

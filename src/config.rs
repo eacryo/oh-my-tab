@@ -669,17 +669,15 @@ impl ThemeColors {
 
 impl Default for Fonts {
     fn default() -> Self {
-        // The two card text lines follow the HTML reference (preview (1).html):
-        // primary = window title at 12px / weight 500 (CSS 500 ~= NSFont medium 0.23,
-        // not bold); secondary = app name at 10px / regular (CSS omits font-weight =
-        // 400 ~= NSFontWeightRegular 0.0).
+        // Built-in overlay typography follows the documented 400/600/700 ladder. Explicit
+        // config values remain advanced user overrides; legacy default weights migrate on load.
         Fonts {
             status_bar_size: 15.0,
-            status_bar_weight: 0.23,
+            status_bar_weight: crate::theme::FONT_WEIGHT_SEMIBOLD,
             title_size: 12.0,
-            title_weight: 0.23,
+            title_weight: crate::theme::FONT_WEIGHT_SEMIBOLD,
             app_name_size: 10.0,
-            app_name_weight: 0.0,
+            app_name_weight: crate::theme::FONT_WEIGHT_REGULAR,
         }
     }
 }
@@ -1679,27 +1677,32 @@ impl Config {
         Self::load_or_default_from(&path)
     }
 
-    /// One-time migration for the card text style: after the content swap (window title
-    /// as primary line, app name as secondary), the OLD default combo (title 11/0.23 +
-    /// app_name 13/0.5, plus the old color pairs) inverts the hierarchy under the new
-    /// layout (the secondary line would render larger than the primary). Rewrites only
-    /// when ALL four font values exactly match the old defaults; colors likewise rewrite
-    /// only on an exact PAIR match against the old dark or old light defaults -- any
-    /// customized value skips the whole rewrite (conservative migration, never clobbers
-    /// customizations). Idempotent: the new defaults no longer match the old values.
+    /// Migrate exact legacy defaults only. The old overlay medium weight (0.23) is no longer
+    /// part of the built-in typography ladder; customized weight values are preserved. The
+    /// previous title/app-name size migration remains gated on the complete old default combo.
+    /// Legacy theme colors still migrate only on an exact old-pair match.
     /// Returns whether anything changed.
     pub(crate) fn migrate_card_text_style(&mut self) -> bool {
         let mut changed = false;
         // Old font defaults: title_size 11 / weight 0.23, app_name_size 13 / weight 0.5.
         let f = &mut self.fonts;
+        let legacy_title_weight = f.title_weight == 0.23;
         if f.title_size == 11.0
-            && f.title_weight == 0.23
+            && legacy_title_weight
             && f.app_name_size == 13.0
             && f.app_name_weight == 0.5
         {
-            f.title_size = 12.0; // reference: title 12px medium
+            f.title_size = 12.0;
             f.app_name_size = 10.0; // app name 10px regular
-            f.app_name_weight = 0.0;
+            f.app_name_weight = crate::theme::FONT_WEIGHT_REGULAR;
+            changed = true;
+        }
+        if legacy_title_weight {
+            f.title_weight = crate::theme::FONT_WEIGHT_SEMIBOLD;
+            changed = true;
+        }
+        if f.status_bar_weight == 0.23 {
+            f.status_bar_weight = crate::theme::FONT_WEIGHT_SEMIBOLD;
             changed = true;
         }
         // Colors migrate per theme section: each section's pair independently and
@@ -2018,6 +2021,11 @@ mod tests {
     fn defaults_validate_clean() {
         let cfg = Config::default();
         assert_eq!(cfg.clipboard.shortcut, "option+v");
+        assert_eq!(cfg.fonts.title_weight, crate::theme::FONT_WEIGHT_SEMIBOLD);
+        assert_eq!(
+            cfg.fonts.status_bar_weight,
+            crate::theme::FONT_WEIGHT_SEMIBOLD
+        );
         assert_err_count(&cfg, 0);
         assert!(!cfg.windows.show_minimized);
         assert!(!cfg.windows.show_hidden_app_windows);
@@ -2374,9 +2382,9 @@ mod tests {
 
         assert!(cfg.migrate_card_text_style());
         assert_eq!(cfg.fonts.title_size, 12.0);
-        assert_eq!(cfg.fonts.title_weight, 0.23);
+        assert_eq!(cfg.fonts.title_weight, crate::theme::FONT_WEIGHT_SEMIBOLD);
         assert_eq!(cfg.fonts.app_name_size, 10.0);
-        assert_eq!(cfg.fonts.app_name_weight, 0.0);
+        assert_eq!(cfg.fonts.app_name_weight, crate::theme::FONT_WEIGHT_REGULAR);
         // each section migrates to its same-family new pair.
         assert_eq!(cfg.colors.dark.app_name, "FFFFFF57");
         assert_eq!(cfg.colors.dark.win_title, "FFFFFFD1");
@@ -2392,11 +2400,14 @@ mod tests {
         // A single customized font value -> the whole group is skipped (conservative;
         // colors are at the new defaults here and do not trigger either).
         cfg.fonts.title_size = 11.0;
-        cfg.fonts.title_weight = 0.23;
+        cfg.fonts.title_weight = 0.35; // customized
         cfg.fonts.app_name_size = 13.0;
         cfg.fonts.app_name_weight = 0.4; // customized
+        cfg.fonts.status_bar_weight = 0.45; // customized
         assert!(!cfg.migrate_card_text_style());
         assert_eq!(cfg.fonts.app_name_weight, 0.4);
+        assert_eq!(cfg.fonts.title_weight, 0.35);
+        assert_eq!(cfg.fonts.status_bar_weight, 0.45);
 
         // Colors likewise: with NEITHER section pairing up against an old default, nothing moves.
         cfg.colors.dark.app_name = "custom01ff".into();
@@ -2404,6 +2415,20 @@ mod tests {
         assert!(!cfg.migrate_card_text_style());
         assert_eq!(cfg.colors.dark.app_name, "custom01ff");
         assert_eq!(cfg.colors.light.app_name, "custom01ff");
+    }
+
+    #[test]
+    fn legacy_overlay_medium_weight_defaults_migrate_to_semibold() {
+        let mut cfg = Config::default();
+        cfg.fonts.title_weight = 0.23;
+        cfg.fonts.status_bar_weight = 0.23;
+        assert!(cfg.migrate_card_text_style());
+        assert_eq!(cfg.fonts.title_weight, crate::theme::FONT_WEIGHT_SEMIBOLD);
+        assert_eq!(
+            cfg.fonts.status_bar_weight,
+            crate::theme::FONT_WEIGHT_SEMIBOLD
+        );
+        assert!(!cfg.migrate_card_text_style());
     }
 
     #[test]

@@ -60,6 +60,13 @@ Three layers, split by **who decides pass/fail** — not by which transport driv
 
 For detailed subsystem behavior, inspect the relevant module and `docs/developer-notes-en.md` rather than adding implementation history here.
 
+## UI design system
+
+- `docs/design-style-en.md` is the normative style for **every** surface the app draws; the Chinese version is `docs/design-style.md`. Any user-visible change must follow it. When code and that document disagree, the document wins and the code is the bug — fix the code, or change the document in the same change, with a reason.
+- It fixes the token set: semantic colors with measured contrast floors, the `12 / 14 / 20 / 26` type scale, a 4px spacing grid with named layout metrics, the `8 / 12 / 16` radius scale plus the concentric-derivation rule, four elevation levels, and two animation durations with one easing curve. Never introduce a literal color, font size, radius, spacing or duration at a call site: add the token in `src/theme.rs` (or the owning module), document it, then use it.
+- Cards and rows are defined by border and surface, not by shadow; hover and selection never change layout; controls stay single-line and truncate long values with a tooltip; every animated surface honors Reduce Motion when the animation runs.
+- `docs/ui-refresh-plan-en.md` (Chinese: `docs/ui-refresh-plan.md`) tracks the migration from the current values to those tokens, phase by phase. Follow its order, and keep its rule: every fix lands with a tier-A assertion, or with a state field that makes the fix assertable.
+
 ## Runtime requirements
 
 - Accessibility permission is required for the global event tap and AX operations. Screen Recording is additionally required for thumbnails; both failures must degrade or report clearly rather than break switching.
@@ -70,7 +77,7 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 
 - Preserve unrelated user changes and avoid destructive Git commands unless explicitly requested.
 - Write comments in English only, and only where they explain something the code cannot: FFI/Objective-C subtleties, thread/lock/ordering invariants, measured platform facts, non-obvious trade-offs. Do not restate the code and do not keep its history; both belong in commit messages, release notes, or tests.
-- Keep user-visible strings in `t()`/`tf()`/`t_count()` and add keys to every supported locale; use `t_count()` for singular/plural counts. Developer logs stay in English; dynamic titles are data, not UI chrome.
+- Keep user-visible strings in `t()`/`tf()`/`t_count()` and add keys to every supported locale; use `t_count()` for singular/plural counts. Developer logs stay in English; dynamic titles are data, not UI chrome. Never show a raw translation key, config key, enum name, hex value, VID/PID or internal preset id — see `docs/design-style-en.md` §11.
 - Prefer native file editors. Use scripts only for genuinely programmatic changes; back up targets, assert all anchors, fail loudly, and inspect `git diff` afterward.
 
 ## Git and commits

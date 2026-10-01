@@ -39,7 +39,7 @@ pub(super) unsafe fn build_switcher_page(
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
     let mut canvas = PageCanvas::new(
         switcher_view,
-        content_w - 12.0,
+        content_w,
         layout,
         &t("settings.sidebar_switcher"),
         switcher_doc_h,
@@ -51,7 +51,7 @@ pub(super) unsafe fn build_switcher_page(
         switcher_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_windows_enabled"),
         &t("settings.desc_windows_enabled"),
@@ -72,7 +72,7 @@ pub(super) unsafe fn build_switcher_page(
         label_x,
         y,
         ctrl_x,
-        18.0,
+        super::SETTINGS_CONTROL_LABEL_GAP,
         &t("settings.row_show_minimized"),
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     )
@@ -85,7 +85,7 @@ pub(super) unsafe fn build_switcher_page(
         label_x,
         y,
         ctrl_x,
-        18.0,
+        super::SETTINGS_CONTROL_LABEL_GAP,
         &t("settings.row_show_hidden_app_windows"),
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     )
@@ -135,7 +135,7 @@ pub(super) unsafe fn build_switcher_page(
         switcher_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_focused_thumbnail_prewarm"),
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
@@ -164,7 +164,7 @@ pub(super) unsafe fn build_switcher_page(
         switcher_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_card_text_size"),
         &t("settings.desc_card_text_size"),
@@ -189,7 +189,7 @@ pub(super) unsafe fn build_switcher_page(
         switcher_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_status_bar_text_size"),
         &t("settings.desc_status_bar_text_size"),
@@ -331,7 +331,7 @@ pub(super) unsafe fn build_keystroke_display_page(
     let described_row_h = layout.described_row_h;
     let mut canvas = PageCanvas::new(
         keystroke_display_view,
-        content_w - 12.0,
+        content_w,
         layout,
         &t("settings.sidebar_keystroke_display"),
         keystroke_display_doc_h,
@@ -343,7 +343,7 @@ pub(super) unsafe fn build_keystroke_display_page(
         keystroke_display_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_keystroke_display_enabled"),
         &t("settings.desc_keystroke_display_enabled"),
@@ -413,7 +413,7 @@ pub(super) unsafe fn build_keystroke_display_page(
         label_x,
         y,
         ctrl_x,
-        18.0,
+        super::SETTINGS_CONTROL_LABEL_GAP,
         &t("settings.row_keystroke_display_follow_screen"),
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     )
@@ -452,7 +452,7 @@ pub(super) unsafe fn build_general_page(
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
     let mut canvas = PageCanvas::new(
         general_view,
-        content_w - 12.0,
+        content_w,
         layout,
         &t("settings.sidebar_general"),
         general_doc_h,
@@ -540,7 +540,7 @@ pub(super) unsafe fn build_general_page(
         general_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         theme_metrics.row_h,
         &t("settings.row_theme"),
         &t("settings.desc_theme"),
@@ -554,15 +554,20 @@ pub(super) unsafe fn build_general_page(
         ),
     );
     bind_control(target, ui.theme);
+    let glass_style_labels = [
+        t("settings.glass_style_regular"),
+        t("settings.glass_style_clear"),
+    ];
+    let glass_style_label_refs: Vec<&str> = glass_style_labels.iter().map(String::as_str).collect();
     let glass_style_metrics =
-        SettingsSelect::metrics(ctrl_w, &["Regular", "Clear"], row_h, described_row_h);
+        SettingsSelect::metrics(ctrl_w, &glass_style_label_refs, row_h, described_row_h);
     let y = canvas.next_block(glass_style_metrics.row_h);
     SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
     ui.glass_style = SettingsRow::described(
         general_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         glass_style_metrics.row_h,
         &t("settings.row_glass_style"),
         &t("settings.desc_glass_style"),
@@ -571,29 +576,32 @@ pub(super) unsafe fn build_general_page(
             y + 10.0,
             ctrl_w,
             glass_style_metrics.control_h,
-            &["Regular", "Clear"],
+            &glass_style_label_refs,
             0,
         ),
     );
     bind_control(target, ui.glass_style);
     let y = canvas.next_block(described_row_h);
     SettingsRow::separator(general_view, y + described_row_h, content_w);
-    ui.glass_tint = SettingsRow::described(
+    let tint_control = make_color_well(
+        ctrl_x,
+        y + 10.0,
+        ctrl_w,
+        row_h,
+        &Config::default().appearance.glass_tint,
+        target,
+    );
+    ui.glass_tint = tint_control.well;
+    ui.glass_tint_hex = tint_control.hex_caption;
+    SettingsRow::described(
         general_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_glass_tint"),
         &t("settings.desc_glass_tint"),
-        make_color_well(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            row_h,
-            &Config::default().appearance.glass_tint,
-            target,
-        ),
+        tint_control.container,
     );
     configure_glass_tint_panel(target);
     canvas.card(&t("settings.header_appearance"));
@@ -655,14 +663,16 @@ pub(super) unsafe fn build_general_page(
 
     canvas.next_section();
     // Log level popup: items = [debug, info]; default index 1 (info).
-    let log_levels: [&str; 2] = ["Debug", "Info"];
-    let log_level_metrics = SettingsSelect::metrics(ctrl_w, &log_levels, row_h, described_row_h);
+    let log_levels = [t("settings.log_level_debug"), t("settings.log_level_info")];
+    let log_level_refs: Vec<&str> = log_levels.iter().map(String::as_str).collect();
+    let log_level_metrics =
+        SettingsSelect::metrics(ctrl_w, &log_level_refs, row_h, described_row_h);
     let y = canvas.next_row(log_level_metrics.row_h);
     ui.log_level = SettingsRow::described(
         general_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         log_level_metrics.row_h,
         &t("settings.row_log_level"),
         &t("settings.desc_log_level"),
@@ -671,7 +681,7 @@ pub(super) unsafe fn build_general_page(
             y + 10.0,
             ctrl_w,
             log_level_metrics.control_h,
-            &log_levels,
+            &log_level_refs,
             1,
         ),
     );
@@ -695,7 +705,7 @@ pub(super) unsafe fn build_general_page(
         general_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_export_logs"),
         &t("settings.desc_export_logs"),
@@ -743,7 +753,7 @@ pub(super) unsafe fn build_mouse_page(
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
     let mut canvas = PageCanvas::new(
         mouse_view,
-        content_w - 12.0,
+        content_w,
         layout,
         &t("settings.sidebar_mouse"),
         mouse_doc_h,
@@ -761,7 +771,7 @@ pub(super) unsafe fn build_mouse_page(
         mouse_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_enable_mouse"),
         &t("settings.desc_enable_mouse"),
@@ -775,10 +785,8 @@ pub(super) unsafe fn build_mouse_page(
     canvas.next_section();
     // Popup: items are rebuilt dynamically in load_settings_values (device list is mutable).
     // A placeholder is inserted here; the real items are filled by rebuild_device_popup.
-    let device_labels: Vec<String> = crate::mouse::device::connected_devices()
-        .iter()
-        .map(|d| format!("{} ({:#x}:{:#x})", d.name, d.vendor_id, d.product_id))
-        .collect();
+    let devices = crate::mouse::device::connected_devices();
+    let device_labels: Vec<String> = devices.iter().map(dispatch::device_display_name).collect();
     let device_label_refs: Vec<&str> = if device_labels.is_empty() {
         vec![""]
     } else {
@@ -800,16 +808,18 @@ pub(super) unsafe fn build_mouse_page(
     // the selected device's effective values.
     let _: () = msg_send![dev_popup, setTarget: target];
     let _: () = msg_send![dev_popup, setAction: sel!(handleDeviceChanged:)];
-    ui.device_indicator = SettingsRow::tall_with_height(
+    let (_, device_info_caption, device_control) = SettingsRow::captioned(
         mouse_view,
         label_x,
         y,
-        label_w,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         device_metrics.row_h,
         &t("settings.header_mouse_device"),
+        &dispatch::device_info_caption(devices.first()),
         dev_popup,
-    )
-    .1;
+    );
+    ui.device_info_caption = device_info_caption;
+    ui.device_indicator = device_control;
 
     let scroll_mode_labels: Vec<String> = SCROLL_MODE_LABEL_KEYS.iter().map(|key| t(key)).collect();
     let scroll_mode_label_refs: Vec<&str> = scroll_mode_labels.iter().map(String::as_str).collect();
@@ -883,7 +893,7 @@ pub(super) unsafe fn build_mouse_page(
         mouse_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_reverse_scroll"),
         &t("settings.desc_reverse_scroll"),
@@ -997,19 +1007,18 @@ pub(super) unsafe fn build_mouse_page(
 
     canvas.next_section();
     let y = canvas.next_row(described_row_h);
-    // disable_pointer_accel switch: disable system pointer acceleration for 1:1 linear
-    // cursor tracking. The subtitle explains linear tracking; the switch keeps the same
-    // trailing inset as every other switch row.
-    ui.disable_pointer_accel = SettingsRow::described(
+    // Keep the explanation in the caption instead of lengthening the setting label.
+    let (_, _, pointer_accel_switch) = SettingsRow::captioned(
         mouse_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_disable_pointer_accel"),
         &t("settings.desc_disable_pointer_accel"),
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     );
+    ui.disable_pointer_accel = pointer_accel_switch;
     bind_control(target, ui.disable_pointer_accel);
 
     // Tracking speed (shown only while "Disable pointer acceleration (linear tracking)" is
@@ -1071,7 +1080,7 @@ pub(super) unsafe fn build_mouse_page(
         mouse_view,
         label_x,
         y,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_mapping_enable"),
         &t("settings.desc_mapping_enable"),
@@ -1085,7 +1094,7 @@ pub(super) unsafe fn build_mouse_page(
     // (the mapping list resizes it as its rows change, see `render_mapping_rows_locked`). The
     // block's origin is the card's bottom edge, so its top stays on the gap and it grows downward.
     canvas.next_block(24.0);
-    let card_w = content_w - 12.0;
+    let card_w = content_w;
     let card_h = MAPPING_PANEL_TOP
         + (MAPPING_HEADER_H + MAPPING_ROW_H * 3.0)
         + MAPPING_ACTION_TOP
@@ -1098,12 +1107,12 @@ pub(super) unsafe fn build_mouse_page(
     let card_bg: *mut AnyObject = msg_send![class!(NSView), alloc];
     // Align the mapping card with the other settings cards; the nested table keeps its own
     // inset so only the outer border expands to the shared content width.
-    let card_bg: *mut AnyObject = msg_send![card_bg, initWithFrame: NSRect::new(NSPoint::new(6.0, card_bottom), NSSize::new(content_w - 12.0, card_h))];
+    let card_bg: *mut AnyObject = msg_send![card_bg, initWithFrame: NSRect::new(NSPoint::new(0.0, card_bottom), NSSize::new(content_w, card_h))];
     let _: () = msg_send![card_bg, setFlipped: true];
     let _: () = msg_send![card_bg, setAutoresizingMask: 0u64];
     let _: () = msg_send![card_bg, setWantsLayer: true];
     let bg_layer: *mut AnyObject = msg_send![card_bg, layer];
-    let _: () = msg_send![bg_layer, setCornerRadius: 14.0f64];
+    let _: () = msg_send![bg_layer, setCornerRadius: crate::theme::RADIUS_CARD];
     let _: () = msg_send![bg_layer, setMasksToBounds: true];
     let palette = settings_palette();
     crate::ffi::layer_set_background(bg_layer, crate::ffi::hex_to_cg_color(palette.card_bg));
@@ -1115,7 +1124,7 @@ pub(super) unsafe fn build_mouse_page(
     let panel: *mut AnyObject = msg_send![panel, initWithFrame: NSRect::new(NSPoint::new(MAPPING_PANEL_X, MAPPING_PANEL_TOP), NSSize::new(card_w - 2.0 * MAPPING_PANEL_X, MAPPING_HEADER_H + MAPPING_ROW_H * 3.0))];
     let _: () = msg_send![panel, setWantsLayer: true];
     let panel_layer: *mut AnyObject = msg_send![panel, layer];
-    let _: () = msg_send![panel_layer, setCornerRadius: 10.0f64];
+    let _: () = msg_send![panel_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
     let _: () = msg_send![panel_layer, setMasksToBounds: true];
     crate::ffi::layer_set_background(panel_layer, crate::ffi::hex_to_cg_color(palette.field_bg));
     crate::ffi::layer_set_border(
@@ -1128,7 +1137,7 @@ pub(super) unsafe fn build_mouse_page(
     release_obj(panel);
     // The header band (.mapping-table thead).
     let header_color = settings_text_color(SettingsTextRole::Secondary);
-    let header_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 12.0f64];
+    let header_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_SEMIBOLD];
     for (hx, hw, htext) in [
         (
             MAPPING_PANEL_X + MAPPING_CELL_X,
@@ -1170,6 +1179,9 @@ pub(super) unsafe fn build_mouse_page(
     let _: () = msg_send![empty, setBezeled: false];
     let _: () = msg_send![empty, setDrawsBackground: false];
     let _: () = msg_send![empty, setEditable: false];
+    let empty_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let _: () = msg_send![empty, setFont: empty_font];
     let _: () = msg_send![empty, setAlignment: 1isize]; // center
     let empty_ns = make_nsstring(&t("settings.mapping_empty"));
     let _: () = msg_send![empty, setStringValue: empty_ns];
@@ -1231,7 +1243,7 @@ pub(super) unsafe fn build_clipboard_page(
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
     let mut canvas = PageCanvas::new(
         clipboard_view,
-        content_w - 12.0,
+        content_w,
         layout,
         &t("settings.sidebar_clipboard"),
         clipboard_doc_h,
@@ -1244,7 +1256,7 @@ pub(super) unsafe fn build_clipboard_page(
         clipboard_view,
         label_x,
         cy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_clipboard_enabled"),
         &t("settings.desc_clipboard_enabled"),
@@ -1372,21 +1384,18 @@ pub(super) unsafe fn build_clipboard_page(
     bind_control(target, ui.clipboard_move_used_to_top);
     let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // Delete after paste (Option+Enter/click = one-shot paste). Off by default -- a
-    // destructive gesture, strictly opt-in. Row subtitles are no longer rendered (see
-    // add_described_row's _subtitle), so the gesture hint lives in the label itself;
-    // the text width follows the master described row's full width so the long label
-    // never truncates.
-    ui.clipboard_delete_after_paste = SettingsRow::described(
+    // The destructive shortcut remains opt-in; its gesture hint lives in the muted caption.
+    let (_, _, ui_control) = SettingsRow::captioned(
         clipboard_view,
         label_x,
         cy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_clipboard_delete_after_paste"),
-        "",
+        &t("settings.desc_clipboard_delete_after_paste"),
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
+    ui.clipboard_delete_after_paste = ui_control;
     bind_control(target, ui.clipboard_delete_after_paste);
     // This row is a child of the switch above (indented label): it only appears while "delete
     // entry after paste" is on, so it belongs to a row group the page layout owner skips (the row
@@ -1473,7 +1482,7 @@ pub(super) unsafe fn build_window_control_page(
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
     let mut canvas = PageCanvas::new(
         window_control_view,
-        content_w - 12.0,
+        content_w,
         layout,
         &t("settings.sidebar_window_control"),
         window_control_doc_h,
@@ -1486,7 +1495,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_enabled"),
         &t("settings.desc_window_control_enabled"),
@@ -1507,7 +1516,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_up"),
         &t("settings.desc_window_control_up"),
@@ -1520,7 +1529,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_down"),
         &t("settings.desc_window_control_down"),
@@ -1533,7 +1542,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_left"),
         &t("settings.desc_window_control_left"),
@@ -1546,7 +1555,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_right"),
         &t("settings.desc_window_control_right"),
@@ -1559,7 +1568,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_display_up"),
         &t("settings.desc_window_control_display_up"),
@@ -1572,7 +1581,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_display_down"),
         &t("settings.desc_window_control_display_down"),
@@ -1585,7 +1594,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_display_left"),
         &t("settings.desc_window_control_display_left"),
@@ -1598,7 +1607,7 @@ pub(super) unsafe fn build_window_control_page(
         window_control_view,
         label_x,
         wy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_window_control_display_right"),
         &t("settings.desc_window_control_display_right"),
@@ -1631,7 +1640,7 @@ pub(super) unsafe fn build_quick_actions_page(
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
     let mut canvas = PageCanvas::new(
         quick_actions_view,
-        content_w - 12.0,
+        content_w,
         layout,
         &t("settings.sidebar_quick_actions"),
         quick_actions_doc_h,
@@ -1644,7 +1653,7 @@ pub(super) unsafe fn build_quick_actions_page(
         quick_actions_view,
         label_x,
         qy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_quick_actions_enabled"),
         &t("settings.desc_quick_actions_enabled"),
@@ -1665,7 +1674,7 @@ pub(super) unsafe fn build_quick_actions_page(
         quick_actions_view,
         label_x,
         qy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_quick_action_open_settings"),
         &t("settings.desc_quick_action_open_settings"),
@@ -1678,7 +1687,7 @@ pub(super) unsafe fn build_quick_actions_page(
         quick_actions_view,
         label_x,
         qy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_quick_action_open_finder"),
         &t("settings.desc_quick_action_open_finder"),
@@ -1691,7 +1700,7 @@ pub(super) unsafe fn build_quick_actions_page(
         quick_actions_view,
         label_x,
         qy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_quick_action_show_desktop"),
         &t("settings.desc_quick_action_show_desktop"),
@@ -1704,7 +1713,7 @@ pub(super) unsafe fn build_quick_actions_page(
         quick_actions_view,
         label_x,
         qy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_quick_action_lock_screen"),
         &t("settings.desc_quick_action_lock_screen"),
@@ -1717,7 +1726,7 @@ pub(super) unsafe fn build_quick_actions_page(
         quick_actions_view,
         label_x,
         qy,
-        ctrl_x - label_x - 18.0,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
         described_row_h,
         &t("settings.row_quick_action_locate_pointer"),
         &t("settings.desc_quick_action_locate_pointer"),
@@ -1760,29 +1769,30 @@ pub(super) unsafe fn build_about_page(
     let header_offset = ABOUT_HEADER_TOP + ABOUT_HEADER_BLOCK_H + layout.section_step;
     let mut canvas = PageCanvas::new_at(
         about_view,
-        content_w - 12.0,
+        content_w,
         layout,
         header_offset,
         about_doc_h,
         context.page_frame.size.height,
     );
     let header_mark = canvas.view_mark();
-    add_about_app_icon(about_view, label_x, header_top - 58.0);
-
+    const ABOUT_APP_ICON_TEXT_INSET: f64 = 73.0;
+    // Offset the icon slot by its render overflow so the visible image aligns with the cards below.
+    let about_header_slot_x = ABOUT_HEADER_CONTENT_LEADING_X + ABOUT_APP_ICON_RENDER_OVERFLOW;
+    let about_header_text_x = about_header_slot_x + ABOUT_APP_ICON_TEXT_INSET;
+    add_about_app_icon(about_view, about_header_slot_x, header_top - 58.0);
     let about_title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let about_title: *mut AnyObject = msg_send![
         about_title,
         initWithFrame: NSRect::new(
-            NSPoint::new(label_x + 73.0, header_top - 33.0),
-            NSSize::new(content_w - 73.0 - label_x, 28.0),
+            NSPoint::new(about_header_text_x, header_top - 33.0),
+            NSSize::new(content_w - about_header_text_x, 32.0),
         )
     ];
-    set_field(about_title, "Oh My Tab");
     let _: () = msg_send![about_title, setBezeled: false];
     let _: () = msg_send![about_title, setDrawsBackground: false];
     let _: () = msg_send![about_title, setEditable: false];
-    let about_title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 24.0f64];
-    let _: () = msg_send![about_title, setFont: about_title_font];
+    widgets::set_page_title_text(about_title, "Oh My Tab");
     let _: () = msg_send![about_view, addSubview: about_title];
     release_obj(about_title);
 
@@ -1790,8 +1800,8 @@ pub(super) unsafe fn build_about_page(
     let about_subtitle: *mut AnyObject = msg_send![
         about_subtitle,
         initWithFrame: NSRect::new(
-            NSPoint::new(label_x + 73.0, header_top - 53.0),
-            NSSize::new(content_w - 73.0 - label_x, 18.0),
+            NSPoint::new(about_header_text_x, header_top - 53.0),
+            NSSize::new(content_w - about_header_text_x, 18.0),
         )
     ];
     set_field(
@@ -1804,7 +1814,8 @@ pub(super) unsafe fn build_about_page(
     let _: () = msg_send![about_subtitle, setBezeled: false];
     let _: () = msg_send![about_subtitle, setDrawsBackground: false];
     let _: () = msg_send![about_subtitle, setEditable: false];
-    let about_subtitle_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.0f64];
+    let about_subtitle_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![about_subtitle, setFont: about_subtitle_font];
     let about_subtitle_color = settings_text_color(SettingsTextRole::Muted);
     let _: () = msg_send![about_subtitle, setTextColor: about_subtitle_color];
@@ -1818,8 +1829,8 @@ pub(super) unsafe fn build_about_page(
     let about_header_hit: *mut AnyObject = msg_send![
         about_header_hit,
         initWithFrame: NSRect::new(
-            NSPoint::new(6.0, header_top - 64.0),
-            NSSize::new(content_w - 12.0, 66.0),
+            NSPoint::new(0.0, header_top - 64.0),
+            NSSize::new(content_w, 66.0),
         )
     ];
     let _: () = msg_send![about_view, addSubview: about_header_hit];
@@ -1832,9 +1843,8 @@ pub(super) unsafe fn build_about_page(
     // Keep the App section title close to its card, matching the spacing used by the
     // other settings pages. The About card holds several rows, so its content cursor is lower
     // than a normal section header; placing the title at the old cursor left a large void.
-    // The page header (icon + title + version subtitle) occupies 88pt below header_top; a
-    // section title must step down from the header's BOTTOM or it lands on the icon (measured:
-    // next_section_cursor(header_top) put the "App" title inside the icon's lower half).
+    // The page title and version subtitle occupy the header block; the App section begins below
+    // that block to keep its heading clear of the page subtitle.
     // Keep every About row on the same two-column grid: label on the left, value on the right.
     let about_value_x = label_x + 145.0;
     let about_value_w = (content_w - 2.0 * label_x - 145.0).max(1.0);
@@ -1854,7 +1864,7 @@ pub(super) unsafe fn build_about_page(
         &t("settings.row_view_guide"),
         // Same component and convention as "Export Logs" and "Open Settings": flush to the
         // control column's right edge instead of the App card's value column (about_value_x).
-        // The row is a single 54pt line, so the button centers vertically inside it.
+        // The row is a single 52pt line, so the button centers vertically inside it.
         row_action_button(
             ctrl_x,
             ctrl_w,
@@ -2079,13 +2089,9 @@ pub(super) unsafe fn build_about_page(
     ui.update_host = update_host;
     ui.update_host_window = window;
     crate::updater::set_update_host(update_host, window, check_button);
-    // The collapsed card bottom hugs the check button with a 10pt inset; the inline area is
+    // The collapsed card bottom hugs the check button with an 8pt inset; the inline area is
     // not reserved by default, avoiding a large blank.
-    let update_card_parts = canvas.card(&t("settings.section_updates"));
-    let update_card = update_card_parts.card;
-    let update_card_shadow = update_card_parts.shadow;
-    ui.update_card = update_card;
-    ui.update_card_shadow = update_card_shadow;
+    ui.update_card = canvas.card(&t("settings.section_updates")).card;
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX] = canvas;
     content_bottom
@@ -2116,7 +2122,7 @@ pub(super) unsafe fn finalize_settings_pages(
             target,
             6.0,
             page_bottoms[index] - 16.0,
-            content_w - 12.0,
+            content_w,
         );
     }
 

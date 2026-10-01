@@ -262,7 +262,7 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                     // Rounded light-gray backing.
                     let _: () = msg_send![cap, setWantsLayer: true];
                     let cap_layer: *mut AnyObject = msg_send![cap, layer];
-                    let _: () = msg_send![cap_layer, setCornerRadius: 4.0f64];
+                    let _: () = msg_send![cap_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
                     let cap_bg: *mut AnyObject = msg_send![class!(NSColor), separatorColor];
                     layer_set_background(cap_layer, ns_color_to_cg(cap_bg));
                     let _: () = msg_send![doc, addSubview: cap];
@@ -739,7 +739,7 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             let ve: *mut AnyObject = msg_send![ve, initWithFrame: frame];
             let _: () = msg_send![ve, setWantsLayer: true];
             let ve_layer: *mut AnyObject = msg_send![ve, layer];
-            let _: () = msg_send![ve_layer, setCornerRadius: 10.0f64];
+            let _: () = msg_send![ve_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
             let _: () = msg_send![ve_layer, setMasksToBounds: true];
             layer_set_background(
                 ve_layer,

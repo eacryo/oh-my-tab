@@ -1288,7 +1288,7 @@ fn create_overlay_window() -> *mut AnyObject {
             let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
             msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
         };
-        let status_color = hex_to_ns_color(0x999999ff);
+        let status_color = hex_to_ns_color(crate::theme::ui_palette().muted_text);
         let status_label = make_centered_label("", status_font, status_color, 0.0, w, footer_h);
         let _: () = msg_send![content_parent, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr::new(status_label));
@@ -2691,12 +2691,21 @@ pub fn run() {
             // injected into the environment any more.
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, finishLaunching];
-            let ok = settings::settings_layout_smoke_runner();
-            if !ok {
-                eprintln!("[smoke-settings-layout] settings window was not created");
-                std::process::exit(1);
+            let original_locale = CONFIG.read().unwrap().i18n.locale.clone();
+            for locale in ["en", "zh-Hans", "zh-Hant"] {
+                i18n::apply_config_locale(locale);
+                settings::invalidate_settings_window();
+                log_info!("[smoke-settings-layout] validating locale={locale}");
+                if !settings::settings_layout_smoke_runner() {
+                    i18n::apply_config_locale(&original_locale);
+                    settings::invalidate_settings_window();
+                    eprintln!("[smoke-settings-layout] layout failed for locale={locale}");
+                    std::process::exit(1);
+                }
             }
-            log_info!("[smoke-settings-layout] all pages survived");
+            i18n::apply_config_locale(&original_locale);
+            settings::invalidate_settings_window();
+            log_info!("[smoke-settings-layout] all pages survived in all locales");
             std::process::exit(0);
         }
     }

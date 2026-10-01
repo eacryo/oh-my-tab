@@ -24,14 +24,15 @@ pub(super) unsafe fn animate_card_close_reflow(
 ) {
     let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
     let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: CARD_CLOSE_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeInEaseOut");
-    let timing: *mut AnyObject =
-        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    let animated = !crate::theme::reduce_motion_enabled();
+    let _: () = msg_send![
+        context,
+        setDuration: if animated { CARD_CLOSE_ANIMATION_DURATION } else { 0.0 }
+    ];
+    let timing = crate::theme::ease_standard_timing_function();
     if !timing.is_null() {
         let _: () = msg_send![context, setTimingFunction: timing];
     }
-    CFRelease(timing_name as *const c_void);
 
     // Use post-commit document coordinates during the animation and animate the containing
     // viewport and document alongside the cards.
@@ -98,14 +99,15 @@ pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
     let views = card_views_by_key(&windows);
     let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
     let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: CARD_CLOSE_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeInEaseOut");
-    let timing: *mut AnyObject =
-        msg_send![class!(CAMediaTimingFunction), functionWithName: timing_name];
+    let animated = !crate::theme::reduce_motion_enabled();
+    let _: () = msg_send![
+        context,
+        setDuration: if animated { CARD_CLOSE_ANIMATION_DURATION } else { 0.0 }
+    ];
+    let timing = crate::theme::ease_standard_timing_function();
     if !timing.is_null() {
         let _: () = msg_send![context, setTimingFunction: timing];
     }
-    CFRelease(timing_name as *const c_void);
     if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
         let animator: *mut AnyObject = msg_send![window.0, animator];
         let _: () = msg_send![animator, setFrame: pending.original_panel_frame, display: true];
@@ -742,8 +744,7 @@ pub(crate) unsafe fn make_close_button(
     let title_ns = make_nsstring("×");
     let _: () = msg_send![button, setTitle: title_ns];
     CFRelease(title_ns as *const c_void);
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: font_size, weight: 0.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: font_size, weight: crate::theme::FONT_WEIGHT_REGULAR];
     let _: () = msg_send![button, setFont: font];
     let _: () = msg_send![button, setAlignment: 1isize]; // NSTextAlignmentCenter on arm64
     let _: () = msg_send![button, setWantsLayer: true];
@@ -769,19 +770,20 @@ pub(crate) unsafe fn make_close_button(
 
 /// Apply the close button's base or hover tint and background.
 unsafe fn set_close_button_hover_style(button: *mut AnyObject, hovered: bool) {
+    let palette = crate::theme::ui_palette();
     let tint = if hovered {
-        // HTML .close:hover: rgba(195, 40, 35, .86)
-        hex_to_ns_color(0xC32823DB)
+        hex_to_ns_color(palette.destructive)
     } else {
-        // HTML .close: rgba(0, 0, 0, .30)
-        hex_to_ns_color(0x0000004D)
+        hex_to_ns_color(palette.muted_text)
     };
     let _: () = msg_send![button, setContentTintColor: tint];
 
     let layer: *mut AnyObject = msg_send![button, layer];
     if hovered {
-        // HTML .close:hover background: rgba(195, 40, 35, .07)
-        layer_set_background(layer, hex_to_cg_color(0xC3282312));
+        layer_set_background(
+            layer,
+            hex_to_cg_color(palette.destructive & 0xFFFF_FF00 | 0x12),
+        );
     } else {
         layer_set_background(layer, std::ptr::null_mut());
     }

@@ -2,6 +2,12 @@
 
 use super::*;
 
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    static NSFontAttributeName: *mut AnyObject;
+    static NSKernAttributeName: *mut AnyObject;
+}
+
 /// Set a control's title and release the temporary NSString.
 pub(super) unsafe fn set_control_title(obj: *mut AnyObject, title: &str) {
     let ns = make_nsstring(title);
@@ -11,6 +17,83 @@ pub(super) unsafe fn set_control_title(obj: *mut AnyObject, title: &str) {
 
 pub(super) fn settings_palette() -> UiPalette {
     ui_palette()
+}
+
+/// 2pt inset accent focus ring (design-style §9/§10). CALayer draws its border inside the layer
+/// bounds, which is the documented inset treatment; `focused == false` restores the idle border.
+pub(super) unsafe fn apply_inset_focus_ring(
+    view: *mut AnyObject,
+    focused: bool,
+    idle_border: u32,
+    idle_width: f64,
+) {
+    if view.is_null() {
+        return;
+    }
+    let layer: *mut AnyObject = msg_send![view, layer];
+    if layer.is_null() {
+        return;
+    }
+    if focused {
+        crate::ffi::layer_set_border(
+            layer,
+            crate::ffi::hex_to_cg_color(settings_palette().accent),
+        );
+        let _: () = msg_send![layer, setBorderWidth: 2.0f64];
+    } else {
+        if idle_width > 0.0 {
+            crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(idle_border));
+        }
+        let _: () = msg_send![layer, setBorderWidth: idle_width];
+    }
+}
+
+/// Shared NSTextField delegate: shows the inset accent ring while the field is being edited.
+extern "C" fn settings_text_field_focus_did_begin(
+    _self: *mut c_void,
+    _cmd: Sel,
+    notification: *mut AnyObject,
+) {
+    unsafe {
+        let field: *mut AnyObject = msg_send![notification, object];
+        apply_inset_focus_ring(field, true, 0, 0.0);
+    }
+}
+
+extern "C" fn settings_text_field_focus_did_end(
+    _self: *mut c_void,
+    _cmd: Sel,
+    notification: *mut AnyObject,
+) {
+    unsafe {
+        let field: *mut AnyObject = msg_send![notification, object];
+        apply_inset_focus_ring(field, false, 0, 0.0);
+    }
+}
+
+fn settings_text_field_delegate() -> *mut AnyObject {
+    static DELEGATE: OnceLock<usize> = OnceLock::new();
+    *DELEGATE.get_or_init(|| unsafe {
+        let name = CString::new("OhMyTabSettingsTextFieldDelegate").unwrap();
+        let superclass = class!(NSObject) as *const _ as *mut AnyObject;
+        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        let types = CString::new("v@:@").unwrap();
+        class_addMethod(
+            cls,
+            sel!(controlTextDidBeginEditing:),
+            settings_text_field_focus_did_begin as *mut c_void,
+            types.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(controlTextDidEndEditing:),
+            settings_text_field_focus_did_end as *mut c_void,
+            types.as_ptr(),
+        );
+        objc_registerClassPair(cls);
+        let delegate: *mut AnyObject = msg_send![cls, new];
+        delegate as usize
+    }) as *mut AnyObject
 }
 
 /// Return a flipped NSView class for embedded flows that use top-down child coordinates.
@@ -87,14 +170,16 @@ pub(super) fn themed_settings_color(hex: u32) -> u32 {
         return hex;
     }
     match hex {
-        0xFFFFFFAD | 0x7676801F | 0x7676801E => p.button_bg,
+        0xFFFFFFAD => p.button_bg,
+        0x7676801F | 0x7676801E => p.field_bg,
         0xFFFFFFC7 => p.footer_button_bg,
         0x76768024 | 0x7676802B => p.hover_bg,
         0x0A84FFFF => p.accent,
         0x0077EDFF => p.accent_hover,
         0xFF3B30FF => p.destructive,
         0xD70015FF => p.destructive_hover,
-        0xFFFFFFFF | 0x2E2E2EFF | 0x2C2C30FF | 0x44444AFF => p.button_text,
+        0xFFFFFFFF => p.accent_text,
+        0x2E2E2EFF | 0x2C2C30FF | 0x44444AFF => p.button_text,
         _ => hex,
     }
 }
@@ -113,7 +198,7 @@ pub(super) unsafe fn style_html_button(button: *mut AnyObject, background_hex: u
         );
         crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![layer, setCornerRadius: 8.0f64];
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
     let text_color = crate::ffi::hex_to_ns_color(themed_settings_color(text_hex));
@@ -145,6 +230,20 @@ pub(super) fn html_action_button_class() -> *mut AnyObject {
                 html_action_button_mouse_exited as *mut c_void,
                 types.as_ptr(),
             );
+            // become/resignFirstResponder return BOOL ('B'), not void.
+            let focus_types = CString::new("B@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(becomeFirstResponder),
+                html_action_button_become_first_responder as *mut c_void,
+                focus_types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(resignFirstResponder),
+                html_action_button_resign_first_responder as *mut c_void,
+                focus_types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             HtmlActionButtonClass(cls)
         })
@@ -159,11 +258,12 @@ pub(super) extern "C" fn html_action_button_mouse_entered(
     unsafe {
         let button = this as *mut AnyObject;
         let tag: isize = msg_send![button, tag];
+        let palette = settings_palette();
         let hover = match tag {
-            -2 => 0x0077EDFFu32, // HTML footer `.ok:hover`
-            -1 => 0x76768024u32, // HTML footer `button:hover`
-            -4 => 0xD70015FFu32, // destructive confirmation hover
-            _ => 0x7676802Bu32,  // HTML small/tiny/full action hover
+            -2 => palette.accent_hover,
+            -1 => palette.hover_bg,
+            -4 => palette.destructive_hover,
+            _ => palette.hover_bg,
         };
         let layer: *mut AnyObject = msg_send![button, layer];
         if !layer.is_null() {
@@ -183,13 +283,14 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
     unsafe {
         let button = this as *mut AnyObject;
         let tag: isize = msg_send![button, tag];
+        let palette = settings_palette();
         let normal = match tag {
-            -2 => 0x0A84FFFFu32,
-            -1 => 0xFFFFFFC7u32,
-            -3 => 0xFFFFFFADu32, // HTML `.full-action` normal background
-            -4 => 0xFF3B30FFu32, // destructive confirmation
-            _ if tag >= 0 => 0x7676801Fu32, // mapping/edit compact action
-            _ => 0xFFFFFFADu32,
+            -2 => palette.accent,
+            -1 => palette.footer_button_bg,
+            -3 => palette.button_bg,
+            -4 => palette.destructive,
+            _ if tag >= 0 => palette.field_bg,
+            _ => palette.button_bg,
         };
         let layer: *mut AnyObject = msg_send![button, layer];
         if !layer.is_null() {
@@ -198,6 +299,49 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
                 crate::ffi::hex_to_cg_color(themed_settings_color(normal)),
             );
         }
+    }
+}
+
+extern "C" fn html_action_button_become_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(becomeFirstResponder));
+        if accepted {
+            // Idle border is the 1pt card_border; focus swaps it for the 2pt accent ring.
+            apply_inset_focus_ring(
+                this as *mut AnyObject,
+                true,
+                settings_palette().card_border,
+                1.0,
+            );
+        }
+        accepted
+    }
+}
+
+extern "C" fn html_action_button_resign_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(resignFirstResponder));
+        if accepted {
+            apply_inset_focus_ring(
+                this as *mut AnyObject,
+                false,
+                settings_palette().card_border,
+                1.0,
+            );
+        }
+        accepted
     }
 }
 
@@ -218,7 +362,10 @@ pub(super) unsafe fn make_settings_styled_button(
     let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
     set_control_title(button, title);
     let _: () = msg_send![button, setControlSize: 0isize]; // NSControlSizeRegular
-                                                           // HTML .small-btn / footer buttons: translucent white surface with a hairline border.
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let _: () = msg_send![button, setFont: font];
+    // HTML .small-btn / footer buttons: translucent white surface with a hairline border.
     style_html_button(button, background_hex, text_hex);
     let _: () = msg_send![button, setTag: hover_tag];
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
@@ -405,10 +552,6 @@ pub(super) static EXTERNAL_LINK_BUTTON_CLASS: OnceLock<ExternalLinkButtonClass> 
 pub(super) static SIDEBAR_BUTTON_CLASS: OnceLock<SidebarButtonClass> = OnceLock::new();
 pub(super) static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_HOVERED: AtomicUsize = AtomicUsize::new(0);
-pub(super) static SIDEBAR_HOVER_VISIBLE: AtomicBool = AtomicBool::new(false);
-pub(super) static SIDEBAR_HOVER_PRIMED: AtomicBool = AtomicBool::new(false);
-pub(super) static SIDEBAR_HOVER_HIGHLIGHT: MainThreadSlot<Option<ObjPtr>> =
-    MainThreadSlot::new(None);
 pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
@@ -476,40 +619,12 @@ unsafe impl Sync for SidebarHoverTrackerClass {}
 pub(super) static SIDEBAR_HOVER_TRACKER_CLASS: OnceLock<SidebarHoverTrackerClass> = OnceLock::new();
 pub(super) static SIDEBAR_HOVER_TRACKER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
-/// Return the shared hover view without duplicating its ownership logic at each event site.
-unsafe fn sidebar_hover_highlight() -> *mut AnyObject {
-    SIDEBAR_HOVER_HIGHLIGHT
-        .lock()
-        .unwrap()
-        .as_ref()
-        .map(|p| p.0)
-        .unwrap_or(std::ptr::null_mut())
-}
-
-/// Check whether a sidebar button is the item currently carrying the hover surface.
-pub(super) fn sidebar_button_is_hovered(button: *mut AnyObject) -> bool {
-    !button.is_null() && SIDEBAR_HOVERED.load(Ordering::SeqCst) == button as usize
-}
-
-/// Clear hover state after a sidebar click has established the selected row.
+/// Clear the active row fill when the settings window hides or changes pages.
 pub(super) unsafe fn clear_sidebar_hover() {
-    SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-    SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
-    super::components::SettingsSidebar::hide_hover_highlight_immediately(sidebar_hover_highlight());
-}
-
-/// Keep a hidden hover origin at the clicked row for the next adjacent-row transition.
-pub(super) unsafe fn prime_sidebar_hover_after_selection(button: *mut AnyObject) {
-    SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-    let hover = sidebar_hover_highlight();
-    if hover.is_null() || button.is_null() {
-        SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
-        return;
+    let hovered = SIDEBAR_HOVERED.swap(0, Ordering::SeqCst) as *mut AnyObject;
+    if !hovered.is_null() {
+        set_sidebar_hovered(hovered, false);
     }
-    let frame: NSRect = msg_send![button, frame];
-    SIDEBAR_HOVER_PRIMED.store(true, Ordering::SeqCst);
-    SIDEBAR_HOVER_VISIBLE.store(true, Ordering::SeqCst);
-    super::components::SettingsSidebar::prime_hover_highlight(hover, frame);
 }
 
 /// Find the visible sidebar button currently under the pointer instead of trusting a possibly
@@ -547,29 +662,20 @@ unsafe fn sidebar_button_under_pointer() -> Option<*mut AnyObject> {
     })
 }
 
-/// Reconcile the shared hover pill with one concrete sidebar button.
-unsafe fn apply_sidebar_hover(button: *mut AnyObject, reentering_sidebar: bool) {
+/// Apply the semantic row fill and foreground to one concrete sidebar button.
+unsafe fn apply_sidebar_hover(button: *mut AnyObject) {
     if button.is_null() {
         return;
     }
     let tag: isize = msg_send![button, tag];
     if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
-        SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-        SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
-        super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
+        clear_sidebar_hover();
+        set_sidebar_hovered(button, false);
         return;
     }
-    SIDEBAR_HOVERED.store(button as usize, Ordering::SeqCst);
-    let hover = sidebar_hover_highlight();
-    if !hover.is_null() {
-        let frame: NSRect = msg_send![button, frame];
-        if SIDEBAR_HOVER_PRIMED.swap(false, Ordering::SeqCst) {
-            super::components::SettingsSidebar::move_hover_highlight_after_selection(hover, frame);
-        } else if reentering_sidebar {
-            super::components::SettingsSidebar::move_hover_highlight_on_reentry(hover, frame);
-        } else {
-            super::components::SettingsSidebar::move_hover_highlight(hover, frame);
-        }
+    let previous = SIDEBAR_HOVERED.swap(button as usize, Ordering::SeqCst) as *mut AnyObject;
+    if !previous.is_null() && previous != button {
+        set_sidebar_hovered(previous, false);
     }
     set_sidebar_hovered(button, true);
 }
@@ -583,10 +689,9 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_entered(
         // Re-entering from the detail pane can skip a child button's mouseEntered callback. Use
         // the current pointer location to restore the actual row instead of the stale last row.
         if let Some(button) = sidebar_button_under_pointer() {
-            apply_sidebar_hover(button, true);
+            apply_sidebar_hover(button);
         } else {
-            SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-            super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
+            clear_sidebar_hover();
         }
     }
 }
@@ -597,10 +702,7 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
     _event: *mut c_void,
 ) {
     unsafe {
-        SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-        SIDEBAR_HOVER_PRIMED.store(false, Ordering::SeqCst);
-        let hover = sidebar_hover_highlight();
-        super::components::SettingsSidebar::hide_hover_highlight(hover);
+        clear_sidebar_hover();
     }
 }
 
@@ -631,7 +733,7 @@ pub(super) fn sidebar_hover_tracker_class() -> *mut AnyObject {
 
 /// Measure one shared row height for all localized sidebar titles.
 pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[String]) -> f64 {
-    let label_width = (width - 46.0 - 8.0).max(1.0);
+    let label_width = (width - 48.0 - 8.0).max(1.0);
     let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let field: *mut AnyObject = msg_send![
         field,
@@ -651,24 +753,18 @@ pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[
     }
     let _: () = msg_send![field, setPreferredMaxLayoutWidth: label_width];
 
-    let mut required_height = 38.0f64;
+    let mut required_height = 40.0f64;
     for title in titles {
         let title_ns = make_nsstring(title);
         let _: () = msg_send![field, setStringValue: title_ns];
         CFRelease(title_ns as *const c_void);
-        let fonts: [*mut AnyObject; 2] = [
-            msg_send![class!(NSFont), messageFontOfSize: 13.5f64],
-            msg_send![class!(NSFont), boldSystemFontOfSize: 13.5f64],
-        ];
-        for font in fonts {
-            let _: () = msg_send![field, setFont: font];
-            let measured: NSSize =
-                msg_send![field, sizeThatFits: NSSize::new(label_width, 10_000.0)];
-            if measured.height.is_finite() && measured.height > 0.0 {
-                // Keep a little vertical breathing room around two wrapped lines, while the
-                // 38pt floor preserves the existing one-line sidebar rhythm.
-                required_height = required_height.max((measured.height + 8.0).ceil());
-            }
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR];
+        let _: () = msg_send![field, setFont: font];
+        let measured: NSSize = msg_send![field, sizeThatFits: NSSize::new(label_width, 10_000.0)];
+        if measured.height.is_finite() && measured.height > 0.0 {
+            // Keep a little vertical breathing room around two wrapped lines, while the
+            // 38pt floor preserves the existing one-line sidebar rhythm.
+            required_height = required_height.max((measured.height + 8.0).ceil());
         }
     }
     release_obj(field);
@@ -678,8 +774,7 @@ pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[
 /// The tracker rect arrives precomputed against the live entry count (see
 /// sidebar_tracking_rect in the component layer), so it can never drift behind the
 /// sidebar's rows again -- the previous hardcoded 6-row rect left the 7th entry
-/// outside the tracker, and leaving the sidebar through that last row stranded the
-/// shared hover pill (no tracker exit fired to hide it).
+/// outside the tracker, leaving a row's hover fill active after the pointer left.
 pub(super) unsafe fn make_sidebar_hover_tracking(parent: *mut AnyObject, rect: NSRect) {
     let tracker: *mut AnyObject = msg_send![sidebar_hover_tracker_class(), alloc];
     let tracker: *mut AnyObject = msg_send![tracker, init];
@@ -713,18 +808,16 @@ pub(super) extern "C" fn sidebar_button_mouse_entered(
     unsafe {
         let button = this as *mut AnyObject;
         // Tracking callbacks may arrive after the pointer has moved into another pane or row.
-        // Reconcile against the current pointer before moving the shared hover surface.
         let current = sidebar_button_under_pointer();
         if current != Some(button) {
             if let Some(current) = current {
-                apply_sidebar_hover(current, false);
+                apply_sidebar_hover(current);
             } else {
-                SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-                super::components::SettingsSidebar::hide_hover_highlight(sidebar_hover_highlight());
+                clear_sidebar_hover();
             }
             return;
         }
-        apply_sidebar_hover(button, false);
+        apply_sidebar_hover(button);
     }
 }
 
@@ -823,10 +916,30 @@ pub(super) unsafe fn make_value_label(
     let _: () = msg_send![label, setUsesSingleLineMode: true];
     let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![label, setFont: font];
     apply_settings_text_role(label, SettingsTextRole::Primary);
     label
+}
+
+/// Set a page heading with the tracking specified by the page-title type role.
+pub(super) unsafe fn set_page_title_text(label: *mut AnyObject, text: &str) {
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
+    let tracking: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: -0.4f64];
+    let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attributes: *mut AnyObject = msg_send![attributes, init];
+    let _: () = msg_send![attributes, setObject: font, forKey: NSFontAttributeName];
+    let _: () = msg_send![attributes, setObject: tracking, forKey: NSKernAttributeName];
+    let value = make_nsstring(text);
+    let attributed: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let attributed: *mut AnyObject =
+        msg_send![attributed, initWithString: value, attributes: attributes];
+    CFRelease(value as *const c_void);
+    release_obj(attributes);
+    let _: () = msg_send![label, setAttributedStringValue: attributed];
+    release_obj(attributed);
 }
 
 /// Build a read-only external-link control for a standard settings row.
@@ -852,7 +965,8 @@ pub(super) unsafe fn make_external_link(
     let _: () = msg_send![link, setAlignment: -1isize]; // NSTextAlignmentNatural
     let _: () = msg_send![link, setUsesSingleLineMode: true];
     let _: () = msg_send![link, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 13.5f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![link, setFont: font];
     apply_settings_text_role(link, SettingsTextRole::Accent);
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
@@ -1062,6 +1176,10 @@ pub(super) fn centered_text_field_cell_frame(bounds: NSRect) -> NSRect {
     )
 }
 
+fn centered_text_field_editor_vertical_inset(bounds: NSRect) -> f64 {
+    centered_text_field_cell_frame(bounds).origin.y - bounds.origin.y
+}
+
 pub(super) unsafe fn centered_text_field_cell_super_draw(
     cell: *mut c_void,
     rect: NSRect,
@@ -1160,9 +1278,19 @@ pub(super) extern "C" fn centered_text_field_cell_setup_editor(
         let _: () = msg_send![editor, setVerticallyResizable: false];
         let _: () = msg_send![editor, setHorizontallyResizable: true];
         if msg_send![editor, respondsToSelector: sel!(setTextContainerInset:)] {
-            // The field editor's glyph baseline sits about one point above the cell's normal
-            // drawing baseline; add one point of vertical inset so edit and display states line up.
-            let _: () = msg_send![editor, setTextContainerInset: NSSize::new(8.0, 8.0)];
+            // Match the editor's vertical inset to the idle cell's draw-rect origin so changing a
+            // control's height cannot shift its text between display and editing states.
+            let control_view: *mut AnyObject = msg_send![this as *mut AnyObject, controlView];
+            let bounds = if control_view.is_null() {
+                NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    NSSize::new(1.0, super::components::SettingsLayout::CONTROL_H),
+                )
+            } else {
+                msg_send![control_view, bounds]
+            };
+            let vertical_inset = centered_text_field_editor_vertical_inset(bounds);
+            let _: () = msg_send![editor, setTextContainerInset: NSSize::new(8.0, vertical_inset)];
         }
         configured_editor
     }
@@ -1191,11 +1319,12 @@ pub(super) unsafe fn make_text_input(
     // Restore them explicitly so a click still opens the field editor and accepts typing.
     let _: () = msg_send![field, setEditable: true];
     let _: () = msg_send![field, setSelectable: true];
-    // The HTML input has no native focus ring; keep the caret while removing AppKit's
-    // blue outline that otherwise appears around a borderless NSTextField when editing.
+    // Keep the caret while replacing AppKit's borderless blue outline with the documented 2pt
+    // inset accent focus ring (design-style §9).
     let _: () = msg_send![field, setFocusRingType: 1isize]; // NSFocusRingTypeNone
-                                                            // Treat the value as a single line so AppKit centers its baseline in the 34pt row,
-                                                            // matching the vertical alignment of the popup controls beside it.
+    let _: () = msg_send![field, setDelegate: settings_text_field_delegate()];
+    // Treat the value as a single line so AppKit centers its baseline in the 32pt row,
+    // matching the vertical alignment of the popup controls beside it.
     let _: () = msg_send![field, setUsesSingleLineMode: true];
     // `scrollable` belongs to NSTextFieldCell rather than NSTextField.  A single-line,
     // scrollable cell uses AppKit's vertically centered editor layout; guard the selector so an
@@ -1220,7 +1349,7 @@ pub(super) unsafe fn make_text_input(
             layer,
             crate::ffi::hex_to_cg_color(settings_palette().field_bg),
         );
-        let _: () = msg_send![layer, setCornerRadius: 9.0f64];
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
     field
@@ -1240,6 +1369,24 @@ const HTML_SWITCH_SPRING_MASS: f64 = 4.0;
 const HTML_SWITCH_SPRING_STIFFNESS: f64 = 800.0;
 const HTML_SWITCH_SPRING_DAMPING: f64 = 80.0;
 const HTML_SWITCH_PRESS_SCALE: f64 = 0.9;
+const HTML_SWITCH_MIN_SETTLING_DURATION: f64 = 0.18;
+const HTML_SWITCH_PRESS_DURATION: f64 = 0.22;
+
+fn html_switch_spring_duration(settling_duration: f64) -> f64 {
+    settling_duration.max(HTML_SWITCH_MIN_SETTLING_DURATION)
+}
+
+fn html_switch_track_radius() -> f64 {
+    crate::theme::rounded_inset_radius(crate::theme::RADIUS_FULL, HTML_SWITCH_W, HTML_SWITCH_H)
+}
+
+fn html_switch_knob_radius() -> f64 {
+    crate::theme::rounded_inset_radius(
+        crate::theme::RADIUS_FULL,
+        HTML_SWITCH_KNOB_D,
+        HTML_SWITCH_KNOB_D,
+    )
+}
 
 pub(super) struct HtmlSwitchClass(*mut AnyObject);
 unsafe impl Send for HtmlSwitchClass {}
@@ -1280,23 +1427,15 @@ pub(super) unsafe fn html_switch_apply_visual(
         if enabled {
             palette.accent
         } else {
-            0x0A84FF73
+            palette.switch_on_disabled_track
         }
     } else if enabled {
-        if palette.dark {
-            0x636366FF
-        } else {
-            0xC7C7CCFF
-        }
+        palette.switch_off_track
     } else {
-        if palette.dark {
-            0x63636673
-        } else {
-            0xC7C7CC73
-        }
+        palette.switch_off_disabled_track
     };
     crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(track_hex));
-    let _: () = msg_send![layer, setCornerRadius: HTML_SWITCH_H / 2.0];
+    let _: () = msg_send![layer, setCornerRadius: html_switch_track_radius()];
     let _: () = msg_send![layer, setMasksToBounds: false];
 
     let sublayers: *mut AnyObject = msg_send![layer, sublayers];
@@ -1309,11 +1448,8 @@ pub(super) unsafe fn html_switch_apply_visual(
         msg_send![sublayers, objectAtIndex: 0usize]
     } else {
         let knob: *mut AnyObject = msg_send![class!(CALayer), layer];
-        crate::ffi::layer_set_background(
-            knob,
-            crate::ffi::hex_to_cg_color(if palette.dark { 0xF5F5F7F5 } else { 0xFFFFFFF5 }),
-        );
-        let _: () = msg_send![knob, setCornerRadius: HTML_SWITCH_KNOB_D / 2.0];
+        crate::ffi::layer_set_background(knob, crate::ffi::hex_to_cg_color(palette.switch_knob));
+        let _: () = msg_send![knob, setCornerRadius: html_switch_knob_radius()];
         let _: () = msg_send![layer, addSublayer: knob];
         knob
     };
@@ -1339,6 +1475,13 @@ pub(super) unsafe fn html_switch_apply_visual(
     ];
 
     if let Some(from_x) = from_x.filter(|x| *x != to_x) {
+        if crate::theme::reduce_motion_enabled() {
+            let knob_layer: *mut AnyObject = msg_send![knob, layer];
+            if !knob_layer.is_null() {
+                let _: () = msg_send![knob_layer, removeAllAnimations];
+            }
+            return;
+        }
         let key_path = make_nsstring("position.x");
         let animation: *mut AnyObject = msg_send![
             class!(CASpringAnimation),
@@ -1356,7 +1499,8 @@ pub(super) unsafe fn html_switch_apply_visual(
         let _: () = msg_send![animation, setDamping: HTML_SWITCH_SPRING_DAMPING];
         let _: () = msg_send![animation, setInitialVelocity: 0.0f64];
         let settling_duration: f64 = msg_send![animation, settlingDuration];
-        let _: () = msg_send![animation, setDuration: settling_duration.max(0.18)];
+        let _: () =
+            msg_send![animation, setDuration: html_switch_spring_duration(settling_duration)];
         let animation_key = make_nsstring("html-switch-position");
         let _: () = msg_send![knob, addAnimation: animation, forKey: animation_key];
         CFRelease(animation_key as *const c_void);
@@ -1365,6 +1509,9 @@ pub(super) unsafe fn html_switch_apply_visual(
 
 /// Give the knob a short press-and-release response when the custom button is clicked.
 unsafe fn html_switch_animate_press(button: *mut AnyObject) {
+    if crate::theme::reduce_motion_enabled() {
+        return;
+    }
     let knob = html_switch_knob(button);
     if knob.is_null() {
         return;
@@ -1385,7 +1532,7 @@ unsafe fn html_switch_animate_press(button: *mut AnyObject) {
         let _: () = msg_send![values, addObject: value];
     }
     let _: () = msg_send![animation, setValues: values];
-    let _: () = msg_send![animation, setDuration: 0.22f64];
+    let _: () = msg_send![animation, setDuration: HTML_SWITCH_PRESS_DURATION];
     let animation_key = make_nsstring("html-switch-press");
     let _: () = msg_send![knob, addAnimation: animation, forKey: animation_key];
     CFRelease(animation_key as *const c_void);
@@ -1445,6 +1592,84 @@ pub(super) extern "C" fn html_switch_mouse_down(this: *mut c_void, _cmd: Sel, _e
     }
 }
 
+/// Design-style §10 requires a hit target of at least 28x28 while §9 fixes the visible track at
+/// 38x22. AppKit routes `mouseDown:` to the view whose `hitTest:` contains the point, so accept
+/// points inside a transparent 28pt-tall rect centred on the track; the track stays 38x22.
+pub(super) extern "C" fn html_switch_hit_test(
+    this: *mut c_void,
+    _cmd: Sel,
+    point: NSPoint,
+) -> *mut AnyObject {
+    unsafe {
+        let button = this as *mut AnyObject;
+        let superview: *mut AnyObject = msg_send![button, superview];
+        let local: NSPoint = if superview.is_null() {
+            point
+        } else {
+            msg_send![button, convertPoint: point, fromView: superview]
+        };
+        let bounds: NSRect = msg_send![button, bounds];
+        let hit = switch_hit_bounds(bounds);
+        let inside = local.x >= hit.origin.x
+            && local.x <= hit.origin.x + hit.size.width
+            && local.y >= hit.origin.y
+            && local.y <= hit.origin.y + hit.size.height;
+        if inside {
+            button
+        } else {
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// The switch's clickable rect: the visible 38x22 track, transparently padded to at least 28x28
+/// (design-style §10) and centred on the track (§9 fixes the visible size).
+pub(super) fn switch_hit_bounds(bounds: NSRect) -> NSRect {
+    const MIN_HIT: f64 = 28.0;
+    let pad_x = ((MIN_HIT - bounds.size.width) / 2.0).max(0.0);
+    let pad_y = ((MIN_HIT - bounds.size.height) / 2.0).max(0.0);
+    NSRect::new(
+        NSPoint::new(bounds.origin.x - pad_x, bounds.origin.y - pad_y),
+        NSSize::new(
+            bounds.size.width + pad_x * 2.0,
+            bounds.size.height + pad_y * 2.0,
+        ),
+    )
+}
+
+extern "C" fn html_switch_become_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(becomeFirstResponder));
+        if accepted {
+            // The track layer has no idle border; the 2pt accent ring is the focus indicator.
+            apply_inset_focus_ring(this as *mut AnyObject, true, 0, 0.0);
+        }
+        accepted
+    }
+}
+
+extern "C" fn html_switch_resign_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
+        let mut sup = ObjcSuper {
+            receiver: this,
+            super_class: class!(NSButton) as *const _ as *mut c_void,
+        };
+        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(resignFirstResponder));
+        if accepted {
+            apply_inset_focus_ring(this as *mut AnyObject, false, 0, 0.0);
+        }
+        accepted
+    }
+}
+
 pub(super) fn html_switch_class() -> *mut AnyObject {
     HTML_SWITCH_CLASS
         .get_or_init(|| unsafe {
@@ -1472,6 +1697,27 @@ pub(super) fn html_switch_class() -> *mut AnyObject {
                 html_switch_mouse_down as *mut c_void,
                 mouse_types.as_ptr(),
             );
+            let hit_types = CString::new("@@:{CGPoint=dd}").unwrap();
+            class_addMethod(
+                cls,
+                sel!(hitTest:),
+                html_switch_hit_test as *mut c_void,
+                hit_types.as_ptr(),
+            );
+            // become/resignFirstResponder return BOOL ('B'), not void.
+            let focus_types = CString::new("B@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(becomeFirstResponder),
+                html_switch_become_first_responder as *mut c_void,
+                focus_types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(resignFirstResponder),
+                html_switch_resign_first_responder as *mut c_void,
+                focus_types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             HtmlSwitchClass(cls)
         })
@@ -1491,6 +1737,11 @@ pub(super) unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) ->
     let empty_title = make_nsstring("");
     let _: () = msg_send![sw, setTitle: empty_title];
     CFRelease(empty_title as *const c_void);
+    // Custom-drawn control: give VoiceOver a role (design-style §11); the label is associated by
+    // SettingsRow::register_label from the row's own label.
+    let role = make_nsstring("AXCheckBox");
+    let _: () = msg_send![sw, setAccessibilityRole: role];
+    CFRelease(role as *const c_void);
     let _: () = msg_send![sw, setBordered: false];
     let _: () = msg_send![
         sw,
@@ -1534,8 +1785,8 @@ pub(super) unsafe fn make_slider(
     let _: () = msg_send![slider, setMinValue: min as f64];
     let _: () = msg_send![slider, setMaxValue: max as f64];
     // Integer steps: 1 tick = 1 unit (same as LinearMouse's By Lines slider: 0...10 step 1).
-    let _: () = msg_send![slider, setNumberOfTickMarks: (max - min + 1) as isize];
-    let _: () = msg_send![slider, setAllowsTickMarkValuesOnly: true];
+    let _: () = msg_send![slider, setNumberOfTickMarks: 0isize];
+    let _: () = msg_send![slider, setAllowsTickMarkValuesOnly: false];
     let _: () = msg_send![slider, setIntegerValue: value];
     apply_slider_default(slider, default_value);
     slider
@@ -1771,11 +2022,7 @@ unsafe fn set_sidebar_title_appearance(
 /// Set the sidebar button title as an attributed title, using the secondary text color when
 /// unselected and the system accent color when selected.
 pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
-    let font: *mut AnyObject = if selected {
-        msg_send![class!(NSFont), boldSystemFontOfSize: 13.5f64]
-    } else {
-        msg_send![class!(NSFont), messageFontOfSize: 13.5f64]
-    };
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR];
     let color = settings_text_color(if selected {
         SettingsTextRole::Accent
     } else {
@@ -1793,17 +2040,27 @@ pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selecte
     let _: () = msg_send![btn, setContentTintColor: color];
 }
 
-/// Apply the sidebar hover surface and foreground transition. The selected item owns its highlight
-/// and is intentionally left untouched by hover tracking.
+/// Apply the sidebar hover fill and foreground. The selected item owns its separate highlight.
 unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
     if btn.is_null() {
         return;
     }
     let tag: isize = msg_send![btn, tag];
-    if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
-        return;
+    let selected = tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst);
+    let hovered = hovered && !selected;
+    let palette = settings_palette();
+    let layer: *mut AnyObject = msg_send![btn, layer];
+    if !layer.is_null() {
+        let fill = if hovered {
+            sidebar_hover_fill(palette)
+        } else {
+            0x00000000
+        };
+        layer_set_background(layer, crate::ffi::hex_to_cg_color(fill));
     }
-    let color = settings_text_color(if hovered {
+    let color = settings_text_color(if selected {
+        SettingsTextRole::Accent
+    } else if hovered {
         SettingsTextRole::Primary
     } else {
         SettingsTextRole::Sidebar
@@ -1814,8 +2071,6 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
         .get(&(btn as usize))
         .map(|p| p.0);
     if let Some(label) = label {
-        // Only change the existing label color. Rebuilding attributed strings and measuring the
-        // cell on every mouse event blocks the main thread and makes the shared pill stutter.
         let _: () = msg_send![label, setTextColor: color];
     }
     if let Some(icon) = SIDEBAR_ICON_VIEWS
@@ -1827,6 +2082,36 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
         let _: () = msg_send![icon, setContentTintColor: color];
     }
     let _: () = msg_send![btn, setContentTintColor: color];
+}
+
+pub(super) unsafe fn sidebar_hover_style_smoke(button: *mut AnyObject) -> bool {
+    if button.is_null() {
+        return false;
+    }
+    let tag: isize = msg_send![button, tag];
+    if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
+        return false;
+    }
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return false;
+    }
+    set_sidebar_hovered(button, true);
+    let fill = crate::ffi::layer_background_color(layer);
+    let observed_alpha = if fill.is_null() {
+        0.0
+    } else {
+        crate::ffi::CGColorGetAlpha(fill)
+    };
+    let expected_alpha = f64::from(sidebar_hover_fill(settings_palette()) & 0xFF) / 255.0;
+    set_sidebar_hovered(button, false);
+    let cleared: *mut c_void = crate::ffi::layer_background_color(layer);
+    let cleared_alpha = if cleared.is_null() {
+        1.0
+    } else {
+        crate::ffi::CGColorGetAlpha(cleared)
+    };
+    (observed_alpha - expected_alpha).abs() <= 0.005 && cleared_alpha <= 0.005
 }
 
 /// Fit the sidebar label to its measured cell height and center that frame in the shared row.
@@ -1913,7 +2198,13 @@ pub(super) unsafe fn set_sidebar_update_indicator(btn: *mut AnyObject, visible: 
         return;
     }
     let _: () = msg_send![dot, setFrame: dot_frame];
-    let _: () = msg_send![dot, setCornerRadius: dot_size / 2.0];
+    // CALayer does not clamp a too-large corner radius: RADIUS_FULL renders an unrounded square.
+    // The status dot must stay circular, so cap the radius at half its bounds.
+    let _: () = msg_send![dot, setCornerRadius: crate::theme::rounded_inset_radius(
+        crate::theme::RADIUS_FULL,
+        dot_size,
+        dot_size,
+    )];
     layer_set_background(
         dot,
         crate::ffi::hex_to_cg_color(settings_palette().destructive),
@@ -1925,45 +2216,8 @@ pub(super) unsafe fn set_sidebar_update_indicator(btn: *mut AnyObject, visible: 
         .insert(key, ObjPtr::new(dot));
 }
 
-/// Create the single shared hover surface used by all sidebar rows.
-pub(super) unsafe fn make_sidebar_hover_highlight(
-    parent: *mut AnyObject,
-    x: f64,
-    y: f64,
-    w: f64,
-    row_h: f64,
-) -> *mut AnyObject {
-    // Keep the hover surface below the buttons so it is purely visual and never intercepts input.
-    let hover: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let hover: *mut AnyObject = msg_send![
-        hover,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, row_h))
-    ];
-    let _: () = msg_send![hover, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![hover, layer];
-    if !layer.is_null() {
-        // HTML `.nav button:hover` = rgba(0,0,0,.045):4.5% black. palette.hover_bg is shared
-        // with generic buttons' dark hover mapping, so the sidebar pill keeps its own token;
-        // the dark palette (no HTML reference) keeps the previous white wash.
-        let pill_hex = if settings_palette().dark {
-            0xFFFFFF22u32
-        } else {
-            0x0000000Bu32
-        };
-        layer_set_background(layer, crate::ffi::hex_to_cg_color(pill_hex));
-        let _: () = msg_send![layer, setCornerRadius: 10.0f64];
-        let _: () = msg_send![layer, setMasksToBounds: true];
-    }
-    let _: () = msg_send![hover, setAlphaValue: 0.0f64];
-    let _: () = msg_send![parent, addSubview: hover];
-    SIDEBAR_HOVER_HIGHLIGHT
-        .lock()
-        .unwrap()
-        .replace(ObjPtr::new(hover));
-    SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
-    SIDEBAR_HOVER_VISIBLE.store(false, Ordering::SeqCst);
-    release_obj(hover);
-    hover
+fn sidebar_hover_fill(palette: crate::theme::UiPalette) -> u32 {
+    palette.hover_bg
 }
 
 /// Sidebar button (borderless NSButton; left-aligned icon + title; tag selects the page).
@@ -1998,7 +2252,7 @@ pub(super) unsafe fn make_sidebar_button(
     let btn_layer: *mut AnyObject = msg_send![btn, layer];
     if !btn_layer.is_null() {
         layer_set_background(btn_layer, crate::ffi::hex_to_cg_color(0x00000000u32));
-        let _: () = msg_send![btn_layer, setCornerRadius: 10.0f64];
+        let _: () = msg_send![btn_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![btn_layer, setMasksToBounds: true];
     }
     let _: () = msg_send![btn, setTag: tag];
@@ -2096,7 +2350,7 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 12.0f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_SEMIBOLD];
     let _: () = msg_send![label, setFont: font];
     apply_settings_text_role(label, SettingsTextRole::Secondary);
     // Adaptive: stretch width with the parent, stay top-anchored (MinYMargin).
@@ -2107,7 +2361,7 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
 }
 
 /// Add a page title matching the HTML redesign's large, tight heading and return its height.
-/// The 30pt size mirrors the mockup's `h1 { font-size: 30px }`; the top-padding metric itself
+/// The 26pt size mirrors the design system's page-title role; the top-padding metric itself
 /// lives in the SettingsPageHeader component, which passes the adjusted cursor here.
 ///
 /// `top_cursor` is the cursor used by the page layout. The title keeps the same top inset while
@@ -2125,12 +2379,10 @@ pub(super) unsafe fn add_page_title(
         label,
         initWithFrame: NSRect::new(NSPoint::new(x, 0.0), NSSize::new(w, MIN_HEIGHT))
     ];
-    set_field(label, text);
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 30.0f64];
-    let _: () = msg_send![label, setFont: font];
+    set_page_title_text(label, text);
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let _: () = msg_send![label, setUsesSingleLineMode: false];
     let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
@@ -2163,88 +2415,45 @@ pub(super) unsafe fn add_page_title(
     title_height
 }
 
-/// Build the About header icon directly from the source PNG so AppKit does not reinterpret the
-/// bundled `.icns` representation.
-pub(super) unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
-    let icon: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let icon: *mut AnyObject = msg_send![
-        icon,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(58.0, 58.0))
-    ];
+pub(super) const ABOUT_APP_ICON_IDENTIFIER: &str = "settings-about-app-icon";
+pub(super) const ABOUT_HEADER_CONTENT_LEADING_X: f64 = 0.0;
+pub(super) const ABOUT_APP_ICON_RENDER_OVERFLOW: f64 = 2.0;
 
-    // Use the PNG directly so NSApplicationIcon/.icns cannot add a system-rendered edge on dark backgrounds.
+/// Draw the app's bundled icon in the About header.
+pub(super) unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) {
+    const ICON_SLOT_SIZE: f64 = 58.0;
+    const ICON_RENDER_SIZE: f64 = 62.0;
+
+    let slot: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let slot: *mut AnyObject = msg_send![
+        slot,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(ICON_SLOT_SIZE, ICON_SLOT_SIZE))
+    ];
     let image = crate::load_embedded_app_icon();
     if !image.is_null() {
         let image_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
         let image_view: *mut AnyObject = msg_send![
             image_view,
-            // Let the source PNG occupy the whole slot; it already contains its own rounded silhouette.
-            initWithFrame: NSRect::new(NSPoint::new(-2.0, -2.0), NSSize::new(62.0, 62.0))
+            initWithFrame: NSRect::new(
+                NSPoint::new(-ABOUT_APP_ICON_RENDER_OVERFLOW, -ABOUT_APP_ICON_RENDER_OVERFLOW),
+                NSSize::new(ICON_RENDER_SIZE, ICON_RENDER_SIZE)
+            )
         ];
         let _: () = msg_send![image_view, setImage: image];
         let _: () = msg_send![image_view, setImageScaling: 3isize];
         let _: () = msg_send![image_view, setImageFrameStyle: 0isize];
-        let _: () = msg_send![icon, addSubview: image_view];
+        let identifier = make_nsstring(ABOUT_APP_ICON_IDENTIFIER);
+        let _: () = msg_send![image_view, setIdentifier: identifier];
+        release_obj(identifier);
+        let _: () = msg_send![slot, addSubview: image_view];
         release_obj(image_view);
         release_obj(image);
     }
-    let _: () = msg_send![parent, addSubview: icon];
-    release_obj(icon);
+    let _: () = msg_send![parent, addSubview: slot];
+    release_obj(slot);
 }
 
-// Shadow clearance = key-shadow offset (8) + blur (24) = 32pt; 36 leaves margin.
-pub(super) const SETTINGS_CARD_SHADOW_INSET: f64 = 36.0;
-
-/// Draw the settings card shadow into pixels owned by the shadow view itself. This keeps the
-/// blur inside the view's expanded frame instead of relying on a CALayer shadow crossing the
-/// AppKit scroll/document hierarchy. Two layers mirror the HTML `.group` shadow:
-/// `0 1px 2px rgba(0,0,0,.025)` (ambient) + `0 8px 24px rgba(0,0,0,.035)` (key).
-pub(super) extern "C" fn settings_card_shadow_draw_rect(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _rect: NSRect,
-) {
-    unsafe {
-        let view = _self as *mut AnyObject;
-        let bounds: NSRect = msg_send![view, bounds];
-        let card_rect = NSRect::new(
-            NSPoint::new(SETTINGS_CARD_SHADOW_INSET, SETTINGS_CARD_SHADOW_INSET),
-            NSSize::new(
-                (bounds.size.width - SETTINGS_CARD_SHADOW_INSET * 2.0).max(1.0),
-                (bounds.size.height - SETTINGS_CARD_SHADOW_INSET * 2.0).max(1.0),
-            ),
-        );
-        let path: *mut AnyObject = msg_send![
-            class!(NSBezierPath),
-            bezierPathWithRoundedRect: card_rect,
-            xRadius: 14.0f64,
-            yRadius: 14.0f64
-        ];
-        let fill = crate::ffi::hex_to_ns_color(settings_palette().card_bg);
-        let _: () = msg_send![fill, set];
-        // AppKit's y axis points up, so a CSS "0 Npx" downward shadow maps to dy = -N.
-        // The ambient layer is fixed 2.5% black; the key layer uses palette.shadow (light
-        // 0x0000000A ≈ 3.9%, i.e. the HTML's .035; dark resolves to the heavier black).
-        let key_color = crate::ffi::hex_to_ns_color(settings_palette().shadow);
-        for (offset_y, blur, ambient) in [(-1.0f64, 2.0f64, true), (-8.0, 24.0, false)] {
-            let shadow: *mut AnyObject = msg_send![class!(NSShadow), alloc];
-            let shadow: *mut AnyObject = msg_send![shadow, init];
-            let shadow_color = if ambient {
-                crate::ffi::hex_to_ns_color(0x00000006u32)
-            } else {
-                key_color
-            };
-            let _: () = msg_send![shadow, setShadowColor: shadow_color];
-            let _: () = msg_send![shadow, setShadowBlurRadius: blur];
-            let _: () = msg_send![shadow, setShadowOffset: NSSize::new(0.0, offset_y)];
-            let _: () = msg_send![shadow, set];
-            let _: () = msg_send![path, fill];
-            release_obj(shadow);
-        }
-    }
-}
-
-pub(super) extern "C" fn settings_card_shadow_hit_test(
+pub(super) extern "C" fn settings_decoration_hit_test(
     _self: *mut c_void,
     _cmd: Sel,
     _point: NSPoint,
@@ -2252,108 +2461,18 @@ pub(super) extern "C" fn settings_card_shadow_hit_test(
     std::ptr::null_mut()
 }
 
-pub(super) fn settings_card_shadow_view_class() -> *mut AnyObject {
+/// Flat detail-pane surface. The pane background is a solid `detail_bg` layer fill (no radial
+/// gradient); the class only overrides `hitTest:` so the decoration never intercepts input.
+pub(super) fn settings_pane_surface_view_class() -> *mut AnyObject {
     static CLASS: OnceLock<usize> = OnceLock::new();
     *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabSettingsCardShadowView").unwrap();
+        let name = CString::new("OhMyTabSettingsPaneSurfaceView").unwrap();
         let superclass = class!(NSView) as *const _ as *mut AnyObject;
         let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_draw = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
-        class_addMethod(
-            cls,
-            sel!(drawRect:),
-            settings_card_shadow_draw_rect as *mut c_void,
-            types_draw.as_ptr(),
-        );
-        let types_hit = CString::new("@@:{CGPoint=dd}").unwrap();
         class_addMethod(
             cls,
             sel!(hitTest:),
-            settings_card_shadow_hit_test as *mut c_void,
-            types_hit.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
-}
-
-/// Radial white highlight at the detail pane's top-right, mirroring the HTML `.main`
-/// background: `radial-gradient(circle at 82% 0%, rgba(255,255,255,.96), transparent 34%)`.
-/// The layer's flat `detail_bg` fill stays underneath; drawRect composites the glow over it.
-pub(super) extern "C" fn settings_pane_highlight_draw_rect(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _rect: NSRect,
-) {
-    unsafe {
-        let bounds: NSRect = msg_send![_self as *mut AnyObject, bounds];
-        if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
-            return;
-        }
-        let gfx: *mut AnyObject = msg_send![class!(NSGraphicsContext), currentContext];
-        if gfx.is_null() {
-            return;
-        }
-        // The CGContext getter returns '^{CGContext=}', while objc2's msg_send! encodes a
-        // *mut c_void return as '^v' and the runtime encoding check panics (a panic inside an
-        // extern "C" drawRect aborts the process). Follow nsimage_from_cgimage's raw
-        // objc_msgSend convention to bypass the check.
-        let sel_cg_context = sel!(CGContext);
-        type CGContextGetter = unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut c_void;
-        let send: CGContextGetter = std::mem::transmute(crate::ffi::objc_msgSend as *const ());
-        let ctx: *mut c_void = send(gfx, sel_cg_context);
-        if ctx.is_null() {
-            return;
-        }
-        // drawRect's origin is bottom-left; the center sits at 82% width on the top edge.
-        let center = crate::ffi::CGPoint {
-            x: bounds.size.width * 0.82,
-            y: bounds.size.height,
-        };
-        // CSS `circle`'s default ray reaches the farthest corner (bottom-left here);
-        // the 34% color stop maps to endRadius.
-        let farthest = (center.x * center.x + center.y * center.y).sqrt();
-        let end_radius = farthest * 0.34;
-        // White .96 → white 0; option 2 = kCGGradientDrawsAfterEndLocation (transparent
-        // beyond). Dark mode dials the start alpha down to 5%: the same blob reads as a
-        // glaring white patch on the dark backdrop, so keep only a faint cool glow there.
-        let start_alpha = if settings_palette().dark { 0.05 } else { 0.96 };
-        let components: [f64; 8] = [1.0, 1.0, 1.0, start_alpha, 1.0, 1.0, 1.0, 0.0];
-        let space = crate::ffi::CGColorSpaceCreateDeviceRGB();
-        let gradient = crate::ffi::CGGradientCreateWithColorComponents(
-            space,
-            components.as_ptr(),
-            std::ptr::null(),
-            2,
-        );
-        if !gradient.is_null() {
-            crate::ffi::CGContextDrawRadialGradient(
-                ctx, gradient, center, 0.0, center, end_radius, 2,
-            );
-            crate::ffi::CGGradientRelease(gradient);
-        }
-        crate::ffi::CFRelease(space);
-    }
-}
-
-pub(super) fn settings_pane_highlight_view_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabSettingsPaneHighlightView").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_draw = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
-        class_addMethod(
-            cls,
-            sel!(drawRect:),
-            settings_pane_highlight_draw_rect as *mut c_void,
-            types_draw.as_ptr(),
-        );
-        // Pure background decoration: hitTest returns nil so it never intercepts input.
-        class_addMethod(
-            cls,
-            sel!(hitTest:),
-            settings_card_shadow_hit_test as *mut c_void,
+            settings_decoration_hit_test as *mut c_void,
             CString::new("@@:{CGPoint=dd}").unwrap().as_ptr(),
         );
         objc_registerClassPair(cls);
@@ -2361,30 +2480,26 @@ pub(super) fn settings_pane_highlight_view_class() -> *mut AnyObject {
     }) as *mut AnyObject
 }
 
-/// Add a grouped card behind a section, matching the HTML redesign's light card surface.
-/// The translucent white fill + hairline border live on the card's own layer; the two-layer
-/// shadow (HTML `0 1px 2px` + `0 8px 24px`) is drawn by the dedicated shadow view behind it.
-/// The HTML also stacks a backdrop blur under the surface, but a live blur on every scrolling
-/// card re-samples the backdrop every frame and drags scrolling/window dragging down, while
-/// over the pane's flat backdrop the blur is visually invisible anyway -- deliberately
-/// omitted (the Plan-A tradeoff).
-pub(super) unsafe fn add_settings_card(
-    parent: *mut AnyObject,
-    frame: NSRect,
-) -> (*mut AnyObject, *mut AnyObject) {
+pub(super) const SETTINGS_CARD_STYLE_IDENTIFIER: &str = "com.ohmytab.settings-card";
+
+/// Add a grouped settings card. Its surface and border define the container; settings cards do
+/// not cast an elevation shadow.
+pub(super) unsafe fn add_settings_card(parent: *mut AnyObject, frame: NSRect) -> *mut AnyObject {
     if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
-        return (std::ptr::null_mut(), std::ptr::null_mut());
+        return std::ptr::null_mut();
     }
     let palette = settings_palette();
     let card: *mut AnyObject = msg_send![class!(NSView), alloc];
     let card: *mut AnyObject = msg_send![card, initWithFrame: frame];
+    let identifier = make_nsstring(SETTINGS_CARD_STYLE_IDENTIFIER);
+    let _: () = msg_send![card, setIdentifier: identifier];
+    CFRelease(identifier as *const c_void);
     let _: () = msg_send![card, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![card, layer];
     if !layer.is_null() {
         layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.card_bg));
-        let _: () = msg_send![layer, setCornerRadius: 14.0f64];
-        // The outer shadow is a separate view, so the layer needs no clipping.
-        let _: () = msg_send![layer, setMasksToBounds: false];
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CARD];
+        let _: () = msg_send![layer, setMasksToBounds: true];
         crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
     }
@@ -2396,42 +2511,13 @@ pub(super) unsafe fn add_settings_card(
         relativeTo: std::ptr::null::<AnyObject>()
     ];
 
-    // Put the self-contained shadow behind the card. Its expanded frame provides enough room
-    // for the blur, while hitTest: keeps the shadow outside the card non-interactive.
-    let shadow_inset = SETTINGS_CARD_SHADOW_INSET;
-    let shadow: *mut AnyObject = msg_send![settings_card_shadow_view_class(), alloc];
-    let shadow: *mut AnyObject = msg_send![
-        shadow,
-        initWithFrame: NSRect::new(
-            NSPoint::new(frame.origin.x - shadow_inset, frame.origin.y - shadow_inset),
-            NSSize::new(
-                frame.size.width + shadow_inset * 2.0,
-                frame.size.height + shadow_inset * 2.0,
-            ),
-        )
-    ];
-    let _: () = msg_send![
-        parent,
-        addSubview: shadow,
-        positioned: -1isize,
-        relativeTo: card
-    ];
-    release_obj(shadow);
-
     release_obj(card);
-    (card, shadow)
+    card
 }
 
-/// The rect a section frame turns into: a card trimmed by the extra bottom inset, shared with the
-/// page layout owner so a re-flow derives exactly the frame the builder created.
+/// The card uses the section frame directly so its eight-point bottom inset remains visible.
 pub(super) fn settings_card_rect(frame: NSRect) -> NSRect {
-    /// Existing page coordinates reserve 4pt above a section card and 10pt below its last row;
-    /// trimming the extra inset here centers the row content in the card's visible area.
-    const EXTRA_BOTTOM_INSET: f64 = 6.0;
-    let mut card_frame = frame;
-    card_frame.origin.y += EXTRA_BOTTOM_INSET;
-    card_frame.size.height = (card_frame.size.height - EXTRA_BOTTOM_INSET).max(1.0);
-    card_frame
+    frame
 }
 
 /// Draw the HTML `.row + .row` hairline inside a grouped card.
@@ -2441,15 +2527,11 @@ pub(super) unsafe fn add_row_separator(
     y: f64,
     w: f64,
 ) -> *mut AnyObject {
-    // Keep the hairline inside the card's rounded frame. Grouped cards are
-    // inset by the same six points, so their row separators need that inset
-    // as well instead of reaching the content pane edge.
-    let line_x = x + 6.0;
-    let line_w = (w - 12.0).max(1.0);
+    let frame = settings_row_separator_frame(x, y, w);
     let line: *mut AnyObject = msg_send![class!(NSView), alloc];
     let line: *mut AnyObject = msg_send![
         line,
-        initWithFrame: NSRect::new(NSPoint::new(line_x, y), NSSize::new(line_w, 1.0))
+        initWithFrame: frame
     ];
     let _: () = msg_send![line, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![line, layer];
@@ -2462,6 +2544,10 @@ pub(super) unsafe fn add_row_separator(
     let _: () = msg_send![parent, addSubview: line];
     release_obj(line);
     line
+}
+
+fn settings_row_separator_frame(x: f64, y: f64, width: f64) -> NSRect {
+    NSRect::new(NSPoint::new(x, y), NSSize::new(width.max(1.0), 1.0))
 }
 
 /// Add a standard row and also return its label pointer for conditional visibility.
@@ -2485,7 +2571,11 @@ pub(super) unsafe fn add_row_with_label(
     // legacy width for compatibility, but translated labels should not depend on per-string
     // 150/220pt patches.
     let control_frame: NSRect = msg_send![control, frame];
-    let effective_label_w = derived_label_width(control_frame.origin.x, label_x, 18.0);
+    let effective_label_w = derived_label_width(
+        control_frame.origin.x,
+        label_x,
+        super::SETTINGS_CONTROL_LABEL_GAP,
+    );
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(
         NSPoint::new(label_x, y),
@@ -2497,6 +2587,9 @@ pub(super) unsafe fn add_row_with_label(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let _: () = msg_send![label, setFont: font];
     // Left-aligned: the row label hugs the content area's left edge (NSTextAlignmentLeft = 0,
     // identical on arm64 and x86_64).
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
@@ -2552,16 +2645,18 @@ pub(super) unsafe fn add_described_row(
     let _: () = msg_send![title_label, setUsesSingleLineMode: false];
     let _: () = msg_send![title_label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
     if msg_send![title_label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-        let _: () = msg_send![title_label, setMaximumNumberOfLines: 3isize];
+        let _: () = msg_send![title_label, setMaximumNumberOfLines: 2isize];
     }
     let _: () = msg_send![title_label, setPreferredMaxLayoutWidth: text_w.max(1.0)];
     let title_cell: *mut AnyObject = msg_send![title_label, cell];
     if !title_cell.is_null()
         && msg_send![title_cell, respondsToSelector: sel!(setTruncatesLastVisibleLine:)]
     {
-        let _: () = msg_send![title_cell, setTruncatesLastVisibleLine: false];
+        // Ellipsize instead of silently clipping text that overflows the fixed-height row.
+        let _: () = msg_send![title_cell, setTruncatesLastVisibleLine: true];
     }
-    let title_font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), messageFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![title_label, setFont: title_font];
     let _: () = msg_send![parent, addSubview: title_label];
     release_obj(title_label);
@@ -2571,6 +2666,74 @@ pub(super) unsafe fn add_described_row(
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
     (title_label, control)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn add_captioned_row(
+    parent: *mut AnyObject,
+    x: f64,
+    y: f64,
+    text_w: f64,
+    row_h: f64,
+    title: &str,
+    caption: &str,
+    control: *mut AnyObject,
+) -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
+    let title_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let title_label: *mut AnyObject = msg_send![
+        title_label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(x, y + row_h - 24.0),
+            NSSize::new(text_w, 18.0),
+        )
+    ];
+    set_field(title_label, title);
+    let _: () = msg_send![title_label, setBezeled: false];
+    let _: () = msg_send![title_label, setDrawsBackground: false];
+    let _: () = msg_send![title_label, setEditable: false];
+    let _: () = msg_send![title_label, setSelectable: false];
+    let _: () = msg_send![title_label, setUsesSingleLineMode: true];
+    let _: () = msg_send![title_label, setLineBreakMode: 4isize];
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let _: () = msg_send![title_label, setFont: title_font];
+    apply_settings_text_role(title_label, SettingsTextRole::Primary);
+
+    let caption_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let caption_label: *mut AnyObject = msg_send![
+        caption_label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(x, y + 4.0),
+            NSSize::new(text_w, 16.0),
+        )
+    ];
+    set_field(caption_label, caption);
+    let _: () = msg_send![caption_label, setBezeled: false];
+    let _: () = msg_send![caption_label, setDrawsBackground: false];
+    let _: () = msg_send![caption_label, setEditable: false];
+    let _: () = msg_send![caption_label, setSelectable: false];
+    let _: () = msg_send![caption_label, setUsesSingleLineMode: true];
+    let _: () = msg_send![caption_label, setLineBreakMode: 4isize];
+    let caption_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let _: () = msg_send![caption_label, setFont: caption_font];
+    apply_settings_text_role(caption_label, SettingsTextRole::Muted);
+    let caption_ns = make_nsstring(caption);
+    let _: () = msg_send![caption_label, setToolTip: caption_ns];
+    CFRelease(caption_ns as *const c_void);
+    let title_ns = make_nsstring(title);
+    let _: () = msg_send![title_label, setToolTip: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![title_label, setAutoresizingMask: 4u64];
+    let _: () = msg_send![caption_label, setAutoresizingMask: 4u64];
+    let _: () = msg_send![control, setAutoresizingMask: 2u64];
+    let _: () = msg_send![parent, addSubview: caption_label];
+    let _: () = msg_send![parent, addSubview: title_label];
+    let _: () = msg_send![parent, addSubview: control];
+    release_obj(caption_label);
+    release_obj(title_label);
+    release_obj(control);
+    (title_label, caption_label, control)
 }
 
 /// A single-line settings row; the component layer centers its label and control inside the
@@ -2596,7 +2759,8 @@ pub(super) unsafe fn add_tall_row(
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let label_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![label, setTextColor: label_color];
-    let font: *mut AnyObject = msg_send![class!(NSFont), messageFontOfSize: 13.5f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), messageFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setUsesSingleLineMode: false];
     let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
@@ -2622,7 +2786,7 @@ pub(super) unsafe fn style_flat_popup(popup: *mut AnyObject) {
     let _: () = msg_send![popup, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![popup, layer];
     if !layer.is_null() {
-        let _: () = msg_send![layer, setCornerRadius: 9.0f64];
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setMasksToBounds: true];
         let palette = settings_palette();
         crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.field_bg));
@@ -2818,6 +2982,7 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
     collect_debug_layout(document, document, &mut entries, false);
     let mut errors = Vec::new();
     let document_rect = NSRect::new(NSPoint::new(0.0, 0.0), document_bounds.size);
+    collect_switch_visual_errors(document, &mut errors);
     for entry in &entries {
         if !rect_inside(document_rect, entry.frame, -1.0) {
             errors.push(format!(
@@ -2858,6 +3023,59 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
     }
 }
 
+unsafe fn collect_switch_visual_errors(view: *mut AnyObject, errors: &mut Vec<String>) {
+    if view.is_null() {
+        return;
+    }
+    if msg_send![view, isKindOfClass: html_switch_class()] {
+        let bounds: NSRect = msg_send![view, bounds];
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if layer.is_null() {
+            errors.push("switch track layer is missing".into());
+        } else {
+            let track_radius: f64 = msg_send![layer, cornerRadius];
+            let track_limit = bounds.size.width.min(bounds.size.height) / 2.0;
+            if bounds.size.width <= 0.0
+                || bounds.size.height <= 0.0
+                || !track_radius.is_finite()
+                || track_radius > track_limit + 0.01
+            {
+                errors.push(format!(
+                    "switch track is not drawable: bounds={bounds:?} radius={track_radius:.1}"
+                ));
+            }
+        }
+
+        let knob = html_switch_knob(view);
+        if knob.is_null() {
+            errors.push("switch knob layer is missing".into());
+        } else {
+            let knob_frame: NSRect = msg_send![knob, frame];
+            let knob_radius: f64 = msg_send![knob, cornerRadius];
+            let knob_limit = knob_frame.size.width.min(knob_frame.size.height) / 2.0;
+            if knob_frame.size.width <= 0.0
+                || knob_frame.size.height <= 0.0
+                || !knob_radius.is_finite()
+                || knob_radius > knob_limit + 0.01
+            {
+                errors.push(format!(
+                    "switch knob is not drawable: frame={knob_frame:?} radius={knob_radius:.1}"
+                ));
+            }
+        }
+    }
+
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if subviews.is_null() {
+        return;
+    }
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        collect_switch_visual_errors(child, errors);
+    }
+}
+
 /// Scroll a settings page's clip view to the top. Call this after the window has been laid out:
 /// a frame-time scrollToPoint gets reset by AppKit's first layout pass, leaving the scrollbar
 /// mid-track. The page scroll views are the same views stored on SettingsUi (general_view, etc.).
@@ -2884,7 +3102,11 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 
 #[cfg(test)]
 mod tests {
-    use super::{derived_label_width, rect_inside, rects_overlap, slider_should_reset};
+    use super::{
+        derived_label_width, html_switch_knob_radius, html_switch_track_radius, rect_inside,
+        rects_overlap, sidebar_hover_fill, slider_should_reset, switch_hit_bounds, HTML_SWITCH_H,
+        HTML_SWITCH_KNOB_D, HTML_SWITCH_W,
+    };
     // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
     use crate::ffi::release_obj;
     use objc2::runtime::AnyObject;
@@ -2952,8 +3174,138 @@ mod tests {
 
     #[test]
     fn label_width_follows_control_leading_edge() {
-        assert_eq!(derived_label_width(319.0, 12.0, 18.0), 289.0);
-        assert_eq!(derived_label_width(20.0, 12.0, 18.0), 1.0);
+        assert_eq!(derived_label_width(319.0, 16.0, 16.0), 287.0);
+        assert_eq!(derived_label_width(20.0, 16.0, 16.0), 1.0);
+    }
+
+    #[test]
+    #[ignore]
+    fn switch_hit_test_and_focus_ring_smoke() {
+        unsafe {
+            // Switch hit-test: the padded click rect answers, points outside it do not.
+            let sw = super::make_switch(200.0, 0.0, 52.0, false);
+            let inside: *mut AnyObject = msg_send![sw, hitTest: NSPoint::new(1.0, 1.0)];
+            assert_eq!(
+                inside, sw,
+                "a click inside the padded hit rect must reach the switch"
+            );
+            let outside: *mut AnyObject = msg_send![sw, hitTest: NSPoint::new(-200.0, -200.0)];
+            assert!(
+                outside.is_null(),
+                "a click far outside must miss the switch"
+            );
+            release_obj(sw);
+
+            // Select focus: become/resignFirstResponder run the super call and must not crash.
+            let popup = super::make_popup(0.0, 0.0, 200.0, 32.0, &["A", "B"], 0);
+            let _: bool = msg_send![popup, becomeFirstResponder];
+            let _: bool = msg_send![popup, resignFirstResponder];
+            release_obj(popup);
+
+            // Switch focus: the 2pt accent ring is drawn on the track layer while focused.
+            let sw = super::make_switch(200.0, 0.0, 52.0, false);
+            let layer: *mut AnyObject = msg_send![sw, layer];
+            let _: bool = msg_send![sw, becomeFirstResponder];
+            let focused_width: f64 = msg_send![layer, borderWidth];
+            assert_eq!(
+                focused_width, 2.0,
+                "switch focus must draw the 2pt inset ring"
+            );
+            let _: bool = msg_send![sw, resignFirstResponder];
+            let idle_width: f64 = msg_send![layer, borderWidth];
+            assert_eq!(idle_width, 0.0, "switch blur must clear the ring");
+            release_obj(sw);
+
+            // Action-button focus: idle 1pt card_border swaps to the 2pt accent ring and back.
+            let button = super::SettingsButton::action(
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(120.0, 32.0)),
+                "OK",
+                std::ptr::null_mut(),
+                sel!(noop:),
+                super::SettingsButtonRole::Action,
+            );
+            let layer: *mut AnyObject = msg_send![button, layer];
+            let idle_before: f64 = msg_send![layer, borderWidth];
+            assert_eq!(idle_before, 1.0);
+            let _: bool = msg_send![button, becomeFirstResponder];
+            let focused_width: f64 = msg_send![layer, borderWidth];
+            assert_eq!(
+                focused_width, 2.0,
+                "button focus must draw the 2pt inset ring"
+            );
+            let _: bool = msg_send![button, resignFirstResponder];
+            let idle_after: f64 = msg_send![layer, borderWidth];
+            assert_eq!(idle_after, 1.0, "button blur must restore the idle border");
+            release_obj(button);
+
+            // Text-field focus ring: the shared delegate toggles the 2pt accent border.
+            let field = super::make_text_input(0.0, 0.0, 200.0, 32.0, "x");
+            let name = crate::ffi::make_nsstring("NSControlTextDidBeginEditingNotification");
+            let note: *mut AnyObject = msg_send![
+                class!(NSNotification),
+                notificationWithName: name,
+                object: field
+            ];
+            crate::ffi::CFRelease(name as *const c_void);
+            let delegate: *mut AnyObject = msg_send![field, delegate];
+            assert!(
+                !delegate.is_null(),
+                "the field must have the focus-ring delegate"
+            );
+            let _: () = msg_send![delegate, controlTextDidBeginEditing: note];
+            let layer: *mut AnyObject = msg_send![field, layer];
+            let focused_width: f64 = msg_send![layer, borderWidth];
+            assert_eq!(focused_width, 2.0, "focus must draw the 2pt inset ring");
+            let _: () = msg_send![delegate, controlTextDidEndEditing: note];
+            let idle_width: f64 = msg_send![layer, borderWidth];
+            assert_eq!(idle_width, 0.0, "losing focus must clear the ring");
+            release_obj(field);
+        }
+    }
+
+    #[test]
+    fn switch_pill_radii_fit_their_layer_bounds() {
+        assert_eq!(html_switch_track_radius(), HTML_SWITCH_H / 2.0);
+        assert_eq!(html_switch_knob_radius(), HTML_SWITCH_KNOB_D / 2.0);
+    }
+
+    #[test]
+    fn switch_hit_target_meets_the_documented_minimum_size() {
+        // The visible track stays 38x22 (design-style §9); the click target is padded to at
+        // least 28x28 (§10) and stays centred on the track.
+        let track = NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(HTML_SWITCH_W, HTML_SWITCH_H),
+        );
+        let hit = switch_hit_bounds(track);
+        assert!(hit.size.width >= 28.0 && hit.size.height >= 28.0);
+        assert_eq!(hit.size.width, HTML_SWITCH_W);
+        assert_eq!(hit.origin.x, track.origin.x);
+        assert_eq!(hit.origin.y, (HTML_SWITCH_H - hit.size.height) / 2.0);
+    }
+
+    #[test]
+    fn switch_hit_target_never_shrinks_a_larger_track() {
+        let track = NSRect::new(NSPoint::new(4.0, 8.0), NSSize::new(40.0, 30.0));
+        assert_eq!(switch_hit_bounds(track), track);
+    }
+
+    #[test]
+    fn switch_keeps_its_original_spring_and_press_timings() {
+        assert_eq!(super::html_switch_spring_duration(0.1), 0.18);
+        assert_eq!(super::html_switch_spring_duration(0.31), 0.31);
+        assert_eq!(super::HTML_SWITCH_PRESS_DURATION, 0.22);
+    }
+
+    #[test]
+    fn text_field_editor_vertical_inset_tracks_the_cell_draw_rect() {
+        for (height, expected) in [(32.0, 7.0), (34.0, 8.0), (40.0, 11.0)] {
+            let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, height));
+            assert_eq!(
+                super::centered_text_field_editor_vertical_inset(bounds),
+                expected
+            );
+        }
     }
 
     #[test]
@@ -2966,5 +3318,29 @@ mod tests {
         assert!(!rects_overlap(first, outside, 0.5));
         assert!(rect_inside(page, first, 0.0));
         assert!(!rect_inside(page, outside, 0.0));
+    }
+
+    #[test]
+    fn row_divider_runs_full_bleed_across_its_card() {
+        let card = NSRect::new(NSPoint::new(12.0, 0.0), NSSize::new(520.0, 300.0));
+        let y = 124.0;
+        let divider = super::settings_row_separator_frame(card.origin.x, y, card.size.width);
+        assert_eq!(divider.origin.x, card.origin.x);
+        assert_eq!(divider.origin.y, y);
+        assert_eq!(divider.size.width, card.size.width);
+        assert_eq!(
+            divider.origin.x + divider.size.width,
+            card.origin.x + card.size.width
+        );
+    }
+
+    #[test]
+    fn sidebar_hover_uses_the_semantic_palette_role() {
+        for palette in [
+            crate::theme::ui_palette_for_mode(false),
+            crate::theme::ui_palette_for_mode(true),
+        ] {
+            assert_eq!(sidebar_hover_fill(palette), palette.hover_bg);
+        }
     }
 }

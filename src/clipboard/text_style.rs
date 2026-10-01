@@ -35,9 +35,9 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font: *mut AnyObject = match kind {
         TextKind::Code => {
-            msg_send![class!(NSFont), monospacedSystemFontOfSize: 14.0f64, weight: 0.0f64]
+            msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR]
         }
-        _ => msg_send![class!(NSFont), systemFontOfSize: 14.0f64],
+        _ => msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL],
     };
     let color = match kind {
         TextKind::Url => crate::ffi::hex_to_ns_color(palette.accent),
@@ -143,7 +143,8 @@ pub(super) unsafe fn make_meta_footer_attributed(
     if !meta.is_empty() {
         let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
         let attrs: *mut AnyObject = msg_send![attrs, init];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
         let font_key = make_nsstring("NSFont");
         let color_key = make_nsstring("NSColor");
@@ -707,7 +708,7 @@ pub(super) unsafe fn make_action_button(
     // hover fill needs a layer.
     let _: () = msg_send![b, setWantsLayer: true];
     let blayer: *mut AnyObject = msg_send![b, layer];
-    let _: () = msg_send![blayer, setCornerRadius: 5.0];
+    let _: () = msg_send![blayer, setCornerRadius: crate::theme::RADIUS_CONTROL];
     let title_ns = make_nsstring(title);
     let _: () = msg_send![b, setTitle: title_ns];
     CFRelease(title_ns as *const c_void);
@@ -760,7 +761,8 @@ pub(super) unsafe fn make_filter_pill(
         initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, FILTERS_H))
     ];
     let _: () = msg_send![b, setBordered: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![b, setFont: font];
     let label_ns = make_nsstring(label);
     let _: () = msg_send![b, setTitle: label_ns];
@@ -797,7 +799,7 @@ unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor:
         crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
     );
     crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-    let _: () = msg_send![layer, setCornerRadius: 8.0f64];
+    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
     let _: () = msg_send![layer, setMasksToBounds: true];
     let _: () = msg_send![surface, setHidden: true];
     let _: () = msg_send![surface, setAlphaValue: 0.0f64];
@@ -816,7 +818,8 @@ unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor:
             initWithFrame: button_frames[i]
         ];
         let _: () = msg_send![button, setBordered: false];
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0f64];
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let _: () = msg_send![button, setFont: font];
         let title = make_nsstring(&labels[i]);
         let _: () = msg_send![button, setTitle: title];
@@ -828,7 +831,7 @@ unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor:
         if !button_layer.is_null() {
             crate::ffi::layer_set_border(button_layer, crate::ffi::hex_to_cg_color(0x00000000));
             let _: () = msg_send![button_layer, setBorderWidth: 0.0f64];
-            let _: () = msg_send![button_layer, setCornerRadius: 5.0f64];
+            let _: () = msg_send![button_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
             let _: () = msg_send![button_layer, setMasksToBounds: true];
         }
         if !button_layer.is_null() {
@@ -872,71 +875,7 @@ pub(super) unsafe fn apply_clear_history_confirmation_theme() {
 /// Refresh the filter styling: the active item is 78% black with a 16x2 underline below;
 /// the rest are 38% black (the mockup's .filter). The underline is one shared little view
 /// repositioned under the active button (created on the first style pass).
-unsafe fn animate_filter_underline(underline: *mut AnyObject, target_frame: NSRect) {
-    let layer: *mut AnyObject = msg_send![underline, layer];
-    if layer.is_null() {
-        let _: () = msg_send![underline, setFrame: target_frame];
-        return;
-    }
-
-    // Use the layer's actual anchor point so the animation target matches the view frame even
-    // when AppKit changes the backing-layer geometry.
-    let anchor: NSPoint = msg_send![layer, anchorPoint];
-    let target_position = NSPoint::new(
-        target_frame.origin.x + target_frame.size.width * anchor.x,
-        target_frame.origin.y + target_frame.size.height * anchor.y,
-    );
-
-    // Read the presentation position first so rapid Tab presses continue from the visible
-    // position instead of jumping back to the previous model position.
-    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
-    let from_position: NSPoint = if presentation.is_null() {
-        msg_send![layer, position]
-    } else {
-        msg_send![presentation, position]
-    };
-
-    let animation_key = make_nsstring("clipboard-filter-underline");
-    let _: () = msg_send![layer, removeAnimationForKey: animation_key];
-    if (from_position.x - target_position.x).abs() < 0.1 {
-        let _: () = msg_send![class!(CATransaction), begin];
-        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-        let _: () = msg_send![layer, setPosition: target_position];
-        let _: () = msg_send![class!(CATransaction), commit];
-        CFRelease(animation_key as *const c_void);
-        return;
-    }
-
-    // Keep the model position and the explicit animation in one transaction. Updating the
-    // NSView frame separately lets AppKit briefly expose a second geometry transition.
-    let _: () = msg_send![class!(CATransaction), begin];
-    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-    let _: () = msg_send![layer, setPosition: target_position];
-    let _: () = msg_send![class!(CATransaction), commit];
-
-    let key_path = make_nsstring("position.x");
-    let animation: *mut AnyObject =
-        msg_send![class!(CABasicAnimation), animationWithKeyPath: key_path];
-    CFRelease(key_path as *const c_void);
-    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from_position.x];
-    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: target_position.x];
-    let _: () = msg_send![animation, setFromValue: from_value];
-    let _: () = msg_send![animation, setToValue: to_value];
-    let _: () = msg_send![animation, setDuration: FILTER_UNDERLINE_ANIMATION_DURATION];
-    let timing_name = make_nsstring("easeInEaseOut");
-    let timing: *mut AnyObject = msg_send![
-        class!(CAMediaTimingFunction),
-        functionWithName: timing_name
-    ];
-    CFRelease(timing_name as *const c_void);
-    if !timing.is_null() {
-        let _: () = msg_send![animation, setTimingFunction: timing];
-    }
-    let _: () = msg_send![layer, addAnimation: animation, forKey: animation_key];
-    CFRelease(animation_key as *const c_void);
-}
-
-pub(super) fn update_filter_pill_style(animate_underline: bool) {
+pub(super) fn update_filter_pill_style(_animate_underline: bool) {
     let active = *CLIP_FILTER.lock().unwrap();
     unsafe {
         let active_tag = match active {
@@ -976,11 +915,7 @@ pub(super) fn update_filter_pill_style(animate_underline: bool) {
                     NSPoint::new(ux, uy),
                     NSSize::new(FILTER_UNDERLINE_W, FILTER_UNDERLINE_H),
                 );
-                if animate_underline {
-                    animate_filter_underline(u.0, target_frame);
-                } else {
-                    let _: () = msg_send![u.0, setFrame: target_frame];
-                }
+                let _: () = msg_send![u.0, setFrame: target_frame];
             } else {
                 let u: *mut AnyObject = msg_send![class!(NSView), alloc];
                 let u: *mut AnyObject = msg_send![
@@ -996,7 +931,7 @@ pub(super) fn update_filter_pill_style(animate_underline: bool) {
                     ulayer,
                     crate::ffi::hex_to_cg_color(palette.secondary_text),
                 );
-                let _: () = msg_send![ulayer, setCornerRadius: 1.0f64];
+                let _: () = msg_send![ulayer, setCornerRadius: FILTER_UNDERLINE_H / 2.0];
                 let _: () = msg_send![parent, addSubview: u];
                 release_obj(u);
                 *guard = Some(ObjPtr::new(u));
@@ -1150,7 +1085,8 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let _: () = msg_send![count_label, setDrawsBackground: false];
     let _: () = msg_send![count_label, setEditable: false];
     let _: () = msg_send![count_label, setSelectable: false];
-    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let cf: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![count_label, setFont: cf];
     let cc = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
     let _: () = msg_send![count_label, setTextColor: cc];
@@ -1190,7 +1126,7 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         crate::ffi::layer_set_background(clayer, crate::ffi::hex_to_cg_color(palette.field_bg));
         crate::ffi::layer_set_border(clayer, crate::ffi::hex_to_cg_color(palette.card_border));
         let _: () = msg_send![clayer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![clayer, setCornerRadius: 4.0f64];
+        let _: () = msg_send![clayer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         // NSTextField top-aligns its glyph, so a full-height label would float the arrow at
         // the cap's top; hug the line height and center it inside the 19pt cap instead.
         let key_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -1206,7 +1142,8 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![key_label, setEditable: false];
         let _: () = msg_send![key_label, setSelectable: false];
         let _: () = msg_send![key_label, setAlignment: 1isize]; // Center on arm64
-        let kf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 9.0f64];
+        let kf: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let _: () = msg_send![key_label, setFont: kf];
         // Swallow the text with the 9pt font's line height and center it vertically.
         let asc: f64 = msg_send![kf, ascender];
@@ -1228,7 +1165,8 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         // Give the hint 6pt width slack so cell insets do not clip its tail; its height uses
         // the font's real line height and is centered. The old fixed 16pt NSTextField drew
         // from its top, making the hint sit slightly above the keycap glyph.
-        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+        let hf: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let hint_asc: f64 = msg_send![hf, ascender];
         let hint_desc: f64 = msg_send![hf, descender];
         let hint_line_h = (hint_asc - hint_desc + 1.0).max(11.0);

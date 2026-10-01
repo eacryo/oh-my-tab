@@ -55,14 +55,13 @@ struct Section {
     rel: f64,
     header: *mut AnyObject,
     /// Extra points the page steps below the previous card (the About page steps from the card's
-    /// bottom edge, 10pt below its last row).
+    /// bottom edge, 8pt below its last row).
     extra: f64,
 }
 
 /// One card, derived from its section's cursor down past its last row.
 struct Card {
     card: *mut AnyObject,
-    shadow: *mut AnyObject,
     section: usize,
     last_row: usize,
     /// Distance from its last row's origin to the card's bottom edge
@@ -123,7 +122,7 @@ pub(super) struct PageCanvas {
     cards: Vec<Card>,
     pending: Option<PendingRow>,
     /// Views the page pins to the document's top edge, with their distance from it: the About page
-    /// draws its own header (app icon + name) instead of the shared page title.
+    /// draws its own About title and version subtitle instead of the shared page title.
     pinned: Vec<(*mut AnyObject, f64)>,
     /// The group the following rows belong to.
     group: Option<RowGroup>,
@@ -161,18 +160,25 @@ impl RelativeLayout {
         sections: usize,
         section_extras: &[f64],
     ) -> Self {
+        let mut visible_sections = vec![false; sections];
+        for row in rows {
+            if !row.group.is_some_and(|group| hidden.contains(&group)) {
+                if let Some(visible) = visible_sections.get_mut(row.section) {
+                    *visible = true;
+                }
+            }
+        }
         let mut cursor = 0.0;
         let mut section = 0;
         let mut section_rels = vec![0.0];
         let mut origins = Vec::with_capacity(rows.len());
         for (index, row) in rows.iter().enumerate() {
-            // A section heading step is consumed whether or not the section's rows are visible:
-            // the section still exists, it just has fewer rows (and a hidden group never spans a
-            // whole section in this UI).
             while section < row.section {
-                cursor -=
-                    layout.section_step + section_extras.get(section + 1).copied().unwrap_or(0.0);
                 section += 1;
+                if visible_sections.get(section).copied().unwrap_or(false) {
+                    cursor -=
+                        layout.section_step + section_extras.get(section).copied().unwrap_or(0.0);
+                }
                 section_rels.push(cursor);
             }
             if row.group.is_some_and(|group| hidden.contains(&group)) {
@@ -182,13 +188,12 @@ impl RelativeLayout {
             cursor -= consumes.get(index).copied().unwrap_or(row.consume);
             origins.push(Some(cursor));
         }
-        // A trailing section without rows still hangs from the cursor (the last card's section).
         while section_rels.len() < sections {
-            cursor -= layout.section_step
-                + section_extras
-                    .get(section_rels.len())
-                    .copied()
-                    .unwrap_or(0.0);
+            let next_section = section_rels.len();
+            if visible_sections.get(next_section).copied().unwrap_or(false) {
+                cursor -=
+                    layout.section_step + section_extras.get(next_section).copied().unwrap_or(0.0);
+            }
             section_rels.push(cursor);
         }
         Self {
@@ -210,9 +215,9 @@ unsafe fn subview_at(view: *mut AnyObject, index: usize) -> *mut AnyObject {
 
 /// Views appended to `view` since `mark`.
 ///
-/// Only views added with the plain `addSubview:` belong to a row. The card/shadow pair is inserted
-/// at the bottom of the z-order (`addSubview:positioned:relativeTo:`) and shifts the array indices,
-/// so cards are always created right after a row has been captured (see `card`).
+/// Only views added with the plain `addSubview:` belong to a row. The card is inserted at the
+/// bottom of the z-order (`addSubview:positioned:relativeTo:`) and shifts array indices, so cards
+/// are created right after a row has been captured (see `card`).
 unsafe fn views_added_since(view: *mut AnyObject, mark: usize) -> Vec<*mut AnyObject> {
     let count = subview_count(view);
     if count <= mark {
@@ -263,7 +268,7 @@ impl PageCanvas {
         }
     }
 
-    /// Start a page whose header the page draws itself (the About page's app icon and name):
+    /// Start a page whose header the page draws itself (the About title and version subtitle):
     /// `header_offset` is the distance from the document's top edge down to the first section
     /// cursor, and the header's own views are pinned through [`PageCanvas::pin_to_top`].
     pub(super) unsafe fn new_at(
@@ -355,7 +360,7 @@ impl PageCanvas {
     ) -> Self {
         let mark = subview_count(document);
         let (actual_doc_top, cursor) =
-            SettingsPageHeader::attach(document, title, 6.0, doc_h, content_w);
+            SettingsPageHeader::attach(document, title, 0.0, doc_h, content_w);
         let title_view = views_added_since(document, mark)
             .first()
             .copied()
@@ -496,7 +501,7 @@ impl PageCanvas {
 
     /// Same, for a card whose bottom edge the caller places itself: `offset` is the distance from
     /// its last row's origin to the card's visible bottom (the General page's preview card hangs
-    /// 12pt below the preview block rather than the shared 10pt inset).
+    /// 12pt below the preview block rather than the shared 8pt inset).
     pub(super) unsafe fn card_with_bottom_offset(
         &mut self,
         title: &str,
@@ -507,7 +512,7 @@ impl PageCanvas {
         let last_row = self.rows.len().saturating_sub(1);
         let card_bottom = self.card_bottom_at(last_row, offset);
         let section_frame = NSRect::new(
-            NSPoint::new(6.0, card_bottom),
+            NSPoint::new(0.0, card_bottom),
             NSSize::new(
                 self.content_w,
                 self.layout.card_top(self.base + self.sections[section].rel) - card_bottom,
@@ -515,14 +520,13 @@ impl PageCanvas {
         );
         let card = SettingsSection::attach(self.document, section_frame, title);
         // `SettingsSection::attach` draws the header with a plain append and then inserts the card
-        // and its shadow at the bottom of the z-order, so the header is the document's last view.
+        // at the bottom of the z-order, so the header is the document's last view.
         let count = subview_count(self.document);
         if count > 0 {
             self.sections[section].header = subview_at(self.document, count - 1);
         }
         self.cards.push(Card {
             card: card.card,
-            shadow: card.shadow,
             section,
             last_row,
             bottom_offset: offset,
@@ -717,9 +721,8 @@ impl PageCanvas {
             .map(|(index, card)| card_row_rel[index].map(|rel| rel + card.bottom_offset))
             .collect();
 
-        // The lowest content: a card's shadow hangs `SETTINGS_CARD_SHADOW_INSET` below the card, a
-        // row the page registered itself ends at its origin (the Mouse page's binding table), and
-        // the restore control sits below everything.
+        // The lowest content is the visible card/row edge or the restore control, whichever sits
+        // lower.
         let content_bottom_rel = relative
             .origins
             .iter()
@@ -733,13 +736,6 @@ impl PageCanvas {
             0.0
         };
         let mut lowest = content_bottom_rel;
-        for rel in card_bottom_rel.iter().flatten() {
-            let rect = widgets::settings_card_rect(NSRect::new(
-                NSPoint::new(0.0, *rel),
-                NSSize::new(0.0, 0.0),
-            ));
-            lowest = lowest.min(rect.origin.y - widgets::SETTINGS_CARD_SHADOW_INSET);
-        }
         if let Some((container, _, offset)) = restore {
             // A hidden restore control does not count: the inline update flow hides it and owns the
             // page's bottom padding while it runs.
@@ -890,7 +886,7 @@ impl PageCanvas {
             let visible_bottom = card_bottom_rel.get(index).copied().flatten();
             let visible = visible_bottom.is_some();
             let header = self.sections[card.section].header;
-            for view in [card.card, card.shadow, header] {
+            for view in [card.card, header] {
                 if !view.is_null() {
                     let _: () = msg_send![view, setHidden: !visible];
                 }
@@ -912,19 +908,6 @@ impl PageCanvas {
                 NSSize::new(frame.size.width, (top - bottom).max(1.0)),
             ));
             let _: () = msg_send![card.card, setFrame: rect];
-            if !card.shadow.is_null() {
-                let inset = widgets::SETTINGS_CARD_SHADOW_INSET;
-                let _: () = msg_send![
-                    card.shadow,
-                    setFrame: NSRect::new(
-                        NSPoint::new(rect.origin.x - inset, rect.origin.y - inset),
-                        NSSize::new(
-                            rect.size.width + inset * 2.0,
-                            rect.size.height + inset * 2.0
-                        )
-                    )
-                ];
-            }
         }
 
         // The page title hangs from the document's top edge, and so do the views a page pinned
@@ -1081,6 +1064,30 @@ mod tests {
         assert_eq!(shown.origins[2], Some(-3.0 * step));
         assert_eq!(hidden.origins[2], Some(-2.0 * step));
         assert_eq!(hidden.origins[2].unwrap() - shown.origins[2].unwrap(), step);
+    }
+
+    #[test]
+    fn fully_hidden_section_collapses_its_heading_gap() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [
+            row_in(layout.described_row_h, None, 0),
+            row_in(layout.described_row_h, Some(RowGroup::SmoothScrolling), 1),
+            row_in(layout.described_row_h, None, 2),
+        ];
+        let shown = RelativeLayout::of(&rows, &[], layout);
+        let hidden = RelativeLayout::of(&rows, &[RowGroup::SmoothScrolling], layout);
+        let row_step = layout.row_gap + layout.described_row_h;
+
+        assert_eq!(hidden.origins[1], None);
+        assert_eq!(hidden.section_rels[1], hidden.origins[0].unwrap());
+        assert_eq!(
+            hidden.section_rels[2],
+            hidden.section_rels[1] - layout.section_step
+        );
+        assert_eq!(
+            hidden.origins[2].unwrap() - shown.origins[2].unwrap(),
+            row_step + layout.section_step
+        );
     }
 
     #[test]

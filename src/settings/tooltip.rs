@@ -103,19 +103,6 @@ extern "C" fn tooltip_timeout(_self: *mut c_void, _cmd: Sel, timer: *mut c_void)
     }
 }
 
-/// Remove a bubble after its exit animation has finished.
-extern "C" fn tooltip_remove_bubble(_self: *mut c_void, _cmd: Sel, timer: *mut c_void) {
-    unsafe {
-        let timer = timer as *mut AnyObject;
-        let bubble: *mut AnyObject = objc2::msg_send![timer, userInfo];
-        if bubble.is_null() {
-            return;
-        }
-        let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
-        let _: () = objc2::msg_send![bubble, removeFromSuperview];
-    }
-}
-
 fn disabled_cursor_target() -> *mut AnyObject {
     DISABLED_CURSOR_TARGET
         .get_or_init(|| unsafe {
@@ -139,12 +126,6 @@ fn disabled_cursor_target() -> *mut AnyObject {
                 cls,
                 objc2::sel!(hideTooltip:),
                 tooltip_timeout as *mut c_void,
-                types.as_ptr(),
-            );
-            crate::ffi::class_addMethod(
-                cls,
-                objc2::sel!(removeTooltipBubble:),
-                tooltip_remove_bubble as *mut c_void,
                 types.as_ptr(),
             );
             crate::ffi::objc_registerClassPair(cls);
@@ -198,159 +179,20 @@ impl SettingsTooltip {
         }
     }
 
-    unsafe fn remove_bubble_now() {
-        let active = ACTIVE_BUBBLE.lock().unwrap().take();
-        if let Some(bubble) = active {
-            let bubble = bubble as *mut AnyObject;
-            let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
-            let _: () = objc2::msg_send![bubble, removeFromSuperview];
-        }
-    }
-
     unsafe fn hide_bubble() {
         Self::cancel_timer();
         Self::dismiss_bubble();
     }
 
-    /// Hide and remove the current bubble atomically so dismissal cannot flash a stale frame.
+    /// Tooltips disappear immediately so pointer movement remains direct.
     unsafe fn dismiss_bubble() {
         let active = ACTIVE_BUBBLE.lock().unwrap().take();
         let Some(bubble) = active else {
             return;
         };
         let bubble = bubble as *mut AnyObject;
-        let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
-        if layer.is_null() || Self::accessibility_reduce_motion() {
-            let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
-            let _: () = objc2::msg_send![bubble, removeFromSuperview];
-            return;
-        }
-
-        let opacity = Self::presentation_scalar(layer, "opacity", 1.0);
-        let x = Self::presentation_scalar(layer, "transform.translation.x", 0.0);
-        let scale = Self::presentation_scalar(layer, "transform.scale", 1.0);
-        Self::set_layer_model(layer, "opacity", 0.0);
-        Self::set_layer_model(layer, "transform.translation.x", 32.0);
-        Self::set_layer_model(layer, "transform.scale", 0.96);
-        Self::add_basic_animation(
-            layer,
-            "opacity",
-            opacity,
-            0.0,
-            0.14,
-            "settings-tooltip-exit-opacity",
-        );
-        Self::add_basic_animation(
-            layer,
-            "transform.translation.x",
-            x,
-            32.0,
-            0.18,
-            "settings-tooltip-exit-x",
-        );
-        Self::add_basic_animation(
-            layer,
-            "transform.scale",
-            scale,
-            0.96,
-            0.18,
-            "settings-tooltip-exit-scale",
-        );
-
-        let _: *mut AnyObject = objc2::msg_send![
-            objc2::class!(NSTimer),
-            scheduledTimerWithTimeInterval: 0.18f64,
-            target: disabled_cursor_target(),
-            selector: objc2::sel!(removeTooltipBubble:),
-            // Retain the bubble through the timer so a rapid replacement or window rebuild
-            // cannot leave the exit callback with a dangling pointer.
-            userInfo: bubble,
-            repeats: false
-        ];
-    }
-
-    unsafe fn set_layer_model(layer: *mut AnyObject, key_path: &str, value: f64) {
-        let number: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: value];
-        let key_path = crate::ffi::make_nsstring(key_path);
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
-        let _: () = objc2::msg_send![layer, setValue: number, forKeyPath: key_path];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-        crate::ffi::CFRelease(key_path as *const c_void);
-    }
-
-    unsafe fn presentation_scalar(layer: *mut AnyObject, key_path: &str, fallback: f64) -> f64 {
-        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
-        if presentation.is_null() {
-            return fallback;
-        }
-        let key_path = crate::ffi::make_nsstring(key_path);
-        let value: *mut AnyObject = objc2::msg_send![presentation, valueForKeyPath: key_path];
-        crate::ffi::CFRelease(key_path as *const c_void);
-        if value.is_null() {
-            fallback
-        } else {
-            objc2::msg_send![value, doubleValue]
-        }
-    }
-
-    unsafe fn add_basic_animation(
-        layer: *mut AnyObject,
-        key_path: &str,
-        from: f64,
-        to: f64,
-        duration: f64,
-        animation_key: &str,
-    ) {
-        let key_path_ns = crate::ffi::make_nsstring(key_path);
-        let animation: *mut AnyObject = objc2::msg_send![
-            objc2::class!(CABasicAnimation),
-            animationWithKeyPath: key_path_ns
-        ];
-        crate::ffi::CFRelease(key_path_ns as *const c_void);
-        let from_value: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: from];
-        let to_value: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: to];
-        let _: () = objc2::msg_send![animation, setFromValue: from_value];
-        let _: () = objc2::msg_send![animation, setToValue: to_value];
-        let _: () = objc2::msg_send![animation, setDuration: duration];
-        // Match the reference toast's fast-out, gentle-settle cubic curve.
-        extern "C" {
-            fn objc_msgSend();
-        }
-        type TimingFunction =
-            unsafe extern "C" fn(*mut AnyObject, Sel, f32, f32, f32, f32) -> *mut AnyObject;
-        let make_timing: TimingFunction = std::mem::transmute(objc_msgSend as *const ());
-        let timing = make_timing(
-            objc2::class!(CAMediaTimingFunction) as *const _ as *mut AnyObject,
-            objc2::sel!(functionWithControlPoints::::),
-            0.22,
-            1.0,
-            0.36,
-            1.0,
-        );
-        if !timing.is_null() {
-            let _: () = objc2::msg_send![animation, setTimingFunction: timing];
-        }
-        let animation_key = crate::ffi::make_nsstring(animation_key);
-        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
-        crate::ffi::CFRelease(animation_key as *const c_void);
-    }
-
-    unsafe fn accessibility_reduce_motion() -> bool {
-        let workspace: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
-        if workspace.is_null()
-            || !objc2::msg_send![
-                workspace,
-                respondsToSelector: objc2::sel!(accessibilityDisplayShouldReduceMotion)
-            ]
-        {
-            return false;
-        }
-        objc2::msg_send![workspace, accessibilityDisplayShouldReduceMotion]
+        let _: () = objc2::msg_send![bubble, setAlphaValue: 0.0f64];
+        let _: () = objc2::msg_send![bubble, removeFromSuperview];
     }
 
     unsafe fn show_bubble(view: *mut AnyObject, text: &str) {
@@ -414,38 +256,21 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![bubble, setWantsLayer: true];
         let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
         if !layer.is_null() {
-            // Explicitly anchor the transform at the bubble's bottom center so scale grows
-            // upward from the footer instead of depending on the backing layer's default anchor.
-            let bounds: NSRect = objc2::msg_send![layer, bounds];
-            let old_anchor: NSPoint = objc2::msg_send![layer, anchorPoint];
-            let old_position: NSPoint = objc2::msg_send![layer, position];
-            let anchor = NSPoint::new(0.5, 0.0);
-            let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
-            let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
-            let _: () = objc2::msg_send![layer, setAnchorPoint: anchor];
-            let _: () = objc2::msg_send![
-                layer,
-                setPosition: NSPoint::new(
-                    old_position.x + (anchor.x - old_anchor.x) * bounds.size.width,
-                    old_position.y + (anchor.y - old_anchor.y) * bounds.size.height,
-                )
-            ];
-            let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-            // Match the reference card: a near-opaque surface, large radius, and a soft
-            // downward shadow that remains visible outside the bubble bounds.
-            let background = if palette.dark { 0x3A3A3FF2 } else { 0xF8F8F8F2 };
-            crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-            let _: () = objc2::msg_send![layer, setCornerRadius: 16.0f64];
+            // A tooltip floats over page content, so it uses the shared card surface and med
+            // elevation rather than a separate surface color.
+            crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.card_bg));
+            let _: () = objc2::msg_send![layer, setCornerRadius: crate::theme::RADIUS_PANEL];
             let _: () = objc2::msg_send![layer, setMasksToBounds: false];
-            crate::ffi::layer_set_border(
-                layer,
-                crate::ffi::hex_to_cg_color(if palette.dark { 0xFFFFFF20 } else { 0x00000010 }),
-            );
+            crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
             let _: () = objc2::msg_send![layer, setBorderWidth: 1.0f64];
-            crate::ffi::layer_set_shadow_color(layer, crate::ffi::hex_to_cg_color(0x000000FF));
-            let _: () = objc2::msg_send![layer, setShadowOpacity: 0.25f32];
-            let _: () = objc2::msg_send![layer, setShadowRadius: 25.0f64];
-            let _: () = objc2::msg_send![layer, setShadowOffset: NSSize::new(0.0, -12.0)];
+            crate::ffi::layer_set_shadow_color(
+                layer,
+                crate::ffi::hex_to_cg_color(crate::theme::ELEVATION_MED_SHADOW_COLOR),
+            );
+            let _: () = objc2::msg_send![layer, setShadowOpacity: crate::theme::ELEVATION_MED_SHADOW_OPACITY];
+            let _: () =
+                objc2::msg_send![layer, setShadowRadius: crate::theme::ELEVATION_MED_SHADOW_RADIUS];
+            let _: () = objc2::msg_send![layer, setShadowOffset: NSSize::new(0.0, crate::theme::ELEVATION_MED_SHADOW_OFFSET_Y)];
         }
 
         let mut icon_view: *mut AnyObject = std::ptr::null_mut();
@@ -461,11 +286,7 @@ impl SettingsTooltip {
         crate::ffi::CFRelease(symbol_ns as *const c_void);
         if !image.is_null() {
             let tint_hex = if success {
-                if palette.dark {
-                    0x30D158FF
-                } else {
-                    0x34C759FF
-                }
+                palette.success_text
             } else {
                 palette.accent
             };
@@ -482,18 +303,15 @@ impl SettingsTooltip {
             let icon_layer: *mut AnyObject = objc2::msg_send![icon_container, layer];
             if !icon_layer.is_null() {
                 let tint_hex = if success {
-                    if palette.dark {
-                        0x30D15826
-                    } else {
-                        0x34C75920
-                    }
+                    palette.success_text & 0xFFFF_FF00 | if palette.dark { 0x26 } else { 0x20 }
                 } else if palette.dark {
                     palette.accent & 0xFFFFFF00 | 0x26
                 } else {
                     palette.accent & 0xFFFFFF00 | 0x20
                 };
                 crate::ffi::layer_set_background(icon_layer, crate::ffi::hex_to_cg_color(tint_hex));
-                let _: () = objc2::msg_send![icon_layer, setCornerRadius: 14.0f64];
+                let _: () =
+                    objc2::msg_send![icon_layer, setCornerRadius: crate::theme::RADIUS_CARD];
             }
             let icon: *mut AnyObject = objc2::msg_send![objc2::class!(NSImageView), alloc];
             let icon: *mut AnyObject = objc2::msg_send![
@@ -535,8 +353,8 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![label, setLineBreakMode: 4isize];
         let font: *mut AnyObject = objc2::msg_send![
             objc2::class!(NSFont),
-            systemFontOfSize: 14.0f64,
-            weight: 0.23f64
+            systemFontOfSize: crate::theme::FONT_CONTROL,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
         ];
         let _: () = objc2::msg_send![label, setFont: font];
         let color = crate::ffi::hex_to_ns_color(palette.primary_text);
@@ -581,40 +399,6 @@ impl SettingsTooltip {
         let _: () = objc2::msg_send![content, addSubview: bubble];
         crate::ffi::release_obj(bubble);
         *ACTIVE_BUBBLE.lock().unwrap() = Some(bubble as usize);
-
-        // Enter from below with the same scale/offset profile as the reference toast.
-        let layer: *mut AnyObject = objc2::msg_send![bubble, layer];
-        if !layer.is_null() {
-            Self::set_layer_model(layer, "opacity", 1.0);
-            Self::set_layer_model(layer, "transform.translation.y", 0.0);
-            Self::set_layer_model(layer, "transform.scale", 1.0);
-            if !Self::accessibility_reduce_motion() {
-                Self::add_basic_animation(
-                    layer,
-                    "opacity",
-                    0.0,
-                    1.0,
-                    0.4,
-                    "settings-tooltip-enter-opacity",
-                );
-                Self::add_basic_animation(
-                    layer,
-                    "transform.translation.y",
-                    -22.0,
-                    0.0,
-                    0.4,
-                    "settings-tooltip-enter-y",
-                );
-                Self::add_basic_animation(
-                    layer,
-                    "transform.scale",
-                    0.96,
-                    1.0,
-                    0.4,
-                    "settings-tooltip-enter-scale",
-                );
-            }
-        }
 
         let timer: *mut AnyObject = objc2::msg_send![
             objc2::class!(NSTimer),
@@ -775,7 +559,7 @@ impl SettingsTooltip {
     pub(super) fn clear_runtime_registries() {
         unsafe {
             Self::cancel_timer();
-            Self::remove_bubble_now();
+            Self::dismiss_bubble();
         }
         DISABLED_TRACKING_AREAS.lock().unwrap().clear();
         DISABLED_TOOLTIPS.lock().unwrap().clear();

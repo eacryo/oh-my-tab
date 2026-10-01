@@ -551,7 +551,7 @@ unsafe fn add_label(
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: style.size, weight: style.weight];
     let _: () = msg_send![field, setFont: font];
-    let _: () = msg_send![field, setTextColor: hex_to_ns_color(style.color)];
+    let _: () = msg_send![field, setTextColor: hex_to_ns_color(style.color.resolve())];
     if style.wrap {
         let cell: *mut AnyObject = msg_send![field, cell];
         let _: () = msg_send![cell, setWraps: true];
@@ -649,7 +649,7 @@ unsafe fn add_menu_icon_label(
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: style.size, weight: style.weight];
     let _: () = msg_send![field, setFont: font];
-    let _: () = msg_send![field, setTextColor: hex_to_ns_color(style.color)];
+    let _: () = msg_send![field, setTextColor: hex_to_ns_color(style.color.resolve())];
     if style.wrap {
         let cell: *mut AnyObject = msg_send![field, cell];
         let _: () = msg_send![cell, setWraps: true];
@@ -733,9 +733,9 @@ fn render_current_step() {
             content,
             &title,
             PAD,
-            WINDOW_H - 34.0,
+            WINDOW_H - COUNTER_TOP_INSET - COUNTER_H,
             WINDOW_W - PAD * 2.0,
-            18.0,
+            COUNTER_H,
             COUNTER_STYLE,
         );
         match step {
@@ -781,10 +781,10 @@ unsafe fn render_permissions_and_startup(
         content,
         &t("onboarding.permissions_title"),
         PAD,
-        194.0,
+        STEP_TITLE_Y,
         WINDOW_W - PAD * 2.0,
         TITLE_H,
-        TITLE_STYLE,
+        STEP_TITLE_STYLE,
     );
     add_label(
         content,
@@ -799,11 +799,14 @@ unsafe fn render_permissions_and_startup(
         BODY_STYLE,
     );
     let (status_key, status_color) = if restart_required {
-        ("onboarding.status_restart_required", STATUS_WARN)
+        (
+            "onboarding.status_restart_required",
+            LabelColorRole::Warning,
+        )
     } else if ax_granted {
-        ("onboarding.status_granted", STATUS_OK)
+        ("onboarding.status_granted", LabelColorRole::Success)
     } else {
-        ("onboarding.status_missing", STATUS_WARN)
+        ("onboarding.status_missing", LabelColorRole::Warning)
     };
     add_label(
         content,
@@ -812,7 +815,7 @@ unsafe fn render_permissions_and_startup(
         STATUS_ROW_Y,
         STATUS_LABEL_W,
         STATUS_H,
-        status_style(SECONDARY_TEXT),
+        status_style(LabelColorRole::Secondary),
     );
     add_label(
         content,
@@ -839,7 +842,7 @@ unsafe fn render_permissions_and_startup(
             &primary_title,
             primary_action,
             WINDOW_W - PAD - BUTTON_W,
-            99.0,
+            100.0,
             BUTTON_W,
             crate::settings::components::SettingsButtonRole::Action,
         );
@@ -848,15 +851,15 @@ unsafe fn render_permissions_and_startup(
         content,
         &t("onboarding.launch_label"),
         PAD,
-        62.0,
+        60.0,
         WINDOW_W - PAD * 2.0 - 58.0,
-        28.0,
-        TITLE_STYLE,
+        SWITCH_ROW_LABEL_H,
+        ROW_LABEL_STYLE,
     );
     add_switch(
         content,
         WINDOW_W - PAD,
-        59.0,
+        56.0,
         launch_at_login,
         ACTION_TOGGLE_LAUNCH_DRAFT,
         "onboarding.launch_label",
@@ -872,10 +875,10 @@ unsafe fn render_display_mode(
         content,
         &t("onboarding.display_title"),
         PAD,
-        194.0,
+        STEP_TITLE_Y,
         WINDOW_W - PAD * 2.0,
         TITLE_H,
-        TITLE_STYLE,
+        STEP_TITLE_STYLE,
     );
     add_label(
         content,
@@ -893,17 +896,17 @@ unsafe fn render_display_mode(
             content,
             &t("onboarding.screen_permission_needed"),
             PAD,
-            59.0,
+            60.0,
             WINDOW_W - PAD * 2.0 - BUTTON_W - GAP,
             STATUS_H,
-            status_style(STATUS_WARN),
+            status_style(LabelColorRole::Warning),
         );
         add_button(
             content,
             &t("onboarding.btn_open_settings"),
             ACTION_ALLOW_SCREEN,
             WINDOW_W - PAD - BUTTON_W,
-            55.0,
+            56.0,
             BUTTON_W,
             crate::settings::components::SettingsButtonRole::Action,
         );
@@ -928,20 +931,20 @@ struct ClipboardStepLayout {
 
 const CLIPBOARD_STEP: ClipboardStepLayout = ClipboardStepLayout {
     // The title keeps the same y as the other steps so moving between steps does not shift it.
-    title_y: 194.0,
+    title_y: STEP_TITLE_Y,
     body_y: 156.0,
-    body_h: 34.0,
-    shortcut_hint_y: 142.0,
-    shortcut_hint_h: 14.0,
-    enabled_row_y: 110.0,
-    persist_row_y: 78.0,
+    body_h: 40.0,
+    shortcut_hint_y: 140.0,
+    shortcut_hint_h: 16.0,
+    enabled_row_y: 104.0,
+    persist_row_y: 72.0,
     persist_hint_y: 56.0,
     persist_hint_h: 16.0,
 };
 
 /// Switch-row label height, and the width the label leaves for the switch on the trailing edge.
-const SWITCH_ROW_LABEL_H: f64 = 28.0;
-const SWITCH_ROW_LABEL_TRAILING: f64 = 58.0;
+const SWITCH_ROW_LABEL_H: f64 = 24.0;
+const SWITCH_ROW_LABEL_TRAILING: f64 = 56.0;
 
 unsafe fn render_clipboard_history(
     content: *mut AnyObject,
@@ -956,7 +959,7 @@ unsafe fn render_clipboard_history(
         CLIPBOARD_STEP.title_y,
         WINDOW_W - PAD * 2.0,
         TITLE_H,
-        TITLE_STYLE,
+        STEP_TITLE_STYLE,
     );
     add_label(
         content,
@@ -1022,10 +1025,10 @@ unsafe fn render_more_features(content: *mut AnyObject) {
         content,
         &t("onboarding.more_title"),
         PAD,
-        194.0,
+        STEP_TITLE_Y,
         WINDOW_W - PAD * 2.0,
         TITLE_H,
-        TITLE_STYLE,
+        STEP_TITLE_STYLE,
     );
     add_menu_icon_label(
         content,
@@ -1051,7 +1054,7 @@ unsafe fn add_display_mode_control(content: *mut AnyObject, thumbnails_enabled: 
     let control: *mut AnyObject = msg_send![class!(NSSegmentedControl), alloc];
     let control: *mut AnyObject = msg_send![
         control,
-        initWithFrame: NSRect::new(NSPoint::new(PAD, 96.0), NSSize::new(320.0, 34.0))
+        initWithFrame: NSRect::new(NSPoint::new(PAD, 96.0), NSSize::new(320.0, 32.0))
     ];
     let _: () = msg_send![control, setSegmentCount: 2isize];
     let icons = make_nsstring(&t("onboarding.display_icons"));
@@ -1124,7 +1127,7 @@ unsafe fn add_switch_row(
         row_y + (BUTTON_H - SWITCH_ROW_LABEL_H) / 2.0,
         WINDOW_W - PAD * 2.0 - SWITCH_ROW_LABEL_TRAILING,
         SWITCH_ROW_LABEL_H,
-        TITLE_STYLE,
+        ROW_LABEL_STYLE,
     );
     add_switch(
         content,
@@ -1180,7 +1183,7 @@ unsafe fn add_text_button(content: *mut AnyObject, title: &str, action_tag: isiz
     let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let button: *mut AnyObject = msg_send![
         button,
-        initWithFrame: NSRect::new(NSPoint::new(x, BUTTON_Y + 2.0), NSSize::new(100.0, BUTTON_H - 4.0))
+        initWithFrame: NSRect::new(NSPoint::new(x, BUTTON_Y), NSSize::new(100.0, BUTTON_H))
     ];
     let title_ns = make_nsstring(title);
     let _: () = msg_send![button, setTitle: title_ns];
@@ -1188,8 +1191,11 @@ unsafe fn add_text_button(content: *mut AnyObject, title: &str, action_tag: isiz
     release_obj(title_ns);
     let _: () = msg_send![button, setButtonType: 0isize];
     let _: () = msg_send![button, setBordered: false];
-    let _: () = msg_send![button, setContentTintColor: hex_to_ns_color(SECONDARY_TEXT)];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let _: () = msg_send![button, setContentTintColor: hex_to_ns_color(
+        crate::theme::ui_palette().secondary_text
+    )];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![button, setFont: font];
     let _: () = msg_send![button, setTarget: target];
     let _: () = msg_send![button, setAction: sel!(handleOnboardingAction:)];
@@ -1675,10 +1681,13 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
 
 const WINDOW_W: f64 = 520.0;
 const WINDOW_H: f64 = 280.0;
-const TITLE_H: f64 = 24.0;
+const TITLE_H: f64 = 32.0;
+const STEP_TITLE_Y: f64 = 200.0;
+const COUNTER_H: f64 = 16.0;
+const COUNTER_TOP_INSET: f64 = 16.0;
 const WINDOW_STYLE_TITLED: u64 = 1;
 const PAD: f64 = 24.0;
-const GAP: f64 = 10.0;
+const GAP: f64 = 8.0;
 const BUTTON_H: f64 = 32.0;
 const BUTTON_W: f64 = 132.0;
 /// The wide action button ("Open App Settings"): 132pt wraps it to two lines and clips the second,
@@ -1686,75 +1695,142 @@ const BUTTON_W: f64 = 132.0;
 const WIDE_BUTTON_W: f64 = 176.0;
 const BUTTON_Y: f64 = 20.0;
 /// Permissions-step status row: the label and the status share the width left of the action button.
-/// English needs ~155pt for both the label ("Accessibility permission") and the longest status
-/// ("Restart the app to apply"); the old 136pt label column truncated the label.
-const STATUS_ROW_Y: f64 = 105.0;
+/// At 14pt, the English label and longest status each need about 160pt; the old 136pt label column
+/// truncated the label.
+const STATUS_ROW_Y: f64 = 104.0;
 const STATUS_LABEL_W: f64 = 160.0;
-const STATUS_COLUMN_GAP: f64 = 6.0;
+const STATUS_COLUMN_GAP: f64 = 8.0;
 const STATUS_COLUMN_W: f64 = 160.0;
-/// Wrapped body copy keeps at least three lines at `BODY_LINE_H`; the previous 46pt frames clipped
-/// the English text (the screenshots ended mid-sentence).
-const BODY_LINE_H: f64 = 16.0;
-const PERMISSIONS_BODY_Y: f64 = 140.0;
+/// Wrapped body copy reserves three 20pt lines; the former 46pt frames clipped English text.
+const BODY_LINE_H: f64 = 20.0;
+const PERMISSIONS_BODY_Y: f64 = 132.0;
 const PERMISSIONS_BODY_H: f64 = 3.0 * BODY_LINE_H + 4.0;
-const DISPLAY_BODY_Y: f64 = 143.0;
+const DISPLAY_BODY_Y: f64 = 136.0;
 const DISPLAY_BODY_H: f64 = 3.0 * BODY_LINE_H;
-const MORE_BODY_Y: f64 = 130.0;
-const MORE_BODY_H: f64 = 3.0 * BODY_LINE_H + 12.0;
+const MORE_BODY_Y: f64 = 136.0;
+const MORE_BODY_H: f64 = 3.0 * BODY_LINE_H;
 /// The guide only needs three text styles plus one status-line style, kept as constants so each
 /// call site does not repeat the parameters.
 #[derive(Clone, Copy)]
 struct LabelStyle {
     size: f64,
     weight: f64,
-    color: u32,
+    color: LabelColorRole,
     wrap: bool,
 }
-const TITLE_STYLE: LabelStyle = LabelStyle {
-    size: 17.0,
-    weight: 0.23,
-    color: PRIMARY_TEXT,
+#[derive(Clone, Copy)]
+enum LabelColorRole {
+    Primary,
+    Secondary,
+    Muted,
+    Success,
+    Warning,
+}
+
+impl LabelColorRole {
+    fn resolve(self) -> u32 {
+        self.resolve_from(crate::theme::ui_palette())
+    }
+
+    fn resolve_from(self, palette: crate::theme::UiPalette) -> u32 {
+        match self {
+            Self::Primary => palette.primary_text,
+            Self::Secondary => palette.secondary_text,
+            Self::Muted => palette.muted_text,
+            Self::Success => palette.success_text,
+            Self::Warning => palette.warning_text,
+        }
+    }
+}
+
+const STEP_TITLE_STYLE: LabelStyle = LabelStyle {
+    size: crate::theme::FONT_PAGE_TITLE,
+    weight: crate::theme::FONT_WEIGHT_BOLD,
+    color: LabelColorRole::Primary,
+    wrap: false,
+};
+const ROW_LABEL_STYLE: LabelStyle = LabelStyle {
+    size: crate::theme::FONT_CONTROL,
+    weight: crate::theme::FONT_WEIGHT_REGULAR,
+    color: LabelColorRole::Primary,
     wrap: false,
 };
 const BODY_STYLE: LabelStyle = LabelStyle {
-    size: 13.0,
-    weight: 0.0,
-    color: SECONDARY_TEXT,
+    size: crate::theme::FONT_CONTROL,
+    weight: crate::theme::FONT_WEIGHT_REGULAR,
+    color: LabelColorRole::Secondary,
     wrap: true,
 };
 const COUNTER_STYLE: LabelStyle = LabelStyle {
-    size: 11.5,
-    weight: 0.23,
-    color: 0x8E8E93FF,
+    size: crate::theme::FONT_CAPTION,
+    weight: crate::theme::FONT_WEIGHT_REGULAR,
+    color: LabelColorRole::Muted,
     wrap: false,
 };
 /// Small muted explanatory text under an option (e.g. the clipboard persist warning).
 const HINT_STYLE: LabelStyle = LabelStyle {
-    size: 11.5,
-    weight: 0.0,
-    color: 0x8E8E93FF,
+    size: crate::theme::FONT_CAPTION,
+    weight: crate::theme::FONT_WEIGHT_REGULAR,
+    color: LabelColorRole::Muted,
     wrap: true,
 };
-fn status_style(color: u32) -> LabelStyle {
+fn status_style(color: LabelColorRole) -> LabelStyle {
     LabelStyle {
-        size: 13.5,
-        weight: 0.0,
+        size: crate::theme::FONT_CONTROL,
+        weight: crate::theme::FONT_WEIGHT_REGULAR,
         color,
         wrap: false,
     }
 }
 
 /// Body heights, chosen per page from its line count (the longest Chinese page sets the value).
-const STATUS_H: f64 = 20.0;
-
-const PRIMARY_TEXT: u32 = 0x1D1D1FFF;
-const SECONDARY_TEXT: u32 = 0x6E6E73FF;
-const STATUS_OK: u32 = 0x1F8B4CFF;
-const STATUS_WARN: u32 = 0xC2410CFF;
+const STATUS_H: f64 = 24.0;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn onboarding_chrome_uses_the_shared_type_and_color_roles() {
+        assert_eq!(
+            [
+                COUNTER_STYLE.size,
+                HINT_STYLE.size,
+                ROW_LABEL_STYLE.size,
+                BODY_STYLE.size,
+                status_style(LabelColorRole::Warning).size,
+                STEP_TITLE_STYLE.size,
+            ],
+            [12.0, 12.0, 14.0, 14.0, 14.0, 26.0]
+        );
+
+        let light = crate::theme::ui_palette_for_mode(false);
+        let dark = crate::theme::ui_palette_for_mode(true);
+        for palette in [light, dark] {
+            assert_eq!(
+                LabelColorRole::Primary.resolve_from(palette),
+                palette.primary_text
+            );
+            assert_eq!(
+                LabelColorRole::Secondary.resolve_from(palette),
+                palette.secondary_text
+            );
+            assert_eq!(
+                LabelColorRole::Muted.resolve_from(palette),
+                palette.muted_text
+            );
+            assert_eq!(
+                LabelColorRole::Success.resolve_from(palette),
+                palette.success_text
+            );
+            assert_eq!(
+                LabelColorRole::Warning.resolve_from(palette),
+                palette.warning_text
+            );
+        }
+        assert_eq!(BODY_LINE_H, 20.0);
+        assert_eq!(STEP_TITLE_Y % 4.0, 0.0);
+    }
 
     #[test]
     fn text_button_tint_selector_is_supported_by_nsbutton() {
@@ -1783,13 +1859,13 @@ mod tests {
             .to_string()
     }
 
-    /// Measured single-line widths (AppKit 13.5pt system font, taken once on the main thread) that
-    /// the status row must cover: "Accessibility permission" ~154.1pt and "Restart the app to
-    /// apply" ~154.3pt. The old 136pt label column truncated the English label
+    /// The previous AppKit 13.5pt measurements were about 154pt; at the 14pt control size the
+    /// status row reserves 160pt for both "Accessibility permission" and "Restart the app to
+    /// apply". The old 136pt label column truncated the English label
     /// ("Accessibility permi... Granted"). Kept as constants: AppKit text measurement hangs when it
     /// runs off the test thread, so a live measurement cannot be part of the headless gate.
-    const STATUS_LABEL_MIN_W: f64 = 155.0;
-    const STATUS_COLUMN_MIN_W: f64 = 155.0;
+    const STATUS_LABEL_MIN_W: f64 = 160.0;
+    const STATUS_COLUMN_MIN_W: f64 = 160.0;
 
     /// The permissions step's label/status columns must cover the measured widths and clear the
     /// action button that shares the row.
@@ -1856,8 +1932,8 @@ mod tests {
             );
             assert!(body_y > 0.0, "{name} body sits below the window");
             assert!(
-                body_y + body_h <= 194.0,
-                "{name} body overlaps the shared 194pt title row"
+                body_y + body_h <= STEP_TITLE_Y,
+                "{name} body overlaps the shared title row"
             );
         }
         // The permissions status row and the two action buttons sit below their bodies.
@@ -1995,7 +2071,7 @@ mod tests {
         assert!(step.body_y >= step.shortcut_hint_y + step.shortcut_hint_h);
         assert!(step.title_y >= step.body_y + step.body_h);
         assert!(
-            step.title_y + TITLE_H <= WINDOW_H - 34.0,
+            step.title_y + TITLE_H <= WINDOW_H - COUNTER_TOP_INSET - COUNTER_H,
             "the title must clear the step counter pinned near the top edge"
         );
         for (locale, raw) in LOCALE_SOURCES {

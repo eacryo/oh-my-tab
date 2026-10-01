@@ -618,7 +618,7 @@ unsafe fn set_check_loading_frame(button: *mut AnyObject, frame: usize) {
     let loader_font: *mut AnyObject = msg_send![
         class!(NSFont),
         monospacedSystemFontOfSize: button_font_size + 1.0,
-        weight: 0.0f64
+        weight: crate::theme::FONT_WEIGHT_REGULAR
     ];
     let baseline_offset: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
     let font_key = make_nsstring("NSFont");
@@ -685,13 +685,10 @@ unsafe fn start_check_loading_indicator(button: *mut AnyObject) {
     let _: () = msg_send![button, setAccessibilityLabel: accessibility_label];
     crate::ffi::CFRelease(accessibility_label as *const c_void);
 
-    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
-    let reduce_motion: bool = msg_send![workspace, accessibilityDisplayShouldReduceMotion];
-    let cycle_seconds = if reduce_motion {
-        CHECK_LOADING_CYCLE_SECONDS * 2.5
-    } else {
-        CHECK_LOADING_CYCLE_SECONDS
-    };
+    if crate::theme::reduce_motion_enabled() {
+        return;
+    }
+    let cycle_seconds = CHECK_LOADING_CYCLE_SECONDS;
     let interval = cycle_seconds / CHECK_LOADING_FRAMES.len() as f64;
     UPDATE_UI_STATE.lock().unwrap().check_loading_frame = 1;
     let timer: *mut AnyObject = msg_send![
@@ -832,7 +829,8 @@ unsafe fn make_custom_update_window(driver: *mut c_void, cancellation: *mut c_vo
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     let _: () = msg_send![label, setSelectable: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 18.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
     let _: () = msg_send![label, setFont: font];
     add_control(
         target,
@@ -933,7 +931,8 @@ unsafe fn make_custom_result_window(
     let _: () = msg_send![title, setDrawsBackground: false];
     let _: () = msg_send![title, setEditable: false];
     let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 22.0f64];
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
     let _: () = msg_send![title, setFont: title_font];
     add_control(
         target,
@@ -955,7 +954,8 @@ unsafe fn make_custom_result_window(
     let _: () = msg_send![message, setDrawsBackground: false];
     let _: () = msg_send![message, setEditable: false];
     let _: () = msg_send![message, setSelectable: false];
-    let message_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 16.0f64];
+    let message_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
@@ -1032,7 +1032,8 @@ unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void)
     let _: () = msg_send![title, setDrawsBackground: false];
     let _: () = msg_send![title, setEditable: false];
     let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 20.0f64];
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
     let _: () = msg_send![title, setFont: title_font];
     add_control(
         target,
@@ -1053,7 +1054,8 @@ unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void)
     let _: () = msg_send![message, setDrawsBackground: false];
     let _: () = msg_send![message, setEditable: false];
     let _: () = msg_send![message, setSelectable: false];
-    let message_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 15.0f64];
+    let message_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
@@ -1157,6 +1159,20 @@ extern "C" fn defer_automatic_update(_this: *mut c_void, _cmd: Sel, _sender: *mu
 }
 
 /// Build the custom update window's release-notes view from Sparkle's appcast item description.
+fn release_notes_heading_style(level: u8) -> (f64, f64) {
+    if level == 1 {
+        (
+            crate::theme::FONT_SIDEBAR_TITLE,
+            crate::theme::FONT_WEIGHT_BOLD,
+        )
+    } else {
+        (
+            crate::theme::FONT_CONTROL,
+            crate::theme::FONT_WEIGHT_SEMIBOLD,
+        )
+    }
+}
+
 unsafe fn make_release_notes_view(
     item: *mut AnyObject,
     measured_width: ReleaseNotesMeasuredWidth,
@@ -1200,7 +1216,8 @@ unsafe fn make_release_notes_view(
 
     let length: usize = msg_send![attributed, length];
     if length > 0 {
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
         let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
         let font_key = make_nsstring("NSFont");
         let color_key = make_nsstring("NSForegroundColor");
@@ -1217,9 +1234,12 @@ unsafe fn make_release_notes_view(
             range: NSRange::new(0, length)
         ];
         for heading in &document.heading_ranges {
-            let size = if heading.level == 1 { 18.0 } else { 16.0 };
-            let heading_font: *mut AnyObject =
-                msg_send![class!(NSFont), boldSystemFontOfSize: size];
+            let (size, weight) = release_notes_heading_style(heading.level);
+            let heading_font: *mut AnyObject = msg_send![
+                class!(NSFont),
+                systemFontOfSize: size,
+                weight: weight
+            ];
             let _: () = msg_send![
                 attributed,
                 addAttribute: font_key,
@@ -1590,7 +1610,8 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![title, setEditable: false];
     let _: () = msg_send![title, setSelectable: false];
     let _: () = msg_send![title, setAlignment: 1isize]; // centered
-    let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 22.0f64];
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
     let _: () = msg_send![title, setFont: title_font];
     add_control(
         target,
@@ -1613,7 +1634,8 @@ unsafe fn make_custom_update_found_window(
     let _: () = msg_send![message, setEditable: false];
     let _: () = msg_send![message, setSelectable: false];
     let _: () = msg_send![message, setAlignment: 1isize]; // centered
-    let message_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 16.0f64];
+    let message_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
@@ -1763,7 +1785,8 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     let _: () = msg_send![title, setDrawsBackground: false];
     let _: () = msg_send![title, setEditable: false];
     let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 22.0f64];
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
     let _: () = msg_send![title, setFont: title_font];
     add_control(
         target,
@@ -1804,7 +1827,8 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     let _: () = msg_send![status, setDrawsBackground: false];
     let _: () = msg_send![status, setEditable: false];
     let _: () = msg_send![status, setSelectable: false];
-    let status_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 14.0f64];
+    let status_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![status, setFont: status_font];
     add_control(
         target,
@@ -1961,7 +1985,8 @@ unsafe fn make_custom_choice_window(
     let _: () = msg_send![title, setDrawsBackground: false];
     let _: () = msg_send![title, setEditable: false];
     let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject = msg_send![class!(NSFont), boldSystemFontOfSize: 20.0f64];
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
     let _: () = msg_send![title, setFont: title_font];
     add_control(
         target,
@@ -1981,7 +2006,8 @@ unsafe fn make_custom_choice_window(
     let _: () = msg_send![message, setDrawsBackground: false];
     let _: () = msg_send![message, setEditable: false];
     let _: () = msg_send![message, setSelectable: false];
-    let message_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 15.0f64];
+    let message_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![message, setFont: message_font];
     let _: () = msg_send![message, setLineBreakMode: 0u64];
     let _: () = msg_send![message, setMaximumNumberOfLines: 0isize];
@@ -2813,9 +2839,10 @@ pub(crate) fn check_for_updates() -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        inline_layout_scale, is_safe_update_info_url, release_notes_measured_width,
-        render_release_notes_markdown, scale_frame, select_release_notes_locale,
-        update_prompt_kind, RenderTarget, UpdatePromptKind, RELEASE_NOTES_LAYOUT_WIDTH,
+        inline_layout_scale, is_safe_update_info_url, release_notes_heading_style,
+        release_notes_measured_width, render_release_notes_markdown, scale_frame,
+        select_release_notes_locale, update_prompt_kind, RenderTarget, UpdatePromptKind,
+        RELEASE_NOTES_LAYOUT_WIDTH,
     };
     use objc2::runtime::AnyObject;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -2900,6 +2927,24 @@ mod tests {
         assert_eq!(document.heading_ranges.len(), 2);
         assert_eq!(document.heading_ranges[0].level, 1);
         assert_eq!(document.heading_ranges[1].level, 2);
+    }
+
+    #[test]
+    fn release_note_heading_levels_use_documented_typography_tokens() {
+        assert_eq!(
+            release_notes_heading_style(1),
+            (
+                crate::theme::FONT_SIDEBAR_TITLE,
+                crate::theme::FONT_WEIGHT_BOLD
+            )
+        );
+        assert_eq!(
+            release_notes_heading_style(2),
+            (
+                crate::theme::FONT_CONTROL,
+                crate::theme::FONT_WEIGHT_SEMIBOLD
+            )
+        );
     }
 
     #[test]

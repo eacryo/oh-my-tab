@@ -24,7 +24,9 @@ use crate::ffi::{MainThreadSlot, StaticClass};
 const PANEL_H: f64 = 54.0;
 const PANEL_BOTTOM_MARGIN: f64 = 18.0;
 const BADGE_H: f64 = 34.0;
-const HIDE_FADE: Duration = Duration::from_millis(200);
+const HIDE_FADE: Duration = Duration::from_millis(
+    (crate::theme::ANIMATION_DURATION_MEDIUM * crate::theme::ANIMATION_EXIT_RATIO * 1000.0) as u64,
+);
 const PANEL_TIMER_INTERVAL: f64 = 0.016;
 const MAX_MEASUREMENTS: usize = 512;
 const MAX_TEXT_CENTROID_OFFSET: f64 = 2.0;
@@ -531,19 +533,38 @@ pub(super) fn render(
             if state.visible {
                 state.visible = false;
                 state.last_badges.clear();
-                state.fade_deadline = Some(now + HIDE_FADE);
+                let reduce_motion = crate::theme::reduce_motion_enabled();
+                state.fade_deadline = (!reduce_motion).then_some(now + HIDE_FADE);
                 if let Some(panel) = state.panel {
                     unsafe {
-                        let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-                        let context: *mut AnyObject =
-                            msg_send![class!(NSAnimationContext), currentContext];
-                        let _: () = msg_send![context, setDuration: HIDE_FADE.as_secs_f64()];
-                        let animator: *mut AnyObject = msg_send![panel, animator];
-                        let _: () = msg_send![animator, setAlphaValue: 0.0f64];
-                        let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+                        if reduce_motion {
+                            let _: () = msg_send![panel, orderOut: std::ptr::null::<AnyObject>()];
+                            let _: () = msg_send![panel, setAlphaValue: 1.0f64];
+                        } else {
+                            let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+                            let context: *mut AnyObject =
+                                msg_send![class!(NSAnimationContext), currentContext];
+                            let _: () = msg_send![
+                                context,
+                                setDuration: crate::theme::animation_exit_duration(
+                                    crate::theme::ANIMATION_DURATION_MEDIUM
+                                )
+                            ];
+                            let timing = crate::theme::ease_standard_timing_function();
+                            if !timing.is_null() {
+                                let _: () = msg_send![context, setTimingFunction: timing];
+                            }
+                            let animator: *mut AnyObject = msg_send![panel, animator];
+                            let _: () = msg_send![animator, setAlphaValue: 0.0f64];
+                            let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+                        }
                     }
                 } else {
                     state.fade_deadline = None;
+                }
+                if reduce_motion {
+                    state.target_frame = None;
+                    set_grip_mouse_state(&mut state, false, GripCursor::None);
                 }
             } else if state
                 .fade_deadline
@@ -1116,12 +1137,7 @@ pub(super) unsafe fn apply_glass_properties() {
 }
 
 unsafe fn set_alpha_immediately(panel: *mut AnyObject, alpha: f64) {
-    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: 0.0f64];
-    let animator: *mut AnyObject = msg_send![panel, animator];
-    let _: () = msg_send![animator, setAlphaValue: alpha];
-    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+    let _: () = msg_send![panel, setAlphaValue: alpha];
 }
 
 fn cached_badge_width(cache: &mut HashMap<String, f64>, label: &str, repeats: u32) -> f64 {
@@ -1141,8 +1157,7 @@ fn cached_badge_width(cache: &mut HashMap<String, f64>, label: &str, repeats: u3
 
 unsafe fn measure_text_width(text: &str) -> f64 {
     let value = make_nsstring(text);
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: 16.0f64, weight: 0.23f64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR];
     let attributes: *mut AnyObject =
         msg_send![class!(NSDictionary), dictionaryWithObject: font, forKey: NSFontAttributeName];
     let size: NSSize = msg_send![value, sizeWithAttributes: attributes];
@@ -1180,11 +1195,15 @@ unsafe fn rebuild_badges(
         let badge_view: *mut AnyObject = msg_send![badge_view, initWithFrame: NSRect::new(NSPoint::new(x, 10.0), NSSize::new(*width, BADGE_H))];
         let _: () = msg_send![badge_view, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![badge_view, layer];
-        let _: () = msg_send![layer, setCornerRadius: 9.0f64];
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
         let (background, border, text_color) =
             if badge.kind == BadgeKind::Modifier || badge.kind == BadgeKind::Indicator {
-                (0x0A84FF38, 0x0A84FFB0, 0xF8F9FAFF)
+                (
+                    palette.keycap_accent_bg,
+                    palette.keycap_accent_border,
+                    palette.keycap_accent_text,
+                )
             } else {
                 (
                     keycap_fill(palette.card_bg),
@@ -1197,8 +1216,7 @@ unsafe fn rebuild_badges(
         layer_set_background(layer, hex_to_cg_color(background));
         layer_set_border(layer, hex_to_cg_color(border));
 
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 16.0f64, weight: 0.23f64];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR];
         let ascender: f64 = msg_send![font, ascender];
         let descender: f64 = msg_send![font, descender];
         let leading: f64 = msg_send![font, leading];
@@ -1398,6 +1416,11 @@ mod tests {
             assert_eq!(fill & 0xFFFF_FF00, source & 0xFFFF_FF00);
             assert_eq!(fill & 0xFF, KEYCAP_FILL_ALPHA);
         }
+    }
+
+    #[test]
+    fn keycap_hide_fade_uses_the_shared_exit_duration() {
+        assert_eq!(super::HIDE_FADE.as_millis(), 285);
     }
 
     fn virtual_screens() -> [ScreenGeometry; 2] {

@@ -77,7 +77,8 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
     let cap_bg = crate::ffi::hex_to_ns_color(clipboard_palette().field_bg);
     let _: () = msg_send![cap_bg, set];
     let _: () = msg_send![path, fill];
-    let chip_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
+    let chip_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let chip_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let chip_attrs: *mut AnyObject = msg_send![chip_attrs, init];
     let font_key = make_nsstring("NSFont");
@@ -135,7 +136,8 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 16.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let color: *mut AnyObject = if hovered {
         msg_send![
             class!(NSColor),

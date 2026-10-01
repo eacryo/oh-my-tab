@@ -6,7 +6,6 @@
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::sync::atomic::Ordering;
 use std::sync::{LazyLock, Mutex};
 
 use crate::ffi::release_obj;
@@ -16,7 +15,7 @@ use super::{tooltip::SettingsTooltip, widgets, SETTINGS_PAGE_COUNT};
 
 /// Shared dimensions for in-row action buttons.
 pub(crate) const ROW_ACTION_BTN_W: f64 = 110.0;
-pub(crate) const ROW_ACTION_BTN_H: f64 = 28.0;
+pub(crate) const ROW_ACTION_BTN_H: f64 = 32.0;
 
 /// Build an in-row action button aligned to the control column's right edge.
 pub(crate) unsafe fn row_action_button(
@@ -52,12 +51,19 @@ pub(crate) unsafe fn onboarding_switch(
 /// Right-hand read-only readout of a slider row: its width, the gap before it, and its own
 /// height. The readout hugs the slider's right end and is vertically centred on it, so a slider
 /// in such a row takes the control column's width minus the first two.
-const SLIDER_READOUT_W: f64 = 40.0;
-const SLIDER_READOUT_GAP: f64 = 6.0;
-const SLIDER_READOUT_H: f64 = 18.0;
+const SLIDER_READOUT_W: f64 = 44.0;
+const SLIDER_READOUT_GAP: f64 = 8.0;
+const SLIDER_READOUT_H: f64 = 20.0;
+// The macOS SDK uses iOS alignment enum values on arm64 and legacy AppKit values on x86_64.
+const TEXT_ALIGNMENT_RIGHT: isize = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
+const RESTORE_SHELL_INSET: f64 = 8.0;
+const RESTORE_TRIGGER_INSET: f64 = 8.0;
+const RESTORE_CONTAINER_ORIGIN: f64 = 16.0;
+const RESTORE_SIDEBAR_OUTER_INSET: f64 = RESTORE_CONTAINER_ORIGIN + RESTORE_TRIGGER_INSET;
+const RESTORE_ACTION_ROW_GAP: f64 = 16.0;
 
 /// Gap between a card's internal divider and the top edge of the row below it (`separator_above_row`).
-const SEPARATOR_ABOVE_ROW_GAP: f64 = 3.0;
+const SEPARATOR_ABOVE_ROW_GAP: f64 = 4.0;
 
 /// Standard rows keep their label and control as sibling views in the card, so retain the
 /// association here instead of forcing every SettingsUi field to grow a second label pointer.
@@ -84,13 +90,13 @@ pub(super) struct SettingsLayout {
 
 impl SettingsLayout {
     /// Standard visual height of one settings row; controls remain shorter and center inside it.
-    pub(super) const SINGLE_LINE_ROW_H: f64 = 54.0;
-    pub(super) const CONTROL_H: f64 = 34.0;
+    pub(super) const SINGLE_LINE_ROW_H: f64 = 52.0;
+    pub(super) const CONTROL_H: f64 = 32.0;
 
     pub(super) fn new(content_w: f64) -> Self {
         let control_w = 200.0;
         Self {
-            label_x: 12.0,
+            label_x: 16.0,
             label_w: 220.0,
             control_x: content_w - control_w - super::SETTINGS_CONTROL_TRAILING_INSET,
             control_w,
@@ -100,7 +106,7 @@ impl SettingsLayout {
             described_row_h: Self::SINGLE_LINE_ROW_H,
             section_step: super::SETTINGS_SECTION_HEADER_GAP + 24.0,
             row_gap: 8.0,
-            card_bottom_inset: 10.0,
+            card_bottom_inset: 8.0,
             card_header_gap: super::SETTINGS_SECTION_CARD_GAP,
         }
     }
@@ -142,7 +148,7 @@ impl SettingsPage {
     }
 }
 
-/// Page header component: the mockup's big page title (`h1 { font-size: 30px }`) plus its
+/// Page header component: the design system's page title (`26px`) plus its
 /// distance from the pane top (`.content { padding: 42px 0 72px }`), plus the gap down to the
 /// first section heading. Owns the whole page-top block so pages neither hardcode its metrics nor
 /// drift apart: one call returns the cursor that first heading hangs from.
@@ -150,10 +156,10 @@ pub(super) struct SettingsPageHeader;
 
 impl SettingsPageHeader {
     /// Distance from the pane top to the title's frame. The HTML mockup's `.content` padding is
-    /// 42px, but the 30pt title's frame is taller than its ink, so the visible gap was tighter than
-    /// the mockup's; 50 keeps `TOP_PADDING + FIRST_SECTION_GAP` unchanged (everything below the
+    /// 42px, but the 26pt title's frame is taller than its ink, so the visible gap was tighter than
+    /// the mockup's; 48 keeps `TOP_PADDING + FIRST_SECTION_GAP` unchanged (everything below the
     /// title stays where it was) while giving the title the intended breathing room.
-    pub(super) const TOP_PADDING: f64 = 50.0;
+    pub(super) const TOP_PADDING: f64 = 48.0;
 
     /// HTML `.content`'s bottom padding, i.e. the space the page must keep below its last element.
     /// Page documents keep this much space below their lowest content; overshooting it is the dead
@@ -212,11 +218,10 @@ impl SettingsPageHeader {
 }
 
 /// Card component. Rows remain siblings of the card background so native controls keep their
-/// normal hit-testing and z-order; the component owns only the card/shadow pair.
+/// normal hit-testing and z-order; the component owns only the card surface.
 #[derive(Clone, Copy)]
 pub(super) struct SettingsCard {
     pub(super) card: *mut AnyObject,
-    pub(super) shadow: *mut AnyObject,
 }
 
 unsafe impl Send for SettingsCard {}
@@ -224,8 +229,8 @@ unsafe impl Sync for SettingsCard {}
 
 impl SettingsCard {
     pub(super) unsafe fn attach(parent: *mut AnyObject, frame: NSRect) -> Self {
-        let (card, shadow) = widgets::add_settings_card(parent, frame);
-        Self { card, shadow }
+        let card = widgets::add_settings_card(parent, frame);
+        Self { card }
     }
 }
 
@@ -239,7 +244,7 @@ impl SettingsSection {
         title: &str,
     ) -> SettingsCard {
         let header_y = frame.origin.y + frame.size.height + super::SETTINGS_SECTION_CARD_GAP;
-        widgets::add_header(parent, title, 6.0, header_y, frame.size.width);
+        widgets::add_header(parent, title, 0.0, header_y, frame.size.width);
         SettingsCard::attach(parent, widgets::settings_card_rect(frame))
     }
 }
@@ -252,6 +257,12 @@ impl SettingsRow {
     unsafe fn register_label(label: *mut AnyObject, control: *mut AnyObject) {
         if label.is_null() || control.is_null() {
             return;
+        }
+        // VoiceOver: expose the row label as the control's accessibility label (design-style §11).
+        // AppKit does not associate a sibling NSTextField with a control on its own.
+        let text: *mut AnyObject = objc2::msg_send![label, stringValue];
+        if !text.is_null() {
+            let _: () = objc2::msg_send![control, setAccessibilityLabel: text];
         }
         let mut labels = ROW_LABELS.lock().unwrap();
         let control = control as usize;
@@ -387,9 +398,13 @@ impl SettingsRow {
             SLIDER_READOUT_H,
             &format!("{value}"),
         );
-        // The readout centres under the slider's right end (the About page's version value is
-        // Natural; the two play different roles).
-        let _: () = objc2::msg_send![label, setAlignment: 1isize]; // NSTextAlignmentCenter
+        let font: *mut AnyObject = objc2::msg_send![
+            objc2::class!(NSFont),
+            monospacedDigitSystemFontOfSize: crate::theme::FONT_CONTROL,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        let _: () = objc2::msg_send![label, setFont: font];
+        let _: () = objc2::msg_send![label, setAlignment: TEXT_ALIGNMENT_RIGHT];
         let _: () = objc2::msg_send![parent, addSubview: label];
         release_obj(label);
         label
@@ -463,6 +478,24 @@ impl SettingsRow {
         Self::center_control(control, y, row_h);
         Self::register_label(label, control);
         control
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) unsafe fn captioned(
+        parent: *mut AnyObject,
+        x: f64,
+        y: f64,
+        text_w: f64,
+        row_h: f64,
+        title: &str,
+        caption: &str,
+        control: *mut AnyObject,
+    ) -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
+        let (title_label, caption_label, control) =
+            widgets::add_captioned_row(parent, x, y, text_w, row_h, title, caption, control);
+        Self::center_control(control, y, row_h);
+        Self::register_label(title_label, control);
+        (title_label, caption_label, control)
     }
 
     pub(super) unsafe fn tall(
@@ -744,15 +777,13 @@ pub(crate) enum SettingsButtonRole {
 }
 
 impl SettingsButtonRole {
-    fn style(self) -> (u32, u32, isize) {
+    fn style(self, palette: crate::theme::UiPalette) -> (u32, u32, isize) {
         match self {
-            // The generic action uses the translucent light surface shared by small/full actions.
-            Self::Action => (0xFFFFFFAD, 0x2E2E2EFF, -3),
-            // Mapping/edit actions use the denser gray surface but the same generic hover state.
-            Self::Compact => (0x7676801F, 0x44444AFF, 0),
-            Self::Footer => (0xFFFFFFC7, 0x2E2E2EFF, -1),
-            Self::Primary => (0x0A84FFFF, 0xFFFFFFFF, -2),
-            Self::Destructive => (0xFF3B30FF, 0xFFFFFFFF, -4),
+            Self::Action => (palette.button_bg, palette.button_text, -3),
+            Self::Compact => (palette.field_bg, palette.button_text, 0),
+            Self::Footer => (palette.footer_button_bg, palette.button_text, -1),
+            Self::Primary => (palette.accent, palette.accent_text, -2),
+            Self::Destructive => (palette.destructive, palette.accent_text, -4),
         }
     }
 }
@@ -769,7 +800,7 @@ impl SettingsButton {
         action: Sel,
         role: SettingsButtonRole,
     ) -> *mut AnyObject {
-        let (background, text, hover_tag) = role.style();
+        let (background, text, hover_tag) = role.style(crate::theme::ui_palette());
         widgets::make_settings_styled_button(
             frame, title, target, action, background, text, hover_tag,
         )
@@ -798,22 +829,59 @@ pub(super) struct RestoreDefaultsControl {
     pub(super) expanded: bool,
 }
 
+fn restore_surface_frame(container_origin: NSPoint, trigger_frame: NSRect) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            container_origin.x + trigger_frame.origin.x,
+            container_origin.y + trigger_frame.origin.y,
+        ),
+        trigger_frame.size,
+    )
+}
+
+fn restore_shell_frame(collapsed_surface: NSRect, height: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            collapsed_surface.origin.x - RESTORE_SHELL_INSET,
+            collapsed_surface.origin.y - RESTORE_SHELL_INSET,
+        ),
+        NSSize::new(
+            collapsed_surface.size.width + RESTORE_SHELL_INSET * 2.0,
+            height,
+        ),
+    )
+}
+
+fn restore_sidebar_container_frame(sidebar_width: f64, height: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(RESTORE_CONTAINER_ORIGIN, RESTORE_CONTAINER_ORIGIN),
+        NSSize::new(
+            (sidebar_width - RESTORE_CONTAINER_ORIGIN * 2.0).max(1.0),
+            height,
+        ),
+    )
+}
+
+fn restore_sidebar_trigger_frame(sidebar_width: f64, height: f64) -> NSRect {
+    let container_width = sidebar_width - RESTORE_CONTAINER_ORIGIN * 2.0;
+    NSRect::new(
+        NSPoint::new(RESTORE_TRIGGER_INSET, RESTORE_TRIGGER_INSET),
+        NSSize::new(
+            (container_width - RESTORE_TRIGGER_INSET * 2.0).max(1.0),
+            height,
+        ),
+    )
+}
+
 unsafe impl Send for RestoreDefaultsControl {}
 unsafe impl Sync for RestoreDefaultsControl {}
 
 impl RestoreDefaultsControl {
-    // Two timelines matching the reference component: the shell morphs its size, while the
-    // content handles its own enter/exit motion.
-    const SHELL_DURATION: f64 = 0.58;
-    const SHELL_STIFFNESS: f64 = 160.0;
-    const SHELL_DAMPING: f64 = 24.0;
-    const CONTENT_DURATION: f64 = 0.46;
-    const CONTENT_STIFFNESS: f64 = 266.0;
-    const CONTENT_DAMPING: f64 = 30.0;
-    const LABEL_OPEN_DURATION: f64 = 0.38;
-    const LABEL_OPEN_STIFFNESS: f64 = 350.0;
-    const LABEL_OPEN_DAMPING: f64 = 36.0;
-    const LABEL_CLOSE_DURATION: f64 = 0.16;
+    const SHELL_DURATION: f64 = crate::theme::ANIMATION_DURATION_MEDIUM;
+    const CONTENT_DURATION: f64 = crate::theme::ANIMATION_DURATION_MEDIUM;
+    const LABEL_OPEN_DURATION: f64 = crate::theme::ANIMATION_DURATION_FAST;
+    const LABEL_CLOSE_DURATION: f64 =
+        crate::theme::ANIMATION_DURATION_FAST * crate::theme::ANIMATION_EXIT_RATIO;
 
     pub(super) fn empty() -> Self {
         Self {
@@ -835,11 +903,8 @@ impl RestoreDefaultsControl {
         target: *mut AnyObject,
         sidebar_width: f64,
     ) -> Self {
-        let button_w = (sidebar_width - 44.0).max(1.0);
-        let button_frame = NSRect::new(
-            NSPoint::new(8.0, 6.0),
-            objc2_foundation::NSSize::new(button_w, 30.0),
-        );
+        let button_frame = restore_sidebar_trigger_frame(sidebar_width, 32.0);
+        let button_w = button_frame.size.width;
         let trigger_title = t("settings.btn_restore_defaults");
         let confirm_title = t("settings.btn_confirm");
         let cancel_title = t("settings.btn_cancel");
@@ -867,7 +932,7 @@ impl RestoreDefaultsControl {
         let button_h = [trigger, confirm, cancel]
             .into_iter()
             .map(|button| widgets::configure_settings_button_wrapping(button, button_w, 3))
-            .fold(30.0f64, f64::max);
+            .fold(32.0f64, f64::max);
         let button_frame = NSRect::new(
             button_frame.origin,
             objc2_foundation::NSSize::new(button_w, button_h),
@@ -877,16 +942,17 @@ impl RestoreDefaultsControl {
             widgets::center_settings_button_label(button, button_h);
             widgets::refresh_settings_button_tracking(button);
         }
-        let collapsed_h = button_h + 12.0;
-        let expanded_h = button_h * 2.0 + 32.0;
-        let confirm_y = button_h + 20.0;
-        let container_y = 14.0;
+        let collapsed_h = button_h + RESTORE_SHELL_INSET * 2.0;
+        let expanded_h = button_h * 2.0 + RESTORE_ACTION_ROW_GAP + RESTORE_SHELL_INSET * 2.0;
+        let confirm_y = RESTORE_TRIGGER_INSET + button_h + RESTORE_ACTION_ROW_GAP;
+        let container_y = RESTORE_CONTAINER_ORIGIN;
+        let separator_x = RESTORE_SIDEBAR_OUTER_INSET;
         let separator: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let separator: *mut AnyObject = objc2::msg_send![
             separator,
             initWithFrame: NSRect::new(
-                NSPoint::new(26.0, container_y + collapsed_h + 5.0),
-                objc2_foundation::NSSize::new(sidebar_width - 52.0, 1.0),
+                NSPoint::new(separator_x, container_y + collapsed_h + 4.0),
+                objc2_foundation::NSSize::new(sidebar_width - separator_x * 2.0, 1.0),
             )
         ];
         let _: () = objc2::msg_send![separator, setWantsLayer: true];
@@ -902,13 +968,16 @@ impl RestoreDefaultsControl {
         // The expanded card is a separate surface behind the buttons. Keeping it outside the
         // button container lets the compact trigger retain its original look while the card
         // fades/grows in as one rounded surface.
+        let initial_trigger_frame =
+            NSRect::new(button_frame.origin, NSSize::new(button_w, button_h));
+        let initial_surface_frame = restore_surface_frame(
+            NSPoint::new(container_y, container_y),
+            initial_trigger_frame,
+        );
         let surface: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let surface: *mut AnyObject = objc2::msg_send![
             surface,
-            initWithFrame: NSRect::new(
-                NSPoint::new(22.0, container_y + 6.0),
-                objc2_foundation::NSSize::new(button_w, button_h),
-            )
+            initWithFrame: initial_surface_frame
         ];
         let _: () = objc2::msg_send![surface, setWantsLayer: true];
         let surface_layer: *mut AnyObject = objc2::msg_send![surface, layer];
@@ -923,11 +992,8 @@ impl RestoreDefaultsControl {
                 crate::ffi::hex_to_cg_color(palette.card_border),
             );
             let _: () = objc2::msg_send![surface_layer, setBorderWidth: 1.0f64];
-            let _: () = objc2::msg_send![surface_layer, setCornerRadius: 14.0f64];
-            let _: () = objc2::msg_send![surface_layer, setMasksToBounds: false];
-            let _: () = objc2::msg_send![surface_layer, setShadowOpacity: 0.0f32];
-            let _: () = objc2::msg_send![surface_layer, setShadowRadius: 8.0f64];
-            let _: () = objc2::msg_send![surface_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
+            let _: () = objc2::msg_send![surface_layer, setCornerRadius: crate::theme::RADIUS_CARD];
+            let _: () = objc2::msg_send![surface_layer, setMasksToBounds: true];
         }
         // Collapsed state: the shell stays fully hidden. It shares the trigger's frame, and its
         // own hairline border composites with the trigger's border into a muddy double ring
@@ -937,13 +1003,11 @@ impl RestoreDefaultsControl {
         let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![parent, addSubview: surface];
 
+        let container_frame = restore_sidebar_container_frame(sidebar_width, collapsed_h);
         let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let container: *mut AnyObject = objc2::msg_send![
             container,
-            initWithFrame: NSRect::new(
-                NSPoint::new(container_y, container_y),
-                objc2_foundation::NSSize::new(sidebar_width - 28.0, collapsed_h),
-            )
+            initWithFrame: container_frame
         ];
         let _: () = objc2::msg_send![container, setAutoresizingMask: 36u64];
         let _: () = objc2::msg_send![container, setWantsLayer: true];
@@ -952,7 +1016,8 @@ impl RestoreDefaultsControl {
             // Match the reference root's `overflow-hidden`: the upper row is revealed only as
             // the shell grows past it.
             let _: () = objc2::msg_send![container_layer, setMasksToBounds: true];
-            let _: () = objc2::msg_send![container_layer, setCornerRadius: 14.0f64];
+            let _: () =
+                objc2::msg_send![container_layer, setCornerRadius: crate::theme::RADIUS_CARD];
         }
         let _: () = objc2::msg_send![parent, addSubview: container];
 
@@ -1006,11 +1071,11 @@ impl RestoreDefaultsControl {
         width: f64,
     ) -> Self {
         let button_w = width.clamp(1.0, 180.0);
-        let horizontal_inset = 8.0;
+        let horizontal_inset = RESTORE_TRIGGER_INSET;
         let container_w = button_w + horizontal_inset * 2.0;
         let button_frame = NSRect::new(
-            NSPoint::new(horizontal_inset, 6.0),
-            objc2_foundation::NSSize::new(button_w, 30.0),
+            NSPoint::new(horizontal_inset, RESTORE_TRIGGER_INSET),
+            objc2_foundation::NSSize::new(button_w, 32.0),
         );
         let trigger_title = t("settings.btn_restore_page_defaults");
         let confirm_title = t("settings.btn_confirm");
@@ -1024,8 +1089,11 @@ impl RestoreDefaultsControl {
         );
         let confirm = SettingsButton::action(
             NSRect::new(
-                NSPoint::new(horizontal_inset, 54.0),
-                objc2_foundation::NSSize::new(button_w, 30.0),
+                NSPoint::new(
+                    horizontal_inset,
+                    RESTORE_TRIGGER_INSET + 32.0 + RESTORE_ACTION_ROW_GAP,
+                ),
+                objc2_foundation::NSSize::new(button_w, 32.0),
             ),
             &confirm_title,
             target,
@@ -1042,10 +1110,10 @@ impl RestoreDefaultsControl {
         let button_h = [trigger, confirm, cancel]
             .into_iter()
             .map(|button| widgets::configure_settings_button_wrapping(button, button_w, 3))
-            .fold(30.0f64, f64::max);
-        let collapsed_h = button_h + 12.0;
-        let expanded_h = button_h * 2.0 + 32.0;
-        let confirm_y = button_h + 20.0;
+            .fold(32.0f64, f64::max);
+        let collapsed_h = button_h + RESTORE_SHELL_INSET * 2.0;
+        let expanded_h = button_h * 2.0 + RESTORE_ACTION_ROW_GAP + RESTORE_SHELL_INSET * 2.0;
+        let confirm_y = RESTORE_TRIGGER_INSET + button_h + RESTORE_ACTION_ROW_GAP;
         let container_frame = NSRect::new(
             NSPoint::new(x + width - container_w, y_bottom - collapsed_h),
             objc2_foundation::NSSize::new(container_w, collapsed_h),
@@ -1062,13 +1130,17 @@ impl RestoreDefaultsControl {
             // Match the reference root's `overflow-hidden`: the upper row is revealed only as
             // the shell grows past it.
             let _: () = objc2::msg_send![container_layer, setMasksToBounds: true];
-            let _: () = objc2::msg_send![container_layer, setCornerRadius: 14.0f64];
+            let _: () =
+                objc2::msg_send![container_layer, setCornerRadius: crate::theme::RADIUS_CARD];
         }
 
         // Keep the trigger compact and pinned to the page content's bottom-right; the expanded
         // confirm/cancel rows reuse the same width.
         for button in [trigger, confirm, cancel] {
             let mut frame: NSRect = objc2::msg_send![button, frame];
+            if button == confirm {
+                frame.origin.y = confirm_y;
+            }
             frame.size.height = button_h;
             let _: () = objc2::msg_send![button, setFrame: frame];
             widgets::center_settings_button_label(button, button_h);
@@ -1078,14 +1150,13 @@ impl RestoreDefaultsControl {
         // The expanded card is a separate surface behind the buttons that fades in and grows
         // upward as one rounded unit.
         // Collapsed shell stays hidden (same double-ring reason as the sidebar variant).
+        let initial_trigger_frame =
+            NSRect::new(button_frame.origin, NSSize::new(button_w, button_h));
+        let initial_surface_frame =
+            restore_surface_frame(container_frame.origin, initial_trigger_frame);
         let surface: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
-        let surface: *mut AnyObject = objc2::msg_send![surface, initWithFrame: NSRect::new(
-            NSPoint::new(
-                container_frame.origin.x + horizontal_inset,
-                container_frame.origin.y + 6.0,
-            ),
-            objc2_foundation::NSSize::new(button_w, button_h),
-        )];
+        let surface: *mut AnyObject =
+            objc2::msg_send![surface, initWithFrame: initial_surface_frame];
         let _: () = objc2::msg_send![surface, setHidden: true];
         let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![surface, setWantsLayer: true];
@@ -1101,11 +1172,8 @@ impl RestoreDefaultsControl {
                 crate::ffi::hex_to_cg_color(palette.card_border),
             );
             let _: () = objc2::msg_send![surface_layer, setBorderWidth: 1.0f64];
-            let _: () = objc2::msg_send![surface_layer, setCornerRadius: 14.0f64];
-            let _: () = objc2::msg_send![surface_layer, setMasksToBounds: false];
-            let _: () = objc2::msg_send![surface_layer, setShadowOpacity: 0.0f32];
-            let _: () = objc2::msg_send![surface_layer, setShadowRadius: 8.0f64];
-            let _: () = objc2::msg_send![surface_layer, setShadowOffset: NSSize::new(0.0, -1.0)];
+            let _: () = objc2::msg_send![surface_layer, setCornerRadius: crate::theme::RADIUS_CARD];
+            let _: () = objc2::msg_send![surface_layer, setMasksToBounds: true];
         }
         let _: () = objc2::msg_send![parent, addSubview: surface];
         // The container (with the buttons) must join the hierarchy ABOVE the surface.
@@ -1134,8 +1202,7 @@ impl RestoreDefaultsControl {
             surface,
             container,
             separator: std::ptr::null_mut(),
-            // The cancel row shares the trigger's position (y=6); the rows keep a 14pt gap
-            // with 12pt of top padding above Confirm.
+            // The cancel row shares the trigger's position; the two action rows keep a 16pt gap.
             confirm_y,
             collapsed_h,
             expanded_h,
@@ -1174,7 +1241,7 @@ impl RestoreDefaultsControl {
             return;
         }
         self.expanded = expanded;
-        let animated = animated && !Self::accessibility_reduce_motion();
+        let animated = animated && !crate::theme::reduce_motion_enabled();
 
         let trigger_frame: NSRect = objc2::msg_send![self.trigger, frame];
         let container_frame: NSRect = objc2::msg_send![self.container, frame];
@@ -1211,35 +1278,27 @@ impl RestoreDefaultsControl {
         let target_separator = if self.separator.is_null() {
             separator_frame
         } else {
+            let shell_growth = self.expanded_h - self.collapsed_h;
             let target_separator_y = if expanded {
-                separator_frame.origin.y + 51.0
+                separator_frame.origin.y + shell_growth
             } else {
-                separator_frame.origin.y - 51.0
+                separator_frame.origin.y - shell_growth
             };
             NSRect::new(
                 NSPoint::new(separator_frame.origin.x, target_separator_y),
                 separator_frame.size,
             )
         };
-        let target_container = NSRect::new(
-            container_frame.origin,
-            objc2_foundation::NSSize::new(
-                container_frame.size.width,
-                if expanded {
-                    self.expanded_h
-                } else {
-                    self.collapsed_h
-                },
-            ),
-        );
-        // The shell starts exactly behind the trigger and grows outward by 8pt on each side,
-        // while its bottom edge stays fixed. This also keeps the compact outline fully covered.
-        let collapsed_surface = NSRect::new(
-            NSPoint::new(
-                container_frame.origin.x + trigger_frame.origin.x,
-                container_frame.origin.y + trigger_frame.origin.y,
-            ),
-            trigger_frame.size,
+        // Keep the collapsed shell exactly under the trigger; expansion adds the same inset on
+        // each side, so the trigger remains centered in the rounded surface.
+        let collapsed_surface = restore_surface_frame(container_frame.origin, trigger_frame);
+        let target_container = restore_shell_frame(
+            collapsed_surface,
+            if expanded {
+                self.expanded_h
+            } else {
+                self.collapsed_h
+            },
         );
         let target_surface = if expanded {
             target_container
@@ -1278,12 +1337,10 @@ impl RestoreDefaultsControl {
                     Self::LABEL_CLOSE_DURATION,
                     "restore-trigger-close",
                 );
-                Self::animate_spring_opacity(
+                Self::animate_motion_opacity(
                     self.cancel,
                     1.0,
                     Self::LABEL_OPEN_DURATION,
-                    Self::LABEL_OPEN_STIFFNESS,
-                    Self::LABEL_OPEN_DAMPING,
                     "restore-cancel-open",
                 );
                 Self::animate_content_open(self.confirm);
@@ -1312,12 +1369,10 @@ impl RestoreDefaultsControl {
                     Self::LABEL_CLOSE_DURATION,
                     "restore-cancel-close",
                 );
-                Self::animate_spring_opacity(
+                Self::animate_motion_opacity(
                     self.trigger,
                     1.0,
                     Self::LABEL_OPEN_DURATION,
-                    Self::LABEL_OPEN_STIFFNESS,
-                    Self::LABEL_OPEN_DAMPING,
                     "restore-trigger-open",
                 );
                 // Fade the shell with the shrink so it never ends up painting behind the
@@ -1347,54 +1402,27 @@ impl RestoreDefaultsControl {
         }
 
         if animated {
-            // Exact beUI timing: shell spring 0.58s with a restrained 0.06 bounce. The native
-            // stiffness/damping pair is calibrated to that low-bounce duration.
-            Self::spring_view_frame(
+            Self::animate_view_frame(
                 self.surface,
                 target_surface,
                 Self::SHELL_DURATION,
-                Self::SHELL_STIFFNESS,
-                Self::SHELL_DAMPING,
                 "restore-shell",
             );
-            let surface_layer: *mut AnyObject = objc2::msg_send![self.surface, layer];
-            if !surface_layer.is_null() {
-                let target_shadow = if expanded { 0.12 } else { 0.0 };
-                let from_shadow = Self::presentation_scalar(
-                    surface_layer,
-                    "shadowOpacity",
-                    if expanded { 0.0 } else { 0.12 },
-                );
-                Self::animate_spring_scalar(
-                    surface_layer,
-                    "shadowOpacity",
-                    from_shadow,
-                    target_shadow,
-                    Self::SHELL_DURATION,
-                    Self::SHELL_STIFFNESS,
-                    Self::SHELL_DAMPING,
-                    "restore-shell-shadow",
-                );
-            }
-            Self::spring_view_frame(
+            Self::animate_view_frame(
                 self.container,
                 target_container,
                 Self::SHELL_DURATION,
-                Self::SHELL_STIFFNESS,
-                Self::SHELL_DAMPING,
                 "restore-clip",
             );
             if !self.separator.is_null() {
-                Self::spring_view_frame(
+                Self::animate_view_frame(
                     self.separator,
                     target_separator,
                     Self::SHELL_DURATION,
-                    Self::SHELL_STIFFNESS,
-                    Self::SHELL_DAMPING,
                     "restore-divider",
                 );
             }
-            Self::spring_view_frame(
+            Self::animate_view_frame(
                 self.confirm,
                 if expanded {
                     confirm_frame
@@ -1402,17 +1430,10 @@ impl RestoreDefaultsControl {
                     confirm_collapsed_frame
                 },
                 Self::CONTENT_DURATION,
-                Self::CONTENT_STIFFNESS,
-                Self::CONTENT_DAMPING,
                 "restore-confirm-frame",
             );
         } else {
             let _: () = objc2::msg_send![self.surface, setFrame: target_surface];
-            let surface_layer: *mut AnyObject = objc2::msg_send![self.surface, layer];
-            if !surface_layer.is_null() {
-                let shadow_opacity = if expanded { 0.12f32 } else { 0.0f32 };
-                let _: () = objc2::msg_send![surface_layer, setShadowOpacity: shadow_opacity];
-            }
             let _: () = objc2::msg_send![self.container, setFrame: target_container];
             if !self.separator.is_null() {
                 let _: () = objc2::msg_send![self.separator, setFrame: target_separator];
@@ -1428,23 +1449,10 @@ impl RestoreDefaultsControl {
         }
     }
 
-    unsafe fn accessibility_reduce_motion() -> bool {
-        let workspace: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSWorkspace), sharedWorkspace];
-        if workspace.is_null()
-            || !objc2::msg_send![workspace, respondsToSelector: objc2::sel!(accessibilityDisplayShouldReduceMotion)]
-        {
-            return false;
-        }
-        objc2::msg_send![workspace, accessibilityDisplayShouldReduceMotion]
-    }
-
-    unsafe fn spring_view_frame(
+    unsafe fn animate_view_frame(
         view: *mut AnyObject,
         target_frame: NSRect,
         duration: f64,
-        stiffness: f64,
-        damping: f64,
         key_prefix: &str,
     ) {
         let layer: *mut AnyObject = objc2::msg_send![view, layer];
@@ -1476,14 +1484,12 @@ impl RestoreDefaultsControl {
             objc2::msg_send![objc2::class!(NSValue), valueWithRect: from_bounds];
         let to_bounds_value: *mut AnyObject =
             objc2::msg_send![objc2::class!(NSValue), valueWithRect: to_bounds];
-        Self::add_spring_value(
+        Self::add_motion_value(
             layer,
             "bounds",
             from_bounds_value,
             to_bounds_value,
             duration,
-            stiffness,
-            damping,
             &format!("{key_prefix}-bounds"),
         );
 
@@ -1491,42 +1497,40 @@ impl RestoreDefaultsControl {
             objc2::msg_send![objc2::class!(NSValue), valueWithPoint: from_position];
         let to_position_value: *mut AnyObject =
             objc2::msg_send![objc2::class!(NSValue), valueWithPoint: to_position];
-        Self::add_spring_value(
+        Self::add_motion_value(
             layer,
             "position",
             from_position_value,
             to_position_value,
             duration,
-            stiffness,
-            damping,
             &format!("{key_prefix}-position"),
         );
     }
 
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn add_spring_value(
+    unsafe fn add_motion_value(
         layer: *mut AnyObject,
         key_path: &str,
         from: *mut AnyObject,
         to: *mut AnyObject,
         duration: f64,
-        stiffness: f64,
-        damping: f64,
         animation_key: &str,
     ) {
+        if crate::theme::reduce_motion_enabled() {
+            return;
+        }
         let key_path = crate::ffi::make_nsstring(key_path);
         let animation: *mut AnyObject = objc2::msg_send![
-            objc2::class!(CASpringAnimation),
+            objc2::class!(CABasicAnimation),
             animationWithKeyPath: key_path
         ];
         crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
         let _: () = objc2::msg_send![animation, setFromValue: from];
         let _: () = objc2::msg_send![animation, setToValue: to];
-        let _: () = objc2::msg_send![animation, setMass: 1.0f64];
-        let _: () = objc2::msg_send![animation, setStiffness: stiffness];
-        let _: () = objc2::msg_send![animation, setDamping: damping];
-        let _: () = objc2::msg_send![animation, setInitialVelocity: 0.0f64];
         let _: () = objc2::msg_send![animation, setDuration: duration];
+        let timing = crate::theme::ease_standard_timing_function();
+        if !timing.is_null() {
+            let _: () = objc2::msg_send![animation, setTimingFunction: timing];
+        }
         let animation_key = crate::ffi::make_nsstring(animation_key);
         let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
         crate::ffi::CFRelease(animation_key as *const std::ffi::c_void);
@@ -1555,15 +1559,12 @@ impl RestoreDefaultsControl {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    unsafe fn animate_spring_scalar(
+    unsafe fn animate_motion_scalar(
         layer: *mut AnyObject,
         key_path: &str,
         from: f64,
         to: f64,
         duration: f64,
-        stiffness: f64,
-        damping: f64,
         animation_key: &str,
     ) {
         let from: *mut AnyObject =
@@ -1574,24 +1575,13 @@ impl RestoreDefaultsControl {
         let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
         Self::set_layer_scalar(layer, key_path, to);
         let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-        Self::add_spring_value(
-            layer,
-            key_path,
-            from,
-            to_value,
-            duration,
-            stiffness,
-            damping,
-            animation_key,
-        );
+        Self::add_motion_value(layer, key_path, from, to_value, duration, animation_key);
     }
 
-    unsafe fn animate_spring_opacity(
+    unsafe fn animate_motion_opacity(
         view: *mut AnyObject,
         target: f64,
         duration: f64,
-        stiffness: f64,
-        damping: f64,
         animation_key: &str,
     ) {
         let layer: *mut AnyObject = objc2::msg_send![view, layer];
@@ -1604,16 +1594,7 @@ impl RestoreDefaultsControl {
         // AppKit does not reliably mirror direct CALayer opacity writes back to alphaValue.
         // Update both so later animated and immediate transitions share one model value.
         let _: () = objc2::msg_send![view, setAlphaValue: target];
-        Self::animate_spring_scalar(
-            layer,
-            "opacity",
-            from,
-            target,
-            duration,
-            stiffness,
-            damping,
-            animation_key,
-        );
+        Self::animate_motion_scalar(layer, "opacity", from, target, duration, animation_key);
     }
 
     unsafe fn animate_basic_opacity(
@@ -1661,6 +1642,9 @@ impl RestoreDefaultsControl {
         let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
         Self::set_layer_scalar(layer, key_path, to);
         let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+        if crate::theme::reduce_motion_enabled() {
+            return;
+        }
         let key_path = crate::ffi::make_nsstring(key_path);
         let animation: *mut AnyObject = objc2::msg_send![
             objc2::class!(CABasicAnimation),
@@ -1670,22 +1654,7 @@ impl RestoreDefaultsControl {
         let _: () = objc2::msg_send![animation, setFromValue: from_value];
         let _: () = objc2::msg_send![animation, setToValue: to_value];
         let _: () = objc2::msg_send![animation, setDuration: duration];
-        // `functionWithControlPoints::::` has unlabeled selector segments that `msg_send!`
-        // cannot express, so call it through the typed Objective-C entry point.
-        extern "C" {
-            fn objc_msgSend();
-        }
-        type TimingFunction =
-            unsafe extern "C" fn(*mut AnyObject, Sel, f32, f32, f32, f32) -> *mut AnyObject;
-        let make_timing: TimingFunction = std::mem::transmute(objc_msgSend as *const ());
-        let timing = make_timing(
-            objc2::class!(CAMediaTimingFunction) as *const _ as *mut AnyObject,
-            objc2::sel!(functionWithControlPoints::::),
-            0.16,
-            1.0,
-            0.3,
-            1.0,
-        );
+        let timing = crate::theme::ease_standard_timing_function();
         if !timing.is_null() {
             let _: () = objc2::msg_send![animation, setTimingFunction: timing];
         }
@@ -1717,34 +1686,28 @@ impl RestoreDefaultsControl {
         Self::set_content_model(view, 1.0, 0.0, 1.0);
         // Exact CONTENT_VARIANTS + CONTENT_SPRING mapping from the reference. AppKit's positive
         // Y points upward, so CSS y:-8 maps to native y:+8.
-        Self::animate_spring_scalar(
+        Self::animate_motion_scalar(
             layer,
             "opacity",
             0.0,
             1.0,
             Self::CONTENT_DURATION,
-            Self::CONTENT_STIFFNESS,
-            Self::CONTENT_DAMPING,
             "restore-content-opacity",
         );
-        Self::animate_spring_scalar(
+        Self::animate_motion_scalar(
             layer,
             "transform.translation.y",
             8.0,
             0.0,
             Self::CONTENT_DURATION,
-            Self::CONTENT_STIFFNESS,
-            Self::CONTENT_DAMPING,
             "restore-content-y",
         );
-        Self::animate_spring_scalar(
+        Self::animate_motion_scalar(
             layer,
             "transform.scale",
             0.98,
             1.0,
             Self::CONTENT_DURATION,
-            Self::CONTENT_STIFFNESS,
-            Self::CONTENT_DAMPING,
             "restore-content-scale",
         );
     }
@@ -1764,7 +1727,7 @@ impl RestoreDefaultsControl {
             "opacity",
             opacity,
             0.0,
-            0.08,
+            crate::theme::animation_exit_duration(Self::CONTENT_DURATION),
             "restore-content-opacity",
         );
         Self::animate_basic_scalar(
@@ -1772,7 +1735,7 @@ impl RestoreDefaultsControl {
             "transform.translation.y",
             y,
             6.0,
-            0.08,
+            crate::theme::animation_exit_duration(Self::CONTENT_DURATION),
             "restore-content-y",
         );
         Self::animate_basic_scalar(
@@ -1780,7 +1743,7 @@ impl RestoreDefaultsControl {
             "transform.scale",
             scale,
             0.98,
-            0.08,
+            crate::theme::animation_exit_duration(Self::CONTENT_DURATION),
             "restore-content-scale",
         );
     }
@@ -1825,7 +1788,7 @@ impl SettingsSidebarIcon {
 fn sidebar_item_frames(w: f64, row_h: f64) -> (NSRect, NSRect) {
     const ICON_X: f64 = 16.0;
     const ICON_SIZE: f64 = 18.0;
-    const LABEL_X: f64 = 46.0;
+    const LABEL_X: f64 = 48.0;
     let icon_frame = NSRect::new(
         objc2_foundation::NSPoint::new(ICON_X, (row_h - ICON_SIZE) / 2.0),
         objc2_foundation::NSSize::new(ICON_SIZE, ICON_SIZE),
@@ -1842,7 +1805,7 @@ fn sidebar_item_frames(w: f64, row_h: f64) -> (NSRect, NSRect) {
 /// source with button creation (entries.len()), so adding a sidebar entry keeps the
 /// tracker in sync automatically -- the previous hardcoded 6-row rect left the 7th
 /// entry outside the tracker, so leaving the sidebar through that last row produced
-/// no exit event and the shared hover pill stuck on it.
+/// no exit event and left its hover fill active.
 fn sidebar_tracking_rect(x: f64, y_top: f64, w: f64, row_h: f64, row_count: usize) -> NSRect {
     let row_step = row_h + 4.0;
     let spanned = row_count.saturating_sub(1) as f64;
@@ -1879,222 +1842,12 @@ impl SettingsSidebar {
         let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
     }
 
-    /// Move a layer-backed view's center along the sidebar using one layer position animation.
-    unsafe fn spring_move_view(
-        view: *mut AnyObject,
-        frame: NSRect,
-        animation_key_name: &str,
-        stiffness: f64,
-        damping: f64,
-    ) {
-        let layer: *mut AnyObject = objc2::msg_send![view, layer];
-        if layer.is_null() {
-            Self::set_frame_without_implicit_animation(view, frame);
-            return;
-        }
-        // NSView backing layers are not guaranteed to use a centered anchor point. Derive the
-        // target from the layer's actual anchor so `position` remains equivalent to this frame.
-        let anchor: NSPoint = objc2::msg_send![layer, anchorPoint];
-        let target_x = frame.origin.x + frame.size.width * anchor.x;
-        let target_y = frame.origin.y + frame.size.height * anchor.y;
-        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
-        let from_position: NSPoint = if presentation.is_null() {
-            objc2::msg_send![layer, position]
-        } else {
-            objc2::msg_send![presentation, position]
-        };
-        let animation_key = crate::ffi::make_nsstring(animation_key_name);
-        let _: () = objc2::msg_send![layer, removeAnimationForKey: animation_key];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
-        let _: () = objc2::msg_send![
-            objc2::class!(CATransaction),
-            setDisableActions: true
-        ];
-        let _: () = objc2::msg_send![
-            layer,
-            setPosition: NSPoint::new(target_x, target_y)
-        ];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-
-        let key_path = crate::ffi::make_nsstring("position.y");
-        let from_value: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: from_position.y];
-        let target_value: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSNumber), numberWithDouble: target_y];
-        let animation: *mut AnyObject = objc2::msg_send![
-            objc2::class!(CASpringAnimation),
-            animationWithKeyPath: key_path
-        ];
-        let _: () = objc2::msg_send![animation, setFromValue: from_value];
-        let _: () = objc2::msg_send![animation, setToValue: target_value];
-        let _: () = objc2::msg_send![animation, setMass: 0.6f64];
-        let _: () = objc2::msg_send![animation, setStiffness: stiffness];
-        let _: () = objc2::msg_send![animation, setDamping: damping];
-        let _: () = objc2::msg_send![animation, setInitialVelocity: 0.0f64];
-        let duration: f64 = objc2::msg_send![animation, settlingDuration];
-        let _: () = objc2::msg_send![animation, setDuration: duration];
-        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
-        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
-        crate::ffi::CFRelease(animation_key as *const std::ffi::c_void);
-    }
-
-    /// Fade a sidebar background layer from its current presentation opacity to the target.
-    unsafe fn fade_view(view: *mut AnyObject, target_opacity: f32, animation_key_name: &str) {
-        let layer: *mut AnyObject = objc2::msg_send![view, layer];
-        if layer.is_null() {
-            let _: () = objc2::msg_send![view, setAlphaValue: target_opacity as f64];
-            return;
-        }
-        let presentation: *mut AnyObject = objc2::msg_send![layer, presentationLayer];
-        let from_opacity: f32 = if presentation.is_null() {
-            objc2::msg_send![layer, opacity]
-        } else {
-            objc2::msg_send![presentation, opacity]
-        };
-        let animation_key = crate::ffi::make_nsstring(animation_key_name);
-        let _: () = objc2::msg_send![layer, removeAnimationForKey: animation_key];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
-        let _: () = objc2::msg_send![
-            objc2::class!(CATransaction),
-            setDisableActions: true
-        ];
-        let _: () = objc2::msg_send![layer, setOpacity: target_opacity];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-        let key_path = crate::ffi::make_nsstring("opacity");
-        let animation: *mut AnyObject = objc2::msg_send![
-            objc2::class!(CABasicAnimation),
-            animationWithKeyPath: key_path
-        ];
-        let from: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSNumber), numberWithFloat: from_opacity];
-        let to: *mut AnyObject =
-            objc2::msg_send![objc2::class!(NSNumber), numberWithFloat: target_opacity];
-        let _: () = objc2::msg_send![animation, setFromValue: from];
-        let _: () = objc2::msg_send![animation, setToValue: to];
-        let _: () = objc2::msg_send![animation, setDuration: 0.15f64];
-        let _: () = objc2::msg_send![layer, addAnimation: animation, forKey: animation_key];
-        crate::ffi::CFRelease(key_path as *const std::ffi::c_void);
-        crate::ffi::CFRelease(animation_key as *const std::ffi::c_void);
-    }
-
-    /// Move the active-row background with beUI's shared-layout spring.
-    pub(super) unsafe fn move_highlight(highlight: *mut AnyObject, frame: NSRect, animated: bool) {
+    /// Keep sidebar selection immediate while users move through the page list.
+    pub(super) unsafe fn move_highlight(highlight: *mut AnyObject, frame: NSRect) {
         if highlight.is_null() {
             return;
         }
-        if !animated {
-            Self::set_frame_without_implicit_animation(highlight, frame);
-            return;
-        }
-        Self::spring_move_view(
-            highlight,
-            frame,
-            "settings-sidebar-highlight-spring",
-            360.0,
-            32.0,
-        );
-    }
-
-    /// Move the shared hover pill using the normal sidebar spring.
-    unsafe fn move_hover_highlight_with_spring(
-        hover: *mut AnyObject,
-        frame: NSRect,
-        stiffness: f64,
-        damping: f64,
-    ) {
-        if hover.is_null() {
-            return;
-        }
-        let was_visible = widgets::SIDEBAR_HOVER_VISIBLE.swap(true, Ordering::SeqCst);
-        if was_visible {
-            Self::spring_move_view(
-                hover,
-                frame,
-                "settings-sidebar-hover-spring",
-                stiffness,
-                damping,
-            );
-        } else {
-            Self::set_frame_without_implicit_animation(hover, frame);
-            Self::fade_view(hover, 1.0, "settings-sidebar-hover-opacity");
-        }
-    }
-
-    /// Move the shared hover pill with the faster re-entry spring.
-    pub(super) unsafe fn move_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
-        Self::move_hover_highlight_with_spring(hover, frame, 360.0, 32.0);
-    }
-
-    /// Prime the hover pill at the clicked row while keeping it invisible until the next row.
-    pub(super) unsafe fn prime_hover_highlight(hover: *mut AnyObject, frame: NSRect) {
-        if hover.is_null() {
-            return;
-        }
-        let layer: *mut AnyObject = objc2::msg_send![hover, layer];
-        if layer.is_null() {
-            Self::set_frame_without_implicit_animation(hover, frame);
-            let _: () = objc2::msg_send![hover, setAlphaValue: 0.0f64];
-            return;
-        }
-        let opacity_key = crate::ffi::make_nsstring("settings-sidebar-hover-opacity");
-        let position_key = crate::ffi::make_nsstring("settings-sidebar-hover-spring");
-        let _: () = objc2::msg_send![layer, removeAnimationForKey: opacity_key];
-        let _: () = objc2::msg_send![layer, removeAnimationForKey: position_key];
-        crate::ffi::CFRelease(opacity_key as *const std::ffi::c_void);
-        crate::ffi::CFRelease(position_key as *const std::ffi::c_void);
-        Self::set_frame_without_implicit_animation(hover, frame);
-        let _: () = objc2::msg_send![layer, setOpacity: 0.0f32];
-    }
-
-    /// Move the primed hover pill from the clicked row and reveal it at the next row.
-    pub(super) unsafe fn move_hover_highlight_after_selection(
-        hover: *mut AnyObject,
-        frame: NSRect,
-    ) {
-        if hover.is_null() {
-            return;
-        }
-        Self::spring_move_view(hover, frame, "settings-sidebar-hover-spring", 360.0, 32.0);
-        Self::fade_view(hover, 1.0, "settings-sidebar-hover-opacity");
-    }
-
-    /// Re-entry (pointer returning to the sidebar from the detail pane / window edges) keeps the
-    /// pre-refinement tuning used before the tracker change.
-    pub(super) unsafe fn move_hover_highlight_on_reentry(hover: *mut AnyObject, frame: NSRect) {
-        Self::move_hover_highlight_with_spring(hover, frame, 500.0, 30.0);
-    }
-
-    /// Hide the shared hover pill after the pointer leaves the whole menu.
-    pub(super) unsafe fn hide_hover_highlight(hover: *mut AnyObject) {
-        if hover.is_null() {
-            return;
-        }
-        if widgets::SIDEBAR_HOVER_VISIBLE.swap(false, Ordering::SeqCst) {
-            Self::fade_view(hover, 0.0, "settings-sidebar-hover-opacity");
-        }
-    }
-
-    /// Remove the hover surface immediately when a click promotes that row to selected.
-    pub(super) unsafe fn hide_hover_highlight_immediately(hover: *mut AnyObject) {
-        if hover.is_null() {
-            return;
-        }
-        widgets::SIDEBAR_HOVER_VISIBLE.store(false, Ordering::SeqCst);
-        let layer: *mut AnyObject = objc2::msg_send![hover, layer];
-        if layer.is_null() {
-            let _: () = objc2::msg_send![hover, setAlphaValue: 0.0f64];
-            return;
-        }
-        let opacity_key = crate::ffi::make_nsstring("settings-sidebar-hover-opacity");
-        let position_key = crate::ffi::make_nsstring("settings-sidebar-hover-spring");
-        let _: () = objc2::msg_send![layer, removeAnimationForKey: opacity_key];
-        let _: () = objc2::msg_send![layer, removeAnimationForKey: position_key];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
-        let _: () = objc2::msg_send![layer, setOpacity: 0.0f32];
-        let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-        crate::ffi::CFRelease(opacity_key as *const std::ffi::c_void);
-        crate::ffi::CFRelease(position_key as *const std::ffi::c_void);
+        Self::set_frame_without_implicit_animation(highlight, frame);
     }
 
     pub(super) unsafe fn build(
@@ -2127,7 +1880,6 @@ impl SettingsSidebar {
             ("settings.sidebar_about", SettingsSidebarIcon::About),
         ];
         let row_step = row_h + 4.0;
-        widgets::make_sidebar_hover_highlight(parent, x, y0, w, row_h);
         widgets::make_sidebar_hover_tracking(
             parent,
             sidebar_tracking_rect(x, y0, w, row_h, entries.len()),
@@ -2187,14 +1939,53 @@ impl SettingsSidebarTab {
 #[cfg(test)]
 mod tests {
     use super::{
-        sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole, SettingsLayout,
-        SettingsRow, SETTINGS_PAGE_COUNT,
+        restore_shell_frame, restore_sidebar_container_frame, restore_sidebar_trigger_frame,
+        restore_surface_frame, sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole,
+        SettingsLayout, SettingsRow, RESTORE_ACTION_ROW_GAP, RESTORE_CONTAINER_ORIGIN,
+        RESTORE_SHELL_INSET, RESTORE_SIDEBAR_OUTER_INSET, RESTORE_TRIGGER_INSET, ROW_ACTION_BTN_H,
+        SEPARATOR_ABOVE_ROW_GAP, SETTINGS_PAGE_COUNT, SLIDER_READOUT_GAP, SLIDER_READOUT_H,
+        SLIDER_READOUT_W,
     };
     use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
 
     #[test]
+    fn restore_sidebar_trigger_and_shell_are_centered() {
+        let sidebar_width = 220.0;
+        let container = restore_sidebar_container_frame(sidebar_width, 48.0);
+        let trigger = restore_sidebar_trigger_frame(sidebar_width, 32.0);
+        let collapsed = restore_surface_frame(container.origin, trigger);
+        assert_eq!(container.origin.x, RESTORE_CONTAINER_ORIGIN);
+        assert_eq!(
+            container.origin.x + container.size.width,
+            sidebar_width - RESTORE_CONTAINER_ORIGIN
+        );
+        assert_eq!(collapsed.origin.x, RESTORE_SIDEBAR_OUTER_INSET);
+        assert_eq!(
+            collapsed.origin.x + collapsed.size.width,
+            sidebar_width - RESTORE_SIDEBAR_OUTER_INSET
+        );
+        assert_eq!(
+            collapsed.origin.x * 2.0 + collapsed.size.width,
+            sidebar_width
+        );
+
+        let shell = restore_shell_frame(collapsed, 48.0);
+        assert_eq!(collapsed.origin.x - shell.origin.x, RESTORE_SHELL_INSET);
+        assert_eq!(collapsed.origin.y - shell.origin.y, RESTORE_SHELL_INSET);
+        assert_eq!(
+            shell.origin.x + shell.size.width - (collapsed.origin.x + collapsed.size.width),
+            RESTORE_SHELL_INSET
+        );
+        assert_eq!(
+            shell.origin.y + shell.size.height - (collapsed.origin.y + collapsed.size.height),
+            RESTORE_SHELL_INSET
+        );
+        assert_eq!(RESTORE_ACTION_ROW_GAP, 16.0);
+    }
+
+    #[test]
     fn sidebar_tracking_rect_spans_every_row() {
-        let row_h = 38.0;
+        let row_h = 40.0;
         let row_step = row_h + 4.0;
         let y0 = 300.0;
         let rect = sidebar_tracking_rect(0.0, y0, 240.0, row_h, SETTINGS_PAGE_COUNT);
@@ -2218,10 +2009,10 @@ mod tests {
             layout.control_x + layout.control_w,
             600.0 - SETTINGS_CONTROL_TRAILING_INSET
         );
-        assert_eq!(layout.row_h, 34.0);
-        assert_eq!(layout.described_row_h, 54.0);
-        assert_eq!(SettingsLayout::CONTROL_H, 34.0);
-        assert_eq!(SettingsLayout::SINGLE_LINE_ROW_H, 54.0);
+        assert_eq!(layout.row_h, 32.0);
+        assert_eq!(layout.described_row_h, 52.0);
+        assert_eq!(SettingsLayout::CONTROL_H, 32.0);
+        assert_eq!(SettingsLayout::SINGLE_LINE_ROW_H, 52.0);
         assert_eq!(layout.section_step, 48.0);
         assert_eq!(layout.row_gap, 8.0);
         // `card_top`/`card_bottom` moved into the page layout owner (`settings::page_canvas`).
@@ -2230,15 +2021,15 @@ mod tests {
     #[test]
     fn row_label_width_tracks_the_space_before_the_control_column() {
         assert_eq!(
-            SettingsRow::label_width_before_control(12.0, 420.0, 18.0),
-            390.0
+            SettingsRow::label_width_before_control(16.0, 420.0, 16.0),
+            388.0
         );
         assert_eq!(
-            SettingsRow::label_width_before_control(12.0, 320.0, 18.0),
-            290.0
+            SettingsRow::label_width_before_control(16.0, 320.0, 16.0),
+            288.0
         );
         assert_eq!(
-            SettingsRow::label_width_before_control(12.0, 20.0, 18.0),
+            SettingsRow::label_width_before_control(16.0, 20.0, 16.0),
             1.0
         );
     }
@@ -2257,10 +2048,10 @@ mod tests {
         // (`PageCanvas` re-places the title at `doc_height - TOP_PADDING - title_height`).
         assert_eq!(
             SettingsPageHeader::TOP_PADDING + SettingsPageHeader::FIRST_SECTION_GAP,
-            58.0
+            56.0
         );
         // The title sits clearly below the pane top and clearly above the first card's heading.
-        assert_eq!(SettingsPageHeader::TOP_PADDING, 50.0);
+        assert_eq!(SettingsPageHeader::TOP_PADDING, 48.0);
         assert_eq!(SettingsPageHeader::FIRST_SECTION_GAP, 8.0);
 
         let layout = SettingsLayout::new(600.0);
@@ -2269,8 +2060,8 @@ mod tests {
         let row_h = SettingsLayout::SINGLE_LINE_ROW_H;
         let row_bottom = heading_cursor - layout.row_gap - row_h;
         let row_top = row_bottom + row_h;
-        // Single-row card: the row starts 4pt under the heading, and trimming the extra 6pt bottom
-        // inset leaves the same 4pt beneath the row.
+        // Single-row card: the row starts 4pt under the heading and the card keeps its 8pt bottom
+        // inset below the row.
         let card_top = heading_cursor - layout.card_header_gap;
         assert_eq!(card_top - row_top, 4.0);
         let card_visible_bottom = super::widgets::settings_card_rect(super::NSRect::new(
@@ -2279,7 +2070,35 @@ mod tests {
         ))
         .origin
         .y;
-        assert_eq!(row_bottom - card_visible_bottom, 4.0);
+        assert_eq!(row_bottom - card_visible_bottom, 8.0);
+    }
+
+    #[test]
+    fn settings_layout_tokens_follow_the_four_point_grid() {
+        let layout = SettingsLayout::new(600.0);
+        for value in [
+            ROW_ACTION_BTN_H,
+            RESTORE_SHELL_INSET,
+            RESTORE_TRIGGER_INSET,
+            RESTORE_CONTAINER_ORIGIN,
+            RESTORE_ACTION_ROW_GAP,
+            SLIDER_READOUT_W,
+            SLIDER_READOUT_GAP,
+            SLIDER_READOUT_H,
+            SEPARATOR_ABOVE_ROW_GAP,
+            layout.label_x,
+            layout.control_w,
+            layout.row_h,
+            layout.described_row_h,
+            layout.row_gap,
+            layout.card_bottom_inset,
+            layout.card_header_gap,
+            SETTINGS_CONTROL_TRAILING_INSET,
+            super::super::SETTINGS_CONTROL_LABEL_GAP,
+            super::SettingsPageHeader::TOP_PADDING,
+        ] {
+            assert_eq!(value % 4.0, 0.0, "off-grid settings metric: {value}");
+        }
     }
 
     #[test]
@@ -2289,30 +2108,35 @@ mod tests {
         let label_center = label.origin.y + label.size.height / 2.0;
         assert_eq!(icon_center, label_center);
         assert_eq!(icon.origin.x, 16.0);
-        assert_eq!(label.origin.x, 46.0);
+        assert_eq!(label.origin.x, 48.0);
     }
 
     #[test]
     fn button_roles_keep_normal_and_hover_semantics_distinct() {
-        assert_eq!(
-            SettingsButtonRole::Action.style(),
-            (0xFFFFFFAD, 0x2E2E2EFF, -3)
-        );
-        assert_eq!(
-            SettingsButtonRole::Compact.style(),
-            (0x7676801F, 0x44444AFF, 0)
-        );
-        assert_eq!(
-            SettingsButtonRole::Footer.style(),
-            (0xFFFFFFC7, 0x2E2E2EFF, -1)
-        );
-        assert_eq!(
-            SettingsButtonRole::Primary.style(),
-            (0x0A84FFFF, 0xFFFFFFFF, -2)
-        );
-        assert_eq!(
-            SettingsButtonRole::Destructive.style(),
-            (0xFF3B30FF, 0xFFFFFFFF, -4)
-        );
+        for palette in [
+            crate::theme::ui_palette_for_mode(false),
+            crate::theme::ui_palette_for_mode(true),
+        ] {
+            assert_eq!(
+                SettingsButtonRole::Action.style(palette),
+                (palette.button_bg, palette.button_text, -3)
+            );
+            assert_eq!(
+                SettingsButtonRole::Compact.style(palette),
+                (palette.field_bg, palette.button_text, 0)
+            );
+            assert_eq!(
+                SettingsButtonRole::Footer.style(palette),
+                (palette.footer_button_bg, palette.button_text, -1)
+            );
+            assert_eq!(
+                SettingsButtonRole::Primary.style(palette),
+                (palette.accent, palette.accent_text, -2)
+            );
+            assert_eq!(
+                SettingsButtonRole::Destructive.style(palette),
+                (palette.destructive, palette.accent_text, -4)
+            );
+        }
     }
 }

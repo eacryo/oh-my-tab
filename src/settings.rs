@@ -173,6 +173,7 @@ pub(super) struct SettingsUi {
     theme: *mut AnyObject,             // NSPopUpButton: auto / light / dark
     glass_style: *mut AnyObject,       // NSPopUpButton: regular / clear
     glass_tint: *mut AnyObject,        // glass tint
+    glass_tint_hex: *mut AnyObject,    // displayed user-owned color value
     glass_preview_switcher: *mut AnyObject, // NSGlassEffectView: app switcher preview
     glass_preview_clipboard: *mut AnyObject, // NSGlassEffectView: clipboard preview
     corner_radius: *mut AnyObject,     // NSTextField
@@ -259,6 +260,7 @@ pub(super) struct SettingsUi {
     mapping_enabled: *mut AnyObject,        // mappings master switch (per-device)
     mapping_empty: *mut AnyObject,          // empty-state hint (in-card)
     device_indicator: *mut AnyObject,       // device indicator (opens picker)
+    device_info_caption: *mut AnyObject,
     restore_defaults: RestoreDefaultsControl, // restore-defaults control
     // One "Restore Page Defaults" control per page (embedded at the end of each page's
     // scrolling document).
@@ -273,7 +275,6 @@ pub(super) struct SettingsUi {
     update_host: *mut AnyObject,             // In-about update flow host container
     update_host_window: *mut AnyObject,      // host's settings window
     update_card: *mut AnyObject,             // Updates card (grows when expanded)
-    update_card_shadow: *mut AnyObject,      // Updates card shadow
     update_divider: *mut AnyObject,          // divider between update settings and result
     update_card_expanded: bool,              // whether expanded for a flow
     accessibility_permission_status: *mut AnyObject,
@@ -321,15 +322,15 @@ impl MappingRow {
 /// Mapping-row height (independent of the global row_h; shared by the card height in build
 /// and by render).
 const MAPPING_HEADER_H: f64 = 32.0;
-const MAPPING_ROW_H: f64 = 38.0;
+const MAPPING_ROW_H: f64 = 40.0;
 
 // Layout constants for the nested mapping table (HTML `.mapping-table`).
-const MAPPING_PANEL_X: f64 = 10.0; // sub-table horizontal inset
-const MAPPING_PANEL_TOP: f64 = 10.0; // sub-table top padding
+const MAPPING_PANEL_X: f64 = 8.0; // sub-table horizontal inset
+const MAPPING_PANEL_TOP: f64 = 8.0; // sub-table top padding
 const MAPPING_CELL_X: f64 = 12.0; // row content left padding
 const MAPPING_ACTION_TOP: f64 = 12.0; // gap above the add-mapping button
-const MAPPING_ACTION_H: f64 = 34.0; // add-mapping button height
-const MAPPING_CARD_PAD_BOT: f64 = 10.0; // card bottom padding
+const MAPPING_ACTION_H: f64 = 32.0; // add-mapping button height
+const MAPPING_CARD_PAD_BOT: f64 = 8.0; // card bottom padding
 
 /// Gap from a section header to the top edge of its grouped card.
 const SETTINGS_SECTION_CARD_GAP: f64 = 4.0;
@@ -338,7 +339,9 @@ const SETTINGS_SECTION_CARD_GAP: f64 = 4.0;
 const SETTINGS_SECTION_HEADER_GAP: f64 = 24.0;
 
 /// Optical trailing inset for row controls, matching the text's visible leading inset.
-const SETTINGS_CONTROL_TRAILING_INSET: f64 = 17.0;
+const SETTINGS_CONTROL_TRAILING_INSET: f64 = 16.0;
+/// Clear space between a localized row label and its control column.
+pub(crate) const SETTINGS_CONTROL_LABEL_GAP: f64 = 16.0;
 
 /// The action-type popup items; index maps 1:1 to semantics (shared by render and the
 /// change handler).

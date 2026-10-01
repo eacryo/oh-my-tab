@@ -135,7 +135,7 @@ pub(crate) fn smoke_runner() -> bool {
         assert_eq!(frames[0].origin.y, frames[1].origin.y);
         assert_eq!(
             frames[1].origin.x - (frames[0].origin.x + frames[0].size.width),
-            10.0
+            super::CLEAR_CONFIRM_GAP
         );
         let header: *mut AnyObject = msg_send![buttons[0].0, superview];
         let parent: *mut AnyObject = msg_send![header, superview];

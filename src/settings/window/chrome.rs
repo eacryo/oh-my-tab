@@ -52,7 +52,7 @@ extern "C" fn settings_root_view_did_change_effective_corner_radii(this: *mut c_
         let view = this as *mut AnyObject;
         let radii: *mut AnyObject = msg_send![view, effectiveCornerRadii];
         let radius = if radii.is_null() {
-            settings_effective_corner_radius(None, 26.0)
+            settings_effective_corner_radius(None, crate::theme::SETTINGS_WINDOW_RADIUS)
         } else {
             let top_left: f64 = msg_send![radii, topLeft];
             let top_right: f64 = msg_send![radii, topRight];
@@ -60,7 +60,7 @@ extern "C" fn settings_root_view_did_change_effective_corner_radii(this: *mut c_
             let bottom_right: f64 = msg_send![radii, bottomRight];
             settings_effective_corner_radius(
                 Some([top_left, top_right, bottom_left, bottom_right]),
-                26.0,
+                crate::theme::SETTINGS_WINDOW_RADIUS,
             )
         };
         let layer: *mut AnyObject = msg_send![view, layer];

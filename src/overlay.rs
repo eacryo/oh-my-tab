@@ -68,7 +68,7 @@ const SELECTED_CONTENT_NUDGE: f64 = 2.0;
 /// and surface as one unit.
 const SELECTED_CARD_LIFT: f64 = 1.0;
 /// Duration of the slot-collapse/reflow animation; the whole transition stays in one AppKit transaction.
-const CARD_CLOSE_ANIMATION_DURATION: f64 = 0.16;
+const CARD_CLOSE_ANIMATION_DURATION: f64 = crate::theme::ANIMATION_DURATION_MEDIUM;
 
 pub(crate) static OVERLAY_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 pub(crate) static CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -232,6 +232,9 @@ struct CardSignature {
     theme_dark: bool,
     card_width_bits: u64,
     card_height_bits: u64,
+    card_radius_bits: u64,
+    title_font_bits: u64,
+    app_name_font_bits: u64,
     thumbnail_layout: bool,
     /// Whether the caption includes the app name; a toggle must force Replace, or reuse
     /// would keep the old caption.
@@ -274,6 +277,9 @@ fn card_signature(
         theme_dark: crate::theme::resolved_is_dark(),
         card_width_bits: frame.size.width.to_bits(),
         card_height_bits: frame.size.height.to_bits(),
+        card_radius_bits: crate::theme::overlay_card_radius().to_bits(),
+        title_font_bits: crate::theme::card_title_font_size().to_bits(),
+        app_name_font_bits: crate::theme::card_app_name_font_size().to_bits(),
         thumbnail_layout,
         show_app_name_in_cards: crate::theme::show_app_name_in_cards(),
         thumbnail_capture_allowed,
@@ -781,6 +787,9 @@ mod tests {
             theme_dark: false,
             card_width_bits: 100.0f64.to_bits(),
             card_height_bits: 100.0f64.to_bits(),
+            card_radius_bits: 12.0f64.to_bits(),
+            title_font_bits: 13.0f64.to_bits(),
+            app_name_font_bits: 13.0f64.to_bits(),
             thumbnail_layout: true,
             show_app_name_in_cards: false,
             thumbnail_capture_allowed: true,

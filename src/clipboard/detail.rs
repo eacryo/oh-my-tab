@@ -100,9 +100,9 @@ pub(super) unsafe fn add_detail_text(
     let _: () = msg_send![tv, setDrawsBackground: false];
     // Plain detail text uses 14pt; code uses a 14pt monospaced font for stable columns/breaks.
     let font: *mut AnyObject = if is_code {
-        msg_send![class!(NSFont), monospacedSystemFontOfSize: 14.0f64, weight: 0.0f64]
+        msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR]
     } else {
-        msg_send![class!(NSFont), systemFontOfSize: 14.0f64]
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL]
     };
     let _: () = msg_send![tv, setFont: font];
     if code_soft_wrap {
@@ -923,9 +923,10 @@ pub(super) unsafe fn ensure_picker_window() {
         let _: () = msg_send![button, setWantsLayer: true];
         let button_layer: *mut AnyObject = msg_send![button, layer];
         if !button_layer.is_null() {
-            let _: () = msg_send![button_layer, setCornerRadius: 5.0f64];
+            let _: () = msg_send![button_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         }
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let _: () = msg_send![button, setFont: font];
         let title = make_nsstring(&clear_labels[i]);
         let _: () = msg_send![button, setTitle: title];
@@ -960,7 +961,8 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![toast_label, setEditable: false];
     let _: () = msg_send![toast_label, setSelectable: false];
     let _: () = msg_send![toast_label, setAlignment: 1isize]; // Center on arm64
-    let tf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let tf: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![toast_label, setFont: tf];
     let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let _: () = msg_send![toast_label, setTextColor: white];
@@ -969,7 +971,7 @@ pub(super) unsafe fn ensure_picker_window() {
     let tbg: *mut AnyObject =
         msg_send![class!(NSColor), colorWithWhite: 30.0f64 / 255.0, alpha: 0.86f64];
     crate::ffi::layer_set_background(tlayer, crate::ffi::ns_color_to_cg(tbg));
-    let _: () = msg_send![tlayer, setCornerRadius: 7.0f64];
+    let _: () = msg_send![tlayer, setCornerRadius: crate::theme::RADIUS_PANEL];
     let _: () = msg_send![toast_label, setHidden: true];
     let _: () = msg_send![content_parent, addSubview: toast_label];
     release_obj(toast_label);
@@ -1061,8 +1063,7 @@ unsafe fn create_row_views(
         let _: () = msg_send![g, setDrawsBackground: false];
         let _: () = msg_send![g, setEditable: false];
         let _: () = msg_send![g, setSelectable: false];
-        let g_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: 12.0f64, weight: 0.23f64]; // Medium
+        let g_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_REGULAR];
         let _: () = msg_send![g, setFont: g_font];
         let g_color = crate::ffi::hex_to_ns_color(palette.muted_text);
         let _: () = msg_send![g, setTextColor: g_color];
@@ -1385,7 +1386,8 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     // The empty state follows the new mockup's .empty-state: 12px, 30% black.
     let text_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
     let _: () = msg_send![label, setTextColor: text_color];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0f64];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![container, addSubview: label];
     release_obj(label);

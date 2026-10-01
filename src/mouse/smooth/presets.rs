@@ -93,19 +93,19 @@ impl SmoothPreset {
 
     pub(crate) fn label_key(self) -> &'static str {
         match self {
-            Self::Custom => "mouse_smooth_preset_custom",
-            Self::Linear => "mouse_smooth_preset_linear",
-            Self::EaseIn => "mouse_smooth_preset_ease_in",
-            Self::EaseOut => "mouse_smooth_preset_ease_out",
-            Self::EaseInOut => "mouse_smooth_preset_ease_in_out",
-            Self::Quadratic => "mouse_smooth_preset_quadratic",
-            Self::Cubic => "mouse_smooth_preset_cubic",
-            Self::Quartic => "mouse_smooth_preset_quartic",
-            Self::EaseOutCubic => "mouse_smooth_preset_ease_out_cubic",
-            Self::EaseInOutCubic => "mouse_smooth_preset_ease_in_out_cubic",
-            Self::EaseOutQuartic => "mouse_smooth_preset_ease_out_quartic",
-            Self::EaseInOutQuartic => "mouse_smooth_preset_ease_in_out_quartic",
-            Self::Smooth => "mouse_smooth_preset_smooth",
+            Self::Custom => "settings.mouse_smooth_preset_custom",
+            Self::Linear => "settings.mouse_smooth_preset_linear",
+            Self::EaseIn => "settings.mouse_smooth_preset_ease_in",
+            Self::EaseOut => "settings.mouse_smooth_preset_ease_out",
+            Self::EaseInOut => "settings.mouse_smooth_preset_ease_in_out",
+            Self::Quadratic => "settings.mouse_smooth_preset_quadratic",
+            Self::Cubic => "settings.mouse_smooth_preset_cubic",
+            Self::Quartic => "settings.mouse_smooth_preset_quartic",
+            Self::EaseOutCubic => "settings.mouse_smooth_preset_ease_out_cubic",
+            Self::EaseInOutCubic => "settings.mouse_smooth_preset_ease_in_out_cubic",
+            Self::EaseOutQuartic => "settings.mouse_smooth_preset_ease_out_quartic",
+            Self::EaseInOutQuartic => "settings.mouse_smooth_preset_ease_in_out_quartic",
+            Self::Smooth => "settings.mouse_smooth_preset_smooth",
         }
     }
 
@@ -388,6 +388,33 @@ mod tests {
         }
         assert_eq!(SmoothPreset::ALL[0], SmoothPreset::EaseInOut);
         assert_eq!(SmoothPreset::ALL[12], SmoothPreset::Custom);
+    }
+
+    #[test]
+    fn every_preset_label_resolves_in_all_supported_locales() {
+        let locale_sources = [
+            include_str!("../../../locales/en.toml"),
+            include_str!("../../../locales/zh-Hans.toml"),
+            include_str!("../../../locales/zh-Hant.toml"),
+        ];
+        for source in locale_sources {
+            let parsed: toml::Value = toml::from_str(source).expect("valid locale TOML");
+            let settings = parsed
+                .get("settings")
+                .and_then(toml::Value::as_table)
+                .expect("settings table");
+            for preset in SmoothPreset::ALL {
+                let key = preset.label_key();
+                let leaf = key
+                    .strip_prefix("settings.")
+                    .expect("qualified settings key");
+                let value = settings
+                    .get(leaf)
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or_else(|| panic!("missing preset translation: {key}"));
+                assert!(!value.is_empty() && value != key, "unresolved label: {key}");
+            }
+        }
     }
 
     #[test]

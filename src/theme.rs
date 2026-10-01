@@ -30,6 +30,93 @@ pub(crate) const CARD_TEXT_SIZE_MIN: f64 = 13.0;
 pub(crate) const CARD_TEXT_SIZE_MAX: f64 = 20.0;
 const STATUS_BAR_TEXT_BASE_SIZE: f64 = 13.0;
 
+pub(crate) const FONT_CAPTION: f64 = 12.0;
+pub(crate) const FONT_CONTROL: f64 = 14.0;
+pub(crate) const FONT_SIDEBAR_TITLE: f64 = 20.0;
+pub(crate) const FONT_PAGE_TITLE: f64 = 26.0;
+pub(crate) const FONT_WEIGHT_REGULAR: f64 = 0.0;
+pub(crate) const FONT_WEIGHT_SEMIBOLD: f64 = 0.3;
+pub(crate) const FONT_WEIGHT_BOLD: f64 = 0.4;
+pub(crate) const ANIMATION_DURATION_FAST: f64 = 0.175;
+pub(crate) const ANIMATION_DURATION_MEDIUM: f64 = 0.380;
+pub(crate) const ANIMATION_EXIT_RATIO: f64 = 0.75;
+pub(crate) const ANIMATION_EASE_STANDARD: (f32, f32, f32, f32) = (0.24, 1.0, 0.4, 1.0);
+pub(crate) const ELEVATION_MED_SHADOW_COLOR: u32 = 0x000000FF;
+pub(crate) const ELEVATION_MED_SHADOW_OPACITY: f32 = 0.10;
+pub(crate) const ELEVATION_MED_SHADOW_RADIUS: f64 = 12.0;
+pub(crate) const ELEVATION_MED_SHADOW_OFFSET_Y: f64 = -4.0;
+pub(crate) const OVERLAY_SYMBOL_SHADOW_OPACITY: f32 = 0.85;
+pub(crate) const OVERLAY_SYMBOL_SHADOW_RADIUS: f64 = 2.0;
+pub(crate) const OVERLAY_SYMBOL_SHADOW_OFFSET_Y: f64 = -1.0;
+
+pub(crate) const RADIUS_CONTROL: f64 = 8.0;
+pub(crate) const RADIUS_CARD: f64 = 12.0;
+pub(crate) const RADIUS_PANEL: f64 = 16.0;
+pub(crate) const RADIUS_FULL: f64 = 9999.0;
+pub(crate) const SETTINGS_WINDOW_RADIUS: f64 = 26.0;
+pub(crate) const OVERLAY_RING_INSET: f64 = 3.0;
+pub(crate) const THUMBNAIL_PREVIEW_RADIUS: f64 = 0.0;
+pub(crate) const PREVIEW_TILE_LIGHT: u32 = 0xFFFFFFE8;
+pub(crate) const PREVIEW_TILE_DARK: u32 = 0x2C2C2EE8;
+pub(crate) const PREVIEW_TILE_LIGHT_SECONDARY: u32 = 0xFFFFFFD8;
+pub(crate) const PREVIEW_TILE_DARK_SECONDARY: u32 = 0x2C2C2ED8;
+pub(crate) const PREVIEW_TILE_LIGHT_TERTIARY: u32 = 0xFFFFFFC8;
+pub(crate) const PREVIEW_TILE_DARK_TERTIARY: u32 = 0x2C2C2EC8;
+pub(crate) const PREVIEW_TILE_BORDER_LIGHT: u32 = 0x0000001A;
+pub(crate) const PREVIEW_TILE_BORDER_DARK: u32 = 0xFFFFFF24;
+
+pub(crate) const fn settings_preview_stage_color(dark: bool) -> u32 {
+    if dark {
+        0xF5F5F7FF
+    } else {
+        0x1C1C1EFF
+    }
+}
+
+fn linear_channel(value: f64) -> f64 {
+    let value = value / 255.0;
+    if value <= 0.04045 {
+        value / 12.92
+    } else {
+        ((value + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn color_rgb(color: u32) -> [f64; 3] {
+    [
+        ((color >> 24) & 0xff) as f64,
+        ((color >> 16) & 0xff) as f64,
+        ((color >> 8) & 0xff) as f64,
+    ]
+}
+
+fn composite_rgb(color: u32, background: u32) -> [f64; 3] {
+    let alpha = (color & 0xff) as f64 / 255.0;
+    let foreground = color_rgb(color);
+    let background = color_rgb(background);
+    std::array::from_fn(|index| foreground[index] * alpha + background[index] * (1.0 - alpha))
+}
+
+fn relative_luminance(rgb: [f64; 3]) -> f64 {
+    0.2126 * linear_channel(rgb[0])
+        + 0.7152 * linear_channel(rgb[1])
+        + 0.0722 * linear_channel(rgb[2])
+}
+
+fn contrast_ratio(foreground: [f64; 3], background: [f64; 3]) -> f64 {
+    let foreground = relative_luminance(foreground);
+    let background = relative_luminance(background);
+    (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
+}
+
+pub(crate) fn settings_preview_contrast(palette: UiPalette) -> f64 {
+    let stage = settings_preview_stage_color(palette.dark);
+    contrast_ratio(
+        composite_rgb(stage, palette.card_bg),
+        color_rgb(palette.card_bg),
+    )
+}
+
 /// All colors resolved for the current theme (u32 = RRGGBBAA). Some fields are currently
 /// unused but kept for future use.
 #[allow(dead_code)]
@@ -66,75 +153,113 @@ pub(crate) struct UiPalette {
     pub(crate) sidebar_text: u32,
     pub(crate) muted_text: u32,
     pub(crate) disabled_text: u32,
+    pub(crate) success_text: u32,
+    pub(crate) warning_text: u32,
+    pub(crate) error_text: u32,
+    pub(crate) keycap_accent_bg: u32,
+    pub(crate) keycap_accent_border: u32,
+    pub(crate) keycap_accent_text: u32,
     pub(crate) button_bg: u32,
     pub(crate) button_text: u32,
     pub(crate) footer_button_bg: u32,
+    pub(crate) accent_text: u32,
+    pub(crate) switch_on_disabled_track: u32,
+    pub(crate) switch_off_track: u32,
+    pub(crate) switch_off_disabled_track: u32,
+    pub(crate) switch_knob: u32,
     pub(crate) selection_bg: u32,
     pub(crate) hover_bg: u32,
     pub(crate) accent: u32,
     pub(crate) accent_hover: u32,
     pub(crate) destructive: u32,
     pub(crate) destructive_hover: u32,
+    pub(crate) symbol_shadow: u32,
     pub(crate) shadow: u32,
 }
 
 /// Palette for the native settings window and other custom UI surfaces.
 pub(crate) fn ui_palette() -> UiPalette {
-    if resolved_is_dark() {
+    ui_palette_for_mode(resolved_is_dark())
+}
+
+pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
+    if dark {
         UiPalette {
             dark: true,
-            window_bg: 0x1C1C1EE8,
-            sidebar_bg: 0x2C2C2EDB,
-            detail_bg: 0x1C1C1EE8,
-            card_bg: 0x2C2C2EEA,
-            card_border: 0xFFFFFF1C,
-            separator: 0xFFFFFF20,
-            field_bg: 0xFFFFFF1C,
+            window_bg: 0x1C1C1EFF,
+            sidebar_bg: 0x242426FF,
+            detail_bg: 0x1C1C1EFF,
+            card_bg: 0x2C2C2EFF,
+            card_border: 0xFFFFFF1A,
+            separator: 0xFFFFFF17,
+            field_bg: 0xFFFFFF12,
             primary_text: 0xF5F5F7FF,
-            secondary_text: 0xEBEBF5A3,
-            sidebar_text: 0xEBEBF5A3,
-            muted_text: 0xEBEBF56B,
-            disabled_text: 0xEBEBF552,
-            button_bg: 0xFFFFFF1C,
+            secondary_text: 0xC7C7CCFF,
+            sidebar_text: 0x9E9EA6FF,
+            muted_text: 0x9E9EA6FF,
+            disabled_text: 0x7C7C84FF,
+            success_text: 0x30D158FF,
+            warning_text: 0xFF9F0AFF,
+            error_text: 0xFF6961FF,
+            keycap_accent_bg: 0x0A84FF38,
+            keycap_accent_border: 0x0A84FFB0,
+            keycap_accent_text: 0xF8F9FAFF,
+            button_bg: 0x2C2C2EFF,
             button_text: 0xF5F5F7FF,
-            footer_button_bg: 0xFFFFFF25,
+            footer_button_bg: 0x2C2C2EFF,
+            accent_text: 0xFFFFFFFF,
+            switch_on_disabled_track: 0x0A84FF73,
+            switch_off_track: 0x636366FF,
+            switch_off_disabled_track: 0x63636673,
+            switch_knob: 0xF5F5F7F5,
             selection_bg: 0x0A84FF38,
-            hover_bg: 0xFFFFFF22,
+            hover_bg: 0xFFFFFF1A,
             accent: 0x0A84FFFF,
-            accent_hover: 0x0077EDFF,
+            accent_hover: 0x3D9BFFFF,
             destructive: 0xFF453AFF,
             destructive_hover: 0xD93630FF,
-            shadow: 0x00000042,
+            symbol_shadow: 0x000000B3,
+            shadow: 0x00000059,
         }
     } else {
         UiPalette {
             dark: false,
             // Match the light reference surfaces: #f6f7f9 window/detail, #f1f2f4 sidebar,
-            // and rgba(255,255,255,.82) grouped settings rows/cards.
+            // and opaque white grouped settings rows/cards.
             window_bg: 0xF6F7F9FF,
             sidebar_bg: 0xF1F2F4FF,
             detail_bg: 0xF6F7F9FF,
-            card_bg: 0xFFFFFFD1,
-            card_border: 0x00000012,
-            separator: 0x00000016,
-            field_bg: 0x7676801C,
+            card_bg: 0xFFFFFFFF,
+            card_border: 0x0000001A,
+            separator: 0x00000012,
+            field_bg: 0x7676801A,
             primary_text: 0x2C2C30FF,
-            secondary_text: 0x73737AFF,
-            sidebar_text: 0x686970FF,
-            muted_text: 0x9B9BA2FF,
-            disabled_text: 0xAEAEB5FF,
-            button_bg: 0xFFFFFFAD,
-            button_text: 0x2E2E2EFF,
-            footer_button_bg: 0xFFFFFFC7,
-            // Keep the accent hue, but use a lighter wash so the selected sidebar row does not
-            // compete with enabled switches and other blue controls.
-            selection_bg: 0x0A84FF16,
-            hover_bg: 0x76768024,
+            secondary_text: 0x4A4A52FF,
+            sidebar_text: 0x68686FFF,
+            muted_text: 0x68686FFF,
+            disabled_text: 0x9B9BA2FF,
+            success_text: 0x176B3AFF,
+            warning_text: 0xA63D0AFF,
+            error_text: 0xB42318FF,
+            keycap_accent_bg: 0x0A84FF38,
+            keycap_accent_border: 0x0A84FFB0,
+            keycap_accent_text: 0x2C2C30FF,
+            button_bg: 0xFFFFFFFF,
+            button_text: 0x2C2C30FF,
+            footer_button_bg: 0xFFFFFFFF,
+            accent_text: 0xFFFFFFFF,
+            switch_on_disabled_track: 0x0A84FF73,
+            switch_off_track: 0xC7C7CCFF,
+            switch_off_disabled_track: 0xC7C7CC73,
+            switch_knob: 0xFFFFFFF5,
+            selection_bg: 0x0A84FF14,
+            hover_bg: 0x7676801F,
             accent: 0x0A84FFFF,
             accent_hover: 0x0077EDFF,
             destructive: 0xFF3B30FF,
             destructive_hover: 0xD70015FF,
-            shadow: 0x0000000A,
+            symbol_shadow: 0x000000B3,
+            shadow: 0x0000000F,
         }
     }
 }
@@ -224,32 +349,39 @@ pub(crate) fn text_scale() -> f64 {
 
 pub(crate) fn card_title_font_size() -> f64 {
     let cfg = CONFIG.read().unwrap();
-    cfg.fonts.title_size
-        * cfg
-            .layout
-            .card_text_size
-            .clamp(CARD_TEXT_SIZE_MIN, CARD_TEXT_SIZE_MAX)
-        / CARD_TEXT_BASE_SIZE
+    overlay_text_size_for(cfg.fonts.title_size, cfg.layout.card_text_size)
 }
 
 pub(crate) fn card_app_name_font_size() -> f64 {
     let cfg = CONFIG.read().unwrap();
-    cfg.fonts.app_name_size
-        * cfg
-            .layout
-            .card_text_size
-            .clamp(CARD_TEXT_SIZE_MIN, CARD_TEXT_SIZE_MAX)
-        / CARD_TEXT_BASE_SIZE
+    overlay_text_size_for(cfg.fonts.app_name_size, cfg.layout.card_text_size)
 }
 
 /// Bottom title-bar text size, exposed through the switcher settings page.
 pub(crate) fn status_bar_text_size() -> f64 {
-    let size = CONFIG.read().unwrap().fonts.status_bar_size;
-    if size.is_finite() {
-        size.clamp(13.0, 20.0)
+    status_bar_text_size_for(CONFIG.read().unwrap().fonts.status_bar_size)
+}
+
+fn status_bar_text_size_for(configured_size: f64) -> f64 {
+    if configured_size.is_finite() {
+        configured_size.clamp(13.0, 20.0)
     } else {
         STATUS_BAR_TEXT_BASE_SIZE
     }
+}
+
+fn overlay_text_size_for(base_size: f64, card_text_size: f64) -> f64 {
+    let base_size = if base_size.is_finite() && base_size > 0.0 {
+        base_size
+    } else {
+        CARD_TEXT_BASE_SIZE
+    };
+    let card_text_size = if card_text_size.is_finite() {
+        card_text_size
+    } else {
+        CARD_TEXT_BASE_SIZE
+    };
+    (base_size * card_text_size / CARD_TEXT_BASE_SIZE).clamp(13.0, 20.0)
 }
 
 /// The footer grows with its text so the selected window title remains vertically centered.
@@ -269,6 +401,91 @@ pub(crate) fn status_bar_height_for_text_size(size: f64) -> f64 {
 /// Thumbnail captions use the same setting, but grow only as much as their caption row needs.
 pub(crate) fn thumb_caption_h() -> f64 {
     (THUMB_CAPTION_H * text_scale()).clamp(20.0, 36.0)
+}
+
+pub(crate) fn thumb_caption_h_for_card(card_h: f64) -> f64 {
+    thumb_caption_h().min((card_h.max(0.0) / 3.0).max(1.0))
+}
+
+pub(crate) fn overlay_card_radius() -> f64 {
+    let radius = CONFIG.read().unwrap().appearance.corner_radius;
+    effective_overlay_card_radius(radius)
+}
+
+pub(crate) fn effective_overlay_card_radius(configured_radius: f64) -> f64 {
+    if configured_radius.is_finite() {
+        configured_radius.clamp(0.0, RADIUS_PANEL)
+    } else {
+        RADIUS_PANEL
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct OverlayRadii {
+    pub(crate) card: f64,
+    pub(crate) selection_ring: f64,
+    pub(crate) thumbnail_preview: f64,
+    pub(crate) thumbnail_icon: f64,
+    pub(crate) close_button: f64,
+}
+
+pub(crate) fn overlay_radii(card_radius: f64, thumbnail_padding: f64) -> OverlayRadii {
+    let inner = (card_radius - thumbnail_padding.max(0.0)).max(0.0);
+    OverlayRadii {
+        card: card_radius.max(0.0),
+        selection_ring: card_radius.max(0.0) + OVERLAY_RING_INSET,
+        thumbnail_preview: THUMBNAIL_PREVIEW_RADIUS,
+        thumbnail_icon: RADIUS_CONTROL,
+        close_button: rounded_inset_radius(inner, 20.0, 20.0),
+    }
+}
+
+pub(crate) fn rounded_inset_radius(radius: f64, width: f64, height: f64) -> f64 {
+    radius
+        .max(0.0)
+        .min(width.max(0.0).min(height.max(0.0)) / 2.0)
+}
+
+pub(crate) fn reduce_motion_enabled() -> bool {
+    let forced = crate::dev_flags::enabled("reduce-motion");
+    let system = unsafe {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        !workspace.is_null()
+            && msg_send![workspace, respondsToSelector: objc2::sel!(accessibilityDisplayShouldReduceMotion)]
+            && msg_send![workspace, accessibilityDisplayShouldReduceMotion]
+    };
+    !animation_allowed(system, forced)
+}
+
+pub(crate) const fn animation_allowed(system_reduce_motion: bool, forced: bool) -> bool {
+    !system_reduce_motion && !forced
+}
+
+pub(crate) unsafe fn ease_standard_timing_function() -> *mut AnyObject {
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type MakeTimingFunction = unsafe extern "C" fn(
+        *mut AnyObject,
+        objc2::runtime::Sel,
+        f32,
+        f32,
+        f32,
+        f32,
+    ) -> *mut AnyObject;
+    let make_timing: MakeTimingFunction = std::mem::transmute(objc_msgSend as *const ());
+    make_timing(
+        class!(CAMediaTimingFunction) as *const _ as *mut AnyObject,
+        objc2::sel!(functionWithControlPoints::::),
+        ANIMATION_EASE_STANDARD.0,
+        ANIMATION_EASE_STANDARD.1,
+        ANIMATION_EASE_STANDARD.2,
+        ANIMATION_EASE_STANDARD.3,
+    )
+}
+
+pub(crate) fn animation_exit_duration(entrance: f64) -> f64 {
+    entrance * ANIMATION_EXIT_RATIO
 }
 
 /// Window-thumbnail master switch (the thumbnail module additionally sleeps
@@ -425,7 +642,7 @@ pub(crate) fn thumb_card_h_for_scale(scale: f64) -> f64 {
 
 /// Preview height = card height - vertical paddings - caption - gap (pure, testable).
 pub(crate) fn thumb_preview_h(card_h: f64) -> f64 {
-    (card_h - THUMB_PAD * 2.0 - thumb_caption_h() - THUMB_GAP).max(40.0)
+    (card_h - THUMB_PAD * 2.0 - thumb_caption_h_for_card(card_h) - THUMB_GAP).max(40.0)
 }
 
 /// Aspect clamp: windows can be extremely wide/tall; unclamped cards would become
@@ -1428,6 +1645,242 @@ mod tests {
     use super::*;
 
     #[test]
+    fn palette_text_and_accent_meet_documented_contrast_floors() {
+        for palette in [ui_palette_for_mode(false), ui_palette_for_mode(true)] {
+            let roles = [
+                (palette.primary_text, 12.0),
+                (palette.secondary_text, 7.0),
+                (palette.muted_text, 4.5),
+                (palette.disabled_text, 2.5),
+                (palette.success_text, 4.5),
+                (palette.warning_text, 4.5),
+                (palette.error_text, 4.5),
+            ];
+            for (color, floor) in roles {
+                for background in [palette.window_bg, palette.card_bg] {
+                    assert!(
+                        contrast_ratio(composite_rgb(color, background), color_rgb(background))
+                            >= floor,
+                        "color {color:#010x} misses {floor}:1 on {background:#010x}"
+                    );
+                }
+            }
+            for background in [palette.window_bg, palette.card_bg] {
+                assert!(
+                    contrast_ratio(
+                        composite_rgb(palette.accent, background),
+                        color_rgb(background),
+                    ) >= 3.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn documented_structural_boundary_colors_keep_their_measured_contrast() {
+        let light = ui_palette_for_mode(false);
+        let card_border = contrast_ratio(
+            composite_rgb(light.card_border, light.card_bg),
+            color_rgb(light.card_bg),
+        );
+        assert!((card_border - 1.25).abs() < 0.02);
+        assert!((contrast_ratio(color_rgb(0xC7C7CCFF), color_rgb(0xFFFFFFFF)) - 1.68).abs() < 0.02);
+
+        let dark = ui_palette_for_mode(true);
+        assert_eq!(dark.detail_bg, 0x1C1C1EFF);
+        assert!(
+            (contrast_ratio(color_rgb(0x636366FF), color_rgb(dark.card_bg)) - 2.33).abs() < 0.03
+        );
+    }
+
+    #[test]
+    fn selection_background_alpha_matches_the_documented_opacity() {
+        for (palette, expected) in [
+            (ui_palette_for_mode(false), 0.08),
+            (ui_palette_for_mode(true), 0.22),
+        ] {
+            let actual = f64::from(palette.selection_bg & 0xFF) / 255.0;
+            assert!((actual - expected).abs() < 0.002);
+        }
+    }
+
+    #[test]
+    fn documented_sidebar_destructive_and_symbol_roles_match_the_palette() {
+        let light = ui_palette_for_mode(false);
+        assert_eq!(light.sidebar_text, 0x68686FFF);
+        assert_eq!(light.destructive_hover, 0xD70015FF);
+        assert_eq!(light.symbol_shadow, 0x000000B3);
+
+        let dark = ui_palette_for_mode(true);
+        assert_eq!(dark.sidebar_text, 0x9E9EA6FF);
+        assert_eq!(dark.destructive_hover, 0xD93630FF);
+        assert_eq!(dark.symbol_shadow, 0x000000B3);
+        assert_eq!(OVERLAY_SYMBOL_SHADOW_OPACITY, 0.85);
+        assert_eq!(OVERLAY_SYMBOL_SHADOW_RADIUS, 2.0);
+        assert_eq!(OVERLAY_SYMBOL_SHADOW_OFFSET_Y, -1.0);
+    }
+
+    #[test]
+    fn preview_stage_is_visibly_distinct_in_both_palettes() {
+        assert!(settings_preview_contrast(ui_palette_for_mode(false)) >= 3.0);
+        assert!(settings_preview_contrast(ui_palette_for_mode(true)) >= 3.0);
+    }
+
+    #[test]
+    fn accent_keycap_text_meets_contrast_on_its_translucent_fill() {
+        for palette in [ui_palette_for_mode(false), ui_palette_for_mode(true)] {
+            let background = composite_rgb(palette.keycap_accent_bg, palette.card_bg);
+            assert!(
+                contrast_ratio(color_rgb(palette.keycap_accent_text), background) >= 4.5,
+                "keycap accent contrast is too low in {} mode",
+                if palette.dark { "dark" } else { "light" }
+            );
+        }
+    }
+
+    #[test]
+    fn settings_and_overlay_use_the_documented_type_scale() {
+        let sizes = [
+            FONT_CAPTION,
+            FONT_CONTROL,
+            FONT_SIDEBAR_TITLE,
+            FONT_PAGE_TITLE,
+        ];
+        assert_eq!(sizes, [12.0, 14.0, 20.0, 26.0]);
+        assert_eq!(
+            [FONT_WEIGHT_REGULAR, FONT_WEIGHT_SEMIBOLD, FONT_WEIGHT_BOLD],
+            [0.0, 0.3, 0.4]
+        );
+    }
+
+    #[test]
+    fn overlay_roles_share_the_multiplier_and_clamp_the_result() {
+        assert_eq!(overlay_text_size_for(12.0, 15.0), 15.0);
+        assert_eq!(overlay_text_size_for(10.0, 15.0), 13.0);
+        assert_eq!(overlay_text_size_for(30.0, 15.0), 20.0);
+        assert_eq!(overlay_text_size_for(10.0, 25.0), 20.0);
+        assert_eq!(overlay_text_size_for(10.0, 5.0), 13.0);
+        assert_eq!(overlay_text_size_for(f64::NAN, f64::NAN), 13.0);
+    }
+
+    #[test]
+    fn status_bar_text_uses_its_configured_size_without_card_scaling() {
+        assert_eq!(status_bar_text_size_for(15.0), 15.0);
+        assert_eq!(status_bar_text_size_for(13.0), 13.0);
+        assert_eq!(status_bar_text_size_for(20.0), 20.0);
+        assert_eq!(
+            status_bar_text_size_for(f64::NAN),
+            STATUS_BAR_TEXT_BASE_SIZE
+        );
+    }
+
+    #[test]
+    fn thumbnail_caption_never_exceeds_a_third_of_its_card() {
+        for card_h in [24.0, 60.0, 90.0, 160.0, 260.0] {
+            let caption_h = thumb_caption_h_for_card(card_h);
+            assert!(caption_h <= card_h / 3.0 + f64::EPSILON);
+        }
+        assert_eq!(thumb_caption_h_for_card(90.0), 30.0);
+    }
+
+    #[test]
+    fn overlay_radii_are_derived_from_the_configured_card_radius() {
+        let radii = overlay_radii(effective_overlay_card_radius(32.0), 8.0);
+        assert_eq!(radii.card, RADIUS_PANEL);
+        assert_eq!(radii.selection_ring, RADIUS_PANEL + OVERLAY_RING_INSET);
+        assert_eq!(radii.thumbnail_preview, 0.0);
+        assert_eq!(radii.thumbnail_icon, RADIUS_CONTROL);
+        assert_eq!(radii.close_button, 8.0);
+        assert_eq!(rounded_inset_radius(24.0, 20.0, 18.0), 9.0);
+    }
+
+    #[test]
+    fn full_radius_clamps_to_half_the_smaller_side() {
+        // CALayer does not clamp a too-large corner radius, so shape helpers must: a status dot
+        // (6x6) and the clipboard scrollbar (6pt wide) stay circles/pills instead of squares.
+        assert_eq!(rounded_inset_radius(RADIUS_FULL, 6.0, 6.0), 3.0);
+        assert_eq!(rounded_inset_radius(RADIUS_FULL, 6.0, 40.0), 3.0);
+        assert_eq!(rounded_inset_radius(RADIUS_FULL, 38.0, 22.0), 11.0);
+        assert_eq!(rounded_inset_radius(RADIUS_FULL, 18.0, 18.0), 9.0);
+    }
+
+    #[test]
+    fn overlay_card_radius_stays_within_the_documented_radius_scale() {
+        assert_eq!(effective_overlay_card_radius(32.0), RADIUS_PANEL);
+        assert_eq!(effective_overlay_card_radius(12.0), 12.0);
+        assert_eq!(effective_overlay_card_radius(-4.0), 0.0);
+        assert_eq!(effective_overlay_card_radius(f64::NAN), RADIUS_PANEL);
+    }
+
+    #[test]
+    fn motion_uses_two_durations_one_curve_and_honors_reduce_motion() {
+        assert_eq!(ANIMATION_DURATION_FAST, 0.175);
+        assert_eq!(ANIMATION_DURATION_MEDIUM, 0.380);
+        assert!((animation_exit_duration(ANIMATION_DURATION_MEDIUM) - 0.285).abs() < f64::EPSILON);
+        assert_eq!(ANIMATION_EASE_STANDARD, (0.24, 1.0, 0.4, 1.0));
+        assert!(animation_allowed(false, false));
+        assert!(!animation_allowed(true, false));
+        assert!(!animation_allowed(false, true));
+    }
+
+    #[test]
+    fn motion_call_sites_use_tokens_and_check_reduce_motion() {
+        let sources = [
+            include_str!("settings/components.rs"),
+            include_str!("settings/select.rs"),
+            include_str!("settings/widgets.rs"),
+            include_str!("clipboard/picker.rs"),
+            include_str!("clipboard/notifications.rs"),
+            include_str!("overlay/card_close.rs"),
+            include_str!("keystroke_display/panel.rs"),
+        ];
+        for source in sources {
+            for line in source.lines().filter(|line| line.contains("setDuration:")) {
+                let operand = line.split_once("setDuration:").unwrap().1.trim();
+                assert!(
+                    !operand.starts_with(|c: char| c.is_ascii_digit()),
+                    "animation duration is hardcoded: {line}"
+                );
+            }
+        }
+
+        for source in [
+            include_str!("settings/components.rs"),
+            include_str!("settings/select.rs"),
+            include_str!("settings/widgets.rs"),
+            include_str!("clipboard/picker.rs"),
+            include_str!("clipboard/notifications.rs"),
+            include_str!("overlay/card_close.rs"),
+            include_str!("keystroke_display/panel.rs"),
+            include_str!("updater.rs"),
+        ] {
+            assert!(source.contains("reduce_motion_enabled()"));
+        }
+
+        let components = include_str!("settings/components.rs");
+        let sidebar_hover = include_str!("settings/widgets.rs")
+            .split("unsafe fn set_sidebar_hovered")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) unsafe fn sidebar_hover_style_smoke")
+            .next()
+            .unwrap();
+        assert!(sidebar_hover.contains("sidebar_hover_fill(palette)"));
+        assert!(!sidebar_hover.contains("Animation"));
+        assert!(!sidebar_hover.contains("setDuration:"));
+        assert!(!components.contains("move_hover_highlight"));
+        let filter_style = include_str!("clipboard/text_style.rs")
+            .split("pub(super) fn update_filter_pill_style")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) fn ")
+            .next()
+            .unwrap();
+        assert!(!filter_style.contains("addAnimation"));
+        assert!(!filter_style.contains("setDuration:"));
+    }
+
+    #[test]
     fn status_bar_height_tracks_text_size() {
         assert_eq!(status_bar_height_for_text_size(13.0), STATUS_H);
         assert_eq!(
@@ -1744,7 +2197,7 @@ mod flow_tests {
             with_margin <= without_margin,
             "the margin can only lower or keep the step ({with_margin} vs {without_margin})"
         );
-        // On the measured 1920x1080 screen the margin is nearly free: the step stays 0.95.
+        // The independent 15pt footer leaves enough room for a 0.95 card step on this display.
         let wide = 1920.0 * PANEL_MAX_WIDTH_RATIO;
         let wide_inner = wide - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         let on_wide = thumb_scale_for_panel(
@@ -1758,7 +2211,7 @@ mod flow_tests {
         );
         assert!(
             (on_wide - 0.95).abs() < 1e-9,
-            "with the margin subtracted the wide screen must still land on 0.95, got {on_wide}"
+            "with the margin subtracted the wide screen must land on 0.95, got {on_wide}"
         );
     }
 
