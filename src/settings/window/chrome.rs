@@ -71,6 +71,11 @@ extern "C" fn settings_root_view_did_change_effective_corner_radii(this: *mut c_
     }
 }
 
+extern "C" fn settings_window_key_down(_this: *mut c_void, _cmd: Sel, _event: *mut AnyObject) {
+    // Unhandled keys should stop at the settings window instead of reaching NSApplication's
+    // terminal responder, whose default noResponderFor:keyDown: implementation beeps.
+}
+
 pub(in crate::settings) fn settings_root_view_class() -> *mut AnyObject {
     SETTINGS_ROOT_VIEW_CLS
         .get_or_init(|| unsafe {
@@ -185,6 +190,13 @@ pub(in crate::settings) fn settings_window_class() -> *mut AnyObject {
                 sel!(performClose:),
                 settings_window_perform_close as *mut c_void,
                 types.as_ptr(),
+            );
+            let types_key_down = CString::new("v@:@").unwrap(); // -keyDown:(NSEvent*) -> void
+            class_addMethod(
+                cls,
+                sel!(keyDown:),
+                settings_window_key_down as *mut c_void,
+                types_key_down.as_ptr(),
             );
             let types_close = CString::new("v@:").unwrap(); // -close -> void
             class_addMethod(

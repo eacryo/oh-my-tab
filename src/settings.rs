@@ -6,7 +6,7 @@
 
 use objc2::runtime::{AnyClass, AnyObject, Sel};
 use objc2::{class, msg_send, sel};
-use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize};
+use objc2_foundation::{NSEdgeInsets, NSPoint, NSRange, NSRect, NSSize};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::ffi::{c_void, CString};

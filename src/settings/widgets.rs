@@ -4,7 +4,7 @@ use super::*;
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
-    static NSFontAttributeName: *mut AnyObject;
+    pub(super) static NSFontAttributeName: *mut AnyObject;
     static NSKernAttributeName: *mut AnyObject;
 }
 

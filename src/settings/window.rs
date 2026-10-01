@@ -679,7 +679,11 @@ fn page_restored(before: &AboutPanelSnapshot, after: &AboutPanelSnapshot) -> boo
             .all(|(before, after)| (after - before).abs() <= 1.0)
 }
 
-unsafe fn settings_style_tree_is_valid(view: *mut AnyObject, inside_control: bool) -> bool {
+unsafe fn settings_style_tree_is_valid(
+    view: *mut AnyObject,
+    inside_control: bool,
+    page_name: &str,
+) -> bool {
     if view.is_null() {
         return true;
     }
@@ -705,39 +709,41 @@ unsafe fn settings_style_tree_is_valid(view: *mut AnyObject, inside_control: boo
         false
     };
     if draws_text && (!inside_control || super::select::is_registered_select_label(view)) {
-        let responds_to_font: bool = msg_send![view, respondsToSelector: sel!(font)];
-        if responds_to_font {
-            let font: *mut AnyObject = msg_send![view, font];
-            if !font.is_null() {
-                let size: f64 = msg_send![font, pointSize];
-                let allowed = [
+        let invalid_size = settings_rendered_font_sizes(view, is_text_field)
+            .into_iter()
+            .find(|size| {
+                ![
                     crate::theme::FONT_CAPTION,
                     crate::theme::FONT_CONTROL,
                     crate::theme::FONT_SIDEBAR_TITLE,
                     crate::theme::FONT_PAGE_TITLE,
                 ]
                 .into_iter()
-                .any(|token| (size - token).abs() <= 0.1);
-                if !allowed {
-                    let tag = if is_control {
-                        msg_send![view, tag]
-                    } else {
-                        -1isize
-                    };
-                    let value = if is_text_field {
-                        let string: *mut AnyObject = msg_send![view, stringValue];
-                        crate::ffi::nsstring_to_rust(string)
-                    } else if is_button {
-                        let title: *mut AnyObject = msg_send![view, title];
-                        crate::ffi::nsstring_to_rust(title)
-                    } else {
-                        String::new()
-                    };
-                    let frame: NSRect = msg_send![view, frame];
-                    log_info!("[smoke-settings-layout] unexpected font size {size:.2}, control={is_control}, text={is_text_field}, button={is_button}, tag={tag}, value={value:?}, frame={frame:?}");
-                    return false;
-                }
-            }
+                .any(|token| (size - token).abs() <= 0.1)
+            });
+        if let Some(size) = invalid_size {
+            let tag = if is_control {
+                msg_send![view, tag]
+            } else {
+                -1isize
+            };
+            let value = if is_text_field {
+                let string: *mut AnyObject = msg_send![view, stringValue];
+                crate::ffi::nsstring_to_rust(string)
+            } else if is_button {
+                let title: *mut AnyObject = msg_send![view, title];
+                crate::ffi::nsstring_to_rust(title)
+            } else {
+                String::new()
+            };
+            let class: *const AnyClass = msg_send![view, class];
+            let class_name = class
+                .as_ref()
+                .map(|class| class.name().to_string_lossy().into_owned())
+                .unwrap_or_else(|| "<unknown>".to_string());
+            let frame: NSRect = msg_send![view, frame];
+            log_info!("[smoke-settings-layout] unexpected rendered font size {size:.2}, page={page_name}, class={class_name}, control={is_control}, text={is_text_field}, button={is_button}, tag={tag}, value={value:?}, frame={frame:?}");
+            return false;
         }
     }
     let identifier: *mut AnyObject = msg_send![view, identifier];
@@ -761,11 +767,62 @@ unsafe fn settings_style_tree_is_valid(view: *mut AnyObject, inside_control: boo
     let count: usize = msg_send![subviews, count];
     for index in 0..count {
         let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        if !settings_style_tree_is_valid(child, inside_control || is_control) {
+        if !settings_style_tree_is_valid(child, inside_control || is_control, page_name) {
             return false;
         }
     }
     true
+}
+
+unsafe fn settings_rendered_font_sizes(view: *mut AnyObject, is_text_field: bool) -> Vec<f64> {
+    let mut sizes = Vec::new();
+    let mut uses_control_font = true;
+    if is_text_field {
+        let attributed: *mut AnyObject = msg_send![view, attributedStringValue];
+        let length: usize = msg_send![attributed, length];
+        if !attributed.is_null() && length > 0 {
+            let mut index = 0usize;
+            uses_control_font = false;
+            while index < length {
+                let mut effective_range = NSRange::new(0, 0);
+                let attributes: *mut AnyObject = msg_send![
+                    attributed,
+                    attributesAtIndex: index,
+                    effectiveRange: &mut effective_range as *mut NSRange
+                ];
+                let font: *mut AnyObject = if attributes.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    msg_send![attributes, objectForKey: widgets::NSFontAttributeName]
+                };
+                if font.is_null() {
+                    uses_control_font = true;
+                } else {
+                    sizes.push(msg_send![font, pointSize]);
+                }
+                let next = effective_range
+                    .location
+                    .saturating_add(effective_range.length)
+                    .min(length);
+                if next <= index {
+                    uses_control_font = true;
+                    break;
+                }
+                index = next;
+            }
+        }
+    }
+
+    if uses_control_font || sizes.is_empty() {
+        let responds_to_font: bool = msg_send![view, respondsToSelector: sel!(font)];
+        if responds_to_font {
+            let font: *mut AnyObject = msg_send![view, font];
+            if !font.is_null() {
+                sizes.push(msg_send![font, pointSize]);
+            }
+        }
+    }
+    sizes
 }
 
 unsafe fn settings_about_icon_is_aligned(view: *mut AnyObject) -> bool {
@@ -1019,9 +1076,20 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
+        let page_names = [
+            "general",
+            "switcher",
+            "mouse",
+            "clipboard",
+            "window-control",
+            "quick-actions",
+            "keystroke-display",
+            "about",
+        ];
         if pages
             .iter()
-            .any(|page| !settings_style_tree_is_valid(*page, false))
+            .zip(page_names.iter())
+            .any(|(page, page_name)| !settings_style_tree_is_valid(*page, false, page_name))
         {
             log_info!(
                 "[smoke-settings-layout] font tokens, slider ticks, or card elevation are invalid"
