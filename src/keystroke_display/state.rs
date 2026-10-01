@@ -8,7 +8,6 @@ const SHORTCUT_MODIFIERS: u64 =
     keyboard::FLAG_COMMAND | keyboard::FLAG_OPTION | keyboard::FLAG_SHIFT | keyboard::FLAG_CONTROL;
 const MODIFIER_ONLY_FADE: Duration = Duration::from_millis(600);
 pub(super) const IDLE_FADE: Duration = Duration::from_millis(1800);
-const TEXT_RUN_LIMIT: usize = 40;
 pub(crate) const BADGE_GAP: f64 = 6.0;
 pub(crate) const PANEL_SIDE_PADDING: f64 = 12.0;
 pub(crate) const BADGE_HORIZONTAL_PADDING: f64 = 28.0;
@@ -115,7 +114,6 @@ pub(crate) enum BadgeKind {
     Modifier,
     ModifierReleased,
     Chord,
-    TextRun,
     Indicator,
 }
 
@@ -172,14 +170,6 @@ struct LastKey {
     badge_index: usize,
     press_count: u32,
     glyph: String,
-    text_char_count: usize,
-    storage: KeyStorage,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum KeyStorage {
-    TextRun,
-    Badges,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -383,7 +373,7 @@ impl StateMachine {
         }
 
         let actual_modifiers = flags & crate::keystroke_display::mapping::modifier_mask();
-        if self.repeat_key_group(keycode, actual_modifiers, unicode, now) {
+        if self.repeat_key_group(keycode, actual_modifiers, now) {
             return;
         }
 
@@ -422,8 +412,6 @@ impl StateMachine {
                 badge_index: index,
                 press_count: 1,
                 glyph: group_glyph,
-                text_char_count: 0,
-                storage: KeyStorage::Badges,
             });
             self.deadline = Some(now + IDLE_FADE);
             return;
@@ -436,21 +424,15 @@ impl StateMachine {
                 self.last_key = None;
                 return;
             };
-            if self
-                .badges
-                .last()
-                .is_some_and(|last| last.kind == BadgeKind::TextRun)
-            {
-                self.start_text_group(keycode, actual_modifiers, " ", glyph);
-            } else {
-                self.start_badge_group(keycode, actual_modifiers, glyph, BadgeKind::Chord);
-            }
+            self.start_badge_group(keycode, actual_modifiers, glyph, BadgeKind::Chord);
             return;
         }
 
+        // Every key is its own badge: consecutive printable characters are never run together
+        // into a shared text capsule.
         if crate::keystroke_display::mapping::is_printable(unicode) {
             let display_glyph = glyph.unwrap_or(unicode);
-            self.start_text_group(keycode, actual_modifiers, unicode, display_glyph);
+            self.start_badge_group(keycode, actual_modifiers, display_glyph, BadgeKind::Chord);
             return;
         }
 
@@ -462,13 +444,7 @@ impl StateMachine {
         self.start_badge_group(keycode, actual_modifiers, glyph, BadgeKind::Chord);
     }
 
-    fn repeat_key_group(
-        &mut self,
-        keycode: u16,
-        modifiers: u64,
-        unicode: &str,
-        now: Instant,
-    ) -> bool {
+    fn repeat_key_group(&mut self, keycode: u16, modifiers: u64, now: Instant) -> bool {
         let Some(last) = self.last_key.as_ref().cloned() else {
             return false;
         };
@@ -476,80 +452,26 @@ impl StateMachine {
             return false;
         }
 
+        // The same key pressed repeatedly shows three separate badges, then collapses into one
+        // with a count that keeps climbing on further presses.
         let next_count = last.press_count.saturating_add(1);
-        match last.storage {
-            KeyStorage::TextRun if last.press_count < 3 => {
-                self.append_text(unicode);
-                if let Some(group) = self.last_key.as_mut() {
-                    group.press_count = next_count;
-                    group.text_char_count = group
-                        .text_char_count
-                        .saturating_add(unicode.chars().count());
-                }
-            }
-            KeyStorage::TextRun => {
-                let insertion_index =
-                    self.remove_text_group_suffix(last.badge_index, last.text_char_count);
-                let mut badge = Badge::new(last.glyph.clone(), BadgeKind::Chord);
-                badge.repeats = next_count;
-                self.badges.insert(insertion_index, badge);
-                if let Some(group) = self.last_key.as_mut() {
-                    group.badge_index = insertion_index;
-                    group.press_count = next_count;
-                    group.text_char_count = 0;
-                    group.storage = KeyStorage::Badges;
-                }
-            }
-            KeyStorage::Badges if last.press_count < 3 => {
-                self.push_badge(last.glyph, BadgeKind::Chord);
-                if let Some(group) = self.last_key.as_mut() {
-                    group.press_count = next_count;
-                }
-            }
-            KeyStorage::Badges if last.press_count == 3 => {
-                let mut badge = Badge::new(last.glyph, BadgeKind::Chord);
-                badge.repeats = next_count;
-                self.badges.splice(
-                    last.badge_index..last.badge_index + 3,
-                    std::iter::once(badge),
-                );
-                if let Some(group) = self.last_key.as_mut() {
-                    group.press_count = next_count;
-                }
-            }
-            KeyStorage::Badges => {
-                if let Some(badge) = self.badges.get_mut(last.badge_index) {
-                    badge.repeats = next_count;
-                }
-                if let Some(group) = self.last_key.as_mut() {
-                    group.press_count = next_count;
-                }
-            }
+        if last.press_count < 3 {
+            self.push_badge(last.glyph, BadgeKind::Chord);
+        } else if last.press_count == 3 {
+            let mut badge = Badge::new(last.glyph, BadgeKind::Chord);
+            badge.repeats = next_count;
+            self.badges.splice(
+                last.badge_index..last.badge_index + 3,
+                std::iter::once(badge),
+            );
+        } else if let Some(badge) = self.badges.get_mut(last.badge_index) {
+            badge.repeats = next_count;
+        }
+        if let Some(group) = self.last_key.as_mut() {
+            group.press_count = next_count;
         }
         self.deadline = Some(now + IDLE_FADE);
         true
-    }
-
-    fn start_text_group(&mut self, keycode: u16, modifiers: u64, text: &str, glyph: &str) {
-        let start_index = if self
-            .badges
-            .last()
-            .is_some_and(|badge| badge.kind == BadgeKind::TextRun)
-        {
-            self.badges.len() - 1
-        } else {
-            self.badges.len()
-        };
-        self.append_text(text);
-        self.last_key = Some(LastKey {
-            keycode,
-            modifiers,
-            badge_index: start_index,
-            press_count: 1,
-            glyph: glyph.to_string(),
-            text_char_count: text.chars().count(),
-            storage: KeyStorage::TextRun,
-        });
     }
 
     fn start_badge_group(&mut self, keycode: u16, modifiers: u64, glyph: &str, kind: BadgeKind) {
@@ -560,53 +482,7 @@ impl StateMachine {
             badge_index,
             press_count: 1,
             glyph: glyph.to_string(),
-            text_char_count: 0,
-            storage: KeyStorage::Badges,
         });
-    }
-
-    fn remove_text_group_suffix(&mut self, start_index: usize, mut char_count: usize) -> usize {
-        while char_count > 0 {
-            let Some(last) = self.badges.last_mut() else {
-                break;
-            };
-            if last.kind != BadgeKind::TextRun {
-                break;
-            }
-            let text_chars = last.text.chars().count();
-            let remove_count = char_count.min(text_chars);
-            for _ in 0..remove_count {
-                last.text.pop();
-            }
-            char_count -= remove_count;
-            if last.text.is_empty() {
-                self.badges.pop();
-            }
-        }
-
-        if self
-            .badges
-            .get(start_index)
-            .is_some_and(|badge| badge.kind == BadgeKind::TextRun && !badge.text.is_empty())
-        {
-            start_index + 1
-        } else {
-            start_index.min(self.badges.len())
-        }
-    }
-
-    fn append_text(&mut self, text: &str) {
-        for ch in text.chars() {
-            let Some(last) = self.badges.last_mut() else {
-                self.push_badge(ch.to_string(), BadgeKind::TextRun);
-                continue;
-            };
-            if last.kind == BadgeKind::TextRun && last.text.chars().count() < TEXT_RUN_LIMIT {
-                last.text.push(ch);
-            } else {
-                self.push_badge(ch.to_string(), BadgeKind::TextRun);
-            }
-        }
     }
 
     fn push_badge(&mut self, text: String, kind: BadgeKind) -> usize {
@@ -619,7 +495,7 @@ impl StateMachine {
 mod tests {
     use super::{
         estimated_badge_width, estimated_stream_width, BadgeKind, DisplayMode, Input, KeyGlyph,
-        StateMachine, IDLE_FADE, MODIFIER_ONLY_FADE, TEXT_RUN_LIMIT,
+        StateMachine, IDLE_FADE, MODIFIER_ONLY_FADE,
     };
     use crate::event_tap::keyboard;
     use std::time::{Duration, Instant};
@@ -692,25 +568,25 @@ mod tests {
     }
 
     #[test]
-    fn key_groups_show_three_instances_then_collapse_and_count_all_keydowns() {
+    fn repeated_keys_show_three_instances_then_collapse_and_count_all_keydowns() {
         let now = Instant::now();
         let mut state = StateMachine::default();
         state.apply(down(0, 0, "a"), DisplayMode::All, now);
+        assert_eq!(state.badges().len(), 1);
+        assert_eq!(state.badges()[0].text, "a");
         state.apply(
             down(0, 0, "a"),
             DisplayMode::All,
             now + Duration::from_millis(1),
         );
-        assert_eq!(state.badges().len(), 1);
-        assert_eq!(state.badges()[0].text, "aa");
-        assert_eq!(state.badges()[0].repeats, 1);
+        assert_eq!(state.badges().len(), 2);
         state.apply(
             down_with_repeat(0, 0, true, "a"),
             DisplayMode::All,
             now + Duration::from_millis(2),
         );
-        assert_eq!(state.badges()[0].text, "aaa");
-        assert_eq!(state.badges()[0].repeats, 1);
+        assert_eq!(state.badges().len(), 3);
+        assert!(state.badges().iter().all(|badge| badge.text == "a"));
         state.apply(
             down(0, 0, "a"),
             DisplayMode::All,
@@ -758,37 +634,32 @@ mod tests {
     }
 
     #[test]
-    fn interleaved_text_keeps_prefix_and_suffix_around_collapsed_group() {
+    fn each_printable_key_gets_its_own_badge() {
+        // "hello": the two consecutive l's are separate presses, so they are two badges rather
+        // than one merged capsule.
         let now = Instant::now();
         let mut state = StateMachine::default();
-        state.apply(down(0, 0, "a"), DisplayMode::All, now);
-        state.apply(down(11, 0, "b"), DisplayMode::All, now);
-        for count in 1..=4 {
+        let keys = [(4u16, "h"), (14, "e"), (37, "l"), (37, "l"), (31, "o")];
+        for (offset, (keycode, text)) in keys.into_iter().enumerate() {
             state.apply(
-                down(0, 0, "a"),
+                down(keycode, 0, text),
                 DisplayMode::All,
-                now + Duration::from_millis(count),
+                now + Duration::from_millis(offset as u64),
             );
         }
-        state.apply(
-            down(11, 0, "b"),
-            DisplayMode::All,
-            now + Duration::from_millis(5),
-        );
-        assert_eq!(state.badges().len(), 3);
-        assert_eq!(state.badges()[0].kind, BadgeKind::TextRun);
-        assert_eq!(state.badges()[0].text, "ab");
-        assert_eq!(state.badges()[1].text, "a");
-        assert_eq!(state.badges()[1].repeats, 4);
-        assert_eq!(state.badges()[2].kind, BadgeKind::TextRun);
-        assert_eq!(state.badges()[2].text, "b");
+        let texts: Vec<&str> = state
+            .badges()
+            .iter()
+            .map(|badge| badge.text.as_str())
+            .collect();
+        assert_eq!(texts, ["h", "e", "l", "l", "o"]);
     }
 
     #[test]
-    fn different_key_resets_text_repeat_group_without_reordering_content() {
+    fn a_different_key_resets_the_repeat_group() {
         let now = Instant::now();
         let mut state = StateMachine::default();
-        for offset in 0..3 {
+        for offset in 0..2 {
             state.apply(
                 down(0, 0, "a"),
                 DisplayMode::All,
@@ -798,19 +669,21 @@ mod tests {
         state.apply(
             down(11, 0, "b"),
             DisplayMode::All,
-            now + Duration::from_millis(3),
+            now + Duration::from_millis(2),
         );
-        for offset in 4..8 {
+        for offset in 3..7 {
             state.apply(
                 down(0, 0, "a"),
                 DisplayMode::All,
                 now + Duration::from_millis(offset),
             );
         }
-        assert_eq!(state.badges().len(), 2);
-        assert_eq!(state.badges()[0].text, "aaab");
-        assert_eq!(state.badges()[1].text, "a");
-        assert_eq!(state.badges()[1].repeats, 4);
+        let badges: Vec<(&str, u32)> = state
+            .badges()
+            .iter()
+            .map(|badge| (badge.text.as_str(), badge.repeats))
+            .collect();
+        assert_eq!(badges, [("a", 1), ("a", 1), ("b", 1), ("a", 4)]);
     }
 
     #[test]
@@ -891,15 +764,15 @@ mod tests {
     }
 
     #[test]
-    fn text_runs_merge_and_split_at_forty_characters() {
+    fn many_distinct_keys_never_merge_into_one_badge() {
         let now = Instant::now();
         let mut state = StateMachine::default();
-        for index in 0..42 {
-            state.apply(down(index as u16 % 2, 0, "a"), DisplayMode::All, now);
+        for keycode in 0..42u16 {
+            // Distinct keycodes avoid repeat collapsing, so every press must add its own badge.
+            state.apply(down(keycode, 0, "a"), DisplayMode::All, now);
         }
-        assert_eq!(state.badges().len(), 2);
-        assert_eq!(state.badges()[0].text.chars().count(), 40);
-        assert_eq!(state.badges()[1].text, "aa");
+        assert_eq!(state.badges().len(), 42);
+        assert!(state.badges().iter().all(|badge| badge.text == "a"));
     }
 
     #[test]
@@ -915,27 +788,25 @@ mod tests {
     fn width_limit_keeps_the_current_oversized_badge_intact() {
         let now = Instant::now();
         let mut state = StateMachine::default();
-        for _ in 0..TEXT_RUN_LIMIT {
-            state.apply(down(0, 0, "a"), DisplayMode::All, now);
-        }
+        state.apply(down(0, 0, "a"), DisplayMode::All, now);
         let text = state.badges()[0].text.clone();
-        assert!(!state.trim_to_width(64.0));
+        assert!(!state.trim_to_width(1.0));
         assert_eq!(state.badges()[0].text, text);
     }
 
     #[test]
-    fn space_is_named_standalone_and_merges_into_text_runs() {
+    fn space_is_its_own_named_key() {
         let now = Instant::now();
-        let mut standalone = StateMachine::default();
-        standalone.apply(down(keyboard::VK_SPACE, 0, " "), DisplayMode::All, now);
-        assert_eq!(standalone.badges()[0].text, "Space");
-
-        let mut text = StateMachine::default();
-        text.apply(down(0, 0, "h"), DisplayMode::All, now);
-        text.apply(down(keyboard::VK_SPACE, 0, " "), DisplayMode::All, now);
-        text.apply(down(1, 0, "i"), DisplayMode::All, now);
-        assert_eq!(text.badges().len(), 1);
-        assert_eq!(text.badges()[0].text, "h i");
+        let mut state = StateMachine::default();
+        state.apply(down(0, 0, "h"), DisplayMode::All, now);
+        state.apply(down(keyboard::VK_SPACE, 0, " "), DisplayMode::All, now);
+        state.apply(down(1, 0, "i"), DisplayMode::All, now);
+        let texts: Vec<&str> = state
+            .badges()
+            .iter()
+            .map(|badge| badge.text.as_str())
+            .collect();
+        assert_eq!(texts, ["h", "Space", "i"]);
     }
 
     #[test]

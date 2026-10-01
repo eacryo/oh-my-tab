@@ -677,7 +677,7 @@ pub(super) fn smoke_runner() -> bool {
     let cjk_badges = [
         Badge {
             text: "中文".into(),
-            kind: BadgeKind::TextRun,
+            kind: BadgeKind::Chord,
             repeats: 1,
         },
         Badge {

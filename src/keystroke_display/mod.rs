@@ -411,7 +411,6 @@ pub(crate) fn e2e_snapshot() -> E2eSnapshot {
                     BadgeKind::Modifier => "modifier",
                     BadgeKind::ModifierReleased => "modifier_released",
                     BadgeKind::Chord => "chord",
-                    BadgeKind::TextRun => "text_run",
                     BadgeKind::Indicator => "indicator",
                 },
                 repeats: badge.repeats,
