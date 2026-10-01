@@ -574,56 +574,94 @@ pub(super) unsafe fn build_general_page(
         ),
     );
     bind_control(target, ui.theme);
-    let glass_style_labels = [
-        t("settings.glass_style_regular"),
-        t("settings.glass_style_clear"),
+    let material_items = [
+        t("settings.panel_material_liquid_glass"),
+        t("settings.panel_material_frost"),
+        t("settings.panel_material_opaque"),
     ];
-    let glass_style_label_refs: Vec<&str> = glass_style_labels.iter().map(String::as_str).collect();
-    let glass_style_metrics =
-        SettingsSelect::metrics(ctrl_w, &glass_style_label_refs, row_h, described_row_h);
-    let y = canvas.next_block(glass_style_metrics.row_h);
-    SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
-    ui.glass_style = SettingsRow::described(
+    let material_item_refs: Vec<&str> = material_items.iter().map(String::as_str).collect();
+    let material_metrics =
+        SettingsSelect::metrics(ctrl_w, &material_item_refs, row_h, described_row_h);
+    let y = canvas.next_block(material_metrics.row_h);
+    SettingsRow::separator(general_view, y + material_metrics.row_h, content_w);
+    ui.panel_material = SettingsRow::described(
         general_view,
         label_x,
         y,
         ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        glass_style_metrics.row_h,
-        &t("settings.row_glass_style"),
-        &t("settings.desc_glass_style"),
+        material_metrics.row_h,
+        &t("settings.row_panel_material"),
+        &t("settings.desc_panel_material"),
         SettingsControl::popup(
             ctrl_x,
             y + 10.0,
             ctrl_w,
-            glass_style_metrics.control_h,
-            &glass_style_label_refs,
+            material_metrics.control_h,
+            &material_item_refs,
             0,
         ),
     );
-    bind_control(target, ui.glass_style);
-    let y = canvas.next_block(described_row_h);
-    SettingsRow::separator(general_view, y + described_row_h, content_w);
-    let tint_control = make_color_well(
-        ctrl_x,
-        y + 10.0,
-        ctrl_w,
-        row_h,
-        &Config::default().appearance.glass_tint,
-        target,
-    );
-    ui.glass_tint = tint_control.well;
-    ui.glass_tint_hex = tint_control.hex_caption;
-    SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_glass_tint"),
-        &t("settings.desc_glass_tint"),
-        tint_control.container,
-    );
-    configure_glass_tint_panel(target);
+    bind_control(target, ui.panel_material);
+    // The glass style and tint are Liquid-Glass sub-options: they are only built (and thus
+    // only occupy layout space) while that material is selected. A material change rebuilds
+    // the settings content via the settings_appearance path, so the rows come and go live.
+    // Consumers of ui.glass_style/ui.glass_tint all tolerate the null pointers (nil checks
+    // in load_settings_values, the tint-panel close path, and the smoke validators).
+    let liquid_glass_selected =
+        crate::config::effective_panel_material().as_str() == "liquid-glass";
+    if liquid_glass_selected {
+        let glass_style_labels = [
+            t("settings.glass_style_regular"),
+            t("settings.glass_style_clear"),
+        ];
+        let glass_style_label_refs: Vec<&str> =
+            glass_style_labels.iter().map(String::as_str).collect();
+        let glass_style_metrics =
+            SettingsSelect::metrics(ctrl_w, &glass_style_label_refs, row_h, described_row_h);
+        let y = canvas.next_block(glass_style_metrics.row_h);
+        SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
+        ui.glass_style = SettingsRow::described(
+            general_view,
+            label_x,
+            y,
+            ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+            glass_style_metrics.row_h,
+            &t("settings.row_glass_style"),
+            &t("settings.desc_glass_style"),
+            SettingsControl::popup(
+                ctrl_x,
+                y + 10.0,
+                ctrl_w,
+                glass_style_metrics.control_h,
+                &glass_style_label_refs,
+                0,
+            ),
+        );
+        bind_control(target, ui.glass_style);
+        let y = canvas.next_block(described_row_h);
+        SettingsRow::separator(general_view, y + described_row_h, content_w);
+        let tint_control = make_color_well(
+            ctrl_x,
+            y + 10.0,
+            ctrl_w,
+            row_h,
+            &Config::default().appearance.glass_tint,
+            target,
+        );
+        ui.glass_tint = tint_control.well;
+        ui.glass_tint_hex = tint_control.hex_caption;
+        SettingsRow::described(
+            general_view,
+            label_x,
+            y,
+            ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+            described_row_h,
+            &t("settings.row_glass_tint"),
+            &t("settings.desc_glass_tint"),
+            tint_control.container,
+        );
+        configure_glass_tint_panel(target);
+    }
     canvas.card(&t("settings.header_appearance"));
 
     canvas.next_section();

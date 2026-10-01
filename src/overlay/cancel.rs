@@ -705,35 +705,49 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
     }
 }
 
-/// Re-apply glass properties (style/tint/cornerRadius) from CONFIG to the existing
-/// NSGlassEffectView, for hot reload. Only effective on macOS 26+ once the glass view
-/// exists; otherwise a no-op.
+/// Re-apply surface properties from CONFIG to the installed backdrop, for hot reload:
+/// glass style/tint, frost material, opaque surface color. Corner radius is re-asserted on
+/// whichever root view is installed (glass also carries it as its own rounding property).
 pub(crate) unsafe fn apply_glass_properties() {
-    let glass = match *GLASS_VIEW.lock().unwrap() {
-        Some(g) => g.0,
-        None => return,
+    let Some(backdrop) = *OVERLAY_BACKDROP.lock().unwrap() else {
+        return;
     };
-    if glass.is_null() {
+    crate::glass::apply_live_properties(backdrop, None);
+    let Some(root) = backdrop.root else {
+        return;
+    };
+    let radius = CONFIG.read().unwrap().appearance.corner_radius;
+    if backdrop.glass.is_some() {
+        let _: () = msg_send![root.0, setCornerRadius: radius];
+    }
+    // Mirror the layer hard-clip: the glass cornerRadius rounds the tint but not the blur, so
+    // masksToBounds is needed to clip the blur into the rounded shape (see (6.5) notes).
+    let root_layer: *mut AnyObject = msg_send![root.0, layer];
+    if !root_layer.is_null() {
+        let _: () = msg_send![root_layer, setCornerRadius: radius];
+        let _: () = msg_send![root_layer, setMasksToBounds: true];
+    }
+}
+
+/// Bring the switcher's backdrop in line with the effective material. Called when the
+/// panel-material setting changes and on every summon: the window is created once and
+/// reused, so show-time sync is what picks up Reduce Transparency toggles.
+pub(crate) unsafe fn apply_backdrop_material() {
+    let Some(window) = overlay_window_ptr() else {
+        return;
+    };
+    let Some(old) = *OVERLAY_BACKDROP.lock().unwrap() else {
+        return;
+    };
+    if old.material == crate::glass::PanelMaterial::effective() {
         return;
     }
     let radius = CONFIG.read().unwrap().appearance.corner_radius;
-    let style_name = config::effective_glass_style();
-    let tint_hex = config::parse_hex8(&config::effective_glass_tint());
-    let _: () = msg_send![glass, setCornerRadius: radius];
-    // Mirror the layer hard-clip: cornerRadius rounds the tint but not the blur, so masksToBounds
-    // is needed to clip the blur into the rounded shape (see (6.5) in create_overlay_window).
-    let glass_layer: *mut AnyObject = msg_send![glass, layer];
-    if !glass_layer.is_null() {
-        let _: () = msg_send![glass_layer, setCornerRadius: radius];
-        let _: () = msg_send![glass_layer, setMasksToBounds: true];
-    }
-    let style: i64 = match style_name.as_str() {
-        "clear" => 1,
-        _ => 0, // regular
-    };
-    let _: () = msg_send![glass, setStyle: style];
-    let tint = hex_to_ns_color(tint_hex);
-    let _: () = msg_send![glass, setTintColor: tint];
+    let frame_rect: NSRect = msg_send![window, frame];
+    let content_rect: NSRect = msg_send![window, contentRectForFrameRect: frame_rect];
+    let new = crate::glass::swap_backdrop(window, &old, content_rect, radius, None);
+    *OVERLAY_BACKDROP.lock().unwrap() = Some(new);
+    apply_glass_properties();
 }
 
 pub(crate) fn apply_theme() {

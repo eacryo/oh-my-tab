@@ -11,6 +11,7 @@ use super::*;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ControlField {
     Theme,
+    PanelMaterial,
     GlassStyle,
     GlassTint,
     Locale,
@@ -79,6 +80,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
         let ptr = sender as usize;
         let m = |ctrl: *mut AnyObject, field: ControlField| (ptr == ctrl as usize).then_some(field);
         m(u.theme, ControlField::Theme)
+            .or_else(|| m(u.panel_material, ControlField::PanelMaterial))
             .or_else(|| m(u.glass_style, ControlField::GlassStyle))
             .or_else(|| m(u.glass_tint, ControlField::GlassTint))
             .or_else(|| m(u.locale, ControlField::Locale))
@@ -452,6 +454,13 @@ fn apply_control_field(field: ControlField) {
                         _ => "auto",
                     }
                     .into();
+                }
+                ControlField::PanelMaterial => {
+                    let idx: isize = msg_send![u.panel_material, indexOfSelectedItem];
+                    cfg.appearance.panel_material = crate::config::PANEL_MATERIAL_VALUES
+                        .get(idx as usize)
+                        .map(|value| (*value).to_string())
+                        .unwrap_or_else(|| "liquid-glass".into());
                 }
                 ControlField::GlassStyle => {
                     let idx: isize = msg_send![u.glass_style, indexOfSelectedItem];

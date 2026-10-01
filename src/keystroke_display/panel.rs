@@ -424,6 +424,12 @@ pub(super) fn render(
     cursor_point: Option<NSPoint>,
 ) -> Option<bool> {
     crate::debug_assert_main_thread();
+    if visible {
+        // The panel window persists across shows: sync the backdrop material first (here,
+        // outside the PANEL borrow below). The check is a cheap enum compare unless the
+        // material actually changed.
+        unsafe { apply_backdrop_material() };
+    }
     PANEL.with(|panel| {
         let mut state = panel.borrow_mut();
         if !visible && state.drag.is_some() {
@@ -730,6 +736,7 @@ pub(super) fn smoke_runner() -> bool {
                 && typical_glyph_advances
                 && option_q_is_unmodified
                 && backdrop_structure_valid(panel, badge_container)
+                && backdrop_frost_mask_valid()
                 && centroid_offsets.as_ref().is_some_and(|offsets| {
                     offsets.len() == cjk_badges.len()
                         && offsets.iter().all(|(offset, pixels)| {
@@ -1099,11 +1106,11 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
     let Some(backdrop) = installed_backdrop() else {
         return false;
     };
+    let root: *mut AnyObject = msg_send![panel, contentView];
     if let Some(glass) = backdrop.glass {
         let Some(glass_class) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") else {
             return false;
         };
-        let root: *mut AnyObject = msg_send![panel, contentView];
         let is_glass: bool = msg_send![root, isKindOfClass: glass_class];
         let radius: f64 = msg_send![glass.0, cornerRadius];
         let inner: *mut AnyObject = msg_send![glass.0, contentView];
@@ -1122,21 +1129,26 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
             && fill_is_child
             && badges_are_child
             && !fill_layer.0.is_null()
-    } else {
-        let Some(effect) = backdrop.effect_view else {
-            return false;
-        };
+    } else if let Some(effect) = backdrop.effect_view {
         let Some(effect_class) = objc2::runtime::AnyClass::get(c"NSVisualEffectView") else {
             return false;
         };
-        let root: *mut AnyObject = msg_send![panel, contentView];
         let is_effect: bool = msg_send![effect.0, isKindOfClass: effect_class];
         let effect_layer: *mut AnyObject = msg_send![effect.0, layer];
         let radius: f64 = msg_send![effect_layer, cornerRadius];
+        // Every material now installs its root view as the window's content view directly.
         is_effect
-            && view_contains_subview(root, effect.0)
+            && effect.0 == root
             && view_contains_subview(effect.0, badge_container)
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
+    } else if let Some(plain) = backdrop.opaque_view {
+        let plain_layer: *mut AnyObject = msg_send![plain.0, layer];
+        let radius: f64 = msg_send![plain_layer, cornerRadius];
+        plain.0 == root
+            && view_contains_subview(plain.0, badge_container)
+            && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
+    } else {
+        false
     }
 }
 
@@ -1154,10 +1166,54 @@ pub(super) unsafe fn apply_glass_properties() {
         return;
     };
     crate::glass::apply_live_properties(
-        backdrop.glass,
-        backdrop.compensation_layer,
+        backdrop,
         Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
     );
+}
+
+/// The frost material's blur is composited by the window server and ignores layer
+/// clipping: without the rounded maskImage the square blur bleeds past the corners (white
+/// corner frames over light backgrounds). The smoke asserts the mask exists on frost.
+unsafe fn backdrop_frost_mask_valid() -> bool {
+    let Some(backdrop) = installed_backdrop() else {
+        return false;
+    };
+    let Some(effect) = backdrop.effect_view else {
+        return !matches!(backdrop.material, crate::glass::PanelMaterial::Frost);
+    };
+    let is_frost: bool = msg_send![effect.0, isKindOfClass: class!(NSVisualEffectView)];
+    if !is_frost {
+        return true;
+    }
+    let mask: *mut AnyObject = msg_send![effect.0, maskImage];
+    !mask.is_null()
+}
+
+/// Bring the panel's backdrop in line with the effective material. Called when the
+/// panel-material setting changes and when the panel becomes visible; the swap reparents
+/// the badge container and grip into the new hierarchy, so only the slot and surface
+/// styles need refreshing afterwards.
+pub(super) unsafe fn apply_backdrop_material() {
+    let Some(panel) = PANEL.with(|panel| panel.borrow().panel) else {
+        return;
+    };
+    let Some(old) = installed_backdrop() else {
+        return;
+    };
+    if old.material == crate::glass::PanelMaterial::effective() {
+        return;
+    }
+    let frame_rect: NSRect = msg_send![panel, frame];
+    let content_rect: NSRect = msg_send![panel, contentRectForFrameRect: frame_rect];
+    let new = crate::glass::swap_backdrop(
+        panel,
+        &old,
+        content_rect,
+        crate::glass::PANEL_CORNER_RADIUS,
+        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+    );
+    *PANEL_BACKDROP.lock().unwrap() = Some(new);
+    apply_glass_properties();
 }
 
 unsafe fn set_alpha_immediately(panel: *mut AnyObject, alpha: f64) {

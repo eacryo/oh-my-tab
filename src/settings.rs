@@ -172,7 +172,8 @@ pub(super) struct SettingsUi {
     about_view: *mut AnyObject,        // About page container
     about_subtitle: *mut AnyObject,    // About-page version label
     theme: *mut AnyObject,             // NSPopUpButton: auto / light / dark
-    glass_style: *mut AnyObject,       // NSPopUpButton: regular / clear
+    panel_material: *mut AnyObject,    // NSPopUpButton: liquid-glass / frost / opaque
+    glass_style: *mut AnyObject,       // NSPopUpButton: regular / clear (liquid glass only)
     glass_tint: *mut AnyObject,        // glass tint
     glass_tint_hex: *mut AnyObject,    // displayed user-owned color value
     glass_preview_switcher: *mut AnyObject, // NSGlassEffectView: app switcher preview
@@ -934,6 +935,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.appearance.theme
     );
     changed!(
+        "appearance.panel_material",
+        old.appearance.panel_material,
+        new.appearance.panel_material
+    );
+    changed!(
         "appearance.glass_style",
         old.appearance.glass_style,
         new.appearance.glass_style
@@ -1263,19 +1269,30 @@ fn load_settings_from(cfg: &Config) {
                 _ => 2,
             };
             let _: () = msg_send![ui.theme, selectItemAtIndex: theme_idx];
-            let gs_idx: isize = if cfg.appearance.glass_style == "clear" {
-                1
-            } else {
-                0
-            };
-            let _: () = msg_send![ui.glass_style, selectItemAtIndex: gs_idx];
-            GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
-            let tint =
-                crate::ffi::hex_to_ns_color(crate::config::parse_hex8(&cfg.appearance.glass_tint));
-            let _: () = msg_send![ui.glass_tint, setColor: tint];
-            let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
-            let _: () = msg_send![panel, setColor: tint];
-            GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
+            let pm_idx: isize = crate::config::PANEL_MATERIAL_VALUES
+                .iter()
+                .position(|value| *value == cfg.appearance.panel_material)
+                .unwrap_or(0) as isize;
+            let _: () = msg_send![ui.panel_material, selectItemAtIndex: pm_idx];
+            // The glass sub-option rows exist only while Liquid Glass is the selected
+            // material; with another material their controls are null and there is
+            // nothing to synchronize.
+            if !ui.glass_style.is_null() {
+                let gs_idx: isize = if cfg.appearance.glass_style == "clear" {
+                    1
+                } else {
+                    0
+                };
+                let _: () = msg_send![ui.glass_style, selectItemAtIndex: gs_idx];
+                GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
+                let tint = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(
+                    &cfg.appearance.glass_tint,
+                ));
+                let _: () = msg_send![ui.glass_tint, setColor: tint];
+                let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
+                let _: () = msg_send![panel, setColor: tint];
+                GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
+            }
             set_field(ui.corner_radius, cfg.appearance.corner_radius);
             let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
             let status_bar_text_size = text_size_slider_value(cfg.fonts.status_bar_size);

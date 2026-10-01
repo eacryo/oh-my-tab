@@ -154,6 +154,18 @@ remain opaque enough that the contrast table above still holds on the worst-case
 overlay's glass is the exception: it is a transient surface over arbitrary content, and its text
 colors are chosen for the darkest and lightest backdrops it can ever cover.
 
+The floating panels (switcher, clipboard, keystroke display) offer three material families via the
+`panel_material` setting:
+
+| Material | Surface | Notes |
+| --- | --- | --- |
+| `liquid-glass` (default) | `NSGlassEffectView`, `glass_style`/`glass_tint` sub-options | Degrades to frost on macOS < 26 |
+| `frost` | `NSVisualEffectView`, behind-window, themed material | Neutral system blur; the glass sub-options do not apply |
+| `opaque` | `window_bg` fill, no blur | Also the forced fallback while the system's Reduce Transparency accessibility setting is on |
+
+Material only ever changes which surface sits behind the panel content — text colors, spacing,
+radius, and the palette remain exactly as specified here.
+
 ## 4. Typography
 
 Four sizes. Anything else is a bug.

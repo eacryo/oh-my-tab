@@ -2182,6 +2182,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             screen_recording_permission_status: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
+            panel_material: std::ptr::null_mut(),
             glass_tint: std::ptr::null_mut(),
             glass_tint_hex: std::ptr::null_mut(),
             glass_preview_switcher: std::ptr::null_mut(),

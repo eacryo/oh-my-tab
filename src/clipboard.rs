@@ -83,7 +83,7 @@ use search::*;
 use smoke::*;
 use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
-pub(crate) use detail::{apply_glass_properties, apply_theme};
+pub(crate) use detail::{apply_backdrop_material, apply_glass_properties, apply_theme};
 pub(crate) use monitor::{start, stop};
 pub(crate) use persist::apply_persist_toggle;
 pub(crate) use picker::on_clipboard_toggle;
@@ -525,8 +525,9 @@ fn picker_container_ptr() -> Option<*mut AnyObject> {
 }
 /// the localized footer in place.
 static PICKER_CONTENT_PARENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// The macOS 26+ picker glass view, used for live tint/style preview updates.
-static PICKER_GLASS: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The picker's installed backdrop, held for live material/tint updates and material swaps.
+static PICKER_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
+    MainThreadSlot::new(None);
 /// The empty-state hint view (shown when the history is empty / nothing matches). Tracked
 /// separately from row views so the next rebuild can remove it.
 static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -703,9 +704,9 @@ struct ScrollDragState {
 static SCROLL_DRAG: Mutex<Option<ScrollDragState>> = Mutex::new(None);
 /// the detail panel window (right-arrow expands).
 static DETAIL_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// The macOS 26+ detail glass view and its inactive compensation layer.
-static DETAIL_GLASS: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static DETAIL_GLASS_FILL_LAYER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The detail panel's installed backdrop (glass view + inactive compensation layer inside).
+static DETAIL_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
+    MainThreadSlot::new(None);
 /// Keep clipboard panels on the same resolved appearance as the settings window and switcher.
 unsafe fn apply_panel_appearance(window: *mut AnyObject) {
     let name = make_nsstring(if resolved_is_dark() {

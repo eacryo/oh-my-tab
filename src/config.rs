@@ -177,10 +177,16 @@ impl Default for WindowControlSection {
 #[serde(default)]
 pub struct Appearance {
     pub theme: String,
+    /// Floating-panel material family: liquid glass, plain frost, or opaque.
+    /// `glass_style`/`glass_tint` are sub-options that only apply to liquid glass.
+    pub panel_material: String,
     pub glass_style: String,
     pub glass_tint: String,
     pub corner_radius: f64,
 }
+
+/// Valid `appearance.panel_material` values, in settings-dropdown order.
+pub const PANEL_MATERIAL_VALUES: [&str; 3] = ["liquid-glass", "frost", "opaque"];
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -624,6 +630,7 @@ impl Default for Appearance {
             // Follow the system by default while preserving explicit user choices from existing
             // config files.
             theme: "auto".into(),
+            panel_material: "liquid-glass".into(),
             glass_style: "regular".into(),
             // Default Liquid Glass overlay tint (RRGGBBAA); the settings page lets users pick another color.
             glass_tint: "eeeeee66".into(),
@@ -755,6 +762,12 @@ impl Config {
             errs.push(tf(
                 "errors.appearance_glass_style_invalid",
                 &[("value", &self.appearance.glass_style)],
+            ));
+        }
+        if !PANEL_MATERIAL_VALUES.contains(&self.appearance.panel_material.as_str()) {
+            errs.push(tf(
+                "errors.appearance_panel_material_invalid",
+                &[("value", &self.appearance.panel_material)],
             ));
         }
         if !is_hex8(&self.appearance.glass_tint) {
@@ -1076,6 +1089,12 @@ impl Config {
             }
             if !errs.iter().any(|e| e.starts_with("appearance.glass_style")) {
                 self.appearance.glass_style = other.appearance.glass_style;
+            }
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("appearance.panel_material"))
+            {
+                self.appearance.panel_material = other.appearance.panel_material;
             }
             if !errs.iter().any(|e| e.starts_with("appearance.glass_tint")) {
                 self.appearance.glass_tint = other.appearance.glass_tint;
@@ -1831,6 +1850,18 @@ pub fn effective_glass_style() -> String {
     CONFIG.read().unwrap().appearance.glass_style.clone()
 }
 
+/// Return the effective floating-panel material. A valid `--panel-material=<id>` launch
+/// switch overrides the config for that launch (the dev-verification channel); an invalid
+/// one is ignored so a typo can never break the panels.
+pub fn effective_panel_material() -> String {
+    if let Some(value) = crate::dev_flags::value("panel-material") {
+        if PANEL_MATERIAL_VALUES.contains(&value.as_str()) {
+            return value;
+        }
+    }
+    CONFIG.read().unwrap().appearance.panel_material.clone()
+}
+
 /// Return the effective glass tint.
 pub fn effective_glass_tint() -> String {
     CONFIG.read().unwrap().appearance.glass_tint.clone()
@@ -2338,6 +2369,29 @@ mod tests {
             merged.appearance.corner_radius,
             Config::default().appearance.corner_radius
         );
+    }
+
+    #[test]
+    fn panel_material_validates_and_merges_per_field() {
+        let mut cfg = Config::default();
+        assert_err_count(&cfg, 0);
+        cfg.appearance.panel_material = "frost".into();
+        assert_err_count(&cfg, 0);
+        cfg.appearance.panel_material = "opaque".into();
+        assert_err_count(&cfg, 0);
+        cfg.appearance.panel_material = "glass".into();
+        assert_err_count(&cfg, 1);
+
+        // An invalid material falls back to the default while valid neighbors survive.
+        let mut loaded = Config::default();
+        loaded.appearance.theme = "dark".into();
+        loaded.appearance.panel_material = "transparent".into();
+        let errors = loaded.validate();
+        assert_eq!(errors.len(), 1);
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert_eq!(merged.appearance.theme, "dark");
+        assert_eq!(merged.appearance.panel_material, "liquid-glass");
     }
 
     #[test]

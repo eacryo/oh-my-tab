@@ -253,7 +253,15 @@ pub(super) unsafe fn make_glass_preview(
 ) -> *mut AnyObject {
     let palette = settings_palette();
     let stage_color = crate::theme::settings_preview_stage_color(palette.dark);
-    crate::e2e_state::set_settings_preview_colors(stage_color, palette.card_bg);
+    let material = crate::glass::PanelMaterial::effective();
+    // The reported preview surface is the material's actual backdrop color: the theme card
+    // surface for translucent materials, the window surface for the opaque one.
+    let preview_surface = if material == crate::glass::PanelMaterial::Opaque {
+        palette.window_bg
+    } else {
+        palette.card_bg
+    };
+    crate::e2e_state::set_settings_preview_colors(stage_color, preview_surface);
     let stage: *mut AnyObject = msg_send![class!(NSView), alloc];
     let stage: *mut AnyObject = msg_send![
         stage,
@@ -272,51 +280,87 @@ pub(super) unsafe fn make_glass_preview(
     let _: () = msg_send![parent, addSubview: stage];
     release_obj(stage);
 
-    let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
+    let supports_glass = AnyClass::get(c"NSGlassEffectView").is_some();
     let content_parent: *mut AnyObject;
     let glass: *mut AnyObject;
-    if is_macos_26 {
-        let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
-        let view: *mut AnyObject = msg_send![glass_cls, alloc];
-        glass = msg_send![
-            view,
-            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
-        ];
-        let _: () = msg_send![glass, setCornerRadius: crate::theme::RADIUS_CARD];
-        let style = if crate::config::effective_glass_style() == "clear" {
-            1i64
-        } else {
-            0i64
-        };
-        let _: () = msg_send![glass, setStyle: style];
-        let tint = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(
-            &crate::config::effective_glass_tint(),
-        ));
-        let _: () = msg_send![glass, setTintColor: tint];
-        let _: () = msg_send![glass, setWantsLayer: true];
-        let layer: *mut AnyObject = msg_send![glass, layer];
-        if !layer.is_null() {
-            let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CARD];
-            let _: () = msg_send![layer, setMasksToBounds: true];
+    match material {
+        crate::glass::PanelMaterial::LiquidGlass if supports_glass => {
+            let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
+            let view: *mut AnyObject = msg_send![glass_cls, alloc];
+            glass = msg_send![
+                view,
+                initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+            ];
+            let _: () = msg_send![glass, setCornerRadius: crate::theme::RADIUS_CARD];
+            let style = if crate::config::effective_glass_style() == "clear" {
+                1i64
+            } else {
+                0i64
+            };
+            let _: () = msg_send![glass, setStyle: style];
+            let tint = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(
+                &crate::config::effective_glass_tint(),
+            ));
+            let _: () = msg_send![glass, setTintColor: tint];
+            let _: () = msg_send![glass, setWantsLayer: true];
+            let layer: *mut AnyObject = msg_send![glass, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CARD];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+            let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let inner: *mut AnyObject = msg_send![
+                inner,
+                initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
+            ];
+            let _: () = msg_send![inner, setAutoresizingMask: 18u64];
+            let _: () = msg_send![glass, setContentView: inner];
+            content_parent = inner;
         }
-        let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let inner: *mut AnyObject = msg_send![
-            inner,
-            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
-        ];
-        let _: () = msg_send![inner, setAutoresizingMask: 18u64];
-        let _: () = msg_send![glass, setContentView: inner];
-        content_parent = inner;
-    } else {
-        let view: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        glass = msg_send![
-            view,
-            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
-        ];
-        let _: () = msg_send![glass, setBlendingMode: 1u64]; // WithinWindow
-        let _: () = msg_send![glass, setMaterial: 12u64]; // Dark
-        let _: () = msg_send![glass, setState: 1u64];
-        content_parent = glass;
+        // Frost — and Liquid Glass on pre-26 macOS, which never had the Glass class.
+        crate::glass::PanelMaterial::LiquidGlass | crate::glass::PanelMaterial::Frost => {
+            let view: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+            glass = msg_send![
+                view,
+                initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+            ];
+            // BehindWindow: blur the stage underneath, like the real panels do.
+            let _: () = msg_send![glass, setBlendingMode: 0u64];
+            let _: () = msg_send![glass, setMaterial: crate::glass::frost_material()];
+            let _: () = msg_send![glass, setState: 1u64];
+            let _: () = msg_send![glass, setWantsLayer: true];
+            let layer: *mut AnyObject = msg_send![glass, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CARD];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+            // Same server-side blur as the real panels: the rounded mask keeps the
+            // preview's corners square-blur-free too.
+            let mask = crate::glass::rounded_effect_mask(crate::theme::RADIUS_CARD);
+            if !mask.is_null() {
+                let _: () = msg_send![glass, setMaskImage: mask];
+                release_obj(mask);
+            }
+            content_parent = glass;
+        }
+        crate::glass::PanelMaterial::Opaque => {
+            let view: *mut AnyObject = msg_send![class!(NSView), alloc];
+            glass = msg_send![
+                view,
+                initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+            ];
+            let _: () = msg_send![glass, setWantsLayer: true];
+            let layer: *mut AnyObject = msg_send![glass, layer];
+            if !layer.is_null() {
+                crate::ffi::layer_set_background(
+                    layer,
+                    crate::ffi::hex_to_cg_color(palette.window_bg),
+                );
+                let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CARD];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+            content_parent = glass;
+        }
     }
     let _: () = msg_send![glass, setAutoresizingMask: 0u64];
     let _: () = msg_send![parent, addSubview: glass];

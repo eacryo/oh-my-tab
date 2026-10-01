@@ -414,6 +414,12 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         SETTINGS_PREVIEW_STAGE.load(Ordering::Relaxed),
         SETTINGS_PREVIEW_CARD.load(Ordering::Relaxed),
     ));
+    // The installed panel material (after the Reduce Transparency override) — AX cannot tell
+    // a glass view from a plain layer, so the app states the fact itself.
+    json.push_str(&format!(
+        "  \"panel_material\": {},\n",
+        json_string(crate::glass::effective_material_id())
+    ));
     json.push_str(&format!(
         "  \"smooth_scroll\": {{\"ticks\": {}, \"touch_began\": {}, \"touch_changed\": {}, \"touch_ended\": {}, \"momentum_began\": {}, \"momentum_changed\": {}, \"momentum_ended\": {}}},\n",
         SMOOTH_TICKS.load(Ordering::Relaxed),

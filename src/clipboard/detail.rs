@@ -426,18 +426,61 @@ pub(super) fn copy_detail_selection() {
     }
 }
 
-/// During the settings live preview, update only the glass views and detail compensation layer;
-/// do not rebuild clipboard content.
+/// During the settings live preview, update only the backdrop surfaces and detail
+/// compensation layer; do not rebuild clipboard content.
 pub(crate) unsafe fn apply_glass_properties() {
-    let picker_glass = *PICKER_GLASS.lock().unwrap();
-    crate::glass::apply_live_properties(picker_glass, None, None);
-    let detail_glass = *DETAIL_GLASS.lock().unwrap();
-    let compensation_layer = *DETAIL_GLASS_FILL_LAYER.lock().unwrap();
-    crate::glass::apply_live_properties(
-        detail_glass,
-        compensation_layer,
+    if let Some(backdrop) = *PICKER_BACKDROP.lock().unwrap() {
+        crate::glass::apply_live_properties(backdrop, None);
+    }
+    if let Some(backdrop) = *DETAIL_BACKDROP.lock().unwrap() {
+        crate::glass::apply_live_properties(
+            backdrop,
+            Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+        );
+    }
+}
+
+/// Bring both panels' backdrops in line with the effective material. Called when the
+/// panel-material setting changes and when a panel is shown: a panel whose window does not
+/// exist yet installs the new material on first build, and an existing window only swaps
+/// when its installed material actually differs.
+pub(crate) unsafe fn apply_backdrop_material() {
+    if let Some(new) = swap_backdrop_if_material_changed(&PICKER_WINDOW, &PICKER_BACKDROP, None) {
+        // The picker footer rebuild (locale/text-size changes) hangs content off this
+        // pointer; a stale one would point into the retired hierarchy.
+        *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(new.content_parent));
+    }
+    swap_backdrop_if_material_changed(
+        &DETAIL_WINDOW,
+        &DETAIL_BACKDROP,
         Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
     );
+    apply_glass_properties();
+}
+
+/// Swap one panel's backdrop when its installed material differs from the effective one.
+/// Returns the new backdrop, or None when there was nothing to swap.
+unsafe fn swap_backdrop_if_material_changed(
+    window_slot: &crate::ffi::MainThreadSlot<Option<ObjPtr>>,
+    backdrop_slot: &crate::ffi::MainThreadSlot<Option<crate::glass::InstalledBackdrop>>,
+    compensation: Option<u32>,
+) -> Option<crate::glass::InstalledBackdrop> {
+    let window = (*window_slot.lock().unwrap())?;
+    let old = (*backdrop_slot.lock().unwrap())?;
+    if old.material == crate::glass::PanelMaterial::effective() {
+        return None;
+    }
+    let frame_rect: NSRect = msg_send![window.0, frame];
+    let content_rect: NSRect = msg_send![window.0, contentRectForFrameRect: frame_rect];
+    let new = crate::glass::swap_backdrop(
+        window.0,
+        &old,
+        content_rect,
+        crate::glass::PANEL_CORNER_RADIUS,
+        compensation,
+    );
+    *backdrop_slot.lock().unwrap() = Some(new);
+    Some(new)
 }
 
 /// Apply the active light/dark appearance to already-created clipboard panels.
@@ -511,14 +554,14 @@ pub(super) unsafe fn ensure_picker_window() {
     // The glass carries its own depth; the window shadow is redundant (same as the overlay).
     let _: () = msg_send![window, setHasShadow: false];
 
-    // Share the rounded 26+ Glass / pre-26 dark visual-effect backdrop with the other panels.
+    // Share the rounded 26+ Glass / frost / opaque backdrop with the other panels.
     let backdrop = crate::glass::install_backdrop(
         window,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
         crate::glass::PANEL_CORNER_RADIUS,
         None,
     );
-    *PICKER_GLASS.lock().unwrap() = backdrop.glass;
+    *PICKER_BACKDROP.lock().unwrap() = Some(backdrop);
     *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(backdrop.content_parent));
     let content_parent = backdrop.content_parent;
 

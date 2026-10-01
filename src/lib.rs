@@ -52,7 +52,7 @@ use overlay::*;
 // Status bar menu (menu-item state/action callbacks/title refresh) live in menu.rs
 use menu::*;
 // Settings window (control builders/window build-show-collect/validation alerts/hot config apply) live in settings.rs
-use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use settings::*;
@@ -1080,67 +1080,17 @@ fn create_overlay_window() -> *mut AnyObject {
         // Don't let the window hide on deactivate (we manage show/hide)
         let _: () = msg_send![window, setHidesOnDeactivate: false];
 
-        // macOS 26+  → NSGlassEffectView  (new public API, built-in blur)
-        // macOS <26 → NSVisualEffectView  (withinWindow + Dark material)
-        let is_macos_26 = AnyClass::get(c"NSGlassEffectView").is_some();
-
-        // The view that will contain the card container.
-        // On macOS 26 this is the glass view's inner contentView;
-        // on older macOS it's the NSVisualEffectView itself.
-        let content_parent: *mut AnyObject;
-
-        if is_macos_26 {
-            let glass_cls = AnyClass::get(c"NSGlassEffectView").unwrap();
-            let glass: *mut AnyObject = msg_send![glass_cls, alloc];
-            let glass: *mut AnyObject = msg_send![glass, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-            *GLASS_VIEW.lock().unwrap() = Some(ObjPtr::new(glass)); // save for hot reload
-                                                                    // (4) Corner radius — native NSGlassEffectView property, from config.
-            let _: () =
-                msg_send![glass, setCornerRadius: CONFIG.read().unwrap().appearance.corner_radius];
-            // (5) Glass style — "regular" (0) or "clear" (1), from config.
-            let style: i64 = match config::effective_glass_style().as_str() {
-                "clear" => 1,
-                _ => 0, // regular (default)
-            };
-            let _: () = msg_send![glass, setStyle: style];
-            // (6) Tint color — hex RRGGBBAA from config.
-            let tint_hex = config::parse_hex8(&config::effective_glass_tint());
-            let tint = hex_to_ns_color(tint_hex);
-            let _: () = msg_send![glass, setTintColor: tint];
-            // (7) Autoresizing so the glass view fills the window on resize.
-            let _: () = msg_send![glass, setAutoresizingMask: 18u64];
-            let _: () = msg_send![window, setContentView: glass];
-            // NSGlassEffectView.contentView may be nil initially - create our own.
-            let inner: *mut AnyObject = msg_send![class!(NSView), alloc];
-            let inner: *mut AnyObject = msg_send![inner, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-            let _: () = msg_send![inner, setAutoresizingMask: 18u64];
-            let _: () = msg_send![glass, setContentView: inner];
-            // (6.5) Hard-clip the backdrop blur: NSGlassEffectView's cornerRadius property only rounds
-            //       the tint/appearance, not the backdrop blur. Setting masksToBounds + cornerRadius on
-            //       the layer clips the blur into the round (the standard trick for NSVisualEffectView;
-            //       unverified for NSGlassEffectView). Done after setContentView + an explicit
-            //       setWantsLayer so the layer is realized (non-nil) and masksToBounds actually takes
-            //       effect; logged to confirm.
-            let radius = CONFIG.read().unwrap().appearance.corner_radius;
-            let _: () = msg_send![glass, setWantsLayer: true];
-            let glass_layer: *mut AnyObject = msg_send![glass, layer];
-            if !glass_layer.is_null() {
-                let _: () = msg_send![glass_layer, setCornerRadius: radius];
-                let _: () = msg_send![glass_layer, setMasksToBounds: true];
-            }
-            content_parent = inner;
-        } else {
-            let content: *mut AnyObject = msg_send![window, contentView];
-            let ve: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-            let ve: *mut AnyObject = msg_send![ve, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))];
-            // withinWindow blending + Dark material (same as the GPUI version used)
-            let _: () = msg_send![ve, setBlendingMode: 1u64]; // WithinWindow
-            let _: () = msg_send![ve, setMaterial: 12u64]; // Dark
-            let _: () = msg_send![ve, setState: 1u64]; // Active
-            let _: () = msg_send![ve, setAutoresizingMask: 18u64];
-            let _: () = msg_send![content, addSubview: ve];
-            content_parent = ve;
-        }
+        // Shared material backdrop: Liquid Glass on macOS 26+, frost on older systems — or
+        // the user's chosen material (frost / opaque) on any system.
+        let radius = CONFIG.read().unwrap().appearance.corner_radius;
+        let backdrop = crate::glass::install_backdrop(
+            window,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
+            radius,
+            None,
+        );
+        *crate::overlay::OVERLAY_BACKDROP.lock().unwrap() = Some(backdrop);
+        let content_parent = backdrop.content_parent;
 
         // Register OhMyTabContainerView : NSClipView
         let container_cls = {

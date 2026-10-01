@@ -16,6 +16,7 @@ pub(crate) enum ConfigChangeSource {
 struct ChangeFlags {
     visual: bool,
     settings_appearance: bool,
+    panel_material: bool,
     locale: bool,
     modifier: bool,
     startup: bool,
@@ -42,6 +43,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.colors != new.colors
             || old.fonts != new.fonts,
         settings_appearance: old.appearance != new.appearance || old.colors != new.colors,
+        panel_material: old.appearance.panel_material != new.appearance.panel_material,
         locale: old.i18n.locale != new.i18n.locale,
         modifier: startup || old.keyboard.modifier != new.keyboard.modifier,
         startup: startup || old.startup.launch_at_login != new.startup.launch_at_login,
@@ -84,6 +86,18 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // Font-size changes only affect the switcher preview; rebuilding Settings makes other
         // controls jump while a slider is being dragged.
         crate::settings::refresh_system_appearance();
+    }
+
+    if flags.panel_material {
+        // Each material installs a different root view, so existing panels swap their
+        // backdrop; the settings page rebuild comes from the settings_appearance path above
+        // (appearance changed), which re-derives the sub-option rows' visibility.
+        unsafe {
+            crate::overlay::apply_backdrop_material();
+            crate::clipboard::apply_backdrop_material();
+            crate::keystroke_display::apply_backdrop_material();
+        }
+        crate::settings::glass_preview::apply_glass_preview();
     }
 
     if flags.modifier {

@@ -466,6 +466,21 @@ pub(crate) fn reduce_motion_enabled() -> bool {
     !animation_allowed(system, forced)
 }
 
+/// Whether the system's Reduce Transparency accessibility setting asks apps to drop
+/// backdrop blur. Queried on demand — at backdrop build time and at each panel
+/// show/summon (the persistent windows sync their installed material there) — rather than
+/// observed, so no permanent NSWorkspace observer is needed.
+pub(crate) fn reduce_transparency_enabled() -> bool {
+    let forced = crate::dev_flags::enabled("reduce-transparency");
+    forced
+        || unsafe {
+            let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+            !workspace.is_null()
+                && msg_send![workspace, respondsToSelector: objc2::sel!(accessibilityDisplayShouldReduceTransparency)]
+                && msg_send![workspace, accessibilityDisplayShouldReduceTransparency]
+        }
+}
+
 pub(crate) const fn animation_allowed(system_reduce_motion: bool, forced: bool) -> bool {
     !system_reduce_motion && !forced
 }

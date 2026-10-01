@@ -26,6 +26,10 @@ pub(crate) unsafe fn apply_glass_properties() {
     panel::apply_glass_properties();
 }
 
+pub(crate) unsafe fn apply_backdrop_material() {
+    panel::apply_backdrop_material();
+}
+
 const EVENT_QUEUE_CAPACITY: usize = 256;
 
 static ACTIVE: AtomicBool = AtomicBool::new(false);

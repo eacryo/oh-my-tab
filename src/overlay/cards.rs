@@ -902,6 +902,9 @@ pub(crate) fn show_overlay() {
         return;
     }
     unsafe {
+        // The window persists across summons: re-check the material first so a Reduce
+        // Transparency toggle (or a config edit) is honored by this very summon.
+        apply_backdrop_material();
         // TIMING-DEBUG stage timing: locate summon stalls (card build / icons / resize / status bar).
         let t0 = Instant::now();
         let windows = with_tab_state(|state_opt| {

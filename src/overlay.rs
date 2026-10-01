@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant; // TIMING-DEBUG
 
-use crate::config::{self, CONFIG};
+use crate::config::CONFIG;
 use crate::event_tap;
 use crate::event_tap::keyboard;
 use crate::ffi::*;
@@ -77,8 +77,10 @@ pub(crate) static CARD_DOCUMENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot
 pub(crate) static STATUS_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// Native vertical scroller shown when the thumbnail rows overflow the viewport.
 pub(crate) static THUMB_SCROLLER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// Pointer to the NSGlassEffectView on macOS 26+ (used to re-apply glass properties on hot reload).
-pub(crate) static GLASS_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The switcher panel's installed backdrop (glass / frost / opaque), kept for hot-reload
+/// property updates and material swaps.
+pub(crate) static OVERLAY_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
+    MainThreadSlot::new(None);
 pub(crate) static CARD_CLASS: Mutex<Option<StaticClass>> = Mutex::new(None);
 
 /// Copy a main-thread UI pointer out of its slot before calling AppKit.
@@ -344,9 +346,9 @@ pub(crate) use callbacks::{
     thumbnail_scroller_mouse_exited, thumbnail_scroller_mouse_moved, thumbnail_scroller_mouse_up,
 };
 pub(crate) use cancel::{
-    apply_glass_properties, apply_theme, close_window_at, extract_uncached_icons,
-    install_click_to_cancel, on_deferred_raise, on_delayed_order_out, refresh_highlight,
-    refresh_thumbnail_previews, vanish_overlay,
+    apply_backdrop_material, apply_glass_properties, apply_theme, close_window_at,
+    extract_uncached_icons, install_click_to_cancel, on_deferred_raise, on_delayed_order_out,
+    refresh_highlight, refresh_thumbnail_previews, vanish_overlay,
 };
 pub(crate) use cards::{create_card_view, show_overlay};
 // Only the thumbnail unit tests use crate::overlay::nsimage_from_cgimage (cards.rs

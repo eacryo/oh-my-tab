@@ -467,6 +467,11 @@ pub(super) fn show_picker() {
         let ensure_started = Instant::now();
         ensure_picker_window();
         let ensure_window_ms = ensure_started.elapsed().as_millis();
+        // The picker window persists: sync its backdrop with the effective material so a
+        // Reduce Transparency toggle (or a config edit) is honored by this summon. This
+        // also refreshes PICKER_CONTENT_PARENT after a material swap, before the footer
+        // rebuild below can hang anything off it.
+        crate::clipboard::apply_backdrop_material();
         // Reset the search on every summon (a clean slate); a stale detail panel goes too.
         hide_detail();
         clear_search();
@@ -808,8 +813,7 @@ unsafe fn ensure_detail_window() {
         crate::glass::PANEL_CORNER_RADIUS,
         Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
     );
-    *DETAIL_GLASS.lock().unwrap() = backdrop.glass;
-    *DETAIL_GLASS_FILL_LAYER.lock().unwrap() = backdrop.compensation_layer;
+    *DETAIL_BACKDROP.lock().unwrap() = Some(backdrop);
     let content_parent = backdrop.content_parent;
 
     // The content container is flipped and top-aligned. Detail text is selectable, and an
