@@ -448,6 +448,16 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
     show_picker();
 }
 
+/// Show the picker for the `--show-clipboard` development switch. Identical to the hotkey path
+/// except that a disabled clipboard module is not a refusal: the switch exists to inspect the
+/// laid-out UI, which must be verifiable regardless of the current config.
+pub(crate) fn show_picker_for_development() {
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        crate::log_info!("[clip] --show-clipboard: clipboard module is disabled in config");
+    }
+    show_picker();
+}
+
 /// Show the picker (built once, reused; the window height follows the visible row count).
 pub(super) fn show_picker() {
     unsafe {

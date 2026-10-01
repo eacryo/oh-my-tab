@@ -86,7 +86,7 @@ use text_style::*;
 pub(crate) use detail::{apply_backdrop_material, apply_glass_properties, apply_theme};
 pub(crate) use monitor::{start, stop};
 pub(crate) use persist::apply_persist_toggle;
-pub(crate) use picker::on_clipboard_toggle;
+pub(crate) use picker::{on_clipboard_toggle, show_picker_for_development};
 pub(crate) use smoke::{set_smoke_mode, smoke_runner};
 pub(crate) use text_style::refresh_localized_ui;
 /// The pasteboard file-URL type (carried by Finder file copies; restoring it on paste =
@@ -212,6 +212,32 @@ const PAD_Y: f64 = 12.0;
 const FOOTER_PAD_X: f64 = 16.0;
 /// the footer shortcut groups' spacing.
 const FOOTER_GROUP_GAP: f64 = 16.0;
+/// Horizontal breathing room a footer shortcut label's frame adds on top of the text it must
+/// hold. The frame is allocated before the font is assigned, so this slack is what keeps the
+/// label from wrapping out of its one-line-high field when the drawn font is the widest one the
+/// label can legitimately use (see `legend_required_width`).
+const FOOTER_LABEL_SLACK: f64 = 6.0;
+/// Fill alpha of a shortcut legend's key chip, applied over the footer surface. Deliberately
+/// lighter than `field_bg`: the chip exists to bind a key symbol to its label, not to look
+/// pressable. Paired with a zero border width, because the border is what reads as a control.
+const LEGEND_CHIP_ALPHA: u32 = 0x0E;
+/// Vertical slack a single-line footer label's frame adds on top of the font's line height. A
+/// frame of exactly the line height is one rounding step short of what the cell needs, and a
+/// single-line cell that is even fractionally short renders the tail truncation, so "Tab" drew
+/// as "T..." even though its width was never in doubt.
+const FOOTER_LABEL_HEIGHT_SLACK: f64 = 2.0;
+/// Cell padding a centered single-line `NSTextField` adds on top of the text it holds. A keycap
+/// is sized from its text with this allowance: measuring only the text under-reserves slightly,
+/// and a cell that is a fraction short renders the tail truncation ("Tab" -> "T…") even though
+/// the text itself would have fit. Measured: "Tab" needs 28.37pt of cell for 20.37pt of text.
+const KBD_CELL_PADDING: f64 = 8.0;
+/// Width reserved for the footer's entry-count label. Bounded, not arbitrary: the count is at
+/// most three digits (`clipboard.max_entries` is validated to 1..=100) and every locale's
+/// template is "{count} 个项目" / "{count} items", whose widest form measures 59.9pt at
+/// FONT_CAPTION. It is a ceiling, not a measurement: the shortcut legends are laid out
+/// right-to-left and must clear this label's right edge, so an oversized reservation silently
+/// pushes the whole legend row over the very text it is naming.
+const FOOTER_COUNT_W: f64 = 72.0;
 /// The list's top offset inside the document.
 const CLEAR_BTN_GAP: f64 = 4.0;
 /// Fixed geometry for the clear-confirmation card; two text actions share one horizontal baseline.
@@ -231,6 +257,18 @@ const SEL_BAR_INSET_Y: f64 = 8.0;
 /// Resolve the shared settings/overlay palette for clipboard surfaces and controls.
 fn clipboard_palette() -> crate::theme::UiPalette {
     crate::theme::ui_palette()
+}
+/// The shortcut legend's chip fill as a CGColor directly usable by a layer: a wash at
+/// `LEGEND_CHIP_ALPHA` in the direction that actually separates it from the footer surface --
+/// darkening a light surface, lightening a dark one -- rather than a fixed gray that would be
+/// invisible in one of the two modes.
+fn legend_chip_background() -> *mut c_void {
+    let base: u32 = if clipboard_palette().dark {
+        0xFFFF_FFFF
+    } else {
+        0x0000_0000
+    };
+    crate::ffi::hex_to_cg_color((base & 0xFFFF_FF00) | LEGEND_CHIP_ALPHA)
 }
 /// visible custom scroll indicator width.
 const SCROLL_INDICATOR_W: f64 = 6.0;

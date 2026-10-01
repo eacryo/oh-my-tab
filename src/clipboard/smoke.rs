@@ -85,6 +85,26 @@ pub(crate) fn smoke_runner() -> bool {
     hide_picker();
     // Second show: rebuild_rows removes the old rows first (the former UAF path).
     show_picker();
+    // Footer shortcut legends must survive the fonts they are drawn with, in every shipped
+    // locale: a label whose frame was sized for a smaller font than the one it renders with
+    // wraps out of its one-line-high field and silently loses its tail.
+    unsafe {
+        assert!(
+            footer_legends_layout_is_sane(),
+            "clipboard footer legends must render fully"
+        );
+        let original_locale = CONFIG.read().unwrap().i18n.locale.clone();
+        for locale in ["en", "zh-Hans", "zh-Hant"] {
+            crate::i18n::apply_config_locale(locale);
+            refresh_localized_ui();
+            assert!(
+                footer_legends_layout_is_sane(),
+                "clipboard footer legends must render fully in locale={locale}"
+            );
+        }
+        crate::i18n::apply_config_locale(&original_locale);
+        refresh_localized_ui();
+    }
     // Delete/undo GUI smoke: delete the top image through the real list-focus path, then use
     // Cmd+Z to restore it; its cache must survive the undo window without duplication.
     unsafe {

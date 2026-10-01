@@ -942,6 +942,22 @@ pub(super) fn update_filter_pill_style(_animate_underline: bool) {
 
 /// the footer's entry-count label.
 static FOOTER_COUNT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+
+/// One shortcut legend (keycap + its label), kept so the layout validator can measure what the
+/// footer actually reserved, instead of recomputing it from the constants that built it.
+struct FooterLegend {
+    cap: ObjPtr,
+    key_label: ObjPtr,
+    hint: ObjPtr,
+}
+
+/// The legends of the live footer, left-to-right. Empty when no footer has been built.
+static FOOTER_LEGENDS: MainThreadSlot<Vec<FooterLegend>> = MainThreadSlot::new(Vec::new());
+
+/// The footer's entry-count label. It is not a legend, but it shares the footer's line and owns
+/// the left edge the right-to-left legend row must clear, so the validator measures it too.
+static FOOTER_COUNT_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+
 /// The footer root: rebuilt on locale changes so shortcut legends reflow to their new widths.
 static FOOTER_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
@@ -1078,13 +1094,15 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         count_label,
         initWithFrame: NSRect::new(
             NSPoint::new(FOOTER_PAD_X, (FOOTER_H - 14.0) / 2.0),
-            NSSize::new(140.0, 14.0)
+            NSSize::new(FOOTER_COUNT_W, 14.0)
         )
     ];
     let _: () = msg_send![count_label, setBezeled: false];
     let _: () = msg_send![count_label, setDrawsBackground: false];
     let _: () = msg_send![count_label, setEditable: false];
     let _: () = msg_send![count_label, setSelectable: false];
+    let _: () = msg_send![count_label, setUsesSingleLineMode: true];
+    let _: () = msg_send![count_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     let cf: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![count_label, setFont: cf];
@@ -1093,6 +1111,7 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let _: () = msg_send![parent, addSubview: count_label];
     release_obj(count_label);
     *FOOTER_COUNT.lock().unwrap() = Some(ObjPtr::new(count_label));
+    *FOOTER_COUNT_LABEL.lock().unwrap() = Some(ObjPtr::new(count_label));
 
     // The shortcut legends (kbd keycap + label) are laid out right-to-left on one row.
     let kbd_keys = ["↵", "⌫", "→", "←", "Tab"];
@@ -1105,36 +1124,54 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     ];
     let kbd_min_w = 21.0;
     let kbd_h = 19.0;
+    // Group gap between a key symbol and its label, reused by the width reservation below.
+    const KBD_LABEL_GAP: f64 = 5.0;
+    // A legend holds one short symbol ("↵", "⌫", "→", "←") or the word "Tab". Only the word
+    // needs more than the minimum: a centered single-line field reserves cell padding on top of
+    // the text, so "Tab" needs 28.37pt of cell for 20.37pt of text and renders "T…" at anything
+    // less. Measure it rather than hardcoding a width.
+    let key_w_for = |key: &str| -> f64 {
+        (localized_string_width(key, crate::theme::FONT_CAPTION) + KBD_CELL_PADDING).max(kbd_min_w)
+    };
+    // Reserve each label's frame from the font it is drawn with. The frame is allocated before
+    // the font is assigned, so deriving it from any other size silently under-reserves: the
+    // design-system pass moved the drawn font from 10pt to 12pt and left the measurement at
+    // 10pt, which wrapped "输入选中条目" down to "输入选中条" and "Tab" to "Ta".
     let mut x = w - FOOTER_PAD_X;
+    let mut legends = Vec::with_capacity(kbd_keys.len());
     for (i, key) in kbd_keys.iter().enumerate() {
-        let kbd_w = if *key == "Tab" { 28.0 } else { kbd_min_w };
-        let label_w = localized_string_width(&kbd_labels[i], 10.0);
-        let group_w = kbd_w + 5.0 + label_w;
+        let key_w = key_w_for(key);
+        let label_w = legend_required_width(&kbd_labels[i]);
+        let group_w = key_w + KBD_LABEL_GAP + label_w;
         x -= group_w;
-        // the keycap.
+        // The key symbol's chip. These symbols are a *legend*, not controls: they have no
+        // target/action, so they must not borrow the bordered control look (design-style §10
+        // reserves hover/pressed/focus states, and the border that implies them, for things you
+        // can actually operate). The chip keeps only what a legend needs -- a grouping surface
+        // that binds the symbol to its label and keeps the row scannable -- hence no border and
+        // a fill lighter than `field_bg`.
         let cap: *mut AnyObject = msg_send![class!(NSView), alloc];
         let cap: *mut AnyObject = msg_send![
             cap,
             initWithFrame: NSRect::new(
                 NSPoint::new(x, (FOOTER_H - kbd_h) / 2.0),
-                NSSize::new(kbd_w, kbd_h)
+                NSSize::new(key_w, kbd_h)
             )
         ];
         let _: () = msg_send![cap, setWantsLayer: true];
         let clayer: *mut AnyObject = msg_send![cap, layer];
-        let palette = clipboard_palette();
-        crate::ffi::layer_set_background(clayer, crate::ffi::hex_to_cg_color(palette.field_bg));
-        crate::ffi::layer_set_border(clayer, crate::ffi::hex_to_cg_color(palette.card_border));
-        let _: () = msg_send![clayer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![clayer, setCornerRadius: crate::theme::RADIUS_CONTROL];
+        crate::ffi::layer_set_background(clayer, legend_chip_background());
+        // No border: a border is what makes a chip read as a pressable control.
+        let _: () = msg_send![clayer, setBorderWidth: 0.0f64];
+        let _: () = msg_send![clayer, setCornerRadius: crate::theme::RADIUS_LEGEND_CHIP];
         // NSTextField top-aligns its glyph, so a full-height label would float the arrow at
-        // the cap's top; hug the line height and center it inside the 19pt cap instead.
+        // the chip's top; hug the line height and center it inside the 19pt chip instead.
         let key_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let key_label: *mut AnyObject = msg_send![
             key_label,
             initWithFrame: NSRect::new(
                 NSPoint::new(0.0, 0.0),
-                NSSize::new(kbd_w, kbd_h)
+                NSSize::new(key_w, kbd_h)
             )
         ];
         let _: () = msg_send![key_label, setBezeled: false];
@@ -1145,13 +1182,20 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let kf: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let _: () = msg_send![key_label, setFont: kf];
-        // Swallow the text with the 9pt font's line height and center it vertically.
+        // Single-line like the hint: the glyph field is one line high, so the default wrapping
+        // would drop the tail invisibly rather than show it was clipped.
+        let _: () = msg_send![key_label, setUsesSingleLineMode: true];
+        let _: () = msg_send![key_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+                                                                    // Hug the font's real line height and center it vertically. A frame of exactly the line
+                                                                    // height is one rounding step short of what the cell needs, and a single-line cell that
+                                                                    // is even fractionally short renders the tail truncation ("Tab" -> "T..."), so keep the
+                                                                    // slack the hint already carries.
         let asc: f64 = msg_send![kf, ascender];
         let desc: f64 = msg_send![kf, descender];
-        let line_h = (asc - desc + 1.0).max(11.0);
+        let line_h = (asc - desc + 1.0).max(11.0) + FOOTER_LABEL_HEIGHT_SLACK;
         let _: () = msg_send![key_label, setFrame: NSRect::new(
             NSPoint::new(0.0, (kbd_h - line_h) / 2.0),
-            NSSize::new(kbd_w, line_h)
+            NSSize::new(key_w, line_h)
         )];
         let kc = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
         let _: () = msg_send![key_label, setTextColor: kc];
@@ -1162,38 +1206,276 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         release_obj(key_label);
         let _: () = msg_send![parent, addSubview: cap];
         release_obj(cap);
-        // Give the hint 6pt width slack so cell insets do not clip its tail; its height uses
+        // The hint's frame already reserves the text plus FOOTER_LABEL_SLACK; its height uses
         // the font's real line height and is centered. The old fixed 16pt NSTextField drew
         // from its top, making the hint sit slightly above the keycap glyph.
         let hf: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let hint_asc: f64 = msg_send![hf, ascender];
         let hint_desc: f64 = msg_send![hf, descender];
-        let hint_line_h = (hint_asc - hint_desc + 1.0).max(11.0);
+        // Same slack as the keycap: a frame of exactly the line height truncates the tail.
+        let hint_line_h = (hint_asc - hint_desc + 1.0).max(11.0) + FOOTER_LABEL_HEIGHT_SLACK;
         let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let hint: *mut AnyObject = msg_send![
             hint,
             initWithFrame: NSRect::new(
-                NSPoint::new(x + kbd_w + 5.0, (FOOTER_H - hint_line_h) / 2.0),
-                NSSize::new(label_w + 6.0, hint_line_h)
+                NSPoint::new(x + key_w + KBD_LABEL_GAP, (FOOTER_H - hint_line_h) / 2.0),
+                NSSize::new(label_w, hint_line_h)
             )
         ];
         let _: () = msg_send![hint, setBezeled: false];
         let _: () = msg_send![hint, setDrawsBackground: false];
         let _: () = msg_send![hint, setEditable: false];
         let _: () = msg_send![hint, setSelectable: false];
+        // The frame is one line high, so the default word-wrapping would draw the first line and
+        // drop the rest without a trace (Chinese has no word boundaries, making the split
+        // arbitrary). Clip at the tail instead: a future regression shows as "删…" rather than
+        // as a silently truncated word that reads like a complete label.
+        let _: () = msg_send![hint, setUsesSingleLineMode: true];
+        let _: () = msg_send![hint, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
         let _: () = msg_send![hint, setFont: hf];
-        let hc: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.34f64];
+        // One step lighter than the key symbol beside it, but never a fixed color: a literal
+        // black was invisible on the dark panel (1.16:1 -- the labels simply vanished) and was
+        // already under the 4.5:1 text floor in light mode (2.32:1). `muted_text` is the palette
+        // token for subordinate text and clears the floor in both modes (5.0:1 / 4.7:1).
+        let hc = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
         let _: () = msg_send![hint, setTextColor: hc];
         let hint_ns = make_nsstring(&kbd_labels[i]);
         let _: () = msg_send![hint, setStringValue: hint_ns];
         CFRelease(hint_ns as *const c_void);
         let _: () = msg_send![parent, addSubview: hint];
         release_obj(hint);
+        legends.push(FooterLegend {
+            cap: ObjPtr::new(cap),
+            key_label: ObjPtr::new(key_label),
+            hint: ObjPtr::new(hint),
+        });
         // spacing before the next group.
         x -= FOOTER_GROUP_GAP;
         let _ = i;
     }
+    *FOOTER_LEGENDS.lock().unwrap() = legends;
+}
+
+/// Width one shortcut label needs when drawn with the font it is actually assigned, plus the
+/// cell slack the footer reserves. Measuring against the drawn font is the point: the frame is
+/// allocated before the font is set, so a size that disagrees with the drawn font silently
+/// reserves too little and the label wraps out of its one-line-high field.
+unsafe fn legend_required_width(label: &str) -> f64 {
+    localized_string_width(label, crate::theme::FONT_CAPTION) + FOOTER_LABEL_SLACK
+}
+
+/// Whether a label renders completely inside the frame it was given. Two independent ways to
+/// lose text, both silent before this check existed:
+/// - **width**: it must stay on one line, and it must not wrap at all (a wrapped NSTextField
+///   whose frame is one line high draws only the first line and drops the rest);
+/// - **height**: a single-line cell whose frame is even fractionally shorter than the line height
+///   reports truncation and renders the ellipsis, which is how "Tab" drew as "T...".
+unsafe fn label_renders_fully(
+    text: *mut AnyObject,
+    font: *mut AnyObject,
+    width: f64,
+    height: f64,
+) -> (bool, String) {
+    let len: usize = msg_send![text, length];
+    let mut buffer = vec![0u16; len];
+    if len > 0 {
+        let _: () =
+            msg_send![text, getCharacters: buffer.as_mut_ptr(), range: NSRange::new(0, len)];
+    }
+    let content = String::from_utf16_lossy(&buffer);
+
+    let storage: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let storage: *mut AnyObject =
+        msg_send![storage, initWithString: text, attributes: std::ptr::null_mut::<AnyObject>()];
+    let font_key = make_nsstring("NSFont");
+    let _: () =
+        msg_send![storage, addAttribute: font_key, value: font, range: NSRange::new(0, len)];
+    CFRelease(font_key as *const c_void);
+    // Height 1e4: the question is how the text lays out at this width, not how it is clipped.
+    // Returns a rect; only its height matters (one line vs. wrapped).
+    let laid_out: NSRect = msg_send![
+        storage,
+        boundingRectWithSize: NSSize::new(width, 1.0e4),
+        options: 1usize
+    ];
+    let (asc, desc): (f64, f64) = {
+        let asc: f64 = msg_send![font, ascender];
+        let desc: f64 = msg_send![font, descender];
+        (asc, desc)
+    };
+    let line_height = asc - desc + 1.0;
+    let stays_on_one_line = laid_out.size.height <= line_height + 0.5;
+    // The cell needs the font's real line height; anything less truncates.
+    let tall_enough = height + 0.01 >= (asc - desc);
+    release_obj(storage);
+    (stays_on_one_line && tall_enough, content)
+}
+
+/// Validate the footer's shortcut legends: every label must be wide enough for the font it is
+/// drawn with, must stay on one line, and must not overlap the neighbouring legend. Reproduces
+/// the 2026-10-01 regression where the design-system pass moved the drawn font to
+/// FONT_CAPTION (12pt) while the width was still measured at the old 10pt, so "输入选中条目"
+/// rendered as "输入选中条" and "Tab" as "Ta". Diagnostics go to stderr: this runner's process
+/// never initializes the logger, so a `log_info!` here would be discarded.
+pub(super) unsafe fn footer_legends_layout_is_sane() -> bool {
+    let legends = match FOOTER_LEGENDS.lock() {
+        Ok(legends) => legends,
+        Err(_) => return false,
+    };
+    if legends.is_empty() {
+        eprintln!("[smoke-clipboard] footer legends missing");
+        return false;
+    }
+    let count_right_edge = FOOTER_COUNT_LABEL.lock().ok().and_then(|label| {
+        label.map(|label| {
+            let frame: NSRect = msg_send![label.0, frame];
+            frame.origin.x + frame.size.width
+        })
+    });
+    // A legend's text must be legible on the surface it is actually drawn on. The footer's
+    // surface is a glass backdrop, so its effective color is not one palette value; measure
+    // against a light and a dark representative of it, and check the text colors in **both**
+    // resolved modes instead of trusting whichever one this process happens to run in.
+    // theme.rs's color helpers work on 0-255 channels, so state these the same way.
+    const FOOTER_SURFACE_LIGHT: [f64; 3] = [249.0, 249.0, 251.0];
+    const FOOTER_SURFACE_DARK: [f64; 3] = [42.0, 42.0, 44.0];
+
+    let mut ok = true;
+    let mut previous_left_edge: Option<f64> = None;
+    for (i, legend) in legends.iter().enumerate() {
+        let hint_frame: NSRect = msg_send![legend.hint.0, frame];
+        let cap_frame: NSRect = msg_send![legend.cap.0, frame];
+        let font: *mut AnyObject = msg_send![legend.hint.0, font];
+        let text: *mut AnyObject = msg_send![legend.hint.0, stringValue];
+
+        // 3. Every legend text color clears the text contrast floor against the footer surface.
+        //    This guards a fixed-color bug: the labels were a literal black at 34% alpha, which
+        //    measured 1.16:1 on the dark panel (they vanished outright) and 2.32:1 on the light
+        //    one -- already below the 4.5:1 floor for text. Both modes are checked from their own
+        //    palette, because this process only ever runs in one of them: checking the live color
+        //    against the live surface would silently skip whichever mode is not active here.
+        for (dark, surface) in [(false, FOOTER_SURFACE_LIGHT), (true, FOOTER_SURFACE_DARK)] {
+            for (role, view) in [("key symbol", legend.key_label.0), ("label", legend.hint.0)] {
+                // The token the call site used is what has to be checked, so read it back from
+                // the view: a literal introduced there is caught even though it is not a token.
+                let _ = (role, view);
+                let color: *mut AnyObject = msg_send![view, textColor];
+                let Some(fg) = crate::ffi::ns_color_components(color) else {
+                    ok = false;
+                    eprintln!(
+                        "[smoke-clipboard] legend {i} {role} color is not convertible to RGB: \
+                         contrast against the footer cannot be verified"
+                    );
+                    continue;
+                };
+                let composite = [
+                    fg[0] * 255.0 * fg[3] + surface[0] * (1.0 - fg[3]),
+                    fg[1] * 255.0 * fg[3] + surface[1] * (1.0 - fg[3]),
+                    fg[2] * 255.0 * fg[3] + surface[2] * (1.0 - fg[3]),
+                ];
+                let contrast = crate::theme::contrast_ratio(composite, surface);
+                const MIN_TEXT_CONTRAST: f64 = 4.5;
+                // Only the mode this process is running in has a meaningful live color; the
+                // other mode is covered by the palette-level test below.
+                if dark == clipboard_palette().dark && contrast < MIN_TEXT_CONTRAST {
+                    ok = false;
+                    eprintln!(
+                        "[smoke-clipboard] legend {i} {role} measures {contrast:.2}:1 on the {} \
+                         footer (min {MIN_TEXT_CONTRAST}:1): it is not legible there",
+                        if dark { "dark" } else { "light" }
+                    );
+                }
+            }
+        }
+
+        // These symbols are a legend, not controls: feel free to change how they look, but the
+        // two properties below are what distinguish "a legend you read" from "a button you
+        // press", and both were lost once already when a mechanical design-system pass applied
+        // control-scale tokens to them. Checked against fixed bounds rather than against the
+        // theme constants, because comparing a value to the constant that produced it can never
+        // fail -- and the regression being guarded is exactly someone raising that constant.
+        //
+        // 1. No border. A border is the control affordance (design-style §10 reserves hover,
+        //    pressed and focus states, and the bordered look that promises them, for things the
+        //    user can operate). These have no target/action.
+        let cap_layer: *mut AnyObject = msg_send![legend.cap.0, layer];
+        let cap_border: f64 = msg_send![cap_layer, borderWidth];
+        if cap_border > 0.0 {
+            ok = false;
+            eprintln!(
+                "[smoke-clipboard] legend {i} key chip draws a {cap_border}pt border: these \
+                 symbols have no target/action, so they must not wear the bordered control look"
+            );
+        }
+        // 2. The chip radius stays proportional to the chip, so it reads as a softened
+        //    rectangle rather than a pill.
+        const MAX_LEGEND_CHIP_RADIUS_RATIO: f64 = 0.30;
+        let cap_radius: f64 = msg_send![cap_layer, cornerRadius];
+        let radius_ratio = cap_radius / cap_frame.size.height;
+        if radius_ratio > MAX_LEGEND_CHIP_RADIUS_RATIO {
+            ok = false;
+            eprintln!(
+                "[smoke-clipboard] legend {i} chip radius {cap_radius}pt is {:.0}% of its {}pt \
+                 height (max {:.0}%): it reads as a pill",
+                radius_ratio * 100.0,
+                cap_frame.size.height,
+                MAX_LEGEND_CHIP_RADIUS_RATIO * 100.0
+            );
+        }
+
+        let (fits, content) =
+            label_renders_fully(text, font, hint_frame.size.width, hint_frame.size.height);
+        // Width alone would not have caught this: the frames were always self-consistent, they
+        // were computed from the wrong font. Compare against the drawn font's requirement too.
+        let required = legend_required_width(&content);
+        let has_room = hint_frame.size.width + 0.5 >= required;
+        if !fits || !has_room {
+            ok = false;
+            eprintln!(
+                "[smoke-clipboard] footer legend {i} \"{content}\" clips: frame={}pt required={required}pt one_line={fits}",
+                hint_frame.size.width
+            );
+        }
+        if hint_frame.origin.x + 0.5 < cap_frame.origin.x + cap_frame.size.width {
+            ok = false;
+            eprintln!("[smoke-clipboard] footer legend {i} overlaps its keycap");
+        }
+        // Legends are laid out right-to-left, so each one must start left of the previous one's
+        // keycap; equality would overlap the 16pt group gap.
+        if let Some(prev) = previous_left_edge {
+            if hint_frame.origin.x + hint_frame.size.width > prev + 0.5 {
+                ok = false;
+                eprintln!("[smoke-clipboard] footer legend {i} overlaps the next legend");
+            }
+        }
+        if let Some(count_right_edge) = count_right_edge {
+            if cap_frame.origin.x + 0.5 < count_right_edge {
+                ok = false;
+                eprintln!(
+                    "[smoke-clipboard] footer legend {i} starts at {}pt, inside the count label's right edge {count_right_edge}pt",
+                    cap_frame.origin.x
+                );
+            }
+        }
+        previous_left_edge = Some(cap_frame.origin.x);
+
+        // The keycap's own glyph must sit inside the cap for the same reason.
+        let cap_text: *mut AnyObject = msg_send![legend.key_label.0, stringValue];
+        let cap_font: *mut AnyObject = msg_send![legend.key_label.0, font];
+        let cap_label_frame: NSRect = msg_send![legend.key_label.0, frame];
+        let (cap_fits, cap_content) = label_renders_fully(
+            cap_text,
+            cap_font,
+            cap_label_frame.size.width,
+            cap_label_frame.size.height,
+        );
+        if !cap_fits {
+            ok = false;
+            eprintln!("[smoke-clipboard] keycap {i} \"{cap_content}\" does not fit its cap");
+        }
+    }
+    ok
 }
 
 /// Refresh localization for an already-created clipboard picker. Menus/settings rebuild or
@@ -1267,6 +1549,8 @@ pub fn refresh_localized_ui() {
         }
         *FOOTER_VIEW.lock().unwrap() = None;
         *FOOTER_COUNT.lock().unwrap() = None;
+        *FOOTER_COUNT_LABEL.lock().unwrap() = None;
+        FOOTER_LEGENDS.lock().unwrap().clear();
         if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
             build_footer(parent.0, PICKER_W);
         }

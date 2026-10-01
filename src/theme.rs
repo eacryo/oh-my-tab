@@ -59,6 +59,11 @@ pub(crate) const RADIUS_CONTROL: f64 = 8.0;
 pub(crate) const RADIUS_CARD: f64 = 12.0;
 pub(crate) const RADIUS_PANEL: f64 = 16.0;
 pub(crate) const RADIUS_FULL: f64 = 9999.0;
+/// Corner radius of a shortcut legend's chip (the clipboard footer's key symbols). The chip is
+/// a grouping aid, not a control: `radius-control` is sized for 32pt controls and reads as a
+/// pill on a small chip, so the chip derives its radius from its own height.
+/// See docs/design-style-en.md §6.
+pub(crate) const RADIUS_LEGEND_CHIP: f64 = 5.0;
 pub(crate) const SETTINGS_WINDOW_RADIUS: f64 = 26.0;
 pub(crate) const OVERLAY_RING_INSET: f64 = 3.0;
 pub(crate) const THUMBNAIL_PREVIEW_RADIUS: f64 = 0.0;
@@ -109,7 +114,9 @@ fn relative_luminance(rgb: [f64; 3]) -> f64 {
         + 0.0722 * linear_channel(rgb[2])
 }
 
-fn contrast_ratio(foreground: [f64; 3], background: [f64; 3]) -> f64 {
+/// WCAG contrast ratio between two already-composited (post-alpha) colors. Shared with the
+/// clipboard smoke runner, which measures legend text against the surface it is drawn on.
+pub(crate) fn contrast_ratio(foreground: [f64; 3], background: [f64; 3]) -> f64 {
     let foreground = relative_luminance(foreground);
     let background = relative_luminance(background);
     (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
@@ -1766,6 +1773,34 @@ mod tests {
     fn preview_stage_is_visibly_distinct_in_both_palettes() {
         assert!(settings_preview_contrast(ui_palette_for_mode(false)) >= 3.0);
         assert!(settings_preview_contrast(ui_palette_for_mode(true)) >= 3.0);
+    }
+
+    /// The clipboard footer's shortcut legends draw their text with palette tokens over a glass
+    /// backdrop. Both roles must stay legible in both modes: the labels were once a literal black
+    /// at 34% alpha, which was invisible on the dark panel (1.16:1) and already under the text
+    /// floor in light mode (2.32:1). The footer surface is glass, so it is represented here by a
+    /// light and a dark bound rather than by one palette value.
+    #[test]
+    fn clipboard_footer_legend_text_clears_the_text_contrast_floor_in_both_modes() {
+        const FOOTER_LIGHT: [f64; 3] = [249.0, 249.0, 251.0];
+        const FOOTER_DARK: [f64; 3] = [42.0, 42.0, 44.0];
+        const MIN_TEXT_CONTRAST: f64 = 4.5;
+        for (dark, surface) in [(false, FOOTER_LIGHT), (true, FOOTER_DARK)] {
+            let palette = ui_palette_for_mode(dark);
+            // The key symbol is the stronger of the two; the label is the subordinate one.
+            for (role, token) in [
+                ("key symbol", palette.secondary_text),
+                ("label", palette.muted_text),
+            ] {
+                let contrast = contrast_ratio(color_rgb(token), surface);
+                assert!(
+                    contrast >= MIN_TEXT_CONTRAST,
+                    "clipboard footer legend {role} measures {contrast:.2}:1 on the {} footer \
+                     (min {MIN_TEXT_CONTRAST}:1)",
+                    if dark { "dark" } else { "light" }
+                );
+            }
+        }
     }
 
     #[test]

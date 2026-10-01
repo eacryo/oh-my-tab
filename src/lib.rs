@@ -2130,6 +2130,14 @@ fn open_settings_page_request() -> Option<usize> {
     }
 }
 
+/// Whether the development switch `--show-clipboard` was forwarded by `scripts/dev-restart.sh`.
+/// The clipboard picker otherwise only appears through a global hotkey, which a script cannot
+/// press without stealing focus, so this is the only way to verify its laid-out UI (the footer's
+/// shortcut legends, the row grid) from a script or cua.
+fn show_clipboard_request() -> bool {
+    crate::dev_flags::present("show-clipboard")
+}
+
 #[cfg(target_arch = "aarch64")]
 type AppKitBool = bool;
 #[cfg(target_arch = "x86_64")]
@@ -2785,6 +2793,11 @@ pub fn run() {
         // verified from a script / cua.
         if let Some(page) = open_settings_page_request() {
             settings::show_settings_page(page);
+        }
+        // Development switch: open the clipboard picker so its laid-out UI is reachable without
+        // driving the global hotkey (which would steal focus).
+        if show_clipboard_request() {
+            clipboard::show_picker_for_development();
         }
         e2e_state::record("launch");
         let _: () = msg_send![nsapp, run];

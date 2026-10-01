@@ -613,6 +613,36 @@ pub(crate) fn hex_to_ns_color(hex: u32) -> *mut AnyObject {
     unsafe { msg_send![class!(NSColor), colorWithRed: r, green: g, blue: b, alpha: a] }
 }
 
+/// NSColor* -> its sRGB components as `[r, g, b, a]` in 0…1, or None when the color cannot be
+/// expressed that way (a catalog or pattern color). Used by contrast assertions, which must read
+/// the color a view actually carries rather than the token the call site meant to use.
+pub(crate) unsafe fn ns_color_components(color: *mut AnyObject) -> Option<[f64; 4]> {
+    if color.is_null() {
+        return None;
+    }
+    // Convert first: a catalog color (labelColor and friends) is not directly convertible and
+    // would otherwise report zeros, which reads as "black" and silently skews a contrast check.
+    let converted: *mut AnyObject = msg_send![color, colorUsingColorSpace: {
+        let space: *mut AnyObject = msg_send![class!(NSColorSpace), sRGBColorSpace];
+        space
+    }];
+    if converted.is_null() {
+        return None;
+    }
+    let mut r: f64 = 0.0;
+    let mut g: f64 = 0.0;
+    let mut b: f64 = 0.0;
+    let mut a: f64 = 1.0;
+    let _: () = msg_send![
+        converted,
+        getRed: &mut r as *mut f64,
+        green: &mut g as *mut f64,
+        blue: &mut b as *mut f64,
+        alpha: &mut a as *mut f64
+    ];
+    Some([r, g, b, a])
+}
+
 /// NSColor* -> CGColorRef. Uses raw objc_msgSend because objc2's msg_send! can't encode CF/CG types.
 pub(crate) unsafe fn ns_color_to_cg(ns: *mut AnyObject) -> *mut c_void {
     let sel = sel!(CGColor);
