@@ -691,7 +691,10 @@ fn select_membership_source(
 }
 
 fn query_space_membership(window_ids: &[u32]) -> (MembershipSource, Option<MembershipSnapshot>) {
-    let force_legacy = crate::dev_flags::enabled("--space-membership-legacy");
+    // `dev_flags::enabled` prepends `--` itself, so the name must be bare: passing
+    // "--space-membership-legacy" searched for "----space-membership-legacy" and never matched,
+    // leaving this switch silently dead.
+    let force_legacy = crate::dev_flags::enabled("space-membership-legacy");
     let started = Instant::now();
     let result = if force_legacy {
         None

@@ -250,6 +250,36 @@ pub(super) fn html_action_button_class() -> *mut AnyObject {
         .0
 }
 
+/// Resolve the fill a `SettingsButton` shows while hovered, from the palette-selecting `tag`.
+///
+/// `tag` carries the role's palette slot, not an action id (see `SettingsButtonRole::style`).
+/// Roles with a dedicated hover token use it; the rest use the generic `hover_bg` tint, which
+/// layers over whatever surface the role's normal color already provides.
+pub(super) fn action_button_hover_color(tag: isize, palette: crate::theme::UiPalette) -> u32 {
+    match tag {
+        -2 => palette.accent_hover,
+        -4 => palette.destructive_hover,
+        _ => palette.hover_bg,
+    }
+}
+
+/// Resolve the fill a `SettingsButton` returns to when the pointer leaves.
+///
+/// This must reproduce the role's own normal color exactly; `SettingsButtonRole::style` is the
+/// authority for that mapping, and the test below pins the two together so a new role cannot
+/// leave a button stuck on its hover fill.
+pub(super) fn action_button_normal_color(tag: isize, palette: crate::theme::UiPalette) -> u32 {
+    match tag {
+        -2 => palette.accent,
+        -1 => palette.footer_button_bg,
+        -3 => palette.button_bg,
+        -4 => palette.destructive,
+        // `Compact` uses tag 0 as its normal, non-negative slot.
+        _ if tag >= 0 => palette.field_bg,
+        _ => palette.button_bg,
+    }
+}
+
 pub(super) extern "C" fn html_action_button_mouse_entered(
     this: *mut c_void,
     _cmd: Sel,
@@ -258,13 +288,7 @@ pub(super) extern "C" fn html_action_button_mouse_entered(
     unsafe {
         let button = this as *mut AnyObject;
         let tag: isize = msg_send![button, tag];
-        let palette = settings_palette();
-        let hover = match tag {
-            -2 => palette.accent_hover,
-            -1 => palette.hover_bg,
-            -4 => palette.destructive_hover,
-            _ => palette.hover_bg,
-        };
+        let hover = action_button_hover_color(tag, settings_palette());
         let layer: *mut AnyObject = msg_send![button, layer];
         if !layer.is_null() {
             layer_set_background(
@@ -283,15 +307,7 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
     unsafe {
         let button = this as *mut AnyObject;
         let tag: isize = msg_send![button, tag];
-        let palette = settings_palette();
-        let normal = match tag {
-            -2 => palette.accent,
-            -1 => palette.footer_button_bg,
-            -3 => palette.button_bg,
-            -4 => palette.destructive,
-            _ if tag >= 0 => palette.field_bg,
-            _ => palette.button_bg,
-        };
+        let normal = action_button_normal_color(tag, settings_palette());
         let layer: *mut AnyObject = msg_send![button, layer];
         if !layer.is_null() {
             layer_set_background(
@@ -558,6 +574,34 @@ pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<MainThreadSlot<HashMap<usize, Obj
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 pub(super) static SIDEBAR_UPDATE_DOTS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+
+/// Forget the hovered row WITHOUT messaging it.
+///
+/// `clear_sidebar_hover` deliberately resets the fill on the stored button, which is only sound
+/// while that view is alive. Here the view is being replaced, so that message is the very thing we
+/// must not send; dropping the address is the only safe action, and the old view is destroyed
+/// moments later with nothing left painted.
+///
+/// `SIDEBAR_HOVERED` is read back out as a raw pointer by `apply_sidebar_hover` (to un-hover the
+/// previously hovered row) and by `clear_sidebar_hover`, so leaving a freed address in it turns the
+/// next sidebar mouse-enter or mouse-exit into a message to a deallocated object.
+pub(super) fn forget_sidebar_hover() {
+    SIDEBAR_HOVERED.store(0, Ordering::SeqCst);
+}
+
+/// Drop every sidebar registry that caches a raw view address, plus the hovered-row pointer.
+///
+/// Call this before (re)building the sidebar and before the content hierarchy is released. The maps
+/// hold `usize` addresses of the label, icon and dot views with no retain of their own, so once a
+/// rebuild releases those views the keys are dangling; the next hover hit-test would message freed
+/// memory. `SIDEBAR_TITLE_LABELS` is additionally *iterated as the list of sidebar buttons* by
+/// `sidebar_button_under_pointer`, so a stale key there is dereferenced directly.
+pub(super) fn clear_sidebar_view_registries() {
+    forget_sidebar_hover();
+    SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
+    SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
+    SIDEBAR_UPDATE_DOTS.lock().unwrap().clear();
+}
 
 pub(super) extern "C" fn external_link_mouse_entered(
     this: *mut c_void,
@@ -3105,7 +3149,7 @@ mod tests {
     use super::{
         derived_label_width, html_switch_knob_radius, html_switch_track_radius, rect_inside,
         rects_overlap, sidebar_hover_fill, slider_should_reset, switch_hit_bounds, HTML_SWITCH_H,
-        HTML_SWITCH_KNOB_D, HTML_SWITCH_W,
+        HTML_SWITCH_KNOB_D, HTML_SWITCH_W, SIDEBAR_HOVERED,
     };
     // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
     use crate::ffi::release_obj;
@@ -3123,6 +3167,109 @@ mod tests {
         assert!(!slider_should_reset(3, true));
         assert!(!slider_should_reset(2, false));
         assert!(!slider_should_reset(0, false));
+    }
+
+    /// `SIDEBAR_HOVERED` caches a raw button address, so dropping it must NOT go through
+    /// `clear_sidebar_hover` -- that one messages the stored button to reset its fill, which is
+    /// precisely the freed object the teardown path must not touch.
+    ///
+    /// The sentinel below is not a real object. If `forget_sidebar_hover` regressed into
+    /// messaging it, this test would trap in objc's receiver check instead of failing an
+    /// assertion: that hard stop is the point, because it is the crash this guards.
+    #[test]
+    fn forget_sidebar_hover_drops_the_address_without_messaging_it() {
+        const SENTINEL: usize = 0xDEAD_BEEF;
+        SIDEBAR_HOVERED.store(SENTINEL, std::sync::atomic::Ordering::SeqCst);
+        super::forget_sidebar_hover();
+        assert_eq!(
+            SIDEBAR_HOVERED.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "the hovered address must not survive a content rebuild"
+        );
+    }
+
+    /// Every `SettingsButtonRole` must round-trip: the fill `mouseExited` restores has to be
+    /// exactly the role's own normal color, or the button stays tinted after the pointer leaves.
+    /// This is the reverse direction of `button_roles_keep_normal_and_hover_semantics_distinct`,
+    /// which only checks the forward `style()` mapping.
+    #[test]
+    fn action_button_exit_restores_every_role_normal_color() {
+        use crate::settings::components::SettingsButtonRole;
+        for palette in [
+            crate::theme::ui_palette_for_mode(false),
+            crate::theme::ui_palette_for_mode(true),
+        ] {
+            for role in [
+                SettingsButtonRole::Action,
+                SettingsButtonRole::Compact,
+                SettingsButtonRole::Footer,
+                SettingsButtonRole::Primary,
+                SettingsButtonRole::Destructive,
+            ] {
+                let (normal, _text, tag) = role.style(palette);
+                assert_eq!(
+                    super::action_button_normal_color(tag, palette),
+                    normal,
+                    "{role:?} (tag {tag}) must restore its own normal color on mouse-exit"
+                );
+            }
+        }
+    }
+
+    /// A hover fill that equals the normal color would make the button look inert; every role
+    /// needs a visibly distinct hover in both palettes.
+    #[test]
+    fn action_button_hover_is_distinct_from_normal_for_every_role() {
+        use crate::settings::components::SettingsButtonRole;
+        for palette in [
+            crate::theme::ui_palette_for_mode(false),
+            crate::theme::ui_palette_for_mode(true),
+        ] {
+            for role in [
+                SettingsButtonRole::Action,
+                SettingsButtonRole::Compact,
+                SettingsButtonRole::Footer,
+                SettingsButtonRole::Primary,
+                SettingsButtonRole::Destructive,
+            ] {
+                let (normal, _text, tag) = role.style(palette);
+                let hover = super::action_button_hover_color(tag, palette);
+                assert_ne!(
+                    hover, normal,
+                    "{role:?} (tag {tag}) hover {hover:#010X} equals its normal {normal:#010X}"
+                );
+            }
+        }
+    }
+
+    /// Pins *which* hover token each role resolves to, not merely that it differs from its normal
+    /// color. Distinctness alone is too weak: pointing `Compact` at `accent` still differs from
+    /// `field_bg`, yet repaints a subtle field button in accent blue on hover.
+    #[test]
+    fn action_button_hover_uses_the_expected_token_per_role() {
+        use crate::settings::components::SettingsButtonRole;
+        for palette in [
+            crate::theme::ui_palette_for_mode(false),
+            crate::theme::ui_palette_for_mode(true),
+        ] {
+            // Roles with a dedicated hover token use it; the rest layer the generic `hover_bg`
+            // tint over whatever surface their normal color provides.
+            let expected = [
+                (SettingsButtonRole::Action, palette.hover_bg),
+                (SettingsButtonRole::Compact, palette.hover_bg),
+                (SettingsButtonRole::Footer, palette.hover_bg),
+                (SettingsButtonRole::Primary, palette.accent_hover),
+                (SettingsButtonRole::Destructive, palette.destructive_hover),
+            ];
+            for (role, want) in expected {
+                let (_normal, _text, tag) = role.style(palette);
+                assert_eq!(
+                    super::action_button_hover_color(tag, palette),
+                    want,
+                    "{role:?} (tag {tag}) resolved the wrong hover token"
+                );
+            }
+        }
     }
 
     /// Smoke (GUI/AppKit): the default-value ivar round-trips and a real NSEvent double-click

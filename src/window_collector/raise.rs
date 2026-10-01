@@ -297,14 +297,35 @@ pub(super) unsafe fn invalidate_cached_ax_window_element(
     }
 }
 
-pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
-    let keys: Vec<_> = AX_WINDOW_CACHE
-        .lock()
-        .unwrap()
-        .keys()
-        .filter(|key| key.pid == pid)
-        .copied()
-        .collect();
+/// Whether `key` belongs to the given process (any incarnation, any window).
+fn ax_window_cache_key_in_pid(key: &AxWindowCacheKey, pid: i32) -> bool {
+    key.pid == pid
+}
+
+/// Whether `key` is the given window of the given process.
+///
+/// Matches on pid AND cgwid: pid alone would take out the live app's other windows, and dropping
+/// cgwid would take out none of this window's incarnations -- which is the residue the
+/// per-window sweep exists to clear. `process_start_time_us` is deliberately not compared: after a
+/// pid is recycled, an entry from the dead incarnation carries the same (pid, cgwid) and is
+/// equally stale.
+fn ax_window_cache_key_in_window(key: &AxWindowCacheKey, pid: i32, cgwid: u32) -> bool {
+    key.pid == pid && key.cgwid == cgwid
+}
+
+/// Select the cache keys a targeted sweep should drop.
+///
+/// Pure so the per-process and per-window sweeps share one tested selection step, and so the
+/// predicates are unit-testable without live `AXUIElement` refs (which `CFRetain` would require).
+fn ax_window_cache_keys_to_drop(
+    keys: &[AxWindowCacheKey],
+    matches: impl Fn(&AxWindowCacheKey) -> bool,
+) -> Vec<AxWindowCacheKey> {
+    keys.iter().filter(|key| matches(key)).copied().collect()
+}
+
+/// Remove the given keys from the cache and release their retained elements.
+fn drop_ax_window_cache_keys(keys: Vec<AxWindowCacheKey>) {
     let removed: Vec<_> = keys
         .into_iter()
         .filter_map(|key| AX_WINDOW_CACHE.lock().unwrap().remove(&key))
@@ -312,7 +333,35 @@ pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
     for element in removed {
         unsafe { CFRelease(element.0) };
     }
+}
+
+pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
+    let keys = {
+        let cache = AX_WINDOW_CACHE.lock().unwrap();
+        let snapshot: Vec<_> = cache.keys().copied().collect();
+        ax_window_cache_keys_to_drop(&snapshot, |key| ax_window_cache_key_in_pid(key, pid))
+    };
+    drop_ax_window_cache_keys(keys);
     AX_SNAPSHOT_CACHE.lock().unwrap().remove(&pid);
+}
+
+/// Drop the cached AXUIElement for one destroyed window.
+///
+/// The cache key carries `cgwid`, so the map accumulates one retained element per window rather
+/// than per process: an app that keeps opening and closing windows (a browser, a terminal with
+/// short-lived windows) grows it while staying alive, and `clear_ax_window_cache_for_pid` never
+/// sees those entries. WindowServer's `Destroyed` event is the reliable signal that a window is
+/// gone -- unlike process termination, whose NSWorkspace notification can be missed entirely --
+/// so the destroy path calls this alongside `forget_destroyed_window`.
+pub(crate) fn clear_ax_window_cache_for_window(pid: i32, cgwid: u32) {
+    let keys = {
+        let cache = AX_WINDOW_CACHE.lock().unwrap();
+        let snapshot: Vec<_> = cache.keys().copied().collect();
+        ax_window_cache_keys_to_drop(&snapshot, |key| {
+            ax_window_cache_key_in_window(key, pid, cgwid)
+        })
+    };
+    drop_ax_window_cache_keys(keys);
 }
 
 pub(super) fn cached_ax_snapshot(
@@ -571,5 +620,69 @@ pub(crate) fn raise_window_fast(pid: i32, cgwid: u32) -> (bool, bool) {
             fast_started.elapsed().as_micros()
         );
         (slps_ok, click_ok)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ax_window_cache_key_in_pid, ax_window_cache_key_in_window, ax_window_cache_keys_to_drop,
+        AxWindowCacheKey,
+    };
+
+    fn key(pid: i32, start: u64, cgwid: u32) -> AxWindowCacheKey {
+        AxWindowCacheKey {
+            pid,
+            process_start_time_us: start,
+            cgwid,
+        }
+    }
+
+    /// The per-window sweep must match on BOTH pid and cgwid. Matching on pid alone would evict a
+    /// live app's other windows; forgetting cgwid would evict nothing for a still-running app,
+    /// which is the leak this sweep exists to close.
+    ///
+    /// It deliberately ignores `process_start_time_us`: when a pid has been recycled, an entry
+    /// from the previous incarnation carries the same (pid, cgwid) and is equally dead, so
+    /// dropping it is correct rather than over-eager.
+    #[test]
+    fn window_sweep_matches_pid_and_cgwid_only() {
+        let keys = vec![
+            key(10, 1, 100),
+            key(10, 1, 200), // same pid+incarnation, different window -> kept
+            key(10, 2, 100), // same pid+window, recycled pid -> also dropped
+            key(20, 1, 100), // same window id, different pid -> kept
+        ];
+        let dropped =
+            ax_window_cache_keys_to_drop(&keys, |k| ax_window_cache_key_in_window(k, 10, 100));
+        assert_eq!(dropped, vec![key(10, 1, 100), key(10, 2, 100)]);
+    }
+
+    #[test]
+    fn window_sweep_keeps_a_recycled_pids_other_windows() {
+        let keys = vec![key(10, 1, 200), key(10, 1, 300)];
+        let dropped =
+            ax_window_cache_keys_to_drop(&keys, |k| ax_window_cache_key_in_window(k, 10, 100));
+        assert!(
+            dropped.is_empty(),
+            "no matching window id -> nothing dropped"
+        );
+    }
+
+    /// The per-process sweep keeps its original behaviour: every window of that pid goes,
+    /// including stale incarnations of a recycled pid.
+    #[test]
+    fn pid_sweep_drops_every_window_of_that_pid() {
+        let keys = vec![
+            key(10, 1, 100),
+            key(10, 1, 200),
+            key(10, 2, 300),
+            key(20, 1, 100),
+        ];
+        let dropped = ax_window_cache_keys_to_drop(&keys, |k| ax_window_cache_key_in_pid(k, 10));
+        assert_eq!(
+            dropped,
+            vec![key(10, 1, 100), key(10, 1, 200), key(10, 2, 300)]
+        );
     }
 }

@@ -870,6 +870,10 @@ fn on_window_server_event_inner() {
             // after destruction, so never guess a PID for cleanup.
             if let Some(pid) = window_server::owner_for_destroyed_window(*window_id) {
                 thumbnail::forget_destroyed_window(pid, *window_id);
+                // The AX cache is keyed by (pid, start time, cgwid), so a window that closes while
+                // its process stays alive would keep its retained AXUIElement forever; the
+                // per-PID sweep only runs on process termination.
+                crate::window_collector::clear_ax_window_cache_for_window(pid, *window_id);
             } else {
                 log_debug!(
                     "[windows] destroyed cgwid={} has no indexed owner PID; thumbnail cleanup skipped",

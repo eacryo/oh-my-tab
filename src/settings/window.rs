@@ -2124,7 +2124,15 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             // usually reused by a new control -- i.e. a message to a freed object (exactly the
             // 2026-09-15 22:19 SIGTRAP crash path: settings_window_send_event -> tooltip hits a
             // stale address).
-            tooltip::SettingsTooltip::clear_runtime_registries();
+            // It also has to cover the registries the author did not think of here: the rows and
+            // the selects are address-keyed too, and the sidebar is worse than a lookup table
+            // because sidebar_button_under_pointer ITERATES SIDEBAR_TITLE_LABELS as the list of
+            // buttons and messages each one, so a stale key traps in objc's receiver check on the
+            // next hover (2026-10-01 17:47 SIGTRAP: NSTrackingArea ->
+            // sidebar_hover_tracker_mouse_entered -> sidebar_button_under_pointer). Clearing all of
+            // them before the hierarchy goes away -- not only when the sidebar is rebuilt -- means
+            // nothing can observe a dangling view.
+            clear_settings_content_registries();
             let subviews: *mut AnyObject = msg_send![content, subviews];
             let count: usize = msg_send![subviews, count];
             for index in (0..count).rev() {
@@ -2526,6 +2534,24 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
     }
 }
 
+/// Drop every settings registry that is keyed by raw view address.
+///
+/// The settings content is built from absolute-positioned views that the code addresses directly
+/// (row label, sidebar label/icon/dot, select parts) instead of routing lookups through a model, so
+/// an entry is only meaningful while the view it names is alive. Whenever the content hierarchy is
+/// replaced -- a full window build, an in-place content rebuild, or teardown -- all of them must be
+/// emptied, or a later hit-test messages a freed object and traps in objc's receiver check.
+///
+/// One function so a newly added address-keyed registry cannot be wired into only some of the
+/// paths. `TRAFFIC_LIGHT_BASE_ORIGINS` is deliberately absent: it names the window, which survives
+/// an in-place rebuild.
+fn clear_settings_content_registries() {
+    SettingsRow::clear_runtime_registry();
+    widgets::clear_settings_select_registry();
+    tooltip::SettingsTooltip::clear_runtime_registries();
+    widgets::clear_sidebar_view_registries();
+}
+
 /// Detach global references owned by a settings window before it is released or replaced.
 /// Keep the traffic-light baseline for in-place redraws; remove it only when the window is
 /// actually released.
@@ -2540,12 +2566,7 @@ unsafe fn detach_settings_window_runtime(ui: &SettingsUi, remove_traffic_light_o
     // Detach the updater's host references before releasing the window so it never touches
     // a deallocated view.
     crate::updater::clear_update_host();
-    SettingsRow::clear_runtime_registry();
-    widgets::clear_settings_select_registry();
-    tooltip::SettingsTooltip::clear_runtime_registries();
-    SIDEBAR_TITLE_LABELS.lock().unwrap().clear();
-    SIDEBAR_ICON_VIEWS.lock().unwrap().clear();
-    SIDEBAR_UPDATE_DOTS.lock().unwrap().clear();
+    clear_settings_content_registries();
 }
 
 /// Invalidate the cached settings window (release + set None) so it is rebuilt with the

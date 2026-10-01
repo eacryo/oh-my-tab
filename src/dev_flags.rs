@@ -60,9 +60,17 @@ pub(crate) fn enabled(name: &str) -> bool {
     enabled_in(args(), name)
 }
 
+/// Whether any of the given arguments starts with `prefix`.
+///
+/// Unlike `value_in`/`enabled_in`, this does NOT prepend `--`: `any_prefix` is for families
+/// like `--smoke*` whose arguments are matched by prefix, so the caller keeps the dashes.
+fn any_prefix_in(args: &[String], prefix: &str) -> bool {
+    args.iter().any(|arg| arg.starts_with(prefix))
+}
+
 /// Whether any argument starts with the given prefix (for families such as `--smoke*`).
 pub(crate) fn any_prefix(prefix: &str) -> bool {
-    args().iter().any(|arg| arg.starts_with(prefix))
+    any_prefix_in(args(), prefix)
 }
 
 #[cfg(test)]
@@ -120,5 +128,34 @@ mod tests {
         let args = argv(&["--smoke-settings-layout", "positional"]);
         assert!(value_in(&args, "smoke-settings-layout").is_some());
         assert!(value_in(&args, "positional").is_none());
+    }
+
+    /// `value`/`enabled`/`present` take a BARE name and prepend `--` themselves, while
+    /// `any_prefix` takes the prefix verbatim. Mixing the two conventions silently produces a
+    /// switch that never matches: `enabled("--space-membership-legacy")` searched for
+    /// `----space-membership-legacy` (see `window_collector/collect.rs`), so the flag was dead
+    /// and the legacy path looked reachable when it was not.
+    #[test]
+    fn a_leading_dash_in_a_name_breaks_the_match() {
+        let args = argv(&["--space-membership-legacy"]);
+        // The correct call form matches.
+        assert!(enabled_in(&args, "space-membership-legacy"));
+        // Passing the already-prefixed name searches for "----space-membership-legacy" and
+        // silently finds nothing. This is the bug this test pins down.
+        assert!(!enabled_in(&args, "--space-membership-legacy"));
+    }
+
+    /// `any_prefix` is the one exception: it does not prepend, so its argument keeps the `--`.
+    /// Both conventions are intentional; this records which is which by calling the real helper
+    /// rather than re-deriving `starts_with` here (a copy would still pass if `any_prefix` broke).
+    #[test]
+    fn any_prefix_keeps_the_dash_because_it_does_not_prepend_one() {
+        let args = argv(&["--smoke-settings-layout", "--smoke-overlay", "positional"]);
+        assert!(any_prefix_in(&args, "--smoke"));
+        // A bare name is the mistake this documents: the stored arguments carry the dashes, so
+        // dropping them here finds nothing -- which is exactly what `value_in` avoids for it.
+        assert!(!any_prefix_in(&args, "smoke"));
+        // Families that share a prefix must not match on a bare substring of a longer argument.
+        assert!(!any_prefix_in(&argv(&["--not-smoke-x"]), "--smoke-"));
     }
 }

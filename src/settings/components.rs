@@ -777,7 +777,9 @@ pub(crate) enum SettingsButtonRole {
 }
 
 impl SettingsButtonRole {
-    fn style(self, palette: crate::theme::UiPalette) -> (u32, u32, isize) {
+    /// The role's (normal fill, text, palette-slot tag). `widgets` reads the tag back to resolve
+    /// hover/exit fills, so the two mappings must stay in one place.
+    pub(super) fn style(self, palette: crate::theme::UiPalette) -> (u32, u32, isize) {
         match self {
             Self::Action => (palette.button_bg, palette.button_text, -3),
             Self::Compact => (palette.field_bg, palette.button_text, 0),

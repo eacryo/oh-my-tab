@@ -40,8 +40,9 @@ pub(crate) use collect::{
     switchable_capture_window_for_pid,
 };
 pub(crate) use raise::{
-    ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid, close_ax_window,
-    focused_window_cgwid, forget_non_normal_window, raise_window_fast,
+    ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
+    clear_ax_window_cache_for_window, close_ax_window, focused_window_cgwid,
+    forget_non_normal_window, raise_window_fast,
 };
 pub(crate) use raiser::{
     cf_to_rust_string, get_ax_windows_for_pid, handle_ax_raise_main, raise_window_ax_async,

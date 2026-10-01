@@ -21,6 +21,13 @@ pub(super) unsafe fn build_settings_sidebar(
     target: *mut AnyObject,
     ui: &mut SettingsUi,
 ) {
+    // The sidebar registries are keyed by raw view address, so building the sidebar invalidates
+    // every address a previous build inserted: the old buttons are released with the old content
+    // while their keys would survive. `sidebar_button_under_pointer` then messages those freed
+    // pointers on the next hover, which traps in objc's receiver check. Clear here, where the
+    // buttons are created, so every rebuild path -- including the in-place
+    // `rebuild_settings_content` one, which never goes through window teardown -- drops them.
+    widgets::clear_sidebar_view_registries();
     let SettingsSidebarGeometry {
         content_h,
         view_w,
