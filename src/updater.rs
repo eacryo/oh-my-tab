@@ -495,7 +495,8 @@ unsafe fn clear_host_subviews(host: *mut AnyObject) {
         }
         let child: *mut AnyObject = msg_send![subviews, objectAtIndex: 0usize];
         let _: () = msg_send![child, removeFromSuperview];
-        release_obj(child);
+        // `objectAtIndex:` returns an autoreleased (+0) object owned by the `subviews` array,
+        // which is itself autoreleased and still retains it; releasing here would double-free.
     }
 }
 

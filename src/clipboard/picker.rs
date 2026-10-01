@@ -1103,8 +1103,8 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
-    release_obj(font);
-    release_obj(color);
+                                                        // `systemFontOfSize:` / `colorWithWhite:alpha:` are convenience constructors (autoreleased,
+                                                        // +0); the label retains them, so releasing here would double-free at pool drain.
     let _: () = msg_send![content, addSubview: label];
 }
 

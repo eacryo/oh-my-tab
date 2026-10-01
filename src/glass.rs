@@ -243,7 +243,8 @@ pub(crate) unsafe fn rounded_effect_mask(corner_radius: f64) -> *mut AnyObject {
     let black: *mut AnyObject = msg_send![class!(NSColor), blackColor];
     let _: () = msg_send![black, setFill];
     let _: () = msg_send![path, fill];
-    release_obj(path);
+    // `bezierPathWithRoundedRect:` is a convenience constructor (autoreleased, +0); releasing it
+    // here would double-free when the autorelease pool drains.
     let _: () = msg_send![img, unlockFocus];
     let radius = corner_radius.min(SIDE / 2.0 - 1.0);
     let _: () = msg_send![img, setCapInsets: NSEdgeInsets {

@@ -10,7 +10,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::state::{
-    estimated_stream_width, Badge, BadgeKind, BADGE_GAP, BADGE_HORIZONTAL_PADDING,
+    estimated_stream_width, Badge, BadgeCell, BadgeKind, BADGE_CELL_GAP, BADGE_CELL_INSET_Y,
+    BADGE_CELL_PADDING_X, BADGE_CONTAINER_PADDING_X, BADGE_GAP, BADGE_HORIZONTAL_PADDING,
     PANEL_SIDE_PADDING,
 };
 use crate::config::KeystrokeDisplayPosition;
@@ -61,6 +62,9 @@ struct PanelState {
     last_badges: Vec<Badge>,
     last_palette: Option<crate::theme::UiPalette>,
     measurements: HashMap<String, f64>,
+    /// Set once the bar has hit the width cap this session; it stays there until the panel hides,
+    /// so keys rolling off the front never make the length breathe.
+    latched: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -418,6 +422,7 @@ fn reposition_to_default() {
 pub(super) fn render(
     badges: &[Badge],
     visible: bool,
+    capped: bool,
     display_position: &str,
     position: Option<KeystrokeDisplayPosition>,
     now: Instant,
@@ -446,6 +451,9 @@ pub(super) fn render(
         }
         if visible && !badges.is_empty() {
             let reopened = !state.visible;
+            if reopened {
+                state.latched = false;
+            }
             let screens = if reopened {
                 unsafe { screen_geometries() }
             } else {
@@ -490,12 +498,8 @@ pub(super) fn render(
                 .expect("a created keystroke panel has a badge container");
             let labels = badge_labels(badges);
             let mut widths = Vec::with_capacity(badges.len());
-            for (badge, text) in badges.iter().zip(&labels) {
-                widths.push(cached_badge_width(
-                    &mut state.measurements,
-                    text,
-                    badge.repeats,
-                ));
+            for badge in badges.iter() {
+                widths.push(cached_badge_width(&mut state.measurements, badge));
             }
             let max_width = screen_frame.size.width * 0.5;
             let mut desired = estimated_stream_width(widths.iter().copied());
@@ -512,7 +516,17 @@ pub(super) fn render(
                 *width = width.min((max_width - PANEL_SIDE_PADDING * 2.0).max(32.0));
             }
             desired = estimated_stream_width(widths.iter().copied());
-            let panel_w = desired.min(max_width).max(max_width.min(64.0));
+            // The stream filled the cap this session: pin the bar to the cap so keys rolling off
+            // the front never shorten it (the length stops changing at the cap). `first > 0`
+            // covers the panel's own measured trim, which can fire a little before the state's
+            // estimate-based trim does.
+            let pinned = capped || state.latched || first > 0;
+            state.latched = pinned;
+            let panel_w = if pinned {
+                max_width
+            } else {
+                desired.min(max_width).max(max_width.min(64.0))
+            };
             let size = NSSize::new(panel_w, PANEL_H);
             let frame = unsafe {
                 if state.drag.is_some() {
@@ -562,6 +576,7 @@ pub(super) fn render(
             if state.visible {
                 state.visible = false;
                 state.last_badges.clear();
+                state.latched = false;
                 let reduce_motion = crate::theme::reduce_motion_enabled();
                 state.fade_deadline = (!reduce_motion).then_some(now + HIDE_FADE);
                 if let Some(panel) = state.panel {
@@ -636,6 +651,7 @@ pub(super) fn reset() {
         state.last_badges.clear();
         state.last_palette = None;
         state.measurements.clear();
+        state.latched = false;
     });
 }
 
@@ -654,21 +670,52 @@ pub(super) fn smoke_runner() -> bool {
         .unwrap()
         .keystroke_display
         .position;
+    let smoke_now = Instant::now();
+    // Exercise the multi-key cell path (one keycap per key) before the single-label checks.
+    let cell_badge = Badge {
+        text: "⌘⇧Q".into(),
+        kind: BadgeKind::Chord,
+        repeats: 1,
+        cells: vec![
+            BadgeCell::Modifier("⌘".into()),
+            BadgeCell::Modifier("⇧".into()),
+            BadgeCell::Key("Q".into()),
+        ],
+    };
+    let _ = render(
+        &[cell_badge],
+        true,
+        false,
+        "main",
+        initial_position,
+        smoke_now,
+        None,
+    );
     let badge = Badge {
         text: "⌘Q".into(),
         kind: BadgeKind::Chord,
         repeats: 2,
+        cells: Vec::new(),
     };
-    let smoke_now = Instant::now();
-    let _ = render(&[badge], true, "main", initial_position, smoke_now, None);
-    let _ = render(&[], false, "main", initial_position, smoke_now, None);
+    let _ = render(
+        &[badge],
+        true,
+        false,
+        "main",
+        initial_position,
+        smoke_now,
+        None,
+    );
+    let _ = render(&[], false, false, "main", initial_position, smoke_now, None);
     let _ = render(
         &[Badge {
             text: "⌘Q".into(),
             kind: BadgeKind::Chord,
             repeats: 2,
+            cells: Vec::new(),
         }],
         true,
+        false,
         "main",
         initial_position,
         smoke_now,
@@ -679,14 +726,24 @@ pub(super) fn smoke_runner() -> bool {
             text: "中文".into(),
             kind: BadgeKind::Chord,
             repeats: 1,
+            cells: Vec::new(),
         },
         Badge {
             text: "漢字かな".into(),
             kind: BadgeKind::Chord,
             repeats: 12,
+            cells: Vec::new(),
         },
     ];
-    let _ = render(&cjk_badges, true, "main", initial_position, smoke_now, None);
+    let _ = render(
+        &cjk_badges,
+        true,
+        false,
+        "main",
+        initial_position,
+        smoke_now,
+        None,
+    );
     let badge_container = PANEL.with(|panel| panel.borrow().badge_container);
     let centroid_offsets =
         badge_container.and_then(|content| unsafe { text_centroid_offsets(content, &cjk_badges) });
@@ -1220,18 +1277,36 @@ unsafe fn set_alpha_immediately(panel: *mut AnyObject, alpha: f64) {
     let _: () = msg_send![panel, setAlphaValue: alpha];
 }
 
-fn cached_badge_width(cache: &mut HashMap<String, f64>, label: &str, repeats: u32) -> f64 {
+fn cached_badge_width(cache: &mut HashMap<String, f64>, badge: &Badge) -> f64 {
     crate::debug_assert_main_thread();
-    let display_text = badge_display_text(label, repeats);
-    if let Some(width) = cache.get(&display_text) {
+    if badge.cells.len() > 1 {
+        // A container holding one keycap cell per key, plus the repeat suffix after the cells.
+        let mut width = BADGE_CONTAINER_PADDING_X * 2.0;
+        for (index, cell) in badge.cells.iter().enumerate() {
+            if index > 0 {
+                width += BADGE_CELL_GAP;
+            }
+            width += cached_label_width(cache, cell.text()) + BADGE_CELL_PADDING_X * 2.0;
+        }
+        if badge.repeats > 1 {
+            width += BADGE_CELL_GAP + cached_label_width(cache, &format!("×{}", badge.repeats));
+        }
+        width
+    } else {
+        cached_label_width(cache, &badge_display_text(&badge.text, badge.repeats))
+            + BADGE_HORIZONTAL_PADDING
+    }
+}
+
+fn cached_label_width(cache: &mut HashMap<String, f64>, label: &str) -> f64 {
+    if let Some(width) = cache.get(label) {
         return *width;
     }
-
-    let width = unsafe { measure_text_width(&display_text) } + BADGE_HORIZONTAL_PADDING;
+    let width = unsafe { measure_text_width(label) };
     if cache.len() >= MAX_MEASUREMENTS {
         cache.clear();
     }
-    cache.insert(display_text, width);
+    cache.insert(label.to_string(), width);
     width
 }
 
@@ -1250,6 +1325,93 @@ fn badge_display_text(label: &str, repeats: u32) -> String {
         format!("{}  ×{}", label, repeats)
     } else {
         label.to_string()
+    }
+}
+
+/// Add one text field, vertically centered in `frame`.
+unsafe fn add_badge_label(parent: *mut AnyObject, frame: NSRect, text: &str, text_color: u32) {
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR];
+    let ascender: f64 = msg_send![font, ascender];
+    let descender: f64 = msg_send![font, descender];
+    let leading: f64 = msg_send![font, leading];
+    let line_height = (ascender - descender + leading).ceil();
+    // A badge-height NSTextField puts its glyph ink about 8 pt off-center; center a font-height
+    // frame in the capsule instead.
+    let field_y = frame.origin.y + ((frame.size.height - line_height) / 2.0).max(0.0);
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![field, initWithFrame: NSRect::new(NSPoint::new(frame.origin.x, field_y), NSSize::new(frame.size.width.max(1.0), line_height))];
+    let _: () = msg_send![field, setEditable: false];
+    let _: () = msg_send![field, setSelectable: false];
+    let _: () = msg_send![field, setBezeled: false];
+    let _: () = msg_send![field, setDrawsBackground: false];
+    let _: () = msg_send![field, setAlignment: 1isize];
+    let _: () = msg_send![field, setLineBreakMode: 4isize];
+    let _: () = msg_send![field, setFont: font];
+    let color = crate::ffi::hex_to_ns_color(text_color);
+    let _: () = msg_send![field, setTextColor: color];
+    let title = make_nsstring(text);
+    let _: () = msg_send![field, setStringValue: title];
+    CFRelease(title as *const c_void);
+    let _: () = msg_send![parent, addSubview: field];
+    release_obj(field);
+}
+
+/// Draw the keycap cells of a multi-key badge inside its container, one per key: modifiers keep
+/// the accent tint while the key they combine with stays neutral.
+unsafe fn layout_badge_cells(
+    parent: *mut AnyObject,
+    badge: &Badge,
+    palette: &crate::theme::UiPalette,
+) {
+    let cell_h = (BADGE_H - BADGE_CELL_INSET_Y * 2.0).max(1.0);
+    let inner_radius = crate::theme::rounded_inset_radius(
+        crate::theme::RADIUS_CONTROL - BADGE_CONTAINER_PADDING_X,
+        100.0,
+        cell_h,
+    );
+    let mut x = BADGE_CONTAINER_PADDING_X;
+    for cell in &badge.cells {
+        let cell_w = measure_text_width(cell.text()) + BADGE_CELL_PADDING_X * 2.0;
+        let cell_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let cell_view: *mut AnyObject = msg_send![cell_view, initWithFrame: NSRect::new(NSPoint::new(x, BADGE_CELL_INSET_Y), NSSize::new(cell_w, cell_h))];
+        let _: () = msg_send![cell_view, setWantsLayer: true];
+        let cell_layer: *mut AnyObject = msg_send![cell_view, layer];
+        let _: () = msg_send![cell_layer, setCornerRadius: inner_radius];
+        let _: () = msg_send![cell_layer, setBorderWidth: 1.0f64];
+        let (background, border, text_color) = if cell.is_modifier() {
+            (
+                palette.keycap_accent_bg,
+                palette.keycap_accent_border,
+                palette.keycap_accent_text,
+            )
+        } else {
+            (
+                keycap_fill(palette.card_bg),
+                palette.card_border,
+                palette.primary_text,
+            )
+        };
+        layer_set_background(cell_layer, hex_to_cg_color(background));
+        layer_set_border(cell_layer, hex_to_cg_color(border));
+        add_badge_label(
+            cell_view,
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(cell_w, cell_h)),
+            cell.text(),
+            text_color,
+        );
+        let _: () = msg_send![parent, addSubview: cell_view];
+        release_obj(cell_view);
+        x += cell_w + BADGE_CELL_GAP;
+    }
+    if badge.repeats > 1 {
+        let suffix = format!("×{}", badge.repeats);
+        let suffix_w = measure_text_width(&suffix);
+        add_badge_label(
+            parent,
+            NSRect::new(NSPoint::new(x, 0.0), NSSize::new(suffix_w, BADGE_H)),
+            &suffix,
+            palette.primary_text,
+        );
     }
 }
 
@@ -1277,50 +1439,43 @@ unsafe fn rebuild_badges(
         let layer: *mut AnyObject = msg_send![badge_view, layer];
         let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-        let (background, border, text_color) = if uses_accent_fill(badge.kind) {
-            (
-                palette.keycap_accent_bg,
-                palette.keycap_accent_border,
-                palette.keycap_accent_text,
-            )
-        } else {
-            (
-                keycap_fill(palette.card_bg),
-                palette.card_border,
-                palette.primary_text,
-            )
-        };
-        // Dark text stays readable on light capsules and white text on dark ones at 90% alpha;
-        // the glass shows through subtly without changing either theme's tuned RGB values.
-        layer_set_background(layer, hex_to_cg_color(background));
-        layer_set_border(layer, hex_to_cg_color(border));
 
-        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR];
-        let ascender: f64 = msg_send![font, ascender];
-        let descender: f64 = msg_send![font, descender];
-        let leading: f64 = msg_send![font, leading];
-        let line_height = (ascender - descender + leading).ceil();
-        // A badge-height NSTextField puts its glyph ink about 8 pt off-center; center a
-        // font-height frame in the capsule instead.
-        let field_y = ((BADGE_H - line_height) / 2.0).max(0.0);
-        let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let field: *mut AnyObject = msg_send![field, initWithFrame: NSRect::new(NSPoint::new(6.0, field_y), NSSize::new((*width - 12.0).max(1.0), line_height))];
-        let _: () = msg_send![field, setEditable: false];
-        let _: () = msg_send![field, setSelectable: false];
-        let _: () = msg_send![field, setBezeled: false];
-        let _: () = msg_send![field, setDrawsBackground: false];
-        let _: () = msg_send![field, setAlignment: 1isize];
-        let _: () = msg_send![field, setLineBreakMode: 4isize];
-        let _: () = msg_send![field, setFont: font];
-        let text_color = crate::ffi::hex_to_ns_color(text_color);
-        let _: () = msg_send![field, setTextColor: text_color];
-        let display_text = badge_display_text(label, badge.repeats);
-        let title = make_nsstring(&display_text);
-        let _: () = msg_send![field, setStringValue: title];
-        CFRelease(title as *const c_void);
+        if badge.cells.len() > 1 {
+            // One container holding one keycap per key. The container is a subtle tray so the
+            // cells and their per-role tints stay legible against it.
+            layer_set_background(layer, hex_to_cg_color(palette.field_bg));
+            layer_set_border(layer, hex_to_cg_color(palette.card_border));
+            layout_badge_cells(badge_view, badge, &palette);
+        } else {
+            let (background, border, text_color) = if uses_accent_fill(badge.kind) {
+                (
+                    palette.keycap_accent_bg,
+                    palette.keycap_accent_border,
+                    palette.keycap_accent_text,
+                )
+            } else {
+                (
+                    keycap_fill(palette.card_bg),
+                    palette.card_border,
+                    palette.primary_text,
+                )
+            };
+            // Dark text stays readable on light capsules and white text on dark ones at 90% alpha;
+            // the glass shows through subtly without changing either theme's tuned RGB values.
+            layer_set_background(layer, hex_to_cg_color(background));
+            layer_set_border(layer, hex_to_cg_color(border));
+            let display_text = badge_display_text(label, badge.repeats);
+            add_badge_label(
+                badge_view,
+                NSRect::new(
+                    NSPoint::new(6.0, 0.0),
+                    NSSize::new((*width - 12.0).max(1.0), BADGE_H),
+                ),
+                &display_text,
+                text_color,
+            );
+        }
         let _: () = msg_send![content, addSubview: badge_view];
-        let _: () = msg_send![badge_view, addSubview: field];
-        release_obj(field);
         release_obj(badge_view);
         x += *width + BADGE_GAP;
     }

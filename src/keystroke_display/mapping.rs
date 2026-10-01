@@ -66,27 +66,29 @@ pub(crate) fn named_key(keycode: u16) -> Option<String> {
         })
 }
 
-pub(crate) fn modifier_glyphs(flags: u64) -> String {
-    let mut output = String::with_capacity(8);
+/// The individual modifier glyphs for a flag set, in conventional display order. Keeping each
+/// key separate lets the panel draw one keycap cell per key.
+pub(crate) fn modifier_cells(flags: u64) -> Vec<String> {
+    let mut cells = Vec::with_capacity(5);
     if flags & keyboard::FLAG_COMMAND != 0 {
-        output.push('⌘');
+        cells.push("⌘".to_string());
     }
     if flags & keyboard::FLAG_OPTION != 0 {
-        output.push('⌥');
+        cells.push("⌥".to_string());
     }
     if flags & keyboard::FLAG_SHIFT != 0 {
-        output.push('⇧');
+        cells.push("⇧".to_string());
     }
     if flags & keyboard::FLAG_CONTROL != 0 {
-        output.push('⌃');
+        cells.push("⌃".to_string());
     }
     if flags & keyboard::FLAG_CAPS_LOCK != 0 {
-        output.push('⇪');
+        cells.push("⇪".to_string());
     }
     if flags & keyboard::FLAG_FN != 0 {
-        output.push_str("fn");
+        cells.push("fn".to_string());
     }
-    output
+    cells
 }
 
 pub(crate) fn modifier_mask() -> u64 {
@@ -357,22 +359,21 @@ fn ansi_key_glyph(keycode: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ansi_key_glyph, fallback_to_ascii_then_ansi, is_printable, modifier_glyphs, named_key,
+        ansi_key_glyph, fallback_to_ascii_then_ansi, is_printable, modifier_cells, named_key,
         resolve_layout_glyph,
     };
     use crate::event_tap::keyboard;
 
     #[test]
     fn modifier_order_is_conventional() {
-        assert_eq!(
-            modifier_glyphs(
-                keyboard::FLAG_COMMAND
-                    | keyboard::FLAG_OPTION
-                    | keyboard::FLAG_SHIFT
-                    | keyboard::FLAG_CONTROL
-            ),
-            "⌘⌥⇧⌃"
+        let cells = modifier_cells(
+            keyboard::FLAG_COMMAND
+                | keyboard::FLAG_OPTION
+                | keyboard::FLAG_SHIFT
+                | keyboard::FLAG_CONTROL,
         );
+        assert_eq!(cells, ["⌘", "⌥", "⇧", "⌃"]);
+        assert_eq!(cells.concat(), "⌘⌥⇧⌃");
     }
 
     #[test]

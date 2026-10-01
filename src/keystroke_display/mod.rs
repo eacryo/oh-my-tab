@@ -172,7 +172,7 @@ fn process_tick() -> bool {
     let cursor_point = panel::current_cursor_appkit_point();
     let cursor_inside_panel = cursor_point.and_then(panel::cursor_inside_visible_panel);
     let mut became_secure = false;
-    let (badges, visible, changed, display_position) = STATE.with(|state| {
+    let (badges, visible, capped, changed, display_position) = STATE.with(|state| {
         let mut state = state.borrow_mut();
         let was_secure = state.secure_paused();
         let mut changed = false;
@@ -199,7 +199,13 @@ fn process_tick() -> bool {
             let max_width = panel::target_screen_width(&display_position, config.position) * 0.5;
             changed |= state.trim_to_width(max_width);
         }
-        (state.badges().to_vec(), visible, changed, display_position)
+        (
+            state.badges().to_vec(),
+            visible,
+            state.capped(),
+            changed,
+            display_position,
+        )
     });
 
     if became_secure {
@@ -212,6 +218,7 @@ fn process_tick() -> bool {
     let first_hover_sample = panel::render(
         &badges,
         visible,
+        capped,
         &display_position,
         config.position,
         now,

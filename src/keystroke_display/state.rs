@@ -11,6 +11,14 @@ pub(super) const IDLE_FADE: Duration = Duration::from_millis(1800);
 pub(crate) const BADGE_GAP: f64 = 6.0;
 pub(crate) const PANEL_SIDE_PADDING: f64 = 12.0;
 pub(crate) const BADGE_HORIZONTAL_PADDING: f64 = 28.0;
+/// Horizontal padding on each side of a multi-key badge container.
+pub(crate) const BADGE_CONTAINER_PADDING_X: f64 = 4.0;
+/// Horizontal padding on each side of one keycap cell inside a badge container.
+pub(crate) const BADGE_CELL_PADDING_X: f64 = 7.0;
+/// Gap between two keycap cells inside a badge container.
+pub(crate) const BADGE_CELL_GAP: f64 = 4.0;
+/// Vertical inset of a keycap cell from its container's top and bottom edges.
+pub(crate) const BADGE_CELL_INSET_Y: f64 = 4.0;
 
 pub(crate) fn estimated_badge_width(text: &str, repeats: u32) -> f64 {
     let repeat_width = if repeats > 1 {
@@ -19,6 +27,27 @@ pub(crate) fn estimated_badge_width(text: &str, repeats: u32) -> f64 {
         0.0
     };
     text.chars().map(estimated_glyph_width).sum::<f64>() + BADGE_HORIZONTAL_PADDING + repeat_width
+}
+
+/// Estimated width of a multi-key badge: a container holding one padded keycap cell per key,
+/// with the repeat suffix after the last cell.
+pub(crate) fn estimated_cells_width(cells: &[BadgeCell], repeats: u32) -> f64 {
+    let mut width = BADGE_CONTAINER_PADDING_X * 2.0;
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            width += BADGE_CELL_GAP;
+        }
+        width += cell.text().chars().map(estimated_glyph_width).sum::<f64>()
+            + BADGE_CELL_PADDING_X * 2.0;
+    }
+    if repeats > 1 {
+        width += BADGE_CELL_GAP
+            + format!("×{repeats}")
+                .chars()
+                .map(estimated_glyph_width)
+                .sum::<f64>();
+    }
+    width
 }
 
 fn estimated_glyph_width(glyph: char) -> f64 {
@@ -117,11 +146,34 @@ pub(crate) enum BadgeKind {
     Indicator,
 }
 
+/// One key inside a multi-key badge. Modifiers and the key they combine with are separated so
+/// the panel can tint modifiers apart from the key, the way a keycap HUD does.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum BadgeCell {
+    Modifier(String),
+    Key(String),
+}
+
+impl BadgeCell {
+    pub(crate) fn text(&self) -> &str {
+        match self {
+            BadgeCell::Modifier(text) | BadgeCell::Key(text) => text,
+        }
+    }
+
+    pub(crate) fn is_modifier(&self) -> bool {
+        matches!(self, BadgeCell::Modifier(_))
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Badge {
     pub(crate) text: String,
     pub(crate) kind: BadgeKind,
     pub(crate) repeats: u32,
+    /// The individual keys inside this badge: empty or single-element badges draw one label from
+    /// `text`, while two or more draw one keycap cell per entry.
+    pub(crate) cells: Vec<BadgeCell>,
 }
 
 impl Badge {
@@ -130,11 +182,26 @@ impl Badge {
             text,
             kind,
             repeats: 1,
+            cells: Vec::new(),
+        }
+    }
+
+    fn with_cells(kind: BadgeKind, cells: Vec<BadgeCell>) -> Self {
+        let text = cells.iter().map(|cell| cell.text()).collect();
+        Self {
+            text,
+            kind,
+            repeats: 1,
+            cells,
         }
     }
 
     pub(crate) fn estimated_width(&self) -> f64 {
-        estimated_badge_width(&self.text, self.repeats)
+        if self.cells.len() > 1 {
+            estimated_cells_width(&self.cells, self.repeats)
+        } else {
+            estimated_badge_width(&self.text, self.repeats)
+        }
     }
 }
 
@@ -170,6 +237,7 @@ struct LastKey {
     badge_index: usize,
     press_count: u32,
     glyph: String,
+    cells: Vec<BadgeCell>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -179,6 +247,9 @@ pub(crate) struct StateMachine {
     modifier_badge: Option<usize>,
     last_key: Option<LastKey>,
     deadline: Option<Instant>,
+    /// Set once the stream outgrows the panel's width cap. The panel then stays at the cap for
+    /// the rest of the session, so old keys being pushed out does not make the bar breathe.
+    capped: bool,
     secure: bool,
 }
 
@@ -221,6 +292,7 @@ impl StateMachine {
         *self != before
     }
 
+    /// Clear the whole stream once its idle deadline passes.
     pub(crate) fn tick(&mut self, now: Instant) -> bool {
         let Some(deadline) = self.deadline else {
             return false;
@@ -232,6 +304,7 @@ impl StateMachine {
         self.modifier_badge = None;
         self.last_key = None;
         self.deadline = None;
+        self.capped = false;
         true
     }
 
@@ -242,6 +315,11 @@ impl StateMachine {
     #[cfg(test)]
     pub(crate) fn deadline(&self) -> Option<Instant> {
         self.deadline
+    }
+
+    /// Whether the stream has filled the panel's width cap this session.
+    pub(crate) fn capped(&self) -> bool {
+        self.capped
     }
 
     pub(crate) fn panel_visible(&self) -> bool {
@@ -263,6 +341,9 @@ impl StateMachine {
         while self.badges.len() > 1 && self.stream_width() > max_width {
             self.badges.remove(0);
             self.rebase_indices_after_front_drop();
+            // Once the cap is reached, the panel pins to it for the rest of the session so the
+            // window rolling (old keys pushed out by new ones) never changes the bar's length.
+            self.capped = true;
         }
         self.badges != before
     }
@@ -291,6 +372,7 @@ impl StateMachine {
         self.modifier_badge = None;
         self.last_key = None;
         self.deadline = None;
+        self.capped = false;
         if active {
             self.badges
                 .push(Badge::new(String::new(), BadgeKind::Indicator));
@@ -312,20 +394,26 @@ impl StateMachine {
         let is_caps_lock = keycode == keyboard::VK_CAPS_LOCK && added != 0;
 
         if new_visible_flags != 0 && mode.accepts(flags) {
-            let text = crate::keystroke_display::mapping::modifier_glyphs(new_visible_flags);
-            if !text.is_empty() {
+            let cells: Vec<BadgeCell> =
+                crate::keystroke_display::mapping::modifier_cells(new_visible_flags)
+                    .into_iter()
+                    .map(BadgeCell::Modifier)
+                    .collect();
+            if !cells.is_empty() {
                 if let Some(index) = self.modifier_badge {
                     if let Some(badge) = self.badges.get_mut(index) {
                         if matches!(
                             badge.kind,
                             BadgeKind::Modifier | BadgeKind::ModifierReleased
                         ) {
-                            badge.text = text;
+                            badge.text = cells.iter().map(|cell| cell.text()).collect();
                             badge.kind = BadgeKind::Modifier;
+                            badge.cells = cells;
                         }
                     }
                 } else {
-                    self.modifier_badge = Some(self.push_badge(text, BadgeKind::Modifier));
+                    self.modifier_badge =
+                        Some(self.push_badge(Badge::with_cells(BadgeKind::Modifier, cells)));
                 }
                 if added != 0 {
                     self.last_key = None;
@@ -383,35 +471,40 @@ impl StateMachine {
                 self.last_key = None;
                 return;
             };
-            let modifier_text =
-                crate::keystroke_display::mapping::modifier_glyphs(visible_modifiers);
-            let text = format!("{modifier_text}{glyph}");
-            let group_glyph = text.clone();
+            // One cell per key: the held modifiers, then the key they combine with.
+            let mut cells: Vec<BadgeCell> =
+                crate::keystroke_display::mapping::modifier_cells(visible_modifiers)
+                    .into_iter()
+                    .map(BadgeCell::Modifier)
+                    .collect();
+            cells.push(BadgeCell::Key(glyph.to_string()));
             let index = if let Some(index) = self.modifier_badge.take() {
                 if let Some(badge) = self.badges.get_mut(index) {
                     if matches!(
                         badge.kind,
                         BadgeKind::Modifier | BadgeKind::ModifierReleased
                     ) {
-                        badge.text = text;
+                        badge.text = cells.iter().map(|cell| cell.text()).collect();
                         badge.kind = BadgeKind::Chord;
                         badge.repeats = 1;
+                        badge.cells = cells.clone();
                         index
                     } else {
-                        self.push_badge(text, BadgeKind::Chord)
+                        self.push_badge(Badge::with_cells(BadgeKind::Chord, cells.clone()))
                     }
                 } else {
-                    self.push_badge(text, BadgeKind::Chord)
+                    self.push_badge(Badge::with_cells(BadgeKind::Chord, cells.clone()))
                 }
             } else {
-                self.push_badge(text, BadgeKind::Chord)
+                self.push_badge(Badge::with_cells(BadgeKind::Chord, cells.clone()))
             };
             self.last_key = Some(LastKey {
                 keycode,
                 modifiers: actual_modifiers,
                 badge_index: index,
                 press_count: 1,
-                glyph: group_glyph,
+                glyph: cells.iter().map(|cell| cell.text()).collect(),
+                cells,
             });
             self.deadline = Some(now + IDLE_FADE);
             return;
@@ -456,9 +549,9 @@ impl StateMachine {
         // with a count that keeps climbing on further presses.
         let next_count = last.press_count.saturating_add(1);
         if last.press_count < 3 {
-            self.push_badge(last.glyph, BadgeKind::Chord);
+            self.push_badge(repeat_badge(&last));
         } else if last.press_count == 3 {
-            let mut badge = Badge::new(last.glyph, BadgeKind::Chord);
+            let mut badge = repeat_badge(&last);
             badge.repeats = next_count;
             self.badges.splice(
                 last.badge_index..last.badge_index + 3,
@@ -475,27 +568,37 @@ impl StateMachine {
     }
 
     fn start_badge_group(&mut self, keycode: u16, modifiers: u64, glyph: &str, kind: BadgeKind) {
-        let badge_index = self.push_badge(glyph.to_string(), kind);
+        let badge_index = self.push_badge(Badge::new(glyph.to_string(), kind));
         self.last_key = Some(LastKey {
             keycode,
             modifiers,
             badge_index,
             press_count: 1,
             glyph: glyph.to_string(),
+            cells: Vec::new(),
         });
     }
 
-    fn push_badge(&mut self, text: String, kind: BadgeKind) -> usize {
-        self.badges.push(Badge::new(text, kind));
+    fn push_badge(&mut self, badge: Badge) -> usize {
+        self.badges.push(badge);
         self.badges.len() - 1
+    }
+}
+
+/// Rebuild the badge for a repeated key, preserving a chord's cell split.
+fn repeat_badge(last: &LastKey) -> Badge {
+    if last.cells.is_empty() {
+        Badge::new(last.glyph.clone(), BadgeKind::Chord)
+    } else {
+        Badge::with_cells(BadgeKind::Chord, last.cells.clone())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        estimated_badge_width, estimated_stream_width, BadgeKind, DisplayMode, Input, KeyGlyph,
-        StateMachine, IDLE_FADE, MODIFIER_ONLY_FADE,
+        estimated_badge_width, estimated_cells_width, estimated_stream_width, BadgeCell, BadgeKind,
+        DisplayMode, Input, KeyGlyph, StateMachine, IDLE_FADE, MODIFIER_ONLY_FADE,
     };
     use crate::event_tap::keyboard;
     use std::time::{Duration, Instant};
@@ -602,6 +705,59 @@ mod tests {
             now + Duration::from_millis(4),
         );
         assert_eq!(state.badges()[0].repeats, 5);
+    }
+
+    #[test]
+    fn chord_badge_splits_into_one_cell_per_key() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        state.apply(flags(keyboard::FLAG_COMMAND, 55), DisplayMode::All, now);
+        state.apply(
+            down(12, keyboard::FLAG_COMMAND, "q"),
+            DisplayMode::All,
+            now + Duration::from_millis(10),
+        );
+        let badge = &state.badges()[0];
+        assert_eq!(badge.kind, BadgeKind::Chord);
+        assert_eq!(badge.text, "⌘q");
+        assert_eq!(
+            badge.cells,
+            [
+                BadgeCell::Modifier("⌘".to_string()),
+                BadgeCell::Key("q".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn cell_badges_estimate_wider_than_a_single_label() {
+        let cells = [
+            BadgeCell::Modifier("⌘".to_string()),
+            BadgeCell::Key("q".to_string()),
+        ];
+        assert!(estimated_cells_width(&cells, 1) > estimated_badge_width("⌘q", 1));
+    }
+
+    #[test]
+    fn the_stream_stays_capped_once_it_overflows_and_resets_when_cleared() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        for offset in 0..6u64 {
+            state.apply(
+                down(offset as u16, 0, "a"),
+                DisplayMode::All,
+                now + Duration::from_millis(offset),
+            );
+        }
+        assert!(!state.capped());
+        // A narrow cap trims the front keys and pins the stream.
+        assert!(state.trim_to_width(60.0));
+        assert!(state.capped());
+        assert!(state.badges().len() < 6);
+        state.trim_to_width(60.0);
+        assert!(state.capped());
+        assert!(state.tick(now + Duration::from_millis(5) + IDLE_FADE));
+        assert!(!state.capped());
     }
 
     #[test]
