@@ -162,7 +162,10 @@ fn process_tick() -> bool {
                     || *keycode == crate::event_tap::keyboard::VK_SPACE
                     || !mapping::is_printable(unicode)) =>
             {
-                *glyph = mapping::key_glyph(*keycode, unicode, *flags & mapping::modifier_mask())
+                // Key events: a held modifier excludes FLAG_FN, which the system sets on every
+                // function-key event (see MODIFIER_MASK). Passing it here would also suppress
+                // the layout-glyph fallback for every arrow key.
+                *glyph = mapping::key_glyph(*keycode, unicode, *flags & mapping::MODIFIER_MASK)
                     .map_or(KeyGlyph::Unavailable, KeyGlyph::Mapped);
             }
             _ => {}

@@ -129,10 +129,21 @@ impl DisplayMode {
         }
     }
 
+    /// The modifiers a key event may show as held. Excludes `FLAG_FN`, which the system sets on
+    /// every function-key event regardless of whether fn is down.
     fn visible_modifier_mask(self) -> u64 {
         match self {
-            Self::All => crate::keystroke_display::mapping::modifier_mask(),
+            Self::All => crate::keystroke_display::mapping::MODIFIER_MASK,
             Self::Shortcuts => SHORTCUT_MODIFIERS,
+            Self::Commands => keyboard::FLAG_COMMAND,
+        }
+    }
+
+    /// The modifiers a modifier event may show as held. Only here is `FLAG_FN` meaningful.
+    fn visible_modifier_event_mask(self) -> u64 {
+        match self {
+            Self::All => crate::keystroke_display::mapping::modifier_mask(),
+            Self::Shortcuts => SHORTCUT_MODIFIERS | keyboard::FLAG_FN,
             Self::Commands => keyboard::FLAG_COMMAND,
         }
     }
@@ -388,14 +399,14 @@ impl StateMachine {
         if self.secure {
             return;
         }
-        let visible_mask = mode.visible_modifier_mask();
+        let visible_mask = mode.visible_modifier_event_mask();
         let added = (flags & !old_flags) & visible_mask;
         let new_visible_flags = flags & visible_mask;
         let is_caps_lock = keycode == keyboard::VK_CAPS_LOCK && added != 0;
 
         if new_visible_flags != 0 && mode.accepts(flags) {
             let cells: Vec<BadgeCell> =
-                crate::keystroke_display::mapping::modifier_cells(new_visible_flags)
+                crate::keystroke_display::mapping::modifier_event_cells(new_visible_flags)
                     .into_iter()
                     .map(BadgeCell::Modifier)
                     .collect();
@@ -460,7 +471,9 @@ impl StateMachine {
             return;
         }
 
-        let actual_modifiers = flags & crate::keystroke_display::mapping::modifier_mask();
+        // A key event's held modifiers exclude FLAG_FN: the system sets that bit on every
+        // function-key event, so including it made a bare arrow key look like "fn ←".
+        let actual_modifiers = flags & crate::keystroke_display::mapping::MODIFIER_MASK;
         if self.repeat_key_group(keycode, actual_modifiers, now) {
             return;
         }
@@ -736,6 +749,47 @@ mod tests {
             BadgeCell::Key("q".to_string()),
         ];
         assert!(estimated_cells_width(&cells, 1) > estimated_badge_width("⌘q", 1));
+    }
+
+    /// The reported bug, end to end: a bare arrow key showed as "fn ←". macOS sets
+    /// `NSEventModifierFlagFunction` on the event itself (measured: `←` arrives as
+    /// `flags=0x00A00100`), so the key path must not read it as a held modifier.
+    #[test]
+    fn a_bare_arrow_key_renders_only_the_arrow() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        state.apply(down(123, keyboard::FLAG_FN, ""), DisplayMode::All, now);
+        let badges = state.badges();
+        assert_eq!(
+            badges.len(),
+            1,
+            "one arrow key must produce exactly one badge"
+        );
+        assert_eq!(badges[0].text, "←");
+        assert!(
+            !badges[0].text.contains("fn"),
+            "the system's function-key bit must not render as a held fn"
+        );
+        assert!(
+            badges[0]
+                .cells
+                .iter()
+                .all(|cell| !matches!(cell, BadgeCell::Modifier(_))),
+            "an arrow key has no held modifier to draw"
+        );
+    }
+
+    /// The same bit on a real modifier event *does* mean fn is held, and must still display.
+    #[test]
+    fn holding_fn_still_renders_an_fn_badge() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        state.apply(flags(keyboard::FLAG_FN, 63), DisplayMode::All, now);
+        let badges = state.badges();
+        assert_eq!(badges.len(), 1);
+        assert_eq!(badges[0].kind, BadgeKind::Modifier);
+        assert_eq!(badges[0].text, "fn");
+        assert_eq!(badges[0].cells, [BadgeCell::Modifier("fn".to_string())]);
     }
 
     #[test]

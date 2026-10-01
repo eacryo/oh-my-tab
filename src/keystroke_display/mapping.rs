@@ -68,6 +68,9 @@ pub(crate) fn named_key(keycode: u16) -> Option<String> {
 
 /// The individual modifier glyphs for a flag set, in conventional display order. Keeping each
 /// key separate lets the panel draw one keycap cell per key.
+///
+/// `FLAG_FN` is deliberately *not* rendered here: see `MODIFIER_MASK` for why that bit means
+/// something different on a key event than it does on a modifier event.
 pub(crate) fn modifier_cells(flags: u64) -> Vec<String> {
     let mut cells = Vec::with_capacity(5);
     if flags & keyboard::FLAG_COMMAND != 0 {
@@ -85,19 +88,37 @@ pub(crate) fn modifier_cells(flags: u64) -> Vec<String> {
     if flags & keyboard::FLAG_CAPS_LOCK != 0 {
         cells.push("⇪".to_string());
     }
+    cells
+}
+
+/// The modifier glyphs for a `FlagsChanged` flag set, which is the one path where `FLAG_FN`
+/// means "the fn key is held". Renders `fn` on top of the shared cells.
+pub(crate) fn modifier_event_cells(flags: u64) -> Vec<String> {
+    let mut cells = modifier_cells(flags);
     if flags & keyboard::FLAG_FN != 0 {
         cells.push("fn".to_string());
     }
     cells
 }
 
+/// The modifiers a *key* event may report as held.
+///
+/// `FLAG_FN` is excluded on purpose. That bit is `NSEventModifierFlagFunction` ("set if any
+/// function key is pressed"), and the system sets it on every event from a function key --
+/// arrows, F1-F12, Home/End/Page Up/Down -- whether or not fn is held. Treating it as a held
+/// modifier made a bare arrow key render as "fn ←". A genuinely held fn key announces itself
+/// separately, as a keycode-63 `FlagsChanged` event, covered by `modifier_event_cells`.
+pub(crate) const MODIFIER_MASK: u64 = keyboard::FLAG_COMMAND
+    | keyboard::FLAG_OPTION
+    | keyboard::FLAG_SHIFT
+    | keyboard::FLAG_CONTROL
+    | keyboard::FLAG_CAPS_LOCK;
+
+/// The modifiers a *modifier* event may report, i.e. a `FlagsChanged` for one of these keys
+/// being pressed or released. This is the one place `FLAG_FN` is meaningful: pressing fn itself
+/// sends a `FlagsChanged` with keycode 63 and this bit set.
 pub(crate) fn modifier_mask() -> u64 {
-    keyboard::FLAG_COMMAND
-        | keyboard::FLAG_OPTION
-        | keyboard::FLAG_SHIFT
-        | keyboard::FLAG_CONTROL
-        | keyboard::FLAG_CAPS_LOCK
-        | keyboard::FLAG_FN
+    MODIFIER_MASK | keyboard::FLAG_FN
 }
 
 /// Resolve a key label. Named keys and an unmodified layout translation win; nonzero modifiers
@@ -359,10 +380,70 @@ fn ansi_key_glyph(keycode: u16) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        ansi_key_glyph, fallback_to_ascii_then_ansi, is_printable, modifier_cells, named_key,
-        resolve_layout_glyph,
+        ansi_key_glyph, fallback_to_ascii_then_ansi, is_printable, modifier_cells,
+        modifier_event_cells, named_key, resolve_layout_glyph, MODIFIER_MASK,
     };
     use crate::event_tap::keyboard;
+
+    /// A bare arrow key used to render as "fn ←". The system sets `NSEventModifierFlagFunction`
+    /// (`FLAG_FN`) on every function-key event, held fn or not, so a key event must never read
+    /// that bit as a held modifier. Measured on macOS: `←`/`→` arrive as
+    /// `flags=0x00A00100` -- bit 23 set with no modifier key involved.
+    #[test]
+    fn function_key_events_never_report_fn_as_a_held_modifier() {
+        // Every named function key the panel can label, plus the arrow cluster.
+        for keycode in [
+            122u16, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, // F1-F12
+            123, 124, 125, 126, // arrows
+            115, 119, 116, 121, // Home / End / Page Up / Page Down
+        ] {
+            let flags = keyboard::FLAG_FN;
+            let held = flags & MODIFIER_MASK;
+            assert_eq!(
+                held, 0,
+                "keycode {keycode} must report no held modifier for a function-key event"
+            );
+            assert!(
+                modifier_cells(held).is_empty(),
+                "keycode {keycode} must not render a modifier cell"
+            );
+            // And the key itself still resolves to its own glyph.
+            assert!(
+                named_key(keycode).is_some(),
+                "keycode {keycode} must still resolve to a key label"
+            );
+        }
+    }
+
+    /// The other half of the rule: pressing fn *itself* is a `FlagsChanged` (keycode 63) that
+    /// carries the same bit, and that path must still show it. Without this, dropping the bit
+    /// everywhere would look like a fix while silently losing the fn display.
+    #[test]
+    fn a_genuine_fn_modifier_event_still_renders_fn() {
+        let fn_down = keyboard::FLAG_FN;
+        assert_eq!(
+            modifier_event_cells(fn_down & super::modifier_mask()),
+            vec!["fn".to_string()]
+        );
+        // Held fn plus a real modifier shows both, in conventional order.
+        let chord = keyboard::FLAG_FN | keyboard::FLAG_COMMAND;
+        assert_eq!(
+            modifier_event_cells(chord & super::modifier_mask()),
+            vec!["⌘".to_string(), "fn".to_string()]
+        );
+        // Released: no fn cell.
+        assert!(modifier_event_cells(0).is_empty());
+    }
+
+    /// A key event carrying a genuine modifier still renders that modifier: the fix must not
+    /// have suppressed legitimate chords such as ⌘←.
+    #[test]
+    fn a_key_event_still_reports_real_modifiers_alongside_the_function_bit() {
+        // Measured: ⌘ held while pressing an arrow key.
+        let flags = keyboard::FLAG_COMMAND | keyboard::FLAG_FN;
+        assert_eq!(flags & MODIFIER_MASK, keyboard::FLAG_COMMAND);
+        assert_eq!(modifier_cells(flags & MODIFIER_MASK), vec!["⌘".to_string()]);
+    }
 
     #[test]
     fn modifier_order_is_conventional() {
