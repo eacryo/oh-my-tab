@@ -71,6 +71,7 @@ auxiliary panels). Never inline a hex value in a view builder.
 | `destructive` | `#FF3B30` | `#FF453A` | Destructive actions and destructive-confirmation UI |
 | `destructive_hover` | `#D70015` | `#D93630` | Hover state for destructive actions |
 | `symbol_shadow` | `rgba(0,0,0,.70)` | `rgba(0,0,0,.70)` | Visibility glyph shadow over arbitrary thumbnails |
+| `badge_scrim` | `rgba(0,0,0,.55)` | `rgba(0,0,0,.55)` | Circular chip behind overlay thumbnail corner badges |
 | `accent_text` | `#FFFFFF` | `#FFFFFF` | Text on accent and destructive fills |
 | `keycap_accent_bg` | `rgba(10,132,255,.22)` | `rgba(10,132,255,.22)` | Modifier and indicator keycaps |
 | `keycap_accent_border` | `rgba(10,132,255,.69)` | `rgba(10,132,255,.69)` | Modifier and indicator keycap outline |
@@ -262,10 +263,12 @@ Four levels. Pick by **how far the surface sits from the page**, not by how much
 | `high` | `0 12px 32px rgba(0,0,0,.18)` | Above the whole UI: dialogs, onboarding, the switcher panel over a dimmed backdrop |
 
 The medium elevation is represented in `theme.rs` by one shared black shadow color, opacity, blur
-radius, and vertical offset. Use those constants for both dropdowns and tooltips. Visibility glyphs
-over thumbnails use the separately named `symbol_shadow` role and its shared geometry constants;
-that small contrast aid is not surface elevation. Its opacity is 0.85, blur radius 2pt, and vertical
-offset −1pt.
+radius, and vertical offset. Use those constants for both dropdowns and tooltips. Thumbnail corner
+badges (fullscreen, minimized/hidden) are a circular `badge_scrim` chip carrying a white glyph; the
+chip uses the separately named `symbol_shadow` role and its shared geometry constants — that small
+contrast aid is not surface elevation. Its opacity is 0.85, blur radius 2pt, and vertical offset
+−1pt. The white glyph on the chip composited over a pure-white thumbnail measures 4.74:1, above the
+3:1 non-text floor.
 
 - Exactly one level per surface. Never stack shadows to make a surface "more elevated".
 - Cards in the settings page are `none`: hierarchy comes from `card_bg` + `card_border`. A large

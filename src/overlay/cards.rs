@@ -170,50 +170,92 @@ fn needs_visibility_badge(minimized: bool, app_hidden: bool) -> bool {
     minimized || app_hidden
 }
 
-unsafe fn add_visibility_badge_if_needed(
+/// True when the fullscreen badge occupies the preview's top-right corner, so the
+/// visibility badge must move to the top-left instead of stacking in the same corner.
+/// Reachable state: Command+H on a fullscreen app (a fullscreen window cannot be minimized,
+/// but its app can still be hidden).
+fn visibility_badge_moves_left(fullscreen: bool, minimized: bool, app_hidden: bool) -> bool {
+    fullscreen && (minimized || app_hidden)
+}
+
+/// One status badge pinned inside a thumbnail preview corner: a circular `badge_scrim`
+/// chip carrying a white SF-symbol glyph. The scrim keeps the glyph readable over bright
+/// captured frames; the shared symbol shadow sits on the chip, not on the glyph.
+unsafe fn add_symbol_badge(container: *mut AnyObject, frame: NSRect, symbol_name: &str) {
+    let palette = crate::theme::ui_palette();
+    let chip: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let chip: *mut AnyObject = msg_send![chip, initWithFrame: frame];
+    let _: () = msg_send![chip, setWantsLayer: true];
+    let chip_layer: *mut AnyObject = msg_send![chip, layer];
+    // `radius-full`: a badge chip is a circle, so the radius is half its side.
+    let _: () = msg_send![chip_layer, setCornerRadius: frame.size.width / 2.0];
+    layer_set_background(chip_layer, hex_to_cg_color(palette.badge_scrim));
+    layer_set_shadow_color(chip_layer, hex_to_cg_color(palette.symbol_shadow));
+    let _: () =
+        msg_send![chip_layer, setShadowOpacity: crate::theme::OVERLAY_SYMBOL_SHADOW_OPACITY];
+    let _: () = msg_send![chip_layer, setShadowRadius: crate::theme::OVERLAY_SYMBOL_SHADOW_RADIUS];
+    let _: () = msg_send![chip_layer, setShadowOffset: NSSize::new(0.0, crate::theme::OVERLAY_SYMBOL_SHADOW_OFFSET_Y)];
+    let glyph = (frame.size.width - 2.0 * crate::theme::OVERLAY_BADGE_GLYPH_INSET).max(0.0);
+    let glyph_frame = NSRect::new(
+        NSPoint::new(
+            (frame.size.width - glyph) / 2.0,
+            (frame.size.height - glyph) / 2.0,
+        ),
+        NSSize::new(glyph, glyph),
+    );
+    let name = make_nsstring(symbol_name);
+    let symbol: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: name,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(name as *const c_void);
+    if !symbol.is_null() {
+        let _: () = msg_send![symbol, setTemplate: true];
+        let _: () = msg_send![symbol, setSize: NSSize::new(glyph, glyph)];
+        let icon: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let icon: *mut AnyObject = msg_send![icon, initWithFrame: glyph_frame];
+        let _: () = msg_send![icon, setImage: symbol];
+        let _: () = msg_send![icon, setImageScaling: 3u64];
+        let _: () = msg_send![icon, setContentTintColor: hex_to_ns_color(palette.accent_text)];
+        let _: () = msg_send![chip, addSubview: icon];
+        release_obj(icon);
+    }
+    let _: () = msg_send![container, addSubview: chip];
+    release_obj(chip);
+}
+
+/// Thumbnail-mode status badges over the preview area (never drawn in icon-only mode,
+/// where there is no preview to pin them to). The fullscreen mark owns the top-right
+/// corner; the minimized/hidden eye-slash shares it and yields to the top-left only
+/// when both apply.
+unsafe fn add_status_badges_if_needed(
     container: *mut AnyObject,
     preview_width: f64,
     preview_height: f64,
     w: &WindowInfo,
 ) {
-    if !needs_visibility_badge(w.minimized, w.app_hidden) {
-        return;
+    // Sizing guard shared with the visibility badge: tiny previews shrink the whole chip.
+    let chip = (crate::theme::OVERLAY_BADGE_GLYPH + 2.0 * crate::theme::OVERLAY_BADGE_GLYPH_INSET)
+        .min(preview_width)
+        .min(preview_height);
+    let y = (preview_height - THUMB_PAD - chip).max(0.0);
+    if w.fullscreen {
+        let frame = NSRect::new(
+            NSPoint::new((preview_width - THUMB_PAD - chip).max(0.0), y),
+            NSSize::new(chip, chip),
+        );
+        // The macOS fullscreen arrows: the same glyph the green zoom button shows.
+        add_symbol_badge(container, frame, "arrow.up.left.and.arrow.down.right");
     }
-
-    let symbol_size = 22.0f64.min(preview_width).min(preview_height);
-    let symbol_frame = NSRect::new(
-        NSPoint::new(
-            (preview_width - THUMB_PAD - symbol_size).max(0.0),
-            (preview_height - THUMB_PAD - symbol_size).max(0.0),
-        ),
-        NSSize::new(symbol_size, symbol_size),
-    );
-    let symbol_name = make_nsstring("eye.slash.fill");
-    let symbol: *mut AnyObject = msg_send![
-        class!(NSImage),
-        imageWithSystemSymbolName: symbol_name,
-        accessibilityDescription: std::ptr::null::<AnyObject>()
-    ];
-    CFRelease(symbol_name as *const c_void);
-    if !symbol.is_null() {
-        let _: () = msg_send![symbol, setTemplate: true];
-        let _: () = msg_send![symbol, setSize: NSSize::new(symbol_size, symbol_size)];
-        let icon: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-        let icon: *mut AnyObject = msg_send![icon, initWithFrame: symbol_frame];
-        let _: () = msg_send![icon, setWantsLayer: true];
-        let _: () = msg_send![icon, setImage: symbol];
-        let _: () = msg_send![icon, setImageScaling: 3u64];
-        let palette = crate::theme::ui_palette();
-        let _: () = msg_send![icon, setContentTintColor: hex_to_ns_color(palette.accent_text)];
-        let icon_layer: *mut AnyObject = msg_send![icon, layer];
-        layer_set_shadow_color(icon_layer, hex_to_cg_color(palette.symbol_shadow));
-        let _: () =
-            msg_send![icon_layer, setShadowOpacity: crate::theme::OVERLAY_SYMBOL_SHADOW_OPACITY];
-        let _: () =
-            msg_send![icon_layer, setShadowRadius: crate::theme::OVERLAY_SYMBOL_SHADOW_RADIUS];
-        let _: () = msg_send![icon_layer, setShadowOffset: NSSize::new(0.0, crate::theme::OVERLAY_SYMBOL_SHADOW_OFFSET_Y)];
-        let _: () = msg_send![container, addSubview: icon];
-        release_obj(icon);
+    if needs_visibility_badge(w.minimized, w.app_hidden) {
+        let x = if visibility_badge_moves_left(w.fullscreen, w.minimized, w.app_hidden) {
+            THUMB_PAD
+        } else {
+            (preview_width - THUMB_PAD - chip).max(0.0)
+        };
+        let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(chip, chip));
+        add_symbol_badge(container, frame, "eye.slash.fill");
     }
 }
 
@@ -244,7 +286,7 @@ pub(super) unsafe fn populate_thumbnail_preview(
     };
     let Some((cg, w_px, h_px)) = thumb else {
         add_preview_icon_fallback(container, pw, ph, w, colors);
-        add_visibility_badge_if_needed(container, pw, ph, w);
+        add_status_badges_if_needed(container, pw, ph, w);
         return;
     };
 
@@ -253,7 +295,7 @@ pub(super) unsafe fn populate_thumbnail_preview(
     CFRelease(cg); // NSImage retains its own copy
     if nsimg.is_null() {
         add_preview_icon_fallback(container, pw, ph, w, colors);
-        add_visibility_badge_if_needed(container, pw, ph, w);
+        add_status_badges_if_needed(container, pw, ph, w);
         return;
     }
     let shown: *mut AnyObject = if w.minimized {
@@ -275,7 +317,7 @@ pub(super) unsafe fn populate_thumbnail_preview(
     let _: () = msg_send![iv, setImageScaling: 2u64]; // exact size, no additional scaling
     let _: () = msg_send![container, addSubview: iv];
     release_obj(iv);
-    add_visibility_badge_if_needed(container, pw, ph, w);
+    add_status_badges_if_needed(container, pw, ph, w);
 }
 
 pub(crate) fn create_card_view(
@@ -1256,7 +1298,7 @@ mod placement_tests {
 
 #[cfg(test)]
 mod visibility_badge_tests {
-    use super::needs_visibility_badge;
+    use super::{needs_visibility_badge, visibility_badge_moves_left};
 
     #[test]
     fn hidden_or_minimized_windows_receive_visibility_badge() {
@@ -1264,5 +1306,16 @@ mod visibility_badge_tests {
         assert!(needs_visibility_badge(false, true));
         assert!(needs_visibility_badge(true, true));
         assert!(!needs_visibility_badge(false, false));
+    }
+
+    #[test]
+    fn fullscreen_badge_pushes_visibility_badge_to_the_left_corner() {
+        // A hidden fullscreen app must show both marks without stacking them.
+        assert!(visibility_badge_moves_left(true, false, true));
+        assert!(visibility_badge_moves_left(true, true, false));
+        // Otherwise the eye-slash keeps the shared top-right corner.
+        assert!(!visibility_badge_moves_left(true, false, false));
+        assert!(!visibility_badge_moves_left(false, true, false));
+        assert!(!visibility_badge_moves_left(false, false, true));
     }
 }

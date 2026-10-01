@@ -376,6 +376,7 @@ unsafe fn collect_windows_for_pid_inner(
             is_active: false,
             minimized: ax_info.minimized,
             app_hidden,
+            fullscreen: native_fullscreen,
             bounds,
         });
         shown.insert(cgwid);
@@ -448,6 +449,7 @@ unsafe fn collect_windows_for_pid_inner(
                 is_active: false,
                 minimized: ax_info.minimized,
                 app_hidden,
+                fullscreen: native_fullscreen,
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }
@@ -1396,6 +1398,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             is_active: false,
             minimized,
             app_hidden: hidden_app_pids.contains(&owner_pid),
+            fullscreen: native_fullscreen,
             bounds,
         });
         shown.insert((owner_pid, cgwid));
@@ -1497,6 +1500,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 is_active: false,
                 minimized: ax_info.minimized,
                 app_hidden: hidden_app_pids.contains(&pid),
+                fullscreen: native_fullscreen,
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }

@@ -48,6 +48,12 @@ pub(crate) const ELEVATION_MED_SHADOW_OFFSET_Y: f64 = -4.0;
 pub(crate) const OVERLAY_SYMBOL_SHADOW_OPACITY: f32 = 0.85;
 pub(crate) const OVERLAY_SYMBOL_SHADOW_RADIUS: f64 = 2.0;
 pub(crate) const OVERLAY_SYMBOL_SHADOW_OFFSET_Y: f64 = -1.0;
+/// Thumbnail corner badges: a circular `badge_scrim` chip sits behind the white symbol so
+/// it stays legible over bright captured frames. The glyph keeps the 22pt mark; the chip
+/// pads it by 4pt (spacing-4) per side and is a circle per the `radius-full` badge rule.
+/// The symbol shadow moves to the chip layer; the glyph itself casts nothing.
+pub(crate) const OVERLAY_BADGE_GLYPH: f64 = 22.0;
+pub(crate) const OVERLAY_BADGE_GLYPH_INSET: f64 = 4.0;
 
 pub(crate) const RADIUS_CONTROL: f64 = 8.0;
 pub(crate) const RADIUS_CARD: f64 = 12.0;
@@ -174,6 +180,7 @@ pub(crate) struct UiPalette {
     pub(crate) destructive: u32,
     pub(crate) destructive_hover: u32,
     pub(crate) symbol_shadow: u32,
+    pub(crate) badge_scrim: u32,
     pub(crate) shadow: u32,
 }
 
@@ -219,6 +226,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             destructive: 0xFF453AFF,
             destructive_hover: 0xD93630FF,
             symbol_shadow: 0x000000B3,
+            badge_scrim: 0x0000008C,
             shadow: 0x00000059,
         }
     } else {
@@ -259,6 +267,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             destructive: 0xFF3B30FF,
             destructive_hover: 0xD70015FF,
             symbol_shadow: 0x000000B3,
+            badge_scrim: 0x0000008C,
             shadow: 0x0000000F,
         }
     }
@@ -1710,14 +1719,32 @@ mod tests {
         assert_eq!(light.sidebar_text, 0x68686FFF);
         assert_eq!(light.destructive_hover, 0xD70015FF);
         assert_eq!(light.symbol_shadow, 0x000000B3);
+        assert_eq!(light.badge_scrim, 0x0000008C);
 
         let dark = ui_palette_for_mode(true);
         assert_eq!(dark.sidebar_text, 0x9E9EA6FF);
         assert_eq!(dark.destructive_hover, 0xD93630FF);
         assert_eq!(dark.symbol_shadow, 0x000000B3);
+        assert_eq!(dark.badge_scrim, 0x0000008C);
         assert_eq!(OVERLAY_SYMBOL_SHADOW_OPACITY, 0.85);
         assert_eq!(OVERLAY_SYMBOL_SHADOW_RADIUS, 2.0);
         assert_eq!(OVERLAY_SYMBOL_SHADOW_OFFSET_Y, -1.0);
+        assert_eq!(OVERLAY_BADGE_GLYPH, 22.0);
+        assert_eq!(OVERLAY_BADGE_GLYPH_INSET, 4.0);
+    }
+
+    /// The white badge glyph must read over the scrim even when the captured thumbnail
+    /// behind it is pure white: the composited chip is the worst-case backdrop.
+    #[test]
+    fn badge_glyph_meets_contrast_on_its_scrim_over_a_white_thumbnail() {
+        for palette in [ui_palette_for_mode(false), ui_palette_for_mode(true)] {
+            let background = composite_rgb(palette.badge_scrim, 0xFFFFFFFF);
+            let ratio = contrast_ratio(color_rgb(palette.accent_text), background);
+            assert!(
+                ratio >= 3.0,
+                "badge glyph contrast on its scrim is too low: {ratio:.2}:1"
+            );
+        }
     }
 
     #[test]

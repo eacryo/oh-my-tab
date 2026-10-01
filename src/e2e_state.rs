@@ -132,6 +132,7 @@ struct Card {
     title: String,
     active: bool,
     minimized: bool,
+    fullscreen: bool,
     bounds: (f64, f64, f64, f64),
 }
 
@@ -359,6 +360,7 @@ fn collect() -> Snapshot {
                     title: w.window_title.clone(),
                     active: w.is_active,
                     minimized: w.minimized,
+                    fullscreen: w.fullscreen,
                     bounds: w.bounds,
                 })
                 .collect(),
@@ -543,13 +545,14 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             json.push(',');
         }
         json.push_str(&format!(
-            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"bounds\": [{}, {}, {}, {}]}}",
+            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"fullscreen\": {}, \"bounds\": [{}, {}, {}, {}]}}",
             card.pid,
             card.window_id,
             json_string(&card.app),
             json_string(&card.title),
             card.active,
             card.minimized,
+            card.fullscreen,
             card.bounds.0,
             card.bounds.1,
             card.bounds.2,

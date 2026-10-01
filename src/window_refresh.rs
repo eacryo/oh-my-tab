@@ -987,6 +987,7 @@ mod tests {
             is_active: false,
             minimized: false,
             app_hidden: false,
+            fullscreen: false,
             bounds: (0.0, 0.0, 100.0, 100.0),
         }
     }

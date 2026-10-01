@@ -228,6 +228,7 @@ struct CardSignature {
     window_title: String,
     icon_path: Option<String>,
     minimized: bool,
+    fullscreen: bool,
     /// Resolved light/dark state used when the card's text and layers were painted.
     theme_dark: bool,
     card_width_bits: u64,
@@ -274,6 +275,7 @@ fn card_signature(
         window_title: window.window_title.clone(),
         icon_path: window.icon_path.clone(),
         minimized: window.minimized,
+        fullscreen: window.fullscreen,
         theme_dark: crate::theme::resolved_is_dark(),
         card_width_bits: frame.size.width.to_bits(),
         card_height_bits: frame.size.height.to_bits(),
@@ -784,6 +786,7 @@ mod tests {
             window_title: title.into(),
             icon_path: None,
             minimized: false,
+            fullscreen: false,
             theme_dark: false,
             card_width_bits: 100.0f64.to_bits(),
             card_height_bits: 100.0f64.to_bits(),
@@ -947,6 +950,7 @@ mod tests {
                 is_active: false,
                 minimized: false,
                 app_hidden: false,
+                fullscreen: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -982,6 +986,7 @@ mod tests {
                 is_active: true,
                 minimized: false,
                 app_hidden: false,
+                fullscreen: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1011,6 +1016,7 @@ mod tests {
                 is_active: false,
                 minimized: false,
                 app_hidden: false,
+                fullscreen: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1035,6 +1041,7 @@ mod tests {
                 is_active: false,
                 minimized: false,
                 app_hidden: false,
+                fullscreen: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1068,6 +1075,7 @@ mod tests {
                 is_active: true,
                 minimized: false,
                 app_hidden: false,
+                fullscreen: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }

@@ -84,6 +84,9 @@ pub struct WindowInfo {
     pub is_active: bool,
     pub minimized: bool,  // minimized (collected only when show_minimized is on)
     pub app_hidden: bool, // app hidden with Command+H
+    // Native macOS fullscreen (AXFullScreen flag or display-filling bounds). Presentation-only:
+    // drives the thumbnail's corner badge; raise and activation logic never read it.
+    pub fullscreen: bool,
     // CG window bounds (x, y, w, h), used to locate the active window's screen. All zeros = unavailable.
     pub bounds: (f64, f64, f64, f64),
 }
@@ -631,6 +634,7 @@ mod tests {
             is_active: false,
             minimized: false,
             app_hidden: false,
+            fullscreen: false,
             bounds: (0.0, 0.0, 0.0, 0.0),
         }
     }
