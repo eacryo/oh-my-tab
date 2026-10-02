@@ -8,8 +8,14 @@ system (semantic tokens, a single scale per dimension, layer-by-layer surfaces, 
 purpose) and from the macOS conventions the app already follows. Where this document disagrees with
 an existing implementation, this document wins and the implementation is a bug.
 
-Deviating is allowed only when the platform forces it — AppKit draws the control, the OS supplies
-the value, or the data is the user's own content. Say why in a comment next to the code.
+The language-tolerance rules in §11 are adapted from Rene Wang's
+[Build Interfaces That Survive Translation](https://rene.wang/essay/build-interfaces-that-survive-translation).
+
+A deviation is allowed for one of two reasons, and both are recorded. Either the platform forces it —
+AppKit draws the control, the OS supplies the value, or the data is the user's own content — and then
+say why in a comment next to the code. Or the project deliberately trades a rule away, and then it is
+written where it applies as a **documented deviation**, with its boundary and its reason; §3.3 clause
+2 and §11.2 are the current instances. An unrecorded deviation is a bug either way.
 
 ---
 
@@ -41,6 +47,9 @@ rewritten.
 6. **Everything visible is localized and human-readable.** No internal identifiers or config keys
    on screen; no hardcoded English inside a localized UI. A user-owned color may show its hex value
    only as the color well's caption.
+7. **A rule that holds in one language only is not a rule.** Every layout decision is checked against
+   all the languages we ship (`en`, `zh-Hans`, `zh-Hant`) and against the ones we might add: widths
+   come from measurement, never from counting characters (§11).
 
 ## 3. Color
 
@@ -185,7 +194,17 @@ Four sizes. Anything else is a bug.
 - Numeric readouts (slider values, counts, byte sizes) use tabular numerals so digits do not jitter.
 - Line height: 1.35 for 12pt, 1.4 for 14pt, 1.2 for titles. Never set a line height manually where a
   role already defines one.
-- Do not shrink text to fit a control. Truncate or move the content instead (§9).
+- Do not shrink text to fit a control. Widen the container or move the content instead (§9, §11.2).
+- **12pt is the floor.** Do not introduce a smaller size for a badge, a keycap or a dense label. CJK
+  glyphs carry their distinguishing detail in interior strokes at high spatial frequency (未/末,
+  己/已/巳), so they need more pixels than Latin before they resolve at all; for this palette and
+  these surfaces, 12pt is where that floor sits.
+- **Hierarchy uses size, weight and color only.** Never let case, italic, small caps or letterspacing
+  carry meaning: Chinese has no case, synthetic italic degrades dense glyphs, and weight is the
+  weakest of those signals on CJK glyphs, because bolding fills the counters instead of increasing
+  contrast against the surrounding whitespace. Where a Latin design reaches for case or italic, use
+  color and enclosure instead. The `page-title` tracking of `-0.4` is optical, not semantic, and is
+  the only letterspacing in the app.
 - The version string in the About page is `caption`, not a row: it belongs in the page subtitle, not
   in a value column.
 
@@ -247,6 +266,7 @@ density and the larger one to separate sections; never mix `12` and `14` for the
 | Token | Value | Applied to |
 | --- | --- | --- |
 | `radius-control` | 8 | Buttons, text fields, selects, tiles, list-item highlight, switch track inner geometry |
+| `radius-legend-chip` | 5 | The chip behind a key symbol in a read-only shortcut legend |
 | `radius-card` | 12 | Cards, grouped row containers, list tiles, popover items |
 | `radius-panel` | 16 | Tooltips, dropdown panels, HUDs, notification cards |
 | `radius-full` | 9999 | Pills: badges, status dots, switch, scrollbar knob |
@@ -256,6 +276,39 @@ density and the larger one to separate sections; never mix `12` and `14` for the
 `max(0, outer_radius - padding)`. A selection ring drawn around a card is
 `card_radius + ring_inset` so the two stay parallel; never pick the ring radius by hand.
 The switcher selection ring uses a 3pt `ring_inset`.
+
+A small chip derives its radius from its own height rather than taking `radius-control`:
+`radius-control` is sized for 32pt controls, and on a 19pt chip it consumes 42% of the height and
+the shape reads as a **pill** instead of a softened rectangle. `radius-legend-chip` (5pt) is 26% of
+19pt. `radius-full` is never right for a chip either — a pill is a different shape, not a rounder
+rectangle.
+
+## 6.1 Legends are not controls
+
+A **legend** states which key does what (`↵ 输入选中条目`). A **control** is something the user
+operates. They are drawn differently on purpose, and the difference is not decoration:
+
+| | Legend | Control |
+| --- | --- | --- |
+| Border | **none** | 1pt `card_border` |
+| Fill | a wash lighter than `field_bg` | `field_bg` / `button_bg` |
+| Pointer states | none | hover, pressed, focus, disabled (§10) |
+| Hit target | none — it is not clickable | ≥ 28×28 |
+
+The clipboard footer's shortcut symbols are the case that motivated this section. They carry no
+target/action at all, yet a design-system pass had given them `field_bg` **plus a 1pt border** —
+the exact visual contract of a pressable control. That is a promise the UI cannot keep: the user
+learns that bordered chips are clickable and then finds these are not. The accent keycap palette
+(`keycap_accent_*`) does **not** apply here either — it means "this modifier is currently held",
+which is a live state, and the keystroke display is where a live state belongs.
+
+So a legend keeps only what it needs to be read: a fill subtle enough not to imply interaction,
+whose sole job is binding the symbol to its label so a row of legends stays scannable. What it
+must **not** do is borrow the border, the radius scale, or the pointer states of a control.
+
+"As subtle as possible" is bounded from below, not free: the fill must still be distinguishable
+from the surface it sits on, in both modes. It is applied as a wash (darkening a light surface,
+lightening a dark one) rather than a fixed gray, so one value works in both.
 
 The overlay's card radius follows `appearance.corner_radius` up to `radius-panel` (16pt). Larger
 values remain available to glass and window surfaces, but do not make switcher cards excessively
@@ -325,6 +378,17 @@ column. Supports an optional `caption` line under the label (12/muted). One conc
 - The control is exactly one line tall (32pt). A value that does not fit is truncated with an
   ellipsis and exposes the full value as a tooltip — **a control never wraps to two lines.**
 - A row's label is a noun phrase, not a sentence. Explanations go in the caption line.
+- **A row's label reads in full in every shipped locale.** Truncation is not the fix for a label that
+  does not fit: widen the label column, shorten the string, or move detail to the caption line —
+  never shrink the type (§4).
+- **Truncation has an allow-list.** Only these may truncate by default, and each must expose its
+  full value (tooltip, or the caption line): a control's value (select, text field, read-only value),
+  a `caption`, and user data (window titles, app names, clipboard content). A label, a section header,
+  a button title, a permission status and an error cause must fit — or be rewritten (§11.2).
+- **Do not fix an ambiguous design with a word.** If two actions need "only", "just" or "also" to be
+  told apart, the grouping or the ordering is wrong: separate them, or move the secondary action
+  away. An explanatory word belongs in the caption line or an accessibility label, never as the
+  thing that makes a control unambiguous.
 - Rows are separated by a full-bleed 1px `separator` inside the card; the first and last rows have no
   divider at the card's edges.
 
@@ -384,6 +448,8 @@ selection never change the layout (no size, no weight change) — only color.
 
 ## 11. Accessibility and localization
 
+### 11.1 Rules that always apply
+
 - Contrast: see §3.3. Re-measure whenever a palette value changes.
 - Reduce Motion: see §8. Mandatory.
 - Every custom-drawn control sets an accessibility label and role through AppKit, so VoiceOver reads
@@ -397,6 +463,150 @@ selection never change the layout (no size, no weight change) — only color.
   no overlap, no truncation of a label that the user needs to read.
 - Text scaling: a user-configurable size never changes the *structure* of a row (no row grows a
   second line because of it).
+
+The rest of this section is about **language tolerance**: what a string, a box or a keystroke costs in
+a language other than the one the surface was drawn in. A rule marked as a recorded gap in §11.7 is a
+gate for new and changed work, not a licence to leave an old surface as it is.
+
+### 11.2 Wrapping, minimum widths and truncation
+
+Every writing system has an atom, and the atom decides how narrow a box can get. English's atom is the
+word: variable-length and unbreakable, so a box stops shrinking at its longest word (`min-content` of
+"Internationalization"). CJK's atom is a single character, so the same box keeps going and a string's
+width comes close to a linear function of its character count. A design system built for the first
+case fills up with `min-width`, `max-width` and truncation policy — none of it free, and all of it a
+workaround for one writing system.
+
+- **Wrap before you truncate.** Let a label take the lines the string needs, and let the row, the list
+  and the pane grow to hold it. A truncating row is exactly as tall in German as it was in English
+  because it is not absorbing the extra length — it is throwing it away, and height is the only thing
+  a row has to spend.
+- **State a minimum width as a visual width.** A hard-coded width must be a measured (or
+  measured-then-rounded) point value — `72–280pt` for menu titles, `160pt` for the onboarding status
+  column — never a character count. `ch` is the advance width of `0` and `ex` is the x-height: both
+  are defined against Latin letterforms, and both are wrong for CJK.
+- **Never let a hard-coded width be the only thing holding a label.** Where the string is the only
+  content, the container derives from the measured string, not the other way round.
+- **Do not assume the platform breaks CJK on word boundaries.** AppKit's public strategies are
+  `none`, `pushOut` (avoids an orphan on the paragraph's last line — the proportions half),
+  `standard`, and `hangulWordPriority`, which is word priority for **Korean** and has no Chinese or
+  Japanese equivalent; the default also differs by field kind (non-editable/selectable text fields use
+  `standard`, editable ones use `none`), and we set no strategy of our own. Nothing therefore
+  guarantees that a Chinese word is not cut. What we control is the space: the width and the line
+  count the string needs, never a character count that decides where the cut lands (§11.5). Where a
+  cut word would change the reading — a short label, a heading — read the rendered result in that
+  locale instead of assuming it.
+
+**Running text (§11.4) cannot get the same treatment today.** The text system will not do the
+dictionary half for us: no strategy gives Chinese or Japanese word priority, and we set none. That is
+not the same as impossible. Apple publishes word segmenters for Chinese and Japanese
+(`CFStringTokenizer`, `NLTokenizer`), and both layout-manager delegates — TextKit 1's
+`layoutManager:shouldBreakLineByWordBeforeCharacterAtIndex:` and TextKit 2's
+`textLayoutManager:shouldBreakLineBeforeLocation:hyphenating:` — are asked to allow or prevent each
+candidate soft break, so a segmenter could steer break points without pre-inserting separators.
+Whether that is safe and affordable in these views is unverified, which makes this a recorded gap
+rather than a platform limit.
+
+**What stands in until that gap is closed.** Running text keeps its container's full content width, and
+a narrower measure for body copy needs a reason rather than being a default. A long CJK paragraph is
+read in the rendered UI at **each width its container can take**, not assumed to be fine; today that is
+one width per surface — the settings window pins its own width with min = max, and the panels are
+fixed-size — but a container that becomes width-resizable brings its whole range into the check. The
+one place we already break lines ourselves — the clipboard's code soft wrap, which prefers a structural
+break (comma, operator, member access, whitespace) and falls back to an arbitrary character boundary —
+is a monospaced-code model and must not be reused for prose, which would need a segmenter, not a column
+count (§11.5).
+
+**Documented deviation — the fixed settings grid.** Read literally, the rule above would make every
+settings row grow to hold its longest translation. This app keeps the settings grid instead (52pt
+rows, 32pt controls, §5) and truncates, because density is the product. The deviation is bounded:
+
+- only what §9's truncation allow-list permits may truncate; a label the user has to read may not;
+- anything that truncates exposes its full value — as a tooltip, or in the caption line;
+- when a localized label does not fit, the fix is a wider column, a shorter string or a moved detail.
+  Never a smaller type size, and never "it truncates, that is the policy".
+
+### 11.3 Hierarchy has to exist in the content language
+
+Latin letterforms encode rank inside the glyph: case gives three levels for free, then italic, weight,
+small caps and letterspacing. CJK has weight — the weakest of them, because bolding a dense glyph
+fills its counters instead of adding contrast against the surrounding whitespace — and no case at all.
+Where a Latin design signals importance with case or italic, a Chinese build has nothing left to
+signal it with.
+
+- Build hierarchy only from the channels the content language grants. §4 fixes the allowed set: size,
+  weight, color. No case, no italic, no small caps, no meaningful letterspacing.
+- When those channels run out, prefer enclosure and spacing over adding another color. A dense screen
+  that looks busy is usually a screen whose hierarchy had to be bought with color.
+- Never let a channel that disappears in translation carry meaning on its own.
+
+### 11.4 Density is spent in chrome, not in running text
+
+CJK is denser per character, and density buys area, not time: measured reading rates converge across
+languages (around 39 bit/s), so a dense script delivers the same meaning in less space rather than
+faster. The area advantage is real in chrome and close to nothing in running text, because dense
+glyphs carry their distinguishing detail in interior strokes at high spatial frequency (未/末,
+己/已/巳) and need more pixels before they resolve at all.
+
+- Spend the density advantage in chrome: row labels, sidebar items, section headers, keycaps, card
+  captions, footer text.
+- Do not bank it in running text. Onboarding body copy, release notes, error explanations and
+  clipboard detail keep their size and their full line height; a screen that fits more controls in
+  Chinese does not get to compress a paragraph.
+- 12pt is the floor for every locale, not only for the Latin ones. See §4.
+
+### 11.5 Direction, units and input
+
+- **Mirror the relationship, not the position.** Anything that encodes sequence mirrors — back
+  arrows, progress, sliders, step flows; anything depicting a convention or a physical object holds
+  still — clocks, playback controls, checkmarks. Numbers never mirror: Arabic numerals stay
+  left-to-right inside a right-to-left run, so one line can carry two directions at once and cursor
+  movement and selection stop meaning what you assumed. No RTL locale ships today, so new surfaces use
+  logical leading/trailing instead of left/right, and the audit stays cheap when one arrives (§11.7).
+- **Distrust character counts.** Widths come from measurement or from a measured constant (§11.2).
+  The same caution applies away from layout: never derive a truncation budget, a validation limit, a
+  sort order or a search decision from a character count — `len()`, `toUpperCase()` and "this field
+  fits 24 characters" all assume the language they were designed in. Length limits on user input count
+  grapheme clusters, and a counted budget is shown as a hint, never enforced as a silent cut.
+- **Price the input.** Eight Latin keystrokes produce eight glyphs; six pinyin keystrokes produce a
+  candidate menu that makes the user look away from the sentence to judge and pick one. So: text entry
+  goes through the platform text system and never consumes Return while an input method may be
+  composing; CJK search matches on the string itself, not on a Latin tokenization of it; and no
+  surface assumes typing is equally fast for both users.
+
+### 11.6 Voice
+
+Geometry has coordinates in every language; voice has none. Register, idiom and rhythm do not survive
+translation, and the stronger the voice, the more it loses.
+
+- **Split strings in two.** *Functional* strings — labels, field names, error causes, settings rows,
+  permission states, button titles — are translated and held to the rules above. A string that would
+  embarrass you coming back flat is *written fresh* in each locale instead of translated.
+- **Our voice is carried by wording, not by type.** Every surface is drawn in the system face, so a
+  translated build cannot silently lose a display font's missing CJK cut. Do not introduce a display
+  face for a localized string.
+- **Round-trip the loudest strings** — `en → zh-Hans → en` and `en → zh-Hant → en` — when a surface
+  introduces a new voice, and read what comes back in a language you can judge. Chinese is two shipped
+  locales, not one, and neither can be read off the other: Traditional is *not* uniformly longer (in
+  the shipped strings it is longer in fewer than a tenth of the keys, equal in most, and shorter in
+  some), but where it is longer it is often a short UI string that doubles via 應用程式 — `应用` →
+  `應用程式`, `立即重启` → `立即重新啟動` (a button title). Measure the locale; do not assume which one
+  overflows. If you cannot read the locale the product ships into, you cannot feel what arrived.
+
+### 11.7 Recorded gaps
+
+Three rules above are not yet satisfied by every existing surface. They are gates for new and changed
+work; leaving an old surface as it is needs a reason, not silence.
+
+- **Per-locale label fit.** Nothing asserts that every settings row label, button title and section
+  header fits in `zh-Hans`, `zh-Hant` and the long-text fixture without truncating; the §11.1
+  pseudo-locale rule is verified by eye. The assertion belongs with the next change that touches such
+  a row.
+- **RTL.** No RTL locale ships and nothing is mirrored; §11.5 states the forward rule.
+- **CJK word-boundary breaking.** The platform gives us no CJK word priority and no breaker parameter.
+  A segmenter (`CFStringTokenizer`, `NLTokenizer`) plus a layout-manager delegate could supply one, but
+  whether that is safe and affordable in these views is unverified; until it is, §11.2's per-width
+  reading rule is what we have.
 
 ## 12. Adding a token or a value
 
@@ -417,6 +627,17 @@ inset is 3pt as specified in §6.
 - [ ] New/changed text roles meet their contrast minimum on every surface they can appear on.
 - [ ] Every new string has keys in `en`, `zh-Hans`, `zh-Hant`; no raw identifier on screen.
 - [ ] Controls are single-line; long values truncate and expose the full value.
+- [ ] Every new or changed label, button title and section header fits in `en`, `zh-Hans` and
+      `zh-Hant` without truncation, and nothing truncates that is not on the §9 allow-list.
+- [ ] No new width, truncation budget or input limit is derived from a character count (§11.2, §11.5).
+- [ ] New hierarchy uses size, weight and color only — no case, italic or letterspacing carries
+      meaning, and no size below 12pt is introduced (§4, §11.3).
+- [ ] New text entry leaves Return and unhandled commands to the platform text system, so an input
+      method can compose (§11.5).
+- [ ] Loud new strings are round-tripped; voice strings are written fresh, not translated (§11.6).
+- [ ] New CJK copy was read in the rendered UI — short labels at every supported width, a long
+      paragraph at each width its container can take — and not assumed to break on word boundaries
+      (§11.2).
 - [ ] Cards use border, not a large shadow; elevation level matches what the surface floats over.
 - [ ] Radius comes from the three-step scale; derived radii are computed, not hardcoded.
 - [ ] Animations use the two durations and the standard curve, and honor Reduce Motion.

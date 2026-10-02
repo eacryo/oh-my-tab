@@ -9,6 +9,8 @@ const SHORTCUT_MODIFIERS: u64 =
 const MODIFIER_ONLY_FADE: Duration = Duration::from_millis(600);
 pub(super) const IDLE_FADE: Duration = Duration::from_millis(1800);
 pub(crate) const BADGE_GAP: f64 = 6.0;
+/// Height of one badge row when keys run horizontally, and of a single keycap in a column.
+pub(crate) const BADGE_H: f64 = 34.0;
 pub(crate) const PANEL_SIDE_PADDING: f64 = 12.0;
 pub(crate) const BADGE_HORIZONTAL_PADDING: f64 = 28.0;
 /// Horizontal padding on each side of a multi-key badge container.
@@ -19,6 +21,42 @@ pub(crate) const BADGE_CELL_PADDING_X: f64 = 7.0;
 pub(crate) const BADGE_CELL_GAP: f64 = 4.0;
 /// Vertical inset of a keycap cell from its container's top and bottom edges.
 pub(crate) const BADGE_CELL_INSET_Y: f64 = 4.0;
+/// Padding on each side of a badge container along the stacking axis (the mirror of
+/// `BADGE_CONTAINER_PADDING_X` when keys are stacked instead of laid in a row).
+pub(crate) const BADGE_CONTAINER_PADDING_Y: f64 = 4.0;
+/// Height of the "×N" repeat suffix when it takes its own row under a stacked chord.
+pub(crate) const BADGE_REPEAT_SUFFIX_H: f64 = 16.0;
+
+/// How the keys are laid out, decided by the screen edge the panel sits on. A panel against a
+/// horizontal edge (`top`/`bottom`) runs its keys across in a row; one against a vertical edge
+/// (`left`/`right`) stacks them in a column, because the strip is tall and narrow.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Orientation {
+    Horizontal,
+    Vertical,
+}
+
+impl Orientation {
+    /// Resolve from `keystroke_display.initial_position`. An unknown value is horizontal, which
+    /// is the shape every config predating this setting already had.
+    pub(crate) fn from_initial_position(initial_position: &str) -> Self {
+        match initial_position {
+            "left" | "right" => Self::Vertical,
+            _ => Self::Horizontal,
+        }
+    }
+
+    pub(crate) fn is_vertical(self) -> bool {
+        matches!(self, Self::Vertical)
+    }
+}
+
+impl Default for Orientation {
+    /// The shape every config predating `initial_position` already had.
+    fn default() -> Self {
+        Self::Horizontal
+    }
+}
 
 pub(crate) fn estimated_badge_width(text: &str, repeats: u32) -> f64 {
     let repeat_width = if repeats > 1 {
@@ -48,6 +86,24 @@ pub(crate) fn estimated_cells_width(cells: &[BadgeCell], repeats: u32) -> f64 {
                 .sum::<f64>();
     }
     width
+}
+
+/// The height of a multi-key badge stacked in a column: one keycap row per cell, plus the repeat
+/// suffix on its own row when the key was held. Mirrors `estimated_cells_width` with the axes
+/// swapped, so a chord that is a wide container in a row becomes a tall one in a column.
+pub(crate) fn estimated_cells_height(cells: &[BadgeCell], repeats: u32) -> f64 {
+    let cell_h = BADGE_H - BADGE_CELL_INSET_Y * 2.0;
+    let mut height = BADGE_CONTAINER_PADDING_Y * 2.0;
+    for index in 0..cells.len() {
+        if index > 0 {
+            height += BADGE_CELL_GAP;
+        }
+        height += cell_h;
+    }
+    if repeats > 1 {
+        height += BADGE_CELL_GAP + BADGE_REPEAT_SUFFIX_H;
+    }
+    height
 }
 
 fn estimated_glyph_width(glyph: char) -> f64 {
@@ -214,6 +270,18 @@ impl Badge {
             estimated_badge_width(&self.text, self.repeats)
         }
     }
+
+    /// This badge's extent along the stream axis: its width when keys run in a row, its height
+    /// when they stack in a column. A lone keycap is the same size either way, but its extent
+    /// still swaps — a row advances across its width, a column down its height — so the trim cap
+    /// measures the same axis the panel lays out.
+    pub(crate) fn estimated_extent(&self, orientation: Orientation) -> f64 {
+        match (orientation.is_vertical(), self.cells.len() > 1) {
+            (true, true) => estimated_cells_height(&self.cells, self.repeats),
+            (true, false) => BADGE_H,
+            (false, _) => self.estimated_width(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -347,9 +415,11 @@ impl StateMachine {
         self.secure
     }
 
-    pub(crate) fn trim_to_width(&mut self, max_width: f64) -> bool {
+    /// Drop the oldest keys until the stream fits the panel's cap. The cap is measured along the
+    /// stream axis, so a column trims against its height while a row trims against its width.
+    pub(crate) fn trim_to_extent(&mut self, max_extent: f64, orientation: Orientation) -> bool {
         let before = self.badges.clone();
-        while self.badges.len() > 1 && self.stream_width() > max_width {
+        while self.badges.len() > 1 && self.stream_extent(orientation) > max_extent {
             self.badges.remove(0);
             self.rebase_indices_after_front_drop();
             // Once the cap is reached, the panel pins to it for the rest of the session so the
@@ -359,8 +429,12 @@ impl StateMachine {
         self.badges != before
     }
 
-    fn stream_width(&self) -> f64 {
-        estimated_stream_width(self.badges.iter().map(Badge::estimated_width))
+    fn stream_extent(&self, orientation: Orientation) -> f64 {
+        estimated_stream_width(
+            self.badges
+                .iter()
+                .map(|badge| badge.estimated_extent(orientation)),
+        )
     }
 
     fn rebase_indices_after_front_drop(&mut self) {
@@ -610,8 +684,9 @@ fn repeat_badge(last: &LastKey) -> Badge {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimated_badge_width, estimated_cells_width, estimated_stream_width, BadgeCell, BadgeKind,
-        DisplayMode, Input, KeyGlyph, StateMachine, IDLE_FADE, MODIFIER_ONLY_FADE,
+        estimated_badge_width, estimated_cells_height, estimated_cells_width,
+        estimated_stream_width, BadgeCell, BadgeKind, DisplayMode, Input, KeyGlyph, Orientation,
+        StateMachine, BADGE_H, IDLE_FADE, MODIFIER_ONLY_FADE,
     };
     use crate::event_tap::keyboard;
     use std::time::{Duration, Instant};
@@ -805,10 +880,10 @@ mod tests {
         }
         assert!(!state.capped());
         // A narrow cap trims the front keys and pins the stream.
-        assert!(state.trim_to_width(60.0));
+        assert!(state.trim_to_extent(60.0, Orientation::Horizontal));
         assert!(state.capped());
         assert!(state.badges().len() < 6);
-        state.trim_to_width(60.0);
+        state.trim_to_extent(60.0, Orientation::Horizontal);
         assert!(state.capped());
         assert!(state.tick(now + Duration::from_millis(5) + IDLE_FADE));
         assert!(!state.capped());
@@ -1000,7 +1075,7 @@ mod tests {
         let mut state = StateMachine::default();
         state.apply(down(0, 0, "a"), DisplayMode::All, now);
         let text = state.badges()[0].text.clone();
-        assert!(!state.trim_to_width(1.0));
+        assert!(!state.trim_to_extent(1.0, Orientation::Horizontal));
         assert_eq!(state.badges()[0].text, text);
     }
 

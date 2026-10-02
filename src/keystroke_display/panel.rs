@@ -10,9 +10,9 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use super::state::{
-    estimated_stream_width, Badge, BadgeCell, BadgeKind, BADGE_CELL_GAP, BADGE_CELL_INSET_Y,
-    BADGE_CELL_PADDING_X, BADGE_CONTAINER_PADDING_X, BADGE_GAP, BADGE_HORIZONTAL_PADDING,
-    PANEL_SIDE_PADDING,
+    estimated_stream_width, Badge, BadgeCell, BadgeKind, Orientation, BADGE_CELL_GAP,
+    BADGE_CELL_INSET_Y, BADGE_CELL_PADDING_X, BADGE_CONTAINER_PADDING_X, BADGE_CONTAINER_PADDING_Y,
+    BADGE_GAP, BADGE_H, BADGE_HORIZONTAL_PADDING, BADGE_REPEAT_SUFFIX_H, PANEL_SIDE_PADDING,
 };
 use crate::config::KeystrokeDisplayPosition;
 use crate::event_tap;
@@ -25,9 +25,12 @@ use crate::ffi::{
 };
 use crate::ffi::{MainThreadSlot, StaticClass};
 
+/// Panel extent across the stream: one badge plus this padding on each side (34 + 2*10).
 const PANEL_H: f64 = 54.0;
-const PANEL_BOTTOM_MARGIN: f64 = 18.0;
-const BADGE_H: f64 = 34.0;
+/// Padding on the panel's cross axis, i.e. above and below a row / either side of a column.
+const PANEL_CROSS_PADDING: f64 = 10.0;
+/// Distance kept from the screen edge the panel is anchored to.
+const PANEL_EDGE_MARGIN: f64 = 18.0;
 const HIDE_FADE: Duration = Duration::from_millis(
     (crate::theme::ANIMATION_DURATION_MEDIUM * crate::theme::ANIMATION_EXIT_RATIO * 1000.0) as u64,
 );
@@ -62,6 +65,9 @@ struct PanelState {
     last_badges: Vec<Badge>,
     last_palette: Option<crate::theme::UiPalette>,
     measurements: HashMap<String, f64>,
+    /// Layout direction of the live panel, refreshed on every render. The grip and hit-testing
+    /// paths run outside `render` and need it to place the handle on the correct edge.
+    orientation: Orientation,
     /// Set once the bar has hit the width cap this session; it stays there until the panel hides,
     /// so keys rolling off the front never make the length breathe.
     latched: bool,
@@ -164,9 +170,12 @@ pub(super) fn fade_pending() -> bool {
     PANEL.with(|panel| panel.borrow().fade_deadline.is_some())
 }
 
-pub(super) fn target_screen_width(
+/// The target screen's extent along the panel's stream axis: the width the cap is measured
+/// against when keys run in a row, the height when they stack in a column.
+pub(super) fn target_screen_extent(
     display_position: &str,
     position: Option<KeystrokeDisplayPosition>,
+    orientation: Orientation,
 ) -> f64 {
     crate::debug_assert_main_thread();
     let screens = unsafe { screen_geometries() };
@@ -188,9 +197,13 @@ pub(super) fn target_screen_width(
             }
         });
     }
-    screens
-        .get(selected)
-        .map_or(1.0, |screen| screen.frame.size.width.max(1.0))
+    screens.get(selected).map_or(1.0, |screen| {
+        if orientation.is_vertical() {
+            screen.frame.size.height.max(1.0)
+        } else {
+            screen.frame.size.width.max(1.0)
+        }
+    })
 }
 
 pub(super) fn drag_active() -> bool {
@@ -279,7 +292,7 @@ fn begin_grip_interaction(point: NSPoint, click_count: isize, now: Instant) {
             return false;
         };
         let frame: NSRect = unsafe { msg_send![window, frame] };
-        let local_grip = grip_frame();
+        let local_grip = grip_frame(state.orientation, frame.size);
         let global_grip = NSRect::new(
             NSPoint::new(
                 frame.origin.x + local_grip.origin.x,
@@ -412,23 +425,41 @@ fn reposition_to_default() {
         if let Some(window) = state.panel {
             unsafe {
                 let frame: NSRect = msg_send![window, frame];
-                let default_frame = default_bottom_center_frame(screen.visible_frame, frame.size);
+                let default_frame =
+                    default_edge_frame(screen.visible_frame, frame.size, &config.initial_position);
                 let _: () = msg_send![window, setFrame: default_frame, display: true];
             }
         }
     });
 }
 
+/// Where the panel is placed and how its keys are laid out, resolved from the keystroke-display
+/// config once per call.
+#[derive(Clone, Copy, Debug)]
+pub(super) struct PanelPlacement<'a> {
+    /// Which screen: `main` or `caret`.
+    pub(super) display_position: &'a str,
+    /// Which edge of it: `top`, `bottom`, `left`, `right`.
+    pub(super) initial_position: &'a str,
+    /// A remembered drag origin, which outranks the edge until the setting changes.
+    pub(super) position: Option<KeystrokeDisplayPosition>,
+}
+
 pub(super) fn render(
     badges: &[Badge],
     visible: bool,
     capped: bool,
-    display_position: &str,
-    position: Option<KeystrokeDisplayPosition>,
+    placement: PanelPlacement<'_>,
     now: Instant,
     cursor_point: Option<NSPoint>,
 ) -> Option<bool> {
     crate::debug_assert_main_thread();
+    let PanelPlacement {
+        display_position,
+        initial_position,
+        position,
+    } = placement;
+    let orientation = Orientation::from_initial_position(initial_position);
     if visible {
         // The panel window persists across shows: sync the backdrop material first (here,
         // outside the PANEL borrow below). The check is a cheap enum compare unless the
@@ -487,7 +518,7 @@ pub(super) fn render(
             let panel = if let Some(panel) = state.panel {
                 panel
             } else {
-                let (panel, badge_container, grip_view) = unsafe { create_panel() };
+                let (panel, badge_container, grip_view) = unsafe { create_panel(orientation) };
                 state.panel = Some(panel);
                 state.badge_container = Some(badge_container);
                 state.grip_view = Some(grip_view);
@@ -497,37 +528,66 @@ pub(super) fn render(
                 .badge_container
                 .expect("a created keystroke panel has a badge container");
             let labels = badge_labels(badges);
-            let mut widths = Vec::with_capacity(badges.len());
+            let mut extents = Vec::with_capacity(badges.len());
             for badge in badges.iter() {
-                widths.push(cached_badge_width(&mut state.measurements, badge));
+                extents.push(cached_badge_extent(
+                    &mut state.measurements,
+                    badge,
+                    orientation,
+                ));
             }
-            let max_width = screen_frame.size.width * 0.5;
-            let mut desired = estimated_stream_width(widths.iter().copied());
+            // The stream may only grow along its own axis, so the cap follows the panel's edge:
+            // half the screen's width for a row, half its height for a column.
+            let max_extent = if orientation.is_vertical() {
+                screen_frame.size.height * 0.5
+            } else {
+                screen_frame.size.width * 0.5
+            };
+            let mut desired = estimated_stream_width(extents.iter().map(|extent| extent.length));
             let mut first = 0usize;
-            while widths.len() > 1 && desired > max_width {
-                widths.remove(0);
+            while extents.len() > 1 && desired > max_extent {
+                extents.remove(0);
                 first += 1;
-                desired = estimated_stream_width(widths.iter().copied());
+                desired = estimated_stream_width(extents.iter().map(|extent| extent.length));
             }
-            let shown_badges = &badges[first..];
-            let shown_labels = &labels[first..];
             // Only this final per-badge clamp can ellipsize a genuinely oversized badge.
-            for width in &mut widths {
-                *width = width.min((max_width - PANEL_SIDE_PADDING * 2.0).max(32.0));
+            let length_limit = (max_extent - PANEL_SIDE_PADDING * 2.0).max(32.0);
+            // A column is only as wide as its widest keycap, itself capped so one long key name
+            // cannot turn the strip into a slab.
+            let thickness_limit = if orientation.is_vertical() {
+                (screen_frame.size.width * 0.5 - PANEL_CROSS_PADDING * 2.0).max(32.0)
+            } else {
+                BADGE_H
+            };
+            for extent in &mut extents {
+                extent.length = extent.length.min(length_limit);
+                extent.thickness = extent.thickness.min(thickness_limit);
             }
-            desired = estimated_stream_width(widths.iter().copied());
+            desired = estimated_stream_width(extents.iter().map(|extent| extent.length));
             // The stream filled the cap this session: pin the bar to the cap so keys rolling off
             // the front never shorten it (the length stops changing at the cap). `first > 0`
             // covers the panel's own measured trim, which can fire a little before the state's
             // estimate-based trim does.
             let pinned = capped || state.latched || first > 0;
             state.latched = pinned;
-            let panel_w = if pinned {
-                max_width
+            let panel_length = if pinned {
+                max_extent
             } else {
-                desired.min(max_width).max(max_width.min(64.0))
+                desired.min(max_extent).max(max_extent.min(64.0))
             };
-            let size = NSSize::new(panel_w, PANEL_H);
+            // The cross axis is one badge thick plus padding on both sides. For a row this is
+            // BADGE_H + 2*10 = 54, i.e. PANEL_H; a column mirrors it with the badge's own width.
+            let panel_cross = extents
+                .iter()
+                .map(|extent| extent.thickness)
+                .fold(BADGE_H, f64::max)
+                + PANEL_CROSS_PADDING * 2.0;
+            let size = if orientation.is_vertical() {
+                NSSize::new(panel_cross, panel_length)
+            } else {
+                NSSize::new(panel_length, PANEL_H.max(panel_cross))
+            };
+
             let frame = unsafe {
                 if state.drag.is_some() {
                     let current: NSRect = msg_send![panel, frame];
@@ -536,7 +596,15 @@ pub(super) fn render(
                     let current: NSRect = msg_send![panel, frame];
                     resize_frame_preserving_center(current, size, geometry.visible_frame)
                 } else {
-                    resolve_panel_frame(position, &[geometry], 0, size).1
+                    resolve_panel_frame(
+                        position,
+                        &[geometry],
+                        0,
+                        size,
+                        orientation,
+                        initial_position,
+                    )
+                    .1
                 }
             };
             unsafe {
@@ -547,17 +615,18 @@ pub(super) fn render(
                 }
                 let _: () = msg_send![panel, setFrame: frame, display: true];
                 if let Some(grip_view) = state.grip_view {
-                    let _: () = msg_send![grip_view, setFrame: grip_frame()];
-                    update_grip_marker(grip_view);
+                    let _: () = msg_send![grip_view, setFrame: grip_frame(orientation, size)];
+                    update_grip_marker(grip_view, orientation);
                 }
                 let palette = crate::theme::ui_palette();
                 if state.last_badges != badges || state.last_palette != Some(palette) {
                     rebuild_badges(
                         badge_container,
-                        shown_badges,
-                        shown_labels,
-                        &widths,
-                        panel_w,
+                        &badges[first..],
+                        &labels[first..],
+                        &extents,
+                        size,
+                        orientation,
                     );
                     state.last_badges = badges.to_vec();
                     state.last_palette = Some(palette);
@@ -565,6 +634,7 @@ pub(super) fn render(
                 let _ = state.fade_deadline.take();
             }
             state.visible = true;
+            state.orientation = orientation;
             state.target_frame = Some(geometry);
             update_grip_tracking(&mut state, cursor_point);
             if reopened {
@@ -665,11 +735,13 @@ pub(super) fn smoke_runner() -> bool {
     )
     .as_deref()
         == Some("q");
-    let initial_position = crate::config::CONFIG
-        .read()
-        .unwrap()
-        .keystroke_display
-        .position;
+    let (initial_position, saved_position) = {
+        let config = crate::config::CONFIG.read().unwrap();
+        (
+            config.keystroke_display.initial_position.clone(),
+            config.keystroke_display.position,
+        )
+    };
     let smoke_now = Instant::now();
     // Exercise the multi-key cell path (one keycap per key) before the single-label checks.
     let cell_badge = Badge {
@@ -686,8 +758,11 @@ pub(super) fn smoke_runner() -> bool {
         &[cell_badge],
         true,
         false,
-        "main",
-        initial_position,
+        PanelPlacement {
+            display_position: "main",
+            initial_position: &initial_position,
+            position: saved_position,
+        },
         smoke_now,
         None,
     );
@@ -701,12 +776,26 @@ pub(super) fn smoke_runner() -> bool {
         &[badge],
         true,
         false,
-        "main",
-        initial_position,
+        PanelPlacement {
+            display_position: "main",
+            initial_position: &initial_position,
+            position: saved_position,
+        },
         smoke_now,
         None,
     );
-    let _ = render(&[], false, false, "main", initial_position, smoke_now, None);
+    let _ = render(
+        &[],
+        false,
+        false,
+        PanelPlacement {
+            display_position: "main",
+            initial_position: &initial_position,
+            position: saved_position,
+        },
+        smoke_now,
+        None,
+    );
     let _ = render(
         &[Badge {
             text: "⌘Q".into(),
@@ -716,8 +805,11 @@ pub(super) fn smoke_runner() -> bool {
         }],
         true,
         false,
-        "main",
-        initial_position,
+        PanelPlacement {
+            display_position: "main",
+            initial_position: &initial_position,
+            position: saved_position,
+        },
         smoke_now,
         None,
     );
@@ -739,8 +831,11 @@ pub(super) fn smoke_runner() -> bool {
         &cjk_badges,
         true,
         false,
-        "main",
-        initial_position,
+        PanelPlacement {
+            display_position: "main",
+            initial_position: &initial_position,
+            position: saved_position,
+        },
         smoke_now,
         None,
     );
@@ -803,8 +898,8 @@ pub(super) fn smoke_runner() -> bool {
                 && badges_fit
         }
     });
-    let grip_valid = smoke_grip_interaction(initial_position);
-    update_config_position(initial_position);
+    let grip_valid = smoke_grip_interaction(saved_position);
+    update_config_position(saved_position);
     let config_restored = crate::config::flush_config_sync().is_ok();
     reset();
     valid && grip_valid && config_restored
@@ -875,9 +970,9 @@ fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -
             .clone();
         let screens = unsafe { screen_geometries() };
         let target_index = target_screen_index_live(&config.display_position, &screens);
-        let expected = screens
-            .get(target_index)
-            .map(|screen| default_bottom_center_frame(screen.visible_frame, frame.size));
+        let expected = screens.get(target_index).map(|screen| {
+            default_edge_frame(screen.visible_frame, frame.size, &config.initial_position)
+        });
         config.position.is_none()
             && ignores_mouse_events
             && frame_after_drag.is_some_and(|dragged| {
@@ -898,7 +993,7 @@ fn panel_frame_and_grip_center() -> Option<(NSRect, NSPoint)> {
         let state = panel.borrow();
         let window = state.panel?;
         let frame: NSRect = unsafe { msg_send![window, frame] };
-        let grip = grip_frame();
+        let grip = grip_frame(state.orientation, frame.size);
         Some((
             frame,
             NSPoint::new(
@@ -991,11 +1086,19 @@ unsafe fn text_centroid_offsets(
     Some(offsets)
 }
 
-unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
+unsafe fn create_panel(
+    orientation: Orientation,
+) -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
+    // A provisional non-empty frame: `render` assigns the real size immediately after creation.
+    let provisional = if orientation.is_vertical() {
+        NSSize::new(PANEL_H, 64.0)
+    } else {
+        NSSize::new(64.0, PANEL_H)
+    };
     let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
-        initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(64.0, PANEL_H)),
+        initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), provisional),
         styleMask: (1u64 << 7),
         backing: 2u64,
         defer: false
@@ -1009,7 +1112,7 @@ unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
     let _: () = msg_send![panel, setCollectionBehavior: ((1u64 << 0) | (1u64 << 6) | (1u64 << 8))];
     let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
     let _: () = msg_send![panel, setBackgroundColor: clear];
-    let local_frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(64.0, PANEL_H));
+    let local_frame = NSRect::new(NSPoint::new(0.0, 0.0), provisional);
     let backdrop = crate::glass::install_backdrop(
         panel,
         local_frame,
@@ -1022,7 +1125,8 @@ unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
     let _: () = msg_send![badge_container, setAutoresizingMask: 18u64];
     let _: () = msg_send![backdrop.content_parent, addSubview: badge_container];
     let grip_view: *mut AnyObject = msg_send![grip_view_class(), alloc];
-    let grip_view: *mut AnyObject = msg_send![grip_view, initWithFrame: grip_frame()];
+    let grip_view: *mut AnyObject =
+        msg_send![grip_view, initWithFrame: grip_frame(orientation, provisional)];
     let _: () = msg_send![grip_view, setWantsLayer: true];
     let grip_layer: *mut AnyObject = msg_send![grip_view, layer];
     layer_set_background(grip_layer, hex_to_cg_color(0x00000000));
@@ -1036,27 +1140,56 @@ unsafe fn create_panel() -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
         release_obj(mark);
     }
     let _: () = msg_send![backdrop.content_parent, addSubview: grip_view];
-    update_grip_marker(grip_view);
+    update_grip_marker(grip_view, orientation);
     *PANEL_BACKDROP.lock().unwrap() = Some(backdrop);
     release_obj(badge_container);
     release_obj(grip_view);
     (panel, badge_container, grip_view)
 }
 
-fn grip_frame() -> NSRect {
-    NSRect::new(
-        NSPoint::new(0.0, (PANEL_H - GRIP_HEIGHT) / 2.0),
-        NSSize::new(GRIP_WIDTH, GRIP_HEIGHT),
-    )
+/// The drag handle's frame inside the panel. A row carries it as a vertical dotted bar on its
+/// leading edge; a column carries it as a horizontal dotted bar along its top edge, so it always
+/// sits on the side the panel is anchored to.
+fn grip_frame(orientation: Orientation, panel_size: NSSize) -> NSRect {
+    if orientation.is_vertical() {
+        NSRect::new(
+            NSPoint::new(
+                (panel_size.width - GRIP_HEIGHT) / 2.0,
+                (panel_size.height - GRIP_WIDTH).max(0.0),
+            ),
+            NSSize::new(GRIP_HEIGHT, GRIP_WIDTH),
+        )
+    } else {
+        NSRect::new(
+            NSPoint::new(0.0, (panel_size.height - GRIP_HEIGHT) / 2.0),
+            NSSize::new(GRIP_WIDTH, GRIP_HEIGHT),
+        )
+    }
 }
 
-unsafe fn update_grip_marker(grip_view: *mut AnyObject) {
+unsafe fn update_grip_marker(grip_view: *mut AnyObject, orientation: Orientation) {
     let marks: *mut AnyObject = msg_send![grip_view, subviews];
     let count: usize = msg_send![marks, count];
+    let mark_color = hex_to_cg_color(crate::theme::ui_palette().secondary_text);
+    if orientation.is_vertical() {
+        // Three dots in a row, centered in the horizontal bar.
+        let total_width = 3.0 * GRIP_MARK_HEIGHT + 2.0 * GRIP_MARK_GAP;
+        let y = (GRIP_WIDTH - GRIP_MARK_HEIGHT) / 2.0;
+        let start_x = (GRIP_HEIGHT - total_width) / 2.0;
+        for index in 0..count.min(3) {
+            let mark: *mut AnyObject = msg_send![marks, objectAtIndex: index as isize];
+            let _: () = msg_send![mark, setFrame: NSRect::new(
+                NSPoint::new(start_x + index as f64 * (GRIP_MARK_HEIGHT + GRIP_MARK_GAP), y),
+                NSSize::new(GRIP_MARK_HEIGHT, GRIP_MARK_HEIGHT)
+            )];
+            let layer: *mut AnyObject = msg_send![mark, layer];
+            layer_set_background(layer, mark_color);
+        }
+        return;
+    }
     let total_height = 3.0 * GRIP_MARK_HEIGHT + 2.0 * GRIP_MARK_GAP;
     let x = (GRIP_WIDTH - GRIP_MARK_WIDTH) / 2.0;
     let start_y = (GRIP_HEIGHT - total_height) / 2.0;
-    let mark_color = hex_to_cg_color(crate::theme::ui_palette().secondary_text);
     for index in 0..count.min(3) {
         let mark: *mut AnyObject = msg_send![marks, objectAtIndex: index as isize];
         let _: () = msg_send![mark, setFrame: NSRect::new(
@@ -1078,7 +1211,7 @@ fn update_grip_tracking(state: &mut PanelState, cursor_point: Option<NSPoint>) {
         cursor_point.is_some_and(|point| {
             state.panel.is_some_and(|window| unsafe {
                 let frame: NSRect = msg_send![window, frame];
-                let local = grip_frame();
+                let local = grip_frame(state.orientation, frame.size);
                 contains(
                     NSRect::new(
                         NSPoint::new(
@@ -1277,25 +1410,95 @@ unsafe fn set_alpha_immediately(panel: *mut AnyObject, alpha: f64) {
     let _: () = msg_send![panel, setAlphaValue: alpha];
 }
 
-fn cached_badge_width(cache: &mut HashMap<String, f64>, badge: &Badge) -> f64 {
+/// A badge's measured footprint. `length` runs along the stream axis (left-to-right in a row,
+/// top-to-bottom in a column) and `thickness` is the cross-axis size.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct BadgeExtent {
+    length: f64,
+    thickness: f64,
+}
+
+fn cached_badge_extent(
+    cache: &mut HashMap<String, f64>,
+    badge: &Badge,
+    orientation: Orientation,
+) -> BadgeExtent {
     crate::debug_assert_main_thread();
     if badge.cells.len() > 1 {
-        // A container holding one keycap cell per key, plus the repeat suffix after the cells.
-        let mut width = BADGE_CONTAINER_PADDING_X * 2.0;
-        for (index, cell) in badge.cells.iter().enumerate() {
-            if index > 0 {
-                width += BADGE_CELL_GAP;
+        // A container holding one keycap per key: side by side in a row, stacked in a column.
+        let cells_width = cached_cells_width(cache, badge);
+        let cells_height = cached_cells_height(cache, badge);
+        if orientation.is_vertical() {
+            let cell_w = badge
+                .cells
+                .iter()
+                .map(|cell| cached_label_width(cache, cell.text()) + BADGE_CELL_PADDING_X * 2.0)
+                .fold(0.0_f64, f64::max);
+            let suffix_w = if badge.repeats > 1 {
+                cached_label_width(cache, &format!("×{}", badge.repeats))
+            } else {
+                0.0
+            };
+            BadgeExtent {
+                length: cells_height,
+                thickness: BADGE_CONTAINER_PADDING_X * 2.0 + cell_w.max(suffix_w),
             }
-            width += cached_label_width(cache, cell.text()) + BADGE_CELL_PADDING_X * 2.0;
+        } else {
+            let thickness = BADGE_H;
+            let _ = cells_height;
+            BadgeExtent {
+                length: cells_width,
+                thickness,
+            }
         }
-        if badge.repeats > 1 {
-            width += BADGE_CELL_GAP + cached_label_width(cache, &format!("×{}", badge.repeats));
-        }
-        width
     } else {
-        cached_label_width(cache, &badge_display_text(&badge.text, badge.repeats))
-            + BADGE_HORIZONTAL_PADDING
+        // A lone keycap keeps its natural size in both orientations, but which of that size is
+        // "along the stream" swaps with the orientation: a row advances across its width, a
+        // column down its height.
+        let width = cached_label_width(cache, &badge_display_text(&badge.text, badge.repeats))
+            + BADGE_HORIZONTAL_PADDING;
+        if orientation.is_vertical() {
+            BadgeExtent {
+                length: BADGE_H,
+                thickness: width,
+            }
+        } else {
+            BadgeExtent {
+                length: width,
+                thickness: BADGE_H,
+            }
+        }
     }
+}
+
+fn cached_cells_width(cache: &mut HashMap<String, f64>, badge: &Badge) -> f64 {
+    let mut width = BADGE_CONTAINER_PADDING_X * 2.0;
+    for (index, cell) in badge.cells.iter().enumerate() {
+        if index > 0 {
+            width += BADGE_CELL_GAP;
+        }
+        width += cached_label_width(cache, cell.text()) + BADGE_CELL_PADDING_X * 2.0;
+    }
+    if badge.repeats > 1 {
+        width += BADGE_CELL_GAP + cached_label_width(cache, &format!("×{}", badge.repeats));
+    }
+    width
+}
+
+fn cached_cells_height(cache: &mut HashMap<String, f64>, badge: &Badge) -> f64 {
+    let cell_h = (BADGE_H - BADGE_CELL_INSET_Y * 2.0).max(1.0);
+    let mut height = BADGE_CONTAINER_PADDING_Y * 2.0;
+    for index in 0..badge.cells.len() {
+        if index > 0 {
+            height += BADGE_CELL_GAP;
+        }
+        height += cell_h;
+    }
+    if badge.repeats > 1 {
+        let _ = cache;
+        height += BADGE_CELL_GAP + BADGE_REPEAT_SUFFIX_H;
+    }
+    height
 }
 
 fn cached_label_width(cache: &mut HashMap<String, f64>, label: &str) -> f64 {
@@ -1362,6 +1565,8 @@ unsafe fn layout_badge_cells(
     parent: *mut AnyObject,
     badge: &Badge,
     palette: &crate::theme::UiPalette,
+    orientation: Orientation,
+    badge_size: NSSize,
 ) {
     let cell_h = (BADGE_H - BADGE_CELL_INSET_Y * 2.0).max(1.0);
     let inner_radius = crate::theme::rounded_inset_radius(
@@ -1369,38 +1574,56 @@ unsafe fn layout_badge_cells(
         100.0,
         cell_h,
     );
+    // Each cell keeps its natural keycap size in both orientations; only the axis they advance
+    // along changes. A column therefore holds the same keycaps a row would, stacked.
+    if orientation.is_vertical() {
+        // Center each keycap horizontally in the container so a column of differing widths reads
+        // as one stack rather than a ragged left edge. Coordinates are non-flipped, so the first
+        // keycap sits at the top and each subsequent one steps down; the repeat suffix, when
+        // present, takes the row below the stack.
+        let mut y = badge_size.height - BADGE_CONTAINER_PADDING_Y - cell_h;
+        for cell in &badge.cells {
+            let cell_w = (measure_text_width(cell.text()) + BADGE_CELL_PADDING_X * 2.0)
+                .min((badge_size.width - BADGE_CONTAINER_PADDING_X * 2.0).max(1.0));
+            let x = (badge_size.width - cell_w) / 2.0;
+            add_badge_cell(
+                parent,
+                cell,
+                NSRect::new(NSPoint::new(x, y), NSSize::new(cell_w, cell_h)),
+                inner_radius,
+                palette,
+            );
+            y -= cell_h + BADGE_CELL_GAP;
+        }
+        if badge.repeats > 1 {
+            let suffix = format!("×{}", badge.repeats);
+            let suffix_w = measure_text_width(&suffix);
+            add_badge_label(
+                parent,
+                NSRect::new(
+                    NSPoint::new(
+                        (badge_size.width - suffix_w) / 2.0,
+                        BADGE_CONTAINER_PADDING_Y,
+                    ),
+                    NSSize::new(suffix_w, BADGE_REPEAT_SUFFIX_H),
+                ),
+                &suffix,
+                palette.primary_text,
+            );
+        }
+        return;
+    }
     let mut x = BADGE_CONTAINER_PADDING_X;
+    let y = BADGE_CELL_INSET_Y;
     for cell in &badge.cells {
         let cell_w = measure_text_width(cell.text()) + BADGE_CELL_PADDING_X * 2.0;
-        let cell_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let cell_view: *mut AnyObject = msg_send![cell_view, initWithFrame: NSRect::new(NSPoint::new(x, BADGE_CELL_INSET_Y), NSSize::new(cell_w, cell_h))];
-        let _: () = msg_send![cell_view, setWantsLayer: true];
-        let cell_layer: *mut AnyObject = msg_send![cell_view, layer];
-        let _: () = msg_send![cell_layer, setCornerRadius: inner_radius];
-        let _: () = msg_send![cell_layer, setBorderWidth: 1.0f64];
-        let (background, border, text_color) = if cell.is_modifier() {
-            (
-                palette.keycap_accent_bg,
-                palette.keycap_accent_border,
-                palette.keycap_accent_text,
-            )
-        } else {
-            (
-                keycap_fill(palette.card_bg),
-                palette.card_border,
-                palette.primary_text,
-            )
-        };
-        layer_set_background(cell_layer, hex_to_cg_color(background));
-        layer_set_border(cell_layer, hex_to_cg_color(border));
-        add_badge_label(
-            cell_view,
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(cell_w, cell_h)),
-            cell.text(),
-            text_color,
+        add_badge_cell(
+            parent,
+            cell,
+            NSRect::new(NSPoint::new(x, y), NSSize::new(cell_w, cell_h)),
+            inner_radius,
+            palette,
         );
-        let _: () = msg_send![parent, addSubview: cell_view];
-        release_obj(cell_view);
         x += cell_w + BADGE_CELL_GAP;
     }
     if badge.repeats > 1 {
@@ -1415,12 +1638,54 @@ unsafe fn layout_badge_cells(
     }
 }
 
+/// Draw one keycap cell: tinted by role, with its glyph centered inside it.
+unsafe fn add_badge_cell(
+    parent: *mut AnyObject,
+    cell: &BadgeCell,
+    frame: NSRect,
+    inner_radius: f64,
+    palette: &crate::theme::UiPalette,
+) {
+    let cell_w = frame.size.width;
+    let cell_h = frame.size.height;
+    let cell_view: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let cell_view: *mut AnyObject = msg_send![cell_view, initWithFrame: frame];
+    let _: () = msg_send![cell_view, setWantsLayer: true];
+    let cell_layer: *mut AnyObject = msg_send![cell_view, layer];
+    let _: () = msg_send![cell_layer, setCornerRadius: inner_radius];
+    let _: () = msg_send![cell_layer, setBorderWidth: 1.0f64];
+    let (background, border, text_color) = if cell.is_modifier() {
+        (
+            palette.keycap_accent_bg,
+            palette.keycap_accent_border,
+            palette.keycap_accent_text,
+        )
+    } else {
+        (
+            keycap_fill(palette.card_bg),
+            palette.card_border,
+            palette.primary_text,
+        )
+    };
+    layer_set_background(cell_layer, hex_to_cg_color(background));
+    layer_set_border(cell_layer, hex_to_cg_color(border));
+    add_badge_label(
+        cell_view,
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(cell_w, cell_h)),
+        cell.text(),
+        text_color,
+    );
+    let _: () = msg_send![parent, addSubview: cell_view];
+    release_obj(cell_view);
+}
+
 unsafe fn rebuild_badges(
     content: *mut AnyObject,
     badges: &[Badge],
     labels: &[String],
-    widths: &[f64],
-    panel_width: f64,
+    extents: &[BadgeExtent],
+    panel_size: NSSize,
+    orientation: Orientation,
 ) {
     let old: *mut AnyObject = msg_send![content, subviews];
     let count: usize = msg_send![old, count];
@@ -1429,12 +1694,38 @@ unsafe fn rebuild_badges(
         let _: () = msg_send![view, removeFromSuperview];
     }
 
-    let total = estimated_stream_width(widths.iter().copied());
-    let mut x = ((panel_width - total) / 2.0).max(PANEL_SIDE_PADDING);
+    let total = estimated_stream_width(extents.iter().map(|extent| extent.length));
     let palette = crate::theme::ui_palette();
-    for ((badge, label), width) in badges.iter().zip(labels).zip(widths) {
+    // Advance along the stream axis. Non-flipped coordinates mean a column counts down from the
+    // top of the panel while a row counts up from its left edge; both center the stream.
+    let mut cursor = if orientation.is_vertical() {
+        let start = (panel_size.height + total) / 2.0;
+        start.min(panel_size.height - PANEL_SIDE_PADDING)
+    } else {
+        ((panel_size.width - total) / 2.0).max(PANEL_SIDE_PADDING)
+    };
+    for ((badge, label), extent) in badges.iter().zip(labels).zip(extents) {
+        // `length` runs along the stream axis and `thickness` across it, so the on-screen box
+        // swaps them for a column.
+        let badge_size = if orientation.is_vertical() {
+            NSSize::new(extent.thickness, extent.length)
+        } else {
+            NSSize::new(extent.length, extent.thickness)
+        };
+        let origin = if orientation.is_vertical() {
+            cursor -= extent.length;
+            NSPoint::new((panel_size.width - badge_size.width) / 2.0, cursor)
+        } else {
+            NSPoint::new(
+                cursor,
+                ((panel_size.height - badge_size.height) / 2.0).max(0.0),
+            )
+        };
         let badge_view: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let badge_view: *mut AnyObject = msg_send![badge_view, initWithFrame: NSRect::new(NSPoint::new(x, 10.0), NSSize::new(*width, BADGE_H))];
+        let badge_view: *mut AnyObject = msg_send![
+            badge_view,
+            initWithFrame: NSRect::new(origin, badge_size)
+        ];
         let _: () = msg_send![badge_view, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![badge_view, layer];
         let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
@@ -1445,7 +1736,7 @@ unsafe fn rebuild_badges(
             // cells and their per-role tints stay legible against it.
             layer_set_background(layer, hex_to_cg_color(palette.field_bg));
             layer_set_border(layer, hex_to_cg_color(palette.card_border));
-            layout_badge_cells(badge_view, badge, &palette);
+            layout_badge_cells(badge_view, badge, &palette, orientation, badge_size);
         } else {
             let (background, border, text_color) = if uses_accent_fill(badge.kind) {
                 (
@@ -1469,7 +1760,10 @@ unsafe fn rebuild_badges(
                 badge_view,
                 NSRect::new(
                     NSPoint::new(6.0, 0.0),
-                    NSSize::new((*width - 12.0).max(1.0), BADGE_H),
+                    NSSize::new(
+                        (badge_size.width - 12.0).max(1.0),
+                        badge_size.height.min(BADGE_H),
+                    ),
                 ),
                 &display_text,
                 text_color,
@@ -1477,7 +1771,11 @@ unsafe fn rebuild_badges(
         }
         let _: () = msg_send![content, addSubview: badge_view];
         release_obj(badge_view);
-        x += *width + BADGE_GAP;
+        if orientation.is_vertical() {
+            cursor -= BADGE_GAP;
+        } else {
+            cursor += extent.length + BADGE_GAP;
+        }
     }
 }
 
@@ -1735,11 +2033,25 @@ fn clamp_origin_to_visible(origin: NSPoint, size: NSSize, visible: NSRect) -> NS
     )
 }
 
-fn default_bottom_center_frame(visible: NSRect, size: NSSize) -> NSRect {
-    let origin = NSPoint::new(
-        visible.origin.x + (visible.size.width - size.width) / 2.0,
-        visible.origin.y + PANEL_BOTTOM_MARGIN,
-    );
+/// The frame the panel takes when nothing has been dragged: centered on the edge named by
+/// `initial_position`, keeping `PANEL_EDGE_MARGIN` from that edge. `top`/`bottom` center
+/// horizontally, `left`/`right` center vertically, so the panel is always parallel to its edge.
+fn default_edge_frame(visible: NSRect, size: NSSize, initial_position: &str) -> NSRect {
+    let centered_x = visible.origin.x + (visible.size.width - size.width) / 2.0;
+    let centered_y = visible.origin.y + (visible.size.height - size.height) / 2.0;
+    let origin = match initial_position {
+        "top" => NSPoint::new(
+            centered_x,
+            visible.origin.y + visible.size.height - size.height - PANEL_EDGE_MARGIN,
+        ),
+        "left" => NSPoint::new(visible.origin.x + PANEL_EDGE_MARGIN, centered_y),
+        "right" => NSPoint::new(
+            visible.origin.x + visible.size.width - size.width - PANEL_EDGE_MARGIN,
+            centered_y,
+        ),
+        // "bottom", and anything unrecognised: the documented default.
+        _ => NSPoint::new(centered_x, visible.origin.y + PANEL_EDGE_MARGIN),
+    };
     NSRect::new(clamp_origin_to_visible(origin, size, visible), size)
 }
 
@@ -1757,15 +2069,18 @@ fn resolve_panel_frame(
     screens: &[ScreenGeometry],
     target_index: usize,
     size: NSSize,
+    orientation: Orientation,
+    initial_position: &str,
 ) -> (usize, NSRect) {
     if screens.is_empty() {
         return (0, NSRect::new(NSPoint::new(0.0, 0.0), size));
     }
     let target_index = target_index.min(screens.len().saturating_sub(1));
+    let _ = orientation;
     let Some(screen_index) = screen_for_saved_origin(position, screens) else {
         return (
             target_index,
-            default_bottom_center_frame(screens[target_index].visible_frame, size),
+            default_edge_frame(screens[target_index].visible_frame, size, initial_position),
         );
     };
     let position = position.expect("a saved position selected a screen");
@@ -1809,11 +2124,12 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        keycap_fill, resize_frame_preserving_center, resolve_panel_frame, target_screen_index,
-        uses_accent_fill, ScreenGeometry, KEYCAP_FILL_ALPHA,
+        default_edge_frame, keycap_fill, resize_frame_preserving_center, resolve_panel_frame,
+        target_screen_index, uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry,
+        BADGE_H, KEYCAP_FILL_ALPHA,
     };
     use crate::config::KeystrokeDisplayPosition;
-    use crate::keystroke_display::state::BadgeKind;
+    use crate::keystroke_display::state::{estimated_cells_height, BadgeKind};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
@@ -1887,6 +2203,8 @@ mod tests {
             &virtual_screens(),
             1,
             NSSize::new(300.0, 54.0),
+            Orientation::Horizontal,
+            "bottom",
         );
         assert_eq!(screen_index, 0);
         assert_eq!(frame.origin, NSPoint::new(700.0, 726.0));
@@ -1898,8 +2216,14 @@ mod tests {
             x: 5000.0,
             y: 100.0,
         });
-        let (screen_index, frame) =
-            resolve_panel_frame(saved, &virtual_screens(), 1, NSSize::new(300.0, 54.0));
+        let (screen_index, frame) = resolve_panel_frame(
+            saved,
+            &virtual_screens(),
+            1,
+            NSSize::new(300.0, 54.0),
+            Orientation::Horizontal,
+            "bottom",
+        );
         assert_eq!(screen_index, 1);
         assert_eq!(frame.origin, NSPoint::new(-790.0, 38.0));
         assert_eq!(
@@ -1913,10 +2237,133 @@ mod tests {
 
     #[test]
     fn absent_saved_origin_uses_bottom_center_of_follow_target() {
-        let (screen_index, frame) =
-            resolve_panel_frame(None, &virtual_screens(), 1, NSSize::new(300.0, 54.0));
+        let (screen_index, frame) = resolve_panel_frame(
+            None,
+            &virtual_screens(),
+            1,
+            NSSize::new(300.0, 54.0),
+            Orientation::Horizontal,
+            "bottom",
+        );
         assert_eq!(screen_index, 1);
         assert_eq!(frame.origin, NSPoint::new(-790.0, 38.0));
+    }
+
+    /// The four edges: `top`/`bottom` center horizontally, `left`/`right` center vertically,
+    /// and each keeps the same margin from the edge it is anchored to.
+    #[test]
+    fn each_initial_position_anchors_to_its_own_edge_and_centers_on_the_other_axis() {
+        let visible = virtual_screens()[0].visible_frame;
+        let size = NSSize::new(300.0, 54.0);
+        let margin = 18.0;
+        let centered_x = visible.origin.x + (visible.size.width - size.width) / 2.0;
+        let centered_y = visible.origin.y + (visible.size.height - size.height) / 2.0;
+
+        let bottom = default_edge_frame(visible, size, "bottom");
+        assert_eq!(
+            bottom.origin,
+            NSPoint::new(centered_x, visible.origin.y + margin)
+        );
+
+        let top = default_edge_frame(visible, size, "top");
+        assert_eq!(
+            top.origin,
+            NSPoint::new(
+                centered_x,
+                visible.origin.y + visible.size.height - size.height - margin
+            )
+        );
+
+        // A column is tall, so its own height is what the edge math has to clear.
+        let tall = NSSize::new(64.0, 300.0);
+        let left = default_edge_frame(visible, tall, "left");
+        assert_eq!(left.origin.x, visible.origin.x + margin);
+        assert_eq!(
+            left.origin.y,
+            visible.origin.y + (visible.size.height - tall.height) / 2.0
+        );
+
+        let right = default_edge_frame(visible, tall, "right");
+        assert_eq!(
+            right.origin.x,
+            visible.origin.x + visible.size.width - tall.width - margin
+        );
+        assert_eq!(
+            right.origin.y,
+            visible.origin.y + (visible.size.height - tall.height) / 2.0
+        );
+
+        // An unrecognised value still lands on the documented default rather than nowhere.
+        assert_eq!(
+            default_edge_frame(visible, size, "sideways").origin,
+            bottom.origin
+        );
+        // `centered_y` documents the horizontal panel's unused axis; keep it meaningful.
+        assert!(centered_y > visible.origin.y);
+    }
+
+    /// Horizontal and vertical extents differ for a chord: a row grows sideways, a column grows
+    /// downward, and a lone keycap is the same either way.
+    #[test]
+    fn orientation_decides_which_axis_a_chord_grows_along() {
+        assert_eq!(
+            Orientation::from_initial_position("top"),
+            Orientation::Horizontal
+        );
+        assert_eq!(
+            Orientation::from_initial_position("bottom"),
+            Orientation::Horizontal
+        );
+        assert_eq!(
+            Orientation::from_initial_position("left"),
+            Orientation::Vertical
+        );
+        assert_eq!(
+            Orientation::from_initial_position("right"),
+            Orientation::Vertical
+        );
+        // Unknown config values fall back to the historical shape.
+        assert_eq!(
+            Orientation::from_initial_position("sideways"),
+            Orientation::Horizontal
+        );
+
+        let chord = Badge {
+            text: "⌘Q".into(),
+            kind: BadgeKind::Chord,
+            repeats: 1,
+            cells: vec![BadgeCell::Modifier("⌘".into()), BadgeCell::Key("Q".into())],
+        };
+        let row = chord.estimated_extent(Orientation::Horizontal);
+        let column = chord.estimated_extent(Orientation::Vertical);
+        assert!(
+            column > row,
+            "a stacked chord must be taller than it is wide ({column} vs {row})"
+        );
+        assert_eq!(
+            column,
+            estimated_cells_height(&chord.cells, 1),
+            "a column's length is the stacked cell height"
+        );
+
+        // A lone keycap is the same size either way, but its extent along the stream swaps:
+        // a row advances across its width, a column down its height.
+        let lone = Badge {
+            text: "A".into(),
+            kind: BadgeKind::Chord,
+            repeats: 1,
+            cells: Vec::new(),
+        };
+        let lone_row = lone.estimated_extent(Orientation::Horizontal);
+        let lone_column = lone.estimated_extent(Orientation::Vertical);
+        assert_eq!(
+            lone_column, BADGE_H,
+            "a column advances by one keycap height"
+        );
+        assert!(
+            lone_row > lone_column,
+            "a keycap is wider than it is tall ({lone_row} vs {lone_column})"
+        );
     }
 
     #[test]

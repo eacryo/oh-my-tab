@@ -1559,6 +1559,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 ui.keystroke_display_mode,
                 ui.keystroke_display_tap_level,
                 ui.keystroke_display_position,
+                ui.keystroke_display_initial_position,
             ]
             .into_iter()
             .all(|control| {
@@ -1579,6 +1580,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 msg_send![ui.keystroke_display_mode, indexOfSelectedItem],
                 msg_send![ui.keystroke_display_tap_level, indexOfSelectedItem],
                 msg_send![ui.keystroke_display_position, indexOfSelectedItem],
+                msg_send![ui.keystroke_display_initial_position, indexOfSelectedItem],
                 controls_on_keystroke_page,
             ))
         });
@@ -1588,6 +1590,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         refreshed_cfg.keystroke_display.mode = "shortcuts".into();
         refreshed_cfg.keystroke_display.tap_level = "session".into();
         refreshed_cfg.keystroke_display.display_position = "main".into();
+        refreshed_cfg.keystroke_display.initial_position = "left".into();
         if let Ok(mut current) = CONFIG.write() {
             *current = refreshed_cfg;
         }
@@ -1599,6 +1602,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 msg_send![ui.keystroke_display_mode, indexOfSelectedItem],
                 msg_send![ui.keystroke_display_tap_level, indexOfSelectedItem],
                 msg_send![ui.keystroke_display_position, indexOfSelectedItem],
+                msg_send![ui.keystroke_display_initial_position, indexOfSelectedItem],
             ))
         });
         hide_settings();
@@ -1606,9 +1610,9 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         states
             == Some((
                 1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 2isize, 1isize, 1isize,
-                true,
+                1isize, true,
             ))
-            && refreshed == Some((0isize, 1isize, 0isize, 0isize))
+            && refreshed == Some((0isize, 1isize, 0isize, 0isize, 2isize))
     }
 }
 
@@ -2214,6 +2218,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             keystroke_display_mode: std::ptr::null_mut(),
             keystroke_display_tap_level: std::ptr::null_mut(),
             keystroke_display_position: std::ptr::null_mut(),
+            keystroke_display_initial_position: std::ptr::null_mut(),
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),

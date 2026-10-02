@@ -96,9 +96,14 @@ keystroke_display_mode_commands = "Command 快捷鍵"
 row_keystroke_display_tap_level = "輸入來源"
 keystroke_display_tap_session = "工作階段（包含重新映射的按鍵）"
 keystroke_display_tap_hid = "硬體（實體按鍵）"
-row_keystroke_display_position = "顯示位置"
-keystroke_display_position_main = "始終顯示在主螢幕"
-keystroke_display_position_caret = "跟隨輸入游標所在螢幕"
+row_keystroke_display_position = "顯示螢幕"
+row_keystroke_display_initial_position = "初始顯示位置"
+keystroke_display_initial_position_top = "螢幕上方"
+keystroke_display_initial_position_bottom = "螢幕下方"
+keystroke_display_initial_position_left = "螢幕左側"
+keystroke_display_initial_position_right = "螢幕右側"
+keystroke_display_position_main = "主螢幕"
+keystroke_display_position_caret = "跟隨游標所在螢幕"
 tooltip_windows_disabled = "請先啟用應用切換浮窗。"
 header_logging = "日誌"
 row_theme = "主題"
@@ -418,6 +423,7 @@ clipboard_shortcut_conflict = "此按鍵組合與內建快速鍵衝突。"
 keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" 只能是 all、shortcuts 或 commands'
 keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" 只能是 session 或 hid'
 keystroke_display_position_mode_invalid = 'keystroke_display.display_position: "{value}" 只能是 main 或 caret'
+keystroke_display_initial_position_invalid = 'keystroke_display.initial_position: "{value}" 只能是 top、bottom、left 或 right'
 keystroke_display_position_invalid = 'keystroke_display.position.{field}: "{value}" 必須是有限數值'
 
 [onboarding]

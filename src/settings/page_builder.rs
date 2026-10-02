@@ -439,6 +439,43 @@ pub(super) unsafe fn build_keystroke_display_page(
     )
     .1;
     bind_control(target, ui.keystroke_display_position);
+
+    let initial_position_labels = [
+        t("settings.keystroke_display_initial_position_top"),
+        t("settings.keystroke_display_initial_position_bottom"),
+        t("settings.keystroke_display_initial_position_left"),
+        t("settings.keystroke_display_initial_position_right"),
+    ];
+    let initial_position_refs: Vec<&str> =
+        initial_position_labels.iter().map(|s| s.as_str()).collect();
+    let initial_position_metrics =
+        SettingsSelect::metrics(ctrl_w, &initial_position_refs, row_h, described_row_h);
+    let y = canvas.next_row(initial_position_metrics.row_h);
+    SettingsRow::separator_above_row(
+        keystroke_display_view,
+        y,
+        initial_position_metrics.row_h,
+        content_w,
+    );
+    ui.keystroke_display_initial_position = SettingsRow::tall_with_height(
+        keystroke_display_view,
+        label_x,
+        y,
+        label_w,
+        initial_position_metrics.row_h,
+        &t("settings.row_keystroke_display_initial_position"),
+        SettingsControl::popup(
+            ctrl_x,
+            y + (initial_position_metrics.row_h - initial_position_metrics.control_h) / 2.0,
+            ctrl_w,
+            initial_position_metrics.control_h,
+            &initial_position_refs,
+            // Index 1 is "bottom", the documented default.
+            1,
+        ),
+    )
+    .1;
+    bind_control(target, ui.keystroke_display_initial_position);
     canvas.card(&t("settings.header_keystroke_display"));
 
     let content_bottom = canvas.finish();

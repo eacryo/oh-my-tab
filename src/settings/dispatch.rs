@@ -33,6 +33,7 @@ pub(super) enum ControlField {
     KeystrokeDisplayMode,
     KeystrokeDisplayTapLevel,
     KeystrokeDisplayPosition,
+    KeystrokeDisplayInitialPosition,
     MouseEnabled,
     ReverseScroll,
     ScrollMode,
@@ -125,6 +126,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                 m(
                     u.keystroke_display_position,
                     ControlField::KeystrokeDisplayPosition,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.keystroke_display_initial_position,
+                    ControlField::KeystrokeDisplayInitialPosition,
                 )
             })
             .or_else(|| m(u.enable_mouse, ControlField::MouseEnabled))
@@ -574,6 +581,19 @@ fn apply_control_field(field: ControlField) {
                             .copied()
                             .unwrap_or("caret")
                             .into();
+                }
+                ControlField::KeystrokeDisplayInitialPosition => {
+                    let index: isize =
+                        msg_send![u.keystroke_display_initial_position, indexOfSelectedItem];
+                    cfg.keystroke_display.initial_position =
+                        super::KEYSTROKE_DISPLAY_INITIAL_POSITION_VALUES
+                            .get(index.max(0) as usize)
+                            .copied()
+                            .unwrap_or("bottom")
+                            .into();
+                    // A remembered drag outranks the edge, so clear it: picking a position in
+                    // Settings is a request to see the panel there now.
+                    cfg.keystroke_display.position = None;
                 }
                 ControlField::MouseEnabled => {
                     let state: isize = msg_send![u.enable_mouse, state];
@@ -1449,6 +1469,14 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             let _: () = msg_send![
                 u.keystroke_display_position,
                 selectItemAtIndex: display_position_idx
+            ];
+            let initial_position_idx = super::KEYSTROKE_DISPLAY_INITIAL_POSITION_VALUES
+                .iter()
+                .position(|edge| *edge == cfg.keystroke_display.initial_position)
+                .unwrap_or(1) as isize;
+            let _: () = msg_send![
+                u.keystroke_display_initial_position,
+                selectItemAtIndex: initial_position_idx
             ];
 
             let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };

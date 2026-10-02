@@ -95,9 +95,14 @@ keystroke_display_mode_commands = "Command shortcuts"
 row_keystroke_display_tap_level = "Input source"
 keystroke_display_tap_session = "Session (includes remapped keys)"
 keystroke_display_tap_hid = "Hardware (physical keys)"
-row_keystroke_display_position = "Display position"
-keystroke_display_position_main = "Always on the main display"
-keystroke_display_position_caret = "Follow the text cursor's display"
+row_keystroke_display_position = "Display screen"
+row_keystroke_display_initial_position = "Initial display position"
+keystroke_display_initial_position_top = "Top of screen"
+keystroke_display_initial_position_bottom = "Bottom of screen"
+keystroke_display_initial_position_left = "Left of screen"
+keystroke_display_initial_position_right = "Right of screen"
+keystroke_display_position_main = "Main display"
+keystroke_display_position_caret = "Follow the text cursor's screen"
 tooltip_windows_disabled = "Enable the app switcher first."
 header_logging = "Logging"
 row_theme = "Theme"
@@ -417,6 +422,7 @@ clipboard_shortcut_conflict = "This key chord conflicts with a built-in shortcut
 keystroke_display_mode_invalid = 'keystroke_display.mode: "{value}" is not one of all, shortcuts, commands'
 keystroke_display_tap_level_invalid = 'keystroke_display.tap_level: "{value}" is not one of session, hid'
 keystroke_display_position_mode_invalid = 'keystroke_display.display_position: "{value}" is not one of main, caret'
+keystroke_display_initial_position_invalid = 'keystroke_display.initial_position: "{value}" is not one of top, bottom, left, right'
 keystroke_display_position_invalid = 'keystroke_display.position.{field}: "{value}" must be finite'
 
 [onboarding]

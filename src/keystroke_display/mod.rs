@@ -199,8 +199,10 @@ fn process_tick() -> bool {
             PANEL_HOVER.with(|hover| hover.borrow_mut().reset());
         }
         if visible {
-            let max_width = panel::target_screen_width(&display_position, config.position) * 0.5;
-            changed |= state.trim_to_width(max_width);
+            let orientation = state::Orientation::from_initial_position(&config.initial_position);
+            let max_extent =
+                panel::target_screen_extent(&display_position, config.position, orientation) * 0.5;
+            changed |= state.trim_to_extent(max_extent, orientation);
         }
         (
             state.badges().to_vec(),
@@ -222,8 +224,11 @@ fn process_tick() -> bool {
         &badges,
         visible,
         capped,
-        &display_position,
-        config.position,
+        panel::PanelPlacement {
+            display_position: &display_position,
+            initial_position: &config.initial_position,
+            position: config.position,
+        },
         now,
         cursor_point,
     );

@@ -39,11 +39,22 @@ pub struct KeystrokeDisplaySection {
         deserialize_with = "deserialize_keystroke_display_position"
     )]
     pub display_position: String,
+    /// Where on that screen the panel first appears. `top`/`bottom` lay the keys out in a row;
+    /// `left`/`right` stack them in a column, because the panel then sits against a vertical
+    /// screen edge. A dragged position still wins until this setting changes, at which point the
+    /// remembered position is dropped so the new choice takes effect immediately.
+    #[serde(default = "default_keystroke_display_initial_position")]
+    pub initial_position: String,
     pub position: Option<KeystrokeDisplayPosition>,
 }
 
 fn default_keystroke_display_position() -> String {
     "caret".into()
+}
+
+/// The documented default: the bottom edge of the screen.
+fn default_keystroke_display_initial_position() -> String {
+    "bottom".into()
 }
 
 fn deserialize_keystroke_display_position<'de, D>(deserializer: D) -> Result<String, D::Error>
@@ -84,6 +95,7 @@ impl Default for KeystrokeDisplaySection {
             mode: "all".into(),
             tap_level: "session".into(),
             display_position: default_keystroke_display_position(),
+            initial_position: default_keystroke_display_initial_position(),
             position: None,
         }
     }
@@ -951,6 +963,14 @@ impl Config {
                 &[("value", &self.keystroke_display.display_position)],
             ));
         }
+        if !["top", "bottom", "left", "right"]
+            .contains(&self.keystroke_display.initial_position.as_str())
+        {
+            errs.push(tf(
+                "errors.keystroke_display_initial_position_invalid",
+                &[("value", &self.keystroke_display.initial_position)],
+            ));
+        }
         if let Some(position) = self.keystroke_display.position {
             for (axis, value) in [("x", position.x), ("y", position.y)] {
                 if !value.is_finite() {
@@ -1227,6 +1247,12 @@ impl Config {
                 .any(|e| e.starts_with("keystroke_display.display_position"))
             {
                 self.keystroke_display.display_position = other.keystroke_display.display_position;
+            }
+            if !errs
+                .iter()
+                .any(|e| e.starts_with("keystroke_display.initial_position"))
+            {
+                self.keystroke_display.initial_position = other.keystroke_display.initial_position;
             }
             if !errs.iter().any(|e| e.starts_with("keystroke_display.mode")) {
                 self.keystroke_display.mode = other.keystroke_display.mode;
@@ -2401,6 +2427,7 @@ mod tests {
         assert_eq!(defaults.keystroke_display.mode, "all");
         assert_eq!(defaults.keystroke_display.tap_level, "session");
         assert_eq!(defaults.keystroke_display.display_position, "caret");
+        assert_eq!(defaults.keystroke_display.initial_position, "bottom");
 
         let mut loaded = defaults.clone();
         loaded.keystroke_display.enabled = true;
@@ -2417,6 +2444,35 @@ mod tests {
         assert_eq!(merged.keystroke_display.display_position, "main");
         assert_eq!(merged.keystroke_display.mode, "shortcuts");
         assert_eq!(merged.keystroke_display.tap_level, "session");
+    }
+
+    /// The initial position is one more per-field enum: an unusable value must fall back to the
+    /// documented default without discarding the section's other, valid settings.
+    #[test]
+    fn keystroke_display_initial_position_validates_and_falls_back_per_field() {
+        for valid in ["top", "bottom", "left", "right"] {
+            let mut config = Config::default();
+            config.keystroke_display.initial_position = valid.into();
+            assert!(
+                config.validate().is_empty(),
+                "\"{valid}\" must be an accepted initial position"
+            );
+        }
+
+        let mut loaded = Config::default();
+        loaded.keystroke_display.enabled = true;
+        loaded.keystroke_display.display_position = "main".into();
+        loaded.keystroke_display.initial_position = "sideways".into();
+        let errors = loaded.validate();
+        assert_eq!(errors.len(), 1);
+        assert!(errors[0].starts_with("keystroke_display.initial_position"));
+
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        // The bad enum falls back, its neighbours survive.
+        assert_eq!(merged.keystroke_display.initial_position, "bottom");
+        assert_eq!(merged.keystroke_display.display_position, "main");
+        assert!(merged.keystroke_display.enabled);
     }
 
     #[test]
