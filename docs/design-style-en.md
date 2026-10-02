@@ -78,6 +78,8 @@ auxiliary panels). Never inline a hex value in a view builder.
 | `scroll_indicator` | `rgba(0,0,0,.35)` | `rgba(255,255,255,.35)` | Custom scrollbar knobs |
 | `accent` | `#0A84FF` | `#0A84FF` | Switches, sliders, primary action, selection ring |
 | `accent_hover` | `#0077ED` | `#3D9BFF` | Pressed/hover state of the accent |
+| `link_text` | `#0068D6` | `#409CFF` | Link-colored body text (clipboard URL rows and their detail view, settings external links) |
+| `link_text_hover` | `#0058B8` | `#66ADFF` | Hover state of link text (settings external links) |
 | `destructive` | `#FF3B30` | `#FF453A` | Destructive actions and destructive-confirmation UI |
 | `destructive_hover` | `#D70015` | `#D93630` | Hover state for destructive actions |
 | `symbol_shadow` | `rgba(0,0,0,.70)` | `rgba(0,0,0,.70)` | Visibility glyph shadow over arbitrary thumbnails |
@@ -125,10 +127,18 @@ Measured with the composited (post-alpha) color against the surface the element 
 | `text_primary` | 12:1 | 12.97:1 on `window_bg` | 15.63:1 |
 | `text_secondary` | 7:1 | 8.19:1 on `window_bg` | 10.10:1 |
 | `text_muted` | 4.5:1 | 5.16:1 on `window_bg`, 5.53:1 on `card_bg` | 6.40:1 / 5.24:1 |
+| `link_text` | 4.5:1 | 4.96:1 on `window_bg`, 5.31:1 on `card_bg` | 6.01:1 / 4.92:1 |
+| `link_text_hover` | 4.5:1 | 6.34:1 on `window_bg`, 6.80:1 on `card_bg` | 7.28:1 / 5.96:1 |
 | `text_disabled` | 2.5:1 | 2.58:1 on `window_bg`, 2.76:1 on `card_bg` | 4.11:1 / 3.37:1 |
 
 `text_primary` has the smallest margin in the palette. Re-measure it whenever the primary color or
 `window_bg` changes; do not darken it for its own sake.
+
+The selected sidebar item's title keeps `accent` over its `selection_bg` wash: the blue names the
+selected state together with the wash, the row's position, and the icon tint. It is state text, not
+reading text -- like `text_disabled` it is held to 2.5:1 instead of 4.5:1 (measured 2.97:1 light /
+3.24:1 dark on the composited wash). Link-colored text never takes this exception: it always uses
+`link_text` / `link_text_hover`.
 
 `scroll_indicator` carries no meaning on its own, so it is not held to a text floor, but it must
 stay on the visible side of the surface in both modes: darker than a light panel, lighter than a

@@ -472,7 +472,7 @@ struct ContentAttributedKey {
     kind: u8,
     primary_text: u32,
     secondary_text: u32,
-    accent: u32,
+    link_text: u32,
 }
 static CONTENT_ATTRIBUTED_CACHE: LazyLock<
     MainThreadSlot<HashMap<ContentAttributedKey, CachedUiObject>>,

@@ -84,12 +84,12 @@ pub(super) unsafe fn add_detail_text(
     CFRelease(ns_text as *const c_void);
 
     // Code retains only monospace layout and soft wrapping, with no syntax coloring; URLs keep
-    // the list's blue color.
+    // the list's link color.
     let storage: *mut AnyObject = msg_send![tv, textStorage];
     // Link color, font, and paragraph styles mutate NSTextStorage. An outer transaction coalesces
     // TextKit invalidation/fix-up instead of repeatedly processing the soft-wrapped detail.
     let _: () = msg_send![storage, beginEditing];
-    apply_link_color(storage, display_text, kind);
+    apply_link_color(storage, display_text, kind, clipboard_palette().link_text);
 
     let _: () = msg_send![tv, setEditable: false];
     // Selectable (it used to be disabled, so a part of a long text could never be

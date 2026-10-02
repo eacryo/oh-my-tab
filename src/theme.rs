@@ -215,6 +215,18 @@ pub(crate) struct UiPalette {
     pub(crate) hover_bg: u32,
     pub(crate) accent: u32,
     pub(crate) accent_hover: u32,
+    /// Body text colored as a link: clipboard URL rows, their detail view, and settings
+    /// external links. Links are text, not an accent fill, so this role carries the 4.5:1 text
+    /// floor that `accent` -- a 3:1 non-text role, 3.40:1 on the light window -- cannot; a
+    /// fixed link blue once composited to 1.88:1 in dark mode. The one remaining accent-as-text
+    /// site is the selected sidebar title, a documented design-style §3.3 exception (state
+    /// text on the selection wash, held to 2.5:1).
+    pub(crate) link_text: u32,
+    /// Hover counterpart of `link_text`, related to it as `accent_hover` is to `accent`:
+    /// darker in light mode, brighter in dark mode. `accent_hover` cannot serve here -- in
+    /// light mode it measures 4.03:1 as text and is *lighter* than `link_text`, so hover
+    /// would reduce contrast instead of strengthening it.
+    pub(crate) link_text_hover: u32,
     pub(crate) destructive: u32,
     pub(crate) destructive_hover: u32,
     pub(crate) symbol_shadow: u32,
@@ -262,6 +274,8 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             hover_bg: 0xFFFFFF1A,
             accent: 0x0A84FFFF,
             accent_hover: 0x3D9BFFFF,
+            link_text: 0x409CFFFF,
+            link_text_hover: 0x66ADFFFF,
             destructive: 0xFF453AFF,
             destructive_hover: 0xD93630FF,
             symbol_shadow: 0x000000B3,
@@ -304,6 +318,8 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             hover_bg: 0x7676801F,
             accent: 0x0A84FFFF,
             accent_hover: 0x0077EDFF,
+            link_text: 0x0068D6FF,
+            link_text_hover: 0x0058B8FF,
             destructive: 0xFF3B30FF,
             destructive_hover: 0xD70015FF,
             symbol_shadow: 0x000000B3,
@@ -1715,6 +1731,11 @@ mod tests {
                 (palette.primary_text, 12.0),
                 (palette.secondary_text, 7.0),
                 (palette.muted_text, 4.5),
+                // Links are body text colored as links (clipboard URL rows and detail, settings
+                // external links). A fixed link blue composited to 1.88:1 in dark mode, so the
+                // token is held to the text floor on both surfaces in both modes.
+                (palette.link_text, 4.5),
+                (palette.link_text_hover, 4.5),
                 (palette.disabled_text, 2.5),
                 (palette.success_text, 4.5),
                 (palette.warning_text, 4.5),
@@ -1729,6 +1750,16 @@ mod tests {
                     );
                 }
             }
+            // The selected sidebar title is the one accent-as-text site: state text over its
+            // selection wash. The blue names the selection (with the wash, position, and icon
+            // tint), and no accent-hue text clears 4.5:1 on a blue-tinted wash, so like
+            // `text_disabled` it is held to the 2.5:1 state tier instead of the reading tier.
+            // The title color is opaque, so it needs no further compositing over the wash.
+            let wash = composite_rgb(palette.selection_bg, palette.sidebar_bg);
+            assert!(
+                contrast_ratio(color_rgb(palette.accent), wash) >= 2.5,
+                "selected sidebar title measures under 2.5:1 on its selection wash"
+            );
             for background in [palette.window_bg, palette.card_bg] {
                 assert!(
                     contrast_ratio(
@@ -1846,6 +1877,48 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Settings external links are body text and must draw with the `link_text` roles. They
+    /// used `SettingsTextRole::Accent`, which measures 3.40:1 on the light window and 3.65:1
+    /// on the light card -- under the 4.5:1 text floor in both modes' card surfaces. The fix
+    /// is call-site-shaped, so nothing structural forces a future link to keep the Link role;
+    /// pin all three states (normal, hover-entered, hover-exited) here.
+    #[test]
+    fn settings_external_links_use_the_link_text_roles() {
+        let source = include_str!("settings/widgets.rs");
+        let builder = source
+            .split("pub(super) unsafe fn make_external_link")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) unsafe fn make_symbol_image")
+            .next()
+            .unwrap();
+        assert!(
+            builder.contains("apply_settings_text_role(link, SettingsTextRole::Link)"),
+            "make_external_link must paint its label with the Link role"
+        );
+        assert!(
+            !builder.contains("SettingsTextRole::Accent"),
+            "make_external_link must not fall back to the accent-as-text role"
+        );
+        let entered = source
+            .split("pub(super) extern \"C\" fn external_link_mouse_entered")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) extern \"C\" fn external_link_mouse_exited")
+            .next()
+            .unwrap();
+        assert!(entered.contains("SettingsTextRole::LinkHover"));
+        let exited = source
+            .split("pub(super) extern \"C\" fn external_link_mouse_exited")
+            .nth(1)
+            .unwrap()
+            .split("pub(super) extern \"C\" fn external_link_mouse_down")
+            .next()
+            .unwrap();
+        assert!(exited.contains("SettingsTextRole::Link"));
+        assert!(!exited.contains("SettingsTextRole::Accent"));
     }
 
     /// The custom scrollbar knob must sit on the visible side of the panel surface in both modes:

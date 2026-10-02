@@ -128,7 +128,11 @@ pub(super) enum SettingsTextRole {
     Muted,
     Disabled,
     Accent,
-    AccentHover,
+    /// Link-colored body text: external links. Text, so it carries the 4.5:1 text floor that
+    /// `Accent` (3.40:1 on the light window) cannot.
+    Link,
+    /// Hover state of `Link`, related to it as the palette's `accent_hover` is to `accent`.
+    LinkHover,
     Destructive,
 }
 
@@ -142,7 +146,8 @@ pub(super) fn settings_text_color(role: SettingsTextRole) -> *mut AnyObject {
         SettingsTextRole::Muted => palette.muted_text,
         SettingsTextRole::Disabled => palette.disabled_text,
         SettingsTextRole::Accent => palette.accent,
-        SettingsTextRole::AccentHover => palette.accent_hover,
+        SettingsTextRole::Link => palette.link_text,
+        SettingsTextRole::LinkHover => palette.link_text_hover,
         SettingsTextRole::Destructive => palette.destructive,
     };
     crate::ffi::hex_to_ns_color(color)
@@ -616,7 +621,7 @@ pub(super) extern "C" fn external_link_mouse_entered(
     _event: *mut c_void,
 ) {
     unsafe {
-        let color = settings_text_color(SettingsTextRole::AccentHover);
+        let color = settings_text_color(SettingsTextRole::LinkHover);
         let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
         let _: () = msg_send![cursor, set];
@@ -629,7 +634,7 @@ pub(super) extern "C" fn external_link_mouse_exited(
     _event: *mut c_void,
 ) {
     unsafe {
-        let color = settings_text_color(SettingsTextRole::Accent);
+        let color = settings_text_color(SettingsTextRole::Link);
         let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
         let _: () = msg_send![cursor, set];
@@ -1242,7 +1247,7 @@ pub(super) unsafe fn make_external_link(
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![link, setFont: font];
-    apply_settings_text_role(link, SettingsTextRole::Accent);
+    apply_settings_text_role(link, SettingsTextRole::Link);
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
     let tracking: *mut AnyObject = msg_send![
         tracking,

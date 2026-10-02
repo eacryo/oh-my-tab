@@ -14,7 +14,7 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
         },
         primary_text: palette.primary_text,
         secondary_text: palette.secondary_text,
-        accent: palette.accent,
+        link_text: palette.link_text,
     };
     if let Some(cached) = CONTENT_ATTRIBUTED_CACHE.lock().unwrap().get_mut(&key) {
         cached.last_used = next_ui_cache_recency();
@@ -46,7 +46,7 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
         _ => msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL],
     };
     let color = match kind {
-        TextKind::Url => crate::ffi::hex_to_ns_color(palette.accent),
+        TextKind::Url => crate::ffi::hex_to_ns_color(palette.link_text),
         TextKind::Code => crate::ffi::hex_to_ns_color(palette.secondary_text),
         TextKind::Plain => crate::ffi::hex_to_ns_color(palette.primary_text),
     };
@@ -68,7 +68,7 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
     if let Some(code) = &prepared_code {
         apply_visible_space_markers(attr, &code.text);
     } else {
-        apply_link_color(attr, display_content, kind);
+        apply_link_color(attr, display_content, kind, palette.link_text);
     }
     CFRetain(attr as *const c_void);
     let mut released = Vec::new();

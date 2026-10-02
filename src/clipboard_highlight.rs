@@ -1138,19 +1138,26 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
     let _: () = msg_send![storage, endEditing];
 }
 
-/// Links retain the list's existing blue color; code keeps only monospace layout and wrapping,
-/// with no syntax coloring.
-pub(crate) unsafe fn apply_link_color(storage: *mut AnyObject, text: &str, kind: TextKind) {
+/// Links paint in the caller's palette `link_text` token (the 4.5:1 text role, resolved
+/// per mode); code keeps only monospace layout and wrapping, with no syntax coloring.
+/// The color is a parameter, not resolved here: this module sits below the clipboard
+/// subsystem and must not reach into its palette.
+pub(crate) unsafe fn apply_link_color(
+    storage: *mut AnyObject,
+    text: &str,
+    kind: TextKind,
+    color: u32,
+) {
     if kind != TextKind::Url || text.is_empty() {
         return;
     }
     let _: () = msg_send![storage, beginEditing];
     let color_key = make_nsstring("NSColor");
-    let color = hex_to_ns_color(0x205BA6B8);
+    let ns_color = hex_to_ns_color(color);
     let _: () = msg_send![
         storage,
         addAttribute: color_key,
-        value: color,
+        value: ns_color,
         range: NSRange::new(0, text.encode_utf16().count())
     ];
     CFRelease(color_key as *const c_void);
