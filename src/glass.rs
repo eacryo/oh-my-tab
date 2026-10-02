@@ -9,6 +9,21 @@ use crate::ffi::{hex_to_cg_color, hex_to_ns_color, layer_set_background, release
 pub(crate) const PANEL_CORNER_RADIUS: f64 = 16.0;
 /// AppKit darkens Liquid Glass in passive panels; this alpha matches the clipboard detail panel.
 pub(crate) const INACTIVE_GLASS_COMPENSATION_ALPHA: u32 = 0x8D;
+/// Opacity of the theme-surface wash laid over the frost blur.
+///
+/// Frost alone cannot satisfy design-style §3.4 ("text-bearing surfaces must remain opaque
+/// enough that the contrast table still holds on the worst-case backdrop"): an `NSVisualEffectView`
+/// behind-window blur is translucent, and measurable surfaces ran from `#868585` (captured) to
+/// `#A6A5A5` (reported over a light desktop) while the dark palette assumes `#1C1C1E`. Measured
+/// dark-mode contrast collapsed from 15.63/10.10/6.40:1 to 3.38/2.18/1.38:1, and a mid-gray
+/// surface caps *any* single text color at 5.71:1 — below the table's own 12:1 and 7:1 floors, so
+/// re-coloring the text cannot fix it. The surface is what has to move.
+///
+/// A wash of `window_bg` at this alpha over the worst case (a pure-white backdrop, 255) lands the
+/// composite at gray 51 or darker, which is what `text_primary` needs for its 12:1 floor; that is
+/// the tightest of the three floors and therefore the binding one. The blur still shows through
+/// at the remainder, which is what keeps the material distinct from `opaque`.
+pub(crate) const FROST_WASH_ALPHA: u32 = 0xE9;
 
 /// NSVisualEffectMaterial constants (raw AppKit values). The frost material follows the
 /// resolved theme: the HUD material reads as the system's dark floating panel, the
@@ -101,7 +116,7 @@ unsafe fn build_backdrop(
                 "clear" => 1,
                 _ => 0,
             };
-            let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
+            let tint_hex = resolved_glass_tint_hex();
             let tint = hex_to_ns_color(tint_hex);
             let _: () = msg_send![glass, setStyle: style];
             let _: () = msg_send![glass, setTintColor: tint];
@@ -177,6 +192,20 @@ unsafe fn build_backdrop(
                 let _: () = msg_send![effect, setMaskImage: mask];
                 release_obj(mask);
             }
+            // The theme-surface wash: the blur alone leaves the panel far lighter than the
+            // palette assumes, so the surface is pinned back toward `window_bg`. Added before
+            // any panel content, so content still draws on top of it.
+            let wash: *mut AnyObject = msg_send![class!(NSView), alloc];
+            let wash: *mut AnyObject = msg_send![wash, initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(frame.size.width, frame.size.height)
+            )];
+            let _: () = msg_send![wash, setWantsLayer: true];
+            let _: () = msg_send![wash, setAutoresizingMask: 18u64];
+            let wash_layer: *mut AnyObject = msg_send![wash, layer];
+            set_frost_wash(wash_layer);
+            let _: () = msg_send![effect, addSubview: wash];
+            release_obj(wash);
             release_obj(effect);
             InstalledBackdrop {
                 material: PanelMaterial::Frost,
@@ -185,8 +214,8 @@ unsafe fn build_backdrop(
                 glass: None,
                 effect_view: Some(ObjPtr::new(effect)),
                 opaque_view: None,
-                compensation_view: None,
-                compensation_layer: None,
+                compensation_view: Some(ObjPtr::new(wash)),
+                compensation_layer: Some(ObjPtr::new(wash_layer)),
             }
         }
         PanelMaterial::Opaque => {
@@ -211,6 +240,95 @@ unsafe fn build_backdrop(
             }
         }
     }
+}
+
+/// The frost wash opacity in force. `--frost-wash=<0..255>` overrides it so the trade-off can be
+/// sampled on a running build without recompiling (development only; see `dev_flags`).
+pub(crate) fn frost_wash_alpha() -> u32 {
+    crate::dev_flags::value("frost-wash")
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|alpha| *alpha <= 0xFF)
+        .unwrap_or(FROST_WASH_ALPHA)
+}
+
+/// Lightness the theme imposes on the glass tint, and the least opaque it may be.
+///
+/// The tint is the user's *hue*, not their lightness: a fixed tint cannot serve both modes.
+/// `eeeeee66` (the historical default, a near-white at 40% alpha) leaves the dark surface at
+/// gray 110 and the light one at 186 -- below the palette's floors in *both* modes, because a
+/// mid-gray surface caps any text color at 5.71:1 while the table asks for 12:1.
+///
+/// Measured on the real panel (the tint's brightness is not the surface's: the glass darkens
+/// further), these land the dark surface at (31,31,31) -- matching `opaque`'s `window_bg` -- for
+/// 17.24/11.15/7.06:1, and the light surface at (249,249,249) for 13.21/8.34/5.25:1. Both clear
+/// every floor, so this is what the theme supplies; the user's hue and any higher alpha survive.
+const GLASS_TINT_DARK_BRIGHTNESS: f64 = 0.28;
+const GLASS_TINT_LIGHT_BRIGHTNESS: f64 = 1.0;
+const GLASS_TINT_DARK_MIN_ALPHA: u32 = 0x99;
+const GLASS_TINT_LIGHT_MIN_ALPHA: u32 = 0xCC;
+
+/// The glass tint actually installed: the configured hue and saturation, re-lit for the current
+/// mode, with an opacity floor so the surface cannot wash out. Pure, so the bounds are unit-tested.
+fn resolve_tint(configured: u32, dark: bool) -> u32 {
+    let alpha = configured & 0xFF;
+    let (hue, saturation) = rgb_to_hue_saturation(configured);
+    let brightness = if dark {
+        GLASS_TINT_DARK_BRIGHTNESS
+    } else {
+        GLASS_TINT_LIGHT_BRIGHTNESS
+    };
+    let floor = if dark {
+        GLASS_TINT_DARK_MIN_ALPHA
+    } else {
+        GLASS_TINT_LIGHT_MIN_ALPHA
+    };
+    hue_saturation_brightness_to_rgb(hue, saturation, brightness, alpha.max(floor))
+}
+
+/// Hue in 0..1 and saturation in 0..1 of a hex8 colour; brightness is deliberately discarded.
+fn rgb_to_hue_saturation(hex: u32) -> (f64, f64) {
+    let r = ((hex >> 24) & 0xFF) as f64 / 255.0;
+    let g = ((hex >> 16) & 0xFF) as f64 / 255.0;
+    let b = ((hex >> 8) & 0xFF) as f64 / 255.0;
+    let max = r.max(g).max(b);
+    let min = r.min(g).min(b);
+    let chroma = max - min;
+    if chroma <= f64::EPSILON {
+        return (0.0, 0.0);
+    }
+    let hue = if max == r {
+        ((g - b) / chroma).rem_euclid(6.0) / 6.0
+    } else if max == g {
+        (((b - r) / chroma) + 2.0) / 6.0
+    } else {
+        (((r - g) / chroma) + 4.0) / 6.0
+    };
+    (hue, chroma / max)
+}
+
+fn hue_saturation_brightness_to_rgb(hue: f64, saturation: f64, brightness: f64, alpha: u32) -> u32 {
+    let c = brightness * saturation;
+    let h = (hue.rem_euclid(1.0)) * 6.0;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let (r, g, b) = match h as u32 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let m = brightness - c;
+    let channel = |value: f64| ((value + m).clamp(0.0, 1.0) * 255.0).round() as u32;
+    (channel(r) << 24) | (channel(g) << 16) | (channel(b) << 8) | (alpha & 0xFF)
+}
+
+/// The tint the glass is actually given: the configured hue, re-lit for the current mode.
+pub(crate) fn resolved_glass_tint_hex() -> u32 {
+    resolve_tint(
+        crate::config::parse_hex8(&crate::config::effective_glass_tint()),
+        crate::theme::resolved_is_dark(),
+    )
 }
 
 pub(crate) fn frost_material() -> i64 {
@@ -324,7 +442,7 @@ pub(crate) unsafe fn apply_live_properties(
         "clear" => 1,
         _ => 0,
     };
-    let tint_hex = crate::config::parse_hex8(&crate::config::effective_glass_tint());
+    let tint_hex = resolved_glass_tint_hex();
     let tint = hex_to_ns_color(tint_hex);
     if let Some(glass) = backdrop.glass {
         let _: () = msg_send![glass.0, setStyle: style];
@@ -340,9 +458,22 @@ pub(crate) unsafe fn apply_live_properties(
             layer_set_background(layer, hex_to_cg_color(crate::theme::ui_palette().window_bg));
         }
     }
-    if let (Some(layer), Some(alpha)) = (backdrop.compensation_layer, compensation_alpha) {
-        set_compensation_tint(layer.0, tint_hex, alpha);
+    if let Some(layer) = backdrop.compensation_layer {
+        if backdrop.material == PanelMaterial::Frost {
+            // Frost's compensation is a theme-surface wash, not a glass tint.
+            set_frost_wash(layer.0);
+        } else if let Some(alpha) = compensation_alpha {
+            set_compensation_tint(layer.0, tint_hex, alpha);
+        }
     }
+}
+
+/// Paint the frost wash: the theme's window surface at `frost_wash_alpha`, so the composited
+/// surface tracks the palette instead of whatever the panel happens to cover.
+unsafe fn set_frost_wash(layer: *mut AnyObject) {
+    let window_bg = crate::theme::ui_palette().window_bg;
+    let alpha = frost_wash_alpha() & 0xFF;
+    layer_set_background(layer, hex_to_cg_color((window_bg & 0xFFFF_FF00) | alpha));
 }
 
 unsafe fn set_compensation_tint(layer: *mut AnyObject, tint_hex: u32, alpha: u32) {
@@ -352,7 +483,69 @@ unsafe fn set_compensation_tint(layer: *mut AnyObject, tint_hex: u32, alpha: u32
 
 #[cfg(test)]
 mod tests {
-    use super::PanelMaterial;
+    use super::{
+        resolve_tint, rgb_to_hue_saturation, PanelMaterial, GLASS_TINT_DARK_MIN_ALPHA,
+        GLASS_TINT_LIGHT_MIN_ALPHA,
+    };
+
+    fn brightness_of(hex: u32) -> f64 {
+        let r = ((hex >> 24) & 0xFF) as f64 / 255.0;
+        let g = ((hex >> 16) & 0xFF) as f64 / 255.0;
+        let b = ((hex >> 8) & 0xFF) as f64 / 255.0;
+        r.max(g).max(b)
+    }
+
+    /// The tint must not decide lightness: a tint that is far too light for dark mode (or too
+    /// dark for light mode) has to be re-lit into the range the palette's contrast table assumes,
+    /// while keeping the hue the user picked. Measured on the real panel, a tint resolved this
+    /// way lands the dark surface at (30,30,31) and the light one at (249,249,249) -- both clear
+    /// every floor in design-style §3.3, which the historical `eeeeee66` default did not in
+    /// either mode.
+    #[test]
+    fn the_glass_tint_is_relit_for_the_mode_and_keeps_its_hue() {
+        let configured = 0xEEEE_EE66; // the historical default: near-white at 40%
+        let dark = resolve_tint(configured, true);
+        let light = resolve_tint(configured, false);
+
+        // Lightness comes from the mode, not the tint: both modes re-light the same near-white
+        // input, and the neutral input stays neutral.
+        assert_eq!(
+            rgb_to_hue_saturation(dark).1,
+            0.0,
+            "a neutral tint stays neutral"
+        );
+        assert_eq!(rgb_to_hue_saturation(light).1, 0.0);
+        assert!(
+            brightness_of(dark) < brightness_of(light),
+            "dark mode must resolve darker than light mode"
+        );
+        assert!(
+            (brightness_of(dark) - 0.28).abs() < 0.01 && (brightness_of(light) - 1.0).abs() < 0.01,
+            "each mode must resolve to its target brightness"
+        );
+
+        // Opacity floors: below these the blurred backdrop shows through enough to wash the
+        // surface out, which is what made both modes fail.
+        assert!((dark & 0xFF) >= GLASS_TINT_DARK_MIN_ALPHA);
+        assert!((light & 0xFF) >= GLASS_TINT_LIGHT_MIN_ALPHA);
+
+        // Hue survives: a blue tint stays blue in both modes.
+        let blue = 0x2A6BFFAA;
+        let (configured_hue, _) = rgb_to_hue_saturation(blue);
+        for dark_mode in [true, false] {
+            let resolved = resolve_tint(blue, dark_mode);
+            let (hue, saturation) = rgb_to_hue_saturation(resolved);
+            assert!(
+                (hue - configured_hue).abs() < 0.02,
+                "hue must survive re-lighting: {hue} vs {configured_hue}"
+            );
+            assert!(saturation > 0.5, "a saturated tint must stay saturated");
+        }
+
+        // A user alpha above the floor is respected rather than lowered.
+        let opaque = resolve_tint(0xEEEE_EEFF, true);
+        assert_eq!(opaque & 0xFF, 0xFF);
+    }
 
     #[test]
     fn material_ids_map_to_panel_materials() {

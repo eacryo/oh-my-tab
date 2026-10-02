@@ -85,6 +85,17 @@ pub(crate) fn smoke_runner() -> bool {
     hide_picker();
     // Second show: rebuild_rows removes the old rows first (the former UAF path).
     show_picker();
+    // An active detail icon is a filled chip, so its glyph has to be readable *against its own
+    // fill*. Measured on the pixels rather than on the tokens, because the failure was a wrong
+    // role: the fill was `primary_text` while the glyph stayed `accent_text`, which is 13.91:1 in
+    // light mode but 1.09:1 in dark mode, where the icon became a blank white disc.
+    unsafe {
+        assert!(
+            active_detail_icon_glyph_is_legible_on_its_fill(),
+            "an active detail icon must draw its glyph on its own fill"
+        );
+    }
+
     // Footer shortcut legends must survive the fonts they are drawn with, in every shipped
     // locale: a label whose frame was sized for a smaller font than the one it renders with
     // wraps out of its one-line-high field and silently loses its tail.
@@ -566,4 +577,115 @@ unsafe fn make_key_event_with_modifiers(keycode: u16, modifiers: u64) -> *mut An
     ];
     CFRelease(chars as *const c_void);
     ev
+}
+
+/// Rasterise an active detail icon and verify its two halves: the chip is filled with the accent
+/// and its glyph is drawn in `accent_text` over it. Reading the pixels catches a mismatched role
+/// (a fill the glyph cannot be seen against), which a token-level check cannot express.
+unsafe fn active_detail_icon_glyph_is_legible_on_its_fill() -> bool {
+    // Both appearances, not just the one this process resolves to: the defect was dark-only.
+    let mut ok = true;
+    for dark in [false, true] {
+        if !active_detail_icon_glyph_is_legible_for_mode(dark) {
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// Render an active detail icon and require its glyph to be legible *against its own fill*.
+///
+/// Measured from the pixels because the defect was a wrong role: the chip was filled with
+/// `primary_text` while the glyph stayed `accent_text`. In light mode that is a dark chip with a
+/// white glyph (13.91:1, fine), but dark `primary_text` is near-white, so the glyph measured
+/// 1.09:1 and the icon showed as a blank disc. A token-level check cannot express "these two
+/// roles are readable together"; the dominant colour is the fill, and the glyph is whatever
+/// other colour the drawing put on top of it.
+unsafe fn active_detail_icon_glyph_is_legible_for_mode(dark: bool) -> bool {
+    // The floor for a non-text indicator (design-style §3.3).
+    const MIN_GLYPH_CONTRAST: f64 = 3.0;
+    let image = super::text_style::make_detail_action_icon_for_mode(dark, true, false);
+    if image.is_null() {
+        return false;
+    }
+    let tiff: *mut AnyObject = msg_send![image, TIFFRepresentation];
+    if tiff.is_null() {
+        release_obj(image);
+        return false;
+    }
+    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), alloc];
+    let rep: *mut AnyObject = msg_send![rep, initWithData: tiff];
+    if rep.is_null() {
+        release_obj(image);
+        return false;
+    }
+    let width: usize = msg_send![rep, pixelsWide];
+    let height: usize = msg_send![rep, pixelsHigh];
+    let mut histogram: Vec<([f64; 3], usize)> = Vec::new();
+    for y in 0..height {
+        for x in 0..width {
+            let color: *mut AnyObject = msg_send![rep, colorAtX: x, y: y];
+            if color.is_null() {
+                continue;
+            }
+            let alpha: f64 = msg_send![color, alphaComponent];
+            if alpha < 0.9 {
+                continue;
+            }
+            let rgb: [f64; 3] = [
+                msg_send![color, redComponent],
+                msg_send![color, greenComponent],
+                msg_send![color, blueComponent],
+            ];
+            let mut bucket: Option<usize> = None;
+            for (index, (existing, _)) in histogram.iter().enumerate() {
+                if (0..3usize).all(|channel| (existing[channel] - rgb[channel]).abs() < 0.04) {
+                    bucket = Some(index);
+                    break;
+                }
+            }
+            match bucket {
+                Some(index) => histogram[index].1 += 1,
+                None => histogram.push((rgb, 1)),
+            }
+        }
+    }
+    release_obj(rep);
+    release_obj(image);
+    let Some((fill, fill_count)) = histogram.iter().max_by_key(|(_, count)| *count).cloned() else {
+        return false;
+    };
+    if fill_count < 20 {
+        eprintln!(
+            "[smoke-clipboard] active detail icon has no filled chip in {} mode",
+            if dark { "dark" } else { "light" }
+        );
+        return false;
+    }
+    // The glyph is the most prominent *other* colour: a solid disc with no visible glyph fails.
+    let glyph = histogram
+        .iter()
+        .filter(|(rgb, count)| *count >= 4 && (0..3usize).any(|c| (rgb[c] - fill[c]).abs() > 0.04))
+        .max_by(|(a, _), (b, _)| {
+            let ca = crate::theme::contrast_ratio_srgb(*a, fill);
+            let cb = crate::theme::contrast_ratio_srgb(*b, fill);
+            ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
+        })
+        .cloned();
+    let Some((glyph, _)) = glyph else {
+        eprintln!(
+            "[smoke-clipboard] active detail icon is a blank disc in {} mode",
+            if dark { "dark" } else { "light" }
+        );
+        return false;
+    };
+    let contrast = crate::theme::contrast_ratio_srgb(glyph, fill);
+    if contrast < MIN_GLYPH_CONTRAST {
+        eprintln!(
+            "[smoke-clipboard] active detail icon glyph measures {contrast:.2}:1 on its own fill in {} mode (min {MIN_GLYPH_CONTRAST})",
+            if dark { "dark" } else { "light" }
+        );
+        return false;
+    }
+    true
 }

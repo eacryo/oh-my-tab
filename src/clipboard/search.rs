@@ -147,7 +147,8 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
             alpha: 0.85f64
         ]
     } else {
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.42f64]
+        // An interactive affordance in the field, so a palette token rather than a literal black.
+        crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text)
     };
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];

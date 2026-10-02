@@ -332,7 +332,26 @@ pub(super) fn detail_action_is_active(detail_visible: bool, selected: usize, row
 /// Draw the mockup's detail icon: a dark outlined circle plus i normally, or a dark filled
 /// circle plus white i while active. Use a precolored NSImage instead of Unicode `ⓘ` so the
 /// ring, dot, and stem follow the mockup independently.
-unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject {
+pub(super) unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject {
+    make_detail_action_icon_with(clipboard_palette(), active, hovered)
+}
+
+/// The icon for an explicit palette, so both appearances can be rendered and checked in one run.
+/// The failure this guards is mode-specific (dark mode only), and a test that only renders the
+/// mode it happens to run in would miss it -- exactly how the bug reached the screen.
+pub(super) unsafe fn make_detail_action_icon_for_mode(
+    dark: bool,
+    active: bool,
+    hovered: bool,
+) -> *mut AnyObject {
+    make_detail_action_icon_with(crate::theme::ui_palette_for_mode(dark), active, hovered)
+}
+
+unsafe fn make_detail_action_icon_with(
+    palette: crate::theme::UiPalette,
+    active: bool,
+    hovered: bool,
+) -> *mut AnyObject {
     let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
     let image: *mut AnyObject = msg_send![
         image,
@@ -349,13 +368,21 @@ unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject
         )
     ];
     // Match the pin/delete buttons' theme text colors: secondary normally, primary on hover/active.
-    let palette = clipboard_palette();
     let icon_color = if active || hovered {
         palette.primary_text
     } else {
         palette.secondary_text
     };
-    let circle_color = crate::ffi::hex_to_ns_color(icon_color);
+    // An active icon is a *filled* chip, so both halves of that pair have to be chosen together:
+    // the accent fill with `accent_text` on top (design-style §3.1). The fill used to be
+    // `primary_text` while the glyph stayed `accent_text` -- 13.91:1 in light mode but, because
+    // dark `primary_text` is near-white, 1.09:1 in dark mode, where the icon read as a blank disc.
+    let (circle_role, glyph_role) = if active {
+        (palette.accent, palette.accent_text)
+    } else {
+        (icon_color, icon_color)
+    };
+    let circle_color = crate::ffi::hex_to_ns_color(circle_role);
     let _: () = msg_send![circle_color, set];
     // Slightly strengthen the ring so its optical weight better matches the neighboring system glyphs.
     let _: () = msg_send![circle, setLineWidth: 1.25f64];
@@ -363,11 +390,7 @@ unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject
         let _: () = msg_send![circle, fill];
     }
     let _: () = msg_send![circle, stroke];
-    let glyph_color: *mut AnyObject = if active {
-        msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: 0.96f64]
-    } else {
-        crate::ffi::hex_to_ns_color(icon_color)
-    };
+    let glyph_color = crate::ffi::hex_to_ns_color(glyph_role);
     let _: () = msg_send![glyph_color, set];
     // Coordinates convert the SVG view's flipped axis: the dot is above the stem.
     let dot: *mut AnyObject = msg_send![
@@ -445,7 +468,7 @@ pub(super) unsafe fn set_clear_confirmation_button_style(button: *mut AnyObject,
     let _: () = msg_send![button, setContentTintColor: crate::ffi::hex_to_ns_color(text)];
 }
 
-unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: bool) {
+pub(super) unsafe fn set_action_button_surface(button: *mut AnyObject, hovered: bool) {
     if button.is_null() {
         return;
     }
@@ -541,13 +564,19 @@ pub(super) unsafe fn hover_button_class() -> *mut AnyObject {
         .0 as *mut AnyObject
 }
 
-unsafe fn set_detail_share_style(button: *mut AnyObject, tint_alpha: f64, bg_alpha: u32) {
+/// The save-as button's hover/pressed state.
+///
+/// It follows its sibling icon buttons exactly: the glyph is `secondary_text` normally and
+/// `primary_text` when engaged, and the surface is the shared `hover_bg`. It previously took a
+/// scalar alpha on a literal black plus a literal black fill, which made the glyph 4.3x fainter
+/// than its neighbours (2.33:1 against 10.10:1) and left hover feedback invisible in dark mode
+/// (a 5% black fill over the dark panel measures 1.01:1).
+unsafe fn set_detail_share_style(button: *mut AnyObject, engaged: bool) {
     // A non-template NSImage ignores contentTintColor, so replace the 18pt icon for each state.
-    let icon = make_detail_save_icon(tint_alpha);
+    let icon = make_detail_save_icon(engaged);
     let _: () = msg_send![button, setImage: icon];
     release_obj(icon);
-    let layer: *mut AnyObject = msg_send![button, layer];
-    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(bg_alpha));
+    set_action_button_surface(button, engaged);
 }
 
 /// Hover enter: color by action (the mockup's .action:hover / .clear-history:hover /
@@ -561,8 +590,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
             return;
         }
         if action == sel!(detailSaveAs:) {
-            // HTML .icon-button:hover: 68% icon tint with a 5% black fill.
-            set_detail_share_style(b, 0.68, 0x0000000D);
+            set_detail_share_style(b, true);
             return;
         }
         if action == sel!(showItemDetails:) {
@@ -619,7 +647,7 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
             }
         }
         if action == sel!(detailSaveAs:) {
-            set_detail_share_style(b, 0.34, 0x00000000);
+            set_detail_share_style(b, false);
             return;
         }
         if action == sel!(filterPillClicked:) {
@@ -674,7 +702,7 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *m
         let button = _self as *mut AnyObject;
         let action: Sel = msg_send![button, action];
         if action == sel!(detailSaveAs:) {
-            set_detail_share_style(button, 0.68, 0x00000013);
+            set_detail_share_style(button, true);
         }
 
         type MouseDown = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void);
@@ -686,7 +714,7 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *m
         call(&mut sup, sel!(mouseDown:), event);
 
         if action == sel!(detailSaveAs:) {
-            set_detail_share_style(button, 0.68, 0x0000000D);
+            set_detail_share_style(button, true);
         }
     }
 }

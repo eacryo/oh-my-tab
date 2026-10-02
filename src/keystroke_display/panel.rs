@@ -1326,10 +1326,26 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         let is_effect: bool = msg_send![effect.0, isKindOfClass: effect_class];
         let effect_layer: *mut AnyObject = msg_send![effect.0, layer];
         let radius: f64 = msg_send![effect_layer, cornerRadius];
+        // Frost must carry the theme-surface wash, and it must sit *under* the panel content:
+        // without it the translucent blur leaves the surface far lighter than the palette
+        // assumes and the text falls below every contrast floor (design-style §3.4).
+        let Some(wash) = backdrop.compensation_view else {
+            return false;
+        };
+        let wash_is_under_content = {
+            let subviews: *mut AnyObject = msg_send![effect.0, subviews];
+            let count: usize = msg_send![subviews, count];
+            (0..count).any(|index| {
+                let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+                view == wash.0
+            })
+        };
         // Every material now installs its root view as the window's content view directly.
         is_effect
             && effect.0 == root
             && view_contains_subview(effect.0, badge_container)
+            && wash_is_under_content
+            && !wash.0.is_null()
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
     } else if let Some(plain) = backdrop.opaque_view {
         let plain_layer: *mut AnyObject = msg_send![plain.0, layer];

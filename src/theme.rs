@@ -114,6 +114,15 @@ fn relative_luminance(rgb: [f64; 3]) -> f64 {
         + 0.0722 * linear_channel(rgb[2])
 }
 
+/// Contrast ratio between two colours given as 0..1 components, in whatever space they were
+/// sampled from. The clipboard smoke reads rendered pixels, which are not in sRGB, so it compares
+/// two sampled colours with each other rather than against a token.
+pub(crate) fn contrast_ratio_srgb(a: [f64; 3], b: [f64; 3]) -> f64 {
+    let luminance = |c: [f64; 3]| relative_luminance([c[0] * 255.0, c[1] * 255.0, c[2] * 255.0]);
+    let (x, y) = (luminance(a), luminance(b));
+    (x.max(y) + 0.05) / (x.min(y) + 0.05)
+}
+
 /// WCAG contrast ratio between two already-composited (post-alpha) colors. Shared with the
 /// clipboard smoke runner, which measures legend text against the surface it is drawn on.
 pub(crate) fn contrast_ratio(foreground: [f64; 3], background: [f64; 3]) -> f64 {
@@ -165,6 +174,10 @@ pub(crate) struct UiPalette {
     pub(crate) secondary_text: u32,
     pub(crate) sidebar_text: u32,
     pub(crate) muted_text: u32,
+    /// The custom scrollbar knob. A translucent neutral that must stay on the visible side of the
+    /// surface in both modes: dark over a light panel, light over a dark one. A fixed black knob
+    /// (as this once was) is invisible in dark mode.
+    pub(crate) scroll_indicator: u32,
     pub(crate) disabled_text: u32,
     pub(crate) success_text: u32,
     pub(crate) warning_text: u32,
@@ -211,6 +224,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             secondary_text: 0xC7C7CCFF,
             sidebar_text: 0x9E9EA6FF,
             muted_text: 0x9E9EA6FF,
+            scroll_indicator: 0xFFFFFF59,
             disabled_text: 0x7C7C84FF,
             success_text: 0x30D158FF,
             warning_text: 0xFF9F0AFF,
@@ -252,6 +266,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             secondary_text: 0x4A4A52FF,
             sidebar_text: 0x68686FFF,
             muted_text: 0x68686FFF,
+            scroll_indicator: 0x00000059,
             disabled_text: 0x9B9BA2FF,
             success_text: 0x176B3AFF,
             warning_text: 0xA63D0AFF,
@@ -1773,6 +1788,81 @@ mod tests {
     fn preview_stage_is_visibly_distinct_in_both_palettes() {
         assert!(settings_preview_contrast(ui_palette_for_mode(false)) >= 3.0);
         assert!(settings_preview_contrast(ui_palette_for_mode(true)) >= 3.0);
+    }
+
+    /// Hover and selection fills must be visible against the surface in both modes. They are
+    /// translucent washes, so a literal that only suits one mode disappears in the other: the
+    /// detail panel's save-as button filled its hover state with black at 5%, which measures
+    /// 1.01:1 against the dark panel -- no feedback at all. `hover_bg` is the shared token for
+    /// that surface, so its visibility is asserted here.
+    #[test]
+    fn hover_and_selection_fills_are_visible_against_the_surface_in_both_modes() {
+        // Deliberately low: the palette's own washes range from 1.097:1 (light selection) to
+        // 1.343:1 (dark hover), so this floor only rules out a fill that is *effectively
+        // invisible* -- the black-at-5% literal measured 1.015:1 -- without rejecting the
+        // documented tokens.
+        const MIN_FILL_CONTRAST: f64 = 1.05;
+        for dark in [false, true] {
+            let palette = ui_palette_for_mode(dark);
+            let surface = color_rgb(palette.window_bg);
+            for (role, token) in [
+                ("hover_bg", palette.hover_bg),
+                ("selection_bg", palette.selection_bg),
+            ] {
+                let fill = composite_rgb(token, palette.window_bg);
+                let contrast = contrast_ratio(fill, surface);
+                assert!(
+                    contrast >= MIN_FILL_CONTRAST,
+                    "{role} measures {contrast:.2}:1 on the {} surface (min {MIN_FILL_CONTRAST})",
+                    if dark { "dark" } else { "light" }
+                );
+                // And it must move the surface toward the text it sits under, i.e. be a visible
+                // change rather than a no-op.
+                assert!(
+                    (fill[0] - surface[0]).abs()
+                        + (fill[1] - surface[1]).abs()
+                        + (fill[2] - surface[2]).abs()
+                        > 4.0,
+                    "{role} does not visibly change the {} surface",
+                    if dark { "dark" } else { "light" }
+                );
+            }
+        }
+    }
+
+    /// The custom scrollbar knob must sit on the visible side of the panel surface in both modes:
+    /// darker than a light panel, lighter than a dark one. It was a fixed black at 35% alpha, which
+    /// is invisible against the dark panel (#1C1C1E) while looking correct in light mode -- the
+    /// error only showed in one mode, so both are asserted.
+    #[test]
+    fn the_scroll_indicator_stays_visible_against_the_panel_in_both_modes() {
+        // A knob this faint is still the accepted look (it matches the native overlay scroller),
+        // so the floor is deliberately modest; the point is the *side*, not a large ratio.
+        const MIN_INDICATOR_CONTRAST: f64 = 2.0;
+        for dark in [false, true] {
+            let palette = ui_palette_for_mode(dark);
+            let surface = color_rgb(palette.window_bg);
+            let knob = composite_rgb(palette.scroll_indicator, palette.window_bg);
+            let contrast = contrast_ratio(knob, surface);
+            assert!(
+                contrast >= MIN_INDICATOR_CONTRAST,
+                "scroll indicator measures {contrast:.2}:1 in {} mode (min {MIN_INDICATOR_CONTRAST})",
+                if dark { "dark" } else { "light" }
+            );
+            let knob_luma = relative_luminance(knob);
+            let surface_luma = relative_luminance(surface);
+            if dark {
+                assert!(
+                    knob_luma > surface_luma,
+                    "in dark mode the knob must be lighter than the panel"
+                );
+            } else {
+                assert!(
+                    knob_luma < surface_luma,
+                    "in light mode the knob must be darker than the panel"
+                );
+            }
+        }
     }
 
     /// The clipboard footer's shortcut legends draw their text with palette tokens over a glass

@@ -75,6 +75,7 @@ auxiliary panels). Never inline a hex value in a view builder.
 | `text_secondary` | `#4A4A52` | `#C7C7CC` | Section headers, descriptions, links' labels |
 | `text_muted` | `#68686F` | `#9E9EA6` | Version strings, subtitles, empty-state text |
 | `text_disabled` | `#9B9BA2` | `#7C7C84` | Disabled control labels |
+| `scroll_indicator` | `rgba(0,0,0,.35)` | `rgba(255,255,255,.35)` | Custom scrollbar knobs |
 | `accent` | `#0A84FF` | `#0A84FF` | Switches, sliders, primary action, selection ring |
 | `accent_hover` | `#0077ED` | `#3D9BFF` | Pressed/hover state of the accent |
 | `destructive` | `#FF3B30` | `#FF453A` | Destructive actions and destructive-confirmation UI |
@@ -129,6 +130,11 @@ Measured with the composited (post-alpha) color against the surface the element 
 `text_primary` has the smallest margin in the palette. Re-measure it whenever the primary color or
 `window_bg` changes; do not darken it for its own sake.
 
+`scroll_indicator` carries no meaning on its own, so it is not held to a text floor, but it must
+stay on the visible side of the surface in both modes: darker than a light panel, lighter than a
+dark one. A knob fixed to one mode's neutral is invisible in the other (a black knob measures
+1.10:1 against the dark `window_bg`).
+
 **Non-text**
 
 Two clauses, because they answer different questions.
@@ -169,11 +175,25 @@ The floating panels (switcher, clipboard, keystroke display) offer three materia
 | Material | Surface | Notes |
 | --- | --- | --- |
 | `liquid-glass` (default) | `NSGlassEffectView`, `glass_style`/`glass_tint` sub-options | Degrades to frost on macOS < 26 |
-| `frost` | `NSVisualEffectView`, behind-window, themed material | Neutral system blur; the glass sub-options do not apply |
+| `frost` | `NSVisualEffectView`, behind-window, themed material, plus the theme-surface wash below | Neutral system blur; the glass sub-options do not apply |
 | `opaque` | `window_bg` fill, no blur | Also the forced fallback while the system's Reduce Transparency accessibility setting is on |
 
 Material only ever changes which surface sits behind the panel content — text colors, spacing,
 radius, and the palette remain exactly as specified here.
+
+**A translucent surface must be held to that.** Both blurring materials drift toward mid gray on
+their own: measured in dark mode, plain frost landed at `#868585` and liquid glass at `#6E6E6E`,
+against the `#1C1C1E` the palette assumes, which drops `text_primary`/`text_secondary`/`text_muted`
+from 15.63/10.10/6.40:1 to 3.38/2.18/1.38:1 and 4.68/3.03/1.92:1. No text color rescues a mid-gray
+surface — the best any single color achieves there is 5.71:1, under this table's own 12:1 and 7:1
+floors — so the **surface** is what gets pinned:
+
+- `frost` composites `window_bg` over the blur at an opacity that keeps the worst case legible
+  (a white backdrop still lands at gray 51 or darker).
+- `liquid-glass` takes **hue and saturation only** from `glass_tint`; lightness comes from the
+  theme and opacity has a floor, so a near-white tint is still a dark glass in dark mode. The
+  historical `eeeeee66` default was a light-mode value that also failed in light mode (7.17:1),
+  which is why the tint no longer decides lightness in either mode.
 
 ## 4. Typography
 

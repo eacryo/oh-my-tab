@@ -1109,7 +1109,9 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
     )];
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.5f64];
+    // A control's label, so it follows the theme instead of a literal black that vanishes on the
+    // dark panel.
+    let color = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
@@ -1120,10 +1122,19 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
 
 /// Draw the save-as icon (download into a tray): a downward arrow plus a bottom tray,
 /// stroked with the same parameters as the other toolbar buttons -- no SF Symbol variant.
-pub(super) unsafe fn make_detail_save_icon(alpha: f64) -> *mut AnyObject {
+pub(super) unsafe fn make_detail_save_icon(engaged: bool) -> *mut AnyObject {
     let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
     let image: *mut AnyObject = msg_send![image, initWithSize: NSSize::new(18.0, 18.0)];
-    let color: *mut AnyObject = msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: alpha];
+    // Same role convention as its sibling icon buttons: secondary normally, primary when engaged.
+    // A literal black (or an alpha on it) cannot invert, which left this glyph both too faint and
+    // invisible in dark mode.
+    let palette = clipboard_palette();
+    let role = if engaged {
+        palette.primary_text
+    } else {
+        palette.secondary_text
+    };
+    let color = crate::ffi::hex_to_ns_color(role);
     let _: () = msg_send![image, lockFocus];
     let _: () = msg_send![color, set];
 
@@ -1180,7 +1191,7 @@ unsafe fn add_detail_save_as_button(content: *mut AnyObject, width: f64, is_imag
     let _: () = msg_send![button, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![button, layer];
     let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
-    let icon = make_detail_save_icon(0.34);
+    let icon = make_detail_save_icon(false);
     let _: () = msg_send![button, setImage: icon];
     let _: () = msg_send![button, setImagePosition: 1u64]; // NSImageOnly
     release_obj(icon);
@@ -1283,8 +1294,8 @@ unsafe fn add_detail_chrome(
         )];
         let font: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-        let color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.30f64];
+        // Same role as the source line next to it, which already uses `muted_text`.
+        let color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
         let _: () = msg_send![stats, setFont: font];
         let _: () = msg_send![stats, setTextColor: color];
         let _: () = msg_send![stats, setAlignment: 2isize]; // NSTextAlignmentRight
@@ -1620,43 +1631,50 @@ struct SoftWrapGlyphs {
     continuation_size: NSSize,
 }
 
-/// Create the soft-wrap glyphs once; drawRect can run frequently, so it must not copy large text
-/// or rebuild attributed strings on every repaint.
+/// The soft-wrap glyphs for the current appearance. Cached per mode: `drawRect` can run
+/// frequently, so it must not rebuild attributed strings on every repaint, but a single cache
+/// would keep the colour it was first built with and go stale on a light/dark switch (the detail
+/// panel is long-lived).
 unsafe fn soft_wrap_glyphs() -> &'static SoftWrapGlyphs {
-    static GLYPHS: OnceLock<SoftWrapGlyphs> = OnceLock::new();
-    GLYPHS.get_or_init(|| {
-        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-        let attrs: *mut AnyObject = msg_send![attrs, init];
-        let font_key = make_nsstring("NSFont");
-        let color_key = make_nsstring("NSColor");
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_REGULAR];
-        let color: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.36f64];
-        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-        let _: () = msg_send![attrs, setObject: color, forKey: color_key];
-        CFRelease(font_key as *const c_void);
-        CFRelease(color_key as *const c_void);
-        let end_ns = make_nsstring("↵");
-        let end: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let end: *mut AnyObject = msg_send![end, initWithString: end_ns, attributes: attrs];
-        CFRelease(end_ns as *const c_void);
-        let continuation_ns = make_nsstring("↪");
-        let continuation: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let continuation: *mut AnyObject = msg_send![
-            continuation,
-            initWithString: continuation_ns,
-            attributes: attrs
-        ];
-        CFRelease(continuation_ns as *const c_void);
-        release_obj(attrs);
-        SoftWrapGlyphs {
-            end: CallbackTarget::new(end),
-            continuation: CallbackTarget::new(continuation),
-            end_size: msg_send![end, size],
-            continuation_size: msg_send![continuation, size],
-        }
-    })
+    static LIGHT: OnceLock<SoftWrapGlyphs> = OnceLock::new();
+    static DARK: OnceLock<SoftWrapGlyphs> = OnceLock::new();
+    let dark = crate::theme::resolved_is_dark();
+    let cache = if dark { &DARK } else { &LIGHT };
+    cache.get_or_init(|| build_soft_wrap_glyphs(dark))
+}
+
+unsafe fn build_soft_wrap_glyphs(dark: bool) -> SoftWrapGlyphs {
+    let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attrs: *mut AnyObject = msg_send![attrs, init];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let font: *mut AnyObject = msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_REGULAR];
+    // An annotation mark, so muted; the palette is passed in so the two caches cannot be
+    // built from a mode other than the one that keyed them.
+    let color = crate::ffi::hex_to_ns_color(crate::theme::ui_palette_for_mode(dark).muted_text);
+    let _: () = msg_send![attrs, setObject: font, forKey: font_key];
+    let _: () = msg_send![attrs, setObject: color, forKey: color_key];
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    let end_ns = make_nsstring("↵");
+    let end: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let end: *mut AnyObject = msg_send![end, initWithString: end_ns, attributes: attrs];
+    CFRelease(end_ns as *const c_void);
+    let continuation_ns = make_nsstring("↪");
+    let continuation: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let continuation: *mut AnyObject = msg_send![
+        continuation,
+        initWithString: continuation_ns,
+        attributes: attrs
+    ];
+    CFRelease(continuation_ns as *const c_void);
+    release_obj(attrs);
+    SoftWrapGlyphs {
+        end: CallbackTarget::new(end),
+        continuation: CallbackTarget::new(continuation),
+        end_size: msg_send![end, size],
+        continuation_size: msg_send![continuation, size],
+    }
 }
 
 /// Draw soft-wrap markers after NSTextView finishes, reading layout results without modifying

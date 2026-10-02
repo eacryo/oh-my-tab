@@ -515,14 +515,16 @@ pub(super) unsafe fn update_scroll_indicator_visual(
     };
     let visual_layer: *mut AnyObject = if count == 0 {
         let visual: *mut AnyObject = msg_send![class!(CALayer), layer];
-        let ind_bg: *mut AnyObject =
-            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: 0.35f64];
-        crate::ffi::layer_set_background(visual, crate::ffi::ns_color_to_cg(ind_bg));
         let _: () = msg_send![parent_layer, addSublayer: visual];
         visual
     } else {
         msg_send![sublayers, objectAtIndex: 0usize]
     };
+    // Repaint on every update rather than only at creation: the knob has to follow a light/dark
+    // switch and this layer outlives it. The colour is a palette token, not a fixed black -- a
+    // black knob is invisible against the dark panel.
+    let ind_bg = crate::ffi::hex_to_ns_color(crate::theme::ui_palette().scroll_indicator);
+    crate::ffi::layer_set_background(visual_layer, crate::ffi::ns_color_to_cg(ind_bg));
     let frame = if horizontal {
         NSRect::new(
             NSPoint::new(0.0, (SCROLL_INDICATOR_HIT_W - SCROLL_INDICATOR_W) / 2.0),
