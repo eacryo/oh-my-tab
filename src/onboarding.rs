@@ -583,12 +583,26 @@ unsafe fn add_label(
         let _: () = msg_send![cell, setUsesSingleLineMode: false];
         let _: () = msg_send![field, setUsesSingleLineMode: false];
         let _: () = msg_send![field, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        crate::ffi::set_text_field_line_height(
+            field,
+            crate::theme::line_height(style.size, wrapped_line_height_ratio(style.size)),
+        );
     } else {
         let _: () = msg_send![field, setUsesSingleLineMode: true];
         let _: () = msg_send![field, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     }
     let _: () = msg_send![content, addSubview: field];
     release_obj(field);
+}
+
+fn wrapped_line_height_ratio(font_size: f64) -> f64 {
+    if font_size <= crate::theme::FONT_CAPTION {
+        crate::theme::LINE_HEIGHT_CAPTION_RATIO
+    } else if font_size >= crate::theme::FONT_PAGE_TITLE {
+        crate::theme::LINE_HEIGHT_TITLE_RATIO
+    } else {
+        crate::theme::LINE_HEIGHT_BODY_RATIO
+    }
 }
 
 unsafe fn add_menu_icon_label(
@@ -1808,8 +1822,11 @@ const STATUS_ROW_Y: f64 = 104.0;
 const STATUS_LABEL_W: f64 = 160.0;
 const STATUS_COLUMN_GAP: f64 = 8.0;
 const STATUS_COLUMN_W: f64 = 160.0;
-/// Wrapped body copy reserves three 20pt lines; the former 46pt frames clipped English text.
-const BODY_LINE_H: f64 = 20.0;
+/// Wrapped body copy reserves three 19.6pt lines; the former 46pt frames clipped English text.
+const BODY_LINE_H: f64 = crate::theme::line_height(
+    crate::theme::FONT_CONTROL,
+    crate::theme::LINE_HEIGHT_BODY_RATIO,
+);
 const PERMISSIONS_BODY_Y: f64 = 132.0;
 const PERMISSIONS_BODY_H: f64 = 3.0 * BODY_LINE_H + 4.0;
 const DISPLAY_BODY_Y: f64 = 136.0;
@@ -1935,8 +1952,24 @@ mod tests {
                 palette.warning_text
             );
         }
-        assert_eq!(BODY_LINE_H, 20.0);
+        assert!((BODY_LINE_H - 19.6).abs() < f64::EPSILON * 128.0);
         assert_eq!(STEP_TITLE_Y % 4.0, 0.0);
+    }
+
+    #[test]
+    fn wrapped_line_height_ratio_tracks_caption_body_and_title_roles() {
+        assert_eq!(
+            wrapped_line_height_ratio(crate::theme::FONT_CAPTION),
+            crate::theme::LINE_HEIGHT_CAPTION_RATIO
+        );
+        assert_eq!(
+            wrapped_line_height_ratio(crate::theme::FONT_CONTROL),
+            crate::theme::LINE_HEIGHT_BODY_RATIO
+        );
+        assert_eq!(
+            wrapped_line_height_ratio(crate::theme::FONT_PAGE_TITLE),
+            crate::theme::LINE_HEIGHT_TITLE_RATIO
+        );
     }
 
     #[test]

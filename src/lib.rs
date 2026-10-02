@@ -15,6 +15,7 @@ mod i18n;
 mod icon_cache;
 mod input_monitor;
 mod keystroke_display;
+mod language_tolerance;
 mod logger;
 mod mem;
 mod menu;
@@ -2256,6 +2257,7 @@ pub fn run() {
             || arg == "--smoke-settings-mouse-profile-callback"
             || arg == "--smoke-app-reopen"
             || arg == "--smoke-onboarding-live-apply"
+            || arg == "--smoke-update-prompts"
             || arg == "--smoke-smooth-scroll-event"
     });
     let _instance_guard = if is_gui_smoke_process {
@@ -2383,6 +2385,19 @@ pub fn run() {
     // standard updater UI and automatic checks; the About page reports a clear setup hint when
     // the framework is not present yet.
     updater::initialize(CONFIG.read().unwrap().updates.automatically_check);
+
+    if crate::dev_flags::present("smoke-update-prompts") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        if !updater::smoke_update_prompt_layouts() {
+            eprintln!("[smoke-update-prompts] one or more localized prompt buttons do not fit");
+            std::process::exit(1);
+        }
+        log_info!("[smoke-update-prompts] all update prompt stages fit in all locales");
+        std::process::exit(0);
+    }
 
     // Start bounded workers for post-activation AX focus queries so notification bursts do not
     // create large numbers of threads.

@@ -141,7 +141,10 @@ const ROW_H: f64 = 78.0;
 const META_FOOTER_H: f64 = 17.0;
 /// Detail body line height (a safe layout height for 14pt text), preventing NSTextView's
 /// actual line box from exceeding the estimate.
-const DETAIL_LINE_H: f64 = 18.0;
+const DETAIL_LINE_H: f64 = crate::theme::line_height(
+    crate::theme::FONT_CONTROL,
+    crate::theme::LINE_HEIGHT_BODY_RATIO,
+);
 /// NSTextView's vertical textContainerInset applies at both the top and bottom. Detail text
 /// reuses the list's 12pt top inset, so sizing must include both sides; otherwise exactly
 /// two lines overflow and incorrectly show a scrollbar.

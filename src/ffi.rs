@@ -74,6 +74,17 @@ extern "C" {
         buffer_size: isize,
         encoding: u32,
     ) -> bool;
+    pub(crate) fn CFStringGetLength(string: *const c_void) -> isize;
+    pub(crate) fn CFStringGetRangeOfComposedCharactersAtIndex(
+        string: *const c_void,
+        index: isize,
+    ) -> CFRange;
+    pub(crate) fn CFStringCreateWithSubstring(
+        alloc: *const c_void,
+        string: *const c_void,
+        range: CFRange,
+    ) -> *const c_void;
+    pub(crate) fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
     /// CFString value comparison: 0 when equal (kCFCompareEqualTo).
     pub(crate) fn CFStringCompare(a: *const c_void, b: *const c_void, options: usize) -> isize;
     pub(crate) fn CFUUIDCreateString(alloc: *const c_void, uuid: *const c_void) -> *const c_void;
@@ -88,6 +99,13 @@ extern "C" {
     pub(crate) fn CFRunLoopSourceSignal(src: *mut c_void);
     pub(crate) fn CFRunLoopRemoveSource(rl: *mut c_void, src: *mut c_void, mode: *const c_void);
     pub(crate) fn CFRunLoopWakeUp(rl: *mut c_void);
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct CFRange {
+    location: isize,
+    length: isize,
 }
 
 /// CFRunLoopSource context (only the perform field is used).
@@ -547,6 +565,135 @@ pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
     }
 }
 
+/// Apply a paragraph line-fragment height to a multiline NSTextField's rendered text.
+pub(crate) unsafe fn set_text_field_line_height(field: *mut AnyObject, line_height: f64) {
+    if field.is_null() {
+        return;
+    }
+    let value: *mut AnyObject = msg_send![field, stringValue];
+    if value.is_null() {
+        return;
+    }
+    let length: usize = msg_send![value, length];
+    if length == 0 {
+        return;
+    }
+
+    let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+    let style: *mut AnyObject = msg_send![style, init];
+    let _: () = msg_send![style, setMinimumLineHeight: line_height];
+    let _: () = msg_send![style, setMaximumLineHeight: line_height];
+    let alignment: isize = msg_send![field, alignment];
+    let line_break_mode: isize = msg_send![field, lineBreakMode];
+    let _: () = msg_send![style, setAlignment: alignment];
+    let _: () = msg_send![style, setLineBreakMode: line_break_mode];
+
+    // NSTextField ignores its font, color, alignment and line-break properties after receiving
+    // an attributed value, so carry those current cell settings into the attributed string.
+    let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attributes: *mut AnyObject = msg_send![attributes, init];
+    let font: *mut AnyObject = msg_send![field, font];
+    let color: *mut AnyObject = msg_send![field, textColor];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let paragraph_key = make_nsstring("NSParagraphStyle");
+    if !font.is_null() {
+        let _: () = msg_send![attributes, setObject: font, forKey: font_key];
+    }
+    if !color.is_null() {
+        let _: () = msg_send![attributes, setObject: color, forKey: color_key];
+    }
+    let _: () = msg_send![attributes, setObject: style, forKey: paragraph_key];
+    let attributed: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let attributed: *mut AnyObject =
+        msg_send![attributed, initWithString: value, attributes: attributes];
+    let _: () = msg_send![field, setAttributedStringValue: attributed];
+
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    CFRelease(paragraph_key as *const c_void);
+    CFRelease(attributed as *const c_void);
+    CFRelease(attributes as *const c_void);
+    CFRelease(style as *const c_void);
+}
+
+/// Split a Rust string at Core Foundation's composed-character boundaries. CFString reports ranges
+/// in UTF-16, so use its range API instead of Rust `char` iteration.
+pub(crate) unsafe fn composed_character_clusters(text: &str) -> Vec<String> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let string = make_nsstring(text);
+    if string.is_null() {
+        return vec![text.to_string()];
+    }
+    let cf_string = string as *const c_void;
+    let length = CFStringGetLength(cf_string);
+    let mut clusters = Vec::new();
+    let mut index = 0isize;
+    while index < length {
+        let range = CFStringGetRangeOfComposedCharactersAtIndex(cf_string, index);
+        if range.length <= 0 || range.location + range.length <= index {
+            break;
+        }
+        if let Some(cluster) = cf_string_range_to_string(cf_string, range) {
+            clusters.push(cluster);
+        }
+        index = range.location + range.length;
+    }
+    CFRelease(cf_string);
+    clusters
+}
+
+/// Return the first user-perceived character, falling back to an empty string for empty input.
+pub(crate) unsafe fn first_composed_character(text: &str) -> String {
+    if text.is_empty() {
+        return String::new();
+    }
+    let string = make_nsstring(text);
+    if string.is_null() {
+        return String::new();
+    }
+    let cf_string = string as *const c_void;
+    let range = CFStringGetRangeOfComposedCharactersAtIndex(cf_string, 0);
+    if range.length <= 0 {
+        CFRelease(cf_string);
+        return String::new();
+    }
+    let result = cf_string_range_to_string(cf_string, range).unwrap_or_default();
+    CFRelease(cf_string);
+    result
+}
+
+unsafe fn cf_string_range_to_string(cf_string: *const c_void, range: CFRange) -> Option<String> {
+    let substring = CFStringCreateWithSubstring(std::ptr::null(), cf_string, range);
+    if substring.is_null() {
+        return None;
+    }
+    let max_bytes = CFStringGetMaximumSizeForEncoding(range.length, 0x08000100u32);
+    let result = if max_bytes >= 0 {
+        let mut buffer = vec![0u8; max_bytes as usize + 1];
+        if CFStringGetCString(
+            substring,
+            buffer.as_mut_ptr().cast::<c_char>(),
+            buffer.len() as isize,
+            0x08000100u32,
+        ) {
+            Some(
+                std::ffi::CStr::from_ptr(buffer.as_ptr().cast::<c_char>())
+                    .to_string_lossy()
+                    .into_owned(),
+            )
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    CFRelease(substring);
+    result
+}
+
 /// Release a +1 object obtained via alloc. objc2's msg_send! is raw MRC (no ARC):
 /// alloc/init return +1 and must be released; addSubview:/setImage:/addTrackingArea:
 /// only add their own retain and don't balance the alloc +1. Once the owning view
@@ -732,4 +879,22 @@ pub(crate) unsafe fn run_save_panel(suggested_name: &str) -> Option<String> {
     };
     let _: () = msg_send![pool, drain];
     result
+}
+
+#[cfg(test)]
+mod composed_character_tests {
+    use super::{composed_character_clusters, first_composed_character};
+
+    #[test]
+    fn composed_character_helpers_keep_grapheme_clusters_intact() {
+        unsafe {
+            assert_eq!(first_composed_character("e\u{301}clair"), "e\u{301}");
+            assert_eq!(first_composed_character("👩‍💻app"), "👩‍💻");
+            assert_eq!(
+                composed_character_clusters("e\u{301}👩‍💻x"),
+                vec!["e\u{301}".to_string(), "👩‍💻".to_string(), "x".to_string()]
+            );
+            assert!(composed_character_clusters("").is_empty());
+        }
+    }
 }

@@ -84,7 +84,10 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
 
 ### P0-4 · Controls wrap to two lines
 
-- **Now**: `settings_select_needs_wrap` deliberately wraps a long value inside a 32–34pt control.
+- **Now**: the old `settings_select_needs_wrap` function has been removed. The existing
+  `settings_select_centers_single_line_inside_the_control` test checks only the label's vertical
+  centering; there is still no assertion for one-line height or the longest device/preset names in
+  all three locales with a complete-value tooltip. This item remains **unverified, not complete**.
 - **Target**: one line, ellipsis, full value in the tooltip.
 - **Files**: `settings/select.rs` (remove the wrap path; keep the label truncation path).
 - **Acceptance**: a layout check that a control's text frame height never exceeds one line; a case

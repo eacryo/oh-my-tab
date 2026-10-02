@@ -982,27 +982,46 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
     // keep the existing 500pt document-growth floor and request enough content height to clear it.
     const MIN_UPDATE_DOCUMENT_GROWTH: f64 = 500.0;
     unsafe {
+        if !widgets::smoke_text_field_line_fragments() {
+            log_info!("[smoke-settings-layout] NSTextField line-fragment smoke failed");
+            return false;
+        }
         log_info!("[smoke-settings-layout] opening settings");
         show_settings();
         log_info!("[smoke-settings-layout] settings opened");
-        let glass_tint_caption_ok = with_settings_ui(|ui| {
-            let Some(ui) = ui.as_ref() else {
-                return false;
-            };
-            if ui.glass_tint_hex.is_null() {
-                return false;
-            }
-            let caption: *mut AnyObject = msg_send![ui.glass_tint_hex, stringValue];
-            if caption.is_null() {
-                return false;
-            }
-            let caption_len: usize = msg_send![caption, length];
-            if caption_len != 9 {
-                return false;
-            }
-            let first: u16 = msg_send![caption, characterAtIndex: 0usize];
-            first == b'#' as u16
-        });
+        let liquid_glass_selected =
+            crate::config::effective_panel_material().as_str() == "liquid-glass";
+        let glass_tint_caption_ok = !liquid_glass_selected
+            || with_settings_ui(|ui| {
+                let Some(ui) = ui.as_ref() else {
+                    return false;
+                };
+                if ui.glass_tint_hex.is_null() {
+                    return false;
+                }
+                let caption: *mut AnyObject = msg_send![ui.glass_tint_hex, stringValue];
+                if caption.is_null() {
+                    log_info!("[smoke-settings-layout] glass tint caption stringValue is null");
+                    return false;
+                }
+                let caption_len: usize = msg_send![caption, length];
+                if caption_len != 9 {
+                    log_info!(
+                    "[smoke-settings-layout] glass tint caption has {caption_len} UTF-16 units: {:?}",
+                    crate::ffi::nsstring_to_rust(caption)
+                );
+                    return false;
+                }
+                let first: u16 = msg_send![caption, characterAtIndex: 0usize];
+                let ok = first == b'#' as u16;
+                if !ok {
+                    log_info!(
+                    "[smoke-settings-layout] glass tint caption has unexpected first character: {:?}",
+                    crate::ffi::nsstring_to_rust(caption)
+                );
+                }
+                ok
+            });
         if !glass_tint_caption_ok {
             log_info!("[smoke-settings-layout] glass tint hex caption missing");
             hide_settings();

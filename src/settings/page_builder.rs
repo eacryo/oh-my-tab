@@ -101,9 +101,8 @@ pub(super) unsafe fn build_switcher_page(
         .iter()
         .map(|s| s.as_str())
         .collect();
-    let display_mode_metrics =
-        SettingsSelect::metrics(ctrl_w, &window_display_mode_refs, row_h, described_row_h);
-    // Reserve the popup's measured row height so wrapped options cannot overlap the preceding row.
+    let display_mode_metrics = SettingsSelect::metrics();
+    // Keep the trigger on the fixed 32pt control grid inside the standard 52pt settings row.
     let y = canvas.next_row(display_mode_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, display_mode_metrics.row_h, content_w);
     ui.thumbnails_enabled = SettingsRow::tall_with_height(
@@ -217,7 +216,7 @@ pub(super) unsafe fn build_switcher_page(
         t("settings.overlay_position_main_screen"),
     ];
     let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
-    let op_metrics = SettingsSelect::metrics(ctrl_w, &op_label_refs, row_h, described_row_h);
+    let op_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(op_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, op_metrics.row_h, content_w);
     ui.overlay_position = SettingsRow::tall_with_height(
@@ -245,8 +244,7 @@ pub(super) unsafe fn build_switcher_page(
         t("settings.activation_mode_click"),
     ];
     let activation_label_refs: Vec<&str> = activation_labels.iter().map(|s| s.as_str()).collect();
-    let activation_metrics =
-        SettingsSelect::metrics(ctrl_w, &activation_label_refs, row_h, described_row_h);
+    let activation_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(activation_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, activation_metrics.row_h, content_w);
     ui.activation_mode = SettingsRow::tall_with_height(
@@ -286,7 +284,7 @@ pub(super) unsafe fn build_switcher_page(
         t("settings.modifier_command"),
     ];
     let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
-    let mod_metrics = SettingsSelect::metrics(ctrl_w, &mod_label_refs, row_h, described_row_h);
+    let mod_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(mod_metrics.row_h);
     ui.modifier = SettingsRow::tall_with_height(
         switcher_view,
@@ -357,7 +355,7 @@ pub(super) unsafe fn build_keystroke_display_page(
         t("settings.keystroke_display_mode_commands"),
     ];
     let mode_refs: Vec<&str> = mode_labels.iter().map(|s| s.as_str()).collect();
-    let mode_metrics = SettingsSelect::metrics(ctrl_w, &mode_refs, row_h, described_row_h);
+    let mode_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(mode_metrics.row_h);
     SettingsRow::separator_above_row(keystroke_display_view, y, mode_metrics.row_h, content_w);
     ui.keystroke_display_mode = SettingsRow::tall_with_height(
@@ -384,7 +382,7 @@ pub(super) unsafe fn build_keystroke_display_page(
         t("settings.keystroke_display_tap_hid"),
     ];
     let tap_refs: Vec<&str> = tap_labels.iter().map(|s| s.as_str()).collect();
-    let tap_metrics = SettingsSelect::metrics(ctrl_w, &tap_refs, row_h, described_row_h);
+    let tap_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(tap_metrics.row_h);
     SettingsRow::separator_above_row(keystroke_display_view, y, tap_metrics.row_h, content_w);
     ui.keystroke_display_tap_level = SettingsRow::tall_with_height(
@@ -412,8 +410,7 @@ pub(super) unsafe fn build_keystroke_display_page(
     ];
     let display_position_refs: Vec<&str> =
         display_position_labels.iter().map(|s| s.as_str()).collect();
-    let display_position_metrics =
-        SettingsSelect::metrics(ctrl_w, &display_position_refs, row_h, described_row_h);
+    let display_position_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(display_position_metrics.row_h);
     SettingsRow::separator_above_row(
         keystroke_display_view,
@@ -448,8 +445,7 @@ pub(super) unsafe fn build_keystroke_display_page(
     ];
     let initial_position_refs: Vec<&str> =
         initial_position_labels.iter().map(|s| s.as_str()).collect();
-    let initial_position_metrics =
-        SettingsSelect::metrics(ctrl_w, &initial_position_refs, row_h, described_row_h);
+    let initial_position_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(initial_position_metrics.row_h);
     SettingsRow::separator_above_row(
         keystroke_display_view,
@@ -591,7 +587,7 @@ pub(super) unsafe fn build_general_page(
         t("settings.theme_auto"),
     ];
     let theme_item_refs: Vec<&str> = theme_items.iter().map(String::as_str).collect();
-    let theme_metrics = SettingsSelect::metrics(ctrl_w, &theme_item_refs, row_h, described_row_h);
+    let theme_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(theme_metrics.row_h);
     ui.theme = SettingsRow::described(
         general_view,
@@ -617,8 +613,7 @@ pub(super) unsafe fn build_general_page(
         t("settings.panel_material_opaque"),
     ];
     let material_item_refs: Vec<&str> = material_items.iter().map(String::as_str).collect();
-    let material_metrics =
-        SettingsSelect::metrics(ctrl_w, &material_item_refs, row_h, described_row_h);
+    let material_metrics = SettingsSelect::metrics();
     let y = canvas.next_block(material_metrics.row_h);
     SettingsRow::separator(general_view, y + material_metrics.row_h, content_w);
     ui.panel_material = SettingsRow::described(
@@ -653,8 +648,7 @@ pub(super) unsafe fn build_general_page(
         ];
         let glass_style_label_refs: Vec<&str> =
             glass_style_labels.iter().map(String::as_str).collect();
-        let glass_style_metrics =
-            SettingsSelect::metrics(ctrl_w, &glass_style_label_refs, row_h, described_row_h);
+        let glass_style_metrics = SettingsSelect::metrics();
         let y = canvas.next_block(glass_style_metrics.row_h);
         SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
         ui.glass_style = SettingsRow::described(
@@ -735,7 +729,7 @@ pub(super) unsafe fn build_general_page(
     canvas.card_with_bottom_offset(&t("settings.header_preview"), -12.0);
 
     canvas.next_section();
-    let locale_metrics = SettingsSelect::metrics(ctrl_w, &LOCALE_LABELS, row_h, described_row_h);
+    let locale_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(locale_metrics.row_h);
     ui.locale = SettingsRow::plain(
         general_view,
@@ -760,8 +754,7 @@ pub(super) unsafe fn build_general_page(
     // Log level popup: items = [debug, info]; default index 1 (info).
     let log_levels = [t("settings.log_level_debug"), t("settings.log_level_info")];
     let log_level_refs: Vec<&str> = log_levels.iter().map(String::as_str).collect();
-    let log_level_metrics =
-        SettingsSelect::metrics(ctrl_w, &log_level_refs, row_h, described_row_h);
+    let log_level_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(log_level_metrics.row_h);
     ui.log_level = SettingsRow::described(
         general_view,
@@ -887,8 +880,7 @@ pub(super) unsafe fn build_mouse_page(
     } else {
         device_labels.iter().map(|s| s.as_str()).collect()
     };
-    let device_metrics =
-        SettingsSelect::metrics(ctrl_w, &device_label_refs, row_h, described_row_h);
+    let device_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(device_metrics.row_h);
     let dev_popup = SettingsControl::popup(
         ctrl_x,
@@ -918,8 +910,7 @@ pub(super) unsafe fn build_mouse_page(
 
     let scroll_mode_labels: Vec<String> = SCROLL_MODE_LABEL_KEYS.iter().map(|key| t(key)).collect();
     let scroll_mode_label_refs: Vec<&str> = scroll_mode_labels.iter().map(String::as_str).collect();
-    let scroll_metrics =
-        SettingsSelect::metrics(ctrl_w, &scroll_mode_label_refs, row_h, described_row_h);
+    let scroll_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(scroll_metrics.row_h);
     let scroll_popup = SettingsControl::popup(
         ctrl_x,
@@ -1004,8 +995,7 @@ pub(super) unsafe fn build_mouse_page(
         .map(|preset| t(preset.label_key()))
         .collect();
     let preset_label_refs: Vec<&str> = preset_labels.iter().map(String::as_str).collect();
-    let preset_metrics =
-        SettingsSelect::metrics(ctrl_w, &preset_label_refs, row_h, described_row_h);
+    let preset_metrics = SettingsSelect::metrics();
     let preset_y = canvas.next_row(preset_metrics.row_h);
     let preset_popup = SettingsControl::popup(
         ctrl_x,
@@ -1406,7 +1396,7 @@ pub(super) unsafe fn build_clipboard_page(
         t("settings.pin_keep_position"),
     ];
     let pin_label_refs: Vec<&str> = pin_labels.iter().map(|s| s.as_str()).collect();
-    let pin_metrics = SettingsSelect::metrics(ctrl_w, &pin_label_refs, row_h, described_row_h);
+    let pin_metrics = SettingsSelect::metrics();
     ui.clipboard_pin_follow_row_height = pin_metrics.row_h;
     ui.clipboard_row_gap = layout.row_gap;
     let cy = canvas.next_row(pin_metrics.row_h);

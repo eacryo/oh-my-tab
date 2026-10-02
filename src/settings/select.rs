@@ -1537,8 +1537,8 @@ pub(super) unsafe fn make_popup(
     popup
 }
 
-/// Measure the largest trigger height required by a select's candidate values.
-pub(super) unsafe fn settings_select_required_control_height(
+/// Measure wrapped option text so the menu can size its rows without changing the trigger.
+unsafe fn settings_select_wrapped_option_text_height(
     width: f64,
     items: &[&str],
     minimum_height: f64,
@@ -1586,7 +1586,7 @@ pub(super) unsafe fn settings_select_required_control_height(
 /// Measure one shared option-row height for every value in a select's menu.
 unsafe fn settings_select_required_option_row_height(width: f64, items: &[String]) -> f64 {
     let items: Vec<&str> = items.iter().map(String::as_str).collect();
-    let text_height = settings_select_required_control_height(width, &items, 1.0);
+    let text_height = settings_select_wrapped_option_text_height(width, &items, 1.0);
     (text_height + 8.0).ceil().max(32.0)
 }
 

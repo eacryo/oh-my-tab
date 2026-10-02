@@ -37,11 +37,12 @@ Three layers, split by **who decides pass/fail** — not by which transport driv
 
 | Tier | Decides | How | Repeatable | Gate |
 | --- | --- | --- | --- | --- |
-| A1 | script | `cargo test` plus the `--smoke-*` runners (real AppKit view tree, headless-safe) | yes | yes, every change |
+| A1 | script | Pure-headless tests plus `--smoke-*` runners over the real AppKit view tree; GUI-dependent runners require a macOS graphical session | yes | yes, every change (run the applicable tier; an unavailable GUI tier is unrun, not passed) |
 | A2 | script | `scripts/e2e/*.sh`, run through `scripts/e2e/run-all.sh` (the entry point; scenarios that steal focus are skipped unless `--include-focus`), driven by the `cua-driver` CLI and asserting app-written JSON state (`--e2e-state=<path>`) plus real WindowServer state | yes | before handoff/release |
 | B | agent or person | MCP tools plus screenshots: taste, first-pass UI review, failure triage, bug investigation | no | never |
 
 - Anything assertable belongs in A: severity is not the split, assertability is.
+- A1 has two execution environments: pure-headless tests can run without a graphical session; AppKit view-tree smoke runners must actually run in a macOS graphical session. A headless run does not pass or waive an unrun GUI smoke.
 - A2 covers what only real input reaches: the global hotkey → summon → raise path, permission branches, cross-app behavior. `--e2e-state` exists because AX cannot express CALayer content or internal state, so the app states those facts itself instead of the test guessing from pixels. A quick hotkey press-release legitimately skips the display path; display and layout assertions belong to A1 smoke runners.
 - **Promotion rule: every bug found in tier B must land an assertion in tier A** — or, when it cannot be asserted yet, a state field that makes it assertable. Otherwise the same regression returns unnoticed.
 - A2 hotkey scenarios press through the system event stream and therefore steal focus: run them only with the user's consent, never in a background loop.

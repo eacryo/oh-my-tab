@@ -1082,6 +1082,12 @@ pub(crate) unsafe fn apply_code_paragraph_styles(storage: *mut AnyObject, text: 
                         let style: *mut AnyObject =
                             msg_send![class!(NSMutableParagraphStyle), alloc];
                         let style: *mut AnyObject = msg_send![style, init];
+                        let line_height = crate::theme::line_height(
+                            crate::theme::FONT_CONTROL,
+                            crate::theme::LINE_HEIGHT_BODY_RATIO,
+                        );
+                        let _: () = msg_send![style, setMinimumLineHeight: line_height];
+                        let _: () = msg_send![style, setMaximumLineHeight: line_height];
                         let _: () = msg_send![
                             style,
                             setHeadIndent: previous_indent as f64 * CODE_ADVANCE_PT

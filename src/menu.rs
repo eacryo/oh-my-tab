@@ -102,20 +102,19 @@ unsafe fn menu_title_width(title: &str) -> f64 {
 }
 
 /// Keep menu titles compact while retaining the full title in the item's tooltip.
-fn compact_menu_title(title: &str) -> String {
-    if capped_menu_title_width(unsafe { menu_title_width(title) }) <= MENU_TITLE_MAX_WIDTH {
+fn compact_menu_title_by(title: &str, max_width: f64, measure: impl Fn(&str) -> f64) -> String {
+    if measure(title) <= max_width {
         return title.to_string();
     }
 
-    let chars: Vec<char> = title.chars().collect();
+    let clusters = unsafe { composed_character_clusters(title) };
     let mut low = 0usize;
-    let mut high = chars.len();
+    let mut high = clusters.len();
     while low < high {
         let mid = low + (high - low).div_ceil(2);
-        let prefix: String = chars[..mid].iter().collect();
+        let prefix: String = clusters[..mid].concat();
         let candidate = format!("{prefix}…");
-        if capped_menu_title_width(unsafe { menu_title_width(&candidate) }) <= MENU_TITLE_MAX_WIDTH
-        {
+        if measure(&candidate) <= max_width {
             low = mid;
         } else {
             high = mid - 1;
@@ -125,9 +124,15 @@ fn compact_menu_title(title: &str) -> String {
     if low == 0 {
         "…".to_string()
     } else {
-        let prefix: String = chars[..low].iter().collect();
+        let prefix: String = clusters[..low].concat();
         format!("{prefix}…")
     }
+}
+
+fn compact_menu_title(title: &str) -> String {
+    compact_menu_title_by(title, MENU_TITLE_MAX_WIDTH, |candidate| {
+        capped_menu_title_width(unsafe { menu_title_width(candidate) })
+    })
 }
 
 /// Set a menu item's native title, truncating only oversized localized text.
@@ -516,7 +521,9 @@ pub(crate) extern "C" fn handle_clear_caches(_self: *mut c_void, _cmd: Sel, _sen
 
 #[cfg(test)]
 mod tests {
-    use super::{capped_menu_title_width, MENU_TITLE_MAX_WIDTH, MENU_TITLE_MIN_WIDTH};
+    use super::{
+        capped_menu_title_width, compact_menu_title_by, MENU_TITLE_MAX_WIDTH, MENU_TITLE_MIN_WIDTH,
+    };
 
     #[test]
     fn menu_title_width_stays_compact_until_the_maximum() {
@@ -524,5 +531,17 @@ mod tests {
         assert_eq!(capped_menu_title_width(120.4), 121.0);
         assert_eq!(capped_menu_title_width(10_000.0), MENU_TITLE_MAX_WIDTH);
         assert_eq!(capped_menu_title_width(f64::NAN), MENU_TITLE_MIN_WIDTH);
+    }
+
+    #[test]
+    fn compact_menu_title_never_splits_a_composed_character() {
+        let title = "e\u{301}x";
+        let compact = compact_menu_title_by(title, 2.0, |candidate| match candidate {
+            "e\u{301}x" => 3.0,
+            "e\u{301}…" => 3.0,
+            "e…" => 2.0,
+            _ => candidate.chars().count() as f64,
+        });
+        assert_eq!(compact, "…");
     }
 }

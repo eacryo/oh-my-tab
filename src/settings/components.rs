@@ -585,18 +585,11 @@ pub(super) struct SettingsSelectMetrics {
 }
 
 impl SettingsSelect {
-    /// Reserve enough row space for the longest candidate without changing height on selection.
-    pub(super) unsafe fn metrics(
-        width: f64,
-        items: &[&str],
-        minimum_control_h: f64,
-        minimum_row_h: f64,
-    ) -> SettingsSelectMetrics {
-        let control_h =
-            widgets::settings_select_required_control_height(width, items, minimum_control_h);
+    /// Keep the trigger and settings row on the fixed grid; option text is sized in the menu.
+    pub(super) fn metrics() -> SettingsSelectMetrics {
         SettingsSelectMetrics {
-            control_h,
-            row_h: minimum_row_h.max(control_h + 20.0),
+            control_h: SettingsLayout::CONTROL_H,
+            row_h: SettingsLayout::SINGLE_LINE_ROW_H,
         }
     }
 
@@ -1943,10 +1936,10 @@ mod tests {
     use super::{
         restore_shell_frame, restore_sidebar_container_frame, restore_sidebar_trigger_frame,
         restore_surface_frame, sidebar_item_frames, sidebar_tracking_rect, SettingsButtonRole,
-        SettingsLayout, SettingsRow, RESTORE_ACTION_ROW_GAP, RESTORE_CONTAINER_ORIGIN,
-        RESTORE_SHELL_INSET, RESTORE_SIDEBAR_OUTER_INSET, RESTORE_TRIGGER_INSET, ROW_ACTION_BTN_H,
-        SEPARATOR_ABOVE_ROW_GAP, SETTINGS_PAGE_COUNT, SLIDER_READOUT_GAP, SLIDER_READOUT_H,
-        SLIDER_READOUT_W,
+        SettingsLayout, SettingsRow, SettingsSelect, RESTORE_ACTION_ROW_GAP,
+        RESTORE_CONTAINER_ORIGIN, RESTORE_SHELL_INSET, RESTORE_SIDEBAR_OUTER_INSET,
+        RESTORE_TRIGGER_INSET, ROW_ACTION_BTN_H, SEPARATOR_ABOVE_ROW_GAP, SETTINGS_PAGE_COUNT,
+        SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
     };
     use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
 
@@ -2018,6 +2011,13 @@ mod tests {
         assert_eq!(layout.section_step, 48.0);
         assert_eq!(layout.row_gap, 8.0);
         // `card_top`/`card_bottom` moved into the page layout owner (`settings::page_canvas`).
+    }
+
+    #[test]
+    fn settings_select_metrics_keep_trigger_and_row_on_the_fixed_grid() {
+        let metrics = SettingsSelect::metrics();
+        assert_eq!(metrics.control_h, 32.0);
+        assert_eq!(metrics.row_h, 52.0);
     }
 
     #[test]

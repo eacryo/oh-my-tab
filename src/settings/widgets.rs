@@ -437,7 +437,7 @@ pub(crate) unsafe fn configure_settings_button_wrapping(
         let _: () = msg_send![label, setMaximumNumberOfLines: max_lines.max(1) as isize];
     }
     if msg_send![label, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
-        let _: () = msg_send![label, setTruncatesLastVisibleLine: false];
+        let _: () = msg_send![label, setTruncatesLastVisibleLine: true];
     }
     let _: () = msg_send![label, setPreferredMaxLayoutWidth: label_w];
     let title_ns = make_nsstring(&title);
@@ -455,6 +455,13 @@ pub(crate) unsafe fn configure_settings_button_wrapping(
     if !tint.is_null() {
         let _: () = msg_send![label, setTextColor: tint];
     }
+    crate::ffi::set_text_field_line_height(
+        label,
+        crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        ),
+    );
     let label_cell: *mut AnyObject = msg_send![label, cell];
     if !label_cell.is_null()
         && msg_send![label_cell, respondsToSelector: sel!(setVerticalAlignment:)]
@@ -815,6 +822,212 @@ pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[
     required_height
 }
 
+/// Measure the full, wrapped text through TextKit using the label's actual attributed paragraph
+/// styles, so the layout smoke catches both clipping and a missing line-height attribute.
+pub(crate) unsafe fn full_wrapped_text_size(label: *mut AnyObject, width: f64) -> Option<NSSize> {
+    if label.is_null() {
+        return None;
+    }
+    let attributed: *mut AnyObject = msg_send![label, attributedStringValue];
+    let (used, fragments) = textkit_line_fragments(attributed, width)?;
+    // A multiline role may use a short localized string that occupies only one line. The style
+    // guide assigns its larger line box to wrapped text; single rendered lines keep their native
+    // frame and are not failures of the multiline height check.
+    if fragments.len() <= 1 {
+        return None;
+    }
+    (used.size.width.is_finite() && used.size.height.is_finite()).then_some(used.size)
+}
+
+unsafe fn textkit_line_fragments(
+    attributed: *mut AnyObject,
+    width: f64,
+) -> Option<(NSRect, Vec<NSRect>)> {
+    if attributed.is_null() {
+        return None;
+    }
+    let text_length: usize = msg_send![attributed, length];
+    if text_length == 0 {
+        return None;
+    }
+    let storage: *mut AnyObject = msg_send![class!(NSTextStorage), alloc];
+    let storage: *mut AnyObject = msg_send![storage, initWithAttributedString: attributed];
+    let layout: *mut AnyObject = msg_send![class!(NSLayoutManager), alloc];
+    let layout: *mut AnyObject = msg_send![layout, init];
+    let container: *mut AnyObject = msg_send![class!(NSTextContainer), alloc];
+    let container: *mut AnyObject = msg_send![
+        container,
+        initWithContainerSize: NSSize::new(width.max(1.0), 100_000.0)
+    ];
+    let _: () = msg_send![container, setLineFragmentPadding: 0.0f64];
+    let _: () = msg_send![storage, addLayoutManager: layout];
+    let _: () = msg_send![layout, addTextContainer: container];
+    let _: () = msg_send![layout, ensureLayoutForTextContainer: container];
+    let used: NSRect = msg_send![layout, usedRectForTextContainer: container];
+    let glyph_count: usize = msg_send![layout, numberOfGlyphs];
+    let mut fragments = Vec::new();
+    let mut glyph_index = 0usize;
+    while glyph_index < glyph_count {
+        let mut glyph_range = NSRange::new(0, 0);
+        let fragment: NSRect = msg_send![
+            layout,
+            lineFragmentRectForGlyphAtIndex: glyph_index,
+            effectiveRange: &mut glyph_range as *mut NSRange
+        ];
+        if glyph_range.length == 0 {
+            break;
+        }
+        fragments.push(fragment);
+        glyph_index = glyph_range.location + glyph_range.length;
+    }
+    release_obj(container);
+    release_obj(layout);
+    release_obj(storage);
+    Some((used, fragments))
+}
+
+/// Exercise the same NSTextField attributed-string path used by wrapping UI without opening a
+/// window or taking keyboard focus. The settings and update-prompt smoke runners share this gate.
+pub(crate) unsafe fn smoke_text_field_line_fragments() -> bool {
+    crate::debug_assert_main_thread();
+    let text = make_nsstring("中文 wrapping line 中文 wrapping line");
+    let paragraph_key = make_nsstring("NSParagraphStyle");
+    let mut ok = true;
+    for (size, ratio) in [
+        (
+            crate::theme::FONT_CAPTION,
+            crate::theme::LINE_HEIGHT_CAPTION_RATIO,
+        ),
+        (
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        ),
+        (
+            crate::theme::FONT_PAGE_TITLE,
+            crate::theme::LINE_HEIGHT_TITLE_RATIO,
+        ),
+    ] {
+        let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let field: *mut AnyObject = msg_send![
+            field,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(90.0, 100.0))
+        ];
+        let _: () = msg_send![field, setStringValue: text];
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: size];
+        let _: () = msg_send![field, setFont: font];
+        let _: () = msg_send![field, setUsesSingleLineMode: false];
+        let _: () = msg_send![field, setLineBreakMode: 0isize];
+        let _: () = msg_send![field, setMaximumNumberOfLines: 0isize];
+        crate::ffi::set_text_field_line_height(field, crate::theme::line_height(size, ratio));
+
+        let attributed: *mut AnyObject = msg_send![field, attributedStringValue];
+        let mut attribute_range = NSRange::new(0, 0);
+        let style: *mut AnyObject = msg_send![
+            attributed,
+            attribute: paragraph_key,
+            atIndex: 0usize,
+            effectiveRange: &mut attribute_range as *mut NSRange
+        ];
+        let expected = crate::theme::line_height(size, ratio);
+        let actual_min = if style.is_null() {
+            f64::NAN
+        } else {
+            msg_send![style, minimumLineHeight]
+        };
+        let actual_max = if style.is_null() {
+            f64::NAN
+        } else {
+            msg_send![style, maximumLineHeight]
+        };
+        let Some((_, fragments)) = textkit_line_fragments(attributed, 90.0) else {
+            log_info!("[line-height-smoke] no TextKit fragments for {size:.1}pt field");
+            ok = false;
+            release_obj(field);
+            continue;
+        };
+        if fragments.len() < 2
+            || (actual_min - expected).abs() > 0.1
+            || (actual_max - expected).abs() > 0.1
+            || fragments
+                .iter()
+                .any(|fragment| (fragment.size.height - expected).abs() > 0.1)
+        {
+            log_info!(
+                "[line-height-smoke] field={size:.1}pt expected={expected:.2}, paragraph={actual_min:.2}/{actual_max:.2}, fragments={:?}",
+                fragments.iter().map(|r| r.size.height).collect::<Vec<_>>()
+            );
+            ok = false;
+        }
+        release_obj(field);
+    }
+
+    // Mirror the sidebar lifecycle: the label starts empty, receives its title through the
+    // appearance setter, then is restyled when hover changes its foreground color.
+    let sidebar_title = "侧边栏标题 Sidebar title wrapping check";
+    let sidebar_field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let sidebar_field: *mut AnyObject = msg_send![
+        sidebar_field,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(90.0, 80.0))
+    ];
+    let _: () = msg_send![sidebar_field, setUsesSingleLineMode: false];
+    let _: () = msg_send![sidebar_field, setLineBreakMode: 0isize];
+    let _: () = msg_send![sidebar_field, setMaximumNumberOfLines: 2isize];
+    if msg_send![sidebar_field, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
+        let _: () = msg_send![sidebar_field, setTruncatesLastVisibleLine: true];
+    }
+    let sidebar_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let mut sidebar_ok = true;
+    for color in [
+        settings_text_color(SettingsTextRole::Sidebar),
+        settings_text_color(SettingsTextRole::Primary),
+    ] {
+        set_sidebar_title_appearance(sidebar_field, sidebar_title, sidebar_font, color);
+        let attributed: *mut AnyObject = msg_send![sidebar_field, attributedStringValue];
+        let mut attribute_range = NSRange::new(0, 0);
+        let style: *mut AnyObject = msg_send![
+            attributed,
+            attribute: paragraph_key,
+            atIndex: 0usize,
+            effectiveRange: &mut attribute_range as *mut NSRange
+        ];
+        let expected = crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        );
+        let actual_min = if style.is_null() {
+            f64::NAN
+        } else {
+            msg_send![style, minimumLineHeight]
+        };
+        let actual_max = if style.is_null() {
+            f64::NAN
+        } else {
+            msg_send![style, maximumLineHeight]
+        };
+        let fragments = textkit_line_fragments(attributed, 90.0);
+        let fits = fragments.is_some_and(|(_, fragments)| {
+            fragments.len() >= 2
+                && fragments
+                    .iter()
+                    .all(|fragment| (fragment.size.height - expected).abs() <= 0.1)
+        });
+        if (actual_min - expected).abs() > 0.1 || (actual_max - expected).abs() > 0.1 || !fits {
+            log_info!(
+                "[line-height-smoke] sidebar title lost paragraph style after appearance update: paragraph={actual_min:.2}/{actual_max:.2}, expected={expected:.2}, wraps={fits}"
+            );
+            sidebar_ok = false;
+        }
+    }
+    if !sidebar_ok {
+        ok = false;
+    }
+    release_obj(sidebar_field);
+    CFRelease(paragraph_key as *const c_void);
+    CFRelease(text as *const c_void);
+    ok
+}
+
 /// The tracker rect arrives precomputed against the live entry count (see
 /// sidebar_tracking_rect in the component layer), so it can never drift behind the
 /// sidebar's rows again -- the previous hardcoded 6-row rect left the 7th entry
@@ -960,6 +1173,11 @@ pub(super) unsafe fn make_value_label(
     let _: () = msg_send![label, setUsesSingleLineMode: true];
     let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
+    if !value.is_empty() {
+        let tooltip = make_nsstring(value);
+        let _: () = msg_send![label, setToolTip: tooltip];
+        CFRelease(tooltip as *const c_void);
+    }
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![label, setFont: font];
@@ -974,14 +1192,26 @@ pub(super) unsafe fn set_page_title_text(label: *mut AnyObject, text: &str) {
     let tracking: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: -0.4f64];
     let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let attributes: *mut AnyObject = msg_send![attributes, init];
+    let paragraph: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+    let paragraph: *mut AnyObject = msg_send![paragraph, init];
+    let line_height = crate::theme::line_height(
+        crate::theme::FONT_PAGE_TITLE,
+        crate::theme::LINE_HEIGHT_TITLE_RATIO,
+    );
+    let _: () = msg_send![paragraph, setMinimumLineHeight: line_height];
+    let _: () = msg_send![paragraph, setMaximumLineHeight: line_height];
     let _: () = msg_send![attributes, setObject: font, forKey: NSFontAttributeName];
     let _: () = msg_send![attributes, setObject: tracking, forKey: NSKernAttributeName];
+    let paragraph_key = make_nsstring("NSParagraphStyle");
+    let _: () = msg_send![attributes, setObject: paragraph, forKey: paragraph_key];
+    CFRelease(paragraph_key as *const c_void);
     let value = make_nsstring(text);
     let attributed: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
     let attributed: *mut AnyObject =
         msg_send![attributed, initWithString: value, attributes: attributes];
     CFRelease(value as *const c_void);
     release_obj(attributes);
+    release_obj(paragraph);
     let _: () = msg_send![label, setAttributedStringValue: attributed];
     release_obj(attributed);
 }
@@ -1400,8 +1630,7 @@ pub(super) unsafe fn make_text_input(
 }
 
 pub(super) use super::select::{
-    clear_settings_select_registry, make_popup, settings_select_required_control_height,
-    settings_select_set_item_symbol,
+    clear_settings_select_registry, make_popup, settings_select_set_item_symbol,
 };
 
 pub(super) const HTML_SWITCH_W: f64 = 38.0;
@@ -2058,6 +2287,13 @@ unsafe fn set_sidebar_title_appearance(
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setStringValue: title_ns];
+    crate::ffi::set_text_field_line_height(
+        label,
+        crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        ),
+    );
     let button_frame: NSRect = msg_send![btn, frame];
     center_sidebar_label(label, button_frame.size.height);
     CFRelease(title_ns as *const c_void);
@@ -2115,7 +2351,9 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
         .get(&(btn as usize))
         .map(|p| p.0);
     if let Some(label) = label {
-        let _: () = msg_send![label, setTextColor: color];
+        let title = crate::ffi::nsstring_to_rust(msg_send![label, stringValue]);
+        let font: *mut AnyObject = msg_send![label, font];
+        set_sidebar_title_appearance(btn, &title, font, color);
     }
     if let Some(icon) = SIDEBAR_ICON_VIEWS
         .lock()
@@ -2342,6 +2580,9 @@ pub(super) unsafe fn make_sidebar_button(
     let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
         let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
+    }
+    if msg_send![label, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
+        let _: () = msg_send![label, setTruncatesLastVisibleLine: true];
     }
     let _: () = msg_send![label, setPreferredMaxLayoutWidth: label_frame.size.width];
     let _: () = msg_send![label, setEnabled: false];
@@ -2644,6 +2885,13 @@ pub(super) unsafe fn add_row_with_label(
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
         let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
     }
+    crate::ffi::set_text_field_line_height(
+        label,
+        crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        ),
+    );
     // Adaptive: label keeps fixed width, stays top- and left-anchored.
     // Vertical placement belongs to the page layout owner (no MinYMargin).
     let _: () = msg_send![label, setAutoresizingMask: 4u64];
@@ -2702,6 +2950,13 @@ pub(super) unsafe fn add_described_row(
     let title_font: *mut AnyObject =
         msg_send![class!(NSFont), messageFontOfSize: crate::theme::FONT_CONTROL];
     let _: () = msg_send![title_label, setFont: title_font];
+    crate::ffi::set_text_field_line_height(
+        title_label,
+        crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        ),
+    );
     let _: () = msg_send![parent, addSubview: title_label];
     release_obj(title_label);
 
@@ -2811,6 +3066,16 @@ pub(super) unsafe fn add_tall_row(
     if msg_send![label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
         let _: () = msg_send![label, setMaximumNumberOfLines: 2isize];
     }
+    if msg_send![label, respondsToSelector: sel!(setTruncatesLastVisibleLine:)] {
+        let _: () = msg_send![label, setTruncatesLastVisibleLine: true];
+    }
+    crate::ffi::set_text_field_line_height(
+        label,
+        crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        ),
+    );
     // Vertical placement belongs to the page layout owner (no MinYMargin).
     let _: () = msg_send![label, setAutoresizingMask: 4u64];
     let _: () = msg_send![parent, addSubview: label];
@@ -2926,12 +3191,14 @@ pub(super) fn rect_inside(outer: NSRect, inner: NSRect, margin: f64) -> bool {
         && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height - margin
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DebugLayoutEntry {
     index: usize,
     frame: NSRect,
     interactive: bool,
+    embedded_in_button: bool,
     text_required_height: Option<f64>,
+    text_value: Option<String>,
 }
 
 /// Collect descendant frames in document coordinates.
@@ -2944,7 +3211,8 @@ unsafe fn collect_debug_layout(
     document: *mut AnyObject,
     view: *mut AnyObject,
     entries: &mut Vec<DebugLayoutEntry>,
-    inside_interactive: bool,
+    inside_native_control: bool,
+    inside_button: bool,
 ) {
     if view.is_null() {
         return;
@@ -2973,29 +3241,56 @@ unsafe fn collect_debug_layout(
             || msg_send![child, isKindOfClass: class!(NSSlider)]
             || msg_send![child, isKindOfClass: class!(NSColorWell)]
             || msg_send![child, isKindOfClass: class!(NSPopUpButton)];
+        let is_button: bool = msg_send![child, isKindOfClass: class!(NSButton)];
         let is_text = msg_send![child, isKindOfClass: class!(NSTextField)];
-        // Native controls such as NSPopUpButton contain internal text views. Their frames are
-        // implementation details, not peer layout items, and must not be compared with the control.
-        if !inside_interactive && (interactive || is_text) {
-            let text_required_height = if is_text {
-                let cell: *mut AnyObject = msg_send![child, cell];
-                if cell.is_null() {
+        let is_wrapping_text = if is_text {
+            let single_line: bool = msg_send![child, usesSingleLineMode];
+            let line_break_mode: isize = msg_send![child, lineBreakMode];
+            !single_line && line_break_mode == 0 // NSLineBreakByWordWrapping
+        } else {
+            false
+        };
+        // Native controls other than NSButton contain internal text views that are implementation
+        // details. Custom settings buttons, however, draw their localized title in a child label;
+        // inspect that label's fit while excluding it from peer-overlap checks.
+        if !inside_native_control && (interactive || is_text) {
+            let text_value = if is_text {
+                let value: *mut AnyObject = msg_send![child, stringValue];
+                let utf8: *const std::ffi::c_char = msg_send![value, UTF8String];
+                if utf8.is_null() {
                     None
                 } else {
-                    let measured: NSSize = msg_send![cell, cellSizeForBounds: local];
-                    Some(measured.height)
+                    Some(
+                        std::ffi::CStr::from_ptr(utf8)
+                            .to_string_lossy()
+                            .into_owned(),
+                    )
                 }
+            } else {
+                None
+            };
+            let text_required_height = if is_wrapping_text {
+                full_wrapped_text_size(child, local.size.width).map(|measured| measured.height)
             } else {
                 None
             };
             entries.push(DebugLayoutEntry {
                 index,
                 frame,
-                interactive,
+                interactive: interactive && !inside_button,
+                embedded_in_button: is_text && inside_button,
                 text_required_height,
+                text_value,
             });
         }
-        collect_debug_layout(document, child, entries, inside_interactive || interactive);
+        let next_inside_native_control = inside_native_control || (interactive && !is_button);
+        collect_debug_layout(
+            document,
+            child,
+            entries,
+            next_inside_native_control,
+            inside_button || is_button,
+        );
     }
 }
 
@@ -3023,7 +3318,7 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
     }
     let document_bounds: NSRect = msg_send![document, bounds];
     let mut entries = Vec::new();
-    collect_debug_layout(document, document, &mut entries, false);
+    collect_debug_layout(document, document, &mut entries, false, false);
     let mut errors = Vec::new();
     let document_rect = NSRect::new(NSPoint::new(0.0, 0.0), document_bounds.size);
     collect_switch_visual_errors(document, &mut errors);
@@ -3037,8 +3332,12 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
         if let Some(required_height) = entry.text_required_height {
             if required_height > entry.frame.size.height + 1.0 {
                 errors.push(format!(
-                    "text[{0}] needs {1:.1}pt but frame is {2:.1}pt high: {3:?}",
-                    entry.index, required_height, entry.frame.size.height, entry.frame
+                    "text[{}] {:?} needs {:.1}pt but frame is {:.1}pt high: {:?}",
+                    entry.index,
+                    entry.text_value,
+                    required_height,
+                    entry.frame.size.height,
+                    entry.frame
                 ));
             }
         }
@@ -3048,6 +3347,8 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
             // Text labels may overlap another label in a deliberately stacked description row,
             // but an interactive control must never intersect a label or another control.
             if (left.interactive || right.interactive)
+                && !left.embedded_in_button
+                && !right.embedded_in_button
                 && rects_overlap(left.frame, right.frame, 0.5)
             {
                 errors.push(format!(

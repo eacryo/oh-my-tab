@@ -2,6 +2,15 @@
 
 use super::*;
 
+unsafe fn app_initial(app_name: &str) -> String {
+    let initial = first_composed_character(app_name);
+    if initial.is_empty() {
+        "?".to_string()
+    } else {
+        initial
+    }
+}
+
 /// Bake a grayed version: composite a light gray over the original with NSCompositeSourceAtop,
 /// so the gray is confined to the icon's alpha and doesn't form a box on transparent edges.
 /// Used to gray out minimized windows' icons.
@@ -130,7 +139,7 @@ unsafe fn add_preview_icon_fallback(
         let _: () = msg_send![ll, setCornerRadius: crate::theme::RADIUS_CARD];
         let _: () = msg_send![ll, setMasksToBounds: true];
         layer_set_background(ll, hex_to_cg_color(colors.icon_inner_bg));
-        let init_char = w.app_name.chars().next().unwrap_or('?').to_string();
+        let init_char = app_initial(&w.app_name);
         let font: *mut AnyObject = msg_send![
             class!(NSFont),
             systemFontOfSize: crate::theme::FONT_PAGE_TITLE,
@@ -434,7 +443,7 @@ pub(crate) fn create_card_view(
                 }
                 None => {
                     layer_set_background(ml, hex_to_cg_color(colors.icon_inner_bg));
-                    let init_char = w.app_name.chars().next().unwrap_or('?').to_string();
+                    let init_char = app_initial(&w.app_name);
                     let font: *mut AnyObject = msg_send![
                         class!(NSFont),
                         systemFontOfSize: crate::theme::FONT_CAPTION,
@@ -566,7 +575,7 @@ pub(crate) fn create_card_view(
                 let bg_color = hex_to_cg_color(colors.icon_inner_bg);
                 layer_set_background(ll, bg_color);
 
-                let init = w.app_name.chars().next().unwrap_or('?').to_string();
+                let init = app_initial(&w.app_name);
                 let font: *mut AnyObject = msg_send![
                     class!(NSFont),
                     systemFontOfSize: crate::theme::FONT_PAGE_TITLE,

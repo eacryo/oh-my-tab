@@ -148,15 +148,16 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
                 Ok(crate::mouse::shortcut::Binding::None) => (1, false),
                 Err(_) => (0, false),
             };
-            // The button name.
-            // The 13pt text sits toward the TOP of the 28pt field (not vertically centered):
-            // shifting the label down 7pt aligns its midline with the buttons' (calibrated).
+            // The physical button name uses the shared 14pt control role.
             let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
             let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(NSPoint::new(row_x0, y + (row_h - 22.0) / 2.0), NSSize::new(70.0, 22.0))];
             set_field(label, 0);
             let _: () = msg_send![label, setBezeled: false];
             let _: () = msg_send![label, setDrawsBackground: false];
             let _: () = msg_send![label, setEditable: false];
+            let font: *mut AnyObject =
+                msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+            let _: () = msg_send![label, setFont: font];
             apply_settings_text_role(label, SettingsTextRole::Primary);
             let name_ns = make_nsstring(&button_name(btn));
             let _: () = msg_send![label, setStringValue: name_ns];
@@ -171,6 +172,9 @@ pub(super) unsafe fn render_mapping_rows_locked(u: &mut SettingsUi) {
             let _: () = msg_send![desc_label, setBezeled: false];
             let _: () = msg_send![desc_label, setDrawsBackground: false];
             let _: () = msg_send![desc_label, setEditable: false];
+            let font: *mut AnyObject =
+                msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+            let _: () = msg_send![desc_label, setFont: font];
             apply_settings_text_role(desc_label, SettingsTextRole::Primary);
             let _: () = msg_send![desc_label, setEnabled: mappings_on];
             if !is_key && action_idx > 0 {

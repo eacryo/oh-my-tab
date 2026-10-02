@@ -34,6 +34,24 @@ pub(crate) const FONT_CAPTION: f64 = 12.0;
 pub(crate) const FONT_CONTROL: f64 = 14.0;
 pub(crate) const FONT_SIDEBAR_TITLE: f64 = 20.0;
 pub(crate) const FONT_PAGE_TITLE: f64 = 26.0;
+pub(crate) const LINE_HEIGHT_CAPTION_RATIO: f64 = 1.35;
+pub(crate) const LINE_HEIGHT_BODY_RATIO: f64 = 1.4;
+pub(crate) const LINE_HEIGHT_TITLE_RATIO: f64 = 1.2;
+pub(crate) const fn line_height(size: f64, ratio: f64) -> f64 {
+    size * ratio
+}
+
+#[cfg(test)]
+mod line_height_tests {
+    use super::*;
+
+    #[test]
+    fn line_height_ratios_multiply_font_size() {
+        assert!((line_height(FONT_CAPTION, LINE_HEIGHT_CAPTION_RATIO) - 16.2).abs() < 1e-10);
+        assert!((line_height(FONT_CONTROL, LINE_HEIGHT_BODY_RATIO) - 19.6).abs() < 1e-10);
+        assert!((line_height(FONT_PAGE_TITLE, LINE_HEIGHT_TITLE_RATIO) - 31.2).abs() < 1e-10);
+    }
+}
 pub(crate) const FONT_WEIGHT_REGULAR: f64 = 0.0;
 pub(crate) const FONT_WEIGHT_SEMIBOLD: f64 = 0.3;
 pub(crate) const FONT_WEIGHT_BOLD: f64 = 0.4;

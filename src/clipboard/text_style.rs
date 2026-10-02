@@ -30,6 +30,12 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
     let pstyle: *mut AnyObject = msg_send![pstyle, init];
     let _: () = msg_send![pstyle, setAlignment: -1isize]; // NSTextAlignmentNatural
     let _: () = msg_send![pstyle, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    let line_height = crate::theme::line_height(
+        crate::theme::FONT_CONTROL,
+        crate::theme::LINE_HEIGHT_BODY_RATIO,
+    );
+    let _: () = msg_send![pstyle, setMinimumLineHeight: line_height];
+    let _: () = msg_send![pstyle, setMaximumLineHeight: line_height];
 
     let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let attrs: *mut AnyObject = msg_send![attrs, init];

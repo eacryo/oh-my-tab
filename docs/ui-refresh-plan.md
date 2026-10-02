@@ -74,7 +74,9 @@
 
 ### P0-4 · 控件折成两行
 
-- **现状**：`settings_select_needs_wrap` 会有意让长值在 32–34pt 的控件里折行。
+- **现状**：旧函数 `settings_select_needs_wrap` 已从当前代码删除；现有
+  `settings_select_centers_single_line_inside_the_control` 只断言文本 frame 在控件内垂直居中，尚无断言覆盖单行
+  高度、三个 locale 下最长设备名／preset 名及完整值 tooltip。此项**待复核，未完成**。
 - **目标**：单行 + 省略号，完整值放 tooltip。
 - **文件**：`settings/select.rs`（移除折行分支，保留标签截断分支）。
 - **验收**：布局检查断言控件的文字 frame 高度不超过一行；覆盖三个 locale 下最长的设备名与 preset 名。

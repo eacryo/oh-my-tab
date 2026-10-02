@@ -105,8 +105,23 @@ pub(super) unsafe fn add_detail_text(
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL]
     };
     let _: () = msg_send![tv, setFont: font];
-    if code_soft_wrap {
+    if is_code {
+        // Keep code line height and hanging indentation consistent in wrapped and unwrapped views.
         apply_code_paragraph_styles(storage, display_text);
+    } else {
+        let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+        let style: *mut AnyObject = msg_send![style, init];
+        let line_height = crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        );
+        let _: () = msg_send![style, setMinimumLineHeight: line_height];
+        let _: () = msg_send![style, setMaximumLineHeight: line_height];
+        let _: () = msg_send![style, setLineBreakMode: 0isize];
+        let style_key = make_nsstring("NSParagraphStyle");
+        let _: () = msg_send![storage, addAttribute: style_key, value: style, range: NSRange::new(0, display_text.encode_utf16().count())];
+        CFRelease(style_key as *const c_void);
+        release_obj(style);
     }
     // Both code-detail modes (soft wrap and no wrap) show intra-paragraph spaces as midpoints with
     // the same tint as list-row space markers. Plain text and links get no midpoints, so this is a no-op.

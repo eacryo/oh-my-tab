@@ -1222,6 +1222,15 @@ unsafe fn make_release_notes_view(
         let color: *mut AnyObject = msg_send![class!(NSColor), labelColor];
         let font_key = make_nsstring("NSFont");
         let color_key = make_nsstring("NSForegroundColor");
+        let paragraph_key = make_nsstring("NSParagraphStyle");
+        let body_style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+        let body_style: *mut AnyObject = msg_send![body_style, init];
+        let body_line_height = crate::theme::line_height(
+            crate::theme::FONT_CONTROL,
+            crate::theme::LINE_HEIGHT_BODY_RATIO,
+        );
+        let _: () = msg_send![body_style, setMinimumLineHeight: body_line_height];
+        let _: () = msg_send![body_style, setMaximumLineHeight: body_line_height];
         let _: () = msg_send![
             attributed,
             addAttribute: font_key,
@@ -1234,6 +1243,13 @@ unsafe fn make_release_notes_view(
             value: color,
             range: NSRange::new(0, length)
         ];
+        let _: () = msg_send![
+            attributed,
+            addAttribute: paragraph_key,
+            value: body_style,
+            range: NSRange::new(0, length)
+        ];
+        release_obj(body_style);
         for heading in &document.heading_ranges {
             let (size, weight) = release_notes_heading_style(heading.level);
             let heading_font: *mut AnyObject = msg_send![
@@ -1247,9 +1263,23 @@ unsafe fn make_release_notes_view(
                 value: heading_font,
                 range: heading.range
             ];
+            let heading_style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+            let heading_style: *mut AnyObject = msg_send![heading_style, init];
+            let line_height =
+                crate::theme::line_height(size, crate::theme::LINE_HEIGHT_TITLE_RATIO);
+            let _: () = msg_send![heading_style, setMinimumLineHeight: line_height];
+            let _: () = msg_send![heading_style, setMaximumLineHeight: line_height];
+            let _: () = msg_send![
+                attributed,
+                addAttribute: paragraph_key,
+                value: heading_style,
+                range: heading.range
+            ];
+            release_obj(heading_style);
         }
         crate::ffi::CFRelease(font_key as *const c_void);
         crate::ffi::CFRelease(color_key as *const c_void);
+        crate::ffi::CFRelease(paragraph_key as *const c_void);
     }
 
     let text_view: *mut AnyObject = msg_send![class!(NSTextView), alloc];
@@ -1438,11 +1468,15 @@ unsafe fn make_custom_update_found_window(
 
     let app = app_display_name();
     let item = item as *mut AnyObject;
-    let version = nsstring_to_string(msg_send![item, displayVersionString]);
-    let version = if version.is_empty() {
-        nsstring_to_string(msg_send![item, versionString])
+    let version = if item.is_null() {
+        "0.0.0".to_string()
     } else {
-        version
+        let display = nsstring_to_string(msg_send![item, displayVersionString]);
+        if display.is_empty() {
+            nsstring_to_string(msg_send![item, versionString])
+        } else {
+            display
+        }
     };
     let version = if version.is_empty() {
         "?".to_string()
@@ -1464,7 +1498,7 @@ unsafe fn make_custom_update_found_window(
         UpdatePromptKind::InformationOnly => "settings.update_information_message",
     };
     let message_text = tf(message_key, &[("app", &app), ("version", &version)]);
-    let information_url = if prompt_kind == UpdatePromptKind::InformationOnly {
+    let information_url = if prompt_kind == UpdatePromptKind::InformationOnly && !item.is_null() {
         let url: *mut AnyObject = msg_send![item, infoURL];
         let absolute_string: *mut AnyObject = msg_send![url, absoluteString];
         nsstring_to_string(absolute_string)
@@ -1699,6 +1733,98 @@ unsafe fn make_custom_update_found_window(
     ui.window = window as usize;
     ui.update_reply = copied_reply;
     ui.information_url = information_url;
+}
+
+unsafe fn update_prompt_button_labels_fit(view: *mut AnyObject) -> (bool, usize) {
+    if view.is_null() || msg_send![view, isHidden] {
+        return (true, 0);
+    }
+    let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+    let mut ok = true;
+    let mut visible_labels = 0;
+    if is_button {
+        let subviews: *mut AnyObject = msg_send![view, subviews];
+        if !subviews.is_null() {
+            let count: usize = msg_send![subviews, count];
+            for index in 0..count {
+                let label: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+                if label.is_null() || !msg_send![label, isKindOfClass: class!(NSTextField)] {
+                    continue;
+                }
+                let text: *mut AnyObject = msg_send![label, stringValue];
+                if nsstring_to_string(text).is_empty() {
+                    continue;
+                }
+                visible_labels += 1;
+                let frame: NSRect = msg_send![label, frame];
+                // Single-line button titles do not acquire the multiline role's line-height floor.
+                let required =
+                    crate::settings::widgets::full_wrapped_text_size(label, frame.size.width)
+                        .map(|size| size.height)
+                        .unwrap_or(0.0);
+                if !required.is_finite() || required > frame.size.height + 1.0 {
+                    log_info!(
+                        "[smoke-update-prompts] button text does not fit: text={:?}, required_h={:.1}, frame={:?}",
+                        nsstring_to_string(text),
+                        required,
+                        frame
+                    );
+                    ok = false;
+                }
+            }
+        }
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if !subviews.is_null() {
+        let count: usize = msg_send![subviews, count];
+        for index in 0..count {
+            let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            let (child_ok, child_labels) = update_prompt_button_labels_fit(child);
+            ok &= child_ok;
+            visible_labels += child_labels;
+        }
+    }
+    (ok, visible_labels)
+}
+
+/// Construct each real update prompt state with localized button text and no Sparkle dependency.
+/// The smoke caller runs this on the AppKit main thread for each supported locale. Each stage is
+/// shown as a key window, so this runner takes keyboard focus and must only be run with user consent.
+pub(crate) fn smoke_update_prompt_layouts() -> bool {
+    crate::debug_assert_main_thread();
+    const STAGES: [(isize, bool); 4] = [(0, false), (1, false), (2, false), (2, true)];
+    let original_locale = crate::i18n::current_locale();
+    let mut ok = unsafe { crate::settings::widgets::smoke_text_field_line_fragments() };
+    if !ok {
+        log_info!("[smoke-update-prompts] NSTextField TextKit fragments do not match their font-size ratios");
+    }
+    unsafe {
+        for locale in ["en", "zh-Hans", "zh-Hant"] {
+            crate::i18n::apply_config_locale(locale);
+            for (stage, information_only) in STAGES {
+                make_custom_update_found_window(
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    stage,
+                    information_only,
+                    std::ptr::null_mut(),
+                );
+                let window = UPDATE_UI_STATE.lock().unwrap().window as *mut AnyObject;
+                let content: *mut AnyObject = msg_send![window, contentView];
+                let (fits, labels) = update_prompt_button_labels_fit(content);
+                let expected_min = if information_only { 2 } else { 3 };
+                if !fits || labels < expected_min {
+                    log_info!(
+                        "[smoke-update-prompts] failed locale={locale}, stage={stage}, information_only={information_only}, labels={labels}"
+                    );
+                    ok = false;
+                }
+                close_custom_update_window();
+            }
+        }
+        crate::i18n::apply_config_locale(&original_locale);
+    }
+    ok
 }
 
 fn format_download_bytes(bytes: u64) -> String {
@@ -2904,6 +3030,47 @@ mod tests {
         assert_eq!(
             update_prompt_kind(2, true),
             UpdatePromptKind::InformationOnly
+        );
+    }
+
+    /// Build every custom update prompt state in the real AppKit process. This is GUI-session
+    /// dependent and is invoked explicitly through `--smoke-update-prompts`.
+    #[test]
+    #[ignore]
+    fn update_prompt_button_layout_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let profile_dir = exe
+            .parent()
+            .and_then(|path| path.parent())
+            .expect("test binary profile directory");
+        let app = profile_dir.join(env!("CARGO_PKG_NAME"));
+        let profile = profile_dir
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("Cargo profile directory name");
+        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+        let mut build = std::process::Command::new(cargo);
+        build
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .arg("build")
+            .arg("--bin")
+            .arg(env!("CARGO_PKG_NAME"));
+        if profile == "release" {
+            build.arg("--release");
+        } else if profile != "debug" {
+            build.arg("--profile").arg(profile);
+        }
+        let status = build.status().expect("failed to build app smoke binary");
+        assert!(status.success(), "failed to build app smoke binary");
+        let output = std::process::Command::new(app)
+            .arg("--smoke-update-prompts")
+            .output()
+            .expect("failed to start update prompt smoke process");
+        assert!(
+            output.status.success(),
+            "update prompt layout smoke failed (exit {:?})\nstderr:\n{}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
         );
     }
 
