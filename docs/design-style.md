@@ -402,6 +402,7 @@ Page Down／下一页），使固定宽度容纳所有已发布语言的键名�
 | hover | `hover_bg` 填充（瞬时，无过渡） |
 | pressed | 填充型控件用 ~85% 的 accent；描边型用 `hover_bg` + 轻微内陷 |
 | selected | `selection_bg` 填充，或卡片/色块使用 accent 环 |
+| open | `hover_bg` 填充、描边保持 idle；在同一位置就地展开的控件用 `hover_bg` + 轻微内陷。收起时必须清掉 open 表面：accent 环属于 focus，不属于“已展开” |
 | disabled | `text_disabled`，控件填充 50% 不透明度，无 hover 反馈 |
 | focus（键盘） | 内嵌 accent 环，2pt，在 `card_bg` 与 `window_bg` 上都清晰可见 |
 

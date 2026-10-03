@@ -13,7 +13,9 @@ struct SettingsSelectState {
     /// settings_select_open).
     popup: usize,
     open: bool,
-    /// Keyboard focus; drives the §10 inset accent ring.
+    /// Genuine keyboard focus; drives the §10 inset accent ring. Opening the popup deliberately does
+    /// NOT set this: that focus request exists so the open panel's keys reach the trigger, and
+    /// spending the ring on it left a permanent blue ring on whichever select was opened last.
     focused: bool,
 }
 
@@ -173,6 +175,28 @@ fn settings_select_surface_color(palette: UiPalette) -> u32 {
     palette.card_bg
 }
 
+/// The trigger's paint for its state: surface color, border color, border width (§10).
+///
+/// Kept pure so the contract is assertable without a window: the accent ring is keyboard focus
+/// only, and the open state is a surface change. A `match` buried in the FFI path is what let the
+/// open state repaint the ring instead.
+fn settings_select_trigger_paint(palette: UiPalette, focused: bool, open: bool) -> (u32, u32, f64) {
+    if focused {
+        // The CALayer border draws inside the bounds, so the 2pt accent border is the documented
+        // inset ring.
+        (settings_select_surface_color(palette), palette.accent, 2.0)
+    } else if open {
+        // §10 open: a surface change, not a ring. The panel itself is the primary cue.
+        (palette.hover_bg, palette.card_border, 1.0)
+    } else {
+        (
+            settings_select_surface_color(palette),
+            palette.card_border,
+            1.0,
+        )
+    }
+}
+
 fn settings_select_item_active_color(palette: UiPalette) -> u32 {
     palette.hover_bg
 }
@@ -304,23 +328,16 @@ unsafe fn settings_select_apply_visual(button: *mut AnyObject, open: bool) {
     let _: () = msg_send![arrow_view, setContentTintColor: tint];
     let layer: *mut AnyObject = msg_send![button, layer];
     if !layer.is_null() {
-        let background = settings_select_surface_color(palette);
-        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
         let focused = SETTINGS_SELECT_STATES
             .lock()
             .unwrap()
             .get(&(button as usize))
             .map(|state| state.focused)
             .unwrap_or(false);
-        if focused {
-            // Keyboard focus uses the documented 2pt inset accent ring (§10); the CALayer border
-            // draws inside the bounds, so this is an inset ring.
-            crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.accent));
-            let _: () = msg_send![layer, setBorderWidth: 2.0f64];
-        } else {
-            crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-            let _: () = msg_send![layer, setBorderWidth: 1.0f64];
-        }
+        let (surface, border, border_width) = settings_select_trigger_paint(palette, focused, open);
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(surface));
+        crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(border));
+        let _: () = msg_send![layer, setBorderWidth: border_width];
         let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
         let _: () = msg_send![layer, setMasksToBounds: true];
     }
@@ -391,6 +408,116 @@ unsafe fn settings_select_close(button: *mut AnyObject) {
         *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
     }
     settings_select_apply_visual(button, false);
+    settings_select_release_panel_focus(button);
+}
+
+/// Hand back the focus the open panel needed.
+///
+/// Opening the popup makes the trigger first responder so the panel's keys reach it (the panel is
+/// non-activating and never becomes key itself). Nothing else in the settings window takes focus —
+/// there is no key view loop — so AppKit would never resign it: without this, whichever select was
+/// opened last stays first responder after its panel closes.
+unsafe fn settings_select_release_panel_focus(button: *mut AnyObject) {
+    if button.is_null() {
+        return;
+    }
+    let window: *mut AnyObject = msg_send![button, window];
+    if window.is_null() {
+        return;
+    }
+    let first_responder: *mut AnyObject = msg_send![window, firstResponder];
+    if first_responder == button {
+        let _: bool = msg_send![window, makeFirstResponder: std::ptr::null::<AnyObject>()];
+    }
+}
+
+/// Wrap up every select before the settings window is hidden: close an open panel and drop the
+/// focus it needed. The panel is a child window, so an open one would otherwise be hidden along with
+/// the host while its state (and the trigger's open surface) stayed behind for the next open.
+pub(super) fn close_open_settings_selects() {
+    let buttons: Vec<usize> = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .keys()
+        .copied()
+        .collect();
+    for button in buttons {
+        let open = SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&button)
+            .is_some_and(|state| state.open);
+        unsafe {
+            let button = button as *mut AnyObject;
+            if open {
+                settings_select_close(button);
+            } else {
+                settings_select_release_panel_focus(button);
+            }
+        }
+    }
+}
+
+/// A1 smoke (AppKit main thread, real settings window): opening a select must not paint the §10
+/// focus ring, and closing it must hand the panel's focus back.
+///
+/// Both facts are about a real window's first responder, so they cannot be asserted from the unit
+/// tests (whose thread is not the main thread). Runs from `--smoke-settings-layout`.
+pub(super) unsafe fn settings_select_focus_ring_smoke() -> bool {
+    let button = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|(_, state)| !state.items.is_empty())
+        .map(|(button, _)| *button);
+    let Some(button) = button else {
+        log_info!("[smoke-settings-layout] no registered select to open");
+        return false;
+    };
+    let button = button as *mut AnyObject;
+    let window: *mut AnyObject = msg_send![button, window];
+    if window.is_null() {
+        log_info!("[smoke-settings-layout] the select has no window to open in");
+        return false;
+    }
+
+    // The real open path, so the trigger holds first responder exactly as it does on a click.
+    settings_select_open(button);
+    let open = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .get(&(button as usize))
+        .is_some_and(|state| state.open);
+    if !open {
+        log_info!("[smoke-settings-layout] the select did not open; cannot check its surface");
+        return false;
+    }
+    let palette = settings_palette();
+    let layer: *mut AnyObject = msg_send![button, layer];
+    let border_width: f64 = msg_send![layer, borderWidth];
+    let border_color = crate::ffi::layer_border_color(layer);
+    let ring_color = crate::ffi::hex_to_cg_color(palette.accent);
+    let ring_drawn = border_width >= 2.0
+        || crate::ffi::CGColorEqualToColor(
+            border_color as *const c_void,
+            ring_color as *const c_void,
+        );
+    if ring_drawn {
+        log_info!(
+            "[smoke-settings-layout] an open select painted the focus ring (width {border_width})"
+        );
+        settings_select_close(button);
+        return false;
+    }
+
+    settings_select_close(button);
+    let first_responder: *mut AnyObject = msg_send![window, firstResponder];
+    if first_responder == button {
+        log_info!("[smoke-settings-layout] a closed select still holds the window's focus");
+        return false;
+    }
+    log_info!("[smoke-settings-layout] select open/close focus behavior holds");
+    true
 }
 
 extern "C" fn settings_select_finish_close(this: *mut c_void, _cmd: Sel, panel: *mut c_void) {
@@ -1269,7 +1396,17 @@ extern "C" fn settings_select_become_first_responder(this: *mut c_void, _cmd: Se
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let accepted = send(&mut sup, sel!(becomeFirstResponder));
         if accepted {
-            settings_select_set_focused(this as usize, true);
+            // The popup asks for the trigger's keys while its panel is up; that is not keyboard
+            // focus, so it must not draw the §10 ring. Genuine keyboard focus (a key view loop, an
+            // explicit request) arrives here with no panel open.
+            let popup_open = SETTINGS_SELECT_STATES
+                .lock()
+                .unwrap()
+                .get(&(this as usize))
+                .is_some_and(|state| state.open);
+            if !popup_open {
+                settings_select_set_focused(this as usize, true);
+            }
         }
         accepted
     }
@@ -1595,6 +1732,7 @@ mod tests {
     use super::{
         settings_select_centered_text_geometry, settings_select_item_active_color,
         settings_select_panel_geometry, settings_select_surface_color,
+        settings_select_trigger_paint,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -1603,6 +1741,39 @@ mod tests {
             && inner.origin.y >= outer.origin.y - epsilon
             && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + epsilon
             && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + epsilon
+    }
+
+    #[test]
+    fn settings_select_open_never_paints_the_focus_ring() {
+        // Regression: the open state used to be spelled as focus, so opening a dropdown left the §10
+        // accent ring on the trigger until the settings window was closed (nothing in this window
+        // takes focus away from it). The ring is keyboard focus only.
+        for palette in [
+            crate::theme::ui_palette_for_mode(false),
+            crate::theme::ui_palette_for_mode(true),
+        ] {
+            let (surface, border, width) = settings_select_trigger_paint(palette, false, true);
+            assert_eq!(surface, palette.hover_bg, "open must use the hover surface");
+            assert_eq!(
+                border, palette.card_border,
+                "open must keep the idle border"
+            );
+            assert_eq!(width, 1.0, "open must not draw the 2pt ring");
+            assert_ne!(border, palette.accent, "open must not use the accent token");
+
+            // Keyboard focus is what the ring is for, and it wins over an open panel.
+            let (_, focused_border, focused_width) =
+                settings_select_trigger_paint(palette, true, true);
+            assert_eq!(focused_border, palette.accent);
+            assert_eq!(focused_width, 2.0);
+
+            // Idle is the card surface with the idle border.
+            let (idle_surface, idle_border, idle_width) =
+                settings_select_trigger_paint(palette, false, false);
+            assert_eq!(idle_surface, settings_select_surface_color(palette));
+            assert_eq!(idle_border, palette.card_border);
+            assert_eq!(idle_width, 1.0);
+        }
     }
 
     #[test]

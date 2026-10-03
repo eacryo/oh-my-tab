@@ -830,6 +830,17 @@ pub(crate) unsafe fn layer_background_color(layer: *mut AnyObject) -> *mut c_voi
     f(layer as *mut c_void, sel)
 }
 
+/// Read CALayer.borderColor as a CGColorRef without objc2's object-pointer signature check.
+pub(crate) unsafe fn layer_border_color(layer: *mut AnyObject) -> *mut c_void {
+    let sel = sel!(borderColor);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel) -> *mut c_void;
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel)
+}
+
 /// Set CALayer.borderColor using raw objc_msgSend (CGColorRef, not NSColor*).
 pub(crate) unsafe fn layer_set_border(layer: *mut AnyObject, cg: *mut c_void) {
     let sel = sel!(setBorderColor:);

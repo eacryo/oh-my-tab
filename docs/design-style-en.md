@@ -491,6 +491,7 @@ Every custom-drawn control needs all six states, and each uses the token above, 
 | hover | `hover_bg` fill (instant, no transition) |
 | pressed | accent at ~85% for filled controls; `hover_bg` + slight inset for bordered ones |
 | selected | `selection_bg` fill, or an accent ring for cards and tiles |
+| open | `hover_bg` fill, idle border; for a control that expands in place instead of opening a separate surface, `hover_bg` + slight inset. The open surface must be cleared when it collapses: the accent ring belongs to focus, not to "expanded" |
 | disabled | `text_disabled`, 50% opacity on the control's fill, no hover feedback |
 | focus (keyboard) | inset accent ring, 2pt, always visible against both `card_bg` and `window_bg` |
 

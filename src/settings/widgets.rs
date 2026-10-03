@@ -3649,7 +3649,10 @@ mod tests {
             );
             release_obj(sw);
 
-            // Select focus: become/resignFirstResponder run the super call and must not crash.
+            // Select focus: become/resignFirstResponder run the super call and must not crash. The
+            // open/close focus behavior needs a real window on the AppKit main thread, so it is
+            // asserted by the in-app settings smoke (`--smoke-settings-layout`); creating a window
+            // here throws, because this test thread is not the main thread.
             let popup = super::make_popup(0.0, 0.0, 200.0, 32.0, &["A", "B"], 0);
             let _: bool = msg_send![popup, becomeFirstResponder];
             let _: bool = msg_send![popup, resignFirstResponder];

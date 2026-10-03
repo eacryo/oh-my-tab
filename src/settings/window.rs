@@ -559,6 +559,9 @@ pub(super) fn hide_settings() {
     // Defensive: wrap up any in-progress recording / edit panel when the window closes.
     cancel_recording_from_main();
     close_mapping_panel();
+    // A select's panel is a child window and the trigger stays first responder while it is open, so
+    // both its state and its focus outlive a hide unless they are wrapped up here.
+    super::select::close_open_settings_selects();
     set_text_input_active(false);
     // Closing settings discards any unconfirmed restore action and resets to one button (both
     // cards).
@@ -989,6 +992,11 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         log_info!("[smoke-settings-layout] opening settings");
         show_settings();
         log_info!("[smoke-settings-layout] settings opened");
+        // The select's open surface and focus hand-back are only observable with a real window.
+        if !super::select::settings_select_focus_ring_smoke() {
+            log_info!("[smoke-settings-layout] select open/close focus smoke failed");
+            return false;
+        }
         let liquid_glass_selected =
             crate::config::effective_panel_material().as_str() == "liquid-glass";
         let glass_tint_caption_ok = !liquid_glass_selected
