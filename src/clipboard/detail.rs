@@ -1075,6 +1075,25 @@ struct RowSpec<'a> {
     sel_idx: usize,
 }
 
+/// The row backdrop wash for one selection/hover combination, shared by the row-build path
+/// (`create_row_views`) and the runtime repaint (`update_hover_visuals`) so the two cannot
+/// drift again. The selection owns the backdrop: when one row is both selected and hovered
+/// (arrow navigation repaints the new selection as hovered; the pointer can rest on the
+/// selected row), the selection wash must win. Pure so the precedence is unit-assertable.
+pub(super) fn row_backdrop_wash(
+    palette: crate::theme::UiPalette,
+    selected: bool,
+    hovered: bool,
+) -> u32 {
+    if selected {
+        palette.selection_bg
+    } else if hovered {
+        palette.hover_bg
+    } else {
+        0x00000000
+    }
+}
+
 /// Create one row (optional group header + tile + content/meta buttons + 3 action buttons),
 /// attach it to the container, and return its hover-related views. Extracted from
 /// `rebuild_rows` so scroll-time incremental materialization (`sync_visible_rows`) can reuse
@@ -1130,9 +1149,10 @@ unsafe fn create_row_views(
         row_group_label = Some(ObjPtr::new(g));
     }
 
-    // The row backdrop (two distinct styles): hovered (not selected) = 0.032 black
-    // with NO bar; selected = 0.050 black + a 2px left bar. The new mockup's
-    // .item:hover vs .item.selected.
+    // The row backdrop (two distinct styles): hovered (not selected) = the palette's hover
+    // wash with NO bar; selected = the selection wash + a 2px left bar. The new mockup's
+    // .item:hover vs .item.selected. update_hover_visuals repaints this same pair at runtime
+    // through row_backdrop_wash.
     let tile: *mut AnyObject = msg_send![class!(NSView), alloc];
     let tile: *mut AnyObject = msg_send![
         tile,
@@ -1140,13 +1160,7 @@ unsafe fn create_row_views(
     ];
     let _: () = msg_send![tile, setWantsLayer: true];
     let tile_layer: *mut AnyObject = msg_send![tile, layer];
-    let bg_hex = if selected {
-        palette.selection_bg
-    } else if hovered {
-        palette.hover_bg
-    } else {
-        0x00000000
-    };
+    let bg_hex = row_backdrop_wash(palette, selected, hovered);
     // layer_set_background goes through raw objc_msgSend: objc2's msg_send! can't encode
     // CGColor args/returns ('^{CGColor=}' vs '^v').
     crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(bg_hex));
@@ -2121,9 +2135,11 @@ fn update_hover_visuals(prev: usize, new: usize) {
     let sel = picker_selection();
     let hist = CLIP_HISTORY.lock().unwrap();
     let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-    // Keep in sync with the constants at row creation (selected 0.050 beats hovered 0.032).
-    const SEL_BG: f64 = 0.050;
-    const HOVER_BG: f64 = 0.032;
+    // Repaint through the same pure wash helper create_row_views paints at row build, so the
+    // two paths cannot drift. They once did: the incremental repaint used literal black
+    // washes (5%/3.2%), which measure ~1.005:1 on the dark panel, so arrow navigation dropped
+    // the blue selection wash and hover feedback vanished in dark mode.
+    let palette = clipboard_palette();
     unsafe {
         for i in [prev, new] {
             if i == NO_SELECTION {
@@ -2134,17 +2150,9 @@ fn update_hover_visuals(prev: usize, new: usize) {
             };
             let selected = i == sel;
             let hovered = i == new;
-            let bg_alpha = if selected {
-                SEL_BG
-            } else if hovered {
-                HOVER_BG
-            } else {
-                0.0
-            };
+            let bg = row_backdrop_wash(palette, selected, hovered);
             let layer: *mut AnyObject = msg_send![rv.tile.0, layer];
-            let bg: *mut AnyObject =
-                msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: bg_alpha];
-            crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(bg));
+            crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(bg));
             if !rv.bar.0.is_null() {
                 let _: () = msg_send![rv.bar.0, setHidden: !selected];
             }
@@ -2178,6 +2186,64 @@ fn set_hover_row(new: usize) {
     update_hover_visuals(prev, new);
 }
 
+/// Exercise both real AppKit row-paint paths with a row that is selected and hovered.
+/// The picker smoke reads the resulting layer colors, so this tests the wiring as well as the
+/// pure precedence rule without scanning source text.
+pub(super) unsafe fn smoke_row_backdrop_paint_paths() -> bool {
+    let selection = picker_selection();
+    let Some(row) = row_view_for_display_index(selection) else {
+        return false;
+    };
+    let Some(container) = picker_container_ptr() else {
+        return false;
+    };
+    let Some(history_index) = with_clipboard_ui(|ui| ui.filtered.get(selection).copied()) else {
+        return false;
+    };
+    let Some(entry) = CLIP_HISTORY.lock().unwrap().get(history_index).cloned() else {
+        return false;
+    };
+
+    let expected = clipboard_palette().selection_bg;
+    set_hover_row(NO_SELECTION);
+    set_hover_row(selection);
+    let repaint_layer: *mut AnyObject = msg_send![row.tile.0, layer];
+    let repaint_ok = layer_matches_hex(repaint_layer, expected);
+
+    let frame: NSRect = msg_send![row.tile.0, frame];
+    let mut stats = RowCreateStats::default();
+    let created = create_row_views(
+        container,
+        RowSpec {
+            entry: &entry,
+            display_index: selection,
+            y: frame.origin.y,
+            row_h: frame.size.height,
+            has_header: false,
+            selected: true,
+            hovered: true,
+            show_source: false,
+            detail_open: false,
+            sel_idx: selection,
+        },
+        &mut stats,
+    );
+    let create_layer: *mut AnyObject = msg_send![created.tile.0, layer];
+    let create_ok = layer_matches_hex(create_layer, expected);
+    remove_row_views(&created);
+    set_hover_row(NO_SELECTION);
+    repaint_ok && create_ok
+}
+
+unsafe fn layer_matches_hex(layer: *mut AnyObject, expected: u32) -> bool {
+    let actual = crate::ffi::layer_background_color(layer);
+    if actual.is_null() {
+        return false;
+    }
+    let expected = crate::ffi::hex_to_cg_color(expected);
+    crate::ffi::CGColorEqualToColor(actual, expected)
+}
+
 /// With search focus, the list has no keyboard-selected row, but filtered entries must still
 /// show their independent mouse-hover style.
 extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
@@ -2187,8 +2253,9 @@ extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *m
     }
     let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
     if idx >= 0 {
-        // Hovering only sets the hovered row (the light 0.032 fill) and does NOT move the
-        // selection (0.050 + the left bar) -- the selection moves via the keyboard arrows
+        // Hovering only sets the hovered row (the hover wash) and does NOT move the
+        // selection (the selection wash + the left bar) -- the selection moves via the
+        // keyboard arrows
         // / clicks only. The two states stay independently visible, matching the mockup's
         // separate .item:hover and .item.selected rules (auto-select-on-hover would always
         // render the hovered row as the selected style, making them look identical).

@@ -2251,6 +2251,7 @@ pub fn run() {
     let is_gui_smoke_process = std::env::args().any(|arg| {
         arg == "--smoke-clipboard"
             || arg == "--smoke-overlay"
+            || arg == "--smoke-keystroke-display-panel"
             || arg == "--smoke-settings-layout"
             || arg == "--smoke-settings-state-sync"
             || arg == "--smoke-settings-collapsible-row"

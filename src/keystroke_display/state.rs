@@ -12,7 +12,13 @@ pub(crate) const BADGE_GAP: f64 = 6.0;
 /// Height of one badge row when keys run horizontally, and of a single keycap in a column.
 pub(crate) const BADGE_H: f64 = 34.0;
 pub(crate) const PANEL_SIDE_PADDING: f64 = 12.0;
-pub(crate) const BADGE_HORIZONTAL_PADDING: f64 = 28.0;
+/// Horizontal padding inside a lone keycap. 8pt per side: keycap-tight rather than
+/// capsule-roomy, which keeps the column rail narrow ("Paused", the widest shipped keycap
+/// text, measures 63.5pt at this padding).
+pub(crate) const BADGE_HORIZONTAL_PADDING: f64 = 16.0;
+/// Minimum width for a horizontal lone keycap, so one-character keys have the same visual
+/// weight as modifier cells (a Command cell is about 32pt including its insets).
+pub(crate) const BADGE_MIN_WIDTH: f64 = 32.0;
 /// Horizontal padding on each side of a multi-key badge container.
 pub(crate) const BADGE_CONTAINER_PADDING_X: f64 = 4.0;
 /// Horizontal padding on each side of one keycap cell inside a badge container.
@@ -26,6 +32,67 @@ pub(crate) const BADGE_CELL_INSET_Y: f64 = 4.0;
 pub(crate) const BADGE_CONTAINER_PADDING_Y: f64 = 4.0;
 /// Height of the "×N" repeat suffix when it takes its own row under a stacked chord.
 pub(crate) const BADGE_REPEAT_SUFFIX_H: f64 = 16.0;
+/// A merge count stops climbing here: further autorepeats keep merging but the displayed
+/// number freezes, so the widest possible suffix stays two digits wide.
+pub(crate) const MAX_REPEAT_COUNT: u32 = 99;
+/// The one fixed width EVERY keycap renders at in a column -- lone keycaps and split chord
+/// cells alike (a column has no trays) -- so the rail and the panel behind it never change
+/// as keys come and go. Sized to hold every shipped locale's widest keycap text without a
+/// merge count ("Paused" measures 63.5pt at the 14pt badge font and the 16pt horizontal
+/// padding; in a column the count renders on its own row below the glyph). The
+/// page-up/down legends are short ("Pg Dn" / "下页") so no key name needs more width than
+/// the common keys do. Only a column uses the shared width -- a row keeps content-sized
+/// keycaps.
+pub(crate) const KEYCAP_RAIL_W: f64 = 64.0;
+
+/// The stream-axis length a merged keycap's own suffix row adds below its glyph in a column:
+/// the gap plus the suffix row's height, or nothing when the key was pressed once.
+pub(crate) fn repeat_suffix_row(repeats: u32) -> f64 {
+    if repeats > 1 {
+        BADGE_CELL_GAP + BADGE_REPEAT_SUFFIX_H
+    } else {
+        0.0
+    }
+}
+
+/// Estimate a column chord after it is split into standalone keycaps, matching the panel's
+/// per-badge stream spacing and the repeat suffix on the final keycap.
+fn estimated_split_chord_height(cell_count: usize, repeats: u32) -> f64 {
+    cell_count as f64 * BADGE_H
+        + cell_count.saturating_sub(1) as f64 * BADGE_GAP
+        + repeat_suffix_row(repeats)
+}
+
+/// The badges a COLUMN actually draws. Every keycap is independent: a chord is split into one
+/// lone badge per cell (modifiers keep their accent tint), stacked in the stream like any
+/// single key -- no grouping tray around them. The chord's repeat count rides on the LAST
+/// cell, whose keycap then grows its own suffix row. Non-chord badges pass through
+/// unchanged. Pure so the split is unit-assertable; a row keeps chords as trayed cells.
+pub(crate) fn column_display_badges(badges: &[Badge]) -> Vec<Badge> {
+    let mut out = Vec::with_capacity(badges.len());
+    for badge in badges {
+        if badge.cells.len() > 1 {
+            let last = badge.cells.len().saturating_sub(1);
+            for (index, cell) in badge.cells.iter().enumerate() {
+                out.push(Badge {
+                    text: cell.text().to_string(),
+                    kind: if cell.is_accented_modifier() {
+                        BadgeKind::Modifier
+                    } else if cell.is_modifier() {
+                        BadgeKind::ModifierReleased
+                    } else {
+                        BadgeKind::Chord
+                    },
+                    repeats: if index == last { badge.repeats } else { 1 },
+                    cells: Vec::new(),
+                });
+            }
+        } else {
+            out.push(badge.clone());
+        }
+    }
+    out
+}
 
 /// How the keys are laid out, decided by the screen edge the panel sits on. A panel against a
 /// horizontal edge (`top`/`bottom`) runs its keys across in a row; one against a vertical edge
@@ -64,7 +131,8 @@ pub(crate) fn estimated_badge_width(text: &str, repeats: u32) -> f64 {
     } else {
         0.0
     };
-    text.chars().map(estimated_glyph_width).sum::<f64>() + BADGE_HORIZONTAL_PADDING + repeat_width
+    (text.chars().map(estimated_glyph_width).sum::<f64>() + BADGE_HORIZONTAL_PADDING + repeat_width)
+        .max(BADGE_MIN_WIDTH)
 }
 
 /// Estimated width of a multi-key badge: a container holding one padded keycap cell per key,
@@ -86,24 +154,6 @@ pub(crate) fn estimated_cells_width(cells: &[BadgeCell], repeats: u32) -> f64 {
                 .sum::<f64>();
     }
     width
-}
-
-/// The height of a multi-key badge stacked in a column: one keycap row per cell, plus the repeat
-/// suffix on its own row when the key was held. Mirrors `estimated_cells_width` with the axes
-/// swapped, so a chord that is a wide container in a row becomes a tall one in a column.
-pub(crate) fn estimated_cells_height(cells: &[BadgeCell], repeats: u32) -> f64 {
-    let cell_h = BADGE_H - BADGE_CELL_INSET_Y * 2.0;
-    let mut height = BADGE_CONTAINER_PADDING_Y * 2.0;
-    for index in 0..cells.len() {
-        if index > 0 {
-            height += BADGE_CELL_GAP;
-        }
-        height += cell_h;
-    }
-    if repeats > 1 {
-        height += BADGE_CELL_GAP + BADGE_REPEAT_SUFFIX_H;
-    }
-    height
 }
 
 fn estimated_glyph_width(glyph: char) -> f64 {
@@ -218,17 +268,27 @@ pub(crate) enum BadgeKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum BadgeCell {
     Modifier(String),
+    ReleasedModifier(String),
     Key(String),
 }
 
 impl BadgeCell {
     pub(crate) fn text(&self) -> &str {
         match self {
-            BadgeCell::Modifier(text) | BadgeCell::Key(text) => text,
+            BadgeCell::Modifier(text)
+            | BadgeCell::ReleasedModifier(text)
+            | BadgeCell::Key(text) => text,
         }
     }
 
     pub(crate) fn is_modifier(&self) -> bool {
+        matches!(
+            self,
+            BadgeCell::Modifier(_) | BadgeCell::ReleasedModifier(_)
+        )
+    }
+
+    pub(crate) fn is_accented_modifier(&self) -> bool {
         matches!(self, BadgeCell::Modifier(_))
     }
 }
@@ -274,11 +334,13 @@ impl Badge {
     /// This badge's extent along the stream axis: its width when keys run in a row, its height
     /// when they stack in a column. A lone keycap is the same size either way, but its extent
     /// still swaps — a row advances across its width, a column down its height — so the trim cap
-    /// measures the same axis the panel lays out.
+    /// measures the same axis the panel lays out. In a column a merged keycap grows DOWN the
+    /// stream axis instead of widening: the count takes its own row below the glyph, mirroring
+    /// a chord's suffix row.
     pub(crate) fn estimated_extent(&self, orientation: Orientation) -> f64 {
         match (orientation.is_vertical(), self.cells.len() > 1) {
-            (true, true) => estimated_cells_height(&self.cells, self.repeats),
-            (true, false) => BADGE_H,
+            (true, true) => estimated_split_chord_height(self.cells.len(), self.repeats),
+            (true, false) => BADGE_H + repeat_suffix_row(self.repeats),
             (false, _) => self.estimated_width(),
         }
     }
@@ -469,6 +531,7 @@ impl StateMachine {
         self.active_flags = flags;
         if (old_flags ^ flags) & crate::keystroke_display::mapping::modifier_mask() != 0 {
             self.last_key = None;
+            self.release_chord_modifiers(flags, mode);
         }
         if self.secure {
             return;
@@ -526,6 +589,27 @@ impl StateMachine {
             }
         } else if self.modifier_badge.is_some() {
             self.deadline = None;
+        }
+    }
+
+    fn release_chord_modifiers(&mut self, flags: u64, mode: DisplayMode) {
+        if self.secure {
+            return;
+        }
+        let active: Vec<String> = crate::keystroke_display::mapping::modifier_event_cells(
+            flags & mode.visible_modifier_event_mask(),
+        );
+        for badge in &mut self.badges {
+            if badge.kind != BadgeKind::Chord {
+                continue;
+            }
+            for cell in &mut badge.cells {
+                if let BadgeCell::Modifier(text) = cell {
+                    if !active.iter().any(|held| held == text) {
+                        *cell = BadgeCell::ReleasedModifier(text.clone());
+                    }
+                }
+            }
         }
     }
 
@@ -633,8 +717,9 @@ impl StateMachine {
         }
 
         // The same key pressed repeatedly shows three separate badges, then collapses into one
-        // with a count that keeps climbing on further presses.
-        let next_count = last.press_count.saturating_add(1);
+        // with a count that keeps climbing on further presses -- freezing at
+        // MAX_REPEAT_COUNT, past which further repeats merge without changing the number.
+        let next_count = last.press_count.saturating_add(1).min(MAX_REPEAT_COUNT);
         if last.press_count < 3 {
             self.push_badge(repeat_badge(&last));
         } else if last.press_count == 3 {
@@ -684,12 +769,82 @@ fn repeat_badge(last: &LastKey) -> Badge {
 #[cfg(test)]
 mod tests {
     use super::{
-        estimated_badge_width, estimated_cells_height, estimated_cells_width,
-        estimated_stream_width, BadgeCell, BadgeKind, DisplayMode, Input, KeyGlyph, Orientation,
-        StateMachine, BADGE_H, IDLE_FADE, MODIFIER_ONLY_FADE,
+        estimated_badge_width, estimated_cells_width, estimated_stream_width, repeat_suffix_row,
+        Badge, BadgeCell, BadgeKind, DisplayMode, Input, KeyGlyph, Orientation, StateMachine,
+        BADGE_H, BADGE_MIN_WIDTH, IDLE_FADE, MAX_REPEAT_COUNT, MODIFIER_ONLY_FADE,
     };
     use crate::event_tap::keyboard;
     use std::time::{Duration, Instant};
+
+    /// A merged lone keycap in a column grows DOWN the stream axis (its own suffix row below
+    /// the glyph), never wider; unmerged it stays one cap tall. A row keeps the count inline
+    /// in the text, so there it is the width estimate that grows.
+    #[test]
+    fn merged_lone_keycap_extent_grows_down_not_wide() {
+        let mut badge = Badge::new("A".to_string(), BadgeKind::Chord);
+        assert_eq!(badge.estimated_extent(Orientation::Vertical), BADGE_H);
+        let unmerged_width = badge.estimated_width();
+        badge.repeats = 7;
+        assert_eq!(
+            badge.estimated_extent(Orientation::Vertical),
+            BADGE_H + repeat_suffix_row(7)
+        );
+        assert!(badge.estimated_width() > unmerged_width);
+    }
+
+    /// A column splits every chord into independent lone keycaps -- one per cell, modifiers
+    /// keeping the accent tint, no tray -- and the chord's repeat count rides on the last
+    /// cell. Non-chord badges pass through unchanged.
+    #[test]
+    fn column_display_badges_split_chords_into_lone_keycaps() {
+        use super::column_display_badges;
+        let lone = Badge::new("A".to_string(), BadgeKind::Chord);
+        let mut chord = Badge::with_cells(
+            BadgeKind::Chord,
+            vec![
+                BadgeCell::Modifier("⌘".to_string()),
+                BadgeCell::Key("C".to_string()),
+            ],
+        );
+        chord.repeats = 5;
+        let split = column_display_badges(&[lone.clone(), chord]);
+        assert_eq!(split.len(), 3);
+        assert_eq!(split[0].text, "A");
+        assert_eq!(split[1].text, "⌘");
+        assert_eq!(split[1].kind, BadgeKind::Modifier);
+        assert_eq!(split[1].repeats, 1);
+        assert_eq!(split[2].text, "C");
+        assert_eq!(split[2].kind, BadgeKind::Chord);
+        assert_eq!(split[2].repeats, 5);
+        assert!(split.iter().all(|badge| badge.cells.is_empty()));
+        // A stream with no chords is unchanged.
+        let unchanged = column_display_badges(std::slice::from_ref(&lone));
+        assert_eq!(unchanged, vec![lone]);
+    }
+
+    /// The merge count freezes at MAX_REPEAT_COUNT: past it, further autorepeats keep merging
+    /// without changing the number, so the widest suffix stays two digits wide.
+    #[test]
+    fn repeat_count_freezes_at_the_cap() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        // Cross the 3-press threshold into merged form, then autorepeat far past the cap.
+        for i in 0..4u64 {
+            state.apply(
+                down(0, 0, "a"),
+                DisplayMode::All,
+                now + Duration::from_millis(i),
+            );
+        }
+        for i in 4..(MAX_REPEAT_COUNT as u64 + 40) {
+            state.apply(
+                down_with_repeat(0, 0, true, "a"),
+                DisplayMode::All,
+                now + Duration::from_millis(i),
+            );
+        }
+        assert_eq!(state.badges()[0].repeats, MAX_REPEAT_COUNT);
+    }
 
     fn down(keycode: u16, flags: u64, unicode: &str) -> Input {
         down_with_repeat(keycode, flags, false, unicode)
@@ -735,6 +890,29 @@ mod tests {
         assert_eq!(state.badges()[0].kind, BadgeKind::Chord);
         assert_eq!(state.badges()[0].text, "⌘⇧q");
         assert_eq!(state.deadline(), Some(now + Duration::from_millis(1820)));
+    }
+
+    #[test]
+    fn releasing_command_neutralizes_its_chord_keycap() {
+        let now = Instant::now();
+        let mut state = StateMachine::default();
+        state.apply(flags(keyboard::FLAG_COMMAND, 55), DisplayMode::All, now);
+        state.apply(
+            down(48, keyboard::FLAG_COMMAND, "⇥"),
+            DisplayMode::All,
+            now + Duration::from_millis(10),
+        );
+        assert!(state.badges()[0].cells[0].is_accented_modifier());
+
+        state.apply(
+            flags(0, 55),
+            DisplayMode::All,
+            now + Duration::from_millis(20),
+        );
+        let cell = &state.badges()[0].cells[0];
+        assert_eq!(cell, &BadgeCell::ReleasedModifier("⌘".to_string()));
+        assert!(cell.is_modifier());
+        assert!(!cell.is_accented_modifier());
     }
 
     #[test]
@@ -1062,11 +1240,12 @@ mod tests {
 
     #[test]
     fn shared_width_estimates_include_repeats_gap_and_padding() {
-        assert_eq!(estimated_badge_width("abc", 1), 58.0);
-        assert_eq!(estimated_badge_width("abc", 10), 88.0);
-        assert_eq!(estimated_stream_width([58.0, 88.0]), 176.0);
-        assert_eq!(estimated_badge_width("中文", 1), 60.0);
-        assert_eq!(estimated_badge_width("🙂", 1), 46.0);
+        assert_eq!(estimated_badge_width("a", 1), BADGE_MIN_WIDTH);
+        assert_eq!(estimated_badge_width("abc", 1), 46.0);
+        assert_eq!(estimated_badge_width("abc", 10), 76.0);
+        assert_eq!(estimated_stream_width([46.0, 76.0]), 152.0);
+        assert_eq!(estimated_badge_width("中文", 1), 48.0);
+        assert_eq!(estimated_badge_width("🙂", 1), 34.0);
     }
 
     #[test]

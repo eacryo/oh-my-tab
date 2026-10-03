@@ -85,6 +85,10 @@ pub(crate) fn smoke_runner() -> bool {
     hide_picker();
     // Second show: rebuild_rows removes the old rows first (the former UAF path).
     show_picker();
+    assert!(
+        unsafe { detail::smoke_row_backdrop_paint_paths() },
+        "selected+hovered row backdrops must match in the build and runtime repaint paths"
+    );
     // An active detail icon is a filled chip, so its glyph has to be readable *against its own
     // fill*. Measured on the pixels rather than on the tokens, because the failure was a wrong
     // role: the fill was `primary_text` while the glyph stayed `accent_text`, which is 13.91:1 in

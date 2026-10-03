@@ -1626,12 +1626,21 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         });
         hide_settings();
 
-        states
+        let rebuilt_matches = states
             == Some((
                 1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 1isize, 2isize, 1isize, 1isize,
                 1isize, true,
-            ))
-            && refreshed == Some((0isize, 1isize, 0isize, 0isize, 2isize))
+            ));
+        let refreshed_matches = refreshed == Some((0isize, 1isize, 0isize, 0isize, 2isize));
+        if !rebuilt_matches {
+            log_info!("[smoke-settings-state-sync] rebuilt control state mismatch: {states:?}");
+        }
+        if !refreshed_matches {
+            log_info!(
+                "[smoke-settings-state-sync] refreshed control state mismatch: {refreshed:?}"
+            );
+        }
+        rebuilt_matches && refreshed_matches
     }
 }
 

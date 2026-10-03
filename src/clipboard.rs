@@ -2526,6 +2526,33 @@ mod tests {
         // Sanity-check the pitch constant (guards regressions): a uniform 61pt row.
         const { assert!(ROW_H >= 50.0 && ROW_H < 80.0) };
     }
+
+    /// The row backdrop wash must resolve per the documented precedence: the selection owns
+    /// the backdrop, so selected-beats-hovered. One row is both selected and hovered whenever
+    /// arrow navigation repaints the new selection (refresh_selection passes it as both the
+    /// old-hover target and the new selection) and whenever the pointer rests on the selected
+    /// row. The wash helper is where both paint paths (row build and runtime repaint) meet,
+    /// so asserting all four combinations there pins the rule for both.
+    #[test]
+    fn row_backdrop_wash_selection_beats_hover() {
+        use super::detail::row_backdrop_wash;
+        for dark in [false, true] {
+            let palette = crate::theme::ui_palette_for_mode(dark);
+            assert_eq!(
+                row_backdrop_wash(palette, true, true),
+                palette.selection_bg,
+                "selected+hovered must keep the selection wash ({} mode)",
+                if dark { "dark" } else { "light" }
+            );
+            assert_eq!(
+                row_backdrop_wash(palette, true, false),
+                palette.selection_bg
+            );
+            assert_eq!(row_backdrop_wash(palette, false, true), palette.hover_bg);
+            assert_eq!(row_backdrop_wash(palette, false, false), 0x00000000);
+        }
+    }
+
     #[test]
     fn classify_text_distinguishes_urls_and_code() {
         use super::{classify_text, TextKind};

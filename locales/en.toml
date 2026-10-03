@@ -73,8 +73,8 @@ key_space = "Space"
 key_clear = "Clear"
 key_home = "Home"
 key_end = "End"
-key_page_up = "Page Up"
-key_page_down = "Page Down"
+key_page_up = "Pg Up"
+key_page_down = "Pg Dn"
 
 [settings]
 window_title = "Settings"

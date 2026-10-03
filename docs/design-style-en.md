@@ -465,6 +465,22 @@ disappears instantly.
 **Empty state.** Centered `caption` text in `text_muted`; no illustration unless the surface is a
 first-run surface (onboarding).
 
+**Keystroke display.** A horizontal stream (bottom/top placement) sizes each keycap to its content
+with a 32pt minimum so single-glyph keys have visual weight comparable to a Command modifier cell,
+shows a chord's keys side by side inside a slim tray, and appends a merge count inline with no
+separator (`A×99`). A vertical stream (side placement) draws every keycap independently at ONE
+fixed width: a chord splits into one keycap per key (modifiers keep their tint) with no grouping
+tray, so the rail — and the panel behind it — never changes as keys come and go. The drag handle
+has a transparent 48×20pt hit area (rotated for horizontal streams), larger than its three visible
+dots; it stays localized to the handle rather than making the whole panel draggable. In a column,
+the hit area starts 4pt inside the top edge while the visible dots sit near its outer side, clear
+of the first keycap. In a column, a merge count takes its own small row below its keycap and
+freezes at ×99; in every placement the count renders
+in muted text, adjacent to the name when inline -- it is metadata about the press, not part of the
+key's name. Long legends are shortened at the
+string level ("Pg Dn", not "Page Down") so the fixed width holds every shipped key name; anything
+longer truncates inside its keycap.
+
 ## 10. Interaction states
 
 Every custom-drawn control needs all six states, and each uses the token above, not a new color:

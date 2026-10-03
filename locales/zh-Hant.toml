@@ -74,8 +74,8 @@ key_space = "空白鍵"
 key_clear = "清除"
 key_home = "Home"
 key_end = "End"
-key_page_up = "上一頁"
-key_page_down = "下一頁"
+key_page_up = "上頁"
+key_page_down = "下頁"
 
 [settings]
 window_title = "設定"

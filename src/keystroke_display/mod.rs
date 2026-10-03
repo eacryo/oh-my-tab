@@ -467,7 +467,9 @@ mod tests {
         let instance_guard = crate::single_instance::acquire()
             .expect("panel smoke requires no running app instance for its refusal probe");
         let refusal = std::process::Command::new(&app)
-            .arg("--smoke-keystroke-display-panel")
+            // Keep this a smoke launch so a lock refusal has a failing exit status, but use
+            // an entry point that remains protected by the single-instance guard.
+            .arg("--smoke-single-instance-probe")
             .output()
             .expect("failed to spawn single-instance refusal probe");
         let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);

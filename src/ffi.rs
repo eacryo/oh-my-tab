@@ -219,6 +219,7 @@ extern "C" {
     pub(crate) fn CGImageGetHeight(image: *const c_void) -> usize;
     pub(crate) fn CGColorSpaceCreateDeviceRGB() -> *const c_void;
     pub(crate) fn CGColorGetAlpha(color: *const c_void) -> f64;
+    pub(crate) fn CGColorEqualToColor(color1: *const c_void, color2: *const c_void) -> bool;
     pub(crate) fn CGBitmapContextCreate(
         data: *mut c_void,
         width: usize,
