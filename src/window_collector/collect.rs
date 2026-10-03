@@ -279,8 +279,8 @@ unsafe fn collect_windows_for_pid_inner(
     membership_window_ids.extend(ax_wid_to_info.keys().copied());
     membership_window_ids.sort_unstable();
     membership_window_ids.dedup();
-    let (membership_source, membership_snapshot) = query_space_membership(&membership_window_ids);
-    let current_space_fullscreen = last_current_space_is_fullscreen();
+    let (membership_source, membership_snapshot) =
+        query_space_membership(&membership_window_ids, false);
     let parent_ids: HashMap<u32, u32> = skylight::window_parent_ids(&cg_window_ids);
     let focused_cgwid = parent_ids
         .get(&focused_cgwid)
@@ -349,8 +349,6 @@ unsafe fn collect_windows_for_pid_inner(
             WindowSpacePolicy {
                 minimized: ax_info.minimized,
                 show_minimized,
-                native_fullscreen,
-                current_space_fullscreen,
             },
         ) {
             crate::e2e_state::space_gate_rejected();
@@ -424,8 +422,6 @@ unsafe fn collect_windows_for_pid_inner(
                 WindowSpacePolicy {
                     minimized: ax_info.minimized,
                     show_minimized,
-                    native_fullscreen,
-                    current_space_fullscreen,
                 },
             ) {
                 crate::e2e_state::space_gate_rejected();
@@ -598,53 +594,6 @@ fn recovered_window_passes_size_filter(bounds: (f64, f64, f64, f64)) -> bool {
     custom_window_is_substantial(bounds)
 }
 
-#[derive(Clone, Copy)]
-struct CurrentSpaceWindowEvidence {
-    cgwid: u32,
-    layer: i32,
-    is_onscreen: Option<bool>,
-    admissible: bool,
-    native_fullscreen: bool,
-    ax_fullscreen: Option<bool>,
-}
-
-fn legacy_current_space_is_fullscreen(
-    evidence: impl IntoIterator<Item = CurrentSpaceWindowEvidence>,
-) -> bool {
-    let (mut onscreen_count, mut fullscreen_count) = (0, 0);
-    for window in evidence {
-        if window.layer == 0 && window.is_onscreen == Some(true) && window.admissible {
-            onscreen_count += 1;
-            if window.native_fullscreen {
-                fullscreen_count += 1;
-            }
-        }
-    }
-    onscreen_count > 0 && onscreen_count == fullscreen_count
-}
-
-fn skylight_current_space_is_fullscreen(
-    snapshot: &MembershipSnapshot,
-    evidence: impl IntoIterator<Item = CurrentSpaceWindowEvidence>,
-) -> bool {
-    let members: Vec<_> = evidence
-        .into_iter()
-        .filter(|window| {
-            window.layer == 0
-                && window.admissible
-                && snapshot.window_is_in_current_space(window.cgwid)
-        })
-        .collect();
-    !members.is_empty()
-        && members
-            .iter()
-            .all(|window| window.ax_fullscreen == Some(true))
-}
-
-fn minimized_window_is_visible(show_minimized: bool, minimized: bool) -> bool {
-    show_minimized || !minimized
-}
-
 /// The all-untitled exemption test (pure; unit-tested). At least one window is required: an
 /// empty set must not qualify, or "saw no windows" would read as "untitled windows".
 pub(super) fn windows_are_all_untitled(windows: &[AxWindowInfo]) -> bool {
@@ -677,8 +626,6 @@ enum MembershipSource {
 }
 
 static SKYLIGHT_MEMBERSHIP_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
-static LAST_CURRENT_SPACE_IS_FULLSCREEN: AtomicBool = AtomicBool::new(false);
-
 fn select_membership_source(
     force_legacy: bool,
     skylight_query_succeeded: bool,
@@ -690,11 +637,15 @@ fn select_membership_source(
     }
 }
 
-fn query_space_membership(window_ids: &[u32]) -> (MembershipSource, Option<MembershipSnapshot>) {
+fn query_space_membership(
+    window_ids: &[u32],
+    complete_observation: bool,
+) -> (MembershipSource, Option<MembershipSnapshot>) {
     // `dev_flags::enabled` prepends `--` itself, so the name must be bare: passing
     // "--space-membership-legacy" searched for "----space-membership-legacy" and never matched,
     // leaving this switch silently dead.
     let force_legacy = crate::dev_flags::enabled("space-membership-legacy");
+    let group_generation = crate::space_groups::with_tracker(|tracker| tracker.generation());
     let started = Instant::now();
     let result = if force_legacy {
         None
@@ -705,6 +656,26 @@ fn query_space_membership(window_ids: &[u32]) -> (MembershipSource, Option<Membe
     let source = select_membership_source(force_legacy, snapshot.is_some());
     crate::e2e_state::set_space_membership_source(source == MembershipSource::SkyLight);
     if let Some(snapshot) = snapshot {
+        let (committed, current_spaces_changed) =
+            crate::space_groups::with_tracker_mut(|tracker| {
+                let current_spaces_changed = complete_observation
+                    && tracker.topology().current_spaces_differ(&snapshot.topology);
+                let committed = tracker.observe_topology_if_generation(
+                    group_generation,
+                    snapshot.topology.clone(),
+                    complete_observation,
+                );
+                (committed, committed && current_spaces_changed)
+            });
+        if current_spaces_changed {
+            crate::window_refresh::note_space_transition(false);
+        }
+        if !committed {
+            log_debug!(
+                "[collect] discarded stale Space topology snapshot generation={}",
+                group_generation
+            );
+        }
         log_debug!(
             "[collect] skylight membership: windows={} current_spaces={} elapsed_ms={}",
             window_ids.len(),
@@ -724,30 +695,29 @@ fn query_space_membership(window_ids: &[u32]) -> (MembershipSource, Option<Membe
     (source, snapshot.cloned())
 }
 
-fn record_current_space_is_fullscreen(value: bool) {
-    LAST_CURRENT_SPACE_IS_FULLSCREEN.store(value, Ordering::Release);
-    crate::e2e_state::set_current_space_is_fullscreen(value);
-}
-
-fn last_current_space_is_fullscreen() -> bool {
-    LAST_CURRENT_SPACE_IS_FULLSCREEN.load(Ordering::Acquire)
-}
-
-fn passes_membership_gate(
-    snapshot: &MembershipSnapshot,
-    cgwid: u32,
-    native_fullscreen: bool,
-    current_space_fullscreen: bool,
-) -> bool {
-    current_space_fullscreen || native_fullscreen || snapshot.window_is_in_current_space(cgwid)
+fn passes_membership_gate(snapshot: &MembershipSnapshot, cgwid: u32) -> bool {
+    let Some(memberships) = snapshot.window_space_ids.get(&cgwid) else {
+        return false;
+    };
+    crate::space_groups::with_tracker(|tracker| {
+        let topology = if tracker.topology().displays.is_empty() {
+            &snapshot.topology
+        } else {
+            tracker.topology()
+        };
+        topology.displays.keys().any(|display_id| {
+            let allowed = topology.allowed_spaces(display_id, tracker.fullscreen_origins());
+            memberships
+                .iter()
+                .any(|space_id| allowed.contains(space_id))
+        })
+    })
 }
 
 #[derive(Clone, Copy)]
 struct WindowSpacePolicy {
     minimized: bool,
     show_minimized: bool,
-    native_fullscreen: bool,
-    current_space_fullscreen: bool,
 }
 
 fn passes_space_policy(
@@ -758,52 +728,22 @@ fn passes_space_policy(
     is_onscreen: Option<bool>,
     policy: WindowSpacePolicy,
 ) -> bool {
-    // Minimized windows have no Space membership; preserve their explicit user policy first.
-    if policy.minimized {
-        return policy.show_minimized;
+    // The option controls admission, never Space ownership. A minimized window still has to
+    // satisfy the same membership test as every other candidate.
+    if policy.minimized && !policy.show_minimized {
+        return false;
     }
     match source {
         MembershipSource::SkyLight => passes_membership_gate(
             snapshot.expect("SkyLight source requires a membership snapshot"),
             cgwid,
-            policy.native_fullscreen,
-            policy.current_space_fullscreen,
         ),
-        MembershipSource::Legacy => passes_legacy_space_gate(
-            pairing_source,
-            is_onscreen,
-            Some(policy.minimized),
-            policy.show_minimized,
-            policy.native_fullscreen,
-            policy.current_space_fullscreen,
-        ),
+        MembershipSource::Legacy => passes_legacy_space_gate(pairing_source, is_onscreen),
     }
 }
 
 /// Legacy Space policy retained for OS updates where SkyLight membership cannot be queried.
-fn passes_legacy_space_gate(
-    source: WindowPairingSource,
-    is_onscreen: Option<bool>,
-    ax_minimized: Option<bool>,
-    show_minimized: bool,
-    native_fullscreen: bool,
-    current_space_fullscreen: bool,
-) -> bool {
-    if current_space_fullscreen {
-        return true;
-    }
-    if source == WindowPairingSource::PublishedAx {
-        return true;
-    }
-    if source == WindowPairingSource::AxUnavailable {
-        return is_onscreen == Some(true);
-    }
-    if native_fullscreen {
-        return true;
-    }
-    if ax_minimized == Some(true) {
-        return show_minimized;
-    }
+fn passes_legacy_space_gate(_source: WindowPairingSource, is_onscreen: Option<bool>) -> bool {
     is_onscreen == Some(true)
 }
 
@@ -889,7 +829,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     let cg_option = K_C_G_WINDOW_LIST_OPTION_ALL;
     let array = unsafe { CGWindowListCopyWindowInfo(cg_option, 0) };
     if array.is_null() {
-        record_current_space_is_fullscreen(false);
         return vec![];
     }
 
@@ -1081,7 +1020,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     membership_window_ids.retain(|window_id| *window_id != 0);
     membership_window_ids.sort_unstable();
     membership_window_ids.dedup();
-    let (membership_source, membership_snapshot) = query_space_membership(&membership_window_ids);
+    let (membership_source, membership_snapshot) =
+        query_space_membership(&membership_window_ids, true);
 
     let fullscreen_cg_window_ids = native_fullscreen_cg_window_ids(
         &cg_window_bounds,
@@ -1089,98 +1029,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         &ax_recovered_wid_to_info,
         &display_bounds,
     );
-    // Preserve the onscreen flip observer as a transition signal for thumbnail settling only.
-    // Window visibility itself now comes from CGS Space membership.
-
-    // Gather per-window facts once: the legacy lift still uses its prior onscreen heuristic only
-    // when forced or when the SkyLight query fails; the normal path derives the lift from exact
-    // current-Space membership and AX fullscreen attributes.
-    let mut current_space_evidence = Vec::new();
-    for i in 0..count {
-        let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
-        if dict.is_null()
-            || cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999) != 0
-            || cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0) <= 0.0
-        {
-            continue;
-        }
-        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-        if owner_pid <= 0 || (!show_hidden_app_windows && hidden_app_pids.contains(&owner_pid)) {
-            continue;
-        }
-        let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
-        if owner_name.is_empty() || owner_name == "Dock" {
-            continue;
-        }
-        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
-        if cgwid == 0 || is_attached_surface(parent_ids.get(&cgwid).copied()) {
-            continue;
-        }
-        let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default();
-        let published_map = ax_wid_to_info.get(&owner_pid);
-        let recovered_info = ax_recovered_wid_to_info
-            .get(&owner_pid)
-            .and_then(|windows| windows.get(&cgwid));
-        let ax_info = match published_map.and_then(|windows| windows.get(&cgwid)) {
-            Some(info) => Some(info),
-            None if recovered_info.is_some_and(|_| recovered_window_passes_size_filter(bounds)) => {
-                recovered_info
-            }
-            None if published_map.is_some() || ax_empty_pids.contains(&owner_pid) => continue,
-            None => None,
-        };
-        let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
-        let titleless_allowed = titleless_pids.contains(&owner_pid);
-        let has_title = ax_info.map_or_else(
-            || !cg_title.is_empty(),
-            |info| !info.title.is_empty() || titleless_allowed,
-        );
-        if !has_title {
-            continue;
-        }
-        let minimized = ax_info.is_some_and(|info| info.minimized);
-        if !minimized_window_is_visible(show_minimized, minimized) {
-            continue;
-        }
-        let is_main = ax_info.is_some_and(|info| info.is_main);
-        let native_fullscreen = ax_info.is_some_and(|info| {
-            native_fullscreen_state(info.is_fullscreen, bounds, &display_bounds)
-        });
-        if !admissible_window_placement(0, is_main, native_fullscreen)
-            || ax_info.is_some_and(|info| {
-                info.is_custom_root && !custom_window_is_substantial(bounds) && !info.is_main
-            })
-            || is_known_non_normal_window(
-                owner_pid,
-                icon_ids
-                    .get(&owner_pid)
-                    .and_then(|identity| identity.process_start_time_us),
-                cgwid,
-            ) && !is_main
-        {
-            continue;
-        }
-        current_space_evidence.push(CurrentSpaceWindowEvidence {
-            cgwid,
-            layer: 0,
-            is_onscreen: cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
-            admissible: true,
-            native_fullscreen,
-            ax_fullscreen: ax_info.and_then(|info| info.is_fullscreen),
-        });
-    }
-    let legacy_current_space_fullscreen =
-        legacy_current_space_is_fullscreen(current_space_evidence.iter().copied());
-    let current_space_fullscreen = match membership_source {
-        MembershipSource::SkyLight => skylight_current_space_is_fullscreen(
-            membership_snapshot
-                .as_ref()
-                .expect("SkyLight source requires a membership snapshot"),
-            current_space_evidence.iter().copied(),
-        ),
-        MembershipSource::Legacy => legacy_current_space_fullscreen,
-    };
-    record_current_space_is_fullscreen(current_space_fullscreen);
+    // Window visibility comes from per-display Space membership, not a global fullscreen flag.
     let mut onscreen_ids = HashSet::new();
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
@@ -1319,15 +1168,12 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         //   legitimate settings dialogs).
         // - AX windows reported after orderOut remain eligible if SkyLight still assigns them to
         //   a current Space; minimized windows follow the setting before any membership check.
-        // - every discovered source uses the same membership rule, with native-fullscreen and
-        //   current-fullscreen policy exceptions applied on top.
+        // - every discovered source uses the same membership rule; fullscreen state never
+        //   overrides actual Space membership.
         let cg_is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen");
         if owner_pid == std::process::id() as i32 && cg_is_onscreen != Some(true) {
             continue;
         }
-        let in_current_space = membership_snapshot
-            .as_ref()
-            .is_some_and(|snapshot| snapshot.window_is_in_current_space(cgwid));
         let passes_space_policy = passes_space_policy(
             membership_source,
             membership_snapshot.as_ref(),
@@ -1337,8 +1183,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             WindowSpacePolicy {
                 minimized,
                 show_minimized,
-                native_fullscreen,
-                current_space_fullscreen,
             },
         );
         if !passes_space_policy {
@@ -1347,9 +1191,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         }
         if pairing_source == WindowPairingSource::RecoveredAx {
             crate::e2e_state::space_recovered_accepted();
-            if native_fullscreen && !in_current_space {
-                crate::e2e_state::space_fullscreen_exempt();
-            }
         }
 
         // Titleless windows are kept only for apps AX confirmed as all-untitled
@@ -1471,8 +1312,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 WindowSpacePolicy {
                     minimized: ax_info.minimized,
                     show_minimized,
-                    native_fullscreen,
-                    current_space_fullscreen,
                 },
             ) {
                 crate::e2e_state::space_gate_rejected();
@@ -1841,69 +1680,82 @@ mod space_gate_tests {
     fn window_policy(
         minimized: bool,
         show_minimized: bool,
-        native_fullscreen: bool,
-        current_space_fullscreen: bool,
+        _native_fullscreen: bool,
+        _current_space_fullscreen: bool,
     ) -> WindowSpacePolicy {
         WindowSpacePolicy {
             minimized,
             show_minimized,
-            native_fullscreen,
-            current_space_fullscreen,
         }
     }
 
     fn membership(current: &[u64], windows: &[(u32, &[u64])]) -> MembershipSnapshot {
+        let current_space_ids = current.iter().copied().collect();
+        let mut all_spaces: std::collections::HashSet<u64> = current.iter().copied().collect();
+        for (_, spaces) in windows {
+            all_spaces.extend(spaces.iter().copied());
+        }
+        let spaces: HashMap<u64, crate::space_groups::SpaceKind> = all_spaces
+            .into_iter()
+            .map(|space| (space, crate::space_groups::SpaceKind::Ordinary))
+            .collect();
+        let displays = current
+            .iter()
+            .enumerate()
+            .map(|(index, space)| {
+                (
+                    format!("display-{index}"),
+                    crate::space_groups::DisplaySpaces {
+                        current: *space,
+                        spaces: spaces.clone(),
+                    },
+                )
+            })
+            .collect();
         MembershipSnapshot {
-            current_space_ids: current.iter().copied().collect(),
+            current_space_ids,
             window_space_ids: windows
                 .iter()
                 .map(|(window_id, spaces)| (*window_id, spaces.to_vec()))
                 .collect(),
-        }
-    }
-
-    fn evidence(
-        cgwid: u32,
-        is_onscreen: Option<bool>,
-        ax_fullscreen: Option<bool>,
-    ) -> CurrentSpaceWindowEvidence {
-        CurrentSpaceWindowEvidence {
-            cgwid,
-            layer: 0,
-            is_onscreen,
-            admissible: true,
-            native_fullscreen: ax_fullscreen == Some(true),
-            ax_fullscreen,
+            topology: crate::space_groups::Topology { displays },
+            ..Default::default()
         }
     }
 
     #[test]
     fn current_space_membership_intersection_controls_visibility() {
         let snapshot = membership(&[10], &[(7, &[10]), (8, &[20]), (9, &[])]);
-        assert!(passes_membership_gate(&snapshot, 7, false, false));
-        assert!(!passes_membership_gate(&snapshot, 8, false, false));
-        assert!(!passes_membership_gate(&snapshot, 9, false, false));
-        assert!(!passes_membership_gate(&snapshot, 99, false, false));
+        assert!(passes_membership_gate(&snapshot, 7));
+        assert!(!passes_membership_gate(&snapshot, 8));
+        assert!(!passes_membership_gate(&snapshot, 9));
+        assert!(!passes_membership_gate(&snapshot, 99));
     }
 
     #[test]
     fn membership_unions_current_spaces_across_displays() {
         let snapshot = membership(&[10, 20], &[(7, &[10]), (8, &[20]), (9, &[30])]);
-        assert!(passes_membership_gate(&snapshot, 7, false, false));
-        assert!(passes_membership_gate(&snapshot, 8, false, false));
-        assert!(!passes_membership_gate(&snapshot, 9, false, false));
+        assert!(passes_membership_gate(&snapshot, 7));
+        assert!(passes_membership_gate(&snapshot, 8));
+        assert!(!passes_membership_gate(&snapshot, 9));
     }
 
     #[test]
-    fn native_fullscreen_and_current_fullscreen_policy_are_applied_over_membership() {
+    fn fullscreen_flags_do_not_bypass_space_membership() {
         let snapshot = membership(&[10], &[(7, &[10]), (8, &[20])]);
-        assert!(passes_membership_gate(&snapshot, 8, true, false));
-        assert!(passes_membership_gate(&snapshot, 8, false, true));
-        assert!(!passes_membership_gate(&snapshot, 8, false, false));
+        assert!(!passes_membership_gate(&snapshot, 8));
+        assert!(!passes_space_policy(
+            MembershipSource::Legacy,
+            None,
+            WindowPairingSource::RecoveredAx,
+            8,
+            Some(false),
+            window_policy(false, false, true, true),
+        ));
     }
 
     #[test]
-    fn minimized_policy_precedes_membership_even_when_the_space_has_no_membership() {
+    fn minimized_visibility_setting_never_bypasses_membership() {
         let snapshot = membership(&[10], &[(7, &[20])]);
         assert!(!passes_space_policy(
             MembershipSource::SkyLight,
@@ -1913,9 +1765,18 @@ mod space_gate_tests {
             None,
             window_policy(true, false, false, false),
         ));
-        assert!(passes_space_policy(
+        assert!(!passes_space_policy(
             MembershipSource::SkyLight,
             Some(&snapshot),
+            WindowPairingSource::RecoveredAx,
+            7,
+            None,
+            window_policy(true, true, false, false),
+        ));
+        let on_current_space = membership(&[10], &[(7, &[10])]);
+        assert!(passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&on_current_space),
             WindowPairingSource::RecoveredAx,
             7,
             None,
@@ -1950,32 +1811,7 @@ mod space_gate_tests {
     }
 
     #[test]
-    fn current_space_fullscreen_uses_only_current_members_and_ax_fullscreen_facts() {
-        let snapshot = membership(&[10, 20], &[(1, &[10]), (2, &[20]), (3, &[30])]);
-        assert!(skylight_current_space_is_fullscreen(
-            &snapshot,
-            [
-                evidence(1, None, Some(true)),
-                evidence(2, None, Some(true)),
-                evidence(3, None, Some(false))
-            ]
-        ));
-        assert!(!skylight_current_space_is_fullscreen(
-            &snapshot,
-            [
-                evidence(1, None, Some(true)),
-                evidence(2, None, Some(false))
-            ]
-        ));
-        assert!(!skylight_current_space_is_fullscreen(
-            &snapshot,
-            [evidence(1, None, None)]
-        ));
-        assert!(!skylight_current_space_is_fullscreen(&snapshot, []));
-    }
-
-    #[test]
-    fn legacy_fallback_keeps_onscreen_and_legacy_fullscreen_semantics() {
+    fn legacy_fallback_requires_current_space_onscreen_evidence() {
         assert_eq!(
             select_membership_source(true, true),
             MembershipSource::Legacy
@@ -2005,7 +1841,7 @@ mod space_gate_tests {
             Some(true),
             window_policy(false, false, false, false),
         ));
-        assert!(passes_space_policy(
+        assert!(!passes_space_policy(
             MembershipSource::Legacy,
             None,
             WindowPairingSource::AxUnavailable,
@@ -2013,27 +1849,14 @@ mod space_gate_tests {
             None,
             window_policy(false, false, false, true),
         ));
-    }
-
-    #[test]
-    fn legacy_fullscreen_lift_still_requires_nonempty_onscreen_evidence() {
-        assert!(!legacy_current_space_is_fullscreen([]));
-        assert!(legacy_current_space_is_fullscreen([
-            CurrentSpaceWindowEvidence {
-                native_fullscreen: true,
-                ..evidence(7, Some(true), Some(true))
-            }
-        ]));
-        assert!(!legacy_current_space_is_fullscreen([evidence(
-            7,
-            Some(true),
-            Some(false)
-        )]));
-        assert!(!legacy_current_space_is_fullscreen([evidence(
-            7,
+        assert!(passes_space_policy(
+            MembershipSource::Legacy,
             None,
-            Some(true)
-        )]));
+            WindowPairingSource::AxUnavailable,
+            42,
+            Some(true),
+            window_policy(false, false, true, true),
+        ));
     }
 
     #[test]

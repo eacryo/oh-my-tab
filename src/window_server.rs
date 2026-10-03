@@ -18,6 +18,12 @@ use crate::{log_debug, log_info, CONTROLLER};
 const WINDOW_CREATED: u32 = 811;
 const WINDOW_DESTROYED: u32 = 804;
 const WINDOW_FOCUSED: u32 = 808;
+const WINDOW_MOVED: u32 = 806;
+const WINDOW_RESIZED: u32 = 807;
+const WINDOW_JOINED_SPACE: u32 = 1325;
+const WINDOW_LEFT_SPACE: u32 = 1326;
+const SPACE_TOPOLOGY_CHANGED: u32 = 1329;
+const SPACE_TRANSITION_CHANGED: u32 = 1401;
 
 type NotifyCallback = unsafe extern "C" fn(
     event: u32,
@@ -40,6 +46,13 @@ pub(crate) enum WindowServerEvent {
     Created,
     Destroyed(u32),
     Focused(u32),
+    GeometryChanged(u32),
+    SpaceMembership {
+        space_id: u64,
+        window_id: u32,
+        joined: bool,
+    },
+    SpaceTopologyChanged,
 }
 
 struct ActivationState {
@@ -60,7 +73,10 @@ struct OwnFocusIntent {
 static STARTED: AtomicBool = AtomicBool::new(false);
 static DELIVERY_SCHEDULED: AtomicBool = AtomicBool::new(false);
 static SUBSCRIPTION_FAILURE_LOGGED: AtomicBool = AtomicBool::new(false);
+static SPACE_MEMBERSHIP_TRACKING_AVAILABLE: AtomicBool = AtomicBool::new(false);
+static SPACE_MEMBERSHIP_REGISTRATIONS_OK: AtomicBool = AtomicBool::new(false);
 static DROPPED_EVENTS: AtomicU64 = AtomicU64::new(0);
+static SPACE_EVIDENCE_DISCONTINUITY: AtomicBool = AtomicBool::new(false);
 static EVENT_TX: OnceLock<flume::Sender<WindowServerEvent>> = OnceLock::new();
 static MAIN_EVENTS: LazyLock<Mutex<VecDeque<WindowServerEvent>>> =
     LazyLock::new(|| Mutex::new(VecDeque::new()));
@@ -134,25 +150,66 @@ unsafe fn window_server_callback_inner(
     _context: *mut c_void,
     _connection: i32,
 ) {
-    let Some(window_id) = read_window_id(data, data_length) else {
-        return;
-    };
     let event = match event {
+        WINDOW_JOINED_SPACE | WINDOW_LEFT_SPACE => {
+            let Some((space_id, window_id)) = read_space_membership(data, data_length) else {
+                return;
+            };
+            WindowServerEvent::SpaceMembership {
+                space_id,
+                window_id,
+                joined: event == WINDOW_JOINED_SPACE,
+            }
+        }
+        SPACE_TOPOLOGY_CHANGED | SPACE_TRANSITION_CHANGED => {
+            WindowServerEvent::SpaceTopologyChanged
+        }
         WINDOW_CREATED => WindowServerEvent::Created,
-        WINDOW_DESTROYED => WindowServerEvent::Destroyed(window_id),
-        WINDOW_FOCUSED => WindowServerEvent::Focused(window_id),
+        WINDOW_DESTROYED | WINDOW_FOCUSED | WINDOW_MOVED | WINDOW_RESIZED => {
+            let Some(window_id) = read_window_id(data, data_length) else {
+                return;
+            };
+            match event {
+                WINDOW_DESTROYED => WindowServerEvent::Destroyed(window_id),
+                WINDOW_FOCUSED => WindowServerEvent::Focused(window_id),
+                _ => WindowServerEvent::GeometryChanged(window_id),
+            }
+        }
         _ => return,
     };
     if let Some(sender) = EVENT_TX.get() {
         // WindowServer callbacks must never wait for the bridge thread. Lifecycle refreshes
         // provide a later authoritative snapshot if a low-value duplicate is dropped.
-        if let Err(flume::TrySendError::Full(_)) = sender.try_send(event) {
+        if let Err(flume::TrySendError::Full(dropped_event)) = sender.try_send(event) {
+            if matches!(
+                dropped_event,
+                WindowServerEvent::SpaceMembership { .. } | WindowServerEvent::SpaceTopologyChanged
+            ) {
+                SPACE_EVIDENCE_DISCONTINUITY.store(true, Ordering::Release);
+            }
             let dropped = DROPPED_EVENTS.fetch_add(1, Ordering::Relaxed) + 1;
             if dropped == 1 || dropped.is_multiple_of(64) {
                 log_debug!("[windows] event bridge queue full; dropped={}", dropped);
             }
         }
     }
+}
+
+unsafe fn read_space_membership(data: *const c_void, data_length: usize) -> Option<(u64, u32)> {
+    if data.is_null() {
+        return None;
+    }
+    let payload = std::slice::from_raw_parts(data.cast::<u8>(), data_length);
+    decode_space_membership_payload(payload)
+}
+
+fn decode_space_membership_payload(payload: &[u8]) -> Option<(u64, u32)> {
+    if payload.len() < std::mem::size_of::<u64>() + std::mem::size_of::<u32>() {
+        return None;
+    }
+    let space_id = u64::from_ne_bytes(payload[..8].try_into().ok()?);
+    let window_id = u32::from_ne_bytes(payload[8..12].try_into().ok()?);
+    (space_id != 0 && window_id != 0).then_some((space_id, window_id))
 }
 
 unsafe fn read_window_id(data: *const c_void, data_length: usize) -> Option<u32> {
@@ -184,7 +241,19 @@ pub(crate) fn start() {
 
     let (sender, receiver) = flume::bounded(EVENT_CHANNEL_CAPACITY);
     let _ = EVENT_TX.set(sender);
-    for event in [WINDOW_CREATED, WINDOW_DESTROYED, WINDOW_FOCUSED] {
+    let mut joined_space_registered = false;
+    let mut left_space_registered = false;
+    for event in [
+        WINDOW_CREATED,
+        WINDOW_DESTROYED,
+        WINDOW_FOCUSED,
+        WINDOW_MOVED,
+        WINDOW_RESIZED,
+        WINDOW_JOINED_SPACE,
+        WINDOW_LEFT_SPACE,
+        SPACE_TOPOLOGY_CHANGED,
+        SPACE_TRANSITION_CHANGED,
+    ] {
         let result = unsafe {
             register(
                 connection,
@@ -199,8 +268,20 @@ pub(crate) fn start() {
                 event,
                 result
             );
+        } else if event == WINDOW_JOINED_SPACE {
+            joined_space_registered = true;
+        } else if event == WINDOW_LEFT_SPACE {
+            left_space_registered = true;
         }
     }
+    let registrations_ok = joined_space_registered && left_space_registered;
+    SPACE_MEMBERSHIP_REGISTRATIONS_OK.store(registrations_ok, Ordering::Release);
+    SPACE_MEMBERSHIP_TRACKING_AVAILABLE.store(registrations_ok, Ordering::Release);
+    log_debug!(
+        "WindowServer Space membership registration: joined={} left={}",
+        joined_space_registered,
+        left_space_registered
+    );
 
     std::thread::Builder::new()
         .name("window-server-events".into())
@@ -232,11 +313,15 @@ fn enqueue_main_event(event: WindowServerEvent) {
             }
         }
         WindowServerEvent::Destroyed(window_id) => {
-            // Destroyed is terminal for this window; remove stale Focused notifications so a
-            // delayed focus cannot overwrite the destruction in the same drain batch.
-            events.retain(
-                |queued| !matches!(queued, WindowServerEvent::Focused(id) if *id == window_id),
-            );
+            // Destruction is terminal for this window; stale focus or geometry refreshes cannot
+            // supersede it within the same drain batch.
+            events.retain(|queued| {
+                !matches!(
+                    queued,
+                    WindowServerEvent::Focused(id) | WindowServerEvent::GeometryChanged(id)
+                        if *id == window_id
+                )
+            });
         }
         WindowServerEvent::Focused(window_id) => {
             if events.iter().any(
@@ -252,6 +337,19 @@ fn enqueue_main_event(event: WindowServerEvent) {
                 return;
             }
         }
+        WindowServerEvent::GeometryChanged(window_id) => {
+            if events.iter().any(
+                |queued| matches!(queued, WindowServerEvent::Destroyed(id) if *id == window_id),
+            ) {
+                return;
+            }
+            if events.iter().any(
+                |queued| matches!(queued, WindowServerEvent::GeometryChanged(id) if *id == window_id),
+            ) {
+                return;
+            }
+        }
+        WindowServerEvent::SpaceMembership { .. } | WindowServerEvent::SpaceTopologyChanged => {}
     }
 
     if events.len() >= MAIN_EVENT_CAPACITY {
@@ -260,6 +358,12 @@ fn enqueue_main_event(event: WindowServerEvent) {
             .iter()
             .position(|queued| !matches!(queued, WindowServerEvent::Destroyed(_)))
         {
+            if matches!(
+                events[index],
+                WindowServerEvent::SpaceMembership { .. } | WindowServerEvent::SpaceTopologyChanged
+            ) {
+                SPACE_EVIDENCE_DISCONTINUITY.store(true, Ordering::Release);
+            }
             events.remove(index);
         } else {
             events.pop_front();
@@ -402,6 +506,7 @@ pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
     };
     let result = unsafe { request(connection, window_ptr, window_count) };
     if result != 0 {
+        SPACE_MEMBERSHIP_TRACKING_AVAILABLE.store(false, Ordering::Release);
         if !SUBSCRIPTION_FAILURE_LOGGED.swap(true, Ordering::Relaxed) {
             log_info!(
                 "WindowServer lifecycle subscription update failed: windows={} status={}",
@@ -410,6 +515,10 @@ pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
             );
         }
     } else {
+        SPACE_MEMBERSHIP_TRACKING_AVAILABLE.store(
+            SPACE_MEMBERSHIP_REGISTRATIONS_OK.load(Ordering::Acquire),
+            Ordering::Release,
+        );
         SUBSCRIPTION_FAILURE_LOGGED.store(false, Ordering::Relaxed);
     }
 }
@@ -423,11 +532,10 @@ pub(crate) fn owner_for_window(window_id: u32) -> Option<i32> {
         .copied()
 }
 
-/// Resolve a destroyed window from the live subscription index or its short-lived history.
-/// Resolve a destroyed window from the live subscription index or its short-lived history.
-/// Destruction can arrive after a subscription refresh, so retain the recent owner briefly
-/// instead of guessing a PID from a post-destruction CG lookup.
-pub(crate) fn owner_for_destroyed_window(window_id: u32) -> Option<i32> {
+/// Resolve a window against the live subscription index, then the recent owner history. A window
+/// that was subscribed and then dropped from a refresh can still emit a membership event, so the
+/// history keeps it attributable instead of being reported as an unknown owner.
+pub(crate) fn owner_for_window_with_history(window_id: u32) -> Option<i32> {
     if let Some(pid) = owner_for_window(window_id) {
         return Some(pid);
     }
@@ -439,6 +547,13 @@ pub(crate) fn owner_for_destroyed_window(window_id: u32) -> Option<i32> {
     } else {
         Some(pid)
     }
+}
+
+/// Resolve a destroyed window from the live subscription index or its short-lived history.
+/// Destruction can arrive after a subscription refresh, so retain the recent owner briefly
+/// instead of guessing a PID from a post-destruction CG lookup.
+pub(crate) fn owner_for_destroyed_window(window_id: u32) -> Option<i32> {
+    owner_for_window_with_history(window_id)
 }
 
 pub(crate) fn forget_destroyed_window_owner(window_id: u32) {
@@ -458,6 +573,14 @@ pub(crate) fn window_ids_for_pid(pid: i32) -> Vec<u32> {
     ids
 }
 
+pub(crate) fn space_membership_tracking_available() -> bool {
+    SPACE_MEMBERSHIP_TRACKING_AVAILABLE.load(Ordering::Acquire)
+}
+
+pub(crate) fn take_space_evidence_discontinuity() -> bool {
+    SPACE_EVIDENCE_DISCONTINUITY.swap(false, Ordering::AcqRel)
+}
+
 pub(crate) fn drain_main() -> Vec<WindowServerEvent> {
     let mut events = MAIN_EVENTS.lock().unwrap();
     let drained = events.drain(..).collect::<Vec<_>>();
@@ -473,6 +596,19 @@ pub(crate) fn drain_main() -> Vec<WindowServerEvent> {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn space_membership_payload_reads_space_then_window_and_rejects_invalid_data() {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(&0x1122_3344_5566_7788u64.to_ne_bytes());
+        payload.extend_from_slice(&0x99AA_BBCCu32.to_ne_bytes());
+        assert_eq!(
+            decode_space_membership_payload(&payload),
+            Some((0x1122_3344_5566_7788, 0x99AA_BBCC))
+        );
+        assert_eq!(decode_space_membership_payload(&payload[..11]), None);
+        assert_eq!(decode_space_membership_payload(&[0; 12]), None);
+    }
 
     #[test]
     fn registry_supports_many_windows_for_one_pid() {

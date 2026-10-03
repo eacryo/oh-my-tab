@@ -32,6 +32,7 @@ mod scroller;
 mod settings;
 mod single_instance;
 mod skylight;
+mod space_groups;
 mod space_transition;
 mod theme;
 mod thumbnail;
@@ -737,6 +738,7 @@ fn on_app_terminated_inner(notification: *mut c_void) {
         // Termination clears the activation token and this PID's window MRUs immediately,
         // invalidating in-flight retries and preventing PID/CGWindowID reuse contamination.
         note_app_terminated(pid);
+        crate::space_groups::with_tracker_mut(|tracker| tracker.remove_process(pid));
         clear_ax_window_cache_for_pid(pid);
         with_tab_state(|state_opt| {
             if let Some(state) = state_opt.as_mut() {

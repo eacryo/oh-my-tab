@@ -647,6 +647,18 @@ pub(crate) extern "C" fn on_cmd_release_diagnostic(
 }
 
 pub(super) fn commit_selected_window(overlay_was_visible: bool) {
+    if crate::space_transition::snapshot().active {
+        with_tab_state(|state_opt| {
+            if let Some(state) = state_opt.as_mut() {
+                state.visible = false;
+            }
+        });
+        if overlay_was_visible {
+            hide_overlay();
+        }
+        log_debug!("[overlay] discarded commit during Space transition");
+        return;
+    }
     let target = with_tab_state(|state_opt| {
         let state = state_opt.as_mut()?;
         if !state.visible {

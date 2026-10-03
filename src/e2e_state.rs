@@ -22,10 +22,12 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 static SMOOTH_TICKS: AtomicU64 = AtomicU64::new(0);
 static SPACE_RECOVERED_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static SPACE_GATE_REJECTED: AtomicU64 = AtomicU64::new(0);
-static SPACE_FULLSCREEN_EXEMPT: AtomicU64 = AtomicU64::new(0);
-static CURRENT_SPACE_IS_FULLSCREEN: AtomicBool = AtomicBool::new(false);
 static SPACE_MEMBERSHIP_SOURCE: AtomicU8 = AtomicU8::new(0);
 static SPACE_IN_TRANSITION: AtomicBool = AtomicBool::new(false);
+/// The last Space context this module published. A Space switch that the grouping feature handles
+/// correctly does not change the candidate set, so nothing else would emit a frame for it; A2 needs
+/// one to assert the app's own view of which Space is active.
+static LAST_SPACE_CONTEXT: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
 static SPACE_TRANSITION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_PREVIEW_STAGE: AtomicU64 = AtomicU64::new(0);
 static SETTINGS_PREVIEW_CARD: AtomicU64 = AtomicU64::new(0);
@@ -81,22 +83,31 @@ pub(crate) fn space_gate_rejected() {
     }
 }
 
-pub(crate) fn space_fullscreen_exempt() {
-    if is_enabled() {
-        SPACE_FULLSCREEN_EXEMPT.fetch_add(1, Ordering::Relaxed);
-    }
-}
-
 pub(crate) fn set_space_membership_source(skylight: bool) {
     if is_enabled() {
         SPACE_MEMBERSHIP_SOURCE.store(u8::from(skylight), Ordering::Relaxed);
     }
 }
 
-pub(crate) fn set_current_space_is_fullscreen(value: bool) {
-    if is_enabled() {
-        CURRENT_SPACE_IS_FULLSCREEN.store(value, Ordering::Relaxed);
-    }
+/// A stable string for the current per-display Space context: display, active Space, kind, origin.
+fn space_context_signature() -> String {
+    crate::space_groups::with_tracker(|tracker| {
+        let mut contexts: Vec<_> = tracker
+            .topology()
+            .displays
+            .iter()
+            .map(|(display_id, display)| {
+                let kind = tracker.topology().kind(display.current);
+                let origin = tracker
+                    .fullscreen_origins()
+                    .get(&display.current)
+                    .map(|origin| origin.ordinary_space);
+                format!("{display_id}:{}:{kind:?}:{origin:?}", display.current)
+            })
+            .collect();
+        contexts.sort();
+        contexts.join("|")
+    })
 }
 
 pub(crate) fn set_space_transition(in_transition: bool, deadline_unix_ms: u64) {
@@ -116,6 +127,29 @@ pub(crate) fn set_settings_preview_colors(stage: u32, card: u32) {
 /// Records one snapshot. Main thread only (it borrows AppState internally).
 pub(crate) fn record(event: &str) {
     write(event, None);
+}
+
+/// Writes a frame when the app's Space context changed since the last published frame, even when
+/// the candidate set did not. Called after a refresh is applied, so the frame's cards are the set
+/// computed for the context it reports.
+pub(crate) fn record_if_space_context_changed() {
+    if !is_enabled() {
+        return;
+    }
+    let signature = Some(space_context_signature());
+    let last = LAST_SPACE_CONTEXT.get_or_init(|| std::sync::Mutex::new(None));
+    let changed = {
+        let mut last = last.lock().unwrap();
+        if *last == signature {
+            false
+        } else {
+            *last = signature;
+            true
+        }
+    };
+    if changed {
+        write("refresh_context", None);
+    }
 }
 
 /// Records a commit snapshot carrying the window this release targets. Must run *before* the
@@ -403,6 +437,10 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     let mut json = String::with_capacity(2048);
     json.push_str("{\n");
     json.push_str(&format!("  \"seq\": {seq},\n"));
+    // The writing process. A scenario restarts the app between runs, so a snapshot left on disk by
+    // the previous process can carry a higher `seq` than the new one has reached yet; scoping the
+    // baseline to the pid is what makes "wait for a newer frame" mean a frame from *this* run.
+    json.push_str(&format!("  \"pid\": {},\n", std::process::id()));
     json.push_str(&format!("  \"event\": {},\n", json_string(event)));
     json.push_str(&format!("  \"visible\": {},\n", snapshot.visible));
     json.push_str(&format!(
@@ -430,15 +468,72 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         SMOOTH_PHASES[4].load(Ordering::Relaxed),
         SMOOTH_PHASES[5].load(Ordering::Relaxed),
     ));
+    let space_group_state = crate::space_groups::with_tracker(|tracker| {
+        let unknown_active = tracker
+            .topology()
+            .displays
+            .iter()
+            .filter(|(_, display)| {
+                tracker.topology().kind(display.current)
+                    == crate::space_groups::SpaceKind::Fullscreen
+                    && !tracker.fullscreen_origins().contains_key(&display.current)
+            })
+            .count();
+        let mut contexts: Vec<_> = tracker
+            .topology()
+            .displays
+            .iter()
+            .map(|(display_id, display)| {
+                let kind = tracker.topology().kind(display.current);
+                let origin = tracker
+                    .fullscreen_origins()
+                    .get(&display.current)
+                    .map(|origin| origin.ordinary_space);
+                (display_id.clone(), display.current, kind, origin)
+            })
+            .collect();
+        contexts.sort_by(|a, b| a.0.cmp(&b.0));
+        (
+            tracker.topology().displays.len(),
+            tracker.fullscreen_origins().len(),
+            unknown_active,
+            tracker.evidence_contiguous(),
+            crate::window_server::space_membership_tracking_available(),
+            contexts,
+        )
+    });
+    let space_contexts = space_group_state
+        .5
+        .iter()
+        .map(|(display_id, space_id, kind, origin)| {
+            let kind = match kind {
+                crate::space_groups::SpaceKind::Ordinary => "ordinary",
+                crate::space_groups::SpaceKind::Fullscreen => "fullscreen",
+                crate::space_groups::SpaceKind::Unknown => "unknown",
+            };
+            let origin = origin
+                .map(|origin| origin.to_string())
+                .unwrap_or_else(|| "null".into());
+            format!(
+                "{{\"display\": \"{}\", \"space\": {}, \"kind\": \"{}\", \"origin\": {}}}",
+                display_id, space_id, kind, origin
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    json.push_str(&format!("  \"space_contexts\": [{}],\n", space_contexts));
     json.push_str(&format!(
-        "  \"space_filter\": {{\"recovered_accepted\": {}, \"gate_rejected\": {}, \"fullscreen_exempt\": {}}},\n",
+        "  \"space_filter\": {{\"recovered_accepted\": {}, \"gate_rejected\": {}}},\n",
         SPACE_RECOVERED_ACCEPTED.load(Ordering::Relaxed),
         SPACE_GATE_REJECTED.load(Ordering::Relaxed),
-        SPACE_FULLSCREEN_EXEMPT.load(Ordering::Relaxed),
     ));
     json.push_str(&format!(
-        "  \"current_space_is_fullscreen\": {},\n",
-        CURRENT_SPACE_IS_FULLSCREEN.load(Ordering::Relaxed)
+        "  \"space_groups\": {{\"displays\": {}, \"confirmed_fullscreen_origins\": {}, \"unknown_active_fullscreen_spaces\": {}, \"evidence_contiguous\": {}, \"source_learning_available\": {}}},\n",
+        space_group_state.0,
+        space_group_state.1,
+        space_group_state.2,
+        space_group_state.3,
+        space_group_state.4,
     ));
     json.push_str(&format!(
         "  \"membership_source\": \"{}\",\n",

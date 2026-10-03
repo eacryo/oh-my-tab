@@ -69,6 +69,7 @@ type SlsWindowQueryResultCopyWindowsFn = unsafe extern "C" fn(*const c_void) -> 
 type SlsWindowIteratorAdvanceFn = unsafe extern "C" fn(*const c_void) -> bool;
 type SlsWindowIteratorGetWindowIdFn = unsafe extern "C" fn(*const c_void) -> u32;
 type SlsWindowIteratorGetParentIdFn = unsafe extern "C" fn(*const c_void) -> u32;
+type SlsWindowIteratorGetSpaceTypeMaskFn = unsafe extern "C" fn(*const c_void) -> u64;
 
 static SLS_WINDOW_QUERY_WINDOWS: LazyLock<Option<SlsWindowQueryWindowsFn>> =
     LazyLock::new(|| unsafe { load_private_symbol(SKYLIGHT_PATH, "SLSWindowQueryWindows") });
@@ -82,6 +83,11 @@ static SLS_WINDOW_ITERATOR_GET_WINDOW_ID: LazyLock<Option<SlsWindowIteratorGetWi
     LazyLock::new(|| unsafe { load_private_symbol(SKYLIGHT_PATH, "SLSWindowIteratorGetWindowID") });
 static SLS_WINDOW_ITERATOR_GET_PARENT_ID: LazyLock<Option<SlsWindowIteratorGetParentIdFn>> =
     LazyLock::new(|| unsafe { load_private_symbol(SKYLIGHT_PATH, "SLSWindowIteratorGetParentID") });
+static SLS_WINDOW_ITERATOR_GET_SPACE_TYPE_MASK: LazyLock<
+    Option<SlsWindowIteratorGetSpaceTypeMaskFn>,
+> = LazyLock::new(|| unsafe {
+    load_private_symbol(SKYLIGHT_PATH, "SLSWindowIteratorGetSpaceTypeMask")
+});
 
 /// Query WindowServer parentage. A non-zero parent identifies an attached sheet/child surface,
 /// not an independent switch destination; callers keep the parent and skip the child surface.
@@ -171,6 +177,76 @@ pub(crate) fn window_parent_ids(window_ids: &[u32]) -> HashMap<u32, u32> {
         CFRelease(iterator);
     }
     parents
+}
+
+/// Query WindowServer space-type masks for the requested windows in one batch.
+pub(crate) fn window_space_type_masks(window_ids: &[u32]) -> Option<HashMap<u32, u64>> {
+    let connection = cgs_main_connection()?;
+    let (
+        Some(query_windows),
+        Some(copy_windows),
+        Some(advance),
+        Some(get_window_id),
+        Some(get_mask),
+    ) = (
+        *SLS_WINDOW_QUERY_WINDOWS,
+        *SLS_WINDOW_QUERY_RESULT_COPY_WINDOWS,
+        *SLS_WINDOW_ITERATOR_ADVANCE,
+        *SLS_WINDOW_ITERATOR_GET_WINDOW_ID,
+        *SLS_WINDOW_ITERATOR_GET_SPACE_TYPE_MASK,
+    )
+    else {
+        return None;
+    };
+    let ids: Vec<u32> = window_ids.iter().copied().filter(|id| *id != 0).collect();
+    if ids.is_empty() {
+        return Some(HashMap::new());
+    }
+    let mut numbers = Vec::with_capacity(ids.len());
+    for id in &ids {
+        let value = *id as i32;
+        let number = unsafe { CFNumberCreate(std::ptr::null(), 3, (&value as *const i32).cast()) };
+        if number.is_null() {
+            unsafe { numbers.into_iter().for_each(|number| CFRelease(number)) };
+            return None;
+        }
+        numbers.push(number);
+    }
+    let array = unsafe {
+        CFArrayCreate(
+            std::ptr::null(),
+            numbers.as_ptr(),
+            numbers.len() as isize,
+            std::ptr::null(),
+        )
+    };
+    if array.is_null() {
+        unsafe {
+            numbers.into_iter().for_each(|number| CFRelease(number));
+        }
+        return None;
+    }
+    let result = unsafe { query_windows(connection, array, ids.len() as i32) };
+    unsafe {
+        CFRelease(array);
+        numbers.into_iter().for_each(|number| CFRelease(number));
+    }
+    if result.is_null() {
+        return None;
+    }
+    let iterator = unsafe { copy_windows(result) };
+    unsafe { CFRelease(result) };
+    if iterator.is_null() {
+        return None;
+    }
+    let mut masks = HashMap::with_capacity(ids.len());
+    unsafe {
+        while advance(iterator) {
+            masks.insert(get_window_id(iterator), get_mask(iterator));
+        }
+        CFRelease(iterator);
+    }
+    Some(masks)
 }
 
 /// C ABI layout of CGAffineTransform; used only for read-only WindowServer queries.

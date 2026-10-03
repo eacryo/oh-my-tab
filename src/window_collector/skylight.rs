@@ -57,18 +57,8 @@ const K_CGS_WINDOWS_QUERY_OPTIONS: isize = (1 << 0) | (1 << 1) | (1 << 2);
 pub(super) struct MembershipSnapshot {
     pub(super) current_space_ids: HashSet<CGSSpaceID>,
     pub(super) window_space_ids: HashMap<CGWindowID, Vec<CGSSpaceID>>,
-}
-
-impl MembershipSnapshot {
-    pub(super) fn window_is_in_current_space(&self, window_id: CGWindowID) -> bool {
-        self.window_space_ids
-            .get(&window_id)
-            .is_some_and(|space_ids| {
-                space_ids
-                    .iter()
-                    .any(|space_id| self.current_space_ids.contains(space_id))
-            })
-    }
+    pub(super) topology: crate::space_groups::Topology,
+    pub(super) window_space_type_masks: HashMap<CGWindowID, u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -147,12 +137,19 @@ fn query_skylight(window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, Membe
         ) else {
             return Err(MembershipQueryError::InvalidDisplaySnapshot);
         };
+        let display_uuid_value = display_uuid.to_string();
         let display_uuid = OwnedCf(cf_string(display_uuid)?);
         let current = unsafe { current_space(connection, display_uuid.0) };
         if current == 0 {
             return Err(MembershipQueryError::InvalidDisplaySnapshot);
         }
         snapshot.current_space_ids.insert(current);
+        let display_spaces = snapshot
+            .topology
+            .displays
+            .entry(display_uuid_value)
+            .or_default();
+        display_spaces.current = current;
 
         let spaces = unsafe { CFDictionaryGetValue(display, spaces_key.0) };
         if !has_type(spaces, unsafe { CFArrayGetTypeID() }) {
@@ -170,6 +167,10 @@ fn query_skylight(window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, Membe
                 return Err(MembershipQueryError::InvalidDisplaySnapshot);
             }
             all_space_ids.insert(space_id);
+            display_spaces
+                .spaces
+                .entry(space_id)
+                .or_insert(crate::space_groups::SpaceKind::Unknown);
         }
     }
     if snapshot.current_space_ids.is_empty()
@@ -248,6 +249,34 @@ fn query_skylight(window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, Membe
             memberships.push(space_id);
         }
         snapshot.window_space_ids.insert(window_id, memberships);
+    }
+
+    if let Some(masks) = crate::skylight::window_space_type_masks(window_ids) {
+        for (window_id, mask) in masks {
+            snapshot.window_space_type_masks.insert(window_id, mask);
+            let kind = if mask & 0x20 != 0 {
+                crate::space_groups::SpaceKind::Fullscreen
+            } else if mask & 0x1 != 0 {
+                crate::space_groups::SpaceKind::Ordinary
+            } else {
+                crate::space_groups::SpaceKind::Unknown
+            };
+            if kind != crate::space_groups::SpaceKind::Unknown {
+                if let Some(spaces) = snapshot.window_space_ids.get(&window_id) {
+                    for space_id in spaces {
+                        for display in snapshot.topology.displays.values_mut() {
+                            if let Some(space_kind) = display.spaces.get_mut(space_id) {
+                                if *space_kind != crate::space_groups::SpaceKind::Fullscreen
+                                    || kind == crate::space_groups::SpaceKind::Fullscreen
+                                {
+                                    *space_kind = kind;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     Ok(snapshot)
@@ -403,11 +432,15 @@ mod tests {
         let expected = MembershipSnapshot {
             current_space_ids: HashSet::from([10, 20]),
             window_space_ids: HashMap::from([(7, vec![20]), (8, vec![30])]),
+            ..Default::default()
         };
         let queried = query_with_provider(&FakeProvider(expected.clone()), &[7, 8]).unwrap();
         assert_eq!(queried, expected);
-        assert!(queried.window_is_in_current_space(7));
-        assert!(!queried.window_is_in_current_space(8));
+        assert!(queried.window_space_ids.contains_key(&7));
+        assert!(!queried.window_space_ids[&7].is_empty());
+        assert!(queried.window_space_ids[&8]
+            .iter()
+            .all(|space| !queried.current_space_ids.contains(space)));
     }
 
     #[test]

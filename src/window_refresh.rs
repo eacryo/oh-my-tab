@@ -765,6 +765,16 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     // below can no longer wedge the pipeline.
     drop(in_flight);
     let pending_request = take_pending_refresh_request();
+    // A2 E2E: publish the accepted candidate set whenever it changes, so a scenario can assert the
+    // real candidate list for the current Space context without driving a summon (which would
+    // steer focus and could move the very context under test). A Space switch that grouping
+    // handles correctly leaves the set unchanged, so the context is published separately.
+    if crate::e2e_state::is_enabled() {
+        if set_changed {
+            crate::e2e_state::record("refresh");
+        }
+        crate::e2e_state::record_if_space_context_changed();
+    }
 
     // First snapshot ready: consume pending_first_show and show once (single-shot render). The
     // list is already the final post-refresh order, so the "stale then reorder" jump is gone.
@@ -859,12 +869,68 @@ pub(crate) extern "C" fn on_window_server_event(_self: *mut c_void, _cmd: Sel, _
 
 fn on_window_server_event_inner() {
     let events = window_server::drain_main();
-    if events.is_empty() {
+    let evidence_discontinuity = window_server::take_space_evidence_discontinuity();
+    if events.is_empty() && !evidence_discontinuity {
         return;
+    }
+    if evidence_discontinuity {
+        crate::space_groups::with_tracker_mut(|tracker| tracker.mark_discontinuous());
     }
     // Process every destruction before the short-circuiting refresh check: a Created
     // event earlier in this batch must not prevent a later window's cache cleanup.
     for event in &events {
+        match event {
+            window_server::WindowServerEvent::SpaceMembership {
+                space_id,
+                window_id,
+                joined,
+            } => {
+                let pid = window_server::owner_for_window_with_history(*window_id);
+                if !window_server::space_membership_tracking_available() {
+                    log_debug!(
+                        "[spaces] membership event without tracking: window={} space={} joined={}",
+                        window_id,
+                        space_id,
+                        joined
+                    );
+                }
+                if window_server::space_membership_tracking_available() {
+                    if let Some(pid) = pid {
+                        let process_start_time_us = objc2::rc::autoreleasepool(|_| unsafe {
+                            crate::app_identity::resolve_app_identity(pid).process_start_time_us
+                        });
+                        crate::space_groups::with_tracker_mut(|tracker| {
+                            tracker.membership_delta(
+                                crate::space_groups::WindowIdentity {
+                                    pid,
+                                    process_start_time_us,
+                                    window_id: *window_id,
+                                },
+                                *space_id,
+                                *joined,
+                                std::time::Instant::now(),
+                            );
+                        });
+                    } else {
+                        log_debug!(
+                            "[spaces] membership event for unknown owner: window={} space={} joined={}",
+                            window_id,
+                            space_id,
+                            joined
+                        );
+                        crate::space_groups::with_tracker_mut(|tracker| {
+                            tracker.note_evidence_gap()
+                        });
+                    }
+                } else {
+                    crate::space_groups::with_tracker_mut(|tracker| tracker.note_evidence_gap());
+                }
+            }
+            window_server::WindowServerEvent::Destroyed(window_id) => {
+                crate::space_groups::with_tracker_mut(|tracker| tracker.remove_window(*window_id));
+            }
+            _ => {}
+        }
         if let window_server::WindowServerEvent::Destroyed(window_id) = event {
             // Read the owner from the current subscription index first; CG lookup usually fails
             // after destruction, so never guess a PID for cleanup.
@@ -884,71 +950,76 @@ fn on_window_server_event_inner() {
             forget_non_normal_window(*window_id);
         }
     }
-    let should_refresh = events.iter().any(|event| match event {
-        window_server::WindowServerEvent::Created
-        | window_server::WindowServerEvent::Destroyed(_) => true,
-        window_server::WindowServerEvent::Focused(window_id) => {
-            let displayed_pid = with_tab_state(|state_opt| {
-                state_opt
-                    .as_ref()
-                    .and_then(|state| {
-                        state
-                            .windows
-                            .iter()
-                            .find(|window| window.window_id == *window_id)
-                    })
-                    .map(|window| window.pid)
-            });
-            let pid = displayed_pid
-                .or_else(|| window_server::owner_for_window(*window_id))
-                .or_else(|| owner_pid_for_cgwid(*window_id));
-            if let Some(pid) = pid {
-                let frontmost_pid = frontmost_app_info().1;
-                log_debug!(
-                    "[windows] focused event: cgwid={} pid={} displayed={} frontmost={}",
-                    window_id,
-                    pid,
-                    displayed_pid.is_some(),
-                    frontmost_pid == pid
-                );
-                if frontmost_pid == pid {
-                    let activation_token = window_server::activation_token(pid);
-                    if window_server::focus_should_bump(pid, *window_id) {
-                        with_tab_state(|state_opt| {
-                            if let Some(state) = state_opt.as_mut() {
-                                // Anchor the focus key only for an AX-confirmed, shown window; an
-                                // undisplayed CG surface (the other Ghostty tab) must not be anchored.
-                                best_effort_bump_focus_key(state, pid, *window_id);
-                            }
-                        });
-                        // A same-app window switch brings no new app-activation
-                        // notification, so the activation token may have expired away;
-                        // mint one here so externally driven window switches also
-                        // refresh the thumbnail.
-                        let activated_at = activation_token
-                            .unwrap_or_else(|| crate::window_collector::note_app_activated(pid));
-                        thumbnail::refresh_after_activation(pid, *window_id, activated_at);
+    let should_refresh = evidence_discontinuity
+        || events.iter().any(|event| match event {
+            window_server::WindowServerEvent::Created
+            | window_server::WindowServerEvent::Destroyed(_)
+            | window_server::WindowServerEvent::GeometryChanged(_)
+            | window_server::WindowServerEvent::SpaceMembership { .. }
+            | window_server::WindowServerEvent::SpaceTopologyChanged => true,
+            window_server::WindowServerEvent::Focused(window_id) => {
+                let displayed_pid = with_tab_state(|state_opt| {
+                    state_opt
+                        .as_ref()
+                        .and_then(|state| {
+                            state
+                                .windows
+                                .iter()
+                                .find(|window| window.window_id == *window_id)
+                        })
+                        .map(|window| window.pid)
+                });
+                let pid = displayed_pid
+                    .or_else(|| window_server::owner_for_window(*window_id))
+                    .or_else(|| owner_pid_for_cgwid(*window_id));
+                if let Some(pid) = pid {
+                    let frontmost_pid = frontmost_app_info().1;
+                    log_debug!(
+                        "[windows] focused event: cgwid={} pid={} displayed={} frontmost={}",
+                        window_id,
+                        pid,
+                        displayed_pid.is_some(),
+                        frontmost_pid == pid
+                    );
+                    if frontmost_pid == pid {
+                        let activation_token = window_server::activation_token(pid);
+                        if window_server::focus_should_bump(pid, *window_id) {
+                            with_tab_state(|state_opt| {
+                                if let Some(state) = state_opt.as_mut() {
+                                    // Anchor the focus key only for an AX-confirmed, shown window; an
+                                    // undisplayed CG surface (the other Ghostty tab) must not be anchored.
+                                    best_effort_bump_focus_key(state, pid, *window_id);
+                                }
+                            });
+                            // A same-app window switch brings no new app-activation
+                            // notification, so the activation token may have expired away;
+                            // mint one here so externally driven window switches also
+                            // refresh the thumbnail.
+                            let activated_at = activation_token.unwrap_or_else(|| {
+                                crate::window_collector::note_app_activated(pid)
+                            });
+                            thumbnail::refresh_after_activation(pid, *window_id, activated_at);
+                        }
+                        if displayed_pid.is_none() {
+                            // Track an undisplayed CG window too, but only let a directed AX refresh
+                            // promote it into the card list after confirmation.
+                            log_debug!(
+                                "[windows] focused unlisted cgwid={} pid={}; directed refresh",
+                                window_id,
+                                pid
+                            );
+                            request_focused_window_refresh(pid, *window_id);
+                        }
                     }
-                    if displayed_pid.is_none() {
-                        // Track an undisplayed CG window too, but only let a directed AX refresh
-                        // promote it into the card list after confirmation.
-                        log_debug!(
-                            "[windows] focused unlisted cgwid={} pid={}; directed refresh",
-                            window_id,
-                            pid
-                        );
-                        request_focused_window_refresh(pid, *window_id);
-                    }
+                } else {
+                    log_debug!(
+                        "[windows] focused cgwid={} has no known owner PID",
+                        window_id
+                    );
                 }
-            } else {
-                log_debug!(
-                    "[windows] focused cgwid={} has no known owner PID",
-                    window_id
-                );
+                false
             }
-            false
-        }
-    });
+        });
     if should_refresh {
         request_lifecycle_window_refresh();
     }
