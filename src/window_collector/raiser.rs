@@ -672,13 +672,17 @@ unsafe fn raise_ax_element(
 /// AX-window subrole keep-rule: standard windows always pass; AXDialog (the subrole
 /// JetBrains IDEs use for their MAIN windows) only when titled; some apps (such as Xcode)
 /// report ordinary windows as AXUnknown, so allow that only with AXWindow role and a non-empty
-/// title. Everything else (popups/panels/invisible windows) is filtered; a missing subrole
-/// counts as standard. Pure function, unit-tested.
+/// title. AXFloatingWindow (what Telegram reports for its windowed media viewer) passes the same
+/// way, because the subrole follows the presentation state; `floating_window_is_admissible`
+/// decides at pairing time whether WindowServer sees an ordinary window. Everything else
+/// (popups/panels/invisible windows) is filtered; a missing subrole counts as standard.
+/// Pure function, unit-tested.
 pub(super) fn ax_subrole_kept(subrole: Option<&str>, role: Option<&str>, titled: bool) -> bool {
     match subrole {
         Some("AXStandardWindow") => true,
         Some("AXFullScreen") => true,
         Some("AXDialog") => titled,
+        Some("AXFloatingWindow") => role == Some("AXWindow") && titled,
         Some("AXUnknown") => role == Some("AXWindow") && titled,
         Some(_) => false,
         // A missing subrole counts as standard (some apps don't set it).
@@ -765,6 +769,32 @@ pub(super) fn custom_window_is_substantial(bounds: (f64, f64, f64, f64)) -> bool
     bounds.2 >= CUSTOM_WINDOW_MIN_WIDTH && bounds.3 >= CUSTOM_WINDOW_MIN_HEIGHT
 }
 
+/// The WindowServer shape a titled AXFloatingWindow needs to be a switch destination.
+/// Mission Control lists such a window (Telegram's windowed media viewer is 880x660 at layer 0),
+/// while the floating surfaces that must stay out -- inspectors, palettes, popovers -- are either
+/// attached to an owner (dropped earlier by `is_attached_surface`) or sit above layer 0.
+/// Pure function, unit-tested.
+pub(super) fn floating_window_is_admissible(layer: i32, bounds: (f64, f64, f64, f64)) -> bool {
+    layer == 0 && custom_window_is_substantial(bounds)
+}
+
+/// Every admission rule the CG pairing stage applies to one window, in the order it applies them,
+/// so the call sites cannot drift from what the tests pin.
+/// Pure function, unit-tested.
+pub(super) fn window_admission(
+    layer: i32,
+    is_main: bool,
+    ax_fullscreen: Option<bool>,
+    is_floating_window: bool,
+    bounds: (f64, f64, f64, f64),
+) -> bool {
+    admissible_window_placement(
+        layer,
+        is_main,
+        crate::window_collector::collect::ax_reports_fullscreen(ax_fullscreen),
+    ) && (!is_floating_window || floating_window_is_admissible(layer, bounds))
+}
+
 pub(super) fn is_attached_surface(parent_id: Option<u32>) -> bool {
     parent_id.is_some_and(|parent| parent != 0)
 }
@@ -777,6 +807,37 @@ pub(super) fn should_backfill_ax_window(cg_layer: Option<i32>) -> bool {
         Some(layer) => layer == 0,
         None => true,
     }
+}
+
+/// The AXFloatingWindow half of the backfill rule. The subrole cannot decide on its own (see
+/// `floating_window_is_admissible`) and the backfill publishes windows with zero bounds, so a
+/// floating window is restored only when this pass's CG snapshot already described it as an
+/// ordinary window: without that, the backfill would undo the size gate the pairing stage just
+/// applied -- a titled 64x33 floating window at layer 0 came back as a card that way.
+/// Pure function, unit-tested.
+pub(super) fn floating_window_backfill_admissible(
+    cg_layer: Option<i32>,
+    cg_bounds: Option<(f64, f64, f64, f64)>,
+) -> bool {
+    cg_layer == Some(0) && cg_bounds.is_some_and(custom_window_is_substantial)
+}
+
+/// Every rule the AX-only backfill applies to one window, in the order it applies them, so the call
+/// sites cannot drift from what the tests pin. The title and Space checks stay at the call site
+/// because they need state this function does not take.
+/// Pure function, unit-tested.
+pub(super) fn backfill_admission(
+    cg_layer: Option<i32>,
+    cg_bounds: Option<(f64, f64, f64, f64)>,
+    sticky: bool,
+    is_custom_root: bool,
+    is_main: bool,
+    is_floating_window: bool,
+) -> bool {
+    !sticky
+        && should_backfill_ax_window(cg_layer)
+        && (!is_custom_root || is_main)
+        && (!is_floating_window || floating_window_backfill_admissible(cg_layer, cg_bounds))
 }
 
 pub(super) fn should_backfill_ax_window_for_process(
@@ -1142,9 +1203,12 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 } else {
                     None
                 };
-                // AXDialog/AXUnknown require a non-empty title; untitled elements stay
-                // filtered as popups/invisible windows.
-                let titled = if matches!(subrole.as_deref(), Some("AXDialog") | Some("AXUnknown")) {
+                // AXDialog/AXUnknown/AXFloatingWindow require a non-empty title; untitled elements
+                // stay filtered as popups/invisible windows.
+                let titled = if matches!(
+                    subrole.as_deref(),
+                    Some("AXDialog") | Some("AXUnknown") | Some("AXFloatingWindow")
+                ) {
                     let mut title_value: *const c_void = std::ptr::null();
                     if AXUIElementCopyAttributeValue(element, title_key, &mut title_value)
                         == K_AX_SUCCESS
@@ -1229,6 +1293,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 is_main,
                 is_fullscreen,
                 is_custom_root: subrole.as_deref() == Some("AXUnknown"),
+                is_floating_window: subrole.as_deref() == Some("AXFloatingWindow"),
                 only_via_key_or_main,
                 tab_group,
             });

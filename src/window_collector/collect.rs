@@ -262,6 +262,9 @@ unsafe fn collect_windows_for_pid_inner(
     let mut current_cg_ids = HashSet::new();
     let mut fullscreen_cgwids = HashSet::new();
     let mut cg_window_layers: HashMap<u32, i32> = HashMap::new();
+    // The AX-only backfill needs this pass's shape for a window it may restore, so the bounds are
+    // recorded before the admission filters rather than where the pairing stage uses them.
+    let mut cg_window_bounds: HashMap<u32, (f64, f64, f64, f64)> = HashMap::new();
     let mut windows = Vec::new();
     let count = CFArrayGetCount(array);
     let mut cg_window_ids = Vec::new();
@@ -301,6 +304,9 @@ unsafe fn collect_windows_for_pid_inner(
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
         if cgwid != 0 {
             cg_window_layers.insert(cgwid, layer);
+            if let Some(bounds) = cf_dict_get_bounds(dict, "kCGWindowBounds") {
+                cg_window_bounds.insert(cgwid, bounds);
+            }
         }
         if is_attached_surface(parent_ids.get(&cgwid).copied()) {
             continue;
@@ -324,7 +330,17 @@ unsafe fn collect_windows_for_pid_inner(
         if native_fullscreen {
             fullscreen_cgwids.insert(cgwid);
         }
-        if !admissible_window_placement(layer, ax_info.is_main, native_fullscreen) {
+        // The layer rule needs positive AX evidence of fullscreen: the bounds fallback is also true
+        // of a display-sized floating overlay (see `ax_reports_fullscreen`). A titled
+        // AXFloatingWindow additionally needs the ordinary-window shape, because its subrole
+        // follows the presentation state (see AxWindowInfo::is_floating_window).
+        if !window_admission(
+            layer,
+            ax_info.is_main,
+            ax_info.is_fullscreen,
+            ax_info.is_floating_window,
+            bounds,
+        ) {
             continue;
         }
         if ax_info.is_custom_root && !custom_window_is_substantial(bounds) && !ax_info.is_main {
@@ -398,15 +414,25 @@ unsafe fn collect_windows_for_pid_inner(
             if is_attached_surface(parent_ids.get(&cgwid).copied()) {
                 continue;
             }
-            if !should_backfill_ax_window_for_process(
-                pid,
-                cgwid,
-                identity.process_start_time_us,
-                cg_window_layers.get(&cgwid).copied(),
+            // The sticky classification is checked first: it decides without asking the WindowServer
+            // anything, and a window already known to be non-normal is dropped whether or not this
+            // pass knows its layer.
+            let sticky = is_known_non_normal_window(pid, identity.process_start_time_us, cgwid);
+            let layer = if sticky {
+                None
+            } else {
+                ax_only_layer_for_backfill(cg_window_layers.get(&cgwid).copied(), || {
+                    window_layer_now(cgwid)
+                })
+            };
+            if !backfill_admission(
+                layer,
+                cg_window_bounds.get(&cgwid).copied(),
+                sticky,
+                ax_info.is_custom_root,
+                ax_info.is_main,
+                ax_info.is_floating_window,
             ) {
-                continue;
-            }
-            if ax_info.is_custom_root && !ax_info.is_main {
                 continue;
             }
             if ax_info.title.is_empty() && !titleless {
@@ -570,6 +596,18 @@ fn native_fullscreen_state(
     displays: &[(f64, f64, f64, f64)],
 ) -> bool {
     ax_fullscreen_from_ax == Some(true) || cg_bounds_identify_native_fullscreen(bounds, displays)
+}
+
+/// Whether AX positively reports the window as a native fullscreen presentation.
+///
+/// This -- not `native_fullscreen_state` -- is the evidence the layer rule may use. The bounds
+/// fallback answers "does this surface look full-screen", which is also true of a display-sized
+/// floating overlay: Telegram's media viewer sits at layer 101 with `AXFullScreen = false` and
+/// bounds equal to the display rect, and treating its size as fullscreen evidence admitted it as a
+/// switcher card. The fallback stays in use for the card's presentation flag and the
+/// space-transition observer, where size is the question being asked.
+pub(super) fn ax_reports_fullscreen(ax_fullscreen: Option<bool>) -> bool {
+    ax_fullscreen == Some(true)
 }
 
 fn native_fullscreen_cg_window_ids(
@@ -1122,21 +1160,25 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             },
         };
 
-        let (window_title, minimized, is_main, ax_fullscreen, is_custom_root) = ax_info
-            .map(|info| {
-                (
-                    info.title.clone(),
-                    info.minimized,
-                    info.is_main,
-                    info.is_fullscreen,
-                    info.is_custom_root,
-                )
-            })
-            .unwrap_or((cg_title, false, false, None, false));
+        let (window_title, minimized, is_main, ax_fullscreen, is_custom_root, is_floating_window) =
+            ax_info
+                .map(|info| {
+                    (
+                        info.title.clone(),
+                        info.minimized,
+                        info.is_main,
+                        info.is_fullscreen,
+                        info.is_custom_root,
+                        info.is_floating_window,
+                    )
+                })
+                .unwrap_or((cg_title, false, false, None, false, false));
         let native_fullscreen =
             ax_info.is_some() && native_fullscreen_state(ax_fullscreen, bounds, &display_bounds);
 
-        if !admissible_window_placement(layer, is_main, native_fullscreen) {
+        // The layer rule needs positive AX evidence of fullscreen (see `ax_reports_fullscreen`),
+        // and a titled AXFloatingWindow needs the ordinary-window shape as well.
+        if !window_admission(layer, is_main, ax_fullscreen, is_floating_window, bounds) {
             continue;
         }
         if is_custom_root && !custom_window_is_substantial(bounds) && !is_main {
@@ -1278,27 +1320,38 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             let process_start_time_us = icon_ids
                 .get(&pid)
                 .and_then(|identity| identity.process_start_time_us);
-            if !should_backfill_ax_window_for_process(
-                pid,
-                cgwid,
-                process_start_time_us,
-                cg_window_layers.get(&(pid, cgwid)).copied(),
+            // The sticky classification is checked first: it decides without asking the WindowServer
+            // anything, and a window already known to be non-normal is dropped whether or not this
+            // pass knows its layer.
+            let sticky = is_known_non_normal_window(pid, process_start_time_us, cgwid);
+            let layer = if sticky {
+                None
+            } else {
+                ax_only_layer_for_backfill(cg_window_layers.get(&(pid, cgwid)).copied(), || {
+                    window_layer_now(cgwid)
+                })
+            };
+            if !backfill_admission(
+                layer,
+                cg_window_bounds.get(&(pid, cgwid)).copied(),
+                sticky,
+                ax_info.is_custom_root,
+                ax_info.is_main,
+                ax_info.is_floating_window,
             ) {
-                let layer = cg_window_layers.get(&(pid, cgwid)).copied();
                 log_debug!(
-                    "[collect] ax-only skipped non-normal layer: pid={} app=\"{}\" cgwid={} layer={:?}",
+                    "[collect] ax-only skipped: pid={} app=\"{}\" cgwid={} layer={:?} sticky={} floating={}",
                     pid,
                     pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
                     cgwid,
-                    layer
+                    layer,
+                    sticky,
+                    ax_info.is_floating_window
                 );
                 continue;
             }
             // Same filters as the CG path: minimized gated by the switch; empty titles
             // (not titleless) are meaningless.
-            if ax_info.is_custom_root && !ax_info.is_main {
-                continue;
-            }
             if ax_info.title.is_empty() && !titleless_pids.contains(&pid) {
                 continue;
             }
@@ -1566,6 +1619,50 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 }
 
 #[cfg(test)]
+mod layer_rule_evidence_tests {
+    use super::*;
+
+    #[test]
+    fn a_display_sized_floating_window_is_not_a_card() {
+        // Observed on Telegram's media viewer: layer 101, `AXFullScreen = false`, bounds equal to the
+        // display rect, on the desktop's Space. The bounds fallback still answers "fullscreen" (that
+        // answer feeds the card's badge and the space-transition observer), but it must not be the
+        // evidence that waives the layer rule, or the viewer becomes a second card.
+        let display = (0.0, 0.0, 1470.0, 956.0);
+        assert!(native_fullscreen_state(
+            Some(false),
+            (0.0, 0.0, 1470.0, 956.0),
+            &[display]
+        ));
+        assert!(!ax_reports_fullscreen(Some(false)));
+        assert!(!admissible_window_placement(
+            101,
+            false,
+            ax_reports_fullscreen(Some(false))
+        ));
+
+        // The exemption keeps working for the cases it is for: a window AX reports as fullscreen, or
+        // one that is the app's main window.
+        assert!(admissible_window_placement(
+            101,
+            false,
+            ax_reports_fullscreen(Some(true))
+        ));
+        assert!(admissible_window_placement(
+            101,
+            true,
+            ax_reports_fullscreen(Some(false))
+        ));
+        // A normal window is admissible whatever AX says about fullscreen.
+        assert!(admissible_window_placement(
+            0,
+            false,
+            ax_reports_fullscreen(None)
+        ));
+    }
+}
+
+#[cfg(test)]
 mod hidden_app_filter_tests {
     use super::should_filter_hidden_app;
 
@@ -1592,6 +1689,7 @@ mod tab_group_fold_tests {
             is_main: false,
             is_fullscreen: Some(false),
             is_custom_root: false,
+            is_floating_window: false,
             only_via_key_or_main: false,
             tab_group: tabs.map(|titles| TabGroupInfo {
                 titles: titles.iter().map(|title| title.to_string()).collect(),
@@ -1889,6 +1987,7 @@ mod space_gate_tests {
             is_main: false,
             is_fullscreen,
             is_custom_root: false,
+            is_floating_window: false,
             only_via_key_or_main: true,
             tab_group: None,
         }

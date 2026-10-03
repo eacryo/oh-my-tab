@@ -369,6 +369,53 @@ fn seed_timestamps(
 // minimized / other Spaces); collection always uses it -- whether an off-screen window
 // shows is decided by AX semantics (see collect_windows' filter comments).
 const K_C_G_WINDOW_LIST_OPTION_ALL: u32 = 0;
+/// Ask about one specific window rather than listing every window.
+const K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
+
+/// The WindowServer's current CGWindowLayer for one window, or `None` when it does not report that
+/// window as on screen.
+///
+/// A collection pass reads the whole CG list *before* its AX phase, so a window created in between
+/// is AX-visible and missing from that pass's list for exactly that pass. Asking about the window
+/// itself answers the question that matters -- how the WindowServer classifies it -- instead of
+/// reading "absent from the earlier list" as "orderOut'd window", which is how a floating
+/// media-viewer window (layer 101) got admitted as a switcher card.
+fn window_layer_now(cgwid: u32) -> Option<i32> {
+    if cgwid == 0 {
+        return None;
+    }
+    let array =
+        unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW, cgwid) };
+    if array.is_null() {
+        return None;
+    }
+    let layer = unsafe {
+        if CFArrayGetCount(array) <= 0 {
+            None
+        } else {
+            let dict = CFArrayGetValueAtIndex(array, 0);
+            if dict.is_null() {
+                None
+            } else {
+                cf_dict_get_i32(dict, "kCGWindowLayer")
+            }
+        }
+    };
+    unsafe { CFRelease(array) };
+    layer
+}
+
+/// The layer that classifies an AX-only window: this pass's snapshot entry when it has one, else a
+/// fresh query for that window alone.
+///
+/// The snapshot entry is preferred because it costs nothing; the query runs only for the windows
+/// the snapshot lacks, which is exactly the case its absence cannot decide.
+fn ax_only_layer_for_backfill(
+    snapshot_layer: Option<i32>,
+    query: impl FnOnce() -> Option<i32>,
+) -> Option<i32> {
+    snapshot_layer.or_else(query)
+}
 
 // AX types
 
@@ -420,6 +467,10 @@ struct AxWindowInfo {
     /// Positive AXSubrole/AXFullScreen evidence; false or unavailable still permits the CG bounds fallback.
     is_fullscreen: Option<bool>,
     is_custom_root: bool,
+    /// AXSubrole == AXFloatingWindow. The subrole follows the presentation state (Telegram's media
+    /// viewer is AXDialog while large and AXFloatingWindow while windowed), so it cannot decide on
+    /// its own: `floating_window_is_admissible` demands WindowServer evidence as well.
+    is_floating_window: bool,
     /// The native tab bar this window exposes (only the selected tab's window has one), used by
     /// collect::fold_tab_group to identify the group's windows.
     tab_group: Option<TabGroupInfo>,
@@ -533,6 +584,39 @@ mod tests {
     }
 
     #[test]
+    fn ax_only_backfill_asks_the_window_only_when_the_snapshot_lacks_it() {
+        // A snapshot entry is authoritative and free, so the query must not run.
+        let mut queried = false;
+        assert_eq!(
+            ax_only_layer_for_backfill(Some(101), || {
+                queried = true;
+                Some(0)
+            }),
+            Some(101)
+        );
+        assert!(
+            !queried,
+            "a layer the pass snapshot already has must not cost a WindowServer query"
+        );
+
+        // The pass snapshot is read before the AX phase, so its absence is not evidence of
+        // anything: the fresh query decides. A floating window (a media viewer at layer 101) that
+        // the snapshot missed stays out of the switcher.
+        assert_eq!(ax_only_layer_for_backfill(None, || Some(101)), Some(101));
+        assert!(!should_backfill_ax_window(ax_only_layer_for_backfill(
+            None,
+            || Some(101)
+        )));
+
+        // Nothing reported for this window: the AX backfill keeps recovering orderOut'd windows.
+        assert_eq!(ax_only_layer_for_backfill(None, || None), None);
+        assert!(should_backfill_ax_window(ax_only_layer_for_backfill(
+            None,
+            || None
+        )));
+    }
+
+    #[test]
     fn ax_subrole_keep_rule_accepts_standard_and_titled_dialog() {
         use super::ax_subrole_kept;
         // Standard windows: any title.
@@ -558,11 +642,156 @@ mod tests {
         assert!(ax_subrole_kept(Some("AXUnknown"), Some("AXWindow"), true));
         assert!(!ax_subrole_kept(Some("AXUnknown"), Some("AXWindow"), false));
         assert!(!ax_subrole_kept(Some("AXUnknown"), Some("AXButton"), true));
+        // AXFloatingWindow: Telegram reports its windowed media viewer this way, and the subrole
+        // flips with the presentation state, so the walk lets a titled one through and the pairing
+        // stage demands WindowServer evidence instead.
+        assert!(ax_subrole_kept(
+            Some("AXFloatingWindow"),
+            Some("AXWindow"),
+            true
+        ));
+        assert!(!ax_subrole_kept(
+            Some("AXFloatingWindow"),
+            Some("AXWindow"),
+            false
+        ));
+        assert!(!ax_subrole_kept(
+            Some("AXFloatingWindow"),
+            Some("AXButton"),
+            true
+        ));
         // Popups/panels/invisible windows: always filtered.
         assert!(!ax_subrole_kept(Some("AXSheet"), Some("AXWindow"), true));
         assert!(!ax_subrole_kept(Some("AXDrawer"), Some("AXWindow"), true));
         // Missing subrole (some apps don't set it) -> standard.
         assert!(ax_subrole_kept(None, None, false));
+    }
+
+    #[test]
+    fn a_titled_floating_window_needs_the_ordinary_window_shape() {
+        use super::floating_window_is_admissible;
+        // Telegram's windowed media viewer: layer 0, 880x660 -- Mission Control lists it, so must we.
+        assert!(floating_window_is_admissible(
+            0,
+            (369.0, 190.0, 880.0, 660.0)
+        ));
+        // A floating window above layer 0 (menu, HUD, palette) stays out.
+        assert!(!floating_window_is_admissible(
+            4,
+            (369.0, 190.0, 880.0, 660.0)
+        ));
+        assert!(!floating_window_is_admissible(
+            101,
+            (0.0, 0.0, 1470.0, 956.0)
+        ));
+        // Too small to be a switch destination at layer 0 (a floating utility strip).
+        assert!(!floating_window_is_admissible(0, (0.0, 0.0, 64.0, 33.0)));
+        assert!(floating_window_is_admissible(0, (0.0, 0.0, 100.0, 50.0)));
+        // The whole admission rule, as both pairing paths call it: the viewer again, then the same
+        // shape as a floating palette (above layer 0) and as a tiny strip -- both rejected.
+        use super::window_admission;
+        assert!(window_admission(
+            0,
+            false,
+            Some(false),
+            true,
+            (369.0, 190.0, 880.0, 660.0)
+        ));
+        assert!(!window_admission(
+            4,
+            false,
+            Some(false),
+            true,
+            (369.0, 190.0, 880.0, 660.0)
+        ));
+        assert!(!window_admission(
+            0,
+            false,
+            Some(false),
+            true,
+            (0.0, 0.0, 64.0, 33.0)
+        ));
+        // A non-floating window keeps the old layer rule: a non-zero layer needs main or fullscreen.
+        assert!(window_admission(
+            101,
+            true,
+            Some(false),
+            false,
+            (0.0, 0.0, 10.0, 10.0)
+        ));
+        assert!(!window_admission(
+            101,
+            false,
+            Some(false),
+            false,
+            (0.0, 0.0, 10.0, 10.0)
+        ));
+    }
+
+    #[test]
+    fn the_floating_size_rule_survives_the_ax_only_backfill() {
+        use super::{backfill_admission, window_admission};
+        // A titled AXFloatingWindow whose WindowServer shape is a small floating strip: the pairing
+        // stage rejects it...
+        assert!(!window_admission(
+            0,
+            false,
+            Some(false),
+            true,
+            (0.0, 0.0, 64.0, 33.0)
+        ));
+        // ...and the AX-only backfill, which publishes a window from AX alone with zero bounds and
+        // used to check the layer only, must not restore it: same pass, same shape, same rejection.
+        // (It is a regression guard: the backfill's `should_backfill_ax_window(Some(0))` is true,
+        // which is what let a rejected floating window come back as a zero-bounds card.)
+        assert!(!backfill_admission(
+            Some(0),
+            Some((0.0, 0.0, 64.0, 33.0)),
+            false,
+            false,
+            false,
+            true
+        ));
+        // A substantial floating window is restored, because this pass's snapshot described it.
+        assert!(backfill_admission(
+            Some(0),
+            Some((369.0, 190.0, 880.0, 660.0)),
+            false,
+            false,
+            false,
+            true
+        ));
+        // No CG entry at all -> no shape evidence -> a floating window stays out.
+        assert!(!backfill_admission(None, None, false, false, false, true));
+        // Non-floating windows keep the backfill they had: a missing CG entry is still an
+        // orderOut'd window AX may legitimately restore.
+        assert!(backfill_admission(None, None, false, false, false, false));
+        // The other backfill rules still hold: sticky drops, a non-main custom root drops, an
+        // attached-surface-free substantial ordinary window at layer 0 comes back.
+        assert!(!backfill_admission(
+            Some(0),
+            Some((0.0, 0.0, 880.0, 660.0)),
+            true,
+            false,
+            false,
+            false
+        ));
+        assert!(!backfill_admission(
+            Some(0),
+            Some((0.0, 0.0, 880.0, 660.0)),
+            false,
+            true,
+            false,
+            false
+        ));
+        assert!(backfill_admission(
+            Some(0),
+            Some((0.0, 0.0, 880.0, 660.0)),
+            false,
+            false,
+            false,
+            false
+        ));
     }
 
     #[test]
@@ -697,6 +926,7 @@ mod tests {
                 is_main: false,
                 is_fullscreen: Some(false),
                 is_custom_root: false,
+                is_floating_window: false,
                 only_via_key_or_main: false,
                 tab_group: None,
             }
