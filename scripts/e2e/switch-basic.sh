@@ -80,6 +80,15 @@ echo "$restart_out" | grep -q "^restart ok" || {
 }
 echo "$restart_out" | grep -E "^(restart ok|build-version|app args)" || true
 
+# The instance that must be driven is the one dev-restart reports. A launchd job left over from a
+# previous run can respawn an older instance while this run starts, and a snapshot read at that
+# moment can belong to a process this scenario is not driving. Clearing the snapshot after the
+# restart (rather than before it) also removes any frame the older instance wrote.
+app_pid="$(printf '%s\n' "$restart_out" \
+    | sed -n 's/^restart ok (app pid \([0-9][0-9]*\).*/\1/p' | head -1)"
+[ -n "$app_pid" ] || fail "could not read the app pid from dev-restart.sh output"
+rm -f "$state_file" "${state_file%.json}.tmp"
+
 # 4) 驱动前记录前台 app,便于断言"确实换了"(否则这次切换什么都没证明)。
 #    Record the pre-drive frontmost app so "it actually switched" can be asserted.
 pre_active="$(cua-driver call list_apps '{"include_installed":false}' | python3 -c '
@@ -113,10 +122,10 @@ PY
 
 # 6) 断言:读快照 + 与 WindowServer 真状态对账(全在 python 里做)。
 #    Assertions: read the snapshot and cross-check real WindowServer state (all in python).
-python3 - "$state_file" "$pre_active" <<'PY'
+python3 - "$state_file" "$pre_active" "$app_pid" <<'PY'
 import json, subprocess, sys, time
 
-state_file, pre_active = sys.argv[1], sys.argv[2]
+state_file, pre_active, app_pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
 problems: list[str] = []
 checks: list[str] = []
 
@@ -143,7 +152,11 @@ frames: list[dict] = []
 while time.time() < deadline:
     try:
         with open(state_file) as handle:
-            frames.append(json.load(handle))
+            snapshot = json.load(handle)
+        # Frames from the instance this scenario started: an older one can still be alive and
+        # writing while this run starts.
+        if snapshot.get("pid") == app_pid:
+            frames.append(snapshot)
     except (FileNotFoundError, json.JSONDecodeError):
         pass
     if any(f.get("event") == "commit" and f.get("committed") for f in frames):

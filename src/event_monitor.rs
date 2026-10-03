@@ -6,7 +6,8 @@ use crate::event_tap::{self, tap_location, tap_options, tap_placement};
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
+use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GlobalEvent {
@@ -69,9 +70,76 @@ fn switcher_tab_event(flags: crate::event_tap::CGEventFlags) -> GlobalEvent {
     }
 }
 
-/// Ignore only the system-generated repeat for one held Tab; separate physical presses still navigate continuously.
-fn should_ignore_tab_autorepeat(autorepeat: i64) -> bool {
-    autorepeat != 0
+/// Held-Tab step cadence. macOS delivers its own autorepeat stream for a held Tab: its initial
+/// delay, then the keyboard-repeat rate configured in System Settings (measured here at 83ms,
+/// ~12/s). Repeating at that rate is faster than the card list, its thumbnail prefetch and its
+/// scroll can follow, so accepted steps are spaced by at least this much. A slower configured
+/// repeat rate is followed as-is rather than overridden.
+const TAB_REPEAT_STEP_INTERVAL: Duration = Duration::from_millis(140);
+
+/// `TAB_REPEAT_LAST_STEP_MS` value meaning "no accepted held-Tab step yet in this hold".
+const TAB_REPEAT_DISARMED: u64 = u64::MAX;
+
+/// Millis since `TAB_REPEAT_EPOCH` of the last accepted held-Tab step. A monotonic clock, not wall
+/// time: it measures an interval. Read and written only from the tap callback thread, and by tests.
+static TAB_REPEAT_LAST_STEP_MS: AtomicU64 = AtomicU64::new(TAB_REPEAT_DISARMED);
+static TAB_REPEAT_EPOCH: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+/// What the tap must do with a Tab keyDown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TabKeyAction {
+    /// Not our combo (the modifier is not held): the system gets the event untouched.
+    PassThrough,
+    /// Our combo, but a held-Tab repeat inside the cadence: swallow it without stepping.
+    Swallow,
+    /// Our combo and due: step the selection (and still swallow).
+    Step,
+}
+
+/// Whether a held-Tab repeat is due for a step, given the time since the last accepted step in
+/// this hold (`None` = none yet). The first repeat after macOS's own initial delay steps
+/// immediately: that delay is already the pause the user sees.
+fn repeat_step_due(since_last_step: Option<Duration>) -> bool {
+    match since_last_step {
+        None => true,
+        Some(since) => since >= TAB_REPEAT_STEP_INTERVAL,
+    }
+}
+
+/// Decide how one Tab keyDown is handled. Throttled repeats must be swallowed rather than passed
+/// through, or the system's native Cmd+Tab responds alongside us.
+fn classify_tab_keydown(
+    modifier_held: bool,
+    autorepeat: bool,
+    since_last_step: Option<Duration>,
+) -> TabKeyAction {
+    if !modifier_held {
+        return TabKeyAction::PassThrough;
+    }
+    if autorepeat && !repeat_step_due(since_last_step) {
+        return TabKeyAction::Swallow;
+    }
+    TabKeyAction::Step
+}
+
+/// Time since the last accepted held-Tab step, or `None` when this hold has not stepped yet.
+fn tab_repeat_elapsed(previous_ms: u64, now_ms: u64) -> Option<Duration> {
+    (previous_ms != TAB_REPEAT_DISARMED)
+        .then(|| Duration::from_millis(now_ms.saturating_sub(previous_ms)))
+}
+
+/// A fresh physical Tab press arms the cadence, so the next repeat steps and later repeats are
+/// spaced from it.
+fn arm_tab_repeat_cadence() {
+    TAB_REPEAT_LAST_STEP_MS.store(TAB_REPEAT_DISARMED, Ordering::Relaxed);
+}
+
+/// Record an accepted held-Tab step. Returns whether it was the first step of this hold, which is
+/// the only one worth logging: a line per accepted step would flood at the repeat rate.
+fn take_tab_repeat_step(now_ms: u64) -> bool {
+    let previous_ms = TAB_REPEAT_LAST_STEP_MS.load(Ordering::Relaxed);
+    TAB_REPEAT_LAST_STEP_MS.store(now_ms, Ordering::Relaxed);
+    previous_ms == TAB_REPEAT_DISARMED
 }
 
 // Tracks whether CmdTabPressed was sent, to avoid spurious CmdReleased
@@ -115,34 +183,53 @@ unsafe extern "C" fn event_tap_callback(
                 } else {
                     K_CG_EVENT_FLAG_MASK_ALTERNATE
                 };
-                if (flags & mod_mask) != 0 {
-                    // Master switch: when off, pass the event through (the native Cmd+Tab
-                    // takes over) -- no swallow, no event. Same philosophy as the clipboard
-                    // passthrough: a disabled feature returns the combo to the system.
-                    if !crate::config::CONFIG
+                // Master switch: when off, pass the event through (the native Cmd+Tab
+                // takes over) -- no swallow, no event. Same philosophy as the clipboard
+                // passthrough: a disabled feature returns the combo to the system.
+                if (flags & mod_mask) != 0
+                    && !crate::config::CONFIG
                         .read()
                         .map(|c| c.windows.enabled)
                         .unwrap_or(true)
-                    {
-                        log_debug!("[kbd] Tab+Command passthrough (switcher disabled)");
-                        return event;
-                    }
-                    let autorepeat = crate::event_tap::CGEventGetIntegerValueField(
-                        event,
-                        K_CG_KEYBOARD_EVENT_AUTOREPEAT,
-                    );
-                    if should_ignore_tab_autorepeat(autorepeat) {
-                        // Repeat events must be swallowed rather than passed through, or the system's native Cmd+Tab responds alongside us.
-                        log_debug!("[kbd] summon autorepeat ignored");
+                {
+                    log_debug!("[kbd] Tab+Command passthrough (switcher disabled)");
+                    return event;
+                }
+                let autorepeat = crate::event_tap::CGEventGetIntegerValueField(
+                    event,
+                    K_CG_KEYBOARD_EVENT_AUTOREPEAT,
+                ) != 0;
+                let now_ms = TAB_REPEAT_EPOCH.elapsed().as_millis() as u64;
+                let since_last_step =
+                    tab_repeat_elapsed(TAB_REPEAT_LAST_STEP_MS.load(Ordering::Relaxed), now_ms);
+                match classify_tab_keydown((flags & mod_mask) != 0, autorepeat, since_last_step) {
+                    // A held Tab inside the cadence: swallow it, but do not step. Returning the
+                    // event would let the system's native Cmd+Tab react alongside us.
+                    TabKeyAction::Swallow => {
+                        crate::e2e_state::tab_repeat_throttled();
                         return std::ptr::null_mut();
                     }
-                    // The summon combo: log only the combo name (not sensitive), never raw keycode/flags.
+                    // Tab without the modifier: not our combo any more, so it belongs to whatever
+                    // app is frontmost (holding Tab after letting the modifier go must not keep
+                    // switching).
+                    TabKeyAction::PassThrough => return event,
+                    TabKeyAction::Step => {}
+                }
+                if autorepeat {
+                    crate::e2e_state::tab_repeat_step();
+                    if take_tab_repeat_step(now_ms) {
+                        log_debug!("[kbd] summon held-Tab repeat: switching continuously");
+                    }
+                } else {
+                    // The summon combo: log only the combo name (not sensitive), never raw
+                    // keycode/flags.
                     let combo = if is_cmd { "Tab+Command" } else { "Tab+Option" };
                     log_debug!("[kbd] summon keyDown {}", combo);
-                    TAB_PRESSED.store(true, Ordering::SeqCst);
-                    crate::enqueue_global_event(switcher_tab_event(flags));
-                    return std::ptr::null_mut();
+                    arm_tab_repeat_cadence();
                 }
+                TAB_PRESSED.store(true, Ordering::SeqCst);
+                crate::enqueue_global_event(switcher_tab_event(flags));
+                return std::ptr::null_mut();
             }
             if clipboard_shortcut_matches(keycode, flags) {
                 // Side-button mappings that synthesize this chord intentionally loop back through
@@ -276,9 +363,56 @@ mod tests {
     }
 
     #[test]
-    fn only_autorepeat_tab_events_are_ignored() {
-        assert!(!should_ignore_tab_autorepeat(0));
-        assert!(should_ignore_tab_autorepeat(1));
+    fn a_fresh_tab_press_with_the_modifier_steps() {
+        assert_eq!(classify_tab_keydown(true, false, None), TabKeyAction::Step);
+    }
+
+    #[test]
+    fn tab_without_the_modifier_passes_through_to_the_system() {
+        // Holding Tab after letting the modifier go must not keep switching, and the event is not
+        // ours any more, so it belongs to whatever app is frontmost.
+        assert_eq!(
+            classify_tab_keydown(false, false, None),
+            TabKeyAction::PassThrough
+        );
+        assert_eq!(
+            classify_tab_keydown(false, true, Some(TAB_REPEAT_STEP_INTERVAL)),
+            TabKeyAction::PassThrough
+        );
+    }
+
+    #[test]
+    fn the_first_repeat_of_a_hold_steps_immediately() {
+        // macOS already applied its own initial repeat delay, so that pause is the one the user
+        // sees; waiting again here would add a second one.
+        assert!(repeat_step_due(None));
+        assert_eq!(classify_tab_keydown(true, true, None), TabKeyAction::Step);
+    }
+
+    #[test]
+    fn repeats_inside_the_cadence_are_swallowed_without_stepping() {
+        let just_inside = TAB_REPEAT_STEP_INTERVAL - Duration::from_millis(1);
+        assert!(!repeat_step_due(Some(just_inside)));
+        assert_eq!(
+            classify_tab_keydown(true, true, Some(just_inside)),
+            TabKeyAction::Swallow
+        );
+        assert!(repeat_step_due(Some(TAB_REPEAT_STEP_INTERVAL)));
+        assert_eq!(
+            classify_tab_keydown(true, true, Some(TAB_REPEAT_STEP_INTERVAL)),
+            TabKeyAction::Step
+        );
+    }
+
+    #[test]
+    fn a_disarmed_cadence_reports_no_elapsed_step() {
+        assert_eq!(tab_repeat_elapsed(TAB_REPEAT_DISARMED, 10_000), None);
+        assert_eq!(
+            tab_repeat_elapsed(1_000, 1_500),
+            Some(Duration::from_millis(500))
+        );
+        // A clock that appears to go backwards must not panic or report a huge interval.
+        assert_eq!(tab_repeat_elapsed(2_000, 1_000), Some(Duration::ZERO));
     }
 
     #[test]

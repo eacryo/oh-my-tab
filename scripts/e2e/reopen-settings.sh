@@ -18,6 +18,15 @@ echo "$restart_out" | grep -q "^restart ok" || {
 }
 echo "$restart_out" | grep -E "^(restart ok|build-version|app args)" || true
 
+# The instance that must be driven is the one dev-restart reports. A launchd job left over from a
+# previous run can respawn an older instance while this run starts, and a snapshot read at that
+# moment can belong to a process this scenario is not driving. Clearing the snapshot after the
+# restart (rather than before it) also removes any frame the older instance wrote.
+app_pid="$(printf '%s\n' "$restart_out" \
+    | sed -n 's/^restart ok (app pid \([0-9][0-9]*\).*/\1/p' | head -1)"
+[ -n "$app_pid" ] || fail "could not read the app pid from dev-restart.sh output"
+rm -f "$state_file" "${state_file%.json}.tmp"
+
 baseline_seq="$(python3 - "$state_file" <<'PY'
 import json
 import sys

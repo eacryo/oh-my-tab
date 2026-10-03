@@ -108,6 +108,9 @@ fn step_switcher(backward: bool) {
         });
         reset_thumbnail_nav_anchor();
         refresh_after_selection_change(true);
+        // A2 E2E: a selection change is otherwise invisible to a script until the release commits
+        // it, so a held-Tab scenario could not assert that the steps advanced and wrapped.
+        crate::e2e_state::record("selection");
     }
 }
 

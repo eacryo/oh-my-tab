@@ -74,13 +74,23 @@ echo "$restart_out" | grep -q "^restart ok" || {
 }
 echo "$restart_out" | grep -E "^(restart ok|build-version|app args)" || true
 
-python3 - "$state_file" "$title_fullscreen" "$title_plain" <<'PY'
+# The instance that must be driven is the one dev-restart reports. A launchd job left over from a
+# previous run can respawn an older instance while this run starts, and a snapshot read at that
+# moment can belong to a process this scenario is not driving. Clearing the snapshot after the
+# restart (rather than before it) also removes any frame the older instance wrote.
+app_pid="$(printf '%s\n' "$restart_out" \
+    | sed -n 's/^restart ok (app pid \([0-9][0-9]*\).*/\1/p' | head -1)"
+[ -n "$app_pid" ] || fail "could not read the app pid from dev-restart.sh output"
+rm -f "$state_file" "${state_file%.json}.tmp"
+
+python3 - "$state_file" "$title_fullscreen" "$title_plain" "$app_pid" <<'PY'
 import json
 import subprocess
 import sys
 import time
 
-state_file, title_fullscreen, title_plain = sys.argv[1:4]
+state_file, title_fullscreen, title_plain, app_pid = sys.argv[1:5]
+app_pid = int(app_pid)
 problems: list[str] = []
 checks: list[str] = []
 
@@ -109,6 +119,10 @@ def state() -> dict | None:
         with open(state_file) as handle:
             snapshot = json.load(handle)
     except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    if snapshot.get("pid") != app_pid:
+        # Not the instance this scenario started; ignore it rather than let an older process's
+        # frame satisfy a wait.
         return None
     mark = [(c.get("space"), c.get("kind")) for c in snapshot.get("space_contexts", [])]
     if mark and mark not in seen_contexts:
@@ -211,7 +225,6 @@ def switch_space(keys: list[str], predicate_context, timeout: float) -> dict:
 # --- 等首个快照:Reconcile 到 app 的初始状态 ---------------------------------
 base = wait_state(lambda s: s.get("seq", 0) > 0 and s.get("pid"), 10, "the first state snapshot")
 # Frames from the process this run started, not a snapshot the previous process left on disk.
-app_pid = base["pid"]
 check(True, "app wrote a state snapshot", f"pid={app_pid} seq={base.get('seq')} event={base.get('event')}")
 
 # 起始必须在一个普通桌面上:否则"来源桌面"无从谈起,而且会污染后面的上下文断言。
@@ -334,6 +347,8 @@ desktop_cards = on_desktop.get("cards", [])
 check(
     card_title(desktop_cards, title_fullscreen) is not None,
     "the desktop lists the fullscreen window whose origin is this desktop",
+    f"space_groups={on_desktop.get('space_groups')} "
+    f"contexts={on_desktop.get('space_contexts')} "
     f"titles={[c.get('title') for c in desktop_cards]}",
 )
 check(

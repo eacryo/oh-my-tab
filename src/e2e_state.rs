@@ -40,6 +40,24 @@ static SMOOTH_PHASES: [AtomicU64; 6] = [
     AtomicU64::new(0),
 ];
 
+/// A held-Tab repeat cannot be synthesized (macOS generates the repeat stream from a physically
+/// held key), so the accepted and throttled counts are the state that makes the behaviour
+/// checkable: hold Tab, then read the snapshot.
+static TAB_REPEAT_STEPS: AtomicU64 = AtomicU64::new(0);
+static TAB_REPEAT_THROTTLED: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn tab_repeat_step() {
+    if is_enabled() {
+        TAB_REPEAT_STEPS.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn tab_repeat_throttled() {
+    if is_enabled() {
+        TAB_REPEAT_THROTTLED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
 /// Resolves `--e2e-state=<path>` once, then serves it from cache.
 fn state_path() -> Option<&'static PathBuf> {
     PATH.get_or_init(|| crate::dev_flags::value("e2e-state").map(PathBuf::from))
@@ -548,6 +566,11 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         SPACE_IN_TRANSITION.load(Ordering::Relaxed),
         SPACE_TRANSITION_DEADLINE_MS.load(Ordering::Relaxed),
     ));
+    json.push_str(&format!(
+        "  \"tab_repeat\": {{\"steps\": {}, \"throttled\": {}}},\n",
+        TAB_REPEAT_STEPS.load(Ordering::Relaxed),
+        TAB_REPEAT_THROTTLED.load(Ordering::Relaxed),
+    ));
     json.push_str(&format!("  \"selected_index\": {},\n", snapshot.selected));
     json.push_str(&format!("  \"cards_count\": {},\n", snapshot.windows.len()));
     let selected_key = snapshot.windows.get(snapshot.selected);
@@ -577,9 +600,12 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     // Stopping any service must never latch the terminal disable; A2 asserts this stays false
     // after toggling a feature off (a self-inflicted `CGEventTapEnable(false)` pseudo-event).
     json.push_str(&format!(
-        "  \"taps\": {{\"user_input_disabled\": {}, \"allowed\": {}}},\n",
+        "  \"taps\": {{\"user_input_disabled\": {}, \"allowed\": {}, \"switcher_active\": {}}},\n",
         crate::input_monitor::user_input_disabled(),
-        crate::input_monitor::taps_allowed()
+        crate::input_monitor::taps_allowed(),
+        // A scenario that synthesizes events must wait for the switcher tap: a frame can already be
+        // on disk while the tap thread is still installing, and events posted then are lost.
+        crate::event_monitor::tap_is_active()
     ));
     json.push_str(&format!(
         "  \"selected_sidebar\": {},\n",
