@@ -463,7 +463,9 @@ caption line.
 shape.
 
 **Tooltip.** `radius-panel`, elevation `med`, 14pt text, appears instantly on hover-delay and
-disappears instantly.
+disappears instantly. A tooltip that exists to reveal text the surface could not fit (a truncated
+`caption`) wraps its text and sizes to its content, up to the wrap cap in `settings/tooltip.rs`; it
+never truncates that text a second time. The fixed-size hint and toast keep their single line.
 
 **Empty state.** Centered `caption` text in `text_muted`; no illustration unless the surface is a
 first-run surface (onboarding).

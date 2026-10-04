@@ -1168,6 +1168,23 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             return false;
         }
         log_info!("[smoke-settings-layout] clipboard disable warning visible");
+        // The hover tooltip is the outlet for a caption that cannot fit its row (design-style §9).
+        // Assert it on the real view tree: the bubble must render the longest shipped caption in full,
+        // not truncate it a second time -- the fixed 288pt bubble with its 220pt text budget did
+        // exactly that for the English and Traditional-Chinese "delete after paste" captions.
+        if !tooltip::SettingsTooltip::debug_hover_bubble_holds_captions(
+            window,
+            &[
+                t("settings.desc_clipboard_enabled"),
+                t("settings.desc_clipboard_delete_after_paste"),
+                t("settings.desc_clipboard_shortcut"),
+            ],
+        ) {
+            log_info!("[smoke-settings-layout] the hover tooltip truncates its own text");
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] hover tooltip renders its captions in full");
         let preview_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let contrast = crate::theme::settings_preview_contrast(crate::theme::ui_palette());

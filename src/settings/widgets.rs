@@ -3022,12 +3022,20 @@ pub(super) unsafe fn add_captioned_row(
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![caption_label, setFont: caption_font];
     apply_settings_text_role(caption_label, SettingsTextRole::Muted);
-    let caption_ns = make_nsstring(caption);
-    let _: () = msg_send![caption_label, setToolTip: caption_ns];
-    CFRelease(caption_ns as *const c_void);
-    let title_ns = make_nsstring(title);
-    let _: () = msg_send![title_label, setToolTip: title_ns];
-    CFRelease(title_ns as *const c_void);
+    // The caption is the row's truncatable text, so it is the one that carries the hover bubble;
+    // the title must read in full in every locale (design-style §9 -- a tooltip does not exempt a
+    // label) and deliberately gets none, so hovering the title never shows a second, redundant
+    // hint. Native `setToolTip:` is not used: AppKit's help-tag window is not dismissed when the
+    // page is hidden or rebuilt, so the tag can be stranded on screen (2026-10-04).
+    super::tooltip::SettingsTooltip::attach_hover(caption_label, caption);
+    if cfg!(debug_assertions) {
+        let caption_tip: *mut AnyObject = msg_send![caption_label, toolTip];
+        let title_tip: *mut AnyObject = msg_send![title_label, toolTip];
+        debug_assert!(
+            caption_tip.is_null() && title_tip.is_null(),
+            "captioned row labels must use the app hover tooltip, not a native setToolTip:"
+        );
+    }
     let _: () = msg_send![title_label, setAutoresizingMask: 4u64];
     let _: () = msg_send![caption_label, setAutoresizingMask: 4u64];
     let _: () = msg_send![control, setAutoresizingMask: 2u64];

@@ -135,6 +135,25 @@ fn compact_menu_title(title: &str) -> String {
     })
 }
 
+/// Set a menu item's native title to the full localized string and never attach a tooltip.
+///
+/// Used for the service items. An `NSMenuItem` tooltip is drawn by AppKit as its own help-tag
+/// window, which is not dismissed when the item's menu closes or the item is re-titled, and it is
+/// then stranded at the screen origin (2026-10-04). Service titles are short in every shipped
+/// locale, so the compact-with-outlet path is not needed for them; the whole title is shown in
+/// place instead (design-style §9: a title reads in full). A previously set tooltip is cleared, so
+/// this path cannot inherit one.
+pub(crate) unsafe fn set_menu_item_full_title(item: *mut AnyObject, title: &str) {
+    if item.is_null() {
+        return;
+    }
+
+    let title_ns = make_nsstring(title);
+    let _: () = msg_send![item, setTitle: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![item, setToolTip: std::ptr::null::<AnyObject>()];
+}
+
 /// Set a menu item's native title, truncating only oversized localized text.
 pub(crate) unsafe fn set_menu_item_title(item: *mut AnyObject, title: &str) {
     if item.is_null() {
@@ -280,7 +299,9 @@ unsafe fn make_menu_item(
     CFRelease(key_ns as *const c_void);
     let _: () = msg_send![item, setTarget: target];
     let _: () = msg_send![item, setTag: tag];
-    set_menu_item_title(item, title);
+    // Service items use the full-title path: no compaction and no native tooltip (the tooltip is the
+    // help-tag leak described on `set_menu_item_full_title`).
+    set_menu_item_full_title(item, title);
     if let Some(symbol) = symbol {
         set_menu_item_symbol(item, symbol);
     }
@@ -308,39 +329,11 @@ pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyOb
     refresh_service_menu();
 }
 
-/// The tooltip a service menu item carries. A menu item has no room for a caption, so the clipboard
-/// entry -- the one whose switch-off deletes the saved history -- carries the same sentence the
-/// settings row shows, and only while it is ON (turning it on deletes nothing). Pure, unit-tested.
-#[cfg(test)]
-mod service_tooltip_tests {
-    use super::service_menu_tooltip;
-    use crate::i18n::t;
-
-    /// The clipboard entry deletes the saved history when switched off, so it says so -- but only
-    /// while it is on (an item that is already off has nothing to lose), and no other service
-    /// carries the sentence. This is the menu-side half of the disclosure the settings page shows as
-    /// a caption.
-    #[test]
-    fn only_the_enabled_clipboard_entry_warns_that_switching_it_off_clears_history() {
-        let warning = t("settings.desc_clipboard_enabled");
-        assert_eq!(service_menu_tooltip(2, true), Some(warning));
-        assert_eq!(service_menu_tooltip(2, false), None);
-        for other in [0, 1, 3, 4, 5] {
-            assert_eq!(service_menu_tooltip(other, true), None, "index {other}");
-            assert_eq!(service_menu_tooltip(other, false), None, "index {other}");
-        }
-        assert_eq!(service_menu_tooltip(9, true), None, "out of range");
-    }
-}
-
-pub(crate) fn service_menu_tooltip(index: usize, enabled: bool) -> Option<String> {
-    if ServiceToggle::from_tag(index as isize) == Some(ServiceToggle::Clipboard) && enabled {
-        Some(t("settings.desc_clipboard_enabled"))
-    } else {
-        None
-    }
-}
-
+/// Synchronize the service items' titles and check states with CONFIG.
+///
+/// Service items deliberately carry no `toolTip` (asserted below): AppKit materializes an
+/// unanchored help-tag window for an `NSMenuItem` tooltip and strands it at the screen origin. The
+/// clipboard warning it used to show lives as the visible caption on the Clipboard settings page.
 pub(crate) fn refresh_service_menu() {
     let enabled: [bool; 6] = {
         let cfg = CONFIG.read().unwrap();
@@ -356,21 +349,26 @@ pub(crate) fn refresh_service_menu() {
     unsafe {
         for (index, item) in items.into_iter().enumerate() {
             let title = t(SERVICE_MENU_TITLE_KEYS[index]);
-            set_menu_item_title(item, &title);
+            set_menu_item_full_title(item, &title);
             let _: () = msg_send![item, setState: if enabled[index] { 1isize } else { 0isize }];
-            // The clipboard entry deletes the saved history when it is switched off, and a menu item
-            // has no room for a caption (the settings page carries the visible one), so the
-            // consequence rides on the item's tooltip -- shown exactly when the switch is on, i.e.
-            // when turning it off would delete something. Set after the title, which manages its own
-            // tooltip for truncated text.
-            if let Some(text) = service_menu_tooltip(index, enabled[index]) {
-                let tooltip = make_nsstring(&text);
-                let _: () = msg_send![item, setToolTip: tooltip];
-                CFRelease(tooltip as *const c_void);
-            } else if ServiceToggle::from_tag(index as isize) == Some(ServiceToggle::Clipboard) {
-                // Switched off: nothing to warn about, and a stale tooltip would be a lie.
-                let _: () = msg_send![item, setToolTip: std::ptr::null_mut::<AnyObject>()];
-            }
+            // Service items deliberately carry no `toolTip`. Setting one on an `NSMenuItem` makes
+            // AppKit materialize its own help-tag window with no anchor, and it is left stranded at
+            // the screen origin (2026-10-04: the clipboard warning's tooltip reappeared there every
+            // time the feature was toggled, because apply_config_change -> refresh_service_menu runs
+            // on every settings change). The warning lives as the visible caption on the Clipboard
+            // settings page instead; the menu title must read in full on its own (design-style §9).
+            debug_assert!(
+                {
+                    let tooltip: *mut AnyObject = msg_send![item, toolTip];
+                    tooltip.is_null()
+                },
+                "service menu items must not carry a native toolTip"
+            );
+            debug_assert_eq!(
+                crate::ffi::nsstring_to_rust(msg_send![item, title]),
+                title,
+                "service menu titles are set in full; a compacted title would need a tooltip outlet"
+            );
         }
     }
 }
