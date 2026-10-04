@@ -1,6 +1,7 @@
 //! Clipboard subsystem · model: captured entries, grouping, and filters.
 
 use super::*;
+use std::collections::HashSet;
 
 /// Conservative fallback for detail document height: explicit newlines start a new line. The
 /// character units are only used when AppKit measurement is unavailable and never truncate list content.
@@ -545,14 +546,22 @@ pub(super) fn restore_entry_at(
 }
 
 /// Remove the confirmed history scope and return dropped entries for cache-reference checks.
+/// The scope is what the user can see: the active filter's category narrowed by the search query
+/// (`filtered_indices`). Clearing only what is on screen keeps a destructive action from deleting
+/// entries the user never saw; `clear_all` additionally takes the pinned entries in that scope.
 pub(super) fn remove_history_scope(
     history: &mut Vec<ClipEntry>,
     clear_all: bool,
+    filter: ClipFilter,
+    query: &str,
 ) -> Vec<ClipEntry> {
+    let visible: HashSet<usize> = filtered_indices(history, query, filter)
+        .into_iter()
+        .collect();
     let mut removed = Vec::new();
     let mut kept = Vec::with_capacity(history.len());
-    for entry in history.drain(..) {
-        if clear_all || !entry.pinned {
+    for (index, entry) in history.drain(..).enumerate() {
+        if visible.contains(&index) && (clear_all || !entry.pinned) {
             removed.push(entry);
         } else {
             kept.push(entry);
@@ -563,6 +572,78 @@ pub(super) fn remove_history_scope(
         super::bump_history_revision();
     }
     removed
+}
+
+/// The two header clear actions, named after the set they will clear: the active filter's
+/// category, or "results" while a query narrows the list. One place so the button titles and the
+/// behaviour cannot drift apart.
+/// Pure, unit-tested.
+pub(super) fn clip_clear_labels(filter: ClipFilter, has_query: bool) -> (String, String) {
+    if has_query {
+        return (
+            t("clipboard.clear_scope_unpinned_results"),
+            t("clipboard.clear_scope_all_results"),
+        );
+    }
+    if filter == ClipFilter::All {
+        return (
+            t("clipboard.clear_confirm_unpinned"),
+            t("clipboard.clear_confirm_all"),
+        );
+    }
+    let kind: String = match filter {
+        ClipFilter::All => String::new(),
+        ClipFilter::Text => t("clipboard.filter_text"),
+        ClipFilter::Image => t("clipboard.filter_image"),
+        ClipFilter::Link => t("clipboard.filter_link"),
+        ClipFilter::Code => t("clipboard.filter_code"),
+    };
+    (
+        tf("clipboard.clear_scope_unpinned", &[("kind", kind.as_str())]),
+        tf("clipboard.clear_scope_all", &[("kind", kind.as_str())]),
+    )
+}
+
+/// The width each clear action reserves: the widest of its variants in the CURRENT locale, so the
+/// buttons never resize when the filter changes, a query is typed, or the locale is switched.
+/// `measure` is injected (the header and the locale refresh both pass `localized_string_width` on
+/// the caption font) so the rule itself is pure and testable.
+/// Pure, unit-tested.
+pub(super) fn clip_clear_action_widths(measure: impl Fn(&str) -> f64) -> [f64; 2] {
+    let variants = clip_clear_label_variants();
+    std::array::from_fn(|i| {
+        variants[i]
+            .iter()
+            .map(|label| measure(label))
+            .fold(0.0_f64, f64::max)
+    })
+}
+
+/// Every label the two clear actions can show, so the header can reserve the widest one: the
+/// buttons must not move when the filter changes or a query is typed.
+/// Pure, unit-tested.
+pub(super) fn clip_clear_label_variants() -> [Vec<String>; 2] {
+    let filters = [
+        ClipFilter::All,
+        ClipFilter::Text,
+        ClipFilter::Image,
+        ClipFilter::Link,
+        ClipFilter::Code,
+    ];
+    std::array::from_fn(|action| {
+        let mut variants: Vec<String> = [false, true]
+            .iter()
+            .flat_map(|has_query| {
+                filters
+                    .iter()
+                    .map(move |filter| clip_clear_labels(*filter, *has_query))
+            })
+            .map(|labels| [labels.0, labels.1][action].clone())
+            .collect();
+        variants.sort();
+        variants.dedup();
+        variants
+    })
 }
 
 /// Record a new text into the history:

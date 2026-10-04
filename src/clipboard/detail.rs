@@ -507,7 +507,6 @@ pub(crate) unsafe fn apply_theme() {
         apply_panel_appearance(window.0);
     }
     apply_glass_properties();
-    apply_clear_history_confirmation_theme();
     if let Some(buttons) = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() {
         for button in buttons {
             set_clear_confirmation_button_style(button.0, false);
@@ -958,16 +957,15 @@ pub(super) unsafe fn ensure_picker_window() {
     }
     update_filter_pill_style(false);
 
-    // Clear history: keep two compact text actions visible beside the filters instead of
-    // expanding a separate confirmation card first.
-    let clear_labels = [
-        t("clipboard.clear_confirm_unpinned"),
-        t("clipboard.clear_confirm_all"),
-    ];
+    // Clear history: keep two compact text actions visible beside the filters. Their text names the
+    // scope they clear (the active category, or "results" while a query narrows the list) and is
+    // refreshed by `update_clear_action_labels`; the frames reserve the widest variant so switching
+    // filter or typing a query moves nothing.
     let clear_actions = [sel!(clearClipboardUnpinned:), sel!(clearClipboardAll:)];
     let clear_widths: [f64; 2] =
-        std::array::from_fn(|i| localized_string_width(&clear_labels[i], 12.0) + 8.0);
-    let clear_total_w = clear_widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
+        clip_clear_action_widths(|label| localized_string_width(label, crate::theme::FONT_CAPTION))
+            .map(|width| width + 8.0);
+    let clear_total_w = clear_widths.iter().sum::<f64>() + CLEAR_ACTION_GAP;
     let mut clear_x = PICKER_W - SEARCH_PAD_X - clear_total_w;
     let mut clear_buttons = [std::ptr::null_mut(); 2];
     for i in 0..2 {
@@ -986,9 +984,6 @@ pub(super) unsafe fn ensure_picker_window() {
         let font: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let _: () = msg_send![button, setFont: font];
-        let title = make_nsstring(&clear_labels[i]);
-        let _: () = msg_send![button, setTitle: title];
-        CFRelease(title as *const c_void);
         let _: () = msg_send![button, setTarget: observer()];
         let _: () = msg_send![button, setAction: clear_actions[i]];
         set_clear_confirmation_button_style(button, false);
@@ -996,11 +991,12 @@ pub(super) unsafe fn ensure_picker_window() {
         let _: () = msg_send![header_strip, addSubview: button];
         release_obj(button);
         clear_buttons[i] = button;
-        clear_x += clear_widths[i] + CLEAR_CONFIRM_GAP;
+        clear_x += clear_widths[i] + CLEAR_ACTION_GAP;
     }
-    *CLEAR_HISTORY_BUTTON.lock().unwrap() = None;
     *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() =
         Some([ObjPtr::new(clear_buttons[0]), ObjPtr::new(clear_buttons[1])]);
+    // Initial titles for the current filter (and no query yet).
+    update_clear_action_labels();
 
     // (clear history now lives in the filters row).
     build_footer(content_parent, w);
@@ -2840,10 +2836,6 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 hide_detail();
             }
             53 => {
-                if clear_history_confirmation_expanded() {
-                    set_clear_history_confirmation_expanded(false);
-                    return;
-                }
                 // Esc: with the detail open, the first press closes the detail (the picker
                 // and the query stay untouched).
                 if detail_visible() {
@@ -2853,12 +2845,11 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 // Esc: a query gets cleared first (restoring the full list), a second press
                 // closes. The search-field-focused first level is handled by the
                 // NSSearchField subclass's cancelOperation:; this handles list focus.
-                let had_query = with_clipboard_ui(|ui| {
-                    let had_query = !ui.search_query.is_empty();
-                    ui.search_query.clear();
-                    had_query
-                });
+                let had_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
                 if had_query {
+                    // The shared path, so the field, the clear button and the scope labels all
+                    // agree; clearing the query by hand used to leave "results" on the buttons.
+                    clear_search();
                     rebuild_rows();
                 } else {
                     hide_picker();

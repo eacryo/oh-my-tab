@@ -83,12 +83,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
-                sel!(clearClipboardHistory:),
-                clear_clipboard_history as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
                 sel!(pickerClose:),
                 picker_close as *mut c_void,
                 types.as_ptr(),
@@ -103,12 +97,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 cls,
                 sel!(clearClipboardAll:),
                 clear_clipboard_all as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(finishClearHistoryCollapse:),
-                finish_clear_history_collapse as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -917,7 +905,7 @@ pub(super) extern "C" fn detail_scroll_indicator_bounds_changed(
         update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
     }
 }
-fn cancel_clipboard_undo_timer() {
+pub(super) fn cancel_clipboard_undo_timer() {
     unsafe {
         let target = observer();
         let _: () = msg_send![
@@ -929,7 +917,7 @@ fn cancel_clipboard_undo_timer() {
     }
 }
 
-fn discard_deleted_clipboard_entry() {
+pub(super) fn discard_deleted_clipboard_entry() {
     let pending = DELETED_CLIPBOARD_ENTRY.lock().unwrap().take();
     let Some(pending) = pending else {
         return;
@@ -1025,323 +1013,32 @@ pub(super) fn picker_filters_y() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
 }
 
-pub(super) fn clear_history_confirmation_layout(anchor: NSRect) -> (NSRect, [NSRect; 2]) {
-    let labels = [
-        t("clipboard.clear_confirm_unpinned"),
-        t("clipboard.clear_confirm_all"),
-    ];
-    let button_widths = labels.map(|label| {
-        localized_string_width(&label, CLEAR_CONFIRM_BUTTON_FONT_SIZE)
-            + CLEAR_CONFIRM_BUTTON_PAD_X * 2.0
-    });
-    let card_width =
-        CLEAR_CONFIRM_CARD_PAD_X * 2.0 + button_widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
-    let surface = NSRect::new(
-        NSPoint::new(
-            anchor.origin.x + anchor.size.width - card_width,
-            anchor.origin.y,
-        ),
-        NSSize::new(card_width, CLEAR_CONFIRM_CARD_H),
-    );
-    let buttons = std::array::from_fn(|index| {
-        let x = CLEAR_CONFIRM_CARD_PAD_X
-            + button_widths[..index].iter().sum::<f64>()
-            + index as f64 * CLEAR_CONFIRM_GAP;
-        NSRect::new(
-            NSPoint::new(x, CLEAR_CONFIRM_CARD_PAD_Y),
-            NSSize::new(button_widths[index], CLEAR_CONFIRM_BUTTON_H),
-        )
-    });
-    (surface, buttons)
+extern "C" fn clear_clipboard_unpinned(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    clear_clipboard_history_scope(false);
 }
 
-unsafe fn clear_confirmation_add_animation(
-    layer: *mut AnyObject,
-    key_path: &str,
-    from: *mut AnyObject,
-    to: *mut AnyObject,
-    duration: f64,
-    animation_key: &str,
-) {
-    let path = make_nsstring(key_path);
-    let animation: *mut AnyObject = msg_send![class!(CABasicAnimation), animationWithKeyPath: path];
-    CFRelease(path as *const c_void);
-    let _: () = msg_send![animation, setFromValue: from];
-    let _: () = msg_send![animation, setToValue: to];
-    let _: () = msg_send![animation, setDuration: duration];
-    let timing = crate::theme::ease_standard_timing_function();
-    if !timing.is_null() {
-        let _: () = msg_send![animation, setTimingFunction: timing];
-    }
-    let key = make_nsstring(animation_key);
-    let _: () = msg_send![layer, addAnimation: animation, forKey: key];
-    CFRelease(key as *const c_void);
+extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    clear_clipboard_history_scope(true);
 }
 
-unsafe fn clear_confirmation_animate_frame(view: *mut AnyObject, target: NSRect) {
-    let layer: *mut AnyObject = msg_send![view, layer];
-    if layer.is_null() || crate::theme::reduce_motion_enabled() {
-        let _: () = msg_send![view, setFrame: target];
-        return;
-    }
-    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
-    let current = if presentation.is_null() {
-        layer
-    } else {
-        presentation
-    };
-    let from_bounds: NSRect = msg_send![current, bounds];
-    let from_position: NSPoint = msg_send![current, position];
-    let _: () = msg_send![class!(CATransaction), begin];
-    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-    let _: () = msg_send![view, setFrame: target];
-    let _: () = msg_send![class!(CATransaction), commit];
-    let to_bounds: NSRect = msg_send![layer, bounds];
-    let to_position: NSPoint = msg_send![layer, position];
-    for (path, from, to, key) in [
-        (
-            "bounds",
-            msg_send![class!(NSValue), valueWithRect: from_bounds],
-            msg_send![class!(NSValue), valueWithRect: to_bounds],
-            "clipboard-clear-shell-bounds",
-        ),
-        (
-            "position",
-            msg_send![class!(NSValue), valueWithPoint: from_position],
-            msg_send![class!(NSValue), valueWithPoint: to_position],
-            "clipboard-clear-shell-position",
-        ),
-    ] {
-        clear_confirmation_add_animation(
-            layer,
-            path,
-            from,
-            to,
-            crate::theme::ANIMATION_DURATION_MEDIUM,
-            key,
-        );
-    }
+/// The header's corner close button: the same dismissal as Esc with no query / an outside click.
+extern "C" fn picker_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    hide_picker();
 }
 
-unsafe fn clear_confirmation_animate_opacity(view: *mut AnyObject, visible: bool) {
-    let layer: *mut AnyObject = msg_send![view, layer];
-    let target = if visible { 1.0 } else { 0.0 };
-    if layer.is_null() {
-        let _: () = msg_send![view, setAlphaValue: target];
-        return;
-    }
-    let presentation: *mut AnyObject = msg_send![layer, presentationLayer];
-    let from: f64 = if presentation.is_null() {
-        msg_send![view, alphaValue]
-    } else {
-        // CALayer opacity is a CGFloat-compatible Objective-C `float`, not an `f64` return.
-        let opacity: f32 = msg_send![presentation, opacity];
-        opacity as f64
-    };
-    let _: () = msg_send![class!(CATransaction), begin];
-    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-    let _: () = msg_send![view, setAlphaValue: target];
-    let _: () = msg_send![class!(CATransaction), commit];
-    let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from];
-    let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: target];
-    if crate::theme::reduce_motion_enabled() {
-        return;
-    }
-    clear_confirmation_add_animation(
-        layer,
-        "opacity",
-        from_value,
-        to_value,
-        if visible {
-            crate::theme::ANIMATION_DURATION_MEDIUM
-        } else {
-            crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
-        },
-        "clipboard-clear-opacity",
-    );
-}
-
-unsafe fn clear_confirmation_animate_content_open(button: *mut AnyObject) {
-    clear_confirmation_animate_opacity(button, true);
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if layer.is_null() {
-        return;
-    }
-    if crate::theme::reduce_motion_enabled() {
-        for (path, value) in [("transform.translation.y", 0.0), ("transform.scale", 1.0)] {
-            let key_path = make_nsstring(path);
-            let number: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: value];
-            let _: () = msg_send![layer, setValue: number, forKeyPath: key_path];
-            CFRelease(key_path as *const c_void);
-        }
-        return;
-    }
-    // Match the settings control's content entrance: a small upward offset and scale
-    // settle into the expanding shell.
-    for (path, from, to, key) in [
-        (
-            "transform.translation.y",
-            8.0,
-            0.0,
-            "clipboard-clear-content-y",
-        ),
-        (
-            "transform.scale",
-            0.98,
-            1.0,
-            "clipboard-clear-content-scale",
-        ),
-    ] {
-        let key_path = make_nsstring(path);
-        let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: from];
-        let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: to];
-        let _: () = msg_send![class!(CATransaction), begin];
-        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-        let _: () = msg_send![layer, setValue: to_value, forKeyPath: key_path];
-        let _: () = msg_send![class!(CATransaction), commit];
-        CFRelease(key_path as *const c_void);
-        clear_confirmation_add_animation(
-            layer,
-            path,
-            from_value,
-            to_value,
-            crate::theme::ANIMATION_DURATION_MEDIUM,
-            key,
-        );
-    }
-}
-
-/// Toggle the clear-history confirmation card; this only changes cached views and never
-/// mutates clipboard history.
-pub(super) fn set_clear_history_confirmation_expanded(expanded: bool) {
-    if CLEAR_HISTORY_CONFIRMATION_EXPANDED.swap(expanded, Ordering::SeqCst) == expanded {
-        return;
-    }
-    let views = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap();
-    let clear_button = *CLEAR_HISTORY_BUTTON.lock().unwrap();
-    let Some(views) = views else {
-        return;
-    };
-
-    unsafe {
-        let parent: *mut AnyObject = msg_send![views.surface.0, superview];
-        let Some(clear) = clear_button else {
-            return;
-        };
-        let header: *mut AnyObject = msg_send![clear.0, superview];
-        let anchor: NSRect = msg_send![clear.0, frame];
-        let (expanded_in_header, _) = clear_history_confirmation_layout(anchor);
-        let expanded_frame: NSRect =
-            msg_send![header, convertRect: expanded_in_header, toView: parent];
-        let collapsed_frame: NSRect = msg_send![header, convertRect: anchor, toView: parent];
-        let animated = !crate::theme::reduce_motion_enabled();
-        let target = observer();
-        let _: () = msg_send![
-            class!(NSObject),
-            cancelPreviousPerformRequestsWithTarget: target,
-            selector: sel!(finishClearHistoryCollapse:),
-            object: std::ptr::null::<AnyObject>()
-        ];
-        if expanded {
-            // Keep the card alongside the header so its lower rows remain hit-testable beyond
-            // the header's bounds. Bring the card above the scroll view when it opens.
-            let _: () = msg_send![
-                parent,
-                addSubview: views.surface.0,
-                positioned: 1isize,
-                relativeTo: std::ptr::null::<AnyObject>()
-            ];
-            let hidden: bool = msg_send![views.surface.0, isHidden];
-            if hidden {
-                let layer: *mut AnyObject = msg_send![views.surface.0, layer];
-                if !layer.is_null() {
-                    let _: () = msg_send![layer, removeAllAnimations];
-                }
-                let _: () = msg_send![class!(CATransaction), begin];
-                let _: () = msg_send![class!(CATransaction), setDisableActions: true];
-                let _: () = msg_send![views.surface.0, setFrame: collapsed_frame];
-                let _: () = msg_send![class!(CATransaction), commit];
-            }
-            let _: () = msg_send![views.surface.0, setHidden: false];
-            let _: () = msg_send![clear.0, setHidden: true];
-        } else {
-            // Keep the trigger and filters above the collapsing card so its fading shell
-            // cannot intercept the next click.
-            let _: () = msg_send![clear.0, setHidden: false];
-            let _: () = msg_send![
-                parent,
-                addSubview: header,
-                positioned: 1isize,
-                relativeTo: std::ptr::null::<AnyObject>()
-            ];
-        }
-        for button in [views.unpinned.0, views.all.0] {
-            let _: () = msg_send![button, setHidden: false];
-            if !animated {
-                let layer: *mut AnyObject = msg_send![button, layer];
-                if !layer.is_null() {
-                    let _: () = msg_send![layer, removeAllAnimations];
-                }
-                let _: () = msg_send![button, setAlphaValue: if expanded { 1.0 } else { 0.0 }];
-            } else if expanded {
-                clear_confirmation_animate_content_open(button);
-            } else {
-                clear_confirmation_animate_opacity(button, false);
-            }
-        }
-        if animated {
-            clear_confirmation_animate_frame(
-                views.surface.0,
-                if expanded {
-                    expanded_frame
-                } else {
-                    collapsed_frame
-                },
-            );
-        } else {
-            let _: () = msg_send![views.surface.0, setFrame: if expanded { expanded_frame } else { collapsed_frame }];
-        }
-        if expanded {
-            let _: () = msg_send![views.surface.0, setAlphaValue: 1.0f64];
-        } else if animated {
-            let _: () = msg_send![
-                target,
-                performSelector: sel!(finishClearHistoryCollapse:),
-                withObject: std::ptr::null::<AnyObject>(),
-                afterDelay: crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
-            ];
-        } else {
-            let _: () = msg_send![views.surface.0, setHidden: true];
-        }
-    }
-}
-
-pub(super) fn clear_history_confirmation_expanded() -> bool {
-    CLEAR_HISTORY_CONFIRMATION_EXPANDED.load(Ordering::SeqCst)
-}
-
-extern "C" fn finish_clear_history_collapse(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    if clear_history_confirmation_expanded() {
-        return;
-    }
-    let views = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap();
-    let Some(views) = views else {
-        return;
-    };
-    unsafe {
-        let _: () = msg_send![views.surface.0, setHidden: true];
-        for button in [views.unpinned.0, views.all.0] {
-            let _: () = msg_send![button, setHidden: true];
-        }
-    }
-}
-
+/// Clear the visible history scope (see `remove_history_scope`) and release the cache files of the
+/// entries that went away, then rewrite the file and refresh the list.
 fn clear_clipboard_history_scope(clear_all: bool) {
     discard_deleted_clipboard_entry();
     cancel_clipboard_undo_timer();
     DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
+    // The scope is what the user is looking at: the active filter narrowed by the search query. The
+    // query stays in the field -- the list then shows whatever is left of it, which is the honest
+    // result of clearing the visible set.
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let query = with_clipboard_ui(|ui| ui.search_query.clone());
     let mut history = CLIP_HISTORY.lock().unwrap();
-    let removed_entries = remove_history_scope(&mut history, clear_all);
+    let removed_entries = remove_history_scope(&mut history, clear_all, filter, &query);
     let removed_hashes: HashSet<u64> = removed_entries
         .iter()
         .filter_map(|entry| entry.image.as_ref().map(|image| image.hash))
@@ -1353,34 +1050,15 @@ fn clear_clipboard_history_scope(clear_all: bool) {
     let kept_count = history.len();
     drop(history);
     save_history();
-    clear_search();
     hide_detail();
     unsafe { rebuild_rows() };
     log_info!(
-        "Clipboard history cleared by user (clear_all={}, kept_entries={})",
+        "Clipboard history cleared by user (clear_all={}, filter={:?}, query={}, kept_entries={})",
         clear_all,
+        filter as u8,
+        !query.is_empty(),
         kept_count
     );
-}
-
-/// The header's corner close button: the same dismissal as Esc with no query / an outside click.
-extern "C" fn picker_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    hide_picker();
-}
-
-/// Clicking the clear entry point only expands the confirmation card; history is untouched.
-extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    set_clear_history_confirmation_expanded(true);
-}
-
-extern "C" fn clear_clipboard_unpinned(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    set_clear_history_confirmation_expanded(false);
-    clear_clipboard_history_scope(false);
-}
-
-extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    set_clear_history_confirmation_expanded(false);
-    clear_clipboard_history_scope(true);
 }
 
 /// Clear the search query and the search field's text (no rebuild; callers rebuild as needed).
@@ -1394,6 +1072,8 @@ pub(super) fn clear_search() {
     with_clipboard_ui(|ui| ui.search_query.clear());
     SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
     unsafe { set_search_clear_button_visible(false) };
+    // The clear actions are named after their scope, which is no longer "results".
+    update_clear_action_labels();
     if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
         unsafe {
             let empty_ns = make_nsstring("");
@@ -1418,6 +1098,8 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
         SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
     }
     unsafe { set_search_clear_button_visible(has_query) };
+    // The clear actions name their scope, which now includes "results" instead of a category.
+    update_clear_action_labels();
     // The hand-drawn ⌘F keycap and right × are positioned from query state, so force a redraw
     // whenever text changes.
     unsafe {

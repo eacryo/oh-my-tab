@@ -682,6 +682,39 @@ fn page_restored(before: &AboutPanelSnapshot, after: &AboutPanelSnapshot) -> boo
             .all(|(before, after)| (after - before).abs() <= 1.0)
 }
 
+/// Whether the clipboard page shows the disable warning as a visible label: the row that turns the
+/// feature off has to state that doing so deletes the records (a `described` row's subtitle is not
+/// rendered, so this walks the view tree for an actually-visible label with that string).
+unsafe fn clipboard_disable_warning_is_visible(page: *mut AnyObject) -> bool {
+    let expected = crate::i18n::t("settings.desc_clipboard_enabled");
+    fn find(view: *mut AnyObject, expected: &str) -> bool {
+        unsafe {
+            if view.is_null() {
+                return false;
+            }
+            let is_text_field: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+            if is_text_field {
+                let hidden: bool = msg_send![view, isHidden];
+                let text: *mut AnyObject = msg_send![view, stringValue];
+                if !hidden && crate::ffi::nsstring_to_rust(text) == expected {
+                    let frame: NSRect = msg_send![view, frame];
+                    return frame.size.width > 0.0 && frame.size.height > 0.0;
+                }
+            }
+            let children: *mut AnyObject = msg_send![view, subviews];
+            if children.is_null() {
+                return false;
+            }
+            let count: usize = msg_send![children, count];
+            (0..count).any(|index| {
+                let child: *mut AnyObject = msg_send![children, objectAtIndex: index];
+                find(child, expected)
+            })
+        }
+    }
+    find(page, &expected)
+}
+
 unsafe fn settings_style_tree_is_valid(
     view: *mut AnyObject,
     inside_control: bool,
@@ -1125,6 +1158,16 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             return false;
         }
         log_info!("[smoke-settings-layout] style tree passed");
+        // The clipboard switch deletes the saved history when it goes off, so the page must SAY so:
+        // its consequence line has to be a visible label in the real view tree. It was previously
+        // handed to a `described` row, whose subtitle this app never renders, and the warning
+        // silently did not exist.
+        if !clipboard_disable_warning_is_visible(pages[3]) {
+            log_info!("[smoke-settings-layout] the clipboard disable warning is not visible");
+            hide_settings();
+            return false;
+        }
+        log_info!("[smoke-settings-layout] clipboard disable warning visible");
         let preview_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let contrast = crate::theme::settings_preview_contrast(crate::theme::ui_palette());
@@ -2304,7 +2347,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             quick_actions_show_desktop: std::ptr::null_mut(),
             quick_actions_lock_screen: std::ptr::null_mut(),
             quick_actions_locate_pointer: std::ptr::null_mut(),
-            clipboard_persist: std::ptr::null_mut(),
+            clipboard_clear_on_quit: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_delete_after_paste: std::ptr::null_mut(),
             clipboard_clear_system_pasteboard_after_paste: std::ptr::null_mut(),

@@ -702,12 +702,18 @@ fn on_app_launched_inner(notification: *mut c_void) {
 }
 
 /// Forwarding point for NSApplicationWillTerminateNotification (main thread): restore the macOS
-/// system pointer values before quitting, matching LinearMouse's applicationWillTerminate --
-/// otherwise the linear switch and our tracking speed stay on the device (Cmd+Q, logout and
-/// shutdown all land here; the menu-quit path has an equivalent call of its own).
+/// system pointer values and, when configured, clear the clipboard history before quitting,
+/// matching LinearMouse's applicationWillTerminate -- otherwise the linear switch and our tracking
+/// speed stay on the device (Cmd+Q, logout and shutdown all land here; the menu-quit path has an
+/// equivalent call of its own).
 extern "C" fn on_will_terminate(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
     callback_guard::void("on_will_terminate", || {
         crate::mouse::pointer::restore();
+        // Cmd+Q, the menu-bar Quit item, logout and shutdown all land here, so one place covers
+        // every orderly exit (a crash or SIGKILL posts no notification, by design).
+        if crate::clipboard::clear_on_quit_enabled() {
+            crate::clipboard::discard_history_on_disk();
+        }
     });
 }
 

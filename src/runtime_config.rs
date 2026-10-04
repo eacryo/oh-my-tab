@@ -28,7 +28,6 @@ struct ChangeFlags {
     mouse: bool,
     clipboard_enabled: bool,
     clipboard_shortcut: bool,
-    clipboard_persist: bool,
     window_control: bool,
     quick_actions: bool,
     keystroke_display: bool,
@@ -58,7 +57,6 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
-        clipboard_persist: old.clipboard.persist != new.clipboard.persist,
         window_control: startup || old.window_control.enabled != new.window_control.enabled,
         quick_actions: startup || old.quick_actions.enabled != new.quick_actions.enabled,
         keystroke_display: startup || old.keystroke_display != new.keystroke_display,
@@ -174,11 +172,11 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         if new.clipboard.enabled {
             crate::clipboard::start();
         } else if !matches!(source, ConfigChangeSource::Startup) {
+            // Turning the switch off means "stop keeping records": the in-memory history and the
+            // file/cache it was written to go with it (see the row's description).
             crate::clipboard::stop();
+            crate::clipboard::clear_history_and_disk();
         }
-    }
-    if flags.clipboard_persist {
-        crate::clipboard::apply_persist_toggle(new.clipboard.persist);
     }
 
     if flags.window_control {

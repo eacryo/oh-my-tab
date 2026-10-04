@@ -85,10 +85,47 @@ use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use detail::{apply_backdrop_material, apply_glass_properties, apply_theme};
 pub(crate) use monitor::{start, stop};
-pub(crate) use persist::apply_persist_toggle;
+pub(crate) use persist::{clear_on_quit_enabled, discard_history_on_disk};
 pub(crate) use picker::{on_clipboard_toggle, show_picker_for_development};
 pub(crate) use smoke::{set_smoke_mode, smoke_runner};
 pub(crate) use text_style::refresh_localized_ui;
+/// Whether the history file currently exists on disk (used by the onboarding smoke to assert that
+/// turning the feature off really cleared it).
+pub(crate) fn history_file_exists() -> bool {
+    persist::history_file_path().exists()
+}
+
+/// The clipboard switch was turned off: drop the in-memory history and delete everything it left
+/// on disk, so "off" means the app keeps no records at all.
+pub(crate) fn clear_history_and_disk() {
+    clear_history_state();
+    clear_search();
+    hide_detail();
+    unsafe { rebuild_rows() };
+}
+
+/// The recorded-data half of the switch-off: the in-memory history, the undo slot, the file and the
+/// image cache. Split out so the picker UI (which needs the main thread) is not part of it.
+pub(super) fn clear_history_state() {
+    {
+        let mut history = CLIP_HISTORY.lock().unwrap();
+        let removed = remove_history_scope(&mut history, true, ClipFilter::All, "");
+        if !removed.is_empty() {
+            log_info!(
+                "Clipboard history cleared with the feature switch ({} entries).",
+                removed.len()
+            );
+        }
+    }
+    // The 30s undo slot is part of the history: leaving it would let Cmd+Z restore an entry (and
+    // rewrite the file) after the feature, and its records, were cleared.
+    notifications::discard_deleted_clipboard_entry();
+    notifications::cancel_clipboard_undo_timer();
+    DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
+    // Deletes the file and wipes the image cache (the per-hash deletes above would be redundant).
+    discard_history_on_disk();
+}
+
 /// The pasteboard file-URL type (carried by Finder file copies; restoring it on paste =
 /// file semantics).
 const NSPASTEBOARD_TYPE_FILE_URL: &str = "public.file-url";
@@ -244,13 +281,8 @@ const FOOTER_COUNT_W: f64 = 72.0;
 /// The list's top offset inside the document.
 const CLEAR_BTN_GAP: f64 = 4.0;
 /// Fixed geometry for the clear-confirmation card; two text actions share one horizontal baseline.
-const CLEAR_CONFIRM_BUTTON_H: f64 = 32.0;
-const CLEAR_CONFIRM_BUTTON_PAD_X: f64 = 8.0;
-const CLEAR_CONFIRM_GAP: f64 = 8.0;
-const CLEAR_CONFIRM_CARD_PAD_X: f64 = 8.0;
-const CLEAR_CONFIRM_CARD_PAD_Y: f64 = 8.0;
-const CLEAR_CONFIRM_CARD_H: f64 = CLEAR_CONFIRM_CARD_PAD_Y * 2.0 + CLEAR_CONFIRM_BUTTON_H;
-const CLEAR_CONFIRM_BUTTON_FONT_SIZE: f64 = crate::theme::FONT_CAPTION;
+/// The gap between the two header clear actions (they sit right of the filter pills).
+const CLEAR_ACTION_GAP: f64 = 8.0;
 /// The row highlight shares the control radius.
 const SEL_TILE_R: f64 = crate::theme::RADIUS_CONTROL;
 /// inset from the selected row's top and bottom edges.
@@ -616,18 +648,6 @@ struct DeletedClipboardEntry {
 static DELETED_CLIPBOARD_ENTRY: LazyLock<Mutex<Option<DeletedClipboardEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 static DELETED_CLIPBOARD_GENERATION: AtomicU64 = AtomicU64::new(0);
-/// Legacy confirmation views retained for compatibility with the existing collapse animation.
-/// The normal picker now uses persistent action buttons and never creates this card.
-#[derive(Clone, Copy)]
-struct ClearHistoryConfirmationViews {
-    surface: ObjPtr,
-    unpinned: ObjPtr,
-    all: ObjPtr,
-}
-static CLEAR_HISTORY_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static CLEAR_HISTORY_CONFIRMATION: MainThreadSlot<Option<ClearHistoryConfirmationViews>> =
-    MainThreadSlot::new(None);
-static CLEAR_HISTORY_CONFIRMATION_EXPANDED: AtomicBool = AtomicBool::new(false);
 /// The active filter's underline (one shared view, moved under the active item).
 static FILTER_UNDERLINE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 fn localized_filter_labels() -> [String; 5] {
@@ -769,11 +789,21 @@ static DETAIL_CONTENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None
 //  match so the disk is never re-read; misses fall through to the disk cache / 480px
 //  preview. Bounded to one entry (~2MB), overwritten by the next delivery; stale content
 //  is dropped by detail_preview_ready.
-static DETAIL_PENDING_HD: Mutex<Option<(u64, Vec<u8>)>> = Mutex::new(None);
+/// A finished hi-res detail preview waiting for the main thread: entry hash, the cache generation and
+/// the hash epoch it was generated in, and the bytes. Both are checked again when the preview is
+/// consumed, so a preview generated before the history was discarded -- or before that record was
+/// deleted -- can never be shown.
+type PendingDetailPreview = (u64, u64, u64, Vec<u8>);
+static DETAIL_PENDING_HD: Mutex<Option<PendingDetailPreview>> = Mutex::new(None);
 /// In-flight detail-preview generation jobs (hash set): shared by record-time pregen and
 /// first-open on-demand requests so the same content never queues twice (arrow-key bounce,
 /// record+open races). The worker removes an entry once its job finishes (including skips).
-static DETAIL_INFLIGHT: LazyLock<Mutex<HashSet<u64>>> =
+/// De-duplication for detail-preview generation: the jobs currently queued or running, keyed by
+/// (hash, cache generation, hash epoch) rather than by hash alone. Clearing one filter scope and
+/// copying the same image again must still queue a preview -- the older job for that hash is about to
+/// be discarded, and a hash-only marker would swallow the new request, leaving the panel at the
+/// low-resolution preview until the user reopens it. Each job removes only its own key.
+static DETAIL_INFLIGHT: LazyLock<Mutex<HashSet<(u64, u64, u64)>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 /// Code-detail soft-wrap toggle, retained for the session; when off, raw text uses the native
 /// horizontal scroller.
@@ -800,10 +830,19 @@ static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None
 static REBUILDING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
+    /// Serializes the tests that read or write the shared image-cache directory (or the history file
+    /// inside it): `clear_image_cache_dir` and a full discard wipe the whole directory, so a test
+    /// asserting on cache files must not run while another one clears them.
+    fn clip_cache_dir_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     use super::{
-        clear_history_confirmation_layout, effective_hover_row, estimated_entry_bytes,
-        header_strip_h, picker_header_frames, rect_contains_point, scroll_indicator_geometry,
-        ClipEntry, ImageEntry, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, PICKER_W,
+        cache_generation, clip_image_detail_path, clip_image_path, effective_hover_row,
+        estimated_entry_bytes, fnv1a64, header_strip_h, picker_header_frames, rect_contains_point,
+        run_image_cache_job, scroll_indicator_geometry, wipe_cache_for_discard, ClipEntry,
+        ImageCacheJob, ImageEntry, CLIP_HISTORY, NO_SELECTION, NSPASTEBOARD_TYPE_PNG, PICKER_W,
         SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -837,26 +876,6 @@ mod tests {
         assert!(!incremental_row_delete_applies(true, 5, 2));
     }
 
-    #[test]
-    fn clear_confirmation_buttons_are_compact_and_horizontal() {
-        let anchor = NSRect::new(NSPoint::new(420.0, 66.0), NSSize::new(60.0, 20.0));
-        let (surface, buttons) = clear_history_confirmation_layout(anchor);
-        assert!(buttons[0].origin.x < buttons[1].origin.x);
-        assert_eq!(buttons[0].origin.y, buttons[1].origin.y);
-        assert_eq!(
-            buttons[1].origin.x - (buttons[0].origin.x + buttons[0].size.width),
-            super::CLEAR_CONFIRM_GAP
-        );
-        for button in buttons {
-            assert!(button.origin.x >= 0.0);
-            assert!(button.origin.x + button.size.width <= surface.size.width);
-            assert!(button.origin.y + button.size.height <= surface.size.height);
-        }
-        let surface_bottom = surface.origin.y + surface.size.height;
-        assert!(surface.origin.x + surface.size.width <= anchor.origin.x + anchor.size.width);
-        assert!(surface.origin.y >= anchor.origin.y);
-        assert!(surface_bottom > header_strip_h());
-    }
     #[test]
     fn row_hover_hit_test_includes_edges_and_rejects_padding_outside() {
         let rect = NSRect::new(NSPoint::new(10.0, 20.0), NSSize::new(100.0, 40.0));
@@ -1006,6 +1025,8 @@ mod tests {
                 hash,
                 PendingImage {
                     seq,
+                    generation: 0,
+                    epoch: 0,
                     bytes: Arc::new(vec![hash as u8]),
                 },
             );
@@ -1056,6 +1077,16 @@ mod tests {
             copied_at: None,
         }
     }
+    /// An 8x8 solid PNG: real, decodable bytes for the tests that must actually generate a preview
+    /// (the same fixture the clipboard smoke uses).
+    const TEST_PNG: &[u8] = &[
+        0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x08, 0x08, 0x02, 0x00, 0x00, 0x00, 0x4B,
+        0x6D, 0x29, 0xDC, 0x00, 0x00, 0x00, 0x11, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9C, 0x63, 0x38,
+        0xA1, 0xA1, 0x81, 0x15, 0x31, 0x0C, 0x2D, 0x09, 0x00, 0x82, 0x5D, 0x46, 0x01, 0x6A, 0x8D,
+        0x16, 0x6B, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+    ];
+
     /// A test image entry: the bytes are written into the TEST cache dir and referenced,
     /// mirroring the real record path (the preview shares the small byte set). No file
     /// source.
@@ -1257,6 +1288,7 @@ mod tests {
     }
     #[test]
     fn image_cache_write_read_delete_roundtrip() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{cache_delete_image, cache_read_image, cache_write_image, fnv1a64};
         let bytes = b"cache-roundtrip-bytes";
         let hash = fnv1a64(bytes);
@@ -1271,6 +1303,7 @@ mod tests {
     }
     #[test]
     fn delete_entry_removes_the_image_cache_file() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{
             cache_read_detail_preview, cache_read_image, cache_write_detail_preview, delete_entry,
         };
@@ -1300,6 +1333,7 @@ mod tests {
     }
     #[test]
     fn trim_beyond_max_deletes_dropped_image_cache_files() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{cache_read_image, record_image};
         let mut h = Vec::new();
         // max=2: 3 images, the oldest is trimmed and its cache file must go.
@@ -1318,6 +1352,7 @@ mod tests {
     }
     #[test]
     fn text_record_trim_deletes_dropped_image_cache_files() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{cache_read_image, record_image, record_text};
         let mut h = Vec::new();
         let img = image(b"text-trim-image");
@@ -1331,13 +1366,14 @@ mod tests {
     }
     #[test]
     fn sweep_clip_image_cache_removes_orphans_and_respects_file_refs() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{
             cache_read_detail_preview, cache_read_image, cache_read_preview,
             cache_write_detail_preview, cache_write_image, cache_write_preview,
-            clear_clip_image_cache, clip_image_detail_path, clip_image_path,
+            clear_image_cache_dir, clip_image_cache_dir, clip_image_detail_path, clip_image_path,
             clip_image_preview_path, sweep_clip_image_cache,
         };
-        clear_clip_image_cache();
+        clear_image_cache_dir(&clip_image_cache_dir());
         let keep = image(b"sweep-keep-data");
         let orphan = image(b"sweep-orphan-data");
         let file_bytes = b"sweep-file-reference";
@@ -1373,22 +1409,27 @@ mod tests {
         assert!(!clip_image_path(file_img.hash).exists());
         assert!(clip_image_preview_path(file_img.hash).exists());
         assert!(clip_image_detail_path(file_img.hash).exists());
-        clear_clip_image_cache();
+        clear_image_cache_dir(&clip_image_cache_dir());
     }
     #[test]
     fn clear_clip_image_cache_wipes_the_test_dir_only() {
-        use super::{cache_read_image, cache_write_image, clear_clip_image_cache, fnv1a64};
+        let _cache_guard = clip_cache_dir_guard();
+        use super::{
+            cache_read_image, cache_write_image, clear_image_cache_dir, clip_image_cache_dir,
+            fnv1a64,
+        };
         let a = b"wipe-test-a";
         let b = b"wipe-test-b";
         let (ha, hb) = (fnv1a64(a), fnv1a64(b));
         assert!(cache_write_image(ha, a));
         assert!(cache_write_image(hb, b));
-        clear_clip_image_cache();
+        clear_image_cache_dir(&clip_image_cache_dir());
         assert_eq!(cache_read_image(ha), None);
         assert_eq!(cache_read_image(hb), None);
     }
     #[test]
     fn cache_preview_roundtrip_and_delete_removes_both() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{
             cache_delete_image, cache_read_image, cache_read_preview, cache_write_image,
             cache_write_preview, fnv1a64,
@@ -1478,6 +1519,7 @@ mod tests {
     }
     #[test]
     fn load_history_keeps_distinct_data_images() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{
             cache_write_image, clip_image_path, fnv1a64, history_file_path, load_history,
             serialize_history, ImageEntry, CLIP_HISTORY, NSPASTEBOARD_TYPE_PNG,
@@ -1485,15 +1527,15 @@ mod tests {
         // Regression: DISTINCT data-image entries (web copies, source_path always None)
         // must all survive; the old all-images-by-source_path dedup (None==None) dropped
         // every entry after the first.
-        let prev = {
+        let prev_ttl = {
             let cfg = crate::config::CONFIG.read().unwrap();
-            (cfg.clipboard.persist, cfg.clipboard.auto_expire_days)
+            cfg.clipboard.auto_expire_days
         };
-        {
-            let mut cfg = crate::config::CONFIG.write().unwrap();
-            cfg.clipboard.persist = true;
-            cfg.clipboard.auto_expire_days = 0;
-        }
+        crate::config::CONFIG
+            .write()
+            .unwrap()
+            .clipboard
+            .auto_expire_days = 0;
         let mk = |bytes: &[u8]| {
             let hash = fnv1a64(bytes);
             assert!(cache_write_image(hash, bytes));
@@ -1549,9 +1591,11 @@ mod tests {
             .count();
         assert_eq!(n, 1, "entries sharing a hash must merge into one");
         // restore the original config.
-        let mut cfg = crate::config::CONFIG.write().unwrap();
-        cfg.clipboard.persist = prev.0;
-        cfg.clipboard.auto_expire_days = prev.1;
+        crate::config::CONFIG
+            .write()
+            .unwrap()
+            .clipboard
+            .auto_expire_days = prev_ttl;
     }
     #[test]
     fn load_history_skips_expired_entries() {
@@ -1613,6 +1657,7 @@ mod tests {
     }
     #[test]
     fn restore_loaded_entry_recovers_preview_and_drops_broken_data_entries() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{cache_write_image, cache_write_preview, fnv1a64, restore_loaded_entry};
         // A data entry with a persisted preview -> the preview is restored and data_path
         // rebuilt.
@@ -1764,6 +1809,7 @@ mod tests {
     }
     #[test]
     fn undo_removal_keeps_image_cache_available_for_restore() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{cache_read_image, remove_entry_for_undo, restore_entry_at};
         let image_entry = entry_image(b"undo-cache-bytes");
         let hash = image_entry.image.as_ref().unwrap().hash;
@@ -1796,17 +1842,654 @@ mod tests {
     }
     #[test]
     fn clear_scope_keeps_pinned_only_when_requested() {
-        use super::remove_history_scope;
+        use super::{remove_history_scope, ClipFilter};
         let mut pinned = entry("keep");
         pinned.pinned = true;
         let mut history = vec![pinned, entry("drop")];
-        let removed = remove_history_scope(&mut history, false);
+        let removed = remove_history_scope(&mut history, false, ClipFilter::All, "");
         assert_eq!(texts(&history), vec!["keep"]);
         assert_eq!(texts(&removed), vec!["drop"]);
-        let removed = remove_history_scope(&mut history, true);
+        let removed = remove_history_scope(&mut history, true, ClipFilter::All, "");
         assert!(history.is_empty());
         assert_eq!(texts(&removed), vec!["keep"]);
     }
+
+    #[test]
+    fn clear_scope_follows_the_active_filter_and_query() {
+        use super::{remove_history_scope, ClipFilter};
+        // The header's clear actions are destructive with no undo, so they only ever touch what the
+        // user can see: the active filter's category, narrowed by the query.
+        let mut history = vec![
+            entry("apple text"),
+            ClipEntry {
+                text: String::new(),
+                image: Some(image(b"apple image")),
+                pinned: false,
+                source_app: String::new(),
+                source_key: String::new(),
+                copied_at: None,
+            },
+            entry("banana text"),
+        ];
+        // Filter = Image: only the image goes, the text stays whatever it says.
+        let removed = remove_history_scope(&mut history, true, ClipFilter::Image, "");
+        assert_eq!(texts(&history), vec!["apple text", "banana text"]);
+        assert_eq!(removed.len(), 1);
+        // Filter = Text + query: only the matching, visible entry goes; the non-matching text
+        // entry (never on screen under that query) survives.
+        let removed = remove_history_scope(&mut history, true, ClipFilter::Text, "apple");
+        assert_eq!(texts(&history), vec!["banana text"]);
+        assert_eq!(removed.len(), 1);
+        // A query with no matches clears nothing.
+        let removed = remove_history_scope(&mut history, true, ClipFilter::All, "nothing matches");
+        assert_eq!(removed.len(), 0);
+        assert_eq!(history.len(), 1);
+    }
+    #[test]
+    fn a_delivered_preview_needs_a_current_generation_epoch_and_selection() {
+        use super::detail_slot_deliverable;
+        // The delivery decision at the end of the (async) preview pipeline. Every axis matters:
+        // - a preview generated before a whole-history discard describes a deleted entry,
+        // - a preview generated before that RECORD was deleted (one filter scope cleared) describes a
+        //   deleted entry even though the history generation never changed,
+        // - a preview the user has navigated away from must not be shown even when it is current.
+        assert!(detail_slot_deliverable(7, 7, 3, 3, true));
+        assert!(
+            !detail_slot_deliverable(6, 7, 3, 3, true),
+            "a preview from before a discard must be refused"
+        );
+        assert!(
+            !detail_slot_deliverable(7, 7, 2, 3, true),
+            "a preview from before its record was deleted must be refused"
+        );
+        assert!(!detail_slot_deliverable(7, 7, 3, 3, false));
+        assert!(!detail_slot_deliverable(6, 7, 2, 3, false));
+    }
+
+    #[test]
+    fn only_our_own_history_temp_files_are_recognized() {
+        use super::is_history_temp_file_name;
+        // Exactly `clipboard-history.toml.tmp<pid>-<generation>`; anything else in that directory
+        // (another program's file, a backup, a partial name) must never be swept.
+        assert!(is_history_temp_file_name(
+            "clipboard-history.toml.tmp1234-7"
+        ));
+        assert!(is_history_temp_file_name("clipboard-history.toml.tmp1-0"));
+        for lookalike in [
+            "clipboard-history.toml",
+            "clipboard-history.toml.tmp",
+            "clipboard-history.toml.tmp1234",
+            "clipboard-history.toml.tmp-7",
+            "clipboard-history.toml.tmp1234-",
+            "clipboard-history.toml.tmp1234-7-8",
+            "clipboard-history.toml.tmpa-7",
+            "clipboard-history.toml.tmp1234-x",
+            "clipboard-history.bak",
+            "clipboard-history.toml.tmp1234-7.tmp",
+            "other.tmp1234-7",
+            "clipboard-history.toml.tmp1234-7 ",
+        ] {
+            assert!(
+                !is_history_temp_file_name(lookalike),
+                "{lookalike:?} must not be recognized"
+            );
+        }
+    }
+
+    #[test]
+    fn discarding_the_history_removes_leftover_temp_files() {
+        use super::{discard_history_in, is_history_temp_file_name};
+        // The cleanup bumps the global generation and clears the shared pending/epoch state, so it
+        // must hold the same lock as every other cache test (a private temp dir only isolates files).
+        let _cache_guard = clip_cache_dir_guard();
+        // A crash between the temp write and the rename leaves the whole plaintext history in a temp
+        // file; the clearing paths must not leave it behind, and must not touch anything else.
+        let dir = std::env::temp_dir().join(format!("oh-my-tab-tmp-sweep-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let history_dir = dir.join("history");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&history_dir).unwrap();
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        let history = history_dir.join("clipboard-history.toml");
+        let leftover = history_dir.join("clipboard-history.toml.tmp4242-9");
+        let lookalike = history_dir.join("clipboard-history.bak");
+        std::fs::write(&history, "version = 1\nentries = []\n").unwrap();
+        std::fs::write(&leftover, "version = 1\nentries = []\n").unwrap();
+        std::fs::write(&lookalike, "keep me").unwrap();
+        discard_history_in(&history, &cache_dir);
+        assert!(!history.exists(), "the history file must go");
+        assert!(
+            !leftover.exists(),
+            "a leftover temp file holds the same plaintext history and must go too"
+        );
+        assert!(lookalike.exists(), "an unrelated file must stay");
+        assert!(is_history_temp_file_name(
+            "clipboard-history.toml.tmp4242-9"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_stale_inflight_preview_does_not_block_the_rerecorded_request() {
+        use super::{
+            cache_write_image, request_detail_preview, run_detail_preview_job, DetailPreviewJob,
+            ImageEntry, DETAIL_INFLIGHT,
+        };
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+        const LIB_FCNTL_O_NONBLOCK: i32 = 0x0004;
+        let _cache_guard = clip_cache_dir_guard();
+        // Reviewer's sequence: copy an image, open its detail (the hi-res job starts), clear that
+        // record, copy the same image again and open the detail again -- all while the first job is
+        // still decoding. De-duplicating by hash alone would swallow the second request, and the
+        // older job is discarded (its epoch is stale), so nothing would refresh the panel: it would
+        // sit on the low-resolution preview until the user reopened it. The marker keys on the job's
+        // identity instead, and a job releases only its own.
+        let root = std::env::temp_dir().join(format!("oh-my-tab-inflight-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let fifo = root.join("slow.pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            made.map(|status| status.success()).unwrap_or(false),
+            "mkfifo must be available"
+        );
+        let bytes: &[u8] = TEST_PNG;
+        let hash = fnv1a64(bytes);
+        // The first record is a FILE copy, so its job reads the (blocking) source path.
+        let first = ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash,
+            data_path: std::path::PathBuf::new(),
+            preview_png: std::sync::Arc::new(bytes.to_vec()),
+            source_path: Some(fifo.to_string_lossy().to_string()),
+        };
+        request_detail_preview(&first, false);
+        // Opening the FIFO for write without blocking succeeds only once the worker is inside its
+        // read: that pins the first job mid-decode without guessing with a sleep.
+        let started_at = Instant::now();
+        // The handle is kept only to be closed: closing every writer is what makes the blocked read
+        // return (EOF), which is what finishes the pinned job.
+        let _release = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(LIB_FCNTL_O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(handle) => break handle,
+                Err(error) => {
+                    assert!(
+                        started_at.elapsed() < Duration::from_secs(10),
+                        "the first job never entered its read: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        // The record is deleted, then the same image is copied again.
+        let generation = super::cache_generation();
+        let stale_epoch = super::hash_epoch_for_new_job(hash);
+        super::cache_delete_for_hash(&[], hash);
+        assert!(cache_write_image(hash, bytes));
+        // Release the first job: it must finish without writing anything for the deleted record.
+        let second = ImageEntry {
+            uti: NSPASTEBOARD_TYPE_PNG.to_string(),
+            hash,
+            data_path: super::clip_image_path(hash),
+            preview_png: std::sync::Arc::new(bytes.to_vec()),
+            source_path: None,
+        };
+        request_detail_preview(&second, false);
+        assert!(
+            DETAIL_INFLIGHT.lock().unwrap().contains(&(
+                hash,
+                generation,
+                super::hash_epoch_for_new_job(hash)
+            )),
+            "the re-recorded request must be queued, not swallowed by the older job's marker"
+        );
+        assert_ne!(super::hash_epoch_for_new_job(hash), stale_epoch);
+        assert!(
+            !super::clip_image_detail_path(hash).exists(),
+            "the stale job must not have written a preview for the deleted record"
+        );
+        // The queued job runs (enqueued by the request above; run here on this thread so the
+        // observation is deterministic -- the worker's cache directory is per thread).
+        unsafe {
+            run_detail_preview_job(&DetailPreviewJob {
+                hash,
+                source_path: None,
+                deliver: false,
+                detail_visible: false,
+                selected_hash: None,
+                generation,
+                epoch: super::hash_epoch_for_new_job(hash),
+            });
+        }
+        assert!(
+            super::clip_image_detail_path(hash).exists(),
+            "the re-recorded image must get its hi-res preview generated"
+        );
+        assert!(
+            !DETAIL_INFLIGHT.lock().unwrap().contains(&(
+                hash,
+                generation,
+                super::hash_epoch_for_new_job(hash)
+            )),
+            "the finished job releases its own marker"
+        );
+        let _ = std::fs::remove_file(super::clip_image_detail_path(hash));
+        let _ = std::fs::remove_file(super::clip_image_path(hash));
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_preview_decoded_before_the_deletion_cannot_be_delivered() {
+        use super::{offer_detail_preview, DETAIL_PENDING_HD};
+        let _cache_guard = clip_cache_dir_guard();
+        // Finding: the preview pipeline decodes outside the cache-write lock, so clearing one filter
+        // scope can land while a preview for one of the deleted images is being encoded. The file
+        // write is refused by the hash epoch, and the DELIVERY must be refused too -- otherwise the
+        // deleted image's bytes come back into memory and the panel shows them.
+        let hash = fnv1a64(b"deleted-while-decoding");
+        let generation = super::cache_generation();
+        let epoch = super::hash_epoch_for_new_job(hash);
+        *DETAIL_PENDING_HD.lock().unwrap() = None;
+        super::cache_delete_for_hash(&[], hash); // the record is deleted mid-decode
+        assert!(
+            !offer_detail_preview(generation, hash, epoch, vec![1, 2, 3]),
+            "a preview decoded before its record was deleted must not reach the slot"
+        );
+        assert!(
+            DETAIL_PENDING_HD.lock().unwrap().is_none(),
+            "the slot must stay empty for a deleted record"
+        );
+        // The same preview for a record that is still alive is delivered as usual.
+        let kept_hash = fnv1a64(b"kept-while-decoding");
+        assert!(offer_detail_preview(
+            generation,
+            kept_hash,
+            super::hash_epoch_for_new_job(kept_hash),
+            vec![4, 5, 6]
+        ));
+        *DETAIL_PENDING_HD.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn clearing_a_scope_retires_its_hashes_but_keeps_other_records_jobs_alive() {
+        use super::{
+            cache_delete_for_hash, clip_image_preview_path, current_hash_epoch,
+            hash_epoch_for_new_job, image_cache::PENDING_IMAGE_DATA, insert_pending_for_tests,
+            run_image_cache_job, ImageCacheJob,
+        };
+        let _cache_guard = clip_cache_dir_guard();
+        // Clearing "Images" (or a search result) must kill the cache work for the entries it deleted:
+        // a job queued a moment earlier still has a valid generation, so without the per-hash epoch
+        // it would write the deleted record's file back after the clear.
+        let cleared_hash = fnv1a64(b"cleared-image");
+        let kept_hash = fnv1a64(b"kept-image");
+        let generation = super::cache_generation();
+        let job = |hash: u64, bytes: &[u8]| ImageCacheJob {
+            hash,
+            data: Some(std::sync::Arc::new(bytes.to_vec())),
+            preview: std::sync::Arc::new(b"preview".to_vec()),
+            source_path: None,
+            warm_detail: false,
+            generation,
+            epoch: hash_epoch_for_new_job(hash),
+        };
+        // A job queued before the clear holds the epoch of that moment.
+        let queued_job = job(cleared_hash, b"cleared-image");
+        insert_pending_for_tests(cleared_hash, std::sync::Arc::new(b"cleared-image".to_vec()));
+        cache_delete_for_hash(&[], cleared_hash);
+        assert_eq!(
+            current_hash_epoch(cleared_hash),
+            1,
+            "deleting the record bumps its epoch"
+        );
+        // The image is copied again (a new record): that admits a NEW job for the hash, and must not
+        // re-admit the one queued before the deletion -- which is why the epoch is not reset here.
+        let new_job = job(cleared_hash, b"cleared-image");
+        run_image_cache_job(&queued_job);
+        assert!(
+            !super::clip_image_path(cleared_hash).exists(),
+            "a job queued before the deletion must not write, even after the image is recorded again"
+        );
+        assert!(
+            !clip_image_preview_path(cleared_hash).exists(),
+            "nor its preview"
+        );
+        assert!(
+            !PENDING_IMAGE_DATA
+                .lock()
+                .unwrap()
+                .contains_key(&cleared_hash),
+            "its pending bytes must go too"
+        );
+        // The new job -- queued after the deletion -- writes normally.
+        run_image_cache_job(&new_job);
+        assert!(
+            super::clip_image_path(cleared_hash).exists(),
+            "the re-recorded image must be writable by its new job"
+        );
+        let _ = std::fs::remove_file(super::clip_image_path(cleared_hash));
+        // ...while another record's queued job was never affected.
+        run_image_cache_job(&job(kept_hash, b"kept-image"));
+        assert!(
+            super::clip_image_path(kept_hash).exists(),
+            "another record's job must still write"
+        );
+        let _ = std::fs::remove_file(super::clip_image_path(kept_hash));
+        let _ = std::fs::remove_file(clip_image_preview_path(kept_hash));
+    }
+
+    #[test]
+    fn an_old_write_cannot_retire_a_rerecorded_entrys_pending_bytes() {
+        use super::{
+            cache_write_image, clip_image_cache_dir, image_cache::PENDING_IMAGE_DATA,
+            insert_pending_for_tests, retire_pending_after_write,
+        };
+        let _cache_guard = clip_cache_dir_guard();
+        // The interleaving this pins, with the old job's pause made explicit (the pause between
+        // writing and retiring is what makes the race reachable):
+        //   1. the old job writes the image (its generation is still current),
+        //   2. the user turns the feature off: the wipe deletes the file, clears the fallback map and
+        //      bumps the generation,
+        //   3. the user copies the same image again -- same hash, a fresh pending entry, its file not
+        //      written yet,
+        //   4. the old job resumes and retires "its" entry.
+        // Retiring by hash would delete the bytes step 3 queued, and a paste or save-as would then
+        // find neither the file nor the fallback bytes.
+        let hash = fnv1a64(b"same-image-twice");
+        let bytes = b"same-image-twice";
+        let old_generation = super::cache_generation();
+        let old_epoch = super::hash_epoch_for_new_job(hash);
+        assert!(
+            cache_write_image(hash, bytes),
+            "step 1: the old job's write"
+        );
+        super::wipe_cache_for_discard(&clip_image_cache_dir()); // step 2: switch off
+        assert!(
+            !super::clip_image_path(hash).exists(),
+            "the wipe must delete the written file"
+        );
+        assert!(PENDING_IMAGE_DATA.lock().unwrap().is_empty());
+        insert_pending_for_tests(hash, std::sync::Arc::new(bytes.to_vec())); // step 3
+        retire_pending_after_write(hash, old_generation, old_epoch); // step 4
+        assert!(
+            PENDING_IMAGE_DATA.lock().unwrap().contains_key(&hash),
+            "the re-recorded entry must keep its pending bytes"
+        );
+        // The entry's own generation retires it as usual once its write lands.
+        retire_pending_after_write(
+            hash,
+            super::cache_generation(),
+            super::hash_epoch_for_new_job(hash),
+        );
+        assert!(!PENDING_IMAGE_DATA.lock().unwrap().contains_key(&hash));
+    }
+
+    #[test]
+    fn a_discard_does_not_wait_for_an_in_progress_decode() {
+        use super::{run_detail_preview_job, wipe_cache_for_discard, DetailPreviewJob};
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::time::{Duration, Instant};
+        // O_NONBLOCK: opening a FIFO for write fails with ENXIO instead of blocking when no reader is
+        // there yet, which keeps this test's wait for the worker bounded (0x0004 on Darwin).
+        const LIB_FCNTL_O_NONBLOCK: i32 = 0x0004;
+        let _cache_guard = clip_cache_dir_guard();
+        // Generating a detail preview reads (and decodes) its source, which can be slow, while the
+        // discard runs on the main thread (switch off, quit, logout). This pins a worker inside its
+        // generate step by making the source a FIFO with no writer -- the read blocks until this test
+        // releases it -- and requires the discard to finish anyway. Holding the cache-write lock
+        // across the read/decode would make the discard wait here instead of returning.
+        let root = std::env::temp_dir().join(format!("oh-my-tab-slow-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        // The FIFO lives outside the directory the discard wipes: the wipe unlinks every entry.
+        let fifo_dir = root.join("source");
+        let wipe_dir = root.join("cache");
+        std::fs::create_dir_all(&fifo_dir).unwrap();
+        std::fs::create_dir_all(&wipe_dir).unwrap();
+        let fifo = fifo_dir.join("slow.pipe");
+        let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+        assert!(
+            made.map(|status| status.success()).unwrap_or(false),
+            "mkfifo must be available"
+        );
+        let generation = super::cache_generation();
+        let hash = fnv1a64(b"slow-read-job");
+        let source = fifo.to_string_lossy().to_string();
+        let worker = std::thread::spawn(move || {
+            unsafe {
+                run_detail_preview_job(&DetailPreviewJob {
+                    hash,
+                    source_path: Some(source),
+                    deliver: false,
+                    detail_visible: false,
+                    selected_hash: None,
+                    generation,
+                    epoch: super::hash_epoch_for_new_job(hash),
+                })
+            };
+        });
+        // Wait for a READER on the FIFO instead of sleeping: opening for write without blocking
+        // succeeds only once the worker is inside its read, which is the state this test needs. It
+        // also cannot hang -- no reader means ENXIO, so the loop retries under a deadline.
+        let started_at = Instant::now();
+        let mut release = loop {
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(LIB_FCNTL_O_NONBLOCK)
+                .open(&fifo)
+            {
+                Ok(handle) => break handle,
+                Err(error) => {
+                    assert!(
+                        started_at.elapsed() < Duration::from_secs(10),
+                        "the worker never entered its read: {error}"
+                    );
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+            }
+        };
+        // The reader is pinned inside the read now; discarding from this thread must not wait for it.
+        let (tx, rx) = std::sync::mpsc::channel();
+        let wipe_target = wipe_dir.clone();
+        std::thread::spawn(move || {
+            wipe_cache_for_discard(&wipe_target);
+            let _ = tx.send(());
+        });
+        let started = Instant::now();
+        assert!(
+            rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+            "the discard must not wait for an in-progress decode"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "the discard took {:?}",
+            started.elapsed()
+        );
+        // Release the reader through the handle opened above (it never blocks), and wait for the
+        // worker to finish: its write must then be refused (stale generation).
+        std::io::Write::write_all(&mut release, b"not an image").expect("release write");
+        drop(release);
+        let _ = worker.join();
+        assert!(
+            !clip_image_detail_path(hash).exists(),
+            "a preview generated before the discard must not be cached"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_preview_finished_after_the_discard_never_reaches_the_slot() {
+        use super::{cache_generation, offer_detail_preview, DETAIL_PENDING_HD};
+        // The window the reviewer found: the worker finishes generating, the discard clears the slot,
+        // and only then does the worker store its (now orphaned) preview. The store must be
+        // generation-checked in the same lock as the check, so this ordering stores nothing.
+        let _cache_guard = clip_cache_dir_guard();
+        let hash = 0x1234_5678u64;
+        *DETAIL_PENDING_HD.lock().unwrap() = None;
+        let stale = cache_generation();
+        // A directory of our own: the wipe deletes every direct child, so handing it a shared
+        // directory would delete other tests' -- or another program's -- files.
+        let dir = std::env::temp_dir().join(format!("oh-my-tab-slot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        super::wipe_cache_for_discard(&dir); // the discard wins the race
+        assert!(
+            !offer_detail_preview(stale, hash, 0, vec![1, 2, 3]),
+            "a preview generated before the discard must not be stored"
+        );
+        assert!(
+            DETAIL_PENDING_HD.lock().unwrap().is_none(),
+            "the slot must stay empty for a discarded entry"
+        );
+        // And with the current generation the same store succeeds (the guard rejects stale work only).
+        let current = cache_generation();
+        assert!(offer_detail_preview(current, hash, 0, vec![4, 5, 6]));
+        assert_eq!(
+            DETAIL_PENDING_HD
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(h, g, e, b)| (*h, *g, *e, b.len())),
+            Some((hash, current, 0, 3))
+        );
+        *DETAIL_PENDING_HD.lock().unwrap() = None;
+    }
+
+    #[test]
+    fn a_job_queued_before_a_discard_cannot_recreate_cache_files() {
+        let _cache_guard = clip_cache_dir_guard();
+        // Recording an image hands its bytes to a background job. Discarding the history must
+        // invalidate those jobs: one that was queued (or waiting on the write lock) before the
+        // discard cannot put the original bytes back after the wipe returned.
+        let hash = fnv1a64(b"stale-after-discard");
+        let dir = std::env::temp_dir().join(format!("oh-my-tab-stale-{}", std::process::id()));
+        let stale_generation = cache_generation();
+        wipe_cache_for_discard(&dir);
+        let job = |generation| ImageCacheJob {
+            hash,
+            data: Some(std::sync::Arc::new(b"stale-after-discard".to_vec())),
+            preview: std::sync::Arc::new(b"stale-preview".to_vec()),
+            source_path: None,
+            warm_detail: false,
+            generation,
+            epoch: super::hash_epoch_for_new_job(hash),
+        };
+        run_image_cache_job(&job(stale_generation));
+        assert!(
+            !clip_image_path(hash).exists(),
+            "a job from before the discard must not write"
+        );
+        // The same job with the current generation still works: the guard rejects stale work only.
+        run_image_cache_job(&job(cache_generation()));
+        assert!(
+            clip_image_path(hash).exists(),
+            "a current job must still write"
+        );
+        let _ = std::fs::remove_file(clip_image_path(hash));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn turning_the_feature_off_also_drops_the_undo_slot() {
+        // A delete parks the entry in a 30s undo slot. Turning the feature off clears the history
+        // and its files, so the slot must go too -- otherwise Cmd+Z restores the text and rewrites
+        // the file that was just deleted.
+        let _cache_guard = clip_cache_dir_guard();
+        CLIP_HISTORY.lock().unwrap().clear();
+        super::notifications::remember_deleted_clipboard_entry(entry("undo-me"), 0);
+        super::clear_history_state();
+        assert!(
+            super::notifications::undo_deleted_clipboard_entry().is_none(),
+            "a cleared history must not be restorable"
+        );
+        assert!(CLIP_HISTORY.lock().unwrap().is_empty());
+        assert!(!super::history_file_exists());
+    }
+
+    #[test]
+    fn discarding_the_history_deletes_the_file_and_the_image_cache() {
+        let _cache_guard = clip_cache_dir_guard();
+        use super::discard_history_in;
+        // The switch-off and clear-on-quit paths both call this, and it must leave nothing behind:
+        // no history file and no cached image bytes (the plaintext originals). It runs in a
+        // directory of its own -- wiping the shared test cache would race every other test.
+        let dir = std::env::temp_dir().join(format!("oh-my-tab-discard-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let history = dir.join("clipboard-history.toml");
+        let cache_dir = dir.join("cache");
+        std::fs::create_dir_all(&cache_dir).unwrap();
+        std::fs::write(&history, "version = 1\nentries = []\n").unwrap();
+        std::fs::write(cache_dir.join("00000000000000ab"), b"image bytes").unwrap();
+        std::fs::write(cache_dir.join("00000000000000ab.preview"), b"preview").unwrap();
+        discard_history_in(&history, &cache_dir);
+        assert!(!history.exists(), "the history file must go");
+        assert!(
+            std::fs::read_dir(&cache_dir).unwrap().next().is_none(),
+            "every cached file must go"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_action_labels_name_the_visible_scope() {
+        use super::{
+            clip_clear_action_widths, clip_clear_label_variants, clip_clear_labels, ClipFilter,
+        };
+        use crate::i18n::{t, tf};
+        // No query: the label names the active category; All keeps the plain wording.
+        assert_eq!(
+            clip_clear_labels(ClipFilter::All, false),
+            (
+                t("clipboard.clear_confirm_unpinned"),
+                t("clipboard.clear_confirm_all")
+            )
+        );
+        let kind = t("clipboard.filter_image");
+        assert_eq!(
+            clip_clear_labels(ClipFilter::Image, false),
+            (
+                tf("clipboard.clear_scope_unpinned", &[("kind", &kind)]),
+                tf("clipboard.clear_scope_all", &[("kind", &kind)])
+            )
+        );
+        // A query narrows the scope to the result set, so the label says so instead of naming a
+        // category the user is not really clearing.
+        assert_eq!(
+            clip_clear_labels(ClipFilter::Image, true),
+            (
+                t("clipboard.clear_scope_unpinned_results"),
+                t("clipboard.clear_scope_all_results")
+            )
+        );
+        // Every combination is a distinct, fully substituted label: the header reserves the widest
+        // of these, and an unsubstituted template would show the raw "{kind}".
+        for variants in clip_clear_label_variants() {
+            assert_eq!(variants.len(), 6);
+            assert!(variants
+                .iter()
+                .all(|label| !label.is_empty() && !label.contains("{kind}")));
+        }
+        // The reservation is the widest variant, not the two short labels: a header that measured
+        // only the short pair clips the scope wording (the in-app smoke asserts the applied width).
+        let widths = clip_clear_action_widths(|label| label.chars().count() as f64);
+        for (action, variants) in clip_clear_label_variants().iter().enumerate() {
+            let widest = variants
+                .iter()
+                .map(|label| label.chars().count() as f64)
+                .fold(0.0_f64, f64::max);
+            assert_eq!(widths[action], widest);
+        }
+        assert!(
+            widths[0] > 0.0 && widths[1] > 0.0,
+            "both actions must reserve a positive width"
+        );
+    }
+
     #[test]
     fn clipboard_undo_window_and_shortcut_are_strict() {
         use super::{clipboard_undo_expired, is_clipboard_undo_shortcut};
@@ -1911,6 +2594,7 @@ mod tests {
     }
     #[test]
     fn same_hash_file_and_data_entries_keep_shared_cache_until_both_are_gone() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{
             cache_read_image, cache_read_preview, cache_write_preview, delete_entry, record_image,
         };
@@ -1952,6 +2636,7 @@ mod tests {
     }
     #[test]
     fn trim_keeps_shared_cache_for_the_surviving_same_hash_entry() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::{
             cache_read_image, cache_read_preview, cache_write_preview, record_image, record_text,
         };
@@ -2359,6 +3044,7 @@ mod tests {
     }
     #[test]
     fn expire_entries_deletes_image_cache_only_when_unreferenced() {
+        let _cache_guard = clip_cache_dir_guard();
         use super::expire_entries;
         let img = image(b"expire-cache-test-bytes");
         // An expired image entry takes its cache files (data + preview) with it.

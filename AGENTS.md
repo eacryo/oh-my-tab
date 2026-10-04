@@ -56,7 +56,7 @@ Three layers, split by **who decides pass/fail** — not by which transport driv
 - The Accessibility window list is authoritative for switchable windows. Preserve stored AX titles for activation; presentation-only fallbacks belong in the UI layer.
 - Configuration is loaded per field: invalid values fall back individually without discarding valid settings. Runtime reload must preserve this and refresh affected UI.
 - Mouse profiles match VID/PID; the mouse event tap is separate from the switcher tap, and pointer settings must be reapplied after reconnects.
-- Clipboard history is optional and off by default. Gate recording and Option+V when disabled, never record sensitive pasteboard markers, and persist only when explicitly enabled.
+- Clipboard history is optional and off by default. Gate recording and Option+V when disabled, and never record sensitive pasteboard markers. The history is written to disk in plaintext while the feature is on, so its disk footprint is the user's decision: turning the switch off clears the saved records, and `clear_on_quit` clears the history file and cached image data on an orderly exit (Command+Q, menu Quit, logout, shutdown); a crash or force quit cannot run that cleanup.
 - Settings UI should reuse `SettingsSection`, `SettingsCard`, `SettingsRow`, `SettingsControl`, and `SettingsButton`; extend shared components when behavior is shared. A `SettingsButton`'s `tag` **selects its hover/normal palette**, so never carry an action id in `setTag:` — keep the component's tag and map the sender pointer to an action id instead, or the colour gets stuck after the pointer leaves.
 
 For detailed subsystem behavior, inspect the relevant module and `docs/developer-notes-en.md` rather than adding implementation history here.

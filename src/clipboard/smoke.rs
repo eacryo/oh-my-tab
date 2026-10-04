@@ -100,6 +100,50 @@ pub(crate) fn smoke_runner() -> bool {
         );
     }
 
+    /// The two clear actions must show (and reserve room for) the scope the current filter and query
+    /// describe, in the locale in effect. Runs on the main thread: the state lives behind
+    /// `MainThreadSlot`s. Every path that can change the scope or the locale has to leave this true.
+    unsafe fn assert_clear_actions_match_scope() {
+        let applied =
+            || super::text_style::clear_action_applied().expect("the clear actions applied");
+        let (unpinned, all, widths) = applied();
+        let expected = super::clip_clear_labels(
+            *super::CLIP_FILTER.lock().unwrap(),
+            super::with_clipboard_ui(|ui| !ui.search_query.is_empty()),
+        );
+        assert_eq!(
+            (unpinned, all),
+            expected,
+            "the clear actions must name the scope they clear"
+        );
+        let titles: Vec<String> = {
+            let buttons = (*CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap())
+                .expect("persistent clear action buttons must be built");
+            buttons
+                .iter()
+                .map(|button| {
+                    let title: *mut AnyObject = msg_send![button.0, title];
+                    crate::ffi::nsstring_to_rust(title)
+                })
+                .collect()
+        };
+        assert_eq!(
+            titles,
+            vec![expected.0.clone(), expected.1.clone()],
+            "the buttons must show the scope they clear"
+        );
+        let widest: [f64; 2] = std::array::from_fn(|index| {
+            super::clip_clear_label_variants()[index]
+                .iter()
+                .map(|label| super::localized_string_width(label, crate::theme::FONT_CAPTION) + 8.0)
+                .fold(0.0_f64, f64::max)
+        });
+        assert!(
+            widths[0] >= widest[0] && widths[1] >= widest[1],
+            "reserved {widths:?} must cover the widest variant {widest:?}"
+        );
+    }
+
     // Footer shortcut legends must survive the fonts they are drawn with, in every shipped
     // locale: a label whose frame was sized for a smaller font than the one it renders with
     // wraps out of its one-line-high field and silently loses its tail.
@@ -109,6 +153,9 @@ pub(crate) fn smoke_runner() -> bool {
             "clipboard footer legends must render fully"
         );
         let original_locale = CONFIG.read().unwrap().i18n.locale.clone();
+        // A query is active so the scope wording (the widest variant) is what must survive.
+        super::with_clipboard_ui(|ui| ui.search_query = "apple".to_string());
+        update_clear_action_labels();
         for locale in ["en", "zh-Hans", "zh-Hant"] {
             crate::i18n::apply_config_locale(locale);
             refresh_localized_ui();
@@ -116,7 +163,11 @@ pub(crate) fn smoke_runner() -> bool {
                 footer_legends_layout_is_sane(),
                 "clipboard footer legends must render fully in locale={locale}"
             );
+            // A locale refresh re-measures the reservation and re-applies the current scope; it
+            // used to reset both to the two short labels.
+            assert_clear_actions_match_scope();
         }
+        super::with_clipboard_ui(|ui| ui.search_query.clear());
         crate::i18n::apply_config_locale(&original_locale);
         refresh_localized_ui();
     }
@@ -170,7 +221,7 @@ pub(crate) fn smoke_runner() -> bool {
         assert_eq!(frames[0].origin.y, frames[1].origin.y);
         assert_eq!(
             frames[1].origin.x - (frames[0].origin.x + frames[0].size.width),
-            super::CLEAR_CONFIRM_GAP
+            super::CLEAR_ACTION_GAP
         );
         let header: *mut AnyObject = msg_send![buttons[0].0, superview];
         let parent: *mut AnyObject = msg_send![header, superview];
@@ -200,8 +251,21 @@ pub(crate) fn smoke_runner() -> bool {
             }),
             "filter tabs must remain visible beside clear actions"
         );
-
-        assert!(CLEAR_HISTORY_CONFIRMATION.lock().unwrap().is_none());
+    }
+    // Clear-action scope smoke: a typed query names the result scope, clearing the query through the
+    // shared path (the × key, the field's Esc, a fresh summon) restores the category wording, and the
+    // reservation always covers the widest variant. Clearing the query by hand in the list-focus Esc
+    // branch used to leave "results" on the buttons.
+    unsafe {
+        super::with_clipboard_ui(|ui| ui.search_query = "apple".to_string());
+        update_clear_action_labels();
+        assert_eq!(
+            super::text_style::clear_action_applied().unwrap().0,
+            super::t("clipboard.clear_scope_unpinned_results"),
+            "a typed query must name the result scope"
+        );
+        clear_search();
+        assert_clear_actions_match_scope();
     }
     // Search smoke: set a query -> rebuild (filtered display) -> arrow navigation within the
     // filtered list -> clear restores everything.
@@ -539,7 +603,7 @@ pub(crate) fn smoke_runner() -> bool {
     unsafe {
         {
             let mut hist = CLIP_HISTORY.lock().unwrap();
-            remove_history_scope(&mut hist, true);
+            remove_history_scope(&mut hist, true, ClipFilter::All, "");
         }
         clear_search();
         *CLIP_FILTER.lock().unwrap() = ClipFilter::All;
@@ -549,6 +613,66 @@ pub(crate) fn smoke_runner() -> bool {
         assert!(
             empty_state_layout_is_sane(),
             "the empty-state hint must be re-centered inside the summoned viewport"
+        );
+    }
+    // A hi-res preview that finished generating before a discard must not be delivered: the slot
+    // carries the generation it was generated in, and the main-thread consumer refuses a stale one
+    // (the worker stores through the same check, so neither end of the pipe can resurrect a deleted
+    // entry's preview).
+    {
+        // Both axes stale: a discard is only one of the ways a preview loses its right to be shown.
+        let stale = super::cache_generation().wrapping_sub(1);
+        *DETAIL_PENDING_HD.lock().unwrap() = Some((12345, stale, 0, vec![1, 2, 3]));
+        detail_preview_ready(
+            std::ptr::null_mut(),
+            sel!(detailPreviewReady:),
+            std::ptr::null_mut(),
+        );
+        assert!(
+            DETAIL_PENDING_HD.lock().unwrap().is_none(),
+            "a preview generated before a discard must be refused and released"
+        );
+    }
+    // Switch-off versus queued image work (the reviewer's scenario: copy an image, turn the feature
+    // off immediately). Recording hands the original bytes to a background cache job; discarding the
+    // history must invalidate those jobs and wait out a write in flight, or the file comes back
+    // after the wipe. The wait below gives the worker time to run a stale job if the generation
+    // guard is missing.
+    {
+        // Its own payload, so the fixture image above cannot mask the result.
+        let bytes = std::sync::Arc::new(b"switch-off-during-queue".to_vec());
+        let hash = crate::hash::fnv1a64(&bytes);
+        super::schedule_image_cache_write(
+            hash,
+            Some(bytes.clone()),
+            std::sync::Arc::new(bytes.as_ref().clone()),
+            None,
+            true,
+        );
+        super::clear_history_state();
+        assert!(
+            !super::clip_image_path(hash).exists(),
+            "discarding the history must not leave the image cache behind"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        assert!(
+            !super::clip_image_path(hash).exists(),
+            "a job queued before the discard must not recreate the cache file"
+        );
+        // Files only: in a smoke run the harness keeps the history file in a subdirectory of the
+        // cache directory, and the wipe removes files, not directories.
+        let leftovers: Vec<String> = std::fs::read_dir(super::clip_image_cache_dir())
+            .map(|entries| {
+                entries
+                    .flatten()
+                    .filter(|entry| entry.path().is_file())
+                    .map(|entry| entry.file_name().to_string_lossy().to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "the image cache must be empty after a discard, found {leftovers:?}"
         );
     }
     hide_picker();

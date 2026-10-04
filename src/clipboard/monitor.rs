@@ -198,23 +198,17 @@ pub(crate) fn start() {
         if !guard.0.is_null() {
             return; // already running
         }
-        // With persist ON: the cache is kept (the previous session's image bytes/previews
-        // are still referenced) and the history is loaded BEFORE recording the current
-        // pasteboard. With persist OFF (default): the cache is wiped -- the history is not
-        // persisted, so leftovers are orphans; sweeping first keeps the just-written cache
-        // from being deleted.
-        if persist_enabled() {
-            load_history();
-        } else {
-            clear_clip_image_cache();
-        }
-        // Expire at startup (load_history only covers the persist-on case; the in-memory
-        // history needs expiry with persist off too).
+        // The image cache is kept across launches (the history references it) and the history is
+        // loaded BEFORE recording the current pasteboard, so a restart continues where it left
+        // off. Orphaned cache files are swept by the load path and below.
+        load_history();
+        // Expire at startup: the loaded history can hold entries that aged out while the app
+        // was not running.
         {
             let mut hist = CLIP_HISTORY.lock().unwrap();
             expire_entries(&mut hist, now_secs(), ttl_secs());
         }
-        if persist_enabled() {
+        {
             let removed = sweep_current_clip_image_cache();
             if removed > 0 {
                 log_debug!("[clip] swept {} orphan image cache files", removed);

@@ -339,11 +339,10 @@ pub struct ClipboardSection {
     // Show the source app: the source is ALWAYS recorded at copy time (ClipEntry.source_app);
     // this switch only controls whether the row displays the app name. Default false.
     pub show_source_app: bool,
-    // Persist the history: when on, text/images (incl. file references) are saved to
-    // ~/.config/oh-my-tab/clipboard-history.toml and survive restarts. Default false --
-    // plaintext on disk has privacy implications (any same-user app can read it); the
-    // README carries an explicit warning.
-    pub persist: bool,
+    // Clear the history when the app quits, so nothing is left on disk after a session
+    // (see `clipboard::discard_history_on_disk`). History is written to disk while the app
+    // runs, whether or not this is on. Default false.
+    pub clear_on_quit: bool,
     // Move used entries to the top: pasting (select + Enter) brings the entry to the
     // front (a side effect: the write-back is re-captured by the poll as another copy).
     // When off, pasting does not reorder the history (like Windows Win+V). Default true.
@@ -375,7 +374,7 @@ impl Default for ClipboardSection {
             shortcut: "option+v".to_string(),
             max_entries: 50,
             show_source_app: false,
-            persist: false,
+            clear_on_quit: false,
             move_used_to_top: true,
             delete_after_paste: false,
             clear_system_pasteboard_after_paste: false,
@@ -1283,7 +1282,7 @@ impl Config {
         // show_source_app / persist / move_used_to_top / delete_after_paste /
         // clear_system_pasteboard_after_paste are bools, always valid.
         self.clipboard.show_source_app = other.clipboard.show_source_app;
-        self.clipboard.persist = other.clipboard.persist;
+        self.clipboard.clear_on_quit = other.clipboard.clear_on_quit;
         self.clipboard.move_used_to_top = other.clipboard.move_used_to_top;
         self.clipboard.delete_after_paste = other.clipboard.delete_after_paste;
         self.clipboard.clear_system_pasteboard_after_paste =
@@ -2267,7 +2266,7 @@ mod tests {
         other.clipboard.enabled = true;
         other.clipboard.shortcut = "cmd+shift+v".into();
         other.clipboard.max_entries = 30;
-        other.clipboard.persist = true;
+        other.clipboard.clear_on_quit = true;
         other.clipboard.move_used_to_top = false;
         other.clipboard.delete_after_paste = true;
         other.clipboard.clear_system_pasteboard_after_paste = true;
@@ -2282,7 +2281,7 @@ mod tests {
         assert!(merged.clipboard.enabled);
         assert_eq!(merged.clipboard.shortcut, "cmd+shift+v");
         assert_eq!(merged.clipboard.max_entries, 30);
-        assert!(merged.clipboard.persist);
+        assert!(merged.clipboard.clear_on_quit);
         assert!(!merged.clipboard.move_used_to_top);
         assert!(merged.clipboard.delete_after_paste);
         assert!(merged.clipboard.clear_system_pasteboard_after_paste);
@@ -2323,7 +2322,7 @@ mod tests {
     fn clipboard_shortcut_conflict_falls_back_per_field() {
         let mut loaded = Config::default();
         loaded.clipboard.shortcut = "option+left".into();
-        loaded.clipboard.persist = true;
+        loaded.clipboard.clear_on_quit = true;
         let errors = loaded.validate();
         assert_eq!(errors.len(), 1);
         assert!(errors[0].starts_with("clipboard.shortcut:"));
@@ -2331,7 +2330,18 @@ mod tests {
         let mut merged = Config::default();
         merged.merge_valid(loaded, &errors);
         assert_eq!(merged.clipboard.shortcut, "option+v");
-        assert!(merged.clipboard.persist);
+        assert!(merged.clipboard.clear_on_quit);
+    }
+
+    #[test]
+    fn a_config_from_an_older_version_that_still_has_persist_loads() {
+        // `persist` was retired: history is always written to disk now. Old files still carry the
+        // key, and an unknown key must not make the whole config fail to load.
+        let cfg: Config = toml::from_str("[clipboard]\nenabled = true\npersist = false\n").unwrap();
+        assert!(cfg.clipboard.enabled);
+        assert!(!cfg.clipboard.clear_on_quit);
+        let cfg: Config = toml::from_str("[clipboard]\nenabled = true\npersist = true\n").unwrap();
+        assert!(cfg.clipboard.enabled);
     }
 
     #[test]

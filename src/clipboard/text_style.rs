@@ -418,27 +418,7 @@ unsafe fn make_detail_action_icon_with(
 /// Apply the shared clipboard action-button state to its own rounded hover background.
 /// never the button background.
 fn is_clear_history_destructive_action(action: Sel) -> bool {
-    action == sel!(clearClipboardHistory:)
-        || action == sel!(clearClipboardUnpinned:)
-        || action == sel!(clearClipboardAll:)
-}
-
-fn confirmation_surface_background(palette: crate::theme::UiPalette) -> u32 {
-    // Use the theme card color so field_bg's darker neutral gray cannot make the confirmation
-    // surface look muddy after compositing.
-    let alpha = if palette.dark { 0xE0 } else { 0xEC };
-    (palette.card_bg & 0xFFFF_FF00) | alpha
-}
-
-unsafe fn is_clear_confirmation_button(button: *mut AnyObject) -> bool {
-    if button.is_null() {
-        return false;
-    }
-    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
-        return false;
-    };
-    let parent: *mut AnyObject = msg_send![button, superview];
-    parent == confirmation.surface.0
+    action == sel!(clearClipboardUnpinned:) || action == sel!(clearClipboardAll:)
 }
 
 unsafe fn is_clear_history_action_button(button: *mut AnyObject) -> bool {
@@ -447,6 +427,20 @@ unsafe fn is_clear_history_action_button(button: *mut AnyObject) -> bool {
         .unwrap()
         .map(|buttons| buttons.iter().any(|candidate| candidate.0 == button))
         .unwrap_or(false)
+}
+
+/// Move one of the two clear actions to `frame` (the caller owns x/width from the locale
+/// measurement; the y stays). No-op when the header has not been built yet.
+pub(super) unsafe fn set_clear_action_button_frame(index: usize, frame: NSRect) {
+    let buttons = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap();
+    let Some(buttons) = buttons else {
+        return;
+    };
+    let current: NSRect = msg_send![buttons[index].0, frame];
+    let _: () = msg_send![
+        buttons[index].0,
+        setFrame: NSRect::new(NSPoint::new(frame.origin.x, current.origin.y), frame.size)
+    ];
 }
 
 pub(super) unsafe fn set_clear_confirmation_button_style(button: *mut AnyObject, hovered: bool) {
@@ -591,7 +585,7 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
-        if is_clear_confirmation_button(b) || is_clear_history_action_button(b) {
+        if is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, true);
             return;
         }
@@ -636,7 +630,7 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
     unsafe {
         let b = _self as *mut AnyObject;
         let action: Sel = msg_send![b, action];
-        if is_clear_confirmation_button(b) || is_clear_history_action_button(b) {
+        if is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, false);
             return;
         }
@@ -812,98 +806,53 @@ pub(super) unsafe fn make_filter_pill(
 /// Build the clear-history confirmation card alongside the fixed header so its lower rows
 /// remain interactive while it overlays the list.
 #[allow(dead_code)]
-unsafe fn build_clear_history_confirmation(header_strip: *mut AnyObject, anchor: NSRect) {
-    let (surface_in_header, button_frames) = clear_history_confirmation_layout(anchor);
-    let parent: *mut AnyObject = msg_send![header_strip, superview];
-    let surface_frame: NSRect =
-        msg_send![header_strip, convertRect: surface_in_header, toView: parent];
-    let surface: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let surface: *mut AnyObject = msg_send![
-        surface,
-        initWithFrame: surface_frame
-    ];
-    let _: () = msg_send![surface, setWantsLayer: true];
-    // The picker parent resizes, so keep the card pinned to its top-aligned trigger.
-    let _: () = msg_send![surface, setAutoresizingMask: 8u64];
-    let layer: *mut AnyObject = msg_send![surface, layer];
-    let palette = clipboard_palette();
-    // Use the theme card surface to match the surrounding picker.
-    crate::ffi::layer_set_background(
-        layer,
-        crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
-    );
-    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
-    let _: () = msg_send![layer, setMasksToBounds: true];
-    let _: () = msg_send![surface, setHidden: true];
-    let _: () = msg_send![surface, setAlphaValue: 0.0f64];
-    let _: () = msg_send![parent, addSubview: surface];
+/// Retitle the two clear actions after the filter or the query changed. The text names the scope
+/// that will be cleared (the active category, or "results" while a query narrows the list), so a
+/// destructive action is never ambiguous. Frames are fixed to the widest variant (`clear_*_width`
+/// in the header builder), so retitling moves no button.
+/// What the two clear actions show right now (titles + reserved widths), written by
+/// `update_clear_action_labels`. See `clear_action_applied`.
+static CLEAR_ACTION_APPLIED: Mutex<Option<(String, String, [f64; 2])>> = Mutex::new(None);
 
-    let labels = [
-        t("clipboard.clear_confirm_unpinned"),
-        t("clipboard.clear_confirm_all"),
-    ];
-    let actions = [sel!(clearClipboardUnpinned:), sel!(clearClipboardAll:)];
-    let mut buttons = [std::ptr::null_mut(); 2];
-    for i in 0..2 {
-        let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-        let button: *mut AnyObject = msg_send![
-            button,
-            initWithFrame: button_frames[i]
-        ];
-        let _: () = msg_send![button, setBordered: false];
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-        let _: () = msg_send![button, setFont: font];
-        let title = make_nsstring(&labels[i]);
-        let _: () = msg_send![button, setTitle: title];
-        CFRelease(title as *const c_void);
-        let _: () = msg_send![button, setTarget: observer()];
-        let _: () = msg_send![button, setAction: actions[i]];
-        let _: () = msg_send![button, setWantsLayer: true];
-        let button_layer: *mut AnyObject = msg_send![button, layer];
-        if !button_layer.is_null() {
-            crate::ffi::layer_set_border(button_layer, crate::ffi::hex_to_cg_color(0x00000000));
-            let _: () = msg_send![button_layer, setBorderWidth: 0.0f64];
-            let _: () = msg_send![button_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
-            let _: () = msg_send![button_layer, setMasksToBounds: true];
-        }
-        if !button_layer.is_null() {
-            crate::ffi::layer_set_background(button_layer, crate::ffi::hex_to_cg_color(0x00000000));
-        }
-        set_clear_confirmation_button_style(button, false);
-        let _: () = msg_send![button, setHidden: true];
-        let _: () = msg_send![button, setAlphaValue: 0.0f64];
-        add_hover_tracking(button);
-        let _: () = msg_send![surface, addSubview: button];
-        release_obj(button);
-        buttons[i] = button;
-    }
-    release_obj(surface);
-    *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() = Some(ClearHistoryConfirmationViews {
-        surface: ObjPtr::new(surface),
-        unpinned: ObjPtr::new(buttons[0]),
-        all: ObjPtr::new(buttons[1]),
-    });
-}
-
-pub(super) unsafe fn apply_clear_history_confirmation_theme() {
-    let Some(confirmation) = *CLEAR_HISTORY_CONFIRMATION.lock().unwrap() else {
+pub(super) fn update_clear_action_labels() {
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
+    let (unpinned, all) = clip_clear_labels(filter, has_query);
+    let widths: [f64; 2] =
+        clip_clear_action_widths(|label| localized_string_width(label, crate::theme::FONT_CAPTION))
+            .map(|width| width + 8.0);
+    // Recorded unconditionally: the titles and the reservation are what the two actions show, and
+    // the regression test reads this instead of poking at AppKit buttons.
+    *CLEAR_ACTION_APPLIED.lock().unwrap() = Some((unpinned.clone(), all.clone(), widths));
+    let buttons = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap();
+    let Some(buttons) = buttons else {
         return;
     };
-    let layer: *mut AnyObject = msg_send![confirmation.surface.0, layer];
-    if layer.is_null() {
-        return;
+    let total_width = widths.iter().sum::<f64>() + CLEAR_ACTION_GAP;
+    let mut x = PICKER_W - SEARCH_PAD_X - total_width;
+    for (index, ((button, label), width)) in
+        buttons.iter().zip([unpinned, all]).zip(widths).enumerate()
+    {
+        unsafe {
+            set_clear_action_button_frame(
+                index,
+                NSRect::new(NSPoint::new(x, 0.0), NSSize::new(width, 20.0)),
+            );
+        }
+        let title = make_nsstring(&label);
+        unsafe {
+            let _: () = msg_send![button.0, setTitle: title];
+            CFRelease(title as *const c_void);
+        }
+        x += width + CLEAR_ACTION_GAP;
     }
-    let palette = clipboard_palette();
-    crate::ffi::layer_set_background(
-        layer,
-        crate::ffi::hex_to_cg_color(confirmation_surface_background(palette)),
-    );
-    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.card_border));
-    for button in [confirmation.unpinned, confirmation.all] {
-        set_clear_confirmation_button_style(button.0, false);
-    }
+}
+
+/// The titles and reserved widths the two clear actions currently show, as last applied. Exposed so
+/// the assertions can check every call site (filter change, query change, locale refresh) without a
+/// built header; `None` until the first apply.
+pub(super) fn clear_action_applied() -> Option<(String, String, [f64; 2])> {
+    CLEAR_ACTION_APPLIED.lock().unwrap().clone()
 }
 
 /// Refresh the filter styling: the active item is 78% black with a 16x2 underline below;
@@ -1551,27 +1500,24 @@ pub fn refresh_localized_ui() {
             }
             update_filter_pill_style(false);
 
-            if let Some(buttons) = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() {
-                let labels = [
-                    t("clipboard.clear_confirm_unpinned"),
-                    t("clipboard.clear_confirm_all"),
-                ];
-                let widths: [f64; 2] =
-                    std::array::from_fn(|i| localized_string_width(&labels[i], 12.0) + 8.0);
-                let total_width = widths.iter().sum::<f64>() + CLEAR_CONFIRM_GAP;
+            if CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap().is_some() {
+                // The locale changed, so every variant's width changed: the buttons reserve the
+                // widest one, and the title follows the CURRENT scope (the old code reset both to
+                // the two short labels, dropping the category or the search scope).
+                let widths: [f64; 2] = clip_clear_action_widths(|label| {
+                    localized_string_width(label, crate::theme::FONT_CAPTION)
+                })
+                .map(|width| width + 8.0);
+                let total_width = widths.iter().sum::<f64>() + CLEAR_ACTION_GAP;
                 let mut x = PICKER_W - SEARCH_PAD_X - total_width;
-                for (index, button) in buttons.iter().enumerate() {
-                    let label = &labels[index];
-                    let title = make_nsstring(label);
-                    let _: () = msg_send![button.0, setTitle: title];
-                    CFRelease(title as *const c_void);
-                    let frame = NSRect::new(
-                        NSPoint::new(x, filters_y + 8.0),
-                        NSSize::new(widths[index], 20.0),
+                for (index, width) in widths.iter().enumerate() {
+                    set_clear_action_button_frame(
+                        index,
+                        NSRect::new(NSPoint::new(x, 0.0), NSSize::new(*width, 20.0)),
                     );
-                    let _: () = msg_send![button.0, setFrame: frame];
-                    x += widths[index] + CLEAR_CONFIRM_GAP;
+                    x += width + CLEAR_ACTION_GAP;
                 }
+                update_clear_action_labels();
             }
         }
 
@@ -1600,6 +1546,7 @@ pub(super) fn apply_clip_filter(filter: ClipFilter) {
     }
     *CLIP_FILTER.lock().unwrap() = filter;
     update_filter_pill_style(true);
+    update_clear_action_labels();
     unsafe { rebuild_rows() };
 }
 

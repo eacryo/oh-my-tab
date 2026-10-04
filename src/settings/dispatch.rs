@@ -47,7 +47,7 @@ pub(super) enum ControlField {
     SmoothScrollingInertia,
     MappingEnabled,
     ClipboardEnabled,
-    ClipboardPersist,
+    ClipboardClearOnQuit,
     ClipboardShowSourceApp,
     ClipboardMoveUsedToTop,
     ClipboardDeleteAfterPaste,
@@ -167,7 +167,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             })
             .or_else(|| m(u.mapping_enabled, ControlField::MappingEnabled))
             .or_else(|| m(u.clipboard_enabled, ControlField::ClipboardEnabled))
-            .or_else(|| m(u.clipboard_persist, ControlField::ClipboardPersist))
+            .or_else(|| {
+                m(
+                    u.clipboard_clear_on_quit,
+                    ControlField::ClipboardClearOnQuit,
+                )
+            })
             .or_else(|| {
                 m(
                     u.clipboard_show_source_app,
@@ -617,9 +622,9 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.clipboard_enabled, state];
                     cfg.clipboard.enabled = state == 1;
                 }
-                ControlField::ClipboardPersist => {
-                    let state: isize = msg_send![u.clipboard_persist, state];
-                    cfg.clipboard.persist = state == 1;
+                ControlField::ClipboardClearOnQuit => {
+                    let state: isize = msg_send![u.clipboard_clear_on_quit, state];
+                    cfg.clipboard.clear_on_quit = state == 1;
                 }
                 ControlField::ClipboardShowSourceApp => {
                     let state: isize = msg_send![u.clipboard_show_source_app, state];
@@ -1123,7 +1128,7 @@ pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
     for &ctrl in &[
         ui.clipboard_shortcut,
         ui.clipboard_pin_follow,
-        ui.clipboard_persist,
+        ui.clipboard_clear_on_quit,
         ui.clipboard_show_source_app,
         ui.clipboard_move_used_to_top,
         ui.clipboard_delete_after_paste,

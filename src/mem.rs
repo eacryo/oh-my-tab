@@ -100,15 +100,18 @@ fn read_ledgers() -> Ledger {
 /// Record only feature switches that affect the memory profile; never record user content.
 fn runtime_profile() -> String {
     let config = CONFIG.read().unwrap();
-    let clipboard_mode = if !config.clipboard.enabled {
-        "off"
-    } else if config.clipboard.persist {
-        "persistent"
+    let clipboard_mode = if config.clipboard.enabled {
+        "on"
     } else {
-        "memory"
+        "off"
+    };
+    let clipboard_scope = if config.clipboard.enabled && config.clipboard.clear_on_quit {
+        "clear_on_quit"
+    } else {
+        "keep"
     };
     format!(
-        "mouse:{},thumbs:{},clipboard:{}",
+        "mouse:{},thumbs:{},clipboard:{}/{}",
         if config.mouse.enabled { "on" } else { "off" },
         if config.layout.thumbnails_enabled {
             "on"
@@ -116,6 +119,7 @@ fn runtime_profile() -> String {
             "off"
         },
         clipboard_mode,
+        clipboard_scope,
     )
 }
 

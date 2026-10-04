@@ -698,7 +698,6 @@ pub(super) fn show_picker() {
 
 pub(super) fn hide_picker() {
     PICKER_VISIBLE.store(false, Ordering::SeqCst);
-    set_clear_history_confirmation_expanded(false);
     *SCROLL_DRAG.lock().unwrap() = None;
     // Hiding does not reliably deliver mouseExited to every child button; clear the row hover
     // state explicitly (the persistent corner × would otherwise come back red).
@@ -1036,13 +1035,27 @@ pub(super) extern "C" fn detail_preview_ready(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
-    let job_hash = match *DETAIL_PENDING_HD.lock().unwrap() {
-        Some((h, _)) => h,
-        None => return,
+    // Read the slot under a scoped lock and release it before touching the slot again: this mutex is
+    // not reentrant, and a `match *SLOT.lock()` scrutinee keeps its guard alive for the whole match,
+    // so locking inside an arm deadlocks the main thread.
+    let (job_hash, generation, epoch) = {
+        let slot = DETAIL_PENDING_HD.lock().unwrap();
+        match slot.as_ref() {
+            Some((hash, generation, epoch, _)) => (*hash, *generation, *epoch),
+            None => return,
+        }
     };
-    if !detail_result_still_wanted(detail_visible(), detail_current_hash(), job_hash) {
-        // Stale: release the slot bytes (the disk cache is written; later opens do not
-        // need the slot).
+    // A preview generated before a discard belongs to a deleted entry: refuse it here as well, so
+    // the last step of the pipeline cannot show it (the bytes are released with the slot).
+    let wanted = detail_result_still_wanted(detail_visible(), detail_current_hash(), job_hash);
+    if !super::detail_slot_deliverable(
+        generation,
+        super::cache_generation(),
+        epoch,
+        super::current_hash_epoch(job_hash),
+        wanted,
+    ) {
+        // The disk cache keeps the data for a later open, so dropping the slot bytes is safe.
         *DETAIL_PENDING_HD.lock().unwrap() = None;
         return;
     }

@@ -131,12 +131,134 @@ pub(super) fn cache_write_detail_preview(hash: u64, png: &[u8]) -> bool {
 
 /// One image-cache write job: persist the original bytes (data entries only), persist the
 /// preview, then optionally pregenerate the detail image.
-struct ImageCacheJob {
-    hash: u64,
-    data: Option<Arc<Vec<u8>>>,
-    preview: Arc<Vec<u8>>,
-    source_path: Option<String>,
-    warm_detail: bool,
+pub(super) struct ImageCacheJob {
+    pub(super) hash: u64,
+    pub(super) data: Option<Arc<Vec<u8>>>,
+    pub(super) preview: Arc<Vec<u8>>,
+    pub(super) source_path: Option<String>,
+    pub(super) warm_detail: bool,
+    /// The cache generation this job was queued in; a job whose generation is stale must not
+    /// write, see `wipe_cache_for_discard`.
+    pub(super) generation: u64,
+    /// The hash epoch this job was queued in; a deletion of that record bumps it, see
+    /// `retire_image_hash`.
+    pub(super) epoch: u64,
+}
+
+/// Per-hash job epoch. The global generation cannot express "this record only" -- it would invalidate
+/// every other record's queued job too -- so each hash carries its own epoch: a job records the epoch
+/// it was queued in, and deleting that record's hash bumps it, which invalidates exactly the jobs
+/// queued before the deletion. Re-recording the same image does NOT restore them: a fresh job reads
+/// the bumped epoch, so only new work is admitted (an old job must not write a file-reference record's
+/// data bytes, or resurrect anything for a deleted entry).
+/// Guarded by `CACHE_WRITE_LOCK` wherever it is read or written.
+static IMAGE_HASH_EPOCHS: LazyLock<Mutex<HashMap<u64, u64>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Invalidate the queued work for one deleted record and drop its pending bytes: the files go, and a
+/// job that is still queued for the same hash can no longer write them back (nor its preview, nor a
+/// detail preview). Only this hash is affected -- other records' jobs keep their generation.
+pub(super) fn retire_image_hash(hash: u64) {
+    if hash == 0 {
+        return;
+    }
+    // One lock with the writers, so the delete cannot interleave with a write it is meant to cancel.
+    let _guard = CACHE_WRITE_LOCK.lock().unwrap();
+    *IMAGE_HASH_EPOCHS.lock().unwrap().entry(hash).or_insert(0) += 1;
+    PENDING_IMAGE_DATA.lock().unwrap().remove(&hash);
+    clear_detail_slot_for_hash(hash);
+    cache_delete_image(hash);
+}
+
+/// Drop the detail-preview delivery slot when it belongs to `hash` (a deleted record's preview must
+/// not be shown later).
+fn clear_detail_slot_for_hash(hash: u64) {
+    let mut slot = DETAIL_PENDING_HD.lock().unwrap();
+    if slot.as_ref().is_some_and(|(h, _, _, _)| *h == hash) {
+        *slot = None;
+    }
+}
+
+/// The epoch `hash` is at now; a job queued in a different epoch was invalidated by a deletion.
+pub(super) fn current_hash_epoch(hash: u64) -> u64 {
+    if hash == 0 {
+        return 0;
+    }
+    *IMAGE_HASH_EPOCHS.lock().unwrap().get(&hash).unwrap_or(&0)
+}
+
+/// The epoch a job about to be queued for `hash` should carry. Recording an image does not reset the
+/// epoch: a job queued before a deletion stays invalid, and only this new job is admitted.
+pub(super) fn hash_epoch_for_new_job(hash: u64) -> u64 {
+    current_hash_epoch(hash)
+}
+
+/// Invalidates queued cache work. `wipe_cache_for_discard` bumps it before wiping, so jobs that
+/// were queued (or are waiting) for the history that was just deleted cannot recreate its image
+/// files afterwards.
+static CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+/// Serializes cache writes against a wipe. A writer holds it across its generation check and its
+/// write; the wipe bumps the generation first and then takes it, so a wipe that has returned can
+/// never be followed by an older job's write, and a write that won the race is removed by the wipe.
+static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+pub(super) fn cache_generation() -> u64 {
+    CACHE_GENERATION.load(Ordering::Acquire)
+}
+
+/// Run one cache write under the write lock, but only while its generation is still current.
+/// Nothing but the write itself belongs here: reading, decoding and encoding happen outside, or a
+/// discard on the main thread (switch off / quit) would wait for a large image to be re-encoded.
+/// Returns whether the write ran.
+pub(super) fn write_while_current(generation: u64, write: impl FnOnce()) -> bool {
+    write_while_current_for(0, generation, 0, write)
+}
+
+/// As `write_while_current`, but for one hash: the job's generation must still be current AND its
+/// hash epoch unchanged, so a record deleted while this job waited (`retire_image_hash`) never gets
+/// its files back. `hash == 0` means "no per-hash rule".
+fn write_while_current_for(hash: u64, generation: u64, epoch: u64, write: impl FnOnce()) -> bool {
+    let _guard = CACHE_WRITE_LOCK.lock().unwrap();
+    if generation != cache_generation() || current_hash_epoch(hash) != epoch {
+        return false;
+    }
+    write();
+    true
+}
+
+/// Store a freshly generated detail preview in the delivery slot, but only while its generation is
+/// still current: the check and the store share one lock, so a discard cannot slip in between them
+/// and leave a deleted entry's preview behind. Returns whether it was stored.
+pub(super) fn offer_detail_preview(generation: u64, hash: u64, epoch: u64, png: Vec<u8>) -> bool {
+    if generation != cache_generation() {
+        return false;
+    }
+    let _guard = CACHE_WRITE_LOCK.lock().unwrap();
+    // Both checks inside the lock: a deletion between the decode and this store must keep the
+    // preview of a deleted record out of the slot (the file write is refused for the same reason).
+    if generation != cache_generation() || current_hash_epoch(hash) != epoch {
+        return false;
+    }
+    *DETAIL_PENDING_HD.lock().unwrap() = Some((hash, generation, epoch, png));
+    true
+}
+
+/// Delete every cached file and invalidate the work queued for it (see `CACHE_GENERATION`). The
+/// pending maps go too: they hold original bytes and generated previews of entries that no longer
+/// exist. Callers reach this only when the whole history is gone -- clearing one scope per hash
+/// keeps the remaining entries' jobs valid.
+pub(super) fn wipe_cache_for_discard(dir: &std::path::Path) {
+    CACHE_GENERATION.fetch_add(1, Ordering::AcqRel);
+    // Taking the lock waits for a write in flight, so that write's files are inside the wipe.
+    {
+        let _guard = CACHE_WRITE_LOCK.lock().unwrap();
+        PENDING_IMAGE_DATA.lock().unwrap().clear();
+        IMAGE_HASH_EPOCHS.lock().unwrap().clear();
+        DETAIL_PENDING_HD.lock().unwrap().take();
+        clear_image_cache_dir(dir);
+    }
+    DETAIL_INFLIGHT.lock().unwrap().clear();
 }
 
 static IMAGE_CACHE_SENDER: OnceLock<Option<SyncSender<ImageCacheJob>>> = OnceLock::new();
@@ -145,7 +267,7 @@ static IMAGE_CACHE_SENDER: OnceLock<Option<SyncSender<ImageCacheJob>>> = OnceLoc
 /// saves before the background write lands, a cache miss falls back to this map, so the
 /// async write never breaks a paste. Bounded: on overflow the oldest entry is written
 /// synchronously and dropped, so memory cannot grow without limit.
-static PENDING_IMAGE_DATA: LazyLock<Mutex<HashMap<u64, PendingImage>>> =
+pub(super) static PENDING_IMAGE_DATA: LazyLock<Mutex<HashMap<u64, PendingImage>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Monotonic insertion sequence: HashMap order is arbitrary, so "oldest" needs an explicit
 /// sequence number.
@@ -156,7 +278,30 @@ const PENDING_IMAGE_LIMIT: usize = 16;
 /// overflow).
 pub(super) struct PendingImage {
     pub(super) seq: u64,
+    /// The cache generation and the hash epoch that recorded these bytes. A finished write retires
+    /// only the entry its own job queued: after a deletion (epoch bump) and a re-record of the same
+    /// image the hash is identical, and dropping the entry by hash -- or by a stale job -- would
+    /// delete the new bytes while the file they belong to is still being written.
+    pub(super) generation: u64,
+    pub(super) epoch: u64,
     pub(super) bytes: Arc<Vec<u8>>,
+}
+
+/// Test-only: place a pending fallback entry exactly as the record path does, but without queueing
+/// the write job, so an interleaving can be constructed deterministically.
+#[cfg(test)]
+pub(super) fn insert_pending_for_tests(hash: u64, bytes: Arc<Vec<u8>>) {
+    let generation = cache_generation();
+    let seq = PENDING_IMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
+    PENDING_IMAGE_DATA.lock().unwrap().insert(
+        hash,
+        PendingImage {
+            seq,
+            generation,
+            epoch: current_hash_epoch(hash),
+            bytes,
+        },
+    );
 }
 
 /// Pick the oldest entry (smallest insertion sequence). Pure and unit-tested: HashMap
@@ -200,6 +345,10 @@ pub(super) fn schedule_image_cache_write(
     if hash == 0 {
         return;
     }
+    let generation = cache_generation();
+    // The epoch a NEW job for this image carries. Deliberately not reset: a job queued before a
+    // deletion stays invalid, so re-recording admits only this new work.
+    let epoch = hash_epoch_for_new_job(hash);
     if let Some(bytes) = &data {
         let mut pending = PENDING_IMAGE_DATA.lock().unwrap();
         if pending.len() >= PENDING_IMAGE_LIMIT {
@@ -209,7 +358,9 @@ pub(super) fn schedule_image_cache_write(
                 let old_bytes = pending.remove(&old_hash).map(|image| image.bytes);
                 drop(pending);
                 if let Some(old_bytes) = old_bytes {
-                    let _ = cache_write_image(old_hash, &old_bytes);
+                    write_while_current(generation, || {
+                        let _ = cache_write_image(old_hash, &old_bytes);
+                    });
                 }
                 pending = PENDING_IMAGE_DATA.lock().unwrap();
             }
@@ -219,6 +370,8 @@ pub(super) fn schedule_image_cache_write(
             hash,
             PendingImage {
                 seq,
+                generation,
+                epoch,
                 bytes: bytes.clone(),
             },
         );
@@ -229,6 +382,8 @@ pub(super) fn schedule_image_cache_write(
         preview,
         source_path,
         warm_detail,
+        generation,
+        epoch,
     };
     match image_cache_sender() {
         Some(sender) => match sender.try_send(job) {
@@ -243,24 +398,60 @@ pub(super) fn schedule_image_cache_write(
     }
 }
 
-/// One background job: persist the original bytes, then the preview, then optionally
-/// pregenerate the detail image (idempotent; skipped when already cached).
-fn run_image_cache_job(job: &ImageCacheJob) {
-    if let Some(data) = &job.data {
-        // Remove from the fallback map only on success; on failure it is kept so a paste can
-        // still obtain the bytes from memory.
-        if cache_write_image(job.hash, data) {
-            PENDING_IMAGE_DATA.lock().unwrap().remove(&job.hash);
+/// Write one job's original bytes and retire its pending fallback entry: both steps under the same
+/// generation guard, and the retirement is keyed to the JOB's generation (not just the hash), so a
+/// job that resumes after a discard cannot drop a re-recorded entry's bytes.
+/// The fallback map is what a paste or save-as reads while the file is not on disk yet, so dropping
+/// the wrong entry there loses data that is still being written. A failed write keeps the entry.
+pub(super) fn finish_image_write(hash: u64, generation: u64, epoch: u64, data: &[u8]) {
+    write_while_current_for(hash, generation, epoch, || {
+        if cache_write_image(hash, data) {
+            retire_pending_after_write(hash, generation, epoch);
         }
+    });
+}
+
+/// Retire the pending fallback entry a finished write replaced. Two things matter, and the failure
+/// they prevent only shows up under a specific interleaving: a job writes (its generation is still
+/// current), the history is discarded, the user copies the SAME image again (same hash, new pending
+/// entry, generation bumped, file not written yet), and only then does the old job get here.
+/// It runs inside the writer's generation guard (`finish_image_write`) AND matches the entry's
+/// generation against the job's rather than the hash alone, so the re-recorded entry keeps the bytes
+/// a paste or save-as needs while the file is missing.
+pub(super) fn retire_pending_after_write(hash: u64, generation: u64, epoch: u64) {
+    let mut pending = PENDING_IMAGE_DATA.lock().unwrap();
+    if pending
+        .get(&hash)
+        .is_some_and(|image| image.generation == generation && image.epoch == epoch)
+    {
+        pending.remove(&hash);
+    }
+}
+
+/// One background job: persist the original bytes, then the preview, then optionally/// One background job: persist the original bytes, then the preview, then optionally
+/// pregenerate the detail image (idempotent; skipped when already cached).
+pub(super) fn run_image_cache_job(job: &ImageCacheJob) {
+    if let Some(data) = &job.data {
+        finish_image_write(job.hash, job.generation, job.epoch, data);
     }
     if !job.preview.is_empty() {
-        let _ = cache_write_preview(job.hash, &job.preview);
+        write_while_current_for(job.hash, job.generation, job.epoch, || {
+            let _ = cache_write_preview(job.hash, &job.preview);
+        });
     }
+    // The optional detail pregen is the expensive part (read + decode + encode): it runs outside the
+    // lock, and only the resulting write is generation-checked.
     if job.warm_detail && !clip_image_detail_path(job.hash).exists() {
-        unsafe {
+        let generated = unsafe {
             let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-            let _ = generate_detail_preview_bytes(job.hash, job.source_path.as_deref());
+            let png = generate_detail_preview_png(job.hash, job.source_path.as_deref());
             let _: () = msg_send![pool, drain];
+            png
+        };
+        if let Some(png) = generated {
+            write_while_current_for(job.hash, job.generation, job.epoch, || {
+                let _ = cache_write_detail_preview(job.hash, &png);
+            });
         }
     }
 }
@@ -276,6 +467,21 @@ pub(super) fn image_bytes_for_hash(hash: u64) -> Option<Arc<Vec<u8>>> {
         .unwrap()
         .get(&hash)
         .map(|image| image.bytes.clone())
+}
+
+/// Whether a finished detail preview may be delivered. Every condition is required: its cache
+/// generation is still current (a discard means the entry it describes is gone), its hash epoch is
+/// still current (that record was deleted meanwhile, even if the history itself was not discarded --
+/// clearing one filter scope is enough), and it is still the one the detail panel wants.
+/// Pure, unit-tested.
+pub(super) fn detail_slot_deliverable(
+    slot_generation: u64,
+    current_generation: u64,
+    slot_epoch: u64,
+    current_epoch: u64,
+    still_wanted: bool,
+) -> bool {
+    slot_generation == current_generation && slot_epoch == current_epoch && still_wanted
 }
 
 /// Freshness predicate for background detail-preview jobs (pure; unit-tested): the
@@ -309,13 +515,17 @@ pub(super) fn detail_current_hash() -> Option<u64> {
 /// from a first-open miss (try to refresh the UI afterwards); false = record/load warm-up
 /// (cache only, no UI interaction).
 pub(super) struct DetailPreviewJob {
-    hash: u64,
-    source_path: Option<String>,
-    deliver: bool,
+    pub(super) hash: u64,
+    pub(super) source_path: Option<String>,
+    pub(super) deliver: bool,
     // Freshness inputs snapshotted by the main thread at enqueue time; the worker never
     // reads picker/UI statics directly.
-    detail_visible: bool,
-    selected_hash: Option<u64>,
+    pub(super) detail_visible: bool,
+    pub(super) selected_hash: Option<u64>,
+    /// The cache generation this job was queued in (see `wipe_cache_for_discard`).
+    pub(super) generation: u64,
+    /// The hash epoch this job was queued in (see `retire_image_hash`).
+    pub(super) epoch: u64,
 }
 
 /// The sender side of the detail-preview worker (a lazily started persistent loop).
@@ -347,48 +557,71 @@ pub(super) fn detail_job_sender() -> flume::Sender<DetailPreviewJob> {
 /// on-demand jobs -> generate inside an autoreleasepool + atomic cache write -> deliver
 /// jobs stash the bytes and hop to the main thread.
 pub(super) unsafe fn run_detail_preview_job(job: &DetailPreviewJob) {
+    // A wipe that happened while this job waited makes the whole job pointless: the entry it
+    // describes is gone, so neither its file nor its delivered preview may come back.
+    if job.generation != cache_generation() || current_hash_epoch(job.hash) != job.epoch {
+        finish_detail_job(job);
+        return;
+    }
     // Idempotent: when pregen and on-demand requests race, whoever lands first writes
     // the file and the other skips.
     if clip_image_detail_path(job.hash).exists() {
-        DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
+        finish_detail_job(job);
         return;
     }
     // Enqueue-time freshness snapshot: the worker uses only values supplied by the main
     // thread for this cheap discard check, never picker/UI statics. The final guard remains
     // in the main-thread callback because the user can navigate away during generation.
     if job.deliver && !detail_result_still_wanted(job.detail_visible, job.selected_hash, job.hash) {
-        DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
+        finish_detail_job(job);
         return;
     }
     // AppKit temporaries (NSImage/TIFF/PNG encodes) drain with the pool -- same
     // precedent as icon extraction's "background thread + autoreleasepool"; if this ever
     // proves unstable, switch to pure CoreGraphics (CGImageSourceCreateThumbnailAtIndex,
     // unconditionally thread-safe).
+    // Reading, decoding and encoding run without the write lock: a discard on the main thread must
+    // not wait for a large image to be re-encoded.
     let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-    let png = generate_detail_preview_bytes(job.hash, job.source_path.as_deref());
+    let png = generate_detail_preview_png(job.hash, job.source_path.as_deref());
     let _: () = msg_send![pool, drain];
     if let Some(png) = png {
+        write_while_current_for(job.hash, job.generation, job.epoch, || {
+            let _ = cache_write_detail_preview(job.hash, &png);
+        });
         if job.deliver {
-            // Stash before hopping to the main thread: the handler / show_detail_for_sel
-            // sees complete bytes when consuming the slot.
-            *DETAIL_PENDING_HD.lock().unwrap() = Some((job.hash, png));
-            let target = observer();
-            let _: () = msg_send![
-                target,
-                performSelectorOnMainThread: sel!(detailPreviewReady:),
-                withObject: std::ptr::null_mut::<AnyObject>(),
-                waitUntilDone: false
-            ];
+            // Stash before hopping to the main thread: the handler / show_detail_for_sel sees
+            // complete bytes when consuming the slot. The store is generation-checked and shares
+            // one lock with the check, so a discard that happens now cannot leave this preview for
+            // a deleted entry behind.
+            if offer_detail_preview(job.generation, job.hash, job.epoch, png) {
+                let target = observer();
+                let _: () = msg_send![
+                    target,
+                    performSelectorOnMainThread: sel!(detailPreviewReady:),
+                    withObject: std::ptr::null_mut::<AnyObject>(),
+                    waitUntilDone: false
+                ];
+            }
         }
     }
-    DETAIL_INFLIGHT.lock().unwrap().remove(&job.hash);
+    finish_detail_job(job);
 }
 
-/// Generate the detail-preview bytes from the data cache / source file and cache them
-/// (the generation half of the old ensure_detail_preview; pure IO + decode/encode with no
-/// UI statics touched -- safe on any thread). Degenerate hash=0 skips the cache write to
-/// avoid orphan files.
-pub(super) unsafe fn generate_detail_preview_bytes(
+/// Release this job's in-flight marker. Keyed by the job's own identity, so a request queued after a
+/// deletion (a new generation or epoch for the same hash) keeps its marker and still runs.
+fn finish_detail_job(job: &DetailPreviewJob) {
+    DETAIL_INFLIGHT
+        .lock()
+        .unwrap()
+        .remove(&(job.hash, job.generation, job.epoch));
+}
+
+/// Generate the detail-preview bytes from the data cache / source file (pure IO + decode/encode
+/// with no UI statics touched -- safe on any thread, and deliberately without the cache write
+/// lock: it can take as long as the image is big). Degenerate hash=0 entries generate the same way
+/// but must not be cached.
+pub(super) unsafe fn generate_detail_preview_png(
     hash: u64,
     source_path: Option<&str>,
 ) -> Option<Vec<u8>> {
@@ -397,11 +630,7 @@ pub(super) unsafe fn generate_detail_preview_bytes(
         Some(p) => std::fs::read(p).ok(),
     };
     let bytes = bytes?;
-    let png = any_image_to_scaled_png(&bytes, DETAIL_PREVIEW_MAX_DIM)?;
-    if hash != 0 {
-        cache_write_detail_preview(hash, &png);
-    }
-    Some(png)
+    any_image_to_scaled_png(&bytes, DETAIL_PREVIEW_MAX_DIM)
 }
 
 /// Enqueue a detail-preview generation job (degenerate hash=0 entries are never queued).
@@ -411,9 +640,14 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
     if img.hash == 0 {
         return;
     }
+    let generation = cache_generation();
+    let epoch = hash_epoch_for_new_job(img.hash);
+    let key = (img.hash, generation, epoch);
     {
         let mut inflight = DETAIL_INFLIGHT.lock().unwrap();
-        if !inflight.insert(img.hash) {
+        // Same hash in a NEW generation/epoch is a different job: the one in flight belongs to a
+        // record that was discarded (its result will be refused), so this request must be queued.
+        if !inflight.insert(key) {
             return;
         }
     }
@@ -432,10 +666,12 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
             deliver,
             detail_visible,
             selected_hash,
+            generation,
+            epoch,
         }),
         Err(flume::TrySendError::Disconnected(_)) | Err(flume::TrySendError::Full(_))
     ) {
-        DETAIL_INFLIGHT.lock().unwrap().remove(&img.hash);
+        DETAIL_INFLIGHT.lock().unwrap().remove(&key);
     }
 }
 
@@ -448,9 +684,19 @@ pub(super) fn request_detail_preview(img: &ImageEntry, deliver: bool) {
 pub(super) fn ensure_detail_preview(img: &ImageEntry) -> Option<Arc<Vec<u8>>> {
     {
         let mut slot = DETAIL_PENDING_HD.lock().unwrap();
-        if let Some((h, _)) = slot.as_ref() {
-            if *h == img.hash {
-                return slot.take().map(|(_, p)| Arc::new(p));
+        if let Some((h, generation, epoch, _)) = slot.as_ref() {
+            // Same rule as the delivery path: bytes generated for a discarded history, or for a
+            // record that was deleted since, are dropped instead of shown.
+            if *h == img.hash
+                && detail_slot_deliverable(
+                    *generation,
+                    cache_generation(),
+                    *epoch,
+                    current_hash_epoch(*h),
+                    true,
+                )
+            {
+                return slot.take().map(|(_, _, _, p)| Arc::new(p));
             }
         }
     }
@@ -479,7 +725,9 @@ pub(super) fn hash_referenced_by<'a>(
 /// Remove a removed image's cache by hash, after confirming no survivor shares the file.
 pub(super) fn cache_delete_for_hash(history: &[ClipEntry], hash: u64) {
     if hash != 0 && !hash_referenced_by(history.iter(), hash) {
-        cache_delete_image(hash);
+        // Deleting the files is not enough: a cache job queued for this record is still allowed to
+        // write (its generation stays valid), so retirement is part of "this hash is gone".
+        retire_image_hash(hash);
     }
 }
 
@@ -495,9 +743,11 @@ pub(super) fn cache_delete_for_removed(history: &[ClipEntry], removed: &ClipEntr
 
 /// Wipe the whole image cache dir (called at startup: the history is not persisted, so
 /// any leftover file is an orphan).
-pub(super) fn clear_clip_image_cache() {
-    let dir = clip_image_cache_dir();
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+/// Wipe one cache directory (the dir itself stays). Parameterized so the discard path can be
+/// tested against a directory of its own instead of the shared one every other test uses; the
+/// production caller passes `clip_image_cache_dir()`.
+pub(super) fn clear_image_cache_dir(dir: &std::path::Path) {
+    if let Ok(entries) = std::fs::read_dir(dir) {
         for e in entries.flatten() {
             let _ = std::fs::remove_file(e.path());
         }

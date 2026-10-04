@@ -204,7 +204,7 @@ const SERVICE_MENU_SYMBOLS: [&str; 6] = [
     "keyboard",
 ];
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum ServiceToggle {
     Windows,
     Mouse,
@@ -308,6 +308,39 @@ pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyOb
     refresh_service_menu();
 }
 
+/// The tooltip a service menu item carries. A menu item has no room for a caption, so the clipboard
+/// entry -- the one whose switch-off deletes the saved history -- carries the same sentence the
+/// settings row shows, and only while it is ON (turning it on deletes nothing). Pure, unit-tested.
+#[cfg(test)]
+mod service_tooltip_tests {
+    use super::service_menu_tooltip;
+    use crate::i18n::t;
+
+    /// The clipboard entry deletes the saved history when switched off, so it says so -- but only
+    /// while it is on (an item that is already off has nothing to lose), and no other service
+    /// carries the sentence. This is the menu-side half of the disclosure the settings page shows as
+    /// a caption.
+    #[test]
+    fn only_the_enabled_clipboard_entry_warns_that_switching_it_off_clears_history() {
+        let warning = t("settings.desc_clipboard_enabled");
+        assert_eq!(service_menu_tooltip(2, true), Some(warning));
+        assert_eq!(service_menu_tooltip(2, false), None);
+        for other in [0, 1, 3, 4, 5] {
+            assert_eq!(service_menu_tooltip(other, true), None, "index {other}");
+            assert_eq!(service_menu_tooltip(other, false), None, "index {other}");
+        }
+        assert_eq!(service_menu_tooltip(9, true), None, "out of range");
+    }
+}
+
+pub(crate) fn service_menu_tooltip(index: usize, enabled: bool) -> Option<String> {
+    if ServiceToggle::from_tag(index as isize) == Some(ServiceToggle::Clipboard) && enabled {
+        Some(t("settings.desc_clipboard_enabled"))
+    } else {
+        None
+    }
+}
+
 pub(crate) fn refresh_service_menu() {
     let enabled: [bool; 6] = {
         let cfg = CONFIG.read().unwrap();
@@ -325,6 +358,19 @@ pub(crate) fn refresh_service_menu() {
             let title = t(SERVICE_MENU_TITLE_KEYS[index]);
             set_menu_item_title(item, &title);
             let _: () = msg_send![item, setState: if enabled[index] { 1isize } else { 0isize }];
+            // The clipboard entry deletes the saved history when it is switched off, and a menu item
+            // has no room for a caption (the settings page carries the visible one), so the
+            // consequence rides on the item's tooltip -- shown exactly when the switch is on, i.e.
+            // when turning it off would delete something. Set after the title, which manages its own
+            // tooltip for truncated text.
+            if let Some(text) = service_menu_tooltip(index, enabled[index]) {
+                let tooltip = make_nsstring(&text);
+                let _: () = msg_send![item, setToolTip: tooltip];
+                CFRelease(tooltip as *const c_void);
+            } else if ServiceToggle::from_tag(index as isize) == Some(ServiceToggle::Clipboard) {
+                // Switched off: nothing to warn about, and a stale tooltip would be a lie.
+                let _: () = msg_send![item, setToolTip: std::ptr::null_mut::<AnyObject>()];
+            }
         }
     }
 }

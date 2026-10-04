@@ -237,7 +237,7 @@ pub(super) struct SettingsUi {
     clipboard_shortcut_row_height: f64,
     clipboard_pin_follow_row_height: f64,
     clipboard_row_gap: f64,
-    clipboard_persist: *mut AnyObject, // persist clipboard history
+    clipboard_clear_on_quit: *mut AnyObject, // clear clipboard history when the app quits
     clipboard_move_used_to_top: *mut AnyObject, // move used entries to top
     clipboard_delete_after_paste: *mut AnyObject, // delete entry after paste
     clipboard_clear_system_pasteboard_after_paste: *mut AnyObject, // clear system pasteboard after paste
@@ -1156,9 +1156,9 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.clipboard.show_source_app
     );
     changed!(
-        "clipboard.persist",
-        old.clipboard.persist,
-        new.clipboard.persist
+        "clipboard.clear_on_quit",
+        old.clipboard.clear_on_quit,
+        new.clipboard.clear_on_quit
     );
     changed!(
         "clipboard.move_used_to_top",
@@ -1496,8 +1496,8 @@ fn load_settings_from(cfg: &Config) {
                 setState: if cfg.window_control.display_right { 1isize } else { 0isize }
             ];
             let _: () = msg_send![
-                ui.clipboard_persist,
-                setState: if cfg.clipboard.persist { 1isize } else { 0isize }
+                ui.clipboard_clear_on_quit,
+                setState: if cfg.clipboard.clear_on_quit { 1isize } else { 0isize }
             ];
             let _: () = msg_send![
                 ui.clipboard_show_source_app,

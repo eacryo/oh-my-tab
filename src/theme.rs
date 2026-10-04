@@ -2088,7 +2088,6 @@ mod tests {
             include_str!("settings/select.rs"),
             include_str!("settings/widgets.rs"),
             include_str!("clipboard/picker.rs"),
-            include_str!("clipboard/notifications.rs"),
             include_str!("overlay/card_close.rs"),
             include_str!("keystroke_display/panel.rs"),
         ];
@@ -2107,7 +2106,6 @@ mod tests {
             include_str!("settings/select.rs"),
             include_str!("settings/widgets.rs"),
             include_str!("clipboard/picker.rs"),
-            include_str!("clipboard/notifications.rs"),
             include_str!("overlay/card_close.rs"),
             include_str!("keystroke_display/panel.rs"),
             include_str!("updater.rs"),

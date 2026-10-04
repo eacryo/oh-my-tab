@@ -1336,8 +1336,11 @@ pub(super) unsafe fn build_clipboard_page(
     );
     let cy = canvas.next_row(described_row_h);
     // English "Enable clipboard history" (measured 146pt) plus cell padding sits on
-    // the label_w=150 edge; widen to 225 along with the persist/move_used_to_top rows.
-    ui.clipboard_enabled = SettingsRow::described(
+    // the label_w=150 edge; widen to 225 along with the clear_on_quit/move_used_to_top rows.
+    // `captioned`, not `described`: the latter's subtitle is not rendered at all, and this row has to
+    // state that turning the feature off deletes the saved records -- that line is the only warning
+    // the user gets, so it must actually be drawn (asserted by the settings layout smoke).
+    let (_, _, ui_clipboard_enabled) = SettingsRow::captioned(
         clipboard_view,
         label_x,
         cy,
@@ -1347,6 +1350,7 @@ pub(super) unsafe fn build_clipboard_page(
         &t("settings.desc_clipboard_enabled"),
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
+    ui.clipboard_enabled = ui_clipboard_enabled;
     let _: () = msg_send![ui.clipboard_enabled, setTarget: target];
     let _: () = msg_send![
         ui.clipboard_enabled,
@@ -1422,21 +1426,21 @@ pub(super) unsafe fn build_clipboard_page(
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
     // privacy implications are documented in the README).
-    // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
-    // privacy implications are documented in the README). The Chinese (11 CJK
-    // chars) and English labels both exceed the default label_w=150 (rendered
-    // truncated), so this row widens its label to 225 -- same as the
-    // show_minimized row; the switch keeps the trailing inset and stays clear of the edge.
-    ui.clipboard_persist = SettingsRow::plain(
+    // Clear-on-quit switch (history is written to disk while the app runs; this is the way to leave
+    // nothing behind after a session). Measured at the row's 14pt label font: en "Clear history on
+    // quit or shutdown" 214.2pt, zh-Hans 194.5pt, zh-Hant 222.3pt -- all past the default
+    // label_w=150, and the Traditional label also past the 220 this row used before, so it reserves
+    // 236 (the control column starts ~150pt further right, so nothing is squeezed).
+    ui.clipboard_clear_on_quit = SettingsRow::plain(
         clipboard_view,
         label_x,
         cy,
-        220.0,
+        236.0,
         described_row_h,
-        &t("settings.row_clipboard_persist"),
+        &t("settings.row_clipboard_clear_on_quit"),
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
-    bind_control(target, ui.clipboard_persist);
+    bind_control(target, ui.clipboard_clear_on_quit);
     let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // show the source app.

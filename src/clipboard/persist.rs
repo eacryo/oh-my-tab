@@ -39,9 +39,12 @@ pub(super) fn history_file_path() -> std::path::PathBuf {
     std::path::PathBuf::from(format!("{}/.config/oh-my-tab/clipboard-history.toml", home))
 }
 
-/// Whether history persistence is enabled (read from CONFIG).
-pub(super) fn persist_enabled() -> bool {
-    CONFIG.read().map(|c| c.clipboard.persist).unwrap_or(false)
+/// Whether the history is cleared when the app quits (read from CONFIG).
+pub(crate) fn clear_on_quit_enabled() -> bool {
+    CONFIG
+        .read()
+        .map(|c| c.clipboard.clear_on_quit)
+        .unwrap_or(false)
 }
 
 /// Serialize the history (pure, unit-tested).
@@ -117,10 +120,10 @@ fn write_history_snapshot(job: PersistJob) {
         return;
     };
 
-    // Share the I/O lock with the persist-off path so disabling persistence deletes the file
-    // after any in-progress write and prevents an older snapshot from being restored.
+    // Share the I/O lock with the discard path so clearing the history deletes the file after any
+    // in-progress write and prevents an older snapshot from being restored.
     let _io = PERSIST_IO_LOCK.lock().unwrap();
-    if !persist_enabled() || PERSIST_GENERATION.load(Ordering::Acquire) != job.generation {
+    if PERSIST_GENERATION.load(Ordering::Acquire) != job.generation {
         return;
     }
     if std::fs::create_dir_all(dir).is_err() {
@@ -140,7 +143,7 @@ fn write_history_snapshot(job: PersistJob) {
     }
     // Check the generation again before rename so a snapshot invalidated while preparing the
     // file is discarded instead of replacing newer history.
-    let current = persist_enabled() && PERSIST_GENERATION.load(Ordering::Acquire) == job.generation;
+    let current = PERSIST_GENERATION.load(Ordering::Acquire) == job.generation;
     let ok = ok && current && std::fs::rename(&tmp, &job.path).is_ok();
     if !ok {
         let _ = std::fs::remove_file(&tmp);
@@ -228,12 +231,9 @@ pub(super) fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
     })
 }
 
-/// Save the current history to disk (only when persist is on; atomic temp+rename, mode
-/// 600). Plaintext -- the privacy implications are documented in the README.
+/// Save the current history to disk (atomic temp+rename, mode 600). Plaintext -- the privacy
+/// implications are documented in the README, and `clear_on_quit` is the in-app way out.
 pub(super) fn save_history() {
-    if !persist_enabled() {
-        return;
-    }
     let mut hist = CLIP_HISTORY.lock().unwrap();
     // Expire before writing: the disk file never keeps expired entries (expiry applies
     // to memory and persistence alike).
@@ -256,10 +256,12 @@ pub(super) fn save_history() {
 /// new) at the tail, then trim to max_entries). A missing/corrupt/version-mismatched file
 /// is logged and treated as an empty history (config-style resilience).
 pub(super) fn load_history() {
-    if !persist_enabled() {
-        return;
-    }
     let path = history_file_path();
+    {
+        // Same lock as the writer: a leftover temp file is only swept when no write is in flight.
+        let _io = PERSIST_IO_LOCK.lock().unwrap();
+        sweep_history_temp_files(&path);
+    }
     let Ok(text) = std::fs::read_to_string(&path) else {
         let removed = sweep_current_clip_image_cache();
         if removed > 0 {
@@ -360,20 +362,67 @@ pub(super) fn load_history() {
     save_history();
 }
 
-/// Applied when the persist toggle changes in Settings:
-/// - ON: load and merge the persisted history into memory (load_history)
-/// - OFF: delete the history file (the in-memory history stays until this session ends)
-pub(crate) fn apply_persist_toggle(on: bool) {
-    if on {
-        load_history();
-        schedule_picker_refresh();
-    } else {
-        PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel);
-        let _io = PERSIST_IO_LOCK.lock().unwrap();
-        let path = history_file_path();
-        if path.exists() {
-            let _ = std::fs::remove_file(path);
-            log_info!("Clipboard history file removed (persistence off).");
+/// The atomic-write temp file name pattern: `clipboard-history.toml.tmp<pid>-<generation>`. A process
+/// that dies between the temp write and the rename leaves one behind -- with the full plaintext
+/// history -- so the cleanup paths have to recognize and remove them.
+/// Pure, unit-tested: strict, so an unrelated file in the same directory is never touched.
+pub(super) fn is_history_temp_file_name(name: &str) -> bool {
+    let Some(rest) = name.strip_prefix("clipboard-history.toml.tmp") else {
+        return false;
+    };
+    let Some((pid, generation)) = rest.split_once('-') else {
+        return false;
+    };
+    !pid.is_empty()
+        && !generation.is_empty()
+        && pid.bytes().all(|b| b.is_ascii_digit())
+        && generation.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Remove leftover atomic-write temp files from the directory holding the history file. They are
+/// plaintext history, so a crash must not leave them for the next session to ignore.
+fn sweep_history_temp_files(history_path: &std::path::Path) {
+    let Some(dir) = history_path.parent() else {
+        return;
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let mut removed = 0usize;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if is_history_temp_file_name(name) && std::fs::remove_file(entry.path()).is_ok() {
+            removed += 1;
         }
     }
+    if removed > 0 {
+        log_info!("Removed {removed} leftover clipboard history temp file(s).");
+    }
+}
+
+/// Delete every trace of the history: the file and the image cache. Used when the clipboard
+/// switch is turned off and when `clear_on_quit` fires, so both paths share one implementation.
+/// The generation bump drops persist jobs that are already queued, or a snapshot prepared before
+/// the delete would land on disk afterwards.
+pub(crate) fn discard_history_on_disk() {
+    PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel);
+    let _io = PERSIST_IO_LOCK.lock().unwrap();
+    let path = history_file_path();
+    let cache_dir = clip_image_cache_dir();
+    discard_history_in(&path, &cache_dir);
+    log_info!("Clipboard history file and image cache removed.");
+}
+
+/// Delete a history file and wipe a cache directory. Parameterized for the test, which must not
+/// disturb the shared directories the rest of the suite writes to.
+pub(super) fn discard_history_in(history_path: &std::path::Path, cache_dir: &std::path::Path) {
+    let _ = std::fs::remove_file(history_path);
+    // A crash between the temp write and the rename leaves the whole history in a temp file.
+    sweep_history_temp_files(history_path);
+    // Invalidates the queued image work and waits out a write in flight, so once this returns no
+    // job for the discarded history can put its files back (`wipe_cache_for_discard`).
+    wipe_cache_for_discard(cache_dir);
 }
