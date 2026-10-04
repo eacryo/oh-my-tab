@@ -16,6 +16,12 @@ pub(crate) fn apply_theme_and_locale_refresh() {
     crate::overlay::apply_theme();
     crate::overlay::refresh_highlight();
     crate::overlay::update_status_label();
+    // The keystroke panel's surface (frost wash, glass tint, opaque background) is written from the
+    // palette, while its keycaps re-read the palette on every render. Without this the surface keeps
+    // the previous theme's color and the panel shows light keycaps on a dark shell (or the reverse).
+    unsafe {
+        crate::keystroke_display::apply_glass_properties();
+    }
     // The guide re-renders its current step with the new palette and re-asserts the
     // window appearance; a no-op when the guide is not on screen.
     crate::onboarding::apply_window_appearance();

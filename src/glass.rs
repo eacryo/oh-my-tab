@@ -244,6 +244,18 @@ unsafe fn build_backdrop(
 
 /// The frost wash opacity in force. `--frost-wash=<0..255>` overrides it so the trade-off can be
 /// sampled on a running build without recompiling (development only; see `dev_flags`).
+/// The frost wash's color as a token: `window_bg` at the effective wash alpha. The panel smoke
+/// compares a live layer against it, so "the surface still carries the previous theme" fails loudly.
+pub(crate) fn frost_wash_token() -> u32 {
+    frost_wash_token_for(&crate::theme::ui_palette())
+}
+
+/// The frost wash for a specific palette: the contrast chain has to be evaluated for *both* modes,
+/// and the panel surface is the wash over whatever is behind the panel.
+pub(crate) fn frost_wash_token_for(palette: &crate::theme::UiPalette) -> u32 {
+    (palette.window_bg & 0xFFFF_FF00) | (frost_wash_alpha() & 0xFF)
+}
+
 pub(crate) fn frost_wash_alpha() -> u32 {
     crate::dev_flags::value("frost-wash")
         .and_then(|value| value.trim().parse::<u32>().ok())
@@ -471,9 +483,7 @@ pub(crate) unsafe fn apply_live_properties(
 /// Paint the frost wash: the theme's window surface at `frost_wash_alpha`, so the composited
 /// surface tracks the palette instead of whatever the panel happens to cover.
 unsafe fn set_frost_wash(layer: *mut AnyObject) {
-    let window_bg = crate::theme::ui_palette().window_bg;
-    let alpha = frost_wash_alpha() & 0xFF;
-    layer_set_background(layer, hex_to_cg_color((window_bg & 0xFFFF_FF00) | alpha));
+    layer_set_background(layer, hex_to_cg_color(frost_wash_token()));
 }
 
 unsafe fn set_compensation_tint(layer: *mut AnyObject, tint_hex: u32, alpha: u32) {

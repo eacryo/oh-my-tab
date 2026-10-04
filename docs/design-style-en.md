@@ -131,6 +131,9 @@ Measured with the composited (post-alpha) color against the surface the element 
 | `link_text_hover` | 4.5:1 | 6.34:1 on `window_bg`, 6.80:1 on `card_bg` | 7.28:1 / 5.96:1 |
 | `text_disabled` | 2.5:1 | 2.58:1 on `window_bg`, 2.76:1 on `card_bg` | 4.11:1 / 3.37:1 |
 
+Text on a *floating* panel's keycap is a recorded class of its own (`primary ≥8:1`, `muted ≥3.25:1`),
+because that surface moves with the backdrop — see the keystroke display in §9.
+
 `text_primary` has the smallest margin in the palette. Re-measure it whenever the primary color or
 `window_bg` changes; do not darken it for its own sake.
 
@@ -480,6 +483,38 @@ in muted text, adjacent to the name when inline -- it is metadata about the pres
 key's name. Long legends are shortened at the
 string level ("Pg Dn", not "Page Down") so the fixed width holds every shipped key name; anything
 longer truncates inside its keycap.
+
+A neutral keycap's fill is **per mode**, and like every text-bearing surface on a floating panel it is
+measured over the **full alpha chain** — backdrop → frost wash (`window_bg` at `0xE9`) → keycap → text
+— at both extremes, because the panel floats over arbitrary content (a pure-white and a pure-black
+backdrop are the two ends; the light panel lands at `(247,248,250)` over white and `(225,226,228)`
+over black):
+
+| Mode | Keycap fill | Tray behind a chord | Cap vs panel (white / black) | Text on the cap (white / black) |
+| --- | --- | --- | --- | --- |
+| Light | `field_bg` (inset field surface) + `card_border` | `card_bg` + `card_border` | 1.12:1 / 1.11:1 | 11.61 / 9.64 primary, 4.62 / 3.83 muted |
+| Dark | `card_bg` at 80% + `card_border` | `field_bg` + `card_border` | 1.04:1 / 1.19:1 | 12.67 / 13.46 primary, 5.19 / 5.51 muted |
+
+**Keycap text is a recorded class**, not §3.3's 12:1 `text_primary` floor: that floor belongs to text
+on `window_bg` and `card_bg`, which do not move, while a cap sits on a translucent wash and therefore
+does. The shipped accent keycaps already measure as low as **8.48:1 primary / 3.37:1 muted** on the
+worst backdrop (a light cap over dark content), so the class floor is **primary ≥8:1, muted ≥3.25:1**,
+asserted for both cap kinds, both modes and both backdrop extremes in `keystroke_display::panel`'s
+tests. This is also why the light neutral cap keeps the inset surface even though it cannot reach
+12:1: a cap dark enough to read as a surface against a near-white panel (≤ ~`#E9E9EB`) cannot also
+carry 12:1 text (which needs ≥ ~`#F0F1F3`) — those ranges do not overlap, and the surface won, because
+a cap nobody can see is worse than a cap whose count reads 3.83:1.
+
+Dark keeps the darker 80% card fill: the same inset surface measured 9.77:1 primary / 4.00:1 muted
+there (light text needs a dark cap), and its cap-against-panel separation is 1.04:1 on a white
+backdrop — recorded; the dark cap is defined by its hairline.
+
+The panel's own surface is the frost wash / glass tint / `window_bg`, written from the palette, so
+**every path that changes the theme must repaint it**, and the keycaps re-read the palette on each
+render — a surface left in the previous theme showed light keycaps on a dark shell. Two entries exist
+and both must call the repaint: the config-change coordinator
+(`ui_coordinator::apply_theme_and_locale_refresh`, for explicit light/dark switches and locale changes)
+and the system-appearance notification (`apply_system_appearance_refresh`, the `theme = "auto"` path).
 
 ## 10. Interaction states
 

@@ -883,10 +883,21 @@ fn on_appearance_changed_inner(_self: *mut c_void) {
         return;
     }
 
+    apply_system_appearance_refresh();
+}
+
+/// Refresh every surface that owns custom layer colors after the *system* appearance changed (the
+/// "auto" theme path). Split out so the panels' surfaces are covered in one place: the keystroke
+/// panel's keycaps re-read the palette on every render while its backdrop is painted once, so a
+/// missing entry here leaves light keycaps on a dark shell after a system theme switch.
+pub(crate) fn apply_system_appearance_refresh() {
     // Each subsystem owns custom layer colors, so update the native window appearance and
     // rebuild any visible content through its existing theme refresh path.
     settings::refresh_system_appearance();
-    unsafe { clipboard::apply_theme() };
+    unsafe {
+        clipboard::apply_theme();
+        keystroke_display::apply_glass_properties();
+    }
     overlay::apply_theme();
 }
 

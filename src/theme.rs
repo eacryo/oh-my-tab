@@ -149,6 +149,34 @@ pub(crate) fn contrast_ratio(foreground: [f64; 3], background: [f64; 3]) -> f64 
     (foreground.max(background) + 0.05) / (foreground.min(background) + 0.05)
 }
 
+/// Contrast of a token composited over `background` against that background: the question "does this
+/// surface read as a surface on top of that one" (a translucent token is composited first).
+/// Used by the assertions that pin surface-on-surface relationships the palette must keep.
+/// Composite a token over another, for chained surfaces (a translucent cap over a panel, say).
+#[cfg(test)]
+pub(crate) fn composite_over(foreground: u32, background: u32) -> [f64; 3] {
+    composite_rgb(foreground, background)
+}
+
+/// Composite a token over an already-composited surface (the next link of an alpha chain).
+#[cfg(test)]
+pub(crate) fn composite_on(foreground: u32, surface: [f64; 3]) -> [f64; 3] {
+    let alpha = (foreground & 0xFF) as f64 / 255.0;
+    let foreground = color_rgb(foreground);
+    std::array::from_fn(|index| foreground[index] * alpha + surface[index] * (1.0 - alpha))
+}
+
+/// Contrast between a token drawn on an already-composited surface and that surface: the
+/// text-on-a-surface case, where the surface is the *result* of the alpha chain.
+#[cfg(test)]
+pub(crate) fn contrast_on(foreground: u32, surface: [f64; 3]) -> f64 {
+    let alpha = (foreground & 0xFF) as f64 / 255.0;
+    let foreground = color_rgb(foreground);
+    let blended =
+        std::array::from_fn(|index| foreground[index] * alpha + surface[index] * (1.0 - alpha));
+    contrast_ratio(blended, surface)
+}
+
 pub(crate) fn settings_preview_contrast(palette: UiPalette) -> f64 {
     let stage = settings_preview_stage_color(palette.dark);
     contrast_ratio(

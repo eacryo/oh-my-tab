@@ -40,6 +40,7 @@ const PANEL_TIMER_INTERVAL: f64 = 0.016;
 const MAX_MEASUREMENTS: usize = 512;
 const MAX_TEXT_CENTROID_OFFSET: f64 = 2.0;
 const BADGE_INLINE_FIELD_SLACK_X: f64 = 8.0;
+/// Alpha of the dark-mode neutral keycap fill (see `keycap_fill`).
 const KEYCAP_FILL_ALPHA: u32 = 0xCC;
 /// Transparent drag target dimensions along the handle and across it; dots remain centered
 /// within this hit area, which is intentionally larger than their visible footprint.
@@ -945,6 +946,7 @@ pub(super) fn smoke_runner() -> bool {
                 && option_q_is_unmodified
                 && backdrop_structure_valid(panel, badge_container)
                 && backdrop_frost_mask_valid()
+                && backdrop_surface_matches_palette()
                 && centroid_offsets.as_ref().is_some_and(|offsets| {
                     offsets.len() == cjk_badges.len()
                         && offsets.iter().all(|(offset, pixels)| {
@@ -954,6 +956,111 @@ pub(super) fn smoke_runner() -> bool {
                 && badges_fit
         }
     });
+    // Every material must end up painted with the surface the palette calls for -- read back from the
+    // real layer (or the glass tint), not from a value the painting function recorded. A material
+    // whose check is skipped (the glass branch used to return true) is a check that cannot fail.
+    let every_material_paints_its_surface = {
+        let original = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .appearance
+            .panel_material
+            .clone();
+        let mut ok = true;
+        for material in ["frost", "opaque", "liquid-glass"] {
+            {
+                let mut config = crate::config::CONFIG.write().unwrap();
+                config.appearance.panel_material = material.to_string();
+            }
+            unsafe {
+                apply_backdrop_material();
+                apply_glass_properties();
+            }
+            let painted = unsafe { backdrop_surface_matches_palette() };
+            if !painted {
+                eprintln!(
+                    "[keystroke-display-smoke] material={material} did not paint its surface"
+                );
+            }
+            ok &= painted;
+        }
+        {
+            let mut config = crate::config::CONFIG.write().unwrap();
+            config.appearance.panel_material = original;
+        }
+        unsafe {
+            apply_backdrop_material();
+            apply_glass_properties();
+        }
+        ok && unsafe { backdrop_surface_matches_palette() }
+    };
+
+    // A theme change refreshes the panel's surface: the keys re-read the palette on every render, so
+    // a surface left in the previous theme shows light keys on a dark shell (or the reverse) -- the
+    // reported light-mode bug. Switching the in-memory config and running the theme refresh is the
+    // same path the settings page and the menu use.
+    let theme_refresh_retints_surface = {
+        let original = crate::config::CONFIG
+            .read()
+            .unwrap()
+            .appearance
+            .theme
+            .clone();
+        let other = if crate::theme::resolved_is_dark() {
+            "light"
+        } else {
+            "dark"
+        };
+        {
+            let mut config = crate::config::CONFIG.write().unwrap();
+            config.appearance.theme = other.to_string();
+        }
+        crate::ui_coordinator::apply_theme_and_locale_refresh();
+        let mut changed = unsafe { backdrop_surface_matches_palette() };
+        // Render once so the keys and the surface are both drawn in the new theme.
+        let probe_badge = Badge {
+            text: "⌘⇧Q".into(),
+            kind: BadgeKind::Chord,
+            repeats: 1,
+            cells: vec![
+                BadgeCell::Modifier("⌘".into()),
+                BadgeCell::Modifier("⇧".into()),
+                BadgeCell::Key("Q".into()),
+            ],
+        };
+        let _ = render(
+            &[probe_badge],
+            true,
+            false,
+            PanelPlacement {
+                display_position: "bottom",
+                initial_position: &initial_position,
+                position: None,
+            },
+            smoke_now,
+            None,
+        );
+        changed &= unsafe { backdrop_surface_matches_palette() };
+        // The system-appearance entry point (the "auto" theme path) must repaint it too: that
+        // notification does not go through the config-change coordinator. Each step starts from the
+        // opposite theme, so a missing repaint leaves the surface mismatched -- a step that set the
+        // theme to what is already painted could not fail.
+        for theme in [original.clone(), other.to_string()] {
+            {
+                let mut config = crate::config::CONFIG.write().unwrap();
+                config.appearance.theme = theme;
+            }
+            crate::apply_system_appearance_refresh();
+            changed &= unsafe { backdrop_surface_matches_palette() };
+        }
+        {
+            let mut config = crate::config::CONFIG.write().unwrap();
+            config.appearance.theme = original;
+        }
+        crate::ui_coordinator::apply_theme_and_locale_refresh();
+        changed && unsafe { backdrop_surface_matches_palette() }
+    };
+
     let grip_valid = smoke_grip_interaction(saved_position);
     let rail_geometry_valid = {
         // The rail geometry over the real render path, in a column: every keycap is
@@ -1124,7 +1231,13 @@ pub(super) fn smoke_runner() -> bool {
     update_config_position(saved_position);
     let config_restored = crate::config::flush_config_sync().is_ok();
     reset();
-    valid && rail_geometry_valid && stream_alignment_valid && grip_valid && config_restored
+    valid
+        && rail_geometry_valid
+        && stream_alignment_valid
+        && grip_valid
+        && config_restored
+        && every_material_paints_its_surface
+        && theme_refresh_retints_surface
 }
 
 fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -> bool {
@@ -1383,6 +1496,10 @@ unsafe fn create_panel(
     *PANEL_BACKDROP.lock().unwrap() = Some(backdrop);
     release_obj(badge_container);
     release_obj(grip_view);
+    // Paint (and record) the surface the palette calls for right away: the panel may be created while
+    // no key is pressed, and until a render or a theme refresh runs the surface would otherwise be
+    // whatever the material installed.
+    apply_glass_properties();
     (panel, badge_container, grip_view)
 }
 
@@ -1636,6 +1753,99 @@ unsafe fn backdrop_frost_mask_valid() -> bool {
     }
     let mask: *mut AnyObject = msg_send![effect.0, maskImage];
     !mask.is_null()
+}
+
+/// Whether the panel's surface currently carries the *current* theme's wash / tint.
+///
+/// The surface is written by `apply_glass_properties` from the palette, while the keycaps re-read the
+/// palette on every render. A theme change that refreshed one and not the other produced light keycaps
+/// on a dark shell, so the theme refresh must reach this panel too
+/// (`ui_coordinator::apply_theme_and_locale_refresh`). The smoke asserts this after switching themes.
+unsafe fn backdrop_surface_matches_palette() -> bool {
+    let Some(backdrop) = installed_backdrop() else {
+        return false;
+    };
+    match (expected_surface(backdrop.material), backdrop.material) {
+        // The real surface: the wash/background the panel painted, read back from its layer.
+        (Some(SurfaceExpectation::Layer(expected)), crate::glass::PanelMaterial::Frost) => backdrop
+            .compensation_layer
+            .is_some_and(|layer| layer_background_matches(layer.0, expected)),
+        (Some(SurfaceExpectation::Layer(expected)), _) => backdrop
+            .opaque_view
+            .is_some_and(|view| layer_background_matches(msg_send![view.0, layer], expected)),
+        (Some(SurfaceExpectation::GlassTint(expected)), _) => backdrop
+            .glass
+            .is_some_and(|glass| glass_tint_matches(glass.0, expected)),
+        (None, _) => false,
+    }
+}
+
+/// The surface the current theme and material call for, read from the palette.
+fn expected_surface(material: crate::glass::PanelMaterial) -> Option<SurfaceExpectation> {
+    match material {
+        crate::glass::PanelMaterial::Frost => {
+            Some(SurfaceExpectation::Layer(crate::glass::frost_wash_token()))
+        }
+        crate::glass::PanelMaterial::Opaque => Some(SurfaceExpectation::Layer(
+            crate::theme::ui_palette().window_bg,
+        )),
+        // The glass surface is the system view plus the user's tint: the tint is a palette-free
+        // value, and it is the only part of that surface this app sets.
+        crate::glass::PanelMaterial::LiquidGlass => Some(SurfaceExpectation::GlassTint(
+            crate::glass::resolved_glass_tint_hex(),
+        )),
+    }
+}
+
+/// What a panel surface is expected to hold, per material.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum SurfaceExpectation {
+    /// Frost wash / opaque background, as a palette token written to a CALayer.
+    Layer(u32),
+    /// The user's glass tint, as an RRGGBBAA token written to the system glass view.
+    GlassTint(u32),
+}
+
+/// Read a CALayer's background CGColor and compare it with a token (RGB, 1/255 precision).
+/// The color is fetched through raw FFI: objc2's `msg_send!` refuses `backgroundColor` (it returns a
+/// CGColor, not an object pointer) and would trap.
+unsafe fn layer_background_matches(layer: *mut AnyObject, expected: u32) -> bool {
+    if layer.is_null() {
+        return false;
+    }
+    let color = crate::ffi::layer_background_color(layer);
+    if color.is_null() {
+        return false;
+    }
+    let count = crate::ffi::CGColorGetNumberOfComponents(color);
+    if count < 3 {
+        return false;
+    }
+    let components = crate::ffi::CGColorGetComponents(color);
+    if components.is_null() {
+        return false;
+    }
+    let close = |value: f64, byte: u32| (value - (byte as f64 / 255.0)).abs() <= 1.5 / 255.0;
+    close(*components, (expected >> 24) & 0xFF)
+        && close(*components.add(1), (expected >> 16) & 0xFF)
+        && close(*components.add(2), (expected >> 8) & 0xFF)
+}
+
+/// Read the system glass view's tint color and compare it with the configured tint token.
+unsafe fn glass_tint_matches(glass: *mut AnyObject, expected: u32) -> bool {
+    if glass.is_null() {
+        return false;
+    }
+    let color: *mut AnyObject = msg_send![glass, tintColor];
+    if color.is_null() {
+        return false;
+    }
+    let (mut r, mut g, mut b, mut a) = (0.0f64, 0.0f64, 0.0f64, 0.0f64);
+    let _: () = msg_send![color, getRed: &mut r, green: &mut g, blue: &mut b, alpha: &mut a];
+    let close = |value: f64, byte: u32| (value - (byte as f64 / 255.0)).abs() <= 1.5 / 255.0;
+    close(r, (expected >> 24) & 0xFF)
+        && close(g, (expected >> 16) & 0xFF)
+        && close(b, (expected >> 8) & 0xFF)
 }
 
 /// Bring the panel's backdrop in line with the effective material. Called when the
@@ -1931,11 +2141,8 @@ unsafe fn add_badge_cell(
             palette.keycap_accent_text,
         )
     } else {
-        (
-            keycap_fill(palette.card_bg),
-            palette.card_border,
-            palette.primary_text,
-        )
+        let (fill, border, _) = neutral_keycap_surface(palette);
+        (fill, border, palette.primary_text)
     };
     layer_set_background(cell_layer, hex_to_cg_color(background));
     layer_set_border(cell_layer, hex_to_cg_color(border));
@@ -2018,7 +2225,9 @@ unsafe fn rebuild_badges(
         if badge.cells.len() > 1 {
             // One container holding one keycap per key. The container is a subtle tray so the
             // cells and their per-role tints stay legible against it.
-            layer_set_background(layer, hex_to_cg_color(palette.field_bg));
+            // The tray is the surface *behind* the keys, so the keys stay visible against it in
+            // both modes (see `neutral_keycap_surface`).
+            layer_set_background(layer, hex_to_cg_color(neutral_keycap_surface(&palette).2));
             layer_set_border(layer, hex_to_cg_color(palette.card_border));
             layout_badge_cells(badge_view, badge, &palette, orientation, badge_size);
         } else {
@@ -2029,11 +2238,8 @@ unsafe fn rebuild_badges(
                     palette.keycap_accent_text,
                 )
             } else {
-                (
-                    keycap_fill(palette.card_bg),
-                    palette.card_border,
-                    palette.primary_text,
-                )
+                let (fill, border, _) = neutral_keycap_surface(&palette);
+                (fill, border, palette.primary_text)
             };
             // Dark text stays readable on light capsules and white text on dark ones at 90% alpha;
             // the glass shows through subtly without changing either theme's tuned RGB values.
@@ -2122,12 +2328,35 @@ unsafe fn rebuild_badges(
     }
 }
 
-fn uses_accent_fill(kind: BadgeKind) -> bool {
-    matches!(kind, BadgeKind::Modifier | BadgeKind::Indicator)
+/// The surface of a neutral keycap and of the tray a chord's keys sit in: `(fill, border, tray)`.
+///
+/// The two modes need different fills, and the reason is measurable text contrast:
+/// - **Light**: the card surface at 80% alpha composited to white on the near-white panel (1.05:1),
+///   so the cap had no visible surface at all. The inset field surface reads at 1.12:1 there, and its
+///   text measures 11.6:1 primary / 4.6:1 muted (the values the design doc records for light keycaps).
+/// - **Dark**: the same lighter inset surface dropped the cap's text to 9.77:1 primary and 4.00:1
+///   muted, under the palette's 12:1 and 4.5:1 floors, because light text needs a *dark* cap. Dark
+///   therefore keeps the card surface at 80% (12.67:1 / 5.19:1), and its tray stays `field_bg`.
+fn neutral_keycap_surface(palette: &crate::theme::UiPalette) -> (u32, u32, u32) {
+    if palette.dark {
+        (
+            keycap_fill(palette.card_bg),
+            palette.card_border,
+            palette.field_bg,
+        )
+    } else {
+        (palette.field_bg, palette.card_border, palette.card_bg)
+    }
 }
 
+/// The card surface at partial alpha: the dark-mode neutral keycap fill. Letting the material show
+/// through subtly keeps the tuned RGB while staying dark enough for the palette's text floors.
 fn keycap_fill(color: u32) -> u32 {
     (color & 0xFFFF_FF00) | KEYCAP_FILL_ALPHA
+}
+
+fn uses_accent_fill(kind: BadgeKind) -> bool {
+    matches!(kind, BadgeKind::Modifier | BadgeKind::Indicator)
 }
 
 fn badge_labels(badges: &[Badge]) -> Vec<String> {
@@ -2467,9 +2696,9 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_stream_cursor, default_edge_frame, keycap_fill, resize_frame_preserving_center,
-        resolve_panel_frame, target_screen_index, uses_accent_fill, Badge, BadgeCell, Orientation,
-        ScreenGeometry, BADGE_H, KEYCAP_FILL_ALPHA,
+        centered_stream_cursor, default_edge_frame, keycap_fill, neutral_keycap_surface,
+        resize_frame_preserving_center, resolve_panel_frame, target_screen_index, uses_accent_fill,
+        Badge, BadgeCell, Orientation, ScreenGeometry, BADGE_H,
     };
     use crate::config::KeystrokeDisplayPosition;
     use crate::keystroke_display::state::{BadgeKind, KEYCAP_RAIL_W};
@@ -2490,11 +2719,82 @@ mod tests {
     }
 
     #[test]
-    fn keycap_fills_use_eighty_percent_alpha_and_preserve_theme_rgb() {
-        for source in [0x2C2C2EEA, 0xFFFFFFD1] {
-            let fill = keycap_fill(source);
-            assert_eq!(fill & 0xFFFF_FF00, source & 0xFFFF_FF00);
-            assert_eq!(fill & 0xFF, KEYCAP_FILL_ALPHA);
+    fn keycap_text_is_a_recorded_class_over_both_extreme_backdrops() {
+        // The panel floats over arbitrary content and the frost wash is only 0xE9 opaque, so the cap
+        // surface moves with the backdrop: a black backdrop lands the light panel at (225,226,228), a
+        // white one at (247,248,250). Everything a keycap shows is therefore measured over the FULL
+        // chain -- backdrop -> wash -> cap -> text -- at both extremes, for both cap kinds.
+        //
+        // Keycap text is a recorded class of its own rather than `text_primary`'s 12:1 floor, which
+        // applies to text on `window_bg`/`card_bg`: the shipped accent keycaps measure 8.48:1 primary
+        // and 3.37:1 muted on the worst backdrop (a light cap over dark content), and the two floors
+        // below sit just under those. This is also why the light neutral cap keeps the inset surface
+        // (1.12:1 against the panel) even though it cannot reach 12:1: a cap dark enough to read as a
+        // surface on a near-white panel cannot also carry 12:1 text.
+        const KEYCAP_TEXT_PRIMARY_FLOOR: f64 = 8.0;
+        const KEYCAP_TEXT_MUTED_FLOOR: f64 = 3.25;
+        for dark in [false, true] {
+            let palette = crate::theme::ui_palette_for_mode(dark);
+            let (fill, border, tray) = neutral_keycap_surface(&palette);
+            let cap_text = palette.primary_text;
+            let accent_text = palette.keycap_accent_text;
+            let keycaps = [
+                ("neutral", fill, cap_text),
+                ("accent", palette.keycap_accent_bg, accent_text),
+            ];
+            for backdrop in [0xFFFF_FFFFu32, 0x0000_00FF] {
+                let panel = crate::theme::composite_over(
+                    crate::glass::frost_wash_token_for(&palette),
+                    backdrop,
+                );
+                for (kind, cap_fill, text) in keycaps {
+                    let cap = crate::theme::composite_on(cap_fill, panel);
+                    let primary = crate::theme::contrast_on(text, cap);
+                    let muted = crate::theme::contrast_on(palette.muted_text, cap);
+                    assert!(
+                        primary >= KEYCAP_TEXT_PRIMARY_FLOOR,
+                        "dark={dark} backdrop={backdrop:#010x} {kind}: primary {primary:.2}",
+                    );
+                    assert!(
+                        muted >= KEYCAP_TEXT_MUTED_FLOOR,
+                        "dark={dark} backdrop={backdrop:#010x} {kind}: muted {muted:.2}",
+                    );
+                }
+            }
+            // The fill and tray identity per mode (the choice this test documents).
+            assert_eq!(border, palette.card_border, "dark={dark}");
+            if dark {
+                assert_eq!(
+                    fill,
+                    keycap_fill(palette.card_bg),
+                    "dark keycaps keep the card surface at 80%"
+                );
+                assert_eq!(tray, palette.field_bg, "dark chord tray");
+            } else {
+                assert_eq!(
+                    fill, palette.field_bg,
+                    "light keycaps use the inset surface"
+                );
+                assert_eq!(tray, palette.card_bg, "light chord tray");
+            }
+            // The light neutral cap must read as a surface on the panel at BOTH extremes: that is the
+            // regression this work fixes (the card surface at 80% measured 1.05:1 over a white
+            // backdrop and disappeared). Dark's cap separation is weaker on a white backdrop
+            // (~1.04:1, recorded) and comes from its hairline, so it is not asserted here.
+            if !dark {
+                for backdrop in [0xFFFF_FFFFu32, 0x0000_00FF] {
+                    let panel = crate::theme::composite_over(
+                        crate::glass::frost_wash_token_for(&palette),
+                        backdrop,
+                    );
+                    let cap = crate::theme::composite_on(fill, panel);
+                    let surface = crate::theme::contrast_ratio(cap, panel);
+                    assert!(
+                        surface >= 1.10,
+                        "light cap against the panel measures {surface:.2}:1 (backdrop={backdrop:#010x})"
+                    );
+                }
+            }
         }
     }
 

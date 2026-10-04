@@ -22,6 +22,7 @@ mod tap;
 
 pub(crate) use state::Input;
 
+/// Repaint the panel surface from the current palette (see `panel::apply_glass_properties`).
 pub(crate) unsafe fn apply_glass_properties() {
     panel::apply_glass_properties();
 }
