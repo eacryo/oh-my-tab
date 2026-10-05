@@ -395,7 +395,6 @@ not_a_number = "{field}: 不是数字"
 not_an_integer = "{field}: 不是整数"
 appearance_theme_invalid = 'appearance.theme: "{value}" 不是 dark、light、auto 之一'
 appearance_glass_style_invalid = 'appearance.glass_style: "{value}" 不是 regular、clear 之一'
-appearance_glass_tint_invalid = 'appearance.glass_tint: "{value}" 不是 RRGGBBAA'
 appearance_panel_material_invalid = 'appearance.panel_material: "{value}" 不是 liquid-glass、frost、opaque 之一'
 appearance_corner_radius_invalid = "appearance.corner_radius: {value} 必须 >= 0"
 colors_not_hex8 = "{field}: 必须是 8 位十六进制"

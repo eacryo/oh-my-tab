@@ -442,7 +442,7 @@ pub(super) fn copy_detail_selection() {
 }
 
 /// The picker's backdrop policy: its rows, group headers and footer bands carry their own text
-/// surfaces, so the material is left honest (design-style §3, `TextSurface`). No inactive-glass
+/// surfaces, so the material is left honest (design-style §3). No inactive-glass
 /// compensation -- the picker is the panel the user is interacting with.
 pub(crate) const fn picker_backdrop_options() -> crate::glass::BackdropOptions {
     crate::glass::BackdropOptions::new(None)
@@ -675,11 +675,7 @@ pub(super) unsafe fn ensure_picker_window() {
         let _: () = msg_send![content_parent, addSubview: strip];
         release_obj(strip);
         // The search field's own fill is translucent and its text sits on the panel material
-        // otherwise, so the band behind it is this panel's text surface (glass::TextSurface).
-        let band_frame: NSRect = msg_send![strip, bounds];
-        let band = crate::glass::make_text_surface(band_frame, 0.0);
-        let _: () = msg_send![strip, addSubview: band];
-        release_obj(band);
+        // otherwise; the material is the panel's surface.
         strip
     };
 
@@ -1094,7 +1090,7 @@ struct RowSpec<'a> {
 /// selected row), the selection wash must win. Pure so the precedence is unit-assertable.
 ///
 /// An idle row is the panel scrim rather than transparent: the row is where this panel's text and
-/// icon buttons live, and the panel behind them is the user's material (`glass::TextSurface`), so the
+/// icon buttons live, and the panel behind them is the user's material (design-style §3), so the
 /// row carries the surface the contrast table is evaluated against. The material still shows in the
 /// panel margins, the search/tab band and the footer.
 pub(super) fn row_backdrop_wash(
@@ -1107,7 +1103,10 @@ pub(super) fn row_backdrop_wash(
     } else if hovered {
         palette.hover_bg
     } else {
-        crate::glass::panel_scrim_token_for(&palette)
+        // An idle row paints nothing: the panel's material is the surface (its text stays legible through
+        // the ink `glass::panel_ink` picks), and a surface here would band against the material wherever a
+        // row does not cover the panel.
+        0x00000000
     }
 }
 
@@ -1148,16 +1147,7 @@ unsafe fn create_row_views(
             NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD),
         );
         // The header sits in the gap between rows, which is material. A text-local surface under
-        // the label keeps it above its floor without covering the gap (glass::TextSurface).
-        let g_plate = crate::glass::make_text_surface(
-            NSRect::new(
-                NSPoint::new(g_frame.origin.x - ROW_PAD_L / 2.0, g_frame.origin.y),
-                NSSize::new(g_frame.size.width + ROW_PAD_L, g_frame.size.height),
-            ),
-            crate::theme::RADIUS_CONTROL,
-        );
-        let _: () = msg_send![container, addSubview: g_plate];
-        release_obj(g_plate);
+        // the label rides the material like every other label (see `glass::panel_ink`).
         let g: *mut AnyObject = msg_send![class!(NSTextField), alloc];
         let g: *mut AnyObject = msg_send![g, initWithFrame: g_frame];
         let _: () = msg_send![g, setStringValue: g_label];
@@ -1168,7 +1158,7 @@ unsafe fn create_row_views(
         let _: () = msg_send![g, setSelectable: false];
         let g_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_REGULAR];
         let _: () = msg_send![g, setFont: g_font];
-        let g_color = crate::ffi::hex_to_ns_color(palette.muted_text);
+        let g_color = crate::glass::panel_ink(palette.muted_text, crate::glass::PanelInk::Muted);
         let _: () = msg_send![g, setTextColor: g_color];
         let _: () = msg_send![container, addSubview: g];
         release_obj(g);
@@ -1460,17 +1450,12 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
         NSSize::new(PICKER_W - PAD_X * 2.0, label_h),
     );
     let hint_ns = make_nsstring(hint);
-    let plate_frame = empty_state_plate_frame(frame);
     let existing = *EMPTY_STATE_VIEW.lock().unwrap();
     if let Some(label) = existing {
         if !label.0.is_null() {
             let _: () = msg_send![label.0, setFrame: frame];
             let _: () = msg_send![label.0, setStringValue: hint_ns];
             CFRelease(hint_ns as *const c_void);
-            // The plate is positioned from the same frame, so a resize must move both.
-            if let Some(plate) = *EMPTY_STATE_PLATE.lock().unwrap() {
-                let _: () = msg_send![plate.0, setFrame: plate_frame];
-            }
             return true;
         }
     }
@@ -1487,32 +1472,20 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
     // The empty state follows the new mockup's .empty-state: 12px, 30% black.
-    let text_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
+    let text_color = crate::glass::panel_ink(
+        clipboard_palette().muted_text,
+        crate::glass::PanelInk::Muted,
+    );
     let _: () = msg_send![label, setTextColor: text_color];
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![label, setFont: font];
     // The empty state is the only content on an otherwise empty panel, so its surface is what the
-    // reader sees; the material stays visible around it (glass::TextSurface).
-    let plate = crate::glass::make_text_surface(plate_frame, crate::theme::RADIUS_CARD);
-    let _: () = msg_send![container, addSubview: plate];
-    release_obj(plate);
-    *EMPTY_STATE_PLATE.lock().unwrap() = Some(ObjPtr::new(plate));
+    // reader sees; the material is the panel's surface.
     let _: () = msg_send![container, addSubview: label];
     release_obj(label);
     *EMPTY_STATE_VIEW.lock().unwrap() = Some(ObjPtr::new(label));
     true
-}
-
-/// The empty-state hint's text surface, derived from the hint's own frame so the two move together.
-fn empty_state_plate_frame(label_frame: NSRect) -> NSRect {
-    NSRect::new(
-        NSPoint::new(label_frame.origin.x - 12.0, label_frame.origin.y - 6.0),
-        NSSize::new(
-            label_frame.size.width + 24.0,
-            label_frame.size.height + 12.0,
-        ),
-    )
 }
 
 /// Summon-time entry point: re-derive the empty-state layout for the viewport the summon just
@@ -1594,11 +1567,6 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     if let Some(empty) = EMPTY_STATE_VIEW.lock().unwrap().take() {
         if !empty.0.is_null() {
             let _: () = msg_send![empty.0, removeFromSuperview];
-        }
-    }
-    if let Some(plate) = EMPTY_STATE_PLATE.lock().unwrap().take() {
-        if !plate.0.is_null() {
-            let _: () = msg_send![plate.0, removeFromSuperview];
         }
     }
     let mut pitches = ROW_PITCHES.lock().unwrap();

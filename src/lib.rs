@@ -2814,6 +2814,12 @@ pub fn run() {
         if let Some(page) = open_settings_page_request() {
             settings::show_settings_page(page);
         }
+        // Development switch: paint a controlled backdrop behind the panels, so a translucent material's
+        // contrast can be measured against a known surface instead of whatever the desktop happens to show
+        // (the A2 scenario `scripts/e2e/panel-contrast.sh` needs that to be repeatable).
+        if let Some(shade) = crate::dev_flags::value("panel-backdrop") {
+            show_dev_backdrop(&shade);
+        }
         // Development switch: open the clipboard picker so its laid-out UI is reachable without
         // driving the global hotkey (which would steal focus).
         if show_clipboard_request() {
@@ -2824,7 +2830,43 @@ pub fn run() {
     }
 }
 
-/// Handle the detached permission-relaunch helper mode before AppKit startup.
+/// Development helper (`--panel-backdrop=black|white|gray|#RRGGBB`): a plain window at the normal level,
+/// which is *below* every panel (they sit at `normal + 3`), so the material samples it instead of the
+/// desktop. Its content view is a solid layer fill, so the backdrop is exactly the requested colour.
+unsafe fn show_dev_backdrop(shade: &str) {
+    let value: f64 = match shade.trim().to_ascii_lowercase().as_str() {
+        "black" => 0.0,
+        "white" => 1.0,
+        "gray" | "grey" => 0.5,
+        other => {
+            let hex = other.trim_start_matches('#');
+            if hex.len() != 6 {
+                log_info!("[dev-backdrop] ignored: {shade} is not black/white/gray/#RRGGBB");
+                return;
+            }
+            let channel = u32::from_str_radix(&hex[0..2], 16).unwrap_or(0);
+            channel as f64 / 255.0
+        }
+    };
+    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+    let frame: NSRect = msg_send![screen, frame];
+    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+    let window: *mut AnyObject =
+        msg_send![window, initWithContentRect: frame, styleMask: 0u64, backing: 2u64, defer: false];
+    let _: () = msg_send![window, setOpaque: true];
+    let _: () = msg_send![window, setReleasedWhenClosed: false];
+    let content: *mut AnyObject = msg_send![window, contentView];
+    let _: () = msg_send![content, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![content, layer];
+    if !layer.is_null() {
+        let colour: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithCalibratedWhite: value, alpha: 1.0f64];
+        crate::ffi::layer_set_background(layer, crate::ffi::ns_color_to_cg(colour));
+    }
+    let _: () = msg_send![window, orderFrontRegardless];
+    log_info!("[dev-backdrop] controlled backdrop up (shade={shade})");
+}
+
 pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
     restart::run_relaunch_helper_if_requested(args)
 }

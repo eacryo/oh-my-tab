@@ -706,7 +706,7 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
 }
 
 /// The switcher's backdrop policy. Every card carries a text surface for its caption, and the status
-/// footer carries one too, so the material is left honest (design-style §3, `TextSurface`); the
+/// footer carries one too, so the material is left honest (design-style §3); the
 /// switcher is the active panel, so no inactive-glass compensation.
 pub(crate) const fn switcher_backdrop_options() -> crate::glass::BackdropOptions {
     crate::glass::BackdropOptions::new(None)

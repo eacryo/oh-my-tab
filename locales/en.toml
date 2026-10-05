@@ -394,7 +394,6 @@ not_a_number = "{field}: not a number"
 not_an_integer = "{field}: not an integer"
 appearance_theme_invalid = 'appearance.theme: "{value}" is not one of dark, light, auto'
 appearance_glass_style_invalid = 'appearance.glass_style: "{value}" is not one of regular, clear'
-appearance_glass_tint_invalid = 'appearance.glass_tint: "{value}" is not RRGGBBAA'
 appearance_panel_material_invalid = 'appearance.panel_material: "{value}" is not one of liquid-glass, frost, opaque'
 appearance_corner_radius_invalid = "appearance.corner_radius: {value} must be >= 0"
 colors_not_hex8 = "{field}: must be 8 hex digits"

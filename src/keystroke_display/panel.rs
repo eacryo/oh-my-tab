@@ -950,9 +950,7 @@ pub(super) fn smoke_runner() -> bool {
                 && backdrop_structure_valid(panel, badge_container)
                 // The frost mask belongs to the system frost material; a launch switch that forces the
                 // development-only blended surface has no material view to mask.
-                && (dev_material_forced
-                    || crate::config::effective_frost_blend().is_some()
-                    || backdrop_frost_mask_valid())
+                && (dev_material_forced || backdrop_frost_mask_valid())
                 // The palette surface is painted by the shipped materials; the development-only blur
                 // surface paints nothing (its own check is the backdrop layer in `backdrop_structure_valid`).
                 && (dev_material_forced || backdrop_surface_matches_palette())
@@ -1876,13 +1874,6 @@ fn expected_surface(material: crate::glass::PanelMaterial) -> Option<SurfaceExpe
     match material {
         // Both blurring surfaces that the app does not paint: the system's material, and the blur-only
         // backdrop layer (whose own layer carries the blur filters, checked separately).
-        // The blended frost surface (development-only) paints the palette's own surface, so it is held to
-        // the same check as `opaque`; the shipped material paints nothing.
-        crate::glass::PanelMaterial::Frost if crate::config::effective_frost_blend().is_some() => {
-            Some(SurfaceExpectation::Layer(
-                crate::theme::ui_palette().window_bg,
-            ))
-        }
         crate::glass::PanelMaterial::Frost | crate::glass::PanelMaterial::Backdrop => {
             Some(SurfaceExpectation::SystemBlur)
         }
@@ -2459,7 +2450,7 @@ fn neutral_keycap_surface(palette: &crate::theme::UiPalette) -> (u32, u32, u32) 
 /// A translucent token flattened onto `base`, so a chip is opaque and independent of the panel.
 ///
 /// The keycaps used to be translucent *because* the panel surface was pinned to `window_bg` for them:
-/// the panel now carries the user's material (see `glass::TextSurface`), so a chip that let the
+/// the panel now carries the user's material (design-style §3), so a chip that let the
 /// desktop through would take its own text color with it -- light text on a chip that goes light over
 /// a white desktop. The flattened value keeps exactly the RGB the translucent token produced over the
 /// card surface, which is what the tuned contrast numbers were measured against.

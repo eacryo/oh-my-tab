@@ -62,6 +62,22 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
   locales with the shortened Appearance card. The look of the switcher and clipboard panels is
   covered by their own panels' checks (`--smoke-keystroke-display-panel`, the overlay smoke).
 
+### P0-2 · Rendered-pixel contrast for the translucent panel materials
+
+- **Now**: `frost` and `liquid-glass` draw their text with the dynamic system label colours on top of the
+  material itself, so their contrast depends on how AppKit composites those colours against a translucent
+  surface. The tier-A smoke can only *log* the numbers (a colour-vs-constant comparison cannot see the
+  composite), and the style document therefore states their tier as a target rather than an enforced floor.
+- **Target**: an A2 scenario that reads the panel's frame from `--e2e-state` (`clipboard_picker`), captures
+  that region, and asserts the tier on rendered pixels -- `text_primary` >= 4.5:1, captions >= 3:1 -- for
+  `{frost, liquid-glass} x {light, dark}`. The dark-mode glass case (`#6E6E6E` surface) is the first one to
+  measure, because `NSGlassEffectView` provides no contrast-preserving composite and the three dynamic label
+  colours are the only ink it gets.
+- **Files**: a new `scripts/e2e/*.sh` scenario plus the measurement helper it needs; `glass::panel_ink` for
+  the dispatch; the tier text in `docs/design-style{,-en}.md` once numbers exist.
+- **Acceptance**: the scenario fails when a material's measured contrast is below the tier, and the style
+  document quotes the measured numbers instead of a target.
+
 ### P0-2 · Preset dropdown shows a raw translation key
 
 - **Now**: `SmoothPreset::label_key()` returns keys without the `settings.` prefix while the locale

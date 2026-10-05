@@ -56,6 +56,18 @@
   且 `--smoke-settings-layout` 在三种语言、缩短后的"外观"卡片下依然通过。浮窗本身的观感由各自的
   检查覆盖（`--smoke-keystroke-display-panel` 与浮窗 smoke）。
 
+### P0-2 · 半透明面板材质的渲染像素对比度
+
+- **现状**：`frost` 与 `liquid-glass` 的文字直接用动态系统标签色画在材质上，因此其对比度取决于 AppKit 如何把
+  这些颜色合成到半透明表面上。tier-A 的 smoke 只能**记录**数值（"颜色 vs 常量"看不见合成），所以设计文档把
+  它们的档位写成**目标值**而非已执行的下限。
+- **目标**：新增一个 A2 场景——从 `--e2e-state` 的 `clipboard_picker` 读面板 frame，截取该区域，在**渲染像素**上
+  断言档位（`text_primary` ≥ 4.5:1、caption ≥ 3:1），覆盖 `{frost, liquid-glass} × {浅色, 深色}`。其中**深色模式的
+  玻璃**（表面 `#6E6E6E`）要优先测，因为 `NSGlassEffectView` 不提供保对比合成，三种动态标签色是它仅有的墨。
+- **文件**：新增 `scripts/e2e/*.sh` 场景及它需要的测量助手；`glass::panel_ink` 的分派；有数字之后再改
+  `docs/design-style{,-en}.md` 的档位文字。
+- **验收**：当某材质的实测对比度低于档位时该场景失败；设计文档引用实测数字而不是目标值。
+
 ### P0-2 · 预设下拉显示原始翻译 key
 
 - **现状**：`SmoothPreset::label_key()` 返回的 key 不带 `settings.` 前缀，而 locale 文件把这些键放在

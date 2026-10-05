@@ -90,33 +90,29 @@ extern "C" fn vibrant_label_allows_vibrancy(
 /// from 15.63/10.10/6.40:1 to 3.38/2.18/1.38:1, and a mid-gray surface caps *any* single text color
 /// at 5.71:1 -- below the table's own 12:1 and 7:1 floors, so re-coloring the text cannot fix it.
 ///
-/// A scrim of `window_bg` at this alpha over the worst case (a pure-white backdrop, 255) lands the
-/// composite at gray 51 or darker, which is what `text_primary` needs for its 12:1 floor; that is the
-/// tightest of the three floors and therefore the binding one.
+/// A translucent surface cannot hold the palette's contrast floors: the material's tone sits away from
+/// `window_bg` by construction (a mid-gray surface caps *any* single ink colour at 5.71:1, below this
+/// app's 12:1 and 7:1 floors). Those panels therefore draw with the dynamic system label colours and are
+/// held to the panel tier stated in the style document -- see `panel_ink` for the dispatch and the note on
+/// the rendered-pixel measurement that tier still needs.
+/// `NSVisualEffectMaterial` constants (raw AppKit values). The frost material follows the resolved theme.
 ///
-/// Where that scrim is applied is the whole design decision (see [`TextSurface`]): washing the
-/// *panel* pins every material to the same surface -- three settings that render identically -- while
-/// putting the same scrim on the *text blocks* keeps the floors and leaves the panel's material
-/// honest.
-/// The text-surface strength this app shipped while panels still painted a plate over their material. It
-/// is no longer used at runtime -- the plate is gone (see `text_surface_alpha`) -- and survives as the
-/// reference value the calibration knob (`--panel-scrim=`) is tested against.
-#[cfg(test)]
-pub(crate) const PANEL_SCRIM_ALPHA: u32 = 0xE9;
-
-/// NSVisualEffectMaterial constants (raw AppKit values). The frost material follows the
-/// resolved theme: the HUD material reads as the system's dark floating panel, the
-/// under-window material as its light counterpart.
-const FROST_MATERIAL_DARK: i64 = 13; // hudWindow
+/// Dark mode uses the legacy **ultraDark** material (raw 9), not `hudWindow` (13). It has to be the darker
+/// one: the material's tone is what the palette's ink sits on now that the panel paints no text surface
+/// (`panel_ink`), and `hudWindow` is lifted by whatever is behind it -- measured with
+/// `scripts/e2e/panel-contrast.sh` on a *white* controlled backdrop, `hudWindow` leaves the dark surface at
+/// 0.648 where the light ink reaches only 2.45:1, below the panel tier. alt-tab-macos uses the same legacy
+/// materials for the same reason (semantic materials follow the view's appearance, which a user-preference
+/// theme cannot rely on).
+const FROST_MATERIAL_DARK: i64 = 9; // ultraDark (legacy)
 const FROST_MATERIAL_LIGHT: i64 = 21; // underWindowBackground
 
 /// One panel's backdrop options.
 ///
-/// There is deliberately no "wash the panel until the text passes" option: pinning the *panel* surface
-/// to `window_bg` left only ~9% of the backdrop visible (the arithmetic is in [`PANEL_SCRIM_ALPHA`]),
-/// which made `frost` and `opaque` measure 3/255 apart on a live panel -- three settings that rendered
-/// as one. Every panel now carries a surface under its own text and leaves the material honest; see
-/// [`make_text_surface`].
+/// There is deliberately no "wash the panel until the text passes" option: pinning a *panel's* surface to
+/// `window_bg` left only ~9% of the backdrop visible and made `frost` and `opaque` measure 3/255 apart on a
+/// live panel -- three settings that rendered as one. The panels' text now rides their material and the ink
+/// carries the contrast (see `panel_ink`), so the material stays honest by construction.
 #[derive(Clone, Copy)]
 pub(crate) struct BackdropOptions {
     /// Liquid Glass darkens in passive panels; this alpha matches the clipboard detail panel.
@@ -402,12 +398,6 @@ unsafe fn build_backdrop(
         // The installed material is frost either way: the sync comparison must see the
         // view class that actually exists, not the configured intent.
         PanelMaterial::LiquidGlass | PanelMaterial::Frost => {
-            if material == PanelMaterial::Frost {
-                let tuning = MaterialTuning::effective();
-                if let Some(installed) = build_blended_frost(frame, corner_radius, &tuning) {
-                    return installed;
-                }
-            }
             let effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
             let effect: *mut AnyObject = msg_send![effect, initWithFrame: frame];
             // BehindWindow: blur whatever is actually under the panel, not window content.
@@ -468,52 +458,32 @@ unsafe fn build_backdrop(
     }
 }
 
-/// The launch override for the text-surface strength, if this run asked for one
-/// (`--panel-scrim=<0..255>`, or the historical `--frost-wash`). It beats every material's own decision,
-/// which is what makes it a calibration knob rather than a second configuration channel.
-fn scrim_override() -> Option<u32> {
-    crate::dev_flags::value("panel-scrim")
-        .or_else(|| crate::dev_flags::value("frost-wash"))
-        .and_then(|value| value.trim().parse::<u32>().ok())
-        .filter(|alpha| *alpha <= 0xFF)
-}
-
-/// The alpha a panel's own *text surface* is painted at: **zero, for every material**.
+/// The colour panel text is drawn in.
 ///
-/// A panel's surface is its material, full stop. The plate existed to move text off a material whose tone
-/// differs from `window_bg` (dark-mode liquid glass renders mid-grey, measured `#6E6E6E` against the
-/// palette's `#1C1C1E`), but it only ever narrowed that difference where it covered things: wherever
-/// nothing covers the panel the material shows at its own tone, so the plate and the material band against
-/// each other at every boundary. Measured on the clipboard picker in light mode, an idle row (plate
-/// `#F3F4F6`) against the gap beside it (material `#E2E2E4`) differed by 17 levels, which reads as the
-/// panel being cut into strips; in dark mode the same pair differs by ~75 levels. Frost made it obvious,
-/// so it was fixed there first; the same argument applies to liquid glass, and the rule below is now
-/// material-independent. `opaque` never showed it because a plate of the surface's own colour is invisible.
+/// `opaque` draws with the palette token, which is exactly right because its surface *is* `window_bg`. Every
+/// other material draws with the dynamic system label colours, because its surface follows the backdrop and
+/// only an ink that resolves against it can be legible there.
 ///
-/// What the plate *was* doing -- holding text contrast -- moves to the ink: panel text rides the material
-/// and AppKit resolves it against the live backdrop (the panels are already created in a vibrant
-/// appearance). `--panel-scrim=<0..255>` still overrides the alpha, so the retired look can be sampled for
-/// comparison on a running build.
-pub(crate) fn text_surface_alpha() -> u32 {
-    text_surface_alpha_with_override(scrim_override())
-}
-
-/// The pure rule behind [`text_surface_alpha`]: an override is honoured, otherwise no plate at all.
-pub(crate) fn text_surface_alpha_with_override(overridden: Option<u32>) -> u32 {
-    overridden.unwrap_or(0)
-}
-
-/// The surface behind panel text, as a token: `window_bg` at the effective scrim alpha. Panels that
-/// own their text blocks paint this on them (and the panel smoke compares a live layer against it,
-/// so "the surface still carries the previous theme" fails loudly).
-pub(crate) fn panel_scrim_token() -> u32 {
-    panel_scrim_token_for(&crate::theme::ui_palette())
-}
-
-/// The scrim for a specific palette: the contrast chain has to be evaluated for *both* modes, and the
-/// text surface is the scrim over whatever is behind it.
-pub(crate) fn panel_scrim_token_for(palette: &crate::theme::UiPalette) -> u32 {
-    (palette.window_bg & 0xFFFF_FF00) | (text_surface_alpha() & 0xFF)
+/// **The two translucent materials are not equally justified in doing so, and the difference matters:**
+/// AppKit's contrast-preserving vibrancy treatment is implemented by `NSVisualEffectView`, which frost's
+/// hierarchy has and liquid glass's (`NSGlassEffectView`) does not. So for frost the treatment is a known
+/// mechanism, while for glass the dynamic colours merely resolve per appearance with **no compensation this
+/// project has verified** -- a mid-grey glass surface in dark mode is the case to check, and the panel tier
+/// in the style document is a target until the rendered-pixel measurement exists (the smoke can only `log`
+/// these, because the composite is invisible to a colour-vs-constant comparison).
+pub(crate) unsafe fn panel_ink(palette_token: u32, role: PanelInk) -> *mut AnyObject {
+    // Frost draws with the dynamic system label colours: AppKit resolves them against the live backdrop and
+    // applies its contrast-preserving treatment, which `NSVisualEffectView` provides (measured: 5.16:1 light,
+    // 5.90:1 dark on the panel's own material -- `scripts/e2e/panel-contrast.sh`).
+    //
+    // Liquid glass draws with the palette token instead. It has no such provider -- `NSGlassEffectView` is
+    // not an `NSVisualEffectView` -- and the dynamic colours measured *worse* than the palette's on its
+    // surface (1.20:1 against the palette's own ink in dark mode), so the deterministic colour is both
+    // better and predictable.
+    match PanelMaterial::effective() {
+        PanelMaterial::Frost => role.color(),
+        _ => hex_to_ns_color(palette_token),
+    }
 }
 
 /// The blur-only surface's default radius. Five already blurs a half-point checkerboard to nothing on the
@@ -521,20 +491,28 @@ pub(crate) fn panel_scrim_token_for(palette: &crate::theme::UiPalette) -> u32 {
 /// a masking one; `--glass-blur` overrides it.
 const BACKDROP_BLUR_RADIUS: f64 = 12.0;
 
-/// The glass tint: the config's `glass_tint`, applied **verbatim** in both modes.
+/// The liquid-glass tint, **per mode**, and both values are measured rather than chosen.
 ///
-/// This is the behaviour of the two looks (`regular` / `clear`) this app shipped before the
-/// glass-strength knobs existed, and it is deliberately not "smart". Two later attempts are recorded
-/// here because both shipped during this work and both were wrong:
+/// With no text surface on the panel the material *is* the surface (see `panel_ink`), so the glass's own tone
+/// decides the ink's contrast. Measured with `scripts/e2e/panel-contrast.sh` (the picker's filter row on the
+/// bare material): light `eeeeee66` -> surface 0.805 -> 5.30:1; dark `1c1c1e99` -> surface 0.164 -> 8.56:1.
 ///
-/// - Re-lighting the tint per mode: `palette.window_bg` in dark mode is near-black, so the veil left a
-///   colourful page's hue as the only thing visible and the panel read as *purple*.
-/// - Multiplying the strength by 255 twice collapsed the alpha to 0x34, so the requested veil never took
-///   effect at all.
-///
-/// The tint's own alpha *is* the strength: `eeeeee66` (40%) by default, no floor and no separate knob.
+/// One tint cannot serve both modes: the light tint in dark mode left the surface mid-grey (0.539), where the
+/// palette's caption ink cannot exceed 2.07:1 -- no ink colour reaches the panel tier on a mid-grey surface.
+/// Two earlier failures are recorded because both shipped during this work: re-lighting a *colour* per mode
+/// (dark `window_bg` is near-black, so a colourful page's hue was all that survived and the panel read as
+/// purple), and multiplying the strength by 255 twice (the alpha collapsed to 20%).
+const GLASS_TINT_LIGHT: &str = "eeeeee66";
+const GLASS_TINT_DARK: &str = "1c1c1e99";
+
+/// The tint for the *resolved* mode.
 pub(crate) fn resolved_glass_tint_hex() -> u32 {
-    crate::config::parse_hex8(&crate::config::effective_glass_tint())
+    let hex = if crate::theme::resolved_is_dark() {
+        GLASS_TINT_DARK
+    } else {
+        GLASS_TINT_LIGHT
+    };
+    crate::config::parse_hex8(hex)
 }
 
 /// The `NSGlassEffectViewStyle` for a configured look: `clear` is 1, anything else `regular` (0).
@@ -694,15 +672,6 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
     if let Some(effect) = backdrop.effect_view {
         let _: () = msg_send![effect.0, setMaterial: frost_material()];
     }
-    if let (Some(host), Some(blend)) = (backdrop.backdrop_view, tuning.frost_blend) {
-        let radius = if tuning.blur_radius > 0.0 {
-            tuning.blur_radius
-        } else {
-            tuning.frost_blur
-        };
-        apply_blur_underlay(host.0, radius, tuning.saturation);
-        set_blend_host_opacity(host.0, blend);
-    }
     if let Some(plain) = backdrop.opaque_view {
         let _: () = msg_send![plain.0, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![plain.0, layer];
@@ -715,12 +684,6 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
             set_compensation_tint(layer.0, tint_hex, alpha);
         }
     }
-}
-
-/// Paint the panel scrim: the theme's window surface at the effective alpha, so the text surface
-/// tracks the palette instead of whatever the panel happens to cover.
-unsafe fn set_panel_scrim(layer: *mut AnyObject) {
-    layer_set_background(layer, hex_to_cg_color(panel_scrim_token()));
 }
 
 /// The material's own strength knobs, i.e. everything AppKit does not expose as a property.
@@ -745,10 +708,6 @@ pub(crate) struct MaterialTuning {
     pub(crate) blur_radius: f64,
     pub(crate) saturation: f64,
     pub(crate) variant: i64,
-    /// `--frost-blend`: which fraction of the blurred backdrop the frost surface carries, if any.
-    pub(crate) frost_blend: Option<f64>,
-    /// `--frost-blur`: the radius that blended surface blurs with.
-    pub(crate) frost_blur: f64,
 }
 
 impl MaterialTuning {
@@ -759,8 +718,6 @@ impl MaterialTuning {
             blur_radius: crate::config::effective_glass_blur_radius(),
             saturation: crate::config::effective_glass_saturation(),
             variant: crate::config::effective_glass_variant(),
-            frost_blend: crate::config::effective_frost_blend(),
-            frost_blur: crate::config::effective_frost_blur(),
         }
     }
 }
@@ -816,106 +773,6 @@ unsafe fn make_ca_filter(filter_type: &str) -> *mut AnyObject {
     let filter: *mut AnyObject = msg_send![class, filterWithType: name];
     crate::ffi::CFRelease(name as *const std::ffi::c_void);
     filter
-}
-
-/// The blur radius the blended frost surface uses when `--frost-blur` names no other. Measured on the
-/// controlled backdrop, a radius of 5 already drops the 0.5pt checkerboard to 2% contrast retention and
-/// 10 to nothing, so the radius is a look knob (`--frost-blur`), not a masking one.
-pub(crate) const FROST_BLEND_BLUR: f64 = 30.0;
-
-/// The development-only frost surface: an opaque palette base with a heavily blurred copy of what is
-/// behind the window composited over it.
-///
-/// The point is the split of duties. The *base* is the palette's `window_bg`, so text contrast is a
-/// property of the theme rather than of whatever the panel happens to cover -- the failure mode the
-/// pure system material has (measured mid-grey `#6E6E6E` in dark mode, which drops the palette's
-/// secondary/muted ink to 3.03/1.92:1). The *blur layer* is what keeps the surface reading as frosted
-/// glass instead of flat paint. `blend` is how much of the blurred backdrop survives that base.
-///
-/// Needs `CABackdropLayer` + `CAFilter`; returns `None` where either is missing so the caller installs
-/// the shipped system material instead.
-unsafe fn build_blended_frost(
-    frame: NSRect,
-    corner_radius: f64,
-    tuning: &MaterialTuning,
-) -> Option<InstalledBackdrop> {
-    let blend = tuning.frost_blend?;
-    if objc2::runtime::AnyClass::get(c"CABackdropLayer").is_none()
-        || objc2::runtime::AnyClass::get(c"CAFilter").is_none()
-    {
-        return None;
-    }
-    let radius = if tuning.blur_radius > 0.0 {
-        tuning.blur_radius
-    } else {
-        tuning.frost_blur
-    };
-
-    let base: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let base: *mut AnyObject = msg_send![base, initWithFrame: frame];
-    let _: () = msg_send![base, setAutoresizingMask: 18u64];
-    let _: () = msg_send![base, setWantsLayer: true];
-    let base_layer: *mut AnyObject = msg_send![base, layer];
-    if !base_layer.is_null() {
-        layer_set_background(
-            base_layer,
-            hex_to_cg_color(crate::theme::ui_palette().window_bg),
-        );
-        let _: () = msg_send![base_layer, setCornerRadius: corner_radius];
-        let _: () = msg_send![base_layer, setMasksToBounds: true];
-    }
-
-    // The blur layer lives on a child view: on the content view's own layer it renders nothing in this
-    // window (measured: the backdrop came through unblurred), one level deeper it blurs.
-    let host: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let host: *mut AnyObject = msg_send![host, initWithFrame: frame];
-    let _: () = msg_send![host, setAutoresizingMask: 18u64];
-    let _: () = msg_send![host, setWantsLayer: true];
-    apply_blur_underlay(host, radius, tuning.saturation);
-    set_blend_host_opacity(host, blend);
-    let _: () = msg_send![base, addSubview: host];
-
-    let content: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let content: *mut AnyObject = msg_send![content, initWithFrame: NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(frame.size.width, frame.size.height)
-    )];
-    let _: () = msg_send![content, setAutoresizingMask: 18u64];
-    let _: () = msg_send![base, addSubview: content];
-
-    release_obj(host);
-    release_obj(base);
-    Some(InstalledBackdrop {
-        material: PanelMaterial::Frost,
-        content_parent: content,
-        root: Some(ObjPtr::new(base)),
-        glass: None,
-        effect_view: None,
-        // The palette surface is painted here, so the "surface matches the palette" check applies exactly
-        // as it does to `opaque`; whether the blur layer is really there is asserted off `backdrop_view`.
-        opaque_view: Some(ObjPtr::new(base)),
-        backdrop_view: Some(ObjPtr::new(host)),
-        compensation_view: None,
-        compensation_layer: None,
-    })
-}
-
-/// How much of the blurred backdrop the blended frost surface shows.
-unsafe fn set_blend_host_opacity(host: *mut AnyObject, opacity: f64) {
-    let layer: *mut AnyObject = msg_send![host, layer];
-    if layer.is_null() {
-        return;
-    }
-    let sublayers: *mut AnyObject = msg_send![layer, sublayers];
-    if sublayers.is_null() {
-        return;
-    }
-    let count: usize = msg_send![sublayers, count];
-    if count == 0 {
-        return;
-    }
-    let child: *mut AnyObject = msg_send![sublayers, objectAtIndex: 0usize];
-    let _: () = msg_send![child, setOpacity: opacity as f32];
 }
 
 /// Give the glass an owned backdrop layer carrying the blur/saturation filters.
@@ -992,28 +849,6 @@ unsafe fn set_layer_filter_value(layer: *mut AnyObject, key: &str, value: f64) {
     crate::ffi::CFRelease(key_ns as *const std::ffi::c_void);
 }
 
-/// A panel's text surface: a view the panel lays its own text on, when the panel is
-/// [`TextSurface::ContentOwned`] and its material must stay honest.
-///
-/// `corner_radius` of 0 leaves the plate square, which is what a band or a list row wants; the
-/// rounded panels pass their own radius. The caller owns the returned view (add it as a subview and
-/// release its alloc +1), and must add it *before* the text so the text draws on top.
-pub(crate) unsafe fn make_text_surface(frame: NSRect, corner_radius: f64) -> *mut AnyObject {
-    let plate: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let plate: *mut AnyObject = msg_send![plate, initWithFrame: frame];
-    let _: () = msg_send![plate, setWantsLayer: true];
-    let _: () = msg_send![plate, setAutoresizingMask: 18u64];
-    let layer: *mut AnyObject = msg_send![plate, layer];
-    if !layer.is_null() {
-        set_panel_scrim(layer);
-        if corner_radius > 0.0 {
-            let _: () = msg_send![layer, setCornerRadius: corner_radius];
-            let _: () = msg_send![layer, setMasksToBounds: true];
-        }
-    }
-    plate
-}
-
 unsafe fn set_compensation_tint(layer: *mut AnyObject, tint_hex: u32, alpha: u32) {
     let compensation_hex = (tint_hex & 0xFFFF_FF00) | (alpha & 0xFF);
     layer_set_background(layer, hex_to_cg_color(compensation_hex));
@@ -1029,61 +864,27 @@ mod tests {
     /// way lands the dark surface at (30,30,31) and the light one at (249,249,249) -- both clear
     /// every floor in design-style §3.3, which the historical `eeeeee66` default did not in
 
-    /// No material paints a text surface: the panel's surface is its material, so that nothing can band
-    /// against it where the material is left bare.
+    /// The tint is per mode: light keeps the shipped value, dark takes the measured dark one. Both
+    /// numbers are pinned so a later "adjustment" has to face the measurement that produced them.
     #[test]
-    fn no_material_paints_a_text_surface() {
-        use super::{text_surface_alpha, PANEL_SCRIM_ALPHA};
-        for material in [
-            PanelMaterial::Frost,
-            PanelMaterial::LiquidGlass,
-            PanelMaterial::Opaque,
-        ] {
-            let _ = material;
-            assert_eq!(
-                text_surface_alpha(),
-                0,
-                "a panel must not paint a plate over its material"
-            );
-        }
-        // The calibration knob still wins, so the banded look can be brought back for A/B.
+    fn the_glass_tint_is_derived_per_mode() {
+        assert_eq!(super::GLASS_TINT_LIGHT, "eeeeee66");
+        assert_eq!(super::GLASS_TINT_DARK, "1c1c1e99");
         assert_eq!(
-            super::text_surface_alpha_with_override(Some(PANEL_SCRIM_ALPHA)),
-            PANEL_SCRIM_ALPHA
+            crate::config::parse_hex8(super::GLASS_TINT_LIGHT),
+            0xEEEE_EE66
         );
-    }
-
-    /// Dropping the plate cannot change the `opaque` material's picture: the plate's colour is the
-    /// opaque surface's colour, and compositing a colour at any alpha over itself is that colour. The
-    /// RGB equality asserted here is that fact, so the claim is checked rather than asserted in prose.
-    #[test]
-    fn the_opaque_material_is_unaffected_by_its_plate() {
-        let palette = crate::theme::ui_palette();
-        let plate = (palette.window_bg & 0xFFFF_FF00) | 0xE9;
         assert_eq!(
-            plate & 0xFFFF_FF00,
-            palette.window_bg & 0xFFFF_FF00,
-            "the plate's colour is the opaque surface's colour"
+            crate::config::parse_hex8(super::GLASS_TINT_DARK),
+            0x1C1C_1E99
         );
-    }
-
-    /// The tint is the configured value, character for character -- no re-lighting, no floor, no second
-    /// multiply. `eeeeee66` is the default the two looks shipped with.
-    #[test]
-    fn the_glass_tint_is_the_configured_hex_verbatim() {
-        assert_eq!(
-            crate::config::Config::default().appearance.glass_tint,
-            "eeeeee66"
-        );
-        for hex in ["eeeeee66", "11223344", "00000000"] {
-            assert_eq!(
-                crate::config::parse_hex8(hex),
-                u32::from_str_radix(hex, 16).unwrap(),
-                "{hex} must parse as-is"
-            );
-        }
-        // The accessor reads the config and nothing else; with the shipped default that is 0xEEEEEE66.
-        assert_eq!(resolved_glass_tint_hex() & 0xFF, 0x66);
+        // The accessor follows the resolved mode, which is what the panel draws with.
+        let expected = if crate::theme::resolved_is_dark() {
+            0x1C1C_1E99
+        } else {
+            0xEEEE_EE66
+        };
+        assert_eq!(resolved_glass_tint_hex(), expected);
     }
 
     /// Only `clear` selects the clear style. Everything else -- including the `system` value an earlier

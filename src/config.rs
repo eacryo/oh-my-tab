@@ -193,12 +193,6 @@ pub struct Appearance {
     /// `glass_style` and the strength knobs are sub-options that only apply to liquid glass.
     pub panel_material: String,
     pub glass_style: String,
-    /// Liquid glass tint as `RRGGBBAA`, applied **verbatim**: the alpha *is* the strength. There is
-    /// deliberately no opacity, blur or saturation setting -- the alpha is the whole knob, which is how
-    /// the two shipped looks worked. The material-strength values exist only as `--glass-*` launch
-    /// switches (the development channel); an invisible setting that silently diverges from the shipped
-    /// look is worse than no setting.
-    pub glass_tint: String,
     pub corner_radius: f64,
 }
 
@@ -668,10 +662,6 @@ impl Default for Appearance {
             theme: "auto".into(),
             panel_material: "liquid-glass".into(),
             glass_style: "regular".into(),
-            // The default the two `regular`/`clear` builds shipped: a light neutral at 40% alpha. It is
-            // applied verbatim in both modes (see `glass::resolved_glass_tint_hex` for the two ways
-            // re-lighting it per mode went wrong).
-            glass_tint: "eeeeee66".into(),
             // Default Liquid Glass overlay tint (RRGGBBAA); the settings page lets users pick another color.
             corner_radius: 32.0,
         }
@@ -801,12 +791,6 @@ impl Config {
             errs.push(tf(
                 "errors.appearance_glass_style_invalid",
                 &[("value", &self.appearance.glass_style)],
-            ));
-        }
-        if !is_hex8(&self.appearance.glass_tint) {
-            errs.push(tf(
-                "errors.appearance_glass_tint_invalid",
-                &[("value", &self.appearance.glass_tint)],
             ));
         }
         if !PANEL_MATERIAL_VALUES.contains(&self.appearance.panel_material.as_str()) {
@@ -1912,11 +1896,6 @@ pub fn effective_panel_material() -> String {
             return value;
         }
     }
-    // `--frost-blend` only means something on the frost material, so naming a blend selects it: one flag
-    // to look at the variant, rather than two that must agree.
-    if effective_frost_blend().is_some() {
-        return "frost".to_string();
-    }
     CONFIG.read().unwrap().appearance.panel_material.clone()
 }
 
@@ -1934,33 +1913,9 @@ pub fn effective_glass_opacity() -> f64 {
     numeric_flag_or("glass-opacity", 1.0).clamp(0.0, 1.0)
 }
 
-/// The liquid glass tint, verbatim from the config (`RRGGBBAA`). No launch switch: the tint is a stated
-/// value, not a strength to calibrate, and the two looks it belongs to are the ones this app shipped.
-pub fn effective_glass_tint() -> String {
-    CONFIG.read().unwrap().appearance.glass_tint.clone()
-}
-
 /// Backdrop blur radius for the owned underlay (development-only, see `glass::apply_blur_underlay`).
 pub fn effective_glass_blur_radius() -> f64 {
     numeric_flag_or("glass-blur", 0.0).clamp(0.0, 64.0)
-}
-
-/// Development-only blend for the frost material: `--frost-blend=<0..1>` composites a heavily blurred
-/// copy of what is behind the window over an opaque palette base (see
-/// `glass::build_blended_frost`). `None` keeps the shipped system material, which is what every release
-/// path must use: the blend needs `CABackdropLayer` + `CAFilter`, and the project's rule is that a
-/// private surface has to earn its place before it ships.
-pub fn effective_frost_blend() -> Option<f64> {
-    crate::dev_flags::value("frost-blend")
-        .and_then(|value| value.trim().parse::<f64>().ok())
-        .filter(|value| value.is_finite())
-        .map(|value| value.clamp(0.0, 1.0))
-}
-
-/// Blur radius for the blended frost surface (`--frost-blur`, default `glass::FROST_BLEND_BLUR`).
-/// Independent of `--glass-blur`, whose 0 means "the glass underlay is off".
-pub fn effective_frost_blur() -> f64 {
-    numeric_flag_or("frost-blur", crate::glass::FROST_BLEND_BLUR).clamp(0.0, 64.0)
 }
 
 /// Backdrop saturation for the owned underlay (development-only, same note).
@@ -2412,20 +2367,6 @@ mod tests {
         );
         // The list order is what the dropdown shows, so it is part of the contract.
         assert_eq!(PANEL_MATERIAL_VALUES, ["liquid-glass", "frost", "opaque"]);
-    }
-
-    fn glass_tint_invalid_value_falls_back_per_field() {
-        let mut loaded = Config::default();
-        loaded.appearance.glass_tint = "zzzzzzzz".into();
-        loaded.appearance.corner_radius = 24.0;
-        let errors = loaded.validate();
-        assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(errors[0].starts_with("appearance.glass_tint:"));
-
-        let mut merged = Config::default();
-        merged.merge_valid(loaded, &errors);
-        assert_eq!(merged.appearance.glass_tint, "eeeeee66");
-        assert_eq!(merged.appearance.corner_radius, 24.0);
     }
 
     fn clipboard_shortcut_invalid_value_falls_back_per_field() {

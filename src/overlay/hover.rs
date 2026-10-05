@@ -81,7 +81,7 @@ fn cg_to_appkit_point(point: NSPoint, primary_frame: NSRect) -> NSPoint {
 
 /// Read the actual primary display frame. Do not use NSScreen.mainScreen, which follows the key
 /// window and can move to a secondary display.
-unsafe fn primary_screen_frame() -> Option<NSRect> {
+pub(crate) unsafe fn primary_screen_frame() -> Option<NSRect> {
     let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
     if screens.is_null() {
         return None;

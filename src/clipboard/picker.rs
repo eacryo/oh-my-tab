@@ -856,11 +856,7 @@ unsafe fn ensure_detail_window() {
         let _: () = msg_send![content_parent, addSubview: content];
         release_obj(content);
         // Every string in this panel is user data drawn over the panel material, and the text view
-        // itself is transparent, so the read surface is the container (glass::TextSurface).
-        let content_frame: NSRect = msg_send![content, bounds];
-        let surface = crate::glass::make_text_surface(content_frame, 0.0);
-        let _: () = msg_send![content, addSubview: surface];
-        release_obj(surface);
+        // itself is transparent, so the read surface is the container.
         content
     };
 
@@ -1130,7 +1126,10 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     // A control's label, so it follows the theme instead of a literal black that vanishes on the
     // dark panel.
-    let color = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
+    let color = crate::glass::panel_ink(
+        clipboard_palette().secondary_text,
+        crate::glass::PanelInk::Secondary,
+    );
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
@@ -1314,7 +1313,10 @@ unsafe fn add_detail_chrome(
         let font: *mut AnyObject =
             msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         // Same role as the source line next to it, which already uses `muted_text`.
-        let color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
+        let color = crate::glass::panel_ink(
+            clipboard_palette().muted_text,
+            crate::glass::PanelInk::Muted,
+        );
         let _: () = msg_send![stats, setFont: font];
         let _: () = msg_send![stats, setTextColor: color];
         let _: () = msg_send![stats, setAlignment: 2isize]; // NSTextAlignmentRight
@@ -1670,7 +1672,10 @@ unsafe fn build_soft_wrap_glyphs(dark: bool) -> SoftWrapGlyphs {
     let font: *mut AnyObject = msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_REGULAR];
     // An annotation mark, so muted; the palette is passed in so the two caches cannot be
     // built from a mode other than the one that keyed them.
-    let color = crate::ffi::hex_to_ns_color(crate::theme::ui_palette_for_mode(dark).muted_text);
+    let color = crate::glass::panel_ink(
+        crate::theme::ui_palette_for_mode(dark).muted_text,
+        crate::glass::PanelInk::Muted,
+    );
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
     CFRelease(font_key as *const c_void);

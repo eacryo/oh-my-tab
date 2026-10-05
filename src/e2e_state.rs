@@ -462,12 +462,19 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"panel_material\": {},\n",
         json_string(crate::glass::effective_material_id())
     ));
-    // The development-only frost blend, if this launch asked for one (`--frost-blend`). A2 asserts the
-    // installed surface from this instead of guessing at pixels.
+    // Where the clipboard picker actually is, top-left based, so a screenshot can measure inside it
+    // instead of guessing from the cursor position.
     json.push_str(&format!(
-        "  \"frost_blend\": {},\n",
-        match crate::config::effective_frost_blend() {
-            Some(value) => format!("{value:.3}"),
+        "  \"clipboard_picker\": {},\n",
+        match crate::clipboard::picker_frame_top_left() {
+            Some((x, y, w, h)) => format!(
+                "{{\"visible\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}}}",
+                crate::clipboard::picker_is_visible(),
+                x,
+                y,
+                w,
+                h
+            ),
             None => "null".to_string(),
         }
     ));

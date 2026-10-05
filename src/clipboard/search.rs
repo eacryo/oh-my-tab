@@ -84,7 +84,10 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let _: () = msg_send![chip_attrs, setObject: chip_font, forKey: font_key];
-    let chip_color = crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text);
+    let chip_color = crate::glass::panel_ink(
+        clipboard_palette().secondary_text,
+        crate::glass::PanelInk::Secondary,
+    );
     let _: () = msg_send![chip_attrs, setObject: chip_color, forKey: color_key];
     CFRelease(font_key as *const c_void);
     CFRelease(color_key as *const c_void);
@@ -148,7 +151,10 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
         ]
     } else {
         // An interactive affordance in the field, so a palette token rather than a literal black.
-        crate::ffi::hex_to_ns_color(clipboard_palette().secondary_text)
+        crate::glass::panel_ink(
+            clipboard_palette().secondary_text,
+            crate::glass::PanelInk::Secondary,
+        )
     };
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
@@ -225,7 +231,10 @@ unsafe fn draw_retained_search_query(cell_frame: NSRect, query: *mut AnyObject) 
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: SEARCH_FONT_SIZE];
-    let color = crate::ffi::hex_to_ns_color(clipboard_palette().primary_text);
+    let color = crate::glass::panel_ink(
+        clipboard_palette().primary_text,
+        crate::glass::PanelInk::Primary,
+    );
     let _: () = msg_send![attrs, setObject: font, forKey: font_key];
     let _: () = msg_send![attrs, setObject: color, forKey: color_key];
     CFRelease(font_key as *const c_void);

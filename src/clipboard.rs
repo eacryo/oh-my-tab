@@ -604,9 +604,6 @@ static PICKER_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> 
 /// The empty-state hint view (shown when the history is empty / nothing matches). Tracked
 /// separately from row views so the next rebuild can remove it.
 static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// The empty state's text surface (see `glass::TextSurface`): the hint is the only content on the
-/// panel then, so it carries its own surface. Tracked so a resize can move it with the hint.
-static EMPTY_STATE_PLATE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// Process-lifetime cache for clipboard source icons; avoids decoding the same small icon from
 /// disk again on every row rebuild.
 struct CachedSourceIcon {
@@ -690,7 +687,10 @@ unsafe fn rebuild_search_hint() {
     let icon_attrs: *mut AnyObject = msg_send![icon_attrs, init];
     let icon_font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
-    let icon_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
+    let icon_color = crate::glass::panel_ink(
+        clipboard_palette().muted_text,
+        crate::glass::PanelInk::Muted,
+    );
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let _: () = msg_send![icon_attrs, setObject: icon_font, forKey: font_key];
@@ -715,7 +715,10 @@ unsafe fn rebuild_search_hint() {
     CFRelease(font_key as *const c_void);
     let color_key = make_nsstring("NSColor");
     // Placeholder text follows the same muted role used by settings labels.
-    let ph_color = crate::ffi::hex_to_ns_color(clipboard_palette().muted_text);
+    let ph_color = crate::glass::panel_ink(
+        clipboard_palette().muted_text,
+        crate::glass::PanelInk::Muted,
+    );
     let _: () = msg_send![ph_text_attrs, setObject: ph_color, forKey: color_key];
     CFRelease(color_key as *const c_void);
     let ph_ns = make_nsstring(&t("clipboard.search_placeholder"));
@@ -782,6 +785,41 @@ unsafe fn apply_panel_appearance(window: *mut AnyObject) {
         let _: () = msg_send![window, setAppearance: appearance];
     }
 }
+/// The picker's frame in screen coordinates, top-left based, or `None` when it has no window yet.
+/// A2 and the screenshots need to know where the panel actually is instead of guessing from the cursor;
+/// the frame is also the only way to tell "the panel is not on screen" from "the capture missed it".
+pub(crate) fn picker_frame_top_left() -> Option<(f64, f64, f64, f64)> {
+    unsafe {
+        let window = (*PICKER_WINDOW.lock().unwrap())?;
+        let frame: NSRect = msg_send![window.0, frame];
+        // The primary display, *not* `NSScreen.mainScreen`: that follows the key window, and the picker
+        // is usually the key window, so a picker on a secondary display would be flipped against that
+        // display's height and the reported y would be wrong (the same trap `overlay/hover.rs` and
+        // `overlay/cards.rs` document).
+        let screen_frame = crate::overlay::hover::primary_screen_frame()?;
+        Some((
+            frame.origin.x,
+            screen_frame.size.height - (frame.origin.y + frame.size.height),
+            frame.size.width,
+            frame.size.height,
+        ))
+    }
+}
+
+/// Whether the picker window is on screen right now.
+///
+/// Asks AppKit rather than reading `PICKER_VISIBLE`: that atomic is this app's *intent*, which can lag (or be
+/// wrong), while the question an assertion asks is whether the panel is really on the display. Where the two
+/// disagree, AppKit is the answer.
+pub(crate) fn picker_is_visible() -> bool {
+    unsafe {
+        let Some(window) = *PICKER_WINDOW.lock().unwrap() else {
+            return false;
+        };
+        msg_send![window.0, isVisible]
+    }
+}
+
 /// The detail panel's content container (hosts the text scroll view / the image view;
 /// clicking anywhere on the panel dismisses it).
 static DETAIL_CONTENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -3236,21 +3274,13 @@ mod tests {
                 palette.selection_bg
             );
             assert_eq!(row_backdrop_wash(palette, false, true), palette.hover_bg);
-            // An idle row *is* the panel's text surface, whatever that surface is for the material in
-            // force: the wools keep the scrim, and frost deliberately paints none so the panel reads as
-            // one piece of material instead of plate-on-material strips (see `glass::text_surface_alpha`).
-            // Asserting the value rather than "not transparent" is what keeps this true for both.
-            let idle = row_backdrop_wash(palette, false, false);
+            // An idle row paints nothing: the panel's material is the surface, and a per-row surface would
+            // band against it wherever a row does not cover the panel (see `glass::panel_ink`).
             assert_eq!(
-                idle,
-                crate::glass::panel_scrim_token_for(&palette),
-                "an idle row must carry the text surface ({} mode)",
+                row_backdrop_wash(palette, false, false),
+                0x00000000,
+                "an idle row must be bare material ({} mode)",
                 if dark { "dark" } else { "light" }
-            );
-            assert_eq!(
-                idle & 0xFF,
-                crate::glass::text_surface_alpha(),
-                "the idle row must use the material's own surface alpha"
             );
         }
     }

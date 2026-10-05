@@ -322,7 +322,7 @@ mod callbacks;
 mod cancel;
 mod card_close;
 mod cards;
-mod hover;
+pub(crate) mod hover;
 use callbacks::*;
 use cancel::*;
 use cards::*;

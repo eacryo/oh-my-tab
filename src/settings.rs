@@ -922,11 +922,6 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.appearance.glass_style
     );
     changed!(
-        "appearance.glass_tint",
-        old.appearance.glass_tint,
-        new.appearance.glass_tint
-    );
-    changed!(
         "appearance.corner_radius",
         old.appearance.corner_radius,
         new.appearance.corner_radius

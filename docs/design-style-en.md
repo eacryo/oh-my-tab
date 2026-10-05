@@ -195,16 +195,13 @@ The floating panels (switcher, clipboard, keystroke display) offer three materia
 Material only ever changes which surface sits behind the panel content — text colors, spacing,
 radius, and the palette remain exactly as specified here.
 
-**The material does not carry the contrast table; a text surface does.** A panel holds the floors in
-one of two ways, and that choice is what keeps the three materials distinguishable:
-
-- *Material-washed*: the panel's own text sits on the material, so the material is washed toward
-  `window_bg` until the floors hold on the worst-case backdrop. This is what makes all three materials
-  render as one surface — measured on a live panel, `frost` landed 3/255 from `opaque`.
-- *Content-owned*: every text block in the panel carries its own surface — the theme scrim
-  (`window_bg` at `0xE9`), a keycap chip, a preview image — so the material is free to be whatever the
-  user selected. The keystroke display is the first panel on this path; the switcher and the clipboard
-  follow as their content surfaces land.
+**A panel's surface is its material, and the ink carries the contrast.** No panel paints a text surface
+over its material: a surface only ever covered part of the panel, so it banded against the material
+everywhere else (measured on the clipboard picker in light mode, an idle row at `#F3F4F6` against the bare
+material at `#E2E2E4` beside it -- 17 levels, which reads as the panel cut into strips; ~75 in dark mode).
+Text therefore rides the material, and the *ink* is what holds the floors: the dynamic system label colours
+where the surface is translucent, the palette token where the surface is `window_bg` itself. The price is
+stated in the panel tier below rather than hidden.
 
 **The material supplies the blur; the two looks differ by style and tint.** Measured with a high-frequency
 backdrop and the panel's high-frequency energy compared against an uncovered control in the *same frame*
@@ -220,8 +217,12 @@ nor a differentiator.** The looks are:
 | `regular` (default) | `.regular` (0) | `glass_tint`, applied verbatim |
 | `clear` | `.clear` (1) | the same tint; the clear style is what makes it read lighter |
 
-`glass_tint` is `RRGGBBAA` and is applied **character for character**: its alpha *is* the strength knob,
-which is why there is no separate opacity setting, and why it is not re-lit per mode. Two attempts at being
+`glass_tint` is `RRGGBBAA` and its alpha *is* the strength knob (there is no separate opacity setting). It
+applies to **light mode**; dark mode takes a fixed dark tint (`#1C1C1E99`) instead. That split is measured,
+not taste: with no text surface on the panel the ink sits on the glass itself, and the light tint in dark mode
+leaves the surface mid-grey, where the palette's caption ink cannot exceed 2.07:1. With the dark tint the same
+cell measures 9.93:1 on a black backdrop and 6.00:1 on a white one
+(`scripts/e2e/panel-contrast.sh`). Two attempts at being
 cleverer than that are recorded because both shipped during this work and both were wrong:
 
 - Re-lighting the tint per mode left dark mode purple -- `palette.window_bg` there is near-black, so a
@@ -234,11 +235,52 @@ blanking the surface. `glass_variant`, `--glass-blur` and `--glass-saturation` s
 and the shipped path never touches the private `_variant` -- the same choice alt-tab-macos's `.regular`
 glass makes.
 
+**No material paints a text surface, and each one answers to the tier its surface allows.**
+
+| Material | Its surface | Ink |
+| --- | --- | --- |
+| `liquid-glass` | the system's glass, which renders away from `window_bg` (mid-grey in dark mode) | dynamic system label colours |
+| `frost` | the frost material (around `#868585` in dark mode) | dynamic system label colours |
+| `opaque` | `window_bg` itself | the palette token, which is exactly the surface it assumes |
+
+Only `opaque` still answers the floors above. The two translucent surfaces cannot: the material's tone sits
+away from `window_bg` by construction, and no ink colour reaches 12:1 / 7:1 there. They are held to the panel
+tier stated below instead.
+
+**Measured on rendered pixels, with a controlled backdrop** — `scripts/e2e/panel-contrast.sh` pins a solid
+black or white window *behind* the panel (`--panel-backdrop`), because a translucent surface's tone follows
+what is behind it and a verdict that depends on the desktop is not a verdict. The picker's filter row on the
+bare material, 3:1 caption tier:
+
+| mode | material | black backdrop | white backdrop |
+| --- | --- | --- | --- |
+| light | `frost` | 5.39:1 | 4.61:1 |
+| light | `liquid-glass` | 4.47:1 | 8.60:1 |
+| light | `opaque` | 8.03:1 | 8.03:1 |
+| dark | `frost` | 5.82:1 | 5.27:1 |
+| dark | `liquid-glass` | 9.93:1 | 6.00:1 |
+| dark | `opaque` | 9.93:1 | 9.93:1 |
+
+Two surfaces needed a deliberate adjustment to get there, and both were found by this measurement rather than
+by reasoning: liquid glass takes a **dark tint in dark mode** (`glass::GLASS_TINT_DARK`; one tint cannot serve
+both modes -- the light tint left the surface mid-grey at 0.539, where the palette's caption ink cannot exceed
+2.07:1), and frost takes the legacy **ultraDark** material in dark mode instead of `hudWindow` (which a bright
+backdrop lifts to 0.648, where the same ink reached 2.45:1). `opaque` is the control that does not move with
+the backdrop at all. The scenario fails the run below 3:1, so this table is enforced rather than asserted.
+
+**A panel whose surface is its material answers to its own tier, not this table's.** A translucent material
+sits away from `window_bg` (measured in dark mode: liquid glass `#6E6E6E`, frost `#868585`, against the
+palette's `#1C1C1E`), and no single ink colour reaches the 12:1 / 7:1 floors there -- the best any colour
+achieves on a mid-grey surface is 5.71:1. Those panels therefore draw with the dynamic system label colours,
+which AppKit resolves and compensates against the live backdrop, and are held to the panel tier below
+(`text_primary` >= 4.5:1, captions >= 3:1) measured on rendered pixels. Only `opaque`, whose surface *is*
+`window_bg`, still answers to the table above.
+
 **Floating-panel text is its own tier, and its ink adapts.** Panel text is drawn with the system's
 vibrant label colors (`NSColor.labelColor` / `secondaryLabelColor` / `tertiaryLabelColor`) inside the
 material's view, so AppKit resolves the color against the live backdrop and applies its own
 contrast-preserving treatment. The surface therefore stays honest and the *ink* carries the trade-off,
-which is the third way out of it (the other two are a smaller text surface and a measured, adaptive
+which is the third way out of it (the other two are a smaller text surface and a measured ink
 scrim). Because that color is system-owned, the panel tier's floors are one step below the table above
 — `text_primary` ≥7:1, `text_secondary`/`text_muted` ≥4.5:1 — and they are verified on **rendered
 pixels** over controlled backdrops, never by token arithmetic. Measured on the real panel: a mid-gray
