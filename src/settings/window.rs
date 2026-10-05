@@ -566,15 +566,12 @@ pub(super) fn hide_settings() {
     // Closing settings discards any unconfirmed restore action and resets to one button (both
     // cards).
     collapse_restore_confirmations(false);
-    let window_and_well = with_settings_ui(|ui| ui.as_ref().map(|u| (u.window, u.glass_tint)));
+    let window = with_settings_ui(|ui| ui.as_ref().map(|u| u.window));
     unsafe {
-        if let Some((window, well)) = window_and_well {
+        if let Some(window) = window {
             // orderOut can bypass the sidebar tracking-area exit callback, so clear any active
             // row fill while the window is hidden.
             widgets::clear_sidebar_hover();
-            // Release the settings lock before closing the color panel; its notification callback
-            // re-enters SETTINGS_UI.
-            close_glass_tint_panel(well);
             let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
         }
     }
@@ -1030,44 +1027,6 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             log_info!("[smoke-settings-layout] select open/close focus smoke failed");
             return false;
         }
-        let liquid_glass_selected =
-            crate::config::effective_panel_material().as_str() == "liquid-glass";
-        let glass_tint_caption_ok = !liquid_glass_selected
-            || with_settings_ui(|ui| {
-                let Some(ui) = ui.as_ref() else {
-                    return false;
-                };
-                if ui.glass_tint_hex.is_null() {
-                    return false;
-                }
-                let caption: *mut AnyObject = msg_send![ui.glass_tint_hex, stringValue];
-                if caption.is_null() {
-                    log_info!("[smoke-settings-layout] glass tint caption stringValue is null");
-                    return false;
-                }
-                let caption_len: usize = msg_send![caption, length];
-                if caption_len != 9 {
-                    log_info!(
-                    "[smoke-settings-layout] glass tint caption has {caption_len} UTF-16 units: {:?}",
-                    crate::ffi::nsstring_to_rust(caption)
-                );
-                    return false;
-                }
-                let first: u16 = msg_send![caption, characterAtIndex: 0usize];
-                let ok = first == b'#' as u16;
-                if !ok {
-                    log_info!(
-                    "[smoke-settings-layout] glass tint caption has unexpected first character: {:?}",
-                    crate::ffi::nsstring_to_rust(caption)
-                );
-                }
-                ok
-            });
-        if !glass_tint_caption_ok {
-            log_info!("[smoke-settings-layout] glass tint hex caption missing");
-            hide_settings();
-            return false;
-        }
         // Regression guard for the guide's "Open App Settings" crash (2026-09-28): the settings
         // window becoming key delivers the scroller notification synchronously from inside
         // `with_settings_ui`, and the resync re-entered the borrow ("RefCell already borrowed" ->
@@ -1185,24 +1144,6 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             return false;
         }
         log_info!("[smoke-settings-layout] hover tooltip renders its captions in full");
-        let preview_ok = with_settings_ui(|ui| {
-            let ui = ui.as_ref()?;
-            let contrast = crate::theme::settings_preview_contrast(crate::theme::ui_palette());
-            let switcher_stage =
-                glass_preview::preview_stage_is_present(ui.glass_preview_switcher);
-            let clipboard_stage =
-                glass_preview::preview_stage_is_present(ui.glass_preview_clipboard);
-            if contrast < 3.0 || !switcher_stage || !clipboard_stage {
-                log_info!("[smoke-settings-layout] preview checks: contrast={contrast:.2}, switcher_stage={switcher_stage}, clipboard_stage={clipboard_stage}");
-            }
-            Some(contrast >= 3.0 && switcher_stage && clipboard_stage)
-        })
-        .unwrap_or(false);
-        if !preview_ok {
-            log_info!("[smoke-settings-layout] preview stage is missing or below 3:1 contrast");
-            hide_settings();
-            return false;
-        }
         let sidebar_layout_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let buttons = [
@@ -2291,10 +2232,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             panel_material: std::ptr::null_mut(),
-            glass_tint: std::ptr::null_mut(),
-            glass_tint_hex: std::ptr::null_mut(),
-            glass_preview_switcher: std::ptr::null_mut(),
-            glass_preview_clipboard: std::ptr::null_mut(),
             corner_radius: std::ptr::null_mut(),
             thumbnails_enabled: std::ptr::null_mut(),
             focused_thumbnail_prewarm: std::ptr::null_mut(),
@@ -2657,7 +2594,6 @@ fn clear_settings_content_registries() {
 /// Keep the traffic-light baseline for in-place redraws; remove it only when the window is
 /// actually released.
 unsafe fn detach_settings_window_runtime(ui: &SettingsUi, remove_traffic_light_origin: bool) {
-    close_glass_tint_panel(ui.glass_tint);
     if remove_traffic_light_origin {
         TRAFFIC_LIGHT_BASE_ORIGINS
             .lock()

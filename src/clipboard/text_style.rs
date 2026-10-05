@@ -1053,6 +1053,15 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     *FOOTER_VIEW.lock().unwrap() = Some(ObjPtr::new(footer));
     let parent = footer;
 
+    // The legends and the entry count sit on this band, and the band sits on the user's material:
+    // a text surface keeps their contrast floors independent of it (glass::TextSurface).
+    let band = crate::glass::make_text_surface(
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, FOOTER_H)),
+        0.0,
+    );
+    let _: () = msg_send![parent, addSubview: band];
+    release_obj(band);
+
     // the top hairline.
     let line: *mut AnyObject = msg_send![class!(NSView), alloc];
     let line: *mut AnyObject = msg_send![

@@ -820,7 +820,7 @@ unsafe fn ensure_detail_window() {
         window,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
         crate::glass::PANEL_CORNER_RADIUS,
-        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+        crate::clipboard::detail_backdrop_options(),
     );
     *DETAIL_BACKDROP.lock().unwrap() = Some(backdrop);
     let content_parent = backdrop.content_parent;
@@ -855,6 +855,12 @@ unsafe fn ensure_detail_window() {
         let _: () = msg_send![content, setAutoresizingMask: 18u64];
         let _: () = msg_send![content_parent, addSubview: content];
         release_obj(content);
+        // Every string in this panel is user data drawn over the panel material, and the text view
+        // itself is transparent, so the read surface is the container (glass::TextSurface).
+        let content_frame: NSRect = msg_send![content, bounds];
+        let surface = crate::glass::make_text_surface(content_frame, 0.0);
+        let _: () = msg_send![content, addSubview: surface];
+        release_obj(surface);
         content
     };
 

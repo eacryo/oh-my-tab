@@ -177,10 +177,6 @@ pub(super) struct SettingsUi {
     theme: *mut AnyObject,             // NSPopUpButton: auto / light / dark
     panel_material: *mut AnyObject,    // NSPopUpButton: liquid-glass / frost / opaque
     glass_style: *mut AnyObject,       // NSPopUpButton: regular / clear (liquid glass only)
-    glass_tint: *mut AnyObject,        // glass tint
-    glass_tint_hex: *mut AnyObject,    // displayed user-owned color value
-    glass_preview_switcher: *mut AnyObject, // NSGlassEffectView: app switcher preview
-    glass_preview_clipboard: *mut AnyObject, // NSGlassEffectView: clipboard preview
     corner_radius: *mut AnyObject,     // NSTextField
     modifier: *mut AnyObject,          // NSPopUpButton: option / command
     locale: *mut AnyObject,            // NSPopUpButton: auto / en / zh-Hans / zh-Hant
@@ -460,23 +456,6 @@ static SYSTEM_APPEARANCE_REBUILD_PENDING: AtomicBool = AtomicBool::new(false);
 static ABOUT_HEADER_CLICKS: Mutex<(u8, Option<Instant>)> = Mutex::new((0, None));
 const ABOUT_HEADER_CLICK_WINDOW: Duration = Duration::from_secs(1);
 
-/// Suppresses callback re-entry while synchronizing the color well and color panel in code.
-static GLASS_UI_UPDATE: AtomicBool = AtomicBool::new(false);
-
-/// Group-layout state for the color panel and settings window; like the detail panel, it stores
-/// the main window's original position only while the group is open.
-static GLASS_TINT_GROUP_ORIGINAL_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
-static GLASS_TINT_PANEL_OBSERVER_INSTALLED: AtomicBool = AtomicBool::new(false);
-
-const GLASS_TINT_GROUP_GAP: f64 = 8.0;
-const GLASS_TINT_SCREEN_MARGIN: f64 = 8.0;
-
-struct GlassTintWellClass(*mut AnyObject);
-unsafe impl Send for GlassTintWellClass {}
-unsafe impl Sync for GlassTintWellClass {}
-
-static GLASS_TINT_WELL_CLASS: OnceLock<GlassTintWellClass> = OnceLock::new();
-
 /// The currently-selected device scope on the Mouse page. None = "All Mice";
 /// Some((vid,pid)) = a specific mouse.
 static SELECTED_DEVICE: Mutex<Option<Option<crate::mouse::device::DeviceKey>>> = Mutex::new(None);
@@ -487,7 +466,6 @@ static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::At
 
 pub(crate) mod components;
 mod dispatch;
-pub(crate) mod glass_preview;
 pub(crate) mod mapping;
 mod page_builder;
 pub(crate) mod page_canvas;
@@ -505,11 +483,6 @@ use components::{
     ROW_ACTION_BTN_W,
 };
 use dispatch::*;
-use glass_preview::*;
-pub(crate) use glass_preview::{
-    apply_glass_preview, on_glass_tint_changed, on_glass_tint_panel_changed,
-    on_glass_tint_panel_will_close, on_glass_tint_reset,
-};
 use mapping::*;
 pub(crate) use mapping::{
     cancel_recording_from_main, handle_add_mapping, handle_clipboard_shortcut_record,
@@ -1273,29 +1246,17 @@ fn load_settings_from(cfg: &Config) {
                 _ => 2,
             };
             let _: () = msg_send![ui.theme, selectItemAtIndex: theme_idx];
-            let pm_idx: isize = crate::config::PANEL_MATERIAL_VALUES
-                .iter()
-                .position(|value| *value == cfg.appearance.panel_material)
-                .unwrap_or(0) as isize;
+            let pm_idx: isize =
+                crate::config::panel_material_index_of(&cfg.appearance.panel_material).unwrap_or(0)
+                    as isize;
             let _: () = msg_send![ui.panel_material, selectItemAtIndex: pm_idx];
             // The glass sub-option rows exist only while Liquid Glass is the selected
             // material; with another material their controls are null and there is
             // nothing to synchronize.
             if !ui.glass_style.is_null() {
-                let gs_idx: isize = if cfg.appearance.glass_style == "clear" {
-                    1
-                } else {
-                    0
-                };
+                let gs_idx: isize =
+                    crate::glass::glass_style_index(&cfg.appearance.glass_style) as isize;
                 let _: () = msg_send![ui.glass_style, selectItemAtIndex: gs_idx];
-                GLASS_UI_UPDATE.store(true, Ordering::SeqCst);
-                let tint = crate::ffi::hex_to_ns_color(crate::config::parse_hex8(
-                    &cfg.appearance.glass_tint,
-                ));
-                let _: () = msg_send![ui.glass_tint, setColor: tint];
-                let panel: *mut AnyObject = msg_send![class!(NSColorPanel), sharedColorPanel];
-                let _: () = msg_send![panel, setColor: tint];
-                GLASS_UI_UPDATE.store(false, Ordering::SeqCst);
             }
             set_field(ui.corner_radius, cfg.appearance.corner_radius);
             let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
@@ -1909,20 +1870,10 @@ mod tests {
         assert_eq!(pointer_accel_display(0.6875), "0.69");
     }
 
-    use super::{
-        color_component_to_byte, glass_tint_group_frames, rgba_hex_from_components,
-        settings_effective_corner_radius, GLASS_TINT_GROUP_GAP, GLASS_TINT_SCREEN_MARGIN,
-    };
+    use super::settings_effective_corner_radius;
     use super::{pointer_accel_display, pointer_accel_from_slider};
     use crate::config::MOUSE_ACCELERATION_MAX;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
-
-    #[test]
-    fn color_components_round_and_clamp_to_rgba_hex() {
-        assert_eq!(rgba_hex_from_components(0.0, 0.5, 1.0, 0.25), "0080ff40");
-        assert_eq!(rgba_hex_from_components(-1.0, 2.0, 0.1, 0.9), "00ff1ae6");
-        assert_eq!(color_component_to_byte(0.501), 128);
-    }
 
     #[test]
     fn mapping_row_interactive_views_match_the_registry_contract() {
@@ -1947,41 +1898,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![1, 2, 3, 4, 5, 7, 8]
         );
-    }
-
-    #[test]
-    fn glass_tint_group_centers_settings_and_panel_together() {
-        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0));
-        let settings = NSRect::new(NSPoint::new(100.0, 200.0), NSSize::new(656.0, 690.0));
-        let panel = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(250.0, 397.0));
-        let (settings_frame, panel_frame) = glass_tint_group_frames(settings, panel, screen);
-        let group_w = settings.size.width + GLASS_TINT_GROUP_GAP + panel.size.width;
-        assert_eq!(settings_frame.origin.x, (screen.size.width - group_w) / 2.0);
-        assert_eq!(
-            panel_frame.origin.x,
-            settings_frame.origin.x + settings.size.width + GLASS_TINT_GROUP_GAP
-        );
-        assert_eq!(
-            panel_frame.origin.y,
-            settings.origin.y + (settings.size.height - panel.size.height) / 2.0
-        );
-    }
-
-    #[test]
-    fn glass_tint_group_uses_screen_origin_and_clamps_panel_vertically() {
-        let screen = NSRect::new(NSPoint::new(-1280.0, 80.0), NSSize::new(800.0, 700.0));
-        let settings = NSRect::new(NSPoint::new(-900.0, -200.0), NSSize::new(656.0, 690.0));
-        let panel = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(250.0, 397.0));
-        let (settings_frame, panel_frame) = glass_tint_group_frames(settings, panel, screen);
-        assert_eq!(
-            settings_frame.origin.x,
-            screen.origin.x + GLASS_TINT_SCREEN_MARGIN
-        );
-        assert_eq!(
-            panel_frame.origin.y,
-            screen.origin.y + GLASS_TINT_SCREEN_MARGIN
-        );
-        assert!(panel_frame.origin.y + panel.size.height <= screen.origin.y + screen.size.height);
     }
 
     #[test]

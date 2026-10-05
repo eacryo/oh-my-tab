@@ -190,15 +190,40 @@ impl Default for WindowControlSection {
 pub struct Appearance {
     pub theme: String,
     /// Floating-panel material family: liquid glass, plain frost, or opaque.
-    /// `glass_style`/`glass_tint` are sub-options that only apply to liquid glass.
+    /// `glass_style` and the strength knobs are sub-options that only apply to liquid glass.
     pub panel_material: String,
     pub glass_style: String,
+    /// Liquid glass tint as `RRGGBBAA`, applied **verbatim**: the alpha *is* the strength. There is
+    /// deliberately no opacity, blur or saturation setting -- the alpha is the whole knob, which is how
+    /// the two shipped looks worked. The material-strength values exist only as `--glass-*` launch
+    /// switches (the development channel); an invisible setting that silently diverges from the shipped
+    /// look is worse than no setting.
     pub glass_tint: String,
     pub corner_radius: f64,
 }
 
 /// Valid `appearance.panel_material` values, in settings-dropdown order.
 pub const PANEL_MATERIAL_VALUES: [&str; 3] = ["liquid-glass", "frost", "opaque"];
+
+/// The dropdown index for a stored material, or `None` when the value is unknown (which the config
+/// validation rejects, so only a hand-edited file can produce it).
+///
+/// Paired with [`panel_material_value_at`] so the two directions live in one place: the settings page
+/// fills the popup from the value and the popup's action stores the index it reports, and an off-by-one
+/// between those two would show one material while persisting another. The round-trip is unit-tested.
+pub fn panel_material_index_of(value: &str) -> Option<usize> {
+    PANEL_MATERIAL_VALUES
+        .iter()
+        .position(|candidate| *candidate == value)
+}
+
+/// The stored material for a dropdown index; the first item is the fallback for an out-of-range index.
+pub fn panel_material_value_at(index: usize) -> &'static str {
+    PANEL_MATERIAL_VALUES
+        .get(index)
+        .copied()
+        .unwrap_or(PANEL_MATERIAL_VALUES[0])
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
@@ -643,8 +668,11 @@ impl Default for Appearance {
             theme: "auto".into(),
             panel_material: "liquid-glass".into(),
             glass_style: "regular".into(),
-            // Default Liquid Glass overlay tint (RRGGBBAA); the settings page lets users pick another color.
+            // The default the two `regular`/`clear` builds shipped: a light neutral at 40% alpha. It is
+            // applied verbatim in both modes (see `glass::resolved_glass_tint_hex` for the two ways
+            // re-lighting it per mode went wrong).
             glass_tint: "eeeeee66".into(),
+            // Default Liquid Glass overlay tint (RRGGBBAA); the settings page lets users pick another color.
             corner_radius: 32.0,
         }
     }
@@ -775,16 +803,16 @@ impl Config {
                 &[("value", &self.appearance.glass_style)],
             ));
         }
-        if !PANEL_MATERIAL_VALUES.contains(&self.appearance.panel_material.as_str()) {
-            errs.push(tf(
-                "errors.appearance_panel_material_invalid",
-                &[("value", &self.appearance.panel_material)],
-            ));
-        }
         if !is_hex8(&self.appearance.glass_tint) {
             errs.push(tf(
                 "errors.appearance_glass_tint_invalid",
                 &[("value", &self.appearance.glass_tint)],
+            ));
+        }
+        if !PANEL_MATERIAL_VALUES.contains(&self.appearance.panel_material.as_str()) {
+            errs.push(tf(
+                "errors.appearance_panel_material_invalid",
+                &[("value", &self.appearance.panel_material)],
             ));
         }
         if self.appearance.corner_radius < 0.0 {
@@ -1114,9 +1142,6 @@ impl Config {
                 .any(|e| e.starts_with("appearance.panel_material"))
             {
                 self.appearance.panel_material = other.appearance.panel_material;
-            }
-            if !errs.iter().any(|e| e.starts_with("appearance.glass_tint")) {
-                self.appearance.glass_tint = other.appearance.glass_tint;
             }
             if !errs
                 .iter()
@@ -1879,17 +1904,81 @@ pub fn effective_glass_style() -> String {
 /// switch overrides the config for that launch (the dev-verification channel); an invalid
 /// one is ignored so a typo can never break the panels.
 pub fn effective_panel_material() -> String {
+    // The launch switch is the only channel that can name a development-only material (`backdrop`), so it
+    // resolves through the enum's own mapping; `PANEL_MATERIAL_VALUES` stays the user-facing set that the
+    // config and the settings writer are held to.
     if let Some(value) = crate::dev_flags::value("panel-material") {
-        if PANEL_MATERIAL_VALUES.contains(&value.as_str()) {
+        if crate::glass::PanelMaterial::from_config_value(&value).is_some() {
             return value;
         }
+    }
+    // `--frost-blend` only means something on the frost material, so naming a blend selects it: one flag
+    // to look at the variant, rather than two that must agree.
+    if effective_frost_blend().is_some() {
+        return "frost".to_string();
     }
     CONFIG.read().unwrap().appearance.panel_material.clone()
 }
 
-/// Return the effective glass tint.
+/// The material-strength knobs, each with a `--…` launch switch that overrides it for one launch.
+fn numeric_flag_or(name: &str, fallback: f64) -> f64 {
+    crate::dev_flags::value(name)
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .unwrap_or(fallback)
+}
+
+/// How strongly the glass renders (the glass view's own alpha). Development channel only: the shipped
+/// look renders at full alpha, exactly as the two looks this app shipped with did.
+pub fn effective_glass_opacity() -> f64 {
+    numeric_flag_or("glass-opacity", 1.0).clamp(0.0, 1.0)
+}
+
+/// The liquid glass tint, verbatim from the config (`RRGGBBAA`). No launch switch: the tint is a stated
+/// value, not a strength to calibrate, and the two looks it belongs to are the ones this app shipped.
 pub fn effective_glass_tint() -> String {
     CONFIG.read().unwrap().appearance.glass_tint.clone()
+}
+
+/// Backdrop blur radius for the owned underlay (development-only, see `glass::apply_blur_underlay`).
+pub fn effective_glass_blur_radius() -> f64 {
+    numeric_flag_or("glass-blur", 0.0).clamp(0.0, 64.0)
+}
+
+/// Development-only blend for the frost material: `--frost-blend=<0..1>` composites a heavily blurred
+/// copy of what is behind the window over an opaque palette base (see
+/// `glass::build_blended_frost`). `None` keeps the shipped system material, which is what every release
+/// path must use: the blend needs `CABackdropLayer` + `CAFilter`, and the project's rule is that a
+/// private surface has to earn its place before it ships.
+pub fn effective_frost_blend() -> Option<f64> {
+    crate::dev_flags::value("frost-blend")
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 1.0))
+}
+
+/// Blur radius for the blended frost surface (`--frost-blur`, default `glass::FROST_BLEND_BLUR`).
+/// Independent of `--glass-blur`, whose 0 means "the glass underlay is off".
+pub fn effective_frost_blur() -> f64 {
+    numeric_flag_or("frost-blur", crate::glass::FROST_BLEND_BLUR).clamp(0.0, 64.0)
+}
+
+/// Backdrop saturation for the owned underlay (development-only, same note).
+pub fn effective_glass_saturation() -> f64 {
+    numeric_flag_or("glass-saturation", 1.0).clamp(0.0, 4.0)
+}
+
+/// `NSGlassEffectView`'s private `_variant`, from the `--glass-variant` launch switch only.
+///
+/// Deliberately not read from the config: the variant is not a user choice (two attempts at labelling
+/// it from a brightness sample were wrong -- variant 19 measures the *most* transparent and renders
+/// broken rainbow edges), and a value left over from a removed settings row would otherwise keep every
+/// panel in that state with no way to undo it from the UI.
+pub fn effective_glass_variant() -> i64 {
+    crate::dev_flags::value("glass-variant")
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .unwrap_or(0)
+        .clamp(0, 19)
 }
 
 /// Return whether focused-window thumbnail prewarming is enabled.
@@ -2302,6 +2391,43 @@ mod tests {
     }
 
     #[test]
+    /// The tint is validated as `RRGGBBAA` and, like every other field, falls back on its own: a typo in
+    /// this hex must not take the rest of the appearance section down with it.
+    #[test]
+    /// The popup's index and the stored value must be inverses: the settings page fills the popup from
+    /// the value, and the popup's action stores the index it reports. A drift here would display one
+    /// material while persisting another -- the "the panel looks like frost but the settings say liquid
+    /// glass" report, which is exactly what these two helpers exist to make impossible.
+    #[test]
+    fn panel_material_index_and_value_round_trip() {
+        for (index, value) in PANEL_MATERIAL_VALUES.iter().enumerate() {
+            assert_eq!(panel_material_index_of(value), Some(index));
+            assert_eq!(panel_material_value_at(index), *value);
+        }
+        assert_eq!(panel_material_index_of("nope"), None);
+        assert_eq!(
+            panel_material_value_at(99),
+            PANEL_MATERIAL_VALUES[0],
+            "an impossible index must fall back to the first item, never to a wrong material"
+        );
+        // The list order is what the dropdown shows, so it is part of the contract.
+        assert_eq!(PANEL_MATERIAL_VALUES, ["liquid-glass", "frost", "opaque"]);
+    }
+
+    fn glass_tint_invalid_value_falls_back_per_field() {
+        let mut loaded = Config::default();
+        loaded.appearance.glass_tint = "zzzzzzzz".into();
+        loaded.appearance.corner_radius = 24.0;
+        let errors = loaded.validate();
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].starts_with("appearance.glass_tint:"));
+
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert_eq!(merged.appearance.glass_tint, "eeeeee66");
+        assert_eq!(merged.appearance.corner_radius, 24.0);
+    }
+
     fn clipboard_shortcut_invalid_value_falls_back_per_field() {
         let mut loaded = Config::default();
         loaded.clipboard.enabled = true;
@@ -2388,7 +2514,6 @@ mod tests {
         // Valid field: everything customized.
         other.appearance.theme = "dark".into();
         other.appearance.glass_style = "regular".into();
-        other.appearance.glass_tint = "11223344".into();
         other.appearance.corner_radius = 12.0;
         // Invalid field: corner_radius < 0.
         let mut cfg = other.clone();
@@ -2400,7 +2525,6 @@ mod tests {
         merged.merge_valid(cfg, &errs);
         // Valid fields survive; the invalid one falls back to the default.
         assert_eq!(merged.appearance.theme, "dark");
-        assert_eq!(merged.appearance.glass_tint, "11223344");
         assert_eq!(
             merged.appearance.corner_radius,
             Config::default().appearance.corner_radius
@@ -2844,7 +2968,6 @@ speed = 2.6
         // All fields set to non-default values -- the old default-value roundtrip masked the
         // migrate_legacy overwrite bug (see docs/test-review.md); this is the regression guard.
         cfg.appearance.theme = "dark".into();
-        cfg.appearance.glass_tint = "11223344".into();
         cfg.keyboard.modifier = "option".into();
         cfg.i18n.locale = "zh-Hans".into();
         cfg.updates.automatically_check = false;
@@ -2881,7 +3004,6 @@ speed = 2.6
         assert!(errs.is_empty());
         // Non-mouse fields survive the roundtrip.
         assert_eq!(loaded.appearance.theme, "dark");
-        assert_eq!(loaded.appearance.glass_tint, "11223344");
         assert_eq!(loaded.keyboard.modifier, "option");
         assert_eq!(loaded.i18n.locale, "zh-Hans");
         assert!(!loaded.updates.automatically_check);
@@ -3025,18 +3147,15 @@ reverse_scroll = false
             r#"
 [appearance]
 theme = "dark"
-glass_tint = "zzzzzzzz"
+corner_radius = -5.0
 "#,
         )
         .unwrap();
         let (cfg, errs) = Config::load_or_default_from(&path);
         assert!(!errs.is_empty());
-        // Valid fields survive; the invalid color falls back to default; retired layout fields are ignored.
+        // Valid fields survive; the out-of-range value falls back to its default, on its own.
         assert_eq!(cfg.appearance.theme, "dark");
-        assert_eq!(
-            cfg.appearance.glass_tint,
-            Config::default().appearance.glass_tint
-        );
+        assert_eq!(cfg.appearance.corner_radius, 32.0);
     }
 
     #[test]

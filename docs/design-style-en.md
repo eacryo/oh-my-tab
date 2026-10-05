@@ -107,8 +107,8 @@ success-green; permission-missing text is warning/error — never the accent.
 | `error_text` | `#B42318` | `#FF6961` |
 
 Against `window_bg`, measured contrast is respectively 6.12:1 / 8.42:1, 5.95:1 / 8.28:1, and
-6.13:1 / 6.03:1. The keycap accent text over its translucent fill composited on `card_bg` measures
-10.61:1 in light mode and 10.22:1 in dark mode.
+6.13:1 / 6.03:1. The keycap accent text over its chip -- the accent fill flattened onto `card_bg`, so
+the chip is opaque -- measures 10.61:1 in light mode and 10.22:1 in dark mode.
 
 ### 3.2 Surface hierarchy
 
@@ -132,7 +132,8 @@ Measured with the composited (post-alpha) color against the surface the element 
 | `text_disabled` | 2.5:1 | 2.58:1 on `window_bg`, 2.76:1 on `card_bg` | 4.11:1 / 3.37:1 |
 
 Text on a *floating* panel's keycap is a recorded class of its own (`primary ≥8:1`, `muted ≥3.25:1`),
-because that surface moves with the backdrop — see the keystroke display in §9.
+because that surface is a chip the panel draws, not `window_bg` or `card_bg` — see the keystroke
+display in §9.
 
 `text_primary` has the smallest margin in the palette. Re-measure it whenever the primary color or
 `window_bg` changes; do not darken it for its own sake.
@@ -187,12 +188,63 @@ The floating panels (switcher, clipboard, keystroke display) offer three materia
 
 | Material | Surface | Notes |
 | --- | --- | --- |
-| `liquid-glass` (default) | `NSGlassEffectView`, `glass_style`/`glass_tint` sub-options | Degrades to frost on macOS < 26 |
+| `liquid-glass` (default) | `NSGlassEffectView`, `glass_style` sub-option | Degrades to frost on macOS < 26 |
 | `frost` | `NSVisualEffectView`, behind-window, themed material, plus the theme-surface wash below | Neutral system blur; the glass sub-options do not apply |
 | `opaque` | `window_bg` fill, no blur | Also the forced fallback while the system's Reduce Transparency accessibility setting is on |
 
 Material only ever changes which surface sits behind the panel content — text colors, spacing,
 radius, and the palette remain exactly as specified here.
+
+**The material does not carry the contrast table; a text surface does.** A panel holds the floors in
+one of two ways, and that choice is what keeps the three materials distinguishable:
+
+- *Material-washed*: the panel's own text sits on the material, so the material is washed toward
+  `window_bg` until the floors hold on the worst-case backdrop. This is what makes all three materials
+  render as one surface — measured on a live panel, `frost` landed 3/255 from `opaque`.
+- *Content-owned*: every text block in the panel carries its own surface — the theme scrim
+  (`window_bg` at `0xE9`), a keycap chip, a preview image — so the material is free to be whatever the
+  user selected. The keystroke display is the first panel on this path; the switcher and the clipboard
+  follow as their content surfaces land.
+
+**The material supplies the blur; the two looks differ by style and tint.** Measured with a high-frequency
+backdrop and the panel's high-frequency energy compared against an uncovered control in the *same frame*
+(the only denominator that survived scrutiny: an uncovered reference reads 100% of the source, a
+material-free cell inside the panel 1.000, a plain translucent overlay 0.43,
+`NSVisualEffectView(.hudWindow)` 0.19): every `NSGlassEffectView` configuration collapses that energy to
+0.000-0.003 -- every variant, `regular`/`clear`, glass as the window's content view or as a subview, tinted
+or not, key or non-key panel, same-process and cross-process backdrops. **Blur is therefore neither a knob
+nor a differentiator.** The looks are:
+
+| Look | `style` | Tint |
+| --- | --- | --- |
+| `regular` (default) | `.regular` (0) | `glass_tint`, applied verbatim |
+| `clear` | `.clear` (1) | the same tint; the clear style is what makes it read lighter |
+
+`glass_tint` is `RRGGBBAA` and is applied **character for character**: its alpha *is* the strength knob,
+which is why there is no separate opacity setting, and why it is not re-lit per mode. Two attempts at being
+cleverer than that are recorded because both shipped during this work and both were wrong:
+
+- Re-lighting the tint per mode left dark mode purple -- `palette.window_bg` there is near-black, so a
+  colourful page's own hue was the only thing that survived the veil.
+- Multiplying the strength by 255 twice collapsed the intended alpha to 20%, so the veil never took effect.
+
+The default is `eeeeee66` (a light neutral at 40%). Any value other than `clear` renders as the regular
+glass, so a retired look (this app briefly shipped a third one named `system`) falls back instead of
+blanking the surface. `glass_variant`, `--glass-blur` and `--glass-saturation` stay development switches,
+and the shipped path never touches the private `_variant` -- the same choice alt-tab-macos's `.regular`
+glass makes.
+
+**Floating-panel text is its own tier, and its ink adapts.** Panel text is drawn with the system's
+vibrant label colors (`NSColor.labelColor` / `secondaryLabelColor` / `tertiaryLabelColor`) inside the
+material's view, so AppKit resolves the color against the live backdrop and applies its own
+contrast-preserving treatment. The surface therefore stays honest and the *ink* carries the trade-off,
+which is the third way out of it (the other two are a smaller text surface and a measured, adaptive
+scrim). Because that color is system-owned, the panel tier's floors are one step below the table above
+— `text_primary` ≥7:1, `text_secondary`/`text_muted` ≥4.5:1 — and they are verified on **rendered
+pixels** over controlled backdrops, never by token arithmetic. Measured on the real panel: a mid-gray
+desktop lands the title at 6.57:1 and the caption at 4.67:1 with vibrant ink, against 6.04:1/2.47:1 for
+a fixed token — a large gain for small text, and still short of this table, which is why the tier is
+stated separately here. Everything drawn on `window_bg`/`card_bg` keeps the table above unchanged.
 
 **A translucent surface must be held to that.** Both blurring materials drift toward mid gray on
 their own: measured in dark mode, plain frost landed at `#868585` and liquid glass at `#6E6E6E`,
@@ -203,10 +255,9 @@ floors — so the **surface** is what gets pinned:
 
 - `frost` composites `window_bg` over the blur at an opacity that keeps the worst case legible
   (a white backdrop still lands at gray 51 or darker).
-- `liquid-glass` takes **hue and saturation only** from `glass_tint`; lightness comes from the
-  theme and opacity has a floor, so a near-white tint is still a dark glass in dark mode. The
-  historical `eeeeee66` default was a light-mode value that also failed in light mode (7.17:1),
-  which is why the tint no longer decides lightness in either mode.
+- `liquid-glass` takes its tint from `glass_tint` verbatim (default `eeeeee66`, a light neutral at 40%),
+  in both modes. There is no user-facing colour picker: the value is a config field, and a hue outside the
+  palette would invalidate the contrast table the vibrant ink is resolved against.
 
 ## 4. Typography
 

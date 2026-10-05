@@ -83,7 +83,7 @@ use search::*;
 use smoke::*;
 use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
-pub(crate) use detail::{apply_backdrop_material, apply_glass_properties, apply_theme};
+pub(crate) use detail::{apply_backdrop_material, apply_theme};
 pub(crate) use monitor::{start, stop};
 pub(crate) use persist::{clear_on_quit_enabled, discard_history_on_disk};
 pub(crate) use picker::{on_clipboard_toggle, show_picker_for_development};
@@ -604,6 +604,9 @@ static PICKER_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> 
 /// The empty-state hint view (shown when the history is empty / nothing matches). Tracked
 /// separately from row views so the next rebuild can remove it.
 static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The empty state's text surface (see `glass::TextSurface`): the hint is the only content on the
+/// panel then, so it carries its own surface. Tracked so a resize can move it with the hint.
+static EMPTY_STATE_PLATE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// Process-lifetime cache for clipboard source icons; avoids decoding the same small icon from
 /// disk again on every row rebuild.
 struct CachedSourceIcon {
@@ -770,11 +773,9 @@ static DETAIL_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> 
     MainThreadSlot::new(None);
 /// Keep clipboard panels on the same resolved appearance as the settings window and switcher.
 unsafe fn apply_panel_appearance(window: *mut AnyObject) {
-    let name = make_nsstring(if resolved_is_dark() {
-        "NSAppearanceNameDarkAqua"
-    } else {
-        "NSAppearanceNameAqua"
-    });
+    // Vibrant, not plain: these panels draw their text on the user's material (see
+    // `glass::vibrant_appearance_name`).
+    let name = make_nsstring(crate::glass::vibrant_appearance_name(resolved_is_dark()));
     let appearance: *mut AnyObject = msg_send![class!(NSAppearance), appearanceNamed: name];
     CFRelease(name as *const c_void);
     if !appearance.is_null() {
@@ -3235,7 +3236,22 @@ mod tests {
                 palette.selection_bg
             );
             assert_eq!(row_backdrop_wash(palette, false, true), palette.hover_bg);
-            assert_eq!(row_backdrop_wash(palette, false, false), 0x00000000);
+            // An idle row *is* the panel's text surface, whatever that surface is for the material in
+            // force: the wools keep the scrim, and frost deliberately paints none so the panel reads as
+            // one piece of material instead of plate-on-material strips (see `glass::text_surface_alpha`).
+            // Asserting the value rather than "not transparent" is what keeps this true for both.
+            let idle = row_backdrop_wash(palette, false, false);
+            assert_eq!(
+                idle,
+                crate::glass::panel_scrim_token_for(&palette),
+                "an idle row must carry the text surface ({} mode)",
+                if dark { "dark" } else { "light" }
+            );
+            assert_eq!(
+                idle & 0xFF,
+                crate::glass::text_surface_alpha(),
+                "the idle row must use the material's own surface alpha"
+            );
         }
     }
 

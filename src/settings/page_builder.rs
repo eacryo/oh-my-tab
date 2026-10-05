@@ -634,14 +634,17 @@ pub(super) unsafe fn build_general_page(
         ),
     );
     bind_control(target, ui.panel_material);
-    // The glass style and tint are Liquid-Glass sub-options: they are only built (and thus
-    // only occupy layout space) while that material is selected. A material change rebuilds
-    // the settings content via the settings_appearance path, so the rows come and go live.
-    // Consumers of ui.glass_style/ui.glass_tint all tolerate the null pointers (nil checks
-    // in load_settings_values, the tint-panel close path, and the smoke validators).
+    // The glass style is a Liquid-Glass sub-option: it is only built (and thus only occupies layout
+    // space) while that material is selected. A material change rebuilds the settings content via the
+    // settings_appearance path, so the row comes and goes live. The private `_variant` is deliberately
+    // NOT a user choice: two attempts at labelling it from a brightness sample were wrong (variant 19
+    // measures the *most* transparent and renders broken rainbow edges), so it stays a config/dev knob
+    // until a backdrop-differential measurement exists.
     let liquid_glass_selected =
         crate::config::effective_panel_material().as_str() == "liquid-glass";
     if liquid_glass_selected {
+        // The two looks this app has always had: `regular` (index 0) and `clear` (index 1). The index is
+        // the config value (see `ControlField::GlassStyle`).
         let glass_style_labels = [
             t("settings.glass_style_regular"),
             t("settings.glass_style_clear"),
@@ -669,64 +672,8 @@ pub(super) unsafe fn build_general_page(
             ),
         );
         bind_control(target, ui.glass_style);
-        let y = canvas.next_block(described_row_h);
-        SettingsRow::separator(general_view, y + described_row_h, content_w);
-        let tint_control = make_color_well(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            row_h,
-            &Config::default().appearance.glass_tint,
-            target,
-        );
-        ui.glass_tint = tint_control.well;
-        ui.glass_tint_hex = tint_control.hex_caption;
-        SettingsRow::described(
-            general_view,
-            label_x,
-            y,
-            ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-            described_row_h,
-            &t("settings.row_glass_tint"),
-            &t("settings.desc_glass_tint"),
-            tint_control.container,
-        );
-        configure_glass_tint_panel(target);
     }
     canvas.card(&t("settings.header_appearance"));
-
-    canvas.next_section();
-    // The preview pair is content the page lays out itself, so it is one block: the row cursor, the
-    // 90pt preview area and the captions above it, all owned by `preview_y`.
-    let preview_h = 90.0;
-    let preview_y = canvas.next_block(layout.row_gap + row_h + preview_h);
-    let preview_w = (content_w - 2.0 * label_x - 12.0) / 2.0;
-    let right_preview_x = label_x + preview_w + 12.0;
-    add_preview_caption(
-        general_view,
-        &t("settings.preview_switcher"),
-        label_x,
-        preview_y + preview_h + 3.0,
-        preview_w,
-    );
-    add_preview_caption(
-        general_view,
-        &t("settings.preview_clipboard"),
-        right_preview_x,
-        preview_y + preview_h + 3.0,
-        preview_w,
-    );
-    ui.glass_preview_switcher =
-        make_glass_preview(general_view, label_x, preview_y, preview_w, preview_h, true);
-    ui.glass_preview_clipboard = make_glass_preview(
-        general_view,
-        right_preview_x,
-        preview_y,
-        preview_w,
-        preview_h,
-        false,
-    );
-    canvas.card_with_bottom_offset(&t("settings.header_preview"), -12.0);
 
     canvas.next_section();
     let locale_metrics = SettingsSelect::metrics();

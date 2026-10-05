@@ -31,7 +31,6 @@
 | 浅色 `text_muted` | `#9B9BA2` → **2.76:1**（卡片上） | `theme.rs:124` |
 | 浅色 `text_disabled` | `#AEAEB5` → **2.21:1** | `theme.rs:125` |
 | 卡片层次 | 7% 描边 + 36pt 柔光投影 | `theme.rs:118`、`settings/widgets.rs:2196` |
-| 实时预览填充 | 白底 0x48–0x90 alpha 叠在白色卡片上 | `settings/glass_preview.rs:253–281` |
 | 预设标签 | 原始 key `mouse_smooth_preset_ease_in` | `mouse/smooth/presets.rs:95–105`、`settings/page_builder.rs:899` |
 | 硬编码英文 | `Regular`、`Clear`、`Debug`、`Info` | `settings/page_builder.rs:558,574,658` |
 | 下拉框溢出 | 折成两行 | `settings/select.rs:26` |
@@ -43,15 +42,19 @@
 
 改动小、收益大、风险低。这些是评审发现的缺陷，不是审美偏好。
 
-### P0-1 · 浅色模式下实时预览不可见
+### P0-1 · 浅色模式下实时预览不可见 —— 以删除收尾
 
-- **现状**：预览块用白底 0x48–0x90 alpha 填充（`glass_preview.rs:253–281`），叠在白色卡片上，什么都看不见。
-- **目标**：预览舞台改为深色/反色画布（切换浮窗和剪贴板面板本来就是覆盖在任意内容之上的临时表面），
-  预览元素用真实颜色绘制。浅色模式下可辨认，深色模式下同样成立。
-- **文件**：`settings/glass_preview.rs`、`settings/page_builder.rs`（预览区块度量）。
-- **验收**：一个 headless 检查，断言预览舞台的填充在两种调色板下都与卡片有 ≥ 3:1 的对比。这一条**有意
-  严于**设计规范里的结构性边界下限——因为这里的填充**本身就是内容**，不是围着内容的描边。通过
-  `--e2e-state` 暴露解析后的预览颜色，使断言不必读像素。挂到 `--smoke-settings-layout`。
+- **现状**：通用页不再绘制应用切换浮窗与剪贴板浮窗的实时预览，因此没有可辨性问题。那两个模拟块曾是
+  App 里唯一"不是面板、却在模拟面板"的内容；它们的填充是白底 0x48–0x90 alpha 叠在白色卡片上，
+  这正是它们在浅色模式下不可见的原因。
+- **已达成**：无需再定样式。一个错误呈现真实表面的预览比没有预览更糟，而它本要预览的材质现在直接
+  由面板本身来评判。
+- **文件**：`settings/glass_preview.rs`（删除）、`settings/page_builder.rs`（区块与度量移除）、
+  `settings.rs`/`settings/window.rs`（句柄、初始化与预览检查移除）、`theme.rs`（`PREVIEW_TILE_*`、
+  舞台色与对比度助手移除）、`e2e_state.rs`（`settings_preview` 帧字段及其读者一并移除）。
+- **验收**：表面已不存在，所以检查是结构性的而非视觉的：`src/settings/` 下不再残留 `preview` 符号，
+  且 `--smoke-settings-layout` 在三种语言、缩短后的"外观"卡片下依然通过。浮窗本身的观感由各自的
+  检查覆盖（`--smoke-keystroke-display-panel` 与浮窗 smoke）。
 
 ### P0-2 · 预设下拉显示原始翻译 key
 
@@ -109,7 +112,7 @@
   `appearance.corner_radius` 计算得出。
 - **文件**：`settings/components.rs:926,955,1065,1104`、`settings/widgets.rs:116,1223,1954,2001,2385,2625`、
   `settings/select.rs:345,858,1059`、`settings/sidebar.rs:188`、`settings/tooltip.rs:438,496`、
-  `settings/glass_preview.rs:208,222`、`settings/page_builder.rs:1106,1118`、`overlay/cards.rs:129,150,295,329`、
+  `settings/page_builder.rs:1106,1118`、`overlay/cards.rs:129,150,295,329`、
   `overlay/cancel.rs:722`、`overlay/card_close.rs:751`、`clipboard/*.rs`。
 - **验收**：测试断言设置界面的每个 `setCornerRadius:` 取值都来自具名常量；环半径等于卡片半径加上文档规定的内缩。
 

@@ -34,7 +34,6 @@ What the app does today, with the literal's location. This is the "before" colum
 | Light `text_muted` | `#9B9BA2` → **2.76:1** (card) | `theme.rs:124` |
 | Light `text_disabled` | `#AEAEB5` → **2.21:1** | `theme.rs:125` |
 | Card definition | 7% border + 36pt soft shadow | `theme.rs:118`, `settings/widgets.rs:2196` |
-| Live preview fill | white @ 0x48–0x90 over a white card | `settings/glass_preview.rs:253–281` |
 | Preset label | raw key `mouse_smooth_preset_ease_in` | `mouse/smooth/presets.rs:95–105`, `settings/page_builder.rs:899` |
 | Hardcoded English | `Regular`, `Clear`, `Debug`, `Info` | `settings/page_builder.rs:558,574,658` |
 | Select overflow | wraps to two lines | `settings/select.rs:26` |
@@ -46,19 +45,22 @@ What the app does today, with the literal's location. This is the "before" colum
 
 Small, high-impact, low-risk. These are the defects the review found, not taste.
 
-### P0-1 · Live preview is invisible in light mode
+### P0-1 · Live preview is invisible in light mode — resolved by removal
 
-- **Now**: the preview blocks are filled with white at 0x48–0x90 alpha (`glass_preview.rs:253–281`)
-  on a white card, so nothing is visible.
-- **Target**: the preview stage is a dark/inverted canvas (the switcher and the clipboard panel are
-  both transient surfaces over arbitrary content), with preview elements drawn in their real
-  colors. It must be legible in light mode and stay legible in dark mode.
-- **Files**: `settings/glass_preview.rs`, `settings/page_builder.rs` (preview block metrics).
-- **Acceptance**: a headless check that the preview stage's fill contrasts with the card by ≥ 3:1 in
-  both palettes. That is deliberately stricter than the structural-boundary floor in the style spec —
-  here the filled area **is** the content, not an outline around it. Expose the resolved preview colors
-  through `--e2e-state` so the assertion does not have to read pixels. Add it to
-  `--smoke-settings-layout`.
+- **Now**: the General page no longer draws a live preview of the switcher and clipboard panels, so
+  there is nothing to make legible. The two mock blocks were the only content in the app that
+  *simulated* a panel instead of being one; their fill was white at 0x48–0x90 alpha over a white card,
+  which is why they were invisible in light mode in the first place.
+- **Target reached**: nothing to style. A preview that misrepresents the real surface is worse than no
+  preview, and the material it was meant to preview is now judged from the panels themselves.
+- **Files**: `settings/glass_preview.rs` (deleted), `settings/page_builder.rs` (block and its metrics
+  removed), `settings.rs`/`settings/window.rs` (handles, init and the preview check removed),
+  `theme.rs` (`PREVIEW_TILE_*`, the stage color and the contrast helper removed), `e2e_state.rs`
+  (the `settings_preview` frame field removed with its readers).
+- **Acceptance**: the surface is gone, so the check is structural rather than visual: no `preview`
+  symbols remain under `src/settings/`, and `--smoke-settings-layout` still passes on all three
+  locales with the shortened Appearance card. The look of the switcher and clipboard panels is
+  covered by their own panels' checks (`--smoke-keystroke-display-panel`, the overlay smoke).
 
 ### P0-2 · Preset dropdown shows a raw translation key
 
@@ -126,7 +128,7 @@ onto them. The visible result is a UI that stops looking almost-aligned.
   tile/close radii from `appearance.corner_radius`.
 - **Files**: `settings/components.rs:926,955,1065,1104`, `settings/widgets.rs:116,1223,1954,2001,2385,2625`,
   `settings/select.rs:345,858,1059`, `settings/sidebar.rs:188`, `settings/tooltip.rs:438,496`,
-  `settings/glass_preview.rs:208,222`, `settings/page_builder.rs:1106,1118`, `overlay/cards.rs:129,150,295,329`,
+  `settings/page_builder.rs:1106,1118`, `overlay/cards.rs:129,150,295,329`,
   `overlay/cancel.rs:722`, `overlay/card_close.rs:751`, `clipboard/*.rs`.
 - **Acceptance**: a test asserting that every `setCornerRadius:` value in the settings surface comes
   from a named constant; the ring radius equals the card radius plus the documented inset.

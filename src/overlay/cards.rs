@@ -54,6 +54,7 @@ pub(crate) unsafe fn nsimage_from_cgimage(cg: *const c_void, size: NSSize) -> *m
 
 /// A left-aligned label (the mockup's .caption-title): fixed width + tail
 /// truncation, no centering.
+#[allow(clippy::too_many_arguments)]
 unsafe fn make_left_label(
     text: &str,
     font: *mut AnyObject,
@@ -62,10 +63,11 @@ unsafe fn make_left_label(
     y: f64,
     width: f64,
     height: f64,
+    label_class: *mut AnyObject,
 ) -> *mut AnyObject {
     let ns_str = make_nsstring(text);
     let init_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(width, height));
-    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label_class, alloc];
     let label: *mut AnyObject = msg_send![label, initWithFrame: init_frame];
     let _: () = msg_send![label, setStringValue: ns_str];
     CFRelease(ns_str as *const c_void);
@@ -474,6 +476,7 @@ pub(crate) fn create_card_view(
                 let cfg = CONFIG.read().unwrap();
                 msg_send![class!(NSFont), systemFontOfSize: title_size, weight: cfg.fonts.title_weight]
             };
+            // The caption rides on the user's material: vibrant ink, no plate (design-style §3).
             let title_label = make_left_label(
                 &card_caption(
                     &w.window_title,
@@ -481,11 +484,12 @@ pub(crate) fn create_card_view(
                     crate::theme::show_app_name_in_cards(),
                 ),
                 title_font,
-                hex_to_ns_color(colors.win_title),
+                crate::glass::PanelInk::Primary.color(),
                 title_x,
                 caption_y + 2.0,
                 title_w,
                 (caption_h - 4.0).max(1.0),
+                crate::glass::vibrant_label_class(),
             );
             let _: () = msg_send![view, addSubview: title_label];
             release_obj(title_label);
@@ -621,14 +625,15 @@ pub(crate) fn create_card_view(
                 let cfg = CONFIG.read().unwrap();
                 msg_send![class!(NSFont), systemFontOfSize: primary_font_size, weight: cfg.fonts.title_weight]
             };
-            let primary_color = hex_to_ns_color(colors.win_title);
-            let title_label = make_centered_label(
+            // Both lines ride on the user's material: vibrant ink, no plate (design-style §3).
+            let title_label = make_centered_label_with_class(
                 display_title(&w.window_title, &w.app_name),
                 primary_font,
-                primary_color,
+                crate::glass::PanelInk::Primary.color(),
                 primary_bottom,
                 card_width,
                 primary_line_h,
+                crate::glass::vibrant_label_class(),
             );
             let _: () = msg_send![view, addSubview: title_label];
             release_obj(title_label); // view owns the label; drop our alloc +1
@@ -639,14 +644,14 @@ pub(crate) fn create_card_view(
                 let cfg = CONFIG.read().unwrap();
                 msg_send![class!(NSFont), systemFontOfSize: secondary_font_size, weight: cfg.fonts.app_name_weight]
             };
-            let secondary_color = hex_to_ns_color(colors.app_name);
-            let name_label = make_centered_label(
+            let name_label = make_centered_label_with_class(
                 &w.app_name,
                 secondary_font,
-                secondary_color,
+                crate::glass::PanelInk::Secondary.color(),
                 secondary_bottom,
                 card_width,
                 secondary_line_h,
+                crate::glass::vibrant_label_class(),
             );
             let _: () = msg_send![view, addSubview: name_label];
             release_obj(name_label); // view owns the label; drop our alloc +1

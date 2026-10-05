@@ -346,9 +346,9 @@ pub(crate) use callbacks::{
     thumbnail_scroller_mouse_exited, thumbnail_scroller_mouse_moved, thumbnail_scroller_mouse_up,
 };
 pub(crate) use cancel::{
-    apply_backdrop_material, apply_glass_properties, apply_theme, close_window_at,
-    extract_uncached_icons, install_click_to_cancel, on_deferred_raise, on_delayed_order_out,
-    refresh_highlight, refresh_thumbnail_previews, vanish_overlay,
+    apply_backdrop_material, apply_theme, close_window_at, extract_uncached_icons,
+    install_click_to_cancel, on_deferred_raise, on_delayed_order_out, refresh_highlight,
+    refresh_thumbnail_previews, switcher_backdrop_options, vanish_overlay,
 };
 pub(crate) use cards::{create_card_view, show_overlay};
 // Only the thumbnail unit tests use crate::overlay::nsimage_from_cgimage (cards.rs
@@ -1272,10 +1272,34 @@ pub(crate) unsafe fn make_centered_label(
     container_width: f64,
     height: f64,
 ) -> *mut AnyObject {
+    make_centered_label_with_class(
+        text,
+        font,
+        color,
+        y,
+        container_width,
+        height,
+        class!(NSTextField) as *const _ as *mut AnyObject,
+    )
+}
+
+/// The same label on a chosen class: the switcher's own text uses `glass::vibrant_label_class()` so
+/// AppKit treats it as vibrant content over the material, while labels that sit on our own opaque
+/// surfaces (the letter avatar on its filled square) keep the plain `NSTextField`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn make_centered_label_with_class(
+    text: &str,
+    font: *mut AnyObject,
+    color: *mut AnyObject,
+    y: f64,
+    container_width: f64,
+    height: f64,
+    label_class: *mut AnyObject,
+) -> *mut AnyObject {
     let ns_str = make_nsstring(text);
     // Create with a wide enough frame
     let init_frame = NSRect::new(NSPoint::new(0.0, y), NSSize::new(container_width, height));
-    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label_class, alloc];
     let label: *mut AnyObject = msg_send![label, initWithFrame: init_frame];
     let _: () = msg_send![label, setStringValue: ns_str];
     CFRelease(ns_str as *const c_void);

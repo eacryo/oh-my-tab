@@ -29,8 +29,6 @@ static SPACE_IN_TRANSITION: AtomicBool = AtomicBool::new(false);
 /// one to assert the app's own view of which Space is active.
 static LAST_SPACE_CONTEXT: OnceLock<std::sync::Mutex<Option<String>>> = OnceLock::new();
 static SPACE_TRANSITION_DEADLINE_MS: AtomicU64 = AtomicU64::new(0);
-static SETTINGS_PREVIEW_STAGE: AtomicU64 = AtomicU64::new(0);
-static SETTINGS_PREVIEW_CARD: AtomicU64 = AtomicU64::new(0);
 static SMOOTH_PHASES: [AtomicU64; 6] = [
     AtomicU64::new(0),
     AtomicU64::new(0),
@@ -132,13 +130,6 @@ pub(crate) fn set_space_transition(in_transition: bool, deadline_unix_ms: u64) {
     if is_enabled() {
         SPACE_TRANSITION_DEADLINE_MS.store(deadline_unix_ms, Ordering::Relaxed);
         SPACE_IN_TRANSITION.store(in_transition, Ordering::Relaxed);
-    }
-}
-
-pub(crate) fn set_settings_preview_colors(stage: u32, card: u32) {
-    if is_enabled() {
-        SETTINGS_PREVIEW_STAGE.store(stage as u64, Ordering::Relaxed);
-        SETTINGS_PREVIEW_CARD.store(card as u64, Ordering::Relaxed);
     }
 }
 
@@ -465,16 +456,39 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"settings_window_visible\": {},\n",
         crate::settings::settings_window_is_visible()
     ));
-    json.push_str(&format!(
-        "  \"settings_preview\": {{\"stage\": \"#{:08x}\", \"card\": \"#{:08x}\"}},\n",
-        SETTINGS_PREVIEW_STAGE.load(Ordering::Relaxed),
-        SETTINGS_PREVIEW_CARD.load(Ordering::Relaxed),
-    ));
     // The installed panel material (after the Reduce Transparency override) — AX cannot tell
     // a glass view from a plain layer, so the app states the fact itself.
     json.push_str(&format!(
         "  \"panel_material\": {},\n",
         json_string(crate::glass::effective_material_id())
+    ));
+    // The development-only frost blend, if this launch asked for one (`--frost-blend`). A2 asserts the
+    // installed surface from this instead of guessing at pixels.
+    json.push_str(&format!(
+        "  \"frost_blend\": {},\n",
+        match crate::config::effective_frost_blend() {
+            Some(value) => format!("{value:.3}"),
+            None => "null".to_string(),
+        }
+    ));
+    // The effective glass look and the tint it resolved to, verbatim from the config. AX cannot express a
+    // tint and `NSGlassEffectView.tintColor` reports a system default, so the app states the value itself:
+    // this is what makes "the panel shipped with the wrong tint (or an opaque white sheet)" assertable.
+    json.push_str(&format!(
+        "  \"glass_look\": {}, \"glass_tint\": \"{:08x}\",\n",
+        json_string(&crate::config::effective_glass_style()),
+        crate::glass::resolved_glass_tint_hex()
+    ));
+    // The material-strength knobs, and whether the private `_variant` selector exists on this system:
+    // no accessibility tree can express either fact, and the look depends on both.
+    json.push_str(&format!(
+        "  \"panel_material_tuning\": {{\"opacity\": {:.3}, \"tint\": \"{:08x}\", \"blur_radius\": {:.1}, \"saturation\": {:.2}, \"variant\": {}, \"variant_supported\": {}}},\n",
+        crate::config::effective_glass_opacity(),
+        crate::glass::resolved_glass_tint_hex(),
+        crate::config::effective_glass_blur_radius(),
+        crate::config::effective_glass_saturation(),
+        crate::config::effective_glass_variant(),
+        crate::glass::glass_variant_is_supported()
     ));
     json.push_str(&format!(
         "  \"smooth_scroll\": {{\"ticks\": {}, \"touch_began\": {}, \"touch_changed\": {}, \"touch_ended\": {}, \"momentum_began\": {}, \"momentum_changed\": {}, \"momentum_ended\": {}}},\n",

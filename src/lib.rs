@@ -1108,7 +1108,7 @@ fn create_overlay_window() -> *mut AnyObject {
             window,
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
             radius,
-            None,
+            crate::overlay::switcher_backdrop_options(),
         );
         *crate::overlay::OVERLAY_BACKDROP.lock().unwrap() = Some(backdrop);
         let content_parent = backdrop.content_parent;
@@ -1259,8 +1259,17 @@ fn create_overlay_window() -> *mut AnyObject {
             let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
             msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
         };
-        let status_color = hex_to_ns_color(crate::theme::ui_palette().muted_text);
-        let status_label = make_centered_label("", status_font, status_color, 0.0, w, footer_h);
+        // The status line (and the "no windows to switch" hint it carries) rides on the user's material
+        // with vibrant ink, so it needs no band (design-style §3).
+        let status_label = make_centered_label_with_class(
+            "",
+            status_font,
+            crate::glass::PanelInk::Muted.color(),
+            0.0,
+            w,
+            footer_h,
+            crate::glass::vibrant_label_class(),
+        );
         let _: () = msg_send![content_parent, addSubview: status_label];
         *STATUS_LABEL.lock().unwrap() = Some(ObjPtr::new(status_label));
 
@@ -1706,30 +1715,6 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleSettings:),
                 on_settings_open as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleGlassTintChanged:),
-                on_glass_tint_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleGlassTintPanelChanged:),
-                on_glass_tint_panel_changed as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleGlassTintPanelWillClose:),
-                on_glass_tint_panel_will_close as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(handleGlassTintReset:),
-                on_glass_tint_reset as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(

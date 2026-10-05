@@ -705,6 +705,13 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
     }
 }
 
+/// The switcher's backdrop policy. Every card carries a text surface for its caption, and the status
+/// footer carries one too, so the material is left honest (design-style §3, `TextSurface`); the
+/// switcher is the active panel, so no inactive-glass compensation.
+pub(crate) const fn switcher_backdrop_options() -> crate::glass::BackdropOptions {
+    crate::glass::BackdropOptions::new(None)
+}
+
 /// Re-apply surface properties from CONFIG to the installed backdrop, for hot reload:
 /// glass style/tint, frost material, opaque surface color. Corner radius is re-asserted on
 /// whichever root view is installed (glass also carries it as its own rounding property).
@@ -712,7 +719,7 @@ pub(crate) unsafe fn apply_glass_properties() {
     let Some(backdrop) = *OVERLAY_BACKDROP.lock().unwrap() else {
         return;
     };
-    crate::glass::apply_live_properties(backdrop, None);
+    crate::glass::apply_live_properties(backdrop, switcher_backdrop_options());
     let Some(root) = backdrop.root else {
         return;
     };
@@ -745,7 +752,13 @@ pub(crate) unsafe fn apply_backdrop_material() {
     let radius = CONFIG.read().unwrap().appearance.corner_radius;
     let frame_rect: NSRect = msg_send![window, frame];
     let content_rect: NSRect = msg_send![window, contentRectForFrameRect: frame_rect];
-    let new = crate::glass::swap_backdrop(window, &old, content_rect, radius, None);
+    let new = crate::glass::swap_backdrop(
+        window,
+        &old,
+        content_rect,
+        radius,
+        switcher_backdrop_options(),
+    );
     *OVERLAY_BACKDROP.lock().unwrap() = Some(new);
     apply_glass_properties();
 }
@@ -775,11 +788,10 @@ pub(crate) fn apply_theme() {
         // auto themes are refreshed from the system appearance notification.
         // Update window appearance for blur material tint
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
-            let appearance_name = if is_dark {
-                make_nsstring("NSAppearanceNameDarkAqua")
-            } else {
-                make_nsstring("NSAppearanceNameAqua")
-            };
+            // Vibrant, not plain: this panel's text is drawn on the user's material, so it uses the
+            // system's vibrant label colors and AppKit's contrast-preserving treatment
+            // (design-style §3, "the ink adapts").
+            let appearance_name = make_nsstring(crate::glass::vibrant_appearance_name(is_dark));
             let appearance: *mut AnyObject =
                 msg_send![class!(NSAppearance), appearanceNamed: appearance_name];
             CFRelease(appearance_name as *const c_void);

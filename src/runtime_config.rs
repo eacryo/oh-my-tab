@@ -95,7 +95,6 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
             crate::clipboard::apply_backdrop_material();
             crate::keystroke_display::apply_backdrop_material();
         }
-        crate::settings::glass_preview::apply_glass_preview();
     }
 
     if flags.modifier {

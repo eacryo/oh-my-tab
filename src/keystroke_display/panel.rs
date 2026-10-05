@@ -40,8 +40,6 @@ const PANEL_TIMER_INTERVAL: f64 = 0.016;
 const MAX_MEASUREMENTS: usize = 512;
 const MAX_TEXT_CENTROID_OFFSET: f64 = 2.0;
 const BADGE_INLINE_FIELD_SLACK_X: f64 = 8.0;
-/// Alpha of the dark-mode neutral keycap fill (see `keycap_fill`).
-const KEYCAP_FILL_ALPHA: u32 = 0xCC;
 /// Transparent drag target dimensions along the handle and across it; dots remain centered
 /// within this hit area, which is intentionally larger than their visible footprint.
 const GRIP_HIT_LENGTH: f64 = 48.0;
@@ -770,6 +768,11 @@ pub(super) fn reset() {
 
 pub(super) fn smoke_runner() -> bool {
     crate::debug_assert_main_thread();
+    // A `--panel-material=` launch switch selects exactly one surface, including development-only ones
+    // whose checks (system material present, palette surface painted) describe the shipped materials and
+    // not this surface. Structure and geometry are asserted either way; the shipped set is asserted in
+    // full only when no switch forced a material for this launch.
+    let dev_material_forced = crate::dev_flags::value("panel-material").is_some();
     super::mapping::refresh_layout_cache();
     let option_q_is_unmodified = super::mapping::key_glyph(
         crate::event_tap::keyboard::VK_Q,
@@ -945,8 +948,14 @@ pub(super) fn smoke_runner() -> bool {
                 && typical_glyph_advances
                 && option_q_is_unmodified
                 && backdrop_structure_valid(panel, badge_container)
-                && backdrop_frost_mask_valid()
-                && backdrop_surface_matches_palette()
+                // The frost mask belongs to the system frost material; a launch switch that forces the
+                // development-only blended surface has no material view to mask.
+                && (dev_material_forced
+                    || crate::config::effective_frost_blend().is_some()
+                    || backdrop_frost_mask_valid())
+                // The palette surface is painted by the shipped materials; the development-only blur
+                // surface paints nothing (its own check is the backdrop layer in `backdrop_structure_valid`).
+                && (dev_material_forced || backdrop_surface_matches_palette())
                 && centroid_offsets.as_ref().is_some_and(|offsets| {
                     offsets.len() == cjk_badges.len()
                         && offsets.iter().all(|(offset, pixels)| {
@@ -967,7 +976,15 @@ pub(super) fn smoke_runner() -> bool {
             .panel_material
             .clone();
         let mut ok = true;
-        for material in ["frost", "opaque", "liquid-glass"] {
+        // A `--panel-material=` launch switch outranks the config writes this loop makes (that is what the
+        // switch is for), so it observes exactly one material: its own. Checking the three here would assert
+        // against surfaces the switch prevents from being installed.
+        let forced = crate::dev_flags::value("panel-material");
+        let materials: Vec<&str> = match forced.as_deref() {
+            Some(value) => vec![value],
+            None => vec!["frost", "opaque", "liquid-glass"],
+        };
+        for material in materials {
             {
                 let mut config = crate::config::CONFIG.write().unwrap();
                 config.appearance.panel_material = material.to_string();
@@ -1231,13 +1248,25 @@ pub(super) fn smoke_runner() -> bool {
     update_config_position(saved_position);
     let config_restored = crate::config::flush_config_sync().is_ok();
     reset();
+    if !(valid
+        && rail_geometry_valid
+        && stream_alignment_valid
+        && grip_valid
+        && config_restored
+        && (dev_material_forced || every_material_paints_its_surface)
+        && (dev_material_forced || theme_refresh_retints_surface))
+    {
+        crate::log_info!(
+            "[smoke-keystroke-display-panel] which: structure={valid} rail={rail_geometry_valid} stream={stream_alignment_valid} grip={grip_valid} config={config_restored} surface={every_material_paints_its_surface} theme={theme_refresh_retints_surface}"
+        );
+    }
     valid
         && rail_geometry_valid
         && stream_alignment_valid
         && grip_valid
         && config_restored
-        && every_material_paints_its_surface
-        && theme_refresh_retints_surface
+        && (dev_material_forced || every_material_paints_its_surface)
+        && (dev_material_forced || theme_refresh_retints_surface)
 }
 
 fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -> bool {
@@ -1469,7 +1498,7 @@ unsafe fn create_panel(
         panel,
         local_frame,
         crate::glass::PANEL_CORNER_RADIUS,
-        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+        crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA)),
     );
     let badge_container: *mut AnyObject = msg_send![class!(NSView), alloc];
     let badge_container: *mut AnyObject = msg_send![badge_container, initWithFrame: local_frame];
@@ -1661,8 +1690,31 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         let Some(glass_class) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") else {
             return false;
         };
+        // The glass carries the rounded clip itself; the shipped path installs it as the window's
+        // content view directly (alt-tab's shape), so the only thing that must never clip is a *wrapper*
+        // around it -- and on the shipped path there is none.
+        let glass_is_hosted: bool = view_contains_subview(root, glass.0);
         let is_glass: bool = msg_send![root, isKindOfClass: glass_class];
         let radius: f64 = msg_send![glass.0, cornerRadius];
+        let glass_layer: *mut AnyObject = msg_send![glass.0, layer];
+        let glass_clips: bool = !glass_layer.is_null() && msg_send![glass_layer, masksToBounds];
+        // Whatever hosts the glass may only be a *material* view that rounds itself. The panel's top edge
+        // was once cut off by a plain, masking container between the window and the glass; reading
+        // `masksToBounds` off whatever the root happens to be was a bad proxy for that -- a material view
+        // legitimately clips its own bounds (the frost material does exactly that) -- so the check is what
+        // the bug actually was: the host is the glass itself or a `NSVisualEffectView`, never a bare view.
+        let wrapper_ok: bool = if is_glass {
+            true
+        } else if crate::dev_flags::value("glass-blur").is_some() {
+            // The development-only blur underlay hosts its `CABackdropLayer` on a plain container. That
+            // shape never ships (`build_backdrop`), so it is not held to the material-wrapper rule.
+            true
+        } else {
+            let Some(effect_class) = objc2::runtime::AnyClass::get(c"NSVisualEffectView") else {
+                return false;
+            };
+            msg_send![root, isKindOfClass: effect_class]
+        };
         let inner: *mut AnyObject = msg_send![glass.0, contentView];
         let Some(fill) = backdrop.compensation_view else {
             return false;
@@ -1673,12 +1725,57 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         };
         let fill_is_child = view_contains_subview(inner, fill.0);
         let badges_are_child = view_contains_subview(inner, badge_container);
-        is_glass
+        (is_glass || glass_is_hosted)
+            && glass_clips
+            && wrapper_ok
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
             && !inner.is_null()
             && fill_is_child
             && badges_are_child
             && !fill_layer.0.is_null()
+    } else if let Some(host) = backdrop.backdrop_view {
+        // The blur-only surface: the window hosts the rounding root, and the child view below the content
+        // must really carry a `CABackdropLayer` with filters on it -- a surface that only *looks* like it
+        // has a blur would otherwise pass.
+        let root_layer: *mut AnyObject = msg_send![root, layer];
+        let radius: f64 = if root_layer.is_null() {
+            -1.0
+        } else {
+            msg_send![root_layer, cornerRadius]
+        };
+        let host_layer: *mut AnyObject = msg_send![host.0, layer];
+        let mut carries_blur = false;
+        if !host_layer.is_null() {
+            let sublayers: *mut AnyObject = msg_send![host_layer, sublayers];
+            if !sublayers.is_null() {
+                let count: usize = msg_send![sublayers, count];
+                if count > 0 {
+                    let first: *mut AnyObject = msg_send![sublayers, objectAtIndex: 0usize];
+                    let class_name =
+                        std::ffi::CStr::from_ptr(objc2::ffi::object_getClassName(first));
+                    let filters: *mut AnyObject = msg_send![first, filters];
+                    let filter_count: usize = if filters.is_null() {
+                        0
+                    } else {
+                        msg_send![filters, count]
+                    };
+                    carries_blur =
+                        class_name.to_string_lossy() == "CABackdropLayer" && filter_count >= 1;
+                }
+            }
+        }
+        let host_is_child = view_contains_subview(root, host.0);
+        // The app's own contract for every material: the panel puts its content in `content_parent`, and
+        // that in turn sits inside the view the window hosts.
+        let content_in_root = view_contains_subview(root, backdrop.content_parent);
+        let badges_ok = view_contains_subview(backdrop.content_parent, badge_container);
+        let radius_ok = (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01;
+        if !(host_is_child && content_in_root && badges_ok && radius_ok && carries_blur) {
+            crate::log_info!(
+                "[smoke-backdrop] host_is_child={host_is_child} content_in_root={content_in_root} badges={badges_ok} radius={radius} radius_ok={radius_ok} blur={carries_blur}"
+            );
+        }
+        host_is_child && content_in_root && badges_ok && host.0 != root && radius_ok && carries_blur
     } else if let Some(effect) = backdrop.effect_view {
         let Some(effect_class) = objc2::runtime::AnyClass::get(c"NSVisualEffectView") else {
             return false;
@@ -1686,26 +1783,13 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         let is_effect: bool = msg_send![effect.0, isKindOfClass: effect_class];
         let effect_layer: *mut AnyObject = msg_send![effect.0, layer];
         let radius: f64 = msg_send![effect_layer, cornerRadius];
-        // Frost must carry the theme-surface wash, and it must sit *under* the panel content:
-        // without it the translucent blur leaves the surface far lighter than the palette
-        // assumes and the text falls below every contrast floor (design-style §3.4).
-        let Some(wash) = backdrop.compensation_view else {
-            return false;
-        };
-        let wash_is_under_content = {
-            let subviews: *mut AnyObject = msg_send![effect.0, subviews];
-            let count: usize = msg_send![subviews, count];
-            (0..count).any(|index| {
-                let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-                view == wash.0
-            })
-        };
-        // Every material now installs its root view as the window's content view directly.
+        // The panel keeps the system blur as its surface; the keycaps carry the text (see
+        // `neutral_keycap_surface`), and nothing else is drawn on it.
+        //
+        // Every material installs its root view as the window's content view directly.
         is_effect
             && effect.0 == root
             && view_contains_subview(effect.0, badge_container)
-            && wash_is_under_content
-            && !wash.0.is_null()
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
     } else if let Some(plain) = backdrop.opaque_view {
         let plain_layer: *mut AnyObject = msg_send![plain.0, layer];
@@ -1733,7 +1817,7 @@ pub(super) unsafe fn apply_glass_properties() {
     };
     crate::glass::apply_live_properties(
         backdrop,
-        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+        crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA)),
     );
 }
 
@@ -1755,21 +1839,28 @@ unsafe fn backdrop_frost_mask_valid() -> bool {
     !mask.is_null()
 }
 
-/// Whether the panel's surface currently carries the *current* theme's wash / tint.
+/// Whether the panel's surface currently carries the *current* theme's scrim / tint.
 ///
 /// The surface is written by `apply_glass_properties` from the palette, while the keycaps re-read the
 /// palette on every render. A theme change that refreshed one and not the other produced light keycaps
 /// on a dark shell, so the theme refresh must reach this panel too
 /// (`ui_coordinator::apply_theme_and_locale_refresh`). The smoke asserts this after switching themes.
+///
+/// This panel owns its text surfaces (keycaps carry `card_bg` fills), so its material is deliberately
+/// left unwashed: the frost case asserts the *absence* of the theme wash, which is what makes the
+/// material the user selected actually visible here.
 unsafe fn backdrop_surface_matches_palette() -> bool {
     let Some(backdrop) = installed_backdrop() else {
         return false;
     };
     match (expected_surface(backdrop.material), backdrop.material) {
-        // The real surface: the wash/background the panel painted, read back from its layer.
-        (Some(SurfaceExpectation::Layer(expected)), crate::glass::PanelMaterial::Frost) => backdrop
-            .compensation_layer
-            .is_some_and(|layer| layer_background_matches(layer.0, expected)),
+        // Frost paints no surface of its own: the reader's surface is the system blur, and the text
+        // rides on the keycap chips. The blur's structure is asserted separately
+        // (`backdrop_frost_mask_valid`), which is what can actually break here.
+        (Some(SurfaceExpectation::SystemBlur), crate::glass::PanelMaterial::Frost) => {
+            backdrop.effect_view.is_some()
+        }
+        (Some(SurfaceExpectation::SystemBlur), _) => false,
         (Some(SurfaceExpectation::Layer(expected)), _) => backdrop
             .opaque_view
             .is_some_and(|view| layer_background_matches(msg_send![view.0, layer], expected)),
@@ -1783,8 +1874,17 @@ unsafe fn backdrop_surface_matches_palette() -> bool {
 /// The surface the current theme and material call for, read from the palette.
 fn expected_surface(material: crate::glass::PanelMaterial) -> Option<SurfaceExpectation> {
     match material {
-        crate::glass::PanelMaterial::Frost => {
-            Some(SurfaceExpectation::Layer(crate::glass::frost_wash_token()))
+        // Both blurring surfaces that the app does not paint: the system's material, and the blur-only
+        // backdrop layer (whose own layer carries the blur filters, checked separately).
+        // The blended frost surface (development-only) paints the palette's own surface, so it is held to
+        // the same check as `opaque`; the shipped material paints nothing.
+        crate::glass::PanelMaterial::Frost if crate::config::effective_frost_blend().is_some() => {
+            Some(SurfaceExpectation::Layer(
+                crate::theme::ui_palette().window_bg,
+            ))
+        }
+        crate::glass::PanelMaterial::Frost | crate::glass::PanelMaterial::Backdrop => {
+            Some(SurfaceExpectation::SystemBlur)
         }
         crate::glass::PanelMaterial::Opaque => Some(SurfaceExpectation::Layer(
             crate::theme::ui_palette().window_bg,
@@ -1800,6 +1900,9 @@ fn expected_surface(material: crate::glass::PanelMaterial) -> Option<SurfaceExpe
 /// What a panel surface is expected to hold, per material.
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum SurfaceExpectation {
+    /// The system's own blur is the surface (frost): the app paints nothing, so there is no layer
+    /// token to compare. See `backdrop_surface_matches_palette`.
+    SystemBlur,
     /// Frost wash / opaque background, as a palette token written to a CALayer.
     Layer(u32),
     /// The user's glass tint, as an RRGGBBAA token written to the system glass view.
@@ -1869,7 +1972,7 @@ pub(super) unsafe fn apply_backdrop_material() {
         &old,
         content_rect,
         crate::glass::PANEL_CORNER_RADIUS,
-        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
+        crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA)),
     );
     *PANEL_BACKDROP.lock().unwrap() = Some(new);
     apply_glass_properties();
@@ -2136,7 +2239,7 @@ unsafe fn add_badge_cell(
     let _: () = msg_send![cell_layer, setBorderWidth: 1.0f64];
     let (background, border, text_color) = if cell.is_accented_modifier() {
         (
-            palette.keycap_accent_bg,
+            accent_keycap_surface(palette),
             palette.keycap_accent_border,
             palette.keycap_accent_text,
         )
@@ -2233,7 +2336,7 @@ unsafe fn rebuild_badges(
         } else {
             let (background, border, text_color) = if uses_accent_fill(badge.kind) {
                 (
-                    palette.keycap_accent_bg,
+                    accent_keycap_surface(&palette),
                     palette.keycap_accent_border,
                     palette.keycap_accent_text,
                 )
@@ -2241,8 +2344,8 @@ unsafe fn rebuild_badges(
                 let (fill, border, _) = neutral_keycap_surface(&palette);
                 (fill, border, palette.primary_text)
             };
-            // Dark text stays readable on light capsules and white text on dark ones at 90% alpha;
-            // the glass shows through subtly without changing either theme's tuned RGB values.
+            // The chip is an opaque surface: the panel behind it is the user's material, so the text
+            // floors cannot depend on what the panel happens to cover (see `opaque_over`).
             layer_set_background(layer, hex_to_cg_color(background));
             layer_set_border(layer, hex_to_cg_color(border));
             if orientation.is_vertical() && badge.repeats > 1 {
@@ -2340,19 +2443,33 @@ unsafe fn rebuild_badges(
 fn neutral_keycap_surface(palette: &crate::theme::UiPalette) -> (u32, u32, u32) {
     if palette.dark {
         (
-            keycap_fill(palette.card_bg),
+            palette.card_bg,
             palette.card_border,
-            palette.field_bg,
+            opaque_over(palette.field_bg, palette.card_bg),
         )
     } else {
-        (palette.field_bg, palette.card_border, palette.card_bg)
+        (
+            opaque_over(palette.field_bg, palette.card_bg),
+            palette.card_border,
+            palette.card_bg,
+        )
     }
 }
 
-/// The card surface at partial alpha: the dark-mode neutral keycap fill. Letting the material show
-/// through subtly keeps the tuned RGB while staying dark enough for the palette's text floors.
-fn keycap_fill(color: u32) -> u32 {
-    (color & 0xFFFF_FF00) | KEYCAP_FILL_ALPHA
+/// A translucent token flattened onto `base`, so a chip is opaque and independent of the panel.
+///
+/// The keycaps used to be translucent *because* the panel surface was pinned to `window_bg` for them:
+/// the panel now carries the user's material (see `glass::TextSurface`), so a chip that let the
+/// desktop through would take its own text color with it -- light text on a chip that goes light over
+/// a white desktop. The flattened value keeps exactly the RGB the translucent token produced over the
+/// card surface, which is what the tuned contrast numbers were measured against.
+fn opaque_over(token: u32, base: u32) -> u32 {
+    crate::theme::flatten_token(token, base)
+}
+
+/// The accent chip's surface: the accent fill flattened onto the card surface (see [`opaque_over`]).
+fn accent_keycap_surface(palette: &crate::theme::UiPalette) -> u32 {
+    opaque_over(palette.keycap_accent_bg, palette.card_bg)
 }
 
 fn uses_accent_fill(kind: BadgeKind) -> bool {
@@ -2696,9 +2813,9 @@ fn contains(frame: NSRect, point: NSPoint) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_stream_cursor, default_edge_frame, keycap_fill, neutral_keycap_surface,
-        resize_frame_preserving_center, resolve_panel_frame, target_screen_index, uses_accent_fill,
-        Badge, BadgeCell, Orientation, ScreenGeometry, BADGE_H,
+        accent_keycap_surface, centered_stream_cursor, default_edge_frame, neutral_keycap_surface,
+        opaque_over, resize_frame_preserving_center, resolve_panel_frame, target_screen_index,
+        uses_accent_fill, Badge, BadgeCell, Orientation, ScreenGeometry, BADGE_H,
     };
     use crate::config::KeystrokeDisplayPosition;
     use crate::keystroke_display::state::{BadgeKind, KEYCAP_RAIL_W};
@@ -2740,13 +2857,13 @@ mod tests {
             let accent_text = palette.keycap_accent_text;
             let keycaps = [
                 ("neutral", fill, cap_text),
-                ("accent", palette.keycap_accent_bg, accent_text),
+                ("accent", accent_keycap_surface(&palette), accent_text),
             ];
             for backdrop in [0xFFFF_FFFFu32, 0x0000_00FF] {
-                let panel = crate::theme::composite_over(
-                    crate::glass::frost_wash_token_for(&palette),
-                    backdrop,
-                );
+                // This panel owns its text surfaces (keycaps carry their own fills), so its material
+                // is unwashed and the panel colour is the blurred backdrop. A blur can only move the
+                // surface *toward* the backdrop, so the backdrop itself is the worst case at each end.
+                let panel = crate::theme::color_rgb(backdrop);
                 for (kind, cap_fill, text) in keycaps {
                     let cap = crate::theme::composite_on(cap_fill, panel);
                     let primary = crate::theme::contrast_on(text, cap);
@@ -2764,36 +2881,31 @@ mod tests {
             // The fill and tray identity per mode (the choice this test documents).
             assert_eq!(border, palette.card_border, "dark={dark}");
             if dark {
+                assert_eq!(fill, palette.card_bg, "dark keycaps are the card surface");
                 assert_eq!(
-                    fill,
-                    keycap_fill(palette.card_bg),
-                    "dark keycaps keep the card surface at 80%"
+                    tray,
+                    opaque_over(palette.field_bg, palette.card_bg),
+                    "dark chord tray"
                 );
-                assert_eq!(tray, palette.field_bg, "dark chord tray");
             } else {
                 assert_eq!(
-                    fill, palette.field_bg,
-                    "light keycaps use the inset surface"
+                    fill,
+                    opaque_over(palette.field_bg, palette.card_bg),
+                    "light keycaps use the inset surface, flattened"
                 );
                 assert_eq!(tray, palette.card_bg, "light chord tray");
             }
-            // The light neutral cap must read as a surface on the panel at BOTH extremes: that is the
-            // regression this work fixes (the card surface at 80% measured 1.05:1 over a white
-            // backdrop and disappeared). Dark's cap separation is weaker on a white backdrop
-            // (~1.04:1, recorded) and comes from its hairline, so it is not asserted here.
-            if !dark {
-                for backdrop in [0xFFFF_FFFFu32, 0x0000_00FF] {
-                    let panel = crate::theme::composite_over(
-                        crate::glass::frost_wash_token_for(&palette),
-                        backdrop,
-                    );
-                    let cap = crate::theme::composite_on(fill, panel);
-                    let surface = crate::theme::contrast_ratio(cap, panel);
-                    assert!(
-                        surface >= 1.10,
-                        "light cap against the panel measures {surface:.2}:1 (backdrop={backdrop:#010x})"
-                    );
-                }
+            // Every chip is opaque, which is what makes the text floors independent of the panel
+            // material the user selected: a chip that took its colour from the panel would carry its
+            // own text colour away with it (light text on a chip that goes light over a white
+            // desktop). Separation from the panel comes from the fill where it exists and otherwise
+            // from the chip's hairline border -- the same treatment dark mode always had.
+            for (kind, fill, _) in keycaps {
+                assert_eq!(
+                    fill & 0xFF,
+                    0xFF,
+                    "dark={dark} {kind}: chip surfaces must be opaque"
+                );
             }
         }
     }

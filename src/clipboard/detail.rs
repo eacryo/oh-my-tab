@@ -441,17 +441,27 @@ pub(super) fn copy_detail_selection() {
     }
 }
 
+/// The picker's backdrop policy: its rows, group headers and footer bands carry their own text
+/// surfaces, so the material is left honest (design-style §3, `TextSurface`). No inactive-glass
+/// compensation -- the picker is the panel the user is interacting with.
+pub(crate) const fn picker_backdrop_options() -> crate::glass::BackdropOptions {
+    crate::glass::BackdropOptions::new(None)
+}
+
+/// The detail panel is a passive companion of the picker, so its Liquid Glass takes the inactive
+/// darkening compensation. It also scrims its own text.
+pub(crate) const fn detail_backdrop_options() -> crate::glass::BackdropOptions {
+    crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA))
+}
+
 /// During the settings live preview, update only the backdrop surfaces and detail
 /// compensation layer; do not rebuild clipboard content.
 pub(crate) unsafe fn apply_glass_properties() {
     if let Some(backdrop) = *PICKER_BACKDROP.lock().unwrap() {
-        crate::glass::apply_live_properties(backdrop, None);
+        crate::glass::apply_live_properties(backdrop, picker_backdrop_options());
     }
     if let Some(backdrop) = *DETAIL_BACKDROP.lock().unwrap() {
-        crate::glass::apply_live_properties(
-            backdrop,
-            Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
-        );
+        crate::glass::apply_live_properties(backdrop, detail_backdrop_options());
     }
 }
 
@@ -460,16 +470,16 @@ pub(crate) unsafe fn apply_glass_properties() {
 /// exist yet installs the new material on first build, and an existing window only swaps
 /// when its installed material actually differs.
 pub(crate) unsafe fn apply_backdrop_material() {
-    if let Some(new) = swap_backdrop_if_material_changed(&PICKER_WINDOW, &PICKER_BACKDROP, None) {
+    if let Some(new) = swap_backdrop_if_material_changed(
+        &PICKER_WINDOW,
+        &PICKER_BACKDROP,
+        picker_backdrop_options(),
+    ) {
         // The picker footer rebuild (locale/text-size changes) hangs content off this
         // pointer; a stale one would point into the retired hierarchy.
         *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(new.content_parent));
     }
-    swap_backdrop_if_material_changed(
-        &DETAIL_WINDOW,
-        &DETAIL_BACKDROP,
-        Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA),
-    );
+    swap_backdrop_if_material_changed(&DETAIL_WINDOW, &DETAIL_BACKDROP, detail_backdrop_options());
     apply_glass_properties();
 }
 
@@ -478,7 +488,7 @@ pub(crate) unsafe fn apply_backdrop_material() {
 unsafe fn swap_backdrop_if_material_changed(
     window_slot: &crate::ffi::MainThreadSlot<Option<ObjPtr>>,
     backdrop_slot: &crate::ffi::MainThreadSlot<Option<crate::glass::InstalledBackdrop>>,
-    compensation: Option<u32>,
+    options: crate::glass::BackdropOptions,
 ) -> Option<crate::glass::InstalledBackdrop> {
     let window = (*window_slot.lock().unwrap())?;
     let old = (*backdrop_slot.lock().unwrap())?;
@@ -492,7 +502,7 @@ unsafe fn swap_backdrop_if_material_changed(
         &old,
         content_rect,
         crate::glass::PANEL_CORNER_RADIUS,
-        compensation,
+        options,
     );
     *backdrop_slot.lock().unwrap() = Some(new);
     Some(new)
@@ -573,7 +583,7 @@ pub(super) unsafe fn ensure_picker_window() {
         window,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
         crate::glass::PANEL_CORNER_RADIUS,
-        None,
+        picker_backdrop_options(),
     );
     *PICKER_BACKDROP.lock().unwrap() = Some(backdrop);
     *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(backdrop.content_parent));
@@ -664,6 +674,12 @@ pub(super) unsafe fn ensure_picker_window() {
         let _: () = msg_send![strip, setAutoresizingMask: 8u64];
         let _: () = msg_send![content_parent, addSubview: strip];
         release_obj(strip);
+        // The search field's own fill is translucent and its text sits on the panel material
+        // otherwise, so the band behind it is this panel's text surface (glass::TextSurface).
+        let band_frame: NSRect = msg_send![strip, bounds];
+        let band = crate::glass::make_text_surface(band_frame, 0.0);
+        let _: () = msg_send![strip, addSubview: band];
+        release_obj(band);
         strip
     };
 
@@ -1076,6 +1092,11 @@ struct RowSpec<'a> {
 /// drift again. The selection owns the backdrop: when one row is both selected and hovered
 /// (arrow navigation repaints the new selection as hovered; the pointer can rest on the
 /// selected row), the selection wash must win. Pure so the precedence is unit-assertable.
+///
+/// An idle row is the panel scrim rather than transparent: the row is where this panel's text and
+/// icon buttons live, and the panel behind them is the user's material (`glass::TextSurface`), so the
+/// row carries the surface the contrast table is evaluated against. The material still shows in the
+/// panel margins, the search/tab band and the footer.
 pub(super) fn row_backdrop_wash(
     palette: crate::theme::UiPalette,
     selected: bool,
@@ -1086,7 +1107,7 @@ pub(super) fn row_backdrop_wash(
     } else if hovered {
         palette.hover_bg
     } else {
-        0x00000000
+        crate::glass::panel_scrim_token_for(&palette)
     }
 }
 
@@ -1122,14 +1143,23 @@ unsafe fn create_row_views(
     let mut row_group_label = None;
     if has_header {
         let g_label = make_nsstring(&group_label(day_group(entry.copied_at)));
+        let g_frame = NSRect::new(
+            NSPoint::new(PAD_X + ROW_PAD_L, y + GROUP_LABEL_PAD),
+            NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD),
+        );
+        // The header sits in the gap between rows, which is material. A text-local surface under
+        // the label keeps it above its floor without covering the gap (glass::TextSurface).
+        let g_plate = crate::glass::make_text_surface(
+            NSRect::new(
+                NSPoint::new(g_frame.origin.x - ROW_PAD_L / 2.0, g_frame.origin.y),
+                NSSize::new(g_frame.size.width + ROW_PAD_L, g_frame.size.height),
+            ),
+            crate::theme::RADIUS_CONTROL,
+        );
+        let _: () = msg_send![container, addSubview: g_plate];
+        release_obj(g_plate);
         let g: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        let g: *mut AnyObject = msg_send![
-            g,
-            initWithFrame: NSRect::new(
-                NSPoint::new(PAD_X + ROW_PAD_L, y + GROUP_LABEL_PAD),
-                NSSize::new(row_w - PAD_X, GROUP_H - GROUP_LABEL_PAD)
-            )
-        ];
+        let g: *mut AnyObject = msg_send![g, initWithFrame: g_frame];
         let _: () = msg_send![g, setStringValue: g_label];
         CFRelease(g_label as *const c_void);
         let _: () = msg_send![g, setBezeled: false];
@@ -1430,12 +1460,17 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
         NSSize::new(PICKER_W - PAD_X * 2.0, label_h),
     );
     let hint_ns = make_nsstring(hint);
+    let plate_frame = empty_state_plate_frame(frame);
     let existing = *EMPTY_STATE_VIEW.lock().unwrap();
     if let Some(label) = existing {
         if !label.0.is_null() {
             let _: () = msg_send![label.0, setFrame: frame];
             let _: () = msg_send![label.0, setStringValue: hint_ns];
             CFRelease(hint_ns as *const c_void);
+            // The plate is positioned from the same frame, so a resize must move both.
+            if let Some(plate) = *EMPTY_STATE_PLATE.lock().unwrap() {
+                let _: () = msg_send![plate.0, setFrame: plate_frame];
+            }
             return true;
         }
     }
@@ -1457,10 +1492,27 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
     let _: () = msg_send![label, setFont: font];
+    // The empty state is the only content on an otherwise empty panel, so its surface is what the
+    // reader sees; the material stays visible around it (glass::TextSurface).
+    let plate = crate::glass::make_text_surface(plate_frame, crate::theme::RADIUS_CARD);
+    let _: () = msg_send![container, addSubview: plate];
+    release_obj(plate);
+    *EMPTY_STATE_PLATE.lock().unwrap() = Some(ObjPtr::new(plate));
     let _: () = msg_send![container, addSubview: label];
     release_obj(label);
     *EMPTY_STATE_VIEW.lock().unwrap() = Some(ObjPtr::new(label));
     true
+}
+
+/// The empty-state hint's text surface, derived from the hint's own frame so the two move together.
+fn empty_state_plate_frame(label_frame: NSRect) -> NSRect {
+    NSRect::new(
+        NSPoint::new(label_frame.origin.x - 12.0, label_frame.origin.y - 6.0),
+        NSSize::new(
+            label_frame.size.width + 24.0,
+            label_frame.size.height + 12.0,
+        ),
+    )
 }
 
 /// Summon-time entry point: re-derive the empty-state layout for the viewport the summon just
@@ -1542,6 +1594,11 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     if let Some(empty) = EMPTY_STATE_VIEW.lock().unwrap().take() {
         if !empty.0.is_null() {
             let _: () = msg_send![empty.0, removeFromSuperview];
+        }
+    }
+    if let Some(plate) = EMPTY_STATE_PLATE.lock().unwrap().take() {
+        if !plate.0.is_null() {
+            let _: () = msg_send![plate.0, removeFromSuperview];
         }
     }
     let mut pitches = ROW_PITCHES.lock().unwrap();
@@ -1991,13 +2048,7 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
 
         let selected = i == selection;
         let hovered = i == new_hover;
-        let background = if selected {
-            palette.selection_bg
-        } else if hovered {
-            palette.hover_bg
-        } else {
-            0x00000000
-        };
+        let background = row_backdrop_wash(palette, selected, hovered);
         let tile_layer: *mut AnyObject = msg_send![view.tile.0, layer];
         crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(background));
         let _: () = msg_send![view.bar.0, setHidden: !selected];

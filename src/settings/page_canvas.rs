@@ -433,7 +433,7 @@ impl PageCanvas {
         self.advance(self.layout.row_gap + height, height)
     }
 
-    /// Open a block of content the page lays out itself (the General page's switcher preview, and
+    /// Open a block of content the page lays out itself (
     /// the rows that draw their own separator on the top edge instead of the shared gap). The
     /// canvas only needs the cursor it consumes, so it can re-place the block's views as one row.
     ///
@@ -500,8 +500,8 @@ impl PageCanvas {
     }
 
     /// Same, for a card whose bottom edge the caller places itself: `offset` is the distance from
-    /// its last row's origin to the card's visible bottom (the General page's preview card hangs
-    /// 12pt below the preview block rather than the shared 8pt inset).
+    /// its last row's origin to the card's visible bottom, for a card that hangs further below its
+    /// content than the shared bottom inset.
     pub(super) unsafe fn card_with_bottom_offset(
         &mut self,
         title: &str,

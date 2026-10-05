@@ -85,22 +85,6 @@ pub(crate) const RADIUS_LEGEND_CHIP: f64 = 5.0;
 pub(crate) const SETTINGS_WINDOW_RADIUS: f64 = 26.0;
 pub(crate) const OVERLAY_RING_INSET: f64 = 3.0;
 pub(crate) const THUMBNAIL_PREVIEW_RADIUS: f64 = 0.0;
-pub(crate) const PREVIEW_TILE_LIGHT: u32 = 0xFFFFFFE8;
-pub(crate) const PREVIEW_TILE_DARK: u32 = 0x2C2C2EE8;
-pub(crate) const PREVIEW_TILE_LIGHT_SECONDARY: u32 = 0xFFFFFFD8;
-pub(crate) const PREVIEW_TILE_DARK_SECONDARY: u32 = 0x2C2C2ED8;
-pub(crate) const PREVIEW_TILE_LIGHT_TERTIARY: u32 = 0xFFFFFFC8;
-pub(crate) const PREVIEW_TILE_DARK_TERTIARY: u32 = 0x2C2C2EC8;
-pub(crate) const PREVIEW_TILE_BORDER_LIGHT: u32 = 0x0000001A;
-pub(crate) const PREVIEW_TILE_BORDER_DARK: u32 = 0xFFFFFF24;
-
-pub(crate) const fn settings_preview_stage_color(dark: bool) -> u32 {
-    if dark {
-        0xF5F5F7FF
-    } else {
-        0x1C1C1EFF
-    }
-}
 
 fn linear_channel(value: f64) -> f64 {
     let value = value / 255.0;
@@ -111,7 +95,9 @@ fn linear_channel(value: f64) -> f64 {
     }
 }
 
-fn color_rgb(color: u32) -> [f64; 3] {
+/// A token's sRGB channels. `pub(crate)` because the panel-surface tests model the material itself
+/// (an unwashed panel passes the backdrop through, so the backdrop's channels *are* the surface).
+pub(crate) fn color_rgb(color: u32) -> [f64; 3] {
     [
         ((color >> 24) & 0xff) as f64,
         ((color >> 16) & 0xff) as f64,
@@ -158,6 +144,17 @@ pub(crate) fn composite_over(foreground: u32, background: u32) -> [f64; 3] {
     composite_rgb(foreground, background)
 }
 
+/// A translucent token flattened onto an opaque `base`, as an opaque token.
+///
+/// Panels own their text surfaces, so a chip that carries text cannot take its colour from whatever
+/// the panel material happens to cover: the flattened value is backdrop-independent and keeps exactly
+/// the RGB the translucent token produced over `base`, which is what the contrast table measured.
+pub(crate) fn flatten_token(token: u32, base: u32) -> u32 {
+    let channels = composite_rgb(token, base);
+    let round = |value: f64| (value.clamp(0.0, 255.0)).round() as u32;
+    (round(channels[0]) << 24) | (round(channels[1]) << 16) | (round(channels[2]) << 8) | 0xFF
+}
+
 /// Composite a token over an already-composited surface (the next link of an alpha chain).
 #[cfg(test)]
 pub(crate) fn composite_on(foreground: u32, surface: [f64; 3]) -> [f64; 3] {
@@ -175,14 +172,6 @@ pub(crate) fn contrast_on(foreground: u32, surface: [f64; 3]) -> f64 {
     let blended =
         std::array::from_fn(|index| foreground[index] * alpha + surface[index] * (1.0 - alpha));
     contrast_ratio(blended, surface)
-}
-
-pub(crate) fn settings_preview_contrast(palette: UiPalette) -> f64 {
-    let stage = settings_preview_stage_color(palette.dark);
-    contrast_ratio(
-        composite_rgb(stage, palette.card_bg),
-        color_rgb(palette.card_bg),
-    )
 }
 
 /// All colors resolved for the current theme (u32 = RRGGBBAA). Some fields are currently
@@ -1859,12 +1848,6 @@ mod tests {
                 "badge glyph contrast on its scrim is too low: {ratio:.2}:1"
             );
         }
-    }
-
-    #[test]
-    fn preview_stage_is_visibly_distinct_in_both_palettes() {
-        assert!(settings_preview_contrast(ui_palette_for_mode(false)) >= 3.0);
-        assert!(settings_preview_contrast(ui_palette_for_mode(true)) >= 3.0);
     }
 
     /// Hover and selection fills must be visible against the surface in both modes. They are

@@ -13,7 +13,6 @@ pub(super) enum ControlField {
     Theme,
     PanelMaterial,
     GlassStyle,
-    GlassTint,
     Locale,
     LogLevel,
     LaunchAtLogin,
@@ -83,7 +82,6 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
         m(u.theme, ControlField::Theme)
             .or_else(|| m(u.panel_material, ControlField::PanelMaterial))
             .or_else(|| m(u.glass_style, ControlField::GlassStyle))
-            .or_else(|| m(u.glass_tint, ControlField::GlassTint))
             .or_else(|| m(u.locale, ControlField::Locale))
             .or_else(|| m(u.log_level, ControlField::LogLevel))
             .or_else(|| m(u.launch_at_login, ControlField::LaunchAtLogin))
@@ -469,20 +467,16 @@ fn apply_control_field(field: ControlField) {
                 }
                 ControlField::PanelMaterial => {
                     let idx: isize = msg_send![u.panel_material, indexOfSelectedItem];
-                    cfg.appearance.panel_material = crate::config::PANEL_MATERIAL_VALUES
-                        .get(idx as usize)
-                        .map(|value| (*value).to_string())
-                        .unwrap_or_else(|| "liquid-glass".into());
+                    cfg.appearance.panel_material =
+                        crate::config::panel_material_value_at(idx.max(0) as usize).to_string();
                 }
                 ControlField::GlassStyle => {
                     let idx: isize = msg_send![u.glass_style, indexOfSelectedItem];
-                    cfg.appearance.glass_style = if idx == 1 { "clear" } else { "regular" }.into();
-                }
-                ControlField::GlassTint => {
-                    let color: *mut AnyObject = msg_send![u.glass_tint, color];
-                    if let Some(hex) = ns_color_to_hex(color) {
-                        cfg.appearance.glass_tint = hex;
+                    cfg.appearance.glass_style = match idx {
+                        1 => "clear",
+                        _ => "regular",
                     }
+                    .into();
                 }
                 ControlField::Locale => {
                     let idx: isize = msg_send![u.locale, indexOfSelectedItem];
@@ -734,9 +728,6 @@ fn apply_control_field(field: ControlField) {
     }
     schedule_config_persist();
     apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
-    if matches!(field, ControlField::GlassStyle | ControlField::GlassTint) {
-        apply_glass_preview();
-    }
 }
 
 /// Mouse-page per-device fields: read the control → write the selected device's profile
