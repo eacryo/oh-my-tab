@@ -96,5 +96,29 @@ for script in "${scenarios[@]}"; do
     fi
 done
 
+# The suite must leave a usable app. Scenarios relaunch it with development switches, two of which break it
+# for the person using it: `--clipboard-blank-text` draws every panel string that goes through
+# `glass::panel_ink` in a transparent ink (row titles, filter labels, keycap legends, the search placeholder),
+# while the accents that do not go through it -- the red "clear all" -- keep drawing, so the panel reads as an
+# empty white sheet; and `--panel-backdrop` pins a solid black or white window behind it. A scenario that
+# forgets to restore hands the user that state, which happened once; every scenario restores in a trap, and
+# this is the check that they did.
+# Every process with that name, not just the first: the release and development builds are both `oh-my-tab`, so
+# checking one of them can pass while the other still carries the switches (reproduced with a second process of
+# the same name: the check passed).
+leftover=""
+for pid in $(pgrep -x oh-my-tab || true); do
+    switches="$(ps -o command= -p "$pid" | tr ' ' '\n' | grep -E '^--(clipboard-blank-text|panel-backdrop)' || true)"
+    if [ -n "$switches" ]; then
+        leftover="$leftover
+  pid $pid: $(ps -o command= -p "$pid")"
+    fi
+done
+if [ -n "$leftover" ]; then
+    echo "e2e run-all: the app is still running with a switch that breaks it:"
+    echo "$leftover"
+    failures=$((failures + 1))
+fi
+
 echo "e2e run-all: $passed passed, $failures failed, $(( ${#skipped[@]} + ${#skipped_prefs[@]} )) skipped"
 [ "$failures" -eq 0 ]

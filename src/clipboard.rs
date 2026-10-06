@@ -505,6 +505,10 @@ struct ContentAttributedKey {
     primary_text: u32,
     secondary_text: u32,
     link_text: u32,
+    /// The material the ink was resolved for (see `clipboard::text_style::material_cache_key`): the palette
+    /// tokens are the same across materials while the colour object they map to is not, so without this a
+    /// material switch keeps serving the previous material's ink.
+    material: u8,
 }
 static CONTENT_ATTRIBUTED_CACHE: LazyLock<
     MainThreadSlot<HashMap<ContentAttributedKey, CachedUiObject>>,
@@ -785,6 +789,55 @@ unsafe fn apply_panel_appearance(window: *mut AnyObject) {
         let _: () = msg_send![window, setAppearance: appearance];
     }
 }
+/// Hide every text field inside the picker (`--clipboard-blank-text=after:N`, development only).
+///
+/// Hiding is what makes the A2 contrast scenario's two frames comparable: every frame in the picker is set
+/// explicitly, so hiding a view changes what is drawn and not where anything is, and a capture taken before
+/// this runs is the "with text" frame of the same panel, in the same launch, over the same material.
+pub(crate) fn dev_hide_picker_text() {
+    unsafe {
+        let Some(window) = (*PICKER_WINDOW.lock().unwrap()).map(|ptr| ptr.0) else {
+            log_info!("[clip] blank-text: the picker has no window yet");
+            return;
+        };
+        let content: *mut AnyObject = msg_send![window, contentView];
+        if content.is_null() {
+            return;
+        }
+        hide_text_fields(content);
+        let _: () = msg_send![content, setNeedsDisplay: true];
+        log_info!("[clip] blank-text: picker text hidden for the differential capture");
+    }
+}
+
+/// Recursive helper for `dev_hide_picker_text`.
+unsafe fn hide_text_fields(view: *mut AnyObject) {
+    let is_text_field: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+    if is_text_field {
+        let _: () = msg_send![view, setHidden: true];
+    }
+    // The filter pills are buttons whose label *is* the title (`make_filter_pill`), so hiding text fields alone
+    // left the filter row's own text in place -- the differential capture then measured something else in that
+    // region. Clearing the title removes the glyphs while the button stays visible, so its frame and its fill are
+    // exactly what they were.
+    let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+    if is_button {
+        let empty: *mut AnyObject = msg_send![class!(NSString), string];
+        let _: () = msg_send![view, setTitle: empty];
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if subviews.is_null() {
+        return;
+    }
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        if !child.is_null() {
+            hide_text_fields(child);
+        }
+    }
+}
+
 /// The picker's frame in screen coordinates, top-left based, or `None` when it has no window yet.
 /// A2 and the screenshots need to know where the panel actually is instead of guessing from the cursor;
 /// the frame is also the only way to tell "the panel is not on screen" from "the capture missed it".
@@ -804,6 +857,13 @@ pub(crate) fn picker_frame_top_left() -> Option<(f64, f64, f64, f64)> {
             frame.size.height,
         ))
     }
+}
+
+/// Each footer caption's own frame in the picker's own points, top-left origin (empty until a footer exists).
+/// The A2 contrast scenario measures each caption separately: one region per role, or the number cannot say
+/// which role it belongs to.
+pub(crate) fn picker_footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
+    text_style::footer_hint_frames()
 }
 
 /// Whether the picker window is on screen right now.
@@ -869,6 +929,29 @@ static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None
 static REBUILDING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
+    /// The row-text and soft-wrap caches key on the material because `glass::panel_ink` returns a different
+    /// colour object per material while the palette tokens stay identical: without that, a material switch kept
+    /// serving the previous material's ink until a mode change or a restart (the panel's text surface is the
+    /// material, so that is the whole ink).
+    #[test]
+    fn attributed_text_cache_key_is_distinct_per_material() {
+        let keys = [
+            crate::glass::PanelMaterial::LiquidGlass,
+            crate::glass::PanelMaterial::Frost,
+            crate::glass::PanelMaterial::Opaque,
+            crate::glass::PanelMaterial::Backdrop,
+        ]
+        .map(super::text_style::material_cache_key_for);
+        let mut unique = keys.to_vec();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            keys.len(),
+            "materials share a cache slot: {keys:?}"
+        );
+    }
+
     /// Serializes the tests that read or write the shared image-cache directory (or the history file
     /// inside it): `clear_image_cache_dir` and a full discard wipe the whole directory, so a test
     /// asserting on cache files must not run while another one clears them.

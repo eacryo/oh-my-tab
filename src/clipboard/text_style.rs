@@ -2,7 +2,25 @@
 
 use super::*;
 
-/// Row title (attributed): selected = white bold, unselected = the panel's own ink (see
+/// The material an attributed string's ink was resolved for. The ink comes from `glass::panel_ink`, which
+/// picks a *different colour object* per material (a dynamic system colour for frost, a palette colour
+/// otherwise), so a cache keyed on the palette tokens alone hands back the previous material's ink after a
+/// material switch: the tokens do not change, the colour does.
+pub(super) fn material_cache_key() -> u8 {
+    material_cache_key_for(crate::glass::PanelMaterial::effective())
+}
+
+/// The pure part of the key: one slot per material, and unit-tested (`clipboard::tests`) because "the key
+/// distinguishes materials" is exactly the property whose absence shipped stale ink.
+pub(super) fn material_cache_key_for(material: crate::glass::PanelMaterial) -> u8 {
+    match material {
+        crate::glass::PanelMaterial::LiquidGlass => 0,
+        crate::glass::PanelMaterial::Frost => 1,
+        crate::glass::PanelMaterial::Opaque => 2,
+        crate::glass::PanelMaterial::Backdrop => 3,
+    }
+}
+
 /// `glass::panel_ink`, which is the single place a material could choose a different ink).
 pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *mut AnyObject {
     let palette = clipboard_palette();
@@ -16,6 +34,7 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
         primary_text: palette.primary_text,
         secondary_text: palette.secondary_text,
         link_text: palette.link_text,
+        material: material_cache_key(),
     };
     if let Some(cached) = CONTENT_ATTRIBUTED_CACHE.lock().unwrap().get_mut(&key) {
         cached.last_used = next_ui_cache_recency();
@@ -961,6 +980,45 @@ struct FooterLegend {
 /// The legends of the live footer, left-to-right. Empty when no footer has been built.
 static FOOTER_LEGENDS: MainThreadSlot<Vec<FooterLegend>> = MainThreadSlot::new(Vec::new());
 
+/// Each footer legend caption's own frame, in the picker's coordinates with a top-left origin.
+///
+/// Per label, not one union of all three: that union is a bounding box which also spans the keycaps between the
+/// labels, so anything that changes along that row lands inside the region and is then read as the caption's
+/// ink (measured: a 1.12:1 "ink" that was identical for all three materials, the opaque control included). A
+/// region has to hold one text role to speak for one tier.
+pub(super) fn footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
+    let legends = match FOOTER_LEGENDS.lock() {
+        Ok(legends) => legends,
+        Err(_) => return Vec::new(),
+    };
+    let mut frames = Vec::new();
+    let mut window_height = 0.0f64;
+    for legend in legends.iter() {
+        unsafe {
+            let label = legend.hint.0;
+            let bounds: NSRect = msg_send![label, bounds];
+            let rect: NSRect =
+                msg_send![label, convertRect: bounds, toView: std::ptr::null_mut::<AnyObject>()];
+            let window: *mut AnyObject = msg_send![label, window];
+            if !window.is_null() {
+                let frame: NSRect = msg_send![window, frame];
+                window_height = frame.size.height;
+            }
+            if window_height <= 0.0 {
+                continue;
+            }
+            // Window coordinates are bottom-left, the capture region is top-left relative to the panel.
+            frames.push((
+                rect.origin.x,
+                window_height - (rect.origin.y + rect.size.height),
+                rect.size.width,
+                rect.size.height,
+            ));
+        }
+    }
+    frames
+}
+
 /// The footer's entry-count label. It is not a legend, but it shares the footer's line and owns
 /// the left edge the right-to-left legend row must clear, so the validator measures it too.
 static FOOTER_COUNT_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -1247,13 +1305,16 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![hint, setUsesSingleLineMode: true];
         let _: () = msg_send![hint, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
         let _: () = msg_send![hint, setFont: hf];
-        // One step lighter than the key symbol beside it, but never a fixed color: a literal
-        // black was invisible on the dark panel (1.16:1 -- the labels simply vanished) and was
-        // already under the 4.5:1 text floor in light mode (2.32:1). `muted_text` is the palette
-        // token for subordinate text and clears the floor in both modes (5.0:1 / 4.7:1).
+        // The caption tier on the material itself, not on a palette constant. The note that used to sit here
+        // -- that `muted_text` "clears the floor in both modes (5.0:1 / 4.7:1)" -- was comparing it against
+        // the palette's own surface, which is not what it is drawn on, and a provisional differential run
+        // (before that method was corrected for local surfaces and same-launch frames) put it at 1.89-2.51:1.
+        // Those numbers are not verified, so this is a deliberate strengthening rather than a measured fix:
+        // `secondary_text` is the next role up, and the tier stays unproven until the scenario measures
+        // same-launch frames.
         let hc = crate::glass::panel_ink(
-            clipboard_palette().muted_text,
-            crate::glass::PanelInk::Muted,
+            clipboard_palette().secondary_text,
+            crate::glass::PanelInk::Secondary,
         );
         let _: () = msg_send![hint, setTextColor: hc];
         let hint_ns = make_nsstring(&kbd_labels[i]);

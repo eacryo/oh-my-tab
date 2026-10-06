@@ -463,17 +463,37 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         json_string(crate::glass::effective_material_id())
     ));
     // Where the clipboard picker actually is, top-left based, so a screenshot can measure inside it
-    // instead of guessing from the cursor position.
+    // instead of guessing from the cursor position. `footer_band` is the footer legend band in the panel's
+    // own points: the footer captions are a different text role from the filter row's, so the A2 contrast
+    // scenario needs their region to measure each role separately (a whole-row extent would report only the
+    // strongest ink and could hide a dim one).
+    // One region per footer caption: a union of them is a bounding box that also spans the keycaps, and a
+    // region has to hold one text role before its contrast number means anything.
+    let hints = {
+        let frames = crate::clipboard::picker_footer_hint_frames();
+        if frames.is_empty() {
+            "null".to_string()
+        } else {
+            let items: Vec<String> = frames
+                .iter()
+                .map(|(x, y, w, h)| {
+                    format!("{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}")
+                })
+                .collect();
+            format!("[{}]", items.join(", "))
+        }
+    };
     json.push_str(&format!(
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {
             Some((x, y, w, h)) => format!(
-                "{{\"visible\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}}}",
+                "{{\"visible\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"footer_hints\": {}}}",
                 crate::clipboard::picker_is_visible(),
                 x,
                 y,
                 w,
-                h
+                h,
+                hints
             ),
             None => "null".to_string(),
         }

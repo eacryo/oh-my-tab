@@ -247,10 +247,78 @@ Only `opaque` still answers the floors above. The two translucent surfaces canno
 away from `window_bg` by construction, and no ink colour reaches 12:1 / 7:1 there. They are held to the panel
 tier stated below instead.
 
-**Measured on rendered pixels, with a controlled backdrop** — `scripts/e2e/panel-contrast.sh` pins a solid
-black or white window *behind* the panel (`--panel-backdrop`), because a translucent surface's tone follows
-what is behind it and a verdict that depends on the desktop is not a verdict. The picker's filter row on the
-bare material, 3:1 caption tier:
+**Rendered-pixel measurement, and why it is not a gate yet.** The instrument is `scripts/e2e/panel-contrast.sh`
+plus `scripts/e2e/lib/png_stats.py`, which derives the capture's scale from the file itself (a fixed pixel region
+measures the wrong band on a 1x display), pins a solid black or white window behind the panel so a translucent
+surface is measured against a known backdrop, and compares two captures so that the pixels which differ *are* the
+glyph pixels rather than the material's own tonal noise (on dark frost a single frame yields a dozen "inks" at
+1.03-1.13:1, and those are the material).
+
+Review and synthetic reproduction found three defects in that comparison, all of which made it report the wrong
+thing: a differential threshold high enough to survive cross-launch jitter (10 tone units) dropped a caption at
+the 1.04:1 floor entirely and then reported its neighbour's 11:1 as the region's answer; a region-wide *average*
+background reported a local contrast of 1.17:1 as 7.52:1; and two frames differing only in the material were
+read as glyphs, giving an "ink" at 1.26:1 from a region that holds no text at all. The measurement now uses a
+threshold of 3 tone units, takes each component's *local* material tone from the pixels around it, and refuses a
+pair whose changed pixels exceed a third of the region instead of believing it; all three counterexamples are in
+`png_stats.py --selftest` (nine cases, run it before trusting any number in this section).
+
+**Measured on rendered pixels, same launch, one region per text role.** `scripts/e2e/panel-contrast.sh` pins a
+solid black or white window behind the panel (a translucent surface's tone follows what is behind it), captures the
+panel with its text, has the app hide the panel's text in place (`--clipboard-blank-text=after:N`: same window, same
+layout, same material), captures again, and measures the pixels that differ -- those are the glyphs, which a single
+capture cannot separate from the material's own tonal noise. Each region holds one role: the filter row, and each
+footer caption separately, because the bounding box of all of them also spans the keycaps between them (that union
+measured a 1.12:1 "ink" identical for every material, the opaque control included -- the tell that it was not text).
+Caption tier, 3:1, `filter row / footer captions`, black backdrop / white backdrop:
+
+| material | mode | contrast |
+| --- | --- | --- |
+| `frost` | light | 5.29:1 / 4.52-5.29:1, 4.59:1 / 3.95-4.59:1 |
+| `frost` | dark | 5.87:1 / 5.16-5.87:1, 5.16:1 / 4.64-5.16:1 |
+| `liquid-glass` | light | 4.53:1 / 3.58-4.53:1, 8.79:1 / 5.97-8.79:1 |
+| `liquid-glass` | dark | 9.89:1 / 9.89:1, 5.87:1 / 5.87:1 |
+| `opaque` | light | 8.20:1 / 5.65-8.20:1 (both backdrops) |
+| `opaque` | dark | 10.10:1 / 10.10:1 (both backdrops) |
+
+The lowest measurement is 3.58:1. Three inks needed a deliberate adjustment, each found by this measurement rather
+than by reasoning: liquid glass takes a **dark tint in dark mode** (`glass::GLASS_TINT_DARK`; one tint cannot serve
+both modes -- the light one left the surface mid-grey at 0.539, where the palette's caption ink cannot exceed
+2.07:1); frost takes the legacy **ultraDark** material in dark mode instead of `hudWindow` (which a bright backdrop
+lifts to 0.648, where the ink reached 2.45:1); and the **footer captions use `secondary_text`, not `muted_text`**
+(the note that used to say `muted_text` "clears the floor in both modes (5.0:1 / 4.7:1)" had compared it against the
+palette's own surface rather than the material it is drawn on). `opaque` is the control: it does not move with the
+backdrop at all.
+
+**What this holds, and what it does not.** The scenario fails the run below 3:1, and it now passes for all twelve
+combinations, so these two roles hold the caption tier on `{frost, liquid-glass, opaque} x {light, dark} x {black,
+white}`. The limits: an ink whose own contribution is under 3 tone units is not visible to the diff at all (far
+under this tier, but it is not a measurement); roles outside these two -- row titles, detail text, the keycap glyphs
+-- are targets, not enforced; and the scenario rewrites the theme, so `run-all.sh` runs it only with
+`--include-prefs`. `lib/png_stats.py --selftest` is the nine-case regression corpus, including the three
+counterexamples that each defeated an earlier version of this measurement.
+
+| material | mode | filter row | footer band |
+| --- | --- | --- | --- |
+| `frost` | light | 5.29:1 / 4.58:1 | 4.40:1 / 3.85:1 |
+| `frost` | dark | 5.86:1 / 5.16:1 | 4.97:1 / 4.46:1 |
+| `liquid-glass` | light | 4.53:1 / 8.78:1 | 3.49:1 / 5.80:1 |
+| `liquid-glass` | dark | 9.88:1 / 5.86:1 | 9.52:1 / 5.64:1 |
+| `opaque` | light | 8.20:1 / 8.20:1 | 5.50:1 / 5.50:1 |
+| `opaque` | dark | 10.09:1 / 10.09:1 | 9.74:1 / 9.74:1 |
+
+Three inks needed a deliberate adjustment to get there, and every one was found by this measurement rather than by
+reasoning: liquid glass takes a **dark tint in dark mode** (`glass::GLASS_TINT_DARK`; one tint cannot serve both
+modes -- the light tint left the surface mid-grey at 0.539, where the palette's caption ink cannot exceed 2.07:1),
+frost takes the legacy **ultraDark** material in dark mode instead of `hudWindow` (which a bright backdrop lifts
+to 0.648, where the ink reached 2.45:1), and the **footer legend's text uses `secondary_text`, not `muted_text`**
+(`muted_text` measured 1.89-2.51:1 on these surfaces; the note it replaced, "clears the floor in both modes
+(5.0:1 / 4.7:1)", had compared it against the palette's own surface instead of the material it is drawn on).
+`opaque` is the control: it does not move with the backdrop at all.
+
+**What this enforces and what it does not.** The filter row and the footer captions, for the three materials, two
+modes and two backdrops above; everything else -- row titles, detail text, the keycap glyphs -- is a target, not an
+enforced floor.
 
 | mode | material | black backdrop | white backdrop |
 | --- | --- | --- | --- |
@@ -266,7 +334,13 @@ by reasoning: liquid glass takes a **dark tint in dark mode** (`glass::GLASS_TIN
 both modes -- the light tint left the surface mid-grey at 0.539, where the palette's caption ink cannot exceed
 2.07:1), and frost takes the legacy **ultraDark** material in dark mode instead of `hudWindow` (which a bright
 backdrop lifts to 0.648, where the same ink reached 2.45:1). `opaque` is the control that does not move with
-the backdrop at all. The scenario fails the run below 3:1, so this table is enforced rather than asserted.
+the backdrop at all. The scenario fails the run below 3:1, so this table is *not* enforced yet. The instrument exists (`scripts/e2e/panel-contrast.sh` plus
+`scripts/e2e/lib/png_stats.py --selftest`, a regression corpus of three synthetic cases), but measuring one
+frame cannot tell a glyph from the material's own tonal noise: on a dark translucent surface a single capture
+yields a dozen "inks" clustered at 1.03-1.13:1, so every translucent cell fails there for a measurement
+reason rather than for a contrast one. The numbers above came from that method, so treat them as indicative:
+the tier becomes enforced once the measurement isolates the glyph pixels themselves (a differential capture,
+with the text's ink transparent in one of the two frames).
 
 **A panel whose surface is its material answers to its own tier, not this table's.** A translucent material
 sits away from `window_bg` (measured in dark mode: liquid glass `#6E6E6E`, frost `#868585`, against the

@@ -472,6 +472,19 @@ unsafe fn build_backdrop(
 /// in the style document is a target until the rendered-pixel measurement exists (the smoke can only `log`
 /// these, because the composite is invisible to a colour-vs-constant comparison).
 pub(crate) unsafe fn panel_ink(palette_token: u32, role: PanelInk) -> *mut AnyObject {
+    // Development switch: draw the panel's text in a fully transparent ink. A second capture then shows the
+    // same layout over the same material with no glyphs, and the A2 contrast scenario diffs the two captures:
+    // the pixels that change *are* the glyph pixels. That is the only way to tell glyphs from the material's
+    // own tonal noise -- on a dark translucent surface a single frame yields a dozen "inks" at 1.03-1.13:1,
+    // so no single-frame histogram can hold a tier.
+    // Only the immediate form blanks here; `after:N` deliberately does not, because the capture taken before the
+    // delay has to be the "with text" frame -- the timed form hides the fields at runtime instead
+    // (`clipboard::dev_hide_picker_text`).
+    if crate::dev_flags::value("clipboard-blank-text")
+        .is_some_and(|value| !value.starts_with("after:"))
+    {
+        return msg_send![class!(NSColor), clearColor];
+    }
     // Frost draws with the dynamic system label colours: AppKit resolves them against the live backdrop and
     // applies its contrast-preserving treatment, which `NSVisualEffectView` provides (measured: 5.16:1 light,
     // 5.90:1 dark on the panel's own material -- `scripts/e2e/panel-contrast.sh`).

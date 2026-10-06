@@ -67,7 +67,12 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
 - **Now**: `frost` and `liquid-glass` draw their text with the dynamic system label colours on top of the
   material itself, so their contrast depends on how AppKit composites those colours against a translucent
   surface. The tier-A smoke can only *log* the numbers (a colour-vs-constant comparison cannot see the
-  composite), and the style document therefore states their tier as a target rather than an enforced floor.
+  composite), and the style document states their tier as a target rather than an enforced floor. **Done, within its scope.** The A2 scenario measures the filter row and each footer caption on rendered pixels,
+  in same-launch differential frames (the app hides the panel's text in place between the two captures), and it
+  fails below 3:1: all twelve `{frost, liquid-glass, opaque} x {light, dark} x {black, white}` combinations clear
+  the caption tier (lowest 3.58:1). Roles outside those two -- row titles, detail text, the keycap glyphs -- remain
+  targets, and an ink contributing under 3 tone units is below what the diff can see. Earlier claim, now void: the
+  two-launch form of this measurement, retracted below.
 - **Target**: an A2 scenario that reads the panel's frame from `--e2e-state` (`clipboard_picker`), captures
   that region, and asserts the tier on rendered pixels -- `text_primary` >= 4.5:1, captions >= 3:1 -- for
   `{frost, liquid-glass} x {light, dark}`. The dark-mode glass case (`#6E6E6E` surface) is the first one to

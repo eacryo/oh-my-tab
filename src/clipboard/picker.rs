@@ -1652,26 +1652,60 @@ struct SoftWrapGlyphs {
     continuation_size: NSSize,
 }
 
-/// The soft-wrap glyphs for the current appearance. Cached per mode: `drawRect` can run
-/// frequently, so it must not rebuild attributed strings on every repaint, but a single cache
-/// would keep the colour it was first built with and go stale on a light/dark switch (the detail
-/// panel is long-lived).
+/// The soft-wrap glyphs for the current appearance *and material*. Cached per (mode, material): `drawRect`
+/// can run frequently, so it must not rebuild attributed strings on every repaint, but a cache keyed on the
+/// mode alone keeps the colour it was first built with and goes stale on a material switch -- the detail
+/// panel is long-lived and the ink now depends on the material.
 unsafe fn soft_wrap_glyphs() -> &'static SoftWrapGlyphs {
-    static LIGHT: OnceLock<SoftWrapGlyphs> = OnceLock::new();
-    static DARK: OnceLock<SoftWrapGlyphs> = OnceLock::new();
+    /// One lazily built entry per material: only the current material's slot is ever built, because
+    /// `panel_ink` resolves against the material in effect when the string is built.
+    struct Slots {
+        liquid_glass: OnceLock<SoftWrapGlyphs>,
+        frost: OnceLock<SoftWrapGlyphs>,
+        opaque: OnceLock<SoftWrapGlyphs>,
+        backdrop: OnceLock<SoftWrapGlyphs>,
+    }
+    impl Slots {
+        fn slot(&self, material: u8) -> &OnceLock<SoftWrapGlyphs> {
+            match material {
+                1 => &self.frost,
+                2 => &self.opaque,
+                3 => &self.backdrop,
+                _ => &self.liquid_glass,
+            }
+        }
+    }
+    static LIGHT: Slots = Slots {
+        liquid_glass: OnceLock::new(),
+        frost: OnceLock::new(),
+        opaque: OnceLock::new(),
+        backdrop: OnceLock::new(),
+    };
+    static DARK: Slots = Slots {
+        liquid_glass: OnceLock::new(),
+        frost: OnceLock::new(),
+        opaque: OnceLock::new(),
+        backdrop: OnceLock::new(),
+    };
     let dark = crate::theme::resolved_is_dark();
     let cache = if dark { &DARK } else { &LIGHT };
-    cache.get_or_init(|| build_soft_wrap_glyphs(dark))
+    let material = super::text_style::material_cache_key();
+    cache
+        .slot(material)
+        .get_or_init(|| build_soft_wrap_glyphs(dark, material))
 }
 
-unsafe fn build_soft_wrap_glyphs(dark: bool) -> SoftWrapGlyphs {
+unsafe fn build_soft_wrap_glyphs(dark: bool, material: u8) -> SoftWrapGlyphs {
+    // The slot's key must be the material the ink is about to be resolved for, or the cache would store a
+    // string built for a different one (the whole reason this cache is keyed by material).
+    debug_assert_eq!(material, super::text_style::material_cache_key());
     let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
     let font: *mut AnyObject = msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_REGULAR];
     // An annotation mark, so muted; the palette is passed in so the two caches cannot be
-    // built from a mode other than the one that keyed them.
+    // built from a mode other than the one that keyed them, and `material` is the slot's own key.
     let color = crate::glass::panel_ink(
         crate::theme::ui_palette_for_mode(dark).muted_text,
         crate::glass::PanelInk::Muted,

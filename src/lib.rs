@@ -294,6 +294,36 @@ fn schedule_global_input_drain() {
     }
 }
 
+/// Main-thread consumer for the development text-hide: the panel's text fields are hidden, so a capture taken
+/// after this has the same panel, the same layout and the same material as one taken before it, without the
+/// glyphs. That is what lets the A2 contrast scenario isolate glyphs from the material's own tonal noise.
+extern "C" fn on_dev_blank_text(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_dev_blank_text", || {
+        crate::clipboard::dev_hide_picker_text();
+    });
+}
+
+/// Hide the picker's text `delay` after this call, on the main thread. Development only, and deliberately not
+/// immediate: a capture taken before the delay is the "with text" frame, so both frames come from this one
+/// process (two launches of a translucent material do not re-render identically, which is what broke the
+/// earlier two-launch form of that measurement).
+pub(crate) fn schedule_dev_blank_text(delay: std::time::Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+            return;
+        };
+        unsafe {
+            let _: () = msg_send![
+                controller,
+                performSelectorOnMainThread: sel!(handleDevBlankText:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    });
+}
+
 /// Ask the controller to write smooth-scroll e2e counters from the main thread. The tap timer
 /// updates only atomics; the snapshot borrows AppState and must remain on AppKit's thread.
 pub(crate) fn schedule_smooth_scroll_e2e_record() {
@@ -1428,6 +1458,12 @@ fn create_controller() -> *mut AnyObject {
             cls,
             sel!(handleSmoothScrollE2eRecord:),
             on_smooth_scroll_e2e_record as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDevBlankText:),
+            on_dev_blank_text as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -2824,6 +2860,18 @@ pub fn run() {
         // driving the global hotkey (which would steal focus).
         if show_clipboard_request() {
             clipboard::show_picker_for_development();
+            // Development only: `--clipboard-blank-text=after:N` hides the picker's text N seconds from now, so
+            // the A2 contrast scenario captures the same panel in the same launch with and without its text.
+            // Two launches would not do: a translucent material does not re-render identically across them.
+            if let Some(seconds) =
+                crate::dev_flags::value("clipboard-blank-text").and_then(|value| {
+                    value
+                        .strip_prefix("after:")
+                        .and_then(|rest| rest.parse::<f64>().ok())
+                })
+            {
+                schedule_dev_blank_text(std::time::Duration::from_secs_f64(seconds));
+            }
         }
         e2e_state::record("launch");
         let _: () = msg_send![nsapp, run];
