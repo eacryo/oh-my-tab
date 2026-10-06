@@ -6,3 +6,6 @@ node_modules/
 dist/
 # Sparkle framework and release tools are vendored under vendor/Sparkle*.
 /tools/r2-publisher/target/
+
+# Independent-review state and evidence (scripts/codex-review.sh).
+.agent-review/
