@@ -72,8 +72,8 @@ pub(super) unsafe fn animate_card_close_reflow(
         }
     }
     if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
-        let animator: *mut AnyObject = msg_send![window.0, animator];
-        let _: () = msg_send![animator, setFrame: pending.final_panel_frame, display: true];
+        // Animated resize: through the animator so the shadow path follows every intermediate size.
+        crate::glass::animate_panel_frame(window.0, pending.final_panel_frame);
     }
     let completion: RcBlock<dyn Fn()> = RcBlock::new(|| {
         // NSAnimationContext completion handlers run on the main thread, so invoke the
@@ -109,8 +109,10 @@ pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
         let _: () = msg_send![context, setTimingFunction: timing];
     }
     if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
-        let animator: *mut AnyObject = msg_send![window.0, animator];
-        let _: () = msg_send![animator, setFrame: pending.original_panel_frame, display: true];
+        // `original_panel_frame` is a *panel* rect, so the rollback goes through the same conversion the
+        // forward animation does: handing it to the animator directly would shrink the window by the
+        // elevation padding and move the material with it.
+        crate::glass::animate_panel_frame(window.0, pending.original_panel_frame);
     }
     if let Some(container) = *CONTAINER.lock().unwrap() {
         let _: () = msg_send![container.0, setAutoresizingMask: 0u64];
@@ -194,7 +196,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             OVERLAY_WINDOW
                 .lock()
                 .unwrap()
-                .map(|window| msg_send![window.0, frame])
+                .map(|window| crate::glass::panel_frame_of(window.0))
                 .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0)))
         };
         let (original_container_frame, original_document_frame, original_bounds_origin) = unsafe {
@@ -494,7 +496,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
 
     unsafe {
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
-            let _: () = msg_send![window.0, setFrame: pending.final_panel_frame, display: false];
+            crate::glass::set_panel_frame(window.0, pending.final_panel_frame, false);
         }
         if let Some(container) = *CONTAINER.lock().unwrap() {
             let _: () = msg_send![
@@ -559,7 +561,9 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
     unsafe {
         apply_thumbnail_clip_offset();
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
-            let frame: NSRect = msg_send![window.0, frame];
+            // The scroller lives inside the panel, so its layout takes the panel's size: the window's is
+            // larger by the elevation padding.
+            let frame = crate::glass::panel_frame_of(window.0);
             update_thumbnail_scroller(
                 frame.size.width,
                 frame.size.height,

@@ -3,6 +3,7 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::ffi::c_void;
 use std::ops::Range;
 
@@ -63,6 +64,105 @@ pub(crate) const ELEVATION_MED_SHADOW_COLOR: u32 = 0x000000FF;
 pub(crate) const ELEVATION_MED_SHADOW_OPACITY: f32 = 0.10;
 pub(crate) const ELEVATION_MED_SHADOW_RADIUS: f64 = 12.0;
 pub(crate) const ELEVATION_MED_SHADOW_OFFSET_Y: f64 = -4.0;
+/// The style document's `high` level: CSS `0 12px 32px rgba(0,0,0,.18)`, used by the floating panels
+/// (see docs/design-style-en.md §7). The document's blur radius maps 1:1 to `shadowRadius`, as the med
+/// level above already does, and a negative y offset moves the shadow down (AppKit's y axis is up).
+pub(crate) const ELEVATION_HIGH_SHADOW_COLOR: u32 = 0x000000FF;
+pub(crate) const ELEVATION_HIGH_SHADOW_OPACITY: f32 = 0.18;
+pub(crate) const ELEVATION_HIGH_SHADOW_RADIUS: f64 = 32.0;
+pub(crate) const ELEVATION_HIGH_SHADOW_OFFSET_Y: f64 = -12.0;
+
+/// One elevation level's shadow parameters, so a surface asks for a level instead of four numbers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct Elevation {
+    pub(crate) color: u32,
+    pub(crate) opacity: f32,
+    pub(crate) radius: f64,
+    pub(crate) offset_y: f64,
+}
+
+pub(crate) const ELEVATION_MED: Elevation = Elevation {
+    color: ELEVATION_MED_SHADOW_COLOR,
+    opacity: ELEVATION_MED_SHADOW_OPACITY,
+    radius: ELEVATION_MED_SHADOW_RADIUS,
+    offset_y: ELEVATION_MED_SHADOW_OFFSET_Y,
+};
+
+pub(crate) const ELEVATION_HIGH: Elevation = Elevation {
+    color: ELEVATION_HIGH_SHADOW_COLOR,
+    opacity: ELEVATION_HIGH_SHADOW_OPACITY,
+    radius: ELEVATION_HIGH_SHADOW_RADIUS,
+    offset_y: ELEVATION_HIGH_SHADOW_OFFSET_Y,
+};
+
+/// How far a panel's window extends beyond the panel itself, per edge.
+///
+/// The panel outline's width. §7: a border is `card_border`, not a shadow and not a darker background.
+pub(crate) const PANEL_OUTLINE_WIDTH: f64 = 1.0;
+
+/// The panel rect stays the semantic rect: layout, hit-testing, the saved HUD position and
+/// `--e2e-state` are all in panel coordinates, so enlarging a window must not move any of them. The
+/// window rect exists only because the WindowServer clips whatever exceeds a window's own frame --
+/// including a layer shadow, which is what needs the room.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) struct PanelInsets {
+    pub(crate) top: f64,
+    pub(crate) right: f64,
+    pub(crate) bottom: f64,
+    pub(crate) left: f64,
+}
+
+/// The window padding a level's shadow starts from.
+///
+/// Deliberately an estimate, not a verified value: a blur's tail is not guaranteed to have decayed at
+/// `radius`, so this is where a measurement begins. `scripts/e2e/panel-contrast.sh` measures the
+/// outermost ring of the window against the pinned backdrop and fails while it is still darker than the
+/// backdrop, which is the check that decides whether this is enough.
+pub(crate) fn elevation_insets(level: Elevation) -> PanelInsets {
+    PanelInsets {
+        top: level.radius + level.offset_y.max(0.0) + ELEVATION_SHADOW_TAIL_ALLOWANCE,
+        right: level.radius + ELEVATION_SHADOW_TAIL_ALLOWANCE,
+        // The shadow is offset downward (negative y), so only the bottom edge needs the offset's room.
+        bottom: level.radius + (-level.offset_y).max(0.0) + ELEVATION_SHADOW_TAIL_ALLOWANCE,
+        left: level.radius + ELEVATION_SHADOW_TAIL_ALLOWANCE,
+    }
+}
+
+/// How far past the blur's nominal reach the window is padded.
+///
+/// `radius + |offset|` is where the shadow's *core* ends, not where it reaches zero: a layer shadow's tail
+/// continues past it, so padding by the radius alone left the tail still 8 tone units dark at the window's
+/// outermost ring (measured with `scripts/e2e/panel-contrast.sh`, which fails while that ring is darker than
+/// the pinned backdrop). This allowance is what the measurement asked for: at 24pt the worst column of the
+/// bottom ring still read -2.2 tone units, and at 32pt it reads under -1.5 across the whole edge. It is a
+/// measurement result, not a derivation, and the scenario is the command that reproduces it.
+pub(crate) const ELEVATION_SHADOW_TAIL_ALLOWANCE: f64 = 32.0;
+
+/// The window frame (screen coordinates) holding a panel at `panel` (also screen coordinates).
+pub(crate) fn window_frame_for_panel(panel: NSRect, insets: PanelInsets) -> NSRect {
+    NSRect::new(
+        NSPoint::new(panel.origin.x - insets.left, panel.origin.y - insets.bottom),
+        NSSize::new(
+            panel.size.width + insets.left + insets.right,
+            panel.size.height + insets.top + insets.bottom,
+        ),
+    )
+}
+
+/// The panel's rect inside a window of `window_size` (window-local coordinates).
+///
+/// This is the rect a shadow path encloses, and it is derived from the *window* size on purpose: padding
+/// already sits outside it, so deriving it from the panel size would let a caller expand it a second
+/// time and put the shadow's silhouette over the padding instead of over the panel.
+pub(crate) fn panel_rect_in_window(window_size: NSSize, insets: PanelInsets) -> NSRect {
+    NSRect::new(
+        NSPoint::new(insets.left, insets.bottom),
+        NSSize::new(
+            (window_size.width - insets.left - insets.right).max(0.0),
+            (window_size.height - insets.top - insets.bottom).max(0.0),
+        ),
+    )
+}
 pub(crate) const OVERLAY_SYMBOL_SHADOW_OPACITY: f32 = 0.85;
 pub(crate) const OVERLAY_SYMBOL_SHADOW_RADIUS: f64 = 2.0;
 pub(crate) const OVERLAY_SYMBOL_SHADOW_OFFSET_Y: f64 = -1.0;
@@ -1761,6 +1861,77 @@ pub(crate) fn window_width(cards_in_row: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The style document states the elevation table; these are its numbers, so a re-tuned blur radius
+    /// cannot drift away from the document silently. `med` had no assertion at all before this.
+    #[test]
+    fn elevation_levels_match_the_style_document() {
+        assert_eq!(ELEVATION_MED.radius, 12.0);
+        assert_eq!(ELEVATION_MED.offset_y, -4.0);
+        assert!((ELEVATION_MED.opacity - 0.10).abs() < 1e-6);
+        assert_eq!(ELEVATION_HIGH.radius, 32.0);
+        assert_eq!(ELEVATION_HIGH.offset_y, -12.0);
+        assert!((ELEVATION_HIGH.opacity - 0.18).abs() < 1e-6);
+        for level in [ELEVATION_MED, ELEVATION_HIGH] {
+            assert_eq!(level.color, 0x000000FF);
+        }
+    }
+
+    /// The padding only ever adds room on the side the shadow is offset towards, and the panel's own
+    /// rect is never widened by it.
+    #[test]
+    fn elevation_insets_leave_the_panel_rect_alone() {
+        let insets = elevation_insets(ELEVATION_HIGH);
+        // radius 32 + the measured tail allowance 32; the bottom also carries the 12pt downward offset.
+        assert_eq!(insets.top, 64.0);
+        assert_eq!(insets.left, 64.0);
+        assert_eq!(insets.right, 64.0);
+        assert_eq!(insets.bottom, 76.0);
+
+        let panel_size = NSSize::new(500.0, 420.0);
+        let window_size = NSSize::new(
+            panel_size.width + insets.left + insets.right,
+            panel_size.height + insets.top + insets.bottom,
+        );
+        let local = panel_rect_in_window(window_size, insets);
+        assert_eq!(local.size.width, panel_size.width);
+        assert_eq!(local.size.height, panel_size.height);
+        assert_eq!(local.origin.x, insets.left);
+        assert_eq!(local.origin.y, insets.bottom);
+    }
+
+    /// Panel coordinates are what every caller and every stored value means, so a panel rect must survive
+    /// the trip out to a window frame and back unchanged.
+    #[test]
+    fn panel_and_window_rects_round_trip() {
+        for insets in [
+            elevation_insets(ELEVATION_MED),
+            elevation_insets(ELEVATION_HIGH),
+        ] {
+            let panel = NSRect::new(NSPoint::new(-320.5, 118.0), NSSize::new(500.0, 420.0));
+            let window = window_frame_for_panel(panel, insets);
+            assert_eq!(
+                window.size.width,
+                panel.size.width + insets.left + insets.right
+            );
+            assert_eq!(
+                window.size.height,
+                panel.size.height + insets.top + insets.bottom
+            );
+            assert_eq!(window.origin.x + insets.left, panel.origin.x);
+            assert_eq!(window.origin.y + insets.bottom, panel.origin.y);
+            // The rect a shadow path encloses must come back as the panel itself, never wider.
+            let local = panel_rect_in_window(window.size, insets);
+            assert_eq!(local.size, panel.size);
+            assert_eq!(
+                NSPoint::new(
+                    window.origin.x + local.origin.x,
+                    window.origin.y + local.origin.y
+                ),
+                panel.origin
+            );
+        }
+    }
 
     #[test]
     fn palette_text_and_accent_meet_documented_contrast_floors() {

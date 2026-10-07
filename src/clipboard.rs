@@ -844,11 +844,31 @@ unsafe fn hide_text_fields(view: *mut AnyObject) {
 pub(crate) fn picker_frame_top_left() -> Option<(f64, f64, f64, f64)> {
     unsafe {
         let window = (*PICKER_WINDOW.lock().unwrap())?;
-        let frame: NSRect = msg_send![window.0, frame];
+        // The *panel* rect, which is what the A2 scenarios measure in: the window is padded for the
+        // elevation shadow, so reporting its frame would shift every region a scenario samples by the
+        // padding.
+        let frame = crate::glass::panel_frame_of(window.0);
         // The primary display, *not* `NSScreen.mainScreen`: that follows the key window, and the picker
         // is usually the key window, so a picker on a secondary display would be flipped against that
         // display's height and the reported y would be wrong (the same trap `overlay/hover.rs` and
         // `overlay/cards.rs` document).
+        let screen_frame = crate::overlay::hover::primary_screen_frame()?;
+        Some((
+            frame.origin.x,
+            screen_frame.size.height - (frame.origin.y + frame.size.height),
+            frame.size.width,
+            frame.size.height,
+        ))
+    }
+}
+
+/// The picker window's frame in screen coordinates, top-left based, or `None` when it has no window yet.
+/// The window is the padded rect, so this is what a scenario needs to find the *outer* edge of the shadow
+/// (the outline and interior measurements use `picker_frame_top_left`, the panel).
+pub(crate) fn picker_window_frame_top_left() -> Option<(f64, f64, f64, f64)> {
+    unsafe {
+        let window = (*PICKER_WINDOW.lock().unwrap())?;
+        let frame: NSRect = msg_send![window.0, frame];
         let screen_frame = crate::overlay::hover::primary_screen_frame()?;
         Some((
             frame.origin.x,

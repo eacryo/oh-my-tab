@@ -2,6 +2,62 @@
 
 These notes cover issues that affect source builds and debugger-launched binaries, not users of Homebrew installations or packaged `.app` builds. The normal development path is `scripts/dev-restart.sh`; a bare `cargo run` is reserved for low-level diagnostics. The README links here for development-only issues.
 
+## Floating panels: the panel/window rect contract, the outline and the elevation shadow
+
+The three floating panels (the switcher overlay, the clipboard picker and the clipboard detail) draw a 1pt
+`card_border` outline and, at the `high` level, an elevation shadow. Three things about that are easy to
+break, so they are stated here rather than only in the code.
+
+**Two rects, one meaning each.** A panel's *window* is larger than the panel: the window server clips
+whatever exceeds a window's frame, and the shadow needs room outside the panel, so the window is the panel
+rect padded by `theme::elevation_insets(level)`. The **panel rect is the semantic one**: layout,
+hit-testing, the picker/detail group geometry, `PICKER_EDGE_MARGIN`, `clamp_into_visible`, the switcher's
+size budget, the keystroke HUD's saved position and the `--e2e-state` geometry all mean the panel. Only
+`setFrame:` gets the padded rect. `glass::set_panel_frame` / `animate_panel_frame` / `panel_frame_of` are
+the only ways to convert, and every panel resize must go through them: a raw `setFrame:` with a panel rect
+shrinks the window, which shrinks the material through its fixed autoresizing margins — measured, the
+keystroke display's keycaps then overflowed their strip by 8pt, because they are laid out for the panel.
+`panel_frame_of` returns the frame unchanged for a window with no remembered padding, so it is safe on
+windows that never installed a backdrop.
+
+**The padding is a measurement, not arithmetic.** `radius + |offset|` is where a layer shadow's core ends,
+not where it reaches zero: padding by the radius alone left the tail 8 tone units dark at the window's
+outermost ring. `theme::ELEVATION_SHADOW_TAIL_ALLOWANCE` is what the measurement asked for, and the
+padding also comes out of the placement budgets and the visible-area clamp (a padded window that overflows
+is constrained by AppKit, which *moves the panel* — measured, 26pt at the menu bar — instead of clipping
+the shadow). `scripts/e2e/panel-edge.sh` is the command that reproduces the verdict.
+
+**The shadow needs a carrier, and the carrier must not clip.** `masksToBounds` clips a layer's own shadow,
+and every material sets it (glass's is load-bearing), so the shadow cannot live on the material layer. The
+material is therefore a child of a carrier view, and the shadow is on a **raw `CALayer` sublayer** of the
+carrier, never on a view's layer: AppKit reconfigures view-managed layers, and `addSubview:` was measured to
+zero a view layer's `shadowOpacity` while leaving its radius — a shadow that silently renders nothing.
+`CALayer.shadowPath` copies what it is assigned ("Upon assignment the path is copied", in Apple's own
+header), and Core Animation holds CF-typed layer properties with CF ownership (Apple QA1565), so the path is
+created, assigned and released in one place (`ffi::layer_set_rounded_shadow_path`) and the layer keeps its own
+copy. The colour helpers on the same layer need no cache for the same reason. The
+carrier itself must not clip (`masksToBounds = false`): the glass variants draw their edge outside the
+glass's bounds, which is why the keystroke-display smoke now asserts *the host does not clip* directly
+instead of the class proxy it used before (glass itself, or an `NSVisualEffectView`) — that proxy rejected
+any non-masking host, the carrier included, while the property the original bug was about is the mask.
+
+The carrier's `layout` recomputes the shadow path from its own bounds, and that hook is deliberate: the
+panels resize *animatedly* (the picker and detail open and close, the switcher reflows as cards close), so
+a path set at each resize call site would be right for the first and last frame only.
+
+**The outline is a decoration view above the material.** One implementation for all three materials: the
+material branches differ (frost carries a rounded mask image, glass clips itself) and `swap_backdrop`
+migrates `content_parent`'s subviews, which is how a decoration would otherwise be carried into the new
+hierarchy and leave a stale stroke behind. It overrides `hitTest:` to return nil, because it covers the
+whole panel and would otherwise swallow every click meant for the panel's content.
+
+**Development switches.** `--panel-outline=off|after:N` and `--panel-shadow=off|med|high|after:N` exist for
+the A2 measurements: each produces the counter-example frame the assertion diffs against, and `after:N`
+does it inside one launch (a translucent material does not re-render identically across launches, so the
+pair has to come from one). `--panel-shadow=off` removes the carrier entirely, which also makes it the
+pre-carrier baseline for the blur-retention gate. None of them may be left running: `scripts/e2e/run-all.sh`
+checks the running process for all of them, alongside `--panel-backdrop` and `--clipboard-blank-text`.
+
 ## Icons may be incorrect in development mode
 
 When running the bare binary with `cargo run` for diagnostics, the overlay may occasionally show oh-my-tab's own card as an initial-letter placeholder instead of its application icon, and the problem may persist until the icon cache is cleared manually. The icon cache is keyed by bundle ID and uses the executable **mtime** as its invalidation fingerprint. Each development build relinks the binary and changes its mtime, invalidating the running instance's cache entry. Packaged `.app` builds are unaffected because the installed binary's mtime remains stable. For normal development runs, use `scripts/dev-restart.sh`; if the diagnostic binary shows this issue, use the *Clear Icon Cache* menu item or delete `~/Library/Caches/oh-my-tab-icons/`.

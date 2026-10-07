@@ -3,8 +3,13 @@
 use objc2::runtime::{AnyClass, AnyObject};
 use objc2::{class, msg_send};
 use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize};
+use std::ffi::c_void;
+use std::sync::OnceLock;
 
-use crate::ffi::{hex_to_cg_color, hex_to_ns_color, layer_set_background, release_obj, ObjPtr};
+use crate::ffi::{
+    hex_to_cg_color, hex_to_ns_color, layer_set_background, layer_set_border,
+    layer_set_shadow_color, release_obj, ObjPtr,
+};
 
 pub(crate) const PANEL_CORNER_RADIUS: f64 = 16.0;
 /// AppKit darkens Liquid Glass in passive panels; this alpha matches the clipboard detail panel.
@@ -117,13 +122,140 @@ const FROST_MATERIAL_LIGHT: i64 = 21; // underWindowBackground
 pub(crate) struct BackdropOptions {
     /// Liquid Glass darkens in passive panels; this alpha matches the clipboard detail panel.
     pub(crate) compensation_alpha: Option<u32>,
+    /// The panel's declared elevation. `None` means the panel casts no shadow, and no shadow carrier is
+    /// built at all -- so the material keeps the hierarchy it had before the carrier existed, which is
+    /// what makes `--panel-shadow=off` a true baseline for the blur-retention measurement rather than a
+    /// second hierarchy that merely has its shadow turned down.
+    pub(crate) elevation: Option<crate::theme::Elevation>,
 }
 
 impl BackdropOptions {
     /// Backdrop options for a panel that carries its own text surfaces.
     pub(crate) const fn new(compensation_alpha: Option<u32>) -> Self {
-        Self { compensation_alpha }
+        Self {
+            compensation_alpha,
+            elevation: None,
+        }
     }
+
+    /// Declare the panel's elevation (see `docs/design-style-en.md` §7).
+    pub(crate) const fn with_elevation(mut self, level: Option<crate::theme::Elevation>) -> Self {
+        self.elevation = level;
+        self
+    }
+}
+
+/// What `--panel-shadow` asked for. `At` starts from the panel's declared level and drops the shadow
+/// after a delay, so one launch yields the with/without pair (see [`DevOutline`] for why the pair has to
+/// come from one launch); `Off` additionally removes the carrier, which is the pre-carrier baseline.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum DevShadow {
+    Off,
+    Level(crate::theme::Elevation),
+    At(std::time::Duration),
+}
+
+/// Pure: parse the `--panel-shadow` value against the panel's declared level. `None` means the value was
+/// not understood.
+pub(crate) fn parse_dev_shadow(
+    value: &str,
+    declared: Option<crate::theme::Elevation>,
+) -> Option<DevShadow> {
+    let mode = match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" | "false" | "no" => DevShadow::Off,
+        "med" | "medium" => DevShadow::Level(crate::theme::ELEVATION_MED),
+        "high" => DevShadow::Level(crate::theme::ELEVATION_HIGH),
+        other => {
+            let seconds = other.strip_prefix("after:")?.parse::<f64>().ok()?;
+            if !seconds.is_finite() || seconds < 0.0 {
+                return None;
+            }
+            DevShadow::At(std::time::Duration::from_secs_f64(seconds))
+        }
+    };
+    Some(match mode {
+        // `after:N` needs a level to start from; with no declared level there is nothing to drop.
+        DevShadow::At(_) if declared.is_none() => DevShadow::Off,
+        other => other,
+    })
+}
+
+fn dev_shadow(declared: Option<crate::theme::Elevation>) -> Option<DevShadow> {
+    let raw = crate::dev_flags::value("panel-shadow")?;
+    match parse_dev_shadow(&raw, declared) {
+        Some(mode) => Some(mode),
+        None => {
+            crate::log_info!("[panel-shadow] ignored: {raw} is not off/med/high/after:N");
+            None
+        }
+    }
+}
+
+/// The elevation a panel actually gets: its declared level, unless the development switch overrides it.
+pub(crate) fn effective_elevation(
+    declared: Option<crate::theme::Elevation>,
+) -> Option<crate::theme::Elevation> {
+    match dev_shadow(declared) {
+        Some(DevShadow::Off) => None,
+        Some(DevShadow::Level(level)) => Some(level),
+        Some(DevShadow::At(_)) | None => declared,
+    }
+}
+
+/// The window padding an installed panel was given, so a resize can keep it without knowing the level.
+static PANEL_INSETS: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, crate::theme::PanelInsets>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+fn remember_panel_insets(window: *mut AnyObject, insets: crate::theme::PanelInsets) {
+    PANEL_INSETS.lock().unwrap().insert(window as usize, insets);
+}
+
+pub(crate) fn panel_insets_of(window: *mut AnyObject) -> crate::theme::PanelInsets {
+    PANEL_INSETS
+        .lock()
+        .unwrap()
+        .get(&(window as usize))
+        .copied()
+        .unwrap_or(crate::theme::PanelInsets {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        })
+}
+
+/// Set a panel window's frame from the **panel** rect (screen coordinates), expanding it by whatever
+/// padding that window was installed with. Every panel resize goes through this: a raw `setFrame:` with a
+/// panel rect would either clip the shadow or move the panel, because the window is the padded rect.
+pub(crate) unsafe fn set_panel_frame(window: *mut AnyObject, panel: NSRect, display: bool) {
+    let insets = panel_insets_of(window);
+    let frame = crate::theme::window_frame_for_panel(panel, insets);
+    let _: () = msg_send![window, setFrame: frame, display: display];
+}
+
+/// Set an animator's target frame from a **panel** rect: the animation lands on the padded window rect
+/// while every caller keeps thinking in panel coordinates. Used by the picker/detail open and close, which
+/// are the resizes that must not have the shadow lagging behind them.
+pub(crate) unsafe fn animate_panel_frame(window: *mut AnyObject, panel: NSRect) {
+    let insets = panel_insets_of(window);
+    let frame = crate::theme::window_frame_for_panel(panel, insets);
+    let animator: *mut AnyObject = msg_send![window, animator];
+    let _: () = msg_send![animator, setFrame: frame, display: true];
+}
+
+/// The panel rect of an installed panel window (screen coordinates), for layout, hit-testing, the saved
+/// HUD position and `--e2e-state`: all of those mean the panel, never the padded window.
+pub(crate) unsafe fn panel_frame_of(window: *mut AnyObject) -> NSRect {
+    let insets = panel_insets_of(window);
+    let frame: NSRect = msg_send![window, frame];
+    NSRect::new(
+        NSPoint::new(frame.origin.x + insets.left, frame.origin.y + insets.bottom),
+        NSSize::new(
+            (frame.size.width - insets.left - insets.right).max(0.0),
+            (frame.size.height - insets.top - insets.bottom).max(0.0),
+        ),
+    )
 }
 
 /// Floating-panel material family (settings: panel material).
@@ -190,8 +322,14 @@ pub(crate) struct InstalledBackdrop {
     /// `PanelMaterial::effective()` to pick up Reduce Transparency and config changes.
     pub(crate) material: PanelMaterial,
     pub(crate) content_parent: *mut AnyObject,
-    /// The view that was made the window's content view; the swap path replaces it.
+    /// The view that was made the window's content view: the shadow carrier when the panel has an
+    /// elevation, otherwise the material hierarchy's own root. The swap path replaces it.
     pub(crate) root: Option<ObjPtr>,
+    /// The material hierarchy's own root, which is what the outline's parent and the blur underlay's host
+    /// must be. It differs from `root` exactly when a shadow carrier wraps it, and its bounds are always
+    /// the *panel* rect (the carrier's are the padded window), so anything expressed in panel coordinates
+    /// has to use this one.
+    pub(crate) material_root: Option<ObjPtr>,
     pub(crate) glass: Option<ObjPtr>,
     pub(crate) effect_view: Option<ObjPtr>,
     pub(crate) opaque_view: Option<ObjPtr>,
@@ -200,6 +338,9 @@ pub(crate) struct InstalledBackdrop {
     /// Liquid Glass's inactive-panel darkening fill. Never a contrast device.
     pub(crate) compensation_view: Option<ObjPtr>,
     pub(crate) compensation_layer: Option<ObjPtr>,
+    /// The panel outline decoration (see [`install_panel_outline`]); `None` while the development switch
+    /// asked for no outline or the decoration could not be created.
+    pub(crate) outline_view: Option<ObjPtr>,
 }
 
 /// Build the shared backdrop hierarchy for the effective material WITHOUT attaching it to
@@ -340,12 +481,14 @@ unsafe fn build_backdrop(
                 // The behind-window blur that gives the glass something sampled to sit on; the glass is
                 // its subview and the window hosts this view.
                 root: Some(ObjPtr::new(root)),
+                material_root: Some(ObjPtr::new(root)),
                 glass: Some(ObjPtr::new(glass)),
                 effect_view: None,
                 opaque_view: None,
                 backdrop_view: None,
                 compensation_view,
                 compensation_layer,
+                outline_view: None,
             }
         }
         PanelMaterial::Backdrop => {
@@ -386,12 +529,14 @@ unsafe fn build_backdrop(
                 material: PanelMaterial::Backdrop,
                 content_parent: content,
                 root: Some(ObjPtr::new(root)),
+                material_root: Some(ObjPtr::new(root)),
                 glass: None,
                 effect_view: None,
                 opaque_view: None,
                 backdrop_view: Some(ObjPtr::new(host)),
                 compensation_view: None,
                 compensation_layer: None,
+                outline_view: None,
             }
         }
         // Frost — and Liquid Glass on pre-26 macOS, which never had the Glass class.
@@ -425,12 +570,14 @@ unsafe fn build_backdrop(
                 material: PanelMaterial::Frost,
                 content_parent: effect,
                 root: Some(ObjPtr::new(effect)),
+                material_root: Some(ObjPtr::new(effect)),
                 glass: None,
                 effect_view: Some(ObjPtr::new(effect)),
                 opaque_view: None,
                 backdrop_view: None,
                 compensation_view: None,
                 compensation_layer: None,
+                outline_view: None,
             }
         }
         PanelMaterial::Opaque => {
@@ -447,12 +594,14 @@ unsafe fn build_backdrop(
                 material: PanelMaterial::Opaque,
                 content_parent: plain,
                 root: Some(ObjPtr::new(plain)),
+                material_root: Some(ObjPtr::new(plain)),
                 glass: None,
                 effect_view: None,
                 opaque_view: Some(ObjPtr::new(plain)),
                 backdrop_view: None,
                 compensation_view: None,
                 compensation_layer: None,
+                outline_view: None,
             }
         }
     }
@@ -583,19 +732,547 @@ pub(crate) unsafe fn rounded_effect_mask(corner_radius: f64) -> *mut AnyObject {
     img
 }
 
+/// What `--panel-outline` asked for.
+///
+/// `off` is the counter-example frame the A2 outline measurement diffs against. `At` starts with the
+/// outline on and drops it after a delay, so *one* launch yields both frames: a translucent material
+/// does not re-render identically across launches, and a cross-launch diff could not tell the outline's
+/// pixels from that difference.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum DevOutline {
+    Off,
+    At(std::time::Duration),
+}
+
+/// Pure: parse the `--panel-outline` value. `None` means the value was not understood, so the caller can
+/// say so instead of silently doing something else.
+pub(crate) fn parse_dev_outline(value: &str) -> Option<DevOutline> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "off" | "0" | "false" | "no" => Some(DevOutline::Off),
+        other => {
+            let seconds = other.strip_prefix("after:")?.parse::<f64>().ok()?;
+            if seconds.is_finite() && seconds >= 0.0 {
+                Some(DevOutline::At(std::time::Duration::from_secs_f64(seconds)))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+/// The dev switch as a value: `None` when it was not given at all (as opposed to asked for `off`).
+fn dev_outline() -> Option<DevOutline> {
+    let raw = crate::dev_flags::value("panel-outline")?;
+    match parse_dev_outline(&raw) {
+        Some(mode) => Some(mode),
+        None => {
+            crate::log_info!("[panel-outline] ignored: {raw} is not off/after:N");
+            None
+        }
+    }
+}
+
+/// The effective elevation's id, for the e2e state document: assertions key on the id rather than on a
+/// layer's opacity, the same way `effective_material_id` works for the material.
+pub(crate) fn effective_elevation_id(declared: Option<crate::theme::Elevation>) -> &'static str {
+    match effective_elevation(declared) {
+        Some(level) if level == crate::theme::ELEVATION_HIGH => "high",
+        Some(_) => "med",
+        None => "none",
+    }
+}
+
+/// The padding the elevation adds around a full panel, as the *effective* value (so a dev switch that turns
+/// the shadow off also gives the layout its room back). Placement uses it to keep the padded window inside
+/// the visible area.
+pub(crate) fn panel_elevation_padding() -> crate::theme::PanelInsets {
+    match effective_elevation(Some(crate::theme::ELEVATION_HIGH)) {
+        Some(level) => crate::theme::elevation_insets(level),
+        None => crate::theme::PanelInsets {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        },
+    }
+}
+
+/// The elevation the full panels use (the switcher, the picker and the detail), for the e2e state document.
+pub(crate) fn effective_panel_elevation_id() -> &'static str {
+    effective_elevation_id(Some(crate::theme::ELEVATION_HIGH))
+}
+
+/// Whether a panel outline should be created at all.
+pub(crate) fn panel_outline_enabled() -> bool {
+    !matches!(dev_outline(), Some(DevOutline::Off))
+}
+
+/// A panel decoration view: transparent, never the hit-test result, and the class both the outline and the
+/// shadow backdrop are made from.
+///
+/// A view added *above* the material rather than a layer border on the material itself. The material
+/// branches differ (frost carries a rounded mask image, glass clips itself) and a border on any of them
+/// inherits that structure's behaviour, while the same view draws the same stroke on all three. It also
+/// stays out of the `swap_backdrop` migration, which moves `content_parent`'s subviews and is how a
+/// decoration would otherwise be carried into the new hierarchy and leave a stale outline behind. The
+/// class overrides `hitTest:` because the decoration covers the whole panel and would otherwise swallow
+/// every click meant for the panel's content.
+fn decoration_view_class() -> *mut AnyObject {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let name = std::ffi::CString::new("OhMyTabPanelDecorationView").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        crate::ffi::class_addMethod(
+            cls,
+            objc2::sel!(hitTest:),
+            outline_hit_test as *mut c_void,
+            std::ffi::CString::new("@@:{CGPoint=dd}").unwrap().as_ptr(),
+        );
+        crate::ffi::class_addMethod(
+            cls,
+            objc2::sel!(dropOutline:),
+            outline_drop as *mut c_void,
+            std::ffi::CString::new("v@:@").unwrap().as_ptr(),
+        );
+        crate::ffi::objc_registerClassPair(cls);
+        cls as usize
+    }) as *mut AnyObject
+}
+
+extern "C" fn outline_hit_test(
+    _self: *mut c_void,
+    _cmd: objc2::runtime::Sel,
+    _point: NSPoint,
+) -> *mut AnyObject {
+    // Never the hit-test result: the decoration must not intercept the panel's own input.
+    std::ptr::null_mut()
+}
+
+extern "C" fn outline_drop(this: *mut c_void, _cmd: objc2::runtime::Sel, _sender: *mut AnyObject) {
+    unsafe {
+        let view = this as *mut AnyObject;
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if !layer.is_null() {
+            let _: () = msg_send![layer, setBorderWidth: 0.0f64];
+        }
+    }
+}
+
+/// Create the outline decoration for `parent` (the material hierarchy's root, whose bounds are the panel
+/// rect), sized and rounded to it. Returns null when the view could not be created.
+unsafe fn make_panel_outline(parent: *mut AnyObject, corner_radius: f64) -> *mut AnyObject {
+    let class = decoration_view_class();
+    let view: *mut AnyObject = msg_send![class, alloc];
+    let bounds: NSRect = msg_send![parent, bounds];
+    let view: *mut AnyObject = msg_send![view, initWithFrame: bounds];
+    // Width/height sizable with fixed margins: the outline stays edge-to-edge as the panel resizes, and
+    // the panels resize animatedly, so a frame set once would go stale mid-animation.
+    let _: () = msg_send![view, setAutoresizingMask: 18u64];
+    let _: () = msg_send![view, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![view, layer];
+    if layer.is_null() {
+        release_obj(view);
+        return std::ptr::null_mut();
+    }
+    let _: () = msg_send![layer, setCornerRadius: corner_radius];
+    // Not clipped: the stroke is the outermost thing the panel draws, and clipping the layer to its own
+    // bounds would silently halve whichever half the platform draws outside.
+    let _: () = msg_send![layer, setMasksToBounds: false];
+    layer_set_border(
+        layer,
+        hex_to_cg_color(crate::theme::ui_palette().card_border),
+    );
+    let _: () = msg_send![layer, setBorderWidth: crate::theme::PANEL_OUTLINE_WIDTH];
+    // Above the material: every material paints its own surface at the same rect, so a decoration below it
+    // would be covered. The class's `hitTest:` is what keeps that from costing the panel its input.
+    let _: () = msg_send![parent, addSubview: view];
+    release_obj(view);
+    view
+}
+
+/// Install the outline on an installed backdrop and return the decoration, which is kept so a live theme
+/// change can recolour it (`card_border` differs per mode).
+pub(crate) unsafe fn install_panel_outline(
+    backdrop: &InstalledBackdrop,
+    corner_radius: f64,
+) -> Option<ObjPtr> {
+    if !panel_outline_enabled() {
+        return None;
+    }
+    // The *material* root's bounds are the panel rect; with a shadow carrier installed, `root` is the
+    // padded window view and an outline hung there would sit at the window's edge instead of the panel's.
+    let parent = backdrop.material_root?;
+    let view = make_panel_outline(parent.0, corner_radius);
+    if view.is_null() {
+        return None;
+    }
+    if let Some(DevOutline::At(delay)) = dev_outline() {
+        // `performSelector:withObject:afterDelay:` on the decoration itself: everything the toggle needs
+        // is on this view, so no controller plumbing and no cross-thread hop is involved.
+        let _: () = msg_send![
+            view,
+            performSelector: objc2::sel!(dropOutline:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: delay.as_secs_f64()
+        ];
+    }
+    Some(ObjPtr::new(view))
+}
+
+/// A shadow carrier's geometry: the panel's corner radius and the padding around it. Keyed by view
+/// pointer, because a dynamically registered class must not depend on Rust-side properties reached through
+/// `msg_send!` (the same reason `overlay` keeps its card index in a map).
+struct CarrierGeometry {
+    radius: f64,
+    insets: crate::theme::PanelInsets,
+    /// The shadow lives on a raw `CALayer` added with `addSublayer:`, not on a view's layer.
+    ///
+    /// A view-managed layer is AppKit's to reconfigure: measured on the real panel, `addSubview:` zeroes
+    /// `shadowOpacity` (the radius survives, so the shadow silently renders nothing), and `NSView` offers no
+    /// shadow-path API to state it through. A sublayer AppKit never created is never touched, and it can
+    /// carry the explicit rounded path the translucent material needs. Held as an address because this map is
+    /// shared across threads and a raw pointer is not `Send`; the carrier's layer owns the sublayer.
+    shadow_layer: usize,
+}
+
+static CARRIER_GEOMETRY: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, CarrierGeometry>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The shadow carrier: a view with no drawing of its own that holds the material inset by the panel's
+/// padding and carries the elevation shadow.
+///
+/// The shadow sits on a *separate* view rather than on the material because `masksToBounds` (which every
+/// material sets, and which glass's own comment records as load-bearing) clips a layer's own shadow away.
+/// `layout` is the hook that keeps the shadow's path in step: the panels resize *animatedly* (the picker
+/// and detail open and close, the HUD re-renders), so a path set at each resize call site would be right
+/// for the first and last frame only and the shadow would lag the panel in between.
+fn carrier_class() -> *mut AnyObject {
+    static CLASS: OnceLock<usize> = OnceLock::new();
+    *CLASS.get_or_init(|| unsafe {
+        let name = std::ffi::CString::new("OhMyTabPanelCarrier").unwrap();
+        let superclass = class!(NSView) as *const _ as *mut AnyObject;
+        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        crate::ffi::class_addMethod(
+            cls,
+            objc2::sel!(layout),
+            carrier_layout as *mut c_void,
+            std::ffi::CString::new("v@:").unwrap().as_ptr(),
+        );
+        crate::ffi::class_addMethod(
+            cls,
+            objc2::sel!(dropShadow:),
+            carrier_drop_shadow as *mut c_void,
+            std::ffi::CString::new("v@:@").unwrap().as_ptr(),
+        );
+        crate::ffi::objc_registerClassPair(cls);
+        cls as usize
+    }) as *mut AnyObject
+}
+
+/// Give the carrier a rounded-rect shadow path covering the *panel* inside it, in the carrier's own
+/// coordinates. The padding is already outside that rect, so it is never expanded again here.
+unsafe fn sync_carrier_shadow_path(carrier: *mut AnyObject) {
+    let Some((shadow_layer, radius, insets)) = CARRIER_GEOMETRY
+        .lock()
+        .unwrap()
+        .get(&(carrier as usize))
+        .map(|geometry| (geometry.shadow_layer, geometry.radius, geometry.insets))
+    else {
+        return;
+    };
+    let shadow_layer = shadow_layer as *mut AnyObject;
+    let bounds: NSRect = msg_send![carrier, bounds];
+    // The sublayer tracks the carrier itself; the path below is the panel inside it.
+    let _: () = msg_send![shadow_layer, setFrame: bounds];
+    let layer = shadow_layer;
+    let panel = crate::theme::panel_rect_in_window(bounds.size, insets);
+    // The layer copies the path, so each layout pass replaces it and leaks nothing (see
+    // `ffi::layer_set_rounded_shadow_path`).
+    crate::ffi::layer_set_rounded_shadow_path(
+        layer,
+        crate::ffi::CGRect {
+            x: panel.origin.x,
+            y: panel.origin.y,
+            w: panel.size.width,
+            h: panel.size.height,
+        },
+        radius,
+    );
+}
+
+/// Drop a retired carrier's geometry entry. Called when a material swap replaces the carrier: a swap builds
+/// a new carrier every time, and leaving the retired one's entry behind would grow this map for the life of
+/// the process.
+pub(crate) fn forget_carrier_shadow_path(carrier: *mut AnyObject) {
+    CARRIER_GEOMETRY.lock().unwrap().remove(&(carrier as usize));
+}
+
+extern "C" fn carrier_layout(this: *mut c_void, _cmd: objc2::runtime::Sel) {
+    unsafe { sync_carrier_shadow_path(this as *mut AnyObject) };
+}
+
+extern "C" fn carrier_drop_shadow(
+    this: *mut c_void,
+    _cmd: objc2::runtime::Sel,
+    _sender: *mut AnyObject,
+) {
+    unsafe {
+        let Some(shadow_layer) = CARRIER_GEOMETRY
+            .lock()
+            .unwrap()
+            .get(&(this as usize))
+            .map(|geometry| geometry.shadow_layer)
+        else {
+            return;
+        };
+        let _: () = msg_send![shadow_layer as *mut AnyObject, setShadowOpacity: 0.0f32];
+    }
+}
+
+/// Wrap `root` (the material hierarchy's root, framed as the panel rect) in a shadow carrier. Returns the
+/// carrier, or null when it could not be created.
+unsafe fn wrap_in_shadow_carrier(
+    root: *mut AnyObject,
+    panel_frame: NSRect,
+    level: crate::theme::Elevation,
+    corner_radius: f64,
+) -> *mut AnyObject {
+    let insets = crate::theme::elevation_insets(level);
+    let padded = crate::theme::window_frame_for_panel(panel_frame, insets);
+    let class = carrier_class();
+    let carrier: *mut AnyObject = msg_send![class, alloc];
+    let carrier: *mut AnyObject = msg_send![carrier, initWithFrame: padded];
+    let _: () = msg_send![carrier, setAutoresizingMask: 18u64];
+    let _: () = msg_send![carrier, setWantsLayer: true];
+    let carrier_layer: *mut AnyObject = msg_send![carrier, layer];
+    if carrier_layer.is_null() {
+        release_obj(carrier);
+        return std::ptr::null_mut();
+    }
+    // The shadow's own layer, sitting *below* the material's layer. See `CarrierGeometry` for why it is a
+    // raw sublayer rather than a view's layer.
+    let shadow_layer: *mut AnyObject = msg_send![class!(CALayer), alloc];
+    let shadow_layer: *mut AnyObject = msg_send![shadow_layer, init];
+    let _: () = msg_send![shadow_layer, setFrame: padded];
+    let layer = shadow_layer;
+    CARRIER_GEOMETRY.lock().unwrap().insert(
+        carrier as usize,
+        CarrierGeometry {
+            radius: corner_radius,
+            insets,
+            shadow_layer: shadow_layer as usize,
+        },
+    );
+    layer_set_shadow_color(layer, hex_to_cg_color(level.color));
+    let _: () = msg_send![layer, setShadowOpacity: level.opacity];
+    let _: () = msg_send![layer, setShadowRadius: level.radius];
+    let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, level.offset_y)];
+    // Not clipped: a layer clips its own shadow away otherwise, which is the whole reason the shadow has a
+    // carrier of its own.
+    let _: () = msg_send![layer, setMasksToBounds: false];
+    // Index 0: the material's own layer is a sublayer of the carrier's, and a shadow above it would be
+    // hidden by the material inside the panel and visible only in the padding.
+    let _: () = msg_send![carrier_layer, insertSublayer: shadow_layer, atIndex: 0u32];
+    release_obj(shadow_layer);
+    // The material keeps the panel rect inside the padding, so every coordinate the panel's content uses
+    // (relative to the material) is unchanged by the carrier's existence.
+    let _: () = msg_send![
+        root,
+        setFrame: crate::theme::panel_rect_in_window(padded.size, insets)
+    ];
+    let _: () = msg_send![carrier, addSubview: root];
+    if let Some(DevShadow::At(delay)) = dev_shadow(Some(level)) {
+        let _: () = msg_send![
+            carrier,
+            performSelector: objc2::sel!(dropShadow:),
+            withObject: std::ptr::null::<AnyObject>(),
+            afterDelay: delay.as_secs_f64()
+        ];
+    }
+    // Layout has not run on a view that is not yet in a window, and a smoke runner reads the path before
+    // the panel is on screen, so the first path is set here.
+    sync_carrier_shadow_path(carrier);
+    carrier
+}
+
+/// Whether this backdrop's window root is a carrier rather than the material root itself.
+fn carrier_installed(backdrop: &InstalledBackdrop) -> bool {
+    match (backdrop.root, backdrop.material_root) {
+        (Some(root), Some(material)) => root.0 != material.0,
+        _ => false,
+    }
+}
+
+/// Install the panel's shadow carrier, if it has an elevation, and return the padding the window must be
+/// enlarged by.
+fn install_shadow_carrier(
+    backdrop: &mut InstalledBackdrop,
+    panel_frame: NSRect,
+    corner_radius: f64,
+    options: BackdropOptions,
+) -> crate::theme::PanelInsets {
+    let no_padding = crate::theme::PanelInsets {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+    };
+    let Some(level) = effective_elevation(options.elevation) else {
+        return no_padding;
+    };
+    let Some(material_root) = backdrop.material_root else {
+        return no_padding;
+    };
+    let carrier =
+        unsafe { wrap_in_shadow_carrier(material_root.0, panel_frame, level, corner_radius) };
+    if carrier.is_null() {
+        crate::log_info!(
+            "[panel-shadow] the carrier could not be created; the panel keeps its material without one"
+        );
+        return no_padding;
+    }
+    backdrop.root = Some(ObjPtr::new(carrier));
+    crate::theme::elevation_insets(level)
+}
+
+/// Hand the carrier to the window and drop this function's own `alloc` reference.
+///
+/// `alloc`/`init` return +1 and `setContentView:` only adds the window's own retain, so without this the
+/// carrier -- and with it the material hierarchy, the shadow layer and their paths -- would stay alive
+/// after a material swap replaced it. The `ObjPtr` stored in `InstalledBackdrop` is a non-owning marker,
+/// so the window's reference is the only one left, which is the shape the other installed views use.
+pub(crate) unsafe fn adopt_window_root(window: *mut AnyObject, root: *mut AnyObject, owned: bool) {
+    let _: () = msg_send![window, setContentView: root];
+    // `owned` is true only for the carrier: every material branch already released its own `alloc`
+    // reference inside `build_backdrop`, so releasing the material root here would over-release a view the
+    // window still holds (the no-carrier path, i.e. the HUD and `--panel-shadow=off`).
+    if owned {
+        release_obj(root);
+    }
+}
+
+/// Recolour an installed outline, e.g. after the system or configured appearance changed.
+pub(crate) unsafe fn refresh_panel_outline(backdrop: &InstalledBackdrop) {
+    let Some(outline) = backdrop.outline_view else {
+        return;
+    };
+    let layer: *mut AnyObject = msg_send![outline.0, layer];
+    if layer.is_null() {
+        return;
+    }
+    layer_set_border(
+        layer,
+        hex_to_cg_color(crate::theme::ui_palette().card_border),
+    );
+}
+
+/// A1: the installed outline view, for a smoke runner that wants to read its layer directly.
+pub(crate) fn outline_view_for_smoke(backdrop: &InstalledBackdrop) -> Option<*mut AnyObject> {
+    backdrop.outline_view.map(|outline| outline.0)
+}
+
+/// A1: the installed outline's observable state -- its stroke width and whether its colour is the
+/// `card_border` token -- or `None` when there is no outline. Exists so a smoke runner can assert the
+/// panel's edge without re-implementing the decoration's structure.
+pub(crate) unsafe fn outline_state(backdrop: &InstalledBackdrop) -> Option<(f64, bool)> {
+    let outline = backdrop.outline_view?;
+    let layer: *mut AnyObject = msg_send![outline.0, layer];
+    if layer.is_null() {
+        return None;
+    }
+    let width: f64 = msg_send![layer, borderWidth];
+    let expected = hex_to_cg_color(crate::theme::ui_palette().card_border);
+    let matches = crate::ffi::CGColorEqualToColor(
+        crate::ffi::layer_border_color(layer),
+        expected as *const c_void,
+    );
+    Some((width, matches))
+}
+
+/// A1: whether the outline would be the hit-test result at `point` (in the outline's own coordinates).
+/// It must never be: the decoration covers the whole panel.
+pub(crate) unsafe fn outline_intercepts(backdrop: &InstalledBackdrop, point: NSPoint) -> bool {
+    let Some(outline) = backdrop.outline_view else {
+        return false;
+    };
+    let hit: *mut AnyObject = msg_send![outline.0, hitTest: point];
+    !hit.is_null()
+}
+
+/// A1: the installed shadow path's bounding box, in the window view's own coordinates, or `None` when the
+/// panel has no shadow carrier. A smoke runner uses it to check that the path encloses the *panel* and not
+/// the padded window (the padding is outside the shadow's silhouette by construction).
+pub(crate) unsafe fn carrier_shadow_path_rect(
+    backdrop: &InstalledBackdrop,
+) -> Option<crate::ffi::CGRect> {
+    // `root` is the content view: the carrier when the panel has one, so a panel without a shadow has no
+    // shadow path on its material layer and reports `None` here.
+    let carrier = backdrop.root?;
+    let shadow_layer = CARRIER_GEOMETRY
+        .lock()
+        .unwrap()
+        .get(&(carrier.0 as usize))
+        .map(|geometry| geometry.shadow_layer)?;
+    let layer = shadow_layer as *mut AnyObject;
+    let path = crate::ffi::layer_shadow_path(layer);
+    if path.is_null() {
+        return None;
+    }
+    Some(crate::ffi::CGPathGetBoundingBox(path))
+}
+
+/// A1: the outline's bounds centre, in its own coordinate space.
+pub(crate) unsafe fn outline_centre(backdrop: &InstalledBackdrop) -> NSPoint {
+    let Some(outline) = backdrop.outline_view else {
+        return NSPoint::new(0.0, 0.0);
+    };
+    let bounds: NSRect = msg_send![outline.0, bounds];
+    NSPoint::new(bounds.size.width / 2.0, bounds.size.height / 2.0)
+}
+
 /// Install the shared backdrop for the effective material and return the view that owns
 /// panel content. `compensation_alpha` is applied only on macOS 26+, where passive Glass
 /// panels are darkened.
+///
+/// `frame` is the **panel** rect. When the panel has an elevation, the window is enlarged to the padded
+/// rect here, because a window clips whatever exceeds its own frame and the shadow needs the room.
 pub(crate) unsafe fn install_backdrop(
     window: *mut AnyObject,
     frame: NSRect,
     corner_radius: f64,
     options: BackdropOptions,
 ) -> InstalledBackdrop {
-    let backdrop = build_backdrop(frame, corner_radius, options);
-    let _: () = msg_send![window, setContentView: backdrop.root.unwrap().0];
+    let mut backdrop = build_backdrop(frame, corner_radius, options);
+    let insets = install_shadow_carrier(&mut backdrop, frame, corner_radius, options);
+    adopt_window_root(
+        window,
+        backdrop.root.unwrap().0,
+        carrier_installed(&backdrop),
+    );
+    remember_panel_insets(window, insets);
+    grow_window_for_insets(window, insets);
     reassert_glass_layer_clip(&backdrop, corner_radius);
+    backdrop.outline_view = install_panel_outline(&backdrop, corner_radius);
     backdrop
+}
+
+/// Enlarge a freshly created panel window by its shadow padding. The window was created at the panel
+/// rect, so its current frame *is* the panel rect.
+unsafe fn grow_window_for_insets(window: *mut AnyObject, insets: crate::theme::PanelInsets) {
+    let zero = crate::theme::PanelInsets {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: 0.0,
+    };
+    if insets == zero {
+        return;
+    }
+    let panel: NSRect = msg_send![window, frame];
+    let frame = crate::theme::window_frame_for_panel(panel, insets);
+    let _: () = msg_send![window, setFrame: frame, display: false];
 }
 
 /// Replace an installed backdrop because the material changed. The panel's content views
@@ -608,7 +1285,7 @@ pub(crate) unsafe fn swap_backdrop(
     corner_radius: f64,
     options: BackdropOptions,
 ) -> InstalledBackdrop {
-    let new = build_backdrop(frame, corner_radius, options);
+    let mut new = build_backdrop(frame, corner_radius, options);
     let subviews: *mut AnyObject = msg_send![old.content_parent, subviews];
     let count: usize = msg_send![subviews, count];
     for index in 0..count {
@@ -618,10 +1295,39 @@ pub(crate) unsafe fn swap_backdrop(
         if old.compensation_view.is_some_and(|fill| fill.0 == child) {
             continue;
         }
+        // Neither is the retired outline. Its parent is the material root, and for `opaque` that root *is*
+        // `content_parent`, so without this the old stroke would be carried into the new hierarchy and the
+        // panel would draw two -- the stale one still in the previous theme's colour.
+        if old.outline_view.is_some_and(|outline| outline.0 == child) {
+            continue;
+        }
         let _: () = msg_send![new.content_parent, addSubview: child];
     }
-    let _: () = msg_send![window, setContentView: new.root.unwrap().0];
+    // The shadow carrier is rebuilt with the hierarchy, so a material change cannot keep the old one's
+    // shadow path or its stale geometry. The panel rect is read *before* the new insets are recorded: the
+    // window is currently padded by the old ones, and the padding is not part of the panel.
+    let panel = panel_frame_of(window);
+    // The retired carrier is about to be dropped with the old content view; the path its layer points at is
+    // ours to free (see `CARRIER_SHADOW_PATHS`).
+    if carrier_installed(old) {
+        if let Some(retired) = old.root {
+            forget_carrier_shadow_path(retired.0);
+        }
+    }
+    let insets = install_shadow_carrier(&mut new, frame, corner_radius, options);
+    adopt_window_root(window, new.root.unwrap().0, carrier_installed(&new));
+    remember_panel_insets(window, insets);
+    if insets != panel_insets_of(window) {
+        // Only reachable when the level itself changed (a dev switch); the window has to be re-padded to
+        // the new level's padding or the shadow would be clipped by the old one's.
+        let _: () = msg_send![
+            window,
+            setFrame: crate::theme::window_frame_for_panel(panel, insets),
+            display: false
+        ];
+    }
     reassert_glass_layer_clip(&new, corner_radius);
+    new.outline_view = install_panel_outline(&new, corner_radius);
     new
 }
 
@@ -678,8 +1384,11 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
             tuning.variant
         };
         apply_glass_variant(glass.0, variant);
-        if let Some(root) = backdrop.root {
-            apply_blur_underlay(root.0, tuning.blur_radius, tuning.saturation);
+        // The blur underlay belongs on the material hierarchy, not on the window's content view: with a
+        // shadow carrier installed the content view is the carrier, and `apply_blur_underlay` inserts a
+        // backdrop layer into whatever it is given.
+        if let Some(material) = backdrop.material_root {
+            apply_blur_underlay(material.0, tuning.blur_radius, tuning.saturation);
         }
     }
     if let Some(effect) = backdrop.effect_view {
@@ -697,6 +1406,10 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
             set_compensation_tint(layer.0, tint_hex, alpha);
         }
     }
+    // The outline is a palette token, not a material one, so it is the one decoration a live appearance
+    // change has to recolour explicitly -- `card_border` is black at 10% in light mode and white at 10%
+    // in dark mode, and a stale value is a visibly wrong stroke rather than a missing one.
+    refresh_panel_outline(&backdrop);
 }
 
 /// The material's own strength knobs, i.e. everything AppKit does not expose as a property.
@@ -869,7 +1582,33 @@ unsafe fn set_compensation_tint(layer: *mut AnyObject, tint_hex: u32, alpha: u32
 
 #[cfg(test)]
 mod tests {
-    use super::{glass_style_index, resolved_glass_tint_hex, PanelMaterial};
+    use super::{
+        glass_style_index, parse_dev_outline, resolved_glass_tint_hex, DevOutline, PanelMaterial,
+    };
+    use std::time::Duration;
+
+    /// The outline switch decides whether the A2 measurement has a counter-example frame at all, so an
+    /// unparsable value must be rejected loudly rather than silently leaving the outline on (which would
+    /// make two "different" captures identical and the assertion vacuous).
+    #[test]
+    fn dev_outline_values_are_parsed_or_rejected() {
+        assert_eq!(parse_dev_outline("off"), Some(DevOutline::Off));
+        assert_eq!(parse_dev_outline(" OFF "), Some(DevOutline::Off));
+        assert_eq!(parse_dev_outline("false"), Some(DevOutline::Off));
+        assert_eq!(
+            parse_dev_outline("after:12"),
+            Some(DevOutline::At(Duration::from_secs(12)))
+        );
+        assert_eq!(
+            parse_dev_outline("after:0"),
+            Some(DevOutline::At(Duration::from_secs(0)))
+        );
+        assert_eq!(parse_dev_outline("after:-1"), None);
+        assert_eq!(parse_dev_outline("after:"), None);
+        assert_eq!(parse_dev_outline("after:abc"), None);
+        assert_eq!(parse_dev_outline("blur"), None);
+        assert_eq!(parse_dev_outline(""), None);
+    }
 
     /// The tint must not decide lightness: a tint that is far too light for dark mode (or too
     /// dark for light mode) has to be re-lit into the range the palette's contrast table assumes,

@@ -789,6 +789,26 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             None => "null".to_string(),
         }
     ));
+    // The picker *window* rect: the panel rect above is what layout and the user mean, this one is the
+    // padded rect the shadow needs. An A2 scenario that measures the shadow's outer tail needs the window's
+    // edge, and one that measures the outline or the panel's interior needs the panel's -- reporting both is
+    // what keeps the two measurements from being taken against the wrong rect.
+    json.push_str(&format!(
+        "  \"clipboard_picker_window\": {},\n",
+        match crate::clipboard::picker_window_frame_top_left() {
+            Some((x, y, w, h)) =>
+                format!("{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}"),
+            None => "null".to_string(),
+        }
+    ));
+    // The decorations actually in effect, so a scenario can tell "the switch did not take" from "the
+    // measurement is wrong" without inferring either from pixels.
+    json.push_str(&format!(
+        "  \"panel_decorations\": {{\"outline\": {}, \"outline_width\": {:.1}, \"elevation\": \"{}\"}},\n",
+        crate::glass::panel_outline_enabled(),
+        crate::theme::PANEL_OUTLINE_WIDTH,
+        crate::glass::effective_panel_elevation_id()
+    ));
     // The effective glass look and the tint it resolved to, verbatim from the config. AX cannot express a
     // tint and `NSGlassEffectView.tintColor` reports a system default, so the app states the value itself:
     // this is what makes "the panel shipped with the wrong tint (or an opaque white sheet)" assertable.

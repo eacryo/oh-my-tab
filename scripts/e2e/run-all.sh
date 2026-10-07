@@ -112,13 +112,15 @@ done
 # while the accents that do not go through it -- the red "clear all" -- keep drawing, so the panel reads as an
 # empty white sheet; and `--panel-backdrop` pins a solid black or white window behind it. A scenario that
 # forgets to restore hands the user that state, which happened once; every scenario restores in a trap, and
-# this is the check that they did.
+# this is the check that they did. `--panel-outline=off` and `--panel-shadow=off` are on the list for the same
+# reason: they are the counter-example frames the edge measurements diff against, so leaving one running hands
+# the user a panel with no outline or no shadow.
 # Every process with that name, not just the first: the release and development builds are both `oh-my-tab`, so
 # checking one of them can pass while the other still carries the switches (reproduced with a second process of
 # the same name: the check passed).
 leftover=""
 for pid in $(pgrep -x oh-my-tab || true); do
-    switches="$(ps -o command= -p "$pid" | tr ' ' '\n' | grep -E '^--(clipboard-blank-text|panel-backdrop)' || true)"
+    switches="$(ps -o command= -p "$pid" | tr ' ' '\n' | grep -E '^--(clipboard-blank-text|panel-backdrop|panel-outline|panel-shadow)' || true)"
     if [ -n "$switches" ]; then
         leftover="$leftover
   pid $pid: $(ps -o command= -p "$pid")"

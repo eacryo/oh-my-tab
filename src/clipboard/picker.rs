@@ -204,14 +204,16 @@ pub(super) fn reposition_detail() {
             Some(w) => w.0,
             None => return,
         };
-        let pf: NSRect = msg_send![picker_win, frame];
+        // Panel rects, not window frames: the two differ by the elevation padding, and aligning the
+        // detail against the padded rect would offset it by the padding on every side.
+        let pf = crate::glass::panel_frame_of(picker_win);
         let Some(align_top_y) = selected_row_screen_y(pf) else {
             return;
         };
-        let cf: NSRect = msg_send![detail_win, frame];
+        let cf = crate::glass::panel_frame_of(detail_win);
         let sf = picker_screen_frame(picker_win);
         let frame = detail_frame_for(pf, align_top_y, sf, cf.size.width, cf.size.height);
-        let _: () = msg_send![detail_win, setFrame: frame, display: true];
+        crate::glass::set_panel_frame(detail_win, frame, true);
     }
 }
 
@@ -327,8 +329,8 @@ unsafe fn animate_detail_open(
     target_detail_frame: NSRect,
 ) {
     if crate::theme::reduce_motion_enabled() {
-        let _: () = msg_send![picker_window, setFrame: target_picker_frame, display: true];
-        let _: () = msg_send![detail_window, setFrame: target_detail_frame, display: true];
+        crate::glass::set_panel_frame(picker_window, target_picker_frame, true);
+        crate::glass::set_panel_frame(detail_window, target_detail_frame, true);
         let _: () = msg_send![detail_window, setAlphaValue: 1.0f64];
         let _: () = msg_send![detail_window, orderFrontRegardless];
         animate_detail_content(detail_content, true);
@@ -338,7 +340,7 @@ unsafe fn animate_detail_open(
         target_detail_frame.origin,
         NSSize::new(1.0, target_detail_frame.size.height),
     );
-    let _: () = msg_send![detail_window, setFrame: collapsed_frame, display: false];
+    crate::glass::set_panel_frame(detail_window, collapsed_frame, false);
     let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
     let _: () = msg_send![detail_window, orderFrontRegardless];
 
@@ -350,10 +352,11 @@ unsafe fn animate_detail_open(
         let _: () = msg_send![context, setTimingFunction: timing];
     }
 
-    let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
-    let _: () = msg_send![picker_animator, setFrame: target_picker_frame, display: true];
+    // Through the animator so the shadow carrier's `layout` sees every intermediate size: the panels are
+    // resized by the animation, and a path set only for the first and last frame would lag the panel.
+    crate::glass::animate_panel_frame(picker_window, target_picker_frame);
+    crate::glass::animate_panel_frame(detail_window, target_detail_frame);
     let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
-    let _: () = msg_send![detail_animator, setFrame: target_detail_frame, display: true];
     let _: () = msg_send![detail_animator, setAlphaValue: 1.0f64];
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 
@@ -367,7 +370,10 @@ unsafe fn animate_detail_close(
     detail_content: *mut AnyObject,
     restored_picker_frame: Option<NSRect>,
 ) {
-    let current_detail_frame: NSRect = msg_send![detail_window, frame];
+    // The collapse is expressed as a *panel* rect: the detail window is padded too, and `set_panel_frame`
+    // re-adds the padding on the way out, so reading the window frame here would make the collapsed panel
+    // 1pt + the padding wide and drift its origin.
+    let current_detail_frame = crate::glass::panel_frame_of(detail_window);
     let collapsed_frame = NSRect::new(
         current_detail_frame.origin,
         NSSize::new(1.0, current_detail_frame.size.height),
@@ -375,9 +381,9 @@ unsafe fn animate_detail_close(
 
     if crate::theme::reduce_motion_enabled() {
         if let Some(frame) = restored_picker_frame {
-            let _: () = msg_send![picker_window, setFrame: frame, display: true];
+            crate::glass::set_panel_frame(picker_window, frame, true);
         }
-        let _: () = msg_send![detail_window, setFrame: collapsed_frame, display: false];
+        crate::glass::set_panel_frame(detail_window, collapsed_frame, false);
         let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
         animate_detail_content(detail_content, false);
         detail_finish_close(
@@ -399,11 +405,10 @@ unsafe fn animate_detail_close(
     }
 
     if let Some(frame) = restored_picker_frame {
-        let picker_animator: *mut AnyObject = msg_send![picker_window, animator];
-        let _: () = msg_send![picker_animator, setFrame: frame, display: true];
+        crate::glass::animate_panel_frame(picker_window, frame);
     }
+    crate::glass::animate_panel_frame(detail_window, collapsed_frame);
     let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
-    let _: () = msg_send![detail_animator, setFrame: collapsed_frame, display: true];
     let _: () = msg_send![detail_animator, setAlphaValue: 0.0f64];
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 
@@ -533,7 +538,10 @@ pub(super) fn show_picker() {
 
         // Max height: the 640pt hard cap, shrunk on small screens (120pt kept for the menu
         // bar / cursor offset / edge margins).
-        let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0);
+        // The window is the padded rect, so the panel's budget has to leave the elevation's padding room:
+        // a window taller than the screen is constrained by AppKit, which moves the panel.
+        let pad = crate::glass::panel_elevation_padding();
+        let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0 - pad.top - pad.bottom);
         // The visible row count derives from the height cap, floored to whole rows (no
         // half-cut row at the window's bottom). The estimate uses the plain (header-less)
         // row pitch -- the first row carries a 26pt group header, which would undercount.
@@ -579,7 +587,7 @@ pub(super) fn show_picker() {
             screen_frame.origin.y,
             center_on_main
         );
-        let _: () = msg_send![window, setFrame: frame, display: true];
+        crate::glass::set_panel_frame(window, frame, true);
         let frame_ms = frame_started.elapsed().as_millis();
 
         let render_summary = if rows_ready {
@@ -744,7 +752,8 @@ pub(super) fn hide_detail() {
             // explicitly (cursor regions re-evaluate only on mouse movement); skip when
             // the cursor is elsewhere so the search field's own I-beam is never clobbered.
             let loc: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-            let f: NSRect = msg_send![w.0, frame];
+            // The panel the pointer can be on, not the padded window: the padding is not part of it.
+            let f = crate::glass::panel_frame_of(w.0);
             if f.origin.x <= loc.x
                 && loc.x <= f.origin.x + f.size.width
                 && f.origin.y <= loc.y
@@ -753,7 +762,10 @@ pub(super) fn hide_detail() {
                 let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
                 let _: () = msg_send![arrow, set];
             }
-            let current_picker: NSRect = msg_send![picker.0, frame];
+            // Panel rect again: `original_origin` was saved in panel coordinates, and the restored frame
+            // goes back through `set_panel_frame`, so mixing a window rect in here would add the padding
+            // twice and change the picker's size on close.
+            let current_picker = crate::glass::panel_frame_of(picker.0);
             let restored_picker =
                 original_origin.map(|origin| NSRect::new(origin, current_picker.size));
             cancel_detail_close(w.0);
@@ -1360,7 +1372,9 @@ pub(super) unsafe fn show_detail_for_sel() {
         None => return,
     };
     let screen_frame = picker_screen_frame(picker_win);
-    let picker_frame: NSRect = msg_send![picker_win, frame];
+    // Panel coordinates: the picker's window is padded for its elevation shadow, and a detail sized or
+    // aligned against the padded rect would be off by the padding and would re-add it on the way back.
+    let picker_frame = crate::glass::panel_frame_of(picker_win);
     let max_detail_h = detail_max_height(picker_frame);
     let preserved_wrap_button =
         if entry.image.is_none() && classify_text(&entry.text) == TextKind::Code {
@@ -1515,8 +1529,8 @@ pub(super) unsafe fn show_detail_for_sel() {
         cursor.x,
     );
     if detail_was_visible {
-        let _: () = msg_send![picker_win, setFrame: target_picker_frame, display: true];
-        let _: () = msg_send![window, setFrame: target_detail_frame, display: true];
+        crate::glass::set_panel_frame(picker_win, target_picker_frame, true);
+        crate::glass::set_panel_frame(window, target_detail_frame, true);
         let _: () = msg_send![window, orderFrontRegardless];
     } else {
         animate_detail_open(

@@ -4,6 +4,7 @@ mod callback_guard;
 mod clipboard;
 mod clipboard_highlight;
 mod config;
+mod dev_backdrop;
 mod dev_flags;
 mod e2e_state;
 mod event_monitor;
@@ -2876,9 +2877,14 @@ pub fn run() {
         }
         // Development switch: paint a controlled backdrop behind the panels, so a translucent material's
         // contrast can be measured against a known surface instead of whatever the desktop happens to show
-        // (the A2 scenario `scripts/e2e/panel-contrast.sh` needs that to be repeatable).
+        // (the A2 scenario `scripts/e2e/panel-contrast.sh` needs that to be repeatable). `texture` is the
+        // patterned form: a flat tone cannot tell a live blur from an opaque fill that covers the texture.
         if let Some(shade) = crate::dev_flags::value("panel-backdrop") {
-            show_dev_backdrop(&shade);
+            if shade.trim().eq_ignore_ascii_case("texture") {
+                dev_backdrop::show_texture();
+            } else {
+                show_dev_backdrop(&shade);
+            }
         }
         // Development switch: open the clipboard picker so its laid-out UI is reachable without
         // driving the global hotkey (which would steal focus).

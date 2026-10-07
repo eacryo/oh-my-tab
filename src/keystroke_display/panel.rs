@@ -234,7 +234,7 @@ pub(super) fn cursor_inside_visible_panel(point: NSPoint) -> Option<bool> {
         if !visible {
             return None;
         }
-        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
         Some(contains(frame, point))
     })
 }
@@ -302,7 +302,7 @@ fn begin_grip_interaction(point: NSPoint, click_count: isize, now: Instant) {
         let Some(window) = state.panel else {
             return false;
         };
-        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
         let local_grip = grip_frame(state.orientation, frame.size);
         let global_grip = NSRect::new(
             NSPoint::new(
@@ -365,7 +365,9 @@ fn drag_grip_to(point: NSPoint, now: Instant) {
                 drag.initial_frame.size,
             );
             unsafe {
-                let _: () = msg_send![window, setFrame: frame, display: true];
+                // The drag is in panel coordinates (the handle the user grabs is on the panel), so the same
+                // rect both starts and lands the drag whatever padding the window carries.
+                crate::glass::set_panel_frame(window, frame, true);
             }
         }
     });
@@ -378,7 +380,7 @@ fn finish_grip_interaction() {
         let drag = state.drag.take();
         let position = if drag.is_some_and(|drag| drag.moved) {
             state.panel.map(|window| unsafe {
-                let frame: NSRect = msg_send![window, frame];
+                let frame: NSRect = crate::glass::panel_frame_of(window);
                 KeystrokeDisplayPosition {
                     x: frame.origin.x,
                     y: frame.origin.y,
@@ -435,10 +437,12 @@ fn reposition_to_default() {
         state.target_frame = Some(screen);
         if let Some(window) = state.panel {
             unsafe {
-                let frame: NSRect = msg_send![window, frame];
+                let frame: NSRect = crate::glass::panel_frame_of(window);
                 let default_frame =
                     default_edge_frame(screen.visible_frame, frame.size, &config.initial_position);
-                let _: () = msg_send![window, setFrame: default_frame, display: true];
+                // Panel coordinates in, panel coordinates out: the padding belongs to the window, while
+                // the HUD's placement is the user's.
+                crate::glass::set_panel_frame(window, default_frame, true);
             }
         }
     });
@@ -629,10 +633,10 @@ pub(super) fn render(
 
             let frame = unsafe {
                 if state.drag.is_some() {
-                    let current: NSRect = msg_send![panel, frame];
+                    let current: NSRect = crate::glass::panel_frame_of(panel);
                     NSRect::new(current.origin, size)
                 } else if !reopened {
-                    let current: NSRect = msg_send![panel, frame];
+                    let current: NSRect = crate::glass::panel_frame_of(panel);
                     resize_frame_preserving_center(current, size, geometry.visible_frame)
                 } else {
                     resolve_panel_frame(
@@ -652,7 +656,10 @@ pub(super) fn render(
                     set_alpha_immediately(panel, 1.0);
                     let _: () = msg_send![panel, orderFront: std::ptr::null::<AnyObject>()];
                 }
-                let _: () = msg_send![panel, setFrame: frame, display: true];
+                // The window is the padded rect; `frame` here is the panel's. A raw `setFrame:` with the
+                // panel rect shrinks the window, which then shrinks the material through its fixed
+                // margins -- the keycaps are laid out for `size` and end up overflowing the strip.
+                crate::glass::set_panel_frame(panel, frame, true);
                 if let Some(grip_view) = state.grip_view {
                     let _: () = msg_send![grip_view, setFrame: grip_frame(orientation, size)];
                     update_grip_marker(grip_view, orientation);
@@ -905,7 +912,7 @@ pub(super) fn smoke_runner() -> bool {
         };
         unsafe {
             let visible: bool = msg_send![panel, isVisible];
-            let frame: NSRect = msg_send![panel, frame];
+            let frame: NSRect = crate::glass::panel_frame_of(panel);
             let alpha: f64 = msg_send![panel, alphaValue];
             let grip_actual: NSRect = msg_send![grip_view, frame];
             let screen_width = screen_geometries()
@@ -1283,7 +1290,7 @@ fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -
         let Some(window) = state.panel else {
             return false;
         };
-        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
         let saved = crate::config::CONFIG
             .read()
             .unwrap()
@@ -1323,7 +1330,7 @@ fn smoke_grip_interaction(original_position: Option<KeystrokeDisplayPosition>) -
         let Some(window) = state.panel else {
             return false;
         };
-        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
         let ignores_mouse_events: bool = unsafe { msg_send![window, ignoresMouseEvents] };
         let config = crate::config::CONFIG
             .read()
@@ -1356,7 +1363,7 @@ fn panel_frame_and_grip_center() -> Option<(NSRect, NSPoint)> {
     PANEL.with(|panel| {
         let state = panel.borrow();
         let window = state.panel?;
-        let frame: NSRect = unsafe { msg_send![window, frame] };
+        let frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
         let grip = grip_frame(state.orientation, frame.size);
         Some((
             frame,
@@ -1484,6 +1491,11 @@ unsafe fn create_panel(
     ];
     let _: () = msg_send![panel, setLevel: 3isize];
     let _: () = msg_send![panel, setOpaque: false];
+    // The HUD keeps its native window shadow: it is placed `PANEL_EDGE_MARGIN` (18pt) from the visible
+    // edge, and a `high`-level shadow needs ~64-76pt of window padding around the panel, which AppKit then
+    // constrains back into the visible area -- measured, that moved the panel by 26pt and changed the
+    // meaning of a saved position. Giving the HUD a carrier shadow is therefore a placement decision of its
+    // own, not part of the switcher/clipboard change (see docs/review-backlog.md).
     let _: () = msg_send![panel, setHasShadow: true];
     let _: () = msg_send![panel, setIgnoresMouseEvents: true];
     let _: () = msg_send![panel, setHidesOnDeactivate: false];
@@ -1597,7 +1609,7 @@ fn update_grip_tracking(state: &mut PanelState, cursor_point: Option<NSPoint>) {
     let inside_grip = if panel_active {
         cursor_point.is_some_and(|point| {
             state.panel.is_some_and(|window| unsafe {
-                let frame: NSRect = msg_send![window, frame];
+                let frame: NSRect = crate::glass::panel_frame_of(window);
                 let local = grip_frame(state.orientation, frame.size);
                 contains(
                     NSRect::new(
@@ -1688,30 +1700,32 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         let Some(glass_class) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") else {
             return false;
         };
-        // The glass carries the rounded clip itself; the shipped path installs it as the window's
-        // content view directly (alt-tab's shape), so the only thing that must never clip is a *wrapper*
-        // around it -- and on the shipped path there is none.
+        // The glass carries the rounded clip itself.
         let glass_is_hosted: bool = view_contains_subview(root, glass.0);
         let is_glass: bool = msg_send![root, isKindOfClass: glass_class];
         let radius: f64 = msg_send![glass.0, cornerRadius];
         let glass_layer: *mut AnyObject = msg_send![glass.0, layer];
         let glass_clips: bool = !glass_layer.is_null() && msg_send![glass_layer, masksToBounds];
-        // Whatever hosts the glass may only be a *material* view that rounds itself. The panel's top edge
-        // was once cut off by a plain, masking container between the window and the glass; reading
-        // `masksToBounds` off whatever the root happens to be was a bad proxy for that -- a material view
-        // legitimately clips its own bounds (the frost material does exactly that) -- so the check is what
-        // the bug actually was: the host is the glass itself or a `NSVisualEffectView`, never a bare view.
-        let wrapper_ok: bool = if is_glass {
-            true
-        } else if crate::dev_flags::value("glass-blur").is_some() {
-            // The development-only blur underlay hosts its `CABackdropLayer` on a plain container. That
-            // shape never ships (`build_backdrop`), so it is not held to the material-wrapper rule.
+        // Whatever hosts the glass must not **clip**. The panel's top edge was once cut off by a plain,
+        // masking container between the window and the glass, because the glass's variants draw their edge
+        // outside the glass's own bounds. This check used to read the host's *class* instead (the glass
+        // itself, or a `NSVisualEffectView`), which was a proxy for that mask and rejected any non-masking
+        // host -- including the shadow carrier, which deliberately does not clip exactly so the glass's edge
+        // is not cut. The property the bug was about is asserted directly now, and directly is stricter: a
+        // masking host fails whatever its class is, while a material view that rounds and clips *itself*
+        // (frost) is judged on the host above it, which is where the bug lived.
+        let host_clips: bool = if is_glass {
+            false
+        } else {
+            let root_layer: *mut AnyObject = msg_send![root, layer];
+            !root_layer.is_null() && msg_send![root_layer, masksToBounds]
+        };
+        let wrapper_ok: bool = if crate::dev_flags::value("glass-blur").is_some() {
+            // The development-only blur underlay hosts its `CABackdropLayer` on a plain container that
+            // insets the glass; that shape never ships (`build_backdrop`).
             true
         } else {
-            let Some(effect_class) = objc2::runtime::AnyClass::get(c"NSVisualEffectView") else {
-                return false;
-            };
-            msg_send![root, isKindOfClass: effect_class]
+            !host_clips
         };
         let inner: *mut AnyObject = msg_send![glass.0, contentView];
         let Some(fill) = backdrop.compensation_view else {
@@ -1956,12 +1970,13 @@ pub(super) unsafe fn apply_backdrop_material() {
     if old.material == crate::glass::PanelMaterial::effective() {
         return;
     }
-    let frame_rect: NSRect = msg_send![panel, frame];
-    let content_rect: NSRect = msg_send![panel, contentRectForFrameRect: frame_rect];
+    // The panel rect, not the window's: the window is padded for the shadow, and the hierarchy a swap
+    // builds is the material's, which is the panel.
+    let panel_rect = crate::glass::panel_frame_of(panel);
     let new = crate::glass::swap_backdrop(
         panel,
         &old,
-        content_rect,
+        panel_rect,
         crate::glass::PANEL_CORNER_RADIUS,
         crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA)),
     );

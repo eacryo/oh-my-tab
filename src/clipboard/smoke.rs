@@ -85,6 +85,101 @@ pub(crate) fn smoke_runner() -> bool {
     hide_picker();
     // Second show: rebuild_rows removes the old rows first (the former UAF path).
     show_picker();
+    // The panel's outline is a decoration over the whole panel, so it has two ways to be wrong that no
+    // token comparison would catch: absent (or present) against its own switch, and swallowing the
+    // panel's input. Both are asserted here on the real view tree, including the `--panel-outline=off`
+    // launch, where "no outline" must be what the switch produced rather than a silent install failure.
+    unsafe {
+        let backdrop = (*PICKER_BACKDROP.lock().unwrap())
+            .expect("the picker's backdrop exists once the picker has been shown");
+        let expected = crate::glass::panel_outline_enabled();
+        match crate::glass::outline_state(&backdrop) {
+            Some((width, colour_matches)) => {
+                assert!(
+                    expected,
+                    "an outline was installed while the switch asked for none"
+                );
+                assert!(
+                    (width - crate::theme::PANEL_OUTLINE_WIDTH).abs() < 1e-9,
+                    "the outline's stroke width {width} is not the PANEL_OUTLINE_WIDTH token"
+                );
+                assert!(
+                    colour_matches,
+                    "the outline is not drawn in the card_border token"
+                );
+            }
+            None => assert!(
+                !expected,
+                "the switch asked for an outline, but none was installed"
+            ),
+        }
+        assert!(
+            !crate::glass::outline_intercepts(&backdrop, crate::glass::outline_centre(&backdrop)),
+            "the outline decoration must never be the hit-test result: it would swallow every click on the panel"
+        );
+        // The outline's colour must be the palette token, not whatever the layer happened to hold: the
+        // theme's `card_border` differs per mode, so a stale value is a visibly wrong stroke. Only checked
+        // when the outline is expected -- `--panel-outline=off` is a legitimate launch, and requiring a view
+        // there would fail the very smoke that verifies the switch.
+        if crate::glass::panel_outline_enabled() {
+            let token = crate::theme::ui_palette().card_border;
+            let expected = crate::ffi::hex_to_cg_color(token);
+            let outline = crate::glass::outline_view_for_smoke(&backdrop)
+                .expect("the outline view exists while the switch is on");
+            let layer: *mut AnyObject = msg_send![outline, layer];
+            assert!(
+                !layer.is_null()
+                    && crate::ffi::CGColorEqualToColor(
+                        crate::ffi::layer_border_color(layer),
+                        expected as *const c_void
+                    ),
+                "the outline must be drawn in the current theme's card_border"
+            );
+        }
+
+        // The elevation shadow's silhouette has to enclose the *panel*: a path over the padded window would
+        // put the shadow's darkest part in the padding, and a path never re-set after a resize would leave
+        // the shadow the size of the previous panel. Both were wrong at least once while this was built, and
+        // neither is visible in a token comparison, so both are asserted on the real geometry.
+        //
+        // Presence is asserted against the *effective* elevation rather than skipped when absent: a panel
+        // that should have a shadow and has no path is exactly the silent-pass this check exists to stop.
+        let shadow = crate::glass::carrier_shadow_path_rect(&backdrop);
+        let expects_shadow = crate::glass::effective_panel_elevation_id() != "none";
+        assert_eq!(
+            shadow.is_some(),
+            expects_shadow,
+            "the picker's elevation is {} but its shadow path {} installed",
+            crate::glass::effective_panel_elevation_id(),
+            if shadow.is_some() { "is" } else { "is not" }
+        );
+        if let Some(shadow) = shadow {
+            let window = (*PICKER_WINDOW.lock().unwrap())
+                .expect("the picker window exists once the picker has been shown")
+                .0;
+            let panel = crate::glass::panel_frame_of(window);
+            let insets = crate::glass::panel_insets_of(window);
+            let padded = crate::theme::window_frame_for_panel(panel, insets);
+            assert!(
+                (shadow.w - panel.size.width).abs() < 1.0
+                    && (shadow.h - panel.size.height).abs() < 1.0,
+                "the shadow path must enclose the panel ({}x{}), not the padded window ({}x{})",
+                panel.size.width,
+                panel.size.height,
+                padded.size.width,
+                padded.size.height
+            );
+            // The panel sits inside the window by the padding, so the path must be offset by it: a path at
+            // the window's origin would be the "expanded twice" mistake.
+            assert!(
+                (shadow.x - insets.left).abs() < 1.0 && (shadow.y - insets.bottom).abs() < 1.0,
+                "the shadow path must sit at the panel's offset inside the window ({}, {}), not at {}",
+                insets.left,
+                insets.bottom,
+                shadow.x
+            );
+        }
+    }
     assert!(
         unsafe { detail::smoke_row_backdrop_paint_paths() },
         "selected+hovered row backdrops must match in the build and runtime repaint paths"

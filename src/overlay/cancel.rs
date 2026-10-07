@@ -83,7 +83,9 @@ fn overlay_window_resigned_inner() {
             // The helper ends the slot borrow before any AppKit query can re-enter us.
             let window = overlay_window_ptr();
             let pointer_inside = window.is_some_and(|window| {
-                let frame: NSRect = msg_send![window, frame];
+                // The panel, not the padded window: the padding is not part of the panel the pointer can
+                // be "inside of".
+                let frame = crate::glass::panel_frame_of(window);
                 let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
                 mouse.x >= frame.origin.x
                     && mouse.x <= frame.origin.x + frame.size.width
@@ -716,7 +718,9 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
 /// footer carries one too, so the material is left honest (design-style §3); the
 /// switcher is the active panel, so no inactive-glass compensation.
 pub(crate) const fn switcher_backdrop_options() -> crate::glass::BackdropOptions {
-    crate::glass::BackdropOptions::new(None)
+    // `high`: §7's row for a surface above the whole UI, which is what a switcher summoned over another
+    // app's content is.
+    crate::glass::BackdropOptions::new(None).with_elevation(Some(crate::theme::ELEVATION_HIGH))
 }
 
 /// Re-apply surface properties from CONFIG to the installed backdrop, for hot reload:
@@ -757,12 +761,13 @@ pub(crate) unsafe fn apply_backdrop_material() {
         return;
     }
     let radius = CONFIG.read().unwrap().appearance.corner_radius;
-    let frame_rect: NSRect = msg_send![window, frame];
-    let content_rect: NSRect = msg_send![window, contentRectForFrameRect: frame_rect];
+    // The panel rect: a swap rebuilds the material hierarchy, which is the panel's, not the padded
+    // window's.
+    let panel_rect = crate::glass::panel_frame_of(window);
     let new = crate::glass::swap_backdrop(
         window,
         &old,
-        content_rect,
+        panel_rect,
         radius,
         switcher_backdrop_options(),
     );

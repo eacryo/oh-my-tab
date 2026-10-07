@@ -195,6 +195,12 @@ The floating panels (switcher, clipboard, keystroke display) offer three materia
 Material only ever changes which surface sits behind the panel content — text colors, spacing,
 radius, and the palette remain exactly as specified here.
 
+The panel's outline is the same on all three materials: a 1pt inside stroke in `card_border` over the
+panel's own rounded rect. It is drawn as a decoration above the material rather than as a layer border
+on the material itself, because the three material views differ (frost carries a rounded mask image,
+glass clips itself) and a border on any of them inherits that structure's behaviour. The *visual*
+contract is shared; only the implementation is material-specific where a material forces it.
+
 **A panel's surface is its material, and the ink carries the contrast.** No panel paints a text surface
 over its material: a surface only ever covered part of the panel, so it banded against the material
 everywhere else (measured on the clipboard picker in light mode, an idle row at `#F3F4F6` against the bare
@@ -527,10 +533,25 @@ Four levels. Pick by **how far the surface sits from the page**, not by how much
 | `none` | — (border only) | Default. Rows, cards, inline banners, buttons |
 | `low` | `0 1px 2px rgba(0,0,0,.06)` | In-flow surfaces that must read as distinct (a card that needs emphasis) |
 | `med` | `0 4px 12px rgba(0,0,0,.10)` + border | Floating above page content: popovers, dropdown menus, tooltips |
-| `high` | `0 12px 32px rgba(0,0,0,.18)` | Above the whole UI: dialogs, onboarding, the switcher panel over a dimmed backdrop |
+| `high` | `0 12px 32px rgba(0,0,0,.18)` | Above the whole UI: dialogs, onboarding, the switcher, clipboard and detail panels |
 
 The medium elevation is represented in `theme.rs` by one shared black shadow color, opacity, blur
-radius, and vertical offset. Use those constants for both dropdowns and tooltips. Thumbnail corner
+radius, and vertical offset. Use those constants for both dropdowns and tooltips. The high level is
+represented the same way (`ELEVATION_HIGH_*`), and the floating panels use it: the switcher, the
+clipboard picker and the detail panel all float over another app's content rather than over a page.
+The keystroke display keeps its native window shadow: it sits `PANEL_EDGE_MARGIN` from the visible
+edge, and a high-level shadow needs 64–76pt of window padding around the panel, which the window
+server then constrains back into the visible area — measured, that moved the panel by 26pt and
+changed what a saved position means. Giving the HUD its own shadow is a placement decision of its
+own (recorded in `docs/review-backlog.md`), not a second elevation level.
+
+**A panel's elevation shadow is drawn only outside the panel.** The padding exists because the
+window clips whatever exceeds its own frame, and it is sized from a measurement, not from the blur
+radius: `radius + |offset|` is where the shadow's core ends, not where it reaches zero, and padding
+by the radius alone left the tail 8 tone units dark at the window's outermost ring. The allowance
+that the measurement asked for is `ELEVATION_SHADOW_TAIL_ALLOWANCE`, and
+`scripts/e2e/panel-edge.sh` is the command that reproduces the verdict (the outer ring must read as
+the pinned backdrop, and the panel's interior must not change when the shadow is toggled). Thumbnail corner
 badges (fullscreen, minimized/hidden) are a circular `badge_scrim` chip carrying a white glyph; the
 chip uses the separately named `symbol_shadow` role and its shared geometry constants — that small
 contrast aid is not surface elevation. Its opacity is 0.85, blur radius 2pt, and vertical offset
@@ -888,7 +909,8 @@ work; leaving an old surface as it is needs a reason, not silence.
 4. Update this document in the same change. A value that is not in this document does not exist.
 
 The font-weight values used by AppKit are named in `theme.rs`: regular `0.0`, semibold `0.3`, and
-bold `0.4`. The medium elevation constants correspond to the `med` row above. The switcher ring
+bold `0.4`. The medium and high elevation constants correspond to the `med` and `high` rows above;
+`ELEVATION_SHADOW_TAIL_ALLOWANCE` is not a style value but a measured one (§7). The switcher ring
 inset is 3pt as specified in §6.
 
 ## 13. Review checklist
@@ -909,6 +931,8 @@ inset is 3pt as specified in §6.
       paragraph at each width its container can take — and not assumed to break on word boundaries
       (§11.2).
 - [ ] Cards use border, not a large shadow; elevation level matches what the surface floats over.
+- [ ] A floating panel's outline is `card_border` on every material, its shadow falls outside the panel
+      only, and the window padding is the measured one (§7) — not the blur radius by arithmetic.
 - [ ] Radius comes from the three-step scale; derived radii are computed, not hardcoded.
 - [ ] Animations use the two durations and the standard curve, and honor Reduce Motion.
 - [ ] New code paths are covered by the appropriate tier-A test (see `AGENTS.md`).

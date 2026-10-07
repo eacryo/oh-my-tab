@@ -992,7 +992,6 @@ pub(super) fn footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
         Err(_) => return Vec::new(),
     };
     let mut frames = Vec::new();
-    let mut window_height = 0.0f64;
     for legend in legends.iter() {
         unsafe {
             let label = legend.hint.0;
@@ -1000,17 +999,22 @@ pub(super) fn footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
             let rect: NSRect =
                 msg_send![label, convertRect: bounds, toView: std::ptr::null_mut::<AnyObject>()];
             let window: *mut AnyObject = msg_send![label, window];
-            if !window.is_null() {
-                let frame: NSRect = msg_send![window, frame];
-                window_height = frame.size.height;
+            if window.is_null() {
+                continue;
             }
-            if window_height <= 0.0 {
+            // The caller measures against the *panel* rect, and the window is the padded rect when the
+            // panel has an elevation shadow, so the insets come off here: reporting window coordinates
+            // would shift every caption by the padding.
+            let insets = crate::glass::panel_insets_of(window);
+            let panel_height = crate::glass::panel_frame_of(window).size.height;
+            let panel_top_from_window_bottom = insets.bottom + panel_height;
+            if panel_height <= 0.0 {
                 continue;
             }
             // Window coordinates are bottom-left, the capture region is top-left relative to the panel.
             frames.push((
-                rect.origin.x,
-                window_height - (rect.origin.y + rect.size.height),
+                rect.origin.x - insets.left,
+                panel_top_from_window_bottom - (rect.origin.y + rect.size.height),
                 rect.size.width,
                 rect.size.height,
             ));

@@ -2,6 +2,47 @@
 
 只影响源码开发和调试器启动的裸二进制的问题，不影响 Homebrew 安装或打包 `.app` 的用户。开发期间的常规启动方式是 `scripts/dev-restart.sh`；裸 `cargo run` 仅用于底层诊断。README 的开发环境说明指向本文。
 
+## 浮动面板：面板/窗口矩形契约、描边与 elevation 阴影
+
+三个浮动面板（切换浮窗、剪贴板 picker、剪贴板详情）现在画 1pt `card_border` 描边，并在 `high` 档挂 elevation
+阴影。这件事有三处很容易被改坏，所以写在这里，而不是只写在代码里。
+
+**两个矩形，各只有一个含义。** 面板的*窗口*比面板大：窗口会裁掉超出自身 frame 的绘制，而阴影需要在面板外侧有
+空间，所以窗口 = 面板矩形按 `theme::elevation_insets(level)` 外扩。**面板矩形才是语义矩形**：布局、命中测试、
+picker/detail 的组合几何、`PICKER_EDGE_MARGIN`、`clamp_into_visible`、切换浮窗的尺寸预算、按键 HUD 的已保存位置
+以及 `--e2e-state` 的几何，全部指面板。只有 `setFrame:` 拿到外扩后的矩形。`glass::set_panel_frame` /
+`animate_panel_frame` / `panel_frame_of` 是唯一的换算入口，面板的每次尺寸变化都必须走它们：直接用面板矩形
+`setFrame:` 会把窗口缩小，窗口再通过固定的 autoresizing 边距把材质一起缩小——实测按键显示的键帽因此溢出背条 8pt，
+因为它们是按面板尺寸排版的。对没有登记过外扩的窗口，`panel_frame_of` 原样返回窗口 frame，所以在从未安装过材质
+底板的窗口上使用它是安全的。
+
+**外扩量来自实测，不是算出来的。** `radius + |offset|` 只是图层阴影核心的边界，不是它衰减到零的位置：只按半径
+外扩时，窗口最外一圈仍残留 8 个色阶的阴影。`theme::ELEVATION_SHADOW_TAIL_ALLOWANCE` 就是实测要求的余量；外扩量
+同样要从放置预算和可见区收边里扣掉（外扩后的窗口一旦越界，AppKit 会*移动面板*——实测在菜单栏处推移 26pt——而不是
+裁掉阴影）。复现该判定的命令是 `scripts/e2e/panel-edge.sh`。
+
+**阴影需要载体，而载体不能裁剪。** `masksToBounds` 会裁掉图层自身的阴影，而三种材质都设了它（glass 那个是承重
+的），所以阴影不能挂在材质层上。材质因此成为一个载体视图的子视图，阴影挂在载体的一个**裸 `CALayer` 子层**上，
+绝不挂在视图的图层上：AppKit 会重置由视图管理的图层，实测 `addSubview:` 会把视图图层的 `shadowOpacity` 清零而
+保留半径——阴影就那样静默地不渲染。`CALayer.shadowPath` 会在赋值时复制路径（Apple 头文件原文 "Upon assignment the path is copied"），而 Core
+Animation 对图层上的 CF 类型属性按 CF 所有权持有（Apple QA1565），所以路径的创建、赋值、释放都在一处完成
+（`ffi::layer_set_rounded_shadow_path`），图层保留自己的副本。同一图层上的颜色助手也因此不需要缓存。载体本身不能裁剪（`masksToBounds = false`）：
+glass 的各个变体会把边缘画在 glass bounds 之外，因此按键显示的 smoke 现在直接断言*宿主不裁剪*，取代了原先按类
+判断的代理（glass 本身或 `NSVisualEffectView`）——那个代理会否掉任何不裁剪的宿主（包括载体），而当初 bug 真正
+关于的属性就是那个 mask。
+
+载体的 `layout` 会按自身 bounds 重算阴影路径，这个钩子是刻意的：面板的尺寸变化是*动画式*的（picker 与详情开合、
+切换浮窗在卡片关闭时重排），在每个 `setFrame:` 调用点设一次路径只能覆盖首尾两帧。
+
+**描边是材质之上的一层装饰视图。** 三种材质共用一套实现：材质分支的结构不同（frost 带圆角 mask image，glass 会
+裁剪自身），而 `swap_backdrop` 会迁移 `content_parent` 的子视图，装饰若放在那里就会被带进新层级、留下一条旧描边。
+它重写了 `hitTest:` 返回 nil，因为它覆盖整个面板，否则会吞掉所有本该给面板内容的点击。
+
+**开发开关。** `--panel-outline=off|after:N` 与 `--panel-shadow=off|med|high|after:N` 是给 A2 测量用的：每个都能
+产出断言所需的对照帧，`after:N` 还能在同一次启动内产出（半透明材质跨启动不会渲染得完全一致，所以这一对必须来自
+同一次启动）。`--panel-shadow=off` 会完全移除载体，因此它同时是模糊保留门禁的「无载体」基线。这些开关都不允许留在
+运行中的实例上：`scripts/e2e/run-all.sh` 会连同 `--panel-backdrop`、`--clipboard-blank-text` 一起检查进程命令行。
+
 ## 开发模式下图标可能不正确
 
 用 `cargo run` 跑裸二进制进行诊断时，浮层偶尔会把 oh-my-tab 自己的卡片显示成首字母占位块而不是应用图标，而且可能一直持续到手动清空图标缓存。图标缓存按 bundle id 索引，以可执行文件的 **mtime** 作为失效指纹；开发模式下每次构建都会重新链接二进制、改变 mtime，导致运行中实例的缓存条目失效。打包后的 `.app` 不受影响（安装后二进制 mtime 稳定）。正常开发运行请使用 `scripts/dev-restart.sh`；如果诊断用裸二进制出现此问题，可从菜单 *Clear Icon Cache* 清空，或删除 `~/Library/Caches/oh-my-tab-icons/`。

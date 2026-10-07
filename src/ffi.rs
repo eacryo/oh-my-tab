@@ -234,6 +234,17 @@ extern "C" {
     pub(crate) fn CGContextDrawImage(ctx: *mut c_void, rect: CGRect, image: *const c_void);
     pub(crate) fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
     pub(crate) fn CGBitmapContextGetData(ctx: *mut c_void) -> *mut c_void;
+    /// A +1 rounded-rect path (pass a null transform for identity). Core Graphics object, not an
+    /// Objective-C one: release it with `CFRelease`, never `release_obj`.
+    pub(crate) fn CGPathCreateWithRoundedRect(
+        rect: CGRect,
+        corner_width: f64,
+        corner_height: f64,
+        transform: *const c_void,
+    ) -> *mut c_void;
+    /// The path's bounding box, for a smoke runner to check the *geometry* of a `shadowPath` rather than
+    /// just its presence. Read-only: it takes a borrowed path.
+    pub(crate) fn CGPathGetBoundingBox(path: *const c_void) -> CGRect;
 }
 
 /// CoreGraphics CGRect (C ABI: {origin:(x,y), size:(w,h)} -- four contiguous f64;
@@ -804,7 +815,13 @@ pub(crate) unsafe fn ns_color_to_cg(ns: *mut AnyObject) -> *mut c_void {
     f(ns as *mut c_void, sel)
 }
 
-/// Convert hex u32 -> CGColorRef for use with CALayer.setBackgroundColor / setBorderColor.
+/// Convert hex u32 -> CGColorRef for use with `CALayer.backgroundColor` / `borderColor` / `shadowColor`.
+///
+/// Those properties are declared without `strong`/`copy` in `QuartzCore/Headers/CALayer.h`, but Core Animation
+/// holds CF-typed layer properties with CF ownership regardless (Apple QA1565), so the layer keeps the colour
+/// alive and the returned pointer does not have to outlive the call. It is deliberately *not* cached: the
+/// values include user-configured colours (`theme::colors_from_config`), so a cache keyed by hex would grow
+/// without a bound as a user experiments with the colour pickers.
 pub(crate) fn hex_to_cg_color(hex: u32) -> *mut c_void {
     let ns = hex_to_ns_color(hex);
     unsafe { ns_color_to_cg(ns) }
@@ -863,6 +880,74 @@ pub(crate) unsafe fn layer_set_shadow_color(layer: *mut AnyObject, cg: *mut c_vo
     type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     f(layer as *mut c_void, sel, cg);
+}
+
+/// Set CALayer.shadowPath from a +1 path. The layer copies it (see
+/// [`layer_set_rounded_shadow_path`]), so the caller still owns the reference it passed.
+pub(crate) unsafe fn layer_set_shadow_path(layer: *mut AnyObject, path: *mut c_void) {
+    let sel = sel!(setShadowPath:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, path);
+}
+
+/// Read CALayer.shadowPath as a **borrowed** reference: the layer owns what it holds, so a reader must
+/// not release it. It is a Core Graphics object, so `release_obj` (which sends `release`) would be
+/// wrong on it in every direction.
+pub(crate) unsafe fn layer_shadow_path(layer: *mut AnyObject) -> *mut c_void {
+    let sel = sel!(shadowPath);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel) -> *mut c_void;
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel)
+}
+
+/// Give `layer` a rounded-rect shadow path covering `rect` **in the layer's own coordinate space**, and
+/// release this function's own reference. `rect` is the shadow's silhouette -- the panel itself, not the
+/// padded window: the padding only decides how much room the blur has before the window edges clip it.
+///
+/// `CALayer.shadowPath` copies what it is assigned ("Upon assignment the path is copied", in
+/// `QuartzCore/Headers/CALayer.h`), so the +1 from `CGPathCreateWithRoundedRect` is released here and the
+/// layer keeps its own copy. Core Graphics objects are not Objective-C objects: `CFRelease`, never
+/// `release_obj`.
+pub(crate) unsafe fn layer_set_rounded_shadow_path(
+    layer: *mut AnyObject,
+    rect: CGRect,
+    radius: f64,
+) {
+    let path = CGPathCreateWithRoundedRect(rect, radius, radius, std::ptr::null());
+    if path.is_null() {
+        return;
+    }
+    layer_set_shadow_path(layer, path);
+    CFRelease(path as *const c_void);
+}
+
+/// Set CALayer.contents from a CGImageRef (raw objc_msgSend: objc2 cannot encode CF/CG types).
+pub(crate) unsafe fn layer_set_contents(layer: *mut AnyObject, cg: *mut c_void) {
+    let sel = sel!(setContents:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, cg);
+}
+
+/// Set CALayer.contentsScale (CGFloat; raw for symmetry with [`layer_set_contents`]).
+pub(crate) unsafe fn layer_set_contents_scale(layer: *mut AnyObject, scale: f64) {
+    let sel = sel!(setContentsScale:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, f64);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, scale);
 }
 
 /// Present an NSSavePanel (runModal) and return the chosen filesystem path; None on

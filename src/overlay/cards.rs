@@ -957,16 +957,31 @@ pub(crate) fn show_overlay() {
         // PANEL_MARGIN above and below comes out of the height budget, so step selection lands on a
         // smaller step (0.8/0.75) instead of the panel crossing the menu bar. The sides keep no
         // margin: the panel hugs its content width anyway.
-        let max_panel_h =
-            (screen_visible.size.height * PANEL_MAX_HEIGHT_RATIO - 2.0 * PANEL_MARGIN).max(240.0);
+        // The elevation padding comes out of the budget as well as the margin: the window is the padded
+        // rect, and a window that does not fit the visible area is constrained by AppKit, which moves the
+        // panel (measured: 26pt at the menu bar) instead of clipping the shadow.
+        let elevation_pad = crate::glass::panel_elevation_padding();
+        let max_panel_h = (screen_visible.size.height * PANEL_MAX_HEIGHT_RATIO
+            - 2.0 * PANEL_MARGIN
+            - elevation_pad.top
+            - elevation_pad.bottom)
+            .max(240.0);
         let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
         let layout = if use_flow {
             // Thumbnails balance rows by window aspect; icon-only mode uses fixed cards and auto columns.
             // The width budget also comes from visibleFrame: a side Dock reserves part of the frame,
             // and using the full frame lets the panel cover it (the height side already did this).
-            let screen_inner = (screen_visible.size.width - H_PADDING * 2.0).max(160.0);
-            let max_panel_w =
-                (screen_visible.size.width * PANEL_MAX_WIDTH_RATIO).max(160.0 + H_PADDING * 2.0);
+            // The elevation padding comes out of the width budget as well as the height's: the window is
+            // the padded rect, and the clamp can only *move* an over-wide window, not fit it.
+            let screen_inner = (screen_visible.size.width
+                - H_PADDING * 2.0
+                - elevation_pad.left
+                - elevation_pad.right)
+                .max(160.0);
+            let max_panel_w = (screen_visible.size.width * PANEL_MAX_WIDTH_RATIO
+                - elevation_pad.left
+                - elevation_pad.right)
+                .max(160.0 + H_PADDING * 2.0);
             let max_inner = (max_panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W)
                 .min(screen_inner)
                 .max(160.0);
@@ -1048,22 +1063,25 @@ pub(crate) fn show_overlay() {
         // bar and never covers a visible Dock. Centering on visibleFrame alone shifts the whole panel
         // down by the top reservation (the 30pt menu bar): measured 174pt above vs 144pt below when
         // the Dock is hidden, since a hidden Dock reserves nothing at the bottom.
+        // The clamp holds the *window* inside the visible area and then offsets back to the panel: the
+        // padding belongs to the window, and a padded window that overflows is constrained by AppKit, which
+        // moves the panel rather than clipping the shadow.
         let x = clamp_into_visible(
-            (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x,
+            (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x - elevation_pad.left,
             screen_visible.origin.x,
             screen_visible.size.width,
-            w,
-        );
+            w + elevation_pad.left + elevation_pad.right,
+        ) + elevation_pad.left;
         let y = clamp_into_visible(
-            (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y,
+            (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y - elevation_pad.bottom,
             // The clamp only uses the visible area: the margin was already subtracted from the height
             // budget, and subtracting it here too would push the panel to one side (54/36-style
             // asymmetry when the panel nearly fills the budget). The budget already guarantees
             // h <= visible - 2*margin, so screen-centering always leaves at least PANEL_MARGIN.
             screen_visible.origin.y,
             screen_visible.size.height,
-            h,
-        );
+            h + elevation_pad.top + elevation_pad.bottom,
+        ) + elevation_pad.bottom;
         // Include the panel frame in the same log line: placement is user-visible, so A2 can assert
         // the top/bottom and left/right gaps stay symmetric.
         log_debug!(
@@ -1128,7 +1146,9 @@ pub(crate) fn show_overlay() {
         let reconcile_ms = t_reconcile.elapsed().as_millis(); // TIMING-DEBUG
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
 
-        let _: () = msg_send![window, setFrame: new_frame, display: false];
+        // Panel coordinates: the window itself is the padded rect, which the shadow needs so it is not
+        // clipped by the window's own frame.
+        crate::glass::set_panel_frame(window, new_frame, false);
 
         // wrapper / VFX view / container all have autoresizingMask = 18
         // (width + height sizable), so they resize automatically when the
@@ -1257,6 +1277,35 @@ fn clamp_into_visible(ideal: f64, visible_origin: f64, visible_size: f64, size: 
 mod placement_tests {
     use super::clamp_into_visible;
     use crate::theme::PANEL_MARGIN;
+
+    /// With an elevation shadow the *window* is padded around the panel, so the clamp has to hold the padded
+    /// rect inside the visible area. Clamping the panel alone left the window overflowing, and AppKit then
+    /// constrained the window -- measured, that moved the panel by 26pt at the menu bar instead of clipping
+    /// the shadow, which would have silently changed where the switcher appears.
+    #[test]
+    fn elevation_padding_stays_inside_the_visible_area() {
+        let pad = crate::glass::panel_elevation_padding();
+        let visible_h = 923.0;
+        let panel_h = visible_h - 2.0 * PANEL_MARGIN - pad.top - pad.bottom;
+        let y = clamp_into_visible(
+            (956.0 - panel_h) / 2.0 - pad.bottom,
+            0.0,
+            visible_h,
+            panel_h + pad.top + pad.bottom,
+        ) + pad.bottom;
+        assert!(
+            y >= pad.bottom - 1e-9,
+            "the window's bottom edge left the visible area"
+        );
+        assert!(
+            y + panel_h + pad.top <= visible_h + 1e-9,
+            "the window's top edge left the visible area"
+        );
+        assert!(
+            y >= PANEL_MARGIN - 1e-9,
+            "the panel keeps its margin from the visible edge"
+        );
+    }
 
     #[test]
     fn panel_margin_keeps_a_gap_above_and_below() {

@@ -347,7 +347,9 @@ unsafe fn pointer_in_picker_window() -> bool {
     let Some(w) = *PICKER_WINDOW.lock().unwrap() else {
         return false;
     };
-    let frame: NSRect = msg_send![w.0, frame];
+    // Panel coordinates: the padding around the window is not part of the picker, and treating it as such
+    // would keep the detail panel open for a pointer that is outside the panel the user sees.
+    let frame = crate::glass::panel_frame_of(w.0);
     let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
     rect_contains_point(frame, mouse)
 }
@@ -445,13 +447,15 @@ pub(super) fn copy_detail_selection() {
 /// surfaces, so the material is left honest (design-style §3). No inactive-glass
 /// compensation -- the picker is the panel the user is interacting with.
 pub(crate) const fn picker_backdrop_options() -> crate::glass::BackdropOptions {
-    crate::glass::BackdropOptions::new(None)
+    // `high`: the picker floats over another app's content exactly as the switcher does.
+    crate::glass::BackdropOptions::new(None).with_elevation(Some(crate::theme::ELEVATION_HIGH))
 }
 
 /// The detail panel is a passive companion of the picker, so its Liquid Glass takes the inactive
 /// darkening compensation. It also scrims its own text.
 pub(crate) const fn detail_backdrop_options() -> crate::glass::BackdropOptions {
     crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA))
+        .with_elevation(Some(crate::theme::ELEVATION_HIGH))
 }
 
 /// During the settings live preview, update only the backdrop surfaces and detail
@@ -495,12 +499,13 @@ unsafe fn swap_backdrop_if_material_changed(
     if old.material == crate::glass::PanelMaterial::effective() {
         return None;
     }
-    let frame_rect: NSRect = msg_send![window.0, frame];
-    let content_rect: NSRect = msg_send![window.0, contentRectForFrameRect: frame_rect];
+    // The panel rect, not the window's content rect: a swap rebuilds the *material* hierarchy, and the
+    // window is padded around the panel for the elevation shadow.
+    let panel_rect = crate::glass::panel_frame_of(window.0);
     let new = crate::glass::swap_backdrop(
         window.0,
         &old,
-        content_rect,
+        panel_rect,
         crate::glass::PANEL_CORNER_RADIUS,
         options,
     );
