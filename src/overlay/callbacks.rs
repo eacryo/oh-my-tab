@@ -358,6 +358,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 pid: i32,
                 cgwid: u32,
                 minimized: bool,
+                on_other_desktop: bool,
             },
             Hide,
         }
@@ -383,6 +384,7 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                             pid: w.pid,
                             cgwid: w.window_id,
                             minimized: w.minimized,
+                            on_other_desktop: w.on_other_desktop,
                         };
                         state.focus_key = Some((w.pid, w.window_id));
                         bump_window_mru(&mut state.mru, w.pid, w.window_id);
@@ -423,11 +425,12 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                 pid,
                 cgwid,
                 minimized,
+                on_other_desktop,
             } => {
                 vanish_overlay();
                 // Same as on_cmd_released: no settings-window handling needed (see comment
                 // there); the raise is deferred by one runloop turn so the vanish commits first.
-                schedule_deferred_raise(pid, cgwid, minimized);
+                schedule_deferred_raise(pid, cgwid, minimized, on_other_desktop);
                 schedule_delayed_order_out();
             }
             KeyAction::Hide => hide_overlay(),

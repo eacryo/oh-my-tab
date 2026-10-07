@@ -62,6 +62,7 @@ use crate::{log_debug, log_info};
 
 mod blank_frame;
 mod cache;
+pub(crate) use cache::ScopePass;
 mod capture;
 mod pregen;
 mod summon;
@@ -181,6 +182,66 @@ pub(crate) fn capture_allowed() -> bool {
     let allowed = unsafe { CGPreflightScreenCaptureAccess() };
     report_capture_permission(allowed);
     allowed
+}
+
+/// Start a collection pass's scope staging (collector thread). The caller that carries the pass
+/// into a result takes it over with `take_current_scope_pass`; a caller that does not (a prewarm
+/// pass) leaves it installed, and it is discarded by the next pass on that thread or by the
+/// thread-local's destructor.
+pub(crate) fn begin_scope_pass() {
+    cache::begin_scope_pass();
+}
+
+/// Take ownership of the pass the calling thread is filling.
+pub(crate) fn take_current_scope_pass() -> Option<cache::ScopePass> {
+    cache::take_current_scope_pass()
+}
+
+/// Stage one window's observed scope; `Unknown` evidence is simply not staged.
+pub(crate) fn stage_window_scope(pid: i32, wid: u32, on_other_desktop: bool) {
+    cache::stage_window_scope(pid, wid, on_other_desktop);
+}
+
+/// Drop the other-desktop evidence for a window that no longer exists.
+pub(crate) fn forget_window_scope(pid: i32, wid: u32) {
+    cache::forget_window_scope(pid, wid);
+}
+
+/// Drop the other-desktop evidence for every window of an ended process.
+pub(crate) fn forget_process_scope(pid: i32) {
+    cache::forget_process_scope(pid);
+}
+
+/// Whether a frame for this window is already cached (diagnostics only).
+pub(crate) fn frame_available(pid: i32, wid: u32) -> bool {
+    cache::cached_frame_available(&ThumbKey { pid, wid })
+}
+
+/// Clear a window's render record when a card build starts.
+pub(crate) fn clear_frame_rendered(pid: i32, wid: u32) {
+    cache::clear_frame_rendered(&ThumbKey { pid, wid });
+}
+
+/// Record that a card actually rendered a thumbnail for this window (called by the card renderer
+/// once the image view is attached).
+pub(crate) fn note_frame_rendered(pid: i32, wid: u32) {
+    cache::note_frame_rendered(ThumbKey { pid, wid });
+}
+
+/// Whether a card rendered a thumbnail for this window recently (diagnostics only). This is the
+/// field that distinguishes "the cache has it" from "the card shows it".
+pub(crate) fn frame_was_rendered(pid: i32, wid: u32) -> bool {
+    cache::frame_was_rendered(&ThumbKey { pid, wid })
+}
+
+/// The last summon's capturable candidate set as (pid, CGWindowID) pairs, sorted. Published by the
+/// A2 snapshot so a scenario can assert a window was never a capture candidate (a card on another
+/// desktop must be absent) instead of trusting an eligibility flag.
+pub(crate) fn e2e_summon_workset() -> Vec<(i32, u32)> {
+    last_summon_workset_keys()
+        .into_iter()
+        .map(|key| (key.pid, key.wid))
+        .collect()
 }
 
 /// Active request when unauthorized: the system prompt fires at most once per

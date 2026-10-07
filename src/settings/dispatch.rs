@@ -19,6 +19,7 @@ pub(super) enum ControlField {
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
+    ShowOtherDesktops,
     ThumbnailsEnabled,
     FocusedThumbnailPrewarm,
     ShowAppNameInCards,
@@ -93,6 +94,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                     ControlField::ShowHiddenAppWindows,
                 )
             })
+            .or_else(|| m(u.show_other_desktops, ControlField::ShowOtherDesktops))
             .or_else(|| m(u.thumbnails_enabled, ControlField::ThumbnailsEnabled))
             .or_else(|| {
                 m(
@@ -508,6 +510,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ShowHiddenAppWindows => {
                     let state: isize = msg_send![u.show_hidden_app_windows, state];
                     cfg.windows.show_hidden_app_windows = state == 1;
+                }
+                ControlField::ShowOtherDesktops => {
+                    let state: isize = msg_send![u.show_other_desktops, state];
+                    cfg.windows.show_other_desktops = state == 1;
                 }
                 ControlField::ThumbnailsEnabled => {
                     let idx: isize = msg_send![u.thumbnails_enabled, indexOfSelectedItem];
@@ -1092,6 +1098,7 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
     for &ctrl in &[
         ui.show_minimized,
         ui.show_hidden_app_windows,
+        ui.show_other_desktops,
         ui.thumbnails_enabled,
         ui.focused_thumbnail_prewarm,
         ui.show_app_name_in_cards,

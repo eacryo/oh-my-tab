@@ -321,6 +321,7 @@ fn current_prewarm_jobs() -> Vec<(i32, u32, u64)> {
                 .iter()
                 .filter(|window| {
                     !window.minimized
+                        && !window.on_other_desktop
                         && window.window_id != 0
                         && window.bounds.2 > 0.0
                         && window.bounds.3 > 0.0

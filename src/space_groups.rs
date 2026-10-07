@@ -26,6 +26,17 @@ pub(crate) enum SpaceKind {
     Fullscreen,
 }
 
+/// How a window's actual Space memberships relate to the candidate scope (see
+/// `Topology::membership_scope`). The switcher admits `CurrentGroup` unconditionally and
+/// `OtherDesktop` only while the "show other desktops" switch is on.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum MembershipScope {
+    #[default]
+    Unknown,
+    CurrentGroup,
+    OtherDesktop,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(crate) struct DisplaySpaces {
     pub(crate) current: SpaceId,
@@ -64,6 +75,47 @@ impl Topology {
             .values()
             .find_map(|display| display.spaces.get(&space_id).copied())
             .unwrap_or_default()
+    }
+
+    /// Whether this Space belongs to the accepted display topology. A membership query can also
+    /// name Spaces the topology does not manage (a stale record, or a Space from a display that is
+    /// gone), and those must not count as evidence that a window lives on another desktop.
+    pub(crate) fn space_is_managed(&self, space_id: SpaceId) -> bool {
+        self.displays
+            .values()
+            .any(|display| display.spaces.contains_key(&space_id))
+    }
+
+    /// How a window's actual Space memberships relate to the switcher's candidate scope.
+    ///
+    /// `Unknown` is not "no windows": an empty membership list and an unmanaged Space both mean
+    /// the same thing here -- there is no accepted evidence about where this window lives, which
+    /// is also the shape an orderOut'd surface presents. Only `CurrentGroup` admits a window
+    /// under today's rule; `OtherDesktop` is the evidence the "other desktops" switch requires.
+    pub(crate) fn membership_scope(
+        &self,
+        memberships: &[SpaceId],
+        fullscreen_origins: &HashMap<SpaceId, Origin>,
+    ) -> MembershipScope {
+        let mut managed = false;
+        for space_id in memberships {
+            if !self.space_is_managed(*space_id) {
+                continue;
+            }
+            managed = true;
+            let in_current_group = self.displays.keys().any(|display_id| {
+                self.allowed_spaces(display_id, fullscreen_origins)
+                    .contains(space_id)
+            });
+            if in_current_group {
+                return MembershipScope::CurrentGroup;
+            }
+        }
+        if managed {
+            MembershipScope::OtherDesktop
+        } else {
+            MembershipScope::Unknown
+        }
     }
 
     /// The ordinary Space that defines the visible switcher group for this display. A fullscreen
@@ -419,7 +471,9 @@ pub(crate) fn with_tracker_mut<T>(f: impl FnOnce(&mut Tracker) -> T) -> T {
 
 #[cfg(test)]
 mod tests {
-    use super::{DisplaySpaces, Origin, SpaceKind, Topology, Tracker, WindowIdentity};
+    use super::{
+        DisplaySpaces, MembershipScope, Origin, SpaceKind, Topology, Tracker, WindowIdentity,
+    };
     use std::collections::{HashMap, HashSet};
     use std::time::{Duration, Instant};
 
@@ -532,6 +586,81 @@ mod tests {
         assert!(tracker.window_belongs_to_current_group(&identity(2, 201)));
         assert!(tracker.window_belongs_to_current_group(&fullscreen));
         assert!(!tracker.window_belongs_to_current_group(&identity(3, 301)));
+    }
+
+    #[test]
+    fn membership_scope_separates_the_group_from_other_desktops_and_from_no_evidence() {
+        let topology = topology();
+        let no_origins = HashMap::new();
+        // No member, or a Space the accepted topology does not manage: no evidence at all. The
+        // unmanaged id is the shape a stale record (or an orderOut'd surface) presents, so it must
+        // never be read as "this window lives on another desktop".
+        for memberships in [vec![], vec![999], vec![999, 998]] {
+            assert_eq!(
+                topology.membership_scope(&memberships, &no_origins),
+                MembershipScope::Unknown,
+                "{memberships:?} must not be accepted evidence"
+            );
+        }
+        // The active ordinary desktop of either display is the current group.
+        assert_eq!(
+            topology.membership_scope(&[10], &no_origins),
+            MembershipScope::CurrentGroup
+        );
+        assert_eq!(
+            topology.membership_scope(&[21], &no_origins),
+            MembershipScope::CurrentGroup
+        );
+        // A managed ordinary desktop that is not active is another desktop: display-a's 11, and
+        // display-b's 20 while 21 is current.
+        for memberships in [vec![11], vec![20]] {
+            assert_eq!(
+                topology.membership_scope(&memberships, &no_origins),
+                MembershipScope::OtherDesktop,
+                "{memberships:?} lives outside the current group"
+            );
+        }
+        // A window that is a member of both an inactive and the active desktop is judged by its
+        // whole membership set: the current group wins, so it is not hidden behind the switch.
+        assert_eq!(
+            topology.membership_scope(&[10, 11], &no_origins),
+            MembershipScope::CurrentGroup
+        );
+    }
+
+    #[test]
+    fn a_confirmed_fullscreen_origin_joins_the_group_and_an_unconfirmed_one_does_not() {
+        let mut topology = topology();
+        let fullscreen = identity(1, 101);
+        let origins = HashMap::from([(
+            100,
+            Origin {
+                display_id: "display-a".into(),
+                ordinary_space: 10,
+                window: fullscreen,
+            },
+        )]);
+        // 100 has a confirmed origin on display-a's desktop 10, so it is part of that group.
+        assert_eq!(
+            topology.membership_scope(&[100], &origins),
+            MembershipScope::CurrentGroup
+        );
+        // 101 has no confirmed origin: it stays a desktop of its own.
+        assert_eq!(
+            topology.membership_scope(&[101], &origins),
+            MembershipScope::OtherDesktop
+        );
+        // Inside an unconfirmed fullscreen context the group is only that Space, so the ordinary
+        // desktop 10 that neighbours it is another desktop rather than a leak back.
+        topology.displays.get_mut("display-a").unwrap().current = 101;
+        assert_eq!(
+            topology.membership_scope(&[101], &origins),
+            MembershipScope::CurrentGroup
+        );
+        assert_eq!(
+            topology.membership_scope(&[10], &origins),
+            MembershipScope::OtherDesktop
+        );
     }
 
     #[test]

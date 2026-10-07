@@ -18,6 +18,13 @@ struct RaiseJob {
     cgwid: u32,
     minimized: bool,
     fast_path_ok: bool,
+    // The target lives on another desktop: the commit path fronts its app (or, with the development
+    // switch, deliberately does not, so the front-switch rescue is what must move the Space). This
+    // job waits for the switch, rescues when it does not arrive, then applies the exact raise.
+    on_other_desktop: bool,
+    /// Whether the commit path's app activation was accepted (`false` also covers the development
+    /// switch that skips it).
+    activation: bool,
     generation: u64,
     enqueued_at: Instant,
 }
@@ -214,6 +221,8 @@ pub(crate) fn raise_window_ax_async(
     cgwid: u32,
     minimized: bool,
     fast_path_ok: bool,
+    on_other_desktop: bool,
+    activation: bool,
 ) -> u64 {
     if cgwid == 0 {
         return 0;
@@ -224,6 +233,8 @@ pub(crate) fn raise_window_ax_async(
         cgwid,
         minimized,
         fast_path_ok,
+        on_other_desktop,
+        activation,
         generation,
         enqueued_at: Instant::now(),
     };
@@ -266,14 +277,156 @@ fn run_raise_ax_job(job: RaiseJob) {
     // today; the pool guards against leaks if ObjC calls are ever added.
     unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        let force_ax_focus = if job.minimized || job.fast_path_ok {
-            !job.fast_path_ok
+        if job.on_other_desktop {
+            // Nothing AX-shaped to do: the window has no AX element on this side of the switch,
+            // and fronting the app again could raise a sibling window that is already visible.
+            // The commit path has already fronted the app; this waits for the desktop to follow
+            // and lands the exact window.
+            raise_other_desktop_window(&job, started, job.fast_path_ok, job.activation);
         } else {
-            !retry_failed_fast_path(&job)
-        };
-        raise_window_ax_job(&job, started, force_ax_focus);
+            let force_ax_focus = if job.minimized || job.fast_path_ok {
+                !job.fast_path_ok
+            } else {
+                !retry_failed_fast_path(&job)
+            };
+            raise_window_ax_job(&job, started, force_ax_focus);
+        }
         let _: () = msg_send![pool, drain];
     }
+}
+
+/// How long the cross-desktop raise gives the Space to become active, when to apply the
+/// exact-window front-switch as the rescue, and the polling step.
+///
+/// The budget is generous because the transition is animated: a switch that lands at all can flip
+/// `isOnscreen` well after the call returns, and a short budget abandons a switch already in flight
+/// (observed: a recorded `onscreen=false` followed by the Space changing afterwards). If nothing
+/// lands, the AX phase still runs and the record says `onscreen=false`.
+const OTHER_DESKTOP_SETTLE_BUDGET: Duration = Duration::from_millis(3000);
+const OTHER_DESKTOP_ACTIVATION_BUDGET: Duration = Duration::from_millis(400);
+const OTHER_DESKTOP_SETTLE_STEP: Duration = Duration::from_millis(20);
+/// Extra window for a switch that only lands while the AX phase is already running.
+const OTHER_DESKTOP_LATE_SETTLE_BUDGET: Duration = Duration::from_millis(1500);
+
+/// Wait (bounded, generation-checked) for the target window to join the active desktop.
+unsafe fn wait_for_target_onscreen(job: &RaiseJob, budget: Duration, waited_ms: &mut u128) -> bool {
+    let deadline = Instant::now() + budget;
+    loop {
+        if !raise_intent_current(job.generation) {
+            return false;
+        }
+        if crate::window_collector::window_is_onscreen_now(job.cgwid) {
+            return true;
+        }
+        if Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(OTHER_DESKTOP_SETTLE_STEP);
+        *waited_ms += OTHER_DESKTOP_SETTLE_STEP.as_millis();
+    }
+}
+
+/// Land the exact window after its desktop has become active.
+///
+/// Two attempts can move the Space, in this order:
+///
+/// 1. app activation (`NSRunningApplication.activateWithOptions:`), which the commit path already
+///    performed;
+/// 2. the exact-window front-switch (SLPS with the window id + the targeted click), applied only
+///    when the window has not joined the active desktop within `OTHER_DESKTOP_ACTIVATION_BUDGET`.
+///    macOS refuses attempt 1 in some states (`activateWithOptions=false` with the target never
+///    becoming frontmost -- observed in the user's log), and both reference implementations use
+///    attempt 2 for a cross-Space target, so it is the rescue rather than an unused belt.
+///
+/// Which attempt moved the Space, and the rescue's own result, are published with the target
+/// identity so the branch is assertable (`scripts/e2e/space-desktops.sh` runs one pass with
+/// activation suppressed so the rescue must do the work alone).
+///
+/// The wait is tied to the fact being waited for (`window_is_onscreen_now`) and the generation is
+/// re-checked every step, so a newer switch cancels this raise. Once the window is part of the
+/// active desktop it is in `kAXWindows` again, so the exact window is reachable through the same AX
+/// path every other card uses -- which is also what makes a known-minimized window recoverable here.
+unsafe fn raise_other_desktop_window(
+    job: &RaiseJob,
+    started: Instant,
+    fast_path_ok: bool,
+    activation: bool,
+) {
+    let mut waited_ms = 0u128;
+
+    // Attempt 1 was the app activation the commit path already performed; give it a short window of
+    // its own before adding the rescue.
+    let mut onscreen =
+        wait_for_target_onscreen(job, OTHER_DESKTOP_ACTIVATION_BUDGET, &mut waited_ms);
+    let mut rescue_attempted = false;
+    let mut rescue = false;
+    if !onscreen && raise_intent_current(job.generation) {
+        // Attempt 2: the exact-window front-switch (SLPS with the window id + the targeted click).
+        // Both reference implementations use it for a cross-Space target; here it is the rescue for
+        // the states where macOS refuses to activate the app.
+        rescue_attempted = true;
+        let (slps_ok, click_ok) = raise_window_fast(job.pid, job.cgwid);
+        rescue = slps_ok && click_ok;
+        log_debug!(
+            "[raise] other-desktop front-switch rescue: pid={} cgwid={} commit_fast_path_ok={} slps={} click={} waited={}ms",
+            job.pid,
+            job.cgwid,
+            fast_path_ok,
+            slps_ok,
+            click_ok,
+            waited_ms
+        );
+        let remaining = OTHER_DESKTOP_SETTLE_BUDGET.saturating_sub(Duration::from_millis(
+            waited_ms.min(u128::from(u64::MAX)) as u64,
+        ));
+        onscreen = wait_for_target_onscreen(job, remaining, &mut waited_ms);
+    }
+    if !raise_intent_current(job.generation) {
+        return;
+    }
+
+    let mut ax_matched = raise_window_ax_job(job, started, false);
+    // The transition is animated, so the window can join the active desktop while the AX phase is
+    // already running -- and that phase then matched an element that was not on the active desktop,
+    // where an AXRaise does nothing. Re-check once and re-apply, so a late arrival still gets the
+    // exact raise instead of only the Space switch.
+    if !onscreen
+        && raise_intent_current(job.generation)
+        && wait_for_target_onscreen(job, OTHER_DESKTOP_LATE_SETTLE_BUDGET, &mut waited_ms)
+    {
+        onscreen = true;
+        let late_matched = raise_window_ax_job(job, started, false);
+        ax_matched = late_matched || ax_matched;
+        log_debug!(
+            "[raise] other-desktop late arrival: pid={} cgwid={} late_matched={} waited={}ms",
+            job.pid,
+            job.cgwid,
+            late_matched,
+            waited_ms
+        );
+    }
+    log_debug!(
+        "[raise] other-desktop raise: pid={} cgwid={} onscreen={} ax_matched={} activation={} rescue_attempted={} rescue={} waited={}ms total={}ms",
+        job.pid,
+        job.cgwid,
+        onscreen,
+        ax_matched,
+        activation,
+        rescue_attempted,
+        rescue,
+        waited_ms,
+        started.elapsed().as_millis()
+    );
+    crate::e2e_state::record_other_desktop_raise(
+        job.pid,
+        job.cgwid,
+        job.generation,
+        onscreen,
+        ax_matched,
+        activation,
+        rescue_attempted,
+        rescue,
+    );
 }
 
 /// Recover a failed synchronous raise without blocking the main thread.
@@ -326,12 +479,17 @@ unsafe fn retry_failed_fast_path(job: &RaiseJob) -> bool {
 /// AX phase: on a cache hit, normal windows only perform AXRaise; known minimized windows are
 /// restored first and then run the fast path. Only a stale/missing cache enumerates AXWindows,
 /// pairs by CGWindowID, and refreshes the cache.
-unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: bool) {
+///
+/// Returns whether the exact window was matched and its raise applied. `false` covers both "no
+/// element for this CGWindowID" and "could not talk to the app" -- the caller that ignores the
+/// value is the normal path, where the SLPS fast raise is the evidence; the other-desktop raise
+/// records it, because there the fast raise is not evidence of anything.
+unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: bool) -> bool {
     let app_started = Instant::now();
     let app = AXUIElementCreateApplication(job.pid);
     if app.is_null() {
         log_info!("[raise] ax skipped: no AX app for pid={}", job.pid);
-        return;
+        return false;
     }
     let process_start_time_us = resolve_app_identity(job.pid).process_start_time_us;
     let app_create_us = app_started.elapsed().as_micros();
@@ -354,7 +512,8 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 CFRelease(minimized_key);
             }
             CFRelease(app);
-            return;
+            // Superseded before applying: this job must not report a match it never made.
+            return false;
         }
         // Unminimize is an AX mutation and is performed by the main-thread queue below.
         let minimized_set_err: Option<AXError> = None;
@@ -391,7 +550,8 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 CFRelease(minimized_key);
             }
             CFRelease(app);
-            return;
+            // The cached element is the exact window and its raise was applied.
+            return true;
         }
         log_debug!(
             "[raise] cached AX element stale: pid={} cgwid={} raise={} — refreshing",
@@ -624,6 +784,9 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
         CFRelease(minimized_key);
     }
     CFRelease(app);
+    // Matched means the exact window element was found and the raise applied (or queued for the
+    // main thread). A superseded job reports no match even when it found one.
+    selected_element.is_some() && !superseded
 }
 
 /// The normal path performs one AXRaise. Only an explicit non-stale failure sets
@@ -795,6 +958,18 @@ pub(super) fn window_admission(
     ) && (!is_floating_window || floating_window_is_admissible(layer, bounds))
 }
 
+/// The conservative validity rule for a candidate that has no AX element at all: a window on
+/// another desktop, which `kAXWindows` cannot publish because it is filtered by the current Space.
+///
+/// AX cannot vouch for such a window, so the shape a custom/restored window needs to be switchable
+/// is required unconditionally: an ordinary layer-0 window of ordinary size. The titled-floating and
+/// custom-root exemptions deliberately do not apply here -- they are AX judgments about a window the
+/// app told us about, and without that judgment a small layer-0 helper surface must not become a
+/// card. Pure function, unit-tested.
+pub(super) fn cg_only_window_admissible(layer: i32, bounds: (f64, f64, f64, f64)) -> bool {
+    layer == 0 && custom_window_is_substantial(bounds)
+}
+
 pub(super) fn is_attached_surface(parent_id: Option<u32>) -> bool {
     parent_id.is_some_and(|parent| parent != 0)
 }
@@ -913,23 +1088,100 @@ pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)
 /// not answer.
 const K_AX_VALUE_AX_ERROR_TYPE: i32 = 5;
 
-/// Read one slot of a batch-read result: an out-of-range index, null or an error placeholder all
-/// mean "did not answer" (None).
-unsafe fn ax_slot_value(slots: *const c_void, index: isize) -> Option<AXUIElementRef> {
+/// What a batch-read slot said. "The app answered that it has no value" and "the read failed" are
+/// different facts: the first means the app has no such window, the second means nothing is known
+/// about it at all -- and only the second may keep the CG fallback (see `cg_only_pairing`).
+pub(super) enum AxSlotOutcome {
+    Value(AXUIElementRef),
+    /// The app answered, but not with a value: `kAXErrorNoValue` / an unsupported attribute.
+    NoValue,
+    /// The read itself failed (communication, a dead element, or an unrecognised code).
+    Failed,
+}
+
+pub(super) const K_AX_ERROR_FAILURE: i32 = -25200;
+pub(super) const K_AX_ERROR_ILLEGAL_ARGUMENT: i32 = -25201;
+pub(super) const K_AX_ERROR_INVALID_UI_ELEMENT: i32 = -25202;
+pub(super) const K_AX_ERROR_CANNOT_COMPLETE: i32 = -25204;
+pub(super) const K_AX_ERROR_ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+pub(super) const K_AX_ERROR_ACTION_UNSUPPORTED: i32 = -25206;
+pub(super) const K_AX_ERROR_NOTIFICATION_UNSUPPORTED: i32 = -25207;
+pub(super) const K_AX_ERROR_NOT_IMPLEMENTED: i32 = -25208;
+pub(super) const K_AX_ERROR_NO_VALUE: i32 = -25212;
+pub(super) const K_AX_ERROR_PARAMETERIZED_ATTRIBUTE_UNSUPPORTED: i32 = -25213;
+
+/// Whether an attribute-level AXError means "the app answered, and has no value for this attribute"
+/// as opposed to a failed read. A batch read without stopOnError reports both the same way -- as an
+/// error placeholder in the slot -- so the code inside the placeholder is the only thing that
+/// separates them. Pure function, unit-tested.
+pub(super) fn ax_error_means_no_answer(code: i32) -> bool {
+    match code {
+        K_AX_ERROR_NO_VALUE
+        | K_AX_ERROR_ATTRIBUTE_UNSUPPORTED
+        | K_AX_ERROR_ILLEGAL_ARGUMENT
+        | K_AX_ERROR_NOT_IMPLEMENTED
+        | K_AX_ERROR_PARAMETERIZED_ATTRIBUTE_UNSUPPORTED
+        | K_AX_ERROR_ACTION_UNSUPPORTED
+        | K_AX_ERROR_NOTIFICATION_UNSUPPORTED => true,
+        // A read that could not complete (a dead element, a communication failure) is a failed
+        // read, never "the app has no value" -- and so is any code this build does not know.
+        K_AX_ERROR_CANNOT_COMPLETE | K_AX_ERROR_INVALID_UI_ELEMENT | K_AX_ERROR_FAILURE => false,
+        _ => false,
+    }
+}
+
+/// Whether a per-app AX read learned nothing usable *and* failed to complete: no window element came
+/// back and at least one of the three attribute reads failed.
+///
+/// This is not the same as an empty answer. Stats answers `AXWindows` with an empty array and
+/// reports `NoValue` for both key/main slots -- it answered, and it has no window (see
+/// `cg_only_pairing`). But when a read *failed* while nothing came back, the answer is incomplete:
+/// the window list is Space-filtered, so a real window of another desktop may have been reachable
+/// only through the key/main slots that just failed, and treating that as "no windows" would drop it.
+/// Pure function, unit-tested.
+pub(super) fn ax_read_is_incomplete(
+    window_elements: usize,
+    has_focused: bool,
+    has_main: bool,
+    any_slot_failed: bool,
+) -> bool {
+    window_elements == 0 && !has_focused && !has_main && any_slot_failed
+}
+
+/// Read one slot of a batch-read result, keeping the distinction the caller needs.
+pub(super) unsafe fn ax_slot_outcome(slots: *const c_void, index: isize) -> AxSlotOutcome {
     if slots.is_null() || index >= CFArrayGetCount(slots) {
-        return None;
+        return AxSlotOutcome::Failed;
     }
     let value = CFArrayGetValueAtIndex(slots, index);
     if value.is_null() {
-        return None;
+        return AxSlotOutcome::Failed;
     }
     // A batch read without stopOnError puts an kAXValueAXErrorType AXValue in a slot the app could
     // not answer; not recognising it would read "did not answer" as "answered an object".
     if CFGetTypeID(value) == AXValueGetTypeID() && AXValueGetType(value) == K_AX_VALUE_AX_ERROR_TYPE
     {
-        return None;
+        let mut code: i32 = K_AX_ERROR_FAILURE;
+        let read = AXValueGetValue(
+            value,
+            K_AX_VALUE_AX_ERROR_TYPE,
+            (&mut code as *mut i32).cast(),
+        );
+        if read && ax_error_means_no_answer(code) {
+            return AxSlotOutcome::NoValue;
+        }
+        return AxSlotOutcome::Failed;
     }
-    Some(value)
+    AxSlotOutcome::Value(value)
+}
+
+/// Read one slot of a batch-read result: an out-of-range index, null or an error placeholder all
+/// mean "did not answer" (None).
+unsafe fn ax_slot_value(slots: *const c_void, index: isize) -> Option<AXUIElementRef> {
+    match ax_slot_outcome(slots, index) {
+        AxSlotOutcome::Value(value) => Some(value),
+        AxSlotOutcome::NoValue | AxSlotOutcome::Failed => None,
+    }
 }
 
 /// Merges the window elements of the three attribute slots: `kAXWindows` order first, then the
@@ -1136,14 +1388,47 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         if err != K_AX_SUCCESS || slots.is_null() {
             return None;
         }
+        // Caller-owned: the guard releases it on every exit path below, including the early
+        // "nothing learned about this app" return.
+        let _slots = super::space_membership::OwnedCf(slots);
 
-        // Slot 0 = kAXWindows (a CFArray), 1 = kAXFocusedWindow, 2 = kAXMainWindow.
-        let windows_array =
-            ax_slot_value(slots, 0).filter(|value| CFGetTypeID(*value) == CFArrayGetTypeID());
-        let focused_window =
-            ax_slot_value(slots, 1).filter(|value| CFGetTypeID(*value) == AXUIElementGetTypeID());
-        let main_window =
-            ax_slot_value(slots, 2).filter(|value| CFGetTypeID(*value) == AXUIElementGetTypeID());
+        // Slot 0 = kAXWindows (a CFArray), 1 = kAXFocusedWindow, 2 = kAXMainWindow. The outcomes
+        // keep "the app answered with no value" apart from "the read failed": only the latter is a
+        // failed query, and only a failed query keeps the CG fallback.
+        let windows_outcome = ax_slot_outcome(slots, 0);
+        let focused_outcome = ax_slot_outcome(slots, 1);
+        let main_outcome = ax_slot_outcome(slots, 2);
+        let windows_array = match windows_outcome {
+            AxSlotOutcome::Value(value) if CFGetTypeID(value) == CFArrayGetTypeID() => Some(value),
+            _ => None,
+        };
+        let focused_window = match focused_outcome {
+            AxSlotOutcome::Value(value) if CFGetTypeID(value) == AXUIElementGetTypeID() => {
+                Some(value)
+            }
+            _ => None,
+        };
+        let main_window = match main_outcome {
+            AxSlotOutcome::Value(value) if CFGetTypeID(value) == AXUIElementGetTypeID() => {
+                Some(value)
+            }
+            _ => None,
+        };
+        // Nothing usable came back and at least one of the three reads failed: the query is
+        // incomplete, so this must not be cached as "the app answered that it has no windows".
+        let any_slot_failed = matches!(windows_outcome, AxSlotOutcome::Failed)
+            || matches!(focused_outcome, AxSlotOutcome::Failed)
+            || matches!(main_outcome, AxSlotOutcome::Failed);
+        let window_elements =
+            windows_array.map_or(0, |array| CFArrayGetCount(array).max(0) as usize);
+        if ax_read_is_incomplete(
+            window_elements,
+            focused_window.is_some(),
+            main_window.is_some(),
+            any_slot_failed,
+        ) {
+            return None;
+        }
 
         let mut published: Vec<(u32, AXUIElementRef)> = Vec::new();
         if let Some(array) = windows_array {
@@ -1303,7 +1588,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         CFRelease(minimized_key);
         CFRelease(fullscreen_key);
         CFRelease(main_key);
-        CFRelease(slots);
+
         cache_ax_snapshot(pid, process_start_time_us, &results);
         Some(results)
     }

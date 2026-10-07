@@ -12,8 +12,8 @@ use crate::ffi::{
     kCFBooleanFalse, AXError, AXUIElementCopyAttributeValue,
     AXUIElementCopyMultipleAttributeValues, AXUIElementCreateApplication, AXUIElementGetTypeID,
     AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
-    AXUIElementSetMessagingTimeout, AXValueGetType, AXValueGetTypeID, CFArrayCreate,
-    CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFBooleanGetValue,
+    AXUIElementSetMessagingTimeout, AXValueGetType, AXValueGetTypeID, AXValueGetValue,
+    CFArrayCreate, CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFBooleanGetValue,
     CFDictionaryGetValue, CFGetTypeID, CFNumberGetValue, CFRelease, CFRetain,
     CFStringCreateWithCString, CFStringGetCString, CGDisplayBounds, CGGetActiveDisplayList,
     CGWindowListCopyWindowInfo, K_AX_CANNOT_COMPLETE, K_AX_INVALID_UI_ELEMENT, K_AX_SUCCESS,
@@ -40,7 +40,7 @@ pub(crate) use collect::{
     switchable_capture_window_for_pid,
 };
 pub(crate) use raise::{
-    ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
+    activate_pid, ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
     clear_ax_window_cache_for_window, close_ax_window, focused_window_cgwid,
     forget_non_normal_window, raise_window_fast,
 };
@@ -88,6 +88,12 @@ pub struct WindowInfo {
     // Native macOS fullscreen (AXFullScreen flag or display-filling bounds). Presentation-only:
     // drives the thumbnail's corner badge; raise and activation logic never read it.
     pub fullscreen: bool,
+    // The window lives on another macOS desktop (Space), admitted by the "show other desktops"
+    // switch. Such a window has no AX element (the AX list is filtered by the current Space), so
+    // its title is the CG window name and its minimized state is unknown. Presentation-only, with
+    // two consequences the raise and thumbnail paths do read: a capture is impossible off the
+    // current desktop, and activation needs the Space switch that fronting the app performs.
+    pub on_other_desktop: bool,
     // CG window bounds (x, y, w, h), used to locate the active window's screen. All zeros = unavailable.
     pub bounds: (f64, f64, f64, f64),
 }
@@ -405,6 +411,34 @@ fn window_layer_now(cgwid: u32) -> Option<i32> {
     layer
 }
 
+/// Whether WindowServer currently reports this window as on screen, i.e. it is a window of the
+/// active desktop.
+///
+/// The cross-desktop raise uses this as its settle signal: a window on another desktop reports
+/// false, and the flag flips exactly when fronting its app switches the Space (measured on
+/// macOS 26). Reading it per window keeps the wait tied to the fact being waited for rather than
+/// to a fixed sleep.
+pub(crate) fn window_is_onscreen_now(cgwid: u32) -> bool {
+    if cgwid == 0 {
+        return false;
+    }
+    let array =
+        unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW, cgwid) };
+    if array.is_null() {
+        return false;
+    }
+    let onscreen = unsafe {
+        if CFArrayGetCount(array) <= 0 {
+            false
+        } else {
+            let dict = CFArrayGetValueAtIndex(array, 0);
+            !dict.is_null() && cf_dict_get_bool(dict, "kCGWindowIsOnscreen") == Some(true)
+        }
+    };
+    unsafe { CFRelease(array) };
+    onscreen
+}
+
 /// The layer that classifies an AX-only window: this pass's snapshot entry when it has one, else a
 /// fresh query for that window alone.
 ///
@@ -514,8 +548,330 @@ struct WindowInstanceKey {
 static KNOWN_NON_NORMAL_WINDOWS: LazyLock<Mutex<HashSet<WindowInstanceKey>>> =
     LazyLock::new(|| Mutex::new(HashSet::new()));
 
+/// Windows AX has identified as one of an app's windows at least once (published by `kAXWindows`,
+/// or recovered from the key/main slots).
+///
+/// The cross-desktop admission needs one piece of history: when an app's `kAXWindows` is
+/// Space-filtered but its key/main slots still name a window, a CG window named by neither is a
+/// secondary surface AX excludes -- 微信 keeps a 280x380 off-screen window titled 微信 beside its
+/// real window, and admitting it produced a second, dead card. A window AX has *ever* identified is
+/// not that case, so a real second window of the app (created on another desktop before this process
+/// saw the app there) is still admitted once its desktop has been visited.
+/// The AX-identity memory and its lifecycle, in one lock so a check, an insert and a cleanup are
+/// atomic with respect to each other.
+///
+/// Validity is a lifecycle question, not a clock one: a destruction bumps `epoch`, every collection
+/// records the epoch it began at, and an observation of a window or process incarnation destroyed
+/// after that epoch is refused. A collection that began after the destruction -- including one that
+/// sees a recycled CGWindowID or a new incarnation of a pid -- is unaffected. Marks are never
+/// expired by time (they are a few bytes per destroyed window, bounded by one session), so a slow
+/// collection can never outlive its veto.
+#[derive(Default)]
+pub(crate) struct AxIdentityMemory {
+    known: HashSet<WindowInstanceKey>,
+    /// CGWindowIDs destroyed, with the epoch at which each became invalid.
+    destroyed_cgwids: HashMap<u32, u64>,
+    /// Processes that ended: pid -> (incarnation that ended when known, epoch of the end). The veto
+    /// is the epoch, not the incarnation: a termination callback can run before this pid's first AX
+    /// query cached anything, and the cache holds the latest snapshot rather than the one that ended,
+    /// so "the pid ended before this pass began" is the fact to act on.
+    forgotten_processes: HashMap<i32, (Option<u64>, u64)>,
+    epoch: u64,
+    /// Identity passes currently open, counted per epoch: two passes can begin at the same epoch
+    /// (no destruction between them), and each guard must unregister only its own. A destruction mark
+    /// is only needed while a pass that began at or before it is still running, so closing the last
+    /// such pass reclaims it.
+    open_passes: std::collections::BTreeMap<u64, usize>,
+}
+
+static AX_IDENTITY: LazyLock<Mutex<AxIdentityMemory>> =
+    LazyLock::new(|| Mutex::new(AxIdentityMemory::default()));
+
+thread_local! {
+    /// The epoch of the collection pass this thread is running (see `begin_ax_identity_pass`).
+    static AX_IDENTITY_PASS_EPOCH: std::cell::Cell<Option<u64>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Reclaim destruction marks no open pass can still need: a mark only matters to a pass that began
+/// at or before the destruction, so once every open pass is newer the marks can go.
+fn prune_identity_marks(memory: &mut AxIdentityMemory) {
+    match memory.open_passes.keys().next().copied() {
+        Some(oldest_open) => {
+            memory
+                .destroyed_cgwids
+                .retain(|_, epoch| *epoch > oldest_open);
+            memory
+                .forgotten_processes
+                .retain(|_, (_, epoch)| *epoch > oldest_open);
+        }
+        None => {
+            memory.destroyed_cgwids.clear();
+            memory.forgotten_processes.clear();
+        }
+    }
+}
+
+/// Owns one identity pass: closing it (or dropping it) reclaims the marks that pass was the last
+/// possible user of.
+pub(crate) struct AxIdentityPassGuard(u64);
+
+impl Drop for AxIdentityPassGuard {
+    fn drop(&mut self) {
+        AX_IDENTITY_PASS_EPOCH.with(|slot| slot.set(None));
+        let mut memory = AX_IDENTITY.lock().unwrap();
+        if let Some(count) = memory.open_passes.get_mut(&self.0) {
+            *count -= 1;
+            if *count == 0 {
+                memory.open_passes.remove(&self.0);
+            }
+        }
+        prune_identity_marks(&mut memory);
+    }
+}
+
+/// Open an identity pass for this thread (collector entry points call this next to the scope pass).
+pub(crate) fn begin_ax_identity_pass() -> AxIdentityPassGuard {
+    let mut memory = AX_IDENTITY.lock().unwrap();
+    let epoch = memory.epoch;
+    *memory.open_passes.entry(epoch).or_insert(0) += 1;
+    AX_IDENTITY_PASS_EPOCH.with(|slot| slot.set(Some(epoch)));
+    AxIdentityPassGuard(epoch)
+}
+
+/// The identity pass the calling thread is in, or `None` when it never opened one.
+fn ax_identity_pass_epoch() -> Option<u64> {
+    AX_IDENTITY_PASS_EPOCH.with(|slot| slot.get())
+}
+
+/// Record that AX identified this window as one of the app's windows. Returns whether the record was
+/// taken; a window or process incarnation invalidated since this pass began is refused inside the
+/// same critical section that would insert it.
+pub(crate) fn remember_ax_identity(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cgwid: u32,
+) -> bool {
+    if pid <= 0 || cgwid == 0 {
+        return false;
+    }
+    let (Some(process_start_time_us), Some(pass_epoch)) =
+        (process_start_time_us, ax_identity_pass_epoch())
+    else {
+        return false;
+    };
+    let key = WindowInstanceKey {
+        pid,
+        process_start_time_us,
+        cgwid,
+    };
+    let mut memory = AX_IDENTITY.lock().unwrap();
+    if memory
+        .destroyed_cgwids
+        .get(&cgwid)
+        .is_some_and(|destroyed| *destroyed > pass_epoch)
+    {
+        return false;
+    }
+    if memory
+        .forgotten_processes
+        .get(&pid)
+        .is_some_and(|(_, epoch)| *epoch > pass_epoch)
+    {
+        return false;
+    }
+    memory.known.retain(|entry| {
+        entry.pid != key.pid || entry.process_start_time_us == key.process_start_time_us
+    });
+    memory.known.insert(key);
+    true
+}
+
+pub(crate) fn is_ax_identified_window(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cgwid: u32,
+) -> bool {
+    if pid <= 0 || cgwid == 0 {
+        return false;
+    }
+    let Some(process_start_time_us) = process_start_time_us else {
+        return false;
+    };
+    let key = WindowInstanceKey {
+        pid,
+        process_start_time_us,
+        cgwid,
+    };
+    AX_IDENTITY.lock().unwrap().known.contains(&key)
+}
+
+/// Whether AX has ever identified this window, ignoring the process incarnation (diagnostics only).
+pub(crate) fn is_ax_identified_window_for_pid(pid: i32, cgwid: u32) -> bool {
+    cgwid != 0
+        && AX_IDENTITY
+            .lock()
+            .unwrap()
+            .known
+            .iter()
+            .any(|entry| entry.pid == pid && entry.cgwid == cgwid)
+}
+
+pub(crate) fn forget_ax_identified_window(cgwid: u32) {
+    if cgwid == 0 {
+        return;
+    }
+    let mut memory = AX_IDENTITY.lock().unwrap();
+    memory.epoch += 1;
+    let epoch = memory.epoch;
+    memory.destroyed_cgwids.insert(cgwid, epoch);
+    memory.known.retain(|entry| entry.cgwid != cgwid);
+    prune_identity_marks(&mut memory);
+}
+
+/// Forget every record of a process that ended. `process_start_time_us` is the incarnation that
+/// ended: it must come from the identity cached while the process was alive, because re-resolving
+/// the pid after termination can answer for a recycled pid instead.
+pub(crate) fn forget_ax_identified_process(pid: i32, process_start_time_us: Option<u64>) {
+    let mut memory = AX_IDENTITY.lock().unwrap();
+    memory.epoch += 1;
+    let epoch = memory.epoch;
+    memory.known.retain(|entry| entry.pid != pid);
+    memory
+        .forgotten_processes
+        .insert(pid, (process_start_time_us, epoch));
+    // Reclaim inside the same critical section: with no older pass open the mark has no consumer.
+    prune_identity_marks(&mut memory);
+}
+
 // The public-framework CG/CF/AX externs now live in ffi.rs (this module keeps only the
 // private APIs loaded via skylight.rs).
+
+#[cfg(test)]
+mod ax_identity_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// These tests share one process-wide memory (and its open-pass set), so they serialize.
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    /// The identity protocol is what keeps a window AX refuses to name out of the cross-desktop
+    /// candidate list; its orderings are asserted here because a single-window A2 cannot reach them.
+    #[test]
+    fn a_destroyed_window_is_refused_to_an_older_pass_and_allowed_to_a_newer_one() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 95_001;
+        let start = Some(1_700_000_000_000_000u64);
+        let cgwid = 95_101;
+
+        let pass = begin_ax_identity_pass();
+        assert!(remember_ax_identity(pid, start, cgwid));
+        drop(pass);
+
+        // The window dies while no pass is open.
+        forget_ax_identified_window(cgwid);
+
+        // A pass that began before the destruction (its epoch predates it) is refused...
+        let stale_pass = begin_ax_identity_pass();
+        // ...simulated by taking the epoch captured at open time and then destroying afterwards:
+        let stale_epoch = AX_IDENTITY_PASS_EPOCH.with(|slot| slot.get());
+        assert!(stale_epoch.is_some());
+        forget_ax_identified_window(cgwid);
+        assert!(
+            !remember_ax_identity(pid, start, cgwid),
+            "an observation from a pass that began before the destruction must be refused"
+        );
+        drop(stale_pass);
+
+        // A pass that begins after it may record the recycled ID immediately.
+        let fresh_pass = begin_ax_identity_pass();
+        assert!(remember_ax_identity(pid, start, cgwid));
+        drop(fresh_pass);
+    }
+
+    #[test]
+    fn a_process_end_vetoes_observations_of_that_pid_even_without_a_cached_incarnation() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        // The termination callback can run before this pid's first AX query cached anything, and the
+        // cache holds the latest snapshot rather than the one that ended -- so the veto is the pid
+        // plus the epoch, and the incarnation is only diagnostic.
+        let pid = 95_002;
+        let cgwid = 95_102;
+        // A pass is already running when the process ends: its later observation must be refused.
+        let stale = begin_ax_identity_pass();
+        forget_ax_identified_process(pid, None);
+        assert!(!remember_ax_identity(pid, Some(42), cgwid));
+        drop(stale);
+
+        // A pass that begins after the termination (a new incarnation) is unaffected.
+        let fresh = begin_ax_identity_pass();
+        assert!(remember_ax_identity(pid, Some(43), cgwid));
+        drop(fresh);
+    }
+
+    #[test]
+    fn destruction_marks_are_reclaimed_once_no_older_pass_is_open() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 95_003;
+        let cgwid = 95_103;
+
+        // A pass is running when the window and the process are invalidated: both marks must stay,
+        // because that pass may still publish an observation taken before the invalidation.
+        let older = begin_ax_identity_pass();
+        forget_ax_identified_window(cgwid);
+        forget_ax_identified_process(pid, None);
+        {
+            let marks = AX_IDENTITY.lock().unwrap();
+            assert!(marks.destroyed_cgwids.contains_key(&cgwid));
+            assert!(marks.forgotten_processes.contains_key(&pid));
+        }
+
+        // Closing the last pass that old reclaims them in the same step.
+        drop(older);
+        {
+            let marks = AX_IDENTITY.lock().unwrap();
+            assert!(marks.destroyed_cgwids.is_empty());
+            assert!(marks.forgotten_processes.is_empty());
+        }
+
+        // With no pass open at all, a new invalidation is reclaimed immediately.
+        forget_ax_identified_window(cgwid);
+        forget_ax_identified_process(pid, None);
+        let marks = AX_IDENTITY.lock().unwrap();
+        assert!(marks.destroyed_cgwids.is_empty());
+        assert!(marks.forgotten_processes.is_empty());
+    }
+
+    #[test]
+    fn two_passes_at_the_same_epoch_each_hold_their_own_mark() {
+        // No destruction between the two opens means both passes share an epoch: closing one must
+        // not reclaim a mark the other still needs (a `BTreeSet` keyed by epoch would have collapsed
+        // them into one entry). The veto itself is asserted by
+        // `a_destroyed_window_is_refused_to_an_older_pass_and_allowed_to_a_newer_one`, which keeps
+        // the pass epoch installed while it checks the refusal.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 95_004;
+        let cgwid = 95_104;
+        let first = begin_ax_identity_pass();
+        let second = begin_ax_identity_pass();
+        forget_ax_identified_window(cgwid);
+        forget_ax_identified_process(pid, None);
+
+        drop(first);
+        {
+            let marks = AX_IDENTITY.lock().unwrap();
+            assert!(
+                marks.destroyed_cgwids.contains_key(&cgwid)
+                    && marks.forgotten_processes.contains_key(&pid),
+                "the second pass still needs both marks"
+            );
+        }
+        drop(second);
+        let marks = AX_IDENTITY.lock().unwrap();
+        assert!(marks.destroyed_cgwids.is_empty());
+        assert!(marks.forgotten_processes.is_empty());
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -865,6 +1221,7 @@ mod tests {
             minimized: false,
             app_hidden: false,
             fullscreen: false,
+            on_other_desktop: false,
             bounds: (0.0, 0.0, 0.0, 0.0),
         }
     }
@@ -965,6 +1322,24 @@ mod tests {
         assert_eq!(
             choose_switchable_capture_window(&[focused], None, 101).map(|window| window.window_id),
             Some(101)
+        );
+
+        // A window on another desktop cannot be captured, so the prewarm target must skip it even
+        // when it is the app's frontmost window -- otherwise the switch would spend capture work on
+        // a frame the WindowServer cannot produce.
+        let mut cross_desktop = window(10, 105);
+        cross_desktop.bounds = (0.0, 0.0, 1200.0, 800.0);
+        cross_desktop.on_other_desktop = true;
+        assert_eq!(
+            choose_switchable_capture_window(&[cross_desktop.clone()], Some(105), 105),
+            None
+        );
+        let mut local = window(10, 106);
+        local.bounds = (0.0, 0.0, 1200.0, 800.0);
+        assert_eq!(
+            choose_switchable_capture_window(&[cross_desktop, local], Some(105), 105)
+                .map(|window| window.window_id),
+            Some(106)
         );
     }
 

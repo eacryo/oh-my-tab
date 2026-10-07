@@ -85,15 +85,25 @@ done
 
 failures=0
 passed=0
+not_run=0
 for script in "${scenarios[@]}"; do
     name="$(basename "$script")"
     echo "=== e2e $name ==="
-    if "$script"; then
-        passed=$((passed + 1))
+    # A scenario that cannot make its assertions in this environment says so instead of failing, and
+    # the aggregate must not then count it among the passes: an unrun check is not a passed check.
+    script_log="$(mktemp)"
+    if "$script" 2>&1 | tee "$script_log"; then
+        if grep -q "NOT RUN" "$script_log"; then
+            not_run=$((not_run + 1))
+            echo "e2e run-all: $name NOT RUN (its own NOT RUN lines above; not counted as a pass)"
+        else
+            passed=$((passed + 1))
+        fi
     else
         failures=$((failures + 1))
         echo "e2e run-all: $name FAILED"
     fi
+    rm -f "$script_log"
 done
 
 # The suite must leave a usable app. Scenarios relaunch it with development switches, two of which break it
@@ -120,5 +130,5 @@ if [ -n "$leftover" ]; then
     failures=$((failures + 1))
 fi
 
-echo "e2e run-all: $passed passed, $failures failed, $(( ${#skipped[@]} + ${#skipped_prefs[@]} )) skipped"
+echo "e2e run-all: $passed passed, $not_run not run, $failures failed, $(( ${#skipped[@]} + ${#skipped_prefs[@]} )) skipped (focus/prefs)"
 [ "$failures" -eq 0 ]

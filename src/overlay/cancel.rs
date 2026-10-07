@@ -312,16 +312,23 @@ struct DeferredRaise {
     pid: i32,
     cgwid: u32,
     minimized: bool,
+    on_other_desktop: bool,
     scheduled_at: Instant,
 }
 
 static DEFERRED_RAISE: LazyLock<Mutex<Option<DeferredRaise>>> = LazyLock::new(|| Mutex::new(None));
 
-pub(super) fn schedule_deferred_raise(pid: i32, cgwid: u32, minimized: bool) {
+pub(super) fn schedule_deferred_raise(
+    pid: i32,
+    cgwid: u32,
+    minimized: bool,
+    on_other_desktop: bool,
+) {
     *DEFERRED_RAISE.lock().unwrap() = Some(DeferredRaise {
         pid,
         cgwid,
         minimized,
+        on_other_desktop,
         scheduled_at: Instant::now(),
     });
     unsafe {
@@ -348,7 +355,7 @@ pub(crate) extern "C" fn on_deferred_raise(_self: *mut c_void, _cmd: Sel, _arg: 
         job.cgwid,
         job.scheduled_at.elapsed().as_millis()
     );
-    activate_and_raise(job.pid, job.cgwid, job.minimized);
+    activate_and_raise(job.pid, job.cgwid, job.minimized, job.on_other_desktop);
 }
 
 pub(super) fn cancel_scheduled_order_out() {

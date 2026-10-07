@@ -290,6 +290,14 @@ pub(super) unsafe fn populate_thumbnail_preview(
     let bounds: NSRect = msg_send![container, bounds];
     let pw = bounds.size.width;
     let ph = bounds.size.height;
+    // Every build states its own decision: clear the previous one first, so a card that falls back
+    // to the icon cannot inherit an earlier successful render (which is what the A2 snapshot reads).
+    crate::thumbnail::clear_frame_rendered(w.pid, w.window_id);
+    // Render whatever the cache holds, including a frame captured while this window was still on
+    // the active desktop. Requesting a *new* capture is what the producers forbid for such a window
+    // (it cannot be captured where the user is); refusing to show the last real frame as well would
+    // throw away a picture the app already paid for -- and the user, who visits both desktops, has
+    // one for most cards. Reference implementations keep the last thumbnail the same way.
     let thumb = if capture_allowed && w.bounds.2 > 0.0 && w.bounds.3 > 0.0 {
         crate::thumbnail::lookup_retained(w.pid, w.window_id)
     } else {
@@ -328,6 +336,9 @@ pub(super) unsafe fn populate_thumbnail_preview(
     let _: () = msg_send![iv, setImageScaling: 2u64]; // exact size, no additional scaling
     let _: () = msg_send![container, addSubview: iv];
     release_obj(iv);
+    // The image view is attached, so this card really presents a picture (not the icon fallback).
+    // Recorded here rather than earlier: everything above can still bail out to the fallback.
+    crate::thumbnail::note_frame_rendered(w.pid, w.window_id);
     add_status_badges_if_needed(container, pw, ph, w);
 }
 

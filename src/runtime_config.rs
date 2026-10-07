@@ -25,6 +25,9 @@ struct ChangeFlags {
     thumbnails: bool,
     focused_thumbnail_prewarm: bool,
     show_app_name_in_cards: bool,
+    // The candidate scope itself changed: the cards already built no longer describe what the
+    // switch now admits, so an open overlay must be dismissed rather than reused.
+    show_other_desktops: bool,
     mouse: bool,
     clipboard_enabled: bool,
     clipboard_shortcut: bool,
@@ -54,6 +57,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.layout.focused_thumbnail_prewarm != new.layout.focused_thumbnail_prewarm,
         show_app_name_in_cards: old.layout.show_app_name_in_cards
             != new.layout.show_app_name_in_cards,
+        show_other_desktops: old.windows.show_other_desktops != new.windows.show_other_desktops,
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
@@ -142,6 +146,14 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // The caption format changed: dismiss the overlay so the next summon rebuilds the
         // cards from the new signature (reusing them would keep the old captions).
         crate::overlay::reset_switcher();
+    }
+
+    if flags.show_other_desktops {
+        // The candidate scope changed: dismiss the overlay so the cards are rebuilt for the new
+        // policy, and invalidate a collection already running under the old one so its result
+        // cannot be applied -- or reused by the next summon -- after the switch moved.
+        crate::overlay::reset_switcher();
+        crate::window_refresh::invalidate_collection_for_policy_change();
     }
 
     if flags.modifier
@@ -239,6 +251,23 @@ mod tests {
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.clipboard_shortcut);
         assert!(!flags.clipboard_enabled);
+    }
+
+    #[test]
+    fn other_desktop_switch_changes_are_detected_alone() {
+        // The switch alone must dismiss the overlay (the cards it was built from no longer describe
+        // what is admitted) without touching any other service.
+        let old = Config::default();
+        let mut new = old.clone();
+        new.windows.show_other_desktops = true;
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.show_other_desktops);
+        assert!(
+            !flags.show_app_name_in_cards
+                && !flags.mouse
+                && !flags.thumbnails
+                && !flags.clipboard_enabled
+        );
     }
 
     #[test]

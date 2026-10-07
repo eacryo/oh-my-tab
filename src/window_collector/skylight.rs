@@ -402,7 +402,9 @@ unsafe fn cf_number_u64(number: *const c_void) -> Option<u64> {
         .then_some(value as u64)
 }
 
-struct OwnedCf(*const c_void);
+/// Owns a CF object and releases it on every exit path. Shared with the AX batch read in
+/// `raiser`, whose slots are caller-owned and whose early returns used to leak them.
+pub(super) struct OwnedCf(pub(super) *const c_void);
 
 impl Drop for OwnedCf {
     fn drop(&mut self) {

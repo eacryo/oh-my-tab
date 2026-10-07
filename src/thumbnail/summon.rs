@@ -27,9 +27,12 @@ pub(crate) fn refresh_selected_for_summon(required_px_h: u32) {
         if !state.visible {
             return None;
         }
+        // A window on another desktop is icon-only: the capture cannot succeed, so requesting the
+        // highest-priority job for it would only delay the ones that can.
         state
             .windows
             .get(state.selected)
+            .filter(|window| !window.on_other_desktop)
             .map(|window| (window.pid, window.window_id))
     }) else {
         return;
@@ -83,7 +86,9 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| capture_range.contains(index))
-                .filter(|(_, w)| !w.minimized && w.bounds.2 > 0.0 && w.bounds.3 > 0.0)
+                .filter(|(_, w)| {
+                    !w.minimized && !w.on_other_desktop && w.bounds.2 > 0.0 && w.bounds.3 > 0.0
+                })
                 .map(|(index, w)| {
                     (
                         index,
@@ -223,34 +228,52 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
 
     // Snapshot keys before enqueueing: enqueue_job takes CAPTURE_STATE and may
     // wake the worker, so never hold TAB_STATE across the queue operations.
-    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) =
-        crate::with_tab_state(|state_opt| match state_opt.as_ref() {
-            Some(state) => {
-                let selected = state.windows.get(state.selected).map(|window| ThumbKey {
+    let (selected, state_keys, other_desktop_keys): (
+        Option<ThumbKey>,
+        Vec<ThumbKey>,
+        HashSet<ThumbKey>,
+    ) = crate::with_tab_state(|state_opt| match state_opt.as_ref() {
+        Some(state) => {
+            let selected = state.windows.get(state.selected).map(|window| ThumbKey {
+                pid: window.pid,
+                wid: window.window_id,
+            });
+            let keys = state
+                .windows
+                .iter()
+                .filter(|window| {
+                    !window.minimized
+                        && !window.on_other_desktop
+                        && window.bounds.2 > 0.0
+                        && window.bounds.3 > 0.0
+                })
+                .map(|window| ThumbKey {
                     pid: window.pid,
                     wid: window.window_id,
-                });
-                let keys = state
-                    .windows
-                    .iter()
-                    .filter(|window| {
-                        !window.minimized && window.bounds.2 > 0.0 && window.bounds.3 > 0.0
-                    })
-                    .map(|window| ThumbKey {
-                        pid: window.pid,
-                        wid: window.window_id,
-                    })
-                    .collect();
-                (selected, keys)
-            }
-            None => (None, Vec::new()),
-        });
+                })
+                .collect();
+            // The cache union below must not smuggle back a window that is on another desktop now:
+            // its stale frame is still cached, but it cannot be captured where it is.
+            let other_desktop = state
+                .windows
+                .iter()
+                .filter(|window| window.on_other_desktop)
+                .map(|window| ThumbKey {
+                    pid: window.pid,
+                    wid: window.window_id,
+                })
+                .collect();
+            (selected, keys, other_desktop)
+        }
+        None => (None, Vec::new(), HashSet::new()),
+    });
 
     // Include pre-generated/cache-only windows as well. The settings window can change theme
     // before the first switcher summon, when TAB_STATE has no current snapshot yet.
     let keys: Vec<ThumbKey> = {
         let mut keys: HashSet<ThumbKey> = state_keys.into_iter().collect();
         keys.extend(CACHE.lock().unwrap().keys());
+        keys.retain(|key| !other_desktop_keys.contains(key) && !is_other_desktop_key(key));
         keys.into_iter().collect()
     };
 
@@ -318,31 +341,47 @@ pub(crate) fn refresh_for_display_change(required_px_h: u32) {
     // Same key collection as refresh_for_theme: non-minimized windows with bounds
     // from TAB_STATE, unioned with cache-only windows (pre-generated frames), so
     // every known target is covered while the overlay is not summoned.
-    let (selected, state_keys): (Option<ThumbKey>, Vec<ThumbKey>) =
-        crate::with_tab_state(|state_opt| match state_opt.as_ref() {
-            Some(state) => {
-                let selected = state.windows.get(state.selected).map(|window| ThumbKey {
+    let (selected, state_keys, other_desktop_keys): (
+        Option<ThumbKey>,
+        Vec<ThumbKey>,
+        HashSet<ThumbKey>,
+    ) = crate::with_tab_state(|state_opt| match state_opt.as_ref() {
+        Some(state) => {
+            let selected = state.windows.get(state.selected).map(|window| ThumbKey {
+                pid: window.pid,
+                wid: window.window_id,
+            });
+            let keys = state
+                .windows
+                .iter()
+                .filter(|window| {
+                    !window.minimized
+                        && !window.on_other_desktop
+                        && window.bounds.2 > 0.0
+                        && window.bounds.3 > 0.0
+                })
+                .map(|window| ThumbKey {
                     pid: window.pid,
                     wid: window.window_id,
-                });
-                let keys = state
-                    .windows
-                    .iter()
-                    .filter(|window| {
-                        !window.minimized && window.bounds.2 > 0.0 && window.bounds.3 > 0.0
-                    })
-                    .map(|window| ThumbKey {
-                        pid: window.pid,
-                        wid: window.window_id,
-                    })
-                    .collect();
-                (selected, keys)
-            }
-            None => (None, Vec::new()),
-        });
+                })
+                .collect();
+            let other_desktop = state
+                .windows
+                .iter()
+                .filter(|window| window.on_other_desktop)
+                .map(|window| ThumbKey {
+                    pid: window.pid,
+                    wid: window.window_id,
+                })
+                .collect();
+            (selected, keys, other_desktop)
+        }
+        None => (None, Vec::new(), HashSet::new()),
+    });
     let keys: Vec<ThumbKey> = {
         let mut keys: HashSet<ThumbKey> = state_keys.into_iter().collect();
         keys.extend(CACHE.lock().unwrap().keys());
+        keys.retain(|key| !other_desktop_keys.contains(key) && !is_other_desktop_key(key));
         keys.into_iter().collect()
     };
 

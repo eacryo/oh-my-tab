@@ -22,8 +22,8 @@ use crate::i18n::t;
 use crate::icon_cache::extract_icon_to_cache;
 use crate::theme::*;
 use crate::window_collector::{
-    bump_window_mru, raise_window_ax_async, raise_window_fast, sort_windows_by_mru, MruMap,
-    WindowInfo,
+    activate_pid, bump_window_mru, raise_window_ax_async, raise_window_fast, sort_windows_by_mru,
+    MruMap, WindowInfo,
 };
 use crate::window_server;
 // cross-module shared state (owned by main.rs)
@@ -231,6 +231,10 @@ struct CardSignature {
     icon_path: Option<String>,
     minimized: bool,
     fullscreen: bool,
+    /// Whether the card presents a window of another desktop (icon-only). A window that moves
+    /// between desktops must Replace, or reuse would keep a captured thumbnail attached to a
+    /// window that can no longer be captured.
+    on_other_desktop: bool,
     /// Resolved light/dark state used when the card's text and layers were painted.
     theme_dark: bool,
     card_width_bits: u64,
@@ -278,6 +282,7 @@ fn card_signature(
         icon_path: window.icon_path.clone(),
         minimized: window.minimized,
         fullscreen: window.fullscreen,
+        on_other_desktop: window.on_other_desktop,
         theme_dark: crate::theme::resolved_is_dark(),
         card_width_bits: frame.size.width.to_bits(),
         card_height_bits: frame.size.height.to_bits(),
@@ -789,6 +794,7 @@ mod tests {
             icon_path: None,
             minimized: false,
             fullscreen: false,
+            on_other_desktop: false,
             theme_dark: false,
             card_width_bits: 100.0f64.to_bits(),
             card_height_bits: 100.0f64.to_bits(),
@@ -964,6 +970,7 @@ mod tests {
                 minimized: false,
                 app_hidden: false,
                 fullscreen: false,
+                on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1000,6 +1007,7 @@ mod tests {
                 minimized: false,
                 app_hidden: false,
                 fullscreen: false,
+                on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1030,6 +1038,7 @@ mod tests {
                 minimized: false,
                 app_hidden: false,
                 fullscreen: false,
+                on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1055,6 +1064,7 @@ mod tests {
                 minimized: false,
                 app_hidden: false,
                 fullscreen: false,
+                on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1089,6 +1099,7 @@ mod tests {
                 minimized: false,
                 app_hidden: false,
                 fullscreen: false,
+                on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
             }
         }
@@ -1325,7 +1336,21 @@ pub(crate) unsafe fn make_centered_label_with_class(
 }
 
 /// Complete the visible fast raise immediately, then enqueue the AX focus backstop.
-pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
+///
+/// `on_other_desktop` marks a card whose window lives on another macOS desktop. It uses the *same*
+/// exact-window front-switch as an ordinary card, because that call is what moves the Space: both
+/// reference implementations rely on it for a cross-Space target (`_SLPSSetFrontProcessWithOptions`
+/// with the window id and the userGenerated mode; AltTab states it "also makes macOS switch to a
+/// Space showing it", and BetterCmdTab keeps it as the menu-bar-correct cross-Space fallback after
+/// rejecting `CGSManagedDisplaySetCurrentSpace` for skipping the Space-transition machinery). An
+/// earlier version of this code skipped it here and fronted the app with
+/// `NSRunningApplication.activateWithOptions:` alone -- macOS refuses that activation in some states
+/// (observed: `activateWithOptions=false` with the target window never becoming frontmost), which
+/// left the card doing nothing at all.
+///
+/// The job then waits for the window to become part of the active desktop (fronting the app is its
+/// own retry) before the AX phase lands the exact window.
+pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool, on_other_desktop: bool) {
     let activation_started = Instant::now();
     window_server::note_own_focus(pid, cgwid);
     // A same-app window switch produces no app-activation notification and its 808
@@ -1334,10 +1359,43 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
     // fails) and keep using the notification-driven refresh chain.
     crate::thumbnail::refresh_after_same_app_switch(pid, cgwid);
 
-    // Native-fullscreen cards have minimized=false, so they use the exact-CGWindowID SLPS raise
-    // and AXRaise backstop below. WindowServer activates the Space containing that target; only
-    // AXMinimized=true takes the restore path and skips the immediate raise.
-    let fast_path_ok = if minimized {
+    // Native-fullscreen cards have minimized=false and use the exact-CGWindowID SLPS raise and
+    // AXRaise backstop below; only AXMinimized=true takes the restore path and skips the immediate
+    // raise.
+    //
+    // A cross-desktop card fronts its app here instead: when macOS accepts `activateWithOptions:`
+    // that switch is the one that lands, while the exact-window SLPS raise is the rescue for the
+    // states where activation is refused (`activateWithOptions=false`, observed in the user's log)
+    // -- so the job applies that second, and only if the window has not joined the active desktop.
+    // The order is the A2 scenario's, which asserts which of the two moved the Space.
+    let activation = if on_other_desktop {
+        // A development switch suppresses this so the exact-window front-switch rescue can be
+        // exercised on its own (macOS refusing `activateWithOptions:` is not reproducible on demand,
+        // and that refusal is exactly the state the rescue exists for).
+        let activated = if crate::dev_flags::enabled("other-desktop-no-activation") {
+            log_debug!(
+                "[raise] other-desktop front skipped by --other-desktop-no-activation: pid={}",
+                pid
+            );
+            false
+        } else {
+            activate_pid(pid)
+        };
+        log_debug!(
+            "[raise] other-desktop front: pid={} cgwid={} minimized={} activated={} elapsed={}ms",
+            pid,
+            cgwid,
+            minimized,
+            activated,
+            activation_started.elapsed().as_millis()
+        );
+        activated
+    } else {
+        false
+    };
+    let fast_path_ok = if on_other_desktop || minimized {
+        // A cross-desktop card's Space is moved by the job's front; a minimized window takes the
+        // restore path there too, so neither applies the immediate raise.
         false
     } else {
         let fast_started = Instant::now();
@@ -1354,12 +1412,20 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool) {
         slps_ok && click_ok
     };
 
-    let generation = raise_window_ax_async(pid, cgwid, minimized, fast_path_ok);
-    log_debug!(
-        "[raise] activation enqueued: pid={} cgwid={} minimized={} gen={} total={}ms",
+    let generation = raise_window_ax_async(
         pid,
         cgwid,
         minimized,
+        fast_path_ok,
+        on_other_desktop,
+        activation,
+    );
+    log_debug!(
+        "[raise] activation enqueued: pid={} cgwid={} minimized={} other_desktop={} gen={} total={}ms",
+        pid,
+        cgwid,
+        minimized,
+        on_other_desktop,
         generation,
         activation_started.elapsed().as_millis()
     );

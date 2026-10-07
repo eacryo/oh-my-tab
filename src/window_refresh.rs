@@ -49,8 +49,8 @@ use crate::performance;
 use crate::thumbnail;
 use crate::window_collector::{
     bump_window_mru, collect_windows_for_pid, collect_windows_with_frontmost_bump,
-    forget_non_normal_window, owner_pid_for_cgwid, sort_windows_by_mru, window_server_candidates,
-    MruMap, WindowInfo,
+    forget_ax_identified_window, forget_non_normal_window, owner_pid_for_cgwid,
+    sort_windows_by_mru, window_server_candidates, MruMap, WindowInfo,
 };
 use crate::window_server;
 use crate::{log_debug, with_tab_state, AppState, CONTROLLER, WINDOW_COUNT};
@@ -93,6 +93,12 @@ enum WindowRefreshRequest {
 struct WindowRefreshResult {
     generation: u64,
     space_transition_generation: u64,
+    /// The scope-observation pass this result's windows were collected in. The guard publishes on
+    /// acceptance and discards on every other path, so a superseded or prewarm collection can never
+    /// publish its observations.
+    scope_pass: Option<crate::thumbnail::ScopePass>,
+    /// The AX pid evidence (`published`, `recovered`) the pass that produced `windows` observed.
+    ax_pid_evidence: Option<(Vec<i32>, Vec<i32>, Vec<i32>)>,
     windows: Vec<WindowInfo>,
     mru: MruMap,
     replace_pid: Option<i32>,
@@ -155,6 +161,17 @@ impl Drop for InFlightGuard {
 /// preventing rapid shortcut presses from creating a thread storm.
 pub(crate) fn request_window_refresh() {
     request_window_refresh_for(WindowRefreshReason::Summon);
+}
+
+/// Invalidate any collection already running and ask for a full one.
+///
+/// A candidate-policy change (the "other desktops" switch) makes a snapshot taken under the old
+/// policy inapplicable. The apply path already discards a result whose generation is stale, so
+/// bumping the generation here is what stops "collected while the switch was on" from being applied
+/// after it was turned off -- or from being consumed by the next summon through the pending state.
+pub(crate) fn invalidate_collection_for_policy_change() {
+    WINDOW_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel);
+    queue_refresh_request(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
 }
 
 /// Periodically reconcile the window/thumbnail set when private WindowServer lifecycle
@@ -487,9 +504,16 @@ fn start_window_refresh(
                     }
                 }
             };
+            // The pass the collection just filled on this thread: carried in the result so only the
+            // apply that accepts this result publishes its observations.
+            let scope_pass = crate::thumbnail::take_current_scope_pass();
+            // The AX pid evidence this pass produced, carried so only an accepted result publishes it.
+            let ax_pid_evidence = crate::e2e_state::take_staged_ax_pid_evidence();
             *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
                 generation,
                 space_transition_generation,
+                scope_pass,
+                ax_pid_evidence,
                 windows,
                 mru,
                 replace_pid,
@@ -668,6 +692,10 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
         return;
     }
 
+    let scope_pass = result.scope_pass;
+    let ax_pid_evidence = result.ax_pid_evidence;
+    // Read before the closure consumes the result: the evidence is published per pass kind.
+    let applied_replace_pid = result.replace_pid;
     let summon_focus_key = result.summon_focus_key;
     let subscriptions = window_server_candidates();
 
@@ -761,6 +789,15 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
             return;
         }
     };
+    // The result was applied, so its scope observations are the current truth for the capture
+    // pipeline. Every other path drops the guard, which discards them instead (a superseded pass
+    // or a prewarm collection must never move eligibility evidence).
+    if let Some(pass) = scope_pass {
+        pass.publish();
+    }
+    // The AX evidence that labelled these cards is published with them: a full pass replaces it, a
+    // directed pass updates only its own pid.
+    crate::e2e_state::publish_ax_pid_evidence(ax_pid_evidence, applied_replace_pid);
     // The snapshot is applied, so the flag can go: a panic in the rebuild/subscription steps
     // below can no longer wedge the pipeline.
     drop(in_flight);
@@ -948,6 +985,7 @@ fn on_window_server_event_inner() {
             }
             window_server::forget_destroyed_window_owner(*window_id);
             forget_non_normal_window(*window_id);
+            forget_ax_identified_window(*window_id);
         }
     }
     let should_refresh = evidence_discontinuity
@@ -1063,6 +1101,7 @@ mod tests {
             minimized: false,
             app_hidden: false,
             fullscreen: false,
+            on_other_desktop: false,
             bounds: (0.0, 0.0, 100.0, 100.0),
         }
     }
@@ -1112,6 +1151,9 @@ mod tests {
         *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
             generation,
             space_transition_generation: 0,
+            // No observations: these tests exercise the deferred-handoff bookkeeping.
+            scope_pass: None,
+            ax_pid_evidence: None,
             windows: Vec::new(),
             mru: HashMap::new(),
             replace_pid: None,
@@ -1127,6 +1169,9 @@ mod tests {
         *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
             generation,
             space_transition_generation: 0,
+            // No observations: these tests exercise the deferred-handoff bookkeeping.
+            scope_pass: None,
+            ax_pid_evidence: None,
             windows: Vec::new(),
             mru: HashMap::new(),
             replace_pid: None,

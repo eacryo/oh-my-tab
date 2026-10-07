@@ -22,6 +22,29 @@ static SEQ: AtomicU64 = AtomicU64::new(0);
 static SMOOTH_TICKS: AtomicU64 = AtomicU64::new(0);
 static SPACE_RECOVERED_ACCEPTED: AtomicU64 = AtomicU64::new(0);
 static SPACE_GATE_REJECTED: AtomicU64 = AtomicU64::new(0);
+static OTHER_DESKTOP_ACCEPTED: AtomicU64 = AtomicU64::new(0);
+/// The last cross-desktop raise, as one record: count, target identity, generation and outcome are
+/// replaced together under this lock, so a snapshot never mixes one raise's identity with another's
+/// result (atomics would allow exactly that interleaving).
+static OTHER_DESKTOP_RAISE: std::sync::LazyLock<
+    std::sync::Mutex<Option<(u64, OtherDesktopRaise)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[derive(Clone, Copy)]
+struct OtherDesktopRaise {
+    pid: i32,
+    window_id: u32,
+    generation: u64,
+    onscreen: bool,
+    ax_matched: bool,
+    /// Whether the commit path's app activation was accepted by macOS. This is the branch that
+    /// decides whether the exact-window front-switch rescue had to run, so it is published rather
+    /// than left in the log.
+    activation: bool,
+    /// Whether the rescue front-switch was applied, and whether it reported success.
+    rescue_attempted: bool,
+    rescue: bool,
+}
 static SPACE_MEMBERSHIP_SOURCE: AtomicU8 = AtomicU8::new(0);
 static SPACE_IN_TRANSITION: AtomicBool = AtomicBool::new(false);
 /// The last Space context this module published. A Space switch that the grouping feature handles
@@ -96,6 +119,162 @@ pub(crate) fn space_recovered_accepted() {
 pub(crate) fn space_gate_rejected() {
     if is_enabled() {
         SPACE_GATE_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// A card admitted only because Space membership places its window on another desktop. Counted
+/// apart from `space_recovered_accepted` so a scenario can tell the switch's admissions from the
+/// key/main recovery it replaces.
+///
+/// This counts admission *decisions*, not distinct cards: one summon runs several collection passes
+/// (the full pass, directed refresh passes, and the refresh after the summon), so the number is
+/// larger than the card count. Assert `> 0` here and use each card's `other_desktop` flag for the
+/// exact set.
+pub(crate) fn other_desktop_accepted() {
+    if is_enabled() {
+        OTHER_DESKTOP_ACCEPTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Record the outcome of a cross-desktop raise: whether the target window had become part of the
+/// active desktop by the time the AX phase ran, and whether the app's AX answer then contained the
+/// exact window and its raise was requested.
+///
+/// `ax_matched` is deliberately narrow: it means the exact window element was found in the app's AX
+/// answer and the raise was *submitted* through `raise_ax_element`. It is not "the SLPS call returned
+/// 0" (the fast path reports success against a window that is not on the active desktop at all), it
+/// is not proof that the submission was enqueued (the main thread drops it when a newer switch
+/// supersedes this one), and it is not proof that the window took focus -- that is what the
+/// system-side AX focus read in the A2 scenario is for. The record carries the target
+/// (pid, window id) and the raise generation so a scenario can bind it to one commit.
+///
+/// Called from the `ax-raiser` thread, so this only publishes a record: writing a snapshot reads the
+/// main-thread runtime (`with_tab_state`) and touches AppKit views, which a worker thread must never
+/// do. The record rides out on the next frame the main thread writes, exactly like the other
+/// background-produced counters here, and one lock covers the whole record so a reader can never mix
+/// one raise's identity with another's result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn record_other_desktop_raise(
+    pid: i32,
+    window_id: u32,
+    generation: u64,
+    onscreen: bool,
+    ax_matched: bool,
+    activation: bool,
+    rescue_attempted: bool,
+    rescue: bool,
+) {
+    if !is_enabled() {
+        return;
+    }
+    // One lock covers the whole record: the count and every field it describes are replaced
+    // together, so a reader can never pair this raise's identity with another raise's result.
+    let mut slot = OTHER_DESKTOP_RAISE.lock().unwrap();
+    let count = slot.as_ref().map_or(1, |(count, _)| count + 1);
+    *slot = Some((
+        count,
+        OtherDesktopRaise {
+            pid,
+            window_id,
+            generation,
+            onscreen,
+            ax_matched,
+            activation,
+            rescue_attempted,
+            rescue,
+        },
+    ));
+}
+
+/// The pids whose `kAXWindows` answer was non-empty (`published`) and whose key/main slots named a
+/// window (`recovered`) in the collection the last accepted frame was built from.
+///
+/// A scenario needs both to tell the cross-desktop admission cases apart: an app with a published
+/// window may legitimately show a real window of another desktop (the CG-only exception), while an
+/// app whose list is Space-filtered *and* whose key/main slots named a window must not have other
+/// windows invented for it. Staged by the collector and published only when the result is accepted,
+/// so a discarded pass cannot label the cards of another one; the snapshot reads without consuming.
+#[derive(Default, Clone)]
+struct AxPidEvidence {
+    published: Vec<i32>,
+    recovered: Vec<i32>,
+    /// Apps whose AX query failed. They are a different state from "AX answered with nothing":
+    /// they keep the CG fallback, so an assertion about the empty case must not flag them.
+    failed: Vec<i32>,
+}
+
+thread_local! {
+    /// The evidence staged by the collection running on *this* thread. Thread-local on purpose: a
+    /// prewarm collection on another thread must not be taken by the refresh worker as the evidence
+    /// for its own windows.
+    static STAGED_AX_PID_EVIDENCE: std::cell::RefCell<Option<AxPidEvidence>> =
+        const { std::cell::RefCell::new(None) };
+}
+static AX_PID_EVIDENCE: std::sync::LazyLock<std::sync::Mutex<AxPidEvidence>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(AxPidEvidence::default()));
+
+pub(crate) fn stage_ax_pid_evidence(
+    published: impl IntoIterator<Item = i32>,
+    recovered: impl IntoIterator<Item = i32>,
+    failed: impl IntoIterator<Item = i32>,
+) {
+    if !is_enabled() {
+        return;
+    }
+    let sort = |pids: Vec<i32>| {
+        let mut pids = pids;
+        pids.sort_unstable();
+        pids.dedup();
+        pids
+    };
+    let published = sort(published.into_iter().collect());
+    let recovered = sort(recovered.into_iter().collect());
+    let failed = sort(failed.into_iter().collect());
+    STAGED_AX_PID_EVIDENCE.with(|slot| {
+        *slot.borrow_mut() = Some(AxPidEvidence {
+            published,
+            recovered,
+            failed,
+        })
+    });
+}
+
+/// Take the staged evidence (the worker takes it right after the collection, so the result carries
+/// exactly the pass that produced its windows).
+pub(crate) fn take_staged_ax_pid_evidence() -> Option<(Vec<i32>, Vec<i32>, Vec<i32>)> {
+    STAGED_AX_PID_EVIDENCE
+        .with(|slot| slot.borrow_mut().take())
+        .map(|evidence| (evidence.published, evidence.recovered, evidence.failed))
+}
+
+/// Publish an accepted result's evidence. A full pass replaces both sets; a directed pass (one pid)
+/// updates only that pid, so the other pids keep the evidence their cards were built from.
+pub(crate) fn publish_ax_pid_evidence(
+    evidence: Option<(Vec<i32>, Vec<i32>, Vec<i32>)>,
+    replace_pid: Option<i32>,
+) {
+    let Some((published, recovered, failed)) = evidence else {
+        return;
+    };
+    let mut known = AX_PID_EVIDENCE.lock().unwrap();
+    match replace_pid {
+        None => {
+            known.published = published;
+            known.recovered = recovered;
+            known.failed = failed;
+        }
+        Some(pid) => {
+            let update = |list: &mut Vec<i32>, present: bool| {
+                list.retain(|known_pid| *known_pid != pid);
+                if present {
+                    list.push(pid);
+                }
+                list.sort_unstable();
+            };
+            update(&mut known.published, published.contains(&pid));
+            update(&mut known.recovered, recovered.contains(&pid));
+            update(&mut known.failed, failed.contains(&pid));
+        }
     }
 }
 
@@ -176,6 +355,25 @@ struct Card {
     active: bool,
     minimized: bool,
     fullscreen: bool,
+    other_desktop: bool,
+    /// Whether the cache already holds a frame for this window.
+    thumbnail_ready: bool,
+    /// Whether a card actually rendered a thumbnail for this window (as opposed to the icon
+    /// fallback). This is the field a "the card stopped showing its thumbnail" regression trips,
+    /// where availability alone would still read true.
+    thumbnail_rendered: bool,
+    /// Whether AX has ever identified this window as one of its app's windows. The rule it supports
+    /// (asserted by `scripts/e2e/space-desktops.sh` together with `ax_published_pids`): an app whose
+    /// `kAXWindows` answer was empty while its key/main slots named a window must not have other
+    /// windows invented from the CG list -- 微信's off-screen second window used to appear as a
+    /// second, dead card that way. An app that does have a published window may legitimately show a
+    /// real window of another desktop that AX has not identified yet.
+    ax_identified: bool,
+    /// Whether the window is on screen right now, measured only for cards of an app whose AX query
+    /// failed (the state that admits a CG-only card without AX evidence). `null` elsewhere: the A2
+    /// assertion is "a card of an AX-failed app must be visible", the rule that keeps a closed
+    /// menu-bar panel out of that fallback.
+    on_screen: Option<bool>,
     bounds: (f64, f64, f64, f64),
 }
 
@@ -389,6 +587,9 @@ struct Snapshot {
 }
 
 fn collect() -> Snapshot {
+    // Which apps' AX read failed in the pass these cards came from; only their cards get the
+    // on-screen measurement (one targeted query each, and only for diagnostics).
+    let failed_pids: Vec<i32> = AX_PID_EVIDENCE.lock().unwrap().failed.clone();
     crate::with_tab_state(|state_opt| match state_opt.as_ref() {
         Some(state) => Snapshot {
             visible: state.visible,
@@ -404,6 +605,16 @@ fn collect() -> Snapshot {
                     active: w.is_active,
                     minimized: w.minimized,
                     fullscreen: w.fullscreen,
+                    other_desktop: w.on_other_desktop,
+                    thumbnail_ready: crate::thumbnail::frame_available(w.pid, w.window_id),
+                    thumbnail_rendered: crate::thumbnail::frame_was_rendered(w.pid, w.window_id),
+                    ax_identified: crate::window_collector::is_ax_identified_window_for_pid(
+                        w.pid,
+                        w.window_id,
+                    ),
+                    on_screen: failed_pids
+                        .contains(&w.pid)
+                        .then(|| crate::window_collector::window_is_onscreen_now(w.window_id)),
                     bounds: w.bounds,
                 })
                 .collect(),
@@ -582,9 +793,60 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         .join(", ");
     json.push_str(&format!("  \"space_contexts\": [{}],\n", space_contexts));
     json.push_str(&format!(
-        "  \"space_filter\": {{\"recovered_accepted\": {}, \"gate_rejected\": {}}},\n",
+        "  \"space_filter\": {{\"recovered_accepted\": {}, \"gate_rejected\": {}, \"other_desktop_accepted\": {}, \"show_other_desktops\": {}}},\n",
         SPACE_RECOVERED_ACCEPTED.load(Ordering::Relaxed),
         SPACE_GATE_REJECTED.load(Ordering::Relaxed),
+        OTHER_DESKTOP_ACCEPTED.load(Ordering::Relaxed),
+        crate::config::CONFIG
+            .read()
+            .map(|cfg| cfg.windows.show_other_desktops)
+            .unwrap_or(false),
+    ));
+    let pid_evidence = AX_PID_EVIDENCE.lock().unwrap().clone();
+    let as_json = |pids: &[i32]| {
+        pids.iter()
+            .map(|pid| pid.to_string())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    json.push_str(&format!(
+        "  \"ax_published_pids\": [{}],\n",
+        as_json(&pid_evidence.published)
+    ));
+    json.push_str(&format!(
+        "  \"ax_recovered_pids\": [{}],\n",
+        as_json(&pid_evidence.recovered)
+    ));
+    json.push_str(&format!(
+        "  \"ax_failed_pids\": [{}],\n",
+        as_json(&pid_evidence.failed)
+    ));
+    // Copy the record under its lock: count, identity and result are one consistent snapshot.
+    let raise = *OTHER_DESKTOP_RAISE.lock().unwrap();
+    let (raise_count, raise) = raise.unwrap_or((
+        0,
+        OtherDesktopRaise {
+            pid: 0,
+            window_id: 0,
+            generation: 0,
+            onscreen: false,
+            ax_matched: false,
+            activation: false,
+            rescue_attempted: false,
+            rescue: false,
+        },
+    ));
+    json.push_str(&format!(
+        "  \"other_desktop_raise\": {{\"count\": {}, \"pid\": {}, \"window_id\": {}, \"generation\": {}, \"onscreen\": {}, \"ax_matched\": {}, \"activation\": {}, \"rescue_attempted\": {}, \"rescue\": {}}},\n",
+        raise_count,
+        raise.pid,
+        raise.window_id,
+        raise.generation,
+        raise.onscreen,
+        raise.ax_matched,
+        raise.activation,
+        raise.rescue_attempted,
+        raise.rescue,
     ));
     json.push_str(&format!(
         "  \"space_groups\": {{\"displays\": {}, \"confirmed_fullscreen_origins\": {}, \"unknown_active_fullscreen_spaces\": {}, \"evidence_contiguous\": {}, \"source_learning_available\": {}}},\n",
@@ -714,13 +976,22 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         )),
         None => json.push_str("  \"thumbnail_range\": null,\n"),
     }
+    // The last summon's capturable candidate set: a scenario asserts a card on another desktop was
+    // never a capture candidate instead of trusting an eligibility flag.
+    let workset = crate::thumbnail::e2e_summon_workset();
+    let workset = workset
+        .iter()
+        .map(|(pid, wid)| format!("[{pid}, {wid}]"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    json.push_str(&format!("  \"thumbnail_workset\": [{workset}],\n"));
     json.push_str("  \"cards\": [");
     for (index, card) in snapshot.windows.iter().enumerate() {
         if index > 0 {
             json.push(',');
         }
         json.push_str(&format!(
-            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"fullscreen\": {}, \"bounds\": [{}, {}, {}, {}]}}",
+            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"fullscreen\": {}, \"other_desktop\": {}, \"thumbnail_ready\": {}, \"thumbnail_rendered\": {}, \"ax_identified\": {}, \"on_screen\": {}, \"bounds\": [{}, {}, {}, {}]}}",
             card.pid,
             card.window_id,
             json_string(&card.app),
@@ -728,6 +999,11 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             card.active,
             card.minimized,
             card.fullscreen,
+            card.other_desktop,
+            card.thumbnail_ready,
+            card.thumbnail_rendered,
+            card.ax_identified,
+            card.on_screen.map_or("null".to_string(), |value| value.to_string()),
             card.bounds.0,
             card.bounds.1,
             card.bounds.2,
@@ -789,4 +1065,57 @@ mod tests {
         // Non-ASCII titles stay literal rather than \\u-escaped so scripts can grep them directly.
         assert_eq!(json_string("微信 — 聊天"), "\"微信 — 聊天\"");
     }
+}
+
+#[cfg(test)]
+mod ax_pid_evidence_tests {
+    use super::*;
+
+    /// A directed refresh must move only its own pid's evidence; a full pass replaces both sets.
+    #[test]
+    fn evidence_follows_the_pass_kind() {
+        let _guard = EVIDENCE_TEST_LOCK.lock().unwrap();
+        publish_ax_pid_evidence(Some((vec![1, 2], vec![2], vec![3])), None);
+        {
+            let known = AX_PID_EVIDENCE.lock().unwrap();
+            assert_eq!(known.published, vec![1, 2]);
+            assert_eq!(known.recovered, vec![2]);
+            assert_eq!(known.failed, vec![3]);
+        }
+
+        // Directed pass for pid 1: it published nothing and recovered nothing, so pid 1 leaves
+        // those sets while pid 2 keeps the evidence its cards were built from -- and pid 3, which
+        // this pass says nothing about, keeps its AX-failed mark (a directed pass only moves its own
+        // pid in every list).
+        publish_ax_pid_evidence(Some((vec![], vec![], vec![])), Some(1));
+        {
+            let known = AX_PID_EVIDENCE.lock().unwrap();
+            assert_eq!(known.published, vec![2]);
+            assert_eq!(known.recovered, vec![2]);
+            assert_eq!(known.failed, vec![3]);
+        }
+
+        // Directed pass for pid 3 with a published window and no longer AX-failed.
+        publish_ax_pid_evidence(Some((vec![3], vec![], vec![])), Some(3));
+        {
+            let known = AX_PID_EVIDENCE.lock().unwrap();
+            assert_eq!(known.published, vec![2, 3]);
+            assert_eq!(known.recovered, vec![2]);
+            assert!(known.failed.is_empty());
+        }
+
+        // A discarded result (None) leaves everything as it was.
+        publish_ax_pid_evidence(None, None);
+        {
+            let known = AX_PID_EVIDENCE.lock().unwrap();
+            assert_eq!(known.published, vec![2, 3]);
+            assert_eq!(known.recovered, vec![2]);
+            assert!(known.failed.is_empty());
+        }
+        AX_PID_EVIDENCE.lock().unwrap().published.clear();
+        AX_PID_EVIDENCE.lock().unwrap().recovered.clear();
+        AX_PID_EVIDENCE.lock().unwrap().failed.clear();
+    }
+
+    static EVIDENCE_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 }

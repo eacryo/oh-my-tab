@@ -14,6 +14,69 @@ When the app is launched in Debug mode through RustRover or another debugger, fr
 
 The switcher treats fullscreen Spaces as part of their source desktop only after observing a matching WindowServer leave/join pair and confirming the target Space type and display. A fullscreen window already present at launch, an event gap, or ambiguous display/source evidence remains isolated to its actual Space. Space membership notifications are consumed in order. A Space switch that grouping handles correctly leaves the candidate set unchanged, so `--e2e-state` publishes a separate `refresh_context` frame when the active Space context changes; scripts must assert only on applied frames (`refresh` / `refresh_context`), since other frames pair the new context with the previous card list. Only a known event loss (queue overflow) clears pending transition evidence; a membership event whose owner cannot be resolved merely downgrades the diagnostic continuity flag, because a fullscreen transition emits such events for auxiliary windows of the same app and clearing on them destroyed the transition being learned. The pair window is 3s rather than 1s: the 1325 join can land while SkyLight still types the new Space ordinary, and the pair must survive until a later query corrects the type. Legacy membership fallback admits only positively onscreen windows and never treats fullscreen bounds as a cross-Space exemption. These private SkyLight event/query paths are best-effort and may be unavailable on future macOS releases.
 
+### Windows on other desktops
+
+By default the candidate scope above is the whole rule: a window on another macOS desktop is not a
+candidate. `windows.show_other_desktops` widens admission to managed Spaces outside every display's
+current group, and only through that switch: a window the switch admits carries no AX element
+(`kAXWindows` is filtered by the current Space), so it keeps the CG window name as its title and has
+no readable minimized state. Admission stays under AX authority. When an app's `kAXWindows` is empty but its key/main slots
+still name one of its windows, AX has answered about that app's window set: a CG window in neither
+slot and never identified by AX before is a surface AX excludes, and is refused -- 微信 keeps a
+280x380 off-screen window titled 微信 beside its real 1097x833 window, and from another desktop that
+helper used to become a second card whose raise does nothing (`ax NO MATCH`). The rule runs before
+the other-desktop exception because such an app lands in `ax_empty_pids`, which that exception would
+otherwise admit. A small history of AX-identified windows (pid + process start + CGWindowID, cleared
+on destroy with a veto against older collections and on process end) keeps a real second window
+admissible once its desktop has been visited; a real window whose desktop has never been visited
+since this process started stays hidden until it is. When the key/main slots are empty too, AX has named no
+window of that app at all, and the app has no switchable window to show: its CG entries are panels and
+are refused on every desktop. Stats is the observed case -- a 280x800, layer 0, parentless, off-screen
+menu-bar panel titled "Combined modules" that answers nothing to AX (`kAXWindows` empty,
+`AXFocusedWindow`/`AXMainWindow` unsupported); it became a dead card on its own desktop as well as
+across Spaces, and selecting it did nothing. The three states are distinct and must not be conflated:
+AX named a window (the other-desktop exception applies, still behind the membership and shape gates),
+the AX query *failed* (`ax_failed_pids`, nothing is known, the CG fallback stays), or AX answered and
+named no window (refused). A read that came back with no window element while one of the three
+attribute reads failed counts as a failed query, not an empty answer: the window list is
+Space-filtered, so the window may have been reachable only through the key/main slot that just failed.
+A failed query admits only a window that is **on screen**: with no AX answer nothing distinguishes a
+real window from a closed menu-bar panel, so the fallback covers only what the user can see (freezing
+Stats so its AX read times out used to admit both its visible settings window and its closed
+"Combined modules" panel -- the pair a user reported).
+
+Admission requires a non-empty membership list that names a Space the
+accepted topology manages: an empty or unmanaged list is the shape an orderOut'd or helper surface
+presents, and stays rejected with the switch on. The switch never widens the legacy fallback, which
+cannot tell another desktop from an off-screen window. The minimized option still applies first.
+
+Thumbnails: such a card never *requests* a capture (the WindowServer cannot capture a window off the
+active desktop), but it does show a frame the cache already holds from when the window was on its own
+desktop -- the producers filter it out while the renderer keeps reading the cache, and the A2 snapshot
+publishes `thumbnail_ready` so that behaviour is assertable. Refusing to render that frame as well was
+wrong: a user who visits both desktops has one for most cards, and reference implementations keep the
+last thumbnail the same way.
+
+Activation: the exact-window front-switch (`_SLPSSetFrontProcessWithOptions` with the window id and
+the userGenerated mode, plus the targeted click) and app activation (`NSRunningApplication
+activateWithOptions:`) both move the Space; which one lands first depends on the state. AltTab relies
+on the front-switch for a cross-Space target ("it also makes macOS switch to a Space showing it") and
+BetterCmdTab keeps it as its menu-bar-correct cross-Space fallback -- after rejecting
+`CGSManagedDisplaySetCurrentSpace`, which sets the Space directly but skips the Space-transition
+machinery and left the destination without a menu bar when leaving a full-screen Space. This project
+therefore tries app activation first and applies the front-switch as the rescue when the window has
+not joined the active desktop within `OTHER_DESKTOP_ACTIVATION_BUDGET`; the wait is bounded by
+`OTHER_DESKTOP_SETTLE_BUDGET` because the transition is animated, and a window that only arrives while
+the AX phase is already running gets one late re-raise (`OTHER_DESKTOP_LATE_SETTLE_BUDGET`). An earlier
+version relied on app activation alone and skipped the front-switch; macOS refuses that activation in
+some states (`activateWithOptions=false` with the target never becoming frontmost, which is what the
+user's log showed), and such a card then did nothing at all. The earlier note here claiming the
+front-switch "reports success while the active Space stays put" came from a probe binary without
+Accessibility trust and was wrong: the call does switch, and both reference implementations rely on it
+for a cross-Space target. Which attempt moved the Space is published per raise, and
+`scripts/e2e/space-desktops.sh` runs one pass with activation suppressed so the rescue is verified on
+its own rather than inferred.
+
 ## Logging and memory diagnostics
 
 The default log path is `~/Library/Logs/oh-my-tab/oh-my-tab.log`. Once the active file reaches 10 MB, it rolls through `oh-my-tab.log.1` to `oh-my-tab.log.5`. Each launch writes a session marker; legacy per-launch logs and backups older than 30 days are cleaned up at startup.

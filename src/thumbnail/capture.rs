@@ -1773,6 +1773,17 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
         return CaptureJobResult::Finished;
     }
+    // A job can be queued while the window is still on this desktop and run after it moved: the
+    // registry is re-checked here, because a capture off the active desktop returns nothing useful
+    // and the request would only spend WindowServer work.
+    if is_other_desktop_key(&key) {
+        log_debug!(
+            "[thumb] job skipped: window moved to another desktop pid={} wid={}",
+            key.pid,
+            key.wid
+        );
+        return CaptureJobResult::Finished;
+    }
     if job
         .activation_at
         .is_some_and(|activated_at| !activation_capture_is_valid_now(key.pid, activated_at))
@@ -1838,6 +1849,22 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
             captured.source_h_px,
             reason.label(),
             job.priority.label()
+        );
+        return CaptureJobResult::Finished;
+    }
+    // A job can be queued while the window is still on this desktop and run after it moved: the
+    // registry is re-checked here, because a capture off the active desktop returns nothing useful
+    // and the request would only spend WindowServer work.
+    if is_other_desktop_key(&key) {
+        // The capture has already happened at this point, so its image is ours and must be released
+        // on this exit like every other post-capture discard.
+        unsafe {
+            CFRelease(captured.thumb.img);
+        }
+        log_debug!(
+            "[thumb] captured result discarded after the window moved to another desktop pid={} wid={}",
+            key.pid,
+            key.wid
         );
         return CaptureJobResult::Finished;
     }

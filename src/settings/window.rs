@@ -2244,6 +2244,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             locale: std::ptr::null_mut(),
             show_minimized: std::ptr::null_mut(),
             show_hidden_app_windows: std::ptr::null_mut(),
+            show_other_desktops: std::ptr::null_mut(),
             windows_enabled: std::ptr::null_mut(),
             overlay_position: std::ptr::null_mut(),
             activation_mode: std::ptr::null_mut(),

@@ -198,8 +198,8 @@ buttons = [
 check(len(buttons) == 3, "found the three in-row action buttons", f"found={len(buttons)}")
 if len(buttons) == 3:
     check(
-        all(abs(b["h"] - 28.0) <= 0.5 for b in buttons),
-        "every in-row action button uses the shared 28pt height",
+        all(abs(b["h"] - 32.0) <= 0.5 for b in buttons),
+        "every in-row action button uses the shared 32pt height",
         f"heights={[round(b['h'], 1) for b in buttons]}",
     )
     widths = {round(b["w"], 1) for b in buttons}
@@ -224,9 +224,13 @@ if labels:
     ys = [round(n["frame"][1], 1) for n in rows]
     deltas = [round(ys[i] - ys[i + 1], 1) for i in range(len(ys) - 1)]
     # 布局步长约定(见 components.rs 的 layout token):0 = 同一行的标签+值,20 = 页头区块,
-    # 43 = 分区标题→首行,62 = 行→行(54 行高 + 8 间隔)。任何别的步长都是排版漂移。
+    # 43 = 分区标题→首行,60 = 行→行(52 行高 + 8 间隔)。任何别的步长都是排版漂移。
+    # 58.7 也落在行→行这一档:一行的**取值**标签比它的行标签高 1.3pt(实测 17.0 vs 19.6),
+    # 于是从取值标签量到下一行的取值标签是 60 - 1.3。
     # Layout step conventions (the layout tokens in components.rs): 0 = label+value on one row,
-    # 20 = page header block, 43 = section header -> first row, 62 = row -> row (54pt + 8pt gap).
+    # 20 = page header block, 43 = section header -> first row, 60 = row -> row (52pt + 8pt gap).
+    # 58.7 belongs to the same bucket: a row's *value* label sits 1.3pt higher than its row label
+    # (measured 17.0 vs 19.6), so measuring value-to-value gives 60 - 1.3.
     # Any other step is layout drift.
     # 步长与预期出现次数(次数是页面结构的钉子:结构变了就会红,需要人工确认)。
     # Steps and their expected occurrence counts; the counts pin the page structure, so a structural
@@ -235,8 +239,10 @@ if labels:
         0.0: ("a label and its value on one row", 3),
         20.0: ("the page header block (app name -> version)", 1),
         43.0: ("a section header to its first row", 3),
-        62.0: ("row to row (54pt row + 8pt gap)", 5),
-        77.0: ("a card to the next section header", 2),
+        60.0: ("row to row (52pt row + 8pt gap)", 5),
+        # 24 (section header gap) + 4 (title -> card) + 20 (header) + 16.2 (row label offset in a
+        # 52pt row) + 8 (card bottom inset) = 72.2, all documented tokens.
+        72.2: ("a card to the next section header", 2),
         75.0: ("the app subtitle to the first section header", 1),
     }
     unexpected = [d for d in deltas if not any(abs(d - v) <= 1.5 for v in allowed)]
@@ -261,7 +267,7 @@ if labels:
     )
     missing = []
     for i, delta in enumerate(deltas):
-        if abs(delta - 62.0) <= 1.5:
+        if abs(delta - 60.0) <= 1.5:
             low, high = ys[i + 1], ys[i]
             if not any(low < separator < high for separator in separators):
                 missing.append((low, high))
@@ -282,7 +288,10 @@ else:
 # *below* it (the top always sat under the page-header padding), so scrolling to the end showed
 # nothing but blank and the scroller proportion was distorted (measured surplus: 140-474pt). The
 # documents are now tightened to "content + bottom padding"; these checks pin that rule.
-TOP_PADDING = 50.0
+# Must equal SettingsPageHeader::TOP_PADDING (docs/design-style.md, "Page top padding"): the token
+# migrated 50 -> 48 (docs/ui-refresh-plan.md) and this constant was left behind, so the lower bound
+# rejected every page by 0.5pt.
+TOP_PADDING = 48.0
 BOTTOM_PADDING = 72.0
 DOC_TOL = 1.5
 expected_pages = {

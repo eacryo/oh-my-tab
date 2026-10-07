@@ -91,6 +91,21 @@ pub(super) unsafe fn build_switcher_page(
     )
     .1;
     bind_control(target, ui.show_hidden_app_windows);
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    // Described row: the switch carries real caveats (icon-only cards, the Screen Recording
+    // dependency for titles, and the unreadable minimized state on another desktop).
+    ui.show_other_desktops = SettingsRow::described(
+        switcher_view,
+        label_x,
+        y,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+        described_row_h,
+        &t("settings.row_show_other_desktops"),
+        &t("settings.desc_show_other_desktops"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
+    );
+    bind_control(target, ui.show_other_desktops);
     // Window display mode: icons only or icons and thumbnails; the config remains stored as
     // the thumbnails_enabled boolean.
     let window_display_mode_labels = [

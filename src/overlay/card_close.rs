@@ -670,6 +670,7 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
             w.pid,
             w.window_id,
             w.minimized,
+            w.on_other_desktop,
             w.app_name.clone(),
             selected,
         );
@@ -678,7 +679,7 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
         state.visible = false;
         Some(target)
     });
-    let Some((pid, cgwid, minimized, app_name, selected)) = target else {
+    let Some((pid, cgwid, minimized, on_other_desktop, app_name, selected)) = target else {
         let hidden = with_tab_state(|state_opt| {
             let Some(state) = state_opt.as_mut() else {
                 return false;
@@ -715,7 +716,7 @@ pub(super) fn commit_selected_window(overlay_was_visible: bool) {
     }
     // No settings-window handling is needed: this nonactivating panel never raises the settings
     // window, which remains in place after switching.
-    activate_and_raise(pid, cgwid, minimized);
+    activate_and_raise(pid, cgwid, minimized, on_other_desktop);
     log_debug!(
         "[raise] release path complete: pid={} cgwid={} elapsed={}ms",
         pid,
@@ -858,20 +859,21 @@ pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: 
             let pid = w.pid;
             let cgwid = w.window_id;
             let minimized = w.minimized;
+            let on_other_desktop = w.on_other_desktop;
             state.focus_key = Some((pid, cgwid));
             bump_window_mru(&mut state.mru, pid, cgwid);
             state.visible = false;
-            Some((pid, cgwid, minimized))
+            Some((pid, cgwid, minimized, on_other_desktop))
         } else {
             state.visible = false;
             None
         }
     });
-    if let Some((pid, cgwid, minimized)) = action {
+    if let Some((pid, cgwid, minimized, on_other_desktop)) = action {
         vanish_overlay();
         // Same as on_cmd_released: no settings-window handling needed (see comment there);
         // the raise is deferred by one runloop turn so the vanish commits first.
-        schedule_deferred_raise(pid, cgwid, minimized);
+        schedule_deferred_raise(pid, cgwid, minimized, on_other_desktop);
         schedule_delayed_order_out();
     } else {
         // Unreachable in practice (no cards when the list is empty); defensive dismiss,

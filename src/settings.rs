@@ -182,6 +182,7 @@ pub(super) struct SettingsUi {
     locale: *mut AnyObject,            // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject,    // show minimized windows
     show_hidden_app_windows: *mut AnyObject, // show hidden-app windows
+    show_other_desktops: *mut AnyObject, // show windows on other macOS desktops (Spaces)
     thumbnails_enabled: *mut AnyObject, // window display mode
     focused_thumbnail_prewarm: *mut AnyObject, // focused thumbnail prewarm
     show_app_name_in_cards: *mut AnyObject, // app name in card titles
@@ -1062,6 +1063,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.windows.show_minimized
     );
     changed!(
+        "windows.show_other_desktops",
+        old.windows.show_other_desktops,
+        new.windows.show_other_desktops
+    );
+    changed!(
         "layout.thumbnails_enabled",
         old.layout.thumbnails_enabled,
         new.layout.thumbnails_enabled
@@ -1322,6 +1328,12 @@ fn load_settings_from(cfg: &Config) {
                 ui.show_hidden_app_windows,
                 setState: hidden_app_windows_state
             ];
+            let other_desktops_state = if cfg.windows.show_other_desktops {
+                1isize
+            } else {
+                0isize
+            };
+            let _: () = msg_send![ui.show_other_desktops, setState: other_desktops_state];
             // Window display mode index 0 = icons only, 1 = icons and thumbnails.
             let th_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![ui.thumbnails_enabled, selectItemAtIndex: th_idx];

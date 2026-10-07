@@ -336,6 +336,13 @@ fn drop_ax_window_cache_keys(keys: Vec<AxWindowCacheKey>) {
 }
 
 pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
+    // Same reason as the per-window sweep: a recycled pid must not inherit another-desktop evidence,
+    // nor the AX-identity history of the process that just ended.
+    crate::thumbnail::forget_process_scope(pid);
+    // Resolve the incarnation from the cache captured while the process was alive: after termination
+    // `resolve_app_identity` can answer for a recycled pid, which would veto the new incarnation and
+    // leave the ended one unvetoed.
+    forget_ax_identified_process(pid, cached_process_start_time(pid));
     let keys = {
         let cache = AX_WINDOW_CACHE.lock().unwrap();
         let snapshot: Vec<_> = cache.keys().copied().collect();
@@ -354,6 +361,9 @@ pub(crate) fn clear_ax_window_cache_for_pid(pid: i32) {
 /// gone -- unlike process termination, whose NSWorkspace notification can be missed entirely --
 /// so the destroy path calls this alongside `forget_destroyed_window`.
 pub(crate) fn clear_ax_window_cache_for_window(pid: i32, cgwid: u32) {
+    // The window is gone, so its other-desktop evidence must go with it: a recycled CGWindowID must
+    // not inherit "this is on another desktop" and lose its thumbnail eligibility.
+    crate::thumbnail::forget_window_scope(pid, cgwid);
     let keys = {
         let cache = AX_WINDOW_CACHE.lock().unwrap();
         let snapshot: Vec<_> = cache.keys().copied().collect();
@@ -362,6 +372,16 @@ pub(crate) fn clear_ax_window_cache_for_window(pid: i32, cgwid: u32) {
         })
     };
     drop_ax_window_cache_keys(keys);
+}
+
+/// The process incarnation last cached for this pid (the AX snapshot cache is written by every
+/// collection while the process is alive). `None` when nothing was ever cached for it.
+fn cached_process_start_time(pid: i32) -> Option<u64> {
+    AX_SNAPSHOT_CACHE
+        .lock()
+        .unwrap()
+        .get(&pid)
+        .and_then(|snapshot| snapshot.process_start_time_us)
 }
 
 pub(super) fn cached_ax_snapshot(

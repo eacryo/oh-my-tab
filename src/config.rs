@@ -291,6 +291,11 @@ pub struct WindowsSection {
     pub show_minimized: bool,
     // Do not show windows belonging to Command+H-hidden apps by default.
     pub show_hidden_app_windows: bool,
+    // Show windows that live on another macOS desktop (Space) -- not another display. Off by
+    // default: the candidate scope has always been the current desktop's group and this is the
+    // one switch that widens it. Such a window has no AX element (the AX window list is
+    // Space-filtered), so its card keeps the CG title and is icon-only.
+    pub show_other_desktops: bool,
     // Overlay display position: "active_window" = follow the active window's screen,
     // "main" = always on the main screen. Defaults to following the active window.
     pub overlay_position: String,
@@ -305,6 +310,7 @@ impl Default for WindowsSection {
             enabled: true,
             show_minimized: false,
             show_hidden_app_windows: false,
+            show_other_desktops: false,
             overlay_position: "active_window".to_string(),
             activation_mode: "hover".to_string(),
         }
@@ -1220,6 +1226,9 @@ impl Config {
             {
                 self.windows.show_hidden_app_windows = other.windows.show_hidden_app_windows;
             }
+            // A boolean cannot fail validation, so it is adopted unconditionally like the
+            // other switches (same convention as the layout booleans above).
+            self.windows.show_other_desktops = other.windows.show_other_desktops;
             if !errs
                 .iter()
                 .any(|e| e.starts_with("windows.overlay_position"))
@@ -2168,6 +2177,7 @@ mod tests {
         assert_err_count(&cfg, 0);
         assert!(!cfg.windows.show_minimized);
         assert!(!cfg.windows.show_hidden_app_windows);
+        assert!(!cfg.windows.show_other_desktops);
     }
 
     #[test]
@@ -2916,6 +2926,7 @@ speed = 2.6
         cfg.windows.activation_mode = "click".into();
         cfg.windows.show_minimized = true;
         cfg.windows.show_hidden_app_windows = false;
+        cfg.windows.show_other_desktops = true;
         cfg.windows.enabled = false; // non-default: verify the roundtrip
         cfg.mouse.enabled = true;
         cfg.mouse.profiles = vec![
@@ -2952,6 +2963,7 @@ speed = 2.6
         assert_eq!(loaded.windows.activation_mode, "click");
         assert!(loaded.windows.show_minimized);
         assert!(!loaded.windows.show_hidden_app_windows);
+        assert!(loaded.windows.show_other_desktops);
         assert!(!loaded.windows.enabled);
         // Mouse profiles survive untouched (one wildcard + one per-device).
         assert!(loaded.mouse.enabled);

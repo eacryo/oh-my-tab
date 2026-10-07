@@ -4,10 +4,27 @@ use super::space_membership::{
     query_with_provider, MembershipSnapshot, SkyLightMembershipProvider,
 };
 use super::*;
+use crate::space_groups::MembershipScope;
 
 /// One worker thread's partial result set for its PID chunk; merged by key afterwards --
 /// the merge equals the serial version field-for-field (card order is decided by the
 /// second pass over the CG array and never depends on collection order).
+/// The fallback for a worker chunk that threw: every pid in it is unknown, which is the *failed*
+/// state, not the empty one. Reporting them as empty would put them in `CgOnlyPairing::Reject` and
+/// drop real windows from the switcher (see `cg_only_pairing`).
+fn ax_partial_after_chunk_exception(chunk: &[i32]) -> AxPartial {
+    AxPartial {
+        icon_ids: HashMap::new(),
+        hidden_app_pids: HashSet::new(),
+        ax_empty_pids: HashSet::new(),
+        ax_recovered_wid_to_info: HashMap::new(),
+        ax_failed_pids: chunk.to_vec(),
+        ax_wid_to_info: HashMap::new(),
+        titleless_pids: HashSet::new(),
+        ax_work_ms: 0,
+    }
+}
+
 struct AxPartial {
     icon_ids: HashMap<i32, AppIdentity>,
     hidden_app_pids: HashSet<i32>,
@@ -183,6 +200,9 @@ pub(crate) fn choose_switchable_capture_window(
         .iter()
         .filter(|window| {
             !window.minimized
+                // A window on another desktop cannot be captured, so it must never become a
+                // prewarm/capture target even when it is the app's frontmost window.
+                && !window.on_other_desktop
                 && window.window_id != 0
                 && window.bounds.2 >= 160.0
                 && window.bounds.3 >= 120.0
@@ -202,7 +222,13 @@ pub(crate) fn switchable_capture_window_for_pid(
 ) -> Option<WindowInfo> {
     let focused_cgwid = unsafe { focused_window_cgwid(pid) };
     let mut mru = MruMap::new();
-    let windows = collect_windows_for_pid(&mut mru, pid, focused_cgwid.unwrap_or(preferred_cgwid))?;
+    let collected =
+        collect_windows_for_pid(&mut mru, pid, focused_cgwid.unwrap_or(preferred_cgwid));
+    // This caller only wants one window to capture, not the pass's scope observations: consume and
+    // drop them on *every* path, including the failure return below, or an idle prewarm thread would
+    // keep its last pass -- and with it the oldest destruction epoch -- alive forever.
+    drop(crate::thumbnail::take_current_scope_pass());
+    let windows = collected?;
     choose_switchable_capture_window(&windows, focused_cgwid, preferred_cgwid)
 }
 
@@ -213,6 +239,10 @@ unsafe fn collect_windows_for_pid_inner(
 ) -> Option<Vec<WindowInfo>> {
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
     let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
+    let show_other_desktops = CONFIG.read().unwrap().windows.show_other_desktops;
+    // See the full-collection entry: staging is per pass and published only on acceptance.
+    crate::thumbnail::begin_scope_pass();
+    let _identity_pass = begin_ax_identity_pass();
     let app_hidden = unsafe { application_is_hidden(pid) } == Some(true);
     if should_filter_hidden_app(show_hidden_app_windows, app_hidden.then_some(true)) {
         return Some(Vec::new());
@@ -278,6 +308,15 @@ unsafe fn collect_windows_for_pid_inner(
             }
         }
     }
+    // The directed pass must publish its own evidence for this pid -- including "no published /
+    // no recovered windows" -- or a scenario would explain its new cards with an older pass's
+    // conditions. It serves one pid and deliberately ignores key/main-only recovery, so its
+    // recovered set is empty. Staged here, taken with the result, published only on acceptance.
+    crate::e2e_state::stage_ax_pid_evidence(
+        (!ax_wid_to_info.is_empty()).then_some(pid),
+        std::iter::empty::<i32>(),
+        std::iter::empty::<i32>(),
+    );
     let mut membership_window_ids = cg_window_ids.clone();
     membership_window_ids.extend(ax_wid_to_info.keys().copied());
     membership_window_ids.sort_unstable();
@@ -302,6 +341,22 @@ unsafe fn collect_windows_for_pid_inner(
             continue;
         }
         let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        // Staged before the attached-surface, alpha and AX-pairing filters below, for the same
+        // reason as the full pass: the observation is about the window, not about its card.
+        let staged_scope = classify_window_space(
+            membership_source,
+            membership_snapshot.as_ref(),
+            WindowPairingSource::PublishedAx,
+            cgwid,
+            cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
+        );
+        if staged_scope != MembershipScope::Unknown {
+            crate::thumbnail::stage_window_scope(
+                pid,
+                cgwid,
+                staged_scope == MembershipScope::OtherDesktop,
+            );
+        }
         if cgwid != 0 {
             cg_window_layers.insert(cgwid, layer);
             if let Some(bounds) = cf_dict_get_bounds(dict, "kCGWindowBounds") {
@@ -322,11 +377,46 @@ unsafe fn collect_windows_for_pid_inner(
             current_cg_ids.insert(cgwid);
         }
         let bounds = cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or((0.0, 0.0, 0.0, 0.0));
-        let Some(ax_info) = ax_wid_to_info.get(&cgwid) else {
-            continue;
+        let cg_is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen");
+        // The directed refresh honours the kAXWindows answer... except for a window Space
+        // membership places on another desktop, which that answer cannot contain (it is filtered
+        // by the current Space). This is the same exception the full collection makes; without it
+        // a per-app refresh would drop a card the summon had just shown.
+        let (ax_info, pairing_source) = match ax_wid_to_info.get(&cgwid) {
+            Some(info) => (Some(info), WindowPairingSource::PublishedAx),
+            // The same app-level rule the full collection applies: a window this app's AX answer
+            // did not identify may only come in through the other-desktop exception, which needs
+            // the app to have named a window. A failed query never reaches here (it keeps the
+            // existing cards above), and an app whose answer named nothing has no switchable window
+            // to show -- admitting its CG entries would let a menu-bar panel back in on a refresh
+            // (see `cg_only_pairing`).
+            None => match cg_only_pairing(
+                !ax_wid_to_info.is_empty(),
+                false,
+                false,
+                cg_is_onscreen.unwrap_or(false),
+            ) {
+                CgOnlyPairing::OtherDesktop
+                    if admits_other_desktop_cg_window(
+                        membership_source,
+                        membership_snapshot.as_ref(),
+                        cgwid,
+                        show_other_desktops,
+                    ) && cg_only_window_admissible(layer, bounds) =>
+                {
+                    (None, WindowPairingSource::UnpublishedAx)
+                }
+                _ => continue,
+            },
         };
-        let native_fullscreen =
-            native_fullscreen_state(ax_info.is_fullscreen, bounds, &display_bounds);
+        if pairing_source == WindowPairingSource::PublishedAx {
+            remember_ax_identity(pid, identity.process_start_time_us, cgwid);
+        }
+        let is_main = ax_info.is_some_and(|info| info.is_main);
+        let is_floating_window = ax_info.is_some_and(|info| info.is_floating_window);
+        let native_fullscreen = ax_info.is_some_and(|info| {
+            native_fullscreen_state(info.is_fullscreen, bounds, &display_bounds)
+        });
         if native_fullscreen {
             fullscreen_cgwids.insert(cgwid);
         }
@@ -336,37 +426,64 @@ unsafe fn collect_windows_for_pid_inner(
         // follows the presentation state (see AxWindowInfo::is_floating_window).
         if !window_admission(
             layer,
-            ax_info.is_main,
-            ax_info.is_fullscreen,
-            ax_info.is_floating_window,
+            is_main,
+            ax_info.and_then(|info| info.is_fullscreen),
+            is_floating_window,
             bounds,
         ) {
             continue;
         }
-        if ax_info.is_custom_root && !custom_window_is_substantial(bounds) && !ax_info.is_main {
-            continue;
-        }
-        if pid == std::process::id() as i32
-            && !cf_dict_get_bool(dict, "kCGWindowIsOnscreen").unwrap_or(false)
+        if ax_info.is_some_and(|info| info.is_custom_root)
+            && !custom_window_is_substantial(bounds)
+            && !is_main
         {
             continue;
         }
-        if ax_info.title.is_empty() && !titleless {
+        // Same sticky rejection as the full pass: a window the full collection refuses must not be
+        // restored by a directed refresh, or a card would come back the moment its app activates.
+        if is_known_non_normal_window(pid, identity.process_start_time_us, cgwid) && !is_main {
             continue;
         }
-        let native_fullscreen =
-            native_fullscreen_state(ax_info.is_fullscreen, bounds, &display_bounds);
-        if !passes_space_policy(
+        if pid == std::process::id() as i32 && !cg_is_onscreen.unwrap_or(false) {
+            continue;
+        }
+        // Without an AX element the title comes from the CG window name (which macOS only exposes
+        // with Screen Recording) and the minimized state is unknowable, so it reads false.
+        let window_title = ax_info
+            .map(|info| info.title.clone())
+            .unwrap_or_else(|| cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default());
+        let minimized = ax_info.is_some_and(|info| info.minimized);
+        let space_scope = classify_window_space(
             membership_source,
             membership_snapshot.as_ref(),
-            WindowPairingSource::PublishedAx,
+            pairing_source,
             cgwid,
-            cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
+            cg_is_onscreen,
+        );
+        if !admits_space_scope(
+            space_scope,
             WindowSpacePolicy {
-                minimized: ax_info.minimized,
+                minimized,
                 show_minimized,
+                show_other_desktops,
             },
         ) {
+            crate::e2e_state::space_gate_rejected();
+            continue;
+        }
+        if space_scope == MembershipScope::OtherDesktop {
+            crate::e2e_state::other_desktop_accepted();
+        }
+        // Title and shape: both follow the classification, so the AX-query-failed and key/main
+        // routes cannot slip an untitled or helper-shaped window in past the published-AX one. The
+        // app-level titleless exemption never applies to another desktop's window.
+        let titleless_exempt = titleless_exemption_applies(space_scope, pairing_source, titleless);
+        if window_title.is_empty() && !titleless_exempt {
+            continue;
+        }
+        if space_scope == MembershipScope::OtherDesktop
+            && !other_desktop_candidate_admissible(layer, bounds, &window_title)
+        {
             crate::e2e_state::space_gate_rejected();
             continue;
         }
@@ -385,12 +502,13 @@ unsafe fn collect_windows_for_pid_inner(
             pid,
             window_id: cgwid,
             app_name: app_name.clone(),
-            window_title: ax_info.title.clone(),
+            window_title,
             icon_path: icon_path.clone(),
             is_active: false,
-            minimized: ax_info.minimized,
+            minimized,
             app_hidden,
             fullscreen: native_fullscreen,
+            on_other_desktop: space_scope == MembershipScope::OtherDesktop,
             bounds,
         });
         shown.insert(cgwid);
@@ -439,17 +557,51 @@ unsafe fn collect_windows_for_pid_inner(
                 continue;
             }
             let native_fullscreen = ax_info.is_fullscreen == Some(true);
-            if !passes_space_policy(
+            let backfill_scope = classify_window_space(
                 membership_source,
                 membership_snapshot.as_ref(),
                 WindowPairingSource::PublishedAx,
                 cgwid,
                 None,
+            );
+            if !admits_space_scope(
+                backfill_scope,
                 WindowSpacePolicy {
                     minimized: ax_info.minimized,
                     show_minimized,
+                    show_other_desktops,
                 },
             ) {
+                crate::e2e_state::space_gate_rejected();
+                continue;
+            }
+            if backfill_scope == MembershipScope::OtherDesktop {
+                crate::e2e_state::other_desktop_accepted();
+            }
+            // This path publishes an AX-reported window, so record the identity: a later pass whose
+            // Space-filtered answer cannot name it must still know AX identified it.
+            remember_ax_identity(pid, identity.process_start_time_us, cgwid);
+            // The backfill restores windows the CG pass did not publish, so it must obey the same
+            // classification-based rules or a window the CG path just refused comes back here.
+            // Geometry evidence is required for an "other desktop" candidate: without a CG entry we
+            // cannot tell an ordinary window from a helper surface, and a cross-desktop window does
+            // have a CG entry (the All-mode enumeration lists off-Space windows).
+            let titleless_exempt = titleless_exemption_applies(
+                backfill_scope,
+                WindowPairingSource::PublishedAx,
+                titleless,
+            );
+            if ax_info.title.is_empty() && !titleless_exempt {
+                continue;
+            }
+            if backfill_scope == MembershipScope::OtherDesktop
+                && !(layer == Some(0)
+                    && cg_window_bounds
+                        .get(&cgwid)
+                        .copied()
+                        .is_some_and(custom_window_is_substantial)
+                    && !ax_info.title.is_empty())
+            {
                 crate::e2e_state::space_gate_rejected();
                 continue;
             }
@@ -472,6 +624,7 @@ unsafe fn collect_windows_for_pid_inner(
                 minimized: ax_info.minimized,
                 app_hidden,
                 fullscreen: native_fullscreen,
+                on_other_desktop: backfill_scope == MembershipScope::OtherDesktop,
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }
@@ -652,9 +805,17 @@ fn ax_wid_map(windows: Vec<AxWindowInfo>) -> HashMap<u32, AxWindowInfo> {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WindowPairingSource {
+    /// The app's `kAXWindows` answer named this window: full AX evidence.
     PublishedAx,
+    /// Recovered from the key/main slots; discovery only, and never Space-filtered by AX.
     RecoveredAx,
+    /// AX could not answer for this app at all.
     AxUnavailable,
+    /// AX answered for this app but did not publish this window, which Space membership places
+    /// on another desktop. Kept distinct from `AxUnavailable` because the missing AX evidence is
+    /// explained, not absent: there is no AX element to reinterpret (no title, no minimized
+    /// state, no raise element), only the CGWindowList facts and the membership that admitted it.
+    UnpublishedAx,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -733,31 +894,77 @@ fn query_space_membership(
     (source, snapshot.cloned())
 }
 
-fn passes_membership_gate(snapshot: &MembershipSnapshot, cgwid: u32) -> bool {
-    let Some(memberships) = snapshot.window_space_ids.get(&cgwid) else {
-        return false;
-    };
-    crate::space_groups::with_tracker(|tracker| {
-        let topology = if tracker.topology().displays.is_empty() {
-            &snapshot.topology
-        } else {
-            tracker.topology()
-        };
-        topology.displays.keys().any(|display_id| {
-            let allowed = topology.allowed_spaces(display_id, tracker.fullscreen_origins());
-            memberships
-                .iter()
-                .any(|space_id| allowed.contains(space_id))
-        })
-    })
+/// Classify one window's Space evidence without applying any window-state option.
+///
+/// SkyLight answers with the window's actual memberships; the accepted topology then decides
+/// whether those name the current group of some display, a managed Space outside it (another
+/// desktop), or nothing usable. The legacy source has no membership data at all, so its only
+/// accepted evidence -- a positively onscreen window -- is classified as the current group;
+/// windows that are merely offscreen stay `Unknown` rather than being guessed onto another
+/// desktop.
+fn classify_window_space(
+    source: MembershipSource,
+    snapshot: Option<&MembershipSnapshot>,
+    pairing_source: WindowPairingSource,
+    cgwid: u32,
+    is_onscreen: Option<bool>,
+) -> MembershipScope {
+    match source {
+        MembershipSource::SkyLight => {
+            let snapshot = snapshot.expect("SkyLight source requires a membership snapshot");
+            let Some(memberships) = snapshot.window_space_ids.get(&cgwid) else {
+                return MembershipScope::Unknown;
+            };
+            crate::space_groups::with_tracker(|tracker| {
+                // An empty tracker topology means no query has been accepted yet; the snapshot's
+                // own topology is then the best available evidence (same fallback as before).
+                let topology = if tracker.topology().displays.is_empty() {
+                    &snapshot.topology
+                } else {
+                    tracker.topology()
+                };
+                topology.membership_scope(memberships, tracker.fullscreen_origins())
+            })
+        }
+        MembershipSource::Legacy => {
+            if passes_legacy_space_gate(pairing_source, is_onscreen) {
+                MembershipScope::CurrentGroup
+            } else {
+                MembershipScope::Unknown
+            }
+        }
+    }
 }
 
 #[derive(Clone, Copy)]
 struct WindowSpacePolicy {
     minimized: bool,
     show_minimized: bool,
+    // Widens the candidate scope to managed Spaces outside every display's current group. Read
+    // per collection like the other switches; it never changes Space ownership or the raise target.
+    show_other_desktops: bool,
 }
 
+/// Apply the window-state options to a classification.
+///
+/// The minimized option controls admission, never Space ownership, so it is checked first and
+/// applies to every scope. `OtherDesktop` is admitted only while the "other desktops" switch is
+/// on; `Unknown` is never admitted by either switch.
+fn admits_space_scope(scope: MembershipScope, policy: WindowSpacePolicy) -> bool {
+    if policy.minimized && !policy.show_minimized {
+        return false;
+    }
+    match scope {
+        MembershipScope::CurrentGroup => true,
+        MembershipScope::OtherDesktop => policy.show_other_desktops,
+        MembershipScope::Unknown => false,
+    }
+}
+
+/// The whole Space decision in one call. Production sites need the classification on its own
+/// (to publish `on_other_desktop` and to relax the AX pairing), so this composition is the shape
+/// the tests assert against.
+#[cfg(test)]
 fn passes_space_policy(
     source: MembershipSource,
     snapshot: Option<&MembershipSnapshot>,
@@ -766,18 +973,139 @@ fn passes_space_policy(
     is_onscreen: Option<bool>,
     policy: WindowSpacePolicy,
 ) -> bool {
-    // The option controls admission, never Space ownership. A minimized window still has to
-    // satisfy the same membership test as every other candidate.
-    if policy.minimized && !policy.show_minimized {
-        return false;
+    admits_space_scope(
+        classify_window_space(source, snapshot, pairing_source, cgwid, is_onscreen),
+        policy,
+    )
+}
+
+/// Whether the app-level "all of its windows are untitled" answer may excuse an empty title.
+///
+/// It never covers a candidate admitted as a window of another desktop, whatever pairing source
+/// carried it: that answer describes the windows AX could see on *this* desktop and cannot vouch for
+/// a window of another one -- neither for a window AX never published, nor for one recovered from the
+/// key/main slots. Such a candidate has only its CG window name, so without one it has no title at
+/// all. The current group keeps the pre-existing exemption.
+fn titleless_exemption_applies(
+    scope: MembershipScope,
+    pairing_source: WindowPairingSource,
+    app_all_untitled: bool,
+) -> bool {
+    scope == MembershipScope::CurrentGroup
+        && pairing_source != WindowPairingSource::UnpublishedAx
+        && app_all_untitled
+}
+
+/// Every extra rule a candidate admitted as a window of another desktop must satisfy on top of the
+/// existing filters.
+///
+/// Such a window has no AX element, so the AX judgments that normally admit a custom-root or
+/// titled-floating window are unavailable: the ordinary layer-0, ordinary-size shape is required
+/// instead, and the title must be its own. Applied to the *classification* rather than to one
+/// pairing source, so the AX-query-failed and key/main-recovered routes cannot slip a helper surface
+/// or an untitled window in. Pure function, unit-tested.
+fn other_desktop_candidate_admissible(
+    layer: i32,
+    bounds: (f64, f64, f64, f64),
+    title: &str,
+) -> bool {
+    cg_only_window_admissible(layer, bounds) && !title.is_empty()
+}
+
+/// What to do with a CG window the app's AX answer did not identify.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CgOnlyPairing {
+    /// Consider it through the other-desktop exception (the caller still applies the membership
+    /// and shape gates).
+    OtherDesktop,
+    /// Keep the CG fallback for an app whose AX query failed.
+    AxUnavailable,
+    /// Not one of the app's windows.
+    Reject,
+}
+
+/// Decide the path for a CG window AX did not identify.
+///
+/// The observed case: Stats keeps a 280x800 window titled "Combined modules" -- its menu-bar panel,
+/// closed and off screen, layer 0, no parent -- and answers *nothing* to AX while it is closed
+/// (`kAXWindows` empty, `AXFocusedWindow`/`AXMainWindow` unsupported). Two rules let it through:
+/// the other-desktop exception, and the CG fallback for "no AX data" -- which also covered "AX
+/// answered about this app and named no window", so the panel became a card on its own desktop too.
+/// Selecting it does nothing.
+///
+/// The exception exists because `kAXWindows` is Space-filtered, so a real window of another desktop
+/// is absent from it by construction -- but that reasoning needs the app to have *some* window AX
+/// can name, in its published list or through its key/main slots. An app AX answered about with
+/// nothing at all has no switchable window to show, and its CG entries are panels.
+///
+/// A *failed* read is a different state: nothing is known. The fallback then covers only a window we
+/// can see (`on_screen`), which is what makes it useful for a hung app -- and, by construction,
+/// excludes a closed panel and everything on another desktop. Measured 2026-10-07: freezing Stats so
+/// its AX read times out put it in `ax_failed_pids` and the fallback admitted both its visible
+/// settings window and the closed panel, which is exactly the pair the user saw.
+/// Pure function, unit-tested.
+fn cg_only_pairing(
+    published_any: bool,
+    recovered_any: bool,
+    query_failed: bool,
+    on_screen: bool,
+) -> CgOnlyPairing {
+    if published_any || recovered_any {
+        CgOnlyPairing::OtherDesktop
+    } else if query_failed && on_screen {
+        CgOnlyPairing::AxUnavailable
+    } else {
+        CgOnlyPairing::Reject
     }
-    match source {
-        MembershipSource::SkyLight => passes_membership_gate(
-            snapshot.expect("SkyLight source requires a membership snapshot"),
+}
+
+/// Whether AX's evidence for this app excludes this particular CG window.
+///
+/// The observed case: 微信 keeps a 280x380 off-screen window titled 微信 beside its real 1097x833
+/// window. `kAXWindows` never lists it, so on the app's own desktop the AX-authority pairing drops
+/// it -- but from another desktop that list is Space-filtered (empty), the key/main slots still
+/// identify the real window, and the CG-only fallback turned the helper into a second, dead card
+/// (no AX element, so raising it does nothing).
+///
+/// The shape to catch is therefore: the published list is empty, the key/main slots named *some*
+/// window of this app, and this window is neither in the recovered map (that arm matches first) nor
+/// ever identified by AX before. `ever_identified` is what keeps a real second window of the app
+/// admissible: once its desktop has been visited, AX has identified it and it is no longer "a window
+/// AX refuses to name".
+///
+/// Pure function, unit-tested.
+fn ax_evidence_excludes_this_window(
+    published_any: bool,
+    recovered_count: usize,
+    ever_identified: bool,
+) -> bool {
+    !published_any && recovered_count > 0 && !ever_identified
+}
+
+/// Whether a CG window that the app's AX answer did not publish may still enter as a window of
+/// another desktop.
+///
+/// This is deliberately narrow. It needs the switch, SkyLight membership, and accepted-topology
+/// evidence that the window is managed *and* outside every display's current group; a window the
+/// current group already covers keeps today's AX authority (the AX list, not this exception,
+/// decides whether it is switchable), and `Unknown` membership is never evidence. That last part
+/// is what keeps orderOut'd and helper surfaces out: they present an empty or unmanaged Space
+/// list, not a managed desktop of their own.
+fn admits_other_desktop_cg_window(
+    source: MembershipSource,
+    snapshot: Option<&MembershipSnapshot>,
+    cgwid: u32,
+    show_other_desktops: bool,
+) -> bool {
+    show_other_desktops
+        && source == MembershipSource::SkyLight
+        && classify_window_space(
+            source,
+            snapshot,
+            WindowPairingSource::UnpublishedAx,
             cgwid,
-        ),
-        MembershipSource::Legacy => passes_legacy_space_gate(pairing_source, is_onscreen),
-    }
+            None,
+        ) == MembershipScope::OtherDesktop
 }
 
 /// Legacy Space policy retained for OS updates where SkyLight membership cannot be queried.
@@ -859,8 +1187,13 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     bump_frontmost: bool,
 ) -> Vec<WindowInfo> {
     let collection_started_at = Instant::now();
+    // This pass owns its scope observations; the caller carries the returned id so only an accepted
+    // pass is ever published (see the main thread apply and `WindowRefreshResult`).
+    crate::thumbnail::begin_scope_pass();
+    let _identity_pass = begin_ax_identity_pass();
     let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
     let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
+    let show_other_desktops = CONFIG.read().unwrap().windows.show_other_desktops;
     crate::e2e_state::set_space_membership_source(false);
     // Enumerate all CG windows. SkyLight membership, not transient onscreen state, decides which
     // Space's switchable windows are candidates; AX remains authoritative for window identity.
@@ -983,16 +1316,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                             }))
                             .unwrap_or_else(|exception| {
                                 log_info!("[collect] ax exception (chunk) {:?}", exception);
-                                AxPartial {
-                                    icon_ids: HashMap::new(),
-                                    hidden_app_pids: HashSet::new(),
-                                    ax_empty_pids: HashSet::new(),
-                                    ax_recovered_wid_to_info: HashMap::new(),
-                                    ax_failed_pids: Vec::new(),
-                                    ax_wid_to_info: HashMap::new(),
-                                    titleless_pids: HashSet::new(),
-                                    ax_work_ms: 0,
-                                }
+                                ax_partial_after_chunk_exception(chunk)
                             })
                         })
                     })
@@ -1102,6 +1426,15 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         &parent_ids,
     );
 
+    // Which apps' `kAXWindows` answered with at least one window, and which apps' key/main slots
+    // named one: the A2 snapshot needs both to tell "another desktop's real window" from "a surface
+    // AX refuses to name". Staged, published only with an accepted result.
+    crate::e2e_state::stage_ax_pid_evidence(
+        ax_wid_to_info.keys().copied(),
+        ax_recovered_wid_to_info.keys().copied(),
+        ax_failed_pids.iter().copied(),
+    );
+
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
         if dict.is_null() {
@@ -1110,14 +1443,33 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
         let layer = cf_dict_get_i32(dict, "kCGWindowLayer").unwrap_or(999);
 
+        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
+        if owner_pid <= 0 {
+            continue;
+        }
+        // Scope evidence is staged before every admission filter below (the alpha check, the hidden
+        // app, the attached-surface rule, the AX pairing, the switch itself): it says where the
+        // window lives, not whether it is a card, and the capture pipeline needs it precisely for the
+        // windows that are not cards. `Unknown` is not staged, so publishing leaves the previous
+        // observation alone.
+        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
+        let staged_scope = classify_window_space(
+            membership_source,
+            membership_snapshot.as_ref(),
+            WindowPairingSource::PublishedAx,
+            cgwid,
+            cf_dict_get_bool(dict, "kCGWindowIsOnscreen"),
+        );
+        if staged_scope != MembershipScope::Unknown {
+            crate::thumbnail::stage_window_scope(
+                owner_pid,
+                cgwid,
+                staged_scope == MembershipScope::OtherDesktop,
+            );
+        }
         // Fully transparent windows (alpha=0) are invisible; Mission Control doesn't show them.
         let alpha = cf_dict_get_f64(dict, "kCGWindowAlpha").unwrap_or(1.0);
         if alpha <= 0.0 {
-            continue;
-        }
-
-        let owner_pid = cf_dict_get_i32(dict, "kCGWindowOwnerPID").unwrap_or(-1);
-        if owner_pid <= 0 {
             continue;
         }
         if !show_hidden_app_windows && hidden_app_pids.contains(&owner_pid) {
@@ -1130,7 +1482,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         }
 
         let cg_title = cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default();
-        let cgwid = cf_dict_get_u32(dict, "kCGWindowNumber").unwrap_or(0);
         if is_attached_surface(parent_ids.get(&cgwid).copied()) {
             continue;
         }
@@ -1142,8 +1493,14 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // the same CGWindowID.
         // Pairing: the kAXWindows answer wins; key/main recovery is discovery only and is
         // published through the same normal-window filters and exact membership gate.
+        // Read before pairing: the CG-only fallback for a failed AX read covers only a window we
+        // can see, and `classify_window_space` below needs the same fact.
+        let cg_is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen");
         let published_map = ax_wid_to_info.get(&owner_pid);
         let recovered_map = ax_recovered_wid_to_info.get(&owner_pid);
+        let owner_process_start_time_us = icon_ids
+            .get(&owner_pid)
+            .and_then(|identity| identity.process_start_time_us);
         let (ax_info, pairing_source) = match published_map.and_then(|wid_map| wid_map.get(&cgwid))
         {
             Some(info) => (Some(info), WindowPairingSource::PublishedAx),
@@ -1152,13 +1509,59 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 .filter(|_| recovered_window_passes_size_filter(bounds))
             {
                 Some(info) => (Some(info), WindowPairingSource::RecoveredAx),
+                // AX named other windows of this app but not this one, and has never named this
+                // one: a secondary surface AX excludes, not a window of another desktop. Checked
+                // before the exception below, because an app whose list is Space-filtered while its
+                // key/main slots still answer lands in `ax_empty_pids` and would take that arm
+                // first. See `ax_evidence_excludes_this_window`.
+                None if ax_evidence_excludes_this_window(
+                    published_map.is_some(),
+                    recovered_map.map_or(0, HashMap::len),
+                    is_ax_identified_window(owner_pid, owner_process_start_time_us, cgwid),
+                ) =>
+                {
+                    continue;
+                }
                 // AX answered for this app (with a window list, or with nothing at all) and this
-                // CG window is in neither -> it is an app overlay, menu bar or hidden surface.
-                None if published_map.is_some() || ax_empty_pids.contains(&owner_pid) => continue,
-                // No AX data (the query failed) -> fall back to the CG title.
-                None => (None, WindowPairingSource::AxUnavailable),
+                // CG window is in neither. Normally that means an app overlay, menu bar or hidden
+                // surface -- EXCEPT when Space membership places the window on another desktop:
+                // `kAXWindows` is filtered by the current Space, so a real window there is absent
+                // from the answer by construction. That exception is what admission for the
+                // "other desktops" switch rests on, and it is why the window keeps its CG-derived
+                // title and no AX state.
+                None => match cg_only_pairing(
+                    published_map.is_some(),
+                    recovered_map.is_some(),
+                    ax_failed_pids.contains(&owner_pid),
+                    cg_is_onscreen.unwrap_or(false),
+                ) {
+                    CgOnlyPairing::OtherDesktop => {
+                        if admits_other_desktop_cg_window(
+                            membership_source,
+                            membership_snapshot.as_ref(),
+                            cgwid,
+                            show_other_desktops,
+                        ) && cg_only_window_admissible(layer, bounds)
+                        {
+                            (None, WindowPairingSource::UnpublishedAx)
+                        } else {
+                            continue;
+                        }
+                    }
+                    CgOnlyPairing::AxUnavailable => (None, WindowPairingSource::AxUnavailable),
+                    CgOnlyPairing::Reject => continue,
+                },
             },
         };
+        // AX identified this window as one of the app's windows: remember it, so a later pass whose
+        // Space-filtered answer does not name it (on another desktop) still knows it is not a
+        // surface AX refuses to name.
+        if matches!(
+            pairing_source,
+            WindowPairingSource::PublishedAx | WindowPairingSource::RecoveredAx
+        ) {
+            remember_ax_identity(owner_pid, owner_process_start_time_us, cgwid);
+        }
 
         let (window_title, minimized, is_main, ax_fullscreen, is_custom_root, is_floating_window) =
             ax_info
@@ -1212,24 +1615,29 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         //   a current Space; minimized windows follow the setting before any membership check.
         // - every discovered source uses the same membership rule; fullscreen state never
         //   overrides actual Space membership.
-        let cg_is_onscreen = cf_dict_get_bool(dict, "kCGWindowIsOnscreen");
         if owner_pid == std::process::id() as i32 && cg_is_onscreen != Some(true) {
             continue;
         }
-        let passes_space_policy = passes_space_policy(
+        let space_scope = classify_window_space(
             membership_source,
             membership_snapshot.as_ref(),
             pairing_source,
             cgwid,
             cg_is_onscreen,
+        );
+        if !admits_space_scope(
+            space_scope,
             WindowSpacePolicy {
                 minimized,
                 show_minimized,
+                show_other_desktops,
             },
-        );
-        if !passes_space_policy {
+        ) {
             crate::e2e_state::space_gate_rejected();
             continue;
+        }
+        if space_scope == MembershipScope::OtherDesktop {
+            crate::e2e_state::other_desktop_accepted();
         }
         if pairing_source == WindowPairingSource::RecoveredAx {
             crate::e2e_state::space_recovered_accepted();
@@ -1237,8 +1645,23 @@ pub(crate) fn collect_windows_with_frontmost_bump(
 
         // Titleless windows are kept only for apps AX confirmed as all-untitled
         // (titleless_pids); the AX-failed fallback no longer exempts empty titles
-        // (window identity can't be verified there).
-        if window_title.is_empty() && !titleless_pids.contains(&owner_pid) {
+        // (window identity can't be verified there). A candidate admitted as a window of another
+        // desktop is excluded from that exemption: the app-level answer describes the windows AX can
+        // see on this desktop and cannot vouch for another desktop's window.
+        let titleless_exempt = titleless_exemption_applies(
+            space_scope,
+            pairing_source,
+            titleless_pids.contains(&owner_pid),
+        );
+        if window_title.is_empty() && !titleless_exempt {
+            continue;
+        }
+        // Shape and title follow the classification, so every route into an "other desktop"
+        // candidate (published AX, recovered key/main, AX query failed) is held to the same rule.
+        if space_scope == MembershipScope::OtherDesktop
+            && !other_desktop_candidate_admissible(layer, bounds, &window_title)
+        {
+            crate::e2e_state::space_gate_rejected();
             continue;
         }
 
@@ -1285,6 +1708,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             minimized,
             app_hidden: hidden_app_pids.contains(&owner_pid),
             fullscreen: native_fullscreen,
+            on_other_desktop: space_scope == MembershipScope::OtherDesktop,
             bounds,
         });
         shown.insert((owner_pid, cgwid));
@@ -1356,17 +1780,54 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 continue;
             }
             let native_fullscreen = ax_info.is_fullscreen == Some(true);
-            if !passes_space_policy(
+            let backfill_scope = classify_window_space(
                 membership_source,
                 membership_snapshot.as_ref(),
                 WindowPairingSource::PublishedAx,
                 cgwid,
                 None,
+            );
+            if !admits_space_scope(
+                backfill_scope,
                 WindowSpacePolicy {
                     minimized: ax_info.minimized,
                     show_minimized,
+                    show_other_desktops,
                 },
             ) {
+                crate::e2e_state::space_gate_rejected();
+                continue;
+            }
+            if backfill_scope == MembershipScope::OtherDesktop {
+                crate::e2e_state::other_desktop_accepted();
+            }
+            // This path publishes an AX-reported window, so record the identity: a later pass whose
+            // Space-filtered answer cannot name it must still know AX identified it.
+            remember_ax_identity(
+                pid,
+                icon_ids
+                    .get(&pid)
+                    .and_then(|identity| identity.process_start_time_us),
+                cgwid,
+            );
+            // Same rule as the directed backfill (see there): the restored window cannot skip the
+            // classification-based title and shape requirements just because AX, not CG, found it.
+            let titleless_exempt = titleless_exemption_applies(
+                backfill_scope,
+                WindowPairingSource::PublishedAx,
+                titleless_pids.contains(&pid),
+            );
+            if ax_info.title.is_empty() && !titleless_exempt {
+                continue;
+            }
+            if backfill_scope == MembershipScope::OtherDesktop
+                && !(layer == Some(0)
+                    && cg_window_bounds
+                        .get(&(pid, cgwid))
+                        .copied()
+                        .is_some_and(custom_window_is_substantial)
+                    && !ax_info.title.is_empty())
+            {
                 crate::e2e_state::space_gate_rejected();
                 continue;
             }
@@ -1396,6 +1857,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 minimized: ax_info.minimized,
                 app_hidden: hidden_app_pids.contains(&pid),
                 fullscreen: native_fullscreen,
+                on_other_desktop: backfill_scope == MembershipScope::OtherDesktop,
                 bounds: (0.0, 0.0, 0.0, 0.0),
             });
         }
@@ -1775,16 +2237,35 @@ mod tab_group_fold_tests {
 mod space_gate_tests {
     use super::*;
 
-    fn window_policy(
+    fn window_policy(minimized: bool, show_minimized: bool) -> WindowSpacePolicy {
+        WindowSpacePolicy {
+            minimized,
+            show_minimized,
+            show_other_desktops: false,
+        }
+    }
+
+    fn window_policy_with_other_desktops(
         minimized: bool,
         show_minimized: bool,
-        _native_fullscreen: bool,
-        _current_space_fullscreen: bool,
+        show_other_desktops: bool,
     ) -> WindowSpacePolicy {
         WindowSpacePolicy {
             minimized,
             show_minimized,
+            show_other_desktops,
         }
+    }
+
+    /// The Space classification a SkyLight-sourced window gets, without any window-state option.
+    fn scope_of(snapshot: &MembershipSnapshot, cgwid: u32) -> MembershipScope {
+        classify_window_space(
+            MembershipSource::SkyLight,
+            Some(snapshot),
+            WindowPairingSource::PublishedAx,
+            cgwid,
+            None,
+        )
     }
 
     fn membership(current: &[u64], windows: &[(u32, &[u64])]) -> MembershipSnapshot {
@@ -1824,61 +2305,367 @@ mod space_gate_tests {
     #[test]
     fn current_space_membership_intersection_controls_visibility() {
         let snapshot = membership(&[10], &[(7, &[10]), (8, &[20]), (9, &[])]);
-        assert!(passes_membership_gate(&snapshot, 7));
-        assert!(!passes_membership_gate(&snapshot, 8));
-        assert!(!passes_membership_gate(&snapshot, 9));
-        assert!(!passes_membership_gate(&snapshot, 99));
+        assert_eq!(scope_of(&snapshot, 7), MembershipScope::CurrentGroup);
+        assert_eq!(scope_of(&snapshot, 8), MembershipScope::OtherDesktop);
+        assert_eq!(scope_of(&snapshot, 9), MembershipScope::Unknown);
+        assert_eq!(scope_of(&snapshot, 99), MembershipScope::Unknown);
+        // The switch only widens admission: the current group and the unknown case are unchanged.
+        assert!(passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::PublishedAx,
+            7,
+            None,
+            window_policy_with_other_desktops(false, false, true),
+        ));
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::PublishedAx,
+            9,
+            None,
+            window_policy_with_other_desktops(false, false, true),
+        ));
+    }
+
+    #[test]
+    fn a_managed_space_outside_the_group_needs_the_other_desktops_switch() {
+        // Space 20 is managed but belongs to no display's current group, so the window lives on
+        // another desktop: rejected while the switch is off, admitted once it is on.
+        let snapshot = membership(&[10], &[(8, &[20])]);
+        assert_eq!(scope_of(&snapshot, 8), MembershipScope::OtherDesktop);
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::UnpublishedAx,
+            8,
+            Some(false),
+            window_policy(false, false),
+        ));
+        assert!(passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::UnpublishedAx,
+            8,
+            Some(false),
+            window_policy_with_other_desktops(false, false, true),
+        ));
+    }
+
+    /// The same snapshot with the given Space ids removed from the accepted topology. SkyLight
+    /// membership can name a Space this topology does not manage (a stale record from a Space that
+    /// is gone, or one from a display that was disconnected).
+    fn without_managed_spaces(mut snapshot: MembershipSnapshot, ids: &[u64]) -> MembershipSnapshot {
+        for display in snapshot.topology.displays.values_mut() {
+            for id in ids {
+                display.spaces.remove(id);
+            }
+        }
+        snapshot
+    }
+
+    #[test]
+    fn a_candidate_without_any_ax_evidence_needs_the_ordinary_window_shape() {
+        // With the switch on, a window of another desktop has no AX element, so the AX judgments
+        // that normally let a custom-root or titled-floating window through are unavailable. The
+        // ordinary shape is required instead, or a small layer-0 helper surface would become a card.
+        let ordinary = (100.0, 80.0, 800.0, 600.0);
+        let small = (0.0, 0.0, 60.0, 30.0);
+        assert!(cg_only_window_admissible(0, ordinary));
+        assert!(!cg_only_window_admissible(0, small));
+        assert!(!cg_only_window_admissible(3, ordinary));
+        assert!(!cg_only_window_admissible(101, ordinary));
+    }
+
+    #[test]
+    fn the_titleless_exemption_never_covers_a_window_of_another_desktop() {
+        // The app-level answer comes from the windows AX can see on this desktop, so it cannot
+        // vouch for another desktop's window -- whatever pairing source carried that candidate.
+        for source in [
+            WindowPairingSource::PublishedAx,
+            WindowPairingSource::RecoveredAx,
+            WindowPairingSource::AxUnavailable,
+            WindowPairingSource::UnpublishedAx,
+        ] {
+            assert!(
+                !titleless_exemption_applies(MembershipScope::OtherDesktop, source, true),
+                "{source:?} must not excuse an untitled window of another desktop"
+            );
+        }
+        // The current group keeps the pre-existing exemption.
+        assert!(titleless_exemption_applies(
+            MembershipScope::CurrentGroup,
+            WindowPairingSource::PublishedAx,
+            true
+        ));
+        assert!(titleless_exemption_applies(
+            MembershipScope::CurrentGroup,
+            WindowPairingSource::RecoveredAx,
+            true
+        ));
+        assert!(!titleless_exemption_applies(
+            MembershipScope::Unknown,
+            WindowPairingSource::PublishedAx,
+            true
+        ));
+    }
+
+    #[test]
+    fn an_other_desktop_candidate_needs_the_ordinary_shape_and_its_own_title() {
+        let ordinary = (100.0, 80.0, 800.0, 600.0);
+        assert!(other_desktop_candidate_admissible(0, ordinary, "Title"));
+        // A helper-shaped surface and an untitled window are both refused, on every route.
+        assert!(!other_desktop_candidate_admissible(
+            0,
+            (0.0, 0.0, 60.0, 30.0),
+            "Title"
+        ));
+        assert!(!other_desktop_candidate_admissible(0, ordinary, ""));
+        assert!(!other_desktop_candidate_admissible(3, ordinary, "Title"));
+    }
+
+    #[test]
+    fn the_switch_never_admits_windows_without_accepted_space_evidence() {
+        // A window whose memberships are empty, or name a Space the accepted topology does not
+        // manage, has no evidence that it lives on another desktop -- which is also what an
+        // orderOut'd or helper surface presents. Neither shape may enter through the switch.
+        let snapshot = membership(&[10], &[(7, &[]), (8, &[999]), (9, &[10, 999])]);
+        let snapshot = without_managed_spaces(snapshot, &[999]);
+        assert_eq!(scope_of(&snapshot, 7), MembershipScope::Unknown);
+        assert_eq!(scope_of(&snapshot, 8), MembershipScope::Unknown);
+        // 10 is still managed and in the group, so the window keeps its current-group admission
+        // and the unmanaged id alongside it changes nothing.
+        assert_eq!(scope_of(&snapshot, 9), MembershipScope::CurrentGroup);
+        for cgwid in [7, 8] {
+            assert!(!passes_space_policy(
+                MembershipSource::SkyLight,
+                Some(&snapshot),
+                WindowPairingSource::UnpublishedAx,
+                cgwid,
+                Some(false),
+                window_policy_with_other_desktops(false, false, true),
+            ));
+        }
+    }
+
+    #[test]
+    fn an_attribute_error_separates_no_value_from_a_failed_read() {
+        // The app answered that it has no such window / does not support the attribute.
+        assert!(ax_error_means_no_answer(K_AX_ERROR_NO_VALUE));
+        assert!(ax_error_means_no_answer(K_AX_ERROR_ATTRIBUTE_UNSUPPORTED));
+        assert!(ax_error_means_no_answer(K_AX_ERROR_NOT_IMPLEMENTED));
+        // The read itself failed, so nothing is known about the app: this keeps the CG fallback.
+        assert!(!ax_error_means_no_answer(K_AX_ERROR_CANNOT_COMPLETE));
+        assert!(!ax_error_means_no_answer(K_AX_ERROR_INVALID_UI_ELEMENT));
+        assert!(!ax_error_means_no_answer(K_AX_ERROR_FAILURE));
+        assert!(!ax_error_means_no_answer(0)); // an unrecognised code is treated as failed
+    }
+
+    #[test]
+    fn an_incomplete_read_is_not_an_empty_answer() {
+        // Empty window list, AXFocusedWindow failed, AXMainWindow has no value: incomplete, so the
+        // CG fallback must stay.
+        assert!(ax_read_is_incomplete(0, false, false, true));
+        // Stats: the app answered an empty list and reported NoValue twice -- it answered.
+        assert!(!ax_read_is_incomplete(0, false, false, false));
+        // A real window came back: nothing is incomplete about it.
+        assert!(!ax_read_is_incomplete(3, false, false, false));
+        // The key/main slot recovered a window even though the list was empty and a read failed.
+        assert!(!ax_read_is_incomplete(0, true, false, true));
+    }
+
+    #[test]
+    fn a_thrown_chunk_reports_its_pids_as_failed_not_empty() {
+        let partial = ax_partial_after_chunk_exception(&[7, 9]);
+        assert_eq!(partial.ax_failed_pids, vec![7, 9]);
+        assert!(partial.ax_empty_pids.is_empty());
+        assert!(partial.ax_wid_to_info.is_empty());
+        assert!(partial.ax_recovered_wid_to_info.is_empty());
+    }
+
+    #[test]
+    fn a_cg_window_ax_did_not_identify_follows_the_apps_ax_state() {
+        // Stats while closed: the published list is empty, the key/main slots answered nothing, and
+        // the query succeeded -- so its panel is rejected on every desktop, not just across Spaces.
+        assert_eq!(
+            cg_only_pairing(false, false, false, false),
+            CgOnlyPairing::Reject
+        );
+        assert_eq!(
+            cg_only_pairing(false, false, false, true),
+            CgOnlyPairing::Reject
+        );
+        // A single-window app on another desktop (Telegram): the key/main slot names its window.
+        assert_eq!(
+            cg_only_pairing(false, true, false, false),
+            CgOnlyPairing::OtherDesktop
+        );
+        // An app with a window on the current desktop may legitimately have one on another.
+        assert_eq!(
+            cg_only_pairing(true, false, false, false),
+            CgOnlyPairing::OtherDesktop
+        );
+        assert_eq!(
+            cg_only_pairing(true, true, false, false),
+            CgOnlyPairing::OtherDesktop
+        );
+        // A failed query knows nothing: the CG fallback covers a window we can see...
+        assert_eq!(
+            cg_only_pairing(false, false, true, true),
+            CgOnlyPairing::AxUnavailable
+        );
+        // ...and nothing else: a closed panel, or anything on another desktop, is not admitted.
+        assert_eq!(
+            cg_only_pairing(false, false, true, false),
+            CgOnlyPairing::Reject
+        );
+    }
+
+    #[test]
+    fn a_window_ax_did_not_identify_is_not_invented_from_the_cg_list() {
+        // 微信's shape from another desktop: the published list is Space-filtered and empty, the
+        // key/main slots still identify the real window, and the helper window is in neither and was
+        // never identified by AX.
+        assert!(ax_evidence_excludes_this_window(false, 1, false));
+        // A real second window of the app, identified while its desktop was visited: admissible.
+        assert!(!ax_evidence_excludes_this_window(false, 1, true));
+        // An app AX told us nothing about (no published window, no key/main window): no evidence
+        // either way, so the CG-only fallback -- what the switch is for -- applies.
+        assert!(!ax_evidence_excludes_this_window(false, 0, false));
+        // An app with a window on the current desktop keeps going through the AX-authority path.
+        assert!(!ax_evidence_excludes_this_window(true, 1, false));
+    }
+
+    #[test]
+    fn other_desktop_pairing_exception_is_narrow() {
+        let snapshot = membership(&[10], &[(8, &[20]), (9, &[10]), (11, &[999])]);
+        let snapshot = without_managed_spaces(snapshot, &[999]);
+        // Switch on + SkyLight + managed-but-elsewhere: the one admitted shape.
+        assert!(admits_other_desktop_cg_window(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            8,
+            true
+        ));
+        // Off is off.
+        assert!(!admits_other_desktop_cg_window(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            8,
+            false
+        ));
+        // A window the current group already covers keeps today's AX authority: the exception
+        // never substitutes for the AX list on the current desktop.
+        assert!(!admits_other_desktop_cg_window(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            9,
+            true
+        ));
+        // No accepted Space evidence is never evidence.
+        assert!(!admits_other_desktop_cg_window(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            11,
+            true
+        ));
+        // Without SkyLight membership there is nothing to attribute, so the legacy source cannot
+        // reach the exception even with the switch on.
+        assert!(!admits_other_desktop_cg_window(
+            MembershipSource::Legacy,
+            None,
+            8,
+            true
+        ));
     }
 
     #[test]
     fn membership_unions_current_spaces_across_displays() {
         let snapshot = membership(&[10, 20], &[(7, &[10]), (8, &[20]), (9, &[30])]);
-        assert!(passes_membership_gate(&snapshot, 7));
-        assert!(passes_membership_gate(&snapshot, 8));
-        assert!(!passes_membership_gate(&snapshot, 9));
+        assert_eq!(scope_of(&snapshot, 7), MembershipScope::CurrentGroup);
+        assert_eq!(scope_of(&snapshot, 8), MembershipScope::CurrentGroup);
+        assert_eq!(scope_of(&snapshot, 9), MembershipScope::OtherDesktop);
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::PublishedAx,
+            9,
+            None,
+            window_policy(false, false),
+        ));
     }
 
     #[test]
     fn fullscreen_flags_do_not_bypass_space_membership() {
+        // Space membership alone decides: there is no fullscreen-shaped input to this policy any
+        // more, so a same-group fullscreen window is admitted and an other-desktop one is not.
         let snapshot = membership(&[10], &[(7, &[10]), (8, &[20])]);
-        assert!(!passes_membership_gate(&snapshot, 8));
+        assert_eq!(scope_of(&snapshot, 8), MembershipScope::OtherDesktop);
         assert!(!passes_space_policy(
             MembershipSource::Legacy,
             None,
             WindowPairingSource::RecoveredAx,
             8,
             Some(false),
-            window_policy(false, false, true, true),
+            window_policy(false, false),
         ));
     }
 
     #[test]
     fn minimized_visibility_setting_never_bypasses_membership() {
         let snapshot = membership(&[10], &[(7, &[20])]);
+        // Unknown scope: rejected whatever the minimized switch says.
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::RecoveredAx,
+            99,
+            None,
+            window_policy(true, false),
+        ));
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&snapshot),
+            WindowPairingSource::RecoveredAx,
+            99,
+            None,
+            window_policy(true, true),
+        ));
+        // Other-desktop scope: the minimized option still applies first and independently, so the
+        // switch cannot smuggle a minimized window past a closed minimized setting.
         assert!(!passes_space_policy(
             MembershipSource::SkyLight,
             Some(&snapshot),
             WindowPairingSource::RecoveredAx,
             7,
             None,
-            window_policy(true, false, false, false),
+            window_policy_with_other_desktops(true, false, true),
         ));
-        assert!(!passes_space_policy(
+        assert!(passes_space_policy(
             MembershipSource::SkyLight,
             Some(&snapshot),
             WindowPairingSource::RecoveredAx,
             7,
             None,
-            window_policy(true, true, false, false),
+            window_policy_with_other_desktops(true, true, true),
         ));
+        // A minimized window in the current group only follows the minimized setting.
         let on_current_space = membership(&[10], &[(7, &[10])]);
+        assert!(!passes_space_policy(
+            MembershipSource::SkyLight,
+            Some(&on_current_space),
+            WindowPairingSource::RecoveredAx,
+            7,
+            None,
+            window_policy(true, false),
+        ));
         assert!(passes_space_policy(
             MembershipSource::SkyLight,
             Some(&on_current_space),
             WindowPairingSource::RecoveredAx,
             7,
             None,
-            window_policy(true, true, false, false),
+            window_policy(true, true),
         ));
     }
 
@@ -1895,7 +2682,7 @@ mod space_gate_tests {
             WindowPairingSource::RecoveredAx,
             42,
             None,
-            window_policy(false, false, false, false),
+            window_policy(false, false),
         ));
         let on_current_space = membership(&[10], &[(42, &[10])]);
         assert!(passes_space_policy(
@@ -1904,7 +2691,7 @@ mod space_gate_tests {
             WindowPairingSource::RecoveredAx,
             42,
             None,
-            window_policy(false, false, false, false),
+            window_policy(false, false),
         ));
     }
 
@@ -1929,7 +2716,7 @@ mod space_gate_tests {
             WindowPairingSource::RecoveredAx,
             42,
             Some(false),
-            window_policy(false, false, false, false),
+            window_policy(false, false),
         ));
         assert!(passes_space_policy(
             MembershipSource::Legacy,
@@ -1937,7 +2724,7 @@ mod space_gate_tests {
             WindowPairingSource::RecoveredAx,
             42,
             Some(true),
-            window_policy(false, false, false, false),
+            window_policy(false, false),
         ));
         assert!(!passes_space_policy(
             MembershipSource::Legacy,
@@ -1945,7 +2732,7 @@ mod space_gate_tests {
             WindowPairingSource::AxUnavailable,
             42,
             None,
-            window_policy(false, false, false, true),
+            window_policy(false, false),
         ));
         assert!(passes_space_policy(
             MembershipSource::Legacy,
@@ -1953,7 +2740,17 @@ mod space_gate_tests {
             WindowPairingSource::AxUnavailable,
             42,
             Some(true),
-            window_policy(false, false, true, true),
+            window_policy(false, false),
+        ));
+        // The switch cannot widen the legacy source: without SkyLight membership there is no way
+        // to tell another desktop from an orderOut'd window, so it stays onscreen-only.
+        assert!(!passes_space_policy(
+            MembershipSource::Legacy,
+            None,
+            WindowPairingSource::UnpublishedAx,
+            42,
+            Some(false),
+            window_policy_with_other_desktops(false, false, true),
         ));
     }
 

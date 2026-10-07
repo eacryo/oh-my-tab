@@ -311,6 +311,308 @@ pub(super) fn recent_workset_membership_at(
     Some(snapshot.keys.contains(&key))
 }
 
+/// The keys currently known to live on another desktop.
+///
+/// This is deliberately *not* rebuilt from the candidate list: a window that leaves the candidates
+/// (its app became hidden, its title emptied, the switch was turned off) would then lose its
+/// evidence while its cached frame and its queued jobs still exist. It is evidence about the window,
+/// so it is updated from the collection that classified it and cleared when the window or its
+/// process is gone.
+static OTHER_DESKTOP_KEYS: LazyLock<Mutex<HashSet<ThumbKey>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
+
+/// The scope-evidence protocol: pass registration, staged observations, destruction marks and the
+/// pruning of those marks.
+///
+/// All of it lives under one lock on purpose. Registration, staging, forgetting, pruning and
+/// publishing are steps of a single lifecycle decision; splitting them across locks let a prune that
+/// had already read "no live pass" delete a mark a pass registered in between still needed. Under one
+/// lock a publishing pass is also protected while it validates, so a destruction cannot slip between
+/// the check and the commit.
+#[derive(Default)]
+struct ScopeEvidence {
+    /// Live passes by id, with the destruction epoch each began at.
+    passes: HashMap<u64, StagedPass>,
+    /// Windows and processes whose destruction was observed: the epoch at which each became invalid.
+    forgotten_keys: HashMap<ThumbKey, u64>,
+    forgotten_pids: HashMap<i32, u64>,
+    next_pass: u64,
+    epoch: u64,
+}
+
+struct StagedPass {
+    /// The destruction epoch when this pass began.
+    epoch: u64,
+    /// Every window this pass classified with usable evidence: key -> lives on another desktop.
+    /// Windows whose evidence is `Unknown` are absent, so publishing leaves their previous state
+    /// alone instead of clearing it.
+    observed: HashMap<ThumbKey, bool>,
+}
+
+static SCOPE_EVIDENCE: LazyLock<Mutex<ScopeEvidence>> =
+    LazyLock::new(|| Mutex::new(ScopeEvidence::default()));
+
+thread_local! {
+    /// The pass installed on this thread. Beginning a new pass drops the previous one, and the
+    /// thread-local's own destructor drops whatever is left when the thread ends.
+    static CURRENT_SCOPE_PASS: std::cell::RefCell<Option<ScopePass>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Ownership of one pass's pending observations. Dropping it without `publish` discards them.
+pub(crate) struct ScopePass(Option<u64>);
+
+impl ScopePass {
+    fn id(&self) -> Option<u64> {
+        self.0
+    }
+
+    /// Hand the observations to the capture pipeline (the accepting path).
+    pub(crate) fn publish(mut self) {
+        if let Some(pass) = self.0.take() {
+            publish_staged_scope(pass);
+        }
+    }
+}
+
+impl Drop for ScopePass {
+    fn drop(&mut self) {
+        if let Some(pass) = self.0.take() {
+            let mut evidence = SCOPE_EVIDENCE.lock().unwrap();
+            evidence.passes.remove(&pass);
+            prune_forget_marks(&mut evidence);
+        }
+    }
+}
+
+/// The epoch at which this key was invalidated, if ever.
+fn forgotten_epoch(evidence: &ScopeEvidence, key: &ThumbKey) -> Option<u64> {
+    match (
+        evidence.forgotten_keys.get(key).copied(),
+        evidence.forgotten_pids.get(&key.pid).copied(),
+    ) {
+        (Some(key_epoch), Some(pid_epoch)) => Some(key_epoch.max(pid_epoch)),
+        (Some(epoch), None) | (None, Some(epoch)) => Some(epoch),
+        (None, None) => None,
+    }
+}
+
+/// Whether an observation taken by a pass that began at `pass_epoch` is still valid. A pass that
+/// begins after the destruction -- including one that sees a recycled pid's new window -- is not
+/// vetoed by it.
+fn observation_is_valid(evidence: &ScopeEvidence, key: &ThumbKey, pass_epoch: u64) -> bool {
+    forgotten_epoch(evidence, key).is_none_or(|forgotten| forgotten <= pass_epoch)
+}
+
+/// Drop destruction marks no live pass can still need: a mark only matters to a pass that began at
+/// or before the destruction, so once every live pass is newer the marks can go.
+fn prune_forget_marks(evidence: &mut ScopeEvidence) {
+    match evidence.passes.values().map(|pass| pass.epoch).min() {
+        Some(min_live_epoch) => {
+            evidence
+                .forgotten_keys
+                .retain(|_, epoch| *epoch > min_live_epoch);
+            evidence
+                .forgotten_pids
+                .retain(|_, epoch| *epoch > min_live_epoch);
+        }
+        None => {
+            evidence.forgotten_keys.clear();
+            evidence.forgotten_pids.clear();
+        }
+    }
+}
+
+/// Start a collection pass (collector thread). The caller that will carry it into a result takes it
+/// over with `take_current_scope_pass`; one that will not (a prewarm pass) leaves it installed, and
+/// it is discarded by the next pass on this thread or by the thread-local's destructor.
+pub(super) fn begin_scope_pass() {
+    let id = {
+        let mut evidence = SCOPE_EVIDENCE.lock().unwrap();
+        evidence.next_pass += 1;
+        let id = evidence.next_pass;
+        let epoch = evidence.epoch;
+        evidence.passes.insert(
+            id,
+            StagedPass {
+                epoch,
+                observed: HashMap::new(),
+            },
+        );
+        id
+    };
+    CURRENT_SCOPE_PASS.with(|slot| *slot.borrow_mut() = Some(ScopePass(Some(id))));
+}
+
+/// Take ownership of the pass the calling thread is filling, for the caller that carries it in its
+/// result.
+pub(super) fn take_current_scope_pass() -> Option<ScopePass> {
+    CURRENT_SCOPE_PASS.with(|slot| slot.borrow_mut().take())
+}
+
+/// The pass the calling thread is filling.
+fn current_scope_pass_id() -> Option<u64> {
+    CURRENT_SCOPE_PASS.with(|slot| slot.borrow().as_ref().and_then(ScopePass::id))
+}
+
+/// Record one window's observed scope for the pass in progress (collector thread). Only usable
+/// evidence is staged; a window whose Space membership could not be established is left untouched,
+/// and a window invalidated since this pass began is not staged at all.
+pub(super) fn stage_window_scope(pid: i32, wid: u32, on_other_desktop: bool) {
+    if wid == 0 {
+        return;
+    }
+    let Some(pass_id) = current_scope_pass_id() else {
+        return;
+    };
+    let key = ThumbKey { pid, wid };
+    let mut evidence = SCOPE_EVIDENCE.lock().unwrap();
+    let Some(pass) = evidence.passes.get_mut(&pass_id) else {
+        return;
+    };
+    let pass_epoch = pass.epoch;
+    if !observation_is_valid(&evidence, &key, pass_epoch) {
+        return;
+    }
+    // Re-borrow after the immutable check above ends.
+    if let Some(pass) = evidence.passes.get_mut(&pass_id) {
+        pass.observed.insert(key, on_other_desktop);
+    }
+}
+
+/// Apply one accepted pass's observations (main thread) and drop its slot.
+///
+/// The pass stays registered while its observations are validated and committed, so a concurrent
+/// prune cannot treat it as gone, and the whole step holds one lock.
+pub(super) fn publish_staged_scope(pass_id: u64) {
+    let mut evidence = SCOPE_EVIDENCE.lock().unwrap();
+    let Some(pass) = evidence.passes.remove(&pass_id) else {
+        return;
+    };
+    if !pass.observed.is_empty() {
+        let mut known = OTHER_DESKTOP_KEYS.lock().unwrap();
+        for (key, on_other_desktop) in &pass.observed {
+            // The lifecycle check is repeated here: a destruction that landed between staging and
+            // this publish must not be undone by the older observation.
+            if !observation_is_valid(&evidence, key, pass.epoch) {
+                continue;
+            }
+            if *on_other_desktop {
+                known.insert(*key);
+            } else {
+                known.remove(key);
+            }
+        }
+    }
+    prune_forget_marks(&mut evidence);
+}
+
+/// Drop the evidence for a window that is gone (destroyed, or its process ended).
+///
+/// The live pass slots are scrubbed, the key is marked with the destruction epoch so a pass that
+/// began earlier can neither stage nor publish it, and the mark is dropped only once no live pass
+/// predates it.
+pub(super) fn forget_window_scope(pid: i32, wid: u32) {
+    let key = ThumbKey { pid, wid };
+    let mut evidence = SCOPE_EVIDENCE.lock().unwrap();
+    evidence.epoch += 1;
+    let epoch = evidence.epoch;
+    evidence.forgotten_keys.insert(key, epoch);
+    for pass in evidence.passes.values_mut() {
+        pass.observed.remove(&key);
+    }
+    OTHER_DESKTOP_KEYS.lock().unwrap().remove(&key);
+    prune_forget_marks(&mut evidence);
+}
+
+/// Drop the evidence for every window of a process that ended. The whole pid is invalidated at one
+/// epoch, so a stale pass cannot re-stage any of its windows -- including ones this process never
+/// saw, which a key-by-key mark could not cover.
+pub(super) fn forget_process_scope(pid: i32) {
+    let mut evidence = SCOPE_EVIDENCE.lock().unwrap();
+    evidence.epoch += 1;
+    let epoch = evidence.epoch;
+    evidence.forgotten_pids.insert(pid, epoch);
+    for pass in evidence.passes.values_mut() {
+        pass.observed.retain(|key, _| key.pid != pid);
+    }
+    OTHER_DESKTOP_KEYS
+        .lock()
+        .unwrap()
+        .retain(|key| key.pid != pid);
+    prune_forget_marks(&mut evidence);
+}
+
+/// Whether the cache already holds a frame for this window (used by the A2 snapshot to assert that
+/// a card keeps its last thumbnail after the window moves to another desktop).
+pub(super) fn cached_frame_available(key: &ThumbKey) -> bool {
+    CACHE.lock().unwrap().peek(key).is_some()
+}
+
+/// Frames a card actually rendered, with the time of the render. This is deliberately not the same
+/// question as "the cache holds it": a defect that refuses the cache for a card leaves the cache
+/// entry in place, so an assertion on availability alone would still pass.
+static RENDERED_FRAMES: LazyLock<Mutex<HashMap<ThumbKey, Instant>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// How long a render counts as current (a card is rebuilt per summon; assertions read soon after).
+const RENDERED_FRAME_TTL: Duration = Duration::from_secs(10);
+
+/// Clear a window's render record at the start of a card build.
+pub(super) fn clear_frame_rendered(key: &ThumbKey) {
+    RENDERED_FRAMES.lock().unwrap().remove(key);
+}
+
+pub(super) fn note_frame_rendered(key: ThumbKey) {
+    let now = Instant::now();
+    let mut rendered = RENDERED_FRAMES.lock().unwrap();
+    rendered.retain(|_, at| now.saturating_duration_since(*at) <= RENDERED_FRAME_TTL);
+    rendered.insert(key, now);
+}
+
+pub(super) fn frame_was_rendered(key: &ThumbKey) -> bool {
+    let now = Instant::now();
+    RENDERED_FRAMES
+        .lock()
+        .unwrap()
+        .get(key)
+        .is_some_and(|at| now.saturating_duration_since(*at) <= RENDERED_FRAME_TTL)
+}
+
+#[cfg(test)]
+pub(super) fn staged_slot_count() -> usize {
+    SCOPE_EVIDENCE.lock().unwrap().passes.len()
+}
+
+#[cfg(test)]
+pub(super) fn forget_mark_count() -> usize {
+    let evidence = SCOPE_EVIDENCE.lock().unwrap();
+    evidence.forgotten_keys.len() + evidence.forgotten_pids.len()
+}
+
+/// Whether this key is currently known to live on another desktop. Such a window cannot be captured
+/// where the user is, so no producer may request it and no queued job may run -- even when the cache
+/// still holds a frame captured before it moved.
+pub(super) fn is_other_desktop_key(key: &ThumbKey) -> bool {
+    OTHER_DESKTOP_KEYS.lock().unwrap().contains(key)
+}
+
+/// The last summon's capturable candidate set, oldest key first (stable for assertions).
+///
+/// This is the record of which windows the summon *considered* capturable, so a test can assert a
+/// window was never requested instead of only reading an eligibility flag: a card on another
+/// desktop must not appear here.
+pub(super) fn last_summon_workset_keys() -> Vec<ThumbKey> {
+    let mut keys: Vec<ThumbKey> = LAST_SUMMON_WORKSET
+        .lock()
+        .unwrap()
+        .keys
+        .iter()
+        .copied()
+        .collect();
+    keys.sort_by_key(|key| (key.pid, key.wid));
+    keys
+}
+
 fn recent_workset_keys() -> HashSet<ThumbKey> {
     let snapshot = LAST_SUMMON_WORKSET.lock().unwrap();
     if snapshot
@@ -581,4 +883,227 @@ pub(crate) fn frame_epoch(pid: i32, wid: u32) -> u64 {
         .peek(&ThumbKey { pid, wid })
         .map(|t| t.epoch)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod scope_evidence_tests {
+    use super::*;
+    use std::sync::Mutex as StdMutex;
+
+    /// These tests touch process-wide state (the registry, the pass table, the forget marks). They
+    /// serialize on this lock instead of relying on distinct pids, and each one cleans up only its
+    /// own keys, so a parallel test can never clear another's evidence mid-assertion.
+    static TEST_LOCK: StdMutex<()> = StdMutex::new(());
+
+    fn clear_keys(pid: i32, wids: &[u32]) {
+        let mut known = OTHER_DESKTOP_KEYS.lock().unwrap();
+        for wid in wids {
+            known.remove(&ThumbKey { pid, wid: *wid });
+        }
+    }
+
+    fn publish_key(pid: i32, wid: u32) {
+        OTHER_DESKTOP_KEYS
+            .lock()
+            .unwrap()
+            .insert(ThumbKey { pid, wid });
+    }
+
+    /// The single observation a taken pass is holding, if any (test-only). Reads the pass that was
+    /// moved out of the thread-local, which is what the publish step will apply.
+    fn pending_observation(pass: &ScopePass) -> Option<bool> {
+        let pass_id = pass.0?;
+        SCOPE_EVIDENCE
+            .lock()
+            .unwrap()
+            .passes
+            .get(&pass_id)?
+            .observed
+            .values()
+            .next()
+            .copied()
+    }
+
+    fn is_other_desktop(pid: i32, wid: u32) -> bool {
+        OTHER_DESKTOP_KEYS
+            .lock()
+            .unwrap()
+            .contains(&ThumbKey { pid, wid })
+    }
+
+    #[test]
+    fn an_accepted_pass_publishes_its_observations() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_001;
+        clear_keys(pid, &[10, 11]);
+        begin_scope_pass();
+        stage_window_scope(pid, 10, true);
+        stage_window_scope(pid, 11, false);
+        take_current_scope_pass()
+            .expect("a pass is installed")
+            .publish();
+        assert!(is_other_desktop(pid, 10));
+        assert!(!is_other_desktop(pid, 11));
+    }
+
+    #[test]
+    fn a_discarded_pass_leaves_the_registry_untouched() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_002;
+        clear_keys(pid, &[20]);
+        publish_key(pid, 20);
+        begin_scope_pass();
+        // The pass says the window came back to this desktop; dropping it must not apply that.
+        stage_window_scope(pid, 20, false);
+        drop(take_current_scope_pass());
+        assert!(is_other_desktop(pid, 20));
+    }
+
+    #[test]
+    fn a_pass_without_an_observation_leaves_the_previous_conclusion_alone() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_003;
+        clear_keys(pid, &[30]);
+        publish_key(pid, 30);
+        // `Unknown` evidence is never staged, so a pass that stages nothing about this key must not
+        // clear it when published.
+        begin_scope_pass();
+        take_current_scope_pass()
+            .expect("a pass is installed")
+            .publish();
+        assert!(is_other_desktop(pid, 30));
+    }
+
+    #[test]
+    fn a_destruction_vetoes_observations_taken_before_it() {
+        // The ordering this pins: collection begins -> window destroyed -> the old pass publishes.
+        // The pass's epoch predates the destruction, so its observation is refused.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_004;
+        clear_keys(pid, &[40]);
+        begin_scope_pass();
+        stage_window_scope(pid, 40, true);
+        forget_window_scope(pid, 40);
+        // The collector then stages the key once more from its older snapshot.
+        stage_window_scope(pid, 40, true);
+        take_current_scope_pass()
+            .expect("a pass is installed")
+            .publish();
+        assert!(
+            !is_other_desktop(pid, 40),
+            "a destroyed window must stay gone"
+        );
+    }
+
+    #[test]
+    fn a_destruction_vetoes_a_pass_that_publishes_late() {
+        // The ordering this pins is the destruction-cleanup effect: the pass carries a real
+        // observation, the window dies, and the destroyed key must not appear afterwards.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_006;
+        clear_keys(pid, &[60]);
+        begin_scope_pass();
+        stage_window_scope(pid, 60, true);
+        let pass = take_current_scope_pass().expect("a pass is installed");
+        // The observation is really pending here; the destruction below then removes it from the
+        // pass, so what this pins is the destruction-cleanup effect (the publish-time validity check
+        // is belt-and-braces under the shared lock, not something this order can exercise).
+        assert_eq!(pending_observation(&pass), Some(true));
+        forget_window_scope(pid, 60);
+        pass.publish();
+        assert!(!is_other_desktop(pid, 60));
+    }
+
+    #[test]
+    fn a_process_end_vetoes_a_pass_that_never_saw_the_window() {
+        // A pid-level invalidation covers windows the ended process never reported, which a
+        // key-by-key mark cannot.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_007;
+        clear_keys(pid, &[70]);
+        begin_scope_pass();
+        forget_process_scope(pid);
+        stage_window_scope(pid, 70, true);
+        take_current_scope_pass()
+            .expect("a pass is installed")
+            .publish();
+        assert!(!is_other_desktop(pid, 70));
+    }
+
+    #[test]
+    fn a_pass_that_begins_after_a_destruction_may_publish_the_recycled_key() {
+        // The other side of the rule: a recycled pid's new window is a new lifecycle, so a pass that
+        // starts after the destruction is not vetoed by it.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_008;
+        clear_keys(pid, &[80]);
+        forget_window_scope(pid, 80);
+        begin_scope_pass();
+        stage_window_scope(pid, 80, true);
+        take_current_scope_pass()
+            .expect("a pass is installed")
+            .publish();
+        assert!(is_other_desktop(pid, 80));
+    }
+
+    #[test]
+    fn a_failed_collection_still_releases_its_pass() {
+        // Protocol-level: this pins the ownership rule the failure branch relies on (a consumed pass
+        // releases its slot and lets the destruction marks go). It does not call
+        // `switchable_capture_window_for_pid`, so it cannot prove that call site's own ordering --
+        // that is checked by reading the call site, not by this test.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let slots_before = super::staged_slot_count();
+        super::begin_scope_pass();
+        super::stage_window_scope(91_010, 100, true);
+        // The caller drops the pass before propagating the failure.
+        let pass = super::take_current_scope_pass();
+        assert!(pass.is_some(), "the failed collection still opened a pass");
+        drop(pass);
+        assert!(super::staged_slot_count() <= slots_before);
+        assert_eq!(super::forget_mark_count(), 0);
+    }
+
+    #[test]
+    fn a_long_lived_thread_can_reclaim_slots_and_forget_marks() {
+        // The failure this pins: a thread that collects once and never consumes the pass (the
+        // startup path, or an idle prewarm thread) would keep the oldest destruction epoch alive, so
+        // the forget marks could never be pruned and would grow for the whole session.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let pid = 91_009;
+        clear_keys(pid, &[90]);
+        let slots_before = super::staged_slot_count();
+        begin_scope_pass();
+        stage_window_scope(pid, 90, true);
+        // A destruction while this pass is still live must keep its mark (the pass may publish late).
+        forget_window_scope(pid, 90);
+        assert!(super::forget_mark_count() > 0, "a live pass needs the mark");
+        // The consumer drops the pass without publishing: both the slot and the now-unneeded mark go.
+        drop(take_current_scope_pass());
+        assert!(super::staged_slot_count() <= slots_before);
+        assert_eq!(
+            super::forget_mark_count(),
+            0,
+            "with no older pass left, the destruction marks must be reclaimable"
+        );
+    }
+
+    #[test]
+    fn repeated_passes_without_consumers_do_not_accumulate_slots() {
+        // A prewarm collection installs a pass and nobody consumes it: the next pass on that thread
+        // (or the thread-local's destructor) must remain the only owner.
+        let _guard = TEST_LOCK.lock().unwrap();
+        let baseline = super::staged_slot_count();
+        for _ in 0..5 {
+            begin_scope_pass();
+            stage_window_scope(91_005, 50, true);
+        }
+        assert!(
+            super::staged_slot_count() <= baseline + 1,
+            "unconsumed passes must not pile up: {} slots",
+            super::staged_slot_count()
+        );
+        drop(take_current_scope_pass());
+        assert!(super::staged_slot_count() <= baseline);
+    }
 }

@@ -33,6 +33,7 @@ mod settings;
 mod single_instance;
 mod skylight;
 mod space_groups;
+mod space_swipe;
 mod space_transition;
 mod theme;
 mod thumbnail;
@@ -119,7 +120,20 @@ impl AppState {
         // initial ordering after a restart matches the native app-level Cmd+Tab order.
         let mut mru = window_collector::seed_mru_from_system_order();
         let windows = if has_accessibility_permission() {
-            window_collector::collect_windows(&mut mru)
+            let windows = window_collector::collect_windows(&mut mru);
+            // The startup collection opens a scope pass like any other; this is the only consumer of
+            // it, so it must be consumed or its slot would sit in this (long-lived) thread pinning
+            // the oldest destruction epoch, which would stop the forget marks from ever healing.
+            if let Some(pass) = crate::thumbnail::take_current_scope_pass() {
+                pass.publish();
+            }
+            // The startup collection's AX evidence is the current truth too; it has no refresh result
+            // to travel in, so publish it here as a full pass.
+            crate::e2e_state::publish_ax_pid_evidence(
+                crate::e2e_state::take_staged_ax_pid_evidence(),
+                None,
+            );
+            windows
         } else {
             Vec::new()
         };
@@ -2426,6 +2440,16 @@ pub fn run() {
     // standard updater UI and automatic checks; the About page reports a clear setup hint when
     // the framework is not present yet.
     updater::initialize(CONFIG.read().unwrap().updates.automatically_check);
+
+    // One-shot instrument for the synthetic Dock swipe (`--space-swipe=left|right`): it posts the
+    // gesture after the app is up and logs the Space before and after, so the mechanism can be
+    // verified without a trackpad. Nothing in the switch path calls it.
+    if let Some(direction) = crate::dev_flags::value("space-swipe") {
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(2000));
+            crate::space_swipe::probe(&direction);
+        });
+    }
 
     if crate::dev_flags::present("smoke-update-prompts") {
         unsafe {

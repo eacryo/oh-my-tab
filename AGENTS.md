@@ -66,8 +66,10 @@ For every non-trivial implementation task:
    tests passing. A half-finished change is never sent to the reviewer, and the reviewer is never used to find
    compile errors or to explore an unfinished design.
 6. Read and evaluate every finding rather than accepting it blindly.
-7. Fix all valid BLOCKER, HIGH, and MEDIUM findings; fix LOW findings when they are worth it.
-8. Ask the **same** reviewer session to review the fixes, then repeat until no significant findings remain.
+7. Triage every valid finding by **impact, not by label** (see *Review budget and triage*): fix the in-scope
+   ones now, and record the rest in `docs/review-backlog.md` with a reason and a revisit trigger.
+8. Ask the **same** reviewer session to review the fixes, then repeat within the review budget. State the
+   deferred findings in `--note` so the reviewer judges the deferral, not just the fixes.
 9. Only then report the task as complete.
 
 A design round does not satisfy the review requirement: it is answered before anything is built, and step 5
@@ -77,6 +79,36 @@ step 2, and both can be asked together.
 
 A task is not complete because the code compiles, the tests pass, the feature works, or the implementation
 looks reasonable. Independent review is mandatory.
+
+## Review budget and triage
+
+A review loop that fixes everything the reviewer can find does not converge: each fix adds surface, the next
+round examines that surface, and the tail is spent on the agent's own test instrument instead of the product.
+One observed task took 21 rounds; the last BLOCKER/HIGH came in round 11, and rounds 12–29 found 45 issues
+without a single one — most of them races inside diagnostic plumbing that only existed to satisfy an earlier
+round. Budget the loop and triage by impact instead.
+
+- **Budget: at most 3 code-review rounds per task** (the first review plus at most two re-reviews; a design
+  round does not count). A fourth round happens only when the user asks for one. Reaching the budget is not a
+  failure: report the remaining findings with the deferral and stop.
+- **In scope, always — whatever the label:** a crash, panic, leak or unbounded growth; data loss; a
+  user-visible behaviour that is wrong, missing or inconsistent with what the UI promises; a breach of an
+  invariant in *Architecture and invariants*; a regression of documented behaviour; a security or privacy
+  problem; a broken gate, or a gate that reports PASS where it cannot decide. A MEDIUM in one of these classes
+  is fixed now even when the reviewer ranked it low.
+- **Deferred to `docs/review-backlog.md`:** rigour of the test instrument beyond the minimum below; races or
+  edge cases that only a diagnostic path can reach; extra assertions and "you could also check X"; comment,
+  copy and doc polish that changes no promise; unrun coverage; re-deriving a number that is not user-facing;
+  speculative hardening. Each entry records the round, severity, why it is deferred, and the trigger that
+  brings it back (usually "next change in this module").
+- **The promotion rule is satisfied by the cheapest sufficient assertion.** One assertion that fails on the
+  original defect — ideally on a pure function, or on a state field the scenario already reads — is enough.
+  Generalising it into a protocol (ownership, epochs, reclamation, cross-thread staging) is backlog work, and
+  building it during the fix is what produced most of the tail above.
+- **State every deferral in `--note`.** The reviewer only sees the prompt, the diff and the repository, so a
+  deferred finding must be visible there with its reason; a round whose only remaining findings are deferred
+  ones counts as PASS. Deferring is a decision, not a silent skip.
+- **Never defer a finding to end a round.** If it is in scope, fix it; if it is not, say so and record it.
 
 ## Independent reviewer
 
