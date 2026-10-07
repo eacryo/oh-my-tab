@@ -403,6 +403,10 @@ pub struct ClipboardSection {
     // (see `clipboard::discard_history_on_disk`). History is written to disk while the app
     // runs, whether or not this is on. Default false.
     pub clear_on_quit: bool,
+    // Show a second header button ("clear all") in the history picker that also takes the
+    // pinned entries of the visible scope. The plain clear button never touches pinned
+    // entries either way. Default false.
+    pub separate_clear_all: bool,
     // Move used entries to the top: pasting (select + Enter) brings the entry to the
     // front (a side effect: the write-back is re-captured by the poll as another copy).
     // When off, pasting does not reorder the history (like Windows Win+V). Default true.
@@ -435,6 +439,7 @@ impl Default for ClipboardSection {
             max_entries: 50,
             show_source_app: false,
             clear_on_quit: false,
+            separate_clear_all: false,
             move_used_to_top: true,
             delete_after_paste: false,
             clear_system_pasteboard_after_paste: false,
@@ -1346,6 +1351,7 @@ impl Config {
         // clear_system_pasteboard_after_paste are bools, always valid.
         self.clipboard.show_source_app = other.clipboard.show_source_app;
         self.clipboard.clear_on_quit = other.clipboard.clear_on_quit;
+        self.clipboard.separate_clear_all = other.clipboard.separate_clear_all;
         self.clipboard.move_used_to_top = other.clipboard.move_used_to_top;
         self.clipboard.delete_after_paste = other.clipboard.delete_after_paste;
         self.clipboard.clear_system_pasteboard_after_paste =

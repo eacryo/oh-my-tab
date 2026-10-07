@@ -548,7 +548,8 @@ pub(super) fn restore_entry_at(
 /// Remove the confirmed history scope and return dropped entries for cache-reference checks.
 /// The scope is what the user can see: the active filter's category narrowed by the search query
 /// (`filtered_indices`). Clearing only what is on screen keeps a destructive action from deleting
-/// entries the user never saw; `clear_all` additionally takes the pinned entries in that scope.
+/// entries the user never saw. Pinned entries survive every clear except the explicit "clear all"
+/// (`clear_all`), which is opt-in through a setting and still limited to the visible scope.
 pub(super) fn remove_history_scope(
     history: &mut Vec<ClipEntry>,
     clear_all: bool,
@@ -574,77 +575,50 @@ pub(super) fn remove_history_scope(
     removed
 }
 
-/// The two header clear actions, named after the set they will clear: the active filter's
-/// category, or "results" while a query narrows the list. One place so the button titles and the
-/// behaviour cannot drift apart.
+/// The header's two clear actions. The first ("clear") sweeps the visible scope but never takes
+/// pinned entries, and its name follows what it keeps safe: a query is active -> "clear current";
+/// a category is selected -> "clear this category"; otherwise the plain "clear". The second
+/// ("clear all", shown only when the user opts in through the settings switch) also takes the
+/// pinned entries of the visible scope, so its name states the wider reach. One place so the
+/// button titles and the behaviour cannot drift apart.
 /// Pure, unit-tested.
 pub(super) fn clip_clear_labels(filter: ClipFilter, has_query: bool) -> (String, String) {
-    if has_query {
-        return (
-            t("clipboard.clear_scope_unpinned_results"),
-            t("clipboard.clear_scope_all_results"),
-        );
-    }
-    if filter == ClipFilter::All {
-        return (
-            t("clipboard.clear_confirm_unpinned"),
-            t("clipboard.clear_confirm_all"),
-        );
-    }
-    let kind: String = match filter {
-        ClipFilter::All => String::new(),
-        ClipFilter::Text => t("clipboard.filter_text"),
-        ClipFilter::Image => t("clipboard.filter_image"),
-        ClipFilter::Link => t("clipboard.filter_link"),
-        ClipFilter::Code => t("clipboard.filter_code"),
+    let clear = if has_query {
+        t("clipboard.clear_button_query")
+    } else if filter == ClipFilter::All {
+        t("clipboard.clear_button")
+    } else {
+        t("clipboard.clear_button_category")
     };
-    (
-        tf("clipboard.clear_scope_unpinned", &[("kind", kind.as_str())]),
-        tf("clipboard.clear_scope_all", &[("kind", kind.as_str())]),
-    )
+    let clear_all = if has_query {
+        t("clipboard.clear_scope_all_results")
+    } else if filter == ClipFilter::All {
+        t("clipboard.clear_confirm_all")
+    } else {
+        let kind: String = match filter {
+            ClipFilter::All => String::new(),
+            ClipFilter::Text => t("clipboard.filter_text"),
+            ClipFilter::Image => t("clipboard.filter_image"),
+            ClipFilter::Link => t("clipboard.filter_link"),
+            ClipFilter::Code => t("clipboard.filter_code"),
+        };
+        tf("clipboard.clear_scope_all", &[("kind", kind.as_str())])
+    };
+    (clear, clear_all)
 }
 
-/// The width each clear action reserves: the widest of its variants in the CURRENT locale, so the
-/// buttons never resize when the filter changes, a query is typed, or the locale is switched.
-/// `measure` is injected (the header and the locale refresh both pass `localized_string_width` on
-/// the caption font) so the rule itself is pure and testable.
+/// The width a clear action shows right now: its CURRENT label measured on the caption font plus
+/// a small click slack. The button hugs its text and resizes (and the right-aligned pair
+/// repositions) whenever the filter, the query or the locale changes the label.
+/// `measure` is injected (the header and the locale refresh both pass `localized_string_width`)
+/// so the rule itself is pure and testable.
 /// Pure, unit-tested.
-pub(super) fn clip_clear_action_widths(measure: impl Fn(&str) -> f64) -> [f64; 2] {
-    let variants = clip_clear_label_variants();
-    std::array::from_fn(|i| {
-        variants[i]
-            .iter()
-            .map(|label| measure(label))
-            .fold(0.0_f64, f64::max)
-    })
+pub(super) fn clip_clear_action_width(label: &str, measure: impl Fn(&str) -> f64) -> f64 {
+    measure(label) + CLEAR_ACTION_CLICK_SLACK
 }
 
-/// Every label the two clear actions can show, so the header can reserve the widest one: the
-/// buttons must not move when the filter changes or a query is typed.
-/// Pure, unit-tested.
-pub(super) fn clip_clear_label_variants() -> [Vec<String>; 2] {
-    let filters = [
-        ClipFilter::All,
-        ClipFilter::Text,
-        ClipFilter::Image,
-        ClipFilter::Link,
-        ClipFilter::Code,
-    ];
-    std::array::from_fn(|action| {
-        let mut variants: Vec<String> = [false, true]
-            .iter()
-            .flat_map(|has_query| {
-                filters
-                    .iter()
-                    .map(move |filter| clip_clear_labels(*filter, *has_query))
-            })
-            .map(|labels| [labels.0, labels.1][action].clone())
-            .collect();
-        variants.sort();
-        variants.dedup();
-        variants
-    })
-}
+/// Horizontal click slack added around a clear action's measured text width.
+pub(super) const CLEAR_ACTION_CLICK_SLACK: f64 = 8.0;
 
 /// Record a new text into the history:
 /// - empty text is ignored

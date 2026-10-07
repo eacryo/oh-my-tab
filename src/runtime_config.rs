@@ -34,6 +34,8 @@ struct ChangeFlags {
     mouse: bool,
     clipboard_enabled: bool,
     clipboard_shortcut: bool,
+    // The "separate clear all" switch: the picker header shows or hides its second button live.
+    clipboard_clear_actions: bool,
     window_control: bool,
     quick_actions: bool,
     keystroke_display: bool,
@@ -80,6 +82,8 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
+        clipboard_clear_actions: startup
+            || old.clipboard.separate_clear_all != new.clipboard.separate_clear_all,
         window_control: startup || old.window_control.enabled != new.window_control.enabled,
         quick_actions: startup || old.quick_actions.enabled != new.quick_actions.enabled,
         keystroke_display: startup || old.keystroke_display != new.keystroke_display,
@@ -137,6 +141,12 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::event_monitor::set_clipboard_shortcut(&new.clipboard.shortcut);
         crate::settings::refresh_clipboard_shortcut_control_from_config();
         crate::onboarding::refresh_clipboard_shortcut(&new.clipboard.shortcut);
+    }
+    if flags.clipboard_clear_actions {
+        crate::clipboard::update_clear_action_labels();
+        // An already-open settings window must re-read the switch too, or it shows the old
+        // value while the picker header already follows the new one.
+        crate::settings::refresh_clipboard_separate_clear_all_switch_from_config();
     }
     if flags.windows_disabled {
         crate::overlay::reset_switcher();
@@ -265,6 +275,33 @@ mod tests {
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.clipboard_shortcut);
         assert!(!flags.clipboard_enabled);
+    }
+
+    #[test]
+    fn separate_clear_all_changes_are_detected_in_both_directions_alone() {
+        // The reload path keys the picker relayout and the settings-switch sync off this flag
+        // alone: it must fire in both directions and stay silent for unrelated fields.
+        let old = Config::default();
+        let mut on = old.clone();
+        on.clipboard.separate_clear_all = true;
+        let flags_on = change_flags(&old, &on, ConfigChangeSource::Reload);
+        assert!(
+            flags_on.clipboard_clear_actions,
+            "off -> on must be detected"
+        );
+        assert!(
+            !flags_on.clipboard_enabled && !flags_on.clipboard_shortcut && !flags_on.visual,
+            "no unrelated flag may fire"
+        );
+        assert!(
+            !needs_in_place_control_sync(&flags_on),
+            "the switch sync is targeted, not a full settings-page rebuild"
+        );
+        let flags_off = change_flags(&on, &old, ConfigChangeSource::Reload);
+        assert!(
+            flags_off.clipboard_clear_actions,
+            "on -> off must be detected"
+        );
     }
 
     #[test]

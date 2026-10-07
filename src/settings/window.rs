@@ -1570,6 +1570,8 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         cfg.keystroke_display.mode = "commands".into();
         cfg.keystroke_display.tap_level = "hid".into();
         cfg.keystroke_display.display_position = "caret".into();
+        cfg.keystroke_display.initial_position = "bottom".into();
+        cfg.clipboard.separate_clear_all = true;
         if let Ok(mut current) = CONFIG.write() {
             *current = cfg.clone();
         }
@@ -1620,7 +1622,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         refreshed_cfg.keystroke_display.display_position = "main".into();
         refreshed_cfg.keystroke_display.initial_position = "left".into();
         if let Ok(mut current) = CONFIG.write() {
-            *current = refreshed_cfg;
+            *current = refreshed_cfg.clone();
         }
         refresh_switcher_keystroke_and_mouse_controls_from_config();
         let refreshed = with_settings_ui(|ui| {
@@ -1633,6 +1635,26 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 msg_send![ui.keystroke_display_initial_position, indexOfSelectedItem],
             ))
         });
+        // The "separate clear all" switch must follow a config reload in both directions while
+        // the window stays open: the reload path in apply_config_change re-reads the switch
+        // (the picker header relayout rides the same flag), so an open window never shows a
+        // stale value after a config-file edit or defaults restore.
+        let clear_switch_after_reload = |before: &Config, after: Config| -> Option<isize> {
+            if let Ok(mut current) = CONFIG.write() {
+                *current = after.clone();
+            }
+            apply_config_change(before, &after, ConfigChangeSource::Reload);
+            with_settings_ui(|ui| {
+                ui.as_ref()
+                    .map(|u| msg_send![u.clipboard_separate_clear_all, state])
+            })
+        };
+        let mut reloaded_off = refreshed_cfg.clone();
+        reloaded_off.clipboard.separate_clear_all = false;
+        let switch_off = clear_switch_after_reload(&refreshed_cfg, reloaded_off.clone());
+        let mut reloaded_on = reloaded_off.clone();
+        reloaded_on.clipboard.separate_clear_all = true;
+        let switch_on = clear_switch_after_reload(&reloaded_off, reloaded_on);
         hide_settings();
 
         let rebuilt_matches = states
@@ -1641,6 +1663,7 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 1isize, true,
             ));
         let refreshed_matches = refreshed == Some((0isize, 1isize, 0isize, 0isize, 2isize));
+        let switch_follows_reload = switch_off == Some(0) && switch_on == Some(1);
         if !rebuilt_matches {
             log_info!("[smoke-settings-state-sync] rebuilt control state mismatch: {states:?}");
         }
@@ -1649,7 +1672,12 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 "[smoke-settings-state-sync] refreshed control state mismatch: {refreshed:?}"
             );
         }
-        rebuilt_matches && refreshed_matches
+        if !switch_follows_reload {
+            log_info!(
+                "[smoke-settings-state-sync] separate-clear-all switch mismatch: off={switch_off:?} on={switch_on:?}"
+            );
+        }
+        rebuilt_matches && refreshed_matches && switch_follows_reload
     }
 }
 
@@ -2304,6 +2332,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             quick_actions_lock_screen: std::ptr::null_mut(),
             quick_actions_locate_pointer: std::ptr::null_mut(),
             clipboard_clear_on_quit: std::ptr::null_mut(),
+            clipboard_separate_clear_all: std::ptr::null_mut(),
             clipboard_move_used_to_top: std::ptr::null_mut(),
             clipboard_delete_after_paste: std::ptr::null_mut(),
             clipboard_clear_system_pasteboard_after_paste: std::ptr::null_mut(),

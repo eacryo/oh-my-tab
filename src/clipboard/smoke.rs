@@ -195,19 +195,26 @@ pub(crate) fn smoke_runner() -> bool {
         );
     }
 
-    /// The two clear actions must show (and reserve room for) the scope the current filter and query
-    /// describe, in the locale in effect. Runs on the main thread: the state lives behind
-    /// `MainThreadSlot`s. Every path that can change the scope or the locale has to leave this true.
+    /// The clear actions must show the scope the current filter, query and "separate clear all"
+    /// setting describe, in the locale in effect, and each button's width must hug its CURRENT
+    /// title. Runs on the main thread: the state lives behind `MainThreadSlot`s. Every path that
+    /// can change the scope, the setting or the locale has to leave this true.
     unsafe fn assert_clear_actions_match_scope() {
         let applied =
             || super::text_style::clear_action_applied().expect("the clear actions applied");
-        let (unpinned, all, widths) = applied();
+        let state = applied();
+        let (clear, clear_all, widths, show_all) = (
+            state.clear.clone(),
+            state.clear_all.clone(),
+            state.widths,
+            state.show_all,
+        );
         let expected = super::clip_clear_labels(
             *super::CLIP_FILTER.lock().unwrap(),
             super::with_clipboard_ui(|ui| !ui.search_query.is_empty()),
         );
         assert_eq!(
-            (unpinned, all),
+            (clear, clear_all),
             expected,
             "the clear actions must name the scope they clear"
         );
@@ -227,16 +234,55 @@ pub(crate) fn smoke_runner() -> bool {
             vec![expected.0.clone(), expected.1.clone()],
             "the buttons must show the scope they clear"
         );
-        let widest: [f64; 2] = std::array::from_fn(|index| {
-            super::clip_clear_label_variants()[index]
-                .iter()
-                .map(|label| super::localized_string_width(label, crate::theme::FONT_CAPTION) + 8.0)
-                .fold(0.0_f64, f64::max)
-        });
+        // The width hugs the CURRENT title: measured text plus the shared click slack — not the
+        // widest variant (the old reservation left a wide pill around the short "clear").
+        let measured: [f64; 2] = [
+            super::localized_string_width(&titles[0], crate::theme::FONT_CAPTION),
+            super::localized_string_width(&titles[1], crate::theme::FONT_CAPTION),
+        ]
+        .map(|width| width + super::CLEAR_ACTION_CLICK_SLACK);
         assert!(
-            widths[0] >= widest[0] && widths[1] >= widest[1],
-            "reserved {widths:?} must cover the widest variant {widest:?}"
+            widths[0] == measured[0] && widths[1] == measured[1],
+            "widths {widths:?} must hug the current titles {measured:?}"
         );
+        // The second button's visibility is the setting's decision; the hidden button parks with a
+        // zero-size frame while the plain clear keeps its full text-hugging width.
+        let buttons = (*CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap()).unwrap();
+        let hidden: bool = msg_send![buttons[1].0, isHidden];
+        assert_eq!(
+            !hidden, show_all,
+            "the clear-all button's visibility must follow the setting"
+        );
+        let frames: [NSRect; 2] = buttons.map(|button| msg_send![button.0, frame]);
+        assert!(
+            (frames[0].size.width - widths[0]).abs() < 0.5,
+            "the plain clear must keep its text-hugging width in both visibility states"
+        );
+        if show_all {
+            assert!(
+                frames[1].size.width >= widths[1],
+                "the visible clear-all button must fit its title"
+            );
+        }
+        // The hover tracking area keeps the rect it was created with, so every resize must have
+        // rebuilt it: after the initial layout AND after any label change it must cover the
+        // button's current bounds (the width used to stay at the 1pt build placeholder). A
+        // tracking rect lives in the button's own coordinate system, so compare it to bounds.
+        for button in buttons.iter() {
+            let bounds: NSRect = msg_send![button.0, bounds];
+            let areas: *mut AnyObject = msg_send![button.0, trackingAreas];
+            let count: usize = msg_send![areas, count];
+            let covered = (0..count).any(|i| {
+                let ta: *mut AnyObject = msg_send![areas, objectAtIndex: i];
+                let rect: NSRect = msg_send![ta, rect];
+                (rect.size.width - bounds.size.width).abs() < 0.5
+                    && (rect.size.height - bounds.size.height).abs() < 0.5
+            });
+            assert!(
+                covered,
+                "a tracking area must cover the clear button's current bounds {bounds:?} (found {count})"
+            );
+        }
     }
 
     // Footer shortcut legends must survive the fonts they are drawn with, in every shipped
@@ -305,12 +351,54 @@ pub(crate) fn smoke_runner() -> bool {
             );
         }
     }
-    // Clear-entry GUI smoke: both clear actions remain visible side by side without an
-    // expansion card; clear scopes are covered by pure logic tests so this smoke retains all
-    // fixtures for the subsequent detail path.
+    // Clear-entry GUI smoke: the plain clear is always visible; the opt-in "clear all" appears
+    // beside it only with the setting on, and both remain hit-testable in either state. Clear
+    // scopes are covered by pure logic tests so this smoke retains all fixtures for the
+    // subsequent detail path.
     unsafe {
         let buttons = (*CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap())
             .expect("persistent clear action buttons must be built");
+        // Hit-test from the window's content view, with the point converted to window
+        // coordinates. (The panel's elevation-outline work nested the content parent inside a
+        // padded container, so hit-testing `parent` directly with parent-local coordinates
+        // silently tested a point shifted by that container's origin.)
+        let content: *mut AnyObject = {
+            let win: *mut AnyObject = msg_send![buttons[0].0, window];
+            msg_send![win, contentView]
+        };
+        let is_hit_testable = |button: *mut AnyObject| -> bool {
+            let bounds: NSRect = msg_send![button, bounds];
+            let in_window: NSRect = msg_send![button, convertRect: bounds, toView: std::ptr::null_mut::<objc2::runtime::AnyObject>()];
+            let center = NSPoint::new(
+                in_window.origin.x + in_window.size.width / 2.0,
+                in_window.origin.y + in_window.size.height / 2.0,
+            );
+            let hit: *mut AnyObject = msg_send![content, hitTest: center];
+            hit == button
+        };
+        let original_separate = CONFIG.read().unwrap().clipboard.separate_clear_all;
+        // Setting off (the default): only the plain clear is visible and hit-testable; the
+        // clear-all button is hidden with a zero-size frame so it can never catch a click.
+        CONFIG.write().unwrap().clipboard.separate_clear_all = false;
+        update_clear_action_labels();
+        let frame0: NSRect = msg_send![buttons[0].0, frame];
+        let hidden1: bool = msg_send![buttons[1].0, isHidden];
+        assert!(
+            hidden1,
+            "clear-all button must hide while the setting is off"
+        );
+        assert!(
+            frame0.size.width > 0.0,
+            "the plain clear must keep a real frame while the setting is off"
+        );
+        assert!(
+            is_hit_testable(buttons[0].0),
+            "the plain clear must remain directly hit-testable (frame0={frame0:?})"
+        );
+        // Setting on: both buttons visible side by side (plain clear left, clear-all right) with
+        // the shared gap, and both hit-testable.
+        CONFIG.write().unwrap().clipboard.separate_clear_all = true;
+        update_clear_action_labels();
         let frames: [NSRect; 2] = buttons.map(|button| msg_send![button.0, frame]);
         assert!(frames[0].origin.x < frames[1].origin.x);
         assert_eq!(frames[0].origin.y, frames[1].origin.y);
@@ -318,21 +406,14 @@ pub(crate) fn smoke_runner() -> bool {
             frames[1].origin.x - (frames[0].origin.x + frames[0].size.width),
             super::CLEAR_ACTION_GAP
         );
-        let header: *mut AnyObject = msg_send![buttons[0].0, superview];
-        let parent: *mut AnyObject = msg_send![header, superview];
         for button in buttons {
-            let bounds: NSRect = msg_send![button.0, bounds];
-            let in_parent: NSRect = msg_send![button.0, convertRect: bounds, toView: parent];
-            let center = NSPoint::new(
-                in_parent.origin.x + in_parent.size.width / 2.0,
-                in_parent.origin.y + in_parent.size.height / 2.0,
-            );
-            let hit: *mut AnyObject = msg_send![parent, hitTest: center];
-            assert_eq!(
-                hit, button.0,
+            assert!(
+                is_hit_testable(button.0),
                 "clear action button must remain directly hit-testable"
             );
         }
+        CONFIG.write().unwrap().clipboard.separate_clear_all = original_separate;
+        update_clear_action_labels();
         let pills: Vec<*mut AnyObject> = FILTER_PILLS
             .lock()
             .unwrap()
@@ -347,17 +428,17 @@ pub(crate) fn smoke_runner() -> bool {
             "filter tabs must remain visible beside clear actions"
         );
     }
-    // Clear-action scope smoke: a typed query names the result scope, clearing the query through the
-    // shared path (the × key, the field's Esc, a fresh summon) restores the category wording, and the
-    // reservation always covers the widest variant. Clearing the query by hand in the list-focus Esc
-    // branch used to leave "results" on the buttons.
+    // Clear-action scope smoke: a typed query renames the plain clear to the "current" wording
+    // (and the opt-in clear-all to "all results"); clearing the query through the shared path
+    // (the × key, the field's Esc, a fresh summon) restores the category wording. Clearing the
+    // query by hand in the list-focus Esc branch used to leave a stale scope on the buttons.
     unsafe {
         super::with_clipboard_ui(|ui| ui.search_query = "apple".to_string());
         update_clear_action_labels();
         assert_eq!(
-            super::text_style::clear_action_applied().unwrap().0,
-            super::t("clipboard.clear_scope_unpinned_results"),
-            "a typed query must name the result scope"
+            super::text_style::clear_action_applied().unwrap().clear,
+            super::t("clipboard.clear_button_query"),
+            "a typed query must name the current view"
         );
         clear_search();
         assert_clear_actions_match_scope();

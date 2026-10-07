@@ -236,6 +236,7 @@ pub(super) struct SettingsUi {
     clipboard_pin_follow_row_height: f64,
     clipboard_row_gap: f64,
     clipboard_clear_on_quit: *mut AnyObject, // clear clipboard history when the app quits
+    clipboard_separate_clear_all: *mut AnyObject, // show the opt-in "clear all" header button
     clipboard_move_used_to_top: *mut AnyObject, // move used entries to top
     clipboard_delete_after_paste: *mut AnyObject, // delete entry after paste
     clipboard_clear_system_pasteboard_after_paste: *mut AnyObject, // clear system pasteboard after paste
@@ -384,6 +385,10 @@ pub(super) fn with_settings_ui<R>(f: impl FnOnce(&mut Option<SettingsUi>) -> R) 
 /// Refresh just the clipboard shortcut recorder after a config reload without rebuilding Settings.
 pub(crate) fn refresh_clipboard_shortcut_control_from_config() {
     dispatch::refresh_clipboard_shortcut_record_control();
+}
+
+pub(crate) fn refresh_clipboard_separate_clear_all_switch_from_config() {
+    dispatch::refresh_clipboard_separate_clear_all_switch_from_config();
 }
 
 pub(crate) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option<&str>) {
@@ -1141,6 +1146,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.clipboard.clear_on_quit
     );
     changed!(
+        "clipboard.separate_clear_all",
+        old.clipboard.separate_clear_all,
+        new.clipboard.separate_clear_all
+    );
+    changed!(
         "clipboard.move_used_to_top",
         old.clipboard.move_used_to_top,
         new.clipboard.move_used_to_top
@@ -1475,6 +1485,14 @@ fn load_settings_from(cfg: &Config) {
             let _: () = msg_send![
                 ui.clipboard_clear_on_quit,
                 setState: if cfg.clipboard.clear_on_quit { 1isize } else { 0isize }
+            ];
+            let _: () = msg_send![
+                ui.clipboard_separate_clear_all,
+                setState: if cfg.clipboard.separate_clear_all {
+                    1isize
+                } else {
+                    0isize
+                }
             ];
             let _: () = msg_send![
                 ui.clipboard_show_source_app,

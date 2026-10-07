@@ -1436,6 +1436,21 @@ pub(super) unsafe fn build_clipboard_page(
     bind_control(target, ui.clipboard_clear_on_quit);
     let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
+    // Opt-in second header button in the history picker ("clear all"): it also takes the pinned
+    // entries of the visible scope, so it stays off by default. The plain clear button never
+    // touches pinned entries either way.
+    ui.clipboard_separate_clear_all = SettingsRow::plain(
+        clipboard_view,
+        label_x,
+        cy,
+        236.0,
+        described_row_h,
+        &t("settings.row_clipboard_separate_clear_all"),
+        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
+    );
+    bind_control(target, ui.clipboard_separate_clear_all);
+    let cy = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // show the source app.
     ui.clipboard_show_source_app = SettingsRow::plain(
         clipboard_view,

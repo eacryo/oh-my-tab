@@ -974,22 +974,15 @@ pub(super) unsafe fn ensure_picker_window() {
     }
     update_filter_pill_style(false);
 
-    // Clear history: keep two compact text actions visible beside the filters. Their text names the
-    // scope they clear (the active category, or "results" while a query narrows the list) and is
-    // refreshed by `update_clear_action_labels`; the frames reserve the widest variant so switching
-    // filter or typing a query moves nothing.
-    let clear_actions = [sel!(clearClipboardUnpinned:), sel!(clearClipboardAll:)];
-    let clear_widths: [f64; 2] =
-        clip_clear_action_widths(|label| localized_string_width(label, crate::theme::FONT_CAPTION))
-            .map(|width| width + 8.0);
-    let clear_total_w = clear_widths.iter().sum::<f64>() + CLEAR_ACTION_GAP;
-    let mut clear_x = PICKER_W - SEARCH_PAD_X - clear_total_w;
+    // Clear history: one compact text action beside the filters always ("clear", pinned entries
+    // stay), plus an opt-in second one ("clear all", settings switch, also takes the pinned
+    // entries). Their text names the scope they clear; `update_clear_action_labels` sizes each
+    // button to its CURRENT label, decides the second button's visibility and lays the pair out
+    // right-aligned, so the build below only needs placeholder frames.
+    let clear_actions = [sel!(clearClipboardHistory:), sel!(clearClipboardAll:)];
     let mut clear_buttons = [std::ptr::null_mut(); 2];
-    for i in 0..2 {
-        let frame = NSRect::new(
-            NSPoint::new(clear_x, filters_y + 8.0),
-            NSSize::new(clear_widths[i], 20.0),
-        );
+    for (i, action) in clear_actions.iter().enumerate() {
+        let frame = NSRect::new(NSPoint::new(0.0, filters_y + 8.0), NSSize::new(1.0, 20.0));
         let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
         let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
         let _: () = msg_send![button, setBordered: false];
@@ -1002,17 +995,16 @@ pub(super) unsafe fn ensure_picker_window() {
             msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
         let _: () = msg_send![button, setFont: font];
         let _: () = msg_send![button, setTarget: observer()];
-        let _: () = msg_send![button, setAction: clear_actions[i]];
+        let _: () = msg_send![button, setAction: *action];
         set_clear_confirmation_button_style(button, false);
         add_hover_tracking(button);
         let _: () = msg_send![header_strip, addSubview: button];
         release_obj(button);
         clear_buttons[i] = button;
-        clear_x += clear_widths[i] + CLEAR_ACTION_GAP;
     }
     *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() =
         Some([ObjPtr::new(clear_buttons[0]), ObjPtr::new(clear_buttons[1])]);
-    // Initial titles for the current filter (and no query yet).
+    // Initial titles, text-hugging widths and visibility for the current filter and setting.
     update_clear_action_labels();
 
     // (clear history now lives in the filters row).

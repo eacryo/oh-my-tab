@@ -49,6 +49,7 @@ pub(super) enum ControlField {
     MappingEnabled,
     ClipboardEnabled,
     ClipboardClearOnQuit,
+    ClipboardSeparateClearAll,
     ClipboardShowSourceApp,
     ClipboardMoveUsedToTop,
     ClipboardDeleteAfterPaste,
@@ -173,6 +174,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                 m(
                     u.clipboard_clear_on_quit,
                     ControlField::ClipboardClearOnQuit,
+                )
+            })
+            .or_else(|| {
+                m(
+                    u.clipboard_separate_clear_all,
+                    ControlField::ClipboardSeparateClearAll,
                 )
             })
             .or_else(|| {
@@ -324,6 +331,23 @@ pub(super) fn refresh_clipboard_shortcut_record_control() {
     let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
         && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
     set_clipboard_shortcut_recording_ui(recording, None);
+}
+
+/// Re-read the "separate clear all" switch from CONFIG. A config reload (file edit, defaults
+/// restore) can flip the field while the settings window stays open; without this the switch
+/// shows the old value while the picker header already follows the new one.
+pub(super) fn refresh_clipboard_separate_clear_all_switch_from_config() {
+    let on = CONFIG.read().unwrap().clipboard.separate_clear_all;
+    with_settings_ui(|ui| {
+        if let Some(u) = ui.as_ref() {
+            unsafe {
+                let _: () = msg_send![
+                    u.clipboard_separate_clear_all,
+                    setState: if on { 1isize } else { 0isize }
+                ];
+            }
+        }
+    });
 }
 
 pub(super) fn apply_recorded_clipboard_shortcut(shortcut: &str) {
@@ -632,6 +656,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ClipboardClearOnQuit => {
                     let state: isize = msg_send![u.clipboard_clear_on_quit, state];
                     cfg.clipboard.clear_on_quit = state == 1;
+                }
+                ControlField::ClipboardSeparateClearAll => {
+                    let state: isize = msg_send![u.clipboard_separate_clear_all, state];
+                    cfg.clipboard.separate_clear_all = state == 1;
                 }
                 ControlField::ClipboardShowSourceApp => {
                     let state: isize = msg_send![u.clipboard_show_source_app, state];
@@ -1135,6 +1163,7 @@ pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
         ui.clipboard_shortcut,
         ui.clipboard_pin_follow,
         ui.clipboard_clear_on_quit,
+        ui.clipboard_separate_clear_all,
         ui.clipboard_show_source_app,
         ui.clipboard_move_used_to_top,
         ui.clipboard_delete_after_paste,

@@ -89,8 +89,8 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
-                sel!(clearClipboardUnpinned:),
-                clear_clipboard_unpinned as *mut c_void,
+                sel!(clearClipboardHistory:),
+                clear_clipboard_history as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -1013,7 +1013,7 @@ pub(super) fn picker_filters_y() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
 }
 
-extern "C" fn clear_clipboard_unpinned(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     clear_clipboard_history_scope(false);
 }
 
@@ -1027,7 +1027,8 @@ extern "C" fn picker_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) 
 }
 
 /// Clear the visible history scope (see `remove_history_scope`) and release the cache files of the
-/// entries that went away, then rewrite the file and refresh the list.
+/// entries that went away, then rewrite the file and refresh the list. The plain clear keeps the
+/// pinned entries; only the explicit "clear all" button takes them.
 fn clear_clipboard_history_scope(clear_all: bool) {
     discard_deleted_clipboard_entry();
     cancel_clipboard_undo_timer();
@@ -1072,7 +1073,7 @@ pub(super) fn clear_search() {
     with_clipboard_ui(|ui| ui.search_query.clear());
     SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
     unsafe { set_search_clear_button_visible(false) };
-    // The clear actions are named after their scope, which is no longer "results".
+    // The clear actions name the scope they clear, which is no longer "current view".
     update_clear_action_labels();
     if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
         unsafe {

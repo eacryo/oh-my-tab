@@ -448,7 +448,7 @@ unsafe fn make_detail_action_icon_with(
 /// Apply the shared clipboard action-button state to its own rounded hover background.
 /// never the button background.
 fn is_clear_history_destructive_action(action: Sel) -> bool {
-    action == sel!(clearClipboardUnpinned:) || action == sel!(clearClipboardAll:)
+    action == sel!(clearClipboardHistory:) || action == sel!(clearClipboardAll:)
 }
 
 unsafe fn is_clear_history_action_button(button: *mut AnyObject) -> bool {
@@ -846,55 +846,95 @@ pub(super) unsafe fn make_filter_pill(
     b
 }
 
-/// Build the clear-history confirmation card alongside the fixed header so its lower rows
-/// remain interactive while it overlays the list.
-#[allow(dead_code)]
-/// Retitle the two clear actions after the filter or the query changed. The text names the scope
-/// that will be cleared (the active category, or "results" while a query narrows the list), so a
-/// destructive action is never ambiguous. Frames are fixed to the widest variant (`clear_*_width`
-/// in the header builder), so retitling moves no button.
-/// What the two clear actions show right now (titles + reserved widths), written by
-/// `update_clear_action_labels`. See `clear_action_applied`.
-static CLEAR_ACTION_APPLIED: Mutex<Option<(String, String, [f64; 2])>> = Mutex::new(None);
+/// What the two clear actions show right now, written by `update_clear_action_labels`. See
+/// `clear_action_applied`.
+#[derive(Clone)]
+pub(super) struct ClearActionState {
+    pub(super) clear: String,
+    pub(super) clear_all: String,
+    pub(super) widths: [f64; 2],
+    pub(super) show_all: bool,
+}
 
-pub(super) fn update_clear_action_labels() {
+static CLEAR_ACTION_APPLIED: Mutex<Option<ClearActionState>> = Mutex::new(None);
+
+/// Whether the opt-in second button ("clear all", which also takes pinned entries) is shown.
+/// Pure config read so every layout path agrees on the visibility rule.
+fn clear_all_button_visible() -> bool {
+    CONFIG.read().unwrap().clipboard.separate_clear_all
+}
+
+/// Retitle and relayout the two clear actions after the filter, the query or the
+/// "separate clear all" setting changed. The first button's text names the scope it clears while
+/// keeping pinned entries safe; the second (shown only when the user opts in through settings)
+/// states the wider reach that also takes the pinned entries. Each button hugs its CURRENT label
+/// (`clip_clear_action_width`), so retitling also resizes it, and the visible pair is
+/// re-right-aligned in the filters row.
+pub(crate) fn update_clear_action_labels() {
     let filter = *CLIP_FILTER.lock().unwrap();
     let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
-    let (unpinned, all) = clip_clear_labels(filter, has_query);
-    let widths: [f64; 2] =
-        clip_clear_action_widths(|label| localized_string_width(label, crate::theme::FONT_CAPTION))
-            .map(|width| width + 8.0);
+    let (clear, clear_all) = clip_clear_labels(filter, has_query);
+    let measure = |label: &str| localized_string_width(label, crate::theme::FONT_CAPTION);
+    let widths: [f64; 2] = [
+        clip_clear_action_width(&clear, measure),
+        clip_clear_action_width(&clear_all, measure),
+    ];
+    let show_all = clear_all_button_visible();
     // Recorded unconditionally: the titles and the reservation are what the two actions show, and
     // the regression test reads this instead of poking at AppKit buttons.
-    *CLEAR_ACTION_APPLIED.lock().unwrap() = Some((unpinned.clone(), all.clone(), widths));
+    *CLEAR_ACTION_APPLIED.lock().unwrap() = Some(ClearActionState {
+        clear: clear.clone(),
+        clear_all: clear_all.clone(),
+        widths,
+        show_all,
+    });
     let buttons = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap();
     let Some(buttons) = buttons else {
         return;
     };
-    let total_width = widths.iter().sum::<f64>() + CLEAR_ACTION_GAP;
+    // The visible buttons are right-aligned; the hidden one parks at the far right edge with a
+    // zero-size frame so it can never be hit.
+    let visible_widths: [f64; 2] = [widths[0], if show_all { widths[1] } else { 0.0 }];
+    let total_width =
+        visible_widths.iter().sum::<f64>() + if show_all { CLEAR_ACTION_GAP } else { 0.0 };
     let mut x = PICKER_W - SEARCH_PAD_X - total_width;
-    for (index, ((button, label), width)) in
-        buttons.iter().zip([unpinned, all]).zip(widths).enumerate()
+    for (index, ((button, label), width)) in buttons
+        .iter()
+        .zip([clear, clear_all])
+        .zip(visible_widths)
+        .enumerate()
     {
         unsafe {
             set_clear_action_button_frame(
                 index,
                 NSRect::new(NSPoint::new(x, 0.0), NSSize::new(width, 20.0)),
             );
+            // The buttons are built with placeholder frames and their hover tracking area keeps
+            // the rect it was created with, so every resize must rebuild it — or hover feedback
+            // would only cover the 1pt-wide placeholder.
+            refresh_tracking_area_to_bounds(button.0);
         }
         let title = make_nsstring(&label);
         unsafe {
             let _: () = msg_send![button.0, setTitle: title];
             CFRelease(title as *const c_void);
         }
-        x += width + CLEAR_ACTION_GAP;
+        x += if index == 0 && show_all {
+            width + CLEAR_ACTION_GAP
+        } else {
+            width
+        };
+    }
+    unsafe {
+        let _: () = msg_send![buttons[1].0, setHidden: !show_all];
     }
 }
 
-/// The titles and reserved widths the two clear actions currently show, as last applied. Exposed so
-/// the assertions can check every call site (filter change, query change, locale refresh) without a
-/// built header; `None` until the first apply.
-pub(super) fn clear_action_applied() -> Option<(String, String, [f64; 2])> {
+/// The titles and reserved widths the two clear actions currently show (plus whether the "clear
+/// all" button is visible), as last applied. Exposed so the assertions can check every call site
+/// (filter change, query change, locale refresh, setting change) without a built header; `None`
+/// until the first apply.
+pub(super) fn clear_action_applied() -> Option<ClearActionState> {
     CLEAR_ACTION_APPLIED.lock().unwrap().clone()
 }
 
@@ -1618,22 +1658,10 @@ pub fn refresh_localized_ui() {
             update_filter_pill_style(false);
 
             if CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap().is_some() {
-                // The locale changed, so every variant's width changed: the buttons reserve the
-                // widest one, and the title follows the CURRENT scope (the old code reset both to
-                // the two short labels, dropping the category or the search scope).
-                let widths: [f64; 2] = clip_clear_action_widths(|label| {
-                    localized_string_width(label, crate::theme::FONT_CAPTION)
-                })
-                .map(|width| width + 8.0);
-                let total_width = widths.iter().sum::<f64>() + CLEAR_ACTION_GAP;
-                let mut x = PICKER_W - SEARCH_PAD_X - total_width;
-                for (index, width) in widths.iter().enumerate() {
-                    set_clear_action_button_frame(
-                        index,
-                        NSRect::new(NSPoint::new(x, 0.0), NSSize::new(*width, 20.0)),
-                    );
-                    x += width + CLEAR_ACTION_GAP;
-                }
+                // The locale changed, so the labels and their text-hugging widths changed:
+                // update_clear_action_labels re-measures, retitles and re-right-aligns the pair
+                // (the old code reset both to the two short labels, dropping the category or the
+                // search scope).
                 update_clear_action_labels();
             }
         }
@@ -1703,6 +1731,19 @@ pub(super) unsafe fn add_hover_tracking(view: *mut AnyObject) {
     ];
     let _: () = msg_send![view, addTrackingArea: ta];
     release_obj(ta);
+}
+
+/// Replace `view`'s tracking areas with one covering its CURRENT bounds. A tracking area keeps
+/// the rect it was created with, so a view whose frame is recomputed later (the clear actions'
+/// text-hugging widths) must rebuild it or hover feedback stays at the stale size.
+pub(super) unsafe fn refresh_tracking_area_to_bounds(view: *mut AnyObject) {
+    let areas: *mut AnyObject = msg_send![view, trackingAreas];
+    let count: usize = msg_send![areas, count];
+    for i in (0..count).rev() {
+        let ta: *mut AnyObject = msg_send![areas, objectAtIndex: i];
+        let _: () = msg_send![view, removeTrackingArea: ta];
+    }
+    add_hover_tracking(view);
 }
 
 /// Attach an auto-resizing tracking area to the fixed picker content parent and deliver its

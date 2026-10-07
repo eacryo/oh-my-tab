@@ -89,6 +89,7 @@ pub(crate) use persist::{clear_on_quit_enabled, discard_history_on_disk};
 pub(crate) use picker::{on_clipboard_toggle, show_picker_for_development};
 pub(crate) use smoke::{set_smoke_mode, smoke_runner};
 pub(crate) use text_style::refresh_localized_ui;
+pub(crate) use text_style::update_clear_action_labels;
 /// Whether the history file currently exists on disk (used by the onboarding smoke to assert that
 /// turning the feature off really cleared it).
 pub(crate) fn history_file_exists() -> bool {
@@ -2580,14 +2581,14 @@ mod tests {
     #[test]
     fn clear_action_labels_name_the_visible_scope() {
         use super::{
-            clip_clear_action_widths, clip_clear_label_variants, clip_clear_labels, ClipFilter,
+            clip_clear_action_width, clip_clear_labels, ClipFilter, CLEAR_ACTION_CLICK_SLACK,
         };
         use crate::i18n::{t, tf};
-        // No query: the label names the active category; All keeps the plain wording.
+        // No query: the plain clear names the category it keeps safe; All keeps the plain wording.
         assert_eq!(
             clip_clear_labels(ClipFilter::All, false),
             (
-                t("clipboard.clear_confirm_unpinned"),
+                t("clipboard.clear_button"),
                 t("clipboard.clear_confirm_all")
             )
         );
@@ -2595,40 +2596,30 @@ mod tests {
         assert_eq!(
             clip_clear_labels(ClipFilter::Image, false),
             (
-                tf("clipboard.clear_scope_unpinned", &[("kind", &kind)]),
+                t("clipboard.clear_button_category"),
                 tf("clipboard.clear_scope_all", &[("kind", &kind)])
             )
         );
-        // A query narrows the scope to the result set, so the label says so instead of naming a
-        // category the user is not really clearing.
-        assert_eq!(
+        // A query narrows the scope to the current view: the plain clear says "current" and the
+        // opt-in clear-all says "all results". Both labels are fully substituted templates: an
+        // unsubstituted template would show the raw "{kind}".
+        for (label, _) in [
+            clip_clear_labels(ClipFilter::Image, false),
             clip_clear_labels(ClipFilter::Image, true),
-            (
-                t("clipboard.clear_scope_unpinned_results"),
-                t("clipboard.clear_scope_all_results")
-            )
+            clip_clear_labels(ClipFilter::All, true),
+        ] {
+            assert!(!label.is_empty() && !label.contains("{kind}"));
+        }
+        // The width hugs the CURRENT label: the measured text plus the shared click slack, so a
+        // longer wording (a category name) makes the button wider and a shorter one shrinks it.
+        let chars = |s: &str| s.chars().count() as f64;
+        assert_eq!(
+            clip_clear_action_width("清除", chars),
+            2.0 + CLEAR_ACTION_CLICK_SLACK
         );
-        // Every combination is a distinct, fully substituted label: the header reserves the widest
-        // of these, and an unsubstituted template would show the raw "{kind}".
-        for variants in clip_clear_label_variants() {
-            assert_eq!(variants.len(), 6);
-            assert!(variants
-                .iter()
-                .all(|label| !label.is_empty() && !label.contains("{kind}")));
-        }
-        // The reservation is the widest variant, not the two short labels: a header that measured
-        // only the short pair clips the scope wording (the in-app smoke asserts the applied width).
-        let widths = clip_clear_action_widths(|label| label.chars().count() as f64);
-        for (action, variants) in clip_clear_label_variants().iter().enumerate() {
-            let widest = variants
-                .iter()
-                .map(|label| label.chars().count() as f64)
-                .fold(0.0_f64, f64::max);
-            assert_eq!(widths[action], widest);
-        }
-        assert!(
-            widths[0] > 0.0 && widths[1] > 0.0,
-            "both actions must reserve a positive width"
+        assert_eq!(
+            clip_clear_action_width("清除该分类", chars),
+            5.0 + CLEAR_ACTION_CLICK_SLACK
         );
     }
 
