@@ -111,6 +111,10 @@ fn query_skylight(window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, Membe
     let display_identifier_key = OwnedCf(cf_string("Display Identifier")?);
     let display_uuid_key = OwnedCf(cf_string("Display UUID")?);
     let space_id_key = OwnedCf(cf_string("id64")?);
+    // The native Space kind, independent of any window: measured values are 0 for an ordinary Space
+    // and 4 for a fullscreen one. Reading it here means an empty fullscreen Space is still known to
+    // be fullscreen, which the window-mask pass below cannot tell.
+    let space_type_key = OwnedCf(cf_string("type")?);
     let display_count = unsafe { CFArrayGetCount(display_spaces.0) };
     if display_count <= 0 {
         return Err(MembershipQueryError::InvalidDisplaySnapshot);
@@ -167,10 +171,16 @@ fn query_skylight(window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, Membe
                 return Err(MembershipQueryError::InvalidDisplaySnapshot);
             }
             all_space_ids.insert(space_id);
-            display_spaces
-                .spaces
-                .entry(space_id)
-                .or_insert(crate::space_groups::SpaceKind::Unknown);
+            // The native index order is what `DisplaySpaces::inferred_origin` reads: macOS keeps a
+            // fullscreen Space right after the ordinary Space it was created from.
+            display_spaces.ordered.push(space_id);
+            let native_kind =
+                match unsafe { cf_number_u64(CFDictionaryGetValue(space, space_type_key.0)) } {
+                    Some(0) => crate::space_groups::SpaceKind::Ordinary,
+                    Some(4) => crate::space_groups::SpaceKind::Fullscreen,
+                    _ => crate::space_groups::SpaceKind::Unknown,
+                };
+            display_spaces.spaces.entry(space_id).or_insert(native_kind);
         }
     }
     if snapshot.current_space_ids.is_empty()

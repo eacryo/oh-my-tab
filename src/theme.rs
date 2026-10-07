@@ -587,6 +587,12 @@ pub(crate) fn animation_exit_duration(entrance: f64) -> f64 {
 
 /// Window-thumbnail master switch (the thumbnail module additionally sleeps
 /// without the Screen Recording permission).
+/// The card scale the user pinned, or `None` for the automatic step. Thumbnail mode only: the
+/// icon-only layout has its own fixed card size.
+pub(crate) fn thumbnail_size_scale_override() -> Option<f64> {
+    crate::config::thumbnail_scale_of(&CONFIG.read().unwrap().layout.thumbnail_size)
+}
+
 pub(crate) fn thumbnails_enabled() -> bool {
     CONFIG.read().unwrap().layout.thumbnails_enabled
 }
@@ -676,45 +682,62 @@ fn choose_thumb_rows(
     }
 }
 
-/// Pick the card step from the **available panel**: the largest candidate that fits, falling back to
-/// the smallest step (scrolling) when nothing fits.
+/// Pick the card step for the automatic size: the largest candidate whose **count-based** estimate
+/// fits the panel, falling back to the smallest step (scrolling) when nothing fits.
 ///
-/// The trial run uses the **real window aspects and the real card-width cap**, i.e. exactly the
-/// inputs of the final packing. That makes "the chosen step fits" a guarantee instead of an
-/// estimate, and avoids leaving space unused because widths were assumed to be the base aspect.
-/// The price is that card size follows window shapes (dragging one window very wide can drop the
-/// whole set a step), which is what using the space requires.
+/// A pinned size skips the search entirely and always uses its own step: the user asked for that
+/// card size, so the panel wraps and scrolls instead of shrinking it.
+///
+/// The estimate is order-independent on purpose. The previous version laid the real packing out at
+/// each candidate step, and `pack_rows` minimises leftover width *in input order*, so the same set
+/// of windows could need three rows in one MRU order and four in another -- measured 2026-10-07:
+/// eleven identical windows chose 1.10 (248pt) when a maximized window was frontmost and 1.00
+/// (230pt) when a narrow one was. Card size must not depend on which window happened to be in
+/// front, so the estimate uses the count and the **widest** card only.
 pub(crate) fn thumb_scale_for_panel(
     aspects: &[f64],
     max_inner: f64,
-    max_panel_w: f64,
     max_panel_h: f64,
     gap: f64,
-    scrollbar_w: f64,
-    max_card_w_for: &impl Fn(f64) -> f64,
+    pinned: Option<f64>,
 ) -> f64 {
+    if let Some(scale) = pinned {
+        return scale.max(THUMB_MIN_SCALE);
+    }
     if aspects.is_empty() {
         return 1.0;
     }
     for &scale in THUMB_SCALE_STEPS.iter() {
         let card_h = thumb_card_h_for_scale(scale);
-        let fits = !plan_thumb_scroll_layout_at_scale(
-            aspects,
-            scale,
-            max_inner,
-            max_panel_w,
-            max_panel_h,
-            gap,
-            scrollbar_w,
-            0.0,
-            max_card_w_for(card_h),
-        )
-        .overflowed;
-        if fits {
+        if thumb_count_estimate_fits(aspects.len(), card_h, max_inner, max_panel_h, gap) {
             return scale;
         }
     }
     THUMB_MIN_SCALE
+}
+
+/// Whether the panel can hold `count` cards at this card height, decided from the count and the
+/// panel budget **alone**.
+///
+/// The reference card is the base preview ratio, not the widest window in the set: window shapes and
+/// the set-wide width cap must not move the automatic step, or the same number of windows would
+/// change size when one of them was resized or maximized. They still decide how the cards wrap, so a
+/// set whose windows are much wider than the base ratio can need a row more than this estimate and
+/// the panel scrolls at the chosen size -- the pinned percent is the way to guarantee both.
+fn thumb_count_estimate_fits(
+    count: usize,
+    card_h: f64,
+    max_inner: f64,
+    max_panel_h: f64,
+    gap: f64,
+) -> bool {
+    let reference_w = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO);
+    if reference_w <= 0.0 {
+        return true;
+    }
+    let per_row = (((max_inner + gap) / (reference_w + gap)).floor() as usize).max(1);
+    let rows = count.div_ceil(per_row);
+    rows <= thumb_max_rows(card_h, max_panel_h, gap)
 }
 
 /// Thumbnail card height derives from the base width per the mockup (pure,
@@ -1474,11 +1497,9 @@ pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
     let scale = thumb_scale_for_panel(
         aspects,
         max_inner,
-        max_panel_w,
         max_panel_h,
         gap,
-        scrollbar_w,
-        &max_card_w_for,
+        thumbnail_size_scale_override(),
     );
     plan_thumb_scroll_layout_at_scale(
         aspects,
@@ -2307,13 +2328,11 @@ mod flow_tests {
         let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         let at = |count: usize| {
             thumb_scale_for_panel(
-                &uniform_aspects(count),
+                &vec![THUMB_PREVIEW_RATIO; count],
                 inner,
-                panel_w,
                 1050.0,
                 THUMB_ROW_GAP,
-                THUMB_SCROLLBAR_W,
-                &|_| f64::INFINITY,
+                None,
             )
         };
         // Small sets still reach the largest step, as with the old ladder.
@@ -2341,79 +2360,132 @@ mod flow_tests {
         // scrolling takes over.
         let tiny = 600.0 - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         assert!(
-            thumb_scale_for_panel(
-                &uniform_aspects(15),
-                tiny,
-                600.0,
-                500.0,
-                THUMB_ROW_GAP,
-                THUMB_SCROLLBAR_W,
-                &|_| f64::INFINITY,
-            ) <= at(15)
+            thumb_scale_for_panel(&uniform_aspects(15), tiny, 500.0, THUMB_ROW_GAP, None,)
+                <= at(15)
         );
         assert_eq!(
-            thumb_scale_for_panel(
-                &uniform_aspects(60),
-                tiny,
-                600.0,
-                300.0,
-                THUMB_ROW_GAP,
-                THUMB_SCROLLBAR_W,
-                &|_| f64::INFINITY,
-            ),
+            thumb_scale_for_panel(&uniform_aspects(60), tiny, 300.0, THUMB_ROW_GAP, None,),
             THUMB_MIN_SCALE
         );
     }
 
     #[test]
-    fn the_chosen_step_accounts_for_the_real_window_aspects() {
-        // Since selection uses the real aspects, a set narrower than the base ratio should reach a
-        // **larger** step (no space left unused), and the chosen step plus the real aspects must really
-        // fit -- the point of giving the trial run the same inputs as the final packing.
+    fn the_automatic_step_depends_on_the_count_not_the_window_shapes() {
+        // The reference card is the base preview ratio, so the same count reaches the same step
+        // whatever the windows' shapes are, and whatever the set-wide width cap is: shapes only
+        // decide how the cards wrap. This is the contract the user asked for -- resizing or
+        // maximizing one window must not resize every card.
         let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
         let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         let budget = 923.0 - 2.0 * PANEL_MARGIN;
-        let cap = |_card_h: f64| f64::INFINITY;
-        let narrow = vec![
-            1.5, 1.5, 1.5, 1.5, 1.4, 1.4, 1.4, 1.4, 1.2, 1.2, 1.2, 1.2, 1.1, 1.1, 1.1, 1.1,
+        let narrow: Vec<f64> = vec![1.5, 1.4, 1.2, 1.1]
+            .into_iter()
+            .cycle()
+            .take(16)
+            .collect();
+        let wide: Vec<f64> = vec![2.2; 16];
+        for count in 1..=16 {
+            let base =
+                thumb_scale_for_panel(&uniform_aspects(count), inner, budget, THUMB_ROW_GAP, None);
+            for (label, aspects) in [("narrow", &narrow), ("wide", &wide)] {
+                let step =
+                    thumb_scale_for_panel(&aspects[..count], inner, budget, THUMB_ROW_GAP, None);
+                assert_eq!(
+                    step, base,
+                    "a {label} set of {count} windows must reach the same step as the base ratio"
+                );
+            }
+            // The width cap (which one maximized window sets for the whole set) must not move it
+            // either.
+            let capped_step =
+                thumb_scale_for_panel(&narrow[..count], inner, budget, THUMB_ROW_GAP, None);
+            assert_eq!(
+                capped_step, base,
+                "the set-wide width cap moved the step at count {count}"
+            );
+        }
+        // The estimate is exact for base-ratio cards, so the chosen step never overflows them.
+        for count in 1..=16 {
+            let aspects = uniform_aspects(count);
+            let step = thumb_scale_for_panel(&aspects, inner, budget, THUMB_ROW_GAP, None);
+            let plan = plan_thumb_scroll_layout_at_scale(
+                &aspects,
+                step,
+                inner,
+                panel_w,
+                budget,
+                THUMB_ROW_GAP,
+                THUMB_SCROLLBAR_W,
+                0.0,
+                f64::INFINITY,
+            );
+            assert!(
+                !plan.overflowed,
+                "step {step} overflowed base-ratio cards at count {count}"
+            );
+        }
+        // A set much wider than the reference can need a row more than the estimate and therefore
+        // scrolls at the chosen size: the documented trade-off of keeping the step count-only. The
+        // step itself stays the same, which is the point.
+        let wide_step = thumb_scale_for_panel(&wide, inner, budget, THUMB_ROW_GAP, None);
+        assert_eq!(
+            wide_step,
+            thumb_scale_for_panel(&uniform_aspects(16), inner, budget, THUMB_ROW_GAP, None)
+        );
+    }
+
+    #[test]
+    fn the_automatic_step_ignores_the_window_order() {
+        // `pack_rows` minimises leftover width in input order, so the previous selection could give
+        // the same set two different steps depending on which window was frontmost (measured
+        // 2026-10-07: 11 windows chose 1.10 in one MRU order and 1.00 in another). The estimate must
+        // be a function of the multiset only.
+        let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
+        let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let budget = 923.0 - 2.0 * PANEL_MARGIN;
+        let set = [
+            1.593, 1.593, 1.341, 1.593, 1.593, 0.838, 1.593, 1.593, 1.593, 1.593, 1.2,
         ];
-        let real = thumb_scale_for_panel(
-            &narrow,
-            inner,
-            panel_w,
-            budget,
-            THUMB_ROW_GAP,
-            THUMB_SCROLLBAR_W,
-            &cap,
+        let chosen = thumb_scale_for_panel(&set, inner, budget, THUMB_ROW_GAP, None);
+        // Every rotation and the reversed order are the same set and must choose the same step.
+        for shift in 0..set.len() {
+            let mut rotated = set;
+            rotated.rotate_left(shift);
+            assert_eq!(
+                thumb_scale_for_panel(&rotated, inner, budget, THUMB_ROW_GAP, None),
+                chosen,
+                "rotation by {shift} changed the step"
+            );
+        }
+        let mut reversed = set;
+        reversed.reverse();
+        assert_eq!(
+            thumb_scale_for_panel(&reversed, inner, budget, THUMB_ROW_GAP, None),
+            chosen,
+            "reversing the order changed the step"
         );
-        let blind = thumb_scale_for_panel(
-            &uniform_aspects(narrow.len()),
-            inner,
-            panel_w,
-            budget,
-            THUMB_ROW_GAP,
-            THUMB_SCROLLBAR_W,
-            &cap,
+    }
+
+    #[test]
+    fn a_pinned_size_skips_the_search() {
+        let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
+        let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let budget = 923.0 - 2.0 * PANEL_MARGIN;
+        // A pinned step is returned as-is even where the automatic search would refuse it (here the
+        // largest step with 40 windows, which overflows and therefore scrolls).
+        let many = uniform_aspects(40);
+        assert_eq!(
+            thumb_scale_for_panel(&many, inner, budget, THUMB_ROW_GAP, Some(1.2)),
+            1.2
         );
-        assert!(
-            real > blind,
-            "a narrower window set must reach a larger step (real {real} vs base-aspect {blind})"
+        assert_eq!(
+            thumb_scale_for_panel(&many, inner, budget, THUMB_ROW_GAP, Some(0.75)),
+            0.75
         );
-        // The chosen step must not overflow with the real aspects.
-        let plan = plan_thumb_scroll_layout_at_scale(
-            &narrow,
-            real,
-            inner,
-            panel_w,
-            budget,
-            THUMB_ROW_GAP,
-            THUMB_SCROLLBAR_W,
-            0.0,
-            cap(thumb_card_h_for_scale(real)),
-        );
-        assert!(
-            !plan.overflowed,
-            "step {real} must not overflow with the real aspects"
+        // The floor still applies, so a hand-edited value below it cannot produce an unreadable card.
+        assert_eq!(
+            thumb_scale_for_panel(&many, inner, budget, THUMB_ROW_GAP, Some(0.1)),
+            THUMB_MIN_SCALE
         );
     }
 
@@ -2441,21 +2513,12 @@ mod flow_tests {
         let with_margin = thumb_scale_for_panel(
             &uniform_aspects(16),
             inner,
-            panel_w,
             923.0 - 2.0 * PANEL_MARGIN,
             THUMB_ROW_GAP,
-            THUMB_SCROLLBAR_W,
-            &|_| f64::INFINITY,
+            None,
         );
-        let without_margin = thumb_scale_for_panel(
-            &uniform_aspects(16),
-            inner,
-            panel_w,
-            923.0,
-            THUMB_ROW_GAP,
-            THUMB_SCROLLBAR_W,
-            &|_| f64::INFINITY,
-        );
+        let without_margin =
+            thumb_scale_for_panel(&uniform_aspects(16), inner, 923.0, THUMB_ROW_GAP, None);
         assert!(
             (with_margin - 0.75).abs() < 1e-9,
             "with the margin subtracted the built-in display must land on 0.75, got {with_margin}"
@@ -2470,11 +2533,9 @@ mod flow_tests {
         let on_wide = thumb_scale_for_panel(
             &uniform_aspects(16),
             wide_inner,
-            wide,
             1050.0 - 2.0 * PANEL_MARGIN,
             THUMB_ROW_GAP,
-            THUMB_SCROLLBAR_W,
-            &|_| f64::INFINITY,
+            None,
         );
         assert!(
             (on_wide - 0.95).abs() < 1e-9,
@@ -2615,7 +2676,7 @@ mod flow_tests {
         let cap = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO).min(inner);
         for count in [1usize, 6, 12, 24] {
             let plan = plan_thumb_scroll_layout_at_scale(
-                &uniform_aspects(count),
+                &vec![THUMB_PREVIEW_RATIO; count],
                 0.75,
                 inner,
                 panel_w,

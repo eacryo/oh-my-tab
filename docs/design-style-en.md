@@ -685,6 +685,19 @@ and both must call the repaint: the config-change coordinator
 (`ui_coordinator::apply_theme_and_locale_refresh`, for explicit light/dark switches and locale changes)
 and the system-appearance notification (`apply_system_appearance_refresh`, the `theme = "auto"` path).
 
+**Thumbnail grid (overlay).** Thumbnail size is a dropdown (App Switcher page, **thumbnail mode
+only**): `Auto`, or a percent of the base card (`120% / 110% / 100% / 95% / 90% / 85% / 80% / 75%`).
+**A pinned percent is a fixed size** -- adding or removing windows only reflows rows and columns and
+scrolls; cards never shrink. `Auto` takes the **first step of the ladder whose count-based estimate
+fits**: the estimate is decided from the window **count** and the panel budget alone -- not from the
+order, not from the windows' shapes, and not from which of them is maximized -- so the same number of
+windows always gets the same size, no matter what was frontmost or how a window was resized. Shapes
+still decide how the cards wrap -- with their count, shapes and order -- so a set whose windows are
+much wider than the base preview ratio can need one row more than the estimate and scrolls at the chosen
+size. Pinning a percent fixes the size only; the wrapping still follows the windows. The log line
+`[overlay] layout mode=thumbnail scale=... card_h=... panel=...` is the only reproducible source for an
+observation.
+
 ## 10. Interaction states
 
 Every custom-drawn control needs all six states, and each uses the token above, not a new color:

@@ -186,6 +186,7 @@ pub(super) struct SettingsUi {
     thumbnails_enabled: *mut AnyObject, // window display mode
     focused_thumbnail_prewarm: *mut AnyObject, // focused thumbnail prewarm
     show_app_name_in_cards: *mut AnyObject, // app name in card titles
+    thumbnail_size: *mut AnyObject,    // NSPopUpButton: auto / 120% / ... / 75%
     card_text_size: *mut AnyObject,    // card text size
     card_text_size_value_label: *mut AnyObject, // card text-size value
     status_bar_text_size: *mut AnyObject, // footer text size
@@ -1088,6 +1089,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.layout.card_text_size
     );
     changed!(
+        "layout.thumbnail_size",
+        old.layout.thumbnail_size,
+        new.layout.thumbnail_size
+    );
+    changed!(
         "windows.overlay_position",
         old.windows.overlay_position,
         new.windows.overlay_position
@@ -1337,6 +1343,9 @@ fn load_settings_from(cfg: &Config) {
             // Window display mode index 0 = icons only, 1 = icons and thumbnails.
             let th_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![ui.thumbnails_enabled, selectItemAtIndex: th_idx];
+            let ts_idx = crate::config::thumbnail_size_index_of(&cfg.layout.thumbnail_size)
+                .unwrap_or(0) as isize;
+            let _: () = msg_send![ui.thumbnail_size, selectItemAtIndex: ts_idx];
             let prewarm_state = if cfg.layout.focused_thumbnail_prewarm {
                 1isize
             } else {

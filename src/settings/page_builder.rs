@@ -171,6 +171,37 @@ pub(super) unsafe fn build_switcher_page(
     );
     ui.show_app_name_in_cards = app_name_switch;
     bind_control(target, ui.show_app_name_in_cards);
+    // Thumbnail card size: "auto" picks the step from the window count, a percent pins it so adding
+    // or removing a window only reflows rows and columns. Thumbnail mode only, like the two rows
+    // above (the group is hidden in icon-only mode).
+    let thumbnail_size_labels: Vec<String> = crate::config::THUMBNAIL_SIZE_VALUES
+        .iter()
+        .map(|value| match *value {
+            "auto" => t("settings.thumbnail_size_auto"),
+            percent => tf("settings.thumbnail_size_percent", &[("percent", percent)]),
+        })
+        .collect();
+    let thumbnail_size_refs: Vec<&str> = thumbnail_size_labels.iter().map(|s| s.as_str()).collect();
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    ui.thumbnail_size = SettingsRow::described(
+        switcher_view,
+        label_x,
+        y,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+        described_row_h,
+        &t("settings.row_thumbnail_size"),
+        &t("settings.desc_thumbnail_size"),
+        SettingsControl::popup(
+            ctrl_x,
+            y + 10.0,
+            ctrl_w,
+            SettingsSelect::metrics().control_h,
+            &thumbnail_size_refs,
+            0,
+        ),
+    );
+    bind_control(target, ui.thumbnail_size);
     canvas.group_end();
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);

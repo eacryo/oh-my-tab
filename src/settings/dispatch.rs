@@ -24,6 +24,7 @@ pub(super) enum ControlField {
     FocusedThumbnailPrewarm,
     ShowAppNameInCards,
     CardTextSize,
+    ThumbnailSize,
     StatusBarTextSize,
     OverlayPosition,
     ActivationMode,
@@ -96,6 +97,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             })
             .or_else(|| m(u.show_other_desktops, ControlField::ShowOtherDesktops))
             .or_else(|| m(u.thumbnails_enabled, ControlField::ThumbnailsEnabled))
+            .or_else(|| m(u.thumbnail_size, ControlField::ThumbnailSize))
             .or_else(|| {
                 m(
                     u.focused_thumbnail_prewarm,
@@ -518,6 +520,11 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ThumbnailsEnabled => {
                     let idx: isize = msg_send![u.thumbnails_enabled, indexOfSelectedItem];
                     cfg.layout.thumbnails_enabled = idx == 1;
+                }
+                ControlField::ThumbnailSize => {
+                    let idx: isize = msg_send![u.thumbnail_size, indexOfSelectedItem];
+                    cfg.layout.thumbnail_size =
+                        crate::config::thumbnail_size_value_at(idx.max(0) as usize).to_string();
                 }
                 ControlField::FocusedThumbnailPrewarm => {
                     let state: isize = msg_send![u.focused_thumbnail_prewarm, state];
@@ -1102,6 +1109,7 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
         ui.thumbnails_enabled,
         ui.focused_thumbnail_prewarm,
         ui.show_app_name_in_cards,
+        ui.thumbnail_size,
         ui.card_text_size,
         ui.card_text_size_value_label,
         ui.status_bar_text_size,
@@ -1484,6 +1492,13 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
 
             let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![u.thumbnails_enabled, selectItemAtIndex: thumbnail_idx];
+            // The size popup has to follow a reload in place as well: the overlay reads the new
+            // value on its next layout, so a stale selection would show one size while the switcher
+            // uses another.
+            let thumbnail_size_idx =
+                crate::config::thumbnail_size_index_of(&cfg.layout.thumbnail_size).unwrap_or(0)
+                    as isize;
+            let _: () = msg_send![u.thumbnail_size, selectItemAtIndex: thumbnail_size_idx];
             let prewarm_state = if cfg.layout.focused_thumbnail_prewarm {
                 1isize
             } else {

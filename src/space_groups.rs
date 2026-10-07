@@ -26,14 +26,24 @@ pub(crate) enum SpaceKind {
     Fullscreen,
 }
 
-/// How a window's actual Space memberships relate to the candidate scope (see
-/// `Topology::membership_scope`). The switcher admits `CurrentGroup` unconditionally and
-/// `OtherDesktop` only while the "show other desktops" switch is on.
+/// Where a window's actual Space memberships put it, relative to what the switcher shows (see
+/// `Topology::membership_scope`). This is a *location*, not a verdict: the admission policy
+/// (`collect::admits_space_scope`) decides which locations are candidates.
+///
+/// The contract since 2026-10-07: the current Space's windows and every fullscreen Space's windows
+/// are always candidates; another ordinary desktop's windows need the "always show other desktops"
+/// switch, or a fullscreen Space being current. The fullscreen Space's *origin desktop* deliberately
+/// plays no part -- see `docs/fullscreen-space-groups-plan.md` for why (the origin is a learned or
+/// inferred association, never a fact macOS exposes, so admission must not depend on it).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum MembershipScope {
     #[default]
     Unknown,
-    CurrentGroup,
+    /// On a display's current Space.
+    CurrentSpace,
+    /// On a fullscreen Space, whatever desktop it was created from.
+    FullscreenSpace,
+    /// On an ordinary Space that is not the current one.
     OtherDesktop,
 }
 
@@ -41,6 +51,34 @@ pub(crate) enum MembershipScope {
 pub(crate) struct DisplaySpaces {
     pub(crate) current: SpaceId,
     pub(crate) spaces: HashMap<SpaceId, SpaceKind>,
+    /// The native Space order for this display (the index order `CGSCopyManagedDisplaySpaces`
+    /// returns). macOS keeps a fullscreen Space immediately after the ordinary Space it was created
+    /// from, which is what `inferred_origin` reads; the map above keeps the kinds.
+    pub(crate) ordered: Vec<SpaceId>,
+}
+
+impl DisplaySpaces {
+    /// The ordinary Space a fullscreen Space is *adjacent to* in the native order: the nearest
+    /// preceding ordinary Space on the same display.
+    ///
+    /// This is a heuristic, not a recovered historical fact. Measured 2026-10-07 with "Automatically
+    /// rearrange Spaces based on most recent use" at its default (on): the list was `[1 ordinary,
+    /// 430 fullscreen, 386 ordinary]` and 430 had been fullscreened from desktop 1, so the fullscreen
+    /// Space sat next to the desktop it came from even though desktops reorder. Nothing in the
+    /// snapshot promises that, though: if the order ever becomes `[D1, D2, F]`, a fresh process
+    /// groups F with D2 (`a_reordered_space_list_groups_by_adjacency` pins that behaviour).
+    ///
+    /// It is only a fallback for the *learned* association (see `Tracker::effective_origin`), so a
+    /// wrong guess is replaced by the first observation, and a fullscreen Space with no preceding
+    /// ordinary Space (or one whose neighbours are all unknown) stays isolated as before.
+    pub(crate) fn inferred_origin(&self, fullscreen: SpaceId) -> Option<SpaceId> {
+        let index = self.ordered.iter().position(|space| *space == fullscreen)?;
+        self.ordered[..index]
+            .iter()
+            .rev()
+            .find(|space| self.spaces.get(space) == Some(&SpaceKind::Ordinary))
+            .copied()
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -92,74 +130,69 @@ impl Topology {
     /// the same thing here -- there is no accepted evidence about where this window lives, which
     /// is also the shape an orderOut'd surface presents. Only `CurrentGroup` admits a window
     /// under today's rule; `OtherDesktop` is the evidence the "other desktops" switch requires.
-    pub(crate) fn membership_scope(
-        &self,
-        memberships: &[SpaceId],
-        fullscreen_origins: &HashMap<SpaceId, Origin>,
-    ) -> MembershipScope {
+    pub(crate) fn membership_scope(&self, memberships: &[SpaceId]) -> MembershipScope {
         let mut managed = false;
+        let mut fullscreen = false;
         for space_id in memberships {
             if !self.space_is_managed(*space_id) {
                 continue;
             }
             managed = true;
-            let in_current_group = self.displays.keys().any(|display_id| {
-                self.allowed_spaces(display_id, fullscreen_origins)
-                    .contains(space_id)
-            });
-            if in_current_group {
-                return MembershipScope::CurrentGroup;
+            // The current Space wins over the rest: a window can be on several Spaces at once
+            // (sticky / "All Desktops" windows), and then it is simply here.
+            if self
+                .displays
+                .values()
+                .any(|display| display.current == *space_id)
+            {
+                return MembershipScope::CurrentSpace;
+            }
+            if self.kind(*space_id) == SpaceKind::Fullscreen {
+                fullscreen = true;
             }
         }
-        if managed {
+        if fullscreen {
+            MembershipScope::FullscreenSpace
+        } else if managed {
             MembershipScope::OtherDesktop
         } else {
             MembershipScope::Unknown
         }
     }
 
-    /// The ordinary Space that defines the visible switcher group for this display. A fullscreen
-    /// Space resolves only through a confirmed origin; otherwise it remains an isolated context.
-    pub(crate) fn context_space(
-        &self,
-        display_id: &str,
-        fullscreen_origins: &HashMap<SpaceId, Origin>,
-    ) -> Option<SpaceId> {
-        let current = self.displays.get(display_id)?.current;
-        if self.kind(current) == SpaceKind::Fullscreen {
-            fullscreen_origins
-                .get(&current)
-                .filter(|origin| origin.display_id == display_id)
-                .map(|origin| origin.ordinary_space)
-                .or(Some(current))
-        } else {
-            Some(current)
-        }
+    /// Whether any display is currently showing a fullscreen Space.
+    ///
+    /// The contract widens the candidate scope to every desktop while the user is inside a
+    /// fullscreen app ("show all desktops' windows + fullscreen windows"), which is what the
+    /// admission policy reads this for.
+    pub(crate) fn any_current_space_is_fullscreen(&self) -> bool {
+        self.displays
+            .values()
+            .any(|display| self.kind(display.current) == SpaceKind::Fullscreen)
     }
 
-    /// All actual Spaces allowed for one display's switcher group. Unknown fullscreen Spaces
-    /// include only themselves; ordinary Spaces include only full-screen Spaces with a confirmed
-    /// source on this same display.
-    pub(crate) fn allowed_spaces(
+    /// The origin governing a fullscreen Space on this display: the learned association when an
+    /// observation confirmed one, otherwise the native Space order's nearest preceding ordinary
+    /// Space (see `DisplaySpaces::inferred_origin`). `None` means no origin is known.
+    ///
+    /// Diagnostics only since 2026-10-07: admission no longer consults the origin (see
+    /// `MembershipScope`), so a wrong or missing association cannot hide a window. Kept because the
+    /// e2e state publishes it and because a future feature may want it back.
+    pub(crate) fn effective_origin(
         &self,
         display_id: &str,
+        fullscreen: SpaceId,
         fullscreen_origins: &HashMap<SpaceId, Origin>,
-    ) -> HashSet<SpaceId> {
-        let Some(context) = self.context_space(display_id, fullscreen_origins) else {
-            return HashSet::new();
-        };
-        let mut allowed = HashSet::from([context]);
-        if self.kind(context) == SpaceKind::Ordinary {
-            allowed.extend(
-                fullscreen_origins
-                    .iter()
-                    .filter_map(|(fullscreen, origin)| {
-                        (origin.display_id == display_id && origin.ordinary_space == context)
-                            .then_some(*fullscreen)
-                    }),
-            );
-        }
-        allowed
+    ) -> Option<SpaceId> {
+        fullscreen_origins
+            .get(&fullscreen)
+            .filter(|origin| origin.display_id == display_id)
+            .map(|origin| origin.ordinary_space)
+            .or_else(|| {
+                self.displays
+                    .get(display_id)
+                    .and_then(|display| display.inferred_origin(fullscreen))
+            })
     }
 }
 
@@ -245,6 +278,32 @@ impl Tracker {
         let after = topology_signature(&self.topology);
         if before != after {
             log_debug!("[spaces] topology changed: {}", after);
+            // Say where each fullscreen Space's origin came from: a learned association, or the
+            // native Space order (see `DisplaySpaces::inferred_origin`).
+            let inferred: Vec<String> = self
+                .topology
+                .displays
+                .iter()
+                .flat_map(|(display_id, display)| {
+                    // Borrow only what the closure needs: `self` is borrowed by the caller.
+                    let learned = &self.fullscreen_origins;
+                    display.spaces.iter().filter_map(move |(space, kind)| {
+                        if *kind != SpaceKind::Fullscreen || learned.contains_key(space) {
+                            return None;
+                        }
+                        Some(match display.inferred_origin(*space) {
+                            Some(origin) => format!("{display_id}:{space}->{origin}"),
+                            None => format!("{display_id}:{space}->none"),
+                        })
+                    })
+                })
+                .collect();
+            if !inferred.is_empty() {
+                log_debug!(
+                    "[spaces] fullscreen origins by native order: {:?}",
+                    inferred
+                );
+            }
         }
         self.fullscreen_origins.retain(|fullscreen, origin| {
             self.topology.kind(*fullscreen) == SpaceKind::Fullscreen
@@ -319,19 +378,6 @@ impl Tracker {
             .retain(|identity, _| identity.pid != pid);
         self.pending_joins.retain(|identity, _| identity.pid != pid);
         self.generation = self.generation.wrapping_add(1);
-    }
-
-    #[cfg(test)]
-    pub(crate) fn window_belongs_to_current_group(&self, window: &WindowIdentity) -> bool {
-        let Some(memberships) = self.actual_memberships.get(window) else {
-            return false;
-        };
-        self.topology.displays.keys().any(|display_id| {
-            let allowed = self
-                .topology
-                .allowed_spaces(display_id, &self.fullscreen_origins);
-            memberships.iter().any(|space| allowed.contains(space))
-        })
     }
 
     fn retry_pending(&mut self, now: Instant) {
@@ -442,6 +488,12 @@ impl Tracker {
 
 static TRACKER: LazyLock<Mutex<Tracker>> = LazyLock::new(|| Mutex::new(Tracker::default()));
 
+/// Whether any display is currently showing a fullscreen Space (see
+/// `Topology::any_current_space_is_fullscreen`). Read per collection pass for the admission policy.
+pub(crate) fn current_space_is_fullscreen() -> bool {
+    with_tracker(|tracker| tracker.topology().any_current_space_is_fullscreen())
+}
+
 fn topology_signature(topology: &Topology) -> String {
     let mut displays: Vec<_> = topology.displays.iter().collect();
     displays.sort_by(|a, b| a.0.cmp(b.0));
@@ -490,6 +542,7 @@ mod tests {
                             (100, SpaceKind::Fullscreen),
                             (101, SpaceKind::Fullscreen),
                         ]),
+                        ordered: vec![10, 11, 100, 101],
                     },
                 ),
                 (
@@ -501,6 +554,7 @@ mod tests {
                             (21, SpaceKind::Ordinary),
                             (200, SpaceKind::Fullscreen),
                         ]),
+                        ordered: vec![20, 21, 200],
                     },
                 ),
             ]),
@@ -533,150 +587,181 @@ mod tests {
     }
 
     #[test]
-    fn ordinary_desktop_includes_only_its_confirmed_fullscreen_spaces() {
-        let mut tracker = Tracker::default();
-        let a_fullscreen = identity(1, 101);
-        let b_fullscreen = identity(2, 201);
-        let origin_a = Origin {
-            display_id: "display-a".into(),
-            ordinary_space: 10,
-            window: a_fullscreen.clone(),
-        };
-        let origin_b = Origin {
-            display_id: "display-b".into(),
-            ordinary_space: 20,
-            window: b_fullscreen.clone(),
-        };
-        tracker.topology = topology();
-        tracker.fullscreen_origins.insert(100, origin_a);
-        tracker.fullscreen_origins.insert(200, origin_b);
-        tracker.actual_memberships = HashMap::from([
-            (identity(3, 301), HashSet::from([10])),
-            (a_fullscreen, HashSet::from([100])),
-            (identity(4, 401), HashSet::from([11])),
-            (b_fullscreen, HashSet::from([200])),
-        ]);
-        assert!(tracker.window_belongs_to_current_group(&identity(3, 301)));
-        assert!(tracker.window_belongs_to_current_group(&identity(1, 101)));
-        assert!(!tracker.window_belongs_to_current_group(&identity(4, 401)));
-        assert!(!tracker.window_belongs_to_current_group(&identity(2, 201)));
-    }
-
-    #[test]
-    fn active_fullscreen_space_resolves_to_its_source_desktop_group() {
-        let mut topology = topology();
-        topology.displays.get_mut("display-a").unwrap().current = 100;
-        let fullscreen = identity(1, 101);
-        let origins = HashMap::from([(
-            100,
-            Origin {
-                display_id: "display-a".into(),
-                ordinary_space: 10,
-                window: fullscreen.clone(),
-            },
-        )]);
-        let mut tracker = Tracker::default();
-        tracker.topology = topology;
-        tracker.fullscreen_origins = origins;
-        tracker.actual_memberships = HashMap::from([
-            (identity(2, 201), HashSet::from([10])),
-            (fullscreen.clone(), HashSet::from([100])),
-            (identity(3, 301), HashSet::from([20])),
-        ]);
-        assert!(tracker.window_belongs_to_current_group(&identity(2, 201)));
-        assert!(tracker.window_belongs_to_current_group(&fullscreen));
-        assert!(!tracker.window_belongs_to_current_group(&identity(3, 301)));
-    }
-
-    #[test]
-    fn membership_scope_separates_the_group_from_other_desktops_and_from_no_evidence() {
+    fn membership_scope_reports_where_a_window_is() {
         let topology = topology();
-        let no_origins = HashMap::new();
         // No member, or a Space the accepted topology does not manage: no evidence at all. The
         // unmanaged id is the shape a stale record (or an orderOut'd surface) presents, so it must
-        // never be read as "this window lives on another desktop".
+        // never be read as "this window lives somewhere".
         for memberships in [vec![], vec![999], vec![999, 998]] {
             assert_eq!(
-                topology.membership_scope(&memberships, &no_origins),
+                topology.membership_scope(&memberships),
                 MembershipScope::Unknown,
                 "{memberships:?} must not be accepted evidence"
             );
         }
-        // The active ordinary desktop of either display is the current group.
-        assert_eq!(
-            topology.membership_scope(&[10], &no_origins),
-            MembershipScope::CurrentGroup
-        );
-        assert_eq!(
-            topology.membership_scope(&[21], &no_origins),
-            MembershipScope::CurrentGroup
-        );
-        // A managed ordinary desktop that is not active is another desktop: display-a's 11, and
+        // The current Space of either display.
+        for memberships in [vec![10], vec![21]] {
+            assert_eq!(
+                topology.membership_scope(&memberships),
+                MembershipScope::CurrentSpace
+            );
+        }
+        // A fullscreen Space is its own location, whatever desktop it came from -- this is the
+        // location the contract always admits, which is why the origin association is not needed.
+        for memberships in [vec![100], vec![101], vec![200]] {
+            assert_eq!(
+                topology.membership_scope(&memberships),
+                MembershipScope::FullscreenSpace,
+                "{memberships:?} is a fullscreen Space"
+            );
+        }
+        // A managed ordinary Space that is not current is another desktop: display-a's 11, and
         // display-b's 20 while 21 is current.
         for memberships in [vec![11], vec![20]] {
             assert_eq!(
-                topology.membership_scope(&memberships, &no_origins),
+                topology.membership_scope(&memberships),
                 MembershipScope::OtherDesktop,
-                "{memberships:?} lives outside the current group"
+                "{memberships:?} is another desktop"
             );
         }
-        // A window that is a member of both an inactive and the active desktop is judged by its
-        // whole membership set: the current group wins, so it is not hidden behind the switch.
+        // A window that is a member of both an inactive and the active Space is judged by its whole
+        // membership set: the current Space wins, so it is not hidden behind the switch.
         assert_eq!(
-            topology.membership_scope(&[10, 11], &no_origins),
-            MembershipScope::CurrentGroup
+            topology.membership_scope(&[10, 11]),
+            MembershipScope::CurrentSpace
+        );
+        // A sticky window that is on the current Space and on fullscreen Spaces is simply here.
+        assert_eq!(
+            topology.membership_scope(&[100, 10]),
+            MembershipScope::CurrentSpace
         );
     }
 
     #[test]
-    fn a_confirmed_fullscreen_origin_joins_the_group_and_an_unconfirmed_one_does_not() {
+    fn a_fullscreen_current_space_widens_the_policy_not_the_location() {
+        // The "inside a fullscreen app shows every desktop" rule is a policy decision, so it must
+        // not change what the classification reports: another desktop stays another desktop.
         let mut topology = topology();
-        let fullscreen = identity(1, 101);
-        let origins = HashMap::from([(
+        assert!(!topology.any_current_space_is_fullscreen());
+        topology.displays.get_mut("display-a").unwrap().current = 100;
+        assert!(topology.any_current_space_is_fullscreen());
+        assert_eq!(
+            topology.membership_scope(&[11]),
+            MembershipScope::OtherDesktop
+        );
+        assert_eq!(
+            topology.membership_scope(&[100]),
+            MembershipScope::CurrentSpace,
+            "the fullscreen Space that is current is the current Space"
+        );
+    }
+
+    #[test]
+    fn a_fullscreen_space_infers_its_origin_from_the_native_order() {
+        // Measured shape: `[1 ordinary, 430 fullscreen, 386 ordinary]` with 430 fullscreened from
+        // desktop 1. The helper's display-a is the same shape: 100/101 follow the ordinary 11.
+        let topology = topology();
+        let learned = HashMap::new();
+        assert_eq!(
+            topology.effective_origin("display-a", 100, &learned),
+            Some(11)
+        );
+        assert_eq!(
+            topology.effective_origin("display-a", 101, &learned),
+            Some(11)
+        );
+        assert_eq!(topology.effective_origin("display-a", 10, &learned), None);
+
+        let display = &topology.displays["display-a"];
+        assert_eq!(
+            display.inferred_origin(100),
+            Some(11),
+            "the nearest preceding ordinary Space is the origin"
+        );
+
+        let mut fullscreen_current = topology.clone();
+        fullscreen_current
+            .displays
+            .get_mut("display-a")
+            .unwrap()
+            .current = 100;
+
+        // An unknown-kind neighbour is not an origin: only an Ordinary Space counts.
+        let mut with_unknown = topology.clone();
+        {
+            let display = with_unknown.displays.get_mut("display-a").unwrap();
+            display.spaces.insert(50, SpaceKind::Unknown);
+            display.ordered = vec![10, 50, 100];
+        }
+        assert_eq!(
+            with_unknown
+                .displays
+                .get("display-a")
+                .unwrap()
+                .inferred_origin(100),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn a_reordered_space_list_groups_by_adjacency() {
+        // The documented limitation, pinned rather than hidden: the inference reads the *current*
+        // order, so a fullscreen Space that no longer follows its origin desktop is grouped with
+        // whatever ordinary Space precedes it now. macOS reorders desktops by recent use
+        // (`mru-spaces`, on by default), and nothing in the snapshot records the historical origin.
+        let mut topology = topology();
+        {
+            let display = topology.displays.get_mut("display-a").unwrap();
+            // 100 was created from the ordinary 10, but the order now puts it after 11.
+            display.ordered = vec![10, 11, 100, 101];
+        }
+        let learned = HashMap::new();
+        assert_eq!(
+            topology.effective_origin("display-a", 100, &learned),
+            Some(11)
+        );
+        // 101 follows the fullscreen 100, so the nearest preceding *ordinary* is still 11.
+        assert_eq!(
+            topology.effective_origin("display-a", 101, &learned),
+            Some(11)
+        );
+        // A learned association is what corrects it once the transition is observed.
+        let learned = HashMap::from([(
             100,
             Origin {
                 display_id: "display-a".into(),
                 ordinary_space: 10,
-                window: fullscreen,
+                window: identity(1, 100),
             },
         )]);
-        // 100 has a confirmed origin on display-a's desktop 10, so it is part of that group.
         assert_eq!(
-            topology.membership_scope(&[100], &origins),
-            MembershipScope::CurrentGroup
-        );
-        // 101 has no confirmed origin: it stays a desktop of its own.
-        assert_eq!(
-            topology.membership_scope(&[101], &origins),
-            MembershipScope::OtherDesktop
-        );
-        // Inside an unconfirmed fullscreen context the group is only that Space, so the ordinary
-        // desktop 10 that neighbours it is another desktop rather than a leak back.
-        topology.displays.get_mut("display-a").unwrap().current = 101;
-        assert_eq!(
-            topology.membership_scope(&[101], &origins),
-            MembershipScope::CurrentGroup
-        );
-        assert_eq!(
-            topology.membership_scope(&[10], &origins),
-            MembershipScope::OtherDesktop
+            topology.effective_origin("display-a", 100, &learned),
+            Some(10)
         );
     }
 
     #[test]
-    fn unknown_fullscreen_context_does_not_leak_other_desktops() {
-        let mut topology = topology();
-        topology.displays.get_mut("display-a").unwrap().current = 101;
-        let mut tracker = Tracker::default();
-        tracker.topology = topology;
-        tracker.actual_memberships = HashMap::from([
-            (identity(1, 101), HashSet::from([101])),
-            (identity(2, 201), HashSet::from([200])),
-            (identity(3, 301), HashSet::from([10])),
-        ]);
-        assert!(tracker.window_belongs_to_current_group(&identity(1, 101)));
-        assert!(!tracker.window_belongs_to_current_group(&identity(2, 201)));
-        assert!(!tracker.window_belongs_to_current_group(&identity(3, 301)));
+    fn a_learned_origin_overrides_the_inferred_one() {
+        // The observation is authoritative: when it disagrees with the native order, the learned
+        // association decides (and the conflict rule keeps the first observation).
+        let topology = topology();
+        let learned = HashMap::from([(
+            100,
+            Origin {
+                display_id: "display-a".into(),
+                ordinary_space: 10,
+                window: identity(1, 100),
+            },
+        )]);
+        assert_eq!(
+            topology.effective_origin("display-a", 100, &learned),
+            Some(10)
+        );
+        // The Space without a learned entry still uses the inference.
+        assert_eq!(
+            topology.effective_origin("display-a", 101, &learned),
+            Some(11)
+        );
     }
 
     #[test]
@@ -751,6 +836,7 @@ mod tests {
                 DisplaySpaces {
                     current: 10,
                     spaces: HashMap::from([(10, SpaceKind::Unknown), (100, SpaceKind::Unknown)]),
+                    ordered: vec![10, 100],
                 },
             )]),
         };

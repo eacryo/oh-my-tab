@@ -798,6 +798,9 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     // The AX evidence that labelled these cards is published with them: a full pass replaces it, a
     // directed pass updates only its own pid.
     crate::e2e_state::publish_ax_pid_evidence(ax_pid_evidence, applied_replace_pid);
+    // The per-window rejection reasons travel with the same accepted result, for the same reason: a
+    // superseded pass or a prewarm collection must not rewrite the evidence a frame's cards carry.
+    crate::e2e_state::publish_staged_rejections(applied_replace_pid);
     // The snapshot is applied, so the flag can go: a panic in the rebuild/subscription steps
     // below can no longer wedge the pipeline.
     drop(in_flight);

@@ -219,6 +219,38 @@ pub fn panel_material_value_at(index: usize) -> &'static str {
         .unwrap_or(PANEL_MATERIAL_VALUES[0])
 }
 
+/// Valid `layout.thumbnail_size` values, in settings-dropdown order: the automatic step first, then
+/// the ladder from largest to smallest. The numbers are percent of the base card (see
+/// `thumbnail_scale_of`), which is what the dropdown shows.
+pub const THUMBNAIL_SIZE_VALUES: [&str; 9] =
+    ["auto", "120", "110", "100", "95", "90", "85", "80", "75"];
+
+/// The dropdown index for a stored thumbnail size, or `None` when the value is unknown (which the
+/// config validation rejects, so only a hand-edited file can produce it). Paired with
+/// [`thumbnail_size_value_at`] so the two directions live in one place and cannot drift by one.
+pub fn thumbnail_size_index_of(value: &str) -> Option<usize> {
+    THUMBNAIL_SIZE_VALUES
+        .iter()
+        .position(|candidate| *candidate == value)
+}
+
+/// The stored thumbnail size for a dropdown index; the first item is the fallback for an
+/// out-of-range index.
+pub fn thumbnail_size_value_at(index: usize) -> &'static str {
+    THUMBNAIL_SIZE_VALUES
+        .get(index)
+        .copied()
+        .unwrap_or(THUMBNAIL_SIZE_VALUES[0])
+}
+
+/// The card scale a stored size pins, or `None` for the automatic step.
+pub fn thumbnail_scale_of(value: &str) -> Option<f64> {
+    let percent: f64 = value.parse().ok()?;
+    THUMBNAIL_SIZE_VALUES
+        .contains(&value)
+        .then_some(percent / 100.0)
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct Layout {
@@ -236,6 +268,9 @@ pub struct Layout {
     // Card text size (points): the window title and app name scale proportionally; the large
     // icon in icon-only mode is unaffected.
     pub card_text_size: f64,
+    // Thumbnail card size: "auto" picks the step from the window count, or a percent of the base
+    // card (see THUMBNAIL_SIZE_VALUES) pins it. Thumbnail mode only.
+    pub thumbnail_size: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -681,6 +716,7 @@ impl Default for Layout {
             focused_thumbnail_prewarm: false,
             show_app_name_in_cards: false,
             card_text_size: 15.0,
+            thumbnail_size: "auto".into(),
         }
     }
 }
@@ -797,6 +833,12 @@ impl Config {
             errs.push(tf(
                 "errors.appearance_glass_style_invalid",
                 &[("value", &self.appearance.glass_style)],
+            ));
+        }
+        if !THUMBNAIL_SIZE_VALUES.contains(&self.layout.thumbnail_size.as_str()) {
+            errs.push(tf(
+                "errors.layout_thumbnail_size_invalid",
+                &[("value", &self.layout.thumbnail_size)],
             ));
         }
         if !PANEL_MATERIAL_VALUES.contains(&self.appearance.panel_material.as_str()) {
@@ -1152,6 +1194,9 @@ impl Config {
             self.layout.show_app_name_in_cards = other.layout.show_app_name_in_cards;
             if !errs.iter().any(|e| e.starts_with("layout.card_text_size")) {
                 self.layout.card_text_size = other.layout.card_text_size;
+            }
+            if !errs.iter().any(|e| e.starts_with("layout.thumbnail_size")) {
+                self.layout.thumbnail_size = other.layout.thumbnail_size;
             }
         }
 
@@ -2160,6 +2205,32 @@ mod tests {
         assert_eq!(parse_hex8("gggggggg"), 0);
     }
 
+    #[test]
+    fn thumbnail_size_values_round_trip_and_pin_scales() {
+        // The dropdown index and the stored value must round-trip, or the page shows one size
+        // while persisting another.
+        for (index, value) in THUMBNAIL_SIZE_VALUES.iter().enumerate() {
+            assert_eq!(thumbnail_size_index_of(value), Some(index));
+            assert_eq!(thumbnail_size_value_at(index), *value);
+        }
+        assert_eq!(thumbnail_size_index_of("nonsense"), None);
+        assert_eq!(thumbnail_size_value_at(99), "auto");
+        // "auto" pins nothing; every other value pins its percent.
+        assert_eq!(thumbnail_scale_of("auto"), None);
+        assert_eq!(thumbnail_scale_of("120"), Some(1.2));
+        assert_eq!(thumbnail_scale_of("75"), Some(0.75));
+        assert_eq!(thumbnail_scale_of("100"), Some(1.0));
+        assert_eq!(thumbnail_scale_of("nonsense"), None);
+    }
+
+    #[test]
+    fn an_unknown_thumbnail_size_is_rejected_per_field() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.layout.thumbnail_size, "auto");
+        cfg.layout.thumbnail_size = "1.2".into(); // the scale, not the stored percent
+        assert_err_count(&cfg, 1);
+    }
+
     fn assert_err_count(cfg: &Config, expected: usize) {
         let errs = cfg.validate();
         assert_eq!(errs.len(), expected, "errors: {:?}", errs);
@@ -2379,6 +2450,7 @@ mod tests {
         assert_eq!(PANEL_MATERIAL_VALUES, ["liquid-glass", "frost", "opaque"]);
     }
 
+    #[test]
     fn clipboard_shortcut_invalid_value_falls_back_per_field() {
         let mut loaded = Config::default();
         loaded.clipboard.enabled = true;

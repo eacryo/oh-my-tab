@@ -14,6 +14,7 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex};
 
 use crate::log_debug;
 
@@ -119,6 +120,85 @@ pub(crate) fn space_recovered_accepted() {
 pub(crate) fn space_gate_rejected() {
     if is_enabled() {
         SPACE_GATE_REJECTED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// Why a CG window of this pass did not become a card. The scenario needs the *target's* own reason
+/// rather than an inference from other cards: only `AxExcluded` is the accepted "this desktop has not
+/// been visited in this process" narrowing, and anything else must stay a failure.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CardRejection {
+    /// AX answered about the app and named another window, and never named this one.
+    AxExcluded,
+    /// The Space verdict refused it (another desktop with the switch off, or no managed Space).
+    Space,
+    /// No title of its own.
+    Title,
+    /// Not the ordinary layer-0 window shape.
+    Shape,
+    /// The app's AX answer identified no window at all, so its CG entries are panels.
+    Unpaired,
+}
+
+impl CardRejection {
+    fn as_str(self) -> &'static str {
+        match self {
+            CardRejection::AxExcluded => "ax_excluded",
+            CardRejection::Space => "space",
+            CardRejection::Title => "title",
+            CardRejection::Shape => "shape",
+            CardRejection::Unpaired => "unpaired",
+        }
+    }
+}
+
+// The rejections recorded by the collection running on *this* thread. Staged rather than published
+// on the spot, for the same reason the AX evidence is: a superseded pass, a prewarm collection or a
+// directed refresh must never move the evidence an applied frame's cards were built from.
+thread_local! {
+    static STAGED_REJECTIONS: std::cell::RefCell<Vec<(i32, u32, CardRejection)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+static REJECTED_WINDOWS: LazyLock<Mutex<Vec<(i32, u32, CardRejection)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Start a collection pass on this thread: the staging describes the pass about to run.
+///
+/// Staging is not gated on `is_enabled`: it is a thread-local clear plus a bounded push per refused
+/// window, and keeping it unconditional means the recording path has no second behaviour to test.
+/// Only publishing and serialization are gated, so a normal run writes nothing.
+pub(crate) fn begin_collection_pass() {
+    STAGED_REJECTIONS.with(|staged| staged.borrow_mut().clear());
+}
+
+pub(crate) fn card_rejected(pid: i32, cgwid: u32, reason: CardRejection) {
+    if cgwid == 0 {
+        return;
+    }
+    STAGED_REJECTIONS.with(|staged| {
+        let mut staged = staged.borrow_mut();
+        if staged.len() < 128 {
+            staged.push((pid, cgwid, reason));
+        }
+    });
+}
+
+/// Publish an accepted pass's rejections, next to the AX evidence they belong with. A full pass
+/// replaces the list (even with nothing recorded: its cards are the truth); a directed pass replaces
+/// only that pid's entries, so the other cards keep the reasons they were built from.
+pub(crate) fn publish_staged_rejections(replace_pid: Option<i32>) {
+    let staged = STAGED_REJECTIONS.with(|staged| std::mem::take(&mut *staged.borrow_mut()));
+    let mut published = REJECTED_WINDOWS.lock().unwrap();
+    match replace_pid {
+        None => *published = staged,
+        Some(pid) => {
+            published.retain(|(entry_pid, _, _)| *entry_pid != pid);
+            published.extend(
+                staged
+                    .into_iter()
+                    .filter(|(entry_pid, _, _)| *entry_pid == pid),
+            );
+        }
     }
 }
 
@@ -743,22 +823,47 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             .topology()
             .displays
             .iter()
-            .filter(|(_, display)| {
+            .filter(|(display_id, display)| {
                 tracker.topology().kind(display.current)
                     == crate::space_groups::SpaceKind::Fullscreen
-                    && !tracker.fullscreen_origins().contains_key(&display.current)
+                    && tracker
+                        .topology()
+                        .effective_origin(display_id, display.current, tracker.fullscreen_origins())
+                        .is_none()
             })
             .count();
+        // Every Space the topology knows, with its kind: a scenario has to tell an ordinary other
+        // desktop from a fullscreen Space that belongs to the current desktop's group.
+        let mut spaces: Vec<(u64, &str)> = tracker
+            .topology()
+            .displays
+            .values()
+            .flat_map(|display| display.spaces.iter())
+            .map(|(space, kind)| {
+                (
+                    *space,
+                    match kind {
+                        crate::space_groups::SpaceKind::Ordinary => "ordinary",
+                        crate::space_groups::SpaceKind::Fullscreen => "fullscreen",
+                        crate::space_groups::SpaceKind::Unknown => "unknown",
+                    },
+                )
+            })
+            .collect();
+        spaces.sort_unstable();
         let mut contexts: Vec<_> = tracker
             .topology()
             .displays
             .iter()
             .map(|(display_id, display)| {
                 let kind = tracker.topology().kind(display.current);
-                let origin = tracker
-                    .fullscreen_origins()
-                    .get(&display.current)
-                    .map(|origin| origin.ordinary_space);
+                // The origin that actually governs this Space: a learned association when one was
+                // observed, otherwise the one the native Space order implies.
+                let origin = tracker.topology().effective_origin(
+                    display_id,
+                    display.current,
+                    tracker.fullscreen_origins(),
+                );
                 (display_id.clone(), display.current, kind, origin)
             })
             .collect();
@@ -770,8 +875,16 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             tracker.evidence_contiguous(),
             crate::window_server::space_membership_tracking_available(),
             contexts,
+            spaces,
         )
     });
+    let spaces = space_group_state
+        .6
+        .iter()
+        .map(|(space, kind)| format!("{{\"id\": {space}, \"kind\": \"{kind}\"}}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    json.push_str(&format!("  \"spaces\": [{}],\n", spaces));
     let space_contexts = space_group_state
         .5
         .iter()
@@ -792,6 +905,22 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         .collect::<Vec<_>>()
         .join(", ");
     json.push_str(&format!("  \"space_contexts\": [{}],\n", space_contexts));
+    let rejected_windows = REJECTED_WINDOWS
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(_, cgwid, reason)| {
+            format!(
+                "{{\"window_id\": {cgwid}, \"reason\": \"{}\"}}",
+                reason.as_str()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    json.push_str(&format!(
+        "  \"rejected_windows\": [{}],\n",
+        rejected_windows
+    ));
     json.push_str(&format!(
         "  \"space_filter\": {{\"recovered_accepted\": {}, \"gate_rejected\": {}, \"other_desktop_accepted\": {}, \"show_other_desktops\": {}}},\n",
         SPACE_RECOVERED_ACCEPTED.load(Ordering::Relaxed),
@@ -1072,6 +1201,58 @@ mod ax_pid_evidence_tests {
     use super::*;
 
     /// A directed refresh must move only its own pid's evidence; a full pass replaces both sets.
+    #[test]
+    fn rejection_reasons_are_published_with_the_accepted_result_only() {
+        // A discarded pass must not rewrite what an applied frame's cards carry: stage without
+        // publishing and the previous reasons stay.
+        begin_collection_pass();
+        card_rejected(7, 20, CardRejection::AxExcluded);
+        publish_staged_rejections(None);
+        assert_eq!(
+            *REJECTED_WINDOWS.lock().unwrap(),
+            vec![(7, 20, CardRejection::AxExcluded)]
+        );
+        begin_collection_pass();
+        card_rejected(7, 20, CardRejection::Space);
+        assert_eq!(
+            *REJECTED_WINDOWS.lock().unwrap(),
+            vec![(7, 20, CardRejection::AxExcluded)],
+            "an unpublished pass leaves the published reasons alone"
+        );
+        // The accepted pass replaces them: an old `ax_excluded` must never survive a new reason, or a
+        // scenario would report the accepted narrowing for a window refused for a real reason.
+        publish_staged_rejections(None);
+        assert_eq!(
+            *REJECTED_WINDOWS.lock().unwrap(),
+            vec![(7, 20, CardRejection::Space)]
+        );
+        // A full pass that recorded nothing still clears the list: its cards are the truth.
+        begin_collection_pass();
+        publish_staged_rejections(None);
+        assert!(REJECTED_WINDOWS.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_directed_pass_replaces_only_its_own_pid() {
+        begin_collection_pass();
+        card_rejected(7, 20, CardRejection::AxExcluded);
+        card_rejected(8, 30, CardRejection::Title);
+        publish_staged_rejections(None);
+        begin_collection_pass();
+        card_rejected(7, 20, CardRejection::Space);
+        card_rejected(7, 21, CardRejection::Unpaired);
+        publish_staged_rejections(Some(7));
+        assert_eq!(
+            *REJECTED_WINDOWS.lock().unwrap(),
+            vec![
+                (8, 30, CardRejection::Title),
+                (7, 20, CardRejection::Space),
+                (7, 21, CardRejection::Unpaired),
+            ],
+            "pid 8 keeps the reason its card was built from"
+        );
+    }
+
     #[test]
     fn evidence_follows_the_pass_kind() {
         let _guard = EVIDENCE_TEST_LOCK.lock().unwrap();

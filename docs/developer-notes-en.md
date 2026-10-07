@@ -12,15 +12,21 @@ When the app is launched in Debug mode through RustRover or another debugger, fr
 
 ## Fullscreen Space grouping
 
-The switcher treats fullscreen Spaces as part of their source desktop only after observing a matching WindowServer leave/join pair and confirming the target Space type and display. A fullscreen window already present at launch, an event gap, or ambiguous display/source evidence remains isolated to its actual Space. Space membership notifications are consumed in order. A Space switch that grouping handles correctly leaves the candidate set unchanged, so `--e2e-state` publishes a separate `refresh_context` frame when the active Space context changes; scripts must assert only on applied frames (`refresh` / `refresh_context`), since other frames pair the new context with the previous card list. Only a known event loss (queue overflow) clears pending transition evidence; a membership event whose owner cannot be resolved merely downgrades the diagnostic continuity flag, because a fullscreen transition emits such events for auxiliary windows of the same app and clearing on them destroyed the transition being learned. The pair window is 3s rather than 1s: the 1325 join can land while SkyLight still types the new Space ordinary, and the pair must survive until a later query corrects the type. Legacy membership fallback admits only positively onscreen windows and never treats fullscreen bounds as a cross-Space exemption. These private SkyLight event/query paths are best-effort and may be unavailable on future macOS releases.
+**Since 2026-10-07 admission no longer reads this association** (see the next section for the contract): the switcher still records a fullscreen Space's source desktop only after observing a matching WindowServer leave/join pair and confirming the target Space type and display, but that record is **e2e diagnostics only** (`space_contexts` reports which desktop a fullscreen Space is attributed to). A fullscreen window already present at launch, an event gap, or ambiguous display/source evidence simply reports "no origin" in the diagnostics -- it changes nothing about which windows appear. Space membership notifications are consumed in order. A Space switch that grouping handles correctly leaves the candidate set unchanged, so `--e2e-state` publishes a separate `refresh_context` frame when the active Space context changes; scripts must assert only on applied frames (`refresh` / `refresh_context`), since other frames pair the new context with the previous card list. Only a known event loss (queue overflow) clears pending transition evidence; a membership event whose owner cannot be resolved merely downgrades the diagnostic continuity flag, because a fullscreen transition emits such events for auxiliary windows of the same app and clearing on them destroyed the transition being learned. The pair window is 3s rather than 1s: the 1325 join can land while SkyLight still types the new Space ordinary, and the pair must survive until a later query corrects the type. Legacy membership fallback admits only positively onscreen windows and never treats fullscreen bounds as a cross-Space exemption. These private SkyLight event/query paths are best-effort and may be unavailable on future macOS releases.
 
 ### Windows on other desktops
 
-By default the candidate scope above is the whole rule: a window on another macOS desktop is not a
-candidate. `windows.show_other_desktops` widens admission to managed Spaces outside every display's
-current group, and only through that switch: a window the switch admits carries no AX element
-(`kAXWindows` is filtered by the current Space), so it keeps the CG window name as its title and has
-no readable minimized state. Admission stays under AX authority. When an app's `kAXWindows` is empty but its key/main slots
+**The contract since 2026-10-07: admission reads *where* a window is, never which desktop a
+fullscreen Space came from.** The current Space's windows and every fullscreen Space's windows are
+always candidates (a fullscreen window has no AX element while it is on its own Space -- `kAXWindows`
+is filtered by the current Space -- so its reachability cannot depend on an origin association macOS
+never exposes); another *ordinary* desktop's windows need `windows.show_other_desktops` (labelled
+"Always show windows from other desktops"), and are admitted too while a fullscreen Space is current,
+when every desktop's windows are shown. The origin association (learned, or inferred from the native
+Space order) is diagnostics only now, so a missing or wrong one can no longer hide a window; the price
+is deliberate cross-Space bleed: with the switch off, other desktops' fullscreen windows still appear.
+An admitted cross-Space window carries no AX element, so it keeps the CG window name as its title, has
+no readable minimized state and is never re-captured. Admission stays under AX authority. When an app's `kAXWindows` is empty but its key/main slots
 still name one of its windows, AX has answered about that app's window set: a CG window in neither
 slot and never identified by AX before is a surface AX excludes, and is refused -- 微信 keeps a
 280x380 off-screen window titled 微信 beside its real 1097x833 window, and from another desktop that
@@ -76,6 +82,48 @@ Accessibility trust and was wrong: the call does switch, and both reference impl
 for a cross-Space target. Which attempt moved the Space is published per raise, and
 `scripts/e2e/space-desktops.sh` runs one pass with activation suppressed so the rescue is verified on
 its own rather than inferred.
+
+## Thumbnail card sizing
+
+The overlay's thumbnail grid gives every card **one** height. The user pins it with the App Switcher
+page's **Thumbnail size** dropdown (`layout.thumbnail_size`: `auto`, or a percent of the base card),
+or `auto` picks it as the first step of `THUMB_SCALE_STEPS` whose **count-based estimate** fits
+(`thumb_scale_for_panel` -> `thumb_count_estimate_fits`). A pinned step skips the search entirely, so
+the panel wraps and scrolls instead of shrinking the cards.
+
+`auto`'s estimate is count-only by construction: it uses the count, the panel budget and a
+**reference card at the base preview ratio** -- never the sequence, the windows' shapes or the
+set-wide width cap. Every card in a base-ratio set is exactly that wide, so any row that fits holds at
+least `floor((max_inner + gap) / (reference_w + gap))` cards, which makes `ceil(count / per_row)` an
+upper bound on the rows the packings can produce -- and `overflowed` is exactly `rows > max_rows`. A
+step that passes therefore never overflows a base-ratio set. Wider windows are not covered by that
+bound: a set much wider than the base ratio can need one row more and scrolls at the chosen size,
+which is the price of keeping the automatic step independent of window shapes. A pinned percent fixes
+the size only -- `thumb_widths_with_max_card_w` still derives each card's width from its own window and
+re-packs, so the wrapping follows the windows' count, shapes and order.
+
+Three facts still make the automatic step a coarse function of the window set:
+
+- The row budget `thumb_max_rows` is derived from the card height and the usable panel height, so it
+  changes with the step: taller cards get fewer rows.
+- The number of cards per row is a step function of the card width, which follows each window's
+  aspect ratio. Crossing a "one more per row" threshold changes the row count for the whole set.
+- The per-set width cap comes from `thumbnail_max_card_width`: the widest window that counts as
+  maximized (>= 90% of the screen width and >= 80% of the usable height) sets it for every card.
+
+The packing itself still depends on the **order** of the cards -- `pack_rows` preserves MRU order and
+then minimises leftover width, so the same multiset of aspects can need three rows in one order and
+four in another -- which is exactly why `auto` no longer lays the packing out to choose its step. With
+a pinned percent the order only changes which rows the cards land in, never their size.
+
+Observed 2026-10-07 (reproduce with `grep "layout mode=thumbnail" ~/Library/Logs/oh-my-tab/oh-my-tab.log`):
+adding one window moved the chosen step from 1.10 to 0.85 and the card height from 248 to 201,
+because 1.10 through 0.90 all need four rows while the height budget allows three, and only 0.85 is
+narrow enough for five cards per row. The same day, with the same 11 windows, summoning from a
+maximized window chose 1.10 (248pt) and summoning from a non-maximized one chose 1.00 (230pt): at
+1.10 the same multiset packed into three rows in one MRU order and four in the other. The recorded trade-off is "fit without scrolling wins over a
+stable size"; the alternative -- accept at most one overflowing teaser row before stepping down, and
+stop the width cap from following a single maximized window -- is tracked in `docs/review-backlog.md`.
 
 ## Logging and memory diagnostics
 

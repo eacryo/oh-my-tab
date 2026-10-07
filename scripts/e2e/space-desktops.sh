@@ -35,6 +35,11 @@ config_backup="/tmp/omt-e2e-space-desktops-config.bak"
 fail() { echo "e2e space-desktops: FAIL: $*" >&2; exit 1; }
 note() { echo "e2e space-desktops: $*"; }
 
+# The shared verdict helper (and its own regression cases) must work before anything else runs.
+repo_dir_verdict="$repo_dir/scripts/e2e/lib"
+python3 -B "$repo_dir_verdict/verdict.py" >/dev/null || fail "verdict.py selftest failed"
+python3 -B "$repo_dir_verdict/space_kinds.py" >/dev/null || fail "space_kinds.py selftest failed"
+
 command -v cua-driver >/dev/null 2>&1 || fail "cua-driver CLI not found in PATH"
 cua-driver status >/dev/null 2>&1 || fail "cua-driver daemon is not running"
 [ -f "$config" ] || fail "no config at $config (run the app once first)"
@@ -60,33 +65,6 @@ trap restore EXIT
 cp "$config" "$config_backup"
 rm -f "$state_file" "${state_file%.json}.tmp"
 
-# Pick the cross-desktop target from the real WindowServer state: a window whose Space list holds
-# no current Space, on a desktop that is not the active one.
-windows_json="$(cua-driver list_windows '{}')" || fail "could not read the WindowServer window list"
-target_json="$(printf '%s' "$windows_json" | python3 -c '
-import json, sys
-snapshot = json.load(sys.stdin)
-current = snapshot.get("current_space_id")
-targets = [
-    w for w in snapshot["windows"]
-    if w.get("space_ids")
-    and current not in w["space_ids"]
-    and not w.get("on_current_space")
-    and w.get("title")
-]
-targets.sort(key=lambda w: w["window_id"])
-print(json.dumps(targets[0] if targets else None))
-')" || fail "could not parse the WindowServer window list"
-case "$target_json" in
-    null)
-        note "NOT RUN: no window on another macOS desktop on this machine (unrun is not passed)"
-        exit 0
-        ;;
-esac
-target_pid="$(printf '%s' "$target_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pid"])')"
-target_wid="$(printf '%s' "$target_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["window_id"])')"
-target_app="$(printf '%s' "$target_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["app_name"])')"
-note "target: $target_app pid=$target_pid wid=$target_wid"
 
 front_app_before="$(cua-driver list_apps '{"include_installed":false}' | python3 -c '
 import json, sys
@@ -119,7 +97,80 @@ PY
 app_pid="$(start_app)"
 [ -n "$app_pid" ] || fail "could not read the app pid from dev-restart.sh output"
 
-python3 - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$config" <<'PY'
+# Pick the cross-desktop target from the real WindowServer state **and the app's Space kinds**: a
+# window whose Space list holds an ORDINARY Space that is not the active one. A window on a fullscreen
+# Space is excluded on purpose: the app resolves that Space's origin from the native Space order, so it
+# belongs to the current desktop's group and is not "another desktop" for this scenario.
+target_json="$(python3 - "$state_file" "$app_pid" <<'TARGET_PY'
+import json
+import subprocess
+import sys
+import time
+
+state_file, app_pid = sys.argv[1], int(sys.argv[2])
+
+
+def state():
+    try:
+        with open(state_file) as handle:
+            snapshot = json.load(handle)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return None
+    return snapshot if snapshot.get("pid") == app_pid else None
+
+
+# The Space kinds come from the app, so wait for the snapshot the app just wrote.
+deadline = time.time() + 10
+snapshot = None
+while time.time() < deadline:
+    snapshot = state()
+    if snapshot and snapshot.get("spaces"):
+        break
+    time.sleep(0.05)
+if not snapshot or not snapshot.get("spaces"):
+    print("null")
+    raise SystemExit(0)
+kinds = {space["id"]: space["kind"] for space in snapshot["spaces"]}
+windows = json.loads(
+    subprocess.run(["cua-driver", "list_windows", "{}"], capture_output=True, text=True).stdout
+)
+current = windows.get("current_space_id")
+# An app that has a window on the current Space answers AX about that window, so its other-desktop
+# window is treated as a secondary surface until that desktop has been visited once (the narrowing
+# documented in docs/fullscreen-space-groups-plan.md). Prefer a window whose app lives entirely on
+# another desktop: that one is admitted as soon as the switch is on, which is what phase 2 asserts.
+pids_here = {
+    window["pid"]
+    for window in windows["windows"]
+    if window.get("space_ids") and current in window["space_ids"]
+}
+targets = [
+    window
+    for window in windows["windows"]
+    if window.get("space_ids")
+    and current not in window["space_ids"]
+    and not window.get("on_current_space")
+    and window.get("title")
+    and window["pid"] not in pids_here
+    and any(kinds.get(space) == "ordinary" for space in window["space_ids"])
+]
+targets.sort(key=lambda window: window["window_id"])
+targets.sort(key=lambda window: window["window_id"])
+print(json.dumps(targets[0] if targets else None))
+TARGET_PY
+)" || fail "could not pick the cross-desktop target"
+case "$target_json" in
+    null)
+        note "NOT RUN: no window on another ordinary macOS desktop on this machine (unrun is not passed)"
+        exit 0
+        ;;
+esac
+target_pid="$(printf '%s' "$target_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pid"])')"
+target_wid="$(printf '%s' "$target_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["window_id"])')"
+target_app="$(printf '%s' "$target_json" | python3 -c 'import json,sys; print(json.load(sys.stdin)["app_name"])')"
+note "target: $target_app pid=$target_pid wid=$target_wid"
+
+python3 -B - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$config" "$repo_dir_verdict" <<'PY'
 import ctypes
 import json
 import pathlib
@@ -127,9 +178,16 @@ import subprocess
 import sys
 import time
 
-state_file, app_pid, target_wid, target_pid, config = (
-    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5],
+state_file, app_pid, target_wid, target_pid, config, repo_dir_verdict = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6],
 )
+sys.path.insert(0, repo_dir_verdict)
+from space_kinds import (  # noqa: E402  (the path above makes it importable)
+    fullscreen_current,
+    fullscreen_window_ids,
+    pick_fullscreen_target,
+)
+notes: list[str] = []
 problems: list[str] = []
 checks: list[str] = []
 
@@ -234,11 +292,46 @@ try:
     cards = frame.get("cards", [])
     check(frame.get("space_filter", {}).get("show_other_desktops") is False,
           "the switch reads off by default", json.dumps(frame.get("space_filter")))
-    check(card_of(frame, target_wid) is None,
-          "with the switch off the other-desktop window is not a card",
-          f"cards={[c['window_id'] for c in cards]}")
-    check(not any(c["other_desktop"] for c in cards),
-          "no card is marked as another desktop while the switch is off")
+    # Since 2026-10-07 a fullscreen window is a candidate whatever the switch says (it has no AX
+    # element while it is on its own Space, so its reachability cannot depend on the switch). Two
+    # facts follow, and both depend on the live context, so each is only asserted when its premise
+    # holds:
+    #   - while a fullscreen Space is current the contract widens to every desktop, so an ordinary
+    #     cross-desktop window IS a card then;
+    #   - a fullscreen window is a card even with the switch off -- pinned on one exact window, so
+    #     losing one of several fullscreen windows cannot pass.
+    contexts = frame.get("space_contexts") or []
+    current_kinds = {context["display"]: context["kind"] for context in contexts}
+    if fullscreen_current(contexts):
+        notes.append(
+            "with the switch off the ordinary cross-desktop window is not a card: NOT RUN "
+            f"(a fullscreen Space is current, so the contract widens to every desktop) contexts={current_kinds}"
+        )
+    else:
+        check(card_of(frame, target_wid) is None,
+              "with the switch off the other-desktop window is not a card",
+              f"cards={[c['window_id'] for c in cards]} contexts={current_kinds}")
+
+    fullscreen_wids = fullscreen_window_ids(
+        frame.get("spaces"), cua("list_windows", {}).get("windows", [])
+    )
+    # One exact window of a fullscreen Space, preferring a titled and substantial one so the choice is
+    # a real window rather than one of its app's helper surfaces.
+    fullscreen_target = pick_fullscreen_target(
+        cua("list_windows", {}).get("windows", []), fullscreen_wids
+    )
+    if fullscreen_target is None:
+        notes.append(
+            "with the switch off a fullscreen window is still a card: NOT RUN "
+            "(no titled, substantial window on a fullscreen Space on this machine)"
+        )
+    else:
+        check(
+            card_of(frame, fullscreen_target["window_id"]) is not None,
+            "with the switch off a fullscreen window is still a card",
+            f"want={fullscreen_target['window_id']} ({fullscreen_target.get('title')!r}) "
+            f"cards={[c['window_id'] for c in cards]} fullscreen={sorted(fullscreen_wids)}",
+        )
     # Cancel (Escape) rather than release the modifier: a release would commit a raise.
     post(VK_ESCAPE, True, FLAG_OPTION)
     post(VK_ESCAPE, False, FLAG_OPTION)
@@ -255,6 +348,8 @@ finally:
     release_all()
 
 print("\n".join(checks))
+for note in notes:
+    print(note)
 if problems:
     print("\n".join(problems), file=sys.stderr)
     raise SystemExit(1)
@@ -268,16 +363,19 @@ phase2_log="/tmp/omt-e2e-space-desktops-phase2.log"
 # reference_pid: a pid that has a focused window right now, used only to prove the AX read
 # works at all before a missing focus read is judged a failure instead of a NOT RUN.
 reference_pid="${front_app_before:-$target_pid}"
-python3 - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$target_app" "$reference_pid" <<'PY' >"$phase2_log"
+python3 -B - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$target_app" "$reference_pid" "$repo_dir_verdict" <<'PY' >"$phase2_log"
 import ctypes
 import json
 import subprocess
 import sys
 import time
 
-state_file, app_pid, target_wid, target_pid, target_app, reference_pid = (
-    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6]),
+state_file, app_pid, target_wid, target_pid, target_app, reference_pid, repo_dir_verdict = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6]), sys.argv[7],
 )
+sys.path.insert(0, repo_dir_verdict)
+from verdict import unrun_or_fail  # noqa: E402  (the path above is what makes it importable)
+from space_kinds import fullscreen_window_ids, target_rejection_reason  # noqa: E402
 problems: list[str] = []
 checks: list[str] = []
 notes: list[str] = []
@@ -475,11 +573,14 @@ def check_ax_identity_invariant(frame, label):
     This is the rule the 微信 duplicate violated: with its list Space-filtered but its key/main slots
     still naming the real window, its off-screen second window (never named by AX) appeared beside it
     as a second, dead card. The condition mirrors the implementation exactly: it applies only to apps
-    *without* a published window this pass (`ax_published_pids`), because an app that does have one
-    may legitimately show a real window of another desktop that AX has not identified yet.
+    *without* a published window this pass (`ax_published_pids`), and a window on a fullscreen Space
+    is exempt, because the contract shows those whatever the switch says (2026-10-07).
     """
     published = set(frame.get("ax_published_pids") or [])
     recovered = set(frame.get("ax_recovered_pids") or [])
+    fullscreen = fullscreen_window_ids(
+        frame.get("spaces"), cua("list_windows", {}).get("windows", [])
+    )
     by_pid: dict[int, list[dict]] = {}
     for card in frame.get("cards", []):
         by_pid.setdefault(card["pid"], []).append(card)
@@ -492,11 +593,14 @@ def check_ax_identity_invariant(frame, label):
         identified = [c for c in group if c.get("ax_identified")]
         if not identified:
             continue
-        unverified = [c for c in group if not c.get("ax_identified")]
+        unverified = [
+            c for c in group if not c.get("ax_identified") and c["window_id"] not in fullscreen
+        ]
         check(not unverified,
               f"{label}: no window invented for an app whose AX list is Space-filtered",
               f"pid={pid} identified={[c['window_id'] for c in identified]} "
-              f"invented={[(c['window_id'], c['title']) for c in unverified]}")
+              f"invented={[(c['window_id'], c['title']) for c in unverified]} "
+              f"fullscreen={sorted(fullscreen)}")
 
 
 
@@ -532,10 +636,27 @@ try:
          if not c["other_desktop"] and not c["minimized"] and c["window_id"] != target_wid),
         None,
     )
+    target_problems_before = len(problems)
     check(target is not None, "the other-desktop window is a card once the switch is on",
           f"cards={[(c['window_id'], c['other_desktop']) for c in frame.get('cards', [])]}")
     if target is None:
-        raise SystemExit(1)
+        # Unrun only on the app's own recorded reason for *this* window: `ax_excluded` is the accepted
+        # narrowing (the app's AX answer named a window on the target's own Space and never named the
+        # target, so its desktop has not been visited in this process). Every other reason -- space,
+        # title, shape, unpaired -- or no recorded decision at all keeps the failure, so a real
+        # admission regression cannot hide behind NOT RUN.
+        reason = target_rejection_reason(frame, target_wid)
+        if reason == "ax_excluded":
+            del problems[target_problems_before:]
+        # Without the narrowing evidence the target check's own failure stays in `problems`, so the
+        # helper exits non-zero instead of reporting an unrun phase.
+        unrun_or_fail(
+            checks,
+            problems,
+            "the chosen cross-desktop window is not admitted yet (its desktop has not been visited "
+            f"in this process); reason={reason} "
+            f"cards={[(c['window_id'], c['other_desktop']) for c in frame.get('cards', [])]}",
+        )
     check(target["other_desktop"], "its card is marked as another desktop",
           f"other_desktop={target['other_desktop']}")
     check(target["pid"] == target_pid, "the card keeps the exact window identity",
@@ -742,20 +863,45 @@ try:
             check(after_card is not None and after_card.get("other_desktop") is True,
                   "the target is an other-desktop card again", f"card={after_card}")
             rendered = False
-            deadline = time.time() + 5
-            while time.time() < deadline:
-                snapshot = read_state() or {}
-                card = next(
-                    (c for c in snapshot.get("cards", []) if c["window_id"] == target_wid), None
-                )
-                if card is not None and card.get("thumbnail_rendered"):
-                    rendered = True
+            # The cached frame of a cross-Space window is attached on the app's own schedule, so give
+            # it a second summon before judging: one frame that had not rendered yet used to fail the
+            # phase even though the next summon rendered it.
+            for attempt in range(2):
+                deadline = time.time() + 5
+                while time.time() < deadline:
+                    snapshot = read_state() or {}
+                    card = next(
+                        (c for c in snapshot.get("cards", []) if c["window_id"] == target_wid), None
+                    )
+                    if card is not None and card.get("thumbnail_rendered"):
+                        rendered = True
+                        break
+                    time.sleep(0.1)
+                if rendered:
                     break
-                time.sleep(0.1)
+                # Dismiss and summon again, so a fresh show pass can attach the cached frame.
+                post(VK_ESCAPE, True, FLAG_OPTION)
+                post(VK_ESCAPE, False, FLAG_OPTION)
+                time.sleep(0.4)
+                before_retry = seq()
+                post(VK_OPTION, True, FLAG_OPTION)
+                post(VK_TAB, True, FLAG_OPTION)
+                try:
+                    wait(
+                        lambda s: s.get("event") == "summon" and s.get("cards_count", 0) >= 2,
+                        3,
+                        "the overlay to summon again",
+                        after_seq=before_retry,
+                    )
+                except AssertionError:
+                    break
             snapshot = read_state() or {}
             final_card = next(
                 (c for c in snapshot.get("cards", []) if c["window_id"] == target_wid), None
             )
+            post(VK_ESCAPE, True, FLAG_OPTION)
+            post(VK_ESCAPE, False, FLAG_OPTION)
+            time.sleep(0.2)
             check(rendered,
                   "the other-desktop card renders the thumbnail captured on its own desktop",
                   f"ready={final_card.get('thumbnail_ready') if final_card else None} "
@@ -905,18 +1051,38 @@ try:
     before_state = (read_state() or {}).get("other_desktop_raise") or {}
     count_before = before_state.get("count", 0)
     steps = 0
-    while steps <= len(frame.get("cards", [])) + 2:
-        current = read_state()
-        if current.get("selected_index") == target["index"]:
+    # Step until the selection reaches the target, waiting for each step to land instead of sleeping a
+    # fixed 0.2s, and re-reading the target's index from the *latest* frame each time: with more cards
+    # (fullscreen windows are candidates too since 2026-10-07) the target sits further along, and a
+    # refresh during the walk can also shift its index -- chasing a stale index made the loop release
+    # the modifier before the target was selected, which then never produced a commit frame.
+    limit = 2 * len(frame.get("cards", [])) + 6
+    while steps <= limit:
+        current = read_state() or {}
+        current_cards = current.get("cards") or []
+        current_target = next(
+            (c for c in current_cards if c["window_id"] == target_wid), None
+        )
+        if current_target is None:
+            raise AssertionError(
+                f"the target left the card list while stepping; cards={[c['window_id'] for c in current_cards]}"
+            )
+        if current.get("selected_index") == current_target["index"]:
             break
+        previous_index = current.get("selected_index")
         post(VK_TAB, True, FLAG_OPTION, 1)
-        time.sleep(0.2)
         steps += 1
+        step_deadline = time.time() + 1.0
+        while time.time() < step_deadline:
+            now = read_state()
+            if now and now.get("selected_index") != previous_index:
+                break
+            time.sleep(0.02)
     before = seq()
     post(VK_OPTION, False, 0)
     post(VK_TAB, False, 0)
     wait(lambda s: s.get("event") == "commit" and s.get("committed"),
-         3, "the commit frame", after_seq=before)
+         5, "the commit frame", after_seq=before)
     deadline = time.time() + 8
     raise_state = None
     while time.time() < deadline:

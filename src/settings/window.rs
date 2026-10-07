@@ -2236,6 +2236,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             thumbnails_enabled: std::ptr::null_mut(),
             focused_thumbnail_prewarm: std::ptr::null_mut(),
             show_app_name_in_cards: std::ptr::null_mut(),
+            thumbnail_size: std::ptr::null_mut(),
             card_text_size: std::ptr::null_mut(),
             card_text_size_value_label: std::ptr::null_mut(),
             status_bar_text_size: std::ptr::null_mut(),

@@ -25,6 +25,9 @@ struct ChangeFlags {
     thumbnails: bool,
     focused_thumbnail_prewarm: bool,
     show_app_name_in_cards: bool,
+    // The pinned card size changed: the overlay picks it up on its next layout, and an open settings
+    // window has to follow in place (`refresh_switcher_keystroke_and_mouse_controls_from_config`).
+    thumbnail_size: bool,
     // The candidate scope itself changed: the cards already built no longer describe what the
     // switch now admits, so an open overlay must be dismissed rather than reused.
     show_other_desktops: bool,
@@ -37,11 +40,26 @@ struct ChangeFlags {
     updates: bool,
 }
 
+/// Whether an already-open settings window has to re-read the config in place after this change.
+///
+/// Pure so the trigger can be asserted without a window: adding a field to `ChangeFlags` without
+/// adding it here leaves the page showing the old value while the app uses the new one (the
+/// thumbnail size hit exactly that).
+fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
+    flags.modifier
+        || flags.thumbnails
+        || flags.focused_thumbnail_prewarm
+        || flags.thumbnail_size
+        || flags.keystroke_display
+        || flags.mouse
+}
+
 fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> ChangeFlags {
     let startup = matches!(source, ConfigChangeSource::Startup);
     ChangeFlags {
         visual: old.appearance != new.appearance
             || old.layout.card_text_size != new.layout.card_text_size
+            || old.layout.thumbnail_size != new.layout.thumbnail_size
             || old.colors != new.colors
             || old.fonts != new.fonts,
         settings_appearance: old.appearance != new.appearance || old.colors != new.colors,
@@ -57,6 +75,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.layout.focused_thumbnail_prewarm != new.layout.focused_thumbnail_prewarm,
         show_app_name_in_cards: old.layout.show_app_name_in_cards
             != new.layout.show_app_name_in_cards,
+        thumbnail_size: old.layout.thumbnail_size != new.layout.thumbnail_size,
         show_other_desktops: old.windows.show_other_desktops != new.windows.show_other_desktops,
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
@@ -156,12 +175,7 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::window_refresh::invalidate_collection_for_policy_change();
     }
 
-    if flags.modifier
-        || flags.thumbnails
-        || flags.focused_thumbnail_prewarm
-        || flags.keystroke_display
-        || flags.mouse
-    {
+    if needs_in_place_control_sync(&flags) {
         // Keep an already-open settings window in sync in place, without activating the app or
         // rebuilding the window.
         crate::settings::refresh_switcher_keystroke_and_mouse_controls_from_config();
@@ -251,6 +265,34 @@ mod tests {
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.clipboard_shortcut);
         assert!(!flags.clipboard_enabled);
+    }
+
+    #[test]
+    fn a_thumbnail_size_change_alone_resyncs_the_open_settings_window() {
+        // Only `layout.thumbnail_size` changes: the overlay picks it up on its next layout, and the
+        // settings page must follow in place or it keeps showing the old size.
+        let old = Config::default();
+        let mut new = old.clone();
+        new.layout.thumbnail_size = "85".into();
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.thumbnail_size, "the field change must be detected");
+        assert!(flags.visual, "the overlay repaints from the new size");
+        assert!(
+            !flags.thumbnails
+                && !flags.focused_thumbnail_prewarm
+                && !flags.modifier
+                && !flags.mouse
+                && !flags.keystroke_display,
+            "no other service changed"
+        );
+        assert!(
+            needs_in_place_control_sync(&flags),
+            "the thumbnail size alone must trigger the in-place control sync"
+        );
+        assert!(
+            !needs_in_place_control_sync(&ChangeFlags::default()),
+            "an empty change set must not resync anything"
+        );
     }
 
     #[test]
