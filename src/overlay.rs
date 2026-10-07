@@ -55,6 +55,11 @@ pub(crate) const ICON_VIEW_TAG: isize = 0xE7F2;
 const THUMB_PREVIEW_TAG: isize = 0xE7F3;
 /// Tag for the thumbnail-mode selected-state 2pt outer ring.
 const THUMB_SELECTION_RING_TAG: isize = 0xE7F4;
+/// Tags for the two preview-corner status badges. They exist so a view-tree runner can assert that
+/// a card actually drew a badge (the decoded flags alone are satisfied by a card that never reached
+/// the renderer, and pixels are not a gate).
+pub(crate) const THUMB_FULLSCREEN_BADGE_TAG: isize = 0xE7F5;
+pub(crate) const THUMB_VISIBILITY_BADGE_TAG: isize = 0xE7F6;
 /// Liquid Glass washes out the mockup's 16% accent-soft; use 38% for a clearer selection.
 const SELECTION_RING_ALPHA: u8 = 0x61;
 /// Zero-offset glow around the ring, layered separately from the card's dark drop shadow.
@@ -330,6 +335,7 @@ mod cards;
 pub(crate) mod hover;
 use callbacks::*;
 use cancel::*;
+pub(crate) use cards::smoke_card_badges;
 use cards::*;
 
 use card_close::*;
@@ -972,6 +978,7 @@ mod tests {
                 fullscreen: false,
                 on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
+                state: Default::default(),
             }
         }
 
@@ -1009,6 +1016,7 @@ mod tests {
                 fullscreen: false,
                 on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
+                state: Default::default(),
             }
         }
 
@@ -1040,6 +1048,7 @@ mod tests {
                 fullscreen: false,
                 on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
+                state: Default::default(),
             }
         }
 
@@ -1066,6 +1075,7 @@ mod tests {
                 fullscreen: false,
                 on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
+                state: Default::default(),
             }
         }
 
@@ -1101,6 +1111,7 @@ mod tests {
                 fullscreen: false,
                 on_other_desktop: false,
                 bounds: (0.0, 0.0, 100.0, 100.0),
+                state: Default::default(),
             }
         }
 

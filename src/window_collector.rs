@@ -29,11 +29,15 @@ mod raise;
 mod raiser;
 #[path = "window_collector/skylight.rs"]
 mod space_membership;
+mod space_state_probe;
+mod window_state;
 // The parent no longer calls collect directly; the glob is test-only.
 #[cfg(test)]
 use collect::*;
 use raise::*;
 use raiser::*;
+pub(crate) use space_state_probe::{run as run_space_state_probe, ProbeMode};
+pub(crate) use window_state::{ax_app_hidden_tag, StateSource, WindowStateEvidence};
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use collect::{
     collect_windows, collect_windows_for_pid, collect_windows_with_frontmost_bump,
@@ -85,17 +89,23 @@ pub struct WindowInfo {
     pub is_active: bool,
     pub minimized: bool,  // minimized (collected only when show_minimized is on)
     pub app_hidden: bool, // app hidden with Command+H
-    // Native macOS fullscreen (AXFullScreen flag or display-filling bounds). Presentation-only:
-    // drives the thumbnail's corner badge; raise and activation logic never read it.
+    // Native macOS fullscreen (AXFullScreen flag, a fullscreen-type Space, or display-filling
+    // bounds). Presentation-only: drives the thumbnail's corner badge; raise and activation logic
+    // never read it.
     pub fullscreen: bool,
     // The window lives on another macOS desktop (Space), admitted by the "show other desktops"
-    // switch. Such a window has no AX element (the AX list is filtered by the current Space), so
-    // its title is the CG window name and its minimized state is unknown. Presentation-only, with
-    // two consequences the raise and thumbnail paths do read: a capture is impossible off the
-    // current desktop, and activation needs the Space switch that fronting the app performs.
+    // switch. Such a window usually has no AX element (the AX list is filtered by the current
+    // Space), so its title is the CG window name; its physical state still comes from the
+    // WindowServer row, which is why `state` travels with the card. Presentation-only, with two
+    // consequences the raise and thumbnail paths do read: a capture is impossible off the current
+    // desktop, and activation needs the Space switch that fronting the app performs.
     pub on_other_desktop: bool,
     // CG window bounds (x, y, w, h), used to locate the active window's screen. All zeros = unavailable.
     pub bounds: (f64, f64, f64, f64),
+    // Per-field evidence for the three state flags above, published by `--e2e-state` so a scenario
+    // can prove which plane decided a value. It carries the raw WindowServer row the card was
+    // decoded from, so it is accepted and discarded with the collection result that produced it.
+    pub(crate) state: WindowStateEvidence,
 }
 
 /// Window-level MRU timestamps, keyed by (pid, CGWindowID).
@@ -1223,6 +1233,7 @@ mod tests {
             fullscreen: false,
             on_other_desktop: false,
             bounds: (0.0, 0.0, 0.0, 0.0),
+            state: Default::default(),
         }
     }
 

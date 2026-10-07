@@ -2315,6 +2315,8 @@ pub fn run() {
             || arg == "--smoke-onboarding-live-apply"
             || arg == "--smoke-update-prompts"
             || arg == "--smoke-smooth-scroll-event"
+            || arg == "--smoke-card-badges"
+            || arg == "--smoke-space-state-matrix"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -2450,6 +2452,54 @@ pub fn run() {
             std::thread::sleep(std::time::Duration::from_millis(2000));
             crate::space_swipe::probe(&direction);
         });
+    }
+
+    // Window-state matrix instrument. Record mode walks the app's own probe window through every
+    // state the decode distinguishes and prints the raw WindowServer fields (the source command for
+    // the bit semantics documented in window_collector::window_state); the smoke mode asserts the
+    // pinned matrix. Both need a GUI session and the main thread, and both restore the window.
+    if crate::dev_flags::present("space-state-record")
+        || crate::dev_flags::present("smoke-space-state-matrix")
+    {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        let recording = crate::dev_flags::present("space-state-record");
+        let mode = if recording {
+            window_collector::ProbeMode::Record
+        } else {
+            window_collector::ProbeMode::Matrix
+        };
+        let ok = window_collector::run_space_state_probe(mode);
+        if !ok {
+            eprintln!("[space-state] the state matrix did not hold");
+            std::process::exit(1);
+        }
+        // The record mode makes no judgement, so it must not claim the matrix held.
+        if recording {
+            log_info!("[space-state] recording complete (no assertions were made)");
+        } else {
+            log_info!("[space-state] the state matrix held");
+        }
+        std::process::exit(0);
+    }
+
+    // Smoke-test entry (--smoke-card-badges): build real cards from controlled window input and
+    // assert the preview-corner badges match the card's state. Needs a GUI session (AppKit view
+    // tree) and no window collection at all, so it can cover the icon-fallback branch that a card
+    // of another desktop takes.
+    if crate::dev_flags::present("smoke-card-badges") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        if !overlay::smoke_card_badges() {
+            eprintln!("[smoke-card-badges] the preview badges do not match the card state");
+            std::process::exit(1);
+        }
+        log_info!("[smoke-card-badges] preview badges match the card state");
+        std::process::exit(0);
     }
 
     if crate::dev_flags::present("smoke-update-prompts") {

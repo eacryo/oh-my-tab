@@ -39,6 +39,7 @@ note() { echo "e2e space-desktops: $*"; }
 repo_dir_verdict="$repo_dir/scripts/e2e/lib"
 python3 -B "$repo_dir_verdict/verdict.py" >/dev/null || fail "verdict.py selftest failed"
 python3 -B "$repo_dir_verdict/space_kinds.py" >/dev/null || fail "space_kinds.py selftest failed"
+python3 -B "$repo_dir_verdict/hotkey.py" >/dev/null || fail "hotkey.py selftest failed"
 
 command -v cua-driver >/dev/null 2>&1 || fail "cua-driver CLI not found in PATH"
 cua-driver status >/dev/null 2>&1 || fail "cua-driver daemon is not running"
@@ -206,9 +207,12 @@ cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 
 FIELD_AUTOREPEAT = 8
 FIELD_KEYCODE = 9
-FLAG_OPTION = 0x80000
-VK_TAB = 48
-VK_OPTION = 58
+from hotkey import chord as chord_for_config  # noqa: E402
+# The modifier is a user setting; injecting the wrong chord would look like a product bug.
+_chord = chord_for_config(config)
+FLAG_MOD = _chord.flag
+VK_MOD = _chord.modifier_keycode
+VK_TAB = _chord.tab_keycode
 VK_ESCAPE = 53
 HID_EVENT_TAP = 0
 
@@ -223,7 +227,25 @@ def post(keycode: int, down: bool, flags: int, autorepeat: int = 0) -> None:
 
 def release_all() -> None:
     post(VK_TAB, False, 0)
-    post(VK_OPTION, False, 0)
+    post(VK_MOD, False, 0)
+
+
+
+def last_commit():
+    """The sticky record of the last commit (`count` moves once per commit)."""
+    return (read_state() or {}).get("last_commit") or {}
+
+def commit_release() -> None:
+    """Bring the modifier up and then Tab, with a settle between them.
+
+    The app writes its `commit` frame when the modifier comes up, and the Tab key-up right after it
+    writes a keystroke-display frame over the same file; a scenario polling that file can therefore
+    miss the commit frame entirely. Settling briefly gives the poll a window it can rely on. The
+    frame stays transient by design -- `other_desktop_raise` is the sticky record read later.
+    """
+    post(VK_MOD, False, 0)
+    time.sleep(0.25)
+    post(VK_TAB, False, 0)
 
 
 def read_state():
@@ -257,8 +279,8 @@ def summon():
     """Hold Option+Tab until the overlay reports cards; retried because a press can precede the tap."""
     for _ in range(6):
         before = seq()
-        post(VK_OPTION, True, FLAG_OPTION)
-        post(VK_TAB, True, FLAG_OPTION)
+        post(VK_MOD, True, FLAG_MOD)
+        post(VK_TAB, True, FLAG_MOD)
         try:
             return wait(
                 lambda s: s.get("event") == "summon" and s.get("cards_count", 0) >= 2,
@@ -333,8 +355,8 @@ try:
             f"cards={[c['window_id'] for c in cards]} fullscreen={sorted(fullscreen_wids)}",
         )
     # Cancel (Escape) rather than release the modifier: a release would commit a raise.
-    post(VK_ESCAPE, True, FLAG_OPTION)
-    post(VK_ESCAPE, False, FLAG_OPTION)
+    post(VK_ESCAPE, True, FLAG_MOD)
+    post(VK_ESCAPE, False, FLAG_MOD)
     time.sleep(0.3)
 
     # --- phase 2: switch on --------------------------------------------------------------
@@ -363,15 +385,16 @@ phase2_log="/tmp/omt-e2e-space-desktops-phase2.log"
 # reference_pid: a pid that has a focused window right now, used only to prove the AX read
 # works at all before a missing focus read is judged a failure instead of a NOT RUN.
 reference_pid="${front_app_before:-$target_pid}"
-python3 -B - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$target_app" "$reference_pid" "$repo_dir_verdict" <<'PY' >"$phase2_log"
+python3 -B - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$target_app" "$reference_pid" "$config" "$repo_dir_verdict" <<'PY' >"$phase2_log"
 import ctypes
 import json
 import subprocess
 import sys
 import time
 
-state_file, app_pid, target_wid, target_pid, target_app, reference_pid, repo_dir_verdict = (
-    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6]), sys.argv[7],
+state_file, app_pid, target_wid, target_pid, target_app, reference_pid, config, repo_dir_verdict = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], int(sys.argv[6]),
+    sys.argv[7], sys.argv[8],
 )
 sys.path.insert(0, repo_dir_verdict)
 from verdict import unrun_or_fail  # noqa: E402  (the path above is what makes it importable)
@@ -394,9 +417,12 @@ cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 
 FIELD_AUTOREPEAT = 8
 FIELD_KEYCODE = 9
-FLAG_OPTION = 0x80000
-VK_TAB = 48
-VK_OPTION = 58
+from hotkey import chord as chord_for_config  # noqa: E402  (sys.path is set above)
+# The modifier is a user setting; injecting the wrong chord would look like a product bug.
+_chord = chord_for_config(config)
+FLAG_MOD = _chord.flag
+VK_MOD = _chord.modifier_keycode
+VK_TAB = _chord.tab_keycode
 VK_ESCAPE = 53
 HID_EVENT_TAP = 0
 
@@ -411,7 +437,25 @@ def post(keycode, down, flags, autorepeat=0):
 
 def release_all():
     post(VK_TAB, False, 0)
-    post(VK_OPTION, False, 0)
+    post(VK_MOD, False, 0)
+
+
+
+def last_commit():
+    """The sticky record of the last commit (`count` moves once per commit)."""
+    return (read_state() or {}).get("last_commit") or {}
+
+def commit_release() -> None:
+    """Bring the modifier up and then Tab, with a settle between them.
+
+    The app writes its `commit` frame when the modifier comes up, and the Tab key-up right after it
+    writes a keystroke-display frame over the same file; a scenario polling that file can therefore
+    miss the commit frame entirely. Settling briefly gives the poll a window it can rely on. The
+    frame stays transient by design -- `other_desktop_raise` is the sticky record read later.
+    """
+    post(VK_MOD, False, 0)
+    time.sleep(0.25)
+    post(VK_TAB, False, 0)
 
 
 # --- AX read-only probe: the app's real focused window -----------------------
@@ -501,8 +545,8 @@ def wait(predicate, timeout, label, after_seq=0):
 def summon():
     for _ in range(6):
         before = seq()
-        post(VK_OPTION, True, FLAG_OPTION)
-        post(VK_TAB, True, FLAG_OPTION)
+        post(VK_MOD, True, FLAG_MOD)
+        post(VK_TAB, True, FLAG_MOD)
         try:
             return wait(lambda s: s.get("event") == "summon" and s.get("cards_count", 0) >= 2,
                         1.5, "the overlay to summon", after_seq=before)
@@ -663,6 +707,46 @@ try:
           f"pid={target['pid']} wid={target['window_id']}")
     check(bool(target["title"]), "the card carries the CG title", repr(target["title"]))
 
+    # --- the WindowServer state-evidence plane (measured 2026-10-07, macOS 27.0.1) --------------
+    # A window on another desktop usually has no accessibility element, so its presented state comes
+    # from the batched WindowServer row. These assertions read the app's own published evidence, and
+    # they are what makes "the field is used, and its source is the one we claim" checkable rather
+    # than merely plausible.
+    check(target.get("ws_attributes") is not None
+          and target.get("ws_tags") is not None
+          and target.get("ws_space_type_mask") is not None,
+          "the card carries the WindowServer row it was decoded from",
+          f"ws_attributes={target.get('ws_attributes')} ws_tags={target.get('ws_tags')} "
+          f"ws_space_type_mask={target.get('ws_space_type_mask')}")
+    # `kAXWindows` is Space-filtered: either AX published nothing for the app ("unpublished") or only
+    # its key/main slot named this window ("recovered"). "published" would mean the window list
+    # contained an other-desktop window, which the measured AppKit query cannot do.
+    check(target.get("ax_pairing") in ("unpublished", "recovered"),
+          "the card came through the no-published-element route",
+          f"ax_pairing={target.get('ax_pairing')}")
+    # The presented flags must name the WindowServer as the decisive source: a `false` that merely
+    # falls back to a default would otherwise satisfy a value assertion.
+    check(target.get("fullscreen") is False and target.get("fullscreen_source") == "window_server",
+          "the presented fullscreen flag comes from the Space-type mask",
+          f"fullscreen={target.get('fullscreen')} source={target.get('fullscreen_source')}")
+    check(target.get("minimized_source") in ("window_server", "ax"),
+          "the presented minimized flag has decisive evidence, not a fallback",
+          f"minimized={target.get('minimized')} source={target.get('minimized_source')}")
+    # Measured: being on another desktop does NOT clear the WindowServer's ordered-in bit (the bit
+    # describes the window's own Space), while minimizing does. So an unminimized cross-desktop
+    # window reads ordered-in, and the presented minimized flag must agree with that.
+    if target.get("minimized"):
+        check(target.get("ordered_in") is False,
+              "a minimized cross-desktop window reads ordered-out",
+              f"ordered_in={target.get('ordered_in')} tags={target.get('ws_tags')}")
+    else:
+        check(target.get("ordered_in") is True,
+              "an unminimized cross-desktop window reads ordered-in in its own Space",
+              f"ordered_in={target.get('ordered_in')} tags={target.get('ws_tags')}")
+    check(target.get("window_server_hidden") is not None,
+          "the WindowServer's own app-hidden tag is published for cross-checking",
+          f"window_server_hidden={target.get('window_server_hidden')}")
+
     # Capture eligibility, asserted on the summon's own candidate set rather than on the card flag.
     # The set is computed after the summon frame is written, so wait for it to appear; when it never
     # does (thumbnails disabled, or Screen Recording not granted) the check cannot be made and is
@@ -698,7 +782,7 @@ try:
         current = read_state()
         if current.get("selected_index") == target["index"]:
             break
-        post(VK_TAB, True, FLAG_OPTION, 1)
+        post(VK_TAB, True, FLAG_MOD, 1)
         time.sleep(0.2)
         steps += 1
     selected = read_state()
@@ -706,14 +790,14 @@ try:
           "the selection reached the other-desktop card",
           f"selected={selected.get('selected_index')} want={target['index']}")
 
-    before = seq()
     raise_state_before = (read_state() or {}).get("other_desktop_raise") or {}
     raise_count_before = raise_state_before.get("count", 0)
-    post(VK_OPTION, False, 0)
-    post(VK_TAB, False, 0)
-    commit = wait(lambda s: s.get("event") == "commit" and s.get("committed"),
-                  3, "the commit frame", after_seq=before)
-    committed = commit.get("committed") or {}
+    commit_count_before = last_commit().get("count", 0)
+    commit_release()
+    # Read the commit from its sticky record, not from the transient `commit` frame: the app writes
+    # the keystroke display's hide frame in the same turn, so a poll can miss the frame.
+    committed = wait(lambda s: (s.get("last_commit") or {}).get("count", 0) > commit_count_before,
+                     3, "the commit record", after_seq=seq() - 1).get("last_commit") or {}
     check(committed.get("window_id") == target_wid and committed.get("pid") == target_pid,
           "the committed window is the exact selected one", json.dumps(committed))
 
@@ -804,8 +888,8 @@ try:
                 None,
             )
             if back_target is None:
-                post(VK_ESCAPE, True, FLAG_OPTION)
-                post(VK_ESCAPE, False, FLAG_OPTION)
+                post(VK_ESCAPE, True, FLAG_MOD)
+                post(VK_ESCAPE, False, FLAG_MOD)
                 time.sleep(0.5)
                 continue
             steps_back = 0
@@ -813,15 +897,18 @@ try:
                 current = read_state()
                 if current.get("selected_index") == back_target["index"]:
                     break
-                post(VK_TAB, True, FLAG_OPTION, 1)
+                post(VK_TAB, True, FLAG_MOD, 1)
                 time.sleep(0.2)
                 steps_back += 1
-            before_back = seq()
-            post(VK_OPTION, False, 0)
-            post(VK_TAB, False, 0)
+            commit_count_before_back = last_commit().get("count", 0)
+            commit_release()
             try:
-                wait(lambda s: s.get("event") == "commit" and s.get("committed"),
-                     3, "the return commit frame", after_seq=before_back)
+                returned_commit = wait(
+                    lambda s: (s.get("last_commit") or {}).get("count", 0) > commit_count_before_back,
+                    3, "the return commit record", after_seq=seq() - 1).get("last_commit") or {}
+                check(returned_commit.get("window_id") == origin_card["window_id"],
+                      "the return commit targets the origin desktop's window",
+                      json.dumps(returned_commit))
                 returned = True
                 break
             except AssertionError:
@@ -857,8 +944,8 @@ try:
                 )
                 if after_card is not None and after_card.get("other_desktop") is True:
                     break
-                post(VK_ESCAPE, True, FLAG_OPTION)
-                post(VK_ESCAPE, False, FLAG_OPTION)
+                post(VK_ESCAPE, True, FLAG_MOD)
+                post(VK_ESCAPE, False, FLAG_MOD)
                 time.sleep(0.5)
             check(after_card is not None and after_card.get("other_desktop") is True,
                   "the target is an other-desktop card again", f"card={after_card}")
@@ -880,12 +967,12 @@ try:
                 if rendered:
                     break
                 # Dismiss and summon again, so a fresh show pass can attach the cached frame.
-                post(VK_ESCAPE, True, FLAG_OPTION)
-                post(VK_ESCAPE, False, FLAG_OPTION)
+                post(VK_ESCAPE, True, FLAG_MOD)
+                post(VK_ESCAPE, False, FLAG_MOD)
                 time.sleep(0.4)
                 before_retry = seq()
-                post(VK_OPTION, True, FLAG_OPTION)
-                post(VK_TAB, True, FLAG_OPTION)
+                post(VK_MOD, True, FLAG_MOD)
+                post(VK_TAB, True, FLAG_MOD)
                 try:
                     wait(
                         lambda s: s.get("event") == "summon" and s.get("cards_count", 0) >= 2,
@@ -899,8 +986,8 @@ try:
             final_card = next(
                 (c for c in snapshot.get("cards", []) if c["window_id"] == target_wid), None
             )
-            post(VK_ESCAPE, True, FLAG_OPTION)
-            post(VK_ESCAPE, False, FLAG_OPTION)
+            post(VK_ESCAPE, True, FLAG_MOD)
+            post(VK_ESCAPE, False, FLAG_MOD)
             time.sleep(0.2)
             check(rendered,
                   "the other-desktop card renders the thumbnail captured on its own desktop",
@@ -945,16 +1032,18 @@ app_pid="$(printf '%s\n' "$rescue_out" | sed -n 's/^restart ok (app pid \([0-9][
 [ -n "$app_pid" ] || fail "could not read the app pid for the rescue phase"
 rm -f "$state_file" "${state_file%.json}.tmp"
 
-python3 - "$state_file" "$app_pid" "$target_wid" "$target_pid" <<'PY' >"$phase2_log"
+python3 - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$config" "$repo_dir_verdict" <<'PY' >"$phase2_log"
 import ctypes
 import json
 import subprocess
 import sys
 import time
 
-state_file, app_pid, target_wid, target_pid = (
-    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]),
+state_file, app_pid, target_wid, target_pid, config, repo_dir_verdict = (
+    sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6],
 )
+sys.path.insert(0, repo_dir_verdict)
+from hotkey import chord as chord_for_config  # noqa: E402  (the path above makes it importable)
 problems: list[str] = []
 checks: list[str] = []
 
@@ -972,9 +1061,12 @@ cg.CGEventPost.argtypes = [ctypes.c_uint32, ctypes.c_void_p]
 
 FIELD_KEYCODE = 9
 FIELD_AUTOREPEAT = 8
-FLAG_OPTION = 0x80000
-VK_TAB = 48
-VK_OPTION = 58
+from hotkey import chord as chord_for_config  # noqa: E402
+# The modifier is a user setting; injecting the wrong chord would look like a product bug.
+_chord = chord_for_config(config)
+FLAG_MOD = _chord.flag
+VK_MOD = _chord.modifier_keycode
+VK_TAB = _chord.tab_keycode
 VK_ESCAPE = 53
 HID_EVENT_TAP = 0
 
@@ -989,7 +1081,25 @@ def post(keycode, down, flags, autorepeat=0):
 
 def release_all():
     post(VK_TAB, False, 0)
-    post(VK_OPTION, False, 0)
+    post(VK_MOD, False, 0)
+
+
+
+def last_commit():
+    """The sticky record of the last commit (`count` moves once per commit)."""
+    return (read_state() or {}).get("last_commit") or {}
+
+def commit_release() -> None:
+    """Bring the modifier up and then Tab, with a settle between them.
+
+    The app writes its `commit` frame when the modifier comes up, and the Tab key-up right after it
+    writes a keystroke-display frame over the same file; a scenario polling that file can therefore
+    miss the commit frame entirely. Settling briefly gives the poll a window it can rely on. The
+    frame stays transient by design -- `other_desktop_raise` is the sticky record read later.
+    """
+    post(VK_MOD, False, 0)
+    time.sleep(0.25)
+    post(VK_TAB, False, 0)
 
 
 def read_state():
@@ -1022,8 +1132,8 @@ def wait(predicate, timeout, label, after_seq=0):
 def summon():
     for _ in range(6):
         before = seq()
-        post(VK_OPTION, True, FLAG_OPTION)
-        post(VK_TAB, True, FLAG_OPTION)
+        post(VK_MOD, True, FLAG_MOD)
+        post(VK_TAB, True, FLAG_MOD)
         try:
             return wait(lambda s: s.get("event") == "summon" and s.get("cards_count", 0) >= 2,
                         1.5, "the overlay to summon", after_seq=before)
@@ -1070,7 +1180,7 @@ try:
         if current.get("selected_index") == current_target["index"]:
             break
         previous_index = current.get("selected_index")
-        post(VK_TAB, True, FLAG_OPTION, 1)
+        post(VK_TAB, True, FLAG_MOD, 1)
         steps += 1
         step_deadline = time.time() + 1.0
         while time.time() < step_deadline:
@@ -1078,11 +1188,10 @@ try:
             if now and now.get("selected_index") != previous_index:
                 break
             time.sleep(0.02)
-    before = seq()
-    post(VK_OPTION, False, 0)
-    post(VK_TAB, False, 0)
-    wait(lambda s: s.get("event") == "commit" and s.get("committed"),
-         5, "the commit frame", after_seq=before)
+    commit_count_before_rescue = last_commit().get("count", 0)
+    commit_release()
+    wait(lambda s: (s.get("last_commit") or {}).get("count", 0) > commit_count_before_rescue,
+         5, "the commit record", after_seq=seq() - 1)
     deadline = time.time() + 8
     raise_state = None
     while time.time() < deadline:
@@ -1113,8 +1222,8 @@ try:
           "the active desktop is the target's desktop after the rescue",
           f"current_space={windows.get('current_space_id')}")
 finally:
-    post(VK_ESCAPE, True, FLAG_OPTION)
-    post(VK_ESCAPE, False, FLAG_OPTION)
+    post(VK_ESCAPE, True, FLAG_MOD)
+    post(VK_ESCAPE, False, FLAG_MOD)
     release_all()
 
 print("\n".join(checks))

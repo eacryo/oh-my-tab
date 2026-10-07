@@ -110,11 +110,67 @@ Stats so its AX read times out used to admit both its visible settings window an
 Admission requires a non-empty membership list that names a Space the
 accepted topology manages: an empty or unmanaged list is the shape an orderOut'd or helper surface
 presents, and stays rejected with the switch on. The switch never widens the legacy fallback, which
-cannot tell another desktop from an off-screen window. The minimized option still applies first.
+cannot tell another desktop from an off-screen window. The minimized option still applies first --
+against the supplemented state below, so a window the WindowServer reports as minimized on another
+desktop is filtered by it too.
 
-Thumbnails: such a card never *requests* a capture (the WindowServer cannot capture a window off the
-active desktop), but it does show a frame the cache already holds from when the window was on its own
-desktop -- the producers filter it out while the renderer keeps reading the cache, and the A2 snapshot
+**State on another desktop comes from the WindowServer, not from the app.** A window on another
+desktop is usually absent from `kAXWindows` (AppKit builds that list from a Space-restricted
+WindowServer query), so the accessibility answer cannot describe it. One batched
+`SLSWindowQueryWindows` call per collection pass carries what the card needs for every window the
+pass can name: `attributes` bit `0x2` (ordered in), `tags` bit 60 (minimized) and bit 39 (the app is
+hidden), and `space_type_mask` bit `0x20` (the window's Space is a fullscreen Space). The decode
+precedence, the per-field evidence sources and the counter-examples live in
+`src/window_collector/window_state.rs`; the raw bits and the source of every presented flag are
+published per card by `--e2e-state` (`minimized_source`, `fullscreen_source`, `ordered_in`,
+`ax_pairing`, `ws_*`). The bit positions are undocumented WindowServer fields. `--space-state-record` walks the app's own
+probe window through ordered-in, ordered-out, minimized, restored, app-hidden and app-unhidden and
+prints the raw fields, and `--smoke-space-state-matrix` asserts the recorded matrix (it fails, rather
+than passes, while a cell is unpinned). Measured on this machine (macOS 27.0.1 / 26A434,
+2026-10-07): being ordered in sets `attributes` bit `0x2` and ordering out clears it; minimize sets
+`tags` bit 60 (`0x200100482001` -> `0x1000200100480001`) and clears `0x2`; `deminiaturize:` brings
+`0x2` back and clears bit 60 in the same 20ms-polled sample (no sample showed an ordered-in window
+with the minimized tag still set); hiding the app sets `tags` bit 39 (`0x208100480001`). Two further facts
+from the same run: an ordered-out window is NOT minimized (its tag loses only the on-screen bit 13,
+which is the reference implementation's #5714 discrimination), and `kAXWindows` omits an ordered-out
+window while a hidden app's windows stay listed. The fullscreen Space mask `0x20` was then verified on a real
+cross-desktop window by toggling `AXFullScreen` on it: the row read `mask=0x20` while the window sat
+in a newly created fullscreen Space, and `mask=0x1` again after leaving it. `--space-state-record`
+itself cannot produce that cell, because this app is a menu-bar application and AppKit refuses
+`toggleFullScreen:` for it.
+
+Three further measured facts about a window that is on another desktop, each of which the naive
+model gets wrong:
+- its `attributes` bit `0x2` stays SET while it is unminimized (the bit describes the window's own
+  Space, not "on the screen the user is looking at"); minimizing it there clears `0x2` and sets the
+  minimized tag, and restoring it brings `0x2` back with the tag already clear in the same 20ms
+  sample. The presented state is therefore unchanged by which desktop is current.
+- `kAXWindows` lists nothing for an app whose windows are all on another desktop, while
+  `kAXFocusedWindow`/`kAXMainWindow` still name such a window: that is the `RecoveredAx` route the
+  switcher admits it through (and the reason a cross-desktop card can exist at all). An app that
+  answers accessibility with no window at all stays refused, as documented above.
+- the remote-token sweep reaches such a window's element (measured: 43 ids for an off-desktop
+  Chrome window), which is what the action path would use if it ever needed more than key/main.
+
+The end-to-end assertions for a cross-desktop card -- `minimized`/`fullscreen` and their evidence
+sources, `ordered_in`, `ax_pairing`, the raw row fields -- live in `scripts/e2e/space-desktops.sh`
+(run it with `--include-focus`); the scenario derives the injected chord from `keyboard.modifier`
+rather than assuming one.
+
+The minimized decode deliberately lets the ordered-in bit outrank a minimized claim. The reference
+implementation measured a *Dock* restore where the WindowServer keeps its minimized tag set for a
+while after the accessibility read already says "restored"; this repository's own recording used the
+programmatic `deminiaturize:`, where the tag was already clear in the same sample that showed the
+window ordered in again, so it did not reproduce that delay and says nothing about the Dock path.
+The rule is the conservative one either way: while the WindowServer reports the window ordered in, it
+is not presented as minimized. When the ordered-in field
+could not be read, the accessibility answer decides alone and the WindowServer tag is consulted only
+for a window accessibility does not publish at all.
+
+Thumbnails: such a card never *requests* a capture -- the private capture call this app uses
+(`SLSHWCaptureWindowList`) cannot capture a window off the active desktop, and no reference
+implementation asks it to -- but it does show a frame the cache already holds from when the window was
+on its own desktop -- the producers filter it out while the renderer keeps reading the cache, and the A2 snapshot
 publishes `thumbnail_ready` so that behaviour is assertable. Refusing to render that frame as well was
 wrong: a user who visits both desktops has one for most cards, and reference implementations keep the
 last thumbnail the same way.

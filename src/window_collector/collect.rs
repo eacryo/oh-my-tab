@@ -3,7 +3,12 @@
 use super::space_membership::{
     query_with_provider, MembershipSnapshot, SkyLightMembershipProvider,
 };
+use super::window_state::{
+    decode_fullscreen, decode_minimized, AxFullscreen, AxMinimized, StateSource,
+    WindowStateEvidence,
+};
 use super::*;
+use crate::skylight::WsWindowRow;
 use crate::space_groups::MembershipScope;
 
 /// One worker thread's partial result set for its PID chunk; merged by key afterwards --
@@ -321,9 +326,25 @@ unsafe fn collect_windows_for_pid_inner(
     membership_window_ids.extend(ax_wid_to_info.keys().copied());
     membership_window_ids.sort_unstable();
     membership_window_ids.dedup();
+    // One WindowServer row query for the whole pass, over the union of the CG and AX window ids.
+    // Every consumer below (Space membership, parentage, state decode) reads this same snapshot, so
+    // the pass cannot explain one window with another pass's rows. This pass serves exactly one pid,
+    // so every id in the union is expected to belong to it.
+    let expected_owners: HashMap<u32, i32> = membership_window_ids
+        .iter()
+        .map(|window_id| (*window_id, pid))
+        .collect();
+    let rows = rows_with_verified_owner(
+        skylight::window_rows(&membership_window_ids),
+        &expected_owners,
+        &HashSet::new(),
+    );
     let (membership_source, membership_snapshot) =
-        query_space_membership(&membership_window_ids, false);
-    let parent_ids: HashMap<u32, u32> = skylight::window_parent_ids(&cg_window_ids);
+        query_space_membership(&membership_window_ids, &rows, false);
+    let parent_ids: HashMap<u32, u32> = rows
+        .iter()
+        .filter_map(|(window_id, row)| row.parent_id.map(|parent| (*window_id, parent)))
+        .collect();
     let focused_cgwid = parent_ids
         .get(&focused_cgwid)
         .copied()
@@ -416,6 +437,17 @@ unsafe fn collect_windows_for_pid_inner(
         if native_fullscreen {
             fullscreen_cgwids.insert(cgwid);
         }
+        // This pass's WindowServer row for the window, and the presented fullscreen verdict.
+        // `native_fullscreen` above stays the AX/bounds evidence the sticky "known non-normal
+        // window" bookkeeping has always used: widening THAT set with Space evidence would relax
+        // later admission, which this change deliberately does not touch. The presented flag may
+        // therefore be true for a window the sticky set does not contain; that is presentation only.
+        let row = rows.get(&cgwid);
+        let (fullscreen, fullscreen_source) = decode_fullscreen(
+            ax_fullscreen_evidence(ax_info),
+            row,
+            cg_bounds_identify_native_fullscreen(bounds, &display_bounds),
+        );
         // The layer rule needs positive AX evidence of fullscreen: the bounds fallback is also true
         // of a display-sized floating overlay (see `ax_reports_fullscreen`). A titled
         // AXFloatingWindow additionally needs the ordinary-window shape, because its subrole
@@ -444,11 +476,12 @@ unsafe fn collect_windows_for_pid_inner(
             continue;
         }
         // Without an AX element the title comes from the CG window name (which macOS only exposes
-        // with Screen Recording) and the minimized state is unknowable, so it reads false.
+        // with Screen Recording); the physical state then comes from the WindowServer row, which is
+        // exactly what makes a window with no accessibility element of its own presentable.
         let window_title = ax_info
             .map(|info| info.title.clone())
             .unwrap_or_else(|| cf_dict_get_string(dict, "kCGWindowName").unwrap_or_default());
-        let minimized = ax_info.is_some_and(|info| info.minimized);
+        let (minimized, minimized_source) = decode_minimized(row, ax_minimized_evidence(ax_info));
         let space_scope = classify_window_space(
             membership_source,
             membership_snapshot.as_ref(),
@@ -514,9 +547,10 @@ unsafe fn collect_windows_for_pid_inner(
             is_active: false,
             minimized,
             app_hidden,
-            fullscreen: native_fullscreen,
+            fullscreen,
             on_other_desktop: is_off_current_space(space_scope),
             bounds,
+            state: card_state_evidence(row, minimized_source, fullscreen_source, pairing_source),
         });
         shown.insert(cgwid);
     }
@@ -563,7 +597,13 @@ unsafe fn collect_windows_for_pid_inner(
             if ax_info.title.is_empty() && !titleless {
                 continue;
             }
-            let native_fullscreen = ax_info.is_fullscreen == Some(true);
+            // An AX-only window has no CG entry in this pass and therefore no bounds to weigh; the
+            // row still carries the Space mask, the only fullscreen evidence available here.
+            let row = rows.get(&cgwid);
+            let (fullscreen, fullscreen_source) =
+                decode_fullscreen(ax_fullscreen_evidence(Some(ax_info)), row, false);
+            let (minimized, minimized_source) =
+                decode_minimized(row, ax_minimized_evidence(Some(ax_info)));
             let backfill_scope = classify_window_space(
                 membership_source,
                 membership_snapshot.as_ref(),
@@ -573,7 +613,7 @@ unsafe fn collect_windows_for_pid_inner(
             );
             if !admits_space_scope(
                 backfill_scope,
-                space_policy(ax_info.minimized, show_minimized, show_other_desktops),
+                space_policy(minimized, show_minimized, show_other_desktops),
             ) {
                 crate::e2e_state::space_gate_rejected();
                 crate::e2e_state::card_rejected(pid, cgwid, crate::e2e_state::CardRejection::Space);
@@ -626,11 +666,17 @@ unsafe fn collect_windows_for_pid_inner(
                 window_title: ax_info.title.clone(),
                 icon_path: icon_path.clone(),
                 is_active: false,
-                minimized: ax_info.minimized,
+                minimized,
                 app_hidden,
-                fullscreen: native_fullscreen,
+                fullscreen,
                 on_other_desktop: is_off_current_space(backfill_scope),
                 bounds: (0.0, 0.0, 0.0, 0.0),
+                state: card_state_evidence(
+                    row,
+                    minimized_source,
+                    fullscreen_source,
+                    WindowPairingSource::PublishedAx,
+                ),
             });
         }
     }
@@ -768,6 +814,128 @@ pub(super) fn ax_reports_fullscreen(ax_fullscreen: Option<bool>) -> bool {
     ax_fullscreen == Some(true)
 }
 
+/// The AX evidence for one window, in the shape the state decode needs. "AX published no element
+/// for this window" and "AX published an element that answered" are different answers, and the
+/// decode treats them differently (see `window_state::decode_minimized`/`decode_fullscreen`).
+fn ax_minimized_evidence(ax_info: Option<&AxWindowInfo>) -> AxMinimized {
+    match ax_info {
+        Some(info) => AxMinimized::Known(info.minimized),
+        None => AxMinimized::NoElement,
+    }
+}
+
+fn ax_fullscreen_evidence(ax_info: Option<&AxWindowInfo>) -> AxFullscreen {
+    match ax_info {
+        Some(info) => AxFullscreen::Paired(info.is_fullscreen),
+        None => AxFullscreen::NoElement,
+    }
+}
+
+/// One owner per window id from a sequence of `(pid, window id)` claims, plus the ids the claims
+/// disagree about. Written over claims rather than over maps because folding several answers into
+/// one map first is exactly how a conflict gets lost: the later answer would overwrite the earlier
+/// one and the disagreement would never reach the gate.
+///
+/// A conflicted id keeps NO accepted owner: it is removed from the map as well as recorded in the
+/// conflict set, so a later merge cannot re-accept it by treating the removal as "no claim".
+fn merge_owner_claims(
+    claims: impl IntoIterator<Item = (i32, u32)>,
+) -> (HashMap<u32, i32>, HashSet<u32>) {
+    let mut owners: HashMap<u32, i32> = HashMap::new();
+    let mut conflicted: HashSet<u32> = HashSet::new();
+    for (pid, window_id) in claims {
+        if conflicted.contains(&window_id) {
+            continue;
+        }
+        match owners.get(&window_id) {
+            Some(existing) if *existing != pid => {
+                owners.remove(&window_id);
+                conflicted.insert(window_id);
+            }
+            Some(_) => {}
+            None => {
+                owners.insert(window_id, pid);
+            }
+        }
+    }
+    (owners, conflicted)
+}
+
+/// The owners a pass will accept for each window id, plus the ids its two reads disagree about.
+///
+/// The CG enumeration and the accessibility answer can name different owners for one window id (a
+/// recycled id, or an app that took the window over). Whichever read came second must not overwrite
+/// the first: the candidate is still built under its own owner, so a row accepted from the other
+/// owner would explain the wrong window. A conflicting id is therefore recorded as conflicted and
+/// its row is dropped, rather than resolved in either direction.
+fn merge_row_owners(
+    cg_owners: &HashMap<u32, i32>,
+    ax_owners: &HashMap<u32, i32>,
+) -> (HashMap<u32, i32>, HashSet<u32>) {
+    let mut expected = cg_owners.clone();
+    let mut conflicted = HashSet::new();
+    for (window_id, ax_pid) in ax_owners {
+        match expected.get(window_id) {
+            Some(cg_pid) if cg_pid != ax_pid => {
+                conflicted.insert(*window_id);
+            }
+            Some(_) => {}
+            None => {
+                expected.insert(*window_id, *ax_pid);
+            }
+        }
+    }
+    (expected, conflicted)
+}
+
+/// Drop rows whose WindowServer owner contradicts the owner this pass recorded for the same window
+/// id.
+///
+/// The CG enumeration, the AX query and the WindowServer row query happen at different times, so a
+/// recycled window id could otherwise let a new window's row explain an old card -- and these rows
+/// feed parentage, the Space kind and the presented state, not only diagnostics. A row whose PID
+/// field could not be read is unknown rather than a mismatch, and is kept: the getter can be absent
+/// on a future macOS, and dropping every row then would silently remove the whole evidence plane.
+fn rows_with_verified_owner(
+    rows: HashMap<u32, WsWindowRow>,
+    expected_owner: &HashMap<u32, i32>,
+    conflicted: &HashSet<u32>,
+) -> HashMap<u32, WsWindowRow> {
+    rows.into_iter()
+        .filter(|(window_id, row)| {
+            if conflicted.contains(window_id) {
+                return false;
+            }
+            match (row.pid, expected_owner.get(window_id)) {
+                (None, _) => true,
+                (Some(actual), Some(expected)) => actual == *expected,
+                // Nothing recorded an owner for this id, so there is nothing to contradict.
+                (Some(_), None) => true,
+            }
+        })
+        .collect()
+}
+
+/// Assemble one card's evidence block from the row of the pass that is producing it. Built at every
+/// construction site so a card can never carry another pass's rows or sources.
+fn card_state_evidence(
+    row: Option<&WsWindowRow>,
+    minimized_source: StateSource,
+    fullscreen_source: StateSource,
+    pairing: WindowPairingSource,
+) -> WindowStateEvidence {
+    WindowStateEvidence {
+        ordered_in: crate::window_collector::window_state::ordered_in(row),
+        minimized_source,
+        fullscreen_source,
+        // The hidden flag still comes from AppKit this round; the WindowServer's own hidden tag is
+        // published alongside it for cross-checking (see `ax_app_hidden_tag`).
+        app_hidden_source: StateSource::AppKit,
+        pairing: Some(pairing),
+        row: row.copied(),
+    }
+}
+
 fn native_fullscreen_cg_window_ids(
     cg_bounds: &HashMap<(i32, u32), (f64, f64, f64, f64)>,
     published: &HashMap<i32, HashMap<u32, AxWindowInfo>>,
@@ -808,8 +976,11 @@ fn ax_wid_map(windows: Vec<AxWindowInfo>) -> HashMap<u32, AxWindowInfo> {
     map
 }
 
+/// How this pass paired (or failed to pair) one window with an accessibility element. Published per
+/// card through `WindowInfo::state`, because the AX identity history cannot answer "did THIS pass
+/// have an element": a window keeps its history entry after it moves to another desktop.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum WindowPairingSource {
+pub(crate) enum WindowPairingSource {
     /// The app's `kAXWindows` answer named this window: full AX evidence.
     PublishedAx,
     /// Recovered from the key/main slots; discovery only, and never Space-filtered by AX.
@@ -821,6 +992,18 @@ enum WindowPairingSource {
     /// explained, not absent: there is no AX element to reinterpret (no title, no minimized
     /// state, no raise element), only the CGWindowList facts and the membership that admitted it.
     UnpublishedAx,
+}
+
+impl WindowPairingSource {
+    /// The stable name `--e2e-state` publishes for a scenario to assert on.
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::PublishedAx => "published",
+            Self::RecoveredAx => "recovered",
+            Self::AxUnavailable => "unavailable",
+            Self::UnpublishedAx => "unpublished",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -843,6 +1026,7 @@ fn select_membership_source(
 
 fn query_space_membership(
     window_ids: &[u32],
+    rows: &HashMap<u32, WsWindowRow>,
     complete_observation: bool,
 ) -> (MembershipSource, Option<MembershipSnapshot>) {
     // `dev_flags::enabled` prepends `--` itself, so the name must be bare: passing
@@ -854,7 +1038,11 @@ fn query_space_membership(
     let result = if force_legacy {
         None
     } else {
-        Some(query_with_provider(&SkyLightMembershipProvider, window_ids))
+        Some(query_with_provider(
+            &SkyLightMembershipProvider,
+            window_ids,
+            rows,
+        ))
     };
     let snapshot = result.as_ref().and_then(|result| result.as_ref().ok());
     let source = select_membership_source(force_legacy, snapshot.is_some());
@@ -1306,6 +1494,8 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // pid -> app name (for the slow-AX log).
     let mut pid_names: HashMap<i32, String> = HashMap::new();
     let mut cg_window_ids = Vec::new();
+    // Window id -> the owner the CG enumeration recorded, used to verify the WindowServer rows.
+    let mut cg_window_owners: HashMap<u32, i32> = HashMap::new();
     for i in 0..count {
         let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
         if dict.is_null() {
@@ -1324,6 +1514,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 cf_dict_get_bounds(dict, "kCGWindowBounds").unwrap_or_default(),
             );
             cg_window_ids.push(cgwid);
+            cg_window_owners.insert(cgwid, owner_pid);
         }
         let owner_name = cf_dict_get_string(dict, "kCGWindowOwnerName").unwrap_or_default();
         if owner_name.is_empty() || owner_name == "Dock" {
@@ -1332,7 +1523,6 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         pid_names.insert(owner_pid, owner_name);
         pids.insert(owner_pid);
     }
-    let parent_ids: HashMap<u32, u32> = skylight::window_parent_ids(&cg_window_ids);
 
     // Use AX window list as primary source (same as macOS App Switcher)
     // pid -> cache identity (bundle id + mtime). Resolved once per pid in the AX phase so the
@@ -1454,8 +1644,41 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     membership_window_ids.retain(|window_id| *window_id != 0);
     membership_window_ids.sort_unstable();
     membership_window_ids.dedup();
+    // One WindowServer row query for the whole pass, over the union of the CG and AX window ids;
+    // Space membership, parentage and the state decode below all read this same snapshot. The
+    // expected owner comes from the CG enumeration, extended with the AX maps so a window the CG
+    // list lacks (an orderOut'd dialog restored from AX) is still verified against the pid that
+    // named it.
+    // Two conflict sources, both fatal to the row: the AX answers disagreeing with each other, and
+    // the CG enumeration disagreeing with the AX answer they agree on.
+    let (ax_window_owners, ax_conflicted) = merge_owner_claims(
+        ax_wid_to_info
+            .iter()
+            .chain(ax_recovered_wid_to_info.iter())
+            .flat_map(|(pid, windows)| windows.keys().map(move |window_id| (*pid, *window_id))),
+    );
+    let (expected_owners, cg_conflicted) = merge_row_owners(&cg_window_owners, &ax_window_owners);
+    let mut conflicted_owners = cg_conflicted;
+    conflicted_owners.extend(ax_conflicted);
+    if !conflicted_owners.is_empty() {
+        let mut conflicted_ids: Vec<u32> = conflicted_owners.iter().copied().collect();
+        conflicted_ids.sort_unstable();
+        log_debug!(
+            "[collect] window owner conflict: the CG and AX reads disagree about {:?}; their rows are dropped",
+            conflicted_ids
+        );
+    }
+    let rows = rows_with_verified_owner(
+        skylight::window_rows(&membership_window_ids),
+        &expected_owners,
+        &conflicted_owners,
+    );
+    let parent_ids: HashMap<u32, u32> = rows
+        .iter()
+        .filter_map(|(window_id, row)| row.parent_id.map(|parent| (*window_id, parent)))
+        .collect();
     let (membership_source, membership_snapshot) =
-        query_space_membership(&membership_window_ids, true);
+        query_space_membership(&membership_window_ids, &rows, true);
 
     let fullscreen_cg_window_ids = native_fullscreen_cg_window_ids(
         &cg_window_bounds,
@@ -1656,21 +1879,26 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             remember_ax_identity(owner_pid, owner_process_start_time_us, cgwid);
         }
 
-        let (window_title, minimized, is_main, ax_fullscreen, is_custom_root, is_floating_window) =
-            ax_info
-                .map(|info| {
-                    (
-                        info.title.clone(),
-                        info.minimized,
-                        info.is_main,
-                        info.is_fullscreen,
-                        info.is_custom_root,
-                        info.is_floating_window,
-                    )
-                })
-                .unwrap_or((cg_title, false, false, None, false, false));
-        let native_fullscreen =
-            ax_info.is_some() && native_fullscreen_state(ax_fullscreen, bounds, &display_bounds);
+        let (window_title, is_main, ax_fullscreen, is_custom_root, is_floating_window) = ax_info
+            .map(|info| {
+                (
+                    info.title.clone(),
+                    info.is_main,
+                    info.is_fullscreen,
+                    info.is_custom_root,
+                    info.is_floating_window,
+                )
+            })
+            .unwrap_or((cg_title, false, None, false, false));
+        // The card's state comes from this pass's row plus the AX reads; a window with no AX element
+        // keeps its CG title and takes its physical state from the WindowServer.
+        let row = rows.get(&cgwid);
+        let (minimized, minimized_source) = decode_minimized(row, ax_minimized_evidence(ax_info));
+        let (fullscreen, fullscreen_source) = decode_fullscreen(
+            ax_fullscreen_evidence(ax_info),
+            row,
+            cg_bounds_identify_native_fullscreen(bounds, &display_bounds),
+        );
 
         // The layer rule needs positive AX evidence of fullscreen (see `ax_reports_fullscreen`),
         // and a titled AXFloatingWindow needs the ordinary-window shape as well.
@@ -1811,9 +2039,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             is_active: false,
             minimized,
             app_hidden: hidden_app_pids.contains(&owner_pid),
-            fullscreen: native_fullscreen,
+            fullscreen,
             on_other_desktop: is_off_current_space(space_scope),
             bounds,
+            state: card_state_evidence(row, minimized_source, fullscreen_source, pairing_source),
         });
         shown.insert((owner_pid, cgwid));
     }
@@ -1883,7 +2112,13 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             if ax_info.title.is_empty() && !titleless_pids.contains(&pid) {
                 continue;
             }
-            let native_fullscreen = ax_info.is_fullscreen == Some(true);
+            // AX-only restore: no CG entry in this pass, so no bounds to weigh; the pass row still
+            // carries the Space mask.
+            let row = rows.get(&cgwid);
+            let (fullscreen, fullscreen_source) =
+                decode_fullscreen(ax_fullscreen_evidence(Some(ax_info)), row, false);
+            let (minimized, minimized_source) =
+                decode_minimized(row, ax_minimized_evidence(Some(ax_info)));
             let backfill_scope = classify_window_space(
                 membership_source,
                 membership_snapshot.as_ref(),
@@ -1893,7 +2128,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             );
             if !admits_space_scope(
                 backfill_scope,
-                space_policy(ax_info.minimized, show_minimized, show_other_desktops),
+                space_policy(minimized, show_minimized, show_other_desktops),
             ) {
                 crate::e2e_state::space_gate_rejected();
                 crate::e2e_state::card_rejected(pid, cgwid, crate::e2e_state::CardRejection::Space);
@@ -1956,11 +2191,17 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 window_title: ax_info.title.clone(),
                 icon_path,
                 is_active: false,
-                minimized: ax_info.minimized,
+                minimized,
                 app_hidden: hidden_app_pids.contains(&pid),
-                fullscreen: native_fullscreen,
+                fullscreen,
                 on_other_desktop: is_off_current_space(backfill_scope),
                 bounds: (0.0, 0.0, 0.0, 0.0),
+                state: card_state_evidence(
+                    row,
+                    minimized_source,
+                    fullscreen_source,
+                    WindowPairingSource::PublishedAx,
+                ),
             });
         }
     }
@@ -2180,6 +2421,98 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         fm_ms
     );
     windows
+}
+
+#[cfg(test)]
+mod window_row_owner_tests {
+    use super::*;
+
+    fn row(window_id: u32, pid: Option<i32>) -> WsWindowRow {
+        WsWindowRow {
+            window_id,
+            pid,
+            ..WsWindowRow::default()
+        }
+    }
+
+    #[test]
+    fn a_row_whose_owner_contradicts_the_pass_is_dropped() {
+        // The recycled-wid counter-example: the CG enumeration recorded pid 100 for wid 7, but by
+        // the time the row query ran the window server answered with pid 200.
+        let rows = HashMap::from([(7, row(7, Some(200))), (8, row(8, Some(100)))]);
+        let expected = HashMap::from([(7, 100), (8, 100)]);
+        let verified = rows_with_verified_owner(rows, &expected, &HashSet::new());
+        assert!(
+            !verified.contains_key(&7),
+            "the mismatching row must not be used"
+        );
+        assert!(verified.contains_key(&8));
+    }
+
+    #[test]
+    fn an_unreadable_owner_is_unknown_not_a_mismatch() {
+        // The PID getter can be absent on a future macOS; dropping every row then would silently
+        // remove the whole evidence plane.
+        let rows = HashMap::from([(7, row(7, None))]);
+        let verified = rows_with_verified_owner(rows, &HashMap::from([(7, 100)]), &HashSet::new());
+        assert!(verified.contains_key(&7));
+    }
+
+    #[test]
+    fn an_ax_owner_cannot_overwrite_a_conflicting_cg_owner() {
+        // The counter-example that survived the first fix: the CG enumeration recorded pid 100 for
+        // wid 7, the AX answer recorded pid 200 for the same id, and the WindowServer row says 200.
+        // The row must not be accepted just because it agrees with the later read -- the candidate is
+        // still built under pid 100.
+        let (owners, conflicted) =
+            merge_row_owners(&HashMap::from([(7, 100)]), &HashMap::from([(7, 200)]));
+        assert_eq!(
+            owners.get(&7),
+            Some(&100),
+            "the first read is not overwritten"
+        );
+        assert!(conflicted.contains(&7));
+        let rows = HashMap::from([(7, row(7, Some(200))), (8, row(8, Some(200)))]);
+        let verified = rows_with_verified_owner(rows, &owners, &conflicted);
+        assert!(!verified.contains_key(&7), "a conflicted id gets no row");
+        assert!(
+            verified.contains_key(&8),
+            "an agreeing AX-only id keeps its row"
+        );
+    }
+
+    #[test]
+    fn two_ax_answers_disagreeing_about_one_id_are_kept_as_a_conflict() {
+        // The counter-example that survived the previous fix: the AX side alone can hold two claims
+        // for one id (an earlier snapshot and a later one). Folding them into one map first would
+        // keep the last and lose the disagreement, so the conflict is detected over the claims.
+        let (owners, conflicted) = merge_owner_claims([(100, 7), (200, 7), (200, 8)]);
+        assert!(conflicted.contains(&7));
+        assert!(!conflicted.contains(&8));
+        // With the CG and WindowServer reads agreeing on 200, nothing else would flag wid 7:
+        let (expected, cg_conflicted) = merge_row_owners(&HashMap::from([(7, 200)]), &owners);
+        assert!(cg_conflicted.is_empty());
+        assert_eq!(expected.get(&7), Some(&200));
+        let mut conflicted_owners = cg_conflicted;
+        conflicted_owners.extend(conflicted);
+        let rows = HashMap::from([(7, row(7, Some(200)))]);
+        let verified = rows_with_verified_owner(rows, &expected, &conflicted_owners);
+        assert!(
+            !verified.contains_key(&7),
+            "the AX-internal conflict must still drop the row"
+        );
+    }
+
+    #[test]
+    fn agreeing_reads_keep_the_owner_and_ax_only_ids_gain_one() {
+        let (owners, conflicted) = merge_row_owners(
+            &HashMap::from([(7, 100)]),
+            &HashMap::from([(7, 100), (9, 300)]),
+        );
+        assert!(conflicted.is_empty());
+        assert_eq!(owners.get(&7), Some(&100));
+        assert_eq!(owners.get(&9), Some(&300));
+    }
 }
 
 #[cfg(test)]

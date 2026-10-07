@@ -8,7 +8,7 @@ use crate::ffi::{
     CFStringGetTypeID, CFUUIDCreateString, CGDisplayCreateUUIDFromDisplayID, CGMainDisplayID,
 };
 use crate::log_debug;
-use crate::skylight::{load_private_symbol, SKYLIGHT_PATH};
+use crate::skylight::{load_private_symbol, WsWindowRow, SKYLIGHT_PATH};
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -71,25 +71,39 @@ pub(super) enum MembershipQueryError {
 
 /// Injectable boundary for the membership gate: headless tests provide maps without calling CGS.
 pub(super) trait MembershipProvider {
-    fn query(&self, window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, MembershipQueryError>;
+    /// `rows` is the pass's single batched WindowServer snapshot; the provider reads the Space type
+    /// kind from it instead of issuing a query of its own.
+    fn query(
+        &self,
+        window_ids: &[CGWindowID],
+        rows: &HashMap<u32, WsWindowRow>,
+    ) -> Result<MembershipSnapshot, MembershipQueryError>;
 }
 
 pub(super) struct SkyLightMembershipProvider;
 
 impl MembershipProvider for SkyLightMembershipProvider {
-    fn query(&self, window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, MembershipQueryError> {
-        query_skylight(window_ids)
+    fn query(
+        &self,
+        window_ids: &[CGWindowID],
+        rows: &HashMap<u32, WsWindowRow>,
+    ) -> Result<MembershipSnapshot, MembershipQueryError> {
+        query_skylight(window_ids, rows)
     }
 }
 
 pub(super) fn query_with_provider(
     provider: &impl MembershipProvider,
     window_ids: &[CGWindowID],
+    rows: &HashMap<u32, WsWindowRow>,
 ) -> Result<MembershipSnapshot, MembershipQueryError> {
-    provider.query(window_ids)
+    provider.query(window_ids, rows)
 }
 
-fn query_skylight(window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, MembershipQueryError> {
+fn query_skylight(
+    window_ids: &[CGWindowID],
+    rows: &HashMap<u32, WsWindowRow>,
+) -> Result<MembershipSnapshot, MembershipQueryError> {
     let connection =
         crate::skylight::cgs_main_connection().ok_or(MembershipQueryError::MissingConnection)?;
     let (Some(copy_displays), Some(current_space), Some(windows_in_space), Some(spaces_for_window)) = (
@@ -261,8 +275,11 @@ fn query_skylight(window_ids: &[CGWindowID]) -> Result<MembershipSnapshot, Membe
         snapshot.window_space_ids.insert(window_id, memberships);
     }
 
-    if let Some(masks) = crate::skylight::window_space_type_masks(window_ids) {
-        for (window_id, mask) in masks {
+    {
+        for (window_id, mask) in rows
+            .iter()
+            .filter_map(|(window_id, row)| row.space_type_mask.map(|mask| (*window_id, mask)))
+        {
             snapshot.window_space_type_masks.insert(window_id, mask);
             let kind = if mask & 0x20 != 0 {
                 crate::space_groups::SpaceKind::Fullscreen
@@ -434,6 +451,7 @@ mod tests {
         fn query(
             &self,
             _window_ids: &[CGWindowID],
+            _rows: &HashMap<u32, WsWindowRow>,
         ) -> Result<MembershipSnapshot, MembershipQueryError> {
             Ok(self.0.clone())
         }
@@ -446,7 +464,8 @@ mod tests {
             window_space_ids: HashMap::from([(7, vec![20]), (8, vec![30])]),
             ..Default::default()
         };
-        let queried = query_with_provider(&FakeProvider(expected.clone()), &[7, 8]).unwrap();
+        let queried =
+            query_with_provider(&FakeProvider(expected.clone()), &[7, 8], &HashMap::new()).unwrap();
         assert_eq!(queried, expected);
         assert!(queried.window_space_ids.contains_key(&7));
         assert!(!queried.window_space_ids[&7].is_empty());

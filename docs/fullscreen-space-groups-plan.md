@@ -265,7 +265,7 @@ Space 变化开始时标记上下文失效并刷新拓扑；稳定后确认成�
 | --- | --- |
 | 成员查询可用，来源事件跟踪不可用 | 仅显示实际当前 Space 成员，不学习新的来源关联 |
 | 成员查询也不可用 | 采用稳定、确实 onscreen 的保守路径，并记录降级原因 |
-| 成员查询可用，`windows.show_other_desktops` 打开 | 按 §1.1 加宽准入；其他桌面的卡片标题取自 CG 窗口名（依赖屏幕录制权限，无权限时因标题为空而不显示）、最小化状态不可读、**不请求新抓图但继续显示缓存里已有的那一张**（`thumbnail_ready` 可断言）；激活先试应用前台切换、失败则用精确窗口前台切换兜底（参考 AltTab／BetterCmdTab；两者都不用 `CGSManagedDisplaySetCurrentSpace`，它跳过 Space 过渡机制会让目标 Space 失去菜单栏），目标进入当前桌面后再走同一条 AX 精确抬窗路径（含最小化恢复、迟到到达再补一次），并以 `other_desktop_raise`（目标身份 + generation + `onscreen` + `ax_matched`）发布结果 |
+| 成员查询可用，`windows.show_other_desktops` 打开 | 按 §1.1 加宽准入；其他桌面的卡片标题取自 CG 窗口名（依赖屏幕录制权限，无权限时因标题为空而不显示）、最小化与全屏状态取自 WindowServer 的批量窗口行（`tags` 第 60 位、`space_type_mask` 的 `0x20` 位；见 developer-notes 的「其他桌面的窗口」）、**不请求新抓图但继续显示缓存里已有的那一张**（`thumbnail_ready` 可断言）；激活先试应用前台切换、失败则用精确窗口前台切换兜底（参考 AltTab／BetterCmdTab；两者都不用 `CGSManagedDisplaySetCurrentSpace`，它跳过 Space 过渡机制会让目标 Space 失去菜单栏），目标进入当前桌面后再走同一条 AX 精确抬窗路径（含最小化恢复、迟到到达再补一次），并以 `other_desktop_raise`（目标身份 + generation + `onscreen` + `ax_matched`）发布结果 |
 | 成员查询不可用，`windows.show_other_desktops` 打开 | 该开关不生效，仍是 onscreen 保守路径；`--e2e-state` 的 `space_filter` 会如实发布开关值与其他桌面准入数，便于断言这是降级而不是关闭 |
 
 降级不宣称完整实现归属组，不恢复全屏全放行。历史成员关系可作为来源证据保留，但未经重新确认不能用于当前候选放行。

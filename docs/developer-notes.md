@@ -83,10 +83,48 @@ AX 已经对该应用的窗口集合作出答复：一个既不在该答复里�
 准入要求成员
 列表非空且命中的 Space 属于已接受的显示器拓扑：空列表或未受管的 Space 正是 orderOut／辅助表面的形状，
 开关打开时同样拒绝。该开关不会放宽旧版降级路径——它区分不了「另一个桌面」和「离屏窗口」；最小化开关
-仍然先生效。
+仍然先生效，且生效的是下面这套补充后的状态：WindowServer 报为「在另一个桌面上最小化」的窗口也会被它过滤。
 
-缩略图：这类卡片**不会请求**新的抓图（WindowServer 抓不到不在活跃桌面上的窗口），但会显示缓存里已有的
-那一张——那是它还在自己桌面上时抓到的。生产端把它过滤掉，渲染端照旧读缓存；A2 快照为此发布
+**其他桌面上的状态来自 WindowServer，而不是来自应用。** 另一桌面的窗口通常不在 `kAXWindows` 里（AppKit
+用一个受 Space 限制的 WindowServer 查询构造该列表），所以 AX 答复描述不了它。每趟采集一次批量
+`SLSWindowQueryWindows`，为这趟能叫出名字的每个窗口带回卡片所需的事实：`attributes` 的 `0x2` 位（在屏
+/ordered-in）、`tags` 的第 60 位（最小化）与第 39 位（应用被隐藏）、`space_type_mask` 的 `0x20` 位
+（窗口所在 Space 是全屏 Space）。解码优先级、逐字段证据来源与反例都在
+`src/window_collector/window_state.rs`；每个呈现标志的来源与原始位由 `--e2e-state` 逐卡发布
+（`minimized_source`、`fullscreen_source`、`ordered_in`、`ax_pairing`、`ws_*`）。这些位是未文档化的
+WindowServer 字段。`--space-state-record` 让应用自建的 probe 窗口依次走 order-in、orderOut、最小化、
+恢复、应用隐藏与取消隐藏并打印原始字段，`--smoke-space-state-matrix` 断言记录下来的矩阵（有未钉住的格
+时它**失败**而不是通过）。本机实测（macOS 27.0.1 / 26A434，2026-10-07）：在屏时 `attributes` 的 `0x2`
+位为 1；最小化会置 `tags` 第 60 位（`0x200100482001` → `0x1000200100480001`）并清 `0x2`；程序化的 `deminiaturize:` 会
+把 `0x2` 置回，并在同一个 20ms 轮询样本里清掉第 60 位（没有任何样本出现「已回到屏幕但 tag 仍置位」）；
+隐藏应用置 `tags` 第 39 位（`0x208100480001`）。同一次运行还给出两个事实：orderOut 的窗口**不是**最小化
+（它的 tag 只掉了在屏位 13，即参考实现记录过的 #5714 判别），以及 `kAXWindows` 会漏掉 orderOut 的窗口、
+但隐藏应用的窗口仍在列表里。全屏 Space 的 `0x20` 位后来在一扇真实的跨桌面窗口上验证：把它的 `AXFullScreen`
+置为 true 后，行读到 `mask=0x20`、窗口位于新建的全屏 Space；退出全屏后回到 `0x1`。`--space-state-record`
+自己产生不了这一格——本应用是菜单栏应用，AppKit 拒绝它的 `toggleFullScreen:`。
+
+还有三条关于「窗口在别的桌面上」的本机实测事实，朴素模型都会搞错：
+- 未最小化时它的 `attributes` 第 `0x2` 位**仍然置位**（该位描述的是窗口自己所在的 Space，不是「用户正看着的
+  屏幕」）；在那边最小化会清 `0x2` 并置最小化位，恢复时 `0x2` 回来而 tag 已在同一个 20ms 样本里清掉。所以呈
+  现状态不因哪个桌面是当前而改变。
+- 一个所有窗口都在别的桌面上的应用，`kAXWindows` 什么都不列，但 `kAXFocusedWindow`／`kAXMainWindow` 仍会指
+  向该窗口——这就是切换器准入它所用的 `RecoveredAx` 路径（跨桌面卡片能存在的原因）。AX 一个窗口都不回答的
+  应用仍然被拒，见上文。
+- 远程 token 枚举能拿到这种窗口的元素（实测：离屏 Chrome 窗口用了 43 个 id），动作路径将来需要超出 key/main
+  时就走它。
+
+跨桌面卡片的端到端断言——`minimized`／`fullscreen` 及其证据来源、`ordered_in`、`ax_pairing`、原始行字段——
+都在 `scripts/e2e/space-desktops.sh`（用 `--include-focus` 跑）；场景现在从 `keyboard.modifier` 推导要注入的
+组合键，而不是假定某一个。
+
+最小化解码有意让 ordered-in 位压过最小化声明。参考实现实测的是**点 Dock** 的恢复：WindowServer 的 tag 会
+在 AX 已经报「已恢复」之后再挂一段时间；本仓库自己的记录用的是程序化的 `deminiaturize:`，看到的是 `0x2` 与
+「tag 已清」出现在同一个轮询样本里——它**没有**复现那个延迟，也不能代表 Dock 那条路径。两种情况下采用的规则
+都是保守的那一条：只要 WindowServer 说窗口已回到屏幕，就不把它呈现为仍在最小化。当 ordered-in 字段读不到时，由 AX 读数单独决定，只有对
+AX 完全不发布的窗口才看 WindowServer 的 tag。
+
+缩略图：这类卡片**不会请求**新的抓图（本应用使用的私有抓图调用 `SLSHWCaptureWindowList` 抓不到不在活跃
+桌面上的窗口，参考实现也不会去请求），但会显示缓存里已有的那一张——那是它还在自己桌面上时抓到的。生产端把它过滤掉，渲染端照旧读缓存；A2 快照为此发布
 `thumbnail_ready`，让这个行为可断言。连缓存帧一起拒绝是错的：两个桌面都去过的用户，大多数卡片本来就有
 一张，参考实现也是保留上一张缩略图。
 

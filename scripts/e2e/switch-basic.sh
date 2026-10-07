@@ -98,6 +98,21 @@ active = [a for a in apps if a.get("active")]
 print(active[0]["pid"] if active else "")
 ')"
 
+# The commit frame is transient: the app writes keystroke-display/refresh frames over the same file
+# in the same turn, so "did a commit happen" is read from the sticky last_commit counter instead of
+# trying to catch that one frame. (中文:提交帧会被同一轮写的其它帧覆盖,故读粘滞计数。)
+commit_count_before="$(python3 - "$state_file" "$app_pid" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        snapshot = json.load(handle)
+except (FileNotFoundError, json.JSONDecodeError):
+    snapshot = {}
+same_process = snapshot.get("pid") == int(sys.argv[2])
+print((snapshot.get("last_commit") or {}).get("count", 0) if same_process else 0)
+PY
+)"
+
 # 5) 注入真实热键。scope=desktop 走系统事件流(route=global_input),不是注入给某个 pid——
 #    全局事件 tap 只认系统级事件,注入给 pid 的组合它看不到。
 #    Inject the real hotkey. scope=desktop goes through the system event stream
@@ -122,10 +137,12 @@ PY
 
 # 6) 断言:读快照 + 与 WindowServer 真状态对账(全在 python 里做)。
 #    Assertions: read the snapshot and cross-check real WindowServer state (all in python).
-python3 - "$state_file" "$pre_active" "$app_pid" <<'PY'
+python3 - "$state_file" "$pre_active" "$app_pid" "$commit_count_before" <<'PY'
 import json, subprocess, sys, time
 
-state_file, pre_active, app_pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
+state_file, pre_active, app_pid, commit_count_before = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]),
+)
 problems: list[str] = []
 checks: list[str] = []
 
@@ -150,6 +167,7 @@ def cua(tool: str, args: dict) -> dict:
 deadline = time.time() + 5
 frames: list[dict] = []
 while time.time() < deadline:
+    snapshot = {}
     try:
         with open(state_file) as handle:
             snapshot = json.load(handle)
@@ -158,8 +176,9 @@ while time.time() < deadline:
         if snapshot.get("pid") == app_pid:
             frames.append(snapshot)
     except (FileNotFoundError, json.JSONDecodeError):
-        pass
-    if any(f.get("event") == "commit" and f.get("committed") for f in frames):
+        snapshot = {}
+    # The commit frame is transient, so the wait keys on the sticky counter instead of that frame.
+    if (snapshot.get("last_commit") or {}).get("count", 0) > commit_count_before:
         break
     time.sleep(0.05)
 
@@ -177,6 +196,7 @@ if not seen:
 # present it enables stronger self-consistency assertions.
 commits = [f for f in seen if f.get("event") == "commit" and f.get("committed")]
 summons = [f for f in seen if f.get("event") == "summon"]
+last_commit = (seen[-1].get("last_commit") if seen else None) or {}
 base = commits[-1] if commits else seen[-1]
 
 check(base["cards_count"] >= 2, "at least two cards in the model", f"cards_count={base['cards_count']}")
@@ -185,7 +205,11 @@ check(
     "selection index is inside the card list",
     f"selected_index={base['selected_index']} cards={base['cards_count']}",
 )
-check(bool(commits), "release committed a window", f"events seen: {events}")
+check(
+    last_commit.get("count", 0) > int(commit_count_before),
+    "release committed a window",
+    f"last_commit={last_commit} events seen: {events}",
+)
 
 if commits:
     commit = commits[-1]

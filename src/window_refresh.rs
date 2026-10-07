@@ -1106,6 +1106,7 @@ mod tests {
             fullscreen: false,
             on_other_desktop: false,
             bounds: (0.0, 0.0, 100.0, 100.0),
+            state: Default::default(),
         }
     }
 

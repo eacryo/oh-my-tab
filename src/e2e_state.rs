@@ -31,6 +31,20 @@ static OTHER_DESKTOP_RAISE: std::sync::LazyLock<
     std::sync::Mutex<Option<(u64, OtherDesktopRaise)>>,
 > = std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
 
+/// The last commit this process made, kept sticky for the same reason the raise record is: the
+/// commit *frame* is transient. The app writes the keystroke display's hide frame in the same
+/// main-thread turn, so a scenario polling the state file can miss the commit frame entirely and a
+/// commit assertion turns into a race. The frame still exists for readers that catch it.
+static LAST_COMMIT: std::sync::LazyLock<std::sync::Mutex<Option<(u64, CommitRecord)>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(None));
+
+#[derive(Clone, Copy)]
+struct CommitRecord {
+    pid: i32,
+    window_id: u32,
+    index: usize,
+}
+
 #[derive(Clone, Copy)]
 struct OtherDesktopRaise {
     pid: i32,
@@ -423,6 +437,18 @@ pub(crate) fn record_if_space_context_changed() {
 /// Records a commit snapshot carrying the window this release targets. Must run *before* the
 /// selection is cleared: once the overlay hides, AppState no longer holds a selected index.
 pub(crate) fn record_commit(pid: i32, window_id: u32, app: &str, index: usize) {
+    if is_enabled() {
+        let mut slot = LAST_COMMIT.lock().unwrap();
+        let count = slot.as_ref().map_or(1, |(count, _)| count + 1);
+        *slot = Some((
+            count,
+            CommitRecord {
+                pid,
+                window_id,
+                index,
+            },
+        ));
+    }
     write("commit", Some((pid, window_id, app.to_string(), index)));
 }
 
@@ -455,6 +481,27 @@ struct Card {
     /// menu-bar panel out of that fallback.
     on_screen: Option<bool>,
     bounds: (f64, f64, f64, f64),
+    /// Which evidence decided each presented state flag ("ax" / "window_server" / "geometry" /
+    /// "appkit" / "unknown"). A scenario proving the WindowServer path produced a value must read
+    /// these: the boolean alone is satisfied by a fallback that happens to agree.
+    minimized_source: &'static str,
+    fullscreen_source: &'static str,
+    app_hidden_source: &'static str,
+    /// Ordered-in as the WindowServer reported it (`null` = that field could not be read).
+    ordered_in: Option<bool>,
+    /// Which AX route paired this window in the pass that produced the card: "published" /
+    /// "recovered" / "unavailable" / "unpublished" (`null` = not recorded, test fixtures only).
+    /// This, not `ax_identified` (which is a history), is how a scenario proves a card came through
+    /// the no-element route.
+    ax_pairing: Option<&'static str>,
+    /// The WindowServer's own hidden-app tag, published for cross-checking the AppKit-derived
+    /// `app_hidden` above. `null` = that field could not be read this pass.
+    window_server_hidden: Option<bool>,
+    /// The raw WindowServer row fields this card was decoded from, as hex strings. Present so a
+    /// failed assertion can name the bits instead of only the decoded booleans.
+    ws_attributes: Option<String>,
+    ws_tags: Option<String>,
+    ws_space_type_mask: Option<String>,
 }
 
 /// One node of the view tree. `frame` is in the parent's coordinate space, so cross-level
@@ -696,6 +743,17 @@ fn collect() -> Snapshot {
                         .contains(&w.pid)
                         .then(|| crate::window_collector::window_is_onscreen_now(w.window_id)),
                     bounds: w.bounds,
+                    minimized_source: state_source_label(w.state.minimized_source),
+                    fullscreen_source: state_source_label(w.state.fullscreen_source),
+                    app_hidden_source: state_source_label(w.state.app_hidden_source),
+                    ordered_in: w.state.ordered_in,
+                    ax_pairing: w.state.pairing.map(|pairing| pairing.label()),
+                    window_server_hidden: crate::window_collector::ax_app_hidden_tag(
+                        w.state.row.as_ref(),
+                    ),
+                    ws_attributes: ws_hex(w.state.row.as_ref(), |row| row.attributes),
+                    ws_tags: ws_hex(w.state.row.as_ref(), |row| row.tags),
+                    ws_space_type_mask: ws_hex(w.state.row.as_ref(), |row| row.space_type_mask),
                 })
                 .collect(),
         },
@@ -705,6 +763,26 @@ fn collect() -> Snapshot {
             windows: Vec::new(),
         },
     })
+}
+
+/// The stable name of a state source, for scenario assertions.
+fn state_source_label(source: crate::window_collector::StateSource) -> &'static str {
+    use crate::window_collector::StateSource;
+    match source {
+        StateSource::Unknown => "unknown",
+        StateSource::Ax => "ax",
+        StateSource::WindowServer => "window_server",
+        StateSource::Geometry => "geometry",
+        StateSource::AppKit => "appkit",
+    }
+}
+
+/// One raw WindowServer row field as a hex string, or None when the row or the field is missing.
+fn ws_hex(
+    row: Option<&crate::skylight::WsWindowRow>,
+    field: impl Fn(&crate::skylight::WsWindowRow) -> Option<u64>,
+) -> Option<String> {
+    row.and_then(&field).map(|value| format!("0x{value:x}"))
 }
 
 fn json_string(value: &str) -> String {
@@ -970,7 +1048,15 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"ax_failed_pids\": [{}],\n",
         as_json(&pid_evidence.failed)
     ));
-    // Copy the record under its lock: count, identity and result are one consistent snapshot.
+    // Copy both records under their locks: count and identity are one consistent snapshot each.
+    let (commit_count, commit) = LAST_COMMIT.lock().unwrap().unwrap_or((
+        0,
+        CommitRecord {
+            pid: 0,
+            window_id: 0,
+            index: 0,
+        },
+    ));
     let raise = *OTHER_DESKTOP_RAISE.lock().unwrap();
     let (raise_count, raise) = raise.unwrap_or((
         0,
@@ -984,6 +1070,10 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             rescue_attempted: false,
             rescue: false,
         },
+    ));
+    json.push_str(&format!(
+        "  \"last_commit\": {{\"count\": {}, \"pid\": {}, \"window_id\": {}, \"index\": {}}},\n",
+        commit_count, commit.pid, commit.window_id, commit.index
     ));
     json.push_str(&format!(
         "  \"other_desktop_raise\": {{\"count\": {}, \"pid\": {}, \"window_id\": {}, \"generation\": {}, \"onscreen\": {}, \"ax_matched\": {}, \"activation\": {}, \"rescue_attempted\": {}, \"rescue\": {}}},\n",
@@ -1140,7 +1230,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             json.push(',');
         }
         json.push_str(&format!(
-            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"fullscreen\": {}, \"other_desktop\": {}, \"thumbnail_ready\": {}, \"thumbnail_rendered\": {}, \"ax_identified\": {}, \"on_screen\": {}, \"bounds\": [{}, {}, {}, {}]}}",
+            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"fullscreen\": {}, \"other_desktop\": {}, \"thumbnail_ready\": {}, \"thumbnail_rendered\": {}, \"ax_identified\": {}, \"on_screen\": {}, \"bounds\": [{}, {}, {}, {}], \"minimized_source\": {}, \"fullscreen_source\": {}, \"app_hidden_source\": {}, \"ordered_in\": {}, \"ax_pairing\": {}, \"window_server_hidden\": {}, \"ws_attributes\": {}, \"ws_tags\": {}, \"ws_space_type_mask\": {}}}",
             card.pid,
             card.window_id,
             json_string(&card.app),
@@ -1156,7 +1246,21 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             card.bounds.0,
             card.bounds.1,
             card.bounds.2,
-            card.bounds.3
+            card.bounds.3,
+            json_string(card.minimized_source),
+            json_string(card.fullscreen_source),
+            json_string(card.app_hidden_source),
+            card.ordered_in.map_or("null".to_string(), |value| value.to_string()),
+            card.ax_pairing.map_or("null".to_string(), json_string),
+            card.window_server_hidden
+                .map_or("null".to_string(), |value| value.to_string()),
+            card.ws_attributes
+                .as_deref()
+                .map_or("null".to_string(), json_string),
+            card.ws_tags.as_deref().map_or("null".to_string(), json_string),
+            card.ws_space_type_mask
+                .as_deref()
+                .map_or("null".to_string(), json_string),
         ));
     }
     json.push_str("\n  ],\n");

@@ -130,10 +130,54 @@ pub(super) fn blank_frame_action(
     BlankFrameAction::Store
 }
 
+/// What the blank test could decide about one frame.
+///
+/// The production entry point only ever needs "blank or not", and deliberately treats a failed
+/// analysis as non-blank (conservative: the frame is stored as before). A measurement that has to
+/// report whether the analysis itself succeeded needs the third state, because "we could not look"
+/// must never be reported as "there is content".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum BlankVerdict {
+    Blank,
+    Content,
+    /// No verdict: the sample was missing or too short for the coverage test.
+    Undecidable,
+}
+
+/// Pure verdict over one RGBA sample. Separated from the CoreGraphics read so the three outcomes
+/// (including the failure one) have real regression cases without an FFI harness.
+pub(super) fn blank_verdict_from_sample(
+    rgba: Option<&[u8]>,
+    w: usize,
+    skip_rows: usize,
+    h: usize,
+) -> BlankVerdict {
+    let Some(rgba) = rgba else {
+        return BlankVerdict::Undecidable;
+    };
+    match blank_modal_coverage(rgba, w, skip_rows, h) {
+        Some(coverage) if coverage >= BLANK_MODAL_COVERAGE_MIN => BlankVerdict::Blank,
+        Some(_) => BlankVerdict::Content,
+        None => BlankVerdict::Undecidable,
+    }
+}
+
 /// Redraw the frame into a small (<=64px) RGBA bitmap and run the blank test.
 /// Analysis failures return None and the caller treats the frame as non-blank
 /// (conservatively preserving the original store behavior).
 pub(super) unsafe fn frame_blankness(img: *const c_void, w_px: u32, h_px: u32) -> Option<bool> {
+    // Production semantics are unchanged by the tri-state split: a failed context is `None`, and an
+    // unreadable sample stays `Some(false)` exactly as before.
+    frame_blankness_verdict(img, w_px, h_px).map(|verdict| verdict == BlankVerdict::Blank)
+}
+
+/// The tri-state form of the blank test, for measurement paths that must distinguish "no verdict"
+/// from "there is content".
+pub(super) unsafe fn frame_blankness_verdict(
+    img: *const c_void,
+    w_px: u32,
+    h_px: u32,
+) -> Option<BlankVerdict> {
     if img.is_null() || w_px == 0 || h_px == 0 {
         return None;
     }
@@ -163,19 +207,15 @@ pub(super) unsafe fn frame_blankness(img: *const c_void, w_px: u32, h_px: u32) -
         img,
     );
     let data = CGBitmapContextGetData(ctx) as *const u8;
-    let coverage = if data.is_null() {
+    let skip_rows = ((sh as f64) * BLANK_TITLE_STRIP_FRACTION).round() as usize;
+    let sample = if data.is_null() {
         None
     } else {
-        let skip_rows = ((sh as f64) * BLANK_TITLE_STRIP_FRACTION).round() as usize;
-        blank_modal_coverage(
-            std::slice::from_raw_parts(data, sw * sh * 4),
-            sw,
-            skip_rows,
-            sh,
-        )
+        Some(std::slice::from_raw_parts(data, sw * sh * 4))
     };
+    let verdict = blank_verdict_from_sample(sample, sw, skip_rows, sh);
     CFRelease(ctx);
-    Some(coverage.is_some_and(|c| c >= BLANK_MODAL_COVERAGE_MIN))
+    Some(verdict)
 }
 
 /// Drop a terminated app's pending blank-retry slots (called from pregen's

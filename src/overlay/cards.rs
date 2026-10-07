@@ -191,11 +191,21 @@ fn visibility_badge_moves_left(fullscreen: bool, minimized: bool, app_hidden: bo
 
 /// One status badge pinned inside a thumbnail preview corner: a circular `badge_scrim`
 /// chip carrying a white SF-symbol glyph. The scrim keeps the glyph readable over bright
-/// captured frames; the shared symbol shadow sits on the chip, not on the glyph.
-unsafe fn add_symbol_badge(container: *mut AnyObject, frame: NSRect, symbol_name: &str) {
+/// captured frames; the shared symbol shadow sits on the chip, not on the glyph. `tag`
+/// identifies the badge in the view tree so a runner can assert it was drawn.
+unsafe fn add_symbol_badge(
+    container: *mut AnyObject,
+    frame: NSRect,
+    symbol_name: &str,
+    tag: isize,
+) {
     let palette = crate::theme::ui_palette();
-    let chip: *mut AnyObject = msg_send![class!(NSView), alloc];
+    // The chip must be a control, not a bare NSView: `setTag:` is `NSControl`'s, and sending it to an
+    // NSView raises "method not found" at runtime (the A1 badge runner caught exactly that). An
+    // NSImageView with no image draws nothing of its own, so the scrim layer is the whole chip.
+    let chip: *mut AnyObject = msg_send![class!(NSImageView), alloc];
     let chip: *mut AnyObject = msg_send![chip, initWithFrame: frame];
+    let _: () = msg_send![chip, setTag: tag];
     let _: () = msg_send![chip, setWantsLayer: true];
     let chip_layer: *mut AnyObject = msg_send![chip, layer];
     // `radius-full`: a badge chip is a circle, so the radius is half its side.
@@ -257,7 +267,12 @@ unsafe fn add_status_badges_if_needed(
             NSSize::new(chip, chip),
         );
         // The macOS fullscreen arrows: the same glyph the green zoom button shows.
-        add_symbol_badge(container, frame, "arrow.up.left.and.arrow.down.right");
+        add_symbol_badge(
+            container,
+            frame,
+            "arrow.up.left.and.arrow.down.right",
+            crate::overlay::THUMB_FULLSCREEN_BADGE_TAG,
+        );
     }
     if needs_visibility_badge(w.minimized, w.app_hidden) {
         let x = if visibility_badge_moves_left(w.fullscreen, w.minimized, w.app_hidden) {
@@ -266,7 +281,12 @@ unsafe fn add_status_badges_if_needed(
             (preview_width - THUMB_PAD - chip).max(0.0)
         };
         let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(chip, chip));
-        add_symbol_badge(container, frame, "eye.slash.fill");
+        add_symbol_badge(
+            container,
+            frame,
+            "eye.slash.fill",
+            crate::overlay::THUMB_VISIBILITY_BADGE_TAG,
+        );
     }
 }
 
@@ -1394,5 +1414,103 @@ mod visibility_badge_tests {
         assert!(!visibility_badge_moves_left(true, false, false));
         assert!(!visibility_badge_moves_left(false, true, false));
         assert!(!visibility_badge_moves_left(false, false, true));
+    }
+}
+
+#[cfg(test)]
+mod badge_smoke_tests {
+    /// Run the real card view tree on the AppKit main thread in a child process and assert that the
+    /// preview-corner badges follow the card's state (including the icon-fallback branch).
+    #[test]
+    #[ignore]
+    fn card_badge_runtime_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("oh-my-tab"))
+            .expect("app binary path");
+        assert!(
+            app.exists(),
+            "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-card-badges")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "card badge smoke failed (exit {:?})\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+/// Count the views carrying `tag` in a view's subtree.
+unsafe fn count_views_with_tag(view: *mut AnyObject, tag: isize) -> usize {
+    let own: isize = msg_send![view, tag];
+    let mut count = usize::from(own == tag);
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    let subview_count: usize = msg_send![subviews, count];
+    for index in 0..subview_count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        count += count_views_with_tag(child, tag);
+    }
+    count
+}
+
+/// A1 runner for the preview-corner badges, driven by controlled card input instead of a summon:
+/// it builds the real card view for a window that has no cached frame (the icon-fallback branch a
+/// card of another desktop takes) and counts the badge chips in the resulting view tree.
+///
+/// The counter-example is built in: an ordinary card must draw neither badge, so a renderer that
+/// draws them unconditionally fails here. Needs a GUI session and the main thread.
+pub(crate) fn smoke_card_badges() -> bool {
+    unsafe {
+        let base = WindowInfo {
+            pid: std::process::id() as i32,
+            window_id: 1,
+            app_name: "badge smoke".to_string(),
+            window_title: "badge smoke".to_string(),
+            icon_path: None,
+            is_active: false,
+            minimized: true,
+            app_hidden: false,
+            fullscreen: true,
+            on_other_desktop: true,
+            bounds: (0.0, 0.0, 640.0, 400.0),
+            state: Default::default(),
+        };
+        let with_state = create_card_view(&base, 0, 220.0, 170.0, true);
+        let fullscreen_badges =
+            count_views_with_tag(with_state, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
+        let visibility_badges =
+            count_views_with_tag(with_state, crate::overlay::THUMB_VISIBILITY_BADGE_TAG);
+        release_obj(with_state);
+
+        let mut plain = base;
+        plain.minimized = false;
+        plain.fullscreen = false;
+        let plain_card = create_card_view(&plain, 1, 220.0, 170.0, true);
+        let plain_fullscreen =
+            count_views_with_tag(plain_card, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
+        let plain_visibility =
+            count_views_with_tag(plain_card, crate::overlay::THUMB_VISIBILITY_BADGE_TAG);
+        release_obj(plain_card);
+
+        log_info!(
+            "[smoke-card-badges] thumbnails={} fullscreen={} visibility={} plain_fullscreen={} plain_visibility={}",
+            crate::theme::thumbnails_enabled(),
+            fullscreen_badges,
+            visibility_badges,
+            plain_fullscreen,
+            plain_visibility
+        );
+        fullscreen_badges == 1
+            && visibility_badges == 1
+            && plain_fullscreen == 0
+            && plain_visibility == 0
     }
 }

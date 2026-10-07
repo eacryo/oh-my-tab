@@ -1521,6 +1521,45 @@ mod tests {
     }
 
     #[test]
+    fn the_blank_verdict_separates_content_from_no_verdict() {
+        // The three outcomes a measurement needs. "Could not look" must not be reported as
+        // "there is content": the production entry point deliberately collapses both to
+        // `Some(false)`, which is why a measurement reads the verdict instead.
+        let (w, h) = (8usize, 8usize);
+        let blank = vec![255u8; w * h * 4];
+        assert_eq!(
+            blank_verdict_from_sample(Some(&blank), w, 1, h),
+            BlankVerdict::Blank
+        );
+
+        let mut content = vec![255u8; w * h * 4];
+        for y in 1..h {
+            for x in 0..w {
+                content[(y * w + x) * 4] = (x * 31) as u8;
+            }
+        }
+        assert_eq!(
+            blank_verdict_from_sample(Some(&content), w, 1, h),
+            BlankVerdict::Content
+        );
+
+        // No sample at all (the pixel read failed), and a sample too short for the requested
+        // region: both are "no verdict".
+        assert_eq!(
+            blank_verdict_from_sample(None, w, 1, h),
+            BlankVerdict::Undecidable
+        );
+        assert_eq!(
+            blank_verdict_from_sample(Some(&blank[..16]), w, 1, h),
+            BlankVerdict::Undecidable
+        );
+        assert_eq!(
+            blank_verdict_from_sample(Some(&blank), w, h, h),
+            BlankVerdict::Undecidable
+        );
+    }
+
+    #[test]
     fn blank_frame_action_matrix() {
         use BlankFrameAction::*;
         // Background + empty cache: the first frame is stored as a placeholder

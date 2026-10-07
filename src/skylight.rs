@@ -70,6 +70,9 @@ type SlsWindowIteratorAdvanceFn = unsafe extern "C" fn(*const c_void) -> bool;
 type SlsWindowIteratorGetWindowIdFn = unsafe extern "C" fn(*const c_void) -> u32;
 type SlsWindowIteratorGetParentIdFn = unsafe extern "C" fn(*const c_void) -> u32;
 type SlsWindowIteratorGetSpaceTypeMaskFn = unsafe extern "C" fn(*const c_void) -> u64;
+type SlsWindowIteratorGetPidFn = unsafe extern "C" fn(*const c_void) -> i32;
+type SlsWindowIteratorGetAttributesFn = unsafe extern "C" fn(*const c_void) -> u64;
+type SlsWindowIteratorGetTagsFn = unsafe extern "C" fn(*const c_void) -> u64;
 
 static SLS_WINDOW_QUERY_WINDOWS: LazyLock<Option<SlsWindowQueryWindowsFn>> =
     LazyLock::new(|| unsafe { load_private_symbol(SKYLIGHT_PATH, "SLSWindowQueryWindows") });
@@ -88,33 +91,85 @@ static SLS_WINDOW_ITERATOR_GET_SPACE_TYPE_MASK: LazyLock<
 > = LazyLock::new(|| unsafe {
     load_private_symbol(SKYLIGHT_PATH, "SLSWindowIteratorGetSpaceTypeMask")
 });
+static SLS_WINDOW_ITERATOR_GET_PID: LazyLock<Option<SlsWindowIteratorGetPidFn>> =
+    LazyLock::new(|| unsafe { load_private_symbol(SKYLIGHT_PATH, "SLSWindowIteratorGetPID") });
+static SLS_WINDOW_ITERATOR_GET_ATTRIBUTES: LazyLock<Option<SlsWindowIteratorGetAttributesFn>> =
+    LazyLock::new(|| unsafe {
+        load_private_symbol(SKYLIGHT_PATH, "SLSWindowIteratorGetAttributes")
+    });
+static SLS_WINDOW_ITERATOR_GET_TAGS: LazyLock<Option<SlsWindowIteratorGetTagsFn>> =
+    LazyLock::new(|| unsafe { load_private_symbol(SKYLIGHT_PATH, "SLSWindowIteratorGetTags") });
 
-/// Query WindowServer parentage. A non-zero parent identifies an attached sheet/child surface,
-/// not an independent switch destination; callers keep the parent and skip the child surface.
-pub(crate) fn window_parent_ids(window_ids: &[u32]) -> HashMap<u32, u32> {
-    let Some(connection) = cgs_main_connection() else {
-        return HashMap::new();
-    };
-    let (
-        Some(query_windows),
-        Some(copy_windows),
-        Some(advance),
-        Some(get_window_id),
-        Some(get_parent_id),
-    ) = (
+/// Which iterator getters this process could resolve. Every field is decided by its own symbol
+/// alone, so a getter that is missing only removes its own field and never a capability an older
+/// consumer already relied on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct WsRowCapabilities {
+    pub(crate) pid: bool,
+    pub(crate) attributes: bool,
+    pub(crate) tags: bool,
+    pub(crate) space_type_mask: bool,
+    pub(crate) parent_id: bool,
+}
+
+impl WsRowCapabilities {
+    /// The mapping is the policy: no field consults another field's symbol.
+    pub(crate) fn from_symbols(
+        pid: bool,
+        attributes: bool,
+        tags: bool,
+        space_type_mask: bool,
+        parent_id: bool,
+    ) -> Self {
+        Self {
+            pid,
+            attributes,
+            tags,
+            space_type_mask,
+            parent_id,
+        }
+    }
+}
+
+static WS_ROW_CAPABILITIES: LazyLock<WsRowCapabilities> = LazyLock::new(|| {
+    WsRowCapabilities::from_symbols(
+        SLS_WINDOW_ITERATOR_GET_PID.is_some(),
+        SLS_WINDOW_ITERATOR_GET_ATTRIBUTES.is_some(),
+        SLS_WINDOW_ITERATOR_GET_TAGS.is_some(),
+        SLS_WINDOW_ITERATOR_GET_SPACE_TYPE_MASK.is_some(),
+        SLS_WINDOW_ITERATOR_GET_PARENT_ID.is_some(),
+    )
+});
+
+/// One batched WindowServer row. Every field is independently valid: `None` means this call could
+/// not read that field, which is "unknown" and never a confirmed `false`.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct WsWindowRow {
+    pub(crate) window_id: u32,
+    pub(crate) pid: Option<i32>,
+    pub(crate) attributes: Option<u64>,
+    pub(crate) tags: Option<u64>,
+    pub(crate) space_type_mask: Option<u64>,
+    pub(crate) parent_id: Option<u32>,
+}
+
+/// The single batched query behind every row consumer. `None` = the connection, a base symbol or
+/// the CF scaffolding failed (the failures each caller used to give up on); `Some(empty)` = no ids.
+fn query_rows_once(window_ids: &[u32]) -> Option<HashMap<u32, WsWindowRow>> {
+    let connection = cgs_main_connection()?;
+    let (Some(query_windows), Some(copy_windows), Some(advance), Some(get_window_id)) = (
         *SLS_WINDOW_QUERY_WINDOWS,
         *SLS_WINDOW_QUERY_RESULT_COPY_WINDOWS,
         *SLS_WINDOW_ITERATOR_ADVANCE,
         *SLS_WINDOW_ITERATOR_GET_WINDOW_ID,
-        *SLS_WINDOW_ITERATOR_GET_PARENT_ID,
-    )
-    else {
-        return HashMap::new();
+    ) else {
+        return None;
     };
+    let capabilities = *WS_ROW_CAPABILITIES;
 
     let ids: Vec<u32> = window_ids.iter().copied().filter(|id| *id != 0).collect();
     if ids.is_empty() {
-        return HashMap::new();
+        return Some(HashMap::new());
     }
 
     let mut number_refs = Vec::with_capacity(ids.len());
@@ -127,7 +182,7 @@ pub(crate) fn window_parent_ids(window_ids: &[u32]) -> HashMap<u32, u32> {
                     CFRelease(number);
                 }
             }
-            return HashMap::new();
+            return None;
         }
         number_refs.push(number);
     }
@@ -148,7 +203,7 @@ pub(crate) fn window_parent_ids(window_ids: &[u32]) -> HashMap<u32, u32> {
                 CFRelease(number);
             }
         }
-        return HashMap::new();
+        return None;
     }
 
     let result = unsafe { query_windows(connection, array, ids.len() as i32) };
@@ -159,94 +214,51 @@ pub(crate) fn window_parent_ids(window_ids: &[u32]) -> HashMap<u32, u32> {
         }
     }
     if result.is_null() {
-        return HashMap::new();
+        return None;
     }
 
     let iterator = unsafe { copy_windows(result) };
     unsafe { CFRelease(result) };
     if iterator.is_null() {
-        return HashMap::new();
+        return None;
     }
 
-    let mut parents = HashMap::with_capacity(ids.len());
+    let mut rows = HashMap::with_capacity(ids.len());
     unsafe {
         while advance(iterator) {
             let window_id = get_window_id(iterator);
-            parents.insert(window_id, get_parent_id(iterator));
+            // Each field is read only when its own getter resolved; a missing getter leaves the
+            // field `None` (unknown) instead of a value that would read as a confirmed fact.
+            let mut row = WsWindowRow {
+                window_id,
+                ..WsWindowRow::default()
+            };
+            if capabilities.pid {
+                row.pid = (*SLS_WINDOW_ITERATOR_GET_PID).map(|get| get(iterator));
+            }
+            if capabilities.attributes {
+                row.attributes = (*SLS_WINDOW_ITERATOR_GET_ATTRIBUTES).map(|get| get(iterator));
+            }
+            if capabilities.tags {
+                row.tags = (*SLS_WINDOW_ITERATOR_GET_TAGS).map(|get| get(iterator));
+            }
+            if capabilities.space_type_mask {
+                row.space_type_mask =
+                    (*SLS_WINDOW_ITERATOR_GET_SPACE_TYPE_MASK).map(|get| get(iterator));
+            }
+            if capabilities.parent_id {
+                row.parent_id = (*SLS_WINDOW_ITERATOR_GET_PARENT_ID).map(|get| get(iterator));
+            }
+            rows.insert(window_id, row);
         }
         CFRelease(iterator);
     }
-    parents
+    Some(rows)
 }
 
-/// Query WindowServer space-type masks for the requested windows in one batch.
-pub(crate) fn window_space_type_masks(window_ids: &[u32]) -> Option<HashMap<u32, u64>> {
-    let connection = cgs_main_connection()?;
-    let (
-        Some(query_windows),
-        Some(copy_windows),
-        Some(advance),
-        Some(get_window_id),
-        Some(get_mask),
-    ) = (
-        *SLS_WINDOW_QUERY_WINDOWS,
-        *SLS_WINDOW_QUERY_RESULT_COPY_WINDOWS,
-        *SLS_WINDOW_ITERATOR_ADVANCE,
-        *SLS_WINDOW_ITERATOR_GET_WINDOW_ID,
-        *SLS_WINDOW_ITERATOR_GET_SPACE_TYPE_MASK,
-    )
-    else {
-        return None;
-    };
-    let ids: Vec<u32> = window_ids.iter().copied().filter(|id| *id != 0).collect();
-    if ids.is_empty() {
-        return Some(HashMap::new());
-    }
-    let mut numbers = Vec::with_capacity(ids.len());
-    for id in &ids {
-        let value = *id as i32;
-        let number = unsafe { CFNumberCreate(std::ptr::null(), 3, (&value as *const i32).cast()) };
-        if number.is_null() {
-            unsafe { numbers.into_iter().for_each(|number| CFRelease(number)) };
-            return None;
-        }
-        numbers.push(number);
-    }
-    let array = unsafe {
-        CFArrayCreate(
-            std::ptr::null(),
-            numbers.as_ptr(),
-            numbers.len() as isize,
-            std::ptr::null(),
-        )
-    };
-    if array.is_null() {
-        unsafe {
-            numbers.into_iter().for_each(|number| CFRelease(number));
-        }
-        return None;
-    }
-    let result = unsafe { query_windows(connection, array, ids.len() as i32) };
-    unsafe {
-        CFRelease(array);
-        numbers.into_iter().for_each(|number| CFRelease(number));
-    }
-    if result.is_null() {
-        return None;
-    }
-    let iterator = unsafe { copy_windows(result) };
-    unsafe { CFRelease(result) };
-    if iterator.is_null() {
-        return None;
-    }
-    let mut masks = HashMap::with_capacity(ids.len());
-    unsafe {
-        while advance(iterator) {
-            masks.insert(get_window_id(iterator), get_mask(iterator));
-        }
-        CFRelease(iterator);
-    }
-    Some(masks)
+/// One batched WindowServer query for the requested windows: every readable field at once.
+pub(crate) fn window_rows(window_ids: &[u32]) -> HashMap<u32, WsWindowRow> {
+    query_rows_once(window_ids).unwrap_or_default()
 }
 
 /// C ABI layout of CGAffineTransform; used only for read-only WindowServer queries.
