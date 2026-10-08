@@ -483,7 +483,10 @@ density and the larger one to separate sections; never mix `12` and `14` for the
 **Concentric rule.** A rounded container with padding gives its inner element
 `max(0, outer_radius - padding)`. A selection ring drawn around a card is
 `card_radius + ring_inset` so the two stay parallel; never pick the ring radius by hand.
-The switcher selection ring uses a 3pt `ring_inset`.
+The switcher selection ring uses a 3pt `ring_inset`, and the switcher's card area keeps an 8pt bottom
+inset (`theme::THUMB_BOTTOM_INSET`: the 3pt ring plus its 4pt glow, on the 4pt grid) so the card
+viewport — which ends at the footer band — cannot clip the ring on the last row. That inset comes out
+of the footer band's own height, not out of the card-size budget.
 
 A small chip derives its radius from its own height rather than taking `radius-control`:
 `radius-control` is sized for 32pt controls, and on a 19pt chip it consumes 42% of the height and

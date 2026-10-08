@@ -65,6 +65,17 @@ const SELECTION_RING_ALPHA: u8 = 0x61;
 /// Zero-offset glow around the ring, layered separately from the card's dark drop shadow.
 const SELECTION_GLOW_OPACITY: f32 = 0.35;
 const SELECTION_GLOW_RADIUS: f64 = 4.0;
+/// How far a selected card's decoration reaches outside the card's own frame: the ring's inset plus
+/// the glow drawn around the ring. Everything below the last row's card is clipped by the card
+/// viewport, so the card area's bottom inset (`theme::THUMB_BOTTOM_INSET`) must cover this.
+pub(crate) const SELECTION_DECORATION_INSET: f64 = OVERLAY_RING_INSET + SELECTION_GLOW_RADIUS;
+
+/// Compile-time invariant for the line above: the room the card area keeps below its last row covers
+/// what a selected card draws outside itself (or the footer's edge clips the selection).
+const _: () = assert!(
+    crate::theme::THUMB_BOTTOM_INSET >= SELECTION_DECORATION_INSET,
+    "the card area's bottom inset must cover the selection ring and its glow"
+);
 /// Mockup selected-preview border = rgba(...,.34), converted to 8-bit alpha.
 /// Distance that only the icon moves upward in legacy icon-only mode.
 const SELECTED_CONTENT_NUDGE: f64 = 2.0;
@@ -386,6 +397,96 @@ unsafe fn card_views(document: *mut AnyObject) -> Vec<*mut AnyObject> {
         .map(|i| msg_send![subviews, objectAtIndex: i])
         .filter(|view| get_card_index(*view).is_some())
         .collect()
+}
+
+/// Smoke assertion over the real view tree: the document's bottom-most card keeps the room outside
+/// itself that a selected card draws into. Returns that clearance in points, or `None` when the
+/// overlay has no windows to lay out (the empty-state panel has no cards, so there is no ring to
+/// clip).
+///
+/// The card viewport (the clip view) ends at the status footer, i.e. at the document's y = 0, and the
+/// selected card draws outside its own bounds: the ring sits `OVERLAY_RING_INSET` out and its
+/// zero-offset glow reaches `SELECTION_GLOW_RADIUS` further. A card closer to the document's bottom
+/// than that gets the ring clipped once the viewport is scrolled to the end -- the "the footer band
+/// covers the selection" defect. Card frames are document coordinates, so this holds at any offset and
+/// does not depend on the scroll position the smoke run happens to leave behind.
+pub(crate) unsafe fn smoke_bottom_card_clears_the_selection_ring() -> Result<Option<f64>, String> {
+    let Some(document) = card_document() else {
+        return Err("the card document view does not exist".to_string());
+    };
+    let mut bottom = f64::INFINITY;
+    let mut cards = 0usize;
+    for card in card_views(document) {
+        let frame: NSRect = msg_send![card, frame];
+        bottom = bottom.min(frame.origin.y);
+        cards += 1;
+    }
+    if cards == 0 {
+        // Windows without cards is the layout failing to build, not an empty overlay; only a genuinely
+        // windowless run may skip the measurement.
+        let windows = with_tab_state(|state| state.as_ref().map_or(0, |state| state.windows.len()));
+        return if windows == 0 {
+            Ok(None)
+        } else {
+            Err(format!(
+                "the card document holds no cards although {windows} windows are laid out"
+            ))
+        };
+    }
+    if bottom + 1e-6 < SELECTION_DECORATION_INSET {
+        return Err(format!(
+            "the bottom-most card sits {bottom:.1}pt above the viewport's bottom edge, \
+             less than the {SELECTION_DECORATION_INSET:.1}pt the selection ring and its glow draw \
+             outside it"
+        ));
+    }
+    Ok(Some(bottom))
+}
+
+/// Smoke assertion over the real view tree: the selected card sits fully inside the card viewport.
+/// Returns its clearance from the viewport's bottom edge.
+///
+/// The viewport renders one row past its own bottom edge as the scroll teaser, so a selection in that
+/// row is drawn but cut off by the viewport's edge (the status footer) -- its card body and the
+/// selection ring's bottom edge included. A selection change must scroll it into view; see
+/// `refresh_after_selection_change`. The clip view's `bounds` is the visible band in document
+/// coordinates, which is also the coordinate space of the cards' frames.
+pub(crate) unsafe fn smoke_selected_card_is_fully_visible() -> Result<f64, String> {
+    let (Some(container), Some(document)) = (overlay_container_ptr(), card_document()) else {
+        return Err("the overlay view tree does not exist".to_string());
+    };
+    let Some(selected) = with_tab_state(|state| state.as_ref().map(|state| state.selected)) else {
+        return Err("the switcher has no selected window".to_string());
+    };
+    let visible: NSRect = msg_send![container, bounds];
+    let visible_bottom = visible.origin.y;
+    let visible_top = visible.origin.y + visible.size.height;
+    for card in card_views(document) {
+        if get_card_index(card) != Some(selected) {
+            continue;
+        }
+        let frame: NSRect = msg_send![card, frame];
+        if frame.origin.y + 1e-6 < visible_bottom {
+            return Err(format!(
+                "the selected card is cut off at the viewport's bottom edge: its frame starts at \
+                 {:.1} but the viewport starts at {visible_bottom:.1} ({:.1}pt hidden)",
+                frame.origin.y,
+                visible_bottom - frame.origin.y
+            ));
+        }
+        let card_top = frame.origin.y + frame.size.height;
+        if card_top > visible_top + 1e-6 {
+            return Err(format!(
+                "the selected card is cut off at the viewport's top edge: it ends at {card_top:.1} \
+                 but the viewport ends at {visible_top:.1} ({:.1}pt hidden)",
+                card_top - visible_top
+            ));
+        }
+        return Ok(frame.origin.y - visible_bottom);
+    }
+    Err(format!(
+        "the card document holds no card for the selected index {selected}"
+    ))
 }
 
 pub(crate) fn set_card_index(view: *mut AnyObject, idx: usize) {

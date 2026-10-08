@@ -2713,11 +2713,14 @@ pub fn run() {
 
     // Global input is drained by handleGlobalInputDrain:; no bridge thread is needed.
 
-    // Smoke-test entry (--smoke-overlay): after full init, drive a summon directly,
-    // then traverse, wrap, and step backward once to cover continuous scrolling and bidirectional navigation. Pump
-    // the main runloop for 2s so async thumbnail deliveries (thumbnailReady) land,
-    // and exit(0) on survival. Synthetic keystrokes never reach the CGEventTap, so
-    // this path must be driven internally.
+    // Smoke-test entry (--smoke-overlay): after full init, drive a summon directly, then traverse,
+    // wrap, and step backward once to cover continuous scrolling and bidirectional navigation. The
+    // show is asynchronous (the window snapshot arrives on a worker and the presses in between are
+    // ignored), so the runloop is pumped before the traversal. Ends with the selection on the last
+    // window: that is the card the viewport must scroll to, and the one whose ring sits closest to the
+    // status footer. Pump the main runloop for 2s so async thumbnail deliveries (thumbnailReady) land,
+    // and exit(0) on survival. Synthetic keystrokes never reach the CGEventTap, so this path must be
+    // driven internally.
     if std::env::args().any(|a| a == "--smoke-overlay") {
         unsafe {
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
@@ -2744,6 +2747,18 @@ pub fn run() {
                     geometry.map_or(0.0, |g| g.knob_h)
                 );
             }
+            // Drive the same absolute-offset path to cover fractional positions and bottom
+            // clamping; real dragging and wheel scrolling use this path too.
+            for fraction in [0.35f64, 1.0f64] {
+                thumbnail_scroller_set_fraction_for_smoke(fraction);
+            }
+            let rl: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
+            let date: *mut AnyObject =
+                msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 2.0f64];
+            let _: () = msg_send![rl, runUntilDate: date];
+
+            // Now that the overlay is up, the presses actually navigate: traverse (wrapping) and step
+            // backward once, then settle on the last window.
             let window_count =
                 with_tab_state(|state| state.as_ref().map_or(0, |state| state.windows.len()));
             for _ in 0..window_count.saturating_add(1) {
@@ -2758,15 +2773,53 @@ pub fn run() {
                 sel!(handleCmdShiftTabPressed:),
                 std::ptr::null_mut(),
             );
-            // Drive the same absolute-offset path to cover fractional positions and bottom
-            // clamping; real dragging and wheel scrolling use this path too.
-            for fraction in [0.35f64, 1.0f64] {
-                thumbnail_scroller_set_fraction_for_smoke(fraction);
+            let mut guard = 0usize;
+            while guard <= window_count {
+                let selected = with_tab_state(|state| {
+                    state.as_ref().map_or(usize::MAX, |state| state.selected)
+                });
+                if selected + 1 >= window_count {
+                    break;
+                }
+                on_cmd_tab_pressed(
+                    std::ptr::null_mut(),
+                    sel!(handleCmdTabPressed:),
+                    std::ptr::null_mut(),
+                );
+                guard += 1;
             }
-            let rl: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
-            let date: *mut AnyObject =
-                msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 2.0f64];
-            let _: () = msg_send![rl, runUntilDate: date];
+            // Let the navigation's scroll land before measuring the laid-out frames.
+            let settle: *mut AnyObject =
+                msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 0.3f64];
+            let _: () = msg_send![rl, runUntilDate: settle];
+
+            // Laid-out frames, not pixels: the bottom-most card must keep the room the selected-state
+            // ring draws into, or the status footer clips it (the card viewport ends there).
+            match crate::overlay::smoke_bottom_card_clears_the_selection_ring() {
+                Ok(Some(clearance)) => log_info!(
+                    "[smoke-overlay] bottom row keeps {:.1}pt clear of the card viewport (selection ring draws {:.1}pt outside a card)",
+                    clearance,
+                    crate::overlay::SELECTION_DECORATION_INSET
+                ),
+                Ok(None) => log_info!(
+                    "[smoke-overlay] no windows laid out; the selection-ring clearance not measured"
+                ),
+                Err(reason) => {
+                    eprintln!("[smoke-overlay] selection ring clearance failed: {reason}");
+                    std::process::exit(1);
+                }
+            }
+            // The selection must have been scrolled fully into the viewport: the rendered range
+            // includes the teaser row below the viewport's bottom edge.
+            match crate::overlay::smoke_selected_card_is_fully_visible() {
+                Ok(clearance) => log_info!(
+                    "[smoke-overlay] selected card is fully visible, {clearance:.1}pt above the viewport's bottom edge"
+                ),
+                Err(reason) => {
+                    eprintln!("[smoke-overlay] selected card visibility failed: {reason}");
+                    std::process::exit(1);
+                }
+            }
             log_info!("[smoke-overlay] summon survived");
             std::process::exit(0);
         }

@@ -566,9 +566,17 @@ fn overlay_text_size_for(base_size: f64, card_text_size: f64) -> f64 {
     (base_size * card_text_size / CARD_TEXT_BASE_SIZE).clamp(13.0, 20.0)
 }
 
-/// The footer grows with its text so the selected window title remains vertically centered.
+/// The footer band's height: the text band minus the card area's bottom inset.
+///
+/// The band holds the footer text, vertically centered, and it grows with that text. Its top
+/// `THUMB_BOTTOM_INSET` belongs to the card viewport instead, because the card viewport ends where the
+/// band starts and the selected card draws outside its own bounds (see `THUMB_BOTTOM_INSET`). Taking
+/// that room from the band's own top padding rather than from the panel height is what keeps the
+/// panel's footprint -- and with it the automatic card-size step and the row budget -- exactly what it
+/// was before the inset existed: the panel's bottom region is still the text band it always was, now
+/// split into card viewport inset + band.
 pub(crate) fn status_h() -> f64 {
-    status_bar_height_for_text_size(status_bar_text_size())
+    status_bar_height_for_text_size(status_bar_text_size()) - THUMB_BOTTOM_INSET
 }
 
 pub(crate) fn status_bar_height_for_text_size(size: f64) -> f64 {
@@ -710,7 +718,8 @@ pub(crate) const THUMB_CARD_BASE_W: f64 = 300.0;
 pub(crate) const THUMB_ROW_GAP: f64 = 14.0;
 /// Width reserved for the scrollbar at the right edge of the scrolling thumbnail viewport.
 pub(crate) const THUMB_SCROLLBAR_W: f64 = 14.0;
-/// Fraction of the next row exposed at the bottom of an overflowing viewport.
+/// Fraction of the next row exposed at the bottom of an overflowing viewport. The exposed sliver is
+/// this fraction of a card plus `THUMB_BOTTOM_INSET`, the card area's own inset below its last row.
 pub(crate) const THUMB_SCROLL_TEASER_RATIO: f64 = 1.0 / 3.0;
 /// Card inner padding (.item padding 8px).
 pub(crate) const THUMB_PAD: f64 = 8.0;
@@ -734,6 +743,15 @@ pub(crate) const THUMB_MIN_SCALE: f64 = 0.75;
 pub(crate) const PANEL_MARGIN: f64 = 24.0;
 /// Top inset above the thumbnail card area.
 const THUMB_TOP_INSET: f64 = 32.0;
+/// Bottom inset below the card area: the blank strip the last row keeps to the status footer.
+///
+/// The card viewport (the clip view) ends where the footer begins, and the selected card draws
+/// outside its own bounds: the ring sits `OVERLAY_RING_INSET` (3pt) out and its zero-offset glow
+/// (`overlay::SELECTION_GLOW_RADIUS`, 4pt) reaches 4pt further. A flush last row therefore loses the
+/// ring's bottom edge to the viewport clip -- read as "the footer band covers the selection". 3 + 4
+/// = 7, rounded up to the 4pt spacing grid; `overlay` asserts that it still covers both at compile
+/// time.
+pub(crate) const THUMB_BOTTOM_INSET: f64 = 8.0;
 
 /// The legacy paged layout stays frozen at its historical 1.5–0.85 range, decoupled from the
 /// production ladder. It has no caller, so keeping these values lets its layout tests describe the
@@ -1025,7 +1043,7 @@ fn thumb_widths_with_max_card_w(
 }
 
 fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
-    let available = (max_panel_h - THUMB_TOP_INSET - status_h()).max(card_h);
+    let available = (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - status_h()).max(card_h);
     ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
 }
 
@@ -1035,7 +1053,8 @@ fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
 /// 921, margins down to 33/2).
 fn thumb_viewport_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
     let teaser_h = gap + card_h * THUMB_SCROLL_TEASER_RATIO;
-    let available = (max_panel_h - THUMB_TOP_INSET - status_h() - teaser_h).max(card_h);
+    let available =
+        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - status_h() - teaser_h).max(card_h);
     ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
 }
 
@@ -1136,6 +1155,7 @@ fn build_thumb_layout(
         (
             panel_inner_w + H_PADDING * 2.0,
             THUMB_TOP_INSET
+                + THUMB_BOTTOM_INSET
                 + max_rows as f64 * card_h
                 + max_rows.saturating_sub(1) as f64 * gap
                 + status_h(),
@@ -1144,6 +1164,7 @@ fn build_thumb_layout(
         (
             panel_inner_w + H_PADDING * 2.0,
             THUMB_TOP_INSET
+                + THUMB_BOTTOM_INSET
                 + n_rows as f64 * card_h
                 + n_rows.saturating_sub(1) as f64 * gap
                 + status_h(),
@@ -1212,7 +1233,8 @@ fn build_thumb_scroll_layout(
         all_rows.len().max(1)
     };
     let row_pitch = constraints.card_h + constraints.gap;
-    let total_content_h = all_rows.len().max(1) as f64 * constraints.card_h
+    let total_content_h = THUMB_BOTTOM_INSET
+        + all_rows.len().max(1) as f64 * constraints.card_h
         + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
     // When content overflows, reserve one extra gap plus a third of a card so the next
     // row is visibly clipped at the bottom of the viewport. This is an intentional
@@ -1223,7 +1245,8 @@ fn build_thumb_scroll_layout(
         constraints.card_h,
         constraints.gap,
     );
-    let viewport_h = viewport_row_count as f64 * constraints.card_h
+    let viewport_h = THUMB_BOTTOM_INSET
+        + viewport_row_count as f64 * constraints.card_h
         + viewport_row_count.saturating_sub(1) as f64 * constraints.gap
         + teaser_h;
     let max_scroll_offset = (total_content_h - viewport_h).max(0.0);
@@ -1283,6 +1306,7 @@ fn build_thumb_scroll_layout(
     // the remaining area shifts the whole visual group left by half the scrollbar width.
     let scrollbar_centering_offset = if overflowed { scrollbar_w / 2.0 } else { 0.0 };
     let document_h = content_inset
+        + THUMB_BOTTOM_INSET
         + all_rows.len() as f64 * constraints.card_h
         + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
     let document_panel_h = document_h + status_h();
@@ -1427,7 +1451,10 @@ pub(crate) fn thumb_document_height_for_rows(
     gap: f64,
     content_inset: f64,
 ) -> f64 {
-    content_inset + row_count.max(1) as f64 * card_h + row_count.saturating_sub(1) as f64 * gap
+    content_inset
+        + THUMB_BOTTOM_INSET
+        + row_count.max(1) as f64 * card_h
+        + row_count.saturating_sub(1) as f64 * gap
 }
 
 /// Height of the bottom teaser when overflowing; zero unless `overflowed && teaser_fits`.
@@ -1445,11 +1472,11 @@ pub(crate) fn thumb_teaser_height(
 }
 
 /// Rows + teaser + status bar -> (panel height, content inset). The panel height *is* the content
-/// height, decided by the cards themselves (rows, card height, gap, teaser, status bar); `max_panel_h`
-/// is only a hard cap. Stretching the panel to the cap from three rows up used to decouple it from the
-/// cards and produced an extra blank band at the top (measured). The normal layout and the post-close
-/// reflow must share this function, or closing a card makes the panel jump taller (measured 901 >
-/// 875).
+/// height, decided by the cards themselves (rows, card height, gap, teaser, both card-area insets,
+/// status bar); `max_panel_h` is only a hard cap. Stretching the panel to the cap from three rows up
+/// used to decouple it from the cards and produced an extra blank band at the top (measured). The
+/// normal layout and the post-close reflow must share this function, or closing a card makes the panel
+/// jump taller (measured 901 > 875).
 pub(crate) fn thumb_panel_metrics(
     rendered_rows: usize,
     card_h: f64,
@@ -1459,6 +1486,7 @@ pub(crate) fn thumb_panel_metrics(
 ) -> (f64, f64) {
     let rows = rendered_rows.max(1);
     let content_h = THUMB_TOP_INSET
+        + THUMB_BOTTOM_INSET
         + rows as f64 * card_h
         + rows.saturating_sub(1) as f64 * gap
         + teaser_h
@@ -1513,6 +1541,7 @@ pub(crate) fn thumb_panel_height_for_rows(
         0.0
     };
     THUMB_TOP_INSET
+        + THUMB_BOTTOM_INSET
         + visible_rows as f64 * card_h
         + visible_rows.saturating_sub(1) as f64 * gap
         + teaser_h
@@ -1696,7 +1725,8 @@ pub(crate) fn plan_icon_scroll_layout(
     } else {
         count.div_ceil(max_columns)
     };
-    let max_rows = ((max_panel_h - THUMB_TOP_INSET - status_h()).max(card_h) / (card_h + gap))
+    let max_rows = ((max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - status_h()).max(card_h)
+        / (card_h + gap))
         .floor()
         .max(1.0) as usize;
     let overflowed = minimum_rows > max_rows;
@@ -1741,6 +1771,7 @@ pub(crate) fn plan_icon_scroll_layout(
     let scrollbar_centering_offset = if overflowed { scrollbar_w / 2.0 } else { 0.0 };
     let row_pitch = card_h + gap;
     let total_content_h = THUMB_TOP_INSET
+        + THUMB_BOTTOM_INSET
         + visual_row_count as f64 * card_h
         + visual_row_count.saturating_sub(1) as f64 * gap;
     let teaser_h = if overflowed {
@@ -1749,6 +1780,7 @@ pub(crate) fn plan_icon_scroll_layout(
         0.0
     };
     let viewport_content_h = THUMB_TOP_INSET
+        + THUMB_BOTTOM_INSET
         + viewport_rows as f64 * card_h
         + viewport_rows.saturating_sub(1) as f64 * gap
         + teaser_h;
@@ -1773,6 +1805,7 @@ pub(crate) fn plan_icon_scroll_layout(
         _ => 0..0,
     };
     let panel_h = THUMB_TOP_INSET
+        + THUMB_BOTTOM_INSET
         + viewport_rows as f64 * card_h
         + viewport_rows.saturating_sub(1) as f64 * gap
         + teaser_h
@@ -1832,11 +1865,11 @@ pub(crate) fn plan_icon_scroll_layout(
     }
 }
 
-/// Initial icon-only overlay height = top 32 + rows * card height + status bar (pure, testable).
-/// Used only for the initial window placeholder; summon-time layout recalculates it.
+/// Initial icon-only overlay height = both card-area insets + rows * card height + status bar (pure,
+/// testable). Used only for the initial window placeholder; summon-time layout recalculates it.
 fn compute_window_height(count: usize, cards_per_row: usize, card_h: f64) -> f64 {
     let rows = count.max(1).div_ceil(cards_per_row);
-    32.0 + rows as f64 * card_h + status_h()
+    THUMB_TOP_INSET + THUMB_BOTTOM_INSET + rows as f64 * card_h + status_h()
 }
 
 /// Initial icon-only overlay height; the live layout computes columns from screen width.
@@ -2362,11 +2395,11 @@ mod tests {
         // Zero windows: at least one row as the floor.
         assert_eq!(
             compute_window_height(0, 5, 100.0),
-            32.0 + 100.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + status_h()
         );
         assert_eq!(
             compute_window_height(1, 5, 100.0),
-            32.0 + 100.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + status_h()
         );
     }
 
@@ -2375,15 +2408,15 @@ mod tests {
         // Four per row: five windows -> two rows.
         assert_eq!(
             compute_window_height(5, 4, 120.0),
-            32.0 + 2.0 * 120.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + status_h()
         );
         assert_eq!(
             compute_window_height(8, 4, 120.0),
-            32.0 + 2.0 * 120.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + status_h()
         );
         assert_eq!(
             compute_window_height(9, 4, 120.0),
-            32.0 + 3.0 * 120.0 + status_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 3.0 * 120.0 + status_h()
         );
     }
 
@@ -2786,6 +2819,7 @@ mod flow_tests {
             // The panel height must be the content height: the cap is only a backstop and must not
             // silently hide a teaser that does not fit.
             let content_h = THUMB_TOP_INSET
+                + THUMB_BOTTOM_INSET
                 + rendered_rows as f64 * card_h
                 + rendered_rows.saturating_sub(1) as f64 * gap
                 + teaser_h
@@ -2801,6 +2835,59 @@ mod flow_tests {
             previous = panel_h;
             widths.pop();
         }
+    }
+
+    /// The bug this pins: the last row used to sit flush against the status footer, and the card
+    /// viewport -- which ends where the footer begins -- clipped the bottom of the selection ring the
+    /// selected card draws outside itself. Every production layout must leave the ring's outward
+    /// extent below its bottom-most card, and it must survive scrolling to the document's end (where
+    /// the document's bottom edge is the viewport's).
+    #[test]
+    fn the_bottom_row_clears_the_footer_for_the_selection_ring() {
+        // The card frame's own y in document coordinates is what the clip view compares against:
+        // placements carry panel coordinates (the footer included), so subtracting `status_h()` gives
+        // the offset above the viewport's bottom edge. The requirement comes from the ring's geometry,
+        // not from the inset constant, or shrinking the constant would satisfy the assertion.
+        let drawn_outside_the_card = crate::overlay::SELECTION_DECORATION_INSET;
+        let room_below_the_last_card = |placements: &[ThumbPlacement]| {
+            placements
+                .iter()
+                .map(|placement| placement.y)
+                .fold(f64::INFINITY, f64::min)
+                - status_h()
+        };
+
+        // Icon-only, everything fits: the document's bottom-most card is on screen and no scrolling
+        // can move it away from the viewport's edge.
+        let icon = plan_icon_scroll_layout(4, 1512.0, 900.0, THUMB_SCROLLBAR_W, 0.0);
+        assert!(!icon.overflowed);
+        let icon_room = room_below_the_last_card(&icon.document_placements);
+        assert!(
+            icon_room >= drawn_outside_the_card - 1e-9,
+            "icon layout: only {icon_room:.1}pt below the last row, the selection ring draws \
+             {drawn_outside_the_card:.1}pt below the card"
+        );
+
+        // Thumbnails, scrolled to the very end: the same edge is reached by scrolling, so the inset
+        // belongs to the document height and not only to the initial viewport.
+        let aspects = vec![THUMB_PREVIEW_RATIO; 12];
+        let scrolled = plan_thumb_scroll_layout_with_max_card_w(
+            &aspects,
+            1200.0,
+            1400.0,
+            600.0,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            f64::MAX,
+            |_| f64::INFINITY,
+        );
+        assert!(scrolled.overflowed);
+        let scrolled_room = room_below_the_last_card(&scrolled.document_placements);
+        assert!(
+            scrolled_room >= drawn_outside_the_card - 1e-9,
+            "thumbnail layout: only {scrolled_room:.1}pt below the last row, the selection ring \
+             draws {drawn_outside_the_card:.1}pt below the card"
+        );
     }
 
     #[test]
@@ -2976,8 +3063,12 @@ mod flow_tests {
     fn wide_thumbnail_budget_fits_four_columns_without_changing_height() {
         let aspects = vec![1.6; 12];
         let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let three_row_panel_h =
-            THUMB_TOP_INSET + card_h * 3.0 + THUMB_ROW_GAP * 2.0 + status_h() + 0.1;
+        let three_row_panel_h = THUMB_TOP_INSET
+            + THUMB_BOTTOM_INSET
+            + card_h * 3.0
+            + THUMB_ROW_GAP * 2.0
+            + status_h()
+            + 0.1;
         // Budgets derive from the *current* card width: the narrow one holds three columns (twelve
         // cards need four rows -> overflow) and the wide one holds four (twelve cards fit three rows ->
         // one page). The assertions therefore express the intent "horizontal budget decides the column
@@ -3051,6 +3142,7 @@ mod flow_tests {
                     selected,
                     constraints.max_inner,
                     THUMB_TOP_INSET
+                        + THUMB_BOTTOM_INSET
                         + constraints.max_rows as f64 * card_h
                         + THUMB_ROW_GAP
                         + status_h()
@@ -3371,7 +3463,10 @@ mod flow_tests {
         let fitting = thumb_panel_height_for_rows(2, 2, 80.0, 10.0, false);
 
         assert!(overflowing > fitting);
-        assert_eq!(fitting, THUMB_TOP_INSET + 2.0 * 80.0 + 10.0 + status_h());
+        assert_eq!(
+            fitting,
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 80.0 + 10.0 + status_h()
+        );
     }
 
     #[test]

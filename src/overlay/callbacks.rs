@@ -187,18 +187,16 @@ pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
 /// rebuild the card tree.
 fn refresh_after_selection_change(backfill_icons: bool) {
     let selected = with_tab_state(|state| state.as_ref().map(|state| state.selected));
-    let needs_relayout = selected.is_some_and(|index| {
-        !THUMB_VISIBLE_RANGE
-            .lock()
-            .unwrap()
-            .as_ref()
-            .is_some_and(|range| range.contains(&index))
-    });
-    if needs_relayout {
-        if let Some(index) = selected {
-            if ensure_thumbnail_selection_visible(index) {
-                apply_thumbnail_scroll_offset();
-            }
+    // Let the viewport decide; `ensure_thumbnail_selection_visible` is a no-op when it already shows
+    // the selection's row. It must not be gated on `THUMB_VISIBLE_RANGE`: that is the *rendered*
+    // range, and the scrolling viewport renders one row past its bottom edge as the scroll teaser, so
+    // a selection in that row was inside the rendered range and never scrolled -- left drawn under the
+    // status footer, its selection ring cut off by the viewport's edge (the reported defect).
+    // `navigate_thumbnail_vertical` (Up/Down) already always asks; horizontal navigation, the primary
+    // key, silently did not.
+    if let Some(index) = selected {
+        if ensure_thumbnail_selection_visible(index) {
+            apply_thumbnail_scroll_offset();
         }
     }
     refresh_highlight();
