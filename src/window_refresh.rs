@@ -998,7 +998,7 @@ fn on_window_server_event_inner() {
             | window_server::WindowServerEvent::GeometryChanged(_)
             | window_server::WindowServerEvent::SpaceMembership { .. }
             | window_server::WindowServerEvent::SpaceTopologyChanged => true,
-            window_server::WindowServerEvent::Focused(window_id) => {
+            window_server::WindowServerEvent::Focused(window_id, captured_at) => {
                 let displayed_pid = with_tab_state(|state_opt| {
                     state_opt
                         .as_ref()
@@ -1015,6 +1015,9 @@ fn on_window_server_event_inner() {
                     .or_else(|| owner_pid_for_cgwid(*window_id));
                 if let Some(pid) = pid {
                     let frontmost_pid = frontmost_app_info().1;
+                    // A raise waiting for this window has just delivered: record it before anything
+                    // else can decide the switch is still pending.
+                    crate::window_collector::note_focused_window(*window_id, pid, *captured_at);
                     log_debug!(
                         "[windows] focused event: cgwid={} pid={} displayed={} frontmost={}",
                         window_id,

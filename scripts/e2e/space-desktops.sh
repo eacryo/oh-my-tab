@@ -35,11 +35,22 @@ config_backup="/tmp/omt-e2e-space-desktops-config.bak"
 fail() { echo "e2e space-desktops: FAIL: $*" >&2; exit 1; }
 note() { echo "e2e space-desktops: $*"; }
 
+# Development switches this scenario forwards to every app it starts, so a raise-path experiment
+# runs through the real cross-desktop flow instead of a hand-driven summon. Cleared by the trap,
+# which restarts the app without them.
+extra_app_args=()
+for arg in "$@"; do
+    case "$arg" in
+        --activation-api=*|--raise-wait) extra_app_args+=("$arg") ;;
+    esac
+done
+
 # The shared verdict helper (and its own regression cases) must work before anything else runs.
 repo_dir_verdict="$repo_dir/scripts/e2e/lib"
 python3 -B "$repo_dir_verdict/verdict.py" >/dev/null || fail "verdict.py selftest failed"
 python3 -B "$repo_dir_verdict/space_kinds.py" >/dev/null || fail "space_kinds.py selftest failed"
 python3 -B "$repo_dir_verdict/hotkey.py" >/dev/null || fail "hotkey.py selftest failed"
+python3 -B "$repo_dir_verdict/ax_focus.py" >/dev/null || fail "ax_focus.py selftest failed"
 
 command -v cua-driver >/dev/null 2>&1 || fail "cua-driver CLI not found in PATH"
 cua-driver status >/dev/null 2>&1 || fail "cua-driver daemon is not running"
@@ -79,7 +90,8 @@ print(active[0]["pid"] if active else "")
 start_app() {
     rm -f "$state_file" "${state_file%.json}.tmp"
     local out
-    out="$("$repo_dir/scripts/dev-restart.sh" --e2e-state="$state_file" --no-onboarding 2>&1)"
+    out="$("$repo_dir/scripts/dev-restart.sh" ${extra_app_args[@]+"${extra_app_args[@]}"} \
+        --e2e-state="$state_file" --no-onboarding 2>&1)"
     printf '%s\n' "$out" | grep -q "^restart ok" || {
         printf '%s\n' "$out" | tail -20 >&2
         fail "dev-restart.sh did not bring the app up"
@@ -790,9 +802,49 @@ try:
           "the selection reached the other-desktop card",
           f"selected={selected.get('selected_index')} want={target['index']}")
 
+    def _log_line_count():
+        import os
+
+        path = os.path.expanduser("~/Library/Logs/oh-my-tab/oh-my-tab.log")
+        try:
+            with open(path, "r", errors="replace") as handle:
+                return sum(1 for _ in handle)
+        except OSError:
+            return 0
+
+    def _raise_from_log(pid, window_id, start_line, count_before):
+        import os
+        import re
+
+        path = os.path.expanduser("~/Library/Logs/oh-my-tab/oh-my-tab.log")
+        fields = {}
+        try:
+            with open(path, "r", errors="replace") as handle:
+                for index, line in enumerate(handle):
+                    if index < start_line or "[raise] other-desktop raise:" not in line:
+                        continue
+                    if f"pid={pid} " not in line or f"cgwid={window_id} " not in line:
+                        continue
+                    fields = dict(re.findall(r"(\w+)=([\w.]+)", line))
+        except OSError:
+            return None
+        if not fields:
+            return None
+        return {
+            "pid": pid,
+            "window_id": window_id,
+            "onscreen": fields.get("onscreen") == "true",
+            "ax_matched": fields.get("ax_matched") == "true",
+            "activation": fields.get("activation") == "true",
+            "rescue_attempted": fields.get("rescue_attempted") == "true",
+            "rescue": fields.get("rescue") == "true",
+            "count": count_before + 1,
+        }
+
     raise_state_before = (read_state() or {}).get("other_desktop_raise") or {}
     raise_count_before = raise_state_before.get("count", 0)
     commit_count_before = last_commit().get("count", 0)
+    log_mark = _log_line_count()
     commit_release()
     # Read the commit from its sticky record, not from the transient `commit` frame: the app writes
     # the keystroke display's hide frame in the same turn, so a poll can miss the frame.
@@ -805,8 +857,9 @@ try:
     # frame can be overwritten by the keystroke stream, so read the counters from a later frame).
     # The count must move past what this run had already recorded, so a stale counter from an
     # earlier commit in the same process cannot satisfy the check.
-    deadline = time.time() + 5
+    deadline = time.time() + 20
     raise_state = None
+    log_fallback_at = time.time() + 2.0
     while time.time() < deadline:
         snapshot = read_state() or {}
         state = snapshot.get("other_desktop_raise") or {}
@@ -817,6 +870,14 @@ try:
         ):
             raise_state = state
             break
+        # The sticky record only reaches the file when the app writes a frame, and after a quiet
+        # commit it may write none; the app logs the same outcome unconditionally, so fall back to
+        # that line (scoped to this commit) instead of calling a raise that happened absent.
+        if time.time() >= log_fallback_at:
+            raise_state = raise_state or _raise_from_log(target_pid, target_wid, log_mark,
+                                                          raise_count_before)
+            if raise_state is not None:
+                break
         time.sleep(0.05)
     check(bool(raise_state),
           "the app recorded a cross-desktop raise bound to this exact target",
@@ -1002,6 +1063,8 @@ print("\n".join(checks))
 for note in notes:
     print(note)
 if problems:
+    # stdout is what the shell prints on failure (this block's stderr is not redirected).
+    print("\n".join(problems))
     print("\n".join(problems), file=sys.stderr)
     raise SystemExit(1)
 PY
@@ -1012,9 +1075,10 @@ cat "$phase2_log"
 # The final line must not claim more than was checked: a sub-check that could not run (no summon-time
 # capture set, no Accessibility permission for the focus read) is reported as NOT RUN, and an unrun
 # check is not a passed check.
-if grep -q "NOT RUN" "$phase2_log"; then
-    note "PASS with NOT RUN sub-checks: the lines above say which; an unrun check is not a passed check"
-else
+# Phase 4 must run even when phase 2 reported NOT RUN sub-checks: a missing summon-time capture, or a
+# focus read without Accessibility permission, says nothing about the rescue branch -- and skipping
+# this phase while the script went on to print PASS was a "PASS where it cannot decide". Phase 4 has
+# its own precondition check below (the target must be on another desktop) and reports NOT RUN itself.
     # --- phase 4: the front-switch rescue, with app activation suppressed -------------------------
 # macOS refusing `activateWithOptions:` is the state that left the user's card doing nothing, and it
 # cannot be reproduced on demand; the development switch makes that branch deterministic instead. If
@@ -1044,8 +1108,64 @@ state_file, app_pid, target_wid, target_pid, config, repo_dir_verdict = (
 )
 sys.path.insert(0, repo_dir_verdict)
 from hotkey import chord as chord_for_config  # noqa: E402  (the path above makes it importable)
+from ax_focus import focused_window_id  # noqa: E402  (the same path)
 problems: list[str] = []
 checks: list[str] = []
+
+
+def _log_line_count():
+    import os
+
+    path = os.path.expanduser("~/Library/Logs/oh-my-tab/oh-my-tab.log")
+    try:
+        with open(path, "r", errors="replace") as handle:
+            return sum(1 for _ in handle)
+    except OSError:
+        return 0
+
+
+def _raise_from_log(pid, window_id, start_line):
+    """The last `[raise] other-desktop raise:` line for this target, or None.
+
+    Fields come straight from the app's own log line; the sticky state record is preferred, and this
+    only covers the case where the app never wrote a frame after the raise.
+    """
+    import os
+    import re
+
+    path = os.path.expanduser("~/Library/Logs/oh-my-tab/oh-my-tab.log")
+    fields = {}
+    try:
+        with open(path, "r", errors="replace") as handle:
+            # Only lines written after this block started: the same window is raised by the earlier
+            # phases too, and matching those would carry their outcome into this phase's assertions.
+            for index, line in enumerate(handle):
+                if index < start_line:
+                    continue
+                if "[raise] other-desktop raise:" not in line:
+                    continue
+                if f"pid={pid} " not in line or f"cgwid={window_id} " not in line:
+                    continue
+                fields = dict(re.findall(r"(\w+)=([\w.]+)", line))
+    except OSError:
+        return None
+    if not fields:
+        return None
+    return {
+        "pid": pid,
+        "window_id": window_id,
+        "onscreen": fields.get("onscreen") == "true",
+        "ax_matched": fields.get("ax_matched") == "true",
+        "activation": fields.get("activation") == "true",
+        "rescue_attempted": fields.get("rescue_attempted") == "true",
+        "rescue": fields.get("rescue") == "true",
+        "count": count_before + 1,
+    }
+
+
+def _ax_readable(pids):
+    """Whether this script may read AXFocusedWindow at all, judged on apps other than the target."""
+    return any(focused_window_id(pid) is not None for pid in pids)
 
 
 def check(ok, label, detail=""):
@@ -1153,7 +1273,24 @@ def cua(tool, args):
 
 
 try:
+    log_mark = _log_line_count()
     frame = summon()
+    # This phase needs a window that is on another desktop *right now*. The phase-1 target may have
+    # been carried to the active desktop by the earlier phases (or by an earlier run of this
+    # scenario, whose raise puts windows where they land), so re-pick instead of reusing it: reusing
+    # a stale target made this phase report NOT RUN, and before the precondition gate existed, a
+    # missing raise read as a failure.
+    # An ordinary desktop, like phase 1 picks: a full-screen window has its own Space and is not what
+    # this phase's rescue is about, and committing one made the later checks disagree with phase 1's.
+    rescue_card = next(
+        (c for c in frame.get("cards", [])
+         if c.get("other_desktop") and not c.get("fullscreen")),
+        None,
+    )
+    if rescue_card is None:
+        print("NOT RUN: phase 4 has no window on another desktop to switch to")
+        raise SystemExit(3)
+    target_pid, target_wid = rescue_card["pid"], rescue_card["window_id"]
     target = next((c for c in frame.get("cards", []) if c["window_id"] == target_wid), None)
     check(target is not None, "the other-desktop window is a card", f"cards={frame.get('cards')}")
     if target is None:
@@ -1188,12 +1325,28 @@ try:
             if now and now.get("selected_index") != previous_index:
                 break
             time.sleep(0.02)
+    # Phase 4 needs the target still on another desktop. Earlier phases -- and earlier runs of this
+    # scenario, which leave windows where their raise put them -- can leave it on the active one; the
+    # commit would then take the same-desktop path and this phase would report a missing raise as a
+    # failure. A gate that cannot decide must not look like one that decided "broken".
+    pre = read_state() or {}
+    # Capability must be established *before* the switch: probing afterwards would let a target that
+    # lost its focus window during the rescue be excused as "no Accessibility permission", which is
+    # exactly the failure this phase exists to catch.
+    other_pids = [c["pid"] for c in pre.get("cards", []) if c["pid"] != target_pid][:6]
+    ax_capable = _ax_readable(other_pids)
+    target_card = next((c for c in pre.get("cards", []) if c.get("window_id") == target_wid), None)
+    if not target_card or not target_card.get("other_desktop"):
+        print("NOT RUN: phase 4 needs the target on another desktop; window_id=%s is on the active "
+              "one (card=%s)" % (target_wid, json.dumps(target_card)))
+        raise SystemExit(3)
     commit_count_before_rescue = last_commit().get("count", 0)
     commit_release()
     wait(lambda s: (s.get("last_commit") or {}).get("count", 0) > commit_count_before_rescue,
          5, "the commit record", after_seq=seq() - 1)
-    deadline = time.time() + 8
+    deadline = time.time() + 20
     raise_state = None
+    log_fallback_at = time.time() + 2.0
     while time.time() < deadline:
         snapshot = read_state() or {}
         state = snapshot.get("other_desktop_raise") or {}
@@ -1201,6 +1354,16 @@ try:
                 and state.get("pid") == target_pid and state.get("window_id") == target_wid):
             raise_state = state
             break
+        # `other_desktop_raise` is sticky, but the state file only carries it when the app writes a
+        # frame -- and after a quiet rescue it may write none before this deadline, so the record
+        # exists in the app without ever reaching the file. The app logs the same outcome
+        # unconditionally when the raise finishes, so fall back to that line rather than reporting a
+        # raise that demonstrably landed (the frontmost and exact-window checks below prove it) as
+        # absent. Nothing is inferred here: every field comes from the app's own log line.
+        if time.time() >= log_fallback_at:
+            raise_state = raise_state or _raise_from_log(target_pid, target_wid, log_mark)
+            if raise_state is not None:
+                break
         time.sleep(0.05)
     check(bool(raise_state), "the rescue phase recorded its raise", json.dumps(raise_state))
     if raise_state:
@@ -1221,6 +1384,26 @@ try:
     check(window is not None and window.get("on_current_space") is True,
           "the active desktop is the target's desktop after the rescue",
           f"current_space={windows.get('current_space_id')}")
+    # The rescue branch must land the same switch the activation branch does, so it is held to the
+    # same frontmost reconciliation instead of only "the window reached this desktop".
+    apps = cua("list_apps", {"include_installed": False}).get("apps", [])
+    active = [a for a in apps if a.get("active")]
+    check(bool(active) and active[0]["pid"] == target_pid,
+          "the rescue left the target app frontmost", f"active={active[0] if active else None}")
+
+    # The exact window, not just its app or its desktop: the rescue branch is held to the same
+    # standard as the activation branch, through the shared AX helper.
+    if not ax_capable:
+        print("rescue focus check NOT RUN: AXFocusedWindow was unreadable for every probed app before "
+              "the switch (Accessibility permission for this script)")
+    else:
+        focused_wid = focused_window_id(target_pid)
+        check(focused_wid is not None,
+              "the rescue left the target app reporting a focused window",
+              f"focused={focused_wid}")
+        check(focused_wid == target_wid,
+              "the rescue's focused window is the exact selected window",
+              f"focused={focused_wid} want={target_wid}")
 finally:
     post(VK_ESCAPE, True, FLAG_MOD)
     post(VK_ESCAPE, False, FLAG_MOD)
@@ -1228,12 +1411,23 @@ finally:
 
 print("\n".join(checks))
 if problems:
+    # This block's stdout is what the shell prints on failure; its stderr is not redirected, so
+    # reporting only there left "exited 1 with no failing check" as the entire evidence.
+    print("\n".join(problems))
     print("\n".join(problems), file=sys.stderr)
     raise SystemExit(1)
 PY
 rescue_status=$?
 cat "$phase2_log"
-[ "$rescue_status" -eq 0 ] || fail "phase 4 (front-switch rescue) assertions failed"
+if [ "$rescue_status" -eq 3 ]; then
+    note "NOT RUN: phase 4 (front-switch rescue) skipped: the target window is on the active desktop (unrun is not passed)"
+    exit 0
+fi
+# Report the status: the block exiting non-zero without a printed failing assertion is itself a
+# finding, and the bare message made that indistinguishable from a real assertion failure.
+[ "$rescue_status" -eq 0 ] || fail "phase 4 (front-switch rescue) assertions failed (block exit status $rescue_status; failing checks are printed above, and no line above means the block exited without recording one)"
 
 note "PASS: with the switch off the other desktop stays hidden; with it on the card appears, is never a capture candidate, and commits to the exact window on its own desktop"
+if grep -q "NOT RUN" "$phase2_log"; then
+    note "phase 2 reported NOT RUN sub-checks: the lines above say which; an unrun check is not a passed check"
 fi

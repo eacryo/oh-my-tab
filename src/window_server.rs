@@ -45,7 +45,10 @@ type RequestNotificationsFn =
 pub(crate) enum WindowServerEvent {
     Created,
     Destroyed(u32),
-    Focused(u32),
+    /// A window became focused. The `Instant` is captured when the WindowServer reported it, not
+    /// when it is processed: the event crosses a bridge thread and a main-thread queue, and a
+    /// notification older than a raise request must not be taken as that request's arrival.
+    Focused(u32, Instant),
     GeometryChanged(u32),
     SpaceMembership {
         space_id: u64,
@@ -171,7 +174,7 @@ unsafe fn window_server_callback_inner(
             };
             match event {
                 WINDOW_DESTROYED => WindowServerEvent::Destroyed(window_id),
-                WINDOW_FOCUSED => WindowServerEvent::Focused(window_id),
+                WINDOW_FOCUSED => WindowServerEvent::Focused(window_id, Instant::now()),
                 _ => WindowServerEvent::GeometryChanged(window_id),
             }
         }
@@ -318,21 +321,20 @@ fn enqueue_main_event(event: WindowServerEvent) {
             events.retain(|queued| {
                 !matches!(
                     queued,
-                    WindowServerEvent::Focused(id) | WindowServerEvent::GeometryChanged(id)
+                    WindowServerEvent::Focused(id, _) | WindowServerEvent::GeometryChanged(id)
                         if *id == window_id
                 )
             });
         }
-        WindowServerEvent::Focused(window_id) => {
+        WindowServerEvent::Focused(window_id, _) => {
             if events.iter().any(
                 |queued| matches!(queued, WindowServerEvent::Destroyed(id) if *id == window_id),
             ) {
                 return;
             }
-            if let Some(existing) = events
-                .iter_mut()
-                .find(|queued| matches!(queued, WindowServerEvent::Focused(id) if *id == window_id))
-            {
+            if let Some(existing) = events.iter_mut().find(
+                |queued| matches!(queued, WindowServerEvent::Focused(id, _) if *id == window_id),
+            ) {
                 *existing = event;
                 return;
             }

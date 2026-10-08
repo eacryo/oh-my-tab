@@ -22,8 +22,8 @@ use crate::i18n::t;
 use crate::icon_cache::extract_icon_to_cache;
 use crate::theme::*;
 use crate::window_collector::{
-    activate_pid, bump_window_mru, raise_window_ax_async, raise_window_fast, sort_windows_by_mru,
-    MruMap, WindowInfo,
+    bump_window_mru, raise_window_ax_async, raise_window_fast, sort_windows_by_mru, MruMap,
+    WindowInfo,
 };
 use crate::window_server;
 // cross-module shared state (owned by main.rs)
@@ -1363,6 +1363,10 @@ pub(crate) unsafe fn make_centered_label_with_class(
 /// own retry) before the AX phase lands the exact window.
 pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool, on_other_desktop: bool) {
     let activation_started = Instant::now();
+    // Allocate this raise's generation and arm its focus-arrival boundary before anything acts: the
+    // front-switch below runs in this call, and the WindowServer notification it triggers is captured
+    // while it runs -- timestamping the boundary afterwards would discard this raise's own arrival.
+    let raise_generation = crate::window_collector::begin_raise(pid, cgwid);
     window_server::note_own_focus(pid, cgwid);
     // A same-app window switch produces no app-activation notification and its 808
     // is silenced as an own-focus echo, so schedule the thumbnail arrival refresh
@@ -1383,20 +1387,24 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool, on_other
         // A development switch suppresses this so the exact-window front-switch rescue can be
         // exercised on its own (macOS refusing `activateWithOptions:` is not reproducible on demand,
         // and that refusal is exactly the state the rescue exists for).
-        let activated = if crate::dev_flags::enabled("other-desktop-no-activation") {
+        let (activated, api) = if crate::dev_flags::enabled("other-desktop-no-activation") {
             log_debug!(
                 "[raise] other-desktop front skipped by --other-desktop-no-activation: pid={}",
                 pid
             );
-            false
+            (false, crate::window_collector::ActivationApi::WithOptions)
         } else {
-            activate_pid(pid)
+            let request = crate::window_collector::ActivationApiRequest::parse(
+                crate::dev_flags::value("activation-api").as_deref(),
+            );
+            crate::window_collector::activate_pid_with_api(pid, request)
         };
         log_debug!(
-            "[raise] other-desktop front: pid={} cgwid={} minimized={} activated={} elapsed={}ms",
+            "[raise] other-desktop front: pid={} cgwid={} minimized={} api={:?} activated={} elapsed={}ms",
             pid,
             cgwid,
             minimized,
+            api,
             activated,
             activation_started.elapsed().as_millis()
         );
@@ -1423,6 +1431,9 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool, on_other
         slps_ok && click_ok
     };
 
+    // The generation and its focus-arrival boundary are allocated *before* the enqueue: the
+    // front-switch below has already run by now, and its own notification must still count as this
+    // raise's arrival.
     let generation = raise_window_ax_async(
         pid,
         cgwid,
@@ -1430,7 +1441,13 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool, on_other
         fast_path_ok,
         on_other_desktop,
         activation,
+        raise_generation,
     );
+    // Delivery is recorded by the main-thread drain *after* it performs its action, never here: this
+    // runs while the panel is being dismissed, and the evidence read (an AX round trip plus the
+    // WindowServer's ordered on-screen list) is main-thread work at the moment the commit and the
+    // keystroke display need the main thread. Recording here also produced a false "delivered" before
+    // the raise had run, which is how the window ended up not coming forward.
     log_debug!(
         "[raise] activation enqueued: pid={} cgwid={} minimized={} other_desktop={} gen={} total={}ms",
         pid,

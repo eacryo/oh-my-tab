@@ -181,11 +181,27 @@ activateWithOptions:`) both move the Space; which one lands first depends on the
 on the front-switch for a cross-Space target ("it also makes macOS switch to a Space showing it") and
 BetterCmdTab keeps it as its menu-bar-correct cross-Space fallback -- after rejecting
 `CGSManagedDisplaySetCurrentSpace`, which sets the Space directly but skips the Space-transition
-machinery and left the destination without a menu bar when leaving a full-screen Space. This project
-therefore tries app activation first and applies the front-switch as the rescue when the window has
-not joined the active desktop within `OTHER_DESKTOP_ACTIVATION_BUDGET`; the wait is bounded by
-`OTHER_DESKTOP_SETTLE_BUDGET` because the transition is animated, and a window that only arrives while
-the AX phase is already running gets one late re-raise (`OTHER_DESKTOP_LATE_SETTLE_BUDGET`). An earlier
+machinery and left the destination without a menu bar when leaving a full-screen Space. This project now
+sends the exact-window front-switch and the targeted click **immediately** (it no longer waits for the
+window to join the active desktop), and submits the AX raise with them; a window that has not arrived
+yet simply misses that raise, and one bounded late re-check re-applies it
+(`OTHER_DESKTOP_LATE_SETTLE_BUDGET`). The order was chosen by measurement, with one caveat: these numbers are **phase
+timings inside the raise worker** (zeroed when the worker starts, so they exclude the earlier
+activation call and the queueing, and they are not the moment the five success criteria first held).
+The waiting version took 3,227-3,288ms per cross-desktop commit (worst case 4,613ms, which never landed
+at all), the immediate version 139-291ms on the same machine (2026-10-08, macOS 27.0.1/26A434; from the
+`[raise] other-desktop terminal` records of `scripts/e2e/space-desktops.sh --include-focus`:
+`first_rescue_ms=0`, `first_ax_attempt_ms<=30`, `elapsed_ms` within that range). The reference
+implementations do not wait for this signal either: AltTab and DockDoor do not wait at all,
+BetterCmdTab waits only for the Space-change notification on its own synthetic-gesture path, and
+vorssaint-utils waits on Space visibility rather than on a window's `kCGWindowIsOnscreen`. The signal
+this project keeps is still the CG flag (`kCGWindowIsOnscreen`, option 8): the membership query lags
+during a transition -- measured, the membership read taken right after the CG flag already reported
+`onscreen=true` still showed the target's Space and the active Space disjoint (the two reads run one
+after the other, they are not two samples of one instant). `--raise-wait` restores the waiting path for comparison only and is
+off by default. One more limit: the terminal's system-frontmost criterion is unavailable
+until the main-thread channel exists, so under the experiment switch the terminal can only be
+`unknown` -- it never claims `landed`. An earlier
 version relied on app activation alone and skipped the front-switch; macOS refuses that activation in
 some states (`activateWithOptions=false` with the target never becoming frontmost, which is what the
 user's log showed), and such a card then did nothing at all. The earlier note here claiming the

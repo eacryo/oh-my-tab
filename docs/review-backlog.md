@@ -55,3 +55,26 @@ so a later reader does not re-derive them. The fixes are in the tree, with their
   migration (in-row button height 28 -> 32, row-to-row 62 -> 60 = 52 + 8, card-to-header 77 -> 72.2 =
   24 + 4 + 20 + 16.2 + 8). The 58.7 step that looked off-grid is the same row pitch measured through a
   row's value label, which sits 1.3pt above its row label. Repaired to 44/44 with no tolerance widened.
+
+- The terminal classification cannot read the system frontmost app yet. `NSWorkspace.frontmostApplication`
+  belongs to the main thread and `terminal_evidence` runs on `ax-raiser`, so the read is gone and
+  `frontmost_pid_matches` is `None`: while the raise experiment carries `--activation-api` the terminal is
+  therefore `unknown` rather than `landed`, and the product path records no terminal at all (`terminal=-`,
+  measured 2026-10-08, `scripts/e2e/space-desktops.sh --include-focus` still PASS). Deferred because the
+  honest fix is the main-thread verification channel the phase-2 repair step has to build anyway, and
+  keeping a background AppKit call alive for a diagnostic is exactly the breach the invariant forbids.
+  Trigger: the change that adds that channel (then sample the frontmost pid on the main thread and carry it
+  back as plain data), or any move of the terminal into product behaviour.
+
+- Recovery-coverage evidence for the cross-desktop raise (raised in review round 2 as MEDIUM: deleting the
+  pre-action wait also shortened the recovery coverage). Three states still lack a counter-example: a first
+  AX raise that matches no element, a target that only arrives late, and a cross-desktop *minimized* restore.
+  Deferred because each needs a purpose-built scenario -- an element absent on the first attempt, a delayed
+  arrival, a minimized window parked on another desktop -- and nothing can force those states from outside
+  today. What *is* covered: `scripts/e2e/space-desktops.sh --include-focus` drives the rescue branch end to
+  end and now reconciles the system frontmost pid **and** the exact focused window (phase 4), and
+  `--other-desktop-no-activation` makes the suppressed-activation branch deterministic
+  (measured 2026-10-08: `activation=false`, `first_rescue_ms=0`, `elapsed_ms=216`, target app frontmost,
+  focused window == the selected one).
+  Trigger: the next change to the raise or recovery path, or the first report of a delayed or minimized
+  cross-desktop switch that does not land.

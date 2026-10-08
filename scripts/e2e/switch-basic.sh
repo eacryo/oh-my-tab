@@ -112,6 +112,20 @@ same_process = snapshot.get("pid") == int(sys.argv[2])
 print((snapshot.get("last_commit") or {}).get("count", 0) if same_process else 0)
 PY
 )"
+# The main-thread drain counts the AX actions it performs. The regression this pins: the drain
+# silently skipped its action, so the title bar changed while the window never came forward -- and
+# every check above still passed, because frontmost pid, focus and on-screen state all looked right.
+ax_actions_before="$(python3 - "$state_file" "$app_pid" <<'PY'
+import json, sys
+try:
+    with open(sys.argv[1]) as handle:
+        snapshot = json.load(handle)
+except (FileNotFoundError, json.JSONDecodeError):
+    snapshot = {}
+same_process = snapshot.get("pid") == int(sys.argv[2])
+print(snapshot.get("ax_actions", 0) if same_process else 0)
+PY
+)"
 
 # 5) 注入真实热键。scope=desktop 走系统事件流(route=global_input),不是注入给某个 pid——
 #    全局事件 tap 只认系统级事件,注入给 pid 的组合它看不到。
@@ -137,11 +151,11 @@ PY
 
 # 6) 断言:读快照 + 与 WindowServer 真状态对账(全在 python 里做)。
 #    Assertions: read the snapshot and cross-check real WindowServer state (all in python).
-python3 - "$state_file" "$pre_active" "$app_pid" "$commit_count_before" <<'PY'
+python3 - "$state_file" "$pre_active" "$app_pid" "$commit_count_before" "$ax_actions_before" <<'PY'
 import json, subprocess, sys, time
 
-state_file, pre_active, app_pid, commit_count_before = (
-    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]),
+state_file, pre_active, app_pid, commit_count_before, ax_actions_before = (
+    sys.argv[1], sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]),
 )
 problems: list[str] = []
 checks: list[str] = []
@@ -182,6 +196,22 @@ while time.time() < deadline:
         break
     time.sleep(0.05)
 
+# The main-thread drain acts *after* the commit frame is written, so keep polling briefly for the
+# frame it publishes there. Without this the assertion below can only ever see the counter as it was
+# before the action -- which is how a skipped action would look identical to a slow one.
+ax_deadline = time.time() + 3
+while time.time() < ax_deadline:
+    try:
+        with open(state_file) as handle:
+            snapshot = json.load(handle)
+        if snapshot.get("pid") == app_pid:
+            frames.append(snapshot)
+            if (snapshot.get("ax_actions") or 0) > int(ax_actions_before):
+                break
+    except (FileNotFoundError, json.JSONDecodeError):
+        pass
+    time.sleep(0.05)
+
 seen = [f for f in frames if f.get("seq")]
 events = [f.get("event") for f in seen]
 check(bool(seen), "app wrote a state snapshot", f"events seen: {events}")
@@ -209,6 +239,16 @@ check(
     last_commit.get("count", 0) > int(commit_count_before),
     "release committed a window",
     f"last_commit={last_commit} events seen: {events}",
+)
+# The drain must have actually performed its AX action. A commit with no action is exactly the
+# "title bar changed, window did not come forward" regression, which no other check here can see.
+# Read the counter from the newest frame seen, not from the commit frame: the drain acts *after* the
+# commit frame is written, so the commit frame still carries the value from before it.
+latest_ax_actions = max((frame.get("ax_actions", 0) for frame in seen), default=0)
+check(
+    latest_ax_actions > ax_actions_before,
+    "the main-thread drain performed its AX raise",
+    f"ax_actions={latest_ax_actions} before={ax_actions_before} frames={len(seen)}",
 )
 
 if commits:
@@ -251,27 +291,50 @@ if commits:
             f"shown={summons[-1]['selected_index']} committed={target['index']}",
         )
 
+# --- OS 侧对账:前台 app + WindowServer 里的真实窗口 -------------------------
+# Driven by the *sticky* record, not by the transient commit frame: the app now publishes an
+# `ax_raise` frame that can overwrite the commit frame, and gating these checks on that frame let the
+# script report PASS after checking almost nothing. These always run; the frame-only checks above say
+# for themselves when they could not run.
+# The sticky record must have *advanced during this run*: a record left by an earlier commit in the
+# same process carries another window's pid, and reconciling against it would fail the wrong switch.
+committed_this_run = last_commit.get("count", 0) > int(commit_count_before)
+committed_pid = last_commit.get("pid") if committed_this_run else None
+committed_wid = last_commit.get("window_id") if committed_this_run else None
+if committed_pid:
+    check(bool(pre_active), "recorded the frontmost app before driving")
+    check(
+        str(committed_pid) != str(pre_active),
+        "the switch changed the frontmost app",
+        f"before={pre_active} target={committed_pid}",
+    )
     # --- OS 侧对账:前台 app + WindowServer 里的真实窗口 -------------------
     time.sleep(0.6)
     apps = cua("list_apps", {"include_installed": False})["apps"]
     active = [a for a in apps if a.get("active")]
     active_pid = active[0]["pid"] if active else None
     check(
-        active_pid == target["pid"],
+        active_pid == committed_pid,
         "macOS agrees the committed pid is frontmost",
-        f"active={active_pid} committed={target['pid']}",
+        f"active={active_pid} committed={committed_pid}",
     )
     windows = cua("list_windows", {})["windows"]
     match = [
-        w for w in windows if w["pid"] == target["pid"] and w["window_id"] == target["window_id"]
+        w for w in windows if w["pid"] == committed_pid and w["window_id"] == committed_wid
     ]
     check(
         bool(match) and match[0]["is_on_screen"],
         "the committed window exists in WindowServer and is on screen",
-        f"pid windows={[(w['window_id'], w['is_on_screen']) for w in windows if w['pid'] == target['pid']]}",
+        f"pid windows={[(w['window_id'], w['is_on_screen']) for w in windows if w['pid'] == committed_pid]}",
+    )
+else:
+    problems.append(
+        "system reconciliation could not run: this run recorded no committed window"
     )
 
 print(f"  info display frame seen: {bool(summons)} (quick press-release skips the display path)")
+print(f"  info commit frame seen: {bool(commits)} "
+      "(a quick press-release can have it overwritten by a later frame; the sticky record above is what was checked)")
 for label in checks:
     print(f"  ok   {label}")
 for label in problems:

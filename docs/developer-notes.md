@@ -132,10 +132,17 @@ AX 完全不发布的窗口才看 WindowServer 的 tag。
 与应用激活（`NSRunningApplication activateWithOptions:`）都能移动 Space，谁先落地取决于状态。AltTab 对
 跨 Space 目标依赖前台切换（「它同时会让 macOS 切到显示该窗口的 Space」），BetterCmdTab 把它保留为菜单栏
 正确的跨 Space 兜底——他们放弃了 `CGSManagedDisplaySetCurrentSpace`，因为那个调用跳过 Space 切换机制，
-从全屏 Space 出来时会让目标 Space 没有菜单栏。因此本项目先试应用激活，若窗口在
-`OTHER_DESKTOP_ACTIVATION_BUDGET` 内没有进入活跃桌面，再用前台切换兜底；等待上限是
-`OTHER_DESKTOP_SETTLE_BUDGET`（过渡是动画的），而在 AX 阶段已经跑起来之后才到达的窗口会补一次精确抬窗
-（`OTHER_DESKTOP_LATE_SETTLE_BUDGET`）。这个文件早先的版本只依赖应用激活、跳过了前台切换；macOS 在某些
+从全屏 Space 出来时会让目标 Space 没有菜单栏。本项目现在**立即**发出精确窗口的前台切换与定向点击（不再先等窗口进入活跃桌面），AX 精确抬窗也随即提交；
+窗口若尚未到达，AX 那一步只是落空，随后由**一次有界补做**重新抬窗（`OTHER_DESKTOP_LATE_SETTLE_BUDGET`）。
+这个顺序是实测选的，但要注意这些数字是**抬窗工作线程内部的阶段耗时**（以工作线程开始为零点，不含此前的激活
+调用与排队，也不是"五项成功条件首次成立"的时刻）：等待版本 3,227–3,288ms（最坏一次 4,613ms 且始终没有落地），
+立即提交版本 139–291ms（同一台机器，2026-10-08，macOS 27.0.1／26A434；由 `scripts/e2e/space-desktops.sh
+--include-focus` 的 `[raise] other-desktop terminal` 记录复现：`first_rescue_ms=0`、`first_ax_attempt_ms<=30`、
+`elapsed_ms` 落在上述区间）。参考实现同样不等这个信号：AltTab 与 DockDoor 完全不等待，BetterCmdTab 只在它
+自己的合成手势路径上等 Space 变化通知，vorssaint-utils 等的是 Space 可见性而不是窗口的 `kCGWindowIsOnscreen`。
+本项目保留的判定信号仍是 CG 的 `kCGWindowIsOnscreen`（option 8）：成员关系查询在过渡期间滞后——实测中
+CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显示目标 Space 与当前 Space 不相交（两次读取是顺序
+执行的，不是同一瞬间的两次采样）。`--raise-wait` 只用于对照旧行为，默认不启用。另外：终态里的系统前台判定目前不可用（那次读取属于主线程，通道尚未建立），所以实验开关下的终态在建立通道之前只会是 `unknown`，不会冒充 `landed`。这个文件早先的版本只依赖应用激活、跳过了前台切换；macOS 在某些
 状态下会拒绝那个激活（`activateWithOptions=false`，目标始终没有成为前台——这正是用户日志里的情形），
 于是这类卡片完全没有反应。此前这里写的「前台切换返回成功但活跃 Space 不动」来自一个没有辅助功能信任的
 探针程序，是错的：该调用确实会切换，两个参考实现都依赖它。每次抬窗都会发布是哪条路径移动了 Space，

@@ -45,7 +45,35 @@ struct CommitRecord {
     index: usize,
 }
 
-#[derive(Clone, Copy)]
+/// One cross-desktop raise's outcome, as the raise path observed it.
+///
+/// A struct rather than a parameter list: the experiment added several timing fields, and a
+/// positional call with eight plus six arguments is where a wrong field silently lands in the wrong
+/// slot. `first_*` are `None` when the event never happened — a missing arrival must not be written
+/// as `0`, which would read as "instant success".
+pub(crate) struct RaiseOutcome {
+    pub(crate) pid: i32,
+    pub(crate) window_id: u32,
+    pub(crate) generation: u64,
+    pub(crate) onscreen: bool,
+    pub(crate) ax_matched: bool,
+    pub(crate) activation: bool,
+    pub(crate) rescue_attempted: bool,
+    pub(crate) rescue: bool,
+    /// Front-switch attempts this raise made (1 in the rescue path today).
+    pub(crate) attempts: u32,
+    /// How the raise ended: `landed` / `timeout` / `cancelled` / `targetgone` / `identitymismatch`
+    /// / `unknown`. Only `landed` means the switch happened.
+    pub(crate) terminal: String,
+    /// Milliseconds from the raise's submit to each first event, when it happened.
+    pub(crate) first_rescue_ms: Option<u128>,
+    pub(crate) first_ax_attempt_ms: Option<u128>,
+    pub(crate) first_arrival_ms: Option<u128>,
+    /// Submit to observation end.
+    pub(crate) elapsed_ms: u128,
+}
+
+#[derive(Clone)]
 struct OtherDesktopRaise {
     pid: i32,
     window_id: u32,
@@ -59,6 +87,12 @@ struct OtherDesktopRaise {
     /// Whether the rescue front-switch was applied, and whether it reported success.
     rescue_attempted: bool,
     rescue: bool,
+    attempts: u32,
+    terminal: String,
+    first_rescue_ms: Option<u128>,
+    first_ax_attempt_ms: Option<u128>,
+    first_arrival_ms: Option<u128>,
+    elapsed_ms: u128,
 }
 static SPACE_MEMBERSHIP_SOURCE: AtomicU8 = AtomicU8::new(0);
 static SPACE_IN_TRANSITION: AtomicBool = AtomicBool::new(false);
@@ -248,16 +282,7 @@ pub(crate) fn other_desktop_accepted() {
 /// background-produced counters here, and one lock covers the whole record so a reader can never mix
 /// one raise's identity with another's result.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn record_other_desktop_raise(
-    pid: i32,
-    window_id: u32,
-    generation: u64,
-    onscreen: bool,
-    ax_matched: bool,
-    activation: bool,
-    rescue_attempted: bool,
-    rescue: bool,
-) {
+pub(crate) fn record_other_desktop_raise(outcome: RaiseOutcome) {
     if !is_enabled() {
         return;
     }
@@ -268,14 +293,20 @@ pub(crate) fn record_other_desktop_raise(
     *slot = Some((
         count,
         OtherDesktopRaise {
-            pid,
-            window_id,
-            generation,
-            onscreen,
-            ax_matched,
-            activation,
-            rescue_attempted,
-            rescue,
+            pid: outcome.pid,
+            window_id: outcome.window_id,
+            generation: outcome.generation,
+            onscreen: outcome.onscreen,
+            ax_matched: outcome.ax_matched,
+            activation: outcome.activation,
+            rescue_attempted: outcome.rescue_attempted,
+            rescue: outcome.rescue,
+            attempts: outcome.attempts,
+            terminal: outcome.terminal,
+            first_rescue_ms: outcome.first_rescue_ms,
+            first_ax_attempt_ms: outcome.first_ax_attempt_ms,
+            first_arrival_ms: outcome.first_arrival_ms,
+            elapsed_ms: outcome.elapsed_ms,
         },
     ));
 }
@@ -436,6 +467,17 @@ pub(crate) fn record_if_space_context_changed() {
 
 /// Records a commit snapshot carrying the window this release targets. Must run *before* the
 /// selection is cleared: once the overlay hides, AppState no longer holds a selected index.
+/// Count of AX raise actions the main-thread drain actually performed.
+///
+/// A scenario asserts this moves across a commit: the user-visible regression was the drain silently
+/// skipping its action (the title bar changed, the window never came forward), which every existing
+/// check tolerated because it only looked at frontmost pid, focus and on-screen state.
+static AX_ACTIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+pub(crate) fn record_ax_action() {
+    AX_ACTIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 pub(crate) fn record_commit(pid: i32, window_id: u32, app: &str, index: usize) {
     if is_enabled() {
         let mut slot = LAST_COMMIT.lock().unwrap();
@@ -785,6 +827,11 @@ fn ws_hex(
     row.and_then(&field).map(|value| format!("0x{value:x}"))
 }
 
+/// `null` for "the event never happened" — writing 0 would read as "it happened instantly".
+fn json_opt_u128(value: Option<u128>) -> String {
+    value.map_or_else(|| "null".to_string(), |value| value.to_string())
+}
+
 fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
@@ -820,6 +867,10 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
     // baseline to the pid is what makes "wait for a newer frame" mean a frame from *this* run.
     json.push_str(&format!("  \"pid\": {},\n", std::process::id()));
     json.push_str(&format!("  \"event\": {},\n", json_string(event)));
+    json.push_str(&format!(
+        "  \"ax_actions\": {},\n",
+        AX_ACTIONS.load(std::sync::atomic::Ordering::Relaxed)
+    ));
     json.push_str(&format!("  \"visible\": {},\n", snapshot.visible));
     json.push_str(&format!(
         "  \"settings_window_visible\": {},\n",
@@ -1057,7 +1108,9 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             index: 0,
         },
     ));
-    let raise = *OTHER_DESKTOP_RAISE.lock().unwrap();
+    // Cloned, not copied: the record now carries a `String` terminal (`OtherDesktopRaise` is no
+    // longer `Copy`), and the read must not hold the lock while the JSON is formatted.
+    let raise = OTHER_DESKTOP_RAISE.lock().unwrap().clone();
     let (raise_count, raise) = raise.unwrap_or((
         0,
         OtherDesktopRaise {
@@ -1069,6 +1122,12 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             activation: false,
             rescue_attempted: false,
             rescue: false,
+            attempts: 0,
+            terminal: String::new(),
+            first_rescue_ms: None,
+            first_ax_attempt_ms: None,
+            first_arrival_ms: None,
+            elapsed_ms: 0,
         },
     ));
     json.push_str(&format!(
@@ -1076,7 +1135,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         commit_count, commit.pid, commit.window_id, commit.index
     ));
     json.push_str(&format!(
-        "  \"other_desktop_raise\": {{\"count\": {}, \"pid\": {}, \"window_id\": {}, \"generation\": {}, \"onscreen\": {}, \"ax_matched\": {}, \"activation\": {}, \"rescue_attempted\": {}, \"rescue\": {}}},\n",
+        "  \"other_desktop_raise\": {{\"count\": {}, \"pid\": {}, \"window_id\": {}, \"generation\": {}, \"onscreen\": {}, \"ax_matched\": {}, \"activation\": {}, \"rescue_attempted\": {}, \"rescue\": {}, \"attempts\": {}, \"terminal\": {}, \"first_rescue_ms\": {}, \"first_ax_attempt_ms\": {}, \"first_arrival_ms\": {}, \"elapsed_ms\": {}}},\n",
         raise_count,
         raise.pid,
         raise.window_id,
@@ -1086,6 +1145,12 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         raise.activation,
         raise.rescue_attempted,
         raise.rescue,
+        raise.attempts,
+        json_string(&raise.terminal),
+        json_opt_u128(raise.first_rescue_ms),
+        json_opt_u128(raise.first_ax_attempt_ms),
+        json_opt_u128(raise.first_arrival_ms),
+        raise.elapsed_ms,
     ));
     json.push_str(&format!(
         "  \"space_groups\": {{\"displays\": {}, \"confirmed_fullscreen_origins\": {}, \"unknown_active_fullscreen_spaces\": {}, \"evidence_contiguous\": {}, \"source_learning_available\": {}}},\n",

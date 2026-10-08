@@ -200,6 +200,90 @@ unsafe fn make_key_window(pid: i32, wid: u32) -> bool {
     status == 0
 }
 
+/// Whether the target app and our own NSApplication both offer the cooperative activation pair
+/// (`yieldActivationToApplication:` + `activateFromApplication:options:`, macOS 14+).
+pub(crate) fn cooperative_activation_available(app: *mut AnyObject) -> bool {
+    unsafe {
+        if app.is_null() {
+            return false;
+        }
+        let target_responds: bool =
+            msg_send![app, respondsToSelector: sel!(activateFromApplication:options:)];
+        if !target_responds {
+            return false;
+        }
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        if nsapp.is_null() {
+            return false;
+        }
+        msg_send![nsapp, respondsToSelector: sel!(yieldActivationToApplication:)]
+    }
+}
+
+/// Activate a cross-desktop target with the API the development switch asked for, reporting which
+/// API was actually used (an explicitly requested cooperative call falls back on systems without it).
+///
+/// Main thread only (see [`activate_pid_cooperatively`]). The choice itself is
+/// `raise_diagnostics::select_activation_api`, so the tests cover the decision this path makes.
+pub(crate) fn activate_pid_with_api(
+    pid: i32,
+    request: super::raise_diagnostics::ActivationApiRequest,
+) -> (bool, super::raise_diagnostics::ActivationApi) {
+    use super::raise_diagnostics::{select_activation_api, ActivationApi};
+
+    unsafe {
+        let app: *mut AnyObject =
+            msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if app.is_null() {
+            log_debug!("[raise] activation: no running app for pid={}", pid);
+            return (false, ActivationApi::WithOptions);
+        }
+        let api = select_activation_api(request, cooperative_activation_available(app));
+        let activated = match api {
+            ActivationApi::FromApplication => activate_pid_cooperatively(pid),
+            ActivationApi::WithOptions => activate_pid(pid),
+        };
+        (activated, api)
+    }
+}
+
+/// Activate a cross-desktop target through the documented cooperative handover (macOS 14+): yield
+/// our own activation to it, then let it take the active status from us.
+///
+/// Main thread only, and deliberately a separate entry point from `activate_pid` (which the
+/// background restore path also calls): both `yieldActivationToApplication:` and
+/// `activateFromApplication:options:` are AppKit calls, and the header states the source
+/// application should yield *before* the activation request is sent. The API takes an
+/// `NSRunningApplication` (the requester) -- passing an `NSApplication` there would be a type error
+/// the compiler cannot see through `msg_send!`.
+pub(crate) fn activate_pid_cooperatively(pid: i32) -> bool {
+    unsafe {
+        let app: *mut AnyObject =
+            msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+        if app.is_null() {
+            log_debug!(
+                "[raise] cooperative activation: no running app for pid={}",
+                pid
+            );
+            return false;
+        }
+        if !cooperative_activation_available(app) {
+            return false;
+        }
+        let source: *mut AnyObject = msg_send![class!(NSRunningApplication), currentApplication];
+        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![nsapp, yieldActivationToApplication: app];
+        let activated: bool = msg_send![app, activateFromApplication: source, options: 0usize];
+        if !activated {
+            log_debug!(
+                "[raise] cooperative activation refused: pid={} activateFromApplication=false",
+                pid
+            );
+        }
+        activated
+    }
+}
+
 /// Ask AppKit to activate an application without raising all of its windows.
 /// This is used only after the precise WindowServer path reports a transient failure.
 pub(crate) fn activate_pid(pid: i32) -> bool {

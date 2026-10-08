@@ -26,6 +26,7 @@ use crate::{log_debug, log_info};
 
 mod collect;
 mod raise;
+mod raise_diagnostics;
 mod raiser;
 #[path = "window_collector/skylight.rs"]
 mod space_membership;
@@ -35,6 +36,11 @@ mod window_state;
 #[cfg(test)]
 use collect::*;
 use raise::*;
+pub(crate) use raise_diagnostics::{
+    classify_terminal, delivery_from_record, exact_delivery_observed, focus_action_allowed,
+    focus_notification_delivery, position_reached, retry_click_allowed, ActivationApi,
+    ActivationApiRequest, PendingDelivery, Terminal, TerminalEvidence,
+};
 use raiser::*;
 pub(crate) use space_state_probe::{run as run_space_state_probe, ProbeMode};
 pub(crate) use window_state::{ax_app_hidden_tag, StateSource, WindowStateEvidence};
@@ -43,11 +49,13 @@ pub(crate) use collect::{
     collect_windows, collect_windows_for_pid, collect_windows_with_frontmost_bump,
     switchable_capture_window_for_pid,
 };
+pub(crate) use raise::activate_pid_with_api;
 pub(crate) use raise::{
     activate_pid, ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
     clear_ax_window_cache_for_window, close_ax_window, focused_window_cgwid,
     forget_non_normal_window, raise_window_fast,
 };
+pub(crate) use raiser::{begin_raise, note_focused_window};
 pub(crate) use raiser::{
     cf_to_rust_string, get_ax_windows_for_pid, handle_ax_raise_main, raise_window_ax_async,
 };
@@ -429,24 +437,77 @@ fn window_layer_now(cgwid: u32) -> Option<i32> {
 /// macOS 26). Reading it per window keeps the wait tied to the fact being waited for rather than
 /// to a fixed sleep.
 pub(crate) fn window_is_onscreen_now(cgwid: u32) -> bool {
+    // A failed query, a window the WindowServer no longer lists, and an unreadable on-screen field
+    // all mean "not shown on the active desktop" for the raise path's purposes.
+    matches!(window_presence_now(cgwid), Some((true, Some(true))))
+}
+
+/// The window number of the frontmost layer-0 window on screen, if one can be read.
+///
+/// `CGWindowListCopyWindowInfo` returns the on-screen list front-to-back, so the first layer-0 entry
+/// is the window the user actually sees on top. This is the evidence that separates "the window is in
+/// front" from "its application calls it focused while it still sits behind".
+pub(crate) fn frontmost_onscreen_window_now() -> Option<u32> {
+    // The same options the snapshot collection uses: on-screen only, desktop elements excluded.
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+    let array = unsafe { CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP_ELEMENTS, 0) };
+    if array.is_null() {
+        return None;
+    }
+    let mut found = None;
+    unsafe {
+        for index in 0..CFArrayGetCount(array) {
+            let dict = CFArrayGetValueAtIndex(array, index);
+            if dict.is_null() {
+                continue;
+            }
+            match cf_dict_get_u32(dict, "kCGWindowLayer") {
+                Some(0) => {
+                    found = cf_dict_get_u32(dict, "kCGWindowNumber");
+                    break;
+                }
+                Some(_) => continue,
+                None => continue,
+            }
+        }
+        CFRelease(array);
+    }
+    found
+}
+
+/// Whether the WindowServer still lists this window, and whether it reports it on screen.
+///
+/// The two are different facts and the state decode reads both: a window that is simply not on
+/// screen is a raise that has not landed yet, while a window the WindowServer no longer lists is
+/// gone (its id may even have been recycled, which is why callers must also check the owner).
+/// `None` when the query itself produced nothing (a null array); the inner `Option` is the window's
+/// on-screen field, `None` when the entry carries none. "Could not read" stays distinct from "the
+/// window is gone": only a query that *succeeded* while omitting the window proves destruction, and
+/// treating a failed query as destruction is how a raise would report a window it failed to see.
+pub(crate) fn window_presence_now(cgwid: u32) -> Option<(bool, Option<bool>)> {
     if cgwid == 0 {
-        return false;
+        return Some((false, None));
     }
     let array =
         unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW, cgwid) };
     if array.is_null() {
-        return false;
+        return None;
     }
-    let onscreen = unsafe {
+    let (present, onscreen) = unsafe {
         if CFArrayGetCount(array) <= 0 {
-            false
+            (false, None)
         } else {
             let dict = CFArrayGetValueAtIndex(array, 0);
-            !dict.is_null() && cf_dict_get_bool(dict, "kCGWindowIsOnscreen") == Some(true)
+            if dict.is_null() {
+                (true, None)
+            } else {
+                (true, cf_dict_get_bool(dict, "kCGWindowIsOnscreen"))
+            }
         }
     };
     unsafe { CFRelease(array) };
-    onscreen
+    Some((present, onscreen))
 }
 
 /// The layer that classifies an AX-only window: this pass's snapshot entry when it has one, else a

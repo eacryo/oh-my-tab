@@ -42,9 +42,75 @@ struct MainThreadAxRaise {
     minimized_key: Option<AXUIElementRef>,
     force_focus: bool,
     generation: u64,
+    /// When the raise was *requested* (the raise job's own enqueue). It must not be refreshed when a
+    /// repair is enqueued: the authorization decision belongs to the original request.
+    requested_at: Instant,
 }
 
 unsafe impl Send for MainThreadAxRaise {}
+
+/// Whether the system is *now* showing this raise as exactly delivered: the application is frontmost,
+/// calls this window its focused one, the window is on screen, **and it is the frontmost window**.
+///
+/// Main thread only (it reads AppKit and the WindowServer's ordered list). Used both to record the
+/// fact and, from a synchronous path, to record what it just performed -- never to skip an action.
+pub(crate) fn delivery_evidence_now(pid: i32, cgwid: u32) -> bool {
+    unsafe {
+        let front = crate::ffi::frontmost_app_info().1;
+        let focused = focused_window_cgwid(pid);
+        let on_screen = crate::window_collector::window_is_onscreen_now(cgwid);
+        let frontmost_window = crate::window_collector::frontmost_onscreen_window_now();
+        exact_delivery_observed(
+            Some(front),
+            focused,
+            on_screen,
+            frontmost_window,
+            pid,
+            cgwid,
+        )
+    }
+}
+
+/// Whether this raise already delivered the exact window, read from the record at *this* moment.
+///
+/// The background paths (the cross-desktop rescue and the failed-fast-path retry) send the synthetic
+/// click, which is what takes the key focus. The main-thread drain refuses its AX action in that
+/// state, but a click sent afterwards would already have stolen it back, so those paths must ask the
+/// same record before they act. Plain data, so it is safe off the main thread.
+fn already_delivered(generation: u64) -> bool {
+    delivery_from_record(*EXACT_DELIVERY.lock().unwrap(), generation)
+}
+
+/// The raise whose focus arrival the WindowServer has not reported yet.
+static PENDING_DELIVERY: Mutex<Option<PendingDelivery>> = Mutex::new(None);
+
+/// Record that a WindowServer focus notification named this window, on the main thread.
+///
+/// This is the delivery evidence for a raise whose focus arrived: the system reported the window as
+/// focused, so a task queued later for the same generation stands down if the focus has moved on.
+/// No AX round trip and no extra main-thread work at commit time.
+pub(crate) fn note_focused_window(window_id: u32, owner_pid: i32, captured_at: Instant) {
+    let pending = *PENDING_DELIVERY.lock().unwrap();
+    if let Some(generation) =
+        focus_notification_delivery(pending, window_id, owner_pid, captured_at)
+    {
+        *EXACT_DELIVERY.lock().unwrap() = Some(generation);
+        *PENDING_DELIVERY.lock().unwrap() = None;
+    }
+}
+
+/// The generation whose exact window was last *observed* focused (see `delivery_from_record`).
+/// Written on the main thread, read where a task is queued.
+static EXACT_DELIVERY: Mutex<Option<u64>> = Mutex::new(None);
+
+unsafe fn observe_exact_delivery(job: &MainThreadAxRaise) -> bool {
+    if delivery_evidence_now(job.pid, job.cgwid) {
+        *EXACT_DELIVERY.lock().unwrap() = Some(job.generation);
+        true
+    } else {
+        false
+    }
+}
 
 static MAIN_THREAD_AX_RAISES: LazyLock<Mutex<Vec<MainThreadAxRaise>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
@@ -65,10 +131,55 @@ pub(crate) fn handle_ax_raise_main() {
                 continue;
             }
 
+            // Record the delivery fact when the system is already showing the target -- but still
+            // perform the action below. Skipping it here made a same-app switch (where the target
+            // application is frontmost and reports the window) leave the window where it was: the
+            // title bar changed and the window never came forward. The authorization check below is
+            // what refuses a genuinely unnecessary action.
+            observe_exact_delivery(&job);
+
+            // The user may have moved on since the request: clicking another app, using the system
+            // switcher, or picking another window does not bump this project's generation, so the
+            // guard above cannot see it. Reading the frontmost app is allowed *here* -- this runs on
+            // the main thread -- and it is what makes a delayed raise stand down instead of taking
+            // the focus back.
+            let front_pid = {
+                let pid = crate::ffi::frontmost_app_info().1;
+                if pid > 0 {
+                    Some(pid)
+                } else {
+                    None
+                }
+            };
+            // The frontmost pid cannot tell "the user picked another window of the same app"
+            // apart, so read that app's own focused window -- but only when it is already in front,
+            // which keeps the ordinary path free of the extra IPC.
+            let focused_window = if front_pid == Some(job.pid) {
+                focused_window_cgwid(job.pid)
+            } else {
+                None
+            };
+            // Read the delivery record *now*, not at enqueue time: a delivery confirmed after this
+            // task was queued must still make it stand down, and one decision drives both the focus
+            // authorization and the synthetic-click control below.
+            let delivered = delivery_from_record(*EXACT_DELIVERY.lock().unwrap(), job.generation);
+            if !focus_action_allowed(front_pid, focused_window, job.pid, job.cgwid, delivered) {
+                log_debug!(
+                    "[raise] AXRaise skipped: front is pid={:?}, not the target pid={} ({}ms after the request)",
+                    front_pid,
+                    job.pid,
+                    job.requested_at.elapsed().as_millis()
+                );
+                release_main_thread_ax_raise(&job);
+                continue;
+            }
+
             let minimized_set_err = job
                 .minimized_key
                 .map(|key| AXUIElementSetAttributeValue(job.element, key, kCFBooleanFalse));
-            if minimized_set_err.is_some() {
+            // A delivered repair must not re-send the synthetic click: the switch already landed, and
+            // that click is what takes the key focus.
+            if minimized_set_err.is_some() && !delivered {
                 let (slps_ok, click_ok) = raise_window_fast(job.pid, job.cgwid);
                 log_debug!(
                     "[raise] precise fast after main-thread unminimize: pid={} cgwid={} slps={} click={}",
@@ -78,6 +189,12 @@ pub(crate) fn handle_ax_raise_main() {
                     click_ok
                 );
             }
+            // The action this drain exists for: counted and published so a scenario can tell "the
+            // window did not come forward" from "we never tried" -- the regression this counter was
+            // added for. Publishing a frame here matters: the commit frame is written *before* this
+            // action, so without it a scenario never sees the counter move.
+            crate::e2e_state::record_ax_action();
+            crate::e2e_state::record("ax_raise");
             let raise_started = Instant::now();
             let raise_first_err = AXUIElementPerformAction(job.element, job.raise_key);
             let raise_first_us = raise_started.elapsed().as_micros();
@@ -108,6 +225,9 @@ pub(crate) fn handle_ax_raise_main() {
                 raise_retry_err,
                 minimized_set_err
             );
+            // Best effort, and it may read before the application has processed the action: a later
+            // task simply stays "not delivered" and is allowed to try, which is the safe direction.
+            observe_exact_delivery(&job);
             release_main_thread_ax_raise(&job);
         }
     }
@@ -134,6 +254,7 @@ unsafe fn enqueue_main_thread_ax_raise(
     minimized_key: Option<AXUIElementRef>,
     force_focus: bool,
     generation: u64,
+    requested_at: Instant,
 ) {
     if !raise_intent_current(generation) {
         return;
@@ -160,6 +281,7 @@ unsafe fn enqueue_main_thread_ax_raise(
             minimized_key,
             force_focus,
             generation,
+            requested_at,
         });
         old
     };
@@ -216,6 +338,22 @@ static RAISE_QUEUE: std::sync::LazyLock<RaiseQueue> = std::sync::LazyLock::new(|
 ///
 /// AX enumeration can block tens to hundreds of milliseconds on an unresponsive app; it must
 /// stay off the main thread.
+/// Allocate this raise's generation and arm its focus-arrival evidence.
+///
+/// Called *before* the raise performs anything: the front-switch's own focus notification is
+/// captured inside that call, and arming afterwards would timestamp the boundary later than the
+/// arrival it is meant to accept (see `focus_notification_delivery`).
+pub(crate) fn begin_raise(pid: i32, cgwid: u32) -> u64 {
+    if cgwid == 0 {
+        return 0;
+    }
+    let generation = RAISE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
+    if generation != 0 {
+        *PENDING_DELIVERY.lock().unwrap() = Some((generation, pid, cgwid, Instant::now()));
+    }
+    generation
+}
+
 pub(crate) fn raise_window_ax_async(
     pid: i32,
     cgwid: u32,
@@ -223,11 +361,11 @@ pub(crate) fn raise_window_ax_async(
     fast_path_ok: bool,
     on_other_desktop: bool,
     activation: bool,
+    generation: u64,
 ) -> u64 {
-    if cgwid == 0 {
+    if cgwid == 0 || generation == 0 {
         return 0;
     }
-    let generation = RAISE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::AcqRel) + 1;
     let job = RaiseJob {
         pid,
         cgwid,
@@ -302,20 +440,72 @@ fn run_raise_ax_job(job: RaiseJob) {
 /// `isOnscreen` well after the call returns, and a short budget abandons a switch already in flight
 /// (observed: a recorded `onscreen=false` followed by the Space changing afterwards). If nothing
 /// lands, the AX phase still runs and the record says `onscreen=false`.
-const OTHER_DESKTOP_SETTLE_BUDGET: Duration = Duration::from_millis(3000);
+/// Kept as a name for the raise path; the value and its single definition live in the diagnostics
+/// module, where the tests pin it.
+const OTHER_DESKTOP_SETTLE_BUDGET: Duration = super::raise_diagnostics::OBSERVATION_BUDGET;
 const OTHER_DESKTOP_ACTIVATION_BUDGET: Duration = Duration::from_millis(400);
 const OTHER_DESKTOP_SETTLE_STEP: Duration = Duration::from_millis(20);
 /// Extra window for a switch that only lands while the AX phase is already running.
 const OTHER_DESKTOP_LATE_SETTLE_BUDGET: Duration = Duration::from_millis(1500);
 
-/// Wait (bounded, generation-checked) for the target window to join the active desktop.
-unsafe fn wait_for_target_onscreen(job: &RaiseJob, budget: Duration, waited_ms: &mut u128) -> bool {
+/// The two arrival signals, for the experiment: the CG on-screen flag the wait keys on, and whether
+/// the window's Space has become one of the active Spaces.
+///
+/// The membership side is only read while the `--activation-api` experiment is running: it costs a
+/// per-Space query, and the default path must not pay for a diagnostic.
+/// `(reached, target space count, active space count)` — the counts are what tell "the window is
+/// elsewhere" apart from "the query answered nothing".
+type SpaceReach = (bool, usize, usize);
+
+fn arrival_space_reached(window_id: u32) -> Option<SpaceReach> {
+    // Only the experiment pays for this; the default path must not run a per-Space query.
+    crate::dev_flags::value("activation-api")?;
+    let snapshot = super::space_membership::query_with_provider(
+        &super::space_membership::SkyLightMembershipProvider,
+        &[window_id],
+        &std::collections::HashMap::new(),
+    )
+    .ok()?;
+    let target: Vec<u64> = snapshot.window_space_ids.get(&window_id)?.clone();
+    let current: Vec<u64> = snapshot.current_space_ids.iter().copied().collect();
+    // The sizes travel with the verdict: "not reached" with an empty current-Space list means the
+    // query told us nothing, which is a different problem from "the window is elsewhere".
+    Some((
+        position_reached(&target, &current),
+        target.len(),
+        current.len(),
+    ))
+}
+
+/// Wait (bounded, generation-checked) for the target window to join the active desktop. Logs the
+/// initial signals and every flip, so the two arrival signals can be compared after the fact.
+unsafe fn wait_for_target_onscreen(
+    job: &RaiseJob,
+    budget: Duration,
+    waited_ms: &mut u128,
+    label: &str,
+) -> bool {
     let deadline = Instant::now() + budget;
+    let mut last_logged: Option<(bool, Option<SpaceReach>)> = None;
     loop {
         if !raise_intent_current(job.generation) {
             return false;
         }
-        if crate::window_collector::window_is_onscreen_now(job.cgwid) {
+        let onscreen = crate::window_collector::window_is_onscreen_now(job.cgwid);
+        let space_reached = arrival_space_reached(job.cgwid);
+        if last_logged != Some((onscreen, space_reached)) {
+            log_debug!(
+                "[raise] arrival: stage={} onscreen={} space_reached={} waited_ms={}",
+                label,
+                onscreen,
+                space_reached.map_or("unknown".to_string(), |(reached, target, current)| {
+                    format!("{reached}(target_spaces={target},current_spaces={current})")
+                }),
+                waited_ms
+            );
+            last_logged = Some((onscreen, space_reached));
+        }
+        if onscreen {
             return true;
         }
         if Instant::now() >= deadline {
@@ -353,19 +543,58 @@ unsafe fn raise_other_desktop_window(
     activation: bool,
 ) {
     let mut waited_ms = 0u128;
+    // Diagnostics for the latency experiment: how many front-switch attempts ran, when each first
+    // happened, and how the raise ended. `attempts` is 1 in the rescue path today; phase 2 (a
+    // bounded re-send) is what would make it larger.
+    let mut attempts: u32 = 0;
+    let mut first_rescue_ms: Option<u128> = None;
+    let mut first_ax_attempt_ms: Option<u128> = None;
+    let mut first_arrival_ms: Option<u128> = None;
 
     // Attempt 1 was the app activation the commit path already performed; give it a short window of
     // its own before adding the rescue.
-    let mut onscreen =
-        wait_for_target_onscreen(job, OTHER_DESKTOP_ACTIVATION_BUDGET, &mut waited_ms);
+    // The front-switch and the AX raise go out immediately: waiting for the target to appear first
+    // measured 3.2s on average (up to 4.6s with no landing at all), while submitting at once and
+    // letting the bounded re-check below repair lands the same switch -- system frontmost and exact
+    // window focus -- in ~160ms (2026-10-08, macOS 27.0.1/26A434). A window that has not arrived yet
+    // simply misses the AX raise; the re-check re-applies it. `--raise-wait` restores the waiting
+    // path for comparison only.
+    let wait_first = crate::dev_flags::enabled("raise-wait");
+    let mut onscreen = if wait_first {
+        wait_for_target_onscreen(
+            job,
+            OTHER_DESKTOP_ACTIVATION_BUDGET,
+            &mut waited_ms,
+            "activation",
+        )
+    } else {
+        false
+    };
+    if onscreen && first_arrival_ms.is_none() {
+        first_arrival_ms = Some(started.elapsed().as_millis());
+    }
     let mut rescue_attempted = false;
     let mut rescue = false;
     if !onscreen && raise_intent_current(job.generation) {
+        attempts += 1;
+        if first_rescue_ms.is_none() {
+            first_rescue_ms = Some(started.elapsed().as_millis());
+        }
         // Attempt 2: the exact-window front-switch (SLPS with the window id + the targeted click).
         // Both reference implementations use it for a cross-Space target; here it is the rescue for
         // the states where macOS refuses to activate the app.
         rescue_attempted = true;
-        let (slps_ok, click_ok) = raise_window_fast(job.pid, job.cgwid);
+        let (slps_ok, click_ok) = if already_delivered(job.generation) {
+            // The window is already exactly delivered: sending the click here would take the focus
+            // back from whatever the user has chosen since.
+            log_debug!(
+                "[raise] front-switch rescue skipped: generation {} is already delivered",
+                job.generation
+            );
+            (false, false)
+        } else {
+            raise_window_fast(job.pid, job.cgwid)
+        };
         rescue = slps_ok && click_ok;
         log_debug!(
             "[raise] other-desktop front-switch rescue: pid={} cgwid={} commit_fast_path_ok={} slps={} click={} waited={}ms",
@@ -379,22 +608,58 @@ unsafe fn raise_other_desktop_window(
         let remaining = OTHER_DESKTOP_SETTLE_BUDGET.saturating_sub(Duration::from_millis(
             waited_ms.min(u128::from(u64::MAX)) as u64,
         ));
-        onscreen = wait_for_target_onscreen(job, remaining, &mut waited_ms);
+        onscreen = if wait_first {
+            wait_for_target_onscreen(job, remaining, &mut waited_ms, "rescue")
+        } else {
+            false
+        };
+        if onscreen && first_arrival_ms.is_none() {
+            first_arrival_ms = Some(started.elapsed().as_millis());
+        }
     }
     if !raise_intent_current(job.generation) {
+        record_other_desktop_outcome(
+            job,
+            started,
+            onscreen,
+            false,
+            activation,
+            rescue_attempted,
+            rescue,
+            attempts,
+            first_rescue_ms,
+            first_ax_attempt_ms,
+            first_arrival_ms,
+            Some(Terminal::Cancelled),
+        );
         return;
     }
 
+    if first_ax_attempt_ms.is_none() {
+        first_ax_attempt_ms = Some(started.elapsed().as_millis());
+    }
     let mut ax_matched = raise_window_ax_job(job, started, false);
     // The transition is animated, so the window can join the active desktop while the AX phase is
     // already running -- and that phase then matched an element that was not on the active desktop,
     // where an AXRaise does nothing. Re-check once and re-apply, so a late arrival still gets the
     // exact raise instead of only the Space switch.
+    // The action already went out; this is the recovery observation. The immediate path keeps the
+    // *waiting* path's total window rather than only the short late tail, so a target that becomes
+    // matchable later (a slow switch, a minimized restore) still gets its repair instead of falling
+    // outside a shortened budget.
+    let recovery_budget = if wait_first {
+        OTHER_DESKTOP_LATE_SETTLE_BUDGET
+    } else {
+        OTHER_DESKTOP_SETTLE_BUDGET
+    };
     if !onscreen
         && raise_intent_current(job.generation)
-        && wait_for_target_onscreen(job, OTHER_DESKTOP_LATE_SETTLE_BUDGET, &mut waited_ms)
+        && wait_for_target_onscreen(job, recovery_budget, &mut waited_ms, "late")
     {
         onscreen = true;
+        if first_arrival_ms.is_none() {
+            first_arrival_ms = Some(started.elapsed().as_millis());
+        }
         let late_matched = raise_window_ax_job(job, started, false);
         ax_matched = late_matched || ax_matched;
         log_debug!(
@@ -417,16 +682,111 @@ unsafe fn raise_other_desktop_window(
         waited_ms,
         started.elapsed().as_millis()
     );
-    crate::e2e_state::record_other_desktop_raise(
-        job.pid,
-        job.cgwid,
-        job.generation,
+    record_other_desktop_outcome(
+        job,
+        started,
         onscreen,
         ax_matched,
         activation,
         rescue_attempted,
         rescue,
+        attempts,
+        first_rescue_ms,
+        first_ax_attempt_ms,
+        first_arrival_ms,
+        None,
     );
+}
+
+/// The five success criteria, read from the system. Diagnostic-path only (see the caller): the
+/// queries are not free and one of them is an IPC into the target application.
+unsafe fn terminal_evidence(job: &RaiseJob, observation_expired: bool) -> TerminalEvidence {
+    let presence = crate::window_collector::window_presence_now(job.cgwid);
+    let (visible, target_gone) = super::raise_diagnostics::presence_evidence(presence);
+    let rows = crate::skylight::window_rows(&[job.cgwid]);
+    // `None` when the row or its owner field could not be read, which is "unknown", not a match.
+    let identity_matches = rows
+        .get(&job.cgwid)
+        .and_then(|row| row.pid)
+        .map(|owner| owner == job.pid);
+    // The system frontmost app belongs to the main thread, and this runs on `ax-raiser`. Until the
+    // verification channel can carry it back as plain data, it stays unknown here -- and an unknown
+    // front can never confirm `landed`, which is the honest reading rather than a background AppKit
+    // call that breaks the thread invariant (see docs/review-backlog.md).
+    let frontmost_pid_matches: Option<bool> = None;
+    let focused_window_matches = focused_window_cgwid(job.pid).map(|w| w == job.cgwid);
+    TerminalEvidence {
+        generation_current: raise_intent_current(job.generation),
+        identity_matches,
+        visible,
+        frontmost_pid_matches,
+        focused_window_matches,
+        target_gone,
+        // The only observation left in the default path is the bounded late re-check: if it never
+        // saw the target, the window is exhausted; if it did, success may still be settling.
+        observation_expired,
+    }
+}
+
+/// Gather the observable evidence for one cross-desktop raise and publish its terminal.
+///
+/// `forced` is how a cancellation is recorded: the raise path returns early when a newer selection
+/// supersedes it, and a scenario must be able to tell that apart from a raise that is still running
+/// or one that timed out. Everything else is derived from the five success criteria.
+#[allow(clippy::too_many_arguments)]
+unsafe fn record_other_desktop_outcome(
+    job: &RaiseJob,
+    started: Instant,
+    onscreen: bool,
+    ax_matched: bool,
+    activation: bool,
+    rescue_attempted: bool,
+    rescue: bool,
+    attempts: u32,
+    first_rescue_ms: Option<u128>,
+    first_ax_attempt_ms: Option<u128>,
+    first_arrival_ms: Option<u128>,
+    forced: Option<Terminal>,
+) {
+    // Everything below is a diagnostic: a CG read, a WindowServer batch query and an AX IPC into the
+    // target. It runs only while the raise experiment carries `--activation-api`, and never when a
+    // newer selection already decided the outcome -- so the product path pays nothing for it and
+    // this worker thread never calls AppKit for it (the experiment's AppKit read is a diagnostic-path
+    // exception, recorded in docs/review-backlog.md).
+    let diagnostics = crate::dev_flags::value("activation-api").is_some();
+    let terminal = match forced {
+        Some(terminal) => Some(terminal),
+        None if diagnostics => Some(classify_terminal(terminal_evidence(job, !onscreen))),
+        None => None,
+    };
+    let elapsed_ms = started.elapsed().as_millis();
+    log_debug!(
+        "[raise] other-desktop terminal: pid={} cgwid={} terminal={} attempts={} first_rescue_ms={:?} first_ax_attempt_ms={:?} first_arrival_ms={:?} elapsed_ms={}",
+        job.pid,
+        job.cgwid,
+        terminal.map_or("-", Terminal::label),
+        attempts,
+        first_rescue_ms,
+        first_ax_attempt_ms,
+        first_arrival_ms,
+        elapsed_ms
+    );
+    crate::e2e_state::record_other_desktop_raise(crate::e2e_state::RaiseOutcome {
+        pid: job.pid,
+        window_id: job.cgwid,
+        generation: job.generation,
+        onscreen,
+        ax_matched,
+        activation,
+        rescue_attempted,
+        rescue,
+        attempts,
+        terminal: terminal.map_or(String::new(), |terminal| terminal.label().to_string()),
+        first_rescue_ms,
+        first_ax_attempt_ms,
+        first_arrival_ms,
+        elapsed_ms,
+    });
 }
 
 /// Recover a failed synchronous raise without blocking the main thread.
@@ -435,6 +795,15 @@ unsafe fn raise_other_desktop_window(
 unsafe fn retry_failed_fast_path(job: &RaiseJob) -> bool {
     const RETRY_DELAYS_MS: [u64; 2] = [8, 20];
     let started = Instant::now();
+    // Same protection as the rescue: an app activation and click aimed at a raise that has already
+    // delivered would take the focus back from the user's current choice.
+    if already_delivered(job.generation) {
+        log_debug!(
+            "[raise] fast-path retry skipped: generation {} is already delivered",
+            job.generation
+        );
+        return false;
+    }
     let activate_ok = activate_pid(job.pid);
     let mut last = (false, false);
     let mut attempts = 0;
@@ -449,6 +818,20 @@ unsafe fn retry_failed_fast_path(job: &RaiseJob) -> bool {
             return false;
         }
         std::thread::sleep(Duration::from_millis(delay_ms));
+        // Re-checked here, after the sleep and immediately before the click: the raise may have been
+        // delivered while this retry was waiting, and the click would then take the focus back.
+        if !retry_click_allowed(
+            raise_intent_current(job.generation),
+            already_delivered(job.generation),
+        ) {
+            log_debug!(
+                "[raise] fast recovery stopped before its click: pid={} cgwid={} gen={} delivered or superseded",
+                job.pid,
+                job.cgwid,
+                job.generation
+            );
+            return false;
+        }
         attempts += 1;
         last = raise_window_fast(job.pid, job.cgwid);
         if last.0 && last.1 {
@@ -527,6 +910,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
             minimized_key,
             force_ax_focus,
             job.generation,
+            job.enqueued_at,
         );
         let effective_raise_err = raise_retry_err.unwrap_or(raise_first_err);
         if effective_raise_err != K_AX_INVALID_UI_ELEMENT {
@@ -741,6 +1125,7 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 minimized_key,
                 force_ax_focus,
                 job.generation,
+                job.enqueued_at,
             );
             log_debug!(
                 "[raise] ax raised refreshed: pid={} cgwid={} source={:?} fullscreen_subrole={} ax_windows={} known_minimized={} raise_first={} set_focused={:?} raise_retry={:?} app_create_us={} waited={}ms total={}ms",
@@ -802,6 +1187,7 @@ unsafe fn raise_ax_element(
     minimized_key: Option<AXUIElementRef>,
     force_focus: bool,
     generation: u64,
+    requested_at: Instant,
 ) -> (AXError, Option<AXError>, Option<AXError>) {
     log_debug!(
         "[raise] AXRaise queued for main thread: pid={} cgwid={} force_focus={}",
@@ -824,6 +1210,7 @@ unsafe fn raise_ax_element(
         minimized_key,
         force_focus,
         generation,
+        requested_at,
     );
     (K_AX_SUCCESS, None, None)
 }
