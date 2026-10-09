@@ -24,12 +24,23 @@ sh scripts/release.sh --push --dry-run   # 准备产物并打印上传计划
 sh scripts/release-dev.sh                 # 只构建开发包，不访问 R2
 sh scripts/release-dev.sh --push          # 上传到 dev_release，并发布 dev_release/appcast.xml
 sh scripts/release-dev.sh --push --dry-run
+sh scripts/release-dev.sh --self-signed   # 改用自签证书签名
+sh scripts/release-dev.sh --identity <name|sha1>   # 用指定的那个身份签名
+sh scripts/release-dev.sh --print-identity         # 只打印解析出的签名身份，不构建
 ```
 
 `release-dev.sh` 仍使用 Release 优化构建，但会专门启用 `dev-long-text` Cargo feature，因此
 开发发布包的语言下拉框包含 `[TEST] English x3`，用于验证超长文案的下拉框、设置行和卡片布局。
 正式 `release.sh` 以及直接调用 `bundle.sh` 的生产路径不启用该 feature，生产包不会包含这个
 测试选项。
+
+签名身份在构建之前就解析好：默认用 Apple 签发的 **Developer ID Application** 证书（和
+`scripts/dev-restart.sh` 用的是同一个身份），`--self-signed` 改用仓库的 `oh-my-tab-sign`，
+`--identity <name|sha1>` 指定其它身份。显式设置的 `CODESIGN_IDENTITY` / `SIGN_IDENTITY` 同样生效；
+两个来源不一致时会直接停下，而不是替用户挑一个；机器上没有任何 Developer ID 身份、或存在多个
+Developer ID 身份时也一样停下并要求显式指定。构建完成后会核对产物的叶证书是否就是这次解析出的
+身份，签错身份构建出来的包不会被发布。上述解析、传参与拦截由
+`scripts/release-dev-signing-selftest.sh` 离线覆盖。
 
 正式发布时，`--notarize` 会构建并暂存签名后的 `.app`，`--check` 用于查询 Apple 公证状态。状态变为 `Accepted` 后，`--staple` 会把票据写入暂存的 `.app`（幂等；已贴票时为无操作），`--push` 则在需要时先贴票，再生成最终 ZIP 和 DMG，然后调用仓库内固定版本的 `vendor/Sparkle/bin/generate_appcast` 和 R2 发布工具。
 
@@ -70,7 +81,7 @@ cask 里硬编码了 `depends_on macos: :ventura` + `depends_on arch: :arm64`，
 
 ## 代码签名：为什么自签证书能让授权稳定
 
-`bundle.sh` 优先用自签名身份 **`oh-my-tab-sign`** 签名，证书缺失或签名失败时退回 ad-hoc（`codesign -s -`）。
+`bundle.sh` 的本地打包路径默认使用自签名身份 **`oh-my-tab-sign`**，并拒绝 ad-hoc 签名：`SIGN_IDENTITY=-` 直接报错，没有静默回退。
 
 **原因：** ad-hoc 签名应用使用 CDHash 作为指定要求（designated requirement）。重新构建会改变这个哈希，macOS 可能把它视为新的 TCC 身份，并再次要求辅助功能授权（日志中可见 `Failed to match existing code requirement` / `errSecCSReqFailed`）。自签名证书提供了跨构建保持稳定的证书身份。
 
@@ -89,6 +100,10 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 **注意：** 自签名证书只稳定 TCC 身份，**不**满足 Gatekeeper 分发——别人安装后仍会看到「未识别开发者」，需要右键打开。若要通过 Gatekeeper 正常分发，需要使用付费的 Apple **Developer ID Application** 证书；有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
 
 **开发渠道的身份（2026-10-08 变更）：** `scripts/dev-restart.sh` 现在优先用 **Apple 签发**的身份签名（`CODESIGN_IDENTITY` 可覆盖），**只接受 Apple 签发与自签名两种身份、拒绝 ad-hoc**，且 Apple 身份签名失败即**构建失败**（除非显式 `--allow-signing-fallback`）；签名不带安全时间戳，本地构建因此不依赖 Apple 的时间戳服务。它**只在输入（构建产物、拷入包的内容、签名身份）变化时**才重新组装与重签——输入没变就复用现有包。原因有一半是实测出来的：钥匙串项的 ACL 按「**创建该项的应用的签名身份**」判定，由 Developer ID 构建创建的项跨重建仍被承认（探针与实机各一次，重建后 67ms 静默读完），而由自签名/ad-hoc 构建创建的项在二进制变化后不再被承认。`bundle.sh` 的本地打包路径仍用自签名 `oh-my-tab-sign`（下面是它的用途与创建步骤）。
+
+**开发频道的发布身份（2026-10-09 变更）：** `scripts/release-dev.sh` 过去沿用 `bundle.sh` 的自签名默认值，于是发布一次更新就把 Developer ID 签名的开发包换成了自签名的包——身份变了，macOS 就再次索要辅助功能与钥匙串授权（实测：14:53 那次发布后日志出现 `No accessibility permission.` 与 `Clipboard history not saved this session (storage is not writable)`）。现在它自己解析出 Developer ID 身份并显式传给 `bundle.sh`，两条流程因此是同一个身份。其余情况由上面的 `--self-signed` / `--identity` / `--print-identity` 覆盖；`bundle.sh` 自己的默认值以及其它调用方都不变。
+
+**时间戳：** 用 Apple 签发的身份时，`codesign` 默认会向 Apple 的时间戳服务索取安全时间戳（实测），因此发布开发频道需要联网，服务不可达时在**上传之前**就失败——重跑即可，`cargo` 与已暂存的产物都还在。`dev-restart.sh` 则刻意传 `--timestamp=none`，让本机重建循环不依赖该服务；自签名路径也不带时间戳。时间戳不参与指定要求（designated requirement），所以两条流程描述的是同一个身份；但「某次更新是否仍会提示一次授权」「之后重建是否保持授权」**没有实测**——见下面那条未实测的边界。
 
 **一条未实测的边界：** 上面「自签名身份让 TCC 授权跨重建保持稳定」的说法来自日志观察（`Failed to match existing code requirement` / `errSecCSReqFailed`），本仓库**没有做过对照实测**；钥匙串侧的对照实测显示自签名身份是按二进制判定的，TCC 侧是否不同不得据此推断。
 

@@ -24,9 +24,14 @@ The development channel uses a separate bundle ID, feed, R2 prefix, and archive 
 sh scripts/release-dev.sh                 # build the development package only
 sh scripts/release-dev.sh --push          # upload to dev_release and publish its appcast
 sh scripts/release-dev.sh --push --dry-run
+sh scripts/release-dev.sh --self-signed   # sign with the self-signed certificate instead
+sh scripts/release-dev.sh --identity <name|sha1>   # sign with that exact identity
+sh scripts/release-dev.sh --print-identity         # print the signing identity and exit
 ```
 
 `release-dev.sh` still uses an optimized Release build, but enables the `dev-long-text` Cargo feature. The development package therefore includes a `[TEST] English x3` language option for checking long dropdown values, settings rows, and card layouts. The production `release.sh` and direct `bundle.sh` paths do not enable this feature.
+
+The signing identity is resolved before anything is built: the Apple-issued **Developer ID Application** certificate by default (the same identity `scripts/dev-restart.sh` uses), `--self-signed` for the repository's `oh-my-tab-sign`, `--identity <name|sha1>` for any other one. An explicit `CODESIGN_IDENTITY` or `SIGN_IDENTITY` is honoured too; two sources that disagree stop the build instead of picking one, and so does a machine with no Developer ID identity or several of them. After the build the artifact's leaf certificate is checked against the resolved identity, so a build signed by something else is never published. `scripts/release-dev-signing-selftest.sh` covers that resolution, the parameter passing and the gates offline.
 
 For production, `--notarize` builds and stages the signed `.app`, while `--check` queries Apple's notarization service. After the status becomes `Accepted`, `--staple` writes the ticket into the staged app (idempotent; a no-op if it is already stapled), and `--push` staples if needed, then creates the final ZIP and DMG. It then generates an appcast with the pinned `vendor/Sparkle/bin/generate_appcast` tool and invokes the R2 publisher.
 
@@ -67,7 +72,7 @@ A single Markdown file may contain multiple language blocks. Start blocks with `
 
 ## Code signing: why a self-signed certificate stabilizes permissions
 
-`bundle.sh` prefers the **`oh-my-tab-sign`** self-signed identity and falls back to ad-hoc signing (`codesign -s -`) if the certificate is missing or signing fails.
+`bundle.sh`'s local packaging path defaults to the **`oh-my-tab-sign`** self-signed identity, and it refuses ad-hoc signing: `SIGN_IDENTITY=-` is an error, with no silent fallback.
 
 **Why:** an ad-hoc signed app uses its CDHash as the designated requirement. Rebuilding changes that hash, so macOS may treat the result as a different TCC identity and ask for Accessibility permission again. A self-signed certificate provides a stable certificate-based identity across rebuilds.
 
@@ -86,6 +91,10 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 **Note:** a self-signed certificate stabilizes TCC identity but does **not** satisfy Gatekeeper for distribution. Other users may still see an unidentified-developer warning. Proper distribution requires a paid Apple **Developer ID Application** certificate; set `SIGN_IDENTITY` in `scripts/bundle.sh` to that identity.
 
 **The development channel's identity (changed 2026-10-08):** `scripts/dev-restart.sh` now signs with the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery); **only the Apple-issued and the self-signed identity are accepted -- ad-hoc is refused** -- and a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` is passed; signing is done without a secure timestamp, so a local build never depends on Apple's timestamp service. It re-assembles and re-signs only when its inputs change (built binary, bundled resources, signing identity) -- an unchanged restart reuses the existing bundle. Half of the reason is measured: a keychain item's ACL is judged against the signing identity of the app that **created** it, so an item created by a Developer ID build survives rebuilds (probe and real app: 67 ms, silent) while one created by a self-signed or ad-hoc build does not. `bundle.sh`'s local packaging path still uses the self-signed `oh-my-tab-sign` (its purpose and setup are below).
+
+**The dev channel's publish identity (changed 2026-10-09):** `scripts/release-dev.sh` used to inherit `bundle.sh`'s self-signed default, so publishing an update replaced a Developer-ID-signed dev app with a self-signed one -- a different signing identity, which made macOS ask for Accessibility and keychain access again (measured: after the 14:53 publish the log showed `No accessibility permission.` and `Clipboard history not saved this session (storage is not writable)`). It now resolves the Developer ID identity itself and passes it to `bundle.sh` explicitly, so both flows carry the same identity. `--self-signed`, `--identity` and `--print-identity` cover the rest (see the command list above); `bundle.sh`'s own default and the other callers are unchanged.
+
+**Timestamps:** with an Apple-issued identity `codesign` requests a secure timestamp from Apple's timestamp service by default (measured), so publishing the dev channel needs network access and fails before anything is uploaded when the service cannot be reached -- re-running is enough, `cargo` and the staged artifacts are cached. `dev-restart.sh` passes `--timestamp=none` on purpose, so the local rebuild loop never depends on that service, and the self-signed path is not timestamped either. A timestamp does not take part in the designated requirement, so the two flows describe the same identity; whether a particular update still prompts once, and whether a later rebuild keeps the grants, is **not** measured -- see the unverified edge below.
 
 **One unverified edge:** the claim above that a self-signed identity keeps TCC grants stable across rebuilds comes from log observations (`Failed to match existing code requirement` / `errSecCSReqFailed`); this repository has **not** run a controlled comparison, and the keychain-side comparison shows a self-signed identity being judged by the binary -- the TCC side may not be inferred from it.
 
