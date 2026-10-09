@@ -259,16 +259,24 @@ if [ "${RELEASE_SIGNING:-0}" = "1" ]; then
   fi
   echo "signed with $CODESIGN_IDENTITY (Hardened Runtime + secure timestamp)"
 else
-  SIGN_IDENTITY="oh-my-tab-sign"
-  SIGN_ERR="$(mktemp)"
-  if codesign --force --sign "$SIGN_IDENTITY" "$APP" 2>"$SIGN_ERR"; then
-    :
-  else
-    echo "warning: signing with '$SIGN_IDENTITY' failed; falling back to ad-hoc (TCC grants won't persist):" >&2
-    sed 's/^/         /' "$SIGN_ERR" >&2
-    codesign --force --sign - "$APP"
+  # 本机开发打包只接受自签名身份:ad-hoc 没有稳定身份,每次重建都会丢掉 TCC 授权,
+  # 也会让该项目创建的钥匙串项不再被承认。签名失败即终止,不再静默降级。
+  # The local development package accepts the self-signed identity only: ad-hoc has no stable
+  # identity -- every rebuild loses the TCC grants and stops matching keychain items it created --
+  # so signing failure terminates the build instead of degrading silently.
+  SIGN_IDENTITY="${SIGN_IDENTITY:-oh-my-tab-sign}"
+  if [ "$SIGN_IDENTITY" = "-" ]; then
+    echo "error: SIGN_IDENTITY=- asks for ad-hoc signing, which is not accepted for development" >&2
+    echo "       packages (it has no stable identity). Use the self-signed certificate or" >&2
+    echo "       CODESIGN_IDENTITY / RELEASE_SIGNING=1 for a Developer ID build." >&2
+    exit 1
   fi
-  rm -f "$SIGN_ERR"
+  if ! codesign --force --sign "$SIGN_IDENTITY" "$APP"; then
+    echo "error: signing with '$SIGN_IDENTITY' failed; ad-hoc signing is not accepted for" >&2
+    echo "       development packages (create the self-signed certificate, or pass" >&2
+    echo "       CODESIGN_IDENTITY / run with RELEASE_SIGNING=1 for a Developer ID build)" >&2
+    exit 1
+  fi
 fi
 
 # Sparkle's preferred archive is a zip containing the complete .app bundle. Keep the DMG for

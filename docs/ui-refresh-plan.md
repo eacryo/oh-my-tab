@@ -36,7 +36,7 @@
 | 下拉框溢出 | 折成两行 | `settings/select.rs:26` |
 | 滑杆 | 整数滑杆绘制刻度线 | `settings/widgets.rs:1536` |
 | 动效 | 0.16–0.58s，四套手调弹簧 | `settings/components.rs:807–816`、`overlay.rs:71` |
-| Reduce Motion | 仅 4 个表面处理 | `settings/tooltip.rs:342`、`settings/components.rs:1431`、`clipboard/notifications.rs:1044`、`updater.rs:689` |
+| Reduce Motion | 仅 4 个表面处理 | `settings/tooltip.rs:342`、`settings/components.rs:1431`、`clipboard/picker.rs:277`、`updater.rs:689` |
 
 ## 3. 阶段 0 —— 修正确性
 

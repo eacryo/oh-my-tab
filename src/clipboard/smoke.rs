@@ -791,6 +791,131 @@ pub(crate) fn smoke_runner() -> bool {
             "the empty-state hint must be re-centered inside the summoned viewport"
         );
     }
+    // Storage-failure notice: an unavailable session records nothing, so the copy belongs in the
+    // empty-state hint -- and the panel must say why instead of looking like an unused history.
+    unsafe {
+        let empty_hint_text = || -> Option<String> {
+            let label = (*EMPTY_STATE_VIEW.lock().unwrap())?.0;
+            if label.is_null() {
+                return None;
+            }
+            let hidden: bool = msg_send![label, isHidden];
+            if hidden {
+                return None;
+            }
+            Some(crate::ffi::nsstring_to_rust(msg_send![label, stringValue]))
+        };
+        // The button that offers the way out exists exactly while the storage is unavailable, sits
+        // centred under the sentence, and carries the action that re-reads the key.
+        let action_button = || -> Option<*mut AnyObject> {
+            let button = (*EMPTY_STATE_ACTION.lock().unwrap())?.0;
+            (!button.is_null() && !msg_send![button, isHidden]).then_some(button)
+        };
+        // 1) Healthy and empty: the ordinary empty text, and no way-out button.
+        super::storage::set_ready(super::keyring::test_key());
+        rebuild_rows();
+        assert_eq!(
+            empty_hint_text(),
+            Some(t("clipboard.empty")),
+            "a healthy empty history must show the ordinary empty text"
+        );
+        assert!(
+            action_button().is_none(),
+            "a healthy empty history must not offer keychain access"
+        );
+
+        // 2) Unavailable and empty: the hint carries the copy instead.
+        super::storage::set_unavailable(super::keyring::KeyUnavailable::Simulated);
+        let unavailable_copy = super::unavailable_copy().expect("the storage is unavailable here");
+        rebuild_rows();
+        assert_eq!(
+            empty_hint_text(),
+            Some(unavailable_copy),
+            "an unavailable storage must say so in the empty-state hint"
+        );
+
+        // 2b) The button appears, centred, below the hint.
+        let button = action_button().expect("an unavailable storage must offer the way out");
+        {
+            let frame: NSRect = msg_send![button, frame];
+            let title: *mut AnyObject = msg_send![button, title];
+            let title = crate::ffi::nsstring_to_rust(title);
+            let action: objc2::runtime::Sel = msg_send![button, action];
+            let hint = (*EMPTY_STATE_VIEW.lock().unwrap())
+                .expect("the hint exists")
+                .0;
+            let hint_frame: NSRect = msg_send![hint, frame];
+            assert_eq!(
+                title,
+                t("clipboard.grant_keychain_access"),
+                "the button must name the action it performs"
+            );
+            assert_eq!(
+                action,
+                sel!(retryKeychainAccess:),
+                "the button must re-read the key"
+            );
+            assert!(
+                (frame.origin.x + frame.size.width / 2.0 - super::PICKER_W / 2.0).abs() <= 0.5,
+                "the button must be centred in the panel (x {} w {})",
+                frame.origin.x,
+                frame.size.width
+            );
+            // Flipped coordinates: the hint's top edge is its origin.y, and the button must start
+            // below it.
+            assert!(
+                frame.origin.y >= hint_frame.origin.y + hint_frame.size.height,
+                "the button must sit under the sentence (button top {} hint bottom {})",
+                frame.origin.y,
+                hint_frame.origin.y + hint_frame.size.height
+            );
+        }
+
+        // 2c) Unavailable with records somehow present: the sentence still wins (the panel must not
+        //     list records next to a notice that says nothing can be recorded), and the button stays
+        //     with it.
+        {
+            let mut hist = CLIP_HISTORY.lock().unwrap();
+            record_text(&mut hist, "row while unavailable", "", "", 50);
+        }
+        rebuild_rows();
+        assert_eq!(
+            empty_hint_text(),
+            super::unavailable_copy(),
+            "the failure sentence outranks a stale row"
+        );
+        assert!(
+            action_button().is_some(),
+            "the way out stays offered while the storage is unavailable"
+        );
+
+        // 3) Recovery through the button (a successful key read) lands on a NON-empty list: the
+        //    empty-state layout is skipped then, so the rebuild itself has to hide the button -- the
+        //    defect this asserts was found in review.
+        super::storage::set_ready(super::keyring::test_key());
+        rebuild_rows();
+        assert_eq!(
+            empty_hint_text(),
+            None,
+            "a non-empty list has no hint to render"
+        );
+        assert!(
+            action_button().is_none(),
+            "a recovered, non-empty list must not keep the way-out button over its rows"
+        );
+
+        // 4) And with the list emptied again, the ordinary empty text returns.
+        {
+            let mut hist = CLIP_HISTORY.lock().unwrap();
+            hist.clear();
+        }
+        rebuild_rows();
+        assert_eq!(empty_hint_text(), Some(t("clipboard.empty")));
+        assert!(
+            action_button().is_none(),
+            "a healthy session must not offer keychain access"
+        );
+    }
     // A hi-res preview that finished generating before a discard must not be delivered: the slot
     // carries the generation it was generated in, and the main-thread consumer refuses a stale one
     // (the worker stores through the same check, so neither end of the pipe can resurrect a deleted

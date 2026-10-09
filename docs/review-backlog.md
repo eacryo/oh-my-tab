@@ -78,3 +78,22 @@ so a later reader does not re-derive them. The fixes are in the tree, with their
   focused window == the selected one).
   Trigger: the next change to the raise or recovery path, or the first report of a delayed or minimized
   cross-desktop switch that does not land.
+
+- The notification **click** path has no assertion. `did_receive_notification_response` (the
+  `didReceiveNotificationResponse:withCompletionHandler:` delegate method) is exercised only when a user
+  clicks an update or clipboard notice, and it cannot be driven from a smoke runner: the callback reads
+  `response.notification.request.identifier`, and `UNNotificationResponse` has no public initializer to
+  build a fake one from. Its arity is correct -- three explicit arguments, unlike the `willPresent`
+  callback that crashed on 2026-10-08 because it was one argument short and therefore read the
+  notification object as the completion handler -- and its zero-argument completion block uses the same
+  hand-rolled invoke the module's authorization block already runs successfully. Deferred as unrun
+  coverage. Trigger: any change to the click path, or a report that clicking a notice does nothing.
+
+- The keychain prompt is **solved and the mechanism measured** (2026-10-08): the ACL is judged against the
+  app that *created* the item, so an item created by an ad-hoc build makes every later build a stranger
+  (`SecItemDelete` on it is refused with `errSecInvalidOwnerEdit`), while an item created by the Developer
+  ID-signed build survives rebuilds (probe and real app: 67 ms, no prompt). The dev bundle now signs with
+  Developer ID and the one-time reset -- user deletes the item, the app creates a fresh one and keeps the
+  old storage aside as `*.failed-<ts>` -- was performed on this machine. No backlog work is pending here;
+  what remains unverified is a *release* install that predates Developer ID signing, which would need the
+  same one-time reset (the release channel does sign with Developer ID today).

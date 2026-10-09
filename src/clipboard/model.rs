@@ -213,9 +213,9 @@ pub(super) fn picker_min_height() -> f64 {
     (header_strip_h() + GROUP_H + ROW_H * 3.0 + FOOTER_H + PAD_Y).max(PICKER_MIN_HEIGHT)
 }
 
-/// The row list's top offset INSIDE the document: just the gap to the header strip (the
-/// strip is no longer inside the scroll area, so no 38pt clearance is needed -- that left
-/// the odd blank band between the first row and the search field).
+/// The row list's top offset INSIDE the document: just the gap to the header strip (the strip is no
+/// longer inside the scroll area, so no 38pt clearance is needed -- that left the odd blank band
+/// between the first row and the search field).
 pub(super) fn rows_top_offset() -> f64 {
     CLEAR_BTN_GAP
 }

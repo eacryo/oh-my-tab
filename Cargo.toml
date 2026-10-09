@@ -16,6 +16,13 @@ objc2-foundation = "0.3"
 flume = "0.11"
 serde = { version = "1", features = ["derive"] }
 toml = "0.8"
+aes-gcm = "0.11"
+zeroize = "1.9.1"
+getrandom = "0.4.3"
+sha2 = "0.11.0"
+security-framework = "3"
+core-foundation = "0.10"
+security-framework-sys = "2"
 # 仅测试用,不进入 release 产物。
 # Dev-only; never linked into the release binary.
 [dev-dependencies]

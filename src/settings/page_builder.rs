@@ -596,6 +596,9 @@ pub(super) unsafe fn build_general_page(
     let wl = make_nsstring(&t(warning_key));
     let _: () = msg_send![warning_label, setStringValue: wl];
     CFRelease(wl as *const c_void);
+    // The refresh path re-texts this label: the warning shown depends on live state (permissions,
+    // and whether the clipboard storage key could be obtained), not only on the build-time one.
+    ui.permission_warning_label = warning_label;
     let _: () = msg_send![warning_label, setEditable: false];
     let _: () = msg_send![warning_label, setBezeled: false];
     let _: () = msg_send![warning_label, setDrawsBackground: false];
@@ -624,6 +627,9 @@ pub(super) unsafe fn build_general_page(
     );
     let _: () = msg_send![banner, addSubview: open_btn];
     release_obj(open_btn);
+    // The storage warning reuses this strip but has no privacy pane to offer, so the refresh hides
+    // the button with the variant.
+    ui.permission_warning_button = open_btn;
 
     // Start hidden; page selection applies the permission state and resizes General's viewport.
     let _: () = msg_send![banner, setHidden: true];
@@ -2099,6 +2105,43 @@ pub(super) unsafe fn build_about_page(
     );
     let _: () = msg_send![about_view, addSubview: screen_recording_button];
     release_obj(screen_recording_button);
+
+    // Keychain access is not a TCC permission -- there is no System Settings pane for it -- so this
+    // row carries the app's own action instead of an "open settings" button: it re-reads the
+    // clipboard key, which raises the system's authorization prompt once.
+    let keychain_row_y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(about_view, keychain_row_y, described_row_h, content_w);
+    let keychain_status = SettingsControl::value_label(
+        ctrl_x,
+        keychain_row_y,
+        permission_status_w,
+        row_h,
+        &t("settings.keychain_status_missing"),
+    );
+    let _: () = msg_send![keychain_status, setAlignment: 1isize];
+    ui.keychain_access_status = SettingsRow::plain(
+        about_view,
+        label_x,
+        keychain_row_y,
+        label_w,
+        described_row_h,
+        &t("settings.permission_keychain_label"),
+        keychain_status,
+    );
+    // A short label: this button shares the in-row action width with the permission buttons, and the
+    // longer wording ("Grant Keychain Access") wraps and overflows the row's height (the settings
+    // layout smoke measures exactly that).
+    let keychain_button = row_action_button(
+        ctrl_x,
+        ctrl_w,
+        keychain_row_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
+        &t("settings.btn_grant_keychain_access"),
+        target,
+        sel!(retryKeychainAccess:),
+    );
+    let _: () = msg_send![about_view, addSubview: keychain_button];
+    ui.keychain_access_button = keychain_button;
+    release_obj(keychain_button);
     canvas.card(&t("settings.section_permissions"));
 
     canvas.next_section_with_offset(layout.card_bottom_inset);

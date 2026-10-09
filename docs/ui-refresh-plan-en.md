@@ -39,7 +39,7 @@ What the app does today, with the literal's location. This is the "before" colum
 | Select overflow | wraps to two lines | `settings/select.rs:26` |
 | Sliders | integer sliders draw tick marks | `settings/widgets.rs:1536` |
 | Motion | 0.16–0.58s, four hand-tuned springs | `settings/components.rs:807–816`, `overlay.rs:71` |
-| Reduce Motion | honoured in 4 surfaces only | `settings/tooltip.rs:342`, `settings/components.rs:1431`, `clipboard/notifications.rs:1044`, `updater.rs:689` |
+| Reduce Motion | honoured in 4 surfaces only | `settings/tooltip.rs:342`, `settings/components.rs:1431`, `clipboard/picker.rs:277`, `updater.rs:689` |
 
 ## 3. Phase 0 — correctness
 

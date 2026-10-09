@@ -69,6 +69,7 @@ const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
 pub(super) const SETTINGS_PAGE_COUNT: usize = 8;
 pub(super) const SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX: usize = 6;
+pub(super) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = 3;
 pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = 7;
 
 /// Fixed width of the settings navigation pane, shared by layout and transient feedback.
@@ -239,6 +240,14 @@ pub(super) struct SettingsUi {
     clipboard_separate_clear_all: *mut AnyObject, // show the opt-in "clear all" header button
     clipboard_move_used_to_top: *mut AnyObject, // move used entries to top
     clipboard_delete_after_paste: *mut AnyObject, // delete entry after paste
+    /// The top warning banner's label and its "Open Privacy & Security" button. Which warning the
+    /// strip carries is recomputed from live state (a missing permission, or a clipboard storage
+    /// failure) rather than fixed at build time, and the button belongs to the permission copy only.
+    permission_warning_label: *mut AnyObject,
+    permission_warning_button: *mut AnyObject,
+    /// The page scroll views' unreserved height. The banner is a sibling of those views, so the page
+    /// it covers is shortened by the banner's height and every other page keeps this one.
+    page_viewport_h: f64,
     clipboard_clear_system_pasteboard_after_paste: *mut AnyObject, // clear system pasteboard after paste
     clipboard_max_entries: *mut AnyObject,                         // max history entries
     clipboard_auto_expire_days: *mut AnyObject,                    // auto-expire days (0 = never)
@@ -285,6 +294,9 @@ pub(super) struct SettingsUi {
     accessibility_permission_status: *mut AnyObject,
     accessibility_permission_button: *mut AnyObject,
     screen_recording_permission_status: *mut AnyObject,
+    /// The About page's keychain-access row: its status label and its "grant access" button.
+    keychain_access_status: *mut AnyObject,
+    keychain_access_button: *mut AnyObject,
 }
 
 /// One button-mapping row (read-only display):
@@ -514,8 +526,8 @@ pub(crate) use dispatch::{
     handle_clipboard_enabled_toggle, handle_device_changed, handle_enable_mouse_toggle,
     handle_export_logs, handle_quick_actions_enabled_toggle, handle_window_control_enabled_toggle,
     handle_windows_enabled_toggle, on_control_changed, on_control_text_did_change,
-    on_control_text_did_end_editing, on_sidebar_select, refresh_device_popup_if_open,
-    refresh_service_controls_from_config,
+    on_control_text_did_end_editing, on_sidebar_select, refresh_clipboard_unavailable_notice,
+    refresh_device_popup_if_open, refresh_service_controls_from_config,
     refresh_switcher_keystroke_and_mouse_controls_from_config,
 };
 pub(crate) use window::{

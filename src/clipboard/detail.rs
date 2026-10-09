@@ -1400,6 +1400,11 @@ unsafe fn remove_materialized_row(index: usize) {
 /// matches. Empty when there are rows to show. Locks the history, so callers already holding that
 /// lock (`rebuild_rows`) pass their own text to `layout_empty_state` instead.
 fn empty_state_hint() -> String {
+    // The storage failure outranks the ordinary empty list: while the feature cannot work, the
+    // panel says why instead of looking like a history nobody has used yet.
+    if let Some(unavailable) = unavailable_copy() {
+        return unavailable;
+    }
     let total = CLIP_HISTORY.lock().unwrap().len();
     if total == 0 {
         t("clipboard.empty")
@@ -1439,9 +1444,34 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     };
     let doc_h = empty_state_doc_height(visible_h);
     let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
-    // The hint: vertically centered within the visible list area.
+    // While the storage is unavailable the panel carries the path out of it: the same "grant
+    // keychain access" action the settings banner offers, centred under the sentence that says why
+    // nothing can be recorded. The sentence and the button are centred as one block, so the panel
+    // does not look top-heavy.
+    let show_action = unavailable_copy().is_some();
+    let button_h = 26.0;
+    let block_gap = 10.0;
+    // The hint: vertically centered within the visible list area (with the button, when present).
     let label_h = 40.0;
-    let label_y = (doc_h - label_h) / 2.0;
+    let block_h = if show_action {
+        label_h + block_gap + button_h
+    } else {
+        label_h
+    };
+    // The container is flipped (y grows downward), so the sentence sits at the top of the block and
+    // the way out under it -- reading order first, then the action.
+    let block_y = (doc_h - block_h) / 2.0;
+    let label_y = block_y;
+    layout_empty_state_action(
+        container,
+        block_y
+            + if show_action {
+                label_h + block_gap
+            } else {
+                0.0
+            },
+        show_action,
+    );
     let frame = NSRect::new(
         NSPoint::new(PAD_X, label_y),
         NSSize::new(PICKER_W - PAD_X * 2.0, label_h),
@@ -1483,6 +1513,61 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     release_obj(label);
     *EMPTY_STATE_VIEW.lock().unwrap() = Some(ObjPtr::new(label));
     true
+}
+
+/// Place (or hide) the empty state's "grant keychain access" button at `y`, centred.
+///
+/// Created once and reused, like the hint label: the panel is a long-lived view tree and the button
+/// has to survive re-layouts. `show` false only hides it -- an unavailable session is the only state
+/// that offers it, and the label above keeps the space otherwise.
+unsafe fn layout_empty_state_action(container: *mut AnyObject, y: f64, show: bool) {
+    let existing = *EMPTY_STATE_ACTION.lock().unwrap();
+    if let Some(button) = existing {
+        if !button.0.is_null() {
+            let _: () = msg_send![button.0, setHidden: !show];
+            if show {
+                let title = t("clipboard.grant_keychain_access");
+                let width = localized_string_width(&title, crate::theme::FONT_CAPTION) + 28.0;
+                let frame = NSRect::new(
+                    NSPoint::new((PICKER_W - width) / 2.0, y),
+                    NSSize::new(width, 26.0),
+                );
+                let _: () = msg_send![button.0, setFrame: frame];
+            }
+            return;
+        }
+    }
+    if !show {
+        return;
+    }
+    let title = t("clipboard.grant_keychain_access");
+    let width = localized_string_width(&title, crate::theme::FONT_CAPTION) + 28.0;
+    let frame = NSRect::new(
+        NSPoint::new((PICKER_W - width) / 2.0, y),
+        NSSize::new(width, 26.0),
+    );
+    let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
+    let ns = make_nsstring(&title);
+    let _: () = msg_send![button, setTitle: ns];
+    CFRelease(ns as *const c_void);
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
+    }
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let _: () = msg_send![button, setFont: font];
+    let _: () = msg_send![button, setTarget: observer()];
+    let _: () = msg_send![button, setAction: sel!(retryKeychainAccess:)];
+    // The clear actions' palette is the panel's bordered-control look (fill + label ink), so the
+    // button reads as a control on the material rather than as chrome.
+    set_clear_confirmation_button_style(button, false);
+    let _: () = msg_send![container, addSubview: button];
+    release_obj(button);
+    *EMPTY_STATE_ACTION.lock().unwrap() = Some(ObjPtr::new(button));
 }
 
 /// Summon-time entry point: re-derive the empty-state layout for the viewport the summon just
@@ -1596,7 +1681,12 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
 
     // Empty state: empty history -> "no history"; a query with no matches -> "no match".
     // Both share the same hint rendering.
-    let empty_hint = if total == 0 {
+    // The storage failure outranks the ordinary empty text, exactly like `empty_state_hint` (which
+    // cannot be called here: this path already holds the history lock). An unavailable session
+    // records nothing, so a non-empty list cannot coexist with it.
+    let empty_hint = if let Some(unavailable) = unavailable_copy() {
+        unavailable
+    } else if total == 0 {
         t("clipboard.empty")
     } else if filtered.is_empty() {
         t("clipboard.no_match")
@@ -1649,6 +1739,12 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         }
         return Some(summary);
     }
+
+    // The empty state's way-out button belongs to the failure, and the failure can leave while rows
+    // are present (a retry that succeeds, or a history that turns out to be readable): the empty-state
+    // layout below is skipped for a non-empty list, so the button is hidden here as well -- otherwise
+    // it would keep its old frame over the rows.
+    layout_empty_state_action(container, 0.0, false);
 
     // Document height covers ALL displayed entries (the scrollable area). Floored at the
     // visible height (the window minus the header strip): a document shorter than the
@@ -2504,6 +2600,19 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
         hide_picker();
         return;
     };
+    // An image whose bytes cannot be produced pastes nothing at all: say so while the picker is
+    // still on screen (the toast lives inside it), then leave it visible so the user reads why.
+    // This runs BEFORE the burn-after-paste token is armed: a refusal that never writes back must
+    // not leave a suppression token behind, or the next real copy would be skipped as our own write.
+    if let Some(img) = &entry.image {
+        if paste_refused_with_notice(
+            paste_kind(img) == PasteKind::Image,
+            image_bytes_available(img.hash),
+        ) {
+            show_toast(&t("clipboard.toast_image_unavailable"));
+            return;
+        }
+    }
     // Effective = gesture AND setting: with the toggle off, Option falls back to a plain
     // paste (the modifier is ignored).
     let burn = delete_after && delete_after_paste();

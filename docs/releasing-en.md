@@ -85,6 +85,10 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 
 **Note:** a self-signed certificate stabilizes TCC identity but does **not** satisfy Gatekeeper for distribution. Other users may still see an unidentified-developer warning. Proper distribution requires a paid Apple **Developer ID Application** certificate; set `SIGN_IDENTITY` in `scripts/bundle.sh` to that identity.
 
+**The development channel's identity (changed 2026-10-08):** `scripts/dev-restart.sh` now signs with the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery); **only the Apple-issued and the self-signed identity are accepted -- ad-hoc is refused** -- and a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` is passed; signing is done without a secure timestamp, so a local build never depends on Apple's timestamp service. It re-assembles and re-signs only when its inputs change (built binary, bundled resources, signing identity) -- an unchanged restart reuses the existing bundle. Half of the reason is measured: a keychain item's ACL is judged against the signing identity of the app that **created** it, so an item created by a Developer ID build survives rebuilds (probe and real app: 67 ms, silent) while one created by a self-signed or ad-hoc build does not. `bundle.sh`'s local packaging path still uses the self-signed `oh-my-tab-sign` (its purpose and setup are below).
+
+**One unverified edge:** the claim above that a self-signed identity keeps TCC grants stable across rebuilds comes from log observations (`Failed to match existing code requirement` / `errSecCSReqFailed`); this repository has **not** run a controlled comparison, and the keychain-side comparison shows a self-signed identity being judged by the binary -- the TCC side may not be inferred from it.
+
 ## Application icon
 
 The application icon (`AppIcon.icns`) is generated from `assets/Icon-Default-1024x1024@1x.png` and packaged into `Contents/Resources/`. `assets/AppIcon.icns` is committed, so contributors do not need extra tools to build the `.app`.

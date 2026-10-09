@@ -30,6 +30,12 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(applyClipboardLoadOnMain:),
+                apply_clipboard_load_on_main as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clipboardWindowResigned:),
                 window_did_resign_key as *mut c_void,
                 types.as_ptr(),
@@ -85,6 +91,20 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 cls,
                 sel!(pickerClose:),
                 picker_close as *mut c_void,
+                types.as_ptr(),
+            );
+            // The picker's empty state offers the same action as the settings banner; the panel's
+            // buttons target this class, so the selector has to exist here too.
+            class_addMethod(
+                cls,
+                sel!(refreshPermissionUI:),
+                refresh_permission_ui as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(retryKeychainAccess:),
+                crate::handle_retry_keychain_access as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -181,6 +201,12 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
 
 /// Keep the long-lived row view tree current on the main thread; the pasteboard observer only
 /// queues one coalesced refresh.
+/// Main-thread refresh of the settings window's permission rows (a silent keychain grant produces no
+/// activation event, so the About row has to be told).
+extern "C" fn refresh_permission_ui(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    crate::settings::refresh_permission_ui_if_visible();
+}
+
 extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     PICKER_REFRESH_PENDING.store(false, Ordering::SeqCst);
     if PICKER_WINDOW.lock().unwrap().is_none() {
@@ -283,6 +309,56 @@ unsafe fn schedule_picker_visible_rows_refresh() {
 
 /// Deliver history changes to the main thread while the picker is visible; while hidden, defer
 /// the refresh until the next summon.
+/// One-time, user-visible notice when this session cannot save the history (no key) or is blocked
+/// (data present but unreadable, or a purge unfinished). Shown when the picker opens, because that
+/// is where the user looks; a failure that only reaches the log is not reported at all.
+/// The one-line "the feature is unavailable right now" copy for a storage state: shown in the
+/// settings page, in the opened picker and as the system notification, so all three say the same
+/// thing. Pure, unit-tested — a session that cannot obtain the key (or cannot read what is stored)
+/// must never look healthy.
+pub(super) fn unavailable_copy_key(state: &StorageState) -> Option<&'static str> {
+    match state {
+        StorageState::Unavailable(_) => Some("clipboard.unavailable_key"),
+        StorageState::Blocked(BlockedReason::PurgePending) => Some("clipboard.unavailable_purge"),
+        StorageState::Blocked(_) => Some("clipboard.unavailable_history"),
+        StorageState::Uninitialized | StorageState::Ready => None,
+    }
+}
+
+/// The unavailable copy for the current state, resolved in the active locale.
+pub(super) fn unavailable_copy() -> Option<String> {
+    unavailable_copy_key(&storage::state()).map(t)
+}
+
+/// The system notification's title: the feature name, so the banner is identifiable without reading
+/// the body.
+pub(super) fn unavailable_notification_title() -> String {
+    t("clipboard.unavailable_title")
+}
+
+/// Post the storage failure as a system notification, once per session. This is the surface that
+/// does not depend on the user opening the clipboard panel (the in-picker toast stays as the
+/// contextual second chance).
+pub(super) fn notify_storage_failure_once() {
+    static NOTIFIED: AtomicBool = AtomicBool::new(false);
+    let Some(body) = unavailable_copy() else {
+        return;
+    };
+    if NOTIFIED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    log_info!(
+        "[clip] storage failure notification posted (state={}, reason={})",
+        storage::state_label(),
+        storage::reason_label()
+    );
+    crate::update_notice::post_local_notice(
+        crate::update_notice::ID_CLIPBOARD_STORAGE,
+        &unavailable_notification_title(),
+        &body,
+    );
+}
+
 pub(super) fn schedule_picker_refresh() {
     if PICKER_WINDOW.lock().unwrap().is_none()
         || !PICKER_VISIBLE.load(Ordering::SeqCst)

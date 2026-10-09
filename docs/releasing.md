@@ -88,6 +88,10 @@ tccutil reset Accessibility com.eacryo.oh-my-tab
 
 **注意：** 自签名证书只稳定 TCC 身份，**不**满足 Gatekeeper 分发——别人安装后仍会看到「未识别开发者」，需要右键打开。若要通过 Gatekeeper 正常分发，需要使用付费的 Apple **Developer ID Application** 证书；有的话把 `scripts/bundle.sh` 里的 `SIGN_IDENTITY` 改成那个名字。
 
+**开发渠道的身份（2026-10-08 变更）：** `scripts/dev-restart.sh` 现在优先用 **Apple 签发**的身份签名（`CODESIGN_IDENTITY` 可覆盖），**只接受 Apple 签发与自签名两种身份、拒绝 ad-hoc**，且 Apple 身份签名失败即**构建失败**（除非显式 `--allow-signing-fallback`）；签名不带安全时间戳，本地构建因此不依赖 Apple 的时间戳服务。它**只在输入（构建产物、拷入包的内容、签名身份）变化时**才重新组装与重签——输入没变就复用现有包。原因有一半是实测出来的：钥匙串项的 ACL 按「**创建该项的应用的签名身份**」判定，由 Developer ID 构建创建的项跨重建仍被承认（探针与实机各一次，重建后 67ms 静默读完），而由自签名/ad-hoc 构建创建的项在二进制变化后不再被承认。`bundle.sh` 的本地打包路径仍用自签名 `oh-my-tab-sign`（下面是它的用途与创建步骤）。
+
+**一条未实测的边界：** 上面「自签名身份让 TCC 授权跨重建保持稳定」的说法来自日志观察（`Failed to match existing code requirement` / `errSecCSReqFailed`），本仓库**没有做过对照实测**；钥匙串侧的对照实测显示自签名身份是按二进制判定的，TCC 侧是否不同不得据此推断。
+
 ## 应用图标
 
 应用图标（`AppIcon.icns`）由 `assets/Icon-Default-1024x1024@1x.png` 生成，打包进 `Contents/Resources/`。`assets/AppIcon.icns` 已提交进仓库，`bundle.sh` 直接使用它，因此贡献者构建 `.app` 时无需任何额外工具。

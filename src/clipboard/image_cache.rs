@@ -40,8 +40,41 @@ pub(super) fn clip_image_path(hash: u64) -> std::path::PathBuf {
     clip_image_cache_dir().join(format!("{hash:016x}"))
 }
 
-/// Write bytes into the cache.
+/// Seal bytes for the cache. `None` when this session may not write (`MemoryOnly` / `Blocked`)
+/// or sealing failed -- the caller must then keep the bytes in memory instead of writing them.
+fn seal_for_cache(hash: u64, kind: ObjectKind, suffix: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    if !storage::writable() {
+        return None;
+    }
+    let key = storage::key()?;
+    let logical = format!("{}{suffix}", image_logical_name(hash));
+    seal(&key, kind, &object_id_for(&logical), bytes)
+}
+
+/// Open a cached file. The object id is recomputed from the name the caller asked for, so a
+/// complete file moved to another hash's slot is rejected.
+fn open_from_cache(hash: u64, kind: ObjectKind, suffix: &str, bytes: &[u8]) -> Option<Vec<u8>> {
+    let key = storage::key()?;
+    let logical = format!("{}{suffix}", image_logical_name(hash));
+    match open(&key, kind, &object_id_for(&logical), bytes) {
+        Ok(plaintext) => Some(plaintext),
+        Err(error) => {
+            log_debug!(
+                "[clip] cache read rejected ({error:?}, {}{suffix})",
+                image_logical_name(hash)
+            );
+            None
+        }
+    }
+}
+
+/// Write bytes into the cache (sealed). The storage gate comes FIRST: in a session that may not
+/// write, not even a directory may be created, and an existing file must not report success (the
+/// caller would then retire the pending bytes and lose the only readable copy).
 pub(super) fn cache_write_image(hash: u64, bytes: &[u8]) -> bool {
+    if !storage::writable() {
+        return false;
+    }
     let dir = clip_image_cache_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
@@ -50,18 +83,44 @@ pub(super) fn cache_write_image(hash: u64, bytes: &[u8]) -> bool {
     if path.exists() {
         return true;
     }
+    let Some(sealed) = seal_for_cache(hash, ObjectKind::ImageData, "", bytes) else {
+        return false;
+    };
     // Write to a temp file then rename, so the paste path never reads a half-written file.
     let tmp = dir.join(format!("{hash:016x}.tmp"));
-    let ok = std::fs::write(&tmp, bytes).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    let ok = std::fs::write(&tmp, &sealed).is_ok() && std::fs::rename(&tmp, &path).is_ok();
     if !ok {
         let _ = std::fs::remove_file(&tmp);
     }
     ok
 }
 
+/// Whether a cache file can be read by this session. The load path needs the difference: a file
+/// that is PRESENT but does not authenticate must block the load, because treating it as "missing"
+/// would drop the entry and let the sweep delete a file that may still be recoverable.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum CacheFileState {
+    Readable,
+    Missing,
+    Failed,
+}
+
+/// Whether the original bytes can be read (see `CacheFileState`).
+pub(super) fn cache_image_state(hash: u64) -> CacheFileState {
+    match std::fs::read(clip_image_path(hash)) {
+        Ok(bytes) => match open_from_cache(hash, ObjectKind::ImageData, "", &bytes) {
+            Some(_) => CacheFileState::Readable,
+            None => CacheFileState::Failed,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheFileState::Missing,
+        Err(_) => CacheFileState::Failed,
+    }
+}
+
 /// Read the original bytes back.
 pub(super) fn cache_read_image(hash: u64) -> Option<Vec<u8>> {
-    std::fs::read(clip_image_path(hash)).ok()
+    let bytes = std::fs::read(clip_image_path(hash)).ok()?;
+    open_from_cache(hash, ObjectKind::ImageData, "", &bytes)
 }
 
 /// Delete a cache file (data + preview).
@@ -77,8 +136,11 @@ pub(super) fn clip_image_preview_path(hash: u64) -> std::path::PathBuf {
     clip_image_cache_dir().join(format!("{hash:016x}.preview"))
 }
 
-/// Write the preview PNG into the cache (idempotent).
+/// Write the preview PNG into the cache (idempotent, sealed).
 pub(super) fn cache_write_preview(hash: u64, preview: &[u8]) -> bool {
+    if !storage::writable() {
+        return false;
+    }
     let dir = clip_image_cache_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
@@ -87,8 +149,11 @@ pub(super) fn cache_write_preview(hash: u64, preview: &[u8]) -> bool {
     if path.exists() {
         return true;
     }
+    let Some(sealed) = seal_for_cache(hash, ObjectKind::Thumbnail, ".preview", preview) else {
+        return false;
+    };
     let tmp = dir.join(format!("{hash:016x}.preview.tmp"));
-    let ok = std::fs::write(&tmp, preview).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    let ok = std::fs::write(&tmp, &sealed).is_ok() && std::fs::rename(&tmp, &path).is_ok();
     if !ok {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -97,7 +162,20 @@ pub(super) fn cache_write_preview(hash: u64, preview: &[u8]) -> bool {
 
 /// Read the preview back (None when missing; the caller regenerates from the data bytes).
 pub(super) fn cache_read_preview(hash: u64) -> Option<Vec<u8>> {
-    std::fs::read(clip_image_preview_path(hash)).ok()
+    let bytes = std::fs::read(clip_image_preview_path(hash)).ok()?;
+    open_from_cache(hash, ObjectKind::Thumbnail, ".preview", &bytes)
+}
+
+/// Whether the preview can be read (see `CacheFileState`).
+pub(super) fn cache_preview_state(hash: u64) -> CacheFileState {
+    match std::fs::read(clip_image_preview_path(hash)) {
+        Ok(bytes) => match open_from_cache(hash, ObjectKind::Thumbnail, ".preview", &bytes) {
+            Some(_) => CacheFileState::Readable,
+            None => CacheFileState::Failed,
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => CacheFileState::Missing,
+        Err(_) => CacheFileState::Failed,
+    }
 }
 
 /// hash -> the detail-preview path (the big image shown by the → detail panel;
@@ -108,11 +186,15 @@ pub(super) fn clip_image_detail_path(hash: u64) -> std::path::PathBuf {
 
 /// Read the detail preview back (None when missing).
 pub(super) fn cache_read_detail_preview(hash: u64) -> Option<Vec<u8>> {
-    std::fs::read(clip_image_detail_path(hash)).ok()
+    let bytes = std::fs::read(clip_image_detail_path(hash)).ok()?;
+    open_from_cache(hash, ObjectKind::Detail, ".detail", &bytes)
 }
 
-/// Write the detail preview PNG into the cache (idempotent).
+/// Write the detail preview PNG into the cache (idempotent, sealed).
 pub(super) fn cache_write_detail_preview(hash: u64, png: &[u8]) -> bool {
+    if !storage::writable() {
+        return false;
+    }
     let dir = clip_image_cache_dir();
     if std::fs::create_dir_all(&dir).is_err() {
         return false;
@@ -121,8 +203,11 @@ pub(super) fn cache_write_detail_preview(hash: u64, png: &[u8]) -> bool {
     if path.exists() {
         return true;
     }
+    let Some(sealed) = seal_for_cache(hash, ObjectKind::Detail, ".detail", png) else {
+        return false;
+    };
     let tmp = dir.join(format!("{hash:016x}.detail.tmp"));
-    let ok = std::fs::write(&tmp, png).is_ok() && std::fs::rename(&tmp, &path).is_ok();
+    let ok = std::fs::write(&tmp, &sealed).is_ok() && std::fs::rename(&tmp, &path).is_ok();
     if !ok {
         let _ = std::fs::remove_file(&tmp);
     }
@@ -167,7 +252,13 @@ pub(super) fn retire_image_hash(hash: u64) {
     *IMAGE_HASH_EPOCHS.lock().unwrap().entry(hash).or_insert(0) += 1;
     PENDING_IMAGE_DATA.lock().unwrap().remove(&hash);
     clear_detail_slot_for_hash(hash);
-    cache_delete_image(hash);
+    // The in-memory bookkeeping above always runs (a deleted record's bytes must go), but the
+    // FILES are only deleted by a session that loaded the storage successfully: in `MemoryOnly` /
+    // `Blocked` the cache may belong to history this session never read, and the design's rule is
+    // "never delete" there.
+    if storage::sweep_allowed() {
+        cache_delete_image(hash);
+    }
 }
 
 /// Drop the detail-preview delivery slot when it belongs to `hash` (a deleted record's preview must
@@ -202,6 +293,12 @@ static CACHE_GENERATION: AtomicU64 = AtomicU64::new(0);
 /// write; the wipe bumps the generation first and then takes it, so a wipe that has returned can
 /// never be followed by an older job's write, and a write that won the race is removed by the wipe.
 static CACHE_WRITE_LOCK: Mutex<()> = Mutex::new(());
+
+/// The cache-write lock, for a caller that has to hold it across a whole multi-file operation (the
+/// migration): the purge takes it in the same order, so the two cannot interleave.
+pub(super) fn cache_write_lock() -> std::sync::MutexGuard<'static, ()> {
+    CACHE_WRITE_LOCK.lock().unwrap()
+}
 
 pub(super) fn cache_generation() -> u64 {
     CACHE_GENERATION.load(Ordering::Acquire)
@@ -287,10 +384,28 @@ pub(super) struct PendingImage {
     pub(super) bytes: Arc<Vec<u8>>,
 }
 
+/// Test-only: drop the process-global pending bookkeeping, so one test's pending originals cannot
+/// steer another's assertions.
+#[cfg(test)]
+pub(super) fn clear_pending_state_for_tests() {
+    PENDING_IMAGE_DATA.lock().unwrap().clear();
+}
+
+/// Test-only: how many pending originals are held (the bound's observable).
+#[cfg(test)]
+pub(super) fn pending_count_for_tests() -> usize {
+    PENDING_IMAGE_DATA.lock().unwrap().len()
+}
+
+/// Test-only: the bound the pending map is held to.
+#[cfg(test)]
+pub(super) const PENDING_IMAGE_LIMIT_FOR_TESTS: usize = PENDING_IMAGE_LIMIT;
+
 /// Test-only: place a pending fallback entry exactly as the record path does, but without queueing
 /// the write job, so an interleaving can be constructed deterministically.
 #[cfg(test)]
 pub(super) fn insert_pending_for_tests(hash: u64, bytes: Arc<Vec<u8>>) {
+    // Mirrors the record path: fresh bytes make the entry pasteable again.
     let generation = cache_generation();
     let seq = PENDING_IMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
     PENDING_IMAGE_DATA.lock().unwrap().insert(
@@ -331,6 +446,66 @@ fn image_cache_sender() -> Option<&'static SyncSender<ImageCacheJob>> {
         .as_ref()
 }
 
+/// Whether an entry's original bytes can still be produced for a paste: on disk, or still in the
+/// pending map because the background write has not landed. An unavailable session records nothing,
+/// so this is the only reason a listed image can fail to paste -- and the caller says so instead of
+/// pasting nothing.
+pub(super) fn image_bytes_available(hash: u64) -> bool {
+    PENDING_IMAGE_DATA.lock().unwrap().contains_key(&hash) || clip_image_path(hash).exists()
+}
+
+/// Drop the oldest pending original when the bytes cannot be written: a session that may not write
+/// must not keep them in memory either (an unavailable session records nothing, so this only covers
+/// bytes recorded before the load decided).
+pub(super) fn drop_oldest_pending() {
+    let mut pending = PENDING_IMAGE_DATA.lock().unwrap();
+    let Some(oldest) = pending
+        .iter()
+        .min_by_key(|(_, image)| image.seq)
+        .map(|(h, _)| *h)
+    else {
+        return;
+    };
+    pending.remove(&oldest);
+    log_info!("[clip] dropped the oldest pending image original (storage is not writable)");
+}
+
+/// Drop every pending original (an unavailable session records nothing, so bytes recorded before
+/// the load decided must not linger in memory either). Never touches files.
+pub(super) fn discard_pending_writes() {
+    let dropped = {
+        let mut pending = PENDING_IMAGE_DATA.lock().unwrap();
+        let count = pending.len();
+        pending.clear();
+        count
+    };
+    if dropped > 0 {
+        log_info!("[clip] discarded {dropped} pending image bytes (the session records nothing)");
+    }
+}
+
+/// Re-submit the writes for original bytes that were recorded while the session was not yet
+/// writable (the load had not decided). Without this they would never reach the disk: the first
+/// job was refused, and the bytes only live in the pending map.
+pub(super) fn resubmit_pending_image_writes() {
+    if !storage::writable() {
+        return;
+    }
+    let pending: Vec<(u64, u64, u64, Arc<Vec<u8>>)> = PENDING_IMAGE_DATA
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(hash, image)| (*hash, image.generation, image.epoch, image.bytes.clone()))
+        .collect();
+    for (hash, generation, epoch, bytes) in pending {
+        write_while_current_for(hash, generation, epoch, || {
+            if cache_write_image(hash, &bytes) {
+                retire_pending_after_write(hash, generation, epoch);
+            }
+        });
+    }
+}
+
 /// The main-thread record path's entry point: hand the image-cache writes (and optional
 /// detail pregen) to the background thread. When enqueueing fails (queue full / worker
 /// gone), fall back to a synchronous write on the main thread -- bytes are never
@@ -352,19 +527,30 @@ pub(super) fn schedule_image_cache_write(
     if let Some(bytes) = &data {
         let mut pending = PENDING_IMAGE_DATA.lock().unwrap();
         if pending.len() >= PENDING_IMAGE_LIMIT {
-            // Extreme burst: flush the oldest entry synchronously before inserting, keeping
-            // the fallback map bounded.
-            if let Some(old_hash) = oldest_pending_hash(&pending) {
-                let old_bytes = pending.remove(&old_hash).map(|image| image.bytes);
-                drop(pending);
-                if let Some(old_bytes) = old_bytes {
-                    write_while_current(generation, || {
-                        let _ = cache_write_image(old_hash, &old_bytes);
-                    });
+            if storage::writable() {
+                // Extreme burst: flush the oldest entry synchronously before inserting, keeping
+                // the fallback map bounded.
+                if let Some(old_hash) = oldest_pending_hash(&pending) {
+                    let old_bytes = pending.remove(&old_hash).map(|image| image.bytes);
+                    drop(pending);
+                    if let Some(old_bytes) = old_bytes {
+                        write_while_current(generation, || {
+                            let _ = cache_write_image(old_hash, &old_bytes);
+                        });
+                    }
+                    pending = PENDING_IMAGE_DATA.lock().unwrap();
                 }
+            } else {
+                // Not writable: the bytes cannot go to disk, so the oldest pending original is
+                // dropped instead of keeping memory growing. Such a session records nothing, so
+                // this only covers bytes recorded before the load decided.
+                drop(pending);
+                drop_oldest_pending();
                 pending = PENDING_IMAGE_DATA.lock().unwrap();
             }
         }
+        // Fresh bytes for this hash: the entry is pasteable again, so a previous drop must not
+        // keep it refused.
         let seq = PENDING_IMAGE_SEQ.fetch_add(1, Ordering::Relaxed);
         pending.insert(
             hash,

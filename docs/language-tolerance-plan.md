@@ -62,7 +62,7 @@ A 层断言或使其可断言的状态字段。
 | 机制 | 位置 |
 | --- | --- |
 | `setLineBreakMode: 4`（尾部截断，省略号） | settings、overlay、clipboard、onboarding、按键显示，共 **17 处设置** |
-| 有限行数上限（静态常量 `1/2/3`） | **10 处命中**：`settings/select.rs:112`、`:139`；`settings/widgets.rs:471`、`:796`、`:2344`、`:2434`、`:2645`、`:2692`、`:2812`；`clipboard/detail.rs:1183`。其中 `widgets.rs:471` 是同一控件为量单行高度而临时设的**测量**调用，不是显示上限 |
+| 有限行数上限（静态常量 `1/2/3`） | **10 处命中**：`settings/select.rs:112`、`:139`；`settings/widgets.rs:471`、`:796`、`:2344`、`:2434`、`:2645`、`:2692`、`:2812`；`clipboard/detail.rs:1224`。其中 `widgets.rs:471` 是同一控件为量单行高度而临时设的**测量**调用，不是显示上限 |
 | 有限行数上限（动态 `max_lines.max(1)`） | **2 处**：`settings/widgets.rs:437`（按钮标题标签构造）与 `:475`（同一控件的**显示**上限，紧跟 `:473` 的测量之后） |
 | `setTruncatesLastVisibleLine: true` | **2 处**：`settings/widgets.rs:2439`、`:2700` |
 | **换行 + 行数上限 + `truncatesLastVisibleLine: false`（静默裁切风险，实际溢出未证实）** | `configure_settings_button_wrapping`（`settings/widgets.rs:405`；调用点 7 处，`max_lines = 3`：`settings/components.rs:936`、`:1114`、`updater.rs:1520`、`:1530`、`:1561`、`:1949`、`onboarding.rs:795`）；`add_tall_row`（`settings/widgets.rs:2786`；唯一调用点 `settings/components.rs:548`，2 行上限） |
@@ -105,7 +105,7 @@ A 层断言或使其可断言的状态字段。
 | LT1-B01 | B | `settings/select.rs:110` | 下拉值 | SET | T4 | TT（`:128`） | `--smoke-settings-layout` |
 | LT1-B02 | B | `settings/widgets.rs:2760` | caption | SET | T4 | TT（`:2766`） | `--smoke-settings-layout` |
 | LT1-B03 | B | `settings/widgets.rs:961` | 只读值（`make_value_label`） | SET | T4 | PEND | `--smoke-settings-layout` |
-| LT1-B04 | B | `clipboard/detail.rs:1181`／`:1183`／`:1234` | 详情行来源／meta | CLIP-D | T4 + LC2 | 出口待明确 | `--smoke-clipboard` |
+| LT1-B04 | B | `clipboard/detail.rs:1671`／`:1919`／`:1988` | 详情行来源／meta | CLIP-D | T4 + LC2 | 出口待明确 | `--smoke-clipboard` |
 | LT1-C01 | C | `overlay/cards.rs:467`–`:472`（经 `make_left_label`，`cards.rs:72`） | 缩略图卡片复合 caption（标题＋应用名，是否并入由 `show_app_name_in_cards()` 决定） | SW-thumb | T4 | UNVER：无障碍树待查；视力用户路径缺失 | `--smoke-overlay`（缩略图布局）+ 无障碍取样 |
 | LT1-C02 | C | `overlay/cards.rs:616`（经 `make_centered_label`，`overlay.rs:1291`） | 图标卡片标题行（空标题回退应用名） | SW-icon | T4 | UNVER：同上 | `--smoke-overlay`（图标布局）+ 无障碍取样 |
 | LT1-C03 | C | `overlay/cards.rs:634`（同构造函数） | 图标卡片独立应用名行（该布局下无条件渲染） | SW-icon | T4 | UNVER：同上 | `--smoke-overlay`（图标布局）+ 无障碍取样 |
@@ -164,8 +164,8 @@ A 层断言或使其可断言的状态字段。
 | --- | --- | --- |
 | 设置页（含侧边栏、行、页标题、按钮、高行） | `--smoke-settings-layout`（`src/lib.rs:2647`） | 已有 locale 循环 |
 | 设置 tooltip | 同上入口内触发 | 禁用提示为 hover 触发（`settings/tooltip.rs:415`、`:439`、`:483`），只有 `show_success_bubble`（`:207`）可编程 → 需合成 hover 或加测试钩子 |
-| 浮窗图标布局 / 缩略图布局 / 页脚 | `--smoke-overlay`（`src/lib.rs:2590`） | **目前只验证唤出存活**；两种卡片布局都要分别实例化；文字与无障碍断言为新增 |
-| 剪贴板选择器与详情 | `--smoke-clipboard`（`src/lib.rs:2280`） | 文字断言为新增 |
+| 浮窗图标布局 / 缩略图布局 / 页脚 | `--smoke-overlay`（`src/lib.rs:2367`） | **目前只验证唤出存活**；两种卡片布局都要分别实例化；文字与无障碍断言为新增 |
+| 剪贴板选择器与详情 | `--smoke-clipboard`（`src/lib.rs:2366`） | 文字断言为新增 |
 | 按键显示面板 | `--smoke-keystroke-display-panel`（`src/lib.rs:2698`） | 文字断言为新增 |
 | 引导页 | `--smoke-onboarding-live-apply`（`src/lib.rs:2764`） | 文字断言为新增 |
 | 更新弹窗（`updater.rs` 按钮） | **无 runner** | **入口不是 `--test-update-notice`**：该开关只发通知（`updater.rs:2637`），点击后走 `update_notice.rs:161` 进设置页 About 更新区。含按钮的弹窗由 `make_custom_update_found_window`（`updater.rs:1430`，调用点 `:2365`）按 `stage` 构造 → 需新增 fixture，直接按四阶段（`update_prompt_kind`，`updater.rs:112`：Available／Downloaded／Installing／InformationOnly）创建弹窗并断言 |
@@ -211,7 +211,7 @@ C 类按两条路径结案；D 类字素簇断言通过；规范要求的 locale
 **现状**：此前 `NSTextFieldCell.setDefaultParagraphStyle:` 的实例 selector 不存在，cell 路径静默 no-op；此前 TextKit
 smoke 手工构造 attributed string，没有经过该 setter。现在 setter 改为给 `NSTextField.attributedStringValue` 写入段落属性，
 并由实际 TextKit line fragment smoke 验证；剪贴板详情与页面标题等 attributed-string 路径也已实际设置行高。
-`DETAIL_LINE_H = 18.0`（`src/clipboard.rs:144`）自述为估算上限；引导正文目标为 14pt × 1.4 = 19.6pt。
+`DETAIL_LINE_H = 18.0`（`src/clipboard.rs:285`）自述为估算上限；引导正文目标为 14pt × 1.4 = 19.6pt。
 
 **第 1 步 · 文档消歧（已完成）**
 比例乘字号，目标绝对行高使用 `minimumLineHeight` / `maximumLineHeight`：14pt 正文为 19.6pt，12pt caption
@@ -227,7 +227,7 @@ smoke 手工构造 attributed string，没有经过该 setter。现在 setter �
   多行标签、可折行的按钮标题及页面标题）。单行标签不受影响。
 - 行高只影响**纵向**量：同步 `DETAIL_LINE_H` 及其他与纵向尺寸直接相关的布局量，并复核面板裁切与滚动条。
 - **`estimate_lines`（`src/clipboard/model.rs:7`）、`detail_text_units`（`:29`）、`LINE_MAX_UNITS`
-  （`src/clipboard.rs:152`）估的是横向容纳与行数，行高变化本身不要求修改它们。** 只有真实换行数或面板尺寸
+  （`src/clipboard/model.rs:8`／`:30` 的 `estimate_lines`／`detail_text_units`）估的是横向容纳与行数，行高变化本身不要求修改它们。** 只有真实换行数或面板尺寸
   验证失败时才改，并保留原有的后备估算测试。
 - 剪贴板详情的高度后备估算（`src/clipboard/model.rs:7`、`src/clipboard/picker.rs:1576`）不决定实际断点；
   用渲染结果验证它不会造成裁切。
@@ -369,11 +369,11 @@ locale 与压力用例均已实际执行。未批准或未取证的项目不得�
 
 | 曾经的说法 | 更正 | 证据 |
 | --- | --- | --- |
-| 14pt 正文实际行高约 1.29 | 无效推论：用估算常量反推渲染值 | `src/clipboard.rs:144` 注释自述为估算上限 |
+| 14pt 正文实际行高约 1.29 | 无效推论：用估算常量反推渲染值 | `src/clipboard.rs:285` 注释自述为估算上限 |
 | 截断共 17 处（搜索命中） | 机制至少 5 类、站点按登记表计；搜索命中含查询与非截断设置 | `setMaximumNumberOfLines` 32 处命中 = 有限 10 + 无上限 6 + `respondsToSelector` 14 + 其他 2；`setTruncatesLastVisibleLine` 8 处 = `true` 2 + `false` 2 + 查询 4 |
 | 带 caption 的行标题「已合规」 | 违规：label 不因 tooltip 而豁免 | §9（:325、:327） |
 | `widgets.rs:1976` 是截断点 | 该处是 slider 的 tooltip 设置点；截断点在 `make_value_label`（:961） | 源码 |
-| 「只能人工实测常量」 | 已有主线程 locale 循环入口 | `src/lib.rs:2644`、`src/settings/window.rs:979` |
+| 「只能人工实测常量」 | 已有主线程 locale 循环入口 | `src/lib.rs:2898`（`--smoke-settings-layout` 的主线程 locale 循环） |
 | 英文×3 可作宽度上界 | 不成立 | `src/i18n.rs:139` 为空格连接重复 |
 | `NSTextField` 断行「不可达」 | 待 spike 证实，不宜预先写成架构结论 | 尚无证据 |
 | RTL「无法验收」 | 可用强制布局方向做定向检查 | `userInterfaceLayoutDirection` 未使用 |
@@ -463,7 +463,7 @@ locale 与压力用例均已实际执行。未批准或未取证的项目不得�
 | R1.3 P0-4 | **成立** | 仅 `settings_select_centers_single_line_inside_the_control`（`select.rs:1609`）；设备名／预设名与三 locale 覆盖不存在 |
 | R1.4 英文版死引用 | **成立**（作者此前已提出） | 原第 4 行；v3 已删除该声明 |
 | R2 登记单位 | **成立，且补到作者漏登的站点** | 侧边栏条目（`widgets.rs:2344`）、`configure_settings_button_wrapping`（`:405`）、`add_tall_row`（`:2786`）均存在；后两者为**无省略号的静默裁切** |
-| R3.1 跨表面 runner | **成立且可行** | `--smoke-overlay`（`lib.rs:2590`）、`--smoke-clipboard`（`:2280`）、`--smoke-keystroke-display-panel`（`:2698`）、`--smoke-onboarding-live-apply`（`:2764`）都存在 |
+| R3.1 跨表面 runner | **成立且可行** | `--smoke-overlay`（`lib.rs:2367`）、`--smoke-clipboard`（`:2366`）、`--smoke-keystroke-display-panel`（`:2368`）、`--smoke-onboarding-live-apply`（`:2374`）都存在 |
 | R3.3 测量方法 | **成立，作者方法写错** | 带行数上限的控件其 `sizeThatFits` 受上限约束 |
 | R3.4 门禁表述 | **成立，属仓库级不一致** | `AGENTS.md:40` headless-safe vs `src/lib.rs:2645` 附近需图形会话 vs `AGENTS.md:21` GUI 依赖 smoke 标 `#[ignore]` |
 | R4 收窄 LT-3 | **成立，作者耦合关系写错** | `estimate_lines`／`detail_text_units`／`LINE_MAX_UNITS` 管横向与行数 |
@@ -553,7 +553,7 @@ locale 与压力用例均已实际执行。未批准或未取证的项目不得�
 | 项 | 判断 | 核实证据 |
 | --- | --- | --- |
 | §11 第 1 条 · 无显式无障碍标签 ≠ 无出口 | **成立，作者推论过强** | 浮窗标题是标准 `NSTextField`（`overlay/cards.rs:59`、`overlay.rs:1278`），标准控件默认可能暴露完整字符串值；且仓库**没有任何无障碍树查询代码**（`NSAccessibility`／`accessibilityValue` 全为空），「取证」本身是新能力 |
-| §11 第 2 条 · 可断言的瞬时表面不得只做 B 层 | **成立，作者的设计有误** | `AGENTS.md`：Anything assertable belongs in A；`--smoke-overlay`（`lib.rs:2590`）已能唤出并遍历视图树 → 文字容纳可断言。v3 的决策 7 等于开了一个与仓库分层规则冲突的后门 |
+| §11 第 2 条 · 可断言的瞬时表面不得只做 B 层 | **成立，作者的设计有误** | `AGENTS.md`：Anything assertable belongs in A；`--smoke-overlay`（`lib.rs:2367`）已能唤出并遍历视图树 → 文字容纳可断言。v3 的决策 7 等于开了一个与仓库分层规则冲突的后门 |
 | §11 第 3 条 · 完成标准与偏离路径要分别定义 | **成立，v3 内部矛盾** | 一边写「B／C 类出口可验证才算完成」，一边允许「记录边界明确的偏离」；已改为两条结案路径 |
 | §11 第 4 条 · 登记表要符合自己的字段要求 | **成立，v3 自相矛盾** | LT-1 声明「五列含 runner」，A 类表实际是「站点／语义角色／表面／机制／出口」；B／C 列数更少。**v5 更正基数措辞**：v4 写的「截断相关调用点共 57 处」是搜索命中数（`setLineBreakMode:4` 17 + `setMaximumNumberOfLines` 32 + `truncatesLastVisibleLine` 8），其中含 14 处 `respondsToSelector` 查询、6 处 `setMaximumNumberOfLines: 0`（无上限）、2 处 `setTruncatesLastVisibleLine: false`，不能作为截断调用点集合的基数 |
 | §11 第 5 条 · 收紧两处措辞 | **成立，两处都要改** | `overlay.no_windows` 存在且为本地化文案（`locales/en.toml:68`、`zh-Hans:69`、`zh-Hant:69`），渲染于 `overlay.rs:1356`（`update_status_label` 内，`:1344`）；`configure_settings_button_wrapping` 的 `max_lines = 3` 与 `add_tall_row`（唯一调用点 `components.rs:548`）机制成立，但无实际溢出证据 |

@@ -2,27 +2,143 @@
 
 use super::*;
 
-/// Show the permission banner in its own top strip and reserve that strip above General.
-unsafe fn set_permission_banner_visible(ui: &SettingsUi, visible: bool) {
-    if ui.permission_warning_view.is_null() || ui.general_view.is_null() {
+/// The page scroll views, indexed by sidebar order.
+fn page_scroll_views(ui: &SettingsUi) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
+    [
+        ui.general_view,
+        ui.switcher_view,
+        ui.mouse_view,
+        ui.clipboard_view,
+        ui.window_control_view,
+        ui.quick_actions_view,
+        ui.keystroke_display_view,
+        ui.about_view,
+    ]
+}
+
+/// Which warning a page's top strip carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PageWarning {
+    /// Nothing to report: the strip stays hidden.
+    None,
+    /// A missing permission, with the "Open Privacy & Security" button.
+    Permission,
+    /// The clipboard storage failure (no key, or nothing readable).
+    Storage,
+}
+
+/// Pick the warning for `page` from the two facts that can produce one.
+///
+/// General reports a missing permission first — without it the shortcut does not work at all — and
+/// otherwise the clipboard storage failure, which is an app-level fact worth stating where settings
+/// opens. The Clipboard page reports the storage failure, which is the page's own subject. Every
+/// other page has nothing to say, so the strip is hidden there.
+pub(super) fn warning_for_page(
+    page: usize,
+    has_required_permissions: bool,
+    storage_unavailable: bool,
+) -> PageWarning {
+    match page {
+        0 if !has_required_permissions => PageWarning::Permission,
+        0 if storage_unavailable => PageWarning::Storage,
+        SETTINGS_CLIPBOARD_PAGE_INDEX if storage_unavailable => PageWarning::Storage,
+        _ => PageWarning::None,
+    }
+}
+
+/// The warning the top strip carries for the selected page.
+fn selected_page_warning() -> PageWarning {
+    let is_permission_migration = crate::update_notice::needs_permission_migration_copy();
+    let has_required_permissions = has_accessibility_permission()
+        && (!is_permission_migration || crate::thumbnail::capture_allowed());
+    warning_for_page(
+        SIDEBAR_SELECTED.load(Ordering::SeqCst),
+        has_required_permissions,
+        crate::clipboard::unavailable_copy().is_some(),
+    )
+}
+
+/// Recompute the top warning banner from live state, and show it while the selected page has
+/// something to report.
+pub(super) unsafe fn refresh_settings_warning_banner(ui: &SettingsUi) {
+    if ui.permission_warning_view.is_null() {
         return;
     }
-
-    let hidden: bool = msg_send![ui.permission_warning_view, isHidden];
-    if hidden == !visible {
-        return;
-    }
-
-    let banner_frame: NSRect = msg_send![ui.permission_warning_view, frame];
-    let mut general_frame: NSRect = msg_send![ui.general_view, frame];
-    let height_delta = if visible {
-        -banner_frame.size.height
-    } else {
-        banner_frame.size.height
+    let warning = selected_page_warning();
+    let copy = match warning {
+        PageWarning::None => None,
+        PageWarning::Permission => {
+            let key = if crate::update_notice::needs_permission_migration_copy() {
+                "settings.permission_migration_warning"
+            } else {
+                "settings.accessibility_warning"
+            };
+            Some(t(key))
+        }
+        PageWarning::Storage => crate::clipboard::unavailable_copy(),
     };
-    general_frame.size.height = (general_frame.size.height + height_delta).max(1.0);
-    let _: () = msg_send![ui.general_view, setFrame: general_frame];
-    let _: () = msg_send![ui.permission_warning_view, setHidden: !visible];
+    if !ui.permission_warning_label.is_null() {
+        widgets::set_field(ui.permission_warning_label, copy.as_deref().unwrap_or(""));
+    }
+    // The banner's button follows the warning it carries: the permission copy offers System
+    // Settings, the storage copy offers keychain access (there is no System Settings pane for the
+    // keychain -- it is not a TCC permission -- so the action has to live in the app).
+    if !ui.permission_warning_button.is_null() {
+        let (title, action, visible) = match warning {
+            PageWarning::Permission => (
+                t("settings.btn_open_privacy"),
+                sel!(handleOpenPrivacy:),
+                true,
+            ),
+            PageWarning::Storage => (
+                t("clipboard.grant_keychain_access"),
+                sel!(retryKeychainAccess:),
+                true,
+            ),
+            PageWarning::None => (String::new(), sel!(handleOpenPrivacy:), false),
+        };
+        if visible {
+            let ns = make_nsstring(&title);
+            let _: () = msg_send![ui.permission_warning_button, setTitle: ns];
+            let _: () = msg_send![ui.permission_warning_button, setAction: action];
+            CFRelease(ns as *const c_void);
+        }
+        let _: () = msg_send![ui.permission_warning_button, setHidden: !visible];
+    }
+    // The banner is a sibling of the page scroll views, so the page it covers has to give up that
+    // height. Reserving against the selected page and restoring every other page (rather than
+    // adjusting whichever page was showing) keeps this idempotent: a page switch cannot leave one
+    // page short and another long. The full height comes from the pages' parent, which is live:
+    // a window resize must not be undone by the next refresh.
+    let parent: *mut AnyObject = msg_send![ui.general_view, superview];
+    let base_h = if parent.is_null() {
+        ui.page_viewport_h
+    } else {
+        let bounds: NSRect = msg_send![parent, bounds];
+        if bounds.size.height > 100.0 {
+            bounds.size.height
+        } else {
+            ui.page_viewport_h
+        }
+    };
+    let banner_frame: NSRect = msg_send![ui.permission_warning_view, frame];
+    let reserved_h = (base_h - banner_frame.size.height).max(1.0);
+    for (index, &scroll) in page_scroll_views(ui).iter().enumerate() {
+        if scroll.is_null() {
+            continue;
+        }
+        let want = if copy.is_some() && index == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
+            reserved_h
+        } else {
+            base_h
+        };
+        let mut frame: NSRect = msg_send![scroll, frame];
+        if (frame.size.height - want).abs() > 0.5 {
+            frame.size.height = want;
+            let _: () = msg_send![scroll, setFrame: frame];
+        }
+    }
+    let _: () = msg_send![ui.permission_warning_view, setHidden: copy.is_none()];
 }
 
 /// Switch the active settings page: align the highlight to the selected button, toggle the
@@ -85,16 +201,7 @@ pub(super) fn select_sidebar(idx: usize) {
             for (i, &v) in views.iter().enumerate() {
                 let _: () = msg_send![v, setHidden: i != idx];
             }
-            let show_permission_banner = if idx == 0 {
-                let is_permission_migration =
-                    crate::update_notice::needs_permission_migration_copy();
-                let has_required_permissions = has_accessibility_permission()
-                    && (!is_permission_migration || crate::thumbnail::capture_allowed());
-                !has_required_permissions
-            } else {
-                false
-            };
-            set_permission_banner_visible(ui, show_permission_banner);
+            refresh_settings_warning_banner(ui);
             if idx == SETTINGS_ABOUT_PAGE_INDEX {
                 refresh_permission_statuses(ui);
             }
@@ -132,11 +239,38 @@ unsafe fn refresh_permission_statuses(ui: &SettingsUi) {
     {
         refresh_accessibility_permission_action(ui);
     }
+    refresh_keychain_access_row(ui);
     if !ui.screen_recording_permission_status.is_null() {
         set_permission_status(
             ui.screen_recording_permission_status,
             crate::thumbnail::capture_allowed(),
         );
+    }
+}
+
+/// Refresh the About page's keychain-access row: the clipboard key is either usable now, or the user
+/// has to authorize the keychain once (the row's button does exactly that).
+unsafe fn refresh_keychain_access_row(ui: &SettingsUi) {
+    if ui.keychain_access_status.is_null() {
+        return;
+    }
+    KEYCHAIN_ROW_REFRESHES.fetch_add(1, Ordering::SeqCst);
+    let granted = crate::clipboard::storage_key_available();
+    let (key, color): (&str, *mut AnyObject) = if granted {
+        (
+            "settings.keychain_status_granted",
+            msg_send![class!(NSColor), systemGreenColor],
+        )
+    } else {
+        (
+            "settings.keychain_status_missing",
+            msg_send![class!(NSColor), systemOrangeColor],
+        )
+    };
+    let _: () = msg_send![ui.keychain_access_status, setTextColor: color];
+    set_field(ui.keychain_access_status, t(key));
+    if !ui.keychain_access_button.is_null() {
+        let _: () = msg_send![ui.keychain_access_button, setHidden: granted];
     }
 }
 
@@ -190,6 +324,27 @@ unsafe fn refresh_accessibility_permission_action(ui: &SettingsUi) {
     }
 }
 
+/// Run the main run loop for up to `seconds`, so work queued with `performSelectorOnMainThread`
+/// (the clipboard load's apply step, the settings refresh) actually runs. Smoke runners drive the app
+/// from the main thread and never yield otherwise.
+unsafe fn pump_run_loop_for(seconds: f64) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs_f64(seconds);
+    while std::time::Instant::now() < deadline {
+        let _ = crate::ffi::CFRunLoopRunInMode(crate::ffi::kCFRunLoopDefaultMode, 0.02, 1u8);
+    }
+}
+
+/// How many times the About page's keychain row has been repainted. Exposed because "a silent grant
+/// repaints the row" is otherwise unobservable: the smoke drives the app from the main thread, so it
+/// can read the row but cannot tell which code path wrote it. A counter-example (removing the
+/// production refresh) makes the smoke fail, so this cannot pass by chance.
+static KEYCHAIN_ROW_REFRESHES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+pub(crate) fn keychain_row_refresh_count() -> usize {
+    KEYCHAIN_ROW_REFRESHES.load(Ordering::SeqCst)
+}
+
 /// Refresh the visible permission UI when the app regains focus.
 pub(crate) fn refresh_permission_ui_if_visible() {
     let selected_page = SIDEBAR_SELECTED.load(Ordering::SeqCst);
@@ -202,11 +357,7 @@ pub(crate) fn refresh_permission_ui_if_visible() {
                 let visible: bool = msg_send![ui.window, isVisible];
                 if visible {
                     if selected_page == 0 {
-                        let is_permission_migration =
-                            crate::update_notice::needs_permission_migration_copy();
-                        let has_required_permissions = has_accessibility_permission()
-                            && (!is_permission_migration || crate::thumbnail::capture_allowed());
-                        set_permission_banner_visible(ui, !has_required_permissions);
+                        refresh_settings_warning_banner(ui);
                     } else {
                         refresh_permission_statuses(ui);
                     }
@@ -518,14 +669,7 @@ fn show_settings_inner(
                         msg_send![u.window, makeFirstResponder: std::ptr::null::<AnyObject>()];
                     set_text_input_active(false);
                 }
-                // The migration copy requires both permissions; the regular copy follows Accessibility only.
-                let is_permission_migration =
-                    crate::update_notice::needs_permission_migration_copy();
-                let has_required_permissions = has_accessibility_permission()
-                    && (!is_permission_migration || crate::thumbnail::capture_allowed());
-                let show_permission_banner =
-                    SIDEBAR_SELECTED.load(Ordering::SeqCst) == 0 && !has_required_permissions;
-                set_permission_banner_visible(u, show_permission_banner);
+                refresh_settings_warning_banner(u);
             }
         });
     }
@@ -1365,6 +1509,63 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             scroll_page_to_top(*page);
             debug_validate_settings_page(*page, names[index]);
         }
+        // The About page's keychain row reads its state from the clipboard session and must follow it
+        // WITHOUT a page switch or an app activation (a keychain grant can be silent, and a load can
+        // land while the window is open). This is a gate rather than a re-check: the row is scribbled
+        // over first and nothing here refreshes it by hand, so it can only pass if the production
+        // path repainted it.
+        {
+            select_sidebar(SETTINGS_ABOUT_PAGE_INDEX);
+            let scribbled = with_settings_ui(|ui| {
+                let Some(ui) = ui.as_ref() else {
+                    return false;
+                };
+                set_field(ui.keychain_access_status, "NOT-A-STATUS");
+                true
+            });
+            assert!(scribbled, "the About page's keychain row must exist");
+            // The public action the row's button performs (a full load here: the feature is on). The
+            // work it starts lands on the main thread through `performSelectorOnMainThread`, which only
+            // runs while this smoke pumps the run loop -- without this the assertion below would be
+            // testing "the notification was queued", not "the row was repainted".
+            let refreshes_before = keychain_row_refresh_count();
+            crate::clipboard::retry_keychain_access();
+            pump_run_loop_for(1.5);
+            let refreshes_after = keychain_row_refresh_count();
+            let (status_text, button_hidden, granted) = with_settings_ui(|ui| {
+                let Some(ui) = ui.as_ref() else {
+                    return (String::new(), true, false);
+                };
+                {
+                    let status: *mut AnyObject = msg_send![ui.keychain_access_status, stringValue];
+                    let hidden: bool = msg_send![ui.keychain_access_button, isHidden];
+                    (
+                        crate::ffi::nsstring_to_rust(status),
+                        hidden,
+                        crate::clipboard::storage_key_available(),
+                    )
+                }
+            });
+            let expected = if granted {
+                t("settings.keychain_status_granted")
+            } else {
+                t("settings.keychain_status_missing")
+            };
+            if refreshes_after <= refreshes_before {
+                log_info!(
+                    "[smoke-settings-layout] the action did not repaint the keychain row (refreshes {refreshes_before}->{refreshes_after})"
+                );
+                hide_settings();
+                return false;
+            }
+            if status_text != expected || button_hidden != granted {
+                log_info!(
+                    "[smoke-settings-layout] keychain row content wrong after the action: status {status_text:?} (expected {expected:?}), button_hidden {button_hidden}, granted {granted}"
+                );
+                hide_settings();
+                return false;
+            }
+        }
         log_info!("[smoke-settings-layout] all pages passed");
         // Inline update content (release notes) expands the About page's Updates card. The page
         // document must grow with the card, otherwise the bottom of the notes is cut off and cannot
@@ -1456,7 +1657,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         };
         // The page layout owner grows only the card and the space below it, so the checks are about
         // the document, the card and the views inside -- not about the whole page travelling.
-        let inline_checks: [(&str, bool); 14] = [
+        let inline_checks: [(&str, bool); 15] = [
+            // The notification delegate's selector, sent with all three arguments (see
+            // `will_present_smoke_check`): an arity slip crashes the app on the first real notice.
+            (
+                "notification_delegate_invokes_the_handler",
+                crate::update_notice::will_present_smoke_check(),
+            ),
             ("inside", first_inside && second_inside && third_inside),
             (
                 "expand_grows",
@@ -2235,6 +2442,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         apply_settings_root_surface(window, content, palette, window_clip_radius);
 
         let mut ui = SettingsUi {
+            permission_warning_label: std::ptr::null_mut(),
+            permission_warning_button: std::ptr::null_mut(),
+            page_viewport_h,
             window,
             sidebar_general: std::ptr::null_mut(),
             sidebar_switcher: std::ptr::null_mut(),
@@ -2257,6 +2467,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             accessibility_permission_status: std::ptr::null_mut(),
             accessibility_permission_button: std::ptr::null_mut(),
             screen_recording_permission_status: std::ptr::null_mut(),
+            keychain_access_status: std::ptr::null_mut(),
+            keychain_access_button: std::ptr::null_mut(),
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             panel_material: std::ptr::null_mut(),
@@ -2482,6 +2694,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let mouse_content_bottom =
             page_builder::build_mouse_page(&page_context, mouse_view, mouse_doc_h, &mut ui);
 
+        // The storage state can be decided before OR after this build (the load runs off the main
+        // thread), so the banner is settled from the state after the views exist: reading it inside
+        // the builder would miss a state that arrives while the page is being laid out.
+        super::dispatch::refresh_clipboard_unavailable_notice();
         let clipboard_options_card_bottom = page_builder::build_clipboard_page(
             &page_context,
             clipboard_view,
@@ -2653,5 +2869,61 @@ pub(crate) fn invalidate_settings_window() {
         // The window is invalidated/destroyed; flip back to .accessory (it may have been open
         // during a locale change).
         crate::set_settings_activation_policy(false);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{warning_for_page, PageWarning, SETTINGS_CLIPBOARD_PAGE_INDEX};
+
+    /// The permission warning outranks the storage one on General, and a page that has nothing to
+    /// report keeps the strip hidden: that is what decides whether the banner covers a page title.
+    #[test]
+    fn the_banner_copy_follows_the_page_and_the_two_failure_facts() {
+        let clipboard = SETTINGS_CLIPBOARD_PAGE_INDEX;
+        let granted = true;
+        let missing = false;
+        let storage_ok = false;
+        let storage_down = true;
+
+        assert_eq!(
+            warning_for_page(0, granted, storage_down),
+            PageWarning::Storage
+        );
+        assert_eq!(
+            warning_for_page(0, missing, storage_down),
+            PageWarning::Permission
+        );
+        assert_eq!(
+            warning_for_page(0, missing, storage_ok),
+            PageWarning::Permission
+        );
+        assert_eq!(
+            warning_for_page(clipboard, granted, storage_down),
+            PageWarning::Storage
+        );
+        assert_eq!(
+            warning_for_page(clipboard, missing, storage_down),
+            PageWarning::Storage
+        );
+        assert_eq!(warning_for_page(0, granted, storage_ok), PageWarning::None);
+        assert_eq!(
+            warning_for_page(clipboard, granted, storage_ok),
+            PageWarning::None
+        );
+        // Any other page stays clear, whatever the two facts are.
+        for page in 1..8 {
+            if page == clipboard {
+                continue;
+            }
+            assert_eq!(
+                warning_for_page(page, missing, storage_down),
+                PageWarning::None
+            );
+            assert_eq!(
+                warning_for_page(page, granted, storage_down),
+                PageWarning::None
+            );
+        }
     }
 }

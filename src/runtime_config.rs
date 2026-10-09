@@ -97,6 +97,22 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
 pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChangeSource) {
     let flags = change_flags(old, new, source);
 
+    // A clipboard purge an earlier session could not finish runs first, on every apply and whether
+    // the clipboard switch is on or off (`clear_on_quit` failures happen with it on). It must come
+    // before anything loads or writes, or the user sees records they asked to delete. Cheap when
+    // nothing is pending: two existence checks.
+    let purge = crate::clipboard::process_pending_purge();
+    if purge == crate::clipboard::PurgeProgress::Completed
+        && new.clipboard.enabled
+        && crate::clipboard::needs_load()
+    {
+        // The purge left the session uninitialized (its key is acquired by a load, off the main
+        // thread). Without this, a session that recovered from a purge failure would stay unable to
+        // save until the next launch. `reload_storage`, not `start`: the polling timer is usually
+        // already running, and `start` would return before loading.
+        crate::clipboard::reload_storage();
+    }
+
     if flags.locale {
         crate::i18n::apply_config_locale(&new.i18n.locale);
     }

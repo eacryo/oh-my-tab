@@ -930,6 +930,18 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             None => "null".to_string(),
         }
     ));
+    // The clipboard's storage state: whether history is written encrypted, kept in memory only (no
+    // readable keychain item this session) or blocked (data present but unreadable, or a purge
+    // unfinished). AX cannot express "this file is encrypted", so the app states it -- and a
+    // scenario that cares still reads the file itself, because a self-report is not evidence.
+    json.push_str(&format!(
+        "  \"clipboard_storage\": {{\"state\": {}, \"reason\": {}, \"key_provider\": {}, \"plaintext_leftover\": {}, \"keychain_acl\": {}}},\n",
+        json_string(crate::clipboard::storage_state_label()),
+        json_string(crate::clipboard::storage_reason_label()),
+        json_string(crate::clipboard::key_provider_label()),
+        crate::clipboard::legacy_index_leftover(),
+        json_string(crate::clipboard::keychain_acl_label())
+    ));
     // The decorations actually in effect, so a scenario can tell "the switch did not take" from "the
     // measurement is wrong" without inferring either from pixels.
     json.push_str(&format!(

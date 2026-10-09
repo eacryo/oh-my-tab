@@ -413,6 +413,14 @@ pub(super) unsafe fn write_pasteboard_text(text: &str, stamp_marker: bool) -> bo
     ok
 }
 
+/// Whether a paste must be refused up front, with a notice the user can actually see. An image
+/// whose bytes cannot be produced (no cache file, nothing pending) would otherwise paste nothing at
+/// all; the caller shows the notice BEFORE hiding the picker, because the toast lives inside it.
+/// Pure, unit-tested.
+pub(super) fn paste_refused_with_notice(kind_is_image: bool, bytes_available: bool) -> bool {
+    kind_is_image && !bytes_available
+}
+
 /// Write an image back to the pasteboard in its ORIGINAL format (the image paste path).
 /// Same clearContents then setData flow; the UTI is the entry's original type -- a JPG
 /// pastes back as JPG, an animated GIF as a GIF, never a blanket PNG re-encode. The

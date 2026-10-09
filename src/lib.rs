@@ -322,6 +322,31 @@ extern "C" fn on_dev_blank_text(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void
 /// immediate: a capture taken before the delay is the "with text" frame, so both frames come from this one
 /// process (two launches of a translucent material do not re-render identically, which is what broke the
 /// earlier two-launch form of that measurement).
+/// Open the clipboard picker after a delay (see `show_clipboard_delay`), through the same
+/// main-thread controller entry the blank-text switch uses.
+pub(crate) fn schedule_dev_show_clipboard(delay: std::time::Duration) {
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+            return;
+        };
+        unsafe {
+            let _: () = msg_send![
+                controller,
+                performSelectorOnMainThread: sel!(handleDevShowClipboard:),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    });
+}
+
+extern "C" fn on_dev_show_clipboard(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    callback_guard::void("on_dev_show_clipboard", || {
+        crate::clipboard::show_picker_for_development();
+    });
+}
+
 pub(crate) fn schedule_dev_blank_text(delay: std::time::Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(delay);
@@ -1483,6 +1508,12 @@ fn create_controller() -> *mut AnyObject {
         );
         class_addMethod(
             cls,
+            sel!(handleDevShowClipboard:),
+            on_dev_show_clipboard as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handlePermissionRestartRequired:),
             restart::on_permission_restart_required as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1796,6 +1827,15 @@ fn setup_status_bar() {
                 cls,
                 sel!(handleOpenPrivacy:),
                 handle_open_privacy as *mut c_void,
+                types.as_ptr(),
+            );
+            // The warning banner's button changes meaning with the warning it carries (permission
+            // guidance vs keychain access), so the same selector is registered on both the settings
+            // and the clipboard observer classes and both route to this handler.
+            class_addMethod(
+                cls,
+                sel!(retryKeychainAccess:),
+                handle_retry_keychain_access as *mut c_void,
                 types.as_ptr(),
             );
             // The settings window's buttons target THIS action class (MENU_TARGET in
@@ -2115,6 +2155,16 @@ fn setup_status_bar() {
     }
 }
 
+/// The "grant keychain access" action (settings banner, picker empty state, About page): re-read the
+/// clipboard key on the clipboard worker, which raises the system's authorization prompt once.
+pub(crate) extern "C" fn handle_retry_keychain_access(
+    _this: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    crate::clipboard::retry_keychain_access();
+}
+
 /// Open System Settings -> Privacy & Security -> Accessibility (deep link).
 /// Shared by the startup alert and the settings warning banner's button.
 pub(crate) fn open_privacy_accessibility() {
@@ -2192,6 +2242,15 @@ fn open_settings_page_request() -> Option<usize> {
 /// shortcut legends, the row grid) from a script or cua.
 fn show_clipboard_request() -> bool {
     crate::dev_flags::present("show-clipboard")
+}
+
+/// `--show-clipboard=after:N` opens the picker N seconds after launch instead of immediately. The
+/// storage load runs off the main thread and can take seconds (a keychain read may block), so this
+/// is how the "load finished first, picker opened later" ordering is reached without a hotkey.
+fn show_clipboard_delay() -> Option<f64> {
+    crate::dev_flags::value("show-clipboard")
+        .and_then(|value| value.strip_prefix("after:").map(str::to_string))
+        .and_then(|rest| rest.parse::<f64>().ok())
 }
 
 #[cfg(target_arch = "aarch64")]
@@ -2992,7 +3051,12 @@ pub fn run() {
         // Development switch: open the clipboard picker so its laid-out UI is reachable without
         // driving the global hotkey (which would steal focus).
         if show_clipboard_request() {
-            clipboard::show_picker_for_development();
+            match show_clipboard_delay() {
+                Some(seconds) if seconds > 0.0 => {
+                    schedule_dev_show_clipboard(std::time::Duration::from_secs_f64(seconds));
+                }
+                _ => clipboard::show_picker_for_development(),
+            }
             // Development only: `--clipboard-blank-text=after:N` hides the picker's text N seconds from now, so
             // the A2 contrast scenario captures the same panel in the same launch with and without its text.
             // Two launches would not do: a translucent material does not re-render identically across them.

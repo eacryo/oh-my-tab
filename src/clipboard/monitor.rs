@@ -24,6 +24,12 @@ pub(super) fn poll_clipboard() {
     if !CONFIG.read().unwrap().clipboard.enabled {
         return;
     }
+    // And stop while the storage is unavailable (no key, or the stored history cannot be read):
+    // the settings page, the picker and the notification all say the feature is unavailable, so
+    // it must not quietly keep collecting records that cannot be kept.
+    if unavailable_copy().is_some() {
+        return;
+    }
     let new_cc: Option<i64> = unsafe {
         let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         if pb.is_null() {
@@ -200,27 +206,16 @@ pub(crate) fn start() {
         }
         // The image cache is kept across launches (the history references it) and the history is
         // loaded BEFORE recording the current pasteboard, so a restart continues where it left
-        // off. Orphaned cache files are swept by the load path and below.
+        // off. The load runs off the main thread (the keychain read may block on a system prompt)
+        // and applies its result here when it finishes: the merge, the orphan sweep and the detail
+        // warm-up all happen in that apply step, because the sweep must only run after a
+        // successful load (invariant R2) and the merge may regenerate previews (AppKit).
         load_history();
         // Expire at startup: the loaded history can hold entries that aged out while the app
-        // was not running.
+        // was not running. Entries recorded before the load lands expire on the next pass.
         {
             let mut hist = CLIP_HISTORY.lock().unwrap();
             expire_entries(&mut hist, now_secs(), ttl_secs());
-        }
-        {
-            let removed = sweep_current_clip_image_cache();
-            if removed > 0 {
-                log_debug!("[clip] swept {} orphan image cache files", removed);
-            }
-            // Warm up detail previews for restored image entries (background): after a
-            // restart {hash}.detail may not exist yet (the last session never opened that
-            // detail), so generating ahead keeps the first open instantly sharp.
-            for entry in CLIP_HISTORY.lock().unwrap().iter() {
-                if let Some(img) = &entry.image {
-                    request_detail_preview(img, false);
-                }
-            }
         }
         // Then record the current pasteboard, or the first summon would show an empty list.
         poll_clipboard();

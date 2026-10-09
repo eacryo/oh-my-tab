@@ -1295,6 +1295,17 @@ unsafe fn set_clipboard_delete_dependent_visibility(ui: &SettingsUi, visible: bo
     ui.page_canvases[3].set_group_visible(RowGroup::ClipboardDeleteChild, visible);
 }
 
+/// Refresh the settings window's top warning banner for the current storage state. The state is
+/// decided by the storage load, which can land while this window is already open, so the clipboard
+/// module calls this when it changes (the page build and the window's own show paths call it too).
+pub(crate) unsafe fn refresh_clipboard_unavailable_notice() {
+    with_settings_ui(|ui| {
+        if let Some(ui) = ui.as_ref() {
+            super::window::refresh_settings_warning_banner(ui);
+        }
+    });
+}
+
 unsafe fn update_clipboard_delete_dependent_visibility(ui: &SettingsUi) {
     let state: isize = msg_send![ui.clipboard_delete_after_paste, state];
     set_clipboard_delete_dependent_visibility(ui, state == 1);

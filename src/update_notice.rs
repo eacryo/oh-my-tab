@@ -15,7 +15,7 @@ extern "C" {}
 
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
-use std::ffi::c_void;
+use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 
@@ -173,16 +173,71 @@ unsafe extern "C" fn handle_update_available_click(_this: *mut c_void, _cmd: Sel
 unsafe extern "C" fn will_present_notification(
     _this: *mut c_void,
     _cmd: Sel,
+    _center: *mut c_void,
     _notification: *mut c_void,
     completion: *mut c_void,
 ) {
     if completion.is_null() {
         return;
     }
-    type PresentFn = unsafe extern "C" fn(*mut c_void, usize);
-    let invoke = *(completion as *const *const c_void).add(2);
-    let invoke: PresentFn = std::mem::transmute(invoke);
-    invoke(completion, PRESENT_BANNER_SOUND);
+    // The selector carries THREE explicit arguments (center, notification, completion handler), so
+    // the callback must take all three: with only two, `completion` received the *notification*
+    // object and the hand-rolled invoke below called into it, which is what crashed with SIGBUS
+    // (2026-10-08). `--smoke-settings-layout` sends this selector with all three arguments and a
+    // real block, so an arity slip fails there instead of in the field.
+    // Logged because this callback only runs while the app is frontmost -- the one case the other
+    // evidence (the banner captured with another app frontmost) cannot cover.
+    log_debug!("[update-notice] willPresent: banner requested");
+    let block: &block2::Block<dyn Fn(usize)> =
+        unsafe { &*(completion as *const block2::Block<dyn Fn(usize)>) };
+    block.call((PRESENT_BANNER_SOUND,));
+}
+
+/// Smoke check (tier A, `--smoke-settings-layout`): send the delegate the exact
+/// `userNotificationCenter:willPresentNotification:withCompletionHandler:` message, with all three
+/// arguments and a real block, and require that block to be invoked with the banner options.
+///
+/// The counter-example this exists for: a callback declared one argument short reads the
+/// *notification* as the completion handler and crashes when it calls it -- the failure that reached
+/// the field on 2026-10-08. Nothing else catches it, because the selector only fires for a real
+/// notification.
+pub(crate) unsafe fn will_present_smoke_check() -> bool {
+    static CALLED: AtomicBool = AtomicBool::new(false);
+    static OPTIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    let delegate = ensure_delegate_registered();
+    let center: *mut AnyObject =
+        msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
+    if delegate.is_null() || center.is_null() {
+        return false;
+    }
+    // The callback ignores the notification object, so the request stands in for it: what has to be
+    // proven is that the three arguments arrive in the right slots and the block is called.
+    let content: *mut AnyObject = msg_send![class!(UNMutableNotificationContent), new];
+    let identifier = make_nsstring(ID_CLIPBOARD_STORAGE);
+    let request: *mut AnyObject = msg_send![
+        class!(UNNotificationRequest),
+        requestWithIdentifier: identifier,
+        content: content,
+        trigger: std::ptr::null::<AnyObject>()
+    ];
+    release_obj(identifier);
+    release_obj(content);
+    if request.is_null() {
+        return false;
+    }
+
+    let handler: block2::RcBlock<dyn Fn(usize)> = block2::RcBlock::new(|options: usize| {
+        OPTIONS.store(options, Ordering::SeqCst);
+        CALLED.store(true, Ordering::SeqCst);
+    });
+    let _: () = msg_send![
+        delegate,
+        userNotificationCenter: center,
+        willPresentNotification: request,
+        withCompletionHandler: &*handler
+    ];
+    CALLED.load(Ordering::SeqCst) && OPTIONS.load(Ordering::SeqCst) == PRESENT_BANNER_SOUND
 }
 
 /// Register the delegate class/instance once (center.delegate is weak, so the instance
@@ -400,39 +455,62 @@ pub(crate) fn post_update_available(app: &str, version: &str) {
     if bundle_id.is_empty() || version.is_empty() {
         return;
     }
-    if objc2::runtime::AnyClass::get(&std::ffi::CString::new("UNUserNotificationCenter").unwrap())
-        .is_none()
-    {
-        log_debug!("[update-notice] UNUserNotificationCenter class unavailable; skipping");
-        return;
-    }
     let title = tf("settings.update_available_notify_title", &[("app", app)]);
     let body = tf(
         "settings.update_available_notify_body",
         &[("version", version)],
     );
-    unsafe {
-        let center: *mut AnyObject =
-            msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
-        if center.is_null() {
-            return;
-        }
+    unsafe { authorize_then_add(&title, &body, ID_UPDATE_AVAILABLE, true) };
+}
+
+/// Post one local notification through the same channel the update notices use: authorization is
+/// requested on first use (one system prompt), the delegate's `willPresent` makes the banner show
+/// even while this app is frontmost, and a fixed `identifier` replaces the previous unread banner
+/// instead of stacking. Used by the clipboard storage failures, which the user must hear about even
+/// if they never open the clipboard panel.
+pub(crate) fn post_local_notice(identifier: &str, title: &str, body: &str) {
+    unsafe { authorize_then_add(title, body, identifier, true) };
+}
+
+/// The shared tail: bail out when the framework or the bundle id is missing, install the delegate
+/// (frontmost banners), stash the notice for the authorization completion, and ask for
+/// authorization.
+unsafe fn authorize_then_add(title: &str, body: &str, identifier: &str, install_delegate: bool) {
+    let bundle_id = bundle_info_string("CFBundleIdentifier");
+    if bundle_id.is_empty() {
+        return;
+    }
+    if objc2::runtime::AnyClass::get(&CString::new("UNUserNotificationCenter").unwrap()).is_none() {
+        log_debug!("[update-notice] UNUserNotificationCenter class unavailable; skipping");
+        return;
+    }
+    let center: *mut AnyObject =
+        msg_send![class!(UNUserNotificationCenter), currentNotificationCenter];
+    if center.is_null() {
+        return;
+    }
+    if install_delegate {
         let delegate = ensure_delegate_registered();
         if !delegate.is_null() {
             let _: () = msg_send![center, setDelegate: delegate];
         }
-        *PENDING_NOTICE.lock().unwrap() = Some((title, body, ID_UPDATE_AVAILABLE.to_string()));
-        type RequestAuthFn =
-            unsafe extern "C" fn(*mut AnyObject, Sel, usize, *const AuthCompletionBlock);
-        let send: RequestAuthFn = std::mem::transmute(objc_msgSend as *const ());
-        send(
-            center,
-            sel!(requestAuthorizationWithOptions:completionHandler:),
-            3,
-            std::ptr::addr_of!(AUTH_BLOCK),
-        );
     }
+    *PENDING_NOTICE.lock().unwrap() =
+        Some((title.to_string(), body.to_string(), identifier.to_string()));
+    type RequestAuthFn =
+        unsafe extern "C" fn(*mut AnyObject, Sel, usize, *const AuthCompletionBlock);
+    let send: RequestAuthFn = std::mem::transmute(objc_msgSend as *const ());
+    send(
+        center,
+        sel!(requestAuthorizationWithOptions:completionHandler:),
+        3,
+        std::ptr::addr_of!(AUTH_BLOCK),
+    );
 }
+
+/// The identifier of the clipboard storage banner: one fixed id, so a later failure notice replaces
+/// an unread earlier one instead of stacking banners.
+pub(crate) const ID_CLIPBOARD_STORAGE: &str = "oh-my-tab-clipboard-storage";
 
 /// Post the "updated" notification (bundled apps only; the first run shows the one-time
 /// system authorization prompt).

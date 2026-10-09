@@ -60,8 +60,11 @@ use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
+mod crypto;
 mod detail;
 mod image_cache;
+mod keyring;
+mod keyring_acl;
 mod model;
 mod monitor;
 mod notifications;
@@ -70,9 +73,12 @@ mod persist;
 mod picker;
 mod search;
 mod smoke;
+mod storage;
 mod text_style;
+use crypto::*;
 use detail::*;
 use image_cache::*;
+use keyring::*;
 use model::*;
 use monitor::*;
 use notifications::*;
@@ -81,6 +87,7 @@ use persist::*;
 use picker::*;
 use search::*;
 use smoke::*;
+use storage::*;
 use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use detail::{apply_backdrop_material, apply_theme};
@@ -96,6 +103,82 @@ pub(crate) fn history_file_exists() -> bool {
     persist::history_file_path().exists()
 }
 
+/// The clipboard's storage state, for `--e2e-state` (see `storage.rs` for the three states).
+pub(crate) fn storage_state_label() -> &'static str {
+    storage::state_label()
+}
+
+/// Why the storage state is what it is (a short label, never key material).
+pub(crate) fn storage_reason_label() -> &'static str {
+    storage::reason_label()
+}
+
+/// Where the master key came from in this process (`keychain` / `test` / `none`).
+pub(crate) fn key_provider_label() -> &'static str {
+    keyring::backend_label(keyring::current_backend())
+}
+
+/// The one-line "clipboard history is unavailable right now" copy for the current storage state, in
+/// the active locale. Used by the settings page and by the picker, so all three surfaces (including
+/// the system notification) say the same thing.
+/// Whether the session holds a usable clipboard key (the About page's keychain row reports this, and
+/// the "grant keychain access" action is offered exactly when it is false).
+pub(crate) fn storage_key_available() -> bool {
+    storage::key().is_some()
+}
+
+/// The form the keychain item's ACL uses (`--e2e-state`). A form report, not a stability verdict: what
+/// decides whether a rebuild keeps working is the *creating* app's signing identity (see `keyring_acl`).
+pub(crate) fn keychain_acl_label() -> &'static str {
+    keyring_acl::cached_acl_identity().label()
+}
+
+pub(crate) fn unavailable_copy() -> Option<String> {
+    notifications::unavailable_copy()
+}
+
+/// Whether a superseded plaintext history index survived this session (reported in `--e2e-state`).
+pub(crate) fn legacy_index_leftover() -> bool {
+    persist::legacy_index_leftover()
+}
+
+/// The user asked for keychain access from the settings banner, the panel's empty state or the About
+/// page: re-read the key (one system prompt) and re-apply the storage state either way.
+pub(crate) fn retry_keychain_access() {
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        // The feature is off: acquire the key so the system prompt appears and the row can report
+        // "granted", but never touch the storage set -- loading, migrating, sweeping and saving all
+        // belong to the master switch.
+        log_info!("[clip] authorization requested while the clipboard feature is off; key only");
+        persist::acquire_key_only();
+        return;
+    }
+    persist::retry_load_history();
+}
+
+/// Finish a purge an earlier session could not complete. Called at launch and on every config
+/// change, BEFORE anything loads or writes, and whether the clipboard switch is on or off
+/// (`clear_on_quit` failures happen with the switch on).
+pub(crate) use storage::PurgeProgress;
+
+pub(crate) fn process_pending_purge() -> storage::PurgeProgress {
+    storage::process_pending_purge()
+}
+
+/// Whether the session is waiting for a fresh load to decide its storage state (e.g. right after a
+/// purge completed). The caller uses this to schedule one instead of leaving the session unable to
+/// save until the next launch.
+pub(crate) fn needs_load() -> bool {
+    matches!(storage::state(), storage::StorageState::Uninitialized)
+}
+
+/// Schedule a fresh storage load on the worker. Separate from `start()`: `start()` also installs the
+/// polling timer and returns early when it is already running, while a session recovering from a
+/// purge needs the load even then.
+pub(crate) fn reload_storage() {
+    persist::load_history();
+}
+
 /// The clipboard switch was turned off: drop the in-memory history and delete everything it left
 /// on disk, so "off" means the app keeps no records at all.
 pub(crate) fn clear_history_and_disk() {
@@ -103,6 +186,26 @@ pub(crate) fn clear_history_and_disk() {
     clear_search();
     hide_detail();
     unsafe { rebuild_rows() };
+}
+
+/// Drop what THIS session recorded, without touching anything on disk: the in-memory entries, the
+/// undo slot and (by the caller) the pending image bytes. Used when the storage turns out to be
+/// unavailable or blocked -- that must never delete the user's stored history, which is exactly what
+/// the full switch-off clear below does.
+pub(super) fn clear_session_records() {
+    let removed = {
+        let mut history = CLIP_HISTORY.lock().unwrap();
+        remove_history_scope(&mut history, true, ClipFilter::All, "").len()
+    };
+    if removed > 0 {
+        log_info!(
+            "[clip] discarded {removed} records from this session (storage is not available)"
+        );
+    }
+    // The undo slot is part of the history: leaving it would let Cmd+Z write a record back.
+    notifications::discard_deleted_clipboard_entry();
+    notifications::cancel_clipboard_undo_timer();
+    DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
 }
 
 /// The recorded-data half of the switch-off: the in-memory history, the undo slot, the file and the
@@ -498,6 +601,9 @@ struct PickerRowsKey {
     query: String,
     show_source: bool,
     minute_bucket: u64,
+    /// Whether the storage-failure notice is part of this render: the state can change while the
+    /// panel is open, and the notice changes both the rows' top offset and the empty-state hint.
+    storage_unavailable: bool,
 }
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
 struct ContentAttributedKey {
@@ -533,6 +639,7 @@ fn picker_rows_key(
         query: query.to_string(),
         show_source,
         minute_bucket: now_secs() / 60,
+        storage_unavailable: unavailable_copy().is_some(),
     }
 }
 thread_local! {
@@ -609,6 +716,8 @@ static PICKER_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> 
 /// The empty-state hint view (shown when the history is empty / nothing matches). Tracked
 /// separately from row views so the next rebuild can remove it.
 static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The empty state's "grant keychain access" button (only while the storage is unavailable).
+static EMPTY_STATE_ACTION: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// Process-lifetime cache for clipboard source icons; avoids decoding the same small icon from
 /// disk again on every row rebuild.
 struct CachedSourceIcon {
@@ -975,10 +1084,13 @@ mod tests {
 
     /// Serializes the tests that read or write the shared image-cache directory (or the history file
     /// inside it): `clear_image_cache_dir` and a full discard wipe the whole directory, so a test
-    /// asserting on cache files must not run while another one clears them.
+    /// asserting on cache files must not run while another one clears them. Also parks the storage
+    /// session in a writable state with the test key: the cache helpers refuse to write while the
+    /// storage state says otherwise, exactly like production.
     fn clip_cache_dir_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        let guard = super::storage::test_lock();
+        super::storage::set_ready(super::keyring::test_key());
+        guard
     }
 
     use super::{
@@ -1665,7 +1777,7 @@ mod tests {
         let _cache_guard = clip_cache_dir_guard();
         use super::{
             cache_write_image, clip_image_path, fnv1a64, history_file_path, load_history,
-            serialize_history, ImageEntry, CLIP_HISTORY, NSPASTEBOARD_TYPE_PNG,
+            ImageEntry, CLIP_HISTORY, NSPASTEBOARD_TYPE_PNG,
         };
         // Regression: DISTINCT data-image entries (web copies, source_path always None)
         // must all survive; the old all-images-by-source_path dedup (None==None) dropped
@@ -1702,7 +1814,10 @@ mod tests {
         let c = mk(b"load-keep-c");
         let path = history_file_path();
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, serialize_history(&[a, b, c]).unwrap()).unwrap();
+        // The live history file is sealed now: write it the way the app does (test key).
+        assert!(super::persist::test_support::write_sealed_history(&[
+            a, b, c
+        ]));
         CLIP_HISTORY.lock().unwrap().clear();
         load_history();
         // The save_history trailing load_history writes back asynchronously: drain the
@@ -1721,8 +1836,9 @@ mod tests {
             "all three entries with distinct data must survive, got: {hashes:?}"
         );
         // Re-copying the same image (same hash) still dedups to one.
-        let dup_path = history_file_path();
-        std::fs::write(&dup_path, serialize_history(&[mk(b"load-keep-a")]).unwrap()).unwrap();
+        assert!(super::persist::test_support::write_sealed_history(&[mk(
+            b"load-keep-a"
+        )]));
         CLIP_HISTORY.lock().unwrap().clear();
         load_history();
         super::persist::flush_persist_worker_for_tests();
@@ -2077,6 +2193,39 @@ mod tests {
                 "{lookalike:?} must not be recognized"
             );
         }
+    }
+
+    #[test]
+    fn a_session_that_cannot_save_always_has_a_notice_to_post() {
+        use super::{unavailable_copy_key, BlockedReason, StorageState};
+        use crate::clipboard::KeyUnavailable;
+        // Both failure states must produce a system notification: a session that cannot save, or
+        // cannot read what is saved, must never stay silent because the picker was never opened.
+        for state in [
+            StorageState::Unavailable(KeyUnavailable::AccessDenied),
+            StorageState::Unavailable(KeyUnavailable::Simulated),
+            StorageState::Blocked(BlockedReason::Damaged),
+            StorageState::Blocked(BlockedReason::PurgePending),
+        ] {
+            assert!(
+                unavailable_copy_key(&state).is_some(),
+                "{state:?} must have a notice"
+            );
+        }
+        // A healthy or not-yet-decided session has nothing to announce.
+        assert!(unavailable_copy_key(&StorageState::Ready).is_none());
+        assert!(unavailable_copy_key(&StorageState::Uninitialized).is_none());
+    }
+
+    #[test]
+    fn an_image_without_bytes_is_refused_with_a_visible_notice() {
+        use super::paste_refused_with_notice;
+        // Only an image whose bytes cannot be produced: a text entry, a file entry or an intact
+        // image must still go through the normal paste path.
+        assert!(paste_refused_with_notice(true, false));
+        assert!(!paste_refused_with_notice(true, true));
+        assert!(!paste_refused_with_notice(false, false));
+        assert!(!paste_refused_with_notice(false, true));
     }
 
     #[test]

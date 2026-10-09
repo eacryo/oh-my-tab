@@ -423,6 +423,37 @@ number = 42
     }
 
     #[test]
+    fn the_clipboard_failure_copy_resolves_in_every_locale() {
+        // Regression: the clipboard failure notices ask for `clipboard.<key>`; when those keys were
+        // authored under `[settings]`, `t()` fell back to returning the key itself and the user saw
+        // "clipboard.notify_not_saved_title" on screen. Assert the exact keys, per locale.
+        let keys = [
+            "clipboard.toast_image_unavailable",
+            "clipboard.unavailable_title",
+            "clipboard.unavailable_key",
+            "clipboard.grant_keychain_access",
+            "clipboard.unavailable_history",
+            "clipboard.unavailable_purge",
+        ];
+        for (locale, raw) in [
+            ("en", EN_TOML),
+            ("zh-Hans", ZH_TOML),
+            ("zh-Hant", ZH_HANT_TOML),
+        ] {
+            let parsed: toml::Value = toml::from_str(raw).unwrap();
+            let mut map = HashMap::new();
+            flatten(&parsed, "", &mut map);
+            for key in keys {
+                let value = map.get(key);
+                assert!(
+                    value.is_some_and(|v| !v.trim().is_empty() && v != key),
+                    "{locale}: {key} must resolve to real copy"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn all_locales_share_identical_key_sets() {
         // All locale files must expose the exact same key set (no missing/extra keys).
         let keys = |raw: &str| {
