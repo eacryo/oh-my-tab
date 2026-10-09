@@ -369,7 +369,29 @@ fn cleanup_old_logs(dir: &Path) {
 
 // Tm and localtime_r live in ffi.rs now
 
-/// Zero-dep ISO-8601 timestamp with milliseconds.
+/// Seconds east of UTC -> the ISO-8601 offset: `Z` at zero, `+HH:MM` / `-HH:MM` otherwise. Pure.
+/// The minutes are part of it because real offsets are not whole hours (India +05:30, Nepal +05:45,
+/// Chatham +12:45, Newfoundland -03:30); the zone *name* is deliberately not used, because an
+/// abbreviation such as CST is ambiguous. Every zone in current tzdata is a whole number of minutes
+/// from UTC, so a sub-minute value — historical LMT data only — would be truncated, not rounded.
+fn format_gmtoff(seconds: i64) -> String {
+    if seconds == 0 {
+        return "Z".to_string();
+    }
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let magnitude = seconds.abs();
+    format!(
+        "{}{:02}:{:02}",
+        sign,
+        magnitude / 3600,
+        (magnitude % 3600) / 60
+    )
+}
+
+/// Zero-dep ISO-8601 timestamp with milliseconds: the local wall clock plus its UTC offset. Local time
+/// is what someone reading their own log expects to see; the offset is what puts two lines on one
+/// timeline when they come from different zones, or when a DST fall-back hour appears twice inside a
+/// single file.
 fn now_timestamp() -> String {
     let now = SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)
@@ -381,7 +403,7 @@ fn now_timestamp() -> String {
         let s = secs as i64;
         localtime_r(&s, &mut tm);
         format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}",
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:03}{}",
             tm.tm_year + 1900,
             tm.tm_mon + 1,
             tm.tm_mday,
@@ -389,6 +411,7 @@ fn now_timestamp() -> String {
             tm.tm_min,
             tm.tm_sec,
             ms,
+            format_gmtoff(tm.tm_gmtoff),
         )
     }
 }
@@ -406,10 +429,39 @@ mod tests {
 
     #[test]
     fn timestamps_are_well_formed() {
-        // Timestamp format: ISO-ish with T and milliseconds.
+        // "YYYY-MM-DDTHH:MM:SS.mmm" plus the offset, which is "Z" in a UTC zone and six characters
+        // elsewhere. The shape is asserted rather than a length: pinning the length is what a machine
+        // in another zone would fail.
         let ts = now_timestamp();
-        assert_eq!(ts.len(), 23); // "YYYY-MM-DDTHH:MM:SS.mmm"
-        assert!(ts.contains('T'));
+        assert!(ts.len() >= 24, "{ts}");
+        let (stamp, offset) = ts.split_at(23);
+        let shape: Vec<char> = "0000-00-00T00:00:00.000".chars().collect();
+        for (index, (got, want)) in stamp.chars().zip(shape).enumerate() {
+            assert!(
+                (want == '0' && got.is_ascii_digit()) || got == want,
+                "position {index} of {ts}"
+            );
+        }
+        if offset == "Z" {
+            return;
+        }
+        assert_eq!(offset.len(), 6, "{ts}");
+        assert!(offset.starts_with(['+', '-']), "{ts}");
+        assert_eq!(offset.as_bytes()[3], b':', "{ts}");
+    }
+
+    #[test]
+    fn gmtoff_covers_whole_and_fractional_hour_zones() {
+        // Real offsets, the odd ones included: formatting hours alone passes the common cases and
+        // silently drops the minutes of these.
+        assert_eq!(format_gmtoff(0), "Z");
+        assert_eq!(format_gmtoff(8 * 3600), "+08:00");
+        assert_eq!(format_gmtoff(-8 * 3600), "-08:00");
+        assert_eq!(format_gmtoff(5 * 3600 + 30 * 60), "+05:30"); // India
+        assert_eq!(format_gmtoff(5 * 3600 + 45 * 60), "+05:45"); // Nepal
+        assert_eq!(format_gmtoff(12 * 3600 + 45 * 60), "+12:45"); // Chatham Islands
+        assert_eq!(format_gmtoff(-(3 * 3600 + 30 * 60)), "-03:30"); // Newfoundland
+        assert_eq!(format_gmtoff(-(9 * 3600 + 30 * 60)), "-09:30"); // Marquesas
     }
 
     #[test]
