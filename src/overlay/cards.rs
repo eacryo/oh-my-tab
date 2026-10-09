@@ -407,37 +407,37 @@ pub(crate) fn create_card_view(
 
         let colors = current_colors();
 
-        if use_new {
-            // The mockup's first box-shadow is a zero-blur soft-blue ring spread 2pt
-            // outward. A transparent NSImageView carries a 2pt border: expanding its
-            // frame by 2pt per side makes the inward-drawn border cover exactly the
-            // card's outer [-2,0] band. It is added before caption/preview content;
-            // masksToBounds=false keeps the outer ring visible. refresh_highlight owns
-            // visibility and theme color.
-            let ring_inset = crate::theme::OVERLAY_RING_INSET;
-            let ring_frame = NSRect::new(
-                NSPoint::new(-ring_inset, -ring_inset),
-                NSSize::new(card_width + ring_inset * 2.0, card_h + ring_inset * 2.0),
-            );
-            let ring: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-            let ring: *mut AnyObject = msg_send![ring, initWithFrame: ring_frame];
-            let _: () = msg_send![ring, setTag: THUMB_SELECTION_RING_TAG];
-            let _: () = msg_send![ring, setWantsLayer: true];
-            let ring_layer: *mut AnyObject = msg_send![ring, layer];
-            let _: () = msg_send![ring_layer, setCornerRadius: radii.selection_ring];
-            let _: () = msg_send![ring_layer, setMasksToBounds: false];
-            let _: () = msg_send![ring_layer, setBorderWidth: 2.0f64];
-            layer_set_border(
-                ring_layer,
-                hex_to_cg_color(color_with_alpha(
-                    colors.card_border_sel,
-                    SELECTION_RING_ALPHA,
-                )),
-            );
-            let _: () = msg_send![ring, setHidden: true];
-            let _: () = msg_send![view, addSubview: ring];
-            release_obj(ring);
+        // The mockup's first box-shadow is a zero-blur soft-blue ring spread 2pt outward. A
+        // transparent NSImageView carries a 2pt border: expanding its frame by 2pt per side makes
+        // the inward-drawn border cover exactly the card's outer [-2,0] band. It is added before
+        // caption/preview content; masksToBounds=false keeps the outer ring visible.
+        // refresh_highlight owns visibility and theme color. Both layouts build it, so the
+        // icon-only selection is the same ring at the same concentric radius as the thumbnail one.
+        let ring_inset = crate::theme::OVERLAY_RING_INSET;
+        let ring_frame = NSRect::new(
+            NSPoint::new(-ring_inset, -ring_inset),
+            NSSize::new(card_width + ring_inset * 2.0, card_h + ring_inset * 2.0),
+        );
+        let ring: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let ring: *mut AnyObject = msg_send![ring, initWithFrame: ring_frame];
+        let _: () = msg_send![ring, setTag: THUMB_SELECTION_RING_TAG];
+        let _: () = msg_send![ring, setWantsLayer: true];
+        let ring_layer: *mut AnyObject = msg_send![ring, layer];
+        let _: () = msg_send![ring_layer, setCornerRadius: radii.selection_ring];
+        let _: () = msg_send![ring_layer, setMasksToBounds: false];
+        let _: () = msg_send![ring_layer, setBorderWidth: 2.0f64];
+        layer_set_border(
+            ring_layer,
+            hex_to_cg_color(color_with_alpha(
+                colors.card_border_sel,
+                SELECTION_RING_ALPHA,
+            )),
+        );
+        let _: () = msg_send![ring, setHidden: true];
+        let _: () = msg_send![view, addSubview: ring];
+        release_obj(ring);
 
+        if use_new {
             let caption_h = thumb_caption_h_for_card(card_h);
             let preview_h = thumb_preview_h(card_h);
             let caption_y = card_h - THUMB_PAD - caption_h;
@@ -1449,6 +1449,38 @@ mod badge_smoke_tests {
     }
 }
 
+#[cfg(test)]
+mod selection_ring_smoke_tests {
+    /// Run the real card view tree on the AppKit main thread in a child process and assert that both
+    /// card layouts build the documented selected-state ring. This is the regression guard for the
+    /// icon-only layout, which used to build no ring at all.
+    #[test]
+    #[ignore]
+    fn selection_ring_runtime_smoke() {
+        let exe = std::env::current_exe().expect("current exe");
+        let app = exe
+            .parent()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("oh-my-tab"))
+            .expect("app binary path");
+        assert!(
+            app.exists(),
+            "app binary missing at {}: run `cargo build` first",
+            app.display()
+        );
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-selection-ring")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "selection ring smoke failed (exit {:?})\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
 /// Count the views carrying `tag` in a view's subtree.
 unsafe fn count_views_with_tag(view: *mut AnyObject, tag: isize) -> usize {
     let own: isize = msg_send![view, tag];
@@ -1460,6 +1492,99 @@ unsafe fn count_views_with_tag(view: *mut AnyObject, tag: isize) -> usize {
         count += count_views_with_tag(child, tag);
     }
     count
+}
+
+/// Find the first view carrying `tag` in a view's subtree (depth-first). The counting variant below
+/// proves how many exist; this one hands the view over so a runner can read its geometry.
+unsafe fn view_with_tag(view: *mut AnyObject, tag: isize) -> Option<*mut AnyObject> {
+    let own: isize = msg_send![view, tag];
+    if own == tag {
+        return Some(view);
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    let subview_count: usize = msg_send![subviews, count];
+    for index in 0..subview_count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        if let Some(found) = view_with_tag(child, tag) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// A1 runner for the selected-state ring, driven by controlled card input instead of a summon: it
+/// builds the real card view once per layout and asserts both carry exactly one ring, sized
+/// `OVERLAY_RING_INSET` outside the card with the documented concentric corner radius
+/// (`card_radius + ring_inset`) and hidden until a selection shows it.
+///
+/// The counter-example is built in: the icon-only layout used to construct no ring at all, so its
+/// selection drew only the card's own 1.5pt border and read differently from the thumbnail layout.
+/// Needs a GUI session and the main thread. The layout switch writes the in-memory config slot that
+/// a runtime reload writes, and restores it before returning.
+pub(crate) fn smoke_selection_ring() -> bool {
+    unsafe {
+        let window = WindowInfo {
+            pid: std::process::id() as i32,
+            window_id: 9,
+            app_name: "selection ring smoke".to_string(),
+            window_title: "selection ring smoke".to_string(),
+            icon_path: None,
+            is_active: false,
+            minimized: false,
+            app_hidden: false,
+            fullscreen: false,
+            on_other_desktop: false,
+            bounds: (0.0, 0.0, 640.0, 400.0),
+            state: Default::default(),
+        };
+        let card_width = 220.0;
+        let card_h = 170.0;
+        let radii = crate::theme::overlay_radii(crate::theme::overlay_card_radius(), THUMB_PAD);
+        let ring_inset = crate::theme::OVERLAY_RING_INSET;
+        let mut ok = true;
+        for thumbnails in [true, false] {
+            let previous = {
+                let mut config = CONFIG.write().unwrap();
+                let previous = config.layout.thumbnails_enabled;
+                config.layout.thumbnails_enabled = thumbnails;
+                previous
+            };
+            let card = create_card_view(&window, 0, card_width, card_h, true);
+            let rings = count_views_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
+            let ring = view_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
+            let mut frame_ok = false;
+            let mut radius_ok = false;
+            let mut border_ok = false;
+            let mut hidden = false;
+            if let Some(ring) = ring {
+                let frame: NSRect = msg_send![ring, frame];
+                let layer: *mut AnyObject = msg_send![ring, layer];
+                let radius: f64 = msg_send![layer, cornerRadius];
+                let border: f64 = msg_send![layer, borderWidth];
+                hidden = msg_send![ring, isHidden];
+                frame_ok = (frame.origin.x + ring_inset).abs() < 0.5
+                    && (frame.origin.y + ring_inset).abs() < 0.5
+                    && (frame.size.width - (card_width + ring_inset * 2.0)).abs() < 0.5
+                    && (frame.size.height - (card_h + ring_inset * 2.0)).abs() < 0.5;
+                radius_ok = (radius - radii.selection_ring).abs() < 0.01;
+                border_ok = (border - 2.0).abs() < 0.01;
+            }
+            let this_ok = rings == 1 && frame_ok && radius_ok && border_ok && hidden;
+            log_info!(
+                "[smoke-selection-ring] thumbnails={} rings={} frame_ok={} radius_ok={} border_ok={} hidden={}",
+                thumbnails,
+                rings,
+                frame_ok,
+                radius_ok,
+                border_ok,
+                hidden
+            );
+            ok = ok && this_ok;
+            release_obj(card);
+            CONFIG.write().unwrap().layout.thumbnails_enabled = previous;
+        }
+        ok
+    }
 }
 
 /// A1 runner for the preview-corner badges, driven by controlled card input instead of a summon:

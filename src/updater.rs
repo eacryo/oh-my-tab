@@ -3143,4 +3143,46 @@ mod tests {
         let source = "# Release notes\n\n- One change";
         assert_eq!(select_release_notes_locale(source, "zh-Hans"), source);
     }
+
+    /// The shipped notes are read by `render_release_notes_markdown`, which understands headings and
+    /// `- ` bullets and nothing else: inline markdown is rendered as its literal characters, and a file
+    /// without a locale's block leaves that language with none of the notes, because the selector falls
+    /// back silently. Both are properties of the files rather than of one of them, so they are asserted
+    /// here instead of being re-checked by hand at each release — the zh blocks of 0.2.5 shipped `**`
+    /// until this test existed.
+    #[test]
+    fn shipped_release_notes_satisfy_the_renderer() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("release_doc_dev");
+        let mut files = 0usize;
+        for entry in std::fs::read_dir(&dir).expect("release_doc_dev is readable") {
+            let path = entry.expect("directory entry").path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("md") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("release notes are readable");
+            for locale in ["en", "zh-Hans", "zh-Hant"] {
+                let open = format!("<!-- locale: {locale} -->");
+                let start = source
+                    .find(&open)
+                    .unwrap_or_else(|| panic!("{} has no {locale} block", path.display()));
+                let rest = &source[start + open.len()..];
+                let end = rest.find("<!-- /locale -->").unwrap_or_else(|| {
+                    panic!("{} leaves the {locale} block unclosed", path.display())
+                });
+                let body = &rest[..end];
+                assert!(
+                    body.contains("- "),
+                    "{} has an empty {locale} block",
+                    path.display()
+                );
+                assert!(
+                    !body.contains("**") && !body.contains('`'),
+                    "{} writes inline markdown in its {locale} block, which the renderer shows literally",
+                    path.display()
+                );
+            }
+            files += 1;
+        }
+        assert!(files > 0, "no release notes found in {}", dir.display());
+    }
 }

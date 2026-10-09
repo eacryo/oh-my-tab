@@ -30,7 +30,7 @@ oh-my-tab is a macOS menu-bar utility centered on window switching. It uses **Co
 
 The app is written in Rust and calls AppKit, CoreGraphics, and ApplicationServices directly through `objc2` FFI, without a Swift bridge or Rust UI framework.
 
-**Every optional feature is opt-in and off by default**: clipboard history, mouse control, window control, quick actions, the keystroke display, and filters such as off-screen/minimized windows all have to be turned on in Settings.
+**Every optional feature is opt-in and off by default**: clipboard history, mouse control, window control, quick actions, the keystroke display, and filters such as hidden/minimized windows all have to be turned on in Settings. Windows on other macOS desktops are the one exception — they are shown by default, and the "Always show windows from other desktops" switch turns them off.
 
 - <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names and window titles, one card per window, multiple displays; switching keeps that app's other windows in order.
 - <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: a preview that follows each window's own aspect ratio (extremely wide or tall windows are narrowed to stay readable); needs **Screen Recording** permission, otherwise icon-only cards.

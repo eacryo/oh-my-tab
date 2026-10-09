@@ -2375,6 +2375,7 @@ pub fn run() {
             || arg == "--smoke-update-prompts"
             || arg == "--smoke-smooth-scroll-event"
             || arg == "--smoke-card-badges"
+            || arg == "--smoke-selection-ring"
             || arg == "--smoke-space-state-matrix"
     });
     let _instance_guard = if is_gui_smoke_process {
@@ -2558,6 +2559,24 @@ pub fn run() {
             std::process::exit(1);
         }
         log_info!("[smoke-card-badges] preview badges match the card state");
+        std::process::exit(0);
+    }
+
+    // Smoke-test entry (--smoke-selection-ring): build real cards from controlled window input in
+    // both layouts and assert the selected-state ring exists with the documented concentric
+    // geometry. Needs a GUI session (AppKit view tree) and no window collection at all.
+    if crate::dev_flags::present("smoke-selection-ring") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        if !overlay::smoke_selection_ring() {
+            eprintln!(
+                "[smoke-selection-ring] a card layout is missing the documented selection ring"
+            );
+            std::process::exit(1);
+        }
+        log_info!("[smoke-selection-ring] both card layouts build the documented selection ring");
         std::process::exit(0);
     }
 

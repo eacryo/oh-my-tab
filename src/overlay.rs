@@ -53,7 +53,7 @@ pub(crate) const ICON_VIEW_TAG: isize = 0xE7F2;
 /// Tag for the thumbnail-mode preview container (used for its selected border and
 /// to identify cards that receive the whole-card lift).
 const THUMB_PREVIEW_TAG: isize = 0xE7F3;
-/// Tag for the thumbnail-mode selected-state 2pt outer ring.
+/// Tag for the selected-state 2pt outer ring, built by both card layouts (thumbnail and icon-only).
 const THUMB_SELECTION_RING_TAG: isize = 0xE7F4;
 /// Tags for the two preview-corner status badges. They exist so a view-tree runner can assert that
 /// a card actually drew a badge (the decoded flags alone are satisfied by a card that never reached
@@ -346,8 +346,8 @@ mod cards;
 pub(crate) mod hover;
 use callbacks::*;
 use cancel::*;
-pub(crate) use cards::smoke_card_badges;
 use cards::*;
+pub(crate) use cards::{smoke_card_badges, smoke_selection_ring};
 
 use card_close::*;
 pub(crate) use card_close::{

@@ -51,6 +51,8 @@ python3 -B "$repo_dir_verdict/verdict.py" >/dev/null || fail "verdict.py selftes
 python3 -B "$repo_dir_verdict/space_kinds.py" >/dev/null || fail "space_kinds.py selftest failed"
 python3 -B "$repo_dir_verdict/hotkey.py" >/dev/null || fail "hotkey.py selftest failed"
 python3 -B "$repo_dir_verdict/ax_focus.py" >/dev/null || fail "ax_focus.py selftest failed"
+python3 -B "$repo_dir_verdict/config_switch.py" --selftest >/dev/null \
+    || fail "config_switch.py selftest failed"
 
 command -v cua-driver >/dev/null 2>&1 || fail "cua-driver CLI not found in PATH"
 cua-driver status >/dev/null 2>&1 || fail "cua-driver daemon is not running"
@@ -85,7 +87,6 @@ active = [a for a in apps if a.get("active")]
 print(active[0]["pid"] if active else "")
 ')"
 
-# --- phase 1: the switch off (the shipped default) --------------------------
 # Prints the app pid on stdout and the restart report on stderr: the caller captures only the pid.
 start_app() {
     rm -f "$state_file" "${state_file%.json}.tmp"
@@ -100,12 +101,11 @@ start_app() {
     printf '%s\n' "$out" | sed -n 's/^restart ok (app pid \([0-9][0-9]*\).*/\1/p' | head -1
 }
 
-python3 - "$config" remove <<'PY'
-import pathlib, sys
-path = pathlib.Path(sys.argv[1])
-lines = [l for l in path.read_text().splitlines(keepends=True) if not l.startswith("show_other_desktops")]
-path.write_text("".join(lines))
-PY
+# --- phase 1: the switch off -------------------------------------------------
+# The shipped default is on since 0.2.5, so the off state is written out explicitly; removing the
+# key would leave the default (on) in place and phase 1 would not test the off state at all.
+python3 -B "$repo_dir_verdict/config_switch.py" --set "$config" windows show_other_desktops false \
+    || fail "could not turn windows.show_other_desktops off"
 
 app_pid="$(start_app)"
 [ -n "$app_pid" ] || fail "could not read the app pid from dev-restart.sh output"
@@ -186,7 +186,6 @@ note "target: $target_app pid=$target_pid wid=$target_wid"
 python3 -B - "$state_file" "$app_pid" "$target_wid" "$target_pid" "$config" "$repo_dir_verdict" <<'PY'
 import ctypes
 import json
-import pathlib
 import subprocess
 import sys
 import time
@@ -195,6 +194,7 @@ state_file, app_pid, target_wid, target_pid, config, repo_dir_verdict = (
     sys.argv[1], int(sys.argv[2]), int(sys.argv[3]), int(sys.argv[4]), sys.argv[5], sys.argv[6],
 )
 sys.path.insert(0, repo_dir_verdict)
+from config_switch import apply  # noqa: E402
 from space_kinds import (  # noqa: E402  (the path above makes it importable)
     fullscreen_current,
     fullscreen_window_ids,
@@ -372,12 +372,9 @@ try:
     time.sleep(0.3)
 
     # --- phase 2: switch on --------------------------------------------------------------
-    path = pathlib.Path(config)
-    text = path.read_text()
-    marker = "[windows]\n"
-    if marker not in text:
-        raise AssertionError("the config has no [windows] section to add the switch to")
-    path.write_text(text.replace(marker, marker + "show_other_desktops = true\n", 1))
+    # config_switch replaces phase 1's line instead of adding a second one: two keys in `[windows]`
+    # are a TOML error and the app would fall back to its defaults.
+    apply(config, "windows", "show_other_desktops", True)
 finally:
     release_all()
 

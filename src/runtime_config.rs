@@ -354,7 +354,7 @@ mod tests {
         // what is admitted) without touching any other service.
         let old = Config::default();
         let mut new = old.clone();
-        new.windows.show_other_desktops = true;
+        new.windows.show_other_desktops = !old.windows.show_other_desktops;
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.show_other_desktops);
         assert!(
