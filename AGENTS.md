@@ -122,8 +122,10 @@ scripts/codex-review.sh --note "<text>"     # the agent's own words: verdicts, d
 scripts/codex-review.sh --note-file <path>  # the same, read from a file
 scripts/codex-review.sh --retry             # resume a round that produced no verdict
 scripts/codex-review.sh --fresh             # start a new session when the old one is gone
+scripts/codex-review.sh --task <slug>       # this task's session, archive and lock (see below)
+scripts/codex-review.sh --tasks             # list the sessions this repository holds
 scripts/codex-review.sh --timeout <sec>     # bound a run that hangs (default 1800, 0 disables)
-scripts/codex-review.sh --finish            # clear the reviewer session for the next task
+scripts/codex-review.sh --finish            # clear this task's reviewer session for the next task
 scripts/codex-review-selftest.sh            # check the helper itself, against a stub CLI, offline
 ```
 
@@ -131,6 +133,18 @@ scripts/codex-review-selftest.sh            # check the helper itself, against a
   findings, the agent's answers, and what was already tried. `--retry` resumes a round that produced no
   verdict; a round that reached one is re-reviewed by running the reviewer again. `--finish` clears the session
   at the end of the task.
+- When more than one task is in flight at once — two agents working two tasks, or a design round for one task
+  while another task's implementation is under review — each task names its own key with `--task <slug>` (or
+  says it once through `OMT_REVIEW_TASK`), so that no round can resume another task's session, read its
+  findings, clear it, or wait on its lock: session, lock, round kind, counter and archive all move under
+  `.agent-review/tasks/<key>/`, and `--tasks` lists whose session is whose. Every round of a task passes the
+  same key, `--finish` included, and a design round and the review of the implementation it agreed to are
+  deliberately the same task under one key — that is what lets the reviewer judge the implementation against
+  what it agreed. A round that names no key belongs to the keyless single-agent flow. A key is lowercased,
+  takes letters, digits, `.`, `_` and `-`, and may not be `default`, `tasks` or `rounds`. **The key separates
+  what the reviewer remembers, not the diff**: two agents in one working tree still put both tasks' changes in
+  front of the reviewer, so a tree per task is what makes two reviews independent, and what is in scope for a
+  task is what `--note` says.
 - Only a round that actually concluded counts. A transport failure, a turn that never completed, a message
   that is not a verdict or a timeout is reported as a failed round with the reason and the archived evidence
   under `.agent-review/rounds/`, and is never counted toward completion. A tree that matches HEAD is refused

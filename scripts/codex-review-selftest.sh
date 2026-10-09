@@ -25,6 +25,13 @@ helper="$script_dir/codex-review.sh"
 
 [[ -f "$helper" ]] || { echo "cannot find $helper" >&2; exit 66; }
 
+# The instrument controls its own environment. A task key the caller exported — a harness that says it once,
+# as the helper's documentation suggests — would move every keyless case's state into that task's directory
+# while the assertions still read the top-level paths, and the gate would fail for a reason that belongs to
+# the caller's shell. The same holds for a model override. The cases that test either variable set it on the
+# call itself.
+unset OMT_REVIEW_TASK OMT_REVIEW_MODEL
+
 tmp="$(mktemp -d)"
 # The pre-check below asks whether the tree is clean, so the runs that test it must keep the harness's
 # own output files outside the repository: shell redirection truncates them before the script starts,
@@ -43,21 +50,37 @@ cat > bin/codex <<'STUB'
 # A stand-in for the CLI: emits the event shapes the helper classifies, writes the -o file when it
 # has a final message, and records what it was asked and what its stdin looked like.
 mode="${STUB_MODE:-ok}"
-printf '%s' "${@: -1}" > "$STUB_DIR/last-prompt.txt"
+prompt="${@: -1}"
+printf '%s' "$prompt" > "$STUB_DIR/last-prompt.txt"
+# The session id carries the task key the prompt named, so a round that resumed another task's
+# session shows up in the assertion instead of looking like the right one. Read from the prompt the
+# way the helper wrote it; a keyless round names no task.
+task_key="$(printf '%s' "$prompt" | sed -n "s/.*belongs to task '\\([a-z0-9._-]*\\)'.*/\\1/p" | head -1)"
 echo called >> "$STUB_DIR/calls.txt"
 if read -t 1 _; then echo "data" > "$STUB_DIR/stdin.txt"; else echo "rc=$?" > "$STUB_DIR/stdin.txt"; fi
 
-out=""; prev=""; is_resume=0; model=""
+out=""; prev=""; is_resume=0; model=""; resume_id=""
 for a in "$@"; do
     [[ "$prev" == "-o" ]] && out="$a"
     [[ "$prev" == "--model" || "$prev" == "-m" ]] && model="$a"
     [[ "$a" == "resume" ]] && is_resume=1
+    [[ "$prev" == "resume" ]] && resume_id="$a"
     prev="$a"
 done
 printf '%s' "$model" > "$STUB_DIR/last-model.txt"
 printf '%s' "$is_resume" > "$STUB_DIR/last-resume.txt"
+# The id it was actually told to resume, not only that it was a resume: the thread id below is built from
+# the prompt, so a round that resumed another task's session would otherwise look like the right one.
+printf '%s' "$resume_id" > "$STUB_DIR/last-resume-id.txt"
 
-start() { echo '{"type":"thread.started","thread_id":"stub-session"}'; echo '{"type":"turn.started"}'; }
+start() {
+    if [[ -n "$task_key" ]]; then
+        echo "{\"type\":\"thread.started\",\"thread_id\":\"stub-$task_key\"}"
+    else
+        echo '{"type":"thread.started","thread_id":"stub-session"}'
+    fi
+    echo '{"type":"turn.started"}'
+}
 msg() {
     [[ -n "$out" ]] && printf '%s\n' "$1" > "$out"
     python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"agent_message","text":sys.argv[1]}}, ensure_ascii=False))' "$1"
@@ -376,9 +399,176 @@ echo "the lock"
 mkdir -p .agent-review/lock
 run ok
 check "a second review is refused" 75 "already running" "$tmp/err.txt"
+expect "the refusal points at task keys" "--task <slug>" "$tmp/err.txt"
 run ok --finish
 check "--finish respects the lock" 75 "cannot be cleared" "$tmp/err.txt"
 rmdir .agent-review/lock
+
+echo "a task key keeps a session, a lock and an archive of its own"
+run ok --task alpha
+check "a named task reviews" 0 - "$tmp/out.txt"
+expect_value "its session is its own" "stub-alpha" .agent-review/tasks/alpha/codex-session-id
+expect_value "and the keyless session is untouched" "stub-session" .agent-review/codex-session-id
+expect "the round says which task it is" "task: alpha (state: .agent-review/tasks/alpha" "$tmp/out.txt"
+expect "the reviewer is told which session it is" "belongs to task 'alpha'" "$tmp/last-prompt.txt"
+expect "and that the key does not filter what it reviews" "does not select, narrow or filter" "$tmp/last-prompt.txt"
+if [[ -f .agent-review/tasks/alpha/round-counter ]]; then
+    echo "  ok   the named task has a round counter of its own"
+else
+    echo "  FAIL the named task kept no counter"
+    failures=$((failures + 1))
+fi
+if ls .agent-review/tasks/alpha/rounds/*-outcome.txt >/dev/null 2>&1; then
+    echo "  ok   its round is archived under its own task"
+else
+    echo "  FAIL the named task's round was not archived"
+    failures=$((failures + 1))
+fi
+
+echo "each task resumes only its own session"
+run ok --task beta
+check "a second task reviews" 0 - "$tmp/out.txt"
+expect_value "it starts a session of its own" "0" "$tmp/last-resume.txt"
+# A new session resumes nothing at all, which is also what gives the check below its teeth: a stub that
+# recorded no id could not tell the two cases apart.
+expect_value "and resumes nothing" "" "$tmp/last-resume-id.txt"
+expect_value "named for that task" "stub-beta" .agent-review/tasks/beta/codex-session-id
+run ok --task alpha
+check "the first task reviews again" 0 - "$tmp/out.txt"
+expect_value "as a resume, not a new session" "1" "$tmp/last-resume.txt"
+expect_value "of its own session id, not another task's" "stub-alpha" "$tmp/last-resume-id.txt"
+expect_value "of its own session" "stub-alpha" .agent-review/tasks/alpha/codex-session-id
+
+echo "a task key is normalised and validated"
+run ok --task Alpha
+check "an uppercase key is accepted" 0 - "$tmp/out.txt"
+# The resolved key is what is asserted, not the absence of a second directory: on a case-insensitive
+# filesystem the two spellings are one directory whatever the script does, which is exactly why the
+# normalisation is stated in the output instead of being left to the filesystem.
+expect "the resolved key is printed" "task: alpha (state: .agent-review/tasks/alpha" "$tmp/out.txt"
+expect "and the session it resumed is the lowercase one" "stub-alpha" "$tmp/out.txt"
+for bad in "" "../escape" "Alpha Beta" "tasks" "rounds"; do
+    run ok --task "$bad"
+    check "the key '${bad:-<empty>}' is refused" 64 "Invalid task key" "$tmp/err.txt"
+done
+# The raw value is what is validated, so a newline a command substitution would have eaten cannot turn
+# a malformed key into a valid one: $'alpha\n' must not become 'alpha' and act on its session.
+run ok --task $'alpha\n'
+check "a key with a trailing newline is refused" 64 "Invalid task key" "$tmp/err.txt"
+expect_value "and the task it would have named is untouched" "stub-alpha" .agent-review/tasks/alpha/codex-session-id
+OMT_REVIEW_TASK=$'gamma\n' run ok
+check "the same key in the environment is refused" 64 "Invalid task key" "$tmp/err.txt"
+if [[ -e .agent-review/tasks/gamma ]]; then
+    echo "  FAIL the malformed env key wrote to a task directory"
+    failures=$((failures + 1))
+else
+    echo "  ok   the malformed env key wrote nothing"
+fi
+long_key="$(printf 'a%.0s' {1..65})"
+run ok --task "$long_key"
+check "a key longer than 64 characters is refused" 64 "Invalid task key" "$tmp/err.txt"
+
+if [[ -e .agent-review/escape || -e .agent-review/tasks/escape ]]; then
+    echo "  FAIL a refused key still made a directory"
+    failures=$((failures + 1))
+else
+    echo "  ok   a refused key creates nothing"
+fi
+# An empty key must not fall back to the environment either: "no task was named" and "the task named
+# is empty" are different statements, and only one of them is true here.
+OMT_REVIEW_TASK=gamma run ok --task ""
+check "an empty key does not fall back to the env var" 64 "Invalid task key" "$tmp/err.txt"
+if [[ -e .agent-review/tasks/gamma ]]; then
+    echo "  FAIL the env var's task was used after all"
+    failures=$((failures + 1))
+else
+    echo "  ok   nothing was written to the env var's task"
+fi
+
+echo "'default' is the keyless task's label, not a key to take"
+run ok --task default
+check "--task default is refused" 64 "Invalid task key" "$tmp/err.txt"
+expect "the refusal says what that name is" "label of the task" "$tmp/err.txt"
+run ok --task DEFAULT
+check "in any case" 64 "Invalid task key" "$tmp/err.txt"
+run ok --finish --task default
+check "--finish cannot be aimed at the keyless task through it" 64 "Invalid task key" "$tmp/err.txt"
+expect_value "so the keyless session is untouched" "stub-session" .agent-review/codex-session-id
+OMT_REVIEW_TASK=default run ok
+check "nor through the environment" 64 "Invalid task key" "$tmp/err.txt"
+expect_value "with the keyless session still untouched" "stub-session" .agent-review/codex-session-id
+
+echo "OMT_REVIEW_TASK names the task for a harness"
+OMT_REVIEW_TASK=gamma run ok
+check "the env var names the task" 0 - "$tmp/out.txt"
+expect_value "its session is its own" "stub-gamma" .agent-review/tasks/gamma/codex-session-id
+OMT_REVIEW_TASK=gamma run ok --task delta
+check "a key on the command line wins" 0 - "$tmp/out.txt"
+expect_value "over the env var" "stub-delta" .agent-review/tasks/delta/codex-session-id
+expect_value "and leaves the env var's task alone" "stub-gamma" .agent-review/tasks/gamma/codex-session-id
+
+echo "one task's lock is not another's"
+mkdir -p .agent-review/tasks/alpha/lock
+run ok
+check "a task's lock does not block the keyless task" 0 - "$tmp/out.txt"
+expect_absent "a keyless prompt names no task" "belongs to task" "$tmp/last-prompt.txt"
+run ok --task beta
+check "nor another task" 0 - "$tmp/out.txt"
+run ok --task alpha
+check "but it does block that task" 75 "already running" "$tmp/err.txt"
+expect_absent "and the keyed refusal needs no hint" "--task <slug>" "$tmp/err.txt"
+rmdir .agent-review/tasks/alpha/lock
+
+echo "two tasks review at the same time"
+STUB_MODE=hang PATH="$tmp/bin:$PATH" ./scripts/codex-review.sh --task alpha --timeout 60 >/dev/null 2>&1 &
+alpha_pid=$!
+for _ in $(seq 1 50); do [[ -d .agent-review/tasks/alpha/lock ]] && break; sleep 0.1; done
+if [[ -d .agent-review/tasks/alpha/lock ]]; then
+    echo "  ok   the hanging task holds its own lock"
+else
+    echo "  FAIL the hanging task never took its lock"
+    failures=$((failures + 1))
+fi
+run ok
+check "the keyless task reviews while it hangs" 0 - "$tmp/out.txt"
+run ok --task beta
+check "and so does another task" 0 - "$tmp/out.txt"
+kill -TERM "$alpha_pid" 2>/dev/null
+set +e
+wait "$alpha_pid" 2>/dev/null
+set -e
+if [[ -d .agent-review/tasks/alpha/lock ]]; then
+    echo "  FAIL the interrupted task left its lock behind"
+    failures=$((failures + 1))
+else
+    echo "  ok   the interrupted task released its own lock"
+fi
+
+echo "--finish clears one task's session, not the others"
+run ok --finish --task alpha
+check "--finish takes the key" 0 - "$tmp/out.txt"
+expect "and says which task it cleared" "task: alpha" "$tmp/out.txt"
+if [[ -f .agent-review/tasks/alpha/codex-session-id ]]; then
+    echo "  FAIL the named task's session survived --finish"
+    failures=$((failures + 1))
+else
+    echo "  ok   the named task's session was cleared"
+fi
+expect_value "another task's session is untouched" "stub-beta" .agent-review/tasks/beta/codex-session-id
+expect_value "and so is the keyless one" "stub-session" .agent-review/codex-session-id
+
+echo "--tasks lists the sessions this repository holds"
+run ok --tasks
+check "the listing is produced" 0 - "$tmp/out.txt"
+expect "the keyless task is listed" "^default" "$tmp/out.txt"
+expect "with its session" "stub-session" "$tmp/out.txt"
+expect "a named task is listed" "^beta" "$tmp/out.txt"
+expect "with its own session" "stub-beta" "$tmp/out.txt"
+expect_absent "a cleared task is not shown as holding one" "stub-alpha" "$tmp/out.txt"
+run ok --tasks --design
+check "a listing takes no round of its own" 64 "--tasks lists" "$tmp/err.txt"
+run ok --tasks --task beta
+check "and no task" 64 "--tasks lists" "$tmp/err.txt"
 
 echo "a signal sent to the script alone, while the CLI ignores TERM"
 rm -f "$tmp/child.pid" "$tmp/script-exit.txt"

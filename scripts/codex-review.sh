@@ -7,8 +7,24 @@
 #   scripts/codex-review.sh --fresh             start a new session when the old one is gone
 #   scripts/codex-review.sh --note "<text>"     the implementation agent's own words to the reviewer
 #   scripts/codex-review.sh --note-file <path>  the same, read from a file
+#   scripts/codex-review.sh --task <slug>       this task's reviewer session (see below)
+#   scripts/codex-review.sh --tasks             list the sessions this repository holds
 #   scripts/codex-review.sh --timeout <sec>     bound a run that hangs (default 1800, 0 disables)
-#   scripts/codex-review.sh --finish            clear the reviewer session for the next task
+#   scripts/codex-review.sh --finish            clear this task's reviewer session for the next task
+#
+# One reviewer session belongs to one task. Two tasks reviewed in this repository at the same time
+# must not resume each other's session, read each other's findings, clear each other's session or wait
+# on each other's lock, so everything kept below is keyed by task: --task <slug>, or OMT_REVIEW_TASK
+# for a harness that wants to say it once. A task key is a short slug for the work (the branch name,
+# or a one-word task name); it is lowercased, so a key is not two keys on a case-insensitive
+# filesystem. Every round of a task — the review, the re-reviews after fixes, the retries, the design
+# round, and the --finish that ends it — must pass the same key.
+#
+# The keyless case is the single-agent flow it always was: it keeps the top-level paths. A named task
+# gets .agent-review/tasks/<key>/ with a session, a lock, an archive and a round counter of its own.
+# Naming separates what the reviewer remembers; it does not separate the diff, so two agents sharing
+# one working tree still put both tasks' changes in front of the reviewer — a tree per task is what
+# makes two reviews independent.
 #
 # The reviewer runs on gpt-6.1-sol; set OMT_REVIEW_MODEL to review with another model.
 #
@@ -31,6 +47,10 @@
 #   .agent-review/last-status.txt    what the classification pass made of the newest run
 #   .agent-review/round-counter      the round number the archive names carry
 #   .agent-review/rounds/            every attempt's events, message, stderr and outcome
+#
+# Those are the paths of the keyless task. A named task holds the same set under
+# .agent-review/tasks/<key>/, so its session, lock, counter and archive are its own and a listing of
+# .agent-review/rounds/ keeps meaning the keyless task's rounds.
 
 set -euo pipefail
 
@@ -56,16 +76,13 @@ cd "$ROOT"
 # The reviewer's model. OMT_REVIEW_MODEL is for trying another one without editing this script.
 MODEL="${OMT_REVIEW_MODEL:-gpt-6.1-sol}"
 
-STATE_DIR="$ROOT/.agent-review"
-SESSION_FILE="$STATE_DIR/codex-session-id"
-OUTPUT_FILE="$STATE_DIR/last-review.txt"
-JSON_FILE="$STATE_DIR/last-review.jsonl"
-MESSAGE_FILE="$STATE_DIR/last-message.txt"
-STDERR_FILE="$STATE_DIR/last-stderr.txt"
-STATUS_FILE="$STATE_DIR/last-status.txt"
+BASE_DIR="$ROOT/.agent-review"
+TASKS_DIR="$BASE_DIR/tasks"
 
 # The conclusion is one authoritative value, so it is replaced, not appended: a signal that arrives while the
 # round is being archived must be able to turn this round's `concluded=yes` into `concluded=no`.
+# One path per field is set below, once the task key has decided which directory this round works in; the
+# function reads $STATUS_FILE when it is called, never here.
 set_concluded() {
     local value="$1" tmp
     tmp="$(mktemp)"
@@ -75,17 +92,20 @@ set_concluded() {
     echo "concluded=$value" >> "$tmp"
     mv "$tmp" "$STATUS_FILE"
 }
-KIND_FILE="$STATE_DIR/last-round-kind"
-ROUNDS_DIR="$STATE_DIR/rounds"
-LOCK_DIR="$STATE_DIR/lock"
-TIMEOUT_MARKER="$STATE_DIR/timed-out"
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/codex-review.sh [--design] [--retry] [--fresh] [--note <text>]
-                               [--note-file <path>] [--timeout <seconds>] [--finish]
+usage: scripts/codex-review.sh [--task <slug>] [--design] [--retry] [--fresh] [--note <text>]
+                               [--note-file <path>] [--timeout <seconds>] [--finish] [--tasks]
 
   (no options)        review, or re-review the same session after fixes
+  --task <slug>       this task's reviewer session: its own session, lock, counter and archive under
+                      .agent-review/tasks/<slug>/. Use the same slug for every round of the task.
+                      Lowercased; letters, digits, '.', '_' and '-'. OMT_REVIEW_TASK sets the
+                      same thing for a harness that wants to say it once; --task wins over it.
+                      Without either, the task is the keyless one and keeps the top-level paths;
+                      'default' is the label that task is listed under and is not a key to take.
+  --tasks             list the sessions this repository holds: key, session, kind, rounds, running
   --design            put the approach to the reviewer before any code is written; ends with
                       PLAN-STATUS instead of REVIEW-STATUS and needs no change in the tree
   --retry             the previous round produced no verdict; resume the same session and say so
@@ -93,7 +113,7 @@ usage: scripts/codex-review.sh [--design] [--retry] [--fresh] [--note <text>]
   --note <text>       put the implementation agent's own words to the reviewer
   --note-file <path>  the same, read from a file (both may be given; they are joined)
   --timeout <sec>     bound a run that has not finished in this long (default 1800, 0 = none)
-  --finish            clear the reviewer session for the next task
+  --finish            clear this task's reviewer session for the next task
 
 The model is gpt-6.1-sol; OMT_REVIEW_MODEL overrides it.
 EOF
@@ -101,6 +121,9 @@ EOF
 
 note=""
 note_file=""
+task_arg=""
+task_given=0
+list_tasks=0
 finish=0
 retry=0
 fresh=0
@@ -118,6 +141,17 @@ while [[ $# -gt 0 ]]; do
             [[ $# -ge 2 ]] || { usage; exit 64; }
             note_file="$2"
             shift 2
+            ;;
+        --task)
+            [[ $# -ge 2 ]] || { usage; exit 64; }
+            task_arg="$2"
+            # Recorded separately from the value: an empty --task is a malformed key, not "no task".
+            task_given=1
+            shift 2
+            ;;
+        --tasks)
+            list_tasks=1
+            shift
             ;;
         --timeout)
             [[ $# -ge 2 ]] || { usage; exit 64; }
@@ -160,6 +194,97 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# A listing of the sessions this repository holds, for the question a keyed workflow raises: whose
+# session is which, and is one of them running. Read-only, so it takes no lock and needs no CLI — and
+# it is answered before any key is resolved, because a listing is not a round and must not be refused
+# on account of a malformed key in the environment.
+if [[ "$list_tasks" == 1 ]]; then
+    if [[ -n "$note" || -n "$note_file" || "$task_given" == 1 || "$design" == 1 || "$retry" == 1 \
+        || "$fresh" == 1 || "$finish" == 1 ]]; then
+        echo "--tasks lists the sessions this repository holds; it takes no task and no round of its own." >&2
+        exit 64
+    fi
+    task_row() {
+        local key="$1" dir="$2" session kind rounds running
+        session="$(cat "$dir/codex-session-id" 2>/dev/null || true)"
+        kind="$(cat "$dir/last-round-kind" 2>/dev/null || true)"
+        rounds=0
+        if [[ -d "$dir/rounds" ]]; then
+            rounds="$(find "$dir/rounds" -name '*-outcome.txt' 2>/dev/null | wc -l | tr -d '[:space:]')"
+        fi
+        running="no"
+        [[ -d "$dir/lock" ]] && running="yes"
+        printf '%-20s %-38s %-7s %-7s %s\n' "$key" "${session:-none}" "${kind:--}" "$rounds" "$running"
+    }
+    printf '%-20s %-38s %-7s %-7s %s\n' "task" "session" "kind" "rounds" "running"
+    task_row "default" "$BASE_DIR"
+    for dir in "$TASKS_DIR"/*/; do
+        [[ -d "$dir" ]] || continue
+        task_row "$(basename "$dir")" "${dir%/}"
+    done
+    exit 0
+fi
+
+# Which reviewer session this round belongs to. The key is what keeps two tasks apart in one
+# repository, so it is resolved before anything is read or written: inside a key every round of that
+# task finds its own session, and across keys no round can find another task's.
+if [[ "$task_given" == 1 ]]; then
+    TASK_KEY="$task_arg"
+    TASK_SOURCE="--task"
+elif [[ -n "${OMT_REVIEW_TASK:-}" ]]; then
+    TASK_KEY="$OMT_REVIEW_TASK"
+    TASK_SOURCE="OMT_REVIEW_TASK"
+else
+    TASK_KEY="default"
+    TASK_SOURCE=""
+fi
+# The value is validated as it was given, before anything is normalised. A command substitution
+# strips trailing newlines and a shell may strip them again on the way in, so a key like $'alpha\n' is
+# checked here as the two-name string it is: accepting it would silently act on the task named 'alpha',
+# which is the mix-up the keys exist to prevent. Uppercase is allowed at this point and only for a key
+# about to be lowercased.
+if [[ ! "$TASK_KEY" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]]; then
+    echo "Invalid task key '${TASK_KEY}' (from ${TASK_SOURCE:-the default}): a task key is a short slug" >&2
+    echo "of letters, digits, '.', '_' and '-', starting with a letter or digit, at most 64 characters." >&2
+    exit 64
+fi
+# Lowercased, because a case-insensitive filesystem would otherwise map two spellings onto one
+# directory and merge two tasks without saying so.
+TASK_KEY="$(printf '%s' "$TASK_KEY" | tr '[:upper:]' '[:lower:]')"
+
+# 'default' is the name the keyless task is listed under, so it is not a key a caller may take: --task
+# default would resume, block on or clear the session of the agent that named nothing, which is exactly
+# the interference the keys are here to stop. The other two are the state directory's own names.
+if [[ -n "$TASK_SOURCE" ]]; then
+    case "$TASK_KEY" in
+        default|tasks|rounds)
+            echo "Invalid task key '$TASK_KEY' (from $TASK_SOURCE): 'default' is the label of the task" >&2
+            echo "that names no key, and 'tasks' and 'rounds' are the state directory's own names." >&2
+            echo "Give this task a slug of its own, or omit the key to work in the keyless task." >&2
+            exit 64
+            ;;
+    esac
+fi
+
+if [[ "$TASK_KEY" == "default" ]]; then
+    STATE_DIR="$BASE_DIR"
+    STATE_LABEL=".agent-review"
+else
+    STATE_DIR="$TASKS_DIR/$TASK_KEY"
+    STATE_LABEL=".agent-review/tasks/$TASK_KEY"
+fi
+
+SESSION_FILE="$STATE_DIR/codex-session-id"
+OUTPUT_FILE="$STATE_DIR/last-review.txt"
+JSON_FILE="$STATE_DIR/last-review.jsonl"
+MESSAGE_FILE="$STATE_DIR/last-message.txt"
+STDERR_FILE="$STATE_DIR/last-stderr.txt"
+STATUS_FILE="$STATE_DIR/last-status.txt"
+KIND_FILE="$STATE_DIR/last-round-kind"
+ROUNDS_DIR="$STATE_DIR/rounds"
+LOCK_DIR="$STATE_DIR/lock"
+TIMEOUT_MARKER="$STATE_DIR/timed-out"
+
 mkdir -p "$STATE_DIR" "$ROUNDS_DIR"
 
 # A relative --note-file belongs to the directory the caller typed it in, not to the repository root
@@ -173,9 +298,18 @@ if [[ "$retry" == 1 && "$fresh" == 1 ]]; then
     exit 64
 fi
 
-# One review at a time: two runs would overwrite each other's session file and event stream.
+# One review at a time *per task*: two runs of one task would overwrite each other's session file and
+# event stream. Two tasks are keyed apart, so their reviews may run side by side, which is the point of
+# the keys.
 release_lock() {
     rmdir "$LOCK_DIR" 2>/dev/null || true
+}
+
+# The key every round of this task has to name, printed where it can be read back out of a transcript:
+# a round that resumed a session nobody expected is the failure this makes visible.
+announce_task() {
+    [[ -n "$TASK_SOURCE" ]] || return 0
+    echo "task: $TASK_KEY (state: $STATE_LABEL, from $TASK_SOURCE)"
 }
 
 if [[ "$finish" == 1 ]]; then
@@ -190,7 +324,11 @@ if [[ "$finish" == 1 ]]; then
     trap release_lock EXIT
     rm -f "$SESSION_FILE" "$OUTPUT_FILE" "$STATE_DIR/last-plan.txt" "$KIND_FILE" "$JSON_FILE" \
         "$MESSAGE_FILE" "$STATUS_FILE" "$TIMEOUT_MARKER" "$JSON_FILE.stream-message"
-    echo "Codex reviewer session cleared."
+    if [[ -n "$TASK_SOURCE" ]]; then
+        echo "Codex reviewer session cleared (task: $TASK_KEY)."
+    else
+        echo "Codex reviewer session cleared."
+    fi
     exit 0
 fi
 
@@ -202,9 +340,14 @@ fi
 if ! mkdir "$LOCK_DIR" 2>/dev/null; then
     echo "Another review is already running (lock: $LOCK_DIR)." >&2
     echo "If nothing is reviewing, remove that directory and try again." >&2
+    if [[ -z "$TASK_SOURCE" ]]; then
+        echo "Two agents sharing this repository need a task key each: --task <slug>, or OMT_REVIEW_TASK." >&2
+    fi
     exit 75
 fi
 trap release_lock EXIT
+
+announce_task
 
 # A retry resumes *that* round, so it keeps that round's kind: the one thing a retry must never do is
 # turn a design consultation that was never answered into a code review verdict. Read under the lock,
@@ -682,6 +825,22 @@ if [[ "$fresh" == 1 ]]; then
         # a reviewer told otherwise could pass over a finding that is still open.
         FRESH_NOTE="The previous reviewer session was lost, so review the current tree from scratch and reach your own conclusion: you have no memory of any earlier finding, and whether one was fixed is for you to judge from the diff."
         FIRST_REVIEW_PROMPT="$FIRST_REVIEW_PROMPT"$'\n\n'"$FRESH_NOTE"
+    fi
+fi
+
+# A named task says which one it is, so that a misuse — a round resuming a session nobody expected —
+# is visible in the transcript. It names the session and nothing else: the key is a slug, not a scope,
+# so the prompt must not ask the reviewer to sort the tree's changes by it. What is in scope for a task
+# is what the note says, and the tree is what the reviewer reviews.
+# It goes in before the status instruction, which has to stay the last thing in the prompt.
+if [[ -n "$TASK_SOURCE" ]]; then
+    TASK_NOTE="This review session belongs to task '$TASK_KEY'. The key names the session only: it does not select, narrow or filter which changes you review, and the working tree may hold work belonging to other tasks."
+    if [[ "$design" == 1 ]]; then
+        DESIGN_PROMPT="$DESIGN_PROMPT"$'\n\n'"$TASK_NOTE"
+    else
+        FIRST_REVIEW_PROMPT="$FIRST_REVIEW_PROMPT"$'\n\n'"$TASK_NOTE"
+        REREVIEW_PROMPT="$REREVIEW_PROMPT"$'\n\n'"$TASK_NOTE"
+        RETRY_PROMPT="$RETRY_PROMPT"$'\n\n'"$TASK_NOTE"
     fi
 fi
 
