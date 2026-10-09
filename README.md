@@ -30,20 +30,17 @@ oh-my-tab is a macOS menu-bar utility centered on window switching. It uses **Co
 
 The app is written in Rust and calls AppKit, CoreGraphics, and ApplicationServices directly through `objc2` FFI, without a Swift bridge or Rust UI framework.
 
-- <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names, window titles, one card per window, across multiple displays.
-- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: a caption row above a 16:10 window preview captured through a private WindowServer API. Cached frames appear first and refresh in the background; rows are balanced when they fit, while overflowing grids fill in MRU order and scroll continuously. Requires **Screen Recording** permission; without it, the switcher falls back to icon-only cards. Turning thumbnails off releases the cached window frames from memory.
-- <img height="14" src="docs/icons/history.svg"> **Window-level MRU**: switching one window keeps the app's other windows in their existing order.
-- <img height="14" src="docs/icons/eye.svg"> **Off-screen and minimized windows**: optionally include them in the switcher.
-- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab, Shift+Tab, arrow keys, or mouse after Command/Option; the shortcut can be switched to Option+Tab.
-- <img height="14" src="docs/icons/tools.svg"> **Window control**: maximize, snap to halves or quarters, or minimize with Option+arrow keys, and move windows across displays with Option+Shift+arrow keys.
-- <img height="14" src="docs/icons/zap.svg"> **Quick actions**: Option+I opens Settings, Option+E opens Finder, Option+D shows the desktop, Option+L locks the screen, and double-tapping Control locates the pointer.
-- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images, file copies — search, pin, delete, expiry, and history kept across restarts ([Clipboard history](#clipboard-history)).
-- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration, and **side-button → shortcut mapping**.
-- <img height="14" src="docs/icons/star.svg"> **Appearance**: light, dark, or system theme, plus Liquid Glass styling (`NSGlassEffectView`, with an `NSVisualEffectView` fallback), tint, corner radius, and font size.
-- <img height="14" src="docs/icons/gear.svg"> **Settings**: configure appearance and features from the Settings window; most changes take effect immediately.
-- <img height="14" src="docs/icons/globe.svg"> **Built-in localization**: English, Simplified Chinese, and Traditional Chinese, with automatic system-language selection.
-- <img height="14" src="docs/icons/package.svg"> **Native Rust app**: uses a bounded in-memory thumbnail cache and does not require an Electron or Tauri runtime.
-- <img height="14" src="docs/icons/note.svg"> **Rolling logs**: stale backups and legacy log files are cleaned up after 30 days ([Logging](#logging)).
+**Every optional feature is opt-in and off by default**: clipboard history, mouse control, window control, quick actions, the keystroke display, and filters such as off-screen/minimized windows all have to be turned on in Settings.
+
+- <img height="14" src="docs/icons/stack.svg"> **Native switcher**: app names and window titles, one card per window, multiple displays; switching keeps that app's other windows in order.
+- <img height="14" src="docs/icons/image.svg"> **Window thumbnails**: a preview that follows each window's own aspect ratio (extremely wide or tall windows are narrowed to stay readable); needs **Screen Recording** permission, otherwise icon-only cards.
+- <img height="14" src="docs/icons/key.svg"> **Keyboard navigation**: Tab / Shift+Tab / arrow keys / mouse; the shortcut can be Option+Tab.
+- <img height="14" src="docs/icons/tools.svg"> **Window control** (optional): Option+arrow keys maximize, snap or minimize; add Shift to move a window to the next display.
+- <img height="14" src="docs/icons/zap.svg"> **Quick actions** (optional): Option+I/E/D/L open Settings, Finder, the desktop and the lock screen; double-tap Control to locate the pointer.
+- <img height="14" src="docs/icons/copy.svg"> **Clipboard history** (optional): text, images and files — search, pin, delete, expiry and encrypted storage.
+- <img height="14" src="docs/icons/sliders.svg"> **Mouse control** (optional): scroll modes, reversal, per-device acceleration and side-button → shortcut mapping.
+- <img height="14" src="docs/icons/star.svg"> **Appearance and settings**: light / dark / system, liquid glass, tint, radius and font size, all managed in Settings.
+- <img height="14" src="docs/icons/globe.svg"> **Languages and logs**: English / Simplified / Traditional Chinese following the system; rotating logs cleaned up after 30 days.
 
 <br />
 
@@ -126,7 +123,7 @@ Development-only issues and raw-binary debugging notes are collected in [docs/de
 > ./scripts/dev-restart.sh  # build, sign, and launch the development .app
 > ```
 
-`scripts/dev-restart.sh` builds and assembles a separately signed development `.app`, then launches it through the per-user `launchd` domain. This keeps Accessibility and Screen Recording permissions associated with the development bundle and starts the binary produced by that build. Layout QA fixtures, debug-only layout assertions, and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md).
+`scripts/dev-restart.sh` builds the development `.app` and re-assembles and re-signs it only when its inputs changed, then launches it through the per-user `launchd` domain. It signs with an Apple-issued identity when one is installed (the self-signed certificate is the only accepted fallback, and ad-hoc signing is refused; a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` asks for the self-signed one). A stable identity is what keeps Accessibility, Screen Recording and keychain grants alive across rebuilds, so a restart without changes reuses the existing bundle; layout QA fixtures, debug-only layout assertions and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md). Layout QA fixtures, debug-only layout assertions, and the GUI smoke test are documented in [docs/developer-notes-en.md](docs/developer-notes-en.md).
 
 ### Release
 

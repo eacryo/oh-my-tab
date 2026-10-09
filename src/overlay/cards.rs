@@ -373,7 +373,8 @@ pub(crate) fn create_card_view(
         let card_cls = CARD_CLASS.lock().unwrap().unwrap();
         let card_cls_ptr = card_cls.0 as *mut AnyObject;
 
-        // Thumbnails on = the mockup layout (caption + 16:10 preview); off = the
+        // Thumbnails on = the mockup layout (caption + preview, whose width follows the window's own
+        // aspect ratio -- 16:10 is only the reference for an unknown one); off = the
         // legacy layout (centered icon + two text lines). The height comes from the
         // caller: after the flow layout's shrink step each card's actual height is
         // smaller than the base, and the internal geometry MUST be laid out from

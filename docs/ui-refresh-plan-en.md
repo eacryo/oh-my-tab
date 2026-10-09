@@ -34,7 +34,7 @@ What the app does today, with the literal's location. This is the "before" colum
 | Light `text_muted` | `#9B9BA2` → **2.76:1** (card) | `theme.rs:124` |
 | Light `text_disabled` | `#AEAEB5` → **2.21:1** | `theme.rs:125` |
 | Card definition | 7% border + 36pt soft shadow | `theme.rs:118`, `settings/widgets.rs:2196` |
-| Preset label | raw key `mouse_smooth_preset_ease_in` | `mouse/smooth/presets.rs:95–105`, `settings/page_builder.rs:899` |
+| Preset label | raw key `mouse_smooth_preset_ease_in` | `mouse/smooth/presets.rs:95–105`, `settings/page_builder.rs:1014` |
 | Hardcoded English | `Regular`, `Clear`, `Debug`, `Info` | `settings/page_builder.rs:558,574,658` |
 | Select overflow | wraps to two lines | `settings/select.rs:26` |
 | Sliders | integer sliders draw tick marks | `settings/widgets.rs:1536` |
@@ -88,7 +88,7 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
 - **Now**: `SmoothPreset::label_key()` returns keys without the `settings.` prefix while the locale
   files store them under `[settings]`, so `t()` falls through to the key itself.
 - **Target**: the dropdown reads 缓入 / Ease In and never renders a key.
-- **Files**: `mouse/smooth/presets.rs`, `settings/page_builder.rs:897–901`.
+- **Files**: `mouse/smooth/presets.rs`, `settings/page_builder.rs:903–907`.
 - **Acceptance**: a unit test asserting every `label_key()` resolves in all three locales (a
   regression test for the whole `label_key` family, not just the one preset); plus a general
   `i18n` test that no call site passes a key with no `settings.`-prefixed counterpart. Consider a
@@ -149,7 +149,7 @@ onto them. The visible result is a UI that stops looking almost-aligned.
   tile/close radii from `appearance.corner_radius`.
 - **Files**: `settings/components.rs:926,955,1065,1104`, `settings/widgets.rs:116,1223,1954,2001,2385,2625`,
   `settings/select.rs:345,858,1059`, `settings/sidebar.rs:188`, `settings/tooltip.rs:438,496`,
-  `settings/page_builder.rs:1106,1118`, `overlay/cards.rs:129,150,295,329`,
+  `settings/page_builder.rs:1112,1124`, `overlay/cards.rs:129,150,295,329`,
   `overlay/cancel.rs:722`, `overlay/card_close.rs:751`, `clipboard/*.rs`.
 - **Acceptance**: a test asserting that every `setCornerRadius:` value in the settings surface comes
   from a named constant; the ring radius equals the card radius plus the documented inset.

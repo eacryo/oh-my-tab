@@ -31,7 +31,7 @@
 | 浅色 `text_muted` | `#9B9BA2` → **2.76:1**（卡片上） | `theme.rs:124` |
 | 浅色 `text_disabled` | `#AEAEB5` → **2.21:1** | `theme.rs:125` |
 | 卡片层次 | 7% 描边 + 36pt 柔光投影 | `theme.rs:118`、`settings/widgets.rs:2196` |
-| 预设标签 | 原始 key `mouse_smooth_preset_ease_in` | `mouse/smooth/presets.rs:95–105`、`settings/page_builder.rs:899` |
+| 预设标签 | 原始 key `mouse_smooth_preset_ease_in` | `mouse/smooth/presets.rs:95–105`、`settings/page_builder.rs:1014` |
 | 硬编码英文 | `Regular`、`Clear`、`Debug`、`Info` | `settings/page_builder.rs:558,574,658` |
 | 下拉框溢出 | 折成两行 | `settings/select.rs:26` |
 | 滑杆 | 整数滑杆绘制刻度线 | `settings/widgets.rs:1536` |
@@ -76,7 +76,7 @@
 - **现状**：`SmoothPreset::label_key()` 返回的 key 不带 `settings.` 前缀，而 locale 文件把这些键放在
   `[settings]` 段下，于是 `t()` 逐级回退，最终把 key 本身渲染出来。
 - **目标**：下拉显示「缓入 / Ease In」，任何情况下都不显示 key。
-- **文件**：`mouse/smooth/presets.rs`、`settings/page_builder.rs:897–901`。
+- **文件**：`mouse/smooth/presets.rs`、`settings/page_builder.rs:903–907`。
 - **验收**：单元测试断言每个 `label_key()` 在三个 locale 中都能解析（针对整个 `label_key` 家族回归，
   而不只是这一个 preset）；再加一个通用 i18n 测试，防止调用点传入没有 `settings.` 前缀对应项的 key。
   可考虑加 debug 断言：`t()` 对含 `_` 的 key 不得返回其入参本身。
@@ -127,7 +127,7 @@
   `appearance.corner_radius` 计算得出。
 - **文件**：`settings/components.rs:926,955,1065,1104`、`settings/widgets.rs:116,1223,1954,2001,2385,2625`、
   `settings/select.rs:345,858,1059`、`settings/sidebar.rs:188`、`settings/tooltip.rs:438,496`、
-  `settings/page_builder.rs:1106,1118`、`overlay/cards.rs:129,150,295,329`、
+  `settings/page_builder.rs:1112,1124`、`overlay/cards.rs:129,150,295,329`、
   `overlay/cancel.rs:722`、`overlay/card_close.rs:751`、`clipboard/*.rs`。
 - **验收**：测试断言设置界面的每个 `setCornerRadius:` 取值都来自具名常量；环半径等于卡片半径加上文档规定的内缩。
 

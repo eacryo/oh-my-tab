@@ -28,20 +28,17 @@
 
 oh-my-tab 是一款使用 Rust 原生开发的 macOS 工具，集成了窗口切换、鼠标控制、历史剪贴板、窗口控制和快捷操作，不依赖 Electron 或 Tauri 运行时。
 
-- <img height="14" src="docs/icons/stack.svg"> **窗口切换器**：显示应用名与窗口标题，每个窗口一张卡片，支持多显示器。
-- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**：标题行下方显示通过私有 WindowServer API 截取的 16:10 窗口预览。应用会先显示内存缓存，再在后台刷新；单页时平衡排列，溢出时按 MRU 顺序填满并连续滚动。需要**屏幕录制**权限；未授权时回退为纯图标卡片。关闭缩略图后会释放内存中的窗口截图。
-- <img height="14" src="docs/icons/history.svg"> **窗口级 MRU**：切换某个窗口时，该应用的其他窗口保持原有顺序。
-- <img height="14" src="docs/icons/eye.svg"> **离屏与最小化窗口**：可选择是否在切换器中显示。
-- <img height="14" src="docs/icons/key.svg"> **灵活导航**：支持 Tab、Shift+Tab、方向键和鼠标；快捷键可切换为 Option+Tab。
-- <img height="14" src="docs/icons/tools.svg"> **窗口控制**：通过 Option+方向键最大化、分屏、四分屏和最小化窗口；Option+Shift+方向键可把窗口移到相邻显示器。
-- <img height="14" src="docs/icons/zap.svg"> **快捷操作**：Option+I 打开设置、Option+E 打开访达、Option+D 显示桌面、Option+L 锁屏，双击 Control 定位鼠标。
-- <img height="14" src="docs/icons/copy.svg"> **历史剪贴板**（可选）：文本、图片和文件条目——搜索、置顶、删除、过期与持久化（[剪贴板历史](#剪贴板历史)）。
-- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**（可选）：滚动模式、反向滚动、按设备禁用指针加速，以及**侧键 → 快捷键映射**。
-- <img height="14" src="docs/icons/star.svg"> **外观定制**：浅色、深色或跟随系统主题，以及 Liquid Glass 样式（`NSGlassEffectView`，旧系统回退 `NSVisualEffectView`）、色调、圆角和字号。
-- <img height="14" src="docs/icons/gear.svg"> **设置**：统一管理外观与各项功能，大多数修改会立即生效。
-- <img height="14" src="docs/icons/globe.svg"> **内置多语言支持**：简体中文、繁体中文和英文，可跟随系统语言。
-- <img height="14" src="docs/icons/package.svg"> **Rust 原生应用**：缩略图使用有明确上限的内存缓存，不依赖 Electron 或 Tauri 运行时。
-- <img height="14" src="docs/icons/note.svg"> **滚动日志**：旧备份和旧版日志超过 30 天后清理（[日志](#日志)）。
+**所有可选功能都按需启用、默认关闭**：历史剪贴板、鼠标控制、窗口控制、快捷操作、按键显示，以及“离屏与最小化窗口”这类筛选，都要在设置里手动打开。
+
+- <img height="14" src="docs/icons/stack.svg"> **窗口切换器**：应用名与窗口标题、每窗口一张卡片、多显示器；切换时该应用其他窗口保持原顺序。
+- <img height="14" src="docs/icons/image.svg"> **窗口缩略图**：预览按窗口自身的宽高比显示（比例极端时收窄到合理范围）；需要**屏幕录制**权限，未授权时退化为纯图标卡片。
+- <img height="14" src="docs/icons/key.svg"> **灵活导航**：Tab / Shift+Tab / 方向键 / 鼠标；快捷键可改为 Option+Tab。
+- <img height="14" src="docs/icons/tools.svg"> **窗口控制**（可选）：Option+方向键最大化、分屏、最小化；加 Shift 移到相邻显示器。
+- <img height="14" src="docs/icons/zap.svg"> **快捷操作**（可选）：Option+I/E/D/L 打开设置、访达、桌面、锁屏；双击 Control 定位鼠标。
+- <img height="14" src="docs/icons/copy.svg"> **历史剪贴板**（可选）：文本、图片与文件条目，可搜索、置顶、删除、过期，并加密持久化。
+- <img height="14" src="docs/icons/sliders.svg"> **鼠标控制**（可选）：滚动模式、反向滚动、按设备指针加速、侧键 → 快捷键映射。
+- <img height="14" src="docs/icons/star.svg"> **外观与设置**：浅色 / 深色 / 跟随系统、液态玻璃、色调、圆角、字号，都在设置里统一管理。
+- <img height="14" src="docs/icons/globe.svg"> **三语与日志**：简繁英跟随系统；日志滚动，旧备份 30 天后清理。
 
 ## 通过 Homebrew 安装
 
@@ -70,7 +67,7 @@ brew uninstall --cask oh-my-tab
 - **历史剪贴板**：开启后按 **Option+V** 呼出；支持键盘和鼠标操作，点击浮窗外部关闭。
 - **权限**：窗口切换需要辅助功能权限；缩略图需要屏幕录制权限。缺少屏幕录制权限时不影响窗口切换，只显示图标卡片。
 
-剪贴板持久化默认关闭。开启后会以未加密形式保存文本、文件名和图片数据；如果你会复制密码或令牌，请不要开启。完整说明见[官方网站](https://oh-my-tab.app/)。
+剪贴板持久化默认关闭。开启后历史会**加密**写入磁盘（密钥在本机登录钥匙串里）；隐私边界见下方「剪贴板历史」中的说明与[官方网站](https://oh-my-tab.app/)。
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;剪贴板历史
 
@@ -86,7 +83,9 @@ brew uninstall --cask oh-my-tab
 
 **使用条目默认会重排历史**（同 Maccy）。选中条目后按 Enter，会将其写回剪贴板；记录器会把它当作一次新的复制并移到最前。设置中的**“使用后移到最前”**可以关闭此行为（同 Windows Win+V）。
 
-开启**“粘贴后删除条目”**后，Option+Enter 或 Option+点按会粘贴条目并将其从历史中移除。其从属选项**“同时删除系统剪贴板中对应条目”**会在短暂延迟后清除对应内容；如果期间出现了新的复制，则不执行清除。“清空历史”会保留置顶条目。**“保存剪贴板历史记录到磁盘”**可让历史在重启后继续保留，隐私风险见上方「快速使用」中的说明。
+开启**“粘贴后删除条目”**后，Option+Enter 或 Option+点按会粘贴条目并将其从历史中移除。其从属选项**“同时删除系统剪贴板中对应条目”**会在短暂延迟后清除对应内容；如果期间出现了新的复制，则不执行清除。筛选行旁边的两个清除动作只清除你正在看的那些条目——当前选中的分类，或搜索时的结果——并且保留置顶条目，除非你选的是“全部清除”那一个。**“退出应用或关机后清除历史记录”**（默认关闭）会在有序退出时删除历史文件与缓存的图片数据——Command+Q、菜单里的“退出”、注销或关机——让这次会话不在磁盘上留下东西。
+
+> **开启剪贴板历史期间，历史会加密写入磁盘。** 复制的文本、文件名与图片数据用 AES-256-GCM 封装，密钥是一把随机值、保存在本机登录钥匙串里，因此没有它这些文件读不出来。**它不覆盖的部分**：应用运行期间历史在内存中；元数据（文件名、大小与时间戳）可见；关闭功能之前已经同步或备份出去的副本仍留在原处；钥匙串项被其它工具删除后，已保存的历史将永久读不出来。拿不到钥匙串访问时功能不可用、什么都不记录（也没有内存回退）；设置页、历史面板与一条系统通知都会说明，其中两个**应用内界面**各有一个**“授予钥匙串访问”**动作，会要求输入一次钥匙串密码。如果你会复制密码或令牌，请保持功能关闭，或打开**“退出应用或关机后清除历史记录”**；崩溃或强制退出无法执行该清理。详见[官方网站](https://oh-my-tab.app/)。
 
 ## 已知问题
 
@@ -127,7 +126,7 @@ cargo test
 ./scripts/dev-restart.sh
 ```
 
-`scripts/dev-restart.sh` 会构建并组装独立签名的开发版 `.app`，再交给用户级 `launchd` 启动，这样辅助功能与屏幕录制授权会绑定到开发版 bundle，启动的也是本次构建生成的二进制。布局 QA 夹具、调试期的布局断言和 GUI 冒烟测试见[开发环境说明](docs/developer-notes.md)。
+`scripts/dev-restart.sh` 构建开发版 `.app`，**只在输入变化时**才重新组装与重签，然后交给用户级 `launchd` 启动。签名优先用 Apple 签发的身份（自签名证书是**唯一**允许的回退，**拒绝 ad-hoc**；Apple 身份签名失败即构建失败，除非显式 `--allow-signing-fallback`）。身份稳定，辅助功能、屏幕录制与钥匙串授权才能跨重建保留，因此没有改动的一次重启会复用现有包。布局 QA 夹具、调试期的布局断言和 GUI 冒烟测试见[开发环境说明](docs/developer-notes.md)。
 
 如需生成可分发的 `.app` 与 `.dmg`，运行 `sh scripts/bundle.sh`。完整发布流程（含 `--push`）、开发通道、Sparkle 更新与代码签名见[发布流程](docs/releasing.md)。
 
