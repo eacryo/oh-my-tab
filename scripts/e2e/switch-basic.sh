@@ -91,7 +91,7 @@ rm -f "$state_file" "${state_file%.json}.tmp"
 
 # 4) 驱动前记录前台 app,便于断言"确实换了"(否则这次切换什么都没证明)。
 #    Record the pre-drive frontmost app so "it actually switched" can be asserted.
-pre_active="$(cua-driver call list_apps '{"include_installed":false}' | python3 -c '
+pre_active="$(cua-driver list_apps '{}' | python3 -c '
 import json, sys
 apps = json.load(sys.stdin)["apps"]
 active = [a for a in apps if a.get("active")]
@@ -310,7 +310,7 @@ if committed_pid:
     )
     # --- OS 侧对账:前台 app + WindowServer 里的真实窗口 -------------------
     time.sleep(0.6)
-    apps = cua("list_apps", {"include_installed": False})["apps"]
+    apps = cua("list_apps", {})["apps"]
     active = [a for a in apps if a.get("active")]
     active_pid = active[0]["pid"] if active else None
     check(

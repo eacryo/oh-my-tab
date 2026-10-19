@@ -654,35 +654,36 @@ pub(super) fn refresh_detail_action_visuals() {
 /// delete/clear turn red, filters only darken. On exit the state is restored (filters go
 /// through update_filter_pill_style so the active tint is never clobbered).
 pub(super) unsafe fn hover_button_class() -> *mut AnyObject {
+    hover_button_class_handle().0 as *mut AnyObject
+}
+
+/// The class handle itself, so the super dispatch inside `mouseDown:` can name the class that
+/// defined that override.
+fn hover_button_class_handle() -> StaticClass {
     static HOVER_BTN_CLS: OnceLock<StaticClass> = OnceLock::new();
-    HOVER_BTN_CLS
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipHoverButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                hover_button_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                hover_button_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                hover_button_mouse_down as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
+    crate::ffi::StaticClass::register_once(&HOVER_BTN_CLS, c"OhMyTabClipHoverButton", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipHoverButton",
+            class!(NSButton),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    hover_button_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    hover_button_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    hover_button_mouse_down
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
 }
 
 /// The save-as button's hover/pressed state.
@@ -702,9 +703,9 @@ unsafe fn set_detail_share_style(button: *mut AnyObject, engaged: bool) {
 
 /// Hover enter: color by action (the mockup's .action:hover / .clear-history:hover /
 /// .filter:hover).
-extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn hover_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     unsafe {
-        let b = _self as *mut AnyObject;
+        let b = _self;
         let action: Sel = msg_send![b, action];
         if is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, true);
@@ -760,9 +761,9 @@ extern "C" fn hover_button_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c
 
 /// Hover exit: restore the base color; a filter only updates its own tint and never touches
 /// the shared underline.
-extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn hover_button_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
-        let b = _self as *mut AnyObject;
+        let b = _self;
         let action: Sel = msg_send![b, action];
         if is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, false);
@@ -784,7 +785,9 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
             // Action buttons are sibling views of the row, so leaving one does not trigger the
             // row button's mouseExited; clear row hover only after the whole row is left.
             let tag: isize = msg_send![b, tag];
-            if tag >= 0 && (event.is_null() || !mouse_inside_row(event, tag as usize)) {
+            if tag >= 0
+                && (event.is_null() || !mouse_inside_row(event as *mut c_void, tag as usize))
+            {
                 clear_hover_row_if(tag as usize);
             }
         }
@@ -838,15 +841,15 @@ extern "C" fn hover_button_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_v
 /// NSButton behavior.
 /// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
 /// aborts the process), so it is contained here.
-extern "C" fn hover_button_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn hover_button_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     crate::callback_guard::void("hover_button_mouse_down", || unsafe {
         hover_button_mouse_down_inner(_self, _cmd, event)
     });
 }
 
-unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+unsafe fn hover_button_mouse_down_inner(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
-        let button = _self as *mut AnyObject;
+        let button = _self;
         let action: Sel = msg_send![button, action];
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(button, true);
@@ -859,7 +862,12 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut c_void, _cmd: Sel, event: *m
         }
 
         // NSButton's own mouseDown: runs the highlight/press tracking loop (the shared trampoline).
-        crate::ui::corner_glyph::call_super_mouse_down(_self, sel!(mouseDown:), event);
+        crate::ui::corner_glyph::call_super_mouse_down(
+            _self as *mut c_void,
+            hover_button_class_handle(),
+            sel!(mouseDown:),
+            event as *mut c_void,
+        );
 
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(button, true);

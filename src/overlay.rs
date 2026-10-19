@@ -340,7 +340,8 @@ mod card_close;
 mod cards;
 mod footer_settings;
 pub(crate) mod hover;
-mod panel_keys;
+// Visible to the crate so the pool helper's own test can exercise it (see panel_keys.rs).
+pub(crate) mod panel_keys;
 pub(crate) use callbacks::show_overlay_for_development;
 use callbacks::*;
 use cancel::*;

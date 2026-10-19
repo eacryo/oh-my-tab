@@ -512,7 +512,7 @@ unsafe fn animate_detail_close(
         let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
         animate_detail_content(detail_content, false);
         detail_finish_close(
-            detail_window as *mut c_void,
+            detail_window,
             sel!(finishDetailClose:),
             std::ptr::null_mut(),
         );
@@ -548,14 +548,13 @@ unsafe fn animate_detail_close(
 
 /// Hide the detail window after the close animation; reopening during the delay keeps the old
 /// callback from hiding the new panel.
-extern "C" fn detail_finish_close(this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+extern "C" fn detail_finish_close(this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     if detail_visible() {
         return;
     }
     unsafe {
-        let window = this as *mut AnyObject;
-        let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
-        let _: () = msg_send![window, setAlphaValue: 1.0f64];
+        let _: () = msg_send![this, orderOut: std::ptr::null::<AnyObject>()];
+        let _: () = msg_send![this, setAlphaValue: 1.0f64];
     }
 }
 
@@ -979,6 +978,53 @@ pub(super) fn hide_detail() {
     }
 }
 
+/// The detail panel's window class, as a handle: it defines `finishDetailClose:`, the delayed
+/// callback the close animation schedules on the window.
+fn detail_window_class_handle() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabClipDetailWindow", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipDetailWindow",
+            class!(NSPanel),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(canBecomeKeyWindow),
+                    detail_window_can_not_become_key
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(finishDetailClose:),
+                    detail_finish_close
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+}
+
+/// The detail content container's class. Flipped and click-consuming, as its two overrides say.
+fn detail_content_class_handle() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabClipDetailContent", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipDetailContent",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    detail_content_mouse_down
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(isFlipped),
+                    detail_content_is_flipped
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+                );
+            },
+        )
+    })
+}
+
 /// Build the detail panel window (once): a Nonactivating NSPanel with the same glass
 /// backdrop as the picker. KEY: canBecomeKeyWindow is overridden to NO, so the panel never
 /// becomes key -- keyboard focus stays in the picker's container (all keys keep going
@@ -998,27 +1044,7 @@ unsafe fn ensure_detail_window() {
     // Same as the picker: NSWindowStyleMaskNonactivatingPanel (1<<7), no app activation.
     let style: u64 = 1 << 7;
 
-    let window_cls = {
-        let name = CString::new("OhMyTabClipDetailWindow").unwrap();
-        let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(canBecomeKeyWindow),
-            detail_window_can_not_become_key as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        let types_finish = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(finishDetailClose:),
-            detail_finish_close as *mut c_void,
-            types_finish.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
+    let window_cls = detail_window_class_handle().0 as *mut AnyObject;
     let window: *mut AnyObject = msg_send![window_cls, alloc];
     let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
     apply_panel_appearance(window);
@@ -1042,25 +1068,8 @@ unsafe fn ensure_detail_window() {
     // The content container is flipped and top-aligned. Detail text is selectable, and an
     // ordinary image click must not dismiss the panel either; Esc/←/→ or list actions close it.
     let content = {
-        let name = CString::new("OhMyTabClipDetailContent").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_v = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(mouseDown:),
-            detail_content_mouse_down as *mut c_void,
-            types_v.as_ptr(),
-        );
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(isFlipped),
-            detail_content_is_flipped as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        let content: *mut AnyObject = msg_send![cls, alloc];
+        let content_cls = detail_content_class_handle().0 as *mut AnyObject;
+        let content: *mut AnyObject = msg_send![content_cls, alloc];
         let content: *mut AnyObject = msg_send![
             content,
             initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
@@ -1085,19 +1094,24 @@ unsafe fn ensure_detail_window() {
 }
 
 /// The detail panel never becomes key (keyboard focus stays in the picker's container).
-extern "C" fn detail_window_can_not_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
-    false
+extern "C" fn detail_window_can_not_become_key(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+) -> objc2::runtime::Bool {
+    // The `B` encoding AppKit declares for this selector, not a Rust `bool`: objc2's signature
+    // check compares the registered method with NSWindow's own before registering it.
+    objc2::runtime::Bool::NO
 }
 
 /// The content container is flipped.
-extern "C" fn detail_content_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
+extern "C" fn detail_content_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
 }
 
 /// Consume ordinary clicks on the detail container. NSTextView already consumes clicks for
 /// selection, whereas image clicks reach the container; both content kinds must behave alike
 /// and never accidentally dismiss the detail panel.
-extern "C" fn detail_content_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {}
+extern "C" fn detail_content_mouse_down(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {}
 
 /// Toggle code-detail soft wrapping and rebuild in place; the new scroll view naturally resets
 /// its horizontal position to the leading edge.
@@ -1849,32 +1863,34 @@ pub(super) fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (
 /// wraps, with markers remaining drawing-only decorations. Text remains mouse-selectable; copying
 /// uses the native context menu or Cmd+C forwarded by the picker because the detail never becomes key.
 pub(super) fn detail_text_view_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabClipDetailTextView").unwrap();
-        let superclass = class!(NSTextView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(copy:),
-            detail_text_view_copy as *mut c_void,
-            types.as_ptr(),
-        );
-        let types_draw = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
-        class_addMethod(
-            cls,
-            sel!(drawRect:),
-            detail_text_view_draw_rect as *mut c_void,
-            types_draw.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    detail_text_view_class_handle().0 as *mut AnyObject
+}
+
+/// The class handle itself, so the `drawRect:` super dispatch can name the class that defined
+/// that override instead of the superclass it calls into.
+fn detail_text_view_class_handle() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabClipDetailTextView", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipDetailTextView",
+            class!(NSTextView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(copy:),
+                    detail_text_view_copy
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(drawRect:),
+                    detail_text_view_draw_rect as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect),
+                );
+            },
+        )
+    })
 }
 
 /// The native Copy menu must also pass through the source mapping, never copying formatted text.
-extern "C" fn detail_text_view_copy(_self: *mut c_void, _cmd: Sel, _sender: *mut AnyObject) {
+extern "C" fn detail_text_view_copy(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     copy_detail_selection();
 }
 
@@ -1970,17 +1986,17 @@ unsafe fn build_soft_wrap_glyphs(dark: bool, material: u8) -> SoftWrapGlyphs {
 
 /// Draw soft-wrap markers after NSTextView finishes, reading layout results without modifying
 /// textStorage.
-extern "C" fn detail_text_view_draw_rect(_self: *mut c_void, _cmd: Sel, rect: NSRect) {
+extern "C" fn detail_text_view_draw_rect(_self: *mut AnyObject, _cmd: Sel, rect: NSRect) {
     unsafe {
         type Draw = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect);
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class: class!(NSTextView) as *const _ as *mut c_void,
-        };
+        // The class that defines this override, not NSTextView: objc_super starts its search there,
+        // so passing the superclass would skip the implementation that must run first.
+        let mut sup =
+            ObjcSuper::for_defined_class(_self as *mut c_void, detail_text_view_class_handle());
         let draw: Draw = std::mem::transmute(objc_msgSendSuper as *const ());
         draw(&mut sup, sel!(drawRect:), rect);
 
-        let view = _self as *mut AnyObject;
+        let view = _self;
         let is_code = DETAIL_SOFT_WRAP_TEXT_VIEW
             .lock()
             .unwrap()

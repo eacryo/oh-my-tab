@@ -87,15 +87,13 @@ pub(crate) unsafe fn refresh_glyph_button_strings(button: *mut AnyObject, key: &
 /// That was a shipped defect in both new gears, and the reason a shared helper matters.
 pub(crate) unsafe fn call_super_mouse_down(
     receiver: *mut c_void,
+    defined: crate::ffi::StaticClass,
     cmd: objc2::runtime::Sel,
     event: *mut c_void,
 ) {
     type MouseDown =
         unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, objc2::runtime::Sel, *mut c_void);
-    let mut sup = crate::ffi::ObjcSuper {
-        receiver,
-        super_class: objc2::class!(NSButton) as *const objc2::runtime::AnyClass as *mut c_void,
-    };
+    let mut sup = crate::ffi::ObjcSuper::for_defined_class(receiver, defined);
     let call: MouseDown = std::mem::transmute(objc2::ffi::objc_msgSendSuper as *const ());
     call(&mut sup, cmd, event);
 }

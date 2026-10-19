@@ -131,14 +131,13 @@ fn is_safe_update_info_url(url: &str) -> bool {
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("https://"))
 }
 
-/// The dynamically registered subclass is retained by the Objective-C runtime forever.
-struct CustomDriverClass(*mut AnyObject);
-
-unsafe impl Send for CustomDriverClass {}
-unsafe impl Sync for CustomDriverClass {}
-
-static CUSTOM_DRIVER_CLASS: OnceLock<CustomDriverClass> = OnceLock::new();
-static CUSTOM_DRIVER_SUPERCLASS: OnceLock<usize> = OnceLock::new();
+/// The defining class of the Sparkle driver subclass. `register_once` owns the slot, so the
+/// class is built once even if `custom_driver_class` is re-entered.
+///
+/// It is the *defined* class, not the superclass: `ObjcSuper::for_defined_class` derives the
+/// superclass from it, because `objc_super.super_class` must be the class the search starts at
+/// (the superclass of the class that defined the override).
+static CUSTOM_DRIVER_DEFINED_CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
 static CHECK_LOADING_TIMER_TARGET: OnceLock<CallbackTarget> = OnceLock::new();
 
 unsafe fn send_id(receiver: *mut AnyObject, selector: Sel) -> *mut AnyObject {
@@ -212,13 +211,10 @@ unsafe fn load_framework() -> *mut c_void {
 
 unsafe fn call_super_no_arguments(receiver: *mut c_void, selector: Sel) {
     type Fn = unsafe extern "C" fn(*mut ObjcSuper, Sel);
-    let superclass = *CUSTOM_DRIVER_SUPERCLASS
+    let defined = *CUSTOM_DRIVER_DEFINED_CLASS
         .get()
-        .expect("Sparkle custom user-driver superclass is initialized");
-    let mut objc_super = ObjcSuper {
-        receiver,
-        super_class: superclass as *mut c_void,
-    };
+        .expect("Sparkle custom user-driver class is initialized");
+    let mut objc_super = ObjcSuper::for_defined_class(receiver, defined);
     let f: Fn = std::mem::transmute(objc_msgSendSuper as *const ());
     f(&mut objc_super, selector);
 }
@@ -723,25 +719,40 @@ extern "C" fn advance_check_loading_frame(_this: *mut c_void, _cmd: Sel, _timer:
 unsafe fn check_loading_timer_target() -> *mut AnyObject {
     CHECK_LOADING_TIMER_TARGET
         .get_or_init(|| {
-            let name = CString::new("OhMyTabUpdateCheckLoadingTimerTarget").unwrap();
-            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(advanceCheckLoadingFrame:),
-                advance_check_loading_frame as *mut c_void,
-                types.as_ptr(),
+            // The class is built once even if a second check starts: register_once owns the slot, so
+            // a re-entry reuses the class instead of meeting a duplicate name.
+            static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+            let cls = crate::ffi::StaticClass::register_once(
+                &CLASS,
+                c"OhMyTabUpdateCheckLoadingTimerTarget",
+                || {
+                    let name = c"OhMyTabUpdateCheckLoadingTimerTarget";
+                    let superclass = class!(NSObject) as *const _ as *mut AnyObject;
+                    let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+                    assert!(
+                        !cls.is_null(),
+                        "dynamic class {} could not be allocated; is it registered twice?",
+                        name.to_string_lossy()
+                    );
+                    let types = CString::new("v@:@").unwrap();
+                    class_addMethod(
+                        cls,
+                        sel!(advanceCheckLoadingFrame:),
+                        advance_check_loading_frame as *mut c_void,
+                        types.as_ptr(),
+                    );
+                    let timeout_types = CString::new("v@:").unwrap();
+                    class_addMethod(
+                        cls,
+                        sel!(handleUpdateCheckTimeout),
+                        handle_update_check_timeout as *mut c_void,
+                        timeout_types.as_ptr(),
+                    );
+                    objc_registerClassPair(cls);
+                    crate::ffi::StaticClass::defining(cls)
+                },
             );
-            let timeout_types = CString::new("v@:").unwrap();
-            class_addMethod(
-                cls,
-                sel!(handleUpdateCheckTimeout),
-                handle_update_check_timeout as *mut c_void,
-                timeout_types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            let target: *mut AnyObject = msg_send![cls as *const AnyObject, new];
+            let target: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, new];
             CallbackTarget::new(target)
         })
         .0
@@ -2625,21 +2636,22 @@ extern "C" fn dismiss_update_installation(this: *mut c_void, _cmd: Sel) {
 }
 
 unsafe fn custom_driver_class() -> *mut AnyObject {
-    CUSTOM_DRIVER_CLASS
-        .get_or_init(|| {
+    // register_once owns the slot: `initialize` is idempotent by contract, and re-registering the
+    // same class name would give objc_allocateClassPair a name the runtime already owns.
+    crate::ffi::StaticClass::register_once(
+        &CUSTOM_DRIVER_DEFINED_CLASS,
+        c"OhMyTabSparkleUserDriver",
+        || unsafe {
             let superclass = AnyClass::get(c"SPUStandardUserDriver")
                 .expect("Sparkle standard user driver class is loaded");
             let superclass_ptr = superclass as *const AnyClass as *mut AnyObject;
-            CUSTOM_DRIVER_SUPERCLASS
-                .set(superclass_ptr as usize)
-                .expect("Sparkle user driver superclass initialized once");
 
-            let class_name = CString::new("OhMyTabSparkleUserDriver")
-                .expect("custom Sparkle user driver class name is valid");
+            let class_name = c"OhMyTabSparkleUserDriver";
             let cls = objc_allocateClassPair(superclass_ptr, class_name.as_ptr(), 0);
             assert!(
                 !cls.is_null(),
-                "failed to allocate Sparkle user driver subclass"
+                "dynamic class {} could not be allocated; is it registered twice?",
+                class_name.to_string_lossy()
             );
 
             let types_one_object = CString::new("v@:@").unwrap();
@@ -2818,9 +2830,10 @@ unsafe fn custom_driver_class() -> *mut AnyObject {
                 types_no_arguments.as_ptr(),
             );
             objc_registerClassPair(cls);
-            CustomDriverClass(cls)
-        })
-        .0
+            crate::ffi::StaticClass::defining(cls)
+        },
+    )
+    .0 as *mut AnyObject
 }
 
 /// Start Sparkle if its framework is available in the current app bundle.

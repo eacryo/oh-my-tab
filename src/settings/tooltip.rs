@@ -3,7 +3,7 @@
 use objc2::runtime::{AnyObject, Sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::collections::HashMap;
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::sync::{LazyLock, Mutex, OnceLock};
 
 /// Disabled rows own their tracking areas through the corresponding AppKit view. Store only
@@ -43,25 +43,25 @@ const HOVER_REVEAL_DELAY: f64 = 0.6;
 /// The bubble is a passive overlay; keeping hit testing disabled ensures it never blocks the
 /// controls underneath it while it is visible.
 fn tooltip_bubble_view_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabSettingsTooltipBubble").unwrap();
-        let superclass = objc2::class!(NSView) as *const _ as *mut AnyObject;
-        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("@@:{CGPoint=dd}").unwrap();
-        crate::ffi::class_addMethod(
-            cls,
-            objc2::sel!(hitTest:),
-            tooltip_bubble_hit_test as *mut c_void,
-            types.as_ptr(),
-        );
-        crate::ffi::objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabSettingsTooltipBubble", || {
+        crate::ffi::build_class(
+            c"OhMyTabSettingsTooltipBubble",
+            objc2::class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    objc2::sel!(hitTest:),
+                    tooltip_bubble_hit_test
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 extern "C" fn tooltip_bubble_hit_test(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
@@ -91,9 +91,13 @@ unsafe fn tracking_area_view(event: *mut AnyObject) -> *mut AnyObject {
     pointer as *mut AnyObject
 }
 
-extern "C" fn disabled_cursor_mouse_entered(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn disabled_cursor_mouse_entered(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+    event: *mut AnyObject,
+) {
     unsafe {
-        let view = tracking_area_view(event as *mut AnyObject);
+        let view = tracking_area_view(event);
         let enabled = if view.is_null() {
             true
         } else if objc2::msg_send![view, respondsToSelector: objc2::sel!(isEnabled)] {
@@ -110,16 +114,19 @@ extern "C" fn disabled_cursor_mouse_entered(_self: *mut c_void, _cmd: Sel, event
     }
 }
 
-extern "C" fn disabled_cursor_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn disabled_cursor_mouse_exited(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+    _event: *mut AnyObject,
+) {
     unsafe {
         let cursor: *mut AnyObject = objc2::msg_send![objc2::class!(NSCursor), arrowCursor];
         let _: () = objc2::msg_send![cursor, set];
     }
 }
 
-extern "C" fn tooltip_timeout(_self: *mut c_void, _cmd: Sel, timer: *mut c_void) {
+extern "C" fn tooltip_timeout(_self: *mut AnyObject, _cmd: Sel, timer: *mut AnyObject) {
     unsafe {
-        let timer = timer as *mut AnyObject;
         let is_active = ACTIVE_TIMER
             .lock()
             .unwrap()
@@ -137,9 +144,9 @@ unsafe impl Sync for HoverTooltipTarget {}
 
 static HOVER_TOOLTIP_TARGET: OnceLock<HoverTooltipTarget> = OnceLock::new();
 
-extern "C" fn hover_tooltip_mouse_entered(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn hover_tooltip_mouse_entered(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
-        let view = tracking_area_view(event as *mut AnyObject);
+        let view = tracking_area_view(event);
         if view.is_null() {
             return;
         }
@@ -192,10 +199,10 @@ fn hover_exit_effect(
     }
 }
 
-extern "C" fn hover_tooltip_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn hover_tooltip_mouse_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
         let exiting = {
-            let view = tracking_area_view(event as *mut AnyObject);
+            let view = tracking_area_view(event);
             (!view.is_null()).then_some(view as usize)
         };
         let effect = hover_exit_effect(
@@ -281,7 +288,7 @@ unsafe fn hover_view_under_pointer(window: *mut AnyObject) -> Option<(usize, Str
 /// Show the tooltip the pointer has been resting on. The delay only ever holds a view *address*;
 /// the label under the pointer is resolved afresh here, so a page that was rebuilt or torn down
 /// during the delay simply has no entry and nothing is shown.
-extern "C" fn hover_tooltip_reveal(_self: *mut c_void, _cmd: Sel, timer: *mut c_void) {
+extern "C" fn hover_tooltip_reveal(_self: *mut AnyObject, _cmd: Sel, timer: *mut AnyObject) {
     unsafe {
         let timer_addr = timer as usize;
         let is_active = HOVER_TIMER
@@ -315,66 +322,66 @@ extern "C" fn hover_tooltip_reveal(_self: *mut c_void, _cmd: Sel, timer: *mut c_
 }
 
 fn hover_tooltip_target() -> *mut AnyObject {
-    HOVER_TOOLTIP_TARGET
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabHoverTooltipTarget").unwrap();
-            let superclass = objc2::class!(NSObject) as *const _ as *mut AnyObject;
-            let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            crate::ffi::class_addMethod(
-                cls,
-                objc2::sel!(mouseEntered:),
-                hover_tooltip_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            crate::ffi::class_addMethod(
-                cls,
-                objc2::sel!(mouseExited:),
-                hover_tooltip_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            crate::ffi::class_addMethod(
-                cls,
-                objc2::sel!(revealHoverTooltip:),
-                hover_tooltip_reveal as *mut c_void,
-                types.as_ptr(),
-            );
-            crate::ffi::objc_registerClassPair(cls);
-            let target: *mut AnyObject = objc2::msg_send![cls, new];
-            HoverTooltipTarget(target)
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    let target: *mut AnyObject =
+        crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabHoverTooltipTarget", || {
+            crate::ffi::build_class(
+                c"OhMyTabHoverTooltipTarget",
+                objc2::class!(NSObject),
+                |builder| unsafe {
+                    builder.add_method::<AnyObject, _>(
+                        objc2::sel!(mouseEntered:),
+                        hover_tooltip_mouse_entered
+                            as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                    builder.add_method::<AnyObject, _>(
+                        objc2::sel!(mouseExited:),
+                        hover_tooltip_mouse_exited
+                            as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                    builder.add_method::<AnyObject, _>(
+                        objc2::sel!(revealHoverTooltip:),
+                        hover_tooltip_reveal
+                            as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                },
+            )
         })
+        .0 as *mut AnyObject;
+    HOVER_TOOLTIP_TARGET
+        .get_or_init(|| unsafe { HoverTooltipTarget(objc2::msg_send![target, new]) })
         .0
 }
 
 fn disabled_cursor_target() -> *mut AnyObject {
-    DISABLED_CURSOR_TARGET
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabDisabledCursorTarget").unwrap();
-            let superclass = objc2::class!(NSObject) as *const _ as *mut AnyObject;
-            let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            crate::ffi::class_addMethod(
-                cls,
-                objc2::sel!(mouseEntered:),
-                disabled_cursor_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            crate::ffi::class_addMethod(
-                cls,
-                objc2::sel!(mouseExited:),
-                disabled_cursor_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            crate::ffi::class_addMethod(
-                cls,
-                objc2::sel!(hideTooltip:),
-                tooltip_timeout as *mut c_void,
-                types.as_ptr(),
-            );
-            crate::ffi::objc_registerClassPair(cls);
-            let target: *mut AnyObject = objc2::msg_send![cls, new];
-            DisabledCursorTarget(target)
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    let target: *mut AnyObject =
+        crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabDisabledCursorTarget", || {
+            crate::ffi::build_class(
+                c"OhMyTabDisabledCursorTarget",
+                objc2::class!(NSObject),
+                |builder| unsafe {
+                    builder.add_method::<AnyObject, _>(
+                        objc2::sel!(mouseEntered:),
+                        disabled_cursor_mouse_entered
+                            as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                    builder.add_method::<AnyObject, _>(
+                        objc2::sel!(mouseExited:),
+                        disabled_cursor_mouse_exited
+                            as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                    builder.add_method::<AnyObject, _>(
+                        objc2::sel!(hideTooltip:),
+                        tooltip_timeout
+                            as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                },
+            )
         })
+        .0 as *mut AnyObject;
+    DISABLED_CURSOR_TARGET
+        .get_or_init(|| unsafe { DisabledCursorTarget(objc2::msg_send![target, new]) })
         .0
 }
 

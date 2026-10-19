@@ -854,10 +854,9 @@ pub(super) extern "C" fn clipboard_window_send_event(
     unsafe {
         let window = _self as *mut AnyObject;
         type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
-        let mut sup = ObjcSuper {
-            receiver: window as *mut c_void,
-            super_class: class!(NSPanel) as *const _ as *mut c_void,
-        };
+        // The class that defined sendEvent:, recorded when the picker window was registered.
+        let defined = *crate::clipboard::picker_window_class();
+        let mut sup = ObjcSuper::for_defined_class(window as *mut c_void, defined);
         let send_event: SendEvent = std::mem::transmute(objc_msgSendSuper as *const ());
         send_event(&mut sup, sel!(sendEvent:), event);
     }
@@ -1892,11 +1891,9 @@ pub(super) extern "C" fn search_field_mouse_down(
             return;
         }
         type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> ();
-        let super_class = class!(NSSearchField) as *const _ as *mut c_void;
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class,
-        };
+        // The class that defined mouseDown: here (registered in detail.rs).
+        let defined = *crate::clipboard::search_field_class();
+        let mut sup = ObjcSuper::for_defined_class(_self, defined);
         let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
         f(&mut sup, sel!(mouseDown:), event);
     }

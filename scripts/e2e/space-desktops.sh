@@ -98,7 +98,7 @@ cp "$config" "$config_backup"
 rm -f "$state_file" "${state_file%.json}.tmp"
 
 
-front_app_before="$(cua-driver list_apps '{"include_installed":false}' | python3 -c '
+front_app_before="$(cua-driver list_apps '{}' | python3 -c '
 import json, sys
 apps = json.load(sys.stdin)["apps"]
 active = [a for a in apps if a.get("active")]
@@ -924,7 +924,7 @@ try:
         check(target_window.get("on_current_space") is True,
               "the active desktop is now the target's desktop",
               f"current_space={windows.get('current_space_id')} spaces={target_window.get('space_ids')}")
-    apps = cua("list_apps", {"include_installed": False}).get("apps", [])
+    apps = cua("list_apps", {}).get("apps", [])
     active = [a for a in apps if a.get("active")]
     check(bool(active) and active[0]["pid"] == target_pid,
           "the target app is frontmost", f"active={active[0] if active else None}")
@@ -1408,7 +1408,7 @@ try:
           f"current_space={windows.get('current_space_id')}")
     # The rescue branch must land the same switch the activation branch does, so it is held to the
     # same frontmost reconciliation instead of only "the window reached this desktop".
-    apps = cua("list_apps", {"include_installed": False}).get("apps", [])
+    apps = cua("list_apps", {}).get("apps", [])
     active = [a for a in apps if a.get("active")]
     check(bool(active) and active[0]["pid"] == target_pid,
           "the rescue left the target app frontmost", f"active={active[0] if active else None}")

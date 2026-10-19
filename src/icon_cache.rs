@@ -186,16 +186,27 @@ fn extract_icon_to_cache_resolved(
 /// suffix ("" -> {key}.png, ".small" -> {key}.small.png); both sizes share one {key}.meta
 /// fingerprint (the same executable mtime).
 fn extract_icon_render(pid: i32, id: &AppIdentity, pt_size: f64, suffix: &str) -> Option<String> {
+    // app/icon/tiff/rep/png are autoreleased (+0). At startup this runs before NSApp run (no pool
+    // yet), so without a pool they all leak -- the ~40MB startup cause.
+    //
+    // The pool wraps the body instead of being drained by hand at each exit: the function has
+    // seven returns, each of which used to repeat the drain, so any new early return leaked the
+    // whole extraction. objc2::rc::autoreleasepool also drains while unwinding, which the
+    // hand-written pairs did not.
+    objc2::rc::autoreleasepool(|_pool| extract_icon_render_inner(pid, id, pt_size, suffix))
+}
+
+fn extract_icon_render_inner(
+    pid: i32,
+    id: &AppIdentity,
+    pt_size: f64,
+    suffix: &str,
+) -> Option<String> {
     unsafe {
         use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-        // Wrap in an autorelease pool: app/icon/tiff/rep/png are autoreleased (+0). At startup
-        // this runs before NSApp run (no pool yet), so they'd all leak - the ~40MB startup cause.
-        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-
         // Hit an existing valid cache (mtime-verified) -> skip extraction.
         if let Some(path) = check_cache_for_suffix(id, suffix) {
-            let _: () = msg_send![pool, drain];
             return Some(path);
         }
 
@@ -222,13 +233,11 @@ fn extract_icon_render(pid: i32, id: &AppIdentity, pt_size: f64, suffix: &str) -
             let cls = class!(NSRunningApplication);
             let app: *mut AnyObject = msg_send![cls, runningApplicationWithProcessIdentifier: pid];
             if app.is_null() {
-                let _: () = msg_send![pool, drain];
                 return None;
             }
             msg_send![app, icon]
         };
         if icon.is_null() {
-            let _: () = msg_send![pool, drain];
             return None;
         }
 
@@ -259,21 +268,18 @@ fn extract_icon_render(pid: i32, id: &AppIdentity, pt_size: f64, suffix: &str) -
         let tiff: *mut AnyObject = msg_send![target_img, TIFFRepresentation];
         let _: () = msg_send![target_img, release]; // target_img is an alloc (+1) the pool cannot own, so release it manually
         if tiff.is_null() {
-            let _: () = msg_send![pool, drain];
             return None;
         }
 
         let rep_cls = class!(NSBitmapImageRep);
         let rep: *mut AnyObject = msg_send![rep_cls, imageRepWithData: tiff];
         if rep.is_null() {
-            let _: () = msg_send![pool, drain];
             return None;
         }
 
         // NSBitmapImageFileTypePNG = 4
         let png: *mut AnyObject = msg_send![rep, representationUsingType: 4u64, properties: std::ptr::null::<AnyObject>()];
         if png.is_null() {
-            let _: () = msg_send![pool, drain];
             return None;
         }
 
@@ -285,7 +291,6 @@ fn extract_icon_render(pid: i32, id: &AppIdentity, pt_size: f64, suffix: &str) -
                 let _ = std::fs::write(meta_path_for_key(&id.key), fp);
             }
         }
-        let _: () = msg_send![pool, drain];
         result
     }
 }

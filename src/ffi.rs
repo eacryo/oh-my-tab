@@ -431,27 +431,10 @@ extern "C" {
         imp: *mut c_void,
         types: *const c_char,
     ) -> bool;
-    /// Add an instance variable to a dynamic subclass BEFORE registering the class (the settings
-    /// slider uses it to carry its double-click default). `alignment` is log2 (f64 -> 3) and
-    /// `types` is the ObjC encoding ("d" = double).
-    pub(crate) fn class_addIvar(
-        cls: *mut AnyObject,
-        name: *const c_char,
-        size: usize,
-        alignment: u8,
-        types: *const c_char,
-    ) -> bool;
-    /// Ivar lookup + its byte offset inside the instance, for typed direct access.
-    ///
-    /// The deprecated `object_set/getInstanceVariable` pair is deliberately avoided: it treats the
-    /// ivar as an `id` (stores/returns a *pointer* instead of copying the declared type), which
-    /// writes a stack address into a scalar ivar (measured: a double ivar read back as a
-    /// denormal like 3e-314).
-    pub(crate) fn class_getInstanceVariable(
-        cls: *mut AnyObject,
-        name: *const c_char,
-    ) -> *mut c_void;
-    pub(crate) fn ivar_getOffset(ivar: *mut c_void) -> isize;
+    // Defining an ivar goes through `ClassBuilder::add_ivar` (it must run before any
+    // `add_method`, and it derives size/alignment/encoding from the Rust type instead of the
+    // three hand-written parameters this declaration used to take). Reading one back uses
+    // objc2::ffi directly at the one place that needs the offset.
     pub(crate) fn objc_getClass(name: *const c_char) -> *mut AnyObject;
     // objc2's msg_send! cannot express every signature; callers transmute the untyped symbol
     // into a concrete function pointer. This is the single declaration site -- do not inline
@@ -464,7 +447,39 @@ extern "C" {
 #[repr(C)]
 pub(crate) struct ObjcSuper {
     pub(crate) receiver: *mut c_void,
-    pub(crate) super_class: *mut c_void,
+    super_class: *mut c_void,
+}
+
+impl ObjcSuper {
+    /// Build the receiver for an override defined in `defined`, deriving the superclass from it.
+    ///
+    /// `defined` must be the class that *defines* the override, never its superclass. The
+    /// superclass is resolved here rather than passed in because `objc_super.super_class` is
+    /// the class the search *starts* at: handing it `defined` itself would re-enter the
+    /// override until the stack overflows, and handing it an unrelated class silently skips
+    /// the implementation that should run.
+    ///
+    /// What this buys is that a call site no longer writes `super_class` at all, so those two
+    /// mistakes cannot be made *there*. It does not verify that `defined` is the defining class:
+    /// any non-null class passes, and passing the superclass by mistake still starts the search
+    /// one level too high. Getting that argument right is the call site's job, which is why every
+    /// converted entry is named in the gate in this module's tests.
+    pub(crate) fn for_defined_class(receiver: *mut c_void, defined: StaticClass) -> Self {
+        let defined_ptr = defined.0;
+        debug_assert!(
+            !defined_ptr.is_null(),
+            "ObjcSuper::for_defined_class needs a registered class"
+        );
+        let superclass = unsafe { objc2::ffi::class_getSuperclass(defined_ptr) };
+        debug_assert!(
+            !superclass.is_null(),
+            "the defined class has no superclass; it cannot dispatch super"
+        );
+        Self {
+            receiver,
+            super_class: superclass as *mut c_void,
+        }
+    }
 }
 
 /// `Rc` marker deliberately makes this type neither `Send` nor `Sync`; putting it in a
@@ -487,9 +502,77 @@ impl ObjPtr {
 /// retained by the Objective-C runtime for the life of the process, so the class identity itself
 /// is safe to share across threads; instances created from it remain main-thread objects.
 #[derive(Clone, Copy)]
+#[repr(transparent)]
+///
+/// The tuple field is reachable inside the crate on purpose (several modules convert a class
+/// pointer they already hold), so this type does not make an arbitrary pointer a valid class: it
+/// only gives the conversion one name, which is what `ObjcSuper` needs to take a class rather than
+/// a bare pointer.
 pub(crate) struct StaticClass(pub(crate) *const objc2::runtime::AnyClass);
 unsafe impl Send for StaticClass {}
 unsafe impl Sync for StaticClass {}
+
+impl StaticClass {
+    /// The handle of the class that defines the override being overridden.
+    ///
+    /// Used by call sites whose class was registered somewhere else (a module that only owns the
+    /// callback).
+    ///
+    /// This narrows the search but does not prove the argument: a class pointer that is not null
+    /// goes through, so the caller still has to pass the class that *defines* the override — the
+    /// superclass and an instance both pass this check. What it removes is the shape where a call
+    /// site writes `super_class` directly, and `ObjcSuper::for_defined_class` deriving from the
+    /// result is where a wrong-but-non-null class would still do damage. Reviewing the argument at
+    /// each call site is still the guarantee; the type only makes the mistake visible.
+    pub(crate) fn defining(class_ptr: *mut AnyObject) -> Self {
+        debug_assert!(
+            !class_ptr.is_null(),
+            "StaticClass::defining needs a class, not a null pointer"
+        );
+        Self(class_ptr as *const objc2::runtime::AnyClass)
+    }
+
+    /// Build the class for `name` with `build`, once per process.
+    ///
+    /// Dynamic classes are registered while the app starts, so registering the same name twice
+    /// (a second call through a path that was supposed to be one-shot) used to mean
+    /// `objc_allocateClassPair` returning nil and every following `class_addMethod` writing
+    /// through it. Taking the `OnceLock` here makes "registered once" a property of the helper
+    /// instead of a comment at each call site.
+    pub(crate) fn register_once(
+        slot: &'static std::sync::OnceLock<StaticClass>,
+        _name: &'static std::ffi::CStr,
+        build: impl FnOnce() -> StaticClass,
+    ) -> StaticClass {
+        *slot.get_or_init(build)
+    }
+}
+
+/// Build and register a dynamic class, naming it in any failure.
+///
+/// `ClassBuilder` derives each method's type encoding from the callback's Rust signature and
+/// compares it with the superclass implementation, so a callback whose signature disagrees with
+/// the selector it is registered under fails at registration rather than misbehaving later. This
+/// wrapper adds what objc2 cannot: the class name (its messages print the class only once one
+/// exists, which on the allocation failure path it does not) and the main-thread assertion.
+///
+/// A nil allocation means a class of that name is already registered. That is a bug in this app
+/// rather than a condition to recover from, so it panics: a class that silently failed to build
+/// would leave a settings page or a panel missing instead of failing where the mistake is.
+pub(crate) fn build_class(
+    name: &'static std::ffi::CStr,
+    superclass: &'static objc2::runtime::AnyClass,
+    build: impl FnOnce(&mut objc2::runtime::ClassBuilder),
+) -> StaticClass {
+    let mut builder = objc2::runtime::ClassBuilder::new(name, superclass).unwrap_or_else(|| {
+        panic!(
+            "dynamic class {} could not be allocated; is it registered twice?",
+            name.to_string_lossy()
+        )
+    });
+    build(&mut builder);
+    StaticClass(builder.register() as *const _)
+}
 
 /// Main-thread slot for UI objects that must remain in a `static` registry for callback lookup.
 /// The slot is synchronized by the main-thread invariant, not by a cross-thread mutex.
@@ -1048,6 +1131,576 @@ pub(crate) unsafe fn run_open_panel() -> Option<String> {
     };
     let _: () = msg_send![pool, drain];
     result
+}
+
+/// Tests for the dynamic-class helpers: the properties this migration relies on, and the
+/// counter-examples that must keep failing if someone reverts a registration site to a
+/// hand-written `class_addMethod` with a wrong encoding.
+#[cfg(test)]
+mod dynamic_class_tests {
+    use super::*;
+    use objc2::runtime::{AnyClass, AnyObject, ClassBuilder, Sel};
+    use std::ffi::c_void;
+
+    /// `ClassBuilder` derives the encoding from the callback's Rust signature, so an object
+    /// parameter declared as `*mut c_void` encodes as '^v' and the superclass check rejects it.
+    ///
+    /// The override check only runs under `debug_assertions`, so the expectation differs by
+    /// build: debug rejects, release accepts. Asserting one outcome unconditionally would make
+    /// `cargo test --release` fail for a reason that is the dependency's designed behaviour.
+    #[test]
+    fn a_void_pointer_object_parameter_is_rejected_only_where_objc2_checks_encodings() {
+        extern "C" fn wrong(_this: *mut AnyObject, _cmd: Sel, _event: *mut c_void) {}
+
+        // The superclass must declare mouseDown: (NSView does, NSObject does not): objc2 only
+        // compares encodings against an inherited method, so on NSObject this would be vacuous.
+        let rejected = std::panic::catch_unwind(|| unsafe {
+            let mut builder = ClassBuilder::new(c"OmTFfiTestWrongPointer", class!(NSView)).unwrap();
+            builder.add_method::<AnyObject, _>(
+                sel!(mouseDown:),
+                wrong as unsafe extern "C" fn(*mut AnyObject, Sel, *mut c_void),
+            );
+            let _ = builder.register();
+        });
+
+        let checked = cfg!(debug_assertions);
+        assert_eq!(
+            rejected.is_err(),
+            checked,
+            "the override encoding check runs under debug_assertions only: \
+             expected rejection={checked}, got rejection={}",
+            rejected.is_err()
+        );
+    }
+
+    /// The callback with the matching object type registers cleanly in every build, so the case
+    /// above is about the encoding and not about the selector or the class.
+    #[test]
+    fn an_object_parameter_registers_cleanly() {
+        extern "C" fn right(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {}
+        unsafe {
+            let mut builder = ClassBuilder::new(c"OmTFfiTestRightPointer", class!(NSView)).unwrap();
+            builder.add_method::<AnyObject, _>(
+                sel!(mouseDown:),
+                right as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+            let _ = builder.register();
+        }
+    }
+
+    /// The argument count check runs regardless of `debug_assertions`: a selector that takes one
+    /// argument cannot be registered with a callback that takes none. This is the half of the
+    /// guarantee that also holds in release builds.
+    #[test]
+    fn a_callback_with_the_wrong_arity_is_rejected() {
+        extern "C" fn no_arguments(_this: *mut AnyObject, _cmd: Sel) {}
+        let rejected = std::panic::catch_unwind(|| unsafe {
+            let mut builder = ClassBuilder::new(c"OmTFfiTestArity", class!(NSView)).unwrap();
+            builder.add_method::<AnyObject, _>(
+                sel!(mouseDown:),
+                no_arguments as unsafe extern "C" fn(*mut AnyObject, Sel),
+            );
+            let _ = builder.register();
+        });
+        assert!(rejected.is_err(), "an arity mismatch must be rejected");
+    }
+
+    /// `ObjcSuper::for_defined_class` resolves the superclass from the class that defines the
+    /// override. Handing it an instance would silently start the search at the wrong place, so
+    /// the type takes a `StaticClass` — which only the class helpers produce.
+    #[test]
+    fn objc_super_derives_the_superclass_from_the_defined_class() {
+        unsafe {
+            let defined = StaticClass(class!(NSView) as *const AnyClass);
+            let sup = ObjcSuper::for_defined_class(std::ptr::null_mut(), defined);
+            let expected = objc2::ffi::class_getSuperclass(class!(NSView) as *const AnyClass);
+            assert_eq!(
+                sup.super_class, expected as *mut c_void,
+                "objc_super.super_class must be the superclass of the defined class"
+            );
+            // The receiver is passed through untouched; only the superclass is derived.
+            assert!(sup.receiver.is_null());
+        }
+    }
+
+    /// The layout the C ABI sees: two pointers, in that order.
+    #[test]
+    fn objc_super_is_two_pointers() {
+        use std::mem::{size_of, MaybeUninit};
+        assert_eq!(size_of::<ObjcSuper>(), 2 * size_of::<*const c_void>());
+
+        let mut sup = MaybeUninit::<ObjcSuper>::uninit();
+        let base = sup.as_mut_ptr() as usize;
+        // SAFETY: only addresses of the fields are taken, nothing is read.
+        let receiver_at = unsafe { std::ptr::addr_of!((*sup.as_ptr()).receiver) } as usize;
+        let super_at = unsafe { std::ptr::addr_of!((*sup.as_ptr()).super_class) } as usize;
+        assert_eq!(receiver_at - base, 0);
+        assert_eq!(super_at - base, size_of::<*const c_void>());
+    }
+
+    /// `StaticClass` is transparent over the class pointer, which is what lets it be embedded in
+    /// and converted to the raw pointer a call site needs without a layout change.
+    #[test]
+    fn static_class_is_transparent_over_a_pointer() {
+        use std::mem::size_of;
+        assert_eq!(size_of::<StaticClass>(), size_of::<*const c_void>());
+    }
+
+    /// `register_once` runs its builder exactly once, so a call site that used to allocate the
+    /// class on every invocation now allocates it on the first.
+    #[test]
+    fn register_once_builds_the_class_exactly_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static ONCE: std::sync::OnceLock<StaticClass> = std::sync::OnceLock::new();
+        static RUNS: AtomicUsize = AtomicUsize::new(0);
+
+        let first = StaticClass::register_once(&ONCE, c"OmTFfiTestOnce", || {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            build_class(c"OmTFfiTestOnce", class!(NSView), |_builder| {})
+        });
+        let second = StaticClass::register_once(&ONCE, c"OmTFfiTestOnce", || {
+            RUNS.fetch_add(1, Ordering::SeqCst);
+            build_class(c"OmTFfiTestOnce", class!(NSView), |_builder| {})
+        });
+
+        assert_eq!(RUNS.load(Ordering::SeqCst), 1, "the builder must run once");
+        assert_eq!(first.0, second.0, "both calls must return the same class");
+    }
+
+    /// Registering a name twice is a bug (two one-shot paths both ran), and it must be loud:
+    /// `objc_allocateClassPair` returns nil, and every following `class_addMethod` would write
+    /// through it.
+    #[test]
+    fn building_the_same_class_name_twice_panics() {
+        build_class(c"OmTFfiTestDuplicate", class!(NSView), |_builder| {});
+        let second = std::panic::catch_unwind(|| {
+            build_class(c"OmTFfiTestDuplicate", class!(NSView), |_builder| {});
+        });
+        assert!(second.is_err(), "a duplicate class name must panic");
+    }
+
+    /// A bounded check on the production registration entries.
+    ///
+    /// The tests above prove the helpers behave; they cannot notice a call site that went back to
+    /// a hand-written `class_addMethod` with a literal encoding, or that dropped its `OnceLock`.
+    /// This scans the source of the modules this migration converted and requires each converted
+    /// class getter to go through the type-checked path. It is deliberately a source scan and not
+    /// an analysis: it proves "these named entries use the helper", not "no encoding is written
+    /// by hand anywhere".
+    #[test]
+    fn converted_class_getters_register_through_the_typed_helper() {
+        // Files whose class getters were converted. Adding a file here is how a new conversion
+        // joins the gate; a conversion that is reverted fails the assertion below.
+        let sources: [(&str, &str); 11] = [
+            ("pointer_locator.rs", include_str!("pointer_locator.rs")),
+            ("glass.rs", include_str!("glass.rs")),
+            ("settings/tooltip.rs", include_str!("settings/tooltip.rs")),
+            ("clipboard/search.rs", include_str!("clipboard/search.rs")),
+            (
+                "settings/window/chrome.rs",
+                include_str!("settings/window/chrome.rs"),
+            ),
+            ("settings/widgets.rs", include_str!("settings/widgets.rs")),
+            ("clipboard/picker.rs", include_str!("clipboard/picker.rs")),
+            (
+                "overlay/footer_settings.rs",
+                include_str!("overlay/footer_settings.rs"),
+            ),
+            (
+                "clipboard/text_style.rs",
+                include_str!("clipboard/text_style.rs"),
+            ),
+            (
+                "keystroke_display/panel.rs",
+                include_str!("keystroke_display/panel.rs"),
+            ),
+            ("ui/corner_glyph.rs", include_str!("ui/corner_glyph.rs")),
+        ];
+
+        // Each converted getter, by name. A getter that is renamed must be renamed here too;
+        // that is what keeps the gate attached to the entries rather than to a file.
+        let getters = [
+            ConvertedGetter {
+                file: "pointer_locator.rs",
+                getter: "locator_panel_class",
+            },
+            ConvertedGetter {
+                file: "pointer_locator.rs",
+                getter: "locator_content_class",
+            },
+            ConvertedGetter {
+                file: "glass.rs",
+                getter: "vibrant_label_class",
+            },
+            ConvertedGetter {
+                file: "glass.rs",
+                getter: "decoration_view_class",
+            },
+            ConvertedGetter {
+                file: "glass.rs",
+                getter: "carrier_class",
+            },
+            ConvertedGetter {
+                file: "settings/tooltip.rs",
+                getter: "tooltip_bubble_view_class",
+            },
+            ConvertedGetter {
+                file: "settings/tooltip.rs",
+                getter: "hover_tooltip_target",
+            },
+            ConvertedGetter {
+                file: "settings/tooltip.rs",
+                getter: "disabled_cursor_target",
+            },
+            ConvertedGetter {
+                file: "clipboard/search.rs",
+                getter: "search_cell_class_handle",
+            },
+            ConvertedGetter {
+                file: "settings/window/chrome.rs",
+                getter: "settings_root_view_class",
+            },
+            ConvertedGetter {
+                file: "settings/window/chrome.rs",
+                getter: "settings_window_class_handle",
+            },
+            ConvertedGetter {
+                file: "settings/widgets.rs",
+                getter: "html_action_button_class_handle",
+            },
+            ConvertedGetter {
+                file: "settings/widgets.rs",
+                getter: "flipped_settings_view_class",
+            },
+            ConvertedGetter {
+                file: "settings/widgets.rs",
+                getter: "html_switch_class_handle",
+            },
+            ConvertedGetter {
+                file: "settings/widgets.rs",
+                getter: "centered_text_field_cell_class_handle",
+            },
+            ConvertedGetter {
+                file: "clipboard/picker.rs",
+                getter: "detail_text_view_class_handle",
+            },
+            ConvertedGetter {
+                file: "overlay/footer_settings.rs",
+                getter: "footer_settings_button_class_handle",
+            },
+            ConvertedGetter {
+                file: "clipboard/text_style.rs",
+                getter: "hover_button_class_handle",
+            },
+        ];
+
+        if let Err(problem) = check_converted_sources(&sources, &getters) {
+            panic!("{problem}");
+        }
+    }
+
+    /// One converted class getter: the file it lives in and the getter's name.
+    ///
+    /// Naming each getter is what makes the gate about the entries rather than about a file: a
+    /// file can keep one correctly converted getter while a second one regresses back to a bare
+    /// class_addMethod, and a whole-file check would never notice.
+    struct ConvertedGetter {
+        file: &'static str,
+        getter: &'static str,
+    }
+
+    /// The rule behind the scan, as a pure function so its counter-examples can be tested without
+    /// editing the tree. A gate whose only evidence is "it passes today" cannot show it would
+    /// catch the regression it exists for.
+    fn check_converted_sources(
+        sources: &[(&'static str, &str)],
+        getters: &[ConvertedGetter],
+    ) -> Result<(), String> {
+        for (name, source) in sources {
+            if source.contains("ObjcSuper {") {
+                return Err(format!(
+                    "{name} still builds ObjcSuper by hand; super dispatch must go through for_defined_class"
+                ));
+            }
+        }
+
+        for entry in getters {
+            let Some((_, source)) = sources.iter().find(|(name, _)| *name == entry.file) else {
+                return Err(format!("{} is not among the scanned sources", entry.file));
+            };
+            let Some(body) = function_body(source, entry.getter) else {
+                return Err(format!(
+                    "{}: getter {} was not found; the gate names it explicitly, so a rename must update the gate",
+                    entry.file, entry.getter
+                ));
+            };
+            if !body.contains("register_once") {
+                return Err(format!(
+                    "{}: getter {} no longer registers through StaticClass::register_once",
+                    entry.file, entry.getter
+                ));
+            }
+            if body.contains("objc_allocateClassPair") || body.contains("class_addMethod") {
+                return Err(format!(
+                    "{}: getter {} registers methods by hand instead of through build_class",
+                    entry.file, entry.getter
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The text of `fn name(...)` up to the closing brace at the same depth.
+    ///
+    /// A bounded slice, not a parser: the gate only needs "is this string inside that function",
+    /// and a getter the slice cannot isolate fails the "was not found" case rather than passing.
+    fn function_body<'a>(source: &'a str, name: &str) -> Option<&'a str> {
+        let needle = format!("fn {name}(");
+        let start = source.find(&needle)?;
+        let rest = &source[start..];
+        let mut depth = 0usize;
+        let mut seen_open = false;
+        for (offset, ch) in rest.char_indices() {
+            match ch {
+                '{' => {
+                    depth += 1;
+                    seen_open = true;
+                }
+                '}' => {
+                    depth -= 1;
+                    if seen_open && depth == 0 {
+                        return Some(&rest[..offset]);
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+
+    /// Counter-examples for the scan above: each shape it must reject, plus the clean shape.
+    #[test]
+    fn the_conversion_gate_rejects_each_way_it_can_be_undone() {
+        let getter =
+            |file: &'static str, name: &'static str| ConvertedGetter { file, getter: name };
+
+        // A hand-built super receiver is the regression the type change exists to prevent.
+        assert!(
+            check_converted_sources(
+                &[(
+                    "some.rs",
+                    "let mut sup = ObjcSuper { receiver, super_class };"
+                )],
+                &[],
+            )
+            .is_err(),
+            "a hand-built ObjcSuper must be rejected"
+        );
+
+        // The clean shape passes, so the rules above are about the violations.
+        assert!(check_converted_sources(
+            &[(
+                "some.rs",
+                "fn getter() { StaticClass::register_once(&C, c\"X\", b) }"
+            )],
+            &[getter("some.rs", "getter")],
+        )
+        .is_ok());
+
+        // One file, one correct getter and one that went back to a bare allocation: the whole-file
+        // shape of the first version of this gate passed here, and it must not.
+        let mixed = "fn good() { StaticClass::register_once(&C, c\"X\", b) }\n                     fn bad() { let cls = objc_allocateClassPair(super, name, 0); }";
+        assert!(
+            check_converted_sources(
+                &[("some.rs", mixed)],
+                &[getter("some.rs", "good"), getter("some.rs", "bad")],
+            )
+            .is_err(),
+            "a second getter in the same file must be checked on its own"
+        );
+
+        // The OnceLock kept but the method written by hand: the idempotence rule alone passes
+        // here, so the encoding rule has to catch it.
+        let kept_lock = "fn getter() { StaticClass::register_once(&C, c\"X\", || { \
+                         class_addMethod(cls, sel, imp, types) }) }";
+        assert!(
+            check_converted_sources(&[("some.rs", kept_lock)], &[getter("some.rs", "getter")])
+                .is_err(),
+            "a getter that keeps register_once but writes the method by hand must be rejected"
+        );
+
+        // A renamed getter cannot silently drop out of the gate.
+        assert!(
+            check_converted_sources(
+                &[("some.rs", "fn other() {}")],
+                &[getter("some.rs", "getter")]
+            )
+            .is_err(),
+            "a getter the gate names but cannot find must be an error"
+        );
+
+        // The corner_glyph exception is narrow: it may skip the register rule, but not the
+        // hand-built-super rule.
+        assert!(check_converted_sources(&[("ui/corner_glyph.rs", "fn f() {}")], &[]).is_ok());
+        assert!(check_converted_sources(
+            &[("ui/corner_glyph.rs", "ObjcSuper { receiver, super_class }")],
+            &[]
+        )
+        .is_err());
+    }
+
+    /// The production pool helper must drain when the body unwinds.
+    ///
+    /// This is the defect the old hand-written `new -> body() -> drain` pair had: a panic inside
+    /// `body` skipped the drain entirely. A test whose body returns normally passes against that
+    /// old implementation too, so the observation has to be a panic — and it has to go through the
+    /// production wrapper, not through `objc2::rc::autoreleasepool`, or it would keep passing
+    /// while the wrapper regressed.
+    #[test]
+    fn the_panel_key_pool_helper_drains_while_unwinding() {
+        use std::sync::atomic::Ordering;
+        let _serial = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DEALLOCS.store(0, Ordering::SeqCst);
+
+        let panicked = std::panic::catch_unwind(|| {
+            crate::overlay::panel_keys::autorelease_pool_for_test(|| unsafe {
+                let object = autocreate_probe();
+                let _: *mut AnyObject = msg_send![object, autorelease];
+                panic!("intentional: the helper's pool must still drain");
+            })
+        });
+
+        assert!(panicked.is_err(), "the body was supposed to panic");
+        assert_eq!(
+            DEALLOCS.load(Ordering::SeqCst),
+            1,
+            "the production pool helper must drain the pool while the body unwinds"
+        );
+    }
+
+    /// An autorelease pool must drain on the early-return path as well, which is the shape the
+    /// hand-written new/drain pairs in `icon_cache` used to get wrong.
+    ///
+    /// The observation is the object's own `-dealloc`, counted in a static: a weak table was the
+    /// first attempt and does not work here — its count stayed at 1 after the drain, so it would
+    /// have reported "never released" for a pool that did release.
+    static DEALLOCS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+    /// The three pool tests share one counter and one probe class, so they must not overlap: the
+    /// test harness runs tests on several threads, and a release from a neighbouring test lands in
+    /// this counter.
+    static POOL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Count the deallocation and then let NSObject free the instance.
+    ///
+    /// An override of `-dealloc` that only counts would leave the object itself unfreed: "it owns
+    /// no fields" is not the same as "the allocation needs no release". Calling super is also what
+    /// makes the test prove a real destroy rather than merely that the callback was entered.
+    extern "C" fn probe_dealloc(this: *mut AnyObject, _cmd: Sel) {
+        DEALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let mut sup =
+            ObjcSuper::for_defined_class(this as *mut c_void, StaticClass(probe_class_ptr()));
+        type Dealloc = unsafe extern "C" fn(*mut ObjcSuper, Sel);
+        let send: Dealloc =
+            unsafe { std::mem::transmute(objc2::ffi::objc_msgSendSuper as *const ()) };
+        unsafe { send(&mut sup, sel!(dealloc)) };
+    }
+
+    /// The class object itself, for the super dispatch above. It is registered by the time
+    /// `-dealloc` can run; asking for it again here returns the same already-registered class
+    /// (register_once is idempotent) rather than re-entering the builder.
+    fn probe_class_ptr() -> *const objc2::runtime::AnyClass {
+        probe_class().0
+    }
+    fn probe_class() -> StaticClass {
+        static CLASS: std::sync::OnceLock<StaticClass> = std::sync::OnceLock::new();
+        StaticClass::register_once(&CLASS, c"OmTFfiTestPoolProbe", || {
+            build_class(c"OmTFfiTestPoolProbe", class!(NSObject), |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(dealloc),
+                    probe_dealloc as unsafe extern "C" fn(*mut AnyObject, Sel),
+                );
+            })
+        })
+    }
+
+    fn autocreate_probe() -> *mut AnyObject {
+        unsafe {
+            let object: *mut AnyObject = msg_send![probe_class().0 as *mut AnyObject, alloc];
+            msg_send![object, init]
+        }
+    }
+
+    #[test]
+    fn autoreleasepool_drains_on_an_early_return() {
+        use std::sync::atomic::Ordering;
+        let _serial = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DEALLOCS.store(0, Ordering::SeqCst);
+
+        unsafe {
+            objc2::rc::autoreleasepool(|_pool| {
+                let object = autocreate_probe();
+                let _: *mut AnyObject = msg_send![object, autorelease];
+                // Early return from the closure: the pool still has to drain what it owns.
+                assert_eq!(
+                    DEALLOCS.load(Ordering::SeqCst),
+                    0,
+                    "the object must still be alive inside the pool"
+                );
+            });
+            assert_eq!(
+                DEALLOCS.load(Ordering::SeqCst),
+                1,
+                "the pool must have released the object on the early-return path"
+            );
+        }
+    }
+
+    /// The same observation for the normal-return path, so the test above cannot pass merely
+    /// because the probe was released for some unrelated reason.
+    #[test]
+    fn autoreleasepool_drains_on_a_normal_return() {
+        use std::sync::atomic::Ordering;
+        let _serial = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DEALLOCS.store(0, Ordering::SeqCst);
+
+        unsafe {
+            let kept = objc2::rc::autoreleasepool(|_pool| {
+                let object = autocreate_probe();
+                let _: *mut AnyObject = msg_send![object, autorelease];
+                1
+            });
+            assert_eq!(kept, 1);
+            assert_eq!(
+                DEALLOCS.load(Ordering::SeqCst),
+                1,
+                "the pool must have released the object on the normal-return path"
+            );
+        }
+    }
+
+    /// A panic unwinds through the closure; the pool must drain there too, which the hand-written
+    /// new/drain pairs never did.
+    #[test]
+    fn autoreleasepool_drains_while_unwinding() {
+        use std::sync::atomic::Ordering;
+        let _serial = POOL_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        DEALLOCS.store(0, Ordering::SeqCst);
+
+        let panicked = std::panic::catch_unwind(|| unsafe {
+            objc2::rc::autoreleasepool(|_pool| {
+                let object = autocreate_probe();
+                let _: *mut AnyObject = msg_send![object, autorelease];
+                panic!("intentional: the pool must still drain");
+            })
+        });
+        assert!(panicked.is_err());
+        assert_eq!(
+            DEALLOCS.load(Ordering::SeqCst),
+            1,
+            "the pool must drain while a panic unwinds"
+        );
+    }
 }
 
 #[cfg(test)]

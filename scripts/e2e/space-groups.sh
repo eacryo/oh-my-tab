@@ -199,14 +199,32 @@ def fullscreen_title(pid: int, title: str) -> None:
             f"got {[(w['window_id'], w.get('title')) for w in windows]}"
         )
     window_id = match[0]["window_id"]
+    # elements, not the default markdown tree: the driver returns tree_markdown unless asked, and a
+    # payload without "elements" makes the zoom search below find nothing on every window. The
+    # requested format is part of what the scenario asserts against, so ask for it explicitly.
+    # Both calls carry the same session label: an element_token is only valid within the session
+    # that took the snapshot, and the CLI opens a fresh one per invocation by default, so the
+    # token taken here would be "stale" by the time the click runs.
+    session = "omt-space-groups-zoom"
     snapshot = cua(
         "get_window_state",
-        {"pid": pid, "window_id": window_id, "include_screenshot": False, "max_depth": 2},
+        {
+            "pid": pid,
+            "window_id": window_id,
+            "include_screenshot": False,
+            "max_depth": 4,
+            "tree_format": "elements",
+            "session": session,
+        },
     )
+    # The driver reports AX action names in two spellings: the AppKit spelling
+    # ("AXZoomWindow") and the lowercased wire form ("zoomwindow"), and which one arrives depends on
+    # the driver version. Match case-insensitively so a driver update cannot turn "no zoom button"
+    # into a scenario failure.
     buttons = [
         element
         for element in snapshot.get("elements", [])
-        if "AXZoomWindow" in (element.get("actions") or [])
+        if any("axzoomwindow" in str(action).lower() for action in (element.get("actions") or []))
     ]
     if not buttons:
         raise SystemExit(
@@ -219,6 +237,7 @@ def fullscreen_title(pid: int, title: str) -> None:
             "action": "press",
             "pid": pid,
             "window_id": window_id,
+            "session": session,
         },
     )
     return window_id
@@ -272,7 +291,7 @@ if problems:
     raise SystemExit(1)
 
 # 找到 TextEdit 的两个探针窗口。
-apps = cua("list_apps", {"include_installed": False})["apps"]
+apps = cua("list_apps", {})["apps"]
 # Match by bundle id: the display name is localized ("文本编辑" here), the bundle id is not.
 textedit = next((a for a in apps if a.get("bundle_id") == "com.apple.TextEdit"), None)
 if not textedit or not textedit.get("pid"):

@@ -179,7 +179,7 @@ PY
 echo "  panel (${panel_x},${panel_y}) ${panel_w}x${panel_h}; gear ${gear_w}x${gear_h} at (${gear_x},${gear_y})"
 echo "  clicking the gear in desktop pixels at (${click_x},${click_y}); commits so far ${commits_before}"
 
-cua click "{\"scope\": \"desktop\", \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"background\"}" >/dev/null
+cua click "{\"target\": {\"kind\": \"desktop\", \"display_id\": \"primary\"}, \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"foreground\"}" >/dev/null
 
 # The assertion the broken gear failed: the settings window must actually come up on its page.
 if ! wait_for_state "s.get('settings_window_visible') and s.get('selected_sidebar_name') == 'switcher'"; then

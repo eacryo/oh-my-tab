@@ -3,7 +3,6 @@
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -44,7 +43,7 @@ pub(crate) fn show() {
 }
 
 /// Polling avoids installing another global event tap solely for this short-lived visual cue.
-unsafe extern "C" fn check_pointer(this: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+unsafe extern "C" fn check_pointer(this: *mut AnyObject, _cmd: Sel, _arg: *mut AnyObject) {
     if !ACTIVE.load(Ordering::Acquire) {
         return;
     }
@@ -52,11 +51,11 @@ unsafe extern "C" fn check_pointer(this: *mut c_void, _cmd: Sel, _arg: *mut c_vo
     let (x, y) = *SPOTLIGHT_CENTER.lock().unwrap();
     if cursor.x != x || cursor.y != y {
         ACTIVE.store(false, Ordering::Release);
-        let window = this as *mut AnyObject;
+        let window = this;
         let _: () = msg_send![class!(NSObject), cancelPreviousPerformRequestsWithTarget: window];
         let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
     } else {
-        schedule_pointer_check(this as *mut AnyObject);
+        schedule_pointer_check(this);
     }
 }
 
@@ -70,8 +69,8 @@ unsafe fn schedule_pointer_check(window: *mut AnyObject) {
 }
 
 /// Draw the dimming mask and punch a transparent hole around the cursor.
-unsafe extern "C" fn draw_mask(this: *mut c_void, _cmd: Sel, _dirty_rect: NSRect) {
-    let view = this as *mut AnyObject;
+unsafe extern "C" fn draw_mask(this: *mut AnyObject, _cmd: Sel, _dirty_rect: NSRect) {
+    let view = this;
     let bounds: NSRect = msg_send![view, bounds];
     let (cursor_x, cursor_y) = *SPOTLIGHT_CENTER.lock().unwrap();
     let window: *mut AnyObject = msg_send![view, window];
@@ -154,37 +153,35 @@ unsafe fn create_locator() -> Locator {
 }
 
 fn locator_panel_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabPointerLocatorWindow").unwrap();
-        let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
-        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("v@:@").unwrap();
-        crate::ffi::class_addMethod(
-            cls,
-            sel!(checkPointer:),
-            check_pointer as *mut c_void,
-            types.as_ptr(),
-        );
-        crate::ffi::objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPointerLocatorWindow", || {
+        crate::ffi::build_class(
+            c"OhMyTabPointerLocatorWindow",
+            class!(NSPanel),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(checkPointer:),
+                    check_pointer as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 fn locator_content_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabPointerLocatorView").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
-        crate::ffi::class_addMethod(
-            cls,
-            sel!(drawRect:),
-            draw_mask as *mut c_void,
-            types.as_ptr(),
-        );
-        crate::ffi::objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPointerLocatorView", || {
+        crate::ffi::build_class(
+            c"OhMyTabPointerLocatorView",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(drawRect:),
+                    draw_mask as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }

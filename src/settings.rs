@@ -2076,11 +2076,15 @@ unsafe fn fill_mouse_device_controls(
 // .accessory), instead of the default orderOut (which would not trigger the policy switch or
 // clean up the independent shared color panel). create_settings_window can be called again after
 // invalidate_settings_window, so registration is guarded with OnceLock.
-extern "C" fn settings_window_perform_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+extern "C" fn settings_window_perform_close(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+    _sender: *mut AnyObject,
+) {
     hide_settings();
 }
 
-extern "C" fn settings_window_close(_self: *mut c_void, _cmd: Sel) {
+extern "C" fn settings_window_close(_self: *mut AnyObject, _cmd: Sel) {
     hide_settings();
 }
 
@@ -2102,13 +2106,17 @@ const NSEVENT_TYPE_RIGHT_MOUSE_UP: usize = 4;
 /// mouse event lets the clicked control become first responder again when appropriate.
 /// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
 /// aborts the process), so it is contained here.
-extern "C" fn settings_window_send_event(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
+extern "C" fn settings_window_send_event(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     crate::callback_guard::void("settings_window_send_event", || unsafe {
         settings_window_send_event_inner(_self, _cmd, event)
     });
 }
 
-unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
+unsafe fn settings_window_send_event_inner(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+    event: *mut AnyObject,
+) {
     unsafe {
         if !event.is_null() {
             let event_type: usize = msg_send![event, type];
@@ -2121,7 +2129,7 @@ unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event:
                 dispatch::end_max_extent_preview();
             }
             if event_type == NSEVENT_TYPE_LEFT_MOUSE_DOWN {
-                let window = _self as *mut AnyObject;
+                let window = _self;
                 collapse_restore_confirmations_on_external_click(window, event);
                 // Closing a dropdown on an outside click no longer lives here: it is handled by the
                 // local event monitor in widgets, because the dropdown has its own popup window and
@@ -2142,13 +2150,16 @@ unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event:
                 }
             }
         }
-        let _: () = msg_send![
-            super(
-                _self as *mut AnyObject,
-                objc2::runtime::AnyClass::get(c"NSWindow").unwrap()
-            ),
-            sendEvent: event
-        ];
+        // Super dispatch names the class that DEFINED this override (OhMyTabSettingsWindow),
+        // never the superclass: ObjcSuper derives the superclass from it, and naming NSWindow
+        // here would start the search one level too high.
+        type SendEvent = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel, *mut AnyObject);
+        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+            _self as *mut c_void,
+            window::settings_window_class_handle(),
+        );
+        let send: SendEvent = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+        send(&mut sup, sel!(sendEvent:), event);
     }
 }
 
@@ -2159,79 +2170,35 @@ unsafe fn settings_window_send_event_inner(_self: *mut c_void, _cmd: Sel, event:
 /// (which doesn't work for status-bar menus on accessory apps, the earlier pitfall).
 /// Other command combos fall through to super so text editing etc. keeps working.
 extern "C" fn settings_window_perform_key_equivalent(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     event: *mut AnyObject,
-) -> bool {
+) -> objc2::runtime::Bool {
     unsafe {
         let keycode: u16 = msg_send![event, keyCode];
         let flags: u64 = msg_send![event, modifierFlags];
         if keycode == KEYCODE_Q && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0 {
             // Same path as the menu Quit item: restore pointer acceleration + terminate.
             crate::quit_from_settings();
-            return true;
+            return objc2::runtime::Bool::YES;
         }
-        let handled: bool = msg_send![
-            super(_self as *mut AnyObject, objc2::runtime::AnyClass::get(c"NSWindow").unwrap()),
-            performKeyEquivalent: event
-        ];
-        handled
+        // Super dispatch names the class that DEFINED this override (OhMyTabSettingsWindow),
+        // never the superclass; see settings_window_send_event_inner.
+        // The selector's encoding is "B" (Objective-C BOOL), so the callback and the super
+        // dispatch both use objc2's Bool rather than a Rust bool.
+        type PerformKeyEquivalent = unsafe extern "C" fn(
+            *mut crate::ffi::ObjcSuper,
+            Sel,
+            *mut AnyObject,
+        ) -> objc2::runtime::Bool;
+        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+            _self as *mut c_void,
+            window::settings_window_class_handle(),
+        );
+        let perform: PerformKeyEquivalent =
+            std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+        perform(&mut sup, sel!(performKeyEquivalent:), event)
     }
-}
-
-// Resize resets the traffic lights to their default positions (verified), so override
-// resizeSubviewsWithOldSize: to re-apply the offset after super's layout. The re-apply is
-// idempotent (same frames each time) and cannot cause a layout loop.
-extern "C" fn settings_window_resize_subviews(_self: *mut c_void, _cmd: Sel, old_size: NSSize) {
-    unsafe {
-        let _: () = msg_send![
-            super(_self as *mut AnyObject, objc2::runtime::AnyClass::get(c"NSWindow").unwrap()),
-            resizeSubviewsWithOldSize: old_size
-        ];
-        reposition_traffic_lights(_self as *mut AnyObject);
-        refresh_settings_root_corner(_self as *mut AnyObject);
-        grow_short_page_documents();
-    }
-}
-
-/// When the window grows, raise any page document shorter than its viewport: AppKit
-/// bottom-pins a non-flipped document shorter than its clip, shifting the whole page down
-/// by (clip - document) -- the quick-actions page (728pt doc in a 752pt window) dropped
-/// 24pt for exactly this reason. Grow-only; a just-grown visible page re-scrolls to the
-/// top while other scroll offsets stay untouched (idempotent per resize tick, no layout
-/// loop risk).
-unsafe fn grow_short_page_documents() {
-    with_settings_ui(|ui| {
-        let Some(ui) = ui.as_ref() else {
-            return;
-        };
-        let scrolls = window::page_scroll_views(ui);
-        let selected = widgets::SIDEBAR_SELECTED.load(Ordering::SeqCst);
-        for (index, &scroll) in scrolls.iter().enumerate() {
-            if scroll.is_null() {
-                continue;
-            }
-            let clip: *mut AnyObject = msg_send![scroll, contentView];
-            if clip.is_null() {
-                continue;
-            }
-            let doc: *mut AnyObject = msg_send![scroll, documentView];
-            if doc.is_null() {
-                continue;
-            }
-            let clip_bounds: NSRect = msg_send![clip, bounds];
-            let doc_frame: NSRect = msg_send![doc, frame];
-            if doc_frame.size.height < clip_bounds.size.height {
-                let _: () = msg_send![doc, setFrame: NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(doc_frame.size.width, clip_bounds.size.height),
-                )];
-                if index == selected {
-                    widgets::scroll_page_to_top(scroll);
-                }
-            }
-        }
-    });
 }
 
 #[cfg(test)]

@@ -199,7 +199,7 @@ PY
     # initial first responder, and resigning a field the user never typed into must not persist anything.
     mtime_before="$(config_mtime)"
     echo "  [$label] clicking the settings button at desktop (${click_x},${click_y})" >&2
-    cua click "{\"scope\": \"desktop\", \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"background\"}" >/dev/null
+    cua click "{\"target\": {\"kind\": \"desktop\", \"display_id\": \"primary\"}, \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"foreground\"}" >/dev/null
     if ! wait_for_state "s.get('seq', 0) > $baseline_seq and s.get('settings_click_ms', 0) > 0"; then
         echo "settings-open-latency: no state frame with a settings-click time after the click ($label); the click missed or the open did not happen" >&2
         exit 1

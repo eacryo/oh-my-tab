@@ -19,15 +19,12 @@
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use std::ffi::{c_void, CString};
+use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;
 
 use super::*;
-use crate::ffi::{
-    class_addMethod, make_nsstring, objc_allocateClassPair, objc_registerClassPair, release_obj,
-    CFRelease,
-};
+use crate::ffi::{make_nsstring, release_obj, CFRelease};
 use crate::ffi::{MainThreadSlot, StaticClass};
 
 /// The footer gear button (kept for theme repaints and layout, like the status label).
@@ -54,66 +51,69 @@ pub(crate) fn is_armed() -> bool {
 /// The button class: a borderless glyph button with the neutral hover the corner-glyph exception
 /// describes. Deliberately NOT the card close button's class -- that one hardcodes the destructive
 /// red hover, which would misread as a dangerous action on a settings control.
-unsafe fn footer_settings_button_class() -> *mut AnyObject {
+///
+/// Returned as the class handle rather than `*mut AnyObject`, so a super dispatch can name the
+/// class that defined the override.
+fn footer_settings_button_class_handle() -> StaticClass {
     static CLASS: OnceLock<StaticClass> = OnceLock::new();
-    CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabFooterSettingsButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            if cls.is_null() {
-                return StaticClass(class!(NSButton));
-            }
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                footer_settings_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                footer_settings_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            // The press arms the gesture; the action (dispatched on mouseUp) consumes it. Arming at
-            // press is what lets a release outside the button cancel cleanly instead of leaving the
-            // session half-ended.
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                footer_settings_mouse_down as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabFooterSettingsButton", || {
+        crate::ffi::build_class(
+            c"OhMyTabFooterSettingsButton",
+            class!(NSButton),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    footer_settings_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    footer_settings_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                // The press arms the gesture; the action (dispatched on mouseUp) consumes it. Arming at
+                // press is what lets a release outside the button cancel cleanly instead of leaving the
+                // session half-ended.
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    footer_settings_mouse_down
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
 }
 
-extern "C" fn footer_settings_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn footer_settings_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     crate::callback_guard::void("footer_settings_mouse_down", || unsafe {
         arm();
-        set_footer_settings_style(_self as *mut AnyObject, true);
+        set_footer_settings_style(_self, true);
         // NSButton's own mouseDown: runs the highlight/press tracking loop without which the button
         // never tracks the press and never dispatches its action.
-        crate::ui::corner_glyph::call_super_mouse_down(_self, sel!(mouseDown:), event);
+        // The defined class, not the instance: `_self` is an OhMyTabFooterSettingsButton
+        // instance, and passing it as the class would make objc_super start its search at
+        // something that is not a class at all.
+        crate::ui::corner_glyph::call_super_mouse_down(
+            _self as *mut c_void,
+            footer_settings_button_class_handle(),
+            sel!(mouseDown:),
+            event as *mut c_void,
+        );
     });
 }
 
-extern "C" fn footer_settings_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn footer_settings_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     crate::callback_guard::void("footer_settings_entered", || unsafe {
-        set_footer_settings_style(_self as *mut AnyObject, true);
+        set_footer_settings_style(_self, true);
     });
 }
 
-extern "C" fn footer_settings_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn footer_settings_exited(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     crate::callback_guard::void("footer_settings_exited", || unsafe {
         // Leaving the button during the press cancels the gesture: the action will still be sent on
         // mouseUp (AppKit tracks the press), so the arm flag is what tells it apart from a real click.
         disarm();
-        set_footer_settings_style(_self as *mut AnyObject, false);
+        set_footer_settings_style(_self, false);
     });
 }
 
@@ -151,7 +151,10 @@ pub(crate) fn footer_settings_frame(panel_size: NSSize) -> NSRect {
 
 /// Build the gear button. Returns a +1 reference; the caller adds it to a superview and releases it.
 pub(crate) unsafe fn make_footer_settings_button(frame: NSRect) -> *mut AnyObject {
-    let button: *mut AnyObject = msg_send![footer_settings_button_class(), alloc];
+    let button: *mut AnyObject = msg_send![
+        footer_settings_button_class_handle().0 as *mut AnyObject,
+        alloc
+    ];
     let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
     let _: () = msg_send![button, setBordered: false];
     let _: () = msg_send![button, setWantsLayer: true];

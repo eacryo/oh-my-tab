@@ -1,7 +1,7 @@
 //! Shared rounded material backdrop for passive floating panels.
 
-use objc2::runtime::{AnyClass, AnyObject};
-use objc2::{class, msg_send};
+use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSEdgeInsets, NSPoint, NSRect, NSSize};
 use std::ffi::c_void;
 use std::sync::OnceLock;
@@ -63,28 +63,27 @@ pub(crate) const fn vibrant_appearance_name(dark: bool) -> &'static str {
 /// inert in the settings window and the onboarding guide (which keep the absolute palette tokens):
 /// panel labels get vibrancy, everything else behaves exactly as before.
 pub(crate) fn vibrant_label_class() -> *mut AnyObject {
-    static CLASS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = std::ffi::CString::new("OhMyTabVibrantLabel").unwrap();
-        let superclass = class!(NSTextField) as *const _ as *mut AnyObject;
-        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = std::ffi::CString::new("B@:").unwrap();
-        crate::ffi::class_addMethod(
-            cls,
-            objc2::sel!(allowsVibrancy),
-            vibrant_label_allows_vibrancy as *mut std::ffi::c_void,
-            types.as_ptr(),
-        );
-        crate::ffi::objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabVibrantLabel", || {
+        crate::ffi::build_class(
+            c"OhMyTabVibrantLabel",
+            class!(NSTextField),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(allowsVibrancy),
+                    vibrant_label_allows_vibrancy
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
-extern "C" fn vibrant_label_allows_vibrancy(
-    _self: *mut std::ffi::c_void,
-    _cmd: objc2::runtime::Sel,
-) -> bool {
-    true
+extern "C" fn vibrant_label_allows_vibrancy(_self: *mut AnyObject, _cmd: Sel) -> Bool {
+    // The override returns Objective-C BOOL ('B' encoding on arm64), which objc2 models as
+    // `Bool`; a plain Rust `bool` has no `Encode` impl and cannot be a method return.
+    Bool::YES
 }
 
 /// Opacity of the theme-surface scrim.
@@ -855,41 +854,39 @@ pub(crate) fn panel_outline_enabled() -> bool {
 /// class overrides `hitTest:` because the decoration covers the whole panel and would otherwise swallow
 /// every click meant for the panel's content.
 fn decoration_view_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = std::ffi::CString::new("OhMyTabPanelDecorationView").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        crate::ffi::class_addMethod(
-            cls,
-            objc2::sel!(hitTest:),
-            outline_hit_test as *mut c_void,
-            std::ffi::CString::new("@@:{CGPoint=dd}").unwrap().as_ptr(),
-        );
-        crate::ffi::class_addMethod(
-            cls,
-            objc2::sel!(dropOutline:),
-            outline_drop as *mut c_void,
-            std::ffi::CString::new("v@:@").unwrap().as_ptr(),
-        );
-        crate::ffi::objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPanelDecorationView", || {
+        crate::ffi::build_class(
+            c"OhMyTabPanelDecorationView",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(hitTest:),
+                    outline_hit_test
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(dropOutline:),
+                    outline_drop as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 extern "C" fn outline_hit_test(
-    _self: *mut c_void,
-    _cmd: objc2::runtime::Sel,
+    _self: *mut AnyObject,
+    _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
     // Never the hit-test result: the decoration must not intercept the panel's own input.
     std::ptr::null_mut()
 }
 
-extern "C" fn outline_drop(this: *mut c_void, _cmd: objc2::runtime::Sel, _sender: *mut AnyObject) {
+extern "C" fn outline_drop(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     unsafe {
-        let view = this as *mut AnyObject;
-        let layer: *mut AnyObject = msg_send![view, layer];
+        let layer: *mut AnyObject = msg_send![_self, layer];
         if !layer.is_null() {
             let _: () = msg_send![layer, setBorderWidth: 0.0f64];
         }
@@ -986,26 +983,20 @@ static CARRIER_GEOMETRY: std::sync::LazyLock<
 /// and detail open and close, the HUD re-renders), so a path set at each resize call site would be right
 /// for the first and last frame only and the shadow would lag the panel in between.
 fn carrier_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = std::ffi::CString::new("OhMyTabPanelCarrier").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = crate::ffi::objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        crate::ffi::class_addMethod(
-            cls,
-            objc2::sel!(layout),
-            carrier_layout as *mut c_void,
-            std::ffi::CString::new("v@:").unwrap().as_ptr(),
-        );
-        crate::ffi::class_addMethod(
-            cls,
-            objc2::sel!(dropShadow:),
-            carrier_drop_shadow as *mut c_void,
-            std::ffi::CString::new("v@:@").unwrap().as_ptr(),
-        );
-        crate::ffi::objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPanelCarrier", || {
+        crate::ffi::build_class(c"OhMyTabPanelCarrier", class!(NSView), |builder| unsafe {
+            builder.add_method::<AnyObject, _>(
+                sel!(layout),
+                carrier_layout as unsafe extern "C" fn(*mut AnyObject, Sel),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(dropShadow:),
+                carrier_drop_shadow as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+        })
+    })
+    .0 as *mut AnyObject
 }
 
 /// Give the carrier a rounded-rect shadow path covering the *panel* inside it, in the carrier's own
@@ -1046,20 +1037,16 @@ pub(crate) fn forget_carrier_shadow_path(carrier: *mut AnyObject) {
     CARRIER_GEOMETRY.lock().unwrap().remove(&(carrier as usize));
 }
 
-extern "C" fn carrier_layout(this: *mut c_void, _cmd: objc2::runtime::Sel) {
-    unsafe { sync_carrier_shadow_path(this as *mut AnyObject) };
+extern "C" fn carrier_layout(_self: *mut AnyObject, _cmd: Sel) {
+    unsafe { sync_carrier_shadow_path(_self) };
 }
 
-extern "C" fn carrier_drop_shadow(
-    this: *mut c_void,
-    _cmd: objc2::runtime::Sel,
-    _sender: *mut AnyObject,
-) {
+extern "C" fn carrier_drop_shadow(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     unsafe {
         let Some(shadow_layer) = CARRIER_GEOMETRY
             .lock()
             .unwrap()
-            .get(&(this as usize))
+            .get(&(_self as usize))
             .map(|geometry| geometry.shadow_layer)
         else {
             return;
@@ -1487,18 +1474,20 @@ pub(crate) struct MaterialTuning {
     pub(crate) blur_radius: f64,
     pub(crate) saturation: f64,
     pub(crate) variant: i64,
-    pub(crate) floor: f64,
 }
 
 impl MaterialTuning {
     /// The knobs as configured (each with its `--glass-*` launch override).
+    ///
+    /// The floor is deliberately not one of them: the veil it drives is installed and synced by the
+    /// theme path (`sync_floor_veil`), which reads `effective_glass_floor` where it needs it. A copy
+    /// here would be a second source for one value, and the copy this replaced was never read.
     pub(crate) fn effective() -> Self {
         Self {
             opacity: crate::config::effective_glass_opacity(),
             blur_radius: crate::config::effective_glass_blur_radius(),
             saturation: crate::config::effective_glass_saturation(),
             variant: crate::config::effective_glass_variant(),
-            floor: crate::config::effective_glass_floor(),
         }
     }
 }

@@ -126,6 +126,37 @@ Before reporting completion, all of the following are true:
 Do **not** run `--finish` here: the session stays open until the user says the task is done. Report completion
 and, if the session is still open, say so and offer to close it.
 
+### Parallelising a wide change
+
+A change that touches many independent files (a mechanical migration, the same edit repeated across
+modules, a set of separate documents) should be split across subagents rather than walked through
+serially: the work is wide, not deep, and one agent doing it file by file spends the whole budget on
+transcription. Split by **file**, give each subagent an exclusive set, and state the shared rules once
+in a brief they all receive.
+
+- **Partition so no two agents write the same file.** Overlap is the one failure mode that costs more
+  than doing it serially: two agents editing one file produce a diff neither can reason about, and the
+  compile errors then get attributed to the wrong change.
+- **Put the contract in the brief, not in each file.** The shared helper's signature, the rule that
+  changed (for example "object parameters are `*mut AnyObject`, BOOL returns are
+  `objc2::runtime::Bool`"), and the skeleton to copy. A teammate that has to discover the pattern from
+  the diff will invent a second one.
+- **Say what not to touch.** Another task's in-flight files, the shared helper module, `Cargo.toml`,
+  and `git` itself (no commits, no `cargo fmt` across the tree) belong in the brief as prohibitions.
+- **Reserve the shared-file and cross-cutting work for the lead.** The helper module, the test file
+  every partition feeds, the gate wiring and the final `cargo fmt` are one owner's job, because they
+  are the points all the partitions meet.
+- **Broadcast a discovered rule to everyone still running.** When one agent finds that the dependency
+  does something unexpected (a type that has no `Encode` implementation, a method that must be called
+  before another), the others are about to hit the same wall; send it once rather than let each
+  rediscover it.
+- **Collect and verify centrally.** A subagent's "cargo check is green" describes its own files at the
+  moment it looked; the lead runs the full gate on the merged tree and reads the diff for collisions.
+  Review and the gate are never delegated — the lead still owns step 5.
+
+This does not change the workflow above: the partition still needs the same gate, the same independent
+review, and the same triage. It changes who types the mechanical part.
+
 ## Investigation budget and stopping
 
 Step 1 asks for the relevant code to be understood before it is changed. It does not ask for that to continue

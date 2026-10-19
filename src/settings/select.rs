@@ -1433,10 +1433,10 @@ fn settings_select_set_focused(key: usize, focused: bool) {
 extern "C" fn settings_select_become_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
     unsafe {
         type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        let mut sup = ObjcSuper::for_defined_class(
+            this,
+            crate::ffi::StaticClass::defining(settings_select_class()),
+        );
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let accepted = send(&mut sup, sel!(becomeFirstResponder));
         if accepted {
@@ -1459,10 +1459,10 @@ extern "C" fn settings_select_become_first_responder(this: *mut c_void, _cmd: Se
 extern "C" fn settings_select_resign_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
     unsafe {
         type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        let mut sup = ObjcSuper::for_defined_class(
+            this,
+            crate::ffi::StaticClass::defining(settings_select_class()),
+        );
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let accepted = send(&mut sup, sel!(resignFirstResponder));
         if accepted {
@@ -1563,10 +1563,10 @@ pub(super) fn settings_select_set_item_symbol(select: *mut AnyObject, index: usi
 
 extern "C" fn settings_select_set_enabled(this: *mut c_void, _cmd: Sel, enabled: bool) {
     unsafe {
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        let mut sup = ObjcSuper::for_defined_class(
+            this,
+            crate::ffi::StaticClass::defining(settings_select_class()),
+        );
         type SetEnabled = unsafe extern "C" fn(*mut ObjcSuper, Sel, bool);
         let send: SetEnabled = std::mem::transmute(objc_msgSendSuper as *const ());
         send(&mut sup, sel!(setEnabled:), enabled);
@@ -1773,11 +1773,14 @@ unsafe fn settings_select_required_option_row_height(width: f64, items: &[String
 
 #[cfg(test)]
 mod tests {
+    use super::settings_select_class;
     use super::{
         settings_select_centered_text_geometry, settings_select_item_active_color,
         settings_select_panel_geometry, settings_select_surface_color,
         settings_select_trigger_paint,
     };
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     fn rect_inside(outer: NSRect, inner: NSRect, epsilon: f64) -> bool {
@@ -1785,6 +1788,51 @@ mod tests {
             && inner.origin.y >= outer.origin.y - epsilon
             && inner.origin.x + inner.size.width <= outer.origin.x + outer.size.width + epsilon
             && inner.origin.y + inner.size.height <= outer.origin.y + outer.size.height + epsilon
+    }
+
+    /// A real override's super dispatch runs to completion on a live instance.
+    ///
+    /// Scope, measured rather than assumed: this does **not** detect a call site that passes the
+    /// wrong class to `for_defined_class`. Replacing `settings_select_class()` with `NSButton`
+    /// (one level too high) still leaves this passing, because `setEnabled:` resolves the same way
+    /// from either starting point. What it does catch is a dispatch that recurses into the override,
+    /// crashes, or never reaches the superclass at all — the failure modes the type change exists
+    /// to remove. Whether `defined` names the defining class is not machine-checkable (any non-null
+    /// class is accepted), so it stays a review obligation; `docs/review-backlog.md` records that.
+    ///
+    /// Returns early when the caller is not on the main thread, rather than reporting a pass.
+    #[test]
+    fn settings_select_super_dispatch_reaches_nsbutton() {
+        if !crate::is_main_thread() {
+            // The class registry and the instance both belong to the main thread; a test runner
+            // thread cannot build this.
+            eprintln!("[smoke] not on the main thread; skipping super dispatch check");
+            return;
+        }
+        unsafe {
+            let trigger: *mut AnyObject = msg_send![settings_select_class(), alloc];
+            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(120.0, 32.0));
+            let trigger: *mut AnyObject = msg_send![trigger, initWithFrame: frame];
+            assert!(!trigger.is_null(), "the select trigger must build");
+
+            // Disable, then enable: each call goes through the override, which derives the
+            // superclass from OhMyTabSettingsSelect and forwards to NSButton.
+            let _: () = msg_send![trigger, setEnabled: false];
+            let disabled: bool = msg_send![trigger, isEnabled];
+            assert!(
+                !disabled,
+                "setEnabled:false must reach NSButton through the override's super dispatch"
+            );
+
+            let _: () = msg_send![trigger, setEnabled: true];
+            let enabled: bool = msg_send![trigger, isEnabled];
+            assert!(
+                enabled,
+                "setEnabled:true must reach NSButton through the override's super dispatch"
+            );
+
+            let _: () = msg_send![trigger, release];
+        }
     }
 
     #[test]

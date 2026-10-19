@@ -768,6 +768,25 @@ static ROW_HOVER_VIEWS: MainThreadSlot<Vec<RowHoverViews>> = MainThreadSlot::new
 static ROW_VIEW_INDICES: MainThreadSlot<Vec<usize>> = MainThreadSlot::new(Vec::new());
 /// the picker window.
 static PICKER_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The picker window's dynamic class. Recorded at registration so an override's super dispatch can
+/// name the class that defined it, rather than recovering it from the instance.
+static PICKER_WINDOW_CLASS: std::sync::OnceLock<crate::ffi::StaticClass> =
+    std::sync::OnceLock::new();
+/// The search field's dynamic class, recorded the same way as the picker window's.
+static SEARCH_FIELD_CLASS: std::sync::OnceLock<crate::ffi::StaticClass> =
+    std::sync::OnceLock::new();
+
+pub(crate) fn picker_window_class() -> &'static crate::ffi::StaticClass {
+    PICKER_WINDOW_CLASS
+        .get()
+        .expect("the picker window class is registered before its override can run")
+}
+
+pub(crate) fn search_field_class() -> &'static crate::ffi::StaticClass {
+    SEARCH_FIELD_CLASS
+        .get()
+        .expect("the search field class is registered before its override can run")
+}
 /// the picker container (receives key events).
 static PICKER_CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// Copy the container pointer and end the slot borrow immediately; never hold a

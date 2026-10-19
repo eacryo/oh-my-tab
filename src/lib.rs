@@ -1242,31 +1242,40 @@ fn create_overlay_window() -> *mut AnyObject {
         let style: u64 = 1 << 7; // NSWindowStyleMaskBorderless(0) | NSWindowStyleMaskNonactivatingPanel
 
         // Register the custom window subclass OhMyTabOverlayWindow : NSPanel (only overrides
-        // canBecomeKeyWindow). Inline, like OhMyTabContainerView; create_overlay_window is called
-        // once, so no double-registration.
+        // canBecomeKeyWindow). Inline, like OhMyTabContainerView. register_once makes "registered
+        // once" a property of the helper instead of a comment promising it.
         let window_cls = {
-            let name = CString::new("OhMyTabOverlayWindow").unwrap();
-            let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types_bool = CString::new("B@:").unwrap();
-            class_addMethod(
-                cls,
-                sel!(canBecomeKeyWindow),
-                overlay_window_can_become_key as *mut c_void,
-                types_bool.as_ptr(),
-            );
-            // Command chords do not arrive at keyDown:. AppKit offers them to performKeyEquivalent:
-            // (key window, then the view hierarchy, then the main menu), so the overlay's own
-            // Cmd+W/M/H/Q are matched here -- the same layer the settings window uses for its Cmd+Q.
-            let types_key_equiv = CString::new("B@:@").unwrap(); // -performKeyEquivalent:(NSEvent*) -> BOOL
-            class_addMethod(
-                cls,
-                sel!(performKeyEquivalent:),
-                overlay_window_perform_key_equivalent as *mut c_void,
-                types_key_equiv.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            cls
+            static CLASS: OnceLock<StaticClass> = OnceLock::new();
+            crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabOverlayWindow", || {
+                let name = c"OhMyTabOverlayWindow";
+                let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
+                let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+                assert!(
+                    !cls.is_null(),
+                    "dynamic class {} could not be allocated; is it registered twice?",
+                    name.to_string_lossy()
+                );
+                let types_bool = CString::new("B@:").unwrap();
+                class_addMethod(
+                    cls,
+                    sel!(canBecomeKeyWindow),
+                    overlay_window_can_become_key as *mut c_void,
+                    types_bool.as_ptr(),
+                );
+                // Command chords do not arrive at keyDown:. AppKit offers them to performKeyEquivalent:
+                // (key window, then the view hierarchy, then the main menu), so the overlay's own
+                // Cmd+W/M/H/Q are matched here -- the same layer the settings window uses for its Cmd+Q.
+                let types_key_equiv = CString::new("B@:@").unwrap(); // -performKeyEquivalent:(NSEvent*) -> BOOL
+                class_addMethod(
+                    cls,
+                    sel!(performKeyEquivalent:),
+                    overlay_window_perform_key_equivalent as *mut c_void,
+                    types_key_equiv.as_ptr(),
+                );
+                objc_registerClassPair(cls);
+                StaticClass::defining(cls)
+            })
+            .0 as *mut AnyObject
         };
 
         let window: *mut AnyObject = msg_send![window_cls, alloc];
@@ -1323,116 +1332,138 @@ fn create_overlay_window() -> *mut AnyObject {
 
         // Register OhMyTabContainerView : NSClipView
         let container_cls = {
-            let name = CString::new("OhMyTabContainerView").unwrap();
-            let superclass = class!(NSClipView) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types_v_obj = CString::new("v@:@").unwrap();
-            let types_bool = CString::new("B@:").unwrap();
-            class_addMethod(
-                cls,
-                sel!(keyDown:),
-                container_key_down as *mut c_void,
-                types_v_obj.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(acceptsFirstResponder),
-                container_accepts_first_responder as *mut c_void,
-                types_bool.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseMoved:),
-                container_mouse_moved as *mut c_void,
-                types_v_obj.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                container_mouse_entered as *mut c_void,
-                types_v_obj.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                container_mouse_exited as *mut c_void,
-                types_v_obj.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseDragged:),
-                container_mouse_moved as *mut c_void,
-                types_v_obj.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(scrollWheel:),
-                container_scroll_wheel as *mut c_void,
-                types_v_obj.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            cls
+            static CLASS: OnceLock<StaticClass> = OnceLock::new();
+            crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabContainerView", || {
+                let name = c"OhMyTabContainerView";
+                let superclass = class!(NSClipView) as *const _ as *mut AnyObject;
+                let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+                assert!(
+                    !cls.is_null(),
+                    "dynamic class {} could not be allocated; is it registered twice?",
+                    name.to_string_lossy()
+                );
+                let types_v_obj = CString::new("v@:@").unwrap();
+                let types_bool = CString::new("B@:").unwrap();
+                class_addMethod(
+                    cls,
+                    sel!(keyDown:),
+                    container_key_down as *mut c_void,
+                    types_v_obj.as_ptr(),
+                );
+                class_addMethod(
+                    cls,
+                    sel!(acceptsFirstResponder),
+                    container_accepts_first_responder as *mut c_void,
+                    types_bool.as_ptr(),
+                );
+                class_addMethod(
+                    cls,
+                    sel!(mouseMoved:),
+                    container_mouse_moved as *mut c_void,
+                    types_v_obj.as_ptr(),
+                );
+                class_addMethod(
+                    cls,
+                    sel!(mouseEntered:),
+                    container_mouse_entered as *mut c_void,
+                    types_v_obj.as_ptr(),
+                );
+                class_addMethod(
+                    cls,
+                    sel!(mouseExited:),
+                    container_mouse_exited as *mut c_void,
+                    types_v_obj.as_ptr(),
+                );
+                class_addMethod(
+                    cls,
+                    sel!(mouseDragged:),
+                    container_mouse_moved as *mut c_void,
+                    types_v_obj.as_ptr(),
+                );
+                class_addMethod(
+                    cls,
+                    sel!(scrollWheel:),
+                    container_scroll_wheel as *mut c_void,
+                    types_v_obj.as_ptr(),
+                );
+                objc_registerClassPair(cls);
+                StaticClass::defining(cls)
+            })
+            .0 as *mut AnyObject
         };
 
         // The custom scrollbar handles dragging explicitly, avoiding native NSScroller tracking
         // failures inside the nonactivating panel.
         let scroller_cls = {
-            let name = CString::new("OhMyTabThumbnailScrollIndicator").unwrap();
-            let superclass = class!(NSView) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types_rect = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
-            class_addMethod(
-                cls,
-                sel!(drawRect:),
-                thumbnail_scroller_draw_rect as *mut c_void,
-                types_rect.as_ptr(),
-            );
-            let types_mouse = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                thumbnail_scroller_mouse_down as *mut c_void,
-                types_mouse.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseDragged:),
-                thumbnail_scroller_mouse_dragged as *mut c_void,
-                types_mouse.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseUp:),
-                thumbnail_scroller_mouse_up as *mut c_void,
-                types_mouse.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                thumbnail_scroller_mouse_entered as *mut c_void,
-                types_mouse.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseMoved:),
-                thumbnail_scroller_mouse_moved as *mut c_void,
-                types_mouse.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                thumbnail_scroller_mouse_exited as *mut c_void,
-                types_mouse.as_ptr(),
-            );
-            let types_accepts_first_mouse = CString::new("B@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(acceptsFirstMouse:),
-                thumbnail_scroller_accepts_first_mouse as *mut c_void,
-                types_accepts_first_mouse.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            cls
+            static CLASS: OnceLock<StaticClass> = OnceLock::new();
+            crate::ffi::StaticClass::register_once(
+                &CLASS,
+                c"OhMyTabThumbnailScrollIndicator",
+                || {
+                    let name = c"OhMyTabThumbnailScrollIndicator";
+                    let superclass = class!(NSView) as *const _ as *mut AnyObject;
+                    let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+                    assert!(
+                        !cls.is_null(),
+                        "dynamic class {} could not be allocated; is it registered twice?",
+                        name.to_string_lossy()
+                    );
+                    let types_rect = CString::new("v@:{CGRect={CGPoint=dd}{CGSize=dd}}").unwrap();
+                    class_addMethod(
+                        cls,
+                        sel!(drawRect:),
+                        thumbnail_scroller_draw_rect as *mut c_void,
+                        types_rect.as_ptr(),
+                    );
+                    let types_mouse = CString::new("v@:@").unwrap();
+                    class_addMethod(
+                        cls,
+                        sel!(mouseDown:),
+                        thumbnail_scroller_mouse_down as *mut c_void,
+                        types_mouse.as_ptr(),
+                    );
+                    class_addMethod(
+                        cls,
+                        sel!(mouseDragged:),
+                        thumbnail_scroller_mouse_dragged as *mut c_void,
+                        types_mouse.as_ptr(),
+                    );
+                    class_addMethod(
+                        cls,
+                        sel!(mouseUp:),
+                        thumbnail_scroller_mouse_up as *mut c_void,
+                        types_mouse.as_ptr(),
+                    );
+                    class_addMethod(
+                        cls,
+                        sel!(mouseEntered:),
+                        thumbnail_scroller_mouse_entered as *mut c_void,
+                        types_mouse.as_ptr(),
+                    );
+                    class_addMethod(
+                        cls,
+                        sel!(mouseMoved:),
+                        thumbnail_scroller_mouse_moved as *mut c_void,
+                        types_mouse.as_ptr(),
+                    );
+                    class_addMethod(
+                        cls,
+                        sel!(mouseExited:),
+                        thumbnail_scroller_mouse_exited as *mut c_void,
+                        types_mouse.as_ptr(),
+                    );
+                    let types_accepts_first_mouse = CString::new("B@:@").unwrap();
+                    class_addMethod(
+                        cls,
+                        sel!(acceptsFirstMouse:),
+                        thumbnail_scroller_accepts_first_mouse as *mut c_void,
+                        types_accepts_first_mouse.as_ptr(),
+                    );
+                    objc_registerClassPair(cls);
+                    StaticClass::defining(cls)
+                },
+            )
+            .0 as *mut AnyObject
         };
 
         let container: *mut AnyObject = msg_send![container_cls, alloc];
@@ -1524,10 +1555,25 @@ fn create_overlay_window() -> *mut AnyObject {
 }
 
 fn create_controller() -> *mut AnyObject {
-    unsafe {
-        let name = CString::new("OhMyTabController").unwrap();
+    unsafe { msg_send![controller_class().0 as *mut AnyObject, new] }
+}
+
+/// Register OhMyTabController : NSObject, the reopen-policy and event-handler target.
+///
+/// register_once makes "registered once" a property of the helper instead of a comment: a second
+/// entry (a smoke runner re-running setup) reuses the class rather than handing
+/// objc_allocateClassPair a name the runtime already owns.
+fn controller_class() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabController", || unsafe {
+        let name = c"OhMyTabController";
         let superclass = class!(NSObject) as *const _ as *mut AnyObject;
         let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+        assert!(
+            !cls.is_null(),
+            "dynamic class {} could not be allocated; is it registered twice?",
+            name.to_string_lossy()
+        );
         let types_v_obj = CString::new("v@:@").unwrap();
         let app_reopen_types = CString::new(APP_REOPEN_METHOD_ENCODING).unwrap();
         class_addMethod(
@@ -1834,8 +1880,8 @@ fn create_controller() -> *mut AnyObject {
             types_v_obj.as_ptr(),
         );
         objc_registerClassPair(cls);
-        msg_send![cls, new]
-    }
+        StaticClass::defining(cls)
+    })
 }
 
 /// Load the canonical app icon directly from the PNG bundled into the binary.
@@ -1870,70 +1916,24 @@ pub(crate) fn set_settings_activation_policy(regular: bool) {
     }
 }
 
-fn setup_status_bar() {
-    unsafe {
-        let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
-        // NSVariableStatusItemLength = -1.0: the slot auto-sizes to the button's content, so after
-        // sizeToFit it hugs the icon with no extra padding. A fixed length (the former 30.0) is not
-        // shrunk by sizeToFit, so the slot stays 30pt while the icon is ~17pt, leaving visible gaps
-        // around the icon.
-        let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: -1.0f64];
-        let _: *mut AnyObject = msg_send![status_item, retain];
-        // Record the handle for "hide menu bar icon" before the item is configured: the toggle only
-        // flips visibility on this same item, so nothing below has to know it can be hidden.
-        crate::menu::register_status_item(status_item);
-
-        let button: *mut AnyObject = msg_send![status_item, button];
-
-        // Status bar icon: monochrome template PNG (two overlapped rects, assets/statusbar-icon.png embedded
-        // in the binary). setTemplate:YES makes the system render it in the menu bar foreground color
-        // (clear on both light/dark menu bars); sizeToFit hugs the image.
-        let png_bytes: &[u8] = include_bytes!("../assets/statusbar-icon.png");
-        let nsdata: *mut AnyObject = msg_send![
-            class!(NSData),
-            dataWithBytes: png_bytes.as_ptr() as *const c_void,
-            length: png_bytes.len()
-        ];
-        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        let image: *mut AnyObject = msg_send![image, initWithData: nsdata];
-        if !image.is_null() {
-            // statusbar-icon.png is 162x128 (wider horizontal margins so the icon sits looser
-            // from its neighbors). Set the height to the status-bar thickness and scale the width
-            // by the PNG aspect ratio, keeping the glyph pixel size while widening the gaps.
-            // Forcing a square (icon_size x icon_size) would squash the non-square PNG.
-            let icon_size: f64 = msg_send![status_bar, thickness];
-            let aspect: f64 = 162.0 / 128.0; // PNG aspect ratio
-            let _: () = msg_send![image, setSize: NSSize::new(icon_size * aspect, icon_size)];
-            let is_template: bool = true;
-            let _: () = msg_send![image, setTemplate: is_template];
-            let _: () = msg_send![button, setImage: image];
-            // NSImageOnly = 1
-            let _: () = msg_send![button, setImagePosition: 1usize];
-            let _: () = msg_send![image, release]; // button retained it; drop our alloc +1
-        } else {
-            let ns_title = make_nsstring("Tab");
-            let _: () = msg_send![button, setTitle: ns_title];
-            CFRelease(ns_title as *const c_void);
-        }
-
-        let _: () = msg_send![button, sizeToFit];
-        let _: () = msg_send![button, setNeedsDisplay: true];
-
-        // Build menu
-        let menu_title = make_nsstring("");
-        let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
-        let menu: *mut AnyObject = msg_send![menu, initWithTitle: menu_title];
-        CFRelease(menu_title as *const c_void);
-
-        // Menu action target class
-        let action_cls = {
-            let name = CString::new("OhMyTabMenuTarget2").unwrap();
-            let superclass: *const objc2::runtime::AnyClass = class!(NSObject);
-            let cls = objc_allocateClassPair(superclass as *mut AnyObject, name.as_ptr(), 0);
-            if cls.is_null() {
-                log_info!("Failed to allocate ObjC class for menu target.");
-                return;
-            }
+/// Register OhMyTabMenuTarget2 : NSObject, the target of every menu-item and settings action.
+///
+/// register_once makes "registered once" a property of the helper instead of a comment: a second
+/// entry reuses the class rather than handing objc_allocateClassPair a name the runtime already
+/// owns.
+fn menu_target_class() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabMenuTarget2", || {
+        // The class is built from raw objc FFI calls.
+        unsafe {
+            let name = c"OhMyTabMenuTarget2";
+            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            assert!(
+                !cls.is_null(),
+                "dynamic class {} could not be allocated; is it registered twice?",
+                name.to_string_lossy()
+            );
             let types = CString::new("v@:@").unwrap();
             class_addMethod(
                 cls,
@@ -2294,9 +2294,67 @@ fn setup_status_bar() {
                 types.as_ptr(),
             );
             objc_registerClassPair(cls);
-            cls
-        };
-        let menu_target: *mut AnyObject = msg_send![action_cls as *const AnyObject, new];
+            StaticClass::defining(cls)
+        }
+    })
+}
+
+fn setup_status_bar() {
+    unsafe {
+        let status_bar: *mut AnyObject = msg_send![class!(NSStatusBar), systemStatusBar];
+        // NSVariableStatusItemLength = -1.0: the slot auto-sizes to the button's content, so after
+        // sizeToFit it hugs the icon with no extra padding. A fixed length (the former 30.0) is not
+        // shrunk by sizeToFit, so the slot stays 30pt while the icon is ~17pt, leaving visible gaps
+        // around the icon.
+        let status_item: *mut AnyObject = msg_send![status_bar, statusItemWithLength: -1.0f64];
+        let _: *mut AnyObject = msg_send![status_item, retain];
+        // Record the handle for "hide menu bar icon" before the item is configured: the toggle only
+        // flips visibility on this same item, so nothing below has to know it can be hidden.
+        crate::menu::register_status_item(status_item);
+
+        let button: *mut AnyObject = msg_send![status_item, button];
+
+        // Status bar icon: monochrome template PNG (two overlapped rects, assets/statusbar-icon.png embedded
+        // in the binary). setTemplate:YES makes the system render it in the menu bar foreground color
+        // (clear on both light/dark menu bars); sizeToFit hugs the image.
+        let png_bytes: &[u8] = include_bytes!("../assets/statusbar-icon.png");
+        let nsdata: *mut AnyObject = msg_send![
+            class!(NSData),
+            dataWithBytes: png_bytes.as_ptr() as *const c_void,
+            length: png_bytes.len()
+        ];
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let image: *mut AnyObject = msg_send![image, initWithData: nsdata];
+        if !image.is_null() {
+            // statusbar-icon.png is 162x128 (wider horizontal margins so the icon sits looser
+            // from its neighbors). Set the height to the status-bar thickness and scale the width
+            // by the PNG aspect ratio, keeping the glyph pixel size while widening the gaps.
+            // Forcing a square (icon_size x icon_size) would squash the non-square PNG.
+            let icon_size: f64 = msg_send![status_bar, thickness];
+            let aspect: f64 = 162.0 / 128.0; // PNG aspect ratio
+            let _: () = msg_send![image, setSize: NSSize::new(icon_size * aspect, icon_size)];
+            let is_template: bool = true;
+            let _: () = msg_send![image, setTemplate: is_template];
+            let _: () = msg_send![button, setImage: image];
+            // NSImageOnly = 1
+            let _: () = msg_send![button, setImagePosition: 1usize];
+            let _: () = msg_send![image, release]; // button retained it; drop our alloc +1
+        } else {
+            let ns_title = make_nsstring("Tab");
+            let _: () = msg_send![button, setTitle: ns_title];
+            CFRelease(ns_title as *const c_void);
+        }
+
+        let _: () = msg_send![button, sizeToFit];
+        let _: () = msg_send![button, setNeedsDisplay: true];
+
+        // Build menu
+        let menu_title = make_nsstring("");
+        let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let menu: *mut AnyObject = msg_send![menu, initWithTitle: menu_title];
+        CFRelease(menu_title as *const c_void);
+
+        let menu_target: *mut AnyObject = msg_send![menu_target_class().0 as *const AnyObject, new];
         *MENU_TARGET.lock().unwrap() = Some(ObjPtr::new(menu_target));
         // Keep a Send-safe handle to the same object for background dispatch (see
         // MENU_TARGET_DISPATCH).

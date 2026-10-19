@@ -277,15 +277,24 @@ fn run_off_main(operation: impl FnOnce() -> bool + Send + 'static) {
     schedule_panel_action_refresh();
 }
 
-/// Run `body` inside a fresh NSAutoreleasePool. Used by the worker threads that touch AppKit.
+/// Run `body` inside a fresh autorelease pool. Used by the worker threads that touch AppKit.
+///
+/// `objc2::rc::autoreleasepool` rather than a hand-written new/drain pair: it drains while a
+/// panic unwinds too, where the pair skipped the drain and left the whole pool's objects behind.
+/// A worker thread still pushes its own pool here -- a pool belongs to the thread that pushed
+/// it, and this is that thread.
 fn autorelease_pool(body: impl FnOnce()) {
-    unsafe {
-        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        body();
-        if !pool.is_null() {
-            let _: () = msg_send![pool, drain];
-        }
-    }
+    objc2::rc::autoreleasepool(|_pool| body());
+}
+
+/// The production pool helper, exercised from a test.
+///
+/// The test could call `objc2::rc::autoreleasepool` itself and pass while this wrapper was broken
+/// (reverted to a pair that skips the drain when `body` unwinds, say). Going through the wrapper is
+/// what makes the assertion about the code that actually runs on the worker thread.
+#[cfg(test)]
+pub(crate) fn autorelease_pool_for_test(body: impl FnOnce()) {
+    autorelease_pool(body);
 }
 
 /// Ask for a refresh shortly after an action, through the existing deferred-refresh machinery.

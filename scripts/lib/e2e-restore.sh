@@ -24,7 +24,11 @@ omt_cua() {
 }
 
 omt_front_pid() {
-    omt_cua list_apps '{"include_installed":false}' 2>/dev/null | python3 -c '
+    # No arguments: the driver's list_apps takes none. It used to accept
+    # {"include_installed":false} and now refuses the call outright ("unknown argument"), which made
+    # every scenario that takes a focus baseline fail before it started rather than read a wrong
+    # answer. Running apps are what carry "active", so the unfiltered list is the one to ask for.
+    omt_cua list_apps '{}' 2>/dev/null | python3 -c '
 import json, sys
 try:
     apps = json.load(sys.stdin).get("apps", [])

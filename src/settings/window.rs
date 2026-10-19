@@ -3085,6 +3085,7 @@ pub(super) use chrome::settings_effective_corner_radius;
 pub(super) use chrome::{
     apply_settings_root_surface, apply_settings_window_appearance, refresh_settings_root_corner,
     settings_root_view_class, settings_root_view_for_host, settings_window_class,
+    settings_window_class_handle,
 };
 
 fn create_settings_window() {

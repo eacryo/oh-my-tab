@@ -8,45 +8,53 @@ use super::*;
 /// The search field cell class (an NSSearchFieldCell subclass overriding
 /// drawInteriorWithFrame:inView:), which centers the icon and placeholder as a group.
 pub(super) unsafe fn search_cell_class() -> *mut AnyObject {
+    search_cell_class_handle().0 as *mut AnyObject
+}
+
+/// The class handle itself, so each override's super dispatch can name the class that defined
+/// it: ObjcSuper::for_defined_class derives the superclass from this handle.
+fn search_cell_class_handle() -> StaticClass {
     static CELL_CLS: OnceLock<StaticClass> = OnceLock::new();
-    CELL_CLS
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipSearchCell").unwrap();
-            let superclass = class!(NSSearchFieldCell) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            // Args: NSRect (struct) + NSView* -> encoding "v@:{CGRect=dddd}@".
-            let types = CString::new("v@:{CGRect=dddd}@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(drawInteriorWithFrame:inView:),
-                search_cell_draw_interior as *mut c_void,
-                types.as_ptr(),
-            );
-            // Outer-draw override: when focused-and-empty, the search icon and the
-            // placeholder are drawn by the superclass's drawWithFrame: (drawInterior only
-            // covers the interior text area, verified); skip the whole frame here.
-            class_addMethod(
-                cls,
-                sel!(drawWithFrame:inView:),
-                search_cell_draw_with_frame as *mut c_void,
-                types.as_ptr(),
-            );
-            // The field editor is positioned directly at edit start: drawingRectForBounds:
-            // has no effect on it (the native NSSearchFieldCell returns the full-height
-            // rect, so the override condition never fires and the text stays top-aligned --
-            // measured 0.5pt from the field top). selectWithFrame: re-centers the editor
-            // frame vertically, centering the caret and the typed text with the line box.
-            let types_sel = CString::new("v@:{CGRect=dddd}@@@@qq").unwrap();
-            class_addMethod(
-                cls,
-                sel!(selectWithFrame:inView:editor:delegate:start:length:),
-                search_cell_select_with_frame as *mut c_void,
-                types_sel.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
+    crate::ffi::StaticClass::register_once(&CELL_CLS, c"OhMyTabClipSearchCell", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipSearchCell",
+            class!(NSSearchFieldCell),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(drawInteriorWithFrame:inView:),
+                    search_cell_draw_interior
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect, *mut AnyObject),
+                );
+                // Outer-draw override: when focused-and-empty, the search icon and the
+                // placeholder are drawn by the superclass's drawWithFrame: (drawInterior only
+                // covers the interior text area, verified); skip the whole frame here.
+                builder.add_method::<AnyObject, _>(
+                    sel!(drawWithFrame:inView:),
+                    search_cell_draw_with_frame
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect, *mut AnyObject),
+                );
+                // The field editor is positioned directly at edit start: drawingRectForBounds:
+                // has no effect on it (the native NSSearchFieldCell returns the full-height
+                // rect, so the override condition never fires and the text stays top-aligned --
+                // measured 0.5pt from the field top). selectWithFrame: re-centers the editor
+                // frame vertically, centering the caret and the typed text with the line box.
+                builder.add_method::<AnyObject, _>(
+                    sel!(selectWithFrame:inView:editor:delegate:start:length:),
+                    search_cell_select_with_frame
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            NSRect,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                            isize,
+                            isize,
+                        ),
+                );
+            },
+        )
+    })
 }
 
 /// Whether the current search needs its right-side clear ×.
@@ -297,20 +305,20 @@ unsafe fn draw_search_query_layout(cell_frame: NSRect, value: *mut AnyObject, x:
 /// Draws the centered placeholder for a non-editing empty field; a retained unfocused query is
 /// hand-drawn on the same baseline, while an actively edited value belongs to the field editor.
 extern "C" fn search_cell_draw_interior(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     cell_frame: NSRect,
-    control_view: *mut c_void,
+    control_view: *mut AnyObject,
 ) {
     unsafe {
         // Editing detection: a live field editor means editing (no placeholder; super).
         let editing = if control_view.is_null() {
             false
         } else {
-            let editor: *mut AnyObject = msg_send![control_view as *mut AnyObject, currentEditor];
+            let editor: *mut AnyObject = msg_send![control_view, currentEditor];
             !editor.is_null()
         };
-        let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
+        let str_obj: *mut AnyObject = msg_send![_self, stringValue];
         let str_len: usize = msg_send![str_obj, length];
         // An unfocused field may still retain a query after ↓ moves focus into the list. Draw
         // the placeholder only while it is empty; otherwise super must draw the entered query.
@@ -344,13 +352,9 @@ extern "C" fn search_cell_draw_interior(
         // Raw objc_msgSendSuper: objc2's msg_send! infinitely recurses in signature
         // verification for the nested-struct encoding (observed stack overflow); CG
         // structs must go through raw FFI (same as ffi::layer_set_*).
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut c_void) -> ();
-        let super_class =
-            objc2::runtime::AnyClass::get(c"NSSearchFieldCell").unwrap() as *const _ as *mut c_void;
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class,
-        };
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut AnyObject) -> ();
+        let mut sup =
+            ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
         let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
         f(
             &mut sup,
@@ -365,21 +369,21 @@ extern "C" fn search_cell_draw_interior(
 /// left-aligned system placeholder); draw our complete search hint instead. This keeps the
 /// HTML mockup's hint visible after a click until the user enters the first character.
 extern "C" fn search_cell_draw_with_frame(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     cell_frame: NSRect,
-    control_view: *mut c_void,
+    control_view: *mut AnyObject,
 ) {
     unsafe {
         // Editing detection (same as drawInterior).
         let editing = if control_view.is_null() {
             false
         } else {
-            let editor: *mut AnyObject = msg_send![control_view as *mut AnyObject, currentEditor];
+            let editor: *mut AnyObject = msg_send![control_view, currentEditor];
             !editor.is_null()
         };
         if editing {
-            let str_obj: *mut AnyObject = msg_send![_self as *mut AnyObject, stringValue];
+            let str_obj: *mut AnyObject = msg_send![_self, stringValue];
             let str_len: usize = msg_send![str_obj, length];
             if str_len == 0 {
                 // Focused with an empty stringValue -> draw ONLY the magnifier and the
@@ -396,13 +400,9 @@ extern "C" fn search_cell_draw_with_frame(
         }
         // Raw objc_msgSendSuper (same as drawInterior; the struct encoding goes through
         // raw FFI).
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut c_void) -> ();
-        let super_class =
-            objc2::runtime::AnyClass::get(c"NSSearchFieldCell").unwrap() as *const _ as *mut c_void;
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class,
-        };
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut AnyObject) -> ();
+        let mut sup =
+            ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
         let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
         f(
             &mut sup,
@@ -418,12 +418,12 @@ extern "C" fn search_cell_draw_with_frame(
 /// The editor frame's top is the text container's top, so centering it centers the caret
 /// and the typed text.
 extern "C" fn search_cell_select_with_frame(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     rect: NSRect,
-    control_view: *mut c_void,
-    editor: *mut c_void,
-    delegate: *mut c_void,
+    control_view: *mut AnyObject,
+    editor: *mut AnyObject,
+    delegate: *mut AnyObject,
     sel_start: isize,
     sel_length: isize,
 ) {
@@ -434,18 +434,14 @@ extern "C" fn search_cell_select_with_frame(
             *mut ObjcSuper,
             Sel,
             NSRect,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
+            *mut AnyObject,
+            *mut AnyObject,
+            *mut AnyObject,
             isize,
             isize,
         ) -> ();
-        let super_class =
-            objc2::runtime::AnyClass::get(c"NSSearchFieldCell").unwrap() as *const _ as *mut c_void;
-        let mut sup = ObjcSuper {
-            receiver: _self,
-            super_class,
-        };
+        let mut sup =
+            ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
         let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
         f(
             &mut sup,
@@ -462,12 +458,12 @@ extern "C" fn search_cell_select_with_frame(
         // plus 22pt icon column, exactly matching draw_retained_search_query after ↓ moves
         // focus to the list, so the text never shifts horizontally.
         if !editor.is_null() && rect.size.height > 0.0 && !control_view.is_null() {
-            let font: *mut AnyObject = msg_send![_self as *mut AnyObject, font];
+            let font: *mut AnyObject = msg_send![_self, font];
             if !font.is_null() {
                 // Force the live field editor to the same font as the hand-drawn unfocused
                 // query. Setting NSSearchField alone does not always override a reused shared
                 // field editor's default font.
-                let _: () = msg_send![editor as *mut AnyObject, setFont: font];
+                let _: () = msg_send![editor, setFont: font];
                 // The caret/line-fragment height is the font's lineHeight (measured 17.0),
                 // not asc-desc+lead (16.49): centering by the latter leaves the 17pt-tall
                 // fragment/caret center at 20.25, 0.25pt off the field's center.
@@ -483,25 +479,22 @@ extern "C" fn search_cell_select_with_frame(
                     // editor's top offset (converted into field coordinates) is SUBTRACTED,
                     // so the inset self-corrects against the editor's real position: the text
                     // stays centered and the editor stops growing.
-                    let ed_bounds: NSRect = msg_send![editor as *mut AnyObject, bounds];
-                    let in_field: NSRect = msg_send![
-                        control_view as *mut AnyObject,
-                        convertRect: ed_bounds,
-                        fromView: editor as *mut AnyObject
-                    ];
+                    let ed_bounds: NSRect = msg_send![editor, bounds];
+                    let in_field: NSRect =
+                        msg_send![control_view, convertRect: ed_bounds, fromView: editor];
                     // How far the editor's top sits above the field's top (non-flipped:
                     // the top edge is maxY).
                     let top_offset = in_field.origin.y + in_field.size.height - rect.size.height;
                     let vertical = ((rect.size.height - line_h) / 2.0 - top_offset).max(0.0);
                     let _: () = msg_send![
-                        editor as *mut AnyObject,
+                        editor,
                         setTextContainerInset: NSSize::new(SEARCH_PAD_IN + SEARCH_ICON_W, vertical)
                     ];
                     // NSTextContainer's default lineFragmentPadding = 2 pushes the typed text
                     // 2pt right of the hand-drawn retained query's start (12 + 22 = 34),
                     // making the text jump left on ↓. Zeroing it makes the glyphs start at
                     // the container origin (the inset start), matching the hand-drawn x.
-                    let tc: *mut AnyObject = msg_send![editor as *mut AnyObject, textContainer];
+                    let tc: *mut AnyObject = msg_send![editor, textContainer];
                     let _: () = msg_send![tc, setLineFragmentPadding: 0.0];
                 }
             }

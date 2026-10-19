@@ -201,10 +201,10 @@ echo "  panel ${panel_w}x${panel_h}; gear ${gear_w}x${gear_h} at (${gear_x},${ge
 # the poll runs on the panel own 16ms timer. Move onto the gear first and give the poll a beat,
 # exactly as a user hand does on the way to a click; clicking from a standing start arrives
 # before the panel has enabled input and the gesture is lost.
-cua move_cursor "{\"scope\": \"desktop\", \"x\": $click_x, \"y\": $click_y}" >/dev/null || true
+cua move_cursor "{\"target\": {\"kind\": \"desktop\", \"display_id\": \"primary\"}, \"x\": $click_x, \"y\": $click_y}" >/dev/null || true
 sleep 0.4
 echo "  clicking the gear in desktop pixels at (${click_x},${click_y})"
-cua click "{\"scope\": \"desktop\", \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"background\"}" >/dev/null
+cua click "{\"target\": {\"kind\": \"desktop\", \"display_id\": \"primary\"}, \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"foreground\"}" >/dev/null
 
 # The assertion the broken gear would fail: the settings window must come up on its page.
 if ! wait_for_state "s.get('settings_window_visible') and s.get('selected_sidebar_name') == 'keystroke-display'"; then

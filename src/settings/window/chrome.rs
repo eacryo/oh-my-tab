@@ -2,18 +2,6 @@
 
 use super::*;
 
-struct SettingsWindowClass(*mut AnyObject);
-unsafe impl Send for SettingsWindowClass {}
-unsafe impl Sync for SettingsWindowClass {}
-
-/// Root view used by the settings window so AppKit can resolve macOS 27's container-relative
-/// corner radii while the layer still clips every custom child into the same surface.
-struct SettingsRootViewClass(*mut AnyObject);
-unsafe impl Send for SettingsRootViewClass {}
-unsafe impl Sync for SettingsRootViewClass {}
-
-static SETTINGS_ROOT_VIEW_CLS: OnceLock<SettingsRootViewClass> = OnceLock::new();
-
 pub(in crate::settings) fn settings_effective_corner_radius(
     radii: Option<[f64; 4]>,
     fallback: f64,
@@ -28,7 +16,10 @@ pub(in crate::settings) fn settings_effective_corner_radius(
     }
 }
 
-extern "C" fn settings_root_corner_configuration(_self: *mut c_void, _cmd: Sel) -> *mut AnyObject {
+extern "C" fn settings_root_corner_configuration(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+) -> *mut AnyObject {
     unsafe {
         let Some(radius_cls) = AnyClass::get(c"NSViewCornerRadius") else {
             return std::ptr::null_mut();
@@ -47,9 +38,12 @@ extern "C" fn settings_root_corner_configuration(_self: *mut c_void, _cmd: Sel) 
     }
 }
 
-extern "C" fn settings_root_view_did_change_effective_corner_radii(this: *mut c_void, _cmd: Sel) {
+extern "C" fn settings_root_view_did_change_effective_corner_radii(
+    this: *mut AnyObject,
+    _cmd: Sel,
+) {
     unsafe {
-        let view = this as *mut AnyObject;
+        let view = this;
         let radii: *mut AnyObject = msg_send![view, effectiveCornerRadii];
         let radius = if radii.is_null() {
             settings_effective_corner_radius(None, crate::theme::SETTINGS_WINDOW_RADIUS)
@@ -71,37 +65,41 @@ extern "C" fn settings_root_view_did_change_effective_corner_radii(this: *mut c_
     }
 }
 
-extern "C" fn settings_window_key_down(_this: *mut c_void, _cmd: Sel, _event: *mut AnyObject) {
+extern "C" fn settings_window_key_down(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     // Unhandled keys should stop at the settings window instead of reaching NSApplication's
     // terminal responder, whose default noResponderFor:keyDown: implementation beeps.
 }
 
+/// Root view used by the settings window so AppKit can resolve macOS 27's container-relative
+/// corner radii while the layer still clips every custom child into the same surface.
+///
+/// The two overrides only exist on systems that have the corner-radius classes at all; both are
+/// added before registration, because a class cannot gain methods after it has been registered.
 pub(in crate::settings) fn settings_root_view_class() -> *mut AnyObject {
-    SETTINGS_ROOT_VIEW_CLS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabSettingsRootView").unwrap();
-            let superclass = class!(NSView) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            if AnyClass::get(c"NSViewCornerConfiguration").is_some()
-                && AnyClass::get(c"NSViewCornerRadius").is_some()
-            {
-                class_addMethod(
-                    cls,
-                    sel!(cornerConfiguration),
-                    settings_root_corner_configuration as *mut c_void,
-                    CString::new("@@:").unwrap().as_ptr(),
-                );
-                class_addMethod(
-                    cls,
-                    sel!(viewDidChangeEffectiveCornerRadii),
-                    settings_root_view_did_change_effective_corner_radii as *mut c_void,
-                    CString::new("v@:").unwrap().as_ptr(),
-                );
-            }
-            objc_registerClassPair(cls);
-            SettingsRootViewClass(cls)
-        })
-        .0
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabSettingsRootView", || {
+        crate::ffi::build_class(
+            c"OhMyTabSettingsRootView",
+            class!(NSView),
+            |builder| unsafe {
+                if AnyClass::get(c"NSViewCornerConfiguration").is_some()
+                    && AnyClass::get(c"NSViewCornerRadius").is_some()
+                {
+                    builder.add_method::<AnyObject, _>(
+                        sel!(cornerConfiguration),
+                        settings_root_corner_configuration
+                            as unsafe extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
+                    );
+                    builder.add_method::<AnyObject, _>(
+                        sel!(viewDidChangeEffectiveCornerRadii),
+                        settings_root_view_did_change_effective_corner_radii
+                            as unsafe extern "C" fn(*mut AnyObject, Sel),
+                    );
+                }
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 pub(in crate::settings) unsafe fn settings_root_view_for_host(
@@ -147,7 +145,7 @@ pub(in crate::settings) unsafe fn refresh_settings_root_corner(window: *mut AnyO
     let _: () = msg_send![root, invalidateCornerConfiguration];
     let _: () = msg_send![root, layoutSubtreeIfNeeded];
     settings_root_view_did_change_effective_corner_radii(
-        root as *mut c_void,
+        root,
         sel!(viewDidChangeEffectiveCornerRadii),
     );
 }
@@ -176,60 +174,50 @@ pub(in crate::settings) unsafe fn apply_settings_root_surface(
     }
 }
 
-static SETTINGS_WINDOW_CLS: OnceLock<SettingsWindowClass> = OnceLock::new();
+/// The class handle itself, so the overrides that dispatch to super can name the class that
+/// defined them: `ObjcSuper::for_defined_class` derives the superclass from this handle.
+pub(in crate::settings) fn settings_window_class_handle() -> crate::ffi::StaticClass {
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabSettingsWindow", || {
+        crate::ffi::build_class(
+            c"OhMyTabSettingsWindow",
+            class!(NSWindow),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(performClose:),
+                    settings_window_perform_close
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(keyDown:),
+                    settings_window_key_down
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(close),
+                    settings_window_close as unsafe extern "C" fn(*mut AnyObject, Sel),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(sendEvent:),
+                    settings_window_send_event
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(performKeyEquivalent:),
+                    settings_window_perform_key_equivalent
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            *mut AnyObject,
+                        ) -> objc2::runtime::Bool,
+                );
+            },
+        )
+    })
+}
 
 pub(in crate::settings) fn settings_window_class() -> *mut AnyObject {
-    SETTINGS_WINDOW_CLS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabSettingsWindow").unwrap();
-            let superclass = class!(NSWindow) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap(); // -performClose:(id)sender -> void
-            class_addMethod(
-                cls,
-                sel!(performClose:),
-                settings_window_perform_close as *mut c_void,
-                types.as_ptr(),
-            );
-            let types_key_down = CString::new("v@:@").unwrap(); // -keyDown:(NSEvent*) -> void
-            class_addMethod(
-                cls,
-                sel!(keyDown:),
-                settings_window_key_down as *mut c_void,
-                types_key_down.as_ptr(),
-            );
-            let types_close = CString::new("v@:").unwrap(); // -close -> void
-            class_addMethod(
-                cls,
-                sel!(close),
-                settings_window_close as *mut c_void,
-                types_close.as_ptr(),
-            );
-            let types_event = CString::new("v@:@").unwrap(); // -sendEvent:(NSEvent*) -> void
-            class_addMethod(
-                cls,
-                sel!(sendEvent:),
-                settings_window_send_event as *mut c_void,
-                types_event.as_ptr(),
-            );
-            let types_key = CString::new("B@:@").unwrap(); // -performKeyEquivalent:(NSEvent*) -> BOOL
-            class_addMethod(
-                cls,
-                sel!(performKeyEquivalent:),
-                settings_window_perform_key_equivalent as *mut c_void,
-                types_key.as_ptr(),
-            );
-            let types_resize = CString::new("v@:{CGSize=dd}").unwrap(); // -resizeSubviewsWithOldSize:(NSSize) -> void
-            class_addMethod(
-                cls,
-                sel!(resizeSubviewsWithOldSize:),
-                settings_window_resize_subviews as *mut c_void,
-                types_resize.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            SettingsWindowClass(cls)
-        })
-        .0
+    settings_window_class_handle().0 as *mut AnyObject
 }
 
 /// Apply the resolved appearance to the settings window and its semantic AppKit controls.

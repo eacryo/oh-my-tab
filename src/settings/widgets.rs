@@ -1,6 +1,7 @@
 //! Control builders: button/text-field/switch/slider/popup custom classes plus card and row layout builders.
 
 use super::*;
+use objc2::runtime::Bool;
 
 #[link(name = "AppKit", kind = "framework")]
 extern "C" {
@@ -75,7 +76,7 @@ pub(super) unsafe fn apply_inset_focus_ring(
 
 /// Shared NSTextField delegate: shows the inset accent ring while the field is being edited.
 extern "C" fn settings_text_field_focus_did_begin(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     notification: *mut AnyObject,
 ) {
@@ -86,7 +87,7 @@ extern "C" fn settings_text_field_focus_did_begin(
 }
 
 extern "C" fn settings_text_field_focus_did_end(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     notification: *mut AnyObject,
 ) {
@@ -97,51 +98,53 @@ extern "C" fn settings_text_field_focus_did_end(
 }
 
 fn settings_text_field_delegate() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
     static DELEGATE: OnceLock<usize> = OnceLock::new();
+    let cls = StaticClass::register_once(&CLASS, c"OhMyTabSettingsTextFieldDelegate", || {
+        build_class(
+            c"OhMyTabSettingsTextFieldDelegate",
+            class!(NSObject),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(controlTextDidBeginEditing:),
+                    settings_text_field_focus_did_begin
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(controlTextDidEndEditing:),
+                    settings_text_field_focus_did_end
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    });
     *DELEGATE.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabSettingsTextFieldDelegate").unwrap();
-        let superclass = class!(NSObject) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(controlTextDidBeginEditing:),
-            settings_text_field_focus_did_begin as *mut c_void,
-            types.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(controlTextDidEndEditing:),
-            settings_text_field_focus_did_end as *mut c_void,
-            types.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        let delegate: *mut AnyObject = msg_send![cls, new];
+        let delegate: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, new];
         delegate as usize
     }) as *mut AnyObject
 }
 
 /// Return a flipped NSView class for embedded flows that use top-down child coordinates.
 pub(crate) fn flipped_settings_view_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabFlippedSettingsView").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(isFlipped),
-            flipped_settings_view_is_flipped as *mut c_void,
-            types.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabFlippedSettingsView", || {
+        build_class(
+            c"OhMyTabFlippedSettingsView",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(isFlipped),
+                    flipped_settings_view_is_flipped
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
-extern "C" fn flipped_settings_view_is_flipped(_this: *mut c_void, _cmd: Sel) -> bool {
-    true
+extern "C" fn flipped_settings_view_is_flipped(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+    Bool::YES
 }
 
 /// Semantic text roles used by every settings label and control.
@@ -235,49 +238,42 @@ pub(super) unsafe fn style_html_button(button: *mut AnyObject, background_hex: u
     let _: () = msg_send![button, setContentTintColor: text_color];
 }
 
-pub(super) struct HtmlActionButtonClass(*mut AnyObject);
-unsafe impl Send for HtmlActionButtonClass {}
-unsafe impl Sync for HtmlActionButtonClass {}
-
-pub(super) static HTML_ACTION_BUTTON_CLASS: OnceLock<HtmlActionButtonClass> = OnceLock::new();
+/// The class handle, so a super dispatch can name the class that defined the override.
+pub(super) fn html_action_button_class_handle() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabHtmlActionButton", || {
+        build_class(
+            c"OhMyTabHtmlActionButton",
+            class!(NSButton),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    html_action_button_mouse_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    html_action_button_mouse_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                // become/resignFirstResponder return BOOL, not void.
+                builder.add_method::<AnyObject, _>(
+                    sel!(becomeFirstResponder),
+                    html_action_button_become_first_responder
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(resignFirstResponder),
+                    html_action_button_resign_first_responder
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+                );
+            },
+        )
+    })
+}
 
 pub(super) fn html_action_button_class() -> *mut AnyObject {
-    HTML_ACTION_BUTTON_CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabHtmlActionButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                html_action_button_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                html_action_button_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            // become/resignFirstResponder return BOOL ('B'), not void.
-            let focus_types = CString::new("B@:").unwrap();
-            class_addMethod(
-                cls,
-                sel!(becomeFirstResponder),
-                html_action_button_become_first_responder as *mut c_void,
-                focus_types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(resignFirstResponder),
-                html_action_button_resign_first_responder as *mut c_void,
-                focus_types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            HtmlActionButtonClass(cls)
-        })
-        .0
+    html_action_button_class_handle().0 as *mut AnyObject
 }
 
 /// Resolve the fill a `SettingsButton` shows while hovered, from the palette-selecting `tag`.
@@ -315,12 +311,12 @@ pub(super) fn action_button_normal_color(tag: isize, palette: crate::theme::UiPa
 }
 
 pub(super) extern "C" fn html_action_button_mouse_entered(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
-        let button = this as *mut AnyObject;
+        let button = this;
         let tag: isize = msg_send![button, tag];
         let hover = action_button_hover_color(tag, settings_palette());
         let layer: *mut AnyObject = msg_send![button, layer];
@@ -334,12 +330,12 @@ pub(super) extern "C" fn html_action_button_mouse_entered(
 }
 
 pub(super) extern "C" fn html_action_button_mouse_exited(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
-        let button = this as *mut AnyObject;
+        let button = this;
         let tag: isize = msg_send![button, tag];
         let normal = action_button_normal_color(tag, settings_palette());
         let layer: *mut AnyObject = msg_send![button, layer];
@@ -352,44 +348,30 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
     }
 }
 
-extern "C" fn html_action_button_become_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+extern "C" fn html_action_button_become_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
     unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
+        let mut sup =
+            ObjcSuper::for_defined_class(this as *mut c_void, html_action_button_class_handle());
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let accepted = send(&mut sup, sel!(becomeFirstResponder));
-        if accepted {
+        if accepted.as_bool() {
             // Idle border is the 1pt card_border; focus swaps it for the 2pt accent ring.
-            apply_inset_focus_ring(
-                this as *mut AnyObject,
-                true,
-                settings_palette().card_border,
-                1.0,
-            );
+            apply_inset_focus_ring(this, true, settings_palette().card_border, 1.0);
         }
         accepted
     }
 }
 
-extern "C" fn html_action_button_resign_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+extern "C" fn html_action_button_resign_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
     unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
+        let mut sup =
+            ObjcSuper::for_defined_class(this as *mut c_void, html_action_button_class_handle());
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let accepted = send(&mut sup, sel!(resignFirstResponder));
-        if accepted {
-            apply_inset_focus_ring(
-                this as *mut AnyObject,
-                false,
-                settings_palette().card_border,
-                1.0,
-            );
+        if accepted.as_bool() {
+            apply_inset_focus_ring(this, false, settings_palette().card_border, 1.0);
         }
         accepted
     }
@@ -601,12 +583,6 @@ pub(crate) unsafe fn refresh_settings_button_tracking(button: *mut AnyObject) {
     release_obj(tracking);
 }
 
-pub(super) struct ExternalLinkButtonClass(*mut AnyObject);
-unsafe impl Send for ExternalLinkButtonClass {}
-unsafe impl Sync for ExternalLinkButtonClass {}
-
-pub(super) static EXTERNAL_LINK_BUTTON_CLASS: OnceLock<ExternalLinkButtonClass> = OnceLock::new();
-pub(super) static SIDEBAR_BUTTON_CLASS: OnceLock<SidebarButtonClass> = OnceLock::new();
 /// How many times the sidebar label's ink has been measured since the process started.
 ///
 /// The measurement renders a bitmap and scans it, which blocks the main thread long enough to be felt,
@@ -698,38 +674,38 @@ pub(super) fn clear_sidebar_view_registries() {
 }
 
 pub(super) extern "C" fn external_link_mouse_entered(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
         let color = settings_text_color(SettingsTextRole::LinkHover);
-        let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
+        let _: () = msg_send![this, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
         let _: () = msg_send![cursor, set];
     }
 }
 
 pub(super) extern "C" fn external_link_mouse_exited(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
         let color = settings_text_color(SettingsTextRole::Link);
-        let _: () = msg_send![this as *mut AnyObject, setTextColor: color];
+        let _: () = msg_send![this, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
         let _: () = msg_send![cursor, set];
     }
 }
 
 pub(super) extern "C" fn external_link_mouse_down(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
-        let tag: isize = msg_send![this as *mut AnyObject, tag];
+        let tag: isize = msg_send![this, tag];
         if tag == 1 {
             handle_open_github(
                 std::ptr::null_mut(),
@@ -746,15 +722,6 @@ pub(super) extern "C" fn external_link_mouse_down(
     }
 }
 
-pub(super) struct SidebarButtonClass(*mut AnyObject);
-unsafe impl Send for SidebarButtonClass {}
-unsafe impl Sync for SidebarButtonClass {}
-
-pub(super) struct SidebarHoverTrackerClass(*mut AnyObject);
-unsafe impl Send for SidebarHoverTrackerClass {}
-unsafe impl Sync for SidebarHoverTrackerClass {}
-
-pub(super) static SIDEBAR_HOVER_TRACKER_CLASS: OnceLock<SidebarHoverTrackerClass> = OnceLock::new();
 pub(super) static SIDEBAR_HOVER_TRACKER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 /// Clear the active row fill when the settings window hides or changes pages.
@@ -819,9 +786,9 @@ unsafe fn apply_sidebar_hover(button: *mut AnyObject) {
 }
 
 pub(super) extern "C" fn sidebar_hover_tracker_mouse_entered(
-    _this: *mut c_void,
+    _this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
         // Re-entering from the detail pane can skip a child button's mouseEntered callback. Use
@@ -835,9 +802,9 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_entered(
 }
 
 pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
-    _this: *mut c_void,
+    _this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
         clear_sidebar_hover();
@@ -845,28 +812,26 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
 }
 
 pub(super) fn sidebar_hover_tracker_class() -> *mut AnyObject {
-    SIDEBAR_HOVER_TRACKER_CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabSidebarHoverTracker").unwrap();
-            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                sidebar_hover_tracker_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                sidebar_hover_tracker_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            SidebarHoverTrackerClass(cls)
-        })
-        .0
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabSidebarHoverTracker", || {
+        build_class(
+            c"OhMyTabSidebarHoverTracker",
+            class!(NSObject),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    sidebar_hover_tracker_mouse_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    sidebar_hover_tracker_mouse_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 /// Measure one shared row height for all localized sidebar titles.
@@ -1145,12 +1110,12 @@ pub(super) unsafe fn make_sidebar_hover_tracking(parent: *mut AnyObject, rect: N
 }
 
 pub(super) extern "C" fn sidebar_button_mouse_entered(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
-        let button = this as *mut AnyObject;
+        let button = this;
         // Tracking callbacks may arrive after the pointer has moved into another pane or row.
         let current = sidebar_button_under_pointer();
         if current != Some(button) {
@@ -1166,12 +1131,12 @@ pub(super) extern "C" fn sidebar_button_mouse_entered(
 }
 
 pub(super) extern "C" fn sidebar_button_mouse_exited(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     unsafe {
-        let button = this as *mut AnyObject;
+        let button = this;
         let tag: isize = msg_send![button, tag];
         if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
             return;
@@ -1184,59 +1149,54 @@ pub(super) extern "C" fn sidebar_button_mouse_exited(
 }
 
 pub(super) fn sidebar_button_class() -> *mut AnyObject {
-    SIDEBAR_BUTTON_CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabSidebarButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                sidebar_button_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                sidebar_button_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            SidebarButtonClass(cls)
-        })
-        .0
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabSidebarButton", || {
+        build_class(
+            c"OhMyTabSidebarButton",
+            class!(NSButton),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    sidebar_button_mouse_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    sidebar_button_mouse_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 pub(super) fn external_link_button_class() -> *mut AnyObject {
-    EXTERNAL_LINK_BUTTON_CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabExternalLinkButton").unwrap();
-            let superclass = class!(NSTextField) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                external_link_mouse_down as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                external_link_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                external_link_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            ExternalLinkButtonClass(cls)
-        })
-        .0
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabExternalLinkButton", || {
+        build_class(
+            c"OhMyTabExternalLinkButton",
+            class!(NSTextField),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    external_link_mouse_down
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    external_link_mouse_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    external_link_mouse_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 /// Build a read-only value label for a standard settings row.
@@ -1388,32 +1348,24 @@ pub(super) unsafe fn make_symbol_image_view(symbol: &str, frame: NSRect) -> *mut
     icon_view
 }
 
-pub(super) struct AboutHeaderClickViewClass(*mut AnyObject);
-unsafe impl Send for AboutHeaderClickViewClass {}
-unsafe impl Sync for AboutHeaderClickViewClass {}
-
-pub(super) static ABOUT_HEADER_CLICK_VIEW_CLASS: OnceLock<AboutHeaderClickViewClass> =
-    OnceLock::new();
-
 // bundle_info_string now lives in ffi.rs
 
 pub(super) fn about_header_click_view_class() -> *mut AnyObject {
-    ABOUT_HEADER_CLICK_VIEW_CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabAboutHeaderClickView").unwrap();
-            let superclass = class!(NSView) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                about_header_click_view_mouse_down as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            AboutHeaderClickViewClass(cls)
-        })
-        .0
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabAboutHeaderClickView", || {
+        build_class(
+            c"OhMyTabAboutHeaderClickView",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    about_header_click_view_mouse_down
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 /// Count clicks on the About header and reveal the bundle build number after five consecutive clicks.
@@ -1471,9 +1423,9 @@ pub(crate) extern "C" fn on_about_header_click(
 }
 
 pub(super) extern "C" fn about_header_click_view_mouse_down(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut c_void,
+    _event: *mut AnyObject,
 ) {
     on_about_header_click(std::ptr::null_mut(), sel!(mouseDown:), std::ptr::null_mut());
 }
@@ -1491,40 +1443,51 @@ pub(super) unsafe fn set_field(field: *mut AnyObject, val: impl std::fmt::Displa
 /// 22pt drawing rect inside the full row. The field editor must still receive AppKit's original
 /// bounding rect: `selectWithFrame:` is also used for double-click word selection, and passing the
 /// compact drawing rect makes the editor jump toward the cell's upper-left corner.
-pub(super) unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
+/// The cell class handle, so the super dispatches can name the class that defined the overrides.
+pub(super) fn centered_text_field_cell_class_handle() -> StaticClass {
     static CELL_CLASS: OnceLock<StaticClass> = OnceLock::new();
-    CELL_CLASS
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabCenteredTextFieldCell").unwrap();
-            let superclass = class!(NSTextFieldCell) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let draw_types = CString::new("v@:{CGRect=dddd}@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(drawInteriorWithFrame:inView:),
-                centered_text_field_cell_draw_interior as *mut c_void,
-                draw_types.as_ptr(),
-            );
-            // The selector has exactly three object parameters: view, editor, and delegate.
-            let select_types = CString::new("v@:{CGRect=dddd}@@@qq").unwrap();
-            class_addMethod(
-                cls,
-                sel!(selectWithFrame:inView:editor:delegate:start:length:),
-                centered_text_field_cell_select as *mut c_void,
-                select_types.as_ptr(),
-            );
-            // AppKit returns the configured NSText; its type encoding must match the IMP ABI.
-            let editor_types = CString::new("@@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(setUpFieldEditorAttributes:),
-                centered_text_field_cell_setup_editor as *mut c_void,
-                editor_types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
+    StaticClass::register_once(&CELL_CLASS, c"OhMyTabCenteredTextFieldCell", || {
+        build_class(
+            c"OhMyTabCenteredTextFieldCell",
+            class!(NSTextFieldCell),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(drawInteriorWithFrame:inView:),
+                    centered_text_field_cell_draw_interior
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect, *mut AnyObject),
+                );
+                // The selector has exactly three object parameters: view, editor, and delegate.
+                builder.add_method::<AnyObject, _>(
+                    sel!(selectWithFrame:inView:editor:delegate:start:length:),
+                    centered_text_field_cell_select
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            NSRect,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                            isize,
+                            isize,
+                        ),
+                );
+                // AppKit returns the configured NSText; its return type must match the IMP ABI.
+                builder.add_method::<AnyObject, _>(
+                    sel!(setUpFieldEditorAttributes:),
+                    centered_text_field_cell_setup_editor
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            *mut AnyObject,
+                        ) -> *mut AnyObject,
+                );
+            },
+        )
+    })
+}
+
+pub(super) unsafe fn centered_text_field_cell_class() -> *mut AnyObject {
+    centered_text_field_cell_class_handle().0 as *mut AnyObject
 }
 
 pub(super) fn centered_text_field_cell_frame(bounds: NSRect) -> NSRect {
@@ -1556,26 +1519,22 @@ fn centered_text_field_editor_vertical_inset(bounds: NSRect) -> f64 {
 }
 
 pub(super) unsafe fn centered_text_field_cell_super_draw(
-    cell: *mut c_void,
+    cell: *mut AnyObject,
     rect: NSRect,
-    view: *mut c_void,
+    view: *mut AnyObject,
 ) {
-    type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut c_void) -> ();
-    let super_class =
-        objc2::runtime::AnyClass::get(c"NSTextFieldCell").unwrap() as *const _ as *mut c_void;
-    let mut sup = ObjcSuper {
-        receiver: cell,
-        super_class,
-    };
+    type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut AnyObject) -> ();
+    let mut sup =
+        ObjcSuper::for_defined_class(cell as *mut c_void, centered_text_field_cell_class_handle());
     let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
     send(&mut sup, sel!(drawInteriorWithFrame:inView:), rect, view);
 }
 
 pub(super) extern "C" fn centered_text_field_cell_draw_interior(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
     bounds: NSRect,
-    view: *mut c_void,
+    view: *mut AnyObject,
 ) {
     unsafe {
         centered_text_field_cell_super_draw(this, centered_text_field_cell_frame(bounds), view);
@@ -1583,12 +1542,12 @@ pub(super) extern "C" fn centered_text_field_cell_draw_interior(
 }
 
 pub(super) extern "C" fn centered_text_field_cell_select(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
     bounds: NSRect,
-    view: *mut c_void,
-    editor: *mut c_void,
-    delegate: *mut c_void,
+    view: *mut AnyObject,
+    editor: *mut AnyObject,
+    delegate: *mut AnyObject,
     start: isize,
     length: isize,
 ) {
@@ -1597,18 +1556,16 @@ pub(super) extern "C" fn centered_text_field_cell_select(
             *mut ObjcSuper,
             Sel,
             NSRect,
-            *mut c_void,
-            *mut c_void,
-            *mut c_void,
+            *mut AnyObject,
+            *mut AnyObject,
+            *mut AnyObject,
             isize,
             isize,
         ) -> ();
-        let super_class =
-            objc2::runtime::AnyClass::get(c"NSTextFieldCell").unwrap() as *const _ as *mut c_void;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class,
-        };
+        let mut sup = ObjcSuper::for_defined_class(
+            this as *mut c_void,
+            centered_text_field_cell_class_handle(),
+        );
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         send(
             &mut sup,
@@ -1630,22 +1587,20 @@ pub(super) extern "C" fn centered_text_field_cell_select(
 /// NSTextView and otherwise draws a single-line value from its own top-left origin, which is most
 /// visible after a double-click when AppKit reuses the editor for word selection.
 pub(super) extern "C" fn centered_text_field_cell_setup_editor(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
-    editor: *mut c_void,
-) -> *mut c_void {
+    editor: *mut AnyObject,
+) -> *mut AnyObject {
     unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> *mut c_void;
-        let super_class =
-            objc2::runtime::AnyClass::get(c"NSTextFieldCell").unwrap() as *const _ as *mut c_void;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class,
-        };
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject) -> *mut AnyObject;
+        let mut sup = ObjcSuper::for_defined_class(
+            this as *mut c_void,
+            centered_text_field_cell_class_handle(),
+        );
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let configured_editor = send(&mut sup, sel!(setUpFieldEditorAttributes:), editor);
 
-        let editor = configured_editor as *mut AnyObject;
+        let editor = configured_editor;
         if editor.is_null() {
             return configured_editor;
         }
@@ -1655,7 +1610,7 @@ pub(super) extern "C" fn centered_text_field_cell_setup_editor(
         if msg_send![editor, respondsToSelector: sel!(setTextContainerInset:)] {
             // Match the editor's vertical inset to the idle cell's draw-rect origin so changing a
             // control's height cannot shift its text between display and editing states.
-            let control_view: *mut AnyObject = msg_send![this as *mut AnyObject, controlView];
+            let control_view: *mut AnyObject = msg_send![this, controlView];
             let bounds = if control_view.is_null() {
                 NSRect::new(
                     NSPoint::new(0.0, 0.0),
@@ -1761,12 +1716,6 @@ fn html_switch_knob_radius() -> f64 {
         HTML_SWITCH_KNOB_D,
     )
 }
-
-pub(super) struct HtmlSwitchClass(*mut AnyObject);
-unsafe impl Send for HtmlSwitchClass {}
-unsafe impl Sync for HtmlSwitchClass {}
-
-pub(super) static HTML_SWITCH_CLASS: OnceLock<HtmlSwitchClass> = OnceLock::new();
 
 /// Return the custom knob layer after the switch has been initialized.
 unsafe fn html_switch_knob(button: *mut AnyObject) -> *mut AnyObject {
@@ -1912,15 +1861,12 @@ unsafe fn html_switch_animate_press(button: *mut AnyObject) {
     CFRelease(animation_key as *const c_void);
 }
 
-pub(super) extern "C" fn html_switch_set_state(this: *mut c_void, _cmd: Sel, state: isize) {
+pub(super) extern "C" fn html_switch_set_state(this: *mut AnyObject, _cmd: Sel, state: isize) {
     unsafe {
-        let button = this as *mut AnyObject;
+        let button = this;
         let previous_state: isize = msg_send![button, state];
         type SetState = unsafe extern "C" fn(*mut ObjcSuper, Sel, isize);
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        let mut sup = ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
         let send: SetState = std::mem::transmute(objc_msgSendSuper as *const ());
         send(&mut sup, sel!(setState:), state);
         html_switch_apply_visual(button, (previous_state != state).then_some(previous_state));
@@ -1948,24 +1894,25 @@ pub(super) unsafe fn set_switch_state_immediate(button: *mut AnyObject, on: bool
 }
 
 /// Refresh the custom switch track whenever its enabled state changes.
-pub(super) extern "C" fn html_switch_set_enabled(this: *mut c_void, _cmd: Sel, enabled: bool) {
+pub(super) extern "C" fn html_switch_set_enabled(this: *mut AnyObject, _cmd: Sel, enabled: Bool) {
     unsafe {
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
-        type SetEnabled = unsafe extern "C" fn(*mut ObjcSuper, Sel, bool);
+        let mut sup = ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
+        type SetEnabled = unsafe extern "C" fn(*mut ObjcSuper, Sel, Bool);
         let send: SetEnabled = std::mem::transmute(objc_msgSendSuper as *const ());
         send(&mut sup, sel!(setEnabled:), enabled);
-        html_switch_apply_visual(this as *mut AnyObject, None);
+        html_switch_apply_visual(this, None);
     }
 }
 
 /// The switch is rendered entirely by its layer, so toggle the state and dispatch the action
 /// explicitly instead of relying on the hidden NSButtonCell drawing/tracking state.
-pub(super) extern "C" fn html_switch_mouse_down(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+pub(super) extern "C" fn html_switch_mouse_down(
+    this: *mut AnyObject,
+    _cmd: Sel,
+    _event: *mut AnyObject,
+) {
     unsafe {
-        let button = this as *mut AnyObject;
+        let button = this;
         let enabled: bool = msg_send![button, isEnabled];
         if !enabled {
             return;
@@ -1990,12 +1937,12 @@ pub(super) extern "C" fn html_switch_mouse_down(this: *mut c_void, _cmd: Sel, _e
 /// 38x22. AppKit routes `mouseDown:` to the view whose `hitTest:` contains the point, so accept
 /// points inside a transparent 28pt-tall rect centred on the track; the track stays 38x22.
 pub(super) extern "C" fn html_switch_hit_test(
-    this: *mut c_void,
+    this: *mut AnyObject,
     _cmd: Sel,
     point: NSPoint,
 ) -> *mut AnyObject {
     unsafe {
-        let button = this as *mut AnyObject;
+        let button = this;
         let superview: *mut AnyObject = msg_send![button, superview];
         let local: NSPoint = if superview.is_null() {
             point
@@ -2031,91 +1978,72 @@ pub(super) fn switch_hit_bounds(bounds: NSRect) -> NSRect {
     )
 }
 
-extern "C" fn html_switch_become_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+extern "C" fn html_switch_become_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
     unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
+        let mut sup = ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let accepted = send(&mut sup, sel!(becomeFirstResponder));
-        if accepted {
+        if accepted.as_bool() {
             // The track layer has no idle border; the 2pt accent ring is the focus indicator.
-            apply_inset_focus_ring(this as *mut AnyObject, true, 0, 0.0);
+            apply_inset_focus_ring(this, true, 0, 0.0);
         }
         accepted
     }
 }
 
-extern "C" fn html_switch_resign_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
+extern "C" fn html_switch_resign_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
     unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
-        let mut sup = ObjcSuper {
-            receiver: this,
-            super_class: class!(NSButton) as *const _ as *mut c_void,
-        };
+        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
+        let mut sup = ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
         let accepted = send(&mut sup, sel!(resignFirstResponder));
-        if accepted {
-            apply_inset_focus_ring(this as *mut AnyObject, false, 0, 0.0);
+        if accepted.as_bool() {
+            apply_inset_focus_ring(this, false, 0, 0.0);
         }
         accepted
     }
+}
+
+/// The class handle, so the super dispatches can name the class that defined the overrides.
+pub(super) fn html_switch_class_handle() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabHtmlSwitch", || {
+        build_class(c"OhMyTabHtmlSwitch", class!(NSButton), |builder| unsafe {
+            builder.add_method::<AnyObject, _>(
+                sel!(setState:),
+                html_switch_set_state as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(setEnabled:),
+                html_switch_set_enabled as unsafe extern "C" fn(*mut AnyObject, Sel, Bool),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(mouseDown:),
+                html_switch_mouse_down as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(hitTest:),
+                html_switch_hit_test
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+            );
+            // become/resignFirstResponder return BOOL, not void.
+            builder.add_method::<AnyObject, _>(
+                sel!(becomeFirstResponder),
+                html_switch_become_first_responder
+                    as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(resignFirstResponder),
+                html_switch_resign_first_responder
+                    as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+            );
+        })
+    })
 }
 
 pub(super) fn html_switch_class() -> *mut AnyObject {
-    HTML_SWITCH_CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabHtmlSwitch").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let state_types = CString::new("v@:q").unwrap();
-            class_addMethod(
-                cls,
-                sel!(setState:),
-                html_switch_set_state as *mut c_void,
-                state_types.as_ptr(),
-            );
-            let enabled_types = CString::new("v@:B").unwrap();
-            class_addMethod(
-                cls,
-                sel!(setEnabled:),
-                html_switch_set_enabled as *mut c_void,
-                enabled_types.as_ptr(),
-            );
-            let mouse_types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                html_switch_mouse_down as *mut c_void,
-                mouse_types.as_ptr(),
-            );
-            let hit_types = CString::new("@@:{CGPoint=dd}").unwrap();
-            class_addMethod(
-                cls,
-                sel!(hitTest:),
-                html_switch_hit_test as *mut c_void,
-                hit_types.as_ptr(),
-            );
-            // become/resignFirstResponder return BOOL ('B'), not void.
-            let focus_types = CString::new("B@:").unwrap();
-            class_addMethod(
-                cls,
-                sel!(becomeFirstResponder),
-                html_switch_become_first_responder as *mut c_void,
-                focus_types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(resignFirstResponder),
-                html_switch_resign_first_responder as *mut c_void,
-                focus_types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            HtmlSwitchClass(cls)
-        })
-        .0
+    html_switch_class_handle().0 as *mut AnyObject
 }
 
 /// HTML reference switch implemented as a custom-drawn NSButton.
@@ -2250,61 +2178,55 @@ pub(super) unsafe fn make_double_slider(
 /// The default lives in an ObjC ivar (`ohMyTabDefaultValue`, f64) so it follows the control's
 /// lifetime -- no global pointer table, hence no cleanup coupling and no stale default if a
 /// pointer is recycled. Sliders without a registered default behave exactly like a plain NSSlider.
-static SETTINGS_SLIDER_CLS: OnceLock<usize> = OnceLock::new();
-static SETTINGS_SLIDER_SUPERCLASS: OnceLock<usize> = OnceLock::new();
+static SETTINGS_SLIDER_CLS: OnceLock<StaticClass> = OnceLock::new();
 
 /// The default-value ivar name (added at class registration); a has-flag ivar of the sibling name
 /// distinguishes "registered a default" from "just a zeroed slot".
-const SLIDER_DEFAULT_IVAR: &str = "ohMyTabDefaultValue";
-const SLIDER_HAS_DEFAULT_IVAR: &str = "ohMyTabHasDefault";
+const SLIDER_DEFAULT_IVAR: &std::ffi::CStr = c"ohMyTabDefaultValue";
+const SLIDER_HAS_DEFAULT_IVAR: &std::ffi::CStr = c"ohMyTabHasDefault";
 
 /// The two ivars' byte offsets inside the instance (fixed after registration, resolved once).
 /// Direct offset access instead of object_set/getInstanceVariable (see the note in ffi.rs).
 static SLIDER_IVAR_OFFSETS: OnceLock<(isize, isize)> = OnceLock::new();
 
+/// The slider class handle, so the `mouseDown:` override can dispatch super through the class
+/// that defines it.
+fn settings_slider_class_handle() -> StaticClass {
+    StaticClass::register_once(&SETTINGS_SLIDER_CLS, c"OhMyTabSlider", || {
+        let handle = build_class(c"OhMyTabSlider", class!(NSSlider), |builder| unsafe {
+            // Ivars must be added before the class is registered, in this order: the offsets
+            // resolved below read them as (has-default flag, default value) and are fixed at
+            // registration. `f64` carries 8-byte alignment; the flag is Objective-C `char`.
+            builder.add_ivar::<f64>(SLIDER_DEFAULT_IVAR);
+            builder.add_ivar::<i8>(SLIDER_HAS_DEFAULT_IVAR);
+            builder.add_method::<AnyObject, _>(
+                sel!(mouseDown:),
+                settings_slider_mouse_down
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+        });
+        // Resolve the offsets once, after registration (ivar_getOffset needs a registered class).
+        let offsets = unsafe {
+            let value_ivar =
+                objc2::ffi::class_getInstanceVariable(handle.0, SLIDER_DEFAULT_IVAR.as_ptr());
+            let flag_ivar =
+                objc2::ffi::class_getInstanceVariable(handle.0, SLIDER_HAS_DEFAULT_IVAR.as_ptr());
+            assert!(
+                !value_ivar.is_null() && !flag_ivar.is_null(),
+                "settings slider ivars must exist after registration"
+            );
+            (
+                objc2::ffi::ivar_getOffset(flag_ivar),
+                objc2::ffi::ivar_getOffset(value_ivar),
+            )
+        };
+        let _ = SLIDER_IVAR_OFFSETS.set(offsets);
+        handle
+    })
+}
+
 fn settings_slider_class() -> *mut AnyObject {
-    let cls = *SETTINGS_SLIDER_CLS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabSlider").unwrap();
-        let superclass = class!(NSSlider) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        // Ivars must be added before objc_registerClassPair (8-byte alignment -> log2 = 3;
-        // char alignment 1).
-        class_addIvar(
-            cls,
-            CString::new(SLIDER_DEFAULT_IVAR).unwrap().as_ptr(),
-            std::mem::size_of::<f64>(),
-            3,
-            CString::new("d").unwrap().as_ptr(),
-        );
-        class_addIvar(
-            cls,
-            CString::new(SLIDER_HAS_DEFAULT_IVAR).unwrap().as_ptr(),
-            1,
-            0,
-            CString::new("c").unwrap().as_ptr(),
-        );
-        let types = CString::new("v@:@").unwrap(); // -mouseDown:(NSEvent*) -> void
-        class_addMethod(
-            cls,
-            sel!(mouseDown:),
-            settings_slider_mouse_down as *mut c_void,
-            types.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        let _ = SETTINGS_SLIDER_SUPERCLASS.set(superclass as usize);
-        // Resolve the offsets after registration (ivar_getOffset needs a registered class).
-        let value_ivar =
-            class_getInstanceVariable(cls, CString::new(SLIDER_DEFAULT_IVAR).unwrap().as_ptr());
-        let flag_ivar =
-            class_getInstanceVariable(cls, CString::new(SLIDER_HAS_DEFAULT_IVAR).unwrap().as_ptr());
-        assert!(
-            !value_ivar.is_null() && !flag_ivar.is_null(),
-            "settings slider ivars must exist after registration"
-        );
-        let _ = SLIDER_IVAR_OFFSETS.set((ivar_getOffset(flag_ivar), ivar_getOffset(value_ivar)));
-        cls as usize
-    });
-    cls as *mut AnyObject
+    settings_slider_class_handle().0 as *mut AnyObject
 }
 
 /// Whether a double-click should restore the default (pure, for unit tests): we only take over
@@ -2364,9 +2286,9 @@ fn settings_slider_display(value: f64) -> String {
 
 /// The `mouseDown:` override -- a double-click restores the default; everything else goes back to
 /// NSSlider (dragging / jump-to-click).
-extern "C" fn settings_slider_mouse_down(this: *mut c_void, _cmd: Sel, event: *mut AnyObject) {
+extern "C" fn settings_slider_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     crate::callback_guard::void("settings_slider_mouse_down", || unsafe {
-        let slider = this as *mut AnyObject;
+        let slider = this;
         let click_count: isize = msg_send![event, clickCount];
         let default = slider_default_value(slider);
         if slider_should_reset(click_count, default.is_some()) {
@@ -2403,14 +2325,8 @@ extern "C" fn settings_slider_mouse_down(this: *mut c_void, _cmd: Sel, event: *m
             return;
         }
         type MouseDownFn = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
-        let superclass = *SETTINGS_SLIDER_SUPERCLASS
-            .get()
-            .expect("settings slider superclass is initialized")
-            as *mut c_void;
-        let mut objc_super = ObjcSuper {
-            receiver: this,
-            super_class: superclass,
-        };
+        let mut objc_super =
+            ObjcSuper::for_defined_class(this as *mut c_void, settings_slider_class_handle());
         let f: MouseDownFn = std::mem::transmute(objc_msgSendSuper as *const ());
         f(&mut objc_super, sel!(mouseDown:), event);
     });
@@ -3241,7 +3157,7 @@ pub(super) unsafe fn add_about_app_icon(parent: *mut AnyObject, x: f64, y: f64) 
 }
 
 pub(super) extern "C" fn settings_decoration_hit_test(
-    _self: *mut c_void,
+    _self: *mut AnyObject,
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
@@ -3251,20 +3167,21 @@ pub(super) extern "C" fn settings_decoration_hit_test(
 /// Flat detail-pane surface. The pane background is a solid `detail_bg` layer fill (no radial
 /// gradient); the class only overrides `hitTest:` so the decoration never intercepts input.
 pub(super) fn settings_pane_surface_view_class() -> *mut AnyObject {
-    static CLASS: OnceLock<usize> = OnceLock::new();
-    *CLASS.get_or_init(|| unsafe {
-        let name = CString::new("OhMyTabSettingsPaneSurfaceView").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        class_addMethod(
-            cls,
-            sel!(hitTest:),
-            settings_decoration_hit_test as *mut c_void,
-            CString::new("@@:{CGPoint=dd}").unwrap().as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls as usize
-    }) as *mut AnyObject
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    StaticClass::register_once(&CLASS, c"OhMyTabSettingsPaneSurfaceView", || {
+        build_class(
+            c"OhMyTabSettingsPaneSurfaceView",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(hitTest:),
+                    settings_decoration_hit_test
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 pub(super) const SETTINGS_CARD_STYLE_IDENTIFIER: &str = "com.ohmytab.settings-card";
@@ -4291,7 +4208,7 @@ mod tests {
 
             // A double-click (clickCount = 2) restores the default 3.
             let double = make_click_event(2);
-            super::settings_slider_mouse_down(slider as *mut c_void, sel!(mouseDown:), double);
+            super::settings_slider_mouse_down(slider, sel!(mouseDown:), double);
             let value: f64 = msg_send![slider, doubleValue];
             assert_eq!(value, 3.0, "double-click must restore the default");
 
@@ -4299,7 +4216,7 @@ mod tests {
             // superclass simply does not track anything).
             let _: () = msg_send![slider, setDoubleValue: 7.0f64];
             let single = make_click_event(1);
-            super::settings_slider_mouse_down(slider as *mut c_void, sel!(mouseDown:), single);
+            super::settings_slider_mouse_down(slider, sel!(mouseDown:), single);
             let value: f64 = msg_send![slider, doubleValue];
             assert_eq!(value, 7.0, "a single click must not reset");
 

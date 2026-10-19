@@ -2242,74 +2242,74 @@ unsafe fn text_centroid_offsets(
 /// The settings button's class: mouseDown arms the press (so a release outside the button cancels
 /// rather than acting), and the hover pair carries the neutral corner-glyph wash.
 unsafe fn settings_button_class() -> *mut AnyObject {
-    static CLASS: OnceLock<StaticClass> = OnceLock::new();
-    CLASS
-        .get_or_init(|| unsafe {
-            let name = CString::new("OhMyTabKeyPanelSettingsButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            if cls.is_null() {
-                return StaticClass(class!(NSButton));
-            }
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseDown:),
-                settings_mouse_down as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                settings_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                settings_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            // The click action MUST be registered on this class: the button targets itself and an
-            // unregistered selector would abort the process on the first click.
-            class_addMethod(
-                cls,
-                sel!(onKeyPanelSettings:),
-                on_key_panel_settings as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
+    settings_button_class_handle().0 as *mut AnyObject
 }
 
-extern "C" fn settings_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+/// The class handle itself, so the super dispatch inside `mouseDown:` can name the class that
+/// defined that override.
+fn settings_button_class_handle() -> StaticClass {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabKeyPanelSettingsButton", || {
+        crate::ffi::build_class(
+            c"OhMyTabKeyPanelSettingsButton",
+            class!(NSButton),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    settings_mouse_down
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    settings_entered as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    settings_exited as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                // The click action MUST be registered on this class: the button targets itself and an
+                // unregistered selector would abort the process on the first click.
+                builder.add_method::<AnyObject, _>(
+                    sel!(onKeyPanelSettings:),
+                    on_key_panel_settings
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+}
+
+extern "C" fn settings_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     crate::callback_guard::void("settings_mouse_down", || unsafe {
         PANEL.with(|panel| panel.borrow_mut().settings_armed = true);
-        set_settings_button_style(_self as *mut AnyObject, true);
+        set_settings_button_style(_self, true);
         // NSButton's own mouseDown: runs the highlight/press tracking loop without which the button
         // never tracks the press and never dispatches its action.
-        crate::ui::corner_glyph::call_super_mouse_down(_self, sel!(mouseDown:), event);
+        crate::ui::corner_glyph::call_super_mouse_down(
+            _self as *mut c_void,
+            settings_button_class_handle(),
+            sel!(mouseDown:),
+            event as *mut c_void,
+        );
     });
 }
 
-extern "C" fn settings_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn settings_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     crate::callback_guard::void("settings_entered", || unsafe {
-        set_settings_button_style(_self as *mut AnyObject, true);
+        set_settings_button_style(_self, true);
     });
 }
 
-extern "C" fn settings_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn settings_exited(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     crate::callback_guard::void("settings_exited", || {
         // Leaving during the press cancels it; AppKit still delivers the action on mouseUp, so the
         // armed flag is what tells a real click from a drag-out.
         PANEL.with(|panel| panel.borrow_mut().settings_armed = false);
-        unsafe { set_settings_button_style(_self as *mut AnyObject, false) };
+        unsafe { set_settings_button_style(_self, false) };
     });
 }
 
-extern "C" fn on_key_panel_settings(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+extern "C" fn on_key_panel_settings(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     crate::callback_guard::void("on_key_panel_settings", || {
         // Two entry paths, with different guards:
         //   * a real mouse press arms on mouseDown; the flag separates this press from a stale

@@ -562,6 +562,35 @@ pub(crate) unsafe fn apply_theme() {
     super::notifications::refresh_pin_button();
 }
 
+/// Register a dynamic class exactly once, for the classes here that still declare their methods
+/// by hand.
+///
+/// `crate::ffi::build_class` derives each type encoding from the Rust signature, so it cannot
+/// register a method whose callback lives in another module and still takes `*mut c_void` (objc2
+/// would then encode `^v` where AppKit expects `@`). These classes keep `class_addMethod` for
+/// that reason, but they still need what `build_class` also gives: one registration per process,
+/// and a loud failure instead of every following `class_addMethod` writing through nil when the
+/// name is already taken.
+unsafe fn raw_class(
+    slot: &'static OnceLock<StaticClass>,
+    name: &'static std::ffi::CStr,
+    superclass: &'static objc2::runtime::AnyClass,
+    build: impl FnOnce(*mut AnyObject),
+) -> StaticClass {
+    crate::ffi::StaticClass::register_once(slot, name, || {
+        let cls =
+            objc_allocateClassPair(superclass as *const _ as *mut AnyObject, name.as_ptr(), 0);
+        assert!(
+            !cls.is_null(),
+            "dynamic class {} could not be allocated; is it registered twice?",
+            name.to_string_lossy()
+        );
+        build(cls);
+        objc_registerClassPair(cls);
+        crate::ffi::StaticClass::defining(cls)
+    })
+}
+
 pub(super) unsafe fn ensure_picker_window() {
     if PICKER_WINDOW.lock().unwrap().is_some() {
         return;
@@ -580,27 +609,32 @@ pub(super) unsafe fn ensure_picker_window() {
     // the owning app (same as the switcher overlay), so focus isn't stolen.
     let style: u64 = 1 << 7;
 
-    let window_cls = {
-        let name = CString::new("OhMyTabClipboardWindow").unwrap();
-        let superclass = class!(NSPanel) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(canBecomeKeyWindow),
-            picker_window_can_become_key as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        let types_event = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(sendEvent:),
-            clipboard_window_send_event as *mut c_void,
-            types_event.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
+    static WINDOW_CLS: OnceLock<StaticClass> = OnceLock::new();
+    let window_cls = raw_class(
+        &WINDOW_CLS,
+        c"OhMyTabClipboardWindow",
+        class!(NSPanel),
+        |cls| {
+            let types_bool = CString::new("B@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(canBecomeKeyWindow),
+                picker_window_can_become_key as *mut c_void,
+                types_bool.as_ptr(),
+            );
+            let types_event = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(sendEvent:),
+                clipboard_window_send_event as *mut c_void,
+                types_event.as_ptr(),
+            );
+        },
+    );
+    // Recorded so the sendEvent: override's super dispatch (notifications.rs) can name the
+    // class that defined it instead of re-deriving it from the instance.
+    let _ = PICKER_WINDOW_CLASS.set(window_cls);
+    let window_cls = window_cls.0 as *mut AnyObject;
     let window: *mut AnyObject = msg_send![window_cls, alloc];
     let window: *mut AnyObject = msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false];
     apply_panel_appearance(window);
@@ -628,52 +662,54 @@ pub(super) unsafe fn ensure_picker_window() {
     let content_parent = backdrop.content_parent;
 
     // Container (receives key events; flipped so rows stack top-down, newest on top).
-    let container = {
-        let name = CString::new("OhMyTabClipboardContainer").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_key = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(keyDown:),
-            container_key_down as *mut c_void,
-            types_key.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseMoved:),
-            container_mouse_moved as *mut c_void,
-            types_key.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseEntered:),
-            container_mouse_moved as *mut c_void,
-            types_key.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseExited:),
-            container_mouse_exited as *mut c_void,
-            types_key.as_ptr(),
-        );
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(acceptsFirstResponder),
-            container_accepts_first_responder as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        // Flipped: origin at top-left, y grows downward -- rows stack from the top.
-        class_addMethod(
-            cls,
-            sel!(isFlipped),
-            container_is_flipped as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
+    static CONTAINER_CLS: OnceLock<StaticClass> = OnceLock::new();
+    let container_cls = raw_class(
+        &CONTAINER_CLS,
+        c"OhMyTabClipboardContainer",
+        class!(NSView),
+        |cls| {
+            let types_key = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(keyDown:),
+                container_key_down as *mut c_void,
+                types_key.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseMoved:),
+                container_mouse_moved as *mut c_void,
+                types_key.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                container_mouse_moved as *mut c_void,
+                types_key.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                container_mouse_exited as *mut c_void,
+                types_key.as_ptr(),
+            );
+            let types_bool = CString::new("B@:").unwrap();
+            class_addMethod(
+                cls,
+                sel!(acceptsFirstResponder),
+                container_accepts_first_responder as *mut c_void,
+                types_bool.as_ptr(),
+            );
+            // Flipped: origin at top-left, y grows downward -- rows stack from the top.
+            class_addMethod(
+                cls,
+                sel!(isFlipped),
+                container_is_flipped as *mut c_void,
+                types_bool.as_ptr(),
+            );
+        },
+    );
+    let container = container_cls.0 as *mut AnyObject;
     let container: *mut AnyObject = msg_send![container, alloc];
     let container: *mut AnyObject = msg_send![
         container,
@@ -688,18 +724,7 @@ pub(super) unsafe fn ensure_picker_window() {
     // with the list (scrolling text used to bleed through the translucent tiles). Flipped so
     // the search/clear frames work unchanged.
     let header_strip: *mut AnyObject = {
-        let name = CString::new("OhMyTabClipHeaderView").unwrap();
-        let superclass = class!(NSView) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_bool = CString::new("B@:").unwrap();
-        class_addMethod(
-            cls,
-            sel!(isFlipped),
-            header_strip_is_flipped as *mut c_void,
-            types_bool.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        let strip: *mut AnyObject = msg_send![cls, alloc];
+        let strip: *mut AnyObject = msg_send![header_strip_class(), alloc];
         let strip: *mut AnyObject = msg_send![
             strip,
             initWithFrame: NSRect::new(
@@ -784,50 +809,55 @@ pub(super) unsafe fn ensure_picker_window() {
     // (the user clicks it to start searching). The subclass only overrides cancelOperation:
     // (Esc) -- while editing, keys go to the field editor, and commands like ↓ are intercepted
     // via the delegate's control:textView:doCommandBySelector: (see search_field_do_command).
-    let search_cls = {
-        let name = CString::new("OhMyTabClipSearchField").unwrap();
-        let superclass = class!(NSSearchField) as *const _ as *mut AnyObject;
-        let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-        let types_v = CString::new("v@:@").unwrap();
-        class_addMethod(
-            cls,
-            sel!(cancelOperation:),
-            search_field_cancel as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(clearSearch:),
-            search_clear_button as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseDown:),
-            search_field_mouse_down as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseMoved:),
-            search_field_mouse_moved as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseEntered:),
-            search_field_mouse_entered as *mut c_void,
-            types_v.as_ptr(),
-        );
-        class_addMethod(
-            cls,
-            sel!(mouseExited:),
-            search_field_mouse_exited as *mut c_void,
-            types_v.as_ptr(),
-        );
-        objc_registerClassPair(cls);
-        cls
-    };
+    static SEARCH_CLS: OnceLock<StaticClass> = OnceLock::new();
+    let search_cls = raw_class(
+        &SEARCH_CLS,
+        c"OhMyTabClipSearchField",
+        class!(NSSearchField),
+        |cls| {
+            let types_v = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(cancelOperation:),
+                search_field_cancel as *mut c_void,
+                types_v.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(clearSearch:),
+                search_clear_button as *mut c_void,
+                types_v.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                search_field_mouse_down as *mut c_void,
+                types_v.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseMoved:),
+                search_field_mouse_moved as *mut c_void,
+                types_v.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseEntered:),
+                search_field_mouse_entered as *mut c_void,
+                types_v.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                search_field_mouse_exited as *mut c_void,
+                types_v.as_ptr(),
+            );
+        },
+    );
+    // Recorded so the mouseDown: override's super dispatch (notifications.rs) can name the
+    // class that defined it.
+    let _ = crate::clipboard::SEARCH_FIELD_CLASS.set(search_cls);
+    let search_cls = search_cls.0 as *mut AnyObject;
     // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
     // with a 1px inner ring; the placeholder is left-aligned. The corner close button shares the
     // row, so the shared geometry gives the field the remaining width.
@@ -2291,14 +2321,29 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
     true
 }
 
+/// The header strip's class: flipped, so the search/clear frames are top-anchored.
+fn header_strip_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabClipHeaderView", || {
+        crate::ffi::build_class(c"OhMyTabClipHeaderView", class!(NSView), |builder| unsafe {
+            builder.add_method::<AnyObject, _>(
+                sel!(isFlipped),
+                header_strip_is_flipped
+                    as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+            );
+        })
+    })
+    .0 as *mut AnyObject
+}
+
 /// The header strip is flipped: the search/clear frames are top-anchored.
-extern "C" fn header_strip_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
+extern "C" fn header_strip_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
 }
 
 /// Container is flipped: origin at top-left, rows stack from the top (newest first).
-extern "C" fn container_is_flipped(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
+extern "C" fn container_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
 }
 
 /// Resolve the visible row actually under the event. Gate on the list scroll view first so
@@ -2348,17 +2393,17 @@ unsafe fn hover_row_at_event(event: *mut c_void) -> usize {
 
 /// Reconcile hover against the whole row backdrop on every picker mouse move. This prevents
 /// a stale style when the pointer leaves a content button through row padding and then exits.
-extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn container_mouse_moved(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     if REBUILDING.load(Ordering::SeqCst) {
         return;
     }
-    let row = unsafe { hover_row_at_event(event) };
+    let row = unsafe { hover_row_at_event(event as *mut c_void) };
     set_hover_row(row);
 }
 
 /// Clear hover when leaving the whole picker. The fixed parent's InVisibleRect tracking area
 /// supplies this event independently of whether any row button receives mouseExited.
-extern "C" fn container_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn container_mouse_exited(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     if !REBUILDING.load(Ordering::SeqCst) {
         set_hover_row(NO_SELECTION);
     }
@@ -2367,28 +2412,25 @@ extern "C" fn container_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut
 /// Row-button class (NSButton subclass; mouseEntered: implements hover selection).
 unsafe fn row_button_class() -> *mut AnyObject {
     static ROW_BTN_CLS: OnceLock<StaticClass> = OnceLock::new();
-    ROW_BTN_CLS
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipboardRowButton").unwrap();
-            let superclass = class!(NSButton) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(mouseEntered:),
-                row_button_mouse_entered as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
-                sel!(mouseExited:),
-                row_button_mouse_exited as *mut c_void,
-                types.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
+    crate::ffi::StaticClass::register_once(&ROW_BTN_CLS, c"OhMyTabClipboardRowButton", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipboardRowButton",
+            class!(NSButton),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    row_button_mouse_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    row_button_mouse_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 fn update_hover_visuals(prev: usize, new: usize) {
@@ -2506,12 +2548,12 @@ unsafe fn layer_matches_hex(layer: *mut AnyObject, expected: u32) -> bool {
 
 /// With search focus, the list has no keyboard-selected row, but filtered entries must still
 /// show their independent mouse-hover style.
-extern "C" fn row_button_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+extern "C" fn row_button_mouse_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     // Ignore enters dispatched during a rebuild (prevents infinite recursion; see REBUILDING).
     if REBUILDING.load(Ordering::SeqCst) {
         return;
     }
-    let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
+    let idx: isize = unsafe { msg_send![_self, tag] };
     if idx >= 0 {
         // Hovering only sets the hovered row (the hover wash) and does NOT move the
         // selection (the selection wash + the left bar) -- the selection moves via the
@@ -2557,13 +2599,13 @@ pub(super) fn clear_hover_row_if(idx: usize) {
 
 /// Mouse leaves a row button: clear hover only after leaving the whole row, so moving to the
 /// bottom-right action buttons does not hide them mid-transition.
-extern "C" fn row_button_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
+extern "C" fn row_button_mouse_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     if REBUILDING.load(Ordering::SeqCst) {
         return;
     }
-    let idx: isize = unsafe { msg_send![_self as *mut AnyObject, tag] };
+    let idx: isize = unsafe { msg_send![_self, tag] };
     if idx >= 0 {
-        if unsafe { mouse_inside_row(event, idx as usize) } {
+        if unsafe { mouse_inside_row(event as *mut c_void, idx as usize) } {
             return;
         }
         clear_hover_row_if(idx as usize);
@@ -3279,12 +3321,19 @@ pub(super) fn refresh_selection(previous: usize, current: usize) {
     update_hover_visuals(previous, current);
 }
 
-extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
+extern "C" fn container_accepts_first_responder(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+) -> objc2::runtime::Bool {
+    // Objective-C BOOL, not Rust bool: this is what the class's "B@:" encoding declares.
+    objc2::runtime::Bool::YES
 }
 
-extern "C" fn picker_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
+extern "C" fn picker_window_can_become_key(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
 }
 
 #[cfg(test)]
