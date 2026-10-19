@@ -34,10 +34,10 @@ BLANK_WAIT_S="${BLANK_WAIT_S:-14}"
 
 # Regions are given in the panel's own points (top-left origin); the sampler converts them with the scale it
 # derives from the capture itself.
-ROW_X_PT="${ROW_X_PT:-20}"
-ROW_Y_PT="${ROW_Y_PT:-62}"
-ROW_W_PT="${ROW_W_PT:-450}"
-ROW_H_PT="${ROW_H_PT:-30}"
+#
+# The filters row is not one of them: its rect comes from the launch's own --e2e-state, because a constant
+# here went stale when the search field above the row moved and every material then reported "a band
+# changed, that is not text". Footer captions report their frames the same way.
 
 # The two translucent materials by default: the tier is about them. `opaque` is the control that must not move
 # with the backdrop. Any material names on the command line replace the default.
@@ -199,6 +199,17 @@ for hint in (state.get("clipboard_picker") or {}).get("footer_hints") or []:
     print("{:.1f} {:.1f} {:.1f} {:.1f}".format(hint["x"], hint["y"], hint["w"], hint["h"]))
 STATE
 )"
+        # The filters row's rect comes from the app, not from a constant. The constant this replaces
+        # (ROW_Y_PT=62) no longer matched the row once the search field above it moved: the capture
+        # then spanned the gap between two rows and reported "a band changed, that is not text" for
+        # every material, which reads as a contrast failure but is a framing one.
+        row_rect="$(python3 - "$state" <<'STATE'
+import json, sys
+row = (json.load(open(sys.argv[1])).get("clipboard_picker") or {}).get("filter_row")
+if row:
+    print("{:.1f} {:.1f} {:.1f} {:.1f}".format(row["x"], row["y"], row["w"], row["h"]))
+STATE
+)"
         if [ "$pw" -le 0 ]; then
             echo "panel-contrast: $theme/$material: the picker never reported a visible frame"
             fail=1
@@ -245,7 +256,13 @@ STATE
                 fail=1
             fi
         }
-        measure "filter-row" "$ROW_X_PT" "$ROW_Y_PT" "$ROW_W_PT" "$ROW_H_PT"
+        if [ -n "$row_rect" ]; then
+            # shellcheck disable=SC2086
+            measure "filter-row" $row_rect
+        else
+            echo "panel-contrast: $theme/$material/$shade: the e2e state carries no filter row to measure"
+            fail=1
+        fi
         if [ -n "$hints" ]; then
             # One region per caption: the union of them is a bounding box that also spans the keycaps, so a
             # change anywhere along that row used to be read as the caption's ink.

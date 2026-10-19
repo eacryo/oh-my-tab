@@ -33,7 +33,11 @@ import sys
 import time
 
 path = sys.argv[1]
-deadline = time.time() + 5
+# A hang guard, not a latency budget: the app writes its first snapshot once it has collected the
+# windows, which on a full desktop is well past the few seconds this used to allow. Waiting for the
+# condition is what makes the run independent of how many windows happen to be open; the deadline
+# only turns a genuine hang into a failure.
+deadline = time.time() + 60
 while time.time() < deadline:
     try:
         with open(path) as handle:
@@ -45,7 +49,7 @@ while time.time() < deadline:
         raise SystemExit("Settings was already visible before the reopen probe")
     print(state.get("seq", 0))
     raise SystemExit(0)
-raise SystemExit("no initial e2e-state snapshot")
+raise SystemExit("no initial e2e-state snapshot within 60s")
 PY
 )" || fail "could not establish a hidden-Settings baseline"
 
@@ -62,7 +66,8 @@ import time
 
 path = sys.argv[1]
 baseline_seq = int(sys.argv[2])
-deadline = time.time() + 5
+# Same rule as the baseline wait: condition first, a 60s hang guard around it.
+deadline = time.time() + 60
 last = None
 while time.time() < deadline:
     try:

@@ -1092,6 +1092,43 @@ pub(crate) fn picker_footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
     text_style::footer_hint_frames()
 }
 
+/// The filters row's band in the picker's own points, top-left origin (None until the row is built).
+///
+/// The A2 contrast scenario used to frame this row from a constant, and the constant fell out of step
+/// with the layout (the row sits below the search field, which moved): the capture then covered the gap
+/// between two rows and reported "a band changed, that is not text" for every material. Reporting the
+/// live union of the pills removes that second source of truth, the same way the footer captions and the
+/// grip already report theirs.
+pub(crate) fn picker_filter_row_rect_top_left() -> Option<(f64, f64, f64, f64)> {
+    let pills = FILTER_PILLS.lock().unwrap();
+    let mut union: Option<(f64, f64, f64, f64)> = None;
+    for pill in pills.iter() {
+        if pill.0.is_null() {
+            continue;
+        }
+        let frame: NSRect = unsafe { msg_send![pill.0, frame] };
+        if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+            continue;
+        }
+        union = Some(match union {
+            None => (
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            ),
+            Some((x, y, w, h)) => {
+                let min_x = x.min(frame.origin.x);
+                let min_y = y.min(frame.origin.y);
+                let max_x = (x + w).max(frame.origin.x + frame.size.width);
+                let max_y = (y + h).max(frame.origin.y + frame.size.height);
+                (min_x, min_y, max_x - min_x, max_y - min_y)
+            }
+        });
+    }
+    union
+}
+
 /// The drag handle's hit band in the picker's own points, top-left origin. The A2 drag scenario has
 /// to start its gesture on the real band: a rect derived from the panel frame would put this
 /// module's geometry into the test, where a later change to it could not be noticed.

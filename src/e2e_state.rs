@@ -979,6 +979,16 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         }
         None => "null".to_string(),
     };
+    // The filters row's live union, for the same reason the footer captions report theirs: a constant
+    // framed the row from the wrong y once the search field above it moved, and the A2 contrast capture
+    // then covered the gap between two rows instead of text.
+    let filter_row = crate::clipboard::picker_filter_row_rect_top_left();
+    let filter_row_json = match filter_row {
+        Some((x, y, w, h)) => {
+            format!("{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}")
+        }
+        None => "null".to_string(),
+    };
     // The display the configured position mode resolves to. On a machine with one display this cannot
     // differ from the picker's own; on a machine with two it is what proves "main" still means the primary
     // display after the panel has been dragged to the other one.
@@ -1020,7 +1030,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {
             Some((x, y, w, h)) => format!(
-                "{{\"visible\": {}, \"pinned\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}}}",
+                "{{\"visible\": {}, \"pinned\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}, \"filter_row\": {}}}",
                 crate::clipboard::picker_is_visible(),
                 crate::clipboard::is_pinned(),
                 x,
@@ -1029,7 +1039,8 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
                 h,
                 grip_json,
                 settings_json,
-                hints
+                hints,
+                filter_row_json
             ),
             None => "null".to_string(),
         }

@@ -82,7 +82,12 @@ Three layers, split by **who decides pass/fail** — not by which transport driv
 
 For every non-trivial implementation task:
 
-1. Understand the change and inspect the relevant existing code before modifying anything.
+1. Understand the change and inspect the relevant existing code before modifying anything. When the change adds
+   or alters a settings field, start from `docs/settings-field-checklist.md`: it names the full chain (config
+   struct, locale keys, page builder, dispatch table, runtime change flags, renderer) and the assertions each
+   layer needs. That chain is not derivable from the type system — Objective-C dispatch and the control-pointer
+   tables are invisible to symbol navigation — so "where is this field read" is answered with `grep`, and the
+   checklist exists to bound that search instead of re-deriving it from the code each time.
 2. If the user asks for a design consultation first (先和 Codex 商量方案, "design first", 先议后做), put the
    approach to the reviewer before writing any code: `./scripts/agent-review.sh --design` with a brief that
    states the goal and constraints, what you inspected, the approach, the alternatives you rejected and why,

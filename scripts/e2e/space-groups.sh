@@ -38,9 +38,45 @@ fail() { echo "e2e space-groups: FAIL: $*" >&2; exit 1; }
 command -v cua-driver >/dev/null 2>&1 || fail "cua-driver CLI not found in PATH"
 cua-driver status >/dev/null 2>&1 || fail "cua-driver daemon is not running"
 
+# The scenario moves between Spaces with the system's own "move left/right a Space" shortcut, so it
+# needs one bound. macOS ships symbolic hotkeys 79/80 (the ctrl+left / ctrl+right pair) ENABLED with
+# no key assigned, which is the common case: the press then does nothing and the wait times out,
+# which would read as a product failure. Report the missing precondition as NOT RUN and exit 0 --
+# AGENTS.md is explicit that "unrun is not passed", and run-all.sh prints that distinction.
+space_shortcut_bound() {  # <symbolic hotkey id> -> 0 when a key is assigned
+    python3 - "$1" <<'PY'
+import plistlib, subprocess, sys
+out = subprocess.run(
+    ["defaults", "export", "com.apple.symbolichotkeys", "-"], capture_output=True
+)
+try:
+    hotkeys = plistlib.loads(out.stdout).get("AppleSymbolicHotKeys", {})
+except Exception:
+    sys.exit(1)
+entry = hotkeys.get(sys.argv[1]) or hotkeys.get(int(sys.argv[1]))
+if not entry or not entry.get("enabled"):
+    sys.exit(1)
+# "value" is null when the shortcut is enabled but has no keys (what this machine ships).
+sys.exit(0 if entry.get("value") else 1)
+PY
+}
+if ! space_shortcut_bound 79 || ! space_shortcut_bound 80; then
+    echo "e2e space-groups: NOT RUN: the move-left/right-a-Space shortcuts are not bound on this machine, so the scenario cannot change Space (unrun is not passed)"
+    exit 0
+fi
+
 close_targets() {
     osascript -e "tell application \"TextEdit\" to close (every window whose name is \"$title_fullscreen\") saving no" >/dev/null 2>&1
     osascript -e "tell application \"TextEdit\" to close (every window whose name is \"$title_plain\") saving no" >/dev/null 2>&1
+    # Quit TextEdit as well, but only when it has nothing of the user's open. Closing our two probe
+    # windows is not enough: the process stays alive with no windows, and panel-action-keys refuses
+    # to run while TextEdit is up (Cmd+H hides the whole app, so it must be alone). That refusal is
+    # correct, so the leak is fixed here rather than by weakening it.
+    local remaining
+    remaining="$(osascript -e 'tell application "TextEdit" to count of documents' 2>/dev/null || echo 1)"
+    if [ "$remaining" = "0" ]; then
+        osascript -e 'tell application "TextEdit" to quit' >/dev/null 2>&1 || true
+    fi
     rm -f "$file_fullscreen" "$file_plain"
 }
 # 失败也清理:场景真的会改桌面/全屏状态,不能让测试窗口留在用户桌面上。
@@ -206,6 +242,12 @@ def fullscreen_title(pid: int, title: str) -> None:
     # that took the snapshot, and the CLI opens a fresh one per invocation by default, so the
     # token taken here would be "stale" by the time the click runs.
     session = "omt-space-groups-zoom"
+    # The session has to exist before the snapshot: a label merely repeated on a call does not create
+    # one, and the driver rejects the snapshot with "session has ended" instead of falling back to the
+    # implicit session. Starting it here also makes the two calls below share the snapshot table that
+    # element tokens live in -- without that the click sees a stale token, because the CLI opens (and
+    # drops) a fresh session per process.
+    cua("start_session", {"session": session})
     snapshot = cua(
         "get_window_state",
         {
