@@ -229,6 +229,21 @@ pub(super) unsafe fn build_switcher_page(
     ui.card_text_size_value_label =
         SettingsRow::attach_slider_readout(switcher_view, ui.card_text_size, TEXT_SIZE_DEFAULT);
     bind_control(target, ui.card_text_size);
+    // Footer title: the switch hides the selected window's title line under the cards, and with it the
+    // whole footer band (the settings gear moves to the panel's bottom-right corner). It is not in the
+    // ThumbnailOnly group -- the footer exists in both display modes.
+    let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    let (_, footer_title_switch) = SettingsRow::tall(
+        switcher_view,
+        label_x,
+        y,
+        220.0,
+        &t("settings.row_show_footer_title"),
+        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, true),
+    );
+    ui.show_footer_title = footer_title_switch;
+    bind_control(target, ui.show_footer_title);
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     ui.status_bar_text_size = SettingsRow::described(

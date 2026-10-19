@@ -3286,6 +3286,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             card_text_size_value_label: std::ptr::null_mut(),
             status_bar_text_size: std::ptr::null_mut(),
             status_bar_text_size_value_label: std::ptr::null_mut(),
+            show_footer_title: std::ptr::null_mut(),
             modifier: std::ptr::null_mut(),
             locale: std::ptr::null_mut(),
             panel_close_enabled: std::ptr::null_mut(),

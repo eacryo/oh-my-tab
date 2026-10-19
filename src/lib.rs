@@ -1525,13 +1525,16 @@ fn create_overlay_window() -> *mut AnyObject {
             Some(ObjPtr::new(settings_button));
 
         // Keep the indicator above the card container; rebuilding cards cannot change its z-order
-        // or interrupt explicit dragging.
+        // or interrupt explicit dragging. Its track starts above the floating settings control when
+        // the footer title is off: the control is added to the hierarchy first, so an overlap would
+        // give the scrollbar the control's clicks.
+        let scroller_bottom = footer_h + crate::theme::footer_control_bottom_reserve();
         let scroller: *mut AnyObject = msg_send![scroller_cls, alloc];
         let scroller: *mut AnyObject = msg_send![
             scroller,
             initWithFrame: NSRect::new(
-                NSPoint::new(w - H_PADDING - THUMB_SCROLLBAR_W, footer_h),
-                NSSize::new(THUMB_SCROLLBAR_W, (h - footer_h).max(1.0))
+                NSPoint::new(w - H_PADDING - THUMB_SCROLLBAR_W, scroller_bottom),
+                NSSize::new(THUMB_SCROLLBAR_W, (h - scroller_bottom).max(1.0))
             )
         ];
         let _: () = msg_send![scroller, setWantsLayer: false];
@@ -1540,7 +1543,7 @@ fn create_overlay_window() -> *mut AnyObject {
         let scroller_tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
         let scroller_tracking: *mut AnyObject = msg_send![
             scroller_tracking,
-            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_SCROLLBAR_W, (h - footer_h).max(1.0))),
+            initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_SCROLLBAR_W, (h - scroller_bottom).max(1.0))),
             options: scroller_tracking_opts,
             owner: scroller,
             userInfo: std::ptr::null::<AnyObject>()

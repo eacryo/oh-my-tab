@@ -25,6 +25,11 @@ struct ChangeFlags {
     thumbnails: bool,
     focused_thumbnail_prewarm: bool,
     show_app_name_in_cards: bool,
+    // The footer title's visibility changed. That switch also decides whether the footer band exists,
+    // and the band is summon-time geometry (card viewport, document, scroller, panel height), so a
+    // standing panel is dismissed rather than repainted; an open settings window follows in place
+    // like any other reloaded control.
+    show_footer_title: bool,
     // The pinned card size changed: the overlay picks it up on its next layout, and an open settings
     // window has to follow in place (`refresh_switcher_keystroke_and_mouse_controls_from_config`).
     thumbnail_size: bool,
@@ -62,6 +67,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.thumbnails
         || flags.focused_thumbnail_prewarm
         || flags.thumbnail_size
+        || flags.show_footer_title
         || flags.keystroke_display
         || flags.mouse
         || flags.key_bindings
@@ -109,6 +115,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.layout.focused_thumbnail_prewarm != new.layout.focused_thumbnail_prewarm,
         show_app_name_in_cards: old.layout.show_app_name_in_cards
             != new.layout.show_app_name_in_cards,
+        show_footer_title: old.layout.show_footer_title != new.layout.show_footer_title,
         thumbnail_size: old.layout.thumbnail_size != new.layout.thumbnail_size,
         show_other_desktops: old.windows.show_other_desktops != new.windows.show_other_desktops,
         mouse: startup || old.mouse != new.mouse,
@@ -272,6 +279,14 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     if flags.show_app_name_in_cards {
         // The caption format changed: dismiss the overlay so the next summon rebuilds the
         // cards from the new signature (reusing them would keep the old captions).
+        crate::overlay::reset_switcher();
+    }
+
+    if flags.show_footer_title {
+        // The switch owns the footer band's height (`theme::footer_band_h` folds to zero while the
+        // title is off), so a standing panel would keep the old geometry: the card viewport, the
+        // document and the scroller are all sized from the band at summon time. Dismiss it instead
+        // of repainting, and the next summon lays out against the new band.
         crate::overlay::reset_switcher();
     }
 

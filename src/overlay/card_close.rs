@@ -250,6 +250,13 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         let content_inset = *THUMB_CONTENT_INSET.lock().unwrap();
         let max_panel_h = *THUMB_PANEL_MAX_H.lock().unwrap();
         let teaser_fits = *THUMB_TEASER_FITS.lock().unwrap();
+        // The floating settings control's trailing room has to survive a close reflow, or closing
+        // one card would narrow the panel back under the control.
+        let trailing_reserve =
+            crate::theme::footer_control_right_reserve(card_area_w + H_PADDING * 2.0, max_panel_h);
+        // The reflow repacks the survivors, so it needs the same packing budget the summon used: the
+        // control's reserve is part of the panel, not of the room left for cards.
+        let max_inner = (max_inner - trailing_reserve).max(1.0);
         let (placements, final_row_ranges, final_panel_w, final_overflowed) =
             plan_thumb_close_reflow(
                 &widths,
@@ -260,6 +267,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
                 content_inset,
                 overflowed,
                 max_rows,
+                trailing_reserve,
             );
         // The panel height must come from the same function the normal layout uses, or closing a card
         // makes the panel jump taller (measured 901 > 875).

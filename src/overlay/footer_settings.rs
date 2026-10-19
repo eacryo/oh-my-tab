@@ -126,20 +126,34 @@ pub(crate) unsafe fn set_footer_settings_style(button: *mut AnyObject, hovered: 
     crate::ui::corner_glyph::set_glyph_button_style(button, ui_palette(), hovered);
 }
 
-/// The gear's frame inside the panel: the trailing corner of the footer band, the corner-safe inset
-/// in from the trailing edge and vertically centred in the band.
+/// The gear's frame inside the panel.
+///
+/// With the footer title on it is the trailing corner of the footer band, the corner-safe inset in
+/// from the trailing edge and vertically centred in the band. With the title off there is no band
+/// (see `theme::footer_band_h`), so the control anchors to the panel's bottom-right corner arc: the
+/// same arc model, with `FOOTER_FLOAT_MARGIN` as its distance from the bottom edge and no
+/// `H_PADDING` floor -- at the shipped radius that floor would push the control into the card area,
+/// while the arc-derived inset keeps it inside the panel's own right padding.
 pub(crate) fn footer_settings_frame(panel_size: NSSize) -> NSRect {
     let band = crate::theme::footer_band_h();
-    let radius = CONFIG.read().unwrap().appearance.corner_radius;
-    let inset = crate::theme::footer_control_inset(
-        radius,
-        panel_size.width,
-        panel_size.height,
-        crate::theme::FOOTER_CONTROL_SIZE,
-        band,
-    )
-    .max(crate::theme::H_PADDING);
+    let radius = crate::theme::layout_corner_radius();
     let size = crate::theme::FOOTER_CONTROL_SIZE;
+    if band <= 0.0 {
+        let margin = crate::theme::FOOTER_FLOAT_MARGIN;
+        let inset = crate::theme::footer_control_inset(
+            radius,
+            panel_size.width,
+            panel_size.height,
+            size,
+            size + margin * 2.0,
+        );
+        let x = (panel_size.width - inset - size).max(0.0);
+        let y = margin.min((panel_size.height - size).max(0.0));
+        return NSRect::new(NSPoint::new(x, y), NSSize::new(size, size));
+    }
+    let inset =
+        crate::theme::footer_control_inset(radius, panel_size.width, panel_size.height, size, band)
+            .max(crate::theme::H_PADDING);
     NSRect::new(
         NSPoint::new(
             (panel_size.width - inset - size).max(0.0),
@@ -252,6 +266,9 @@ mod tests {
 
     #[test]
     fn footer_settings_frame_sits_in_the_footer_band_trailing_corner() {
+        // Pin the band: it is otherwise read from the on-disk config, and this asserts the
+        // band-present geometry specifically.
+        crate::theme::set_test_footer_band(Some(crate::theme::FOOTER_CONTROL_MIN_H));
         let panel = NSSize::new(600.0, 400.0);
         let rect = footer_settings_frame(panel);
         let size = crate::theme::FOOTER_CONTROL_SIZE;
@@ -269,6 +286,42 @@ mod tests {
         assert!(rect.origin.x + rect.size.width <= panel.width);
         assert!(rect.origin.y + rect.size.height <= panel.height);
         assert_eq!(panel.width - (rect.origin.x + rect.size.width), inset);
+        crate::theme::set_test_footer_band(None);
+    }
+
+    /// With the footer title off there is no band, so the control anchors to the panel's bottom-right
+    /// corner instead of being centred in one. The contract is: `FOOTER_FLOAT_MARGIN` above the bottom
+    /// edge, fully inside the panel, and -- at the shipped 32pt radius -- inside the trailing
+    /// `H_PADDING` strip, which is what keeps a full-width bottom card row from running under it.
+    #[test]
+    fn footer_settings_frame_floats_in_the_corner_when_the_band_is_gone() {
+        crate::theme::set_test_footer_band(Some(0.0));
+        // Pin the radius: at the shipped one the reserve is a sub-point, which makes the trailing
+        // assertion below pass no matter what.
+        crate::theme::set_test_corner_radius(Some(64.0));
+        let panel = NSSize::new(600.0, 400.0);
+        let rect = footer_settings_frame(panel);
+        let size = crate::theme::FOOTER_CONTROL_SIZE;
+        assert_eq!(rect.origin.y, crate::theme::FOOTER_FLOAT_MARGIN);
+        assert_eq!(rect.size.width, size);
+        assert!(rect.origin.x + rect.size.width <= panel.width);
+        assert!(rect.origin.y + rect.size.height <= panel.height);
+        // The control's left edge may only reach into the card grid by the trailing reserve the grid
+        // gives up for it. Intrusions under a point are deliberately not reserved (re-deriving row
+        // packing for them would change the layout for no visible gain), hence the one-point slack.
+        // A regression that re-applied the `H_PADDING` floor would land ~28pt further left and fail.
+        let grid_right = panel.width - crate::theme::H_PADDING;
+        let reserve = crate::theme::footer_control_right_reserve(panel.width, panel.height);
+        assert!(
+            rect.origin.x >= grid_right - reserve - 1.0,
+            "the floating control at x={:.1} reaches past what the grid gives up \
+             (grid right {:.1}, reserve {:.1})",
+            rect.origin.x,
+            grid_right,
+            reserve
+        );
+        crate::theme::set_test_corner_radius(None);
+        crate::theme::set_test_footer_band(None);
     }
 
     #[test]

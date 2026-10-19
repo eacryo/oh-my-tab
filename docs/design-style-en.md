@@ -849,6 +849,19 @@ centre stays the panel's centre. The switcher footer band keeps a floor height
 (`theme::FOOTER_CONTROL_MIN_H`) so the control always has its vertical margin: the band otherwise
 follows the footer text size, which bottoms out below the 28pt control.
 
+That floor is the **control's**, not the text's, so it is not a band the title can vacate. With
+`layout.show_footer_title` off the band is gone (`theme::footer_band_h` returns zero) and the control
+anchors to the panel's bottom-right corner arc instead, `theme::FOOTER_FLOAT_MARGIN` above the bottom
+edge; the card viewport, the document, the scroller and the panel height all shrink with the band.
+Because the band is part of the geometry decided at summon time, changing the switch dismisses a
+standing panel rather than repainting it (`overlay::reset_switcher`), and the next summon lays out
+against the new band — nothing re-summons by itself. Two area reservations keep the floating control
+from taking another control's or a card's clicks, since it is added to the hierarchy before both: the
+scrollbar's track starts `theme::footer_control_bottom_reserve` above the bottom edge, and the card
+grid gives up `theme::footer_control_right_reserve` on the trailing side — zero at the shipped 32pt
+radius, where the arc-derived inset already fits inside `H_PADDING`, and growing as the configured
+radius pushes the control further in.
+
 Two limits are recorded rather than glossed. (1) The arc model is what the layout is computed
 against; the tests pin the model, not the shipped panels' actual clipped shape (frost stretches a
 cap-inset template, glass uses `setCornerRadius:`), so a material whose real clipping differed would

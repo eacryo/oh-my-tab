@@ -443,6 +443,10 @@ pub(crate) fn footer_settings_rect_for_e2e() -> Option<(f64, f64, f64, f64, bool
     unsafe {
         let button_frame: NSRect = msg_send![button.0, frame];
         let label_frame: NSRect = msg_send![label.0, frame];
+        // A hidden title has no text to be cleared, so the fact reported is "nothing overlaps it".
+        // Its frame is deliberately left stale-looking rather than zeroed: the A1 smoke asserts the
+        // gear's geometry against the band, not against this label's frame.
+        let label_hidden: bool = msg_send![label.0, isHidden];
         Some((
             panel.0 + button_frame.origin.x,
             // The panel rect's y is already top-left; the button's y is measured up from the
@@ -450,7 +454,7 @@ pub(crate) fn footer_settings_rect_for_e2e() -> Option<(f64, f64, f64, f64, bool
             panel.1 + (panel.3 - (button_frame.origin.y + button_frame.size.height)),
             button_frame.size.width,
             button_frame.size.height,
-            !rects_overlap(button_frame, label_frame),
+            label_hidden || !rects_overlap(button_frame, label_frame),
         ))
     }
 }
@@ -593,16 +597,43 @@ pub(crate) unsafe fn smoke_footer_settings_button_fits() -> Result<(), String> {
             crate::theme::FOOTER_CONTROL_SIZE
         ));
     }
-    if button_frame.origin.y < -0.5 || button_frame.origin.y + button_frame.size.height > band + 0.5
-    {
-        return Err(format!(
-            "the gear at y={:.1}..{:.1} is outside the {:.1}pt footer band",
-            button_frame.origin.y,
-            button_frame.origin.y + button_frame.size.height,
-            band
-        ));
-    }
     let window_frame: NSRect = msg_send![window, frame];
+    if band > 0.0 {
+        // Title shown: the band holds the control, vertically centred.
+        if button_frame.origin.y < -0.5
+            || button_frame.origin.y + button_frame.size.height > band + 0.5
+        {
+            return Err(format!(
+                "the gear at y={:.1}..{:.1} is outside the {:.1}pt footer band",
+                button_frame.origin.y,
+                button_frame.origin.y + button_frame.size.height,
+                band
+            ));
+        }
+    } else {
+        // Title hidden: there is no band, so the control floats in the panel's bottom-right corner.
+        // It must still be fully inside the panel and its bottom margin must stay the documented
+        // corner margin -- a control dragged into the panel's rounded corner would be clipped.
+        let margin = crate::theme::FOOTER_FLOAT_MARGIN;
+        if button_frame.origin.y < margin - 0.5
+            || button_frame.origin.y + button_frame.size.height
+                > margin + crate::theme::FOOTER_CONTROL_SIZE + 0.5
+        {
+            return Err(format!(
+                "the floating gear at y={:.1}..{:.1} is not at the {}pt corner margin",
+                button_frame.origin.y,
+                button_frame.origin.y + button_frame.size.height,
+                margin
+            ));
+        }
+        if button_frame.origin.y + button_frame.size.height > window_frame.size.height + 0.5 {
+            return Err(format!(
+                "the floating gear's top edge {:.1} exceeds the {:.1}pt panel",
+                button_frame.origin.y + button_frame.size.height,
+                window_frame.size.height
+            ));
+        }
+    }
     if button_frame.origin.x + button_frame.size.width > window_frame.size.width + 0.5 {
         return Err(format!(
             "the gear's trailing edge {:.1} exceeds the {:.1}pt panel",
@@ -610,7 +641,10 @@ pub(crate) unsafe fn smoke_footer_settings_button_fits() -> Result<(), String> {
             window_frame.size.width
         ));
     }
-    if rects_overlap(button_frame, label_frame) {
+    // The overlap assertion only means something while the text is drawn: with the title off the
+    // label is hidden, and it keeps no text frame of its own to stay clear of.
+    let label_hidden: bool = msg_send![label, isHidden];
+    if !label_hidden && rects_overlap(button_frame, label_frame) {
         return Err(format!(
             "the footer text and the gear overlap: text {:.1}..{:.1}, gear {:.1}..{:.1}",
             label_frame.origin.x,
@@ -1776,42 +1810,40 @@ pub(crate) fn update_status_label() {
             Some(l) => l.0,
             None => return,
         };
+        // `Some(None)` means "the footer title is turned off": the label is hidden but keeps its
+        // frame, so the gear's reserve and every frame-based assertion keep their meaning.
         let Some(status_text) = with_tab_state(|state_opt| {
             let state = state_opt.as_ref()?;
-            let selected = state.selected;
             // status_text is the long app/window title line below the cards; with an empty window
             // list it shows the "no windows to switch" hint (the empty-overlay state).
-            Some(if state.windows.is_empty() {
-                t("overlay.no_windows")
-            } else {
-                match state.windows.get(selected) {
-                    Some(w) if w.window_title.is_empty() => {
-                        display_title(&w.window_title, &w.app_name).to_string()
-                    }
-                    Some(w) => format!(
-                        "{} · {}",
-                        display_title(&w.window_title, &w.app_name),
-                        w.app_name
-                    ),
-                    None => String::new(),
+            if state.windows.is_empty() {
+                // The hint is a state message, not a window title, so the switch does not hide it:
+                // an empty panel would otherwise carry no explanation at all.
+                return Some(Some(t("overlay.no_windows")));
+            }
+            if !crate::theme::show_footer_title() {
+                return Some(None);
+            }
+            let selected = state.selected;
+            Some(Some(match state.windows.get(selected) {
+                Some(w) if w.window_title.is_empty() => {
+                    display_title(&w.window_title, &w.app_name).to_string()
                 }
-            })
+                Some(w) => format!(
+                    "{} · {}",
+                    display_title(&w.window_title, &w.app_name),
+                    w.app_name
+                ),
+                None => String::new(),
+            }))
         }) else {
             return;
         };
+        let title_visible = status_text.is_some();
+        let status_text = status_text.unwrap_or_default();
 
         let colors = current_colors();
         let footer_h = footer_band_h();
-        let status_font: *mut AnyObject = {
-            let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
-            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
-        };
-        let status_color = hex_to_ns_color(colors.status_bar_text);
-        let ns_stat = make_nsstring(&status_text);
-        let _: () = msg_send![status_label, setStringValue: ns_stat];
-        CFRelease(ns_stat as *const c_void);
-        let _: () = msg_send![status_label, setFont: status_font];
-        let _: () = msg_send![status_label, setTextColor: status_color];
         // The panel's own rect: the window is the padded (elevation) rect, so its frame is NOT the
         // panel size the corner geometry must be computed against. The clip view sits directly above
         // the footer band and carries the panel's width, so panel height = viewport height + band.
@@ -1821,6 +1853,24 @@ pub(crate) fn update_status_label() {
             let f: NSRect = msg_send![c, frame];
             (f.size.width, f.size.height + footer_band_h())
         };
+        if !title_visible {
+            // No title: the band is gone too, so there is no text frame to place. The gear still has
+            // to be laid out -- it now sits in the panel's bottom-right corner.
+            let _: () = msg_send![status_label, setHidden: true];
+            footer_settings::layout_and_repaint(NSSize::new(container_w, panel_h));
+            return;
+        }
+        let status_font: *mut AnyObject = {
+            let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
+            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
+        };
+        let status_color = hex_to_ns_color(colors.status_bar_text);
+        let ns_stat = make_nsstring(&status_text);
+        let _: () = msg_send![status_label, setStringValue: ns_stat];
+        CFRelease(ns_stat as *const c_void);
+        let _: () = msg_send![status_label, setHidden: false];
+        let _: () = msg_send![status_label, setFont: status_font];
+        let _: () = msg_send![status_label, setTextColor: status_color];
         // Keep a fixed visual frame so native tail truncation is based on the actual font and
         // available width. Manual ASCII/CJK width estimates made long titles overflow or cut
         // Unicode grapheme clusters.
@@ -1828,11 +1878,19 @@ pub(crate) fn update_status_label() {
         let _: () = msg_send![status_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
         let ascender: f64 = msg_send![status_font, ascender];
         let descender: f64 = msg_send![status_font, descender];
-        let line_h = (ascender - descender + 1.0).clamp(11.0, footer_h);
+        let natural_h = ascender - descender + 1.0;
+        let line_h = crate::theme::footer_line_height(natural_h, footer_h);
         // The footer text keeps the SAME reserve on both sides, so the settings gear can never
         // overlap it while its centre stays the panel's centre. The reserve includes the gear's own
         // width and gap -- reserving only the corner inset would let a long title draw under it.
-        let (stat_x, stat_y, stat_w) = footer_text_frame(container_w, panel_h, line_h);
+        //
+        // With the title off the only thing this label can still say is the empty-state hint, and
+        // there is no band left to hold it: centre it in the card viewport instead.
+        let (stat_x, stat_y, stat_w) = if footer_h > 0.0 {
+            footer_text_frame(container_w, panel_h, line_h)
+        } else {
+            (0.0, ((panel_h - line_h) / 2.0).max(0.0), container_w)
+        };
         let _: () = msg_send![status_label, setFrame: NSRect::new(
             NSPoint::new(stat_x, stat_y),
             NSSize::new(stat_w, line_h)

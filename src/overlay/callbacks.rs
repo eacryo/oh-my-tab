@@ -797,12 +797,15 @@ pub(super) unsafe fn update_thumbnail_scroller(
         return;
     }
     let footer_h = footer_band_h();
+    // With the title off the gear floats in this same trailing column and is added to the view
+    // hierarchy first, so the track has to start above it or the two hit areas overlap.
+    let bottom = footer_h + crate::theme::footer_control_bottom_reserve();
     let frame = NSRect::new(
         NSPoint::new(
             panel_w - H_PADDING - THUMB_SCROLLBAR_W + THUMB_SCROLLBAR_W / 2.0,
-            footer_h,
+            bottom,
         ),
-        NSSize::new(THUMB_SCROLLBAR_W, (panel_h - footer_h).max(1.0)),
+        NSSize::new(THUMB_SCROLLBAR_W, (panel_h - bottom).max(1.0)),
     );
     // Keep the hit view's frame stable during dragging; card rebuilds only refresh the capsule.
     if THUMB_SCROLL_DRAG.lock().unwrap().is_none() {

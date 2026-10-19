@@ -24,6 +24,7 @@ pub(super) enum ControlField {
     ThumbnailsEnabled,
     FocusedThumbnailPrewarm,
     ShowAppNameInCards,
+    ShowFooterTitle,
     CardTextSize,
     ThumbnailSize,
     StatusBarTextSize,
@@ -102,6 +103,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                 )
             })
             .or_else(|| m(u.show_app_name_in_cards, ControlField::ShowAppNameInCards))
+            .or_else(|| m(u.show_footer_title, ControlField::ShowFooterTitle))
             .or_else(|| m(u.card_text_size, ControlField::CardTextSize))
             .or_else(|| m(u.status_bar_text_size, ControlField::StatusBarTextSize))
             .or_else(|| m(u.overlay_position, ControlField::OverlayPosition))
@@ -573,6 +575,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ShowAppNameInCards => {
                     let state: isize = msg_send![u.show_app_name_in_cards, state];
                     cfg.layout.show_app_name_in_cards = state == 1;
+                }
+                ControlField::ShowFooterTitle => {
+                    let state: isize = msg_send![u.show_footer_title, state];
+                    cfg.layout.show_footer_title = state == 1;
                 }
                 ControlField::CardTextSize => {
                     let val: isize = msg_send![u.card_text_size, integerValue];
@@ -1180,6 +1186,7 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
         ui.card_text_size_value_label,
         ui.status_bar_text_size,
         ui.status_bar_text_size_value_label,
+        ui.show_footer_title,
         ui.overlay_position,
         ui.activation_mode,
         ui.panel_close_enabled,
@@ -1590,6 +1597,15 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 0isize
             };
             let _: () = msg_send![u.focused_thumbnail_prewarm, setState: prewarm_state];
+            // The footer title switch follows a reload / defaults restore like every other control:
+            // without this the page keeps showing the old state after the config file moved, while
+            // the overlay already draws with the new one.
+            let footer_title_state = if cfg.layout.show_footer_title {
+                1isize
+            } else {
+                0isize
+            };
+            let _: () = msg_send![u.show_footer_title, setState: footer_title_state];
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
             // Key bindings: an external change (a menu toggle, a reloaded file) has to reach the

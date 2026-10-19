@@ -623,6 +623,11 @@ pub struct Layout {
     // before the window title, separated by " · "; a titleless window, or one whose title equals
     // the app name, shows a single copy. Default off (window title only).
     pub show_app_name_in_cards: bool,
+    // Window title in the switcher's bottom footer: when off, the title line is not drawn and the
+    // footer band disappears with it -- the panel gets shorter by the band's height and the settings
+    // gear moves from the band to the panel's bottom-right corner. The empty-state hint is not a
+    // window title and stays visible (centred in the panel). Default on (the title is shown).
+    pub show_footer_title: bool,
     // Card text size (points): the window title and app name scale proportionally; the large
     // icon in icon-only mode is unaffected.
     pub card_text_size: f64,
@@ -1104,6 +1109,7 @@ impl Default for Layout {
             thumbnails_enabled: true,
             focused_thumbnail_prewarm: false,
             show_app_name_in_cards: false,
+            show_footer_title: true,
             card_text_size: 15.0,
             thumbnail_size: "auto".into(),
         }
@@ -1598,6 +1604,7 @@ impl Config {
             self.layout.thumbnails_enabled = other.layout.thumbnails_enabled;
             self.layout.focused_thumbnail_prewarm = other.layout.focused_thumbnail_prewarm;
             self.layout.show_app_name_in_cards = other.layout.show_app_name_in_cards;
+            self.layout.show_footer_title = other.layout.show_footer_title;
             if !errs.iter().any(|e| e.starts_with("layout.card_text_size")) {
                 self.layout.card_text_size = other.layout.card_text_size;
             }
@@ -2896,6 +2903,37 @@ mod tests {
         cfg.colors.dark.app_name = "nothex".into();
         cfg.colors.light.card_bg_sel = "12345".into();
         assert_err_count(&cfg, 2);
+    }
+
+    /// `layout.show_footer_title` is additive, so the two compatibility directions matter: a config
+    /// written before the switch existed must load as "title shown" (not hidden), and an explicit
+    /// `false` must survive a round trip and a sibling field's per-field fallback. Getting the first
+    /// one wrong hides the footer for every existing user on upgrade.
+    #[test]
+    fn the_footer_title_switch_defaults_on_and_round_trips() {
+        // An old file has no key for it.
+        let old: Config = toml::from_str("[layout]\ncard_text_size = 15.0\n").unwrap();
+        assert!(
+            old.layout.show_footer_title,
+            "an absent key must mean shown"
+        );
+
+        // Explicitly off survives serialization.
+        let mut cfg = Config::default();
+        cfg.layout.show_footer_title = false;
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(!back.layout.show_footer_title);
+
+        // A sibling field's fallback must not discard it: booleans are adopted unconditionally.
+        let mut other = Config::default();
+        other.layout.show_footer_title = false;
+        let mut merged = Config::default();
+        merged.merge_valid(other, &["layout.card_text_size: out of range".to_string()]);
+        assert!(
+            !merged.layout.show_footer_title,
+            "a per-field fallback elsewhere in [layout] must not reset this switch"
+        );
     }
 
     #[test]

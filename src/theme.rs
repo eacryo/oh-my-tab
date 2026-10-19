@@ -719,19 +719,6 @@ fn overlay_text_size_for(base_size: f64, card_text_size: f64) -> f64 {
     (base_size * card_text_size / CARD_TEXT_BASE_SIZE).clamp(13.0, 20.0)
 }
 
-/// The footer band's height: the text band minus the card area's bottom inset.
-///
-/// The band holds the footer text, vertically centered, and it grows with that text. Its top
-/// `THUMB_BOTTOM_INSET` belongs to the card viewport instead, because the card viewport ends where the
-/// band starts and the selected card draws outside its own bounds (see `THUMB_BOTTOM_INSET`). Taking
-/// that room from the band's own top padding rather than from the panel height is what keeps the
-/// panel's footprint -- and with it the automatic card-size step and the row budget -- exactly what it
-/// was before the inset existed: the panel's bottom region is still the text band it always was, now
-/// split into card viewport inset + band.
-pub(crate) fn status_h() -> f64 {
-    status_bar_height_for_text_size(status_bar_text_size()) - THUMB_BOTTOM_INSET
-}
-
 /// The corner-safe inset for a control in the footer band's trailing corner.
 ///
 /// The gear sits in the panel's bottom-right rounded corner, so the button's own bottom-right corner
@@ -799,12 +786,165 @@ pub(crate) const FOOTER_CONTROL_MIN_H: f64 = 36.0;
 pub(crate) const FOOTER_CONTROL_SIZE: f64 = 28.0;
 /// Gap between the settings control and the footer text's reserved area.
 pub(crate) const FOOTER_CONTROL_GAP: f64 = 8.0;
+/// Bottom margin of the settings control when the footer title is off and the band is gone.
+///
+/// The control then anchors to the panel's bottom-right corner arc instead of being centred in a
+/// band. At the shipped 32pt corner radius this margin is what keeps the control's trailing edge
+/// clear of the card area's own right inset (`H_PADDING`), so a full-width row cannot slide under it.
+pub(crate) const FOOTER_FLOAT_MARGIN: f64 = 16.0;
+
+// Test-only override of the footer band height.
+//
+// The suite builds `CONFIG` from the on-disk config file, so geometry that reads the band depends on
+// the developer's `layout.show_footer_title` unless a test pins it. This is thread-local rather than a
+// `CONFIG` write because the harness runs tests in parallel: a global write would be observed by
+// every other test in the run.
+#[cfg(test)]
+thread_local! {
+    static TEST_FOOTER_BAND: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the footer band height for the current test thread (`None` restores the configured value).
+#[cfg(test)]
+pub(crate) fn set_test_footer_band(band: Option<f64>) {
+    TEST_FOOTER_BAND.with(|cell| cell.set(band));
+}
+
+// Test-only override of the corner radius the layout geometry uses, for the same reason as the band:
+// the suite reads the developer's config, and a reserve that is zero on one machine is not a gate on
+// the machines where it is not.
+#[cfg(test)]
+thread_local! {
+    static TEST_CORNER_RADIUS: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the corner radius used by layout geometry for the current test thread.
+#[cfg(test)]
+pub(crate) fn set_test_corner_radius(radius: Option<f64>) {
+    TEST_CORNER_RADIUS.with(|cell| cell.set(radius));
+}
+
+/// The corner radius that layout geometry must be computed against.
+pub(crate) fn layout_corner_radius() -> f64 {
+    #[cfg(test)]
+    {
+        if let Some(forced) = TEST_CORNER_RADIUS.with(|cell| cell.get()) {
+            return forced;
+        }
+        CONFIG.read().unwrap().appearance.corner_radius
+    }
+    #[cfg(not(test))]
+    {
+        CONFIG.read().unwrap().appearance.corner_radius
+    }
+}
 
 /// The footer band's height, with the floor the settings control needs. Every consumer of the band
 /// (the card viewport, the document, the scroller, the footer text and the control) must use THIS,
 /// or the control and the viewport disagree about where the band starts.
+///
+/// With the title turned off the band disappears: the 36pt floor exists to hold the settings
+/// control, not the text (15pt text needs 33.5pt, below that floor), so keeping any band would keep
+/// an empty strip. The control moves to the panel's corner instead -- see
+/// `overlay::footer_settings_frame` -- and every consumer follows this function, so the panel, the
+/// card viewport and the scroller all shrink by the band together.
 pub(crate) fn footer_band_h() -> f64 {
-    status_h().max(FOOTER_CONTROL_MIN_H)
+    #[cfg(test)]
+    {
+        // The suite builds `CONFIG` from the developer's on-disk config file, so reading the switch
+        // here would make every band-dependent layout assertion depend on that machine's setting.
+        // Tests assume the band is present unless they pin it with `set_test_footer_band`; the
+        // switch-to-band mapping itself is covered by `footer_band_h_for`'s own test.
+        if let Some(forced) = TEST_FOOTER_BAND.with(|cell| cell.get()) {
+            return forced;
+        }
+        footer_band_h_for(true, status_bar_text_size())
+    }
+    #[cfg(not(test))]
+    {
+        footer_band_h_for(show_footer_title(), status_bar_text_size())
+    }
+}
+
+/// The band height for one switch state and one footer text size (pure): the floor the settings
+/// control needs, or nothing at all while the title is off.
+///
+/// The text band grows with the footer text, and its top `THUMB_BOTTOM_INSET` belongs to the card
+/// viewport instead: the viewport ends where the band starts and the selected card draws outside its
+/// own bounds (see `THUMB_BOTTOM_INSET`). Taking that room from the band's own top padding rather than
+/// from the panel height is what keeps the panel's footprint -- and with it the automatic card-size
+/// step and the row budget -- what it was before the inset existed.
+fn footer_band_h_for(show_title: bool, footer_text_size: f64) -> f64 {
+    if !show_title {
+        return 0.0;
+    }
+    let size = status_bar_text_size_for(footer_text_size);
+    (status_bar_height_for_text_size(size) - THUMB_BOTTOM_INSET).max(FOOTER_CONTROL_MIN_H)
+}
+
+/// The footer text's line height, clamped into the footer band when there is one.
+///
+/// The clamp exists so the line cannot outgrow the band. With the title switched off the band is zero
+/// and the label may still carry the empty-state hint, so `clamp(11.0, band_h)` would be
+/// `clamp(11.0, 0.0)` -- which panics (min > max) instead of clamping, on the plain empty-overlay
+/// path. The upper bound is therefore applied only when a band exists.
+pub(crate) fn footer_line_height(natural_h: f64, band_h: f64) -> f64 {
+    if band_h > 0.0 {
+        natural_h.clamp(11.0, band_h)
+    } else {
+        natural_h.max(11.0)
+    }
+}
+
+/// How much room above the panel's bottom edge the trailing column must leave free for the settings
+/// control, beyond the footer band.
+///
+/// Zero while the band exists (the control lives in it). With the title off the control floats over
+/// the panel's bottom-right corner, in the same trailing column as the overflow scrollbar, and it is
+/// added to the view hierarchy *before* the scrollbar -- so a shared area would hand the control's
+/// clicks to the scrollbar. The scrollbar's track starts above this reserve instead of at the panel
+/// edge, which keeps the two hit areas disjoint without relying on z-order.
+pub(crate) fn footer_control_bottom_reserve() -> f64 {
+    if footer_band_h() > 0.0 {
+        return 0.0;
+    }
+    FOOTER_FLOAT_MARGIN + FOOTER_CONTROL_SIZE + FOOTER_CONTROL_GAP
+}
+
+/// Horizontal room the floating settings control takes out of the card grid when the footer title is
+/// off, so no card can slide under it: the control is drawn on top and would take that part of the
+/// card's clicks, and a larger configured corner radius pushes it further in.
+///
+/// Zero while the band exists (the control is inside it). Also zero while the intrusion stays under a
+/// point -- at the shipped 32pt radius it is 0.3pt, and re-deriving row packing for a sub-point would
+/// perturb the layout for no visible gain. Measured against the widest allowed panel, so it is never
+/// an underestimate for the panel the layout finally picks.
+pub(crate) fn footer_control_right_reserve(max_panel_w: f64, max_panel_h: f64) -> f64 {
+    if footer_band_h() > 0.0 {
+        return 0.0;
+    }
+    footer_control_right_reserve_for(layout_corner_radius(), max_panel_w, max_panel_h)
+}
+
+/// The pure half of [`footer_control_right_reserve`]: the reserve a given corner radius implies.
+///
+/// Separate from the config read so the boundary can be asserted without a configured radius: at the
+/// shipped 32pt the arc-derived inset still fits inside `H_PADDING`, and a radius large enough to push
+/// the control past it must produce a reserve that grows with the radius.
+fn footer_control_right_reserve_for(radius: f64, max_panel_w: f64, max_panel_h: f64) -> f64 {
+    let inset = footer_control_inset(
+        radius,
+        max_panel_w,
+        max_panel_h,
+        FOOTER_CONTROL_SIZE,
+        FOOTER_CONTROL_SIZE + FOOTER_FLOAT_MARGIN * 2.0,
+    );
+    let intrusion = inset + FOOTER_CONTROL_SIZE - H_PADDING;
+    if intrusion > 1.0 {
+        intrusion
+    } else {
+        0.0
+    }
 }
 
 /// The trailing horizontal inset reserved for the footer's settings control: the corner-safe inset
@@ -970,6 +1110,15 @@ pub(crate) fn thumbnails_enabled() -> bool {
 /// Whether the thumbnail card's caption prefixes the app name before the window title.
 pub(crate) fn show_app_name_in_cards() -> bool {
     CONFIG.read().unwrap().layout.show_app_name_in_cards
+}
+
+/// Whether the switcher's bottom footer draws the selected window's title.
+///
+/// This switch also decides whether the footer band exists at all (`footer_band_h`), because the
+/// band's floor is the settings control's size rather than the text's: with the title off there is
+/// nothing left for the band to hold except a control that can move to the panel's corner.
+pub(crate) fn show_footer_title() -> bool {
+    CONFIG.read().unwrap().layout.show_footer_title
 }
 
 /// Flow-layout base card width, hard-coded and fully independent of the legacy
@@ -1479,14 +1628,16 @@ fn build_thumb_layout(
 }
 
 /// Pack the complete window list once, then build the viewport from a contiguous slice of rows.
+#[allow(clippy::too_many_arguments)] // the layout inputs are independent geometry terms.
 fn build_thumb_scroll_layout(
     all_rows: &[Vec<usize>],
     widths: &[f64],
     scale: f64,
     constraints: ThumbFlowConstraints,
-    _max_panel_w: f64,
+    max_panel_w: f64,
     scrollbar_w: f64,
     scroll_offset: f64,
+    trailing_reserve: f64,
 ) -> ThumbFlowLayout {
     let overflowed = all_rows.len() > constraints.max_rows;
     // Rows first: show as many whole rows as fit, and only count the teaser when it does not push a
@@ -1549,9 +1700,9 @@ fn build_thumb_scroll_layout(
     // large empty margins on both sides. The row packing already respects max_inner, so the
     // widest actual row is the natural width; only reserve the scrollbar beside it.
     let panel_w = if overflowed {
-        used_inner_w + H_PADDING * 2.0 + scrollbar_w
+        (used_inner_w + H_PADDING * 2.0 + scrollbar_w + trailing_reserve).min(max_panel_w)
     } else {
-        used_inner_w.max(280.0_f64.min(constraints.max_inner)) + H_PADDING * 2.0
+        used_inner_w.max(280.0_f64.min(constraints.max_inner)) + H_PADDING * 2.0 + trailing_reserve
     };
     let rendered_rows = viewport_row_count.max(1);
     let (panel_h, content_inset) = thumb_panel_metrics(
@@ -1578,7 +1729,7 @@ fn build_thumb_scroll_layout(
     for (row_index, row) in all_rows.iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
             + row.len().saturating_sub(1) as f64 * constraints.gap;
-        let mut x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
+        let mut x = (card_area_w - trailing_reserve - row_w) / 2.0 + scrollbar_centering_offset;
         let y = document_panel_h
             - content_inset
             - (row_index as f64 + 1.0) * constraints.card_h
@@ -1597,7 +1748,7 @@ fn build_thumb_scroll_layout(
     for (local_row, row) in all_rows[row_start..row_end].iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
             + row.len().saturating_sub(1) as f64 * constraints.gap;
-        let mut x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
+        let mut x = (card_area_w - trailing_reserve - row_w) / 2.0 + scrollbar_centering_offset;
         let y = panel_h
             - content_inset
             - (local_row as f64 + 1.0) * constraints.card_h
@@ -1648,6 +1799,7 @@ pub(crate) fn plan_thumb_close_reflow(
     content_inset: f64,
     overflowed: bool,
     max_rows: usize,
+    trailing_reserve: f64,
 ) -> (Vec<ThumbPlacement>, Vec<Range<usize>>, f64, bool) {
     // Overflow layouts must keep greedy MRU-order packing so following cards fill the released slot first.
     let rows = if overflowed {
@@ -1673,9 +1825,9 @@ pub(crate) fn plan_thumb_close_reflow(
         0.0
     };
     let final_panel_w = if final_overflowed {
-        used_inner_w + H_PADDING * 2.0 + final_scrollbar_w
+        used_inner_w + H_PADDING * 2.0 + final_scrollbar_w + trailing_reserve
     } else {
-        used_inner_w.max(280.0_f64.min(max_inner)) + H_PADDING * 2.0
+        used_inner_w.max(280.0_f64.min(max_inner)) + H_PADDING * 2.0 + trailing_reserve
     };
     let final_card_area_w = (final_panel_w - final_scrollbar_w).max(1.0);
     let document_h = document_h.max(1.0);
@@ -1686,7 +1838,7 @@ pub(crate) fn plan_thumb_close_reflow(
         }
         let row_w = row.iter().map(|&index| widths[index]).sum::<f64>()
             + row.len().saturating_sub(1) as f64 * gap;
-        let mut x = (final_card_area_w - row_w) / 2.0
+        let mut x = (final_card_area_w - trailing_reserve - row_w) / 2.0
             + if final_overflowed {
                 final_scrollbar_w / 2.0
             } else {
@@ -1922,6 +2074,10 @@ fn plan_thumb_scroll_layout_at_scale(
     max_card_w: f64,
 ) -> ThumbFlowLayout {
     let max_inner = max_inner.max(1.0);
+    // Reserve the floating control's trailing room out of the packing budget: appending it to the
+    // panel afterwards would exceed `max_panel_w`.
+    let trailing_reserve = footer_control_right_reserve(max_panel_w, max_panel_h);
+    let max_inner = (max_inner - trailing_reserve).max(1.0);
     let card_h = thumb_card_h_for_scale(scale);
     let constraints = ThumbFlowConstraints {
         card_h,
@@ -1946,6 +2102,7 @@ fn plan_thumb_scroll_layout_at_scale(
         max_panel_w,
         scrollbar_w,
         scroll_offset,
+        trailing_reserve,
     )
 }
 
@@ -1980,8 +2137,15 @@ pub(crate) fn plan_icon_scroll_layout(
     let card_h = card_h();
     let max_panel_w = (screen_width.max(1.0) * PANEL_MAX_WIDTH_RATIO)
         .max(ICON_CARD_W + H_PADDING * 2.0 + scrollbar_w);
-    let max_inner = (max_panel_w - H_PADDING * 2.0 - scrollbar_w).max(ICON_CARD_W);
-    let max_columns = ((max_inner + gap) / (ICON_CARD_W + gap)).floor().max(1.0) as usize;
+    // The floating settings control's trailing room comes out of the width budget first, so the panel
+    // never grows past `max_panel_w`: packing a row, then appending the reserve, would push the panel
+    // (and the control with it) off the screen.
+    let trailing_reserve = footer_control_right_reserve(max_panel_w, max_panel_h);
+    let packing_inner =
+        (max_panel_w - H_PADDING * 2.0 - scrollbar_w - trailing_reserve).max(ICON_CARD_W);
+    let max_columns = ((packing_inner + gap) / (ICON_CARD_W + gap))
+        .floor()
+        .max(1.0) as usize;
     // Keep the legacy three-slot baseline for small sets, while card dimensions remain fixed.
     let baseline_columns = count.max(3).min(max_columns);
     let minimum_rows = if count == 0 {
@@ -2026,7 +2190,7 @@ pub(crate) fn plan_icon_scroll_layout(
     let panel_w = if overflowed {
         max_panel_w
     } else {
-        grid_w + H_PADDING * 2.0
+        grid_w + H_PADDING * 2.0 + trailing_reserve
     };
     let card_area_w = if overflowed {
         (panel_w - scrollbar_w).max(ICON_CARD_W + H_PADDING * 2.0)
@@ -2080,7 +2244,7 @@ pub(crate) fn plan_icon_scroll_layout(
     let mut document_placements = Vec::with_capacity(count);
     for (row_index, row) in row_ranges.iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
-        let row_x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
+        let row_x = (card_area_w - trailing_reserve - row_w) / 2.0 + scrollbar_centering_offset;
         let y = document_panel_h
             - THUMB_TOP_INSET
             - (row_index as f64 + 1.0) * card_h
@@ -2097,7 +2261,7 @@ pub(crate) fn plan_icon_scroll_layout(
     let mut placements = Vec::new();
     for (local_row, row) in row_ranges[row_start..row_end].iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
-        let row_x = (card_area_w - row_w) / 2.0 + scrollbar_centering_offset;
+        let row_x = (card_area_w - trailing_reserve - row_w) / 2.0 + scrollbar_centering_offset;
         let y =
             panel_h - THUMB_TOP_INSET - (local_row as f64 + 1.0) * card_h - local_row as f64 * gap
                 + intra_row_offset;
@@ -2258,6 +2422,178 @@ mod tests {
                 assert!(footer_text_reserve(width, height) <= width / 2.0 + 1e-9);
             }
         }
+    }
+
+    /// The footer line height is bounded by the band while one exists, and must not panic when it
+    /// does not: with the title switched off the band is zero and the empty-overlay path still draws
+    /// the hint, where `clamp(11.0, 0.0)` would panic (min > max). The zero-band case is the
+    /// counter-example that fails against the previous implementation.
+    #[test]
+    fn footer_line_height_survives_a_missing_band() {
+        // Band present: floor, pass-through and ceiling.
+        assert_eq!(footer_line_height(5.0, 36.0), 11.0);
+        assert_eq!(footer_line_height(18.0, 36.0), 18.0);
+        assert_eq!(footer_line_height(40.0, 36.0), 36.0);
+        // Band gone: the natural line, floored but never clamped from above.
+        assert_eq!(footer_line_height(18.0, 0.0), 18.0);
+        assert_eq!(footer_line_height(5.0, 0.0), 11.0);
+    }
+
+    /// The switch-to-band mapping, asserted on the pure function: the band exists to hold the settings
+    /// control, so it is the control's floor at small footer sizes, grows with the footer text, and is
+    /// gone entirely when the title is off -- at every footer size, which is what makes hiding the
+    /// title reclaim space instead of leaving an empty strip.
+    #[test]
+    fn the_footer_band_vanishes_only_when_the_title_is_off() {
+        assert_eq!(footer_band_h_for(true, 15.0), FOOTER_CONTROL_MIN_H);
+        assert_eq!(footer_band_h_for(false, 15.0), 0.0);
+        assert!(
+            footer_band_h_for(true, 20.0) > FOOTER_CONTROL_MIN_H,
+            "a large footer text must grow the band it is drawn in"
+        );
+        assert_eq!(footer_band_h_for(false, 20.0), 0.0);
+    }
+
+    /// The floating settings control only takes room out of the card grid once the configured corner
+    /// radius pushes it past the grid's own trailing inset. At the shipped 32pt it must take nothing
+    /// (re-deriving row packing for a sub-point would change the layout for no visible gain), and a
+    /// radius large enough to intrude must produce a reserve that clears the grid.
+    #[test]
+    fn footer_control_right_reserve_only_appears_past_the_shipped_radius() {
+        let (panel_w, panel_h) = (900.0, 600.0);
+        assert_eq!(
+            footer_control_right_reserve_for(32.0, panel_w, panel_h),
+            0.0,
+            "the shipped radius must not perturb the card grid"
+        );
+        let large = footer_control_right_reserve_for(64.0, panel_w, panel_h);
+        assert!(
+            large > 10.0,
+            "a 64pt radius intrudes well past H_PADDING, got {large}"
+        );
+        // The reserve is exactly how far the control's left edge would sit past the grid's boundary,
+        // so the grid shrunk by it cannot reach the control.
+        let inset = footer_control_inset(
+            64.0,
+            panel_w,
+            panel_h,
+            FOOTER_CONTROL_SIZE,
+            FOOTER_CONTROL_SIZE + FOOTER_FLOAT_MARGIN * 2.0,
+        );
+        assert!((large - (inset + FOOTER_CONTROL_SIZE - H_PADDING)).abs() < 1e-9);
+    }
+
+    /// The floating settings control must not sit over a card in the real layout, in either display
+    /// mode. This compares the layout's own placements against the control's frame: an earlier
+    /// version of this fix only shrank the packing budget, and the panel then shrank back around the
+    /// widest row, so the card still ended exactly where the control begins.
+    #[test]
+    fn the_floating_settings_control_never_sits_over_a_card() {
+        // Pin both inputs the geometry reads: at the configured radius the reserve can be zero (sub
+        // point), which would make this assertion vacuous on some machines.
+        set_test_footer_band(Some(0.0));
+        set_test_corner_radius(Some(64.0));
+        let max_panel_h = 700.0;
+
+        let icon = plan_icon_scroll_layout(6, 1400.0, max_panel_h, THUMB_SCROLLBAR_W, 0.0);
+        assert!(!icon.overflowed, "the icon fixture must stay in one row");
+        assert_no_card_under_the_control(&icon, "icon");
+
+        let aspects = vec![THUMB_PREVIEW_RATIO; 4];
+        let thumbs = plan_thumb_scroll_layout_with_max_card_w(
+            &aspects,
+            1200.0,
+            1400.0,
+            max_panel_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            0.0,
+            |_| f64::INFINITY,
+        );
+        assert!(
+            !thumbs.overflowed,
+            "the thumbnail fixture must stay non-overflow"
+        );
+        assert_no_card_under_the_control(&thumbs, "thumbnail");
+        set_test_corner_radius(None);
+        set_test_footer_band(None);
+    }
+
+    /// The trailing reserve is taken out of the width budget, not appended to it: packing a row and
+    /// then widening the panel for the control would push the panel -- and the control with it -- past
+    /// the screen budget that `clamp_into_visible` only re-positions, never shrinks.
+    #[test]
+    fn a_large_corner_radius_never_pushes_the_panel_past_its_width_budget() {
+        set_test_footer_band(Some(0.0));
+        set_test_corner_radius(Some(512.0));
+        let max_panel_h = 800.0;
+
+        let screen_w = 1440.0;
+        let icon_budget = (screen_w * PANEL_MAX_WIDTH_RATIO)
+            .max(ICON_CARD_W + H_PADDING * 2.0 + THUMB_SCROLLBAR_W);
+        let icon = plan_icon_scroll_layout(40, screen_w, max_panel_h, THUMB_SCROLLBAR_W, 0.0);
+        assert!(
+            icon.overflowed,
+            "the icon fixture must reach the overflow branch"
+        );
+        assert!(
+            icon.panel_w <= icon_budget + 1e-9,
+            "the icon panel is {:.1}pt, past its {:.1}pt width budget",
+            icon.panel_w,
+            icon_budget
+        );
+
+        let thumb_budget = 1400.0;
+        let aspects = vec![THUMB_PREVIEW_RATIO; 40];
+        let thumbs = plan_thumb_scroll_layout_with_max_card_w(
+            &aspects,
+            thumb_budget - H_PADDING * 2.0 - THUMB_SCROLLBAR_W,
+            thumb_budget,
+            max_panel_h,
+            THUMB_ROW_GAP,
+            THUMB_SCROLLBAR_W,
+            0.0,
+            |_| f64::INFINITY,
+        );
+        assert!(
+            thumbs.overflowed,
+            "the thumbnail fixture must reach the overflow branch"
+        );
+        assert!(
+            thumbs.panel_w <= thumb_budget + 1e-9,
+            "the thumbnail panel is {:.1}pt, past its {:.1}pt width budget",
+            thumbs.panel_w,
+            thumb_budget
+        );
+
+        set_test_corner_radius(None);
+        set_test_footer_band(None);
+    }
+
+    /// Every card in `layout` ends left of the floating control's frame. One point of slack: the grid
+    /// deliberately does not give way for sub-point intrusions (see `footer_control_right_reserve`).
+    fn assert_no_card_under_the_control(layout: &ThumbFlowLayout, label: &str) {
+        let size = FOOTER_CONTROL_SIZE;
+        let radius = CONFIG.read().unwrap().appearance.corner_radius;
+        let inset = footer_control_inset(
+            radius,
+            layout.panel_w,
+            layout.panel_h,
+            size,
+            size + FOOTER_FLOAT_MARGIN * 2.0,
+        );
+        let control_left = layout.panel_w - inset - size;
+        let widest_right = layout
+            .placements
+            .iter()
+            .map(|p| p.x + p.width)
+            .fold(f64::NEG_INFINITY, f64::max);
+        assert!(
+            widest_right <= control_left + 1.0,
+            "{label}: the widest card ends at {widest_right:.1}, the floating control starts at \
+             {control_left:.1} (panel {:.1}pt)",
+            layout.panel_w
+        );
     }
 
     /// The style document states the elevation table; these are its numbers, so a re-tuned blur radius
@@ -3115,6 +3451,10 @@ mod flow_tests {
 
     #[test]
     fn the_panel_margin_costs_a_step_not_a_row() {
+        // Pins the band-present case (the numbers below are the 36pt footer band's). The suite builds
+        // CONFIG from the on-disk config, so without this the step would depend on the developer's
+        // `layout.show_footer_title` -- 36pt of extra room legitimately buys a bigger step.
+        set_test_footer_band(Some(FOOTER_CONTROL_MIN_H));
         // The measured built-in screen (1470x956, 923 visible): after both margins the step should fall
         // to 0.75 instead of overflowing into scrolling.
         let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
@@ -3150,6 +3490,7 @@ mod flow_tests {
             (on_wide - 0.95).abs() < 1e-9,
             "with the margin subtracted the wide screen must land on 0.95, got {on_wide}"
         );
+        set_test_footer_band(None);
     }
 
     #[test]
@@ -3195,6 +3536,7 @@ mod flow_tests {
                 THUMB_TOP_INSET,
                 overflowed,
                 max_rows,
+                0.0,
             );
             rows = row_ranges.len();
             overflowed = next_overflowed;
@@ -3837,8 +4179,17 @@ mod flow_tests {
     #[test]
     fn close_reflow_keeps_order_and_fills_the_removed_slot() {
         let widths = vec![100.0; 5];
-        let (placements, rows, panel_w, overflowed) =
-            plan_thumb_close_reflow(&widths, 80.0, 220.0, 10.0, 180.0, THUMB_TOP_INSET, false, 3);
+        let (placements, rows, panel_w, overflowed) = plan_thumb_close_reflow(
+            &widths,
+            80.0,
+            220.0,
+            10.0,
+            180.0,
+            THUMB_TOP_INSET,
+            false,
+            3,
+            0.0,
+        );
 
         assert_eq!(rows, vec![0..2, 2..4, 4..5]);
         assert_eq!(
@@ -3855,8 +4206,17 @@ mod flow_tests {
     #[test]
     fn overflow_close_reflow_fills_rows_in_window_order() {
         let widths = vec![100.0; 9];
-        let (placements, rows, panel_w, overflowed) =
-            plan_thumb_close_reflow(&widths, 80.0, 320.0, 10.0, 260.0, THUMB_TOP_INSET, true, 2);
+        let (placements, rows, panel_w, overflowed) = plan_thumb_close_reflow(
+            &widths,
+            80.0,
+            320.0,
+            10.0,
+            260.0,
+            THUMB_TOP_INSET,
+            true,
+            2,
+            0.0,
+        );
 
         assert_eq!(rows, vec![0..3, 3..6, 6..9]);
         assert_eq!(placements[3].y, placements[0].y - 90.0);

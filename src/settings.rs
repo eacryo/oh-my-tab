@@ -399,6 +399,7 @@ pub(super) struct SettingsUi {
     card_text_size_value_label: *mut AnyObject, // card text-size value
     status_bar_text_size: *mut AnyObject, // footer text size
     status_bar_text_size_value_label: *mut AnyObject, // footer text-size value
+    show_footer_title: *mut AnyObject, // window title in the overlay's footer
     windows_enabled: *mut AnyObject, // app-switcher master switch
     overlay_position: *mut AnyObject, // overlay position (follow active window / main screen)
     activation_mode: *mut AnyObject, // activation mode (hover / click)
@@ -1375,6 +1376,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.layout.show_app_name_in_cards
     );
     changed!(
+        "layout.show_footer_title",
+        old.layout.show_footer_title,
+        new.layout.show_footer_title
+    );
+    changed!(
         "layout.card_text_size",
         old.layout.card_text_size,
         new.layout.card_text_size
@@ -1782,6 +1788,12 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 0isize
             };
             let _: () = msg_send![ui.show_app_name_in_cards, setState: app_name_state];
+            let footer_title_state = if cfg.layout.show_footer_title {
+                1isize
+            } else {
+                0isize
+            };
+            let _: () = msg_send![ui.show_footer_title, setState: footer_title_state];
             // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
             let op_idx = match cfg.windows.overlay_position.as_str() {
                 "main" => 1,
