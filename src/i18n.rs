@@ -283,6 +283,64 @@ unsafe fn nsstring_to_rust(ns: *mut AnyObject) -> String {
 mod tests {
     use super::*;
 
+    /// Every literal key passed to `t` / `tf` / `t_count` in `src/` must exist in the English
+    /// locale. `t` falls back to the key itself, so a missing key ships a raw key to the UI
+    /// (the updater's `settings.btn_ok`, the sidebar titles after a rename) without failing
+    /// anything else. Keys built at runtime are not literals and are not covered here.
+    #[test]
+    fn every_literal_translation_key_exists() {
+        fn rust_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+            for entry in std::fs::read_dir(dir).unwrap().flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    rust_files(&path, out);
+                } else if path.extension().is_some_and(|ext| ext == "rs") {
+                    out.push(path);
+                }
+            }
+        }
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut files = Vec::new();
+        rust_files(&root.join("src"), &mut files);
+        let mut missing = Vec::new();
+        for file in &files {
+            let text = std::fs::read_to_string(file).unwrap();
+            for call in ["t(\"", "tf(\"", "t_count(\""] {
+                for (pos, _) in text.match_indices(call) {
+                    // `get("`, `assert("` ... also end in `t("`: require a call boundary.
+                    let before = text[..pos].chars().next_back();
+                    if before.is_some_and(|c| c.is_alphanumeric() || c == '_') {
+                        continue;
+                    }
+                    let rest = &text[pos + call.len()..];
+                    let key = &rest[..rest.find('"').unwrap_or(0)];
+                    let is_key = key.contains('.')
+                        && key.chars().all(|c| {
+                            c.is_ascii_lowercase() || c.is_ascii_digit() || "._".contains(c)
+                        });
+                    if !is_key {
+                        continue;
+                    }
+                    let found = if call == "t_count(\"" {
+                        ["_one", "_other"]
+                            .iter()
+                            .all(|suffix| EN_MESSAGES.contains_key(&format!("{key}{suffix}")))
+                    } else {
+                        EN_MESSAGES.contains_key(key)
+                    };
+                    if !found {
+                        let shown = file.strip_prefix(root).unwrap_or(file);
+                        missing.push(format!("{}: {key}", shown.display()));
+                    }
+                }
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "keys missing from en.toml: {missing:#?}"
+        );
+    }
+
     fn list(tags: &[&str]) -> Vec<String> {
         tags.iter().map(|s| s.to_string()).collect()
     }

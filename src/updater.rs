@@ -1053,7 +1053,7 @@ unsafe fn make_custom_result_window(
 
     let ok = crate::settings::components::SettingsButton::action(
         NSRect::new(NSPoint::new(350.0, 24.0), NSSize::new(138.0, 34.0)),
-        &t("settings.btn_ok"),
+        &t("alert.btn_ok"),
         driver as *mut AnyObject,
         sel!(acknowledgeCustomUpdateResult:),
         crate::settings::components::SettingsButtonRole::Action,
