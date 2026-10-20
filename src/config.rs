@@ -2303,7 +2303,25 @@ pub(crate) fn parse_config_content(
 }
 
 fn config_path() -> std::path::PathBuf {
+    // Unit tests must never touch the developer's real config: loading repairs invalid fields and
+    // persists the result, so a test binary that does not know a value (another branch, an older
+    // checkout) would silently rewrite it. Each test process gets its own temporary home.
+    if cfg!(test) {
+        return config_path_in(&test_config_home().to_string_lossy());
+    }
     config_path_in(&std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+}
+
+fn test_config_home() -> std::path::PathBuf {
+    static HOME: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+    HOME.get_or_init(|| {
+        let home = std::env::temp_dir().join(format!("oh-my-tab-test-home-{}", std::process::id()));
+        // PIDs are reused and $TMPDIR outlives a run: start every test process from a clean home
+        // rather than from whatever an earlier process with the same PID saved.
+        let _ = std::fs::remove_dir_all(&home);
+        home
+    })
+    .clone()
 }
 
 /// Whether the config file already exists. The guide uses it to tell a fresh install from an
@@ -4142,6 +4160,18 @@ reverse_scroll = true
         // Path: home/.config/oh-my-tab/config.toml with the dir auto-created.
         assert_eq!(p, dir.path().join(".config/oh-my-tab/config.toml"));
         assert!(p.parent().unwrap().exists());
+    }
+
+    /// Tests resolve the config under a per-process temporary home, never under `$HOME`: the load
+    /// path rewrites a config whose values it does not know, which reset a developer's real
+    /// `keyboard.modifier` when the suite of another branch ran.
+    #[test]
+    fn tests_never_resolve_the_real_config_path() {
+        let path = config_path();
+        assert!(path.starts_with(std::env::temp_dir()), "{}", path.display());
+        if let Ok(home) = std::env::var("HOME") {
+            assert!(!path.starts_with(std::path::Path::new(&home).join(".config")));
+        }
     }
 
     /// The factory config carries the thirteen bindings of the two legacy sections, all of them
