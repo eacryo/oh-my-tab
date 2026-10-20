@@ -1,4 +1,4 @@
-//! Window-switcher-specific event monitoring: CGEventTap intercepts the Cmd/Opt+Tab global shortcut.
+//! Window-switcher-specific event monitoring: CGEventTap intercepts the Cmd/Opt/Ctrl+Tab global shortcut.
 //! Common CGEventTap infrastructure (types/FFI/start helper) has been extracted to `event_tap.rs`;
 //! this module keeps only the keyboard-shortcut matching logic and the GlobalEvent enum.
 
@@ -32,8 +32,8 @@ use crate::event_tap::keyboard::{
     EVENT_FLAGS_CHANGED as K_CG_EVENT_FLAGS_CHANGED, EVENT_KEY_DOWN as K_CG_EVENT_KEY_DOWN,
     FIELD_AUTOREPEAT as K_CG_KEYBOARD_EVENT_AUTOREPEAT,
     FIELD_KEYCODE as K_CG_KEYBOARD_EVENT_KEYCODE, FLAG_COMMAND as K_CG_EVENT_FLAG_MASK_COMMAND,
-    FLAG_OPTION as K_CG_EVENT_FLAG_MASK_ALTERNATE, FLAG_SHIFT as K_CG_EVENT_FLAG_MASK_SHIFT,
-    VK_TAB as K_VK_TAB, VK_V as K_VK_V,
+    FLAG_CONTROL as K_CG_EVENT_FLAG_MASK_CONTROL, FLAG_OPTION as K_CG_EVENT_FLAG_MASK_ALTERNATE,
+    FLAG_SHIFT as K_CG_EVENT_FLAG_MASK_SHIFT, VK_TAB as K_VK_TAB, VK_V as K_VK_V,
 };
 
 const DEFAULT_CLIPBOARD_SHORTCUT: crate::mouse::shortcut::Shortcut =
@@ -153,8 +153,33 @@ static TAP_CONTROL: event_tap::TapThreadControl = event_tap::TapThreadControl::n
 static TAP_THREAD: Mutex<Option<std::thread::JoinHandle<()>>> = Mutex::new(None);
 static TAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 
-// Shortcut mode: true = Command+Tab, false = Option+Tab
+// Shortcut mode: true = Command+Tab, false = Option+Tab (unless SHORTCUT_IS_CTRL is set)
 pub static SHORTCUT_IS_CMD: AtomicBool = AtomicBool::new(false);
+// Control+Tab mode. Takes precedence over SHORTCUT_IS_CMD; both are written together by
+// menu::set_shortcut_modifier.
+pub static SHORTCUT_IS_CTRL: AtomicBool = AtomicBool::new(false);
+
+/// The active switcher modifier as a CGEvent flag (same bit values as NSEvent modifier flags).
+pub(crate) fn switcher_modifier_flag() -> crate::event_tap::CGEventFlags {
+    if SHORTCUT_IS_CTRL.load(Ordering::SeqCst) {
+        K_CG_EVENT_FLAG_MASK_CONTROL
+    } else if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+        K_CG_EVENT_FLAG_MASK_COMMAND
+    } else {
+        K_CG_EVENT_FLAG_MASK_ALTERNATE
+    }
+}
+
+/// The active switcher modifier's config name: "control", "command" or "option".
+pub(crate) fn switcher_modifier_name() -> &'static str {
+    if SHORTCUT_IS_CTRL.load(Ordering::SeqCst) {
+        "control"
+    } else if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
+        "command"
+    } else {
+        "option"
+    }
+}
 
 unsafe extern "C" fn event_tap_callback(
     _proxy: crate::event_tap::CGEventTapProxy,
@@ -182,12 +207,7 @@ unsafe extern "C" fn event_tap_callback(
             // old diagnostic value: any keyDown line proves the tap is alive; a summon line
             // with no reaction means the issue is downstream (bridge/main thread).
             if keycode == K_VK_TAB {
-                let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
-                let mod_mask = if is_cmd {
-                    K_CG_EVENT_FLAG_MASK_COMMAND
-                } else {
-                    K_CG_EVENT_FLAG_MASK_ALTERNATE
-                };
+                let mod_mask = switcher_modifier_flag();
                 // Master switch: when off, pass the event through (the native Cmd+Tab
                 // takes over) -- no swallow, no event. Same philosophy as the clipboard
                 // passthrough: a disabled feature returns the combo to the system.
@@ -228,8 +248,7 @@ unsafe extern "C" fn event_tap_callback(
                 } else {
                     // The summon combo: log only the combo name (not sensitive), never raw
                     // keycode/flags.
-                    let combo = if is_cmd { "Tab+Command" } else { "Tab+Option" };
-                    log_debug!("[kbd] summon keyDown {}", combo);
+                    log_debug!("[kbd] summon keyDown Tab+{}", switcher_modifier_name());
                     arm_tab_repeat_cadence();
                 }
                 TAB_PRESSED.store(true, Ordering::SeqCst);
@@ -259,12 +278,7 @@ unsafe extern "C" fn event_tap_callback(
         }
         K_CG_EVENT_FLAGS_CHANGED => {
             let flags = crate::event_tap::CGEventGetFlags(event);
-            let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
-            let mod_mask = if is_cmd {
-                K_CG_EVENT_FLAG_MASK_COMMAND
-            } else {
-                K_CG_EVENT_FLAG_MASK_ALTERNATE
-            };
+            let mod_mask = switcher_modifier_flag();
             if (flags & mod_mask) == 0 && TAB_PRESSED.swap(false, Ordering::SeqCst) {
                 // Record only the modifier category, never ordinary keys. The stable state after
                 // the event clears the session tap is sampled later by on_cmd_release_diagnostic;
@@ -276,7 +290,7 @@ unsafe extern "C" fn event_tap_callback(
                 let changed_key = modifier_key_name(modifier_keycode);
                 log_debug!(
                     "[kbd] switcher modifier release detected: shortcut={} changed_key={}",
-                    if is_cmd { "command" } else { "option" },
+                    switcher_modifier_name(),
                     changed_key
                 );
                 crate::enqueue_global_event(GlobalEvent::CmdReleased);
@@ -332,11 +346,11 @@ pub fn start() {
         &TAP_CONTROL,
         || {
             TAP_ACTIVE.store(true, Ordering::SeqCst);
-            // The shortcut can be toggled via menu/settings; print the actual combo from SHORTCUT_IS_CMD.
-            let shortcut = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
-                "Command+Tab"
-            } else {
-                "Option+Tab"
+            // The shortcut can be toggled via menu/settings; print the actual combo.
+            let shortcut = match switcher_modifier_name() {
+                "control" => "Control+Tab",
+                "command" => "Command+Tab",
+                _ => "Option+Tab",
             };
             log_info!(
                 "Event monitor started. Listening for {} globally.",

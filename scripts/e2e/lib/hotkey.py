@@ -1,7 +1,7 @@
 """The global switcher chord, read from the user's config.
 
 The A2 scenarios inject the real global hotkey, and the modifier is a user setting
-(`keyboard.modifier`, validated by the app as "option" or "command", default "command"). Hard-coding
+(`keyboard.modifier`, validated by the app as "option", "command" or "control", default "command"). Hard-coding
 one chord makes a scenario silently inject the wrong key on any machine configured with the other --
 the app never summons, and the failure looks like a product bug rather than a harness bug. This helper
 derives the chord from the config instead, and fails loudly on a value it does not know rather than
@@ -18,6 +18,7 @@ from pathlib import Path
 # kCGEventFlagMaskAlternate / kCGEventFlagMaskCommand, and the kVK_* key codes.
 _OPTION = (0x80000, 58)
 _COMMAND = (0x100000, 55)
+_CONTROL = (0x40000, 59)
 _TAB_KEYCODE = 48
 _DEFAULT_MODIFIER = "command"
 
@@ -54,6 +55,8 @@ def chord_for_modifier(modifier: str) -> Chord:
         flag, keycode = _OPTION
     elif modifier == "command":
         flag, keycode = _COMMAND
+    elif modifier == "control":
+        flag, keycode = _CONTROL
     else:
         raise ValueError(f"unsupported keyboard.modifier value: {modifier!r}")
     return Chord(flag=flag, modifier_keycode=keycode)
@@ -66,9 +69,10 @@ def chord(config_path: str | Path) -> Chord:
 
 
 def _selftest() -> None:
-    # Both supported values, the default when the section is missing, and rejection of anything else.
+    # Every supported value, the default when the section is missing, and rejection of anything else.
     assert chord_for_modifier("option") == Chord(0x80000, 58, 48)
     assert chord_for_modifier("command") == Chord(0x100000, 55, 48)
+    assert chord_for_modifier("control") == Chord(0x40000, 59, 48)
     assert modifier_value('[keyboard]\nmodifier = "command"\n') == "command"
     assert modifier_value('[keyboard]\nmodifier = "option"\n') == "option"
     assert modifier_value("[keyboard]\n") == "command", "an absent key uses the app default"

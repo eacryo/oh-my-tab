@@ -224,7 +224,7 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
 
     if flags.modifier {
-        crate::menu::set_shortcut_mode(effective.keyboard.modifier == "command");
+        crate::menu::set_shortcut_mode(&effective.keyboard.modifier);
     }
     if flags.startup {
         crate::autostart::sync(new.startup.launch_at_login);

@@ -147,6 +147,7 @@ row_corner_radius = "Corner radius"
 row_modifier = "Modifier key"
 modifier_option = "Option+Tab"
 modifier_command = "Command+Tab"
+modifier_control = "Control+Tab"
 row_locale = "Language"
 row_show_minimized = "Show minimized (⌘M) windows"
 row_show_hidden_app_windows = "Show hidden (⌘H) windows"
@@ -490,7 +491,7 @@ fonts_size_invalid = "{field}: {value} must be within 13..=20"
 layout_card_text_size_invalid = "layout.card_text_size: {value} must be within 13..=20"
 layout_thumbnail_size_invalid = 'layout.thumbnail_size: "{value}" is not auto or one of 120, 110, 100, 95, 90, 85, 80, 75'
 fonts_weight_invalid = "{field}: {value} must be 0.0..=1.0"
-keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, command'
+keyboard_modifier_invalid = 'keyboard.modifier: "{value}" is not one of option, command, control'
 i18n_locale_invalid = 'i18n.locale: "{value}" is not one of auto, en, zh-Hans, zh-Hant'
 logging_level_invalid = 'logging.level: "{value}" is invalid (expect: debug, info)'
 config_read_failed = "cannot read config: {error}"

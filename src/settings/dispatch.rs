@@ -627,7 +627,8 @@ fn apply_control_field(field: ControlField) {
                 }
                 ControlField::Modifier => {
                     let idx: isize = msg_send![u.modifier, indexOfSelectedItem];
-                    cfg.keyboard.modifier = if idx == 1 { "command" } else { "option" }.into();
+                    cfg.keyboard.modifier =
+                        crate::config::switcher_modifier_value_at(idx.max(0) as usize).into();
                 }
                 ControlField::KeystrokeDisplayEnabled => {
                     let state: isize = msg_send![u.keystroke_display_enabled, state];
@@ -1521,11 +1522,8 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             // config change, whatever page is on screen.
             update_conditional_rows(u);
 
-            let modifier_idx: isize = if cfg.keyboard.modifier == "command" {
-                1
-            } else {
-                0
-            };
+            let modifier_idx =
+                crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier) as isize;
             let _: () = msg_send![u.modifier, selectItemAtIndex: modifier_idx];
 
             // The in-overlay action switches follow a reload like every other control: a config

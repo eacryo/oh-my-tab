@@ -577,6 +577,25 @@ pub fn panel_material_value_at(index: usize) -> &'static str {
         .unwrap_or(PANEL_MATERIAL_VALUES[0])
 }
 
+/// Valid `keyboard.modifier` values, in the settings popup's item order.
+pub const SWITCHER_MODIFIER_VALUES: [&str; 3] = ["option", "command", "control"];
+
+/// The settings popup index for a `keyboard.modifier` value (unknown values show the first item).
+pub fn switcher_modifier_index_of(value: &str) -> usize {
+    SWITCHER_MODIFIER_VALUES
+        .iter()
+        .position(|candidate| *candidate == value)
+        .unwrap_or(0)
+}
+
+/// The `keyboard.modifier` value for a settings popup index; out of range falls back to the first.
+pub fn switcher_modifier_value_at(index: usize) -> &'static str {
+    SWITCHER_MODIFIER_VALUES
+        .get(index)
+        .copied()
+        .unwrap_or(SWITCHER_MODIFIER_VALUES[0])
+}
+
 /// Valid `layout.thumbnail_size` values, in settings-dropdown order: the automatic step first, then
 /// the ladder from largest to smallest. The numbers are percent of the base card (see
 /// `thumbnail_scale_of`), which is what the dropdown shows.
@@ -699,7 +718,8 @@ pub struct WindowsSection {
     // switcher panel is open, and each is gated by its own switch. All default off: ⌘Q quits an
     // app and ⌘H hides one, so the honest default is opt-in -- and the panel already closes the
     // selected card with backspace, so nothing is lost by starting off. Command is the required
-    // modifier in BOTH trigger modes: an Option+Tab user keeps holding Option and adds Command.
+    // modifier in EVERY trigger mode: an Option+Tab or Control+Tab user keeps holding that modifier
+    // and adds Command.
     pub panel_close_enabled: bool,
     pub panel_minimize_enabled: bool,
     pub panel_hide_enabled: bool,
@@ -1361,7 +1381,7 @@ impl Config {
             ));
         }
 
-        if !["option", "command"].contains(&self.keyboard.modifier.as_str()) {
+        if !SWITCHER_MODIFIER_VALUES.contains(&self.keyboard.modifier.as_str()) {
             errs.push(tf(
                 "errors.keyboard_modifier_invalid",
                 &[("value", &self.keyboard.modifier)],
@@ -2968,7 +2988,7 @@ mod tests {
     #[test]
     fn validate_catches_keyboard_and_locale() {
         let mut cfg = Config::default();
-        cfg.keyboard.modifier = "ctrl".into();
+        cfg.keyboard.modifier = "hyper".into();
         cfg.i18n.locale = "fr".into();
         cfg.logging.level = "verbose".into();
         cfg.windows.overlay_position = "nowhere".into();
@@ -3115,6 +3135,24 @@ mod tests {
         );
         // The list order is what the dropdown shows, so it is part of the contract.
         assert_eq!(PANEL_MATERIAL_VALUES, ["liquid-glass", "frost", "opaque"]);
+    }
+
+    /// Same contract for the switcher modifier popup, plus validation accepting every popup value.
+    #[test]
+    fn switcher_modifier_index_and_value_round_trip() {
+        for (index, value) in SWITCHER_MODIFIER_VALUES.iter().enumerate() {
+            assert_eq!(switcher_modifier_index_of(value), index);
+            assert_eq!(switcher_modifier_value_at(index), *value);
+            let mut cfg = Config::default();
+            cfg.keyboard.modifier = (*value).into();
+            assert!(
+                cfg.validate().is_empty(),
+                "{value} must be a valid modifier"
+            );
+        }
+        assert_eq!(switcher_modifier_index_of("nope"), 0);
+        assert_eq!(switcher_modifier_value_at(99), "option");
+        assert_eq!(SWITCHER_MODIFIER_VALUES, ["option", "command", "control"]);
     }
 
     #[test]

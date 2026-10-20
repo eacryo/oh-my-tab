@@ -59,7 +59,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 ## Quick start
 
-- **Window switching**: hold Command (or Option, if configured), press Tab / Shift+Tab or the arrow keys to pick a window, then release the modifier to switch.
+- **Window switching**: hold Command (or Option / Control, if configured), press Tab / Shift+Tab or the arrow keys to pick a window, then release the modifier to switch. With Control, the arrow keys only work once macOS's Control+arrow Mission Control shortcuts are turned off (System Settings → Keyboard → Keyboard Shortcuts → Mission Control); Tab / Shift+Tab always work.
 - **Panel actions**: while the panel is open, Command+W / M / H / Q close the highlighted window, minimize it (or restore it when it is already minimized), hide its app, or ask that app to quit. Each is a separate switch, all off by default.
 - **Clipboard history**: once enabled, press **Option+V** to summon it; it supports both keyboard and mouse, and closes when you click outside.
 - **Key bindings**: open **Settings → Key Bindings** to edit the shortcut list. Every row can be changed, switched off or deleted; the picker offers actions that are not bound by default.

@@ -649,18 +649,11 @@ pub(crate) extern "C" fn on_cmd_release_diagnostic(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    let is_cmd = crate::event_monitor::SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     let live_flags = event_tap::combined_session_flags();
-    let live_down = live_flags
-        & if is_cmd {
-            NSEVENT_MODIFIER_FLAG_COMMAND
-        } else {
-            NSEVENT_MODIFIER_FLAG_OPTION
-        }
-        != 0;
+    let live_down = live_flags & crate::event_monitor::switcher_modifier_flag() != 0;
     log_debug!(
         "[overlay] post-release modifier state: shortcut={} down={} delay_ms=30",
-        if is_cmd { "command" } else { "option" },
+        crate::event_monitor::switcher_modifier_name(),
         live_down
     );
 }

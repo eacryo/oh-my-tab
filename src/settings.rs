@@ -15,7 +15,6 @@ use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use crate::config::{persist_config_now, schedule_config_persist, Config, CONFIG};
-use crate::event_monitor::SHORTCUT_IS_CMD;
 use crate::event_tap::{
     CGEventGetFlags, CGEventGetIntegerValueField, CGEventRef, CGEventTapProxy, CGEventType,
 };
@@ -1662,7 +1661,6 @@ fn load_settings_values() {
 /// Populate settings controls from a given config (shared by normal open and post-restore
 /// refill).
 fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
-    let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
     unsafe {
         with_settings_ui(|ui_guard| {
             let ui = match ui_guard.as_mut() {
@@ -1697,7 +1695,8 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 setIntegerValue: status_bar_text_size as isize
             ];
             set_field(ui.status_bar_text_size_value_label, status_bar_text_size);
-            let mod_idx: isize = if is_cmd { 1 } else { 0 };
+            let mod_idx =
+                crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier) as isize;
             let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];
             let _: () = msg_send![
                 ui.keystroke_display_enabled,

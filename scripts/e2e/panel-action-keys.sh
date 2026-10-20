@@ -45,11 +45,12 @@ done
 fail() { echo "e2e panel-action-keys: FAIL: $*" >&2; exit 1; }
 controlled_pid=""
 
-# 触发键只支持 Command / Option 两种模式,与 app 的 keyboard.modifier 一致。
+# 触发键支持 Command / Option / Control 三种模式,与 app 的 keyboard.modifier 一致。
 case "$hotkey" in
     cmd+tab|command+tab) message_flags=1048576; modifier_vk=55 ;;
     alt+tab|option+tab)   message_flags=524288;  modifier_vk=58 ;;
-    *) fail "unsupported --hotkey=$hotkey (use cmd+tab or option+tab)" ;;
+    ctrl+tab|control+tab) message_flags=262144;  modifier_vk=59 ;;
+    *) fail "unsupported --hotkey=$hotkey (use cmd+tab, option+tab or ctrl+tab)" ;;
 esac
 
 rm -f "$state_file" "${state_file%.json}.tmp"

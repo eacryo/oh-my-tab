@@ -148,6 +148,7 @@ row_corner_radius = "圆角半径"
 row_modifier = "修饰键"
 modifier_option = "Option+Tab"
 modifier_command = "Command+Tab"
+modifier_control = "Control+Tab"
 row_locale = "语言"
 row_show_minimized = "显示最小化（⌘+M）的窗口"
 row_show_hidden_app_windows = "显示隐藏（⌘+H）的窗口"
@@ -491,7 +492,7 @@ fonts_size_invalid = "{field}: {value} 必须在 13..=20 之间"
 layout_card_text_size_invalid = "layout.card_text_size: {value} 必须在 13..=20 之间"
 layout_thumbnail_size_invalid = 'layout.thumbnail_size: "{value}" 不是 auto，也不是 120、110、100、95、90、85、80、75 之一'
 fonts_weight_invalid = "{field}: {value} 必须 0.0..=1.0"
-keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、command 之一'
+keyboard_modifier_invalid = 'keyboard.modifier: "{value}" 不是 option、command、control 之一'
 i18n_locale_invalid = 'i18n.locale: "{value}" 不是 auto、en、zh-Hans、zh-Hant 之一'
 logging_level_invalid = "logging.level: '{value}' 无效（期望: debug, info）"
 config_read_failed = "无法读取配置: {error}"

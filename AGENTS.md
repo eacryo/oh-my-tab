@@ -4,7 +4,7 @@ Guidance for agents working in this repository.
 
 ## Project
 
-`oh-my-tab` is a macOS menu-bar window switcher. It intercepts Command+Tab or Option+Tab, displays a floating application/window overlay, and raises the selected window through Accessibility APIs. Optional modules provide mouse enhancement and clipboard history.
+`oh-my-tab` is a macOS menu-bar window switcher. It intercepts Command+Tab, Option+Tab or Control+Tab, displays a floating application/window overlay, and raises the selected window through Accessibility APIs. Optional modules provide mouse enhancement and clipboard history.
 
 The app is Rust-only and calls AppKit, CoreGraphics, and ApplicationServices through `objc2` FFI; there is no Swift bridge or Rust UI framework.
 

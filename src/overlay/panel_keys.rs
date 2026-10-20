@@ -127,10 +127,13 @@ pub(crate) fn publish_panel_snapshot(visible: bool) {
     ] {
         keymap.set(action, resolve(action, on));
     }
-    // Option is the panel's own hold modifier only in Option+Tab mode, where the user holds it for
-    // the whole summon; Command remains required in both modes.
-    let tolerate_option = !crate::event_monitor::SHORTCUT_IS_CMD.load(Ordering::SeqCst);
-    panel_actions::publish(PanelSnapshot::new(visible, tolerate_option, keymap));
+    // Option / Control is the panel's own hold modifier only in Option+Tab / Control+Tab mode,
+    // where the user holds it for the whole summon; Command remains required in every mode.
+    let mode = crate::event_monitor::switcher_modifier_name();
+    let tolerate_option = mode == "option";
+    panel_actions::publish(
+        PanelSnapshot::new(visible, tolerate_option, keymap).tolerating_control(mode == "control"),
+    );
 }
 
 /// The window-level performKeyEquivalent: override for the overlay.

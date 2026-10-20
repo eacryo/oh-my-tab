@@ -10,7 +10,7 @@
 //! release, a keyUp + modifier flagsChanged is posted so our tap sees the modifier go up and
 //! commits the switch.
 
-use crate::event_monitor::{GlobalEvent, SHORTCUT_IS_CMD};
+use crate::event_monitor::GlobalEvent;
 use crate::event_tap::{
     tap_location, CGEventCreateKeyboardEvent, CGEventFlags, CGEventPost, CGEventSetFlags,
     CGEventSetIntegerValueField, CGEventSetType, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
@@ -19,7 +19,6 @@ use crate::mouse::shortcut::{FLAG_ALT, FLAG_CMD, FLAG_CTRL, FLAG_SHIFT};
 use crate::{enqueue_global_event, log_debug};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 
@@ -92,10 +91,10 @@ pub(crate) fn release_up(keycode: u16, flags: u32, desc: &str) {
 fn internal_dispatch(keycode: u16, flags: u32, down: bool) -> bool {
     // The switcher's current combo: Tab + the active mode's modifier (a binding like
     // "cmd+tab" / "alt+tab", without extra modifiers).
-    let sw_mod = if SHORTCUT_IS_CMD.load(Ordering::SeqCst) {
-        FLAG_CMD
-    } else {
-        FLAG_ALT
+    let sw_mod = match crate::event_monitor::switcher_modifier_name() {
+        "control" => FLAG_CTRL,
+        "command" => FLAG_CMD,
+        _ => FLAG_ALT,
     };
     if keycode == 48 && flags == sw_mod {
         log_debug!(

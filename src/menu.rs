@@ -216,9 +216,12 @@ pub(crate) unsafe fn set_menu_item_title(item: *mut AnyObject, title: &str) {
     }
 }
 
-/// Set shortcut mode (Cmd / Opt), syncing runtime SHORTCUT_IS_CMD and the menu label.
-pub(crate) fn set_shortcut_mode(is_cmd: bool) {
+/// Set shortcut mode from the config modifier name ("command" / "option" / "control"), syncing
+/// the runtime SHORTCUT_IS_CMD / SHORTCUT_IS_CTRL flags and the menu label.
+pub(crate) fn set_shortcut_mode(modifier: &str) {
+    let is_cmd = modifier == "command";
     SHORTCUT_IS_CMD.store(is_cmd, Ordering::SeqCst);
+    crate::event_monitor::SHORTCUT_IS_CTRL.store(modifier == "control", Ordering::SeqCst);
     let key = if is_cmd {
         "menu.toggle_shortcut.opt"
     } else {

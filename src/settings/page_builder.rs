@@ -380,10 +380,11 @@ pub(super) unsafe fn build_switcher_page(
     .1;
     canvas.card(&t("settings.header_window_options"));
     canvas.next_section();
-    // Modifier popup shows Option+Tab / Command+Tab; the index maps to option/command.
+    // Modifier popup items follow config::SWITCHER_MODIFIER_VALUES (option / command / control).
     let mod_labels = [
         t("settings.modifier_option"),
         t("settings.modifier_command"),
+        t("settings.modifier_control"),
     ];
     let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
     let mod_metrics = SettingsSelect::metrics();

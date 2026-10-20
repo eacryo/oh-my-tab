@@ -7,9 +7,10 @@
 //! queries it -- the same shape as `key_bindings::engine::SELF_FRONTMOST`.
 //!
 //! Contract, settled with the user and the design review:
-//! * **Command is required in both trigger modes.** An Option+Tab user keeps holding Option and
-//!   adds Command, so the keys stay ⌘W/⌘M/⌘H/⌘Q exactly as promised; Option is merely tolerated
-//!   as the panel's own hold modifier. Shift/Control are never part of the chord.
+//! * **Command is required in every trigger mode.** An Option+Tab or Control+Tab user keeps holding
+//!   that modifier and adds Command, so the keys stay ⌘W/⌘M/⌘H/⌘Q exactly as promised; Option or
+//!   Control is merely tolerated as the panel's own hold modifier in its own mode. Shift is never part
+//!   of the chord.
 //! * Ownership persists to the physical release: a press the panel claimed keeps its repeats and
 //!   its release, so nothing leaks back to the frontmost app mid-hold.
 //! * Once claimed, the event is consumed even if the panel became ineligible in between (a config
@@ -169,6 +170,7 @@ impl PanelKeymap {
 pub(crate) struct PanelSnapshot {
     visible: bool,
     tolerate_option: bool,
+    tolerate_control: bool,
     keymap: PanelKeymap,
 }
 
@@ -177,8 +179,15 @@ impl PanelSnapshot {
         Self {
             visible,
             tolerate_option,
+            tolerate_control: false,
             keymap,
         }
+    }
+
+    /// Also tolerate Control as the held switcher modifier (Control+Tab mode).
+    pub(crate) fn tolerating_control(mut self, tolerate_control: bool) -> Self {
+        self.tolerate_control = tolerate_control;
+        self
     }
 
     /// The action this key event asks for, if the panel owns it right now.
@@ -186,7 +195,7 @@ impl PanelSnapshot {
         if !self.visible {
             return None;
         }
-        if !modifiers_match(flags, self.tolerate_option) {
+        if !modifiers_match(flags, self.tolerate_option, self.tolerate_control) {
             return None;
         }
         self.keymap.action_for_keycode(keycode)
@@ -218,13 +227,17 @@ const CHORD_MODIFIERS: u32 =
 ///
 /// The comparison is exact on the four chord modifiers and ignores every other bit, because the
 /// rest of the word is event metadata or device markers, never part of what the user pressed.
-/// Shift and Control are rejected: Cmd+Shift+W is not this feature's chord.
-fn modifiers_match(flags: u32, tolerate_option: bool) -> bool {
+/// Shift is rejected: Cmd+Shift+W is not this feature's chord. Control is rejected unless it is
+/// the tolerated hold modifier of Control+Tab mode.
+fn modifiers_match(flags: u32, tolerate_option: bool, tolerate_control: bool) -> bool {
     let modifiers = flags & CHORD_MODIFIERS;
     if modifiers & FLAG_COMMAND as u32 == 0 {
         return false;
     }
-    if modifiers & (FLAG_SHIFT as u32) != 0 || modifiers & (FLAG_CONTROL as u32) != 0 {
+    if modifiers & (FLAG_SHIFT as u32) != 0 {
+        return false;
+    }
+    if modifiers & (FLAG_CONTROL as u32) != 0 && !tolerate_control {
         return false;
     }
     let option = modifiers & FLAG_OPTION as u32 != 0;
@@ -628,6 +641,22 @@ mod tests {
             snapshot_visible(true).action(13, chord),
             Some(PanelAction::Close)
         );
+    }
+
+    #[test]
+    fn control_is_tolerated_only_in_control_mode() {
+        let _guard = state_lock();
+        let chord = FLAG_COMMAND as u32 | FLAG_CONTROL as u32;
+        assert_eq!(snapshot_visible(false).action(13, chord), None);
+        let control_mode = snapshot_visible(false).tolerating_control(true);
+        assert_eq!(control_mode.action(13, chord), Some(PanelAction::Close));
+        assert_eq!(
+            control_mode.action(13, FLAG_COMMAND as u32),
+            Some(PanelAction::Close)
+        );
+        // Control mode tolerates Control only: Option and Shift still break the chord.
+        assert_eq!(control_mode.action(13, chord | FLAG_OPTION as u32), None);
+        assert_eq!(control_mode.action(13, chord | FLAG_SHIFT as u32), None);
     }
 
     #[test]
