@@ -395,12 +395,15 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                     set_field(u.line_count_value_label, val);
                 } else if ctrl == u.card_text_size || ctrl == u.status_bar_text_size {
                     let val: isize = msg_send![ctrl, integerValue];
-                    let label = if ctrl == u.card_text_size {
-                        u.card_text_size_value_label
+                    if ctrl == u.card_text_size {
+                        set_field(u.card_text_size_value_label, val);
                     } else {
-                        u.status_bar_text_size_value_label
-                    };
-                    set_field(label, val);
+                        // Stop index -> point size: the readout shows "0" (hidden) or "13".."20".
+                        set_field(
+                            u.status_bar_text_size_value_label,
+                            super::status_bar_size_for_index(val as i64),
+                        );
+                    }
                 } else if ctrl == u.clipboard_auto_expire_days {
                     let val: isize = msg_send![ctrl, integerValue];
                     set_field(u.clipboard_auto_expire_days_value_label, val);
@@ -589,8 +592,10 @@ fn apply_control_field(field: ControlField) {
                     cfg.layout.card_text_size = val as f64;
                 }
                 ControlField::StatusBarTextSize => {
+                    // The slider reports a stop index (0 = hidden, 1..=8 = 13..=20pt); the config
+                    // stores the point size.
                     let val: isize = msg_send![u.status_bar_text_size, integerValue];
-                    cfg.fonts.status_bar_size = val as f64;
+                    cfg.fonts.status_bar_size = super::status_bar_size_for_index(val as i64) as f64;
                 }
                 ControlField::OverlayPosition => {
                     let idx: isize = msg_send![u.overlay_position, indexOfSelectedItem];
@@ -1602,9 +1607,11 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             // The band is driven by the size, so the slider and its readout are the controls that must
             // follow a reload; without this the page keeps showing the old point size (or 13 after a
             // saved 0) while the overlay already draws the new band.
+            // size_value is a stop index; the readout shows the point size it means.
             let size_value = super::status_bar_size_slider_value(cfg.fonts.status_bar_size);
             let _: () = msg_send![u.status_bar_text_size, setIntegerValue: size_value];
-            let readout = make_nsstring(&format!("{size_value}"));
+            let readout =
+                make_nsstring(&format!("{}", super::status_bar_size_for_index(size_value)));
             let _: () = msg_send![u.status_bar_text_size_value_label, setStringValue: readout];
             CFRelease(readout as *const c_void);
             // The display mode may have just changed: recompute the thumbnail-only pair.
@@ -2499,6 +2506,13 @@ pub(crate) extern "C" fn handle_settings_search_changed(
     _cmd: Sel,
     notification: *mut c_void,
 ) {
+    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+    // notification loses one refresh; an abort loses the app.
+    if crate::settings::settings_ui_borrowed() {
+        return;
+    }
+
     unsafe {
         let field: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
         sidebar::settings_search_field_changed(field);
@@ -2532,5 +2546,12 @@ pub(crate) extern "C" fn handle_settings_search_clear(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
+    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+    // notification loses one refresh; an abort loses the app.
+    if crate::settings::settings_ui_borrowed() {
+        return;
+    }
+
     sidebar::clear_settings_search();
 }

@@ -310,11 +310,13 @@ pub(super) unsafe fn build_switcher_page(
             SettingsRow::slider_width(ctrl_w),
             row_h,
             STATUS_BAR_SIZE_MIN,
-            TEXT_SIZE_MAX,
+            STATUS_BAR_SIZE_STOPS - 1,
             1,
-            TEXT_SIZE_DEFAULT,
-            // Double-click restores the default size (15pt).
-            Some(TEXT_SIZE_DEFAULT as f64),
+            // The domain is stop indices (0 = hidden, 1..=8 = 13..=20pt); the loaded value is
+            // synced by load_settings_values like every other control.
+            STATUS_BAR_SIZE_DEFAULT_INDEX,
+            // Double-click restores the default size (15pt, stop 3).
+            Some(STATUS_BAR_SIZE_DEFAULT_INDEX as f64),
         ),
     );
     ui.status_bar_text_size_value_label = SettingsRow::attach_slider_readout(
@@ -2283,7 +2285,7 @@ pub(super) unsafe fn build_about_page(
     // `PageHeader`-style below the top edge and the first section steps from the block's bottom.
     // `ABOUT_HEADER_TOP` is the header block's own top offset; the block height below is what keeps
     // the first section cursor at `ABOUT_HEADER_TOP + ABOUT_HEADER_BLOCK_H + section_step`.
-    const ABOUT_HEADER_TOP: f64 = 76.0;
+    const ABOUT_HEADER_TOP: f64 = SettingsPageHeader::TOP_PADDING;
     const ABOUT_HEADER_BLOCK_H: f64 = 80.0;
     let header_top = about_doc_h - ABOUT_HEADER_TOP;
     // The About page draws its own header, so it hands the canvas the distance from the document's
@@ -2354,7 +2356,7 @@ pub(super) unsafe fn build_about_page(
         about_header_hit,
         initWithFrame: NSRect::new(
             NSPoint::new(0.0, header_top - 64.0),
-            NSSize::new(content_w, 66.0),
+            NSSize::new(content_w, 64.0),
         )
     ];
     let _: () = msg_send![about_view, addSubview: about_header_hit];

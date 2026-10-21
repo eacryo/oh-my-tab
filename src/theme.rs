@@ -775,6 +775,19 @@ pub(crate) fn status_bar_text_size() -> f64 {
     status_bar_text_size_for(CONFIG.read().unwrap().fonts.status_bar_size)
 }
 
+/// The legal footer-size stops as a stored value lands on them: the settings slider's domain is
+/// 0 plus 13..=20pt integers, so anything else snaps to the nearest stop -- below the 6.5 midpoint
+/// the hidden stop, otherwise the nearest integer clamped into 13..=20. `show_footer_title`,
+/// `status_bar_text_size` and the slider readout all consult this one rule, so a hand-edited
+/// `13.6` renders at the 14pt the settings page reports.
+pub(crate) fn normalize_status_bar_size(size: f64) -> f64 {
+    if !size.is_finite() || size < 6.5 {
+        0.0
+    } else {
+        size.round().clamp(13.0, 20.0)
+    }
+}
+
 fn status_bar_text_size_for(configured_size: f64) -> f64 {
     // 0 is not a text size: it is the "no footer" stop. Everything above 0 is a real size, so 1..12
     // must render at 1..12 rather than silently snapping to 13 while the slider's readout says so.
@@ -783,14 +796,11 @@ fn status_bar_text_size_for(configured_size: f64) -> f64 {
     // through this same accessor even when the footer band is gone (it is a state message, not a window
     // title, and `update_status_label` returns it before the visibility check), so clamping it to 1pt
     // would make that hint unreadable.
-    if configured_size.is_finite() {
-        if configured_size <= 0.0 {
-            STATUS_BAR_TEXT_BASE_SIZE
-        } else {
-            configured_size.clamp(1.0, 20.0)
-        }
-    } else {
+    let size = normalize_status_bar_size(configured_size);
+    if size <= 0.0 {
         STATUS_BAR_TEXT_BASE_SIZE
+    } else {
+        size
     }
 }
 
@@ -1211,7 +1221,9 @@ pub(crate) fn show_footer_title() -> bool {
     // zero, which is the settings slider's far-left stop. `layout.show_footer_title` is still stored
     // (older configs and the export format carry it) but no longer gates the panel.
     let size = CONFIG.read().unwrap().fonts.status_bar_size;
-    size.is_finite() && size > 0.0
+    // The slider's legal stops are 0 and 13..=20pt; normalization snaps any in-between stored
+    // value the same way the settings readout does.
+    normalize_status_bar_size(size) > 0.0
 }
 
 /// Flow-layout base card width, hard-coded and fully independent of the legacy
@@ -3297,10 +3309,20 @@ mod tests {
     fn a_hidden_footer_still_renders_the_empty_state_hint_at_the_base_size() {
         assert_eq!(status_bar_text_size_for(0.0), STATUS_BAR_TEXT_BASE_SIZE);
         assert_eq!(status_bar_text_size_for(-3.0), STATUS_BAR_TEXT_BASE_SIZE);
-        assert_eq!(status_bar_text_size_for(1.0), 1.0);
-        assert_eq!(status_bar_text_size_for(12.0), 12.0);
+        // Below the 6.5 midpoint the band is hidden entirely (`show_footer_title`), so the
+        // size accessor is only reached for the empty-state hint; above it the value snaps to
+        // the slider's 13..=20pt stops.
+        assert_eq!(status_bar_text_size_for(1.0), 13.0);
+        assert_eq!(status_bar_text_size_for(12.0), 13.0);
         assert_eq!(status_bar_text_size_for(20.0), 20.0);
         assert_eq!(status_bar_text_size_for(21.0), 20.0);
+        // Fractional stored values snap to the same integer stops the slider reports --
+        // a 13.6 must render at the 14pt the readout claims.
+        assert_eq!(normalize_status_bar_size(6.4), 0.0);
+        assert_eq!(normalize_status_bar_size(6.5), 13.0);
+        assert_eq!(status_bar_text_size_for(13.6), 14.0);
+        assert_eq!(normalize_status_bar_size(19.6), 20.0);
+        assert_eq!(normalize_status_bar_size(f64::NAN), 0.0);
     }
 
     #[test]

@@ -3291,6 +3291,13 @@ fn rebuild_settings_content(window: *mut AnyObject) {
 }
 
 fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
+    // Resolve the control target BEFORE anything is torn down: this used to bail at the sidebar
+    // build, after `note_settings_content_rebuilt` and the subview removal had already run, which
+    // left a window with no content and a stale search index -- searches then matched nothing (or
+    // worse, resolved stale rows) until a rebuild happened to succeed.
+    let Some(target) = (*MENU_TARGET.lock().unwrap()).map(|t| t.0) else {
+        return;
+    };
     // Every control is new: whatever the mouse page held is gone with the old views.
     crate::settings::note_settings_content_rebuilt();
     unsafe {
@@ -3586,11 +3593,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // it merely narrows instead of being clipped.
         let content_w = (detail_w - crate::scroller::reserved() - page_inset * 2.0).max(1.0);
         let layout = SettingsLayout::new(content_w);
-
-        let target = match *MENU_TARGET.lock().unwrap() {
-            Some(t) => t.0,
-            None => return,
-        };
 
         sidebar::build_settings_sidebar(
             content,

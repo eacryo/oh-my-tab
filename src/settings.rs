@@ -63,7 +63,14 @@ const LOCALE_VALUES: [&str; 4] = ["auto", "en", "zh-Hans", "zh-Hant"];
 const TEXT_SIZE_MIN: i64 = 13;
 /// The footer text size's floor is 0, not 13: the far-left stop means "draw no footer at all", which
 /// is the switch this slider replaced. A 0 value hides the band (`theme::show_footer_title`).
+///
+/// The slider's domain is the stop index 0..=STATUS_BAR_SIZE_STOPS-1, not the point size: stop 0
+/// is the hidden band and stops 1..=8 map to 13..=20pt, so dragging left from 13 jumps straight to
+/// "off" instead of offering 1..12pt.
 const STATUS_BAR_SIZE_MIN: i64 = 0;
+const STATUS_BAR_SIZE_STOPS: i64 = 9;
+/// The stop the 15pt default sits on (13->1, 14->2, 15->3).
+const STATUS_BAR_SIZE_DEFAULT_INDEX: i64 = 3;
 const TEXT_SIZE_MAX: i64 = 20;
 const TEXT_SIZE_DEFAULT: i64 = 15;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
@@ -801,11 +808,31 @@ fn text_size_slider_value(value: f64) -> i64 {
 /// The footer-title slider's own value: its floor is 0 ("no footer at all"), not `TEXT_SIZE_MIN`.
 /// Sharing `text_size_slider_value` here would clamp a saved 0 back to 13 on the next open, so the
 /// panel would draw no footer while the settings page claimed 13.
+///
+/// The slider domain is stop indices, so this maps a stored point size onto its stop: 0 stays 0,
+/// a saved 1..12 (from before the discrete stops existed, or hand-edited) snaps to the nearest
+/// legal stop -- 0 below the midpoint, 13 above it.
 fn status_bar_size_slider_value(value: f64) -> i64 {
-    if value.is_finite() {
-        (value.round() as i64).clamp(STATUS_BAR_SIZE_MIN, TEXT_SIZE_MAX)
+    // Share the renderer's normalization (`theme::normalize_status_bar_size`) so a hand-edited or
+    // fractional config shows the same stop the overlay actually draws.
+    if !value.is_finite() {
+        return STATUS_BAR_SIZE_DEFAULT_INDEX;
+    }
+    let size = crate::theme::normalize_status_bar_size(value);
+    if size <= 0.0 {
+        0
     } else {
-        TEXT_SIZE_DEFAULT
+        (size as i64 - TEXT_SIZE_MIN + 1).clamp(1, STATUS_BAR_SIZE_STOPS - 1)
+    }
+}
+
+/// The point size a footer-title slider stop means, for the readout and the config value.
+/// Stop 0 is the hidden band; stops 1..=8 are 13..=20pt.
+fn status_bar_size_for_index(index: i64) -> i64 {
+    if index <= 0 {
+        STATUS_BAR_SIZE_MIN
+    } else {
+        (TEXT_SIZE_MIN + index - 1).clamp(TEXT_SIZE_MIN, TEXT_SIZE_MAX)
     }
 }
 
@@ -1712,6 +1739,8 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             }
             set_field(ui.corner_radius, cfg.appearance.corner_radius);
             let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
+            // The slider's domain is stop indices; the readout shows the point size the stop
+            // means, so the label reads "0" (hidden) or "13".."20", never a raw index.
             let status_bar_text_size = status_bar_size_slider_value(cfg.fonts.status_bar_size);
             let _: () = msg_send![ui.card_text_size, setIntegerValue: card_text_size as isize];
             set_field(ui.card_text_size_value_label, card_text_size);
@@ -1719,7 +1748,10 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 ui.status_bar_text_size,
                 setIntegerValue: status_bar_text_size as isize
             ];
-            set_field(ui.status_bar_text_size_value_label, status_bar_text_size);
+            set_field(
+                ui.status_bar_text_size_value_label,
+                status_bar_size_for_index(status_bar_text_size),
+            );
             let mod_idx =
                 crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier) as isize;
             let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];

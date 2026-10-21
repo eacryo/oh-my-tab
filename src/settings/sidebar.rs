@@ -1822,6 +1822,13 @@ pub(super) extern "C" fn search_result_row_mouse_down(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
+    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+    // notification loses one refresh; an abort loses the app.
+    if crate::settings::settings_ui_borrowed() {
+        return;
+    }
+
     unsafe {
         let identifier: *mut AnyObject = msg_send![this, identifier];
         if identifier.is_null() {
@@ -1916,6 +1923,13 @@ extern "C" fn search_refresh_target_fired(
     _cmd: Sel,
     _argument: *mut AnyObject,
 ) {
+    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+    // notification loses one refresh; an abort loses the app.
+    if crate::settings::settings_ui_borrowed() {
+        return;
+    }
+
     if settings_search_is_active() {
         unsafe { refresh_settings_search() };
     }
@@ -2074,6 +2088,9 @@ unsafe fn search_flash_target() -> *mut AnyObject {
 }
 
 extern "C" fn search_flash_timer_fired(_this: *mut AnyObject, _cmd: Sel, _timer: *mut AnyObject) {
+    // No settings_ui_borrowed() guard here: this callback never borrows SETTINGS_UI, and an early
+    // return would leave `flash.timer` pointing at a self-invalidated one-shot timer, which the
+    // next `clear_search_flash` would invalidate a second time.
     unsafe {
         let mut flash = SEARCH_FLASH.lock().unwrap();
         if !flash.view.is_null() {
@@ -2150,6 +2167,13 @@ pub(super) extern "C" fn settings_search_field_cancel(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
+    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+    // notification loses one refresh; an abort loses the app.
+    if crate::settings::settings_ui_borrowed() {
+        return;
+    }
+
     clear_settings_search();
     unsafe {
         let value: *mut AnyObject = msg_send![this, stringValue];

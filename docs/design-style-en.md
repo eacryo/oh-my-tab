@@ -579,11 +579,13 @@ setting directly.
 - **The clamp applies to the result**, not to the multiplier and not to the configured base. A
   card-caption `fonts.*_size` value is a base, not a final size: with the 12pt title base the title
   lands on `card_text_size`; the app-name base scales proportionally and both are clamped to 13…20pt.
-- **The footer is independent.** Its size is exactly `fonts.status_bar_size` after the 0…20pt
+- **The footer is independent.** Its size is `fonts.status_bar_size` after the 0…20pt
   validation clamp; card-caption scaling does not change it. The settings row is a **bottom title-bar
-  text size** slider whose floor is 0, not the shared 13pt text minimum: 0 hides the footer band
-  entirely (the band exists only while the size is above zero), 1…20 render at the configured size,
-  and the slider snaps to whole points. The retired `layout.show_footer_title` switch is gone from the
+  text size** slider with nine discrete stops — 0 plus 13…20pt: 0 hides the footer band
+  entirely, 13…20 render at the configured size, and dragging below 13 snaps straight to the
+  hidden stop. A stored 1…12 (from before the discrete stops, or a hand-edited config) snaps the
+  same way: below the 6.5 midpoint the band is hidden, otherwise it renders at 13pt — so the
+  slider readout and the rendered band always agree. The retired `layout.show_footer_title` switch is gone from the
   UI; a legacy config saved with it `false` is migrated once at load to a size of 0. The field remains
   in the config only for older files and the export format.
 - **The rendered line height of any caption row is at most 1/3 of its card's height.**

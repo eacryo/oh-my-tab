@@ -2604,25 +2604,43 @@ unsafe fn child_ink_span_in_parent(child: *mut AnyObject) -> Option<(f64, f64)> 
     if x1 <= x0 {
         return None;
     }
-    let bg_color: *mut AnyObject = msg_send![rep, colorAtX: 0isize, y: ph / 2];
-    if bg_color.is_null() {
+    // Scan the bitmap's own bytes: `colorAtX:y:` allocates an NSColor per pixel through an ObjC
+    // message, and this loop runs over ~20k pixels per label per rebuild -- that per-pixel cost is
+    // what made a locale switch visibly stall the main thread. Comparing raw channel bytes at the
+    // same positions is equivalent: the background is uniform, so "any channel differs" means ink
+    // regardless of byte order or premultiplication. 5/255 matches the old 0.02 threshold.
+    let data: *mut u8 = msg_send![rep, bitmapData];
+    let bytes_per_row: isize = msg_send![rep, bytesPerRow];
+    let samples: isize = msg_send![rep, samplesPerPixel];
+    // Only scan a format we can index safely: packed 8-bit samples, one plane. Anything else
+    // (planar, float, 16-bit) makes `px * samples` address the wrong bytes -- return unmeasurable
+    // instead of reading garbage.
+    let bits_per_sample: isize = msg_send![rep, bitsPerSample];
+    let bits_per_pixel: isize = msg_send![rep, bitsPerPixel];
+    let planar: bool = msg_send![rep, isPlanar];
+    let usable = bits_per_sample == 8
+        && bits_per_pixel == samples * 8
+        && !planar
+        && bytes_per_row >= pw * samples;
+    if data.is_null() || samples < 3 || !usable {
         return None;
     }
-    let (br, bgc, bb, ba) = color_components(bg_color);
+    let n = samples as usize;
+    let bg_offset = (ph / 2) as usize * bytes_per_row as usize;
     let mut top = isize::MAX;
     let mut bottom = isize::MIN;
     for py in 0..ph {
+        let row = unsafe {
+            std::slice::from_raw_parts(
+                data.add(py as usize * bytes_per_row as usize),
+                pw as usize * n,
+            )
+        };
+        let bg = unsafe { std::slice::from_raw_parts(data.add(bg_offset), n) };
         for px in x0..x1 {
-            let c: *mut AnyObject = msg_send![rep, colorAtX: px, y: py];
-            if c.is_null() {
-                continue;
-            }
-            let (r, g, b, a) = color_components(c);
-            if (r - br).abs() > 0.02
-                || (g - bgc).abs() > 0.02
-                || (b - bb).abs() > 0.02
-                || (a - ba).abs() > 0.02
-            {
+            let px_offset = px as usize * n;
+            let differs = (0..n).any(|ch| (row[px_offset + ch] as i32 - bg[ch] as i32).abs() > 5);
+            if differs {
                 top = top.min(py);
                 bottom = bottom.max(py);
             }
@@ -2672,15 +2690,6 @@ pub(super) unsafe fn sidebar_button_title(btn: *mut AnyObject) -> String {
         .map(|pointer| pointer.0)
         .unwrap_or(btn);
     sidebar_label_title(label)
-}
-
-/// The RGBA components of a colour read back out of an RGB bitmap.
-unsafe fn color_components(color: *mut AnyObject) -> (f64, f64, f64, f64) {
-    let r: f64 = msg_send![color, redComponent];
-    let g: f64 = msg_send![color, greenComponent];
-    let b: f64 = msg_send![color, blueComponent];
-    let a: f64 = msg_send![color, alphaComponent];
-    (r, g, b, a)
 }
 
 /// Assert the sidebar's icon and title ink share one vertical mid-line on the real view tree.
@@ -2839,6 +2848,13 @@ unsafe fn center_sidebar_label(label: *mut AnyObject, row_h: f64) {
     frame.origin.y = sidebar_label_frame_y(row_h, measured.height);
     frame.size.height = measured.height;
     let _: () = msg_send![label, setFrame: frame];
+    // A label with no window cannot be measured against its real backing scale, and the answer is
+    // always thrown away by the post-attach pass (`select_sidebar` re-titles every row once the
+    // window exists, so `backing_scale` changes and the cache key misses). Box-centre and stop.
+    let window: *mut AnyObject = msg_send![label, window];
+    if window.is_null() {
+        return;
+    }
     // The ink is only measurable with the frame settled, so the correction is a second pass: measure
     // what this frame actually draws, then move the frame by the difference. The measurement renders
     // the *button* and scans the label's columns, because the position a label reports when rendered
