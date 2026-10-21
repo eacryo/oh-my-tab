@@ -214,8 +214,13 @@ unsafe fn settings_select_set_label_color(button: *mut AnyObject, color: *mut An
     }
 }
 
-/// Select surfaces deliberately use opaque colors; only the surrounding settings window remains
+/// Trigger controls use the subtle filled field token over their card.
 fn settings_select_surface_color(palette: UiPalette) -> u32 {
+    palette.field_bg
+}
+
+/// The dropdown floats over arbitrary content in its own window, so its fill must be opaque.
+fn settings_select_panel_surface_color(palette: UiPalette) -> u32 {
     palette.card_bg
 }
 
@@ -1117,7 +1122,7 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
         let palette = settings_palette();
         crate::ffi::layer_set_background(
             panel_layer,
-            crate::ffi::hex_to_cg_color(settings_select_surface_color(palette)),
+            crate::ffi::hex_to_cg_color(settings_select_panel_surface_color(palette)),
         );
         crate::ffi::layer_set_border(
             panel_layer,
@@ -1776,8 +1781,8 @@ mod tests {
     use super::settings_select_class;
     use super::{
         settings_select_centered_text_geometry, settings_select_item_active_color,
-        settings_select_panel_geometry, settings_select_surface_color,
-        settings_select_trigger_paint,
+        settings_select_panel_geometry, settings_select_panel_surface_color,
+        settings_select_surface_color, settings_select_trigger_paint,
     };
     use objc2::msg_send;
     use objc2::runtime::AnyObject;
@@ -1859,7 +1864,7 @@ mod tests {
             assert_eq!(focused_border, palette.accent);
             assert_eq!(focused_width, 2.0);
 
-            // Idle is the card surface with the idle border.
+            // Idle uses the filled control surface with the idle border.
             let (idle_surface, idle_border, idle_width) =
                 settings_select_trigger_paint(palette, false, false);
             assert_eq!(idle_surface, settings_select_surface_color(palette));
@@ -1886,7 +1891,16 @@ mod tests {
             crate::theme::ui_palette_for_mode(false),
             crate::theme::ui_palette_for_mode(true),
         ] {
-            assert_eq!(settings_select_surface_color(palette), palette.card_bg);
+            assert_eq!(settings_select_surface_color(palette), palette.field_bg);
+            assert_eq!(
+                settings_select_panel_surface_color(palette),
+                palette.card_bg
+            );
+            assert_eq!(
+                settings_select_panel_surface_color(palette) & 0xFF,
+                0xFF,
+                "a floating dropdown panel must not reveal content behind it"
+            );
             assert_eq!(settings_select_item_active_color(palette), palette.hover_bg);
         }
     }

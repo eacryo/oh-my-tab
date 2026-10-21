@@ -71,6 +71,27 @@ const _: () = assert!(
     crate::theme::THUMB_BOTTOM_INSET >= crate::theme::OVERLAY_RING_INSET,
     "the card area's bottom inset must cover the thumbnail ring's outward reach"
 );
+/// The card area's inset above its first row, held here as a local stand-in for
+/// `theme::THUMB_TOP_INSET` (private to that module). The no-footer room below the last row is
+/// defined to match it, so the two must stay equal; `show_overlay` debug-asserts the value against
+/// the layout's own `content_inset`.
+const CARD_AREA_TOP_INSET: f64 = 32.0;
+
+/// Extra room the card area takes below its last row while the footer band is absent.
+///
+/// The band is what holds the card area off the panel's bottom edge while the window-title text is
+/// shown. Collapsed to zero it leaves only `theme::THUMB_BOTTOM_INSET` (8pt, the selection ring's
+/// outward reach) against `CARD_AREA_TOP_INSET` above the first row, so the panel's whitespace is
+/// visibly lopsided. The panel height, the document height and every card's document y grow by this
+/// room together, which keeps the card viewport, the scrollbar, the floating settings gear and every
+/// frame-based hit test in one coordinate system instead of only moving what is drawn.
+fn no_footer_bottom_slack() -> f64 {
+    if crate::theme::footer_band_h() > 0.0 {
+        return 0.0;
+    }
+    (CARD_AREA_TOP_INSET - crate::theme::THUMB_BOTTOM_INSET).max(0.0)
+}
+
 /// Distance that the icon and, in icon-only mode, the selection plate nested around it move
 /// upward when selected, so the icon stays centred inside the plate.
 const SELECTED_CONTENT_NUDGE: f64 = 2.0;
@@ -1122,6 +1143,7 @@ mod tests {
     use super::display_title;
     use super::edge_row_nav_index;
     use super::horizontal_nav_index;
+    use super::no_footer_bottom_slack;
     use super::prepare_first_summon;
     use super::scroll_start_for_selection;
     use super::thumbnail_scroll_offset_for_drag;
@@ -1131,6 +1153,7 @@ mod tests {
     use super::vertical_nav_index;
     use super::CardReconcileAction;
     use super::CardSignature;
+    use super::CARD_AREA_TOP_INSET;
     use crate::window_collector::{MruMap, WindowInfo};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::time::Instant;
@@ -1142,6 +1165,32 @@ mod tests {
             .enumerate()
             .map(|(n, &i)| (i, n as f64 * 110.0, y, 100.0))
             .collect()
+    }
+
+    /// With the footer band absent the card area keeps the same room below its last row that it
+    /// keeps above its first one, or the panel's whitespace reads lopsided. The band is pinned in
+    /// both states: the suite otherwise assumes a band exists (see `theme::footer_band_h`).
+    #[test]
+    fn the_no_footer_bottom_room_matches_the_card_areas_top_inset() {
+        crate::theme::set_test_footer_band(Some(crate::theme::FOOTER_CONTROL_MIN_H));
+        let with_band = no_footer_bottom_slack();
+        crate::theme::set_test_footer_band(Some(0.0));
+        let without_band = no_footer_bottom_slack();
+        crate::theme::set_test_footer_band(None);
+
+        assert_eq!(
+            with_band, 0.0,
+            "the footer band already holds the card area off the panel's bottom edge"
+        );
+        assert_eq!(
+            crate::theme::THUMB_BOTTOM_INSET + without_band,
+            CARD_AREA_TOP_INSET,
+            "with the band gone the bottom room must match the area's top inset"
+        );
+        assert!(
+            crate::theme::THUMB_BOTTOM_INSET + without_band >= crate::theme::OVERLAY_RING_INSET,
+            "the widened room must still cover the selection ring's outward reach"
+        );
     }
 
     fn signature(title: &str) -> CardSignature {

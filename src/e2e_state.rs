@@ -1030,7 +1030,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {
             Some((x, y, w, h)) => format!(
-                "{{\"visible\": {}, \"pinned\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}, \"filter_row\": {}}}",
+                "{{\"visible\": {}, \"pinned\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}, \"filter_row\": {}, \"filter_popover_open\": {}}}",
                 crate::clipboard::picker_is_visible(),
                 crate::clipboard::is_pinned(),
                 x,
@@ -1040,7 +1040,8 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
                 grip_json,
                 settings_json,
                 hints,
-                filter_row_json
+                filter_row_json,
+                crate::clipboard::filter_popover_open()
             ),
             None => "null".to_string(),
         }

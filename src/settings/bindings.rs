@@ -27,8 +27,8 @@ const BINDING_SWITCH_W: f64 = 44.0;
 ///
 /// The height is the design system's minimum control hit target (§10, ≥ 28×28), not the mouse page's
 /// 27pt: that page predates the rule, and copying it would have shrunk this row's only way to edit a
-/// binding below the size the style document promises. The band is 52pt tall, so 28 fits with 12pt
-/// of slack above and below.
+/// binding below the size the style document promises. The band is one settings row (56pt) tall, so
+/// 28 fits with 14pt of slack above and below.
 const BINDING_BTN_W: f64 = 60.0;
 const BINDING_BTN_H: f64 = 28.0;
 const BINDING_BTN_GAP: f64 = 8.0;
@@ -52,7 +52,7 @@ const _: () = assert!(BINDING_KEYCAP_COL > 0.0);
 /// vertically, so the rows line up with every other card's content. `padding_matches_the_shared_layout`
 /// pins the two against those tokens, so moving a token cannot silently misalign this table.
 pub(crate) const BINDING_PAD_X: f64 = 16.0;
-pub(crate) const BINDING_PAD_Y: f64 = 8.0;
+pub(crate) const BINDING_PAD_Y: f64 = 0.0;
 const BINDING_COL_GAP: f64 = 10.0;
 /// The add panel's geometry. Named here rather than at the call sites so the panel's size, its
 /// padding and its control rows stay one set of numbers (the mouse page's panel has its own; the
@@ -1680,7 +1680,7 @@ fn draft_rejection(
             return Some(tf(
                 "errors.key_binding_trigger_invalid",
                 &[("value", trigger.trim())],
-            ))
+            ));
         }
     };
     if parsed.is_bare_key() {
@@ -2361,6 +2361,9 @@ mod tests {
     fn an_empty_group_still_has_one_row_of_height() {
         let rows_h = (BINDING_PAD_Y - BINDING_PAD_Y).max(BINDING_ROW_H);
         assert_eq!(rows_h, BINDING_ROW_H);
-        assert_eq!(rows_h + BINDING_PAD_Y * 2.0, BINDING_ROW_H + 16.0);
+        assert_eq!(
+            rows_h + BINDING_PAD_Y * 2.0,
+            BINDING_ROW_H + BINDING_PAD_Y * 2.0
+        );
     }
 }

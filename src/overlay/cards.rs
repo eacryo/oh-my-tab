@@ -1040,10 +1040,20 @@ pub(crate) fn show_overlay() {
         // rect, and a window that does not fit the visible area is constrained by AppKit, which moves the
         // panel (measured: 26pt at the menu bar) instead of clipping the shadow.
         let elevation_pad = crate::glass::panel_elevation_padding();
+        // With no footer band the card area keeps the top inset below its last row too, and that
+        // room comes out of the height budget here so the finished panel still fits the budget this
+        // computation promises (see `no_footer_bottom_slack`). An empty panel has no card rows to
+        // inset.
+        let bottom_slack = if windows.is_empty() {
+            0.0
+        } else {
+            no_footer_bottom_slack()
+        };
         let max_panel_h = (screen_visible.size.height * PANEL_MAX_HEIGHT_RATIO
             - 2.0 * PANEL_MARGIN
             - elevation_pad.top
-            - elevation_pad.bottom)
+            - elevation_pad.bottom
+            - bottom_slack)
             .max(240.0);
         let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
         let layout = if use_flow {
@@ -1132,10 +1142,20 @@ pub(crate) fn show_overlay() {
             };
         let thumb_scroll_metrics =
             Some((layout.overflowed, layout.row_ranges.len(), layout.max_rows));
-        let h = layout.panel_h;
+        debug_assert!(
+            (layout.content_inset - CARD_AREA_TOP_INSET).abs() < 0.5,
+            "the local CARD_AREA_TOP_INSET stand-in ({CARD_AREA_TOP_INSET}) drifted from the \
+             layout's content inset ({})",
+            layout.content_inset
+        );
+        // The panel and the document both take the no-footer bottom room; the card y values below
+        // move by the same amount, so the room lands below the last row and the top inset is
+        // untouched. Keeping all three in step is what keeps the clip view, the scroll range, the
+        // scroller and every frame-based hit test describing the same panel.
+        let h = layout.panel_h + bottom_slack;
         let w = layout.panel_w;
         let card_h_use = layout.card_h;
-        let document_h = layout.document_h;
+        let document_h = layout.document_h + bottom_slack;
         let card_h_outer = card_h_use;
         // Placement rule (both axes): center on the **screen frame** first, so the gaps to the screen
         // edges look symmetric, then clamp into the visible frame so the panel never crosses the menu
@@ -1170,7 +1190,7 @@ pub(crate) fn show_overlay() {
             layout.card_h,
             layout.content_inset,
             layout.panel_w,
-            layout.panel_h,
+            h,
             x,
             y,
             layout.visible.start,
@@ -1183,11 +1203,12 @@ pub(crate) fn show_overlay() {
             layout.overflowed
         );
         // Keep every card in the document and let clip bounds define the viewport; creating only
-        // visible cards would leave no later windows to reveal while scrolling.
+        // visible cards would leave no later windows to reveal while scrolling. The no-footer
+        // bottom room is carried by the y values below the same way it is by the document height.
         let placements: Vec<CardPlacementFrame> = layout
             .document_placements
             .iter()
-            .map(|p| (p.index, p.x, p.y, p.width))
+            .map(|p| (p.index, p.x, p.y + bottom_slack, p.width))
             .collect();
         let new_frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
         // Compute capture demand only after flow layout determines the actual card height:

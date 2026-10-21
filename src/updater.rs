@@ -1871,7 +1871,9 @@ pub(crate) fn smoke_update_prompt_layouts() -> bool {
     let original_locale = crate::i18n::current_locale();
     let mut ok = unsafe { crate::settings::widgets::smoke_text_field_line_fragments() };
     if !ok {
-        log_info!("[smoke-update-prompts] NSTextField TextKit fragments do not match their font-size ratios");
+        log_info!(
+            "[smoke-update-prompts] NSTextField TextKit fragments do not match their font-size ratios"
+        );
     }
     unsafe {
         for locale in ["en", "zh-Hans", "zh-Hant"] {
@@ -2417,7 +2419,10 @@ extern "C" fn show_update_installed(
     acknowledgement: *mut c_void,
 ) {
     unsafe {
-        log_debug!("[update-notice] driver callback showUpdateInstalledAndRelaunched fired (relaunched={})", _relaunched);
+        log_debug!(
+            "[update-notice] driver callback showUpdateInstalledAndRelaunched fired (relaunched={})",
+            _relaunched
+        );
         crate::settings::set_update_available(false);
         // Sparkle calls this on the freshly relaunched instance after an install; besides
         // the in-app result window, post a system notification so a menu-bar app that

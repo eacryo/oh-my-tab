@@ -228,6 +228,12 @@ unsafe fn views_added_since(view: *mut AnyObject, mark: usize) -> Vec<*mut AnyOb
     (mark..count).map(|index| subview_at(view, index)).collect()
 }
 
+/// Whether a row is hidden because the conditional group it belongs to is off. Pure, so the
+/// visibility rule a search result's reachability depends on is assertable without a window.
+fn row_hidden_by_group(row: &Row, hidden: &[RowGroup]) -> bool {
+    row.group.is_some_and(|group| hidden.contains(&group))
+}
+
 /// A row's live box height: its build-time height adjusted by however much its owner changed the
 /// row's consumption through `set_row_consume`.
 ///
@@ -244,8 +250,8 @@ fn live_row_height(row: &Row, live_consume: Option<f64>) -> f64 {
 /// Whether a card whose bottom edge sits at `bottom_rel` contains a row box that starts at `origin`
 /// and is `height` tall.
 ///
-/// A row's box may reach the section cursor, which sits `card_header_gap` above the card's top edge,
-/// so the limit is the row origin plus that gap; the row's bottom must stay inside the card.
+/// A row's box may reach the section cursor, which sits `card_bottom_inset` below the card's top
+/// edge, so the limit is the row origin plus that inset; the row's bottom must stay inside the card.
 #[cfg(debug_assertions)]
 fn card_covers_row(origin: f64, height: f64, top_limit: f64, bottom_rel: f64) -> bool {
     origin + height <= top_limit && origin >= bottom_rel - 0.5
@@ -284,7 +290,6 @@ impl PageCanvas {
                 section_step: 0.0,
                 row_gap: 0.0,
                 card_bottom_inset: 0.0,
-                card_header_gap: 0.0,
             },
             title: std::ptr::null_mut(),
             title_height: 0.0,
@@ -583,6 +588,91 @@ impl PageCanvas {
         (self.rows.len() + usize::from(self.pending.is_some())).saturating_sub(1)
     }
 
+    /// The box a row occupies in the page document's coordinates: where another surface jumping to
+    /// that row scrolls and draws its highlight (the settings search's result click). `None` for a
+    /// row the page never opened or a canvas that has not re-flowed yet.
+    ///
+    /// The row's origin is the bottom edge of the band it consumed; its height is the live one, so a
+    /// block its owner resized (`set_row_consume`) is covered by its current box rather than the
+    /// provisional height it was built with.
+    pub(super) fn row_frame(&self, row: usize) -> Option<NSRect> {
+        let spec = self.rows.get(row)?;
+        let state = self.state.borrow();
+        let origin = *state.origins.get(row)?;
+        let consume = state.row_consumes.get(row).copied().unwrap_or(spec.consume);
+        let height = (spec.height + (consume - spec.consume)).max(0.0);
+        Some(NSRect::new(
+            NSPoint::new(0.0, origin),
+            NSSize::new(self.content_w, height),
+        ))
+    }
+
+    /// Whether the row is currently hidden because its conditional `RowGroup` is off: a surface that
+    /// offers a jump to a row (the settings search) must not offer one it cannot show.
+    pub(super) fn row_is_hidden(&self, row: usize) -> bool {
+        let Some(spec) = self.rows.get(row) else {
+            return true;
+        };
+        let hidden = self.state.borrow();
+        row_hidden_by_group(spec, &hidden.hidden)
+    }
+
+    /// The views one row drew, in document order (its labels, its control and the separator above
+    /// it). The search results mirror these into a result row, so a result reads exactly like the
+    /// page row it names; the caller must not retain the views past the next page rebuild.
+    pub(super) fn row_views(&self, row: usize) -> Option<&[*mut AnyObject]> {
+        Some(self.rows.get(row)?.views.as_slice())
+    }
+
+    pub(super) unsafe fn row_section_title(&self, row: usize) -> String {
+        let Some(section) = self
+            .rows
+            .get(row)
+            .and_then(|row| self.sections.get(row.section))
+        else {
+            return String::new();
+        };
+        if section.header.is_null() {
+            return String::new();
+        }
+        let text: *mut AnyObject = msg_send![section.header, stringValue];
+        crate::ffi::nsstring_to_rust(text)
+    }
+
+    pub(super) unsafe fn row_view_content_hidden(&self, row: usize, view: *mut AnyObject) -> bool {
+        let state = self.state.borrow();
+        if let Some(Some(saved)) = state.group_hidden_views.get(row) {
+            if let Some((_, hidden)) = saved.iter().find(|(saved_view, _)| *saved_view == view) {
+                return *hidden;
+            }
+        }
+        msg_send![view, isHidden]
+    }
+
+    /// A1 smoke check: the box `row_frame` reports contains the views the row drew (a point of
+    /// slack each way, so a separator riding the row's top edge stays inside). A jump that flashes
+    /// this box therefore highlights the row the result named, not a neighbouring heading.
+    pub(super) unsafe fn row_box_holds_its_views(&self, row: usize) -> bool {
+        let Some(rect) = self.row_frame(row) else {
+            return false;
+        };
+        let Some(spec) = self.rows.get(row) else {
+            return false;
+        };
+        spec.views
+            .iter()
+            .filter(|view| !view.is_null())
+            .all(|view| {
+                let hidden: bool = msg_send![*view, isHidden];
+                if hidden {
+                    return true;
+                }
+                let frame: NSRect = msg_send![*view, frame];
+                frame.origin.y >= rect.origin.y - 4.0
+                    && frame.origin.y + frame.size.height <= rect.origin.y + rect.size.height + 4.0
+            })
+    }
+
     /// Resize a row the page registered with [`PageCanvas::next_block`]. The row's top edge stays
     /// put: a taller block grows downward, exactly like the mapping table.
     pub(super) unsafe fn set_row_consume(&self, row: usize, consume: f64) {
@@ -797,12 +887,13 @@ impl PageCanvas {
                     first_row = card.last_row.saturating_add(1);
                     continue;
                 };
-                let top_rel = relative
+                let section_rel = relative
                     .section_rels
                     .get(card.section)
                     .copied()
-                    .unwrap_or(0.0)
-                    - layout.card_header_gap;
+                    .unwrap_or(0.0);
+                // The card's real top edge, so the `card=[..]` log line prints the painted band.
+                let top_rel = layout.card_top(section_rel);
                 for row_index in first_row..=card.last_row {
                     let Some(Some(origin)) = relative.origins.get(row_index) else {
                         continue;
@@ -811,8 +902,8 @@ impl PageCanvas {
                     // height through `set_row_consume` (the Mouse table, the About host, the key
                     // bindings list) is laid out from the live consume, so measuring the stale
                     // build-time height would fail this check on a list that shrank below its
-                    // provisional height.
-                    let top_limit = top_rel + layout.card_header_gap + 0.5;
+                    // provisional height. A row's top edge may reach the section cursor.
+                    let top_limit = section_rel + 0.5;
                     let coverage = card_coverage_gap(
                         &self.rows[row_index],
                         row_consumes.get(row_index).copied(),
@@ -868,6 +959,13 @@ impl PageCanvas {
                     if delta != 0.0 {
                         for &view in &row.views {
                             if view.is_null() {
+                                continue;
+                            }
+                            // Search temporarily hosts the original controls in its own rows.
+                            // Their page origins still advance, but their local frames belong to
+                            // the results layout until the controls return to this document.
+                            let parent: *mut AnyObject = msg_send![view, superview];
+                            if parent != self.document {
                                 continue;
                             }
                             let frame: NSRect = msg_send![view, frame];
@@ -945,19 +1043,57 @@ impl PageCanvas {
                 continue;
             };
             let frame: NSRect = msg_send![card.card, frame];
-            let top = base
-                + relative
-                    .section_rels
-                    .get(card.section)
-                    .copied()
-                    .unwrap_or(self.sections[card.section].rel)
-                - layout.card_header_gap;
+            let section_rel = relative
+                .section_rels
+                .get(card.section)
+                .copied()
+                .unwrap_or(self.sections[card.section].rel);
+            let top = layout.card_top(base + section_rel);
             let bottom = base + bottom_rel;
             let rect = widgets::settings_card_rect(NSRect::new(
                 NSPoint::new(frame.origin.x, bottom),
                 NSSize::new(frame.size.width, (top - bottom).max(1.0)),
             ));
             let _: () = msg_send![card.card, setFrame: rect];
+            #[cfg(debug_assertions)]
+            {
+                // The painted top edge must be the band the card's rows were laid out in, derived
+                // independently of the formula that placed the frame above: `advance` tops the
+                // first row at `cursor - row_gap`, so the band top is that row's live box top plus
+                // `row_gap + card_bottom_inset`. A second top-edge formula (the `- card_header_gap`
+                // this loop carried) drifted once already; this catches the next one.
+                let first_row = self
+                    .cards
+                    .get(index.wrapping_sub(1))
+                    .map_or(0, |previous| previous.last_row + 1);
+                let first_visible = (first_row..=card.last_row).find_map(|row_index| {
+                    relative
+                        .origins
+                        .get(row_index)
+                        .copied()
+                        .flatten()
+                        .map(|origin| (row_index, origin))
+                });
+                if let Some((row_index, origin)) = first_visible {
+                    let live_height = live_row_height(
+                        &self.rows[row_index],
+                        row_consumes.get(row_index).copied(),
+                    );
+                    let expected_top =
+                        base + origin + live_height + layout.row_gap + layout.card_bottom_inset;
+                    let painted: NSRect = msg_send![card.card, frame];
+                    let painted_top = painted.origin.y + painted.size.height;
+                    if (painted_top - expected_top).abs() > 0.5 {
+                        log_info!(
+                            "[settings] card {index} painted top {painted_top:.1} does not match its first row's band top {expected_top:.1} (row {row_index} origin {origin:.1} live height {live_height:.1})"
+                        );
+                    }
+                    debug_assert!(
+                        (painted_top - expected_top).abs() <= 0.5,
+                        "card {index} painted top {painted_top:.1} does not match band top {expected_top:.1}"
+                    );
+                }
+            }
         }
 
         // The page title hangs from the document's top edge, and so do the views a page pinned
@@ -1065,6 +1201,10 @@ impl PageCanvas {
                 None => previous.get(index).copied().unwrap_or(base),
             })
             .collect();
+        drop(state);
+        if sidebar::settings_search_is_active() {
+            sidebar::schedule_search_refresh();
+        }
     }
 }
 
@@ -1093,6 +1233,25 @@ fn top_following_origin(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row inside a conditional group is hidden exactly while that group is off; a row outside
+    /// any group is always visible. The search filters on this, so it cannot offer a jump to a row
+    /// the page will not show.
+    #[test]
+    fn a_conditional_row_is_hidden_only_while_its_group_is_off() {
+        let row = |group: Option<RowGroup>| Row {
+            views: Vec::new(),
+            consume: 40.0,
+            height: 40.0,
+            group,
+            section: 0,
+        };
+        let conditional = row(Some(RowGroup::LineCount));
+        let plain = row(None);
+        assert!(!row_hidden_by_group(&conditional, &[]));
+        assert!(row_hidden_by_group(&conditional, &[RowGroup::LineCount]));
+        assert!(!row_hidden_by_group(&plain, &[RowGroup::LineCount]));
+    }
 
     /// A normal row: `SettingsLayout::next_row_cursor` consumes the shared gap plus the row's own
     /// height.
@@ -1339,5 +1498,80 @@ mod tests {
             120.0,
             "a grown block measures its live height"
         );
+    }
+
+    /// `card_top` is the one definition of a card's top edge: the section cursor plus the same
+    /// inset the card keeps below its last row.
+    #[test]
+    fn card_top_is_the_section_cursor_plus_the_card_inset() {
+        let layout = SettingsLayout::new(400.0);
+        assert_eq!(
+            layout.card_top(123.0),
+            123.0 + SettingsLayout::CARD_BOTTOM_INSET
+        );
+    }
+
+    /// What the user sees: for a single-row card the painted band and the row band share one
+    /// centre. `reflow`'s card loop used to top the card at `section_rel - card_header_gap`
+    /// instead of `card_top(section_rel)`, which dropped the painted centre 6pt below the row's
+    /// and made every row read as sitting high inside its card.
+    #[test]
+    fn a_single_row_cards_band_is_centred_on_its_row() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [row(layout.described_row_h, None)];
+        let walk = RelativeLayout::of(&rows, &[], layout);
+        let section_rel = walk.section_rels[0];
+        let origin = walk.origins[0].expect("the row is visible");
+        let card_top = layout.card_top(section_rel);
+        let card_bottom = origin - layout.card_bottom_inset;
+        let row_height = rows[0].height;
+        let card_centre = (card_top + card_bottom) / 2.0;
+        let row_centre = (origin + origin + row_height) / 2.0;
+        assert!(
+            (card_centre - row_centre).abs() < 1e-9,
+            "card band [{card_bottom},{card_top}] centre {card_centre} is not the row band's centre {row_centre}"
+        );
+    }
+
+    /// The centre invariant must actually discriminate: the stale `section_rel - card_header_gap`
+    /// top this fix removes was the shipped misalignment, so it has to fail the same check.
+    #[test]
+    fn the_stale_card_top_formula_is_not_centred() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [row(layout.described_row_h, None)];
+        let walk = RelativeLayout::of(&rows, &[], layout);
+        let section_rel = walk.section_rels[0];
+        let origin = walk.origins[0].expect("the row is visible");
+        // The shipped bug: reflow topped the card here instead of at `layout.card_top(section_rel)`.
+        let stale_top = section_rel - super::super::SETTINGS_SECTION_CARD_GAP;
+        let card_bottom = origin - layout.card_bottom_inset;
+        let stale_centre = (stale_top + card_bottom) / 2.0;
+        let row_centre = origin + rows[0].height / 2.0;
+        assert!(
+            (stale_centre - row_centre).abs() > 1e-9,
+            "the stale top must be the failing one, or this test proves nothing"
+        );
+    }
+
+    /// With two rows in one card each row's visible band stays centred on its row: the card keeps
+    /// exactly `card_bottom_inset` above the first row's top and below the last row's bottom, and
+    /// the shared edge between them is the same gap for both.
+    #[test]
+    fn a_two_row_card_keeps_the_same_inset_above_and_below() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [
+            row(layout.described_row_h, None),
+            row(layout.described_row_h, None),
+        ];
+        let walk = RelativeLayout::of(&rows, &[], layout);
+        let card_top = layout.card_top(walk.section_rels[0]);
+        let first_row_top = walk.origins[0].expect("first row is visible") + rows[0].height;
+        let last_row_origin = walk.origins[1].expect("last row is visible");
+        let card_bottom = last_row_origin - layout.card_bottom_inset;
+        assert_eq!(
+            card_top - first_row_top,
+            layout.row_gap + layout.card_bottom_inset
+        );
+        assert_eq!(last_row_origin - card_bottom, layout.card_bottom_inset);
     }
 }

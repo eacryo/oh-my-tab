@@ -844,7 +844,9 @@ fn window_server_geometry_transition_snapshot() -> GeometryProbeSnapshot {
             )
         }
         GeometryProbeTransition::Deactivated => {
-            log_debug!("[geometry-transition] WindowServer geometry transition inactive after below-threshold samples")
+            log_debug!(
+                "[geometry-transition] WindowServer geometry transition inactive after below-threshold samples"
+            )
         }
         GeometryProbeTransition::None => {}
     }
@@ -1034,7 +1036,9 @@ fn schedule_geometry_retry(deadline: GeometryRetryDeadline, job_tx: flume::Sende
     }
     let _ = GEOMETRY_RETRY_SCHEDULER.set(scheduler_tx);
     let Some(scheduler) = GEOMETRY_RETRY_SCHEDULER.get() else {
-        log_debug!("[geometry-transition] retry scheduler became unavailable; deferred job will be dropped");
+        log_debug!(
+            "[geometry-transition] retry scheduler became unavailable; deferred job will be dropped"
+        );
         return false;
     };
     if scheduler.send(deadline).is_err() {

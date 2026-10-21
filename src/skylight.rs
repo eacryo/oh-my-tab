@@ -23,8 +23,7 @@ pub(crate) const SKYLIGHT_PATH: &str =
     "/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight";
 
 /// The HIServices framework path (home of _AXUIElementGetWindow / GetProcessForPID).
-pub(crate) const HISERVICES_PATH: &str =
-    "/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices";
+pub(crate) const HISERVICES_PATH: &str = "/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices";
 
 /// Path containing CoreGraphics' private CGS window-geometry APIs.
 const COREGRAPHICS_PATH: &str = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";

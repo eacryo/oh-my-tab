@@ -403,10 +403,6 @@ pub(super) fn pending_count_for_tests() -> usize {
     PENDING_IMAGE_DATA.lock().unwrap().len()
 }
 
-/// Test-only: the bound the pending map is held to.
-#[cfg(test)]
-pub(super) const PENDING_IMAGE_LIMIT_FOR_TESTS: usize = PENDING_IMAGE_LIMIT;
-
 /// Test-only: place a pending fallback entry exactly as the record path does, but without queueing
 /// the write job, so an interleaving can be constructed deterministically.
 #[cfg(test)]

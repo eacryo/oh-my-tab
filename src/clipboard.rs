@@ -62,7 +62,7 @@ use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 mod crypto;
 mod detail;
-mod grip;
+mod drag;
 mod image_cache;
 mod keyring;
 mod keyring_acl;
@@ -95,6 +95,14 @@ use storage::*;
 use text_style::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use detail::{apply_backdrop_material, apply_theme, set_picker_glass_inactive};
+/// The detail pane's pure geometry (the mock's `.detail-pane` padding and `.meta-table` grid),
+/// re-exported so the sizing helpers and their tests can name it without the model module.
+#[allow(unused_imports)] // the sizing helpers and tests use them through this path
+use detail::{
+    detail_document_height, detail_pane_layout, detail_pane_min_height, media_body_frames,
+};
+#[allow(unused_imports)] // the meta table's rows are built from the model's field table
+use model::{format_byte_size, meta_table, MetaField};
 pub(crate) use monitor::{start, stop};
 pub(crate) use notifications::{
     applied_notice_labels, e2e_settings_click_delivery_ms, e2e_settings_click_ms,
@@ -105,7 +113,10 @@ pub(crate) use notifications::{
 pub(crate) use paste_handback::handback_in_flight;
 pub(crate) use paste_handback::note_external_app_activated;
 pub(crate) use persist::{clear_on_quit_enabled, discard_history_on_disk};
-pub(crate) use picker::{on_clipboard_toggle, show_and_pin_for_menu, show_picker_for_development};
+pub(crate) use picker::{
+    on_clipboard_toggle, show_and_pin_for_menu, show_picker_detail_for_development,
+    show_picker_for_development,
+};
 /// The frozen panel height while pinned, for the geometry assertions.
 pub(crate) use pin::frozen_height;
 /// Whether the panel-level pin is set, for the menu bar's mirrored check state.
@@ -309,8 +320,10 @@ const NSPASTEBOARD_TYPE_BMP: &str = "com.microsoft.bmp";
 const NSPASTEBOARD_TYPE_TIFF: &str = "public.tiff";
 /// The image rows' thumbnail box (72x44, control radius, faint fill + inner ring, mirroring the
 /// HTML mockup).
-const THUMB_W: f64 = 72.0;
-const THUMB_H: f64 = 44.0;
+/// The mock's `.row-thumb`: a 30×30 well (radius 8) holding the type icon or the image
+/// thumbnail.
+const THUMB_W: f64 = 30.0;
+const THUMB_H: f64 = 30.0;
 const THUMB_R: f64 = crate::theme::RADIUS_CONTROL;
 /// gap between the app icon and the thumb in the canvas.
 /// keycode used when synthesizing Cmd+V.
@@ -319,39 +332,59 @@ const VK_V: u16 = keyboard::VK_V;
 const K_CG_EVENT_FLAG_MASK_COMMAND: CGEventFlags = keyboard::FLAG_COMMAND;
 /// polling interval (seconds)
 const POLL_INTERVAL: f64 = 0.5;
-/// The picker's max height: 61pt rows + the header (108) + the footer (43), ~8-9 rows +
-/// paddings ≈ 720pt, ~73% of a 1080p screen's usable height; more entries scroll. Small
-/// screens shrink it further (see show_picker).
-const PICKER_MAX_HEIGHT: f64 = 720.0;
+/// Maximum picker panel height from the clipboard-v2 mockup (580px). On shorter screens,
+/// `show_picker` reduces it to leave room for the screen edge and elevation shadow.
+const PICKER_MAX_HEIGHT: f64 = 580.0;
 /// the picker's minimum height for regular lists.
-const PICKER_MIN_HEIGHT: f64 = 250.0;
-/// Picker width (the mockup's 720px scaled to 560pt -- readable content without losing
-/// density).
-const PICKER_W: f64 = 560.0;
-/// the uniform row height (mockup min-height 61px).
-const ROW_H: f64 = 78.0;
-/// the item's bottom meta bar height.
-const META_FOOTER_H: f64 = 17.0;
-/// Detail body line height (a safe layout height for 14pt text), preventing NSTextView's
-/// actual line box from exceeding the estimate.
-const DETAIL_LINE_H: f64 = crate::theme::line_height(
-    crate::theme::FONT_CONTROL,
-    crate::theme::LINE_HEIGHT_BODY_RATIO,
-);
-/// NSTextView's vertical textContainerInset applies at both the top and bottom. Detail text
-/// reuses the list's 12pt top inset, so sizing must include both sides; otherwise exactly
-/// two lines overflow and incorrectly show a scrollbar.
-const DETAIL_TEXT_INSET_H: f64 = ROW_PAD_TOP * 2.0;
+const PICKER_MIN_HEIGHT: f64 = 280.0;
+/// List-only width from clipboard-v2.html. Expanded geometry is owned by picker_layout.
+const PICKER_W: f64 = 640.0;
+/// Uniform single-line row height from the design.
+const ROW_H: f64 = 40.0;
+/// Detail body line height, computed from the font the text view actually uses so NSTextView's
+/// line box can never exceed the estimate. The mock sets `line-height: 1.75` at 13px for plain
+/// text; that ratio on this app's 12/14 scale step gives 24.5pt for FONT_CONTROL (the mock's own
+/// ratio would put 14pt text at 21pt, tightening the reading surface off the shared scale).
+const DETAIL_BODY_LINE_RATIO: f64 = 1.75;
+const DETAIL_LINE_H: f64 = crate::theme::line_height(13.0, DETAIL_BODY_LINE_RATIO);
+/// Detail body line height (the paragraph style the text view installs; equals `DETAIL_LINE_H`).
+const DETAIL_BODY_LINE_H: f64 = DETAIL_LINE_H;
+/// Trailing slack after an unwrapped code line's width, so its last glyph is never clipped by
+/// the horizontal scroll range.
+const DETAIL_TEXT_TRAILING_GAP: f64 = 12.0;
+/// The mock's `.image-preview img { max-height: 300px }`.
+const DETAIL_IMAGE_PREVIEW_MAX_H: f64 = 300.0;
+/// The mock's `.code-line` grid: a 26px line-number gutter, a 6px gap, then the code.
+const DETAIL_CODE_GUTTER_W: f64 = 26.0;
+const DETAIL_CODE_GUTTER_GAP: f64 = 6.0;
+/// The right-aligned line numbers: mono 11.5px (the mock's `.code-line` font size).
+const DETAIL_GUTTER_FONT: f64 = 11.5;
+/// Space the gutter keeps from the first code glyph, on the mock's `.ln { padding-right: 4px }`.
+const DETAIL_CODE_GUTTER_PAD: f64 = 4.0;
+// The gutter's ink on the mock is rgba(48,48,56,.36) over a light material. This panel draws its
+// text with the system's dynamic label colours (glass::panel_ink), which stay legible across all
+// four materials, so the gutter takes the muted role instead of a literal alpha that would
+// vanish on the dark panel.
+/// The image preview's well (the mock's `.image-preview`): a white wash plus a soft shadow.
+const PREVIEW_WELL_LIGHT: u32 = 0xFFFF_FF4D;
+const PREVIEW_WELL_DARK: u32 = 0xFFFF_FF14;
+const PREVIEW_SHADOW_LIGHT: u32 = 0x2820_141F;
+const PREVIEW_SHADOW_DARK: u32 = 0x0000_0040;
+const PREVIEW_SHADOW_RADIUS: f64 = 28.0;
+const PREVIEW_SHADOW_OFFSET_Y: f64 = 10.0;
+const PREVIEW_SHADOW_OPACITY: f64 = 0.12;
 /// Conservative fallback units for detail-text height estimation. List content no longer uses
 /// character units for truncation; native cells lay it out from real font metrics. This value
 /// is only used by the headless-safe detail document estimate.
+#[cfg(test)]
 const LINE_MAX_UNITS: usize = 60;
 /// the list's side padding (8px).
-const PAD_X: f64 = 8.0;
+const PAD_X: f64 = 10.0;
 /// The row's padding, aligned to the spacing scale.
-const ROW_PAD_TOP: f64 = 12.0;
+/// `.clip-row` vertical padding (4px each side on the 40px row).
+const ROW_PAD_TOP: f64 = 4.0;
 const ROW_PAD_R: f64 = 12.0;
-const ROW_PAD_BOT: f64 = 8.0;
+const ROW_PAD_BOT: f64 = 4.0;
 const ROW_PAD_L: f64 = 12.0;
 /// the search bar's inner padding (12px).
 const SEARCH_PAD_IN: f64 = 12.0;
@@ -360,46 +393,42 @@ const SEARCH_ICON_W: f64 = 22.0;
 /// The extra clear × size when a query exists.
 const SEARCH_CLEAR_W: f64 = 18.0;
 /// Shared query font size for both editing and unfocused states.
-const SEARCH_FONT_SIZE: f64 = crate::theme::FONT_CONTROL;
-/// The meta line's source-app icon size (the new mockup's .app-icon 13px).
-const META_ICON: f64 = 13.0;
-/// The per-row action buttons meet the shared 28pt minimum hit target.
-const ACTION_BTN: f64 = 28.0;
-const ACTION_H: f64 = 28.0;
-const ACTION_GAP: f64 = 4.0;
+const SEARCH_FONT_SIZE: f64 = 13.0;
+/// Row action buttons meet the shared 28pt minimum hit target.
+const ACTION_BTN: f64 = 22.0;
+const ACTION_H: f64 = 22.0;
+const ACTION_GAP: f64 = 1.0;
 /// Detail SVG-style icon canvas (16px in mockup).
 const DETAIL_ACTION_ICON: f64 = 16.0;
-/// the actions strip's width.
-const ACTIONS_W: f64 = ACTION_BTN * 3.0 + ACTION_GAP * 2.0;
 /// The time-group header zone height.
 const GROUP_H: f64 = 28.0;
 /// The group label's top offset (vertically centered).
 const GROUP_LABEL_PAD: f64 = 8.0;
-/// The header strip's top padding. It is also the drag handle's band: the picker is moved by
-/// dragging the three dots centered in this band (see `grip.rs`), and the band is what makes the
-/// handle reach the 28pt hit target §6.1 requires of a control, not the 12pt padding it replaced.
-const TOP_PAD_Y: f64 = 28.0;
-/// The drag handle's three visible dots. The band they sit in is the header's whole top padding (see
-/// `model::picker_grip_frame`): the user drags the panel by the top bar, and the dots mark where.
-/// The handle's visible dots, and the distance between two of them. Same footprint as the
-/// keystroke display's handle so one gesture looks like one component wherever it appears.
-const PICKER_GRIP_MARK: f64 = 3.0;
-const PICKER_GRIP_MARK_GAP: f64 = 3.0;
-/// Pointer travel that separates a click on the handle from a drag: below it the grab is a no-op
-/// (the handle has no click action), above it the panel follows the pointer.
+/// The header strip's top padding: the v2 mock's `.panel-head` padding-top (16px). The whole
+/// padding band is the panel's top drag surface (see `drag.rs`), so it also gives the top bar a
+/// blank target without reserving height for a handle that no longer exists.
+const TOP_PAD_Y: f64 = 16.0;
+/// Pointer travel that separates a blank-area click from a panel drag: below it the press is a
+/// no-op (a blank region has no click action), above it the panel follows the pointer.
 const PICKER_DRAG_THRESHOLD: f64 = 4.0;
-/// the search bar's height (the new mockup's 40px).
+/// the search bar's height (the v2 mock's 40px).
 const SEARCH_H: f64 = 40.0;
 /// The search bar's side padding.
 const SEARCH_PAD_X: f64 = 16.0;
-/// The search bar uses the shared control radius.
-const SEARCH_R: f64 = crate::theme::RADIUS_CONTROL;
-/// Corner close button on the picker's header: a 28pt hit target with a 12pt glyph.
-const PICKER_CLOSE_BTN_SIZE: f64 = 28.0;
+/// The search bar's capsule radius: the v2 mock's 18px on a 40pt field. Deliberately not
+/// `RADIUS_CONTROL` (8) -- the field is a pill in the mock, and the field's height/2 makes it read
+/// as the search capsule rather than as one of the square corner controls.
+const SEARCH_R: f64 = 18.0;
+/// Corner close button on the picker's header: the mock's `.close-btn` 30pt wide hit target
+/// with a 12pt glyph.
+const PICKER_CLOSE_BTN_SIZE: f64 = 30.0;
 const PICKER_CLOSE_BTN_R: f64 = crate::theme::RADIUS_CONTROL;
 const PICKER_CLOSE_BTN_FONT: f64 = 12.0;
 /// Gap between the search field's right edge and the corner close button.
 const PICKER_CLOSE_BTN_GAP: f64 = 8.0;
+/// The pin/gear "orb" buttons: the mock's `.orb` -- 34×34 circles, so their corner radius is
+/// half their size rather than `RADIUS_CONTROL`.
+const PICKER_ORB_SIZE: f64 = 34.0;
 /// The settings button's SF Symbol point size. A symbol image carries its own size (it does not
 /// follow the button's font), so the corner's second glyph is sized here, a step above the close
 /// button's 12pt text × so the two read as the same weight.
@@ -408,23 +437,14 @@ const PICKER_GEAR_GLYPH_SIZE: f64 = 13.0;
 /// family as its two neighbours, so the row reads as one group. Its glyph size matches the gear's
 /// for the same reason (both are SF Symbols, which do not follow the button's font).
 const PICKER_PIN_GLYPH_SIZE: f64 = PICKER_GEAR_GLYPH_SIZE;
-/// The gap under the search bar.
-const SEARCH_GAP_Y: f64 = 8.0;
-/// the filters row's height (the new mockup's 36px).
-const FILTERS_H: f64 = 36.0;
-/// The filters row's side padding.
-const FILTERS_PAD_X: f64 = 16.0;
-/// The gap between filter items.
-const FILTER_GAP: f64 = 16.0;
-/// Fixed underline dimensions and animation duration; tab changes move its center only.
-const FILTER_UNDERLINE_W: f64 = 16.0;
-const FILTER_UNDERLINE_H: f64 = 2.0;
-/// the footer's height (43px).
-const FOOTER_H: f64 = 44.0;
+/// The gap under the search bar (the v2 mock's `.panel-head` padding-bottom, 10px).
+const SEARCH_GAP_Y: f64 = 10.0;
+/// The footer's height: the mock's `.panel-foot` 38px.
+const FOOTER_H: f64 = 38.0;
 /// the window's bottom padding.
 const PAD_Y: f64 = 12.0;
-/// the footer's side padding (16px).
-const FOOTER_PAD_X: f64 = 16.0;
+/// The footer's side padding: the mock's `.panel-foot` 20px.
+const FOOTER_PAD_X: f64 = 20.0;
 /// the footer shortcut groups' spacing.
 const FOOTER_GROUP_GAP: f64 = 16.0;
 /// Horizontal breathing room a footer shortcut label's frame adds on top of the text it must
@@ -457,16 +477,133 @@ const CLEAR_BTN_GAP: f64 = 4.0;
 /// Fixed geometry for the clear-confirmation card; two text actions share one horizontal baseline.
 /// The gap between the two header clear actions (they sit right of the filter pills).
 const CLEAR_ACTION_GAP: f64 = 8.0;
-/// The row highlight shares the control radius.
-const SEL_TILE_R: f64 = crate::theme::RADIUS_CONTROL;
+/// The row highlight's radius: the mock's `.clip-row` 14px (not the shared control radius).
+const SEL_TILE_R: f64 = 14.0;
 /// inset from the selected row's top and bottom edges.
-const SEL_BAR_W: f64 = 2.0;
-const SEL_BAR_X: f64 = 1.0;
-const SEL_BAR_INSET_Y: f64 = 8.0;
 /// Resolve the shared settings/overlay palette for clipboard surfaces and controls.
 fn clipboard_palette() -> crate::theme::UiPalette {
     crate::theme::ui_palette()
 }
+
+// ---------------------------------------------------------------------------------------------
+// Clipboard-only design tokens (the v2 mock, `clipboard-v2.html`)
+// ---------------------------------------------------------------------------------------------
+//
+// The shared token set lives in `theme.rs`, which this subsystem does not own. These are the
+// clipboard panel's own values from the v2 mock, kept here as the adapter until they are promoted
+// into `UiPalette` (the promotion list is reported with this change). They are applied in light
+// mode only: the mock is light-only, and the dark palette's values are the ones measured against
+// the dark material.
+
+/// The clipboard panels' outer corner radius: the v2 mock's 32pt sheet curvature.
+///
+const PICKER_PANEL_RADIUS: f64 = crate::glass::CLIPBOARD_PANEL_RADIUS;
+/// The selected row's wash: `rgba(92, 82, 72, 0.16)`.
+const PICKER_ROW_SELECTED_LIGHT: u32 = 0x5C52_4829;
+/// Hovered (not selected) row wash: `rgba(255, 255, 255, 0.32)`.
+const PICKER_ROW_HOVER_LIGHT: u32 = 0xFFFF_FF52;
+/// Hairline separators (footer top line and friends): `rgba(52, 42, 30, 0.09)`.
+const PICKER_HAIRLINE_LIGHT: u32 = 0x342A_1E17;
+/// Search field fill: `rgba(255, 255, 255, 0.38)`, focused `rgba(255, 255, 255, 0.58)`.
+const PICKER_FIELD_BG_LIGHT: u32 = 0xFFFF_FF61;
+const PICKER_FIELD_BG_FOCUS_LIGHT: u32 = 0xFFFF_FF94;
+/// The glass edge / field border: `rgba(255, 255, 255, 0.5)`, focused `rgba(255, 255, 255, 0.86)`.
+const PICKER_GLASS_LINE_LIGHT: u32 = 0xFFFF_FF80;
+/// The mock's emphasis colour `#2f6fed`.
+const PICKER_ACCENT_LIGHT: u32 = 0x2F6F_EDFF;
+/// The image row's thumbnail well: `rgba(255, 255, 255, 0.32)` fill.
+const PICKER_THUMB_BG_LIGHT: u32 = 0xFFFF_FF52;
+
+/// The selected row's wash. Light mode follows the v2 mock; dark mode keeps the measured palette.
+fn picker_row_selected(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.selection_bg
+    } else {
+        PICKER_ROW_SELECTED_LIGHT
+    }
+}
+
+/// The hovered row's wash, by the same rule as [`picker_row_selected`].
+fn picker_row_hover(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.hover_bg
+    } else {
+        PICKER_ROW_HOVER_LIGHT
+    }
+}
+
+/// Hairline separator colour for the clipboard surfaces.
+fn picker_hairline() -> u32 {
+    if clipboard_palette().dark {
+        clipboard_palette().separator
+    } else {
+        PICKER_HAIRLINE_LIGHT
+    }
+}
+
+/// Search field fill, by focus state (the mock strengthens the fill on focus).
+fn picker_field_fill(focused: bool) -> u32 {
+    let palette = clipboard_palette();
+    if palette.dark {
+        palette.field_bg
+    } else if focused {
+        PICKER_FIELD_BG_FOCUS_LIGHT
+    } else {
+        PICKER_FIELD_BG_LIGHT
+    }
+}
+
+/// Search field border, by focus state.
+///
+/// Focus stays **accent**, not the mock's strengthened glass line: the native focus ring is switched off
+/// for this field (`detail.rs`, so the rounded shape survives), which leaves this stroke as the only
+/// keyboard-focus indication. A near-white line on a light glass panel does not read as focus, and
+/// `docs/design-style` §10 makes an accent ring the focus contract. The glass line is kept for the
+/// resting state so the field still reads as part of the sheet.
+fn picker_field_ring(focused: bool) -> u32 {
+    let palette = clipboard_palette();
+    if palette.dark {
+        if focused {
+            palette.accent
+        } else {
+            palette.card_border
+        }
+    } else if focused {
+        picker_accent(palette)
+    } else {
+        PICKER_GLASS_LINE_LIGHT
+    }
+}
+
+/// The image row's thumbnail well fill: the mock's `rgba(255,255,255,0.32)` in light mode.
+fn picker_thumb_fill() -> u32 {
+    let palette = clipboard_palette();
+    if palette.dark {
+        palette.field_bg
+    } else {
+        PICKER_THUMB_BG_LIGHT
+    }
+}
+
+/// The image row's thumbnail ring: the mock's `rgba(255,255,255,0.5)` glass line in light mode.
+fn picker_thumb_ring() -> u32 {
+    let palette = clipboard_palette();
+    if palette.dark {
+        palette.card_border
+    } else {
+        PICKER_GLASS_LINE_LIGHT
+    }
+}
+
+/// The clipboard surfaces' emphasis colour (the selected row's bar, the field's focus ring).
+fn picker_accent(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.accent
+    } else {
+        PICKER_ACCENT_LIGHT
+    }
+}
+
 /// The shortcut legend's chip fill as a CGColor directly usable by a layer: a wash at
 /// `LEGEND_CHIP_ALPHA` in the direction that actually separates it from the footer surface --
 /// darkening a light surface, lightening a dark one -- rather than a fixed gray that would be
@@ -486,6 +623,15 @@ const SCROLL_INDICATOR_W: f64 = 6.0;
 const SCROLL_INDICATOR_HIT_W: f64 = 10.0;
 /// empty inset at each scrollbar track edge.
 const SCROLL_INDICATOR_EDGE: f64 = 4.0;
+/// The detail panel's scroll area insets: the v2 mock's `.detail-pane` padding
+/// `10px 22px 16px` plus `.detail-scroll` padding-right 4px, which leaves a 22pt content
+/// column from each panel edge.
+const DETAIL_INSET_TOP: f64 = 10.0;
+const DETAIL_INSET_LEFT: f64 = 22.0;
+const DETAIL_INSET_RIGHT: f64 = 26.0;
+const DETAIL_INSET_BOTTOM: f64 = 16.0;
+/// `.meta-v` on the mock: 12px with `line-height: 1.45`.
+const DETAIL_META_LINE_HEIGHT_RATIO: f64 = 1.45;
 /// The detail view always reserves a lower-right safe corner, even when only one scrollbar exists.
 const SCROLL_INDICATOR_CORNER_GAP: f64 = 2.0;
 /// Lower-right safe-corner reserve = the other scrollbar's hit width plus the visual gap.
@@ -493,27 +639,72 @@ const SCROLL_INDICATOR_CORNER_RESERVE: f64 = SCROLL_INDICATOR_HIT_W + SCROLL_IND
 /// minimum indicator length (too short is unreadable).
 const SCROLL_INDICATOR_MIN_LEN: f64 = 24.0;
 /// gap between the picker and the detail panel.
+#[cfg(test)]
 const DETAIL_GAP: f64 = 8.0;
-/// the detail panel's inner padding.
-const DETAIL_PAD: f64 = 12.0;
-/// Heights of the detail toolbar and source/statistics footer.
-const DETAIL_TOOLBAR_H: f64 = 36.0;
-const DETAIL_FOOTER_H: f64 = 44.0;
-const DETAIL_CHROME_H: f64 = DETAIL_TOOLBAR_H + DETAIL_FOOTER_H;
+/// Inner width of a meta row's value column: the meta table is clipped to this, so the panel's
+/// custom scroll capsule (a 10pt track over the scroll view's trailing 3pt) never covers a value.
+const DETAIL_META_CLIP_INSET: f64 = SCROLL_INDICATOR_HIT_W + 3.0;
+/// The detail pane's floating actions: a 28pt hit target (the shared minimum), one gap apart
+/// and trailing inside the pane's right inset. Save-as is the outermost; the code soft-wrap
+/// switch, when the entry is code, sits left of it.
+const DETAIL_ACTION_H: f64 = 28.0;
+const DETAIL_ACTION_GAP: f64 = 6.0;
+/// The wrap switch's chip is wider than the 28pt switch it hosts (the mock's pill button-ish
+/// footprint), with the switch inset from the chip's right edge.
+const DETAIL_SWITCH_CHIP_W: f64 = 48.0;
+const DETAIL_SWITCH_INSET: f64 = 8.0;
+/// A floating action's chip fill in light mode: a light glass wash (the mock's `.btn`
+/// background over the sheet).
+const DETAIL_ACTION_FILL_LIGHT: u32 = 0xFFFF_FF66;
+/// The widest picker that still expands the detail INSIDE itself: the mock switches at
+/// `@media (max-width: 840px)`, where the picker plus the side pane no longer fit a desktop window.
+/// The app's picker is 640pt, so it stands beside the detail today; a narrower panel (a small
+/// display, or a future responsive picker) takes the mock's in-pane branch instead.
+const DETAIL_IN_PANE_BELOW_W: f64 = 840.0;
+/// The widest picker + side pane + gap the app shows side by side. Beyond it the two panels no
+/// longer fit a laptop's visible frame, so the side layout is not offered and the in-pane one is
+/// used instead.
+const DETAIL_SIDE_PANEL_MAX_W: f64 = 960.0;
+/// The mock's `.detail-pane` padding on the narrow branch: `6px 18px 14px` (the wide branch is
+/// `10px 22px 16px`, which the side pane keeps).
+const DETAIL_NARROW_INSET_TOP: f64 = 6.0;
+const DETAIL_NARROW_INSET_LEFT: f64 = 18.0;
+/// The mock's narrow branch leaves 18px of trailing space plus the scroll area's 4px pad. This pane
+/// draws its own scroll capsule inside that band instead of using a native scrollbar, so the column
+/// ends before the capsule: 18 + 4 for the pad, and the rest keeps values off the thumb.
+const DETAIL_NARROW_INSET_RIGHT: f64 = 26.0;
+const DETAIL_NARROW_INSET_BOTTOM: f64 = 14.0;
+/// The mock's `.meta-row` grid: a 56px label column, a 10px gap, then the value.
+const DETAIL_META_LABEL_W: f64 = 56.0;
+const DETAIL_META_GAP: f64 = 10.0;
+/// The mock's `.meta-table` `padding-top: 28px` above the first row and `gap: 11px` between rows.
+const DETAIL_META_PADDING_TOP: f64 = 28.0;
+const DETAIL_META_ROW_GAP: f64 = 11.0;
+/// The mock's `.meta-v` `line-height: 1.45` at 12px.
+const DETAIL_META_LINE_H: f64 =
+    crate::theme::line_height(crate::theme::FONT_CAPTION, DETAIL_META_LINE_HEIGHT_RATIO);
+// The mock's `.meta-table` margin-top: auto: the table is the last child of the scrolling
+// column, so it rests on the pane's bottom edge when the body is shorter than the pane. The table
+// lives INSIDE that scroll area -- pinned above it, it would cover the long text it describes.
 /// Fixed outer width shared by text, code, and image details to prevent horizontal jumps.
 const DETAIL_MAX_W: f64 = 640.0;
 /// Code details use the same fixed width; with soft wrap off, native horizontal scrolling shows
 /// long lines.
+#[cfg(test)]
 const DETAIL_CODE_MAX_W: f64 = DETAIL_MAX_W;
 /// Safety columns reserved for scrollers and the font's actual advance width.
 const DETAIL_CODE_WRAP_SAFETY: usize = 4;
+/// The mock's `.meta-table` column width at its narrow breakpoint (50px + 10px gap).
+const DETAIL_META_LABEL_W_COMPACT: f64 = 50.0;
+/// The meta table switches to the compact label column when the body is narrower than this:
+/// the mock's single-pane layout, where the value column would otherwise be squeezed.
+const DETAIL_META_COMPACT_BELOW: f64 = 420.0;
 /// vertical safety margin for the detail panel.
 const DETAIL_SCREEN_MARGIN: f64 = 8.0;
-/// Match the detail body's minimum height to one history-list row; toolbar and footer are extra.
-const DETAIL_TEXT_MIN_H: f64 = ROW_H;
-const DETAIL_PANEL_MIN_H: f64 = DETAIL_TEXT_MIN_H + DETAIL_CHROME_H;
-/// max inner image width after fixed-panel padding.
-const DETAIL_IMAGE_MAX_W: f64 = DETAIL_MAX_W - DETAIL_PAD * 2.0;
+// The detail panel's minimum body height: decoupled from ROW_H (the list row is the mock's
+// 40px; the detail pane's floor is the old 78pt reading surface), but it may not shrink below
+// the meta table's own required height (see `detail_pane_metrics`).
+const DETAIL_TEXT_MIN_H: f64 = 78.0;
 /// Detail preview max edge (px): ~89% native density on a retina 640pt panel; generated
 /// once on the first detail open and cached as `{hash}.detail`, never held in RAM (RAM
 /// still keeps only the 480px thumbnail).
@@ -750,18 +941,41 @@ fn take_detail_visible() -> bool {
 /// selection -- with keyboard navigation the mouse may park on another row). NO_SELECTION
 /// when nothing is hovered. Maintained by mouseEntered/mouseExited.
 static HOVER_ROW: Mutex<usize> = Mutex::new(NO_SELECTION);
-/// Incremental visual views for materialized rows (tile, selection bar + 3 action buttons);
-/// ROW_VIEW_INDICES maps them back to the full display list.
+/// Incremental visual views for materialized rows (group header + its clear button, tile,
+/// content + the action buttons); ROW_VIEW_INDICES maps them back to the full display list.
 #[derive(Clone, Copy)]
 struct RowHoverViews {
     group_label: Option<ObjPtr>,
+    /// The group header's "clear" button -- a per-row view like the label it sits beside, so it is
+    /// torn down and re-created with the row instead of outliving the day group it belongs to.
+    group_clear: Option<ObjPtr>,
     tile: ObjPtr,
-    bar: ObjPtr,
     content: ObjPtr,
-    meta: ObjPtr,
     pin: ObjPtr,
-    details: ObjPtr,
     del: ObjPtr,
+}
+
+impl RowHoverViews {
+    /// Every view this row owns. Destructured exhaustively on purpose: a new field stops compiling
+    /// here until it is added to the list, so a view cannot be created without also being torn down.
+    fn owned(self) -> [Option<ObjPtr>; 6] {
+        let RowHoverViews {
+            group_label,
+            group_clear,
+            tile,
+            content,
+            pin,
+            del,
+        } = self;
+        [
+            group_label,
+            group_clear,
+            Some(tile),
+            Some(content),
+            Some(pin),
+            Some(del),
+        ]
+    }
 }
 static ROW_HOVER_VIEWS: MainThreadSlot<Vec<RowHoverViews>> = MainThreadSlot::new(Vec::new());
 /// Display indices for materialized row views; rows outside the viewport have no AppKit views.
@@ -804,17 +1018,10 @@ static PICKER_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> 
     MainThreadSlot::new(None);
 /// The empty-state hint view (shown when the history is empty / nothing matches). Tracked
 /// separately from row views so the next rebuild can remove it.
+static EMPTY_STATE_ICON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The empty state's "grant keychain access" button (only while the storage is unavailable).
 static EMPTY_STATE_ACTION: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-/// Process-lifetime cache for clipboard source icons; avoids decoding the same small icon from
-/// disk again on every row rebuild.
-struct CachedSourceIcon {
-    image: ObjPtr,
-    modified: Option<std::time::SystemTime>,
-}
-static SOURCE_ICON_CACHE: LazyLock<MainThreadSlot<HashMap<(String, u64), CachedSourceIcon>>> =
-    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct RowImageKey {
     image_hash: u64,
@@ -829,7 +1036,6 @@ fn next_ui_cache_recency() -> u64 {
 /// varies with the wrapped line count).
 static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 /// The filter pills' button pointers (one per tag; restyled on change/rebuild).
-static FILTER_PILLS: MainThreadSlot<Vec<ObjPtr>> = MainThreadSlot::new(Vec::new());
 /// Persistent clear-history action buttons, relaid out when the locale changes.
 static CLEAR_HISTORY_ACTION_BUTTONS: MainThreadSlot<Option<[ObjPtr; 2]>> =
     MainThreadSlot::new(None);
@@ -851,19 +1057,20 @@ struct DeletedClipboardEntry {
 static DELETED_CLIPBOARD_ENTRY: LazyLock<Mutex<Option<DeletedClipboardEntry>>> =
     LazyLock::new(|| Mutex::new(None));
 static DELETED_CLIPBOARD_GENERATION: AtomicU64 = AtomicU64::new(0);
-/// The active filter's underline (one shared view, moved under the active item).
-static FILTER_UNDERLINE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-fn localized_filter_labels() -> [String; 5] {
+pub(super) fn localized_filter_labels() -> [String; 6] {
     [
         t("clipboard.filter_all"),
         t("clipboard.filter_text"),
         t("clipboard.filter_image"),
         t("clipboard.filter_link"),
         t("clipboard.filter_code"),
+        t("clipboard.filter_pinned"),
     ]
 }
 /// the top search field.
 static SEARCH_FIELD: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// Rounded search surface drawn behind NSSearchField, whose cell paints over its own layer.
+pub(super) static SEARCH_FIELD_SURFACE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The search field clear × hover state.
 static SEARCH_CLEAR_HOVERED: AtomicBool = AtomicBool::new(false);
 /// The real click button over the hand-drawn ×; rendering remains in the cell.
@@ -874,8 +1081,9 @@ static PICKER_CLOSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new
 /// smoke runner can assert its controls against the live view tree, not just against geometry.
 static PICKER_HEADER_STRIP: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The header's settings button, next to the close button (same persistence).
-static PICKER_SETTINGS_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_OPTIONS_ORB: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The panel-level pin button (the corner row's third glyph). Distinct from the per-row entry pin.
+static PICKER_DETAIL_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static PICKER_PIN_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
 /// carries NO placeholder property, so the field editor never draws the placeholder
@@ -981,6 +1189,18 @@ struct ScrollDragState {
 static SCROLL_DRAG: Mutex<Option<ScrollDragState>> = Mutex::new(None);
 /// the detail panel window (right-arrow expands).
 static DETAIL_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// What the picker's body shows: the list, or the detail that took its place. The narrow panel
+/// expands INSIDE itself (the mock's `@media (max-width: 840px)` branch hides `.list-pane` and
+/// gives `.detail-pane` the whole panel), so the two are alternate contents of one rect and only
+/// one of them is ever installed.
+static PICKER_PANE_MODE: MainThreadSlot<PickerPaneMode> = MainThreadSlot::new(PickerPaneMode::List);
+
+/// See `PICKER_PANE_MODE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PickerPaneMode {
+    List,
+    Detail,
+}
 /// The detail panel's installed backdrop (glass view + inactive compensation layer inside).
 static DETAIL_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
     MainThreadSlot::new(None);
@@ -1097,43 +1317,190 @@ pub(crate) fn picker_footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
 /// The A2 contrast scenario used to frame this row from a constant, and the constant fell out of step
 /// with the layout (the row sits below the search field, which moved): the capture then covered the gap
 /// between two rows and reported "a band changed, that is not text" for every material. Reporting the
-/// live union of the pills removes that second source of truth, the same way the footer captions and the
-/// grip already report theirs.
+/// reports the options orb's rect (the popover is closed or not built); once the popover exists
+/// it reports the union of its row rects instead, so the A2 contrast capture follows the real
+/// filter UI either way.
 pub(crate) fn picker_filter_row_rect_top_left() -> Option<(f64, f64, f64, f64)> {
-    let pills = FILTER_PILLS.lock().unwrap();
-    let mut union: Option<(f64, f64, f64, f64)> = None;
-    for pill in pills.iter() {
-        if pill.0.is_null() {
-            continue;
+    if filter_popover_open() {
+        if let Some(rect) = filter_popover_rows_union() {
+            return Some(rect);
         }
-        let frame: NSRect = unsafe { msg_send![pill.0, frame] };
-        if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
-            continue;
-        }
-        union = Some(match union {
-            None => (
-                frame.origin.x,
-                frame.origin.y,
-                frame.size.width,
-                frame.size.height,
-            ),
-            Some((x, y, w, h)) => {
-                let min_x = x.min(frame.origin.x);
-                let min_y = y.min(frame.origin.y);
-                let max_x = (x + w).max(frame.origin.x + frame.size.width);
-                let max_y = (y + h).max(frame.origin.y + frame.size.height);
-                (min_x, min_y, max_x - min_x, max_y - min_y)
-            }
-        });
     }
-    union
+    let orb = (*PICKER_OPTIONS_ORB.lock().unwrap())?;
+    if orb.0.is_null() {
+        return None;
+    }
+    let frame: NSRect = unsafe { msg_send![orb.0, frame] };
+    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+        return None;
+    }
+    Some((
+        frame.origin.x,
+        frame.origin.y,
+        frame.size.width,
+        frame.size.height,
+    ))
 }
 
-/// The drag handle's hit band in the picker's own points, top-left origin. The A2 drag scenario has
-/// to start its gesture on the real band: a rect derived from the panel frame would put this
-/// module's geometry into the test, where a later change to it could not be noticed.
+/// Whether the options popover is currently open (`--e2e-state`'s `filter_popover_open`).
+pub(crate) fn filter_popover_open() -> bool {
+    FILTER_POPOVER_OPEN.load(Ordering::SeqCst)
+}
+static FILTER_POPOVER_OPEN: AtomicBool = AtomicBool::new(false);
+/// The open popover's FILTER-row union in the picker's own points, top-left origin (`.filter-row`
+/// cells only -- the contrast scenario measures text, not the title/tail). The orb is the fallback
+/// while the popover is not built.
+fn filter_popover_rows_union() -> Option<(f64, f64, f64, f64)> {
+    let popover = (*FILTER_POPOVER.lock().unwrap())?;
+    if popover.0.is_null() {
+        return None;
+    }
+    let frame: NSRect = unsafe { msg_send![popover.0, frame] };
+    // The popover is positioned in the content parent's own (bottom-up) coordinates; the union is
+    // reported top-left like every other rect this module hands to a scenario.
+    let parent = (*PICKER_CONTENT_PARENT.lock().unwrap())?;
+    let bounds: NSRect = unsafe { msg_send![parent.0, bounds] };
+    let parent_flipped: objc2::runtime::Bool = unsafe { msg_send![parent.0, isFlipped] };
+    let popover_top = detail::top_offset_of(
+        frame.origin.y,
+        bounds.size.height,
+        frame.size.height,
+        parent_flipped.as_bool(),
+    );
+    let rows_top = popover_top + POPOVER_PAD + POPOVER_TITLE_H;
+    let rows_h =
+        model::CLIP_FILTER_ROWS.len() as f64 * detail::filter_popover_row_h(bounds.size.height);
+    Some((
+        frame.origin.x + POPOVER_PAD,
+        rows_top,
+        frame.size.width - POPOVER_PAD * 2.0,
+        rows_h,
+    ))
+}
+/// The options orb's 5px accent dot (the mock's `.orb-dot`), shown only while the active
+/// filter is not "All".
+pub(super) static OPTIONS_ORB_DOT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// Toggle the options popover's open flag; the popover view is created/destroyed by the
+/// detail module on this transition.
+pub(crate) fn toggle_filter_popover() {
+    let open = !FILTER_POPOVER_OPEN.load(Ordering::SeqCst);
+    if open {
+        POPOVER_KEY_ROW.store(usize::MAX, Ordering::SeqCst);
+    }
+    FILTER_POPOVER_OPEN.store(open, Ordering::SeqCst);
+    unsafe { detail::sync_filter_popover(open) };
+}
+/// Record the popover's open state without a transition (panel hide / programmatic dismiss).
+pub(crate) fn set_filter_popover_open(open: bool) {
+    FILTER_POPOVER_OPEN.store(open, Ordering::SeqCst);
+}
+
+/// Apply a reloaded clear-all preference without retaining a popover whose visible row order was
+/// built from the previous value.
+pub(crate) fn refresh_clear_actions_after_config_change() {
+    if filter_popover_open() {
+        detail::dismiss_filter_popover();
+    }
+    text_style::update_clear_action_labels();
+}
+/// The options popover view itself (built lazily by `toggle_filter_popover`).
+pub(super) static FILTER_POPOVER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The keyboard-highlighted row inside the open popover (usize::MAX = pointer/none).
+pub(super) static POPOVER_KEY_ROW: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(usize::MAX);
+
+// Menu metrics follow clipboard-v2-1.html's .popover, .filter-row and .clean-row rules.
+pub(super) const POPOVER_W: f64 = 236.0;
+pub(super) const POPOVER_PAD: f64 = 6.0;
+pub(super) const POPOVER_R: f64 = 18.0;
+pub(super) const POPOVER_ROW_H: f64 = 32.0;
+/// The lowest the menu rows shrink in a short panel, preserving the documented 28pt hit target.
+pub(super) const POPOVER_MIN_ROW_H: f64 = 28.0;
+pub(super) const POPOVER_ROW_R: f64 = 8.0;
+pub(super) const POPOVER_INSET: f64 = 8.0;
+pub(super) const POPOVER_GLYPH_W: f64 = 14.0;
+pub(super) const POPOVER_COLUMN_GAP: f64 = 9.0;
+pub(super) const POPOVER_TEXT_SIZE: f64 = 13.0;
+pub(super) const POPOVER_META_SIZE: f64 = 12.0;
+pub(super) const POPOVER_TEXT_H: f64 = 18.0;
+
+pub(super) fn popover_muted(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.secondary_text
+    } else {
+        0x48453FFF
+    }
+}
+
+pub(super) fn popover_danger(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.destructive
+    } else {
+        0x882318FF
+    }
+}
+
+pub(super) fn popover_hover_bg(palette: crate::theme::UiPalette, danger: bool) -> u32 {
+    if danger && !palette.dark {
+        0xB3372A12
+    } else {
+        palette.hover_bg
+    }
+}
+/// `.pop-title` 12px semibold with 6px/5px vertical padding.
+pub(super) const POPOVER_TITLE_H: f64 = 23.0;
+/// `.pop-divider` 1px hairline with 6px vertical margins.
+pub(super) const POPOVER_DIVIDER_H: f64 = 13.0;
+/// `.popover { right: 14px; top: 70px }` -- anchored to the panel edge under the orbs.
+pub(super) const POPOVER_RIGHT_INSET: f64 = 14.0;
+pub(super) const POPOVER_TOP: f64 = 70.0;
+/// The gap the popover keeps from the panel's bottom edge when the panel is too short to hold the
+/// whole menu below `POPOVER_TOP` (it is pulled up rather than clipped).
+pub(super) const POPOVER_BOTTOM_INSET: f64 = 8.0;
+/// Number of visible housekeeping rows below the hairline (optional 全部清除, then 设置…).
+pub(super) fn popover_tail_row_count() -> usize {
+    usize::from(text_style::clear_all_button_visible()) + 2
+}
+/// The popover's light-mode fill (`--menu-solid` in the mock), drawn in `build_filter_popover`
+/// and read by the check-on-wash contrast test so the two can never drift apart.
+pub(super) const PICKER_POPOVER_SURFACE_LIGHT: u32 = 0xD6D2CAFF;
+/// The `.filter-row.is-active` wash and the hover wash (light only; dark keeps hover_bg).
+pub(super) fn picker_popover_active_bg(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.hover_bg
+    } else {
+        0x2F6FED1A
+    }
+}
+/// `.filter-row.is-active:hover`: the active row's hover deepens the accent wash
+/// (`--accent-wash-strong`) instead of switching to the generic one (light only).
+pub(super) fn picker_popover_active_hover_bg(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.hover_bg
+    } else {
+        0x2F6FED29
+    }
+}
+/// The `.filter-row .check` ink: the mock's `--accent-strong` (#2359c7). Dark keeps the
+/// accent -- the deeper blue reads as a shadow on the dark surface.
+pub(super) fn popover_check_color(palette: crate::theme::UiPalette) -> u32 {
+    if palette.dark {
+        palette.accent
+    } else {
+        0x2359_C7FF
+    }
+}
+
+/// The picker's top drag band in the picker's own points, top-left origin. The A2 drag scenario has
+/// to start its gesture on a real blank part of the panel: a rect derived from the panel frame would
+/// put this module's geometry into the test, where a later change to it could not be noticed.
+///
+/// The name is historical (the field is `grip` in the `--e2e-state` document, and the A2 scenario
+/// reads it): the three-dot handle is gone, and every blank region of the panel now drags, but this
+/// band stays the reported start area because it is the one region guaranteed to hold no control
+/// whatever the locale or the list contents.
 pub(crate) fn picker_grip_rect_top_left() -> Option<(f64, f64, f64, f64)> {
-    let frame = picker_grip_frame();
+    let frame = picker_drag_band_frame();
     Some((
         frame.origin.x,
         frame.origin.y,
@@ -1166,7 +1533,7 @@ pub(crate) fn picker_configured_screen_top_left() -> Option<(f64, f64, f64, f64)
 /// The settings button's frame in the picker's own points, top-left origin (None until the header
 /// has been built). Read from the live view so the reported rect is the one the user can click.
 pub(crate) fn picker_settings_rect_top_left() -> Option<(f64, f64, f64, f64)> {
-    let button = (*PICKER_SETTINGS_BUTTON.lock().unwrap())?;
+    let button = (*PICKER_OPTIONS_ORB.lock().unwrap())?;
     unsafe {
         let frame: NSRect = msg_send![button.0, frame];
         Some((
@@ -1277,51 +1644,64 @@ mod tests {
 
     use super::{
         cache_generation, clip_image_detail_path, clip_image_path, effective_hover_row,
-        estimated_entry_bytes, fnv1a64, header_strip_h, picker_grip_frame, picker_header_frames,
-        rect_contains_point, run_image_cache_job, scroll_indicator_geometry,
+        estimated_entry_bytes, fnv1a64, header_strip_h, picker_drag_band_frame,
+        picker_header_frames, rect_contains_point, run_image_cache_job, scroll_indicator_geometry,
         wipe_cache_for_discard, ClipEntry, ImageCacheJob, ImageEntry, CLIP_HISTORY, NO_SELECTION,
-        NSPASTEBOARD_TYPE_PNG, PICKER_CLOSE_BTN_GAP, PICKER_W, SCROLL_INDICATOR_CORNER_RESERVE,
-        SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
+        NSPASTEBOARD_TYPE_PNG, PICKER_CLOSE_BTN_GAP, PICKER_CLOSE_BTN_SIZE, PICKER_ORB_SIZE,
+        PICKER_W, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::sync::Arc;
     #[test]
     fn picker_header_separates_the_four_corner_controls() {
-        let (search, pin, gear, close) = picker_header_frames();
+        let (search, options, detail, pin, close) = picker_header_frames();
         // The row is inset symmetrically from the strip's edges and all three buttons are square.
         assert_eq!(search.origin.x, SEARCH_PAD_X);
         assert_eq!(search.origin.y, TOP_PAD_Y);
         assert_eq!(close.origin.x + close.size.width, PICKER_W - SEARCH_PAD_X);
         assert_eq!(close.size.width, close.size.height);
-        assert_eq!(pin.size, close.size);
-        assert_eq!(gear.size, close.size);
+        // The mock's `.orb` trio (options/detail/pin) are equal 34pt circles; the close keeps
+        // its own smaller rect (`.close-btn` 30pt wide).
+        assert_eq!(options.size, detail.size);
+        assert_eq!(detail.size, pin.size);
+        assert_eq!(pin.size.width, PICKER_ORB_SIZE);
+        assert_eq!(close.size.width, PICKER_CLOSE_BTN_SIZE);
         // Every control is clear of the one before it: the close button is never drawn over the
         // gear, the gear never over the pin, the pin never over the query/⌘F keycap, and none of
         // the four overlap whichever label is longest.
-        assert!(search.origin.x + search.size.width < pin.origin.x);
-        assert!(pin.origin.x + pin.size.width < gear.origin.x);
-        assert!(gear.origin.x + gear.size.width < close.origin.x);
+        assert!(search.origin.x + search.size.width < options.origin.x);
+        assert!(options.origin.x + options.size.width < detail.origin.x);
+        assert!(detail.origin.x + detail.size.width < pin.origin.x);
+        assert!(pin.origin.x + pin.size.width < close.origin.x);
         // The three buttons are evenly spaced by the one gap constant, so the row reads as a group.
         assert_eq!(
-            gear.origin.x - (pin.origin.x + pin.size.width),
+            detail.origin.x - (options.origin.x + options.size.width),
             PICKER_CLOSE_BTN_GAP
         );
         assert_eq!(
-            close.origin.x - (gear.origin.x + gear.size.width),
+            pin.origin.x - (detail.origin.x + detail.size.width),
+            PICKER_CLOSE_BTN_GAP
+        );
+        assert_eq!(
+            close.origin.x - (pin.origin.x + pin.size.width),
             PICKER_CLOSE_BTN_GAP
         );
         // All four stay inside the fixed strip (never over the filters row or the list).
         let strip_bottom = header_strip_h();
-        for frame in [search, pin, gear, close] {
+        for frame in [search, options, detail, pin, close] {
             assert!(frame.origin.y + frame.size.height <= strip_bottom);
         }
-        // The drag handle is the WHOLE top bar: it sits in the top padding the strip already reserves
+        // The drag band is the WHOLE top bar: it sits in the top padding the strip already reserves
         // (so it adds no height), spans the panel's full width, and ends exactly where the search row
         // begins -- which is also why it cannot reach any of the three controls.
-        let grip = picker_grip_frame();
-        assert_eq!(grip.origin.x, 0.0);
-        assert_eq!(grip.size.width, PICKER_W);
-        assert_eq!(grip.origin.y + grip.size.height, search.origin.y);
+        let band = picker_drag_band_frame();
+        assert_eq!(band.origin.x, 0.0);
+        assert_eq!(band.size.width, PICKER_W);
+        assert_eq!(band.origin.y + band.size.height, search.origin.y);
+        assert!(
+            band.size.height >= 12.0,
+            "the top drag band must stay a usable press target"
+        );
     }
     #[test]
     fn incremental_row_delete_declines_an_empty_result() {
@@ -1536,6 +1916,34 @@ mod tests {
             source_app: source.to_string(),
             source_key: String::new(),
             copied_at: None,
+        }
+    }
+    /// A text entry copied at `ts`: the day-group tests need an entry in a known group.
+    fn entry_at(text: &str, ts: Option<u64>) -> ClipEntry {
+        ClipEntry {
+            copied_at: ts,
+            ..entry(text)
+        }
+    }
+    /// An image entry copied at `ts`.
+    fn entry_image_at(png: &[u8], ts: Option<u64>) -> ClipEntry {
+        ClipEntry {
+            copied_at: ts,
+            ..entry_image(png)
+        }
+    }
+    /// A timestamp exactly `days` local calendar days before `now`. Derived by walking back an hour
+    /// at a time from `day_no` itself, so a fixture stays correct across a DST transition (where
+    /// `now - days * 86_400` can land two calendar days back).
+    fn ts_with_day_delta(now: u64, days: i64) -> u64 {
+        let today = super::day_no(now);
+        let mut ts = now;
+        loop {
+            if today - super::day_no(ts) == days {
+                return ts;
+            }
+            assert!(ts > 3600, "no timestamp {days} days before {now}");
+            ts -= 3600;
         }
     }
     /// An 8x8 solid PNG: real, decodable bytes for the tests that must actually generate a preview
@@ -2349,6 +2757,138 @@ mod tests {
         let removed = remove_history_scope(&mut history, true, ClipFilter::All, "nothing matches");
         assert_eq!(removed.len(), 0);
         assert_eq!(history.len(), 1);
+    }
+
+    /// A group header's "clear" narrows the visible scope to one day group; it never widens it.
+    /// The defect it pins: the first implementation filtered the history by date alone, so clearing
+    /// "today" under the Image filter deleted the day's hidden text entries as well.
+    #[test]
+    fn a_day_group_clear_only_takes_what_is_on_screen() {
+        use super::{remove_day_group_scope, ClipFilter, DayGroup};
+        let now = super::now_secs();
+        let yesterday = Some(ts_with_day_delta(now, 1));
+        let mut history = vec![
+            entry_at("today text", Some(now)),
+            entry_image_at(b"today image", Some(now)),
+            entry_image_at(b"yesterday image", yesterday),
+            entry_at("yesterday text", yesterday),
+        ];
+        // Image filter: the day group intersects it, so only today's image goes.
+        let removed =
+            remove_day_group_scope(&mut history, false, ClipFilter::Image, "", DayGroup::Today);
+        assert_eq!(removed.len(), 1);
+        assert!(removed[0].image.is_some());
+        assert_eq!(
+            texts(&history),
+            vec!["today text", "", "yesterday text"],
+            "an entry the filter hides must survive the group clear"
+        );
+    }
+
+    /// The search query is the other half of the visible scope: a group clear takes the matching
+    /// rows of that day, not the whole day.
+    #[test]
+    fn a_day_group_clear_follows_the_search_query() {
+        use super::{remove_day_group_scope, ClipFilter, DayGroup};
+        let now = super::now_secs();
+        let mut history = vec![
+            entry_at("apple today", Some(now)),
+            entry_at("banana today", Some(now)),
+            entry_at("apple yesterday", Some(ts_with_day_delta(now, 1))),
+        ];
+        let removed = remove_day_group_scope(
+            &mut history,
+            false,
+            ClipFilter::All,
+            "apple",
+            DayGroup::Today,
+        );
+        assert_eq!(texts(&removed), vec!["apple today"]);
+        assert_eq!(
+            texts(&history),
+            vec!["banana today", "apple yesterday"],
+            "the query's non-matches and the other day both survive"
+        );
+    }
+
+    /// The day boundary is a hard edge: clearing Today cannot reach Yesterday or Earlier, and the
+    /// group with nothing visible removes nothing.
+    #[test]
+    fn a_day_group_clear_stops_at_the_day_boundary() {
+        use super::{remove_day_group_scope, ClipFilter, DayGroup};
+        let now = super::now_secs();
+        let mut history = vec![
+            entry_at("today", Some(now)),
+            entry_at("yesterday", Some(ts_with_day_delta(now, 1))),
+            entry_at("earlier", Some(ts_with_day_delta(now, 3))),
+            entry_at("legacy without a timestamp", None),
+        ];
+        let removed =
+            remove_day_group_scope(&mut history, false, ClipFilter::All, "", DayGroup::Today);
+        assert_eq!(texts(&removed), vec!["today"]);
+        assert_eq!(
+            texts(&history),
+            vec!["yesterday", "earlier", "legacy without a timestamp"]
+        );
+        // Yesterday is equally narrow.
+        let removed = remove_day_group_scope(
+            &mut history,
+            false,
+            ClipFilter::All,
+            "",
+            DayGroup::Yesterday,
+        );
+        assert_eq!(texts(&removed), vec!["yesterday"]);
+        // A group whose visible set is empty (Image filter, no image today) removes nothing.
+        let before = texts(&history);
+        let removed = remove_day_group_scope(
+            &mut history,
+            false,
+            ClipFilter::Image,
+            "",
+            DayGroup::Earlier,
+        );
+        assert!(removed.is_empty());
+        assert_eq!(texts(&history), before);
+    }
+
+    /// Same pinned rule as the plain clear: a pinned entry survives a group clear, and only the
+    /// explicit "clear all" takes it.
+    #[test]
+    fn a_day_group_clear_keeps_pinned_entries_unless_clear_all_asks() {
+        use super::{remove_day_group_scope, ClipFilter, DayGroup};
+        let now = super::now_secs();
+        let mut pinned = entry_at("pinned today", Some(now));
+        pinned.pinned = true;
+        let mut history = vec![pinned, entry_at("plain today", Some(now))];
+        let removed =
+            remove_day_group_scope(&mut history, false, ClipFilter::All, "", DayGroup::Today);
+        assert_eq!(texts(&removed), vec!["plain today"]);
+        assert_eq!(texts(&history), vec!["pinned today"]);
+        let removed =
+            remove_day_group_scope(&mut history, true, ClipFilter::All, "", DayGroup::Today);
+        assert_eq!(texts(&removed), vec!["pinned today"]);
+        assert!(history.is_empty());
+    }
+
+    /// The groups must run FORWARDS through the calendar: an entry copied before today is
+    /// `Yesterday` for exactly one day and `Earlier` after that. The day difference used to be
+    /// subtracted the wrong way round, which made `Yesterday` unreachable (the header never
+    /// appeared, the group-clear tag 1 never matched) and put every older entry in `Earlier`.
+    #[test]
+    fn day_groups_are_ordered_forwards_through_the_calendar() {
+        use super::{day_group, DayGroup};
+        let now = super::now_secs();
+        assert_eq!(day_group(Some(now)), DayGroup::Today);
+        assert_eq!(
+            day_group(Some(ts_with_day_delta(now, 1))),
+            DayGroup::Yesterday
+        );
+        assert_eq!(
+            day_group(Some(ts_with_day_delta(now, 2))),
+            DayGroup::Earlier
+        );
+        assert_eq!(day_group(None), DayGroup::Earlier);
     }
     #[test]
     fn a_delivered_preview_needs_a_current_generation_epoch_and_selection() {
@@ -3301,12 +3841,17 @@ mod tests {
     #[test]
     fn empty_state_hint_uses_the_live_viewport_height() {
         use super::{empty_state_doc_height, header_strip_h, picker_min_height, FOOTER_H};
-        // The empty-state minimum matches a full window containing three same-group records,
-        // including the first group's header.
+        // The empty-state minimum is at least a full window containing three same-group records,
+        // including the first group's header, and respects the picker floor.
         let min_h = picker_min_height();
-        assert_eq!(
-            min_h,
-            header_strip_h() + super::GROUP_H + super::ROW_H * 3.0 + FOOTER_H + super::PAD_Y
+        assert!(
+            min_h
+                >= (header_strip_h()
+                    + super::GROUP_H
+                    + super::ROW_H * 3.0
+                    + FOOTER_H
+                    + super::PAD_Y)
+                    .max(super::PICKER_MIN_HEIGHT)
         );
         let min_list_h = min_h - header_strip_h() - FOOTER_H;
         assert_eq!(empty_state_doc_height(min_list_h - 20.0), min_list_h);
@@ -3353,12 +3898,187 @@ mod tests {
     #[test]
     fn tab_filter_cycle_visits_every_category_and_wraps() {
         use super::{next_clip_filter, ClipFilter};
-        // Tab cycles in the UI's left-to-right filter order and wraps from the last item.
+        // Tab cycles in the options popover's row order and wraps from the last item.
         assert_eq!(next_clip_filter(ClipFilter::All), ClipFilter::Text);
         assert_eq!(next_clip_filter(ClipFilter::Text), ClipFilter::Image);
         assert_eq!(next_clip_filter(ClipFilter::Image), ClipFilter::Link);
         assert_eq!(next_clip_filter(ClipFilter::Link), ClipFilter::Code);
-        assert_eq!(next_clip_filter(ClipFilter::Code), ClipFilter::All);
+        assert_eq!(next_clip_filter(ClipFilter::Code), ClipFilter::Pinned);
+        assert_eq!(next_clip_filter(ClipFilter::Pinned), ClipFilter::All);
+    }
+    #[test]
+    fn the_pinned_filter_matches_only_pinned_entries() {
+        use super::{matches_filter, ClipFilter};
+        let mut pinned = entry("pinned");
+        pinned.pinned = true;
+        assert!(matches_filter(&pinned, ClipFilter::Pinned));
+        assert!(matches_filter(&pinned, ClipFilter::All));
+        assert!(!matches_filter(&entry("plain"), ClipFilter::Pinned));
+        let mut img = entry_image(b"png");
+        img.pinned = true;
+        assert!(matches_filter(&img, ClipFilter::Pinned));
+    }
+    #[test]
+    fn the_popover_frame_anchors_under_the_options_orb() {
+        use super::detail::{filter_popover_frame, top_offset_of};
+        use super::{POPOVER_PAD, POPOVER_RIGHT_INSET, POPOVER_TOP, POPOVER_W, SEARCH_H};
+        // The picker's content parent is a plain (bottom-up) NSView: the top-anchored offset the
+        // mock states is converted into its origin, so the popover's top edge really sits
+        // POPOVER_TOP below the panel's top.
+        let parent_h = 600.0;
+        let frame = filter_popover_frame(parent_h, false);
+        assert_eq!(
+            frame.origin.x + frame.size.width,
+            PICKER_W - POPOVER_RIGHT_INSET
+        );
+        assert_eq!(frame.size.width, POPOVER_W);
+        assert_eq!(
+            top_offset_of(frame.origin.y, parent_h, frame.size.height, false),
+            POPOVER_TOP
+        );
+        // The offset is below the head and the popover stays inside the panel.
+        assert!(
+            top_offset_of(frame.origin.y, parent_h, frame.size.height, false)
+                >= TOP_PAD_Y + SEARCH_H
+        );
+        assert!(frame.origin.y >= 0.0);
+        assert!(frame.origin.y + frame.size.height <= parent_h);
+        assert!(frame.origin.x >= 0.0);
+        let _ = POPOVER_PAD;
+        // A flipped parent (the convention the list container uses) needs no conversion at all.
+        let flipped = filter_popover_frame(parent_h, true);
+        assert_eq!(flipped.origin.y, POPOVER_TOP);
+    }
+
+    /// A short panel must still show the WHOLE menu: the picker shrinks to `picker_min_height`
+    /// when the list is short, and a fixed 296pt menu hung below the anchor lost its housekeeping
+    /// rows ("clear all", "settings…") off the panel's bottom edge. The rows compress just enough
+    /// that the menu fits, and never below `POPOVER_MIN_ROW_H`.
+    #[test]
+    fn a_short_panel_compresses_the_menu_instead_of_clipping_it() {
+        use super::detail::{
+            filter_popover_frame, filter_popover_height, filter_popover_row_h, filter_popover_top,
+            top_offset_of,
+        };
+        use super::{POPOVER_BOTTOM_INSET, POPOVER_MIN_ROW_H, POPOVER_ROW_H, POPOVER_TOP};
+        let rows = (super::CLIP_FILTER_ROWS.len() + super::popover_tail_row_count()) as f64;
+        // Roomy panel: the mock's row height and anchor, and the menu fits with room to spare.
+        assert_eq!(filter_popover_row_h(1000.0), POPOVER_ROW_H);
+        let tall_h = filter_popover_height(1000.0);
+        assert_eq!(filter_popover_top(1000.0, tall_h), POPOVER_TOP);
+        assert!(filter_popover_frame(1000.0, false).size.height == tall_h);
+        // Minimum-height panel: compressed rows, and every row still inside the panel.
+        let min_h = super::picker_min_height();
+        let row_h = filter_popover_row_h(min_h);
+        assert!(
+            row_h < POPOVER_ROW_H,
+            "a short panel must compress the rows"
+        );
+        assert!(
+            row_h >= POPOVER_MIN_ROW_H,
+            "rows must stay legible/clickable"
+        );
+        let h = filter_popover_height(min_h);
+        let top = filter_popover_top(min_h, h);
+        assert!(
+            top + h <= min_h + 0.001,
+            "the whole menu must fit the panel it is anchored to (top={top}, h={h}, panel={min_h})"
+        );
+        assert_eq!(h, super::detail::filter_popover_fixed_h() + rows * row_h);
+        let frame = filter_popover_frame(min_h, false);
+        assert_eq!(frame.size.height, h);
+        assert_eq!(
+            top_offset_of(frame.origin.y, min_h, frame.size.height, false),
+            top
+        );
+        // Bottom margin is respected unless the panel is shorter than the minimum row height
+        // allows; a degenerate panel pins the menu to the top rather than starting above it.
+        assert!(top + h + POPOVER_BOTTOM_INSET >= min_h - 0.001);
+        assert_eq!(filter_popover_top(10.0, h), 0.0);
+    }
+
+    /// One conversion for top-down layout: placing a child at a top offset and reading that offset
+    /// back must agree in both coordinate conventions, or a popover's rows would run upwards (and
+    /// its lowest rows could fall outside a short panel).
+    #[test]
+    fn a_top_anchored_offset_round_trips_in_both_conventions() {
+        use super::detail::{top_anchored_origin_y, top_offset_of};
+        for flipped in [false, true] {
+            for (container_h, child_h, top) in [
+                (600.0, 334.0, 60.0),
+                (334.0, 334.0, 60.0),
+                (300.0, 100.0, 0.0),
+            ] {
+                let origin = top_anchored_origin_y(top, container_h, child_h, flipped);
+                assert_eq!(top_offset_of(origin, container_h, child_h, flipped), top);
+            }
+        }
+        // Bottom-up: the child's origin is measured from the container's bottom edge, so a
+        // top-anchored 60pt child in a 600pt parent starts at 600 - 60 - 334.
+        assert_eq!(top_anchored_origin_y(60.0, 600.0, 334.0, false), 206.0);
+        assert_eq!(top_anchored_origin_y(60.0, 600.0, 334.0, true), 60.0);
+    }
+
+    /// A row's views are all owned by one list, built by an exhaustive destructure: adding a view
+    /// without adding it there does not compile, which is what keeps a per-row button (the group
+    /// clear) from outliving its row.
+    #[test]
+    fn a_row_owns_every_view_it_creates() {
+        use super::RowHoverViews;
+        let sentinel = |n: usize| super::ObjPtr::new(n as *mut objc2::runtime::AnyObject);
+        let view = RowHoverViews {
+            group_label: Some(sentinel(1)),
+            group_clear: Some(sentinel(2)),
+            tile: sentinel(3),
+            content: sentinel(4),
+            pin: sentinel(5),
+            del: sentinel(6),
+        };
+        let owned: Vec<usize> = view
+            .owned()
+            .into_iter()
+            .flatten()
+            .map(|ptr| ptr.0 as usize)
+            .collect();
+        assert_eq!(owned, vec![1, 2, 3, 4, 5, 6]);
+    }
+    #[test]
+    fn the_options_popover_rows_match_the_filter_order() {
+        use super::{localized_filter_labels, next_clip_filter, CLIP_FILTER_ROWS};
+        assert_eq!(CLIP_FILTER_ROWS.len(), localized_filter_labels().len());
+        // Every row's filter is reachable from All by walking the cycle.
+        let mut seen = vec![super::ClipFilter::All];
+        for _ in 1..CLIP_FILTER_ROWS.len() {
+            seen.push(next_clip_filter(*seen.last().unwrap()));
+        }
+        assert_eq!(seen, CLIP_FILTER_ROWS);
+    }
+    /// The active-row check sits on both accent washes (`.is-active` 10% and
+    /// `.is-active:hover` 16%): keep its composite contrast over the light menu surface
+    /// at the 3.5:1 meaning-bearing-glyph floor so a future token change cannot quietly
+    /// sink it (the hover wash currently leaves a ~0.03 margin).
+    #[test]
+    fn popover_check_keeps_the_glyph_contrast_floor_on_both_washes() {
+        use super::{
+            picker_popover_active_bg, picker_popover_active_hover_bg, popover_check_color,
+            PICKER_POPOVER_SURFACE_LIGHT,
+        };
+        use crate::theme::{color_rgb, composite_over, contrast_ratio};
+        let palette = crate::theme::ui_palette_for_mode(false);
+        let check = popover_check_color(palette);
+        // The same token `build_filter_popover` paints the light surface with.
+        let surface = PICKER_POPOVER_SURFACE_LIGHT;
+        for (wash, name) in [
+            (picker_popover_active_bg(palette), "is-active"),
+            (picker_popover_active_hover_bg(palette), "is-active:hover"),
+        ] {
+            let bg = composite_over(wash, surface);
+            let ratio = contrast_ratio(color_rgb(check), bg);
+            assert!(
+                ratio >= 3.5,
+                "check on the {name} wash measures {ratio:.2}:1 (min 3.5:1)"
+            );
+        }
     }
     #[test]
     fn compute_pitches_sizes_image_rows_for_the_thumbnail() {
@@ -3692,13 +4412,13 @@ mod tests {
         let texts = vec![old.clone(), today];
         let pitches = compute_pitches(&texts);
         assert_eq!(pitches[0], pitches[1]);
-        // Text and image rows share the uniform 61pt pitch -- equal after removing the
+        // Text and image rows share the uniform 40pt pitch -- equal after removing the
         // header.
         let mixed = vec![entry("a"), entry_image(b"png")];
         let p2 = compute_pitches(&mixed);
         assert_eq!(p2[1], p2[0] - GROUP_H);
-        // Sanity-check the pitch constant (guards regressions): a uniform 61pt row.
-        const { assert!(ROW_H >= 50.0 && ROW_H < 80.0) };
+        // Sanity-check the pitch constant (guards regressions): the mock's 40px row.
+        const { assert!((ROW_H - 40.0).abs() < f64::EPSILON) };
     }
 
     /// The row backdrop wash must resolve per the documented precedence: the selection owns
@@ -3712,17 +4432,16 @@ mod tests {
         use super::detail::row_backdrop_wash;
         for dark in [false, true] {
             let palette = crate::theme::ui_palette_for_mode(dark);
+            let selected = super::picker_row_selected(palette);
+            let hovered = super::picker_row_hover(palette);
             assert_eq!(
                 row_backdrop_wash(palette, true, true),
-                palette.selection_bg,
+                selected,
                 "selected+hovered must keep the selection wash ({} mode)",
                 if dark { "dark" } else { "light" }
             );
-            assert_eq!(
-                row_backdrop_wash(palette, true, false),
-                palette.selection_bg
-            );
-            assert_eq!(row_backdrop_wash(palette, false, true), palette.hover_bg);
+            assert_eq!(row_backdrop_wash(palette, true, false), selected);
+            assert_eq!(row_backdrop_wash(palette, false, true), hovered);
             // An idle row paints nothing: the panel's material is the surface, and a per-row surface would
             // band against it wherever a row does not cover the panel (see `glass::panel_ink`).
             assert_eq!(
@@ -3731,6 +4450,20 @@ mod tests {
                 "an idle row must be bare material ({} mode)",
                 if dark { "dark" } else { "light" }
             );
+            if dark {
+                // Dark mode keeps the measured shared palette.
+                assert_eq!(selected, palette.selection_bg);
+                assert_eq!(hovered, palette.hover_bg);
+            } else {
+                // Light mode follows the v2 mock and deliberately diverges from the shared palette
+                // until those tokens are promoted into `UiPalette`.
+                assert_eq!(selected, super::PICKER_ROW_SELECTED_LIGHT);
+                assert_eq!(hovered, super::PICKER_ROW_HOVER_LIGHT);
+                assert_ne!(
+                    selected, palette.selection_bg,
+                    "the light row wash is the mock's warm gray, not the shared blue selection"
+                );
+            }
         }
     }
 
@@ -3794,81 +4527,206 @@ mod tests {
             .source_range(NSRange::new(0, display_len));
         assert_eq!(source_range.length, source.encode_utf16().count());
     }
+    /// The meta table row order and values, as the mock's `renderDetail()` builds them:
+    /// 来源 / 类型 / 尺寸 / 大小 / 复制时间, with an em dash wherever the entry has nothing.
     #[test]
-    fn source_icon_visibility_follows_the_source_display_toggle() {
-        use super::should_show_source_icon;
-        let mut e = entry("copied");
-        e.source_key = "com.example.app".to_string();
-        assert!(should_show_source_icon(true, &e));
-        assert!(!should_show_source_icon(false, &e));
-        e.source_key.clear();
-        assert!(!should_show_source_icon(true, &e));
-    }
-    #[test]
-    fn build_meta_text_joins_app_and_relative_time() {
-        use super::build_meta_text;
-        let mut e = entry_with_source("hello", "Safari");
-        e.copied_at = Some(super::now_secs() - 5);
-        // toggle on + source + time (the mockup's "app · time"; no kind badge).
-        let m = build_meta_text(&e, true);
-        assert!(m.starts_with("Safari · "));
-        // Relative time is localized and parallel tests may change the global locale; verify
-        // only that its dynamic segment is present.
-        assert!(m.len() > "Safari · ".len(), "got {m}");
-        // Toggle off -> no source name, just the time.
-        let m2 = build_meta_text(&e, false);
-        assert!(!m2.contains("Safari"));
-        assert!(!m2.is_empty());
-        // Legacy (no timestamp) -> the source name only.
-        let legacy = entry_with_source("t", "Safari");
-        let ml = build_meta_text(&legacy, true);
-        assert_eq!(ml, "Safari");
-        // No source (toggle on) -> the "unknown source" placeholder.
-        let bare = entry("t");
+    fn meta_table_follows_the_mock_row_order_and_values() {
+        use super::{entry_kind_label, meta_table, MetaField};
         assert_eq!(
-            build_meta_text(&bare, true),
-            super::t("clipboard.unknown_source")
+            MetaField::ALL.map(MetaField::label_key),
+            [
+                "clipboard.meta_source",
+                "clipboard.meta_type",
+                "clipboard.meta_dimensions",
+                "clipboard.meta_size",
+                "clipboard.meta_copied_at",
+            ]
+        );
+        let mut e = entry_with_source("hello", "Safari");
+        e.copied_at = Some(1_755_000_000);
+        let rows = meta_table(&e, true);
+        assert_eq!(rows.len(), 5);
+        assert_eq!(rows[0].1, "Safari");
+        assert_eq!(rows[1].1, entry_kind_label(&e));
+        // Text has no pixel size, and this entry has no image.
+        assert_eq!(rows[2].1, "\u{2014}");
+        // 5 UTF-8 bytes of text: the mock's `sizeText` counts the bytes, not the characters.
+        assert_eq!(
+            rows[3].1,
+            super::tf("clipboard.meta_size_bytes", &[("count", "5")])
+        );
+        assert_eq!(rows[4].1, super::copied_at_label(1_755_000_000));
+        // Labels are localized, never the raw key.
+        assert!(rows
+            .iter()
+            .all(|(label, _)| !label.starts_with("clipboard.")));
+        // The "show source app" setting off hides the name and the em dash takes its place.
+        let hidden = meta_table(&e, false);
+        assert_eq!(hidden[0].1, "\u{2014}");
+        // A legacy entry without a timestamp shows the dash instead of a wrong time.
+        let legacy = entry_with_source("t", "Safari");
+        assert_eq!(meta_table(&legacy, true)[4].1, "\u{2014}");
+        // Code and links are named by their kind, not as plain text.
+        assert_eq!(
+            entry_kind_label(&entry("fn main() {}\n    let x = 1;")),
+            super::t("clipboard.filter_code")
+        );
+        assert_eq!(
+            entry_kind_label(&entry("https://example.com")),
+            super::t("clipboard.filter_link")
         );
     }
+
+    /// The size row counts the bytes of the payload (UTF-8 for text, the image's own bytes for an
+    /// image) in the mock's `sizeText` units: whole bytes below 1000, then one decimal of KB and
+    /// MB. The divisor is decimal because the printed unit is ("1000 bytes" is "1.0 KB", never
+    /// "0.98 KB" or "1.0 KiB").
     #[test]
-    fn build_meta_text_reports_source_line_count_after_time() {
-        use super::build_meta_text;
-        let mut e = entry_with_source("long text\n    ", "Safari");
-        e.copied_at = Some(super::now_secs() - 5);
-        let m = build_meta_text(&e, true);
-        assert!(m.starts_with("Safari · "));
-        let line_label = super::tf("clipboard.meta_lines_other", &[("count", "2")]);
-        assert!(m.ends_with(&line_label), "got {m}");
-        assert!(m.find(&line_label).unwrap() > m.find(" · ").unwrap());
-        // Soft wrapping from a long single line is not a source line break.
-        let single = entry_with_source(&"长".repeat(200), "Safari");
-        assert!(!build_meta_text(&single, true).contains(&line_label));
+    fn format_byte_size_uses_the_mocks_decimal_units() {
+        use super::format_byte_size;
+        assert_eq!(
+            format_byte_size(48),
+            super::tf("clipboard.meta_size_bytes", &[("count", "48")])
+        );
+        assert_eq!(
+            format_byte_size(999),
+            super::tf("clipboard.meta_size_bytes", &[("count", "999")])
+        );
+        assert_eq!(
+            format_byte_size(1000),
+            super::tf("clipboard.meta_size_kb", &[("size", "1.0")])
+        );
+        // The unit switches on the raw count (the mock's `sizeText`): at or above 1 MB the row
+        // reads in MB, and just below it stays in KB even when the number reaches four digits.
+        assert_eq!(
+            format_byte_size(411_648),
+            super::tf("clipboard.meta_size_kb", &[("size", "411.6")])
+        );
+        assert_eq!(
+            format_byte_size(1_433_600),
+            super::tf("clipboard.meta_size_mb", &[("size", "1.4")])
+        );
+        assert_eq!(
+            format_byte_size(999_999),
+            super::tf("clipboard.meta_size_kb", &[("size", "1000.0")])
+        );
+        assert_eq!(
+            format_byte_size(1_000_000),
+            super::tf("clipboard.meta_size_mb", &[("size", "1.0")])
+        );
+        assert_eq!(
+            format_byte_size(5_242_880),
+            super::tf("clipboard.meta_size_mb", &[("size", "5.2")])
+        );
+        // A multi-byte character is more than one byte: the row must not count characters.
+        let e = entry("长");
+        assert_eq!(super::entry_payload_bytes(&e), 3);
     }
+
+    /// Screen availability selects the HTML desktop split or narrow replacement.
     #[test]
-    fn physical_line_count_preserves_trailing_and_empty_lines() {
-        use super::physical_line_count;
-        assert_eq!(physical_line_count("single"), None);
-        assert_eq!(physical_line_count("first\nsecond"), Some(2));
-        assert_eq!(physical_line_count("first\n    "), Some(2));
-        assert_eq!(physical_line_count("first\n\n"), Some(3));
+    fn detail_pane_mode_switch_is_the_mocks_breakpoint() {
+        assert!(super::detail_expands_at_width(840.0));
+        assert!(!super::detail_expands_at_width(841.0));
+        let desktop = super::picker_layout(1440.0, true);
+        assert_eq!(desktop.panel_w, 960.0);
+        assert_eq!(desktop.list_w, 340.0);
+        assert_eq!(desktop.list_w + 1.0 + desktop.detail_w, desktop.panel_w);
+        let constrained = super::picker_layout(900.0, true);
+        assert!(constrained.split);
+        assert_eq!(constrained.panel_w, 884.0);
+        let narrow = super::picker_layout(600.0, true);
+        assert!(!narrow.split);
+        assert_eq!(narrow.panel_w, 584.0);
+        assert_eq!(narrow.detail_w, narrow.panel_w);
+        let collapsed = super::picker_layout(1440.0, false);
+        assert!(!collapsed.split);
+        assert_eq!(collapsed.panel_w, 640.0);
     }
+    /// The body rect is what the list and the in-pane detail take turns occupying: under the header
+    /// strip, above the footer, the full width.
     #[test]
-    fn format_copied_at_is_mm_dd_hh_mm() {
-        use super::format_copied_at;
-        // Timezone-independent structure assertion: length 11, shaped "MM-dd HH:mm".
-        let s = format_copied_at(1755000000);
-        assert_eq!(s.len(), 11, "got {s}");
-        assert_eq!(s.as_bytes()[2], b'-', "got {s}");
-        assert_eq!(s.as_bytes()[5], b' ', "got {s}");
-        assert_eq!(s.as_bytes()[8], b':', "got {s}");
-        // all-numeric fields.
-        let digits: Vec<u8> = s
-            .bytes()
-            .filter(|b| !matches!(b, b'-' | b' ' | b':'))
-            .collect();
-        assert_eq!(digits.len(), 8);
-        assert!(digits.iter().all(u8::is_ascii_digit));
+    fn detail_body_rect_is_the_picker_body() {
+        use super::{detail_content_frame, header_strip_h, FOOTER_H};
+        use objc2_foundation::NSSize;
+        let panel = NSSize::new(560.0, 584.0);
+        let frame = detail_content_frame(panel);
+        assert_eq!(frame.origin.x, 0.0);
+        assert_eq!(frame.origin.y, FOOTER_H);
+        assert_eq!(frame.size.width, panel.width);
+        assert_eq!(
+            frame.size.height,
+            panel.height - header_strip_h() - FOOTER_H
+        );
     }
+    /// The "尺寸" row comes from the PNG's own header, so it needs no AppKit: the crash that
+    /// made this a header read was an NSImage rep geometry proxy that had no `pixelsWide`.
+    #[test]
+    fn png_pixel_size_reads_the_ihdr() {
+        use super::png_pixel_size;
+        let mut png = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&1440u32.to_be_bytes());
+        png.extend_from_slice(&900u32.to_be_bytes());
+        png.extend_from_slice(&[8, 6, 0, 0, 0]);
+        assert_eq!(png_pixel_size(&png), Some((1440, 900)));
+        // Anything that is not a PNG header (a JPEG, a truncated buffer, a zero dimension) has
+        // no answer here, and the caller then shows the em dash rather than guessing.
+        assert_eq!(png_pixel_size(b"\xFF\xD8\xFF\xE0 not a png at all"), None);
+        assert_eq!(png_pixel_size(&png[..16]), None);
+        let mut zero = png.clone();
+        zero[16..20].copy_from_slice(&0u32.to_be_bytes());
+        assert_eq!(png_pixel_size(&zero), None);
+    }
+
+    /// The copy time in the detail pane carries the year, and it is written in one localized
+    /// phrase whose date units run largest to smallest (the mock's "2026年10月19日 08:56"), so a
+    /// copy from another year cannot read as this one.
+    #[test]
+    fn copied_at_label_is_an_ordered_date_and_time() {
+        let s = super::copied_at_label(1_755_000_000);
+        let shape = super::tf(
+            "clipboard.meta_copied_at_value",
+            &[
+                ("year", "<y>"),
+                ("month", "<m>"),
+                ("day", "<d>"),
+                ("time", "<t>"),
+            ],
+        );
+        let at = |field: &str| {
+            shape
+                .find(field)
+                .unwrap_or_else(|| panic!("missing {field} in {shape}"))
+        };
+        assert!(at("<y>") < at("<m>"), "got {shape}");
+        assert!(at("<m>") < at("<d>"), "got {shape}");
+        assert!(at("<d>") < at("<t>"), "got {shape}");
+        // Filling the template with the timestamp the value was rendered from must reproduce it
+        // exactly: the shape check above then holds for the rendered text too.
+        let (year, month, day, hour, minute) = {
+            let mut tm: crate::ffi::Tm = unsafe { std::mem::zeroed() };
+            let secs: i64 = 1_755_000_000;
+            unsafe { crate::ffi::localtime_r(&secs, &mut tm) };
+            (
+                tm.tm_year + 1900,
+                tm.tm_mon + 1,
+                tm.tm_mday,
+                tm.tm_hour,
+                tm.tm_min,
+            )
+        };
+        let filled = shape
+            .replace("<y>", &year.to_string())
+            .replace("<m>", &month.to_string())
+            .replace("<d>", &day.to_string())
+            .replace("<t>", &format!("{hour:02}:{minute:02}"));
+        assert_eq!(filled, s);
+        assert!(s.starts_with(&year.to_string()), "got {s}");
+        assert_eq!(s.matches(':').count(), 1, "got {s}");
+    }
+
     #[test]
     fn format_save_stamp_is_yyyy_mm_dd_hh_mm_ss_with_dots() {
         use super::format_save_stamp;
@@ -4154,41 +5012,59 @@ mod tests {
         // A tiny width floors at 1 unit (never 0).
         assert_eq!(detail_text_units(1.0), 1);
     }
+    /// The sizing helpers report the preview BODY's height; the panel adds the meta table and the
+    /// pane padding around it (the mock's detail pane is one column, body above table below).
     #[test]
-    fn detail_text_size_clamps_to_screen_height() {
-        use super::{detail_max_height, detail_text_size, TextKind};
+    fn detail_text_size_reports_body_height_capped_by_the_pane() {
+        use super::TextKind;
+        use crate::clipboard::{
+            detail_max_height, detail_pane_layout, detail_text_size, meta_table_row_count,
+        };
         use objc2_foundation::{NSPoint, NSRect, NSSize};
         let picker = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 400.0));
         let max_height = detail_max_height(picker);
-        // Short text -> the minimum; long text -> the picker height (scrolling only beyond it).
-        let (plain_w, plain_h) = detail_text_size("hi", TextKind::Plain, max_height);
+        // The detail never grows past the picker it stands beside: `detail_frame_for` places it
+        // inside the picker's vertical bounds, so a taller panel had no valid position (and the
+        // debug assertion there caught it at open).
+        assert_eq!(max_height, 400.0);
+        // The pane is a column: the body's share is the cap minus the mock's pane padding and the
+        // meta table (which can be zero here -- a 400pt picker is shorter than the table alone).
+        assert_eq!(
+            max_height,
+            detail_pane_layout(super::DETAIL_MAX_W, max_height, meta_table_row_count())
+                .scroll
+                .size
+                .height
+                + super::DETAIL_INSET_TOP
+                + super::DETAIL_INSET_BOTTOM
+        );
+        let (plain_w, one_line_h) = detail_text_size("hi", TextKind::Plain, max_height);
         assert_eq!(plain_w, super::DETAIL_MAX_W);
-        assert_eq!(plain_h, super::DETAIL_PANEL_MIN_H);
-        // Two lines must grow beyond the 78pt minimum, leaving room for both 11pt sides of
-        // textContainerInset; otherwise the document exceeds the scroll view and exposes a
-        // scrollbar despite having no content that should need scrolling.
+        assert_eq!(one_line_h, super::DETAIL_LINE_H);
         let (_, two_line_h) = detail_text_size("first\nsecond", TextKind::Plain, max_height);
+        assert_eq!(two_line_h, super::DETAIL_LINE_H * 2.0);
+        let (_, three_line_h) = detail_text_size("a\nb\nc", TextKind::Plain, max_height);
+        assert_eq!(three_line_h, super::DETAIL_LINE_H * 3.0);
+        // A long body stops at the pane's body share: beyond that the column scrolls. The body is
+        // a TextKit layout of the same string inside the content column, so the text must exceed
+        // that share at every supported width: a JSON-style indented document gives enough lines
+        // without a megabyte of input (estimate_lines floors a very long single line to one).
+        let long = "{\n  \"key\": \"value\",\n  \"list\": [1, 2, 3]\n},\n".repeat(2_500);
+        let pane = detail_pane_layout(super::DETAIL_MAX_W, max_height, meta_table_row_count());
+        let long_h = detail_text_size(&long, TextKind::Plain, max_height).1;
         assert_eq!(
-            two_line_h,
-            super::DETAIL_LINE_H * 2.0
-                + super::DETAIL_PAD * 2.0
-                + super::DETAIL_TEXT_INSET_H
-                + super::DETAIL_CHROME_H
+            long_h, pane.body_h,
+            "estimate produced {long_h}, pane body is {}",
+            pane.body_h
         );
-        assert!(two_line_h > super::DETAIL_PANEL_MIN_H);
-        let long = "a".repeat(200_000);
-        assert_eq!(
-            detail_text_size(&long, TextKind::Plain, max_height).1,
-            max_height
-        );
-        // Long code lines soft-wrap visually, while the detail panel still clamps to its height.
+        // Long code lines soft-wrap visually and hit the same cap.
         let long_code = "x".repeat(200_000);
         let (code_w, code_h) = detail_text_size(&long_code, TextKind::Code, max_height);
         assert_eq!(code_w, super::DETAIL_CODE_MAX_W);
-        assert_eq!(code_h, max_height);
+        assert_eq!(code_h, pane.body_h);
         // With wrapping off, the same long line occupies one visual line and overflows horizontally.
         let (_, no_wrap_h) = super::detail_unwrapped_code_size(&long_code, max_height);
-        assert_eq!(no_wrap_h, super::DETAIL_PANEL_MIN_H);
+        assert_eq!(no_wrap_h, super::DETAIL_LINE_H);
     }
     #[test]
     fn toggle_pin_on_roundtrips_pinned_state() {

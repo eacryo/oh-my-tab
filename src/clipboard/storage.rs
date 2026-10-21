@@ -401,7 +401,9 @@ fn run_full_purge_body() -> PurgeOutcome {
         return PurgeOutcome::Deferred;
     }
     PURGE_NOT_ACCEPTED.store(false, Ordering::SeqCst);
-    log_info!("Clipboard purge complete (history file, image cache, kept-aside copies and intent removed).");
+    log_info!(
+        "Clipboard purge complete (history file, image cache, kept-aside copies and intent removed)."
+    );
     PurgeOutcome::Done
 }
 

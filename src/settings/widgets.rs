@@ -155,7 +155,9 @@ pub(super) enum SettingsTextRole {
     Sidebar,
     Muted,
     Disabled,
-    Accent,
+    /// The selected sidebar item's ink on its flat nav tint (`nav_active_bg`); the mock's
+    /// `--nav-active-ink`, which replaces the accent-as-text role that used to sit there.
+    NavActive,
     /// Link-colored body text: external links. Text, so it carries the 4.5:1 text floor that
     /// `Accent` (3.40:1 on the light window) cannot.
     Link,
@@ -173,7 +175,7 @@ pub(super) fn settings_text_color(role: SettingsTextRole) -> *mut AnyObject {
         SettingsTextRole::Sidebar => palette.sidebar_text,
         SettingsTextRole::Muted => palette.muted_text,
         SettingsTextRole::Disabled => palette.disabled_text,
-        SettingsTextRole::Accent => palette.accent,
+        SettingsTextRole::NavActive => palette.nav_active_ink,
         SettingsTextRole::Link => palette.link_text,
         SettingsTextRole::LinkHover => palette.link_text_hover,
         SettingsTextRole::Destructive => palette.destructive,
@@ -285,6 +287,8 @@ pub(super) fn action_button_hover_color(tag: isize, palette: crate::theme::UiPal
     match tag {
         -2 => palette.accent_hover,
         -4 => palette.destructive_hover,
+        // Field-family buttons deepen the same wash on hover (`.btn:hover`/`--field-hover`).
+        -3 | -6 => palette.field_hover,
         // The transparent role: a full-row hit target whose owner draws the only visual state (the
         // selection wash). Painting it on hover would add a second highlight the design does not have.
         -5 => 0x0000_0000,
@@ -301,7 +305,7 @@ pub(super) fn action_button_normal_color(tag: isize, palette: crate::theme::UiPa
     match tag {
         -2 => palette.accent,
         -1 => palette.footer_button_bg,
-        -3 => palette.button_bg,
+        -3 | -6 => palette.field_bg,
         -4 => palette.destructive,
         // The transparent role's normal state is no fill at all (see `action_button_hover_color`).
         -5 => 0x0000_0000,
@@ -545,15 +549,25 @@ unsafe fn center_settings_button_label_for_width(button: *mut AnyObject, width: 
 
     let label_w = (width - 16.0).max(1.0);
     let measured: NSSize = msg_send![label, sizeThatFits: NSSize::new(label_w, 10_000.0)];
-    let text_h = if measured.height.is_finite() && measured.height > 0.0 {
+    let mut text_h = if measured.height.is_finite() && measured.height > 0.0 {
         measured.height.min(height.max(1.0))
     } else {
         height.max(1.0)
     };
-    let label_frame = NSRect::new(
-        NSPoint::new(8.0, (height - text_h).max(0.0) / 2.0),
-        NSSize::new(label_w, text_h),
-    );
+    // A frame shorter than the field's forced line box cannot hold the line: the glyphs draw at
+    // the forced height regardless and spill below the centred band. Grow the frame to at least
+    // the forced height (still capped by the button) before centring.
+    let forced = crate::ffi::text_field_forced_line_height(label);
+    if forced > text_h {
+        text_h = forced.min(height.max(1.0));
+    }
+    // The forced line box drops the glyphs below the frame's centre by its extra leading; shift
+    // the centred origin by that amount so the ink lands on the button's centre (as `center_label`
+    // does for row labels). The helper signs it for the superview's axis -- the button is flipped
+    // -- and an unforced label reports 0, keeping the plain centred origin.
+    let origin_y =
+        (height - text_h).max(0.0) / 2.0 + crate::ffi::text_field_line_height_correction(label);
+    let label_frame = NSRect::new(NSPoint::new(8.0, origin_y), NSSize::new(label_w, text_h));
     let _: () = msg_send![label, setFrame: label_frame];
 }
 
@@ -834,9 +848,22 @@ pub(super) fn sidebar_hover_tracker_class() -> *mut AnyObject {
     .0 as *mut AnyObject
 }
 
+/// Horizontal padding inside one sidebar item, from the mockup's
+/// `.nav-item { padding: 0 var(--sp-2) }` (`--sp-2: 8px`).
+pub(super) const SIDEBAR_ITEM_PAD_X: f64 = 8.0;
+/// The mockup's `.nav-icon { width: 17px; height: 17px }`.
+pub(super) const SIDEBAR_ICON_SIZE: f64 = 17.0;
+/// Gap between a sidebar item's icon and its label (`.nav-item { gap: var(--sp-2) }`).
+pub(super) const SIDEBAR_ICON_LABEL_GAP: f64 = 8.0;
+/// Leading x of a sidebar item's label: one item padding, the icon box, and the icon/label gap.
+pub(super) const SIDEBAR_LABEL_X: f64 =
+    SIDEBAR_ITEM_PAD_X + SIDEBAR_ICON_SIZE + SIDEBAR_ICON_LABEL_GAP;
+/// Trailing inset of a sidebar item's label; keeps text off the item's right edge.
+pub(super) const SIDEBAR_LABEL_TRAILING_INSET: f64 = 8.0;
+
 /// Measure one shared row height for all localized sidebar titles.
 pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[String]) -> f64 {
-    let label_width = (width - 48.0 - 8.0).max(1.0);
+    let label_width = (width - SIDEBAR_LABEL_X - SIDEBAR_LABEL_TRAILING_INSET).max(1.0);
     let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let field: *mut AnyObject = msg_send![
         field,
@@ -856,7 +883,9 @@ pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[
     }
     let _: () = msg_send![field, setPreferredMaxLayoutWidth: label_width];
 
-    let mut required_height = 40.0f64;
+    // One-line items keep the mockup's `.nav-item { height: 35px }`; a title that wraps to a
+    // second line grows the shared row rather than being clipped.
+    let mut required_height = 35.0f64;
     for title in titles {
         let title_ns = make_nsstring(title);
         let _: () = msg_send![field, setStringValue: title_ns];
@@ -865,8 +894,8 @@ pub(super) unsafe fn settings_sidebar_required_row_height(width: f64, titles: &[
         let _: () = msg_send![field, setFont: font];
         let measured: NSSize = msg_send![field, sizeThatFits: NSSize::new(label_width, 10_000.0)];
         if measured.height.is_finite() && measured.height > 0.0 {
-            // Keep a little vertical breathing room around two wrapped lines, while the
-            // 38pt floor preserves the existing one-line sidebar rhythm.
+            // Keep a little vertical breathing room around two wrapped lines; the 35pt floor is
+            // the design's one-line item height.
             required_height = required_height.max((measured.height + 8.0).ceil());
         }
     }
@@ -1248,8 +1277,13 @@ pub(super) unsafe fn make_label_with_role(
 
 /// Set a page heading with the tracking specified by the page-title type role.
 pub(super) unsafe fn set_page_title_text(label: *mut AnyObject, text: &str) {
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
+    // `systemFontOfSize:weight:` uses the same native SF family as the design's
+    // `SF Pro Display` / `SF Pro Text` stack and lets the CJK system fallback match too.
+    let font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: crate::theme::FONT_PAGE_TITLE,
+        weight: crate::theme::FONT_WEIGHT_PAGE_TITLE
+    ];
     let tracking: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: -0.4f64];
     let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let attributes: *mut AnyObject = msg_send![attributes, init];
@@ -1432,6 +1466,12 @@ pub(super) extern "C" fn about_header_click_view_mouse_down(
 
 /// Set a text field's value from anything Displayable, releasing the temp NSString.
 pub(super) unsafe fn set_field(field: *mut AnyObject, val: impl std::fmt::Display) {
+    // objc2 asserts on a nil receiver, and a settings row can legitimately be absent: the refreshers
+    // walk every known control by id, so a row retired from the page leaves a null handle behind.
+    // Writing to it would panic the whole settings window over a control nobody can see.
+    if field.is_null() {
+        return;
+    }
     let s = format!("{}", val);
     let ns = make_nsstring(&s);
     let _: () = msg_send![field, setStringValue: ns];
@@ -1689,8 +1729,9 @@ pub(super) use super::select::{
     clear_settings_select_registry, make_popup, settings_select_set_item_symbol,
 };
 
-pub(super) const HTML_SWITCH_W: f64 = 38.0;
-pub(super) const HTML_SWITCH_H: f64 = 22.0;
+/// The mock's `.switch`: 40×24, 18px knob at a 2px inset (CSS `index.html` `.switch::after`).
+pub(super) const HTML_SWITCH_W: f64 = 40.0;
+pub(super) const HTML_SWITCH_H: f64 = 24.0;
 pub(super) const HTML_SWITCH_KNOB_D: f64 = 18.0;
 // Keep switches on the same trailing edge as popup fields in the settings column.
 pub(super) const HTML_SWITCH_TRAILING_INSET: f64 = 0.0;
@@ -1963,7 +2004,7 @@ pub(super) extern "C" fn html_switch_hit_test(
     }
 }
 
-/// The switch's clickable rect: the visible 38x22 track, transparently padded to at least 28x28
+/// The switch's clickable rect: the visible 40x24 track, transparently padded to at least 28x28
 /// (design-style §10) and centred on the track (§9 fixes the visible size).
 pub(super) fn switch_hit_bounds(bounds: NSRect) -> NSRect {
     const MIN_HIT: f64 = 28.0;
@@ -2385,7 +2426,7 @@ unsafe fn set_sidebar_title_text(
 pub(super) unsafe fn set_sidebar_title(btn: *mut AnyObject, title: &str, selected: bool) {
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR];
     let color = settings_text_color(if selected {
-        SettingsTextRole::Accent
+        SettingsTextRole::NavActive
     } else {
         SettingsTextRole::Sidebar
     });
@@ -2420,7 +2461,7 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
         layer_set_background(layer, crate::ffi::hex_to_cg_color(fill));
     }
     let color = settings_text_color(if selected {
-        SettingsTextRole::Accent
+        SettingsTextRole::NavActive
     } else if hovered {
         SettingsTextRole::Primary
     } else {
@@ -3032,17 +3073,27 @@ pub(super) unsafe fn make_sidebar_button(
 
 /// Height of the label box a section heading is drawn in: `add_header` places the box's bottom
 /// edge at the caller's y and grows upwards by this much. The page-top rhythm needs the height to
-/// convert cursors, so it is exported here instead of that 20 being written out again elsewhere.
-pub(super) const SECTION_HEADER_H: f64 = 20.0;
+/// convert cursors, so it is exported here instead of being written out again elsewhere. The
+/// mock's `.section-title` box measures 14.99pt; 15 keeps it on our 4-point grid.
+pub(super) const SECTION_HEADER_H: f64 = 15.0;
 
-/// Bold section header label; released after being added to the parent.
+/// How far a section heading's text sits inside the card's left edge: the mock's
+/// `.section-title { margin-left: 4px }`. Applied inside `add_header` so every heading --
+/// sections and the search results' -- carries the same inset.
+pub(super) const SECTION_HEADER_X_INSET: f64 = 4.0;
+
+/// The mock's `.section-title { letter-spacing: 0.44px }`.
+const SECTION_HEADER_KERN: f64 = 0.44;
+
+/// Section header label in the mock's `.section-title` style (11pt semibold, tracked, muted);
+/// released after being added to the parent.
 pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![
         label,
         initWithFrame: NSRect::new(
-            NSPoint::new(x, y),
-            NSSize::new(w, SECTION_HEADER_H)
+            NSPoint::new(x + SECTION_HEADER_X_INSET, y),
+            NSSize::new((w - SECTION_HEADER_X_INSET).max(1.0), SECTION_HEADER_H)
         )
     ];
     // Keep localized wording intact: uppercase is a hierarchy channel English has but CJK does
@@ -3053,9 +3104,14 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION, weight: crate::theme::FONT_WEIGHT_SEMIBOLD];
+    let font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: crate::theme::FONT_SECTION_TITLE,
+        weight: crate::theme::FONT_WEIGHT_SEMIBOLD
+    ];
     let _: () = msg_send![label, setFont: font];
-    apply_settings_text_role(label, SettingsTextRole::Secondary);
+    apply_settings_text_role(label, SettingsTextRole::Muted);
+    crate::ffi::set_text_field_kern(label, SECTION_HEADER_KERN);
     // Adaptive: stretch width with the parent, stay top-anchored (MinYMargin).
     // Vertical placement belongs to the page layout owner (no MinYMargin).
     let _: () = msg_send![label, setAutoresizingMask: 2u64];
@@ -3291,8 +3347,11 @@ pub(super) unsafe fn add_row_with_label(
     let _: () = msg_send![label, setBezeled: false];
     let _: () = msg_send![label, setDrawsBackground: false];
     let _: () = msg_send![label, setEditable: false];
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: crate::theme::FONT_CONTROL,
+        weight: crate::theme::FONT_WEIGHT_SETTING_LABEL
+    ];
     let _: () = msg_send![label, setFont: font];
     // Left-aligned: the row label hugs the content area's left edge (NSTextAlignmentLeft = 0,
     // identical on arm64 and x86_64).
@@ -3386,6 +3445,197 @@ pub(super) unsafe fn add_described_row(
     (title_label, control)
 }
 
+/// The text block of one settings row, without its control: the shared title/caption typography and
+/// placement (`FONT_CONTROL` title, `FONT_CAPTION` muted caption, the row's own 4/24pt insets).
+///
+/// The page row components use it for their labels, and so does a surface that draws settings rows
+/// with no control at all (the sidebar's search results) -- one implementation of the row text, so
+/// the two can never drift apart. `passthrough` makes the labels decline hit testing: when the row
+/// itself is the control (a search result's jump), a click on the text has to reach it.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn add_row_text_block(
+    parent: *mut AnyObject,
+    x: f64,
+    y: f64,
+    text_w: f64,
+    row_h: f64,
+    title: &str,
+    caption: Option<&str>,
+    passthrough: bool,
+) -> (*mut AnyObject, Option<*mut AnyObject>) {
+    const TITLE_H: f64 = 18.0;
+    // The caption wraps instead of truncating (the mock's `.list-sub` never ellipsizes);
+    // its height is measured so the row can grow to fit.
+    let caption_h = caption
+        .map(|c| wrapped_caption_height(c, text_w).max(CAPTION_H))
+        .unwrap_or(0.0);
+    let (title_y, caption_y) = row_text_block_y_positions(y, row_h, caption_h);
+    let label_class: *mut AnyObject = if passthrough {
+        passthrough_label_class()
+    } else {
+        AnyClass::get(c"NSTextField").expect("NSTextField") as *const AnyClass as *mut AnyObject
+    };
+    let title_label: *mut AnyObject = msg_send![label_class, alloc];
+    let title_label: *mut AnyObject = msg_send![
+        title_label,
+        initWithFrame: NSRect::new(NSPoint::new(x, title_y), NSSize::new(text_w, TITLE_H))
+    ];
+    set_field(title_label, title);
+    let _: () = msg_send![title_label, setBezeled: false];
+    let _: () = msg_send![title_label, setDrawsBackground: false];
+    let _: () = msg_send![title_label, setEditable: false];
+    let _: () = msg_send![title_label, setSelectable: false];
+    let _: () = msg_send![title_label, setUsesSingleLineMode: true];
+    let _: () = msg_send![title_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    let title_font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let _: () = msg_send![title_label, setFont: title_font];
+    apply_settings_text_role(title_label, SettingsTextRole::Primary);
+    let _: () = msg_send![title_label, setAutoresizingMask: 4u64];
+    let _: () = msg_send![parent, addSubview: title_label];
+    release_obj(title_label);
+
+    let caption_label = caption.map(|caption| {
+        let caption_label: *mut AnyObject = msg_send![label_class, alloc];
+        let caption_label: *mut AnyObject = msg_send![
+            caption_label,
+            initWithFrame: NSRect::new(
+                NSPoint::new(x, caption_y),
+                NSSize::new(text_w, caption_h)
+            )
+        ];
+        set_field(caption_label, caption);
+        let _: () = msg_send![caption_label, setBezeled: false];
+        let _: () = msg_send![caption_label, setDrawsBackground: false];
+        let _: () = msg_send![caption_label, setEditable: false];
+        let _: () = msg_send![caption_label, setSelectable: false];
+        let _: () = msg_send![caption_label, setUsesSingleLineMode: false];
+        let _: () = msg_send![caption_label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        let _: () = msg_send![caption_label, setPreferredMaxLayoutWidth: text_w.max(1.0)];
+        let caption_cell: *mut AnyObject = msg_send![caption_label, cell];
+        if !caption_cell.is_null() {
+            let _: () = msg_send![caption_cell, setWraps: true];
+        }
+        if msg_send![caption_label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+            let _: () = msg_send![caption_label, setMaximumNumberOfLines: 0isize];
+        }
+        let caption_font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+        let _: () = msg_send![caption_label, setFont: caption_font];
+        apply_settings_text_role(caption_label, SettingsTextRole::Muted);
+        let _: () = msg_send![caption_label, setAutoresizingMask: 4u64];
+        let _: () = msg_send![parent, addSubview: caption_label];
+        release_obj(caption_label);
+        caption_label
+    });
+    (title_label, caption_label)
+}
+
+/// Return AppKit-frame origins for the title and optional caption. AppKit's view coordinates grow
+/// upward, so the caption is below the title even though it has the lower y origin.
+/// One-line caption height and the gap below the title; shared by the block layout and by
+/// `captioned_row_height`, so the measured row and the drawn stack cannot disagree.
+const CAPTION_H: f64 = 16.0;
+const TITLE_CAPTION_GAP: f64 = 3.0;
+
+fn row_text_block_y_positions(y: f64, row_h: f64, caption_h: f64) -> (f64, f64) {
+    const TITLE_H: f64 = 18.0;
+    if caption_h > 0.0 {
+        let stack_h = TITLE_H + TITLE_CAPTION_GAP + caption_h;
+        let caption_y = y + (row_h - stack_h) / 2.0;
+        let title_y = caption_y + caption_h + TITLE_CAPTION_GAP;
+        (title_y, caption_y)
+    } else {
+        (y + (row_h - TITLE_H) / 2.0, y)
+    }
+}
+
+/// The measured height of `caption` wrapped at `width` in the caption font: `boundingRect`
+/// with line-fragment layout, the same probe `text_style` uses for wrapped cells.
+pub(super) unsafe fn wrapped_caption_height(text: &str, width: f64) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let ns = make_nsstring(text);
+    let len: usize = msg_send![ns, length];
+    let storage: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let storage: *mut AnyObject = msg_send![
+        storage,
+        initWithString: ns,
+        attributes: std::ptr::null_mut::<AnyObject>()
+    ];
+    CFRelease(ns as *const c_void);
+    let font_key = make_nsstring("NSFont");
+    let _: () =
+        msg_send![storage, addAttribute: font_key, value: font, range: NSRange::new(0, len)];
+    CFRelease(font_key as *const c_void);
+    let laid_out: NSRect = msg_send![
+        storage,
+        boundingRectWithSize: NSSize::new(width.max(1.0), 1.0e4),
+        options: 1usize // NSStringDrawingUsesLineFragmentOrigin
+    ];
+    release_obj(storage);
+    laid_out.size.height
+}
+
+/// The row height a `captioned` row needs for `caption` wrapped at `text_w`: the mock's
+/// `.setting-row` is `min-height: 56px`, so the row grows rather than clipping the
+/// description. The 19pt padding keeps the 56pt one-line row unchanged (18+3+16+19 = 56).
+pub(super) unsafe fn captioned_row_height(caption: &str, text_w: f64) -> f64 {
+    let stack = 18.0 + TITLE_CAPTION_GAP + wrapped_caption_height(caption, text_w).max(CAPTION_H);
+    (stack + 19.0).max(crate::settings::components::SettingsLayout::SINGLE_LINE_ROW_H)
+}
+
+/// The class of a label that declines hit testing: a row whose whole surface is the control needs
+/// the press to fall through its text to the row.
+fn passthrough_label_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPassthroughLabel", || {
+        crate::ffi::build_class(
+            c"OhMyTabPassthroughLabel",
+            class!(NSTextField),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(hitTest:),
+                    passthrough_label_hit_test
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
+}
+
+/// The class of a decoration that must never take a click: the row flash draws over a row's own
+/// controls, so it declines hit testing and leaves them reachable while it fades.
+pub(super) fn passthrough_view_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPassthroughDecoration", || {
+        crate::ffi::build_class(
+            c"OhMyTabPassthroughDecoration",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(hitTest:),
+                    passthrough_label_hit_test
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
+}
+
+extern "C" fn passthrough_label_hit_test(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _point: NSPoint,
+) -> *mut AnyObject {
+    std::ptr::null_mut()
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn add_captioned_row(
     parent: *mut AnyObject,
@@ -3397,45 +3647,10 @@ pub(super) unsafe fn add_captioned_row(
     caption: &str,
     control: *mut AnyObject,
 ) -> (*mut AnyObject, *mut AnyObject, *mut AnyObject) {
-    let title_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let title_label: *mut AnyObject = msg_send![
-        title_label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(x, y + row_h - 24.0),
-            NSSize::new(text_w, 18.0),
-        )
-    ];
-    set_field(title_label, title);
-    let _: () = msg_send![title_label, setBezeled: false];
-    let _: () = msg_send![title_label, setDrawsBackground: false];
-    let _: () = msg_send![title_label, setEditable: false];
-    let _: () = msg_send![title_label, setSelectable: false];
-    let _: () = msg_send![title_label, setUsesSingleLineMode: true];
-    let _: () = msg_send![title_label, setLineBreakMode: 4isize];
-    let title_font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
-    let _: () = msg_send![title_label, setFont: title_font];
-    apply_settings_text_role(title_label, SettingsTextRole::Primary);
-
-    let caption_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let caption_label: *mut AnyObject = msg_send![
-        caption_label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(x, y + 4.0),
-            NSSize::new(text_w, 16.0),
-        )
-    ];
-    set_field(caption_label, caption);
-    let _: () = msg_send![caption_label, setBezeled: false];
-    let _: () = msg_send![caption_label, setDrawsBackground: false];
-    let _: () = msg_send![caption_label, setEditable: false];
-    let _: () = msg_send![caption_label, setSelectable: false];
-    let _: () = msg_send![caption_label, setUsesSingleLineMode: true];
-    let _: () = msg_send![caption_label, setLineBreakMode: 4isize];
-    let caption_font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-    let _: () = msg_send![caption_label, setFont: caption_font];
-    apply_settings_text_role(caption_label, SettingsTextRole::Muted);
+    // One implementation of the row's text: the same block the control-less surfaces use.
+    let (title_label, caption_label) =
+        add_row_text_block(parent, x, y, text_w, row_h, title, Some(caption), false);
+    let caption_label = caption_label.expect("a captioned row carries a caption");
     // The caption is the row's truncatable text, so it is the one that carries the hover bubble;
     // the title must read in full in every locale (design-style §9 -- a tooltip does not exempt a
     // label) and deliberately gets none, so hovering the title never shows a second, redundant
@@ -3450,14 +3665,8 @@ pub(super) unsafe fn add_captioned_row(
             "captioned row labels must use the app hover tooltip, not a native setToolTip:"
         );
     }
-    let _: () = msg_send![title_label, setAutoresizingMask: 4u64];
-    let _: () = msg_send![caption_label, setAutoresizingMask: 4u64];
     let _: () = msg_send![control, setAutoresizingMask: 2u64];
-    let _: () = msg_send![parent, addSubview: caption_label];
-    let _: () = msg_send![parent, addSubview: title_label];
     let _: () = msg_send![parent, addSubview: control];
-    release_obj(caption_label);
-    release_obj(title_label);
     release_obj(control);
     (title_label, caption_label, control)
 }
@@ -3595,6 +3804,16 @@ pub(super) unsafe fn make_settings_page(
     let clip_bounds: NSRect = msg_send![clip, bounds];
     let top_origin = (document_h - clip_bounds.size.height).max(0.0);
     let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, top_origin)];
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+    // The page starts at its own top by definition: a stale clip origin inherited from before
+    // the viewport was re-floored (the settings page begins under the title-bar band) would show
+    // the page mid-scroll on open.
+    let _: () = msg_send![scroll, scrollPoint: NSPoint::new(0.0, 0.0)];
+    let top_bounds = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(clip_bounds.size.width, clip_bounds.size.height),
+    );
+    let _: () = msg_send![clip, setBounds: top_bounds];
     let _: () = msg_send![scroll, reflectScrolledClipView: clip];
 
     release_obj(document);
@@ -3877,11 +4096,21 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 
 #[cfg(test)]
 mod tests {
+
+    /// A settings row can be retired from the page while its refresher still walks every known
+    /// control id: the handle is then null, and objc2 panics on a nil receiver. Writing to it used to
+    /// take the whole settings window down with `messsaging setStringValue: to nil`; the writer is a
+    /// no-op instead, so a missing row can never crash the page that no longer draws it.
+    #[test]
+    fn set_field_tolerates_a_retired_control() {
+        unsafe { super::set_field(std::ptr::null_mut(), 18.0) };
+    }
     use super::{
         derived_label_width, html_switch_knob_radius, html_switch_track_radius,
-        pixel_rows_to_parent_span, rect_inside, rects_overlap, sidebar_hover_fill,
-        sidebar_label_frame_y, slider_should_reset, stepped_slider_ticks, switch_hit_bounds,
-        SidebarLabelGeometry, HTML_SWITCH_H, HTML_SWITCH_KNOB_D, HTML_SWITCH_W, SIDEBAR_HOVERED,
+        pixel_rows_to_parent_span, rect_inside, rects_overlap, row_text_block_y_positions,
+        sidebar_hover_fill, sidebar_label_frame_y, slider_should_reset, stepped_slider_ticks,
+        switch_hit_bounds, SidebarLabelGeometry, HTML_SWITCH_H, HTML_SWITCH_KNOB_D, HTML_SWITCH_W,
+        SIDEBAR_HOVERED,
     };
     // The smoke test sends ObjC messages directly (building an NSEvent, driving mouseDown:).
     use crate::ffi::release_obj;
@@ -3889,6 +4118,18 @@ mod tests {
     use objc2::{class, msg_send, sel};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::ffi::c_void;
+
+    #[test]
+    fn captioned_row_text_uses_reference_gap_and_centers_as_a_block() {
+        let (title_y, caption_y) = row_text_block_y_positions(100.0, 56.0, 16.0);
+        assert!((title_y - (caption_y + 16.0 + 3.0)).abs() < 1e-9);
+        let block_bottom = caption_y;
+        let block_top = title_y + 18.0;
+        assert!(((block_top + block_bottom) / 2.0 - 128.0).abs() < 1e-9);
+
+        let (title_y, _) = row_text_block_y_positions(100.0, 56.0, 0.0);
+        assert!((title_y - 119.0).abs() < 1e-9);
+    }
 
     /// The cap slider snaps to whole tens, so AppKit must be told there are ten marks (10..=100 step
     /// 10 is 10, 20, ... 100). A wrong count would either let the knob rest between steps or misplace
@@ -3912,7 +4153,7 @@ mod tests {
     /// The first case is the defect: centring the box alone (the old `(row_h - frame_h) / 2`) draws the
     /// ink low for the app's 14pt control font at a 1.4 line-height ratio, which is what read as a
     /// misaligned icon/label pair.
-    #[test]
+    ///
     /// The sidebar label is centred by its *inked* glyphs, not by its line box.
     ///
     /// This covers the pure half: the box-centred origin the label starts from, and the degenerate
@@ -4178,9 +4419,10 @@ mod tests {
             crate::theme::ui_palette_for_mode(true),
         ] {
             // Roles with a dedicated hover token use it; the rest layer the generic `hover_bg`
-            // tint over whatever surface their normal color provides.
+            // tint over whatever surface their normal color provides. Field-family roles
+            // deepen the same wash (`--field-hover`), so the wash stays on the card.
             let expected = [
-                (SettingsButtonRole::Action, palette.hover_bg),
+                (SettingsButtonRole::Action, palette.field_hover),
                 (SettingsButtonRole::Footer, palette.hover_bg),
                 (SettingsButtonRole::Primary, palette.accent_hover),
                 (SettingsButtonRole::Destructive, palette.destructive_hover),

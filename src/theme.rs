@@ -38,7 +38,15 @@ pub(crate) const CARD_TEXT_SIZE_MIN: f64 = 13.0;
 pub(crate) const CARD_TEXT_SIZE_MAX: f64 = 20.0;
 const STATUS_BAR_TEXT_BASE_SIZE: f64 = 13.0;
 
+/// The mock's `--fs-11`: the small section headings above each settings card
+/// (`.section-title { font-size: 11px }`).
+pub(crate) const FONT_SECTION_TITLE: f64 = 11.0;
 pub(crate) const FONT_CAPTION: f64 = 12.0;
+/// The mock's `--fs-13`: field text and labels that sit one step above a caption and one below a
+/// control's own 14pt (`.field-shell input`, the settings search field). Kept as its own step rather
+/// than rounded to 12 or 14, because the mock draws that size and rounding it moves text metrics
+/// in every field the setting appears in.
+pub(crate) const FONT_BODY: f64 = 13.0;
 pub(crate) const FONT_CONTROL: f64 = 14.0;
 pub(crate) const FONT_SIDEBAR_TITLE: f64 = 20.0;
 pub(crate) const FONT_PAGE_TITLE: f64 = 26.0;
@@ -47,6 +55,18 @@ pub(crate) const LINE_HEIGHT_BODY_RATIO: f64 = 1.4;
 pub(crate) const LINE_HEIGHT_TITLE_RATIO: f64 = 1.2;
 pub(crate) const fn line_height(size: f64, ratio: f64) -> f64 {
     size * ratio
+}
+
+/// How far a forced line box drops a text field's glyphs below the box's centre: TextKit places
+/// the extra leading above the glyphs, so half the difference between the forced and the font's
+/// natural line height is the distance the ink sinks. Returns 0 when no forcing applies -- a
+/// missing, non-finite or non-positive value, or a forced height no taller than the natural one.
+pub(crate) fn forced_line_height_offset(forced: f64, natural: f64) -> f64 {
+    if forced.is_finite() && natural.is_finite() && natural > 0.0 && forced > natural {
+        (forced - natural) / 2.0
+    } else {
+        0.0
+    }
 }
 
 #[cfg(test)]
@@ -59,9 +79,29 @@ mod line_height_tests {
         assert!((line_height(FONT_CONTROL, LINE_HEIGHT_BODY_RATIO) - 19.6).abs() < 1e-10);
         assert!((line_height(FONT_PAGE_TITLE, LINE_HEIGHT_TITLE_RATIO) - 31.2).abs() < 1e-10);
     }
+
+    #[test]
+    fn forced_line_height_offset_is_half_the_extra_leading() {
+        // The real pair: the body-ratio token forces 19.6pt on a font whose natural line is
+        // ~16.49pt, sinking the ink ~1.555pt below the box centre.
+        let forced = line_height(FONT_CONTROL, LINE_HEIGHT_BODY_RATIO);
+        assert!((forced_line_height_offset(forced, 16.49) - 1.555).abs() < 1e-10);
+        // A height equal to or below the natural line adds no leading.
+        assert_eq!(forced_line_height_offset(16.49, 16.49), 0.0);
+        assert_eq!(forced_line_height_offset(16.0, 19.6), 0.0);
+        // Broken inputs correct nothing rather than producing a bogus shift.
+        assert_eq!(forced_line_height_offset(f64::NAN, 16.49), 0.0);
+        assert_eq!(forced_line_height_offset(19.6, 0.0), 0.0);
+        assert_eq!(forced_line_height_offset(19.6, f64::INFINITY), 0.0);
+    }
 }
 pub(crate) const FONT_WEIGHT_REGULAR: f64 = 0.0;
+pub(crate) const FONT_WEIGHT_MEDIUM: f64 = 0.23;
+/// The mock's setting labels use CSS weight 520, between SF's medium and semibold faces.
+pub(crate) const FONT_WEIGHT_SETTING_LABEL: f64 = 0.25;
 pub(crate) const FONT_WEIGHT_SEMIBOLD: f64 = 0.3;
+/// Visual match for the page title on the native Chinese fallback face; semibold still looked too heavy.
+pub(crate) const FONT_WEIGHT_PAGE_TITLE: f64 = 0.23;
 pub(crate) const FONT_WEIGHT_BOLD: f64 = 0.4;
 pub(crate) const ANIMATION_DURATION_FAST: f64 = 0.175;
 pub(crate) const ANIMATION_DURATION_MEDIUM: f64 = 0.380;
@@ -182,7 +222,7 @@ pub(crate) const OVERLAY_BADGE_GLYPH_INSET: f64 = 4.0;
 
 pub(crate) const RADIUS_CONTROL: f64 = 8.0;
 pub(crate) const RADIUS_CARD: f64 = 12.0;
-pub(crate) const RADIUS_PANEL: f64 = 16.0;
+pub(crate) const RADIUS_PANEL: f64 = 18.0;
 pub(crate) const RADIUS_FULL: f64 = 9999.0;
 /// Corner radius of a shortcut legend's chip (the clipboard footer's key symbols). The chip is
 /// a grouping aid, not a control: `radius-control` is sized for 32pt controls and reads as a
@@ -207,7 +247,6 @@ pub(crate) const MODAL_SCRIM: u32 = 0x00000040;
 /// A disabled control's fill opacity: the style document's §10 rule is "50% opacity on the
 /// control's fill", and `setEnabled:` alone does not dim a layer-filled button.
 pub(crate) const DISABLED_FILL_OPACITY: f64 = 0.5;
-pub(crate) const SETTINGS_WINDOW_RADIUS: f64 = 26.0;
 pub(crate) const OVERLAY_RING_INSET: f64 = 3.0;
 /// Captured window pixels keep square corners inside the rounded card.
 pub(crate) const THUMBNAIL_PREVIEW_RADIUS: f64 = 0.0;
@@ -345,6 +384,11 @@ pub(crate) struct UiPalette {
     pub(crate) card_border: u32,
     pub(crate) separator: u32,
     pub(crate) field_bg: u32,
+    /// The mock's `--field-hover`: the hovered fill for buttons and fields that rest on
+    /// `field_bg` normally. Light mode deepens the same warm ink a step past the sheet's
+    /// .085 -- .085 composites to ~1.05:1 against the field fill, on the 1.05 hover floor
+    /// with no margin; .10 clears it.
+    pub(crate) field_hover: u32,
     pub(crate) primary_text: u32,
     pub(crate) secondary_text: u32,
     pub(crate) sidebar_text: u32,
@@ -364,6 +408,18 @@ pub(crate) struct UiPalette {
     pub(crate) button_text: u32,
     pub(crate) footer_button_bg: u32,
     pub(crate) accent_text: u32,
+    /// Ink drawn on an `accent` fill (primary button, active accent chips). `accent_text` stays
+    /// the ink for the destructive fill, the badge scrim and the close chip, which are not
+    /// accent surfaces.
+    pub(crate) accent_ink: u32,
+    /// The frost panel's 1pt rim: a bright line reads as a glass edge, where the dark
+    /// `card_border` stroke reads as a drawn rectangle.
+    pub(crate) glass_rim: u32,
+    /// The selected sidebar row: a flat tinted fill (`--nav-active-bg`) with its own ink
+    /// (`--nav-active-ink`), the mock's `.nav-item.active`. It replaces accent-on-`selection_bg`
+    /// -- the flat tint reads as a nav item, the wash read as a selection.
+    pub(crate) nav_active_bg: u32,
+    pub(crate) nav_active_ink: u32,
     pub(crate) switch_on_disabled_track: u32,
     pub(crate) switch_off_track: u32,
     pub(crate) switch_off_disabled_track: u32,
@@ -406,14 +462,18 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
     if dark {
         UiPalette {
             dark: true,
-            window_bg: 0x1C1C1EFF,
-            sidebar_bg: 0x242426FF,
-            detail_bg: 0x1C1C1EFF,
-            card_bg: 0x2C2C2EFF,
-            card_border: 0xFFFFFF1A,
-            separator: 0xFFFFFF17,
-            field_bg: 0xFFFFFF12,
-            primary_text: 0xF5F5F7FF,
+            // The design sheet's dark surfaces: #121215 page, #17171b sidebar, and the raised
+            // card at rgba(32,32,37,.92) over the page.
+            window_bg: 0x121215FF,
+            sidebar_bg: 0x17171BFF,
+            detail_bg: 0x121215FF,
+            // rgba(32,32,37,.92) composited over the #121215 page, for the same reason.
+            card_bg: 0x1F1F24FF,
+            card_border: 0xFFFFFF17,
+            separator: 0xFFFFFF0F,
+            field_bg: 0xFFFFFF0E,
+            field_hover: 0xFFFFFF17,
+            primary_text: 0xF4F4F5FF,
             secondary_text: 0xC7C7CCFF,
             sidebar_text: 0x9E9EA6FF,
             muted_text: 0x9E9EA6FF,
@@ -429,18 +489,24 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             button_text: 0xF5F5F7FF,
             footer_button_bg: 0x2C2C2EFF,
             accent_text: 0xFFFFFFFF,
+            accent_ink: 0x08111FFF,
+            glass_rim: 0xFFFFFF17,
+            nav_active_bg: 0x2A4A7DFF,
+            nav_active_ink: 0xF4F4F5FF,
             switch_on_disabled_track: 0x0A84FF73,
-            switch_off_track: 0x636366FF,
+            switch_off_track: 0xFFFFFF2B,
             switch_off_disabled_track: 0x63636673,
             switch_knob: 0xF5F5F7F5,
-            selection_bg: 0x0A84FF38,
-            selection_plate_bg: 0x0A84FF4D,
+            selection_bg: 0x5B9BFF24,
+            selection_plate_bg: 0x5B9BFF47,
             hover_bg: 0xFFFFFF1A,
-            accent: 0x0A84FFFF,
-            accent_hover: 0x3D9BFFFF,
+            accent: 0x5B9BFFFF,
+            accent_hover: 0x7DB2FFFF,
             link_text: 0x409CFFFF,
             link_text_hover: 0x66ADFFFF,
-            destructive: 0xFF453AFF,
+            // A step darker than the system red: white text on #FF453A computes 3.41:1, under
+            // the 3.5:1 hard floor; #F53B30 reaches 3.78:1 and keeps the sheet's hue.
+            destructive: 0xF53B30FF,
             destructive_hover: 0xD93630FF,
             symbol_shadow: 0x000000B3,
             badge_scrim: 0x0000008C,
@@ -449,21 +515,29 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
     } else {
         UiPalette {
             dark: false,
-            // Match the light reference surfaces: #f6f7f9 window/detail, #f1f2f4 sidebar,
-            // and opaque white grouped settings rows/cards.
-            window_bg: 0xF6F7F9FF,
-            sidebar_bg: 0xF1F2F4FF,
-            detail_bg: 0xF6F7F9FF,
-            card_bg: 0xFFFFFFFF,
-            card_border: 0x0000001A,
-            separator: 0x00000012,
-            field_bg: 0x7676801A,
-            primary_text: 0x2C2C30FF,
-            secondary_text: 0x4A4A52FF,
-            sidebar_text: 0x68686FFF,
-            muted_text: 0x68686FFF,
+            // The design sheet's light surfaces: #ececec page, #f5f5f5 sidebar, and the raised card
+            // at rgba(255,255,255,.66) over the page. Text is the sheet's warm near-black, not a
+            // neutral grey: #1d1c1a / #4f4c48 / #706d68.
+            window_bg: 0xECECECFF,
+            sidebar_bg: 0xF5F5F5FF,
+            detail_bg: 0xECECECFF,
+            // rgba(255,255,255,.66) composited over the #ececec page: opaque on purpose, because
+            // some surfaces (keycap chips) must be a real fill rather than a wash.
+            card_bg: 0xF9F9F9FF,
+            card_border: 0x2D28241A,
+            separator: 0x2D282412,
+            field_bg: 0x3C342E0E,
+            field_hover: 0x3C342E1A,
+            primary_text: 0x1D1C1AFF,
+            secondary_text: 0x4F4C48FF,
+            sidebar_text: 0x6B6862FF,
+            muted_text: 0x6B6862FF,
             scroll_indicator: 0x00000059,
-            disabled_text: 0x9B9BA2FF,
+            // Two steps darker than the sheet's disabled grey: #9b9ba2 measured 2.34:1 and
+            // #93909a 2.65:1 on the #ececec page -- both under the 3.5:1 hard floor every text
+            // role must clear (§3.3). #7e7b83 is the lightest of the family that computes >= 3.5
+            // on both `window_bg` (3.52:1) and `card_bg` (3.95:1).
+            disabled_text: 0x7E7B83FF,
             success_text: 0x176B3AFF,
             warning_text: 0xA63D0AFF,
             error_text: 0xB42318FF,
@@ -474,17 +548,21 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             button_text: 0x2C2C30FF,
             footer_button_bg: 0xFFFFFFFF,
             accent_text: 0xFFFFFFFF,
+            accent_ink: 0xFFFFFFFF,
+            glass_rim: 0xFFFFFF80,
+            nav_active_bg: 0xD7E3F8FF,
+            nav_active_ink: 0x173A6BFF,
             switch_on_disabled_track: 0x0A84FF73,
-            switch_off_track: 0xC7C7CCFF,
+            switch_off_track: 0x3C342E33,
             switch_off_disabled_track: 0xC7C7CC73,
             switch_knob: 0xFFFFFFF5,
-            selection_bg: 0x0A84FF14,
-            selection_plate_bg: 0x0A84FF38,
+            selection_bg: 0x2F6FED1A,
+            selection_plate_bg: 0x2F6FED47,
             hover_bg: 0x7676801F,
-            accent: 0x0A84FFFF,
-            accent_hover: 0x0077EDFF,
-            link_text: 0x0068D6FF,
-            link_text_hover: 0x0058B8FF,
+            accent: 0x2F6FEDFF,
+            accent_hover: 0x1F5CDAFF,
+            link_text: 0x1F5CDAFF,
+            link_text_hover: 0x17439FFF,
             destructive: 0xFF3B30FF,
             destructive_hover: 0xD70015FF,
             symbol_shadow: 0x000000B3,
@@ -698,8 +776,19 @@ pub(crate) fn status_bar_text_size() -> f64 {
 }
 
 fn status_bar_text_size_for(configured_size: f64) -> f64 {
+    // 0 is not a text size: it is the "no footer" stop. Everything above 0 is a real size, so 1..12
+    // must render at 1..12 rather than silently snapping to 13 while the slider's readout says so.
+    //
+    // 0 itself resolves to the base size rather than to a 1pt clamp: the empty-overlay hint is drawn
+    // through this same accessor even when the footer band is gone (it is a state message, not a window
+    // title, and `update_status_label` returns it before the visibility check), so clamping it to 1pt
+    // would make that hint unreadable.
     if configured_size.is_finite() {
-        configured_size.clamp(13.0, 20.0)
+        if configured_size <= 0.0 {
+            STATUS_BAR_TEXT_BASE_SIZE
+        } else {
+            configured_size.clamp(1.0, 20.0)
+        }
     } else {
         STATUS_BAR_TEXT_BASE_SIZE
     }
@@ -1118,7 +1207,11 @@ pub(crate) fn show_app_name_in_cards() -> bool {
 /// band's floor is the settings control's size rather than the text's: with the title off there is
 /// nothing left for the band to hold except a control that can move to the panel's corner.
 pub(crate) fn show_footer_title() -> bool {
-    CONFIG.read().unwrap().layout.show_footer_title
+    // One control, one source of truth: the footer band exists while its own text size is above
+    // zero, which is the settings slider's far-left stop. `layout.show_footer_title` is still stored
+    // (older configs and the export format carry it) but no longer gates the panel.
+    let size = CONFIG.read().unwrap().fonts.status_bar_size;
+    size.is_finite() && size > 0.0
 }
 
 /// Flow-layout base card width, hard-coded and fully independent of the legacy
@@ -2357,8 +2450,14 @@ mod tests {
                     // asserting nothing about the corner (it would pass for any inset).
                     if inset > 4.0 {
                         assert!(
-                            !inside(inset - 4.0, radius, width, height, FOOTER_CONTROL_SIZE, band)
-                                || inset - 4.0 <= 0.0,
+                            !inside(
+                                inset - 4.0,
+                                radius,
+                                width,
+                                height,
+                                FOOTER_CONTROL_SIZE,
+                                band
+                            ) || inset - 4.0 <= 0.0,
                             "radius={radius} width={width} rows={rows}: the containment test passes \
                              even one grid step inside {inset}, so it does not bound the corner"
                         );
@@ -2679,7 +2778,7 @@ mod tests {
                 // token is held to the text floor on both surfaces in both modes.
                 (palette.link_text, 4.5),
                 (palette.link_text_hover, 4.5),
-                (palette.disabled_text, 2.5),
+                (palette.disabled_text, TEXT_HARD_FLOOR),
                 (palette.success_text, 4.5),
                 (palette.warning_text, 4.5),
                 (palette.error_text, 4.5),
@@ -2693,15 +2792,14 @@ mod tests {
                     );
                 }
             }
-            // The selected sidebar title is the one accent-as-text site: state text over its
-            // selection wash. The blue names the selection (with the wash, position, and icon
-            // tint), and no accent-hue text clears 4.5:1 on a blue-tinted wash, so like
-            // `text_disabled` it is held to the 2.5:1 state tier instead of the reading tier.
-            // The title color is opaque, so it needs no further compositing over the wash.
-            let wash = composite_rgb(palette.selection_bg, palette.sidebar_bg);
+            // The selected sidebar row is the mock's flat nav tint with its own ink
+            // (`nav_active_bg`/`nav_active_ink`), an opaque pairing held to the 3.5:1 hard floor.
             assert!(
-                contrast_ratio(color_rgb(palette.accent), wash) >= 2.5,
-                "selected sidebar title measures under 2.5:1 on its selection wash"
+                contrast_ratio(
+                    color_rgb(palette.nav_active_ink),
+                    color_rgb(palette.nav_active_bg),
+                ) >= TEXT_HARD_FLOOR,
+                "selected sidebar title measures under 3.5:1 on its nav tint"
             );
             for background in [palette.window_bg, palette.card_bg] {
                 assert!(
@@ -2721,21 +2819,21 @@ mod tests {
             composite_rgb(light.card_border, light.card_bg),
             color_rgb(light.card_bg),
         );
-        assert!((card_border - 1.25).abs() < 0.02);
+        assert!((card_border - 1.20).abs() < 0.02);
         assert!((contrast_ratio(color_rgb(0xC7C7CCFF), color_rgb(0xFFFFFFFF)) - 1.68).abs() < 0.02);
 
         let dark = ui_palette_for_mode(true);
-        assert_eq!(dark.detail_bg, 0x1C1C1EFF);
+        assert_eq!(dark.detail_bg, 0x121215FF);
         assert!(
-            (contrast_ratio(color_rgb(0x636366FF), color_rgb(dark.card_bg)) - 2.33).abs() < 0.03
+            (contrast_ratio(color_rgb(0x636366FF), color_rgb(dark.card_bg)) - 2.74).abs() < 0.03
         );
     }
 
     #[test]
     fn selection_background_alpha_matches_the_documented_opacity() {
         for (palette, expected) in [
-            (ui_palette_for_mode(false), 0.08),
-            (ui_palette_for_mode(true), 0.22),
+            (ui_palette_for_mode(false), 0.102),
+            (ui_palette_for_mode(true), 0.141),
         ] {
             let actual = f64::from(palette.selection_bg & 0xFF) / 255.0;
             assert!((actual - expected).abs() < 0.002);
@@ -2747,8 +2845,8 @@ mod tests {
     #[test]
     fn selection_plate_wash_is_a_heavier_accent_than_a_row_wash() {
         for (palette, expected) in [
-            (ui_palette_for_mode(false), 0.22),
-            (ui_palette_for_mode(true), 0.30),
+            (ui_palette_for_mode(false), 0.278),
+            (ui_palette_for_mode(true), 0.278),
         ] {
             let alpha = f64::from(palette.selection_plate_bg & 0xFF) / 255.0;
             assert!((alpha - expected).abs() < 0.002, "{alpha}");
@@ -2766,7 +2864,7 @@ mod tests {
     #[test]
     fn documented_sidebar_destructive_and_symbol_roles_match_the_palette() {
         let light = ui_palette_for_mode(false);
-        assert_eq!(light.sidebar_text, 0x68686FFF);
+        assert_eq!(light.sidebar_text, 0x6B6862FF);
         assert_eq!(light.destructive_hover, 0xD70015FF);
         assert_eq!(light.symbol_shadow, 0x000000B3);
         assert_eq!(light.badge_scrim, 0x0000008C);
@@ -2783,6 +2881,190 @@ mod tests {
         assert_eq!(OVERLAY_BADGE_GLYPH_INSET, 4.0);
     }
 
+    /// The §3.3 hard floor: no text or meaning-carrying glyph ships under 3.5:1 in either mode.
+    /// Role minimums may be higher targets; this is the bound below which nothing may fall.
+    const TEXT_HARD_FLOOR: f64 = 3.5;
+
+    /// Every text or meaning-carrying-glyph pairing in the palette, asserted against the hard
+    /// floor so the §3.3 rule holds for the whole table, not just the pairs a review happened to
+    /// check. Structural boundaries (`card_border`, `separator`, switch tracks) are deliberately
+    /// absent: clause 2 keeps its own 1.2:1 rule.
+    #[test]
+    fn every_text_pairing_clears_the_hard_floor() {
+        for palette in [ui_palette_for_mode(false), ui_palette_for_mode(true)] {
+            let mode = if palette.dark { "dark" } else { "light" };
+            // Surfaces that are themselves translucent tokens are composited onto the surface
+            // they render on, the way the code flattens them before drawing.
+            let badge_over_white = composite_rgb(palette.badge_scrim, 0xFFFFFFFF);
+            let accent_keycap = composite_rgb(palette.keycap_accent_bg, palette.card_bg);
+            // The keystroke panel's neutral keycap (`keystroke_display::panel` flattens it the
+            // same way): field_bg over card_bg in light mode, the card surface in dark.
+            let neutral_keycap = if palette.dark {
+                color_rgb(palette.card_bg)
+            } else {
+                composite_rgb(palette.field_bg, palette.card_bg)
+            };
+            let opaque = |token: u32| color_rgb(token);
+            let pairs: [(&str, u32, [f64; 3]); 27] = [
+                (
+                    "primary on window_bg",
+                    palette.primary_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "primary on card_bg",
+                    palette.primary_text,
+                    opaque(palette.card_bg),
+                ),
+                (
+                    "secondary on window_bg",
+                    palette.secondary_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "secondary on card_bg",
+                    palette.secondary_text,
+                    opaque(palette.card_bg),
+                ),
+                (
+                    "muted on window_bg",
+                    palette.muted_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "muted on card_bg",
+                    palette.muted_text,
+                    opaque(palette.card_bg),
+                ),
+                (
+                    "disabled on window_bg",
+                    palette.disabled_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "disabled on card_bg",
+                    palette.disabled_text,
+                    opaque(palette.card_bg),
+                ),
+                (
+                    "link on window_bg",
+                    palette.link_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "link on card_bg",
+                    palette.link_text,
+                    opaque(palette.card_bg),
+                ),
+                (
+                    "link_hover on window_bg",
+                    palette.link_text_hover,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "link_hover on card_bg",
+                    palette.link_text_hover,
+                    opaque(palette.card_bg),
+                ),
+                (
+                    "sidebar on sidebar_bg",
+                    palette.sidebar_text,
+                    opaque(palette.sidebar_bg),
+                ),
+                (
+                    "accent_ink on accent",
+                    palette.accent_ink,
+                    opaque(palette.accent),
+                ),
+                (
+                    "accent_ink on accent_hover",
+                    palette.accent_ink,
+                    opaque(palette.accent_hover),
+                ),
+                (
+                    "accent_text on destructive",
+                    palette.accent_text,
+                    opaque(palette.destructive),
+                ),
+                (
+                    "accent_text on destructive_hover",
+                    palette.accent_text,
+                    opaque(palette.destructive_hover),
+                ),
+                (
+                    "accent_text on badge_scrim/white",
+                    palette.accent_text,
+                    badge_over_white,
+                ),
+                (
+                    "nav ink on nav active bg",
+                    palette.nav_active_ink,
+                    opaque(palette.nav_active_bg),
+                ),
+                (
+                    // Action/ControlField buttons draw `field_bg` over `card_bg`; the pairing
+                    // is the composited surface, not the raw wash token.
+                    "button_text on field fill over card",
+                    palette.button_text,
+                    composite_on(palette.field_bg, color_rgb(palette.card_bg)),
+                ),
+                (
+                    "button_text on footer_button_bg",
+                    palette.button_text,
+                    opaque(palette.footer_button_bg),
+                ),
+                (
+                    "success on window_bg",
+                    palette.success_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "warning on window_bg",
+                    palette.warning_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "error on window_bg",
+                    palette.error_text,
+                    opaque(palette.window_bg),
+                ),
+                (
+                    "keycap_accent_text on keycap",
+                    palette.keycap_accent_text,
+                    accent_keycap,
+                ),
+                (
+                    "muted on neutral keycap",
+                    palette.muted_text,
+                    neutral_keycap,
+                ),
+                ("muted on accent keycap", palette.muted_text, accent_keycap),
+            ];
+            for (name, ink, surface) in pairs {
+                let ratio = contrast_ratio(color_rgb(ink), surface);
+                assert!(
+                    ratio >= TEXT_HARD_FLOOR,
+                    "{name} measures {ratio:.2}:1 in {mode} mode (hard floor {TEXT_HARD_FLOOR}:1)"
+                );
+            }
+        }
+    }
+
+    /// Ink on an `accent` fill is a documented §3.3 deviation: the role target is higher, but
+    /// the relaxed 3.5:1 hard floor still applies to both the normal and the hover fill.
+    #[test]
+    fn primary_button_ink_clears_the_relaxed_floor_on_both_states() {
+        for palette in [ui_palette_for_mode(false), ui_palette_for_mode(true)] {
+            for fill in [palette.accent, palette.accent_hover] {
+                let ratio = contrast_ratio(color_rgb(palette.accent_ink), color_rgb(fill));
+                assert!(
+                    ratio >= 3.5,
+                    "accent ink contrast on its fill is too low: {ratio:.2}:1"
+                );
+            }
+        }
+    }
+
     /// The white badge glyph must read over the scrim even when the captured thumbnail
     /// behind it is pure white: the composited chip is the worst-case backdrop.
     #[test]
@@ -2791,15 +3073,16 @@ mod tests {
             let background = composite_rgb(palette.badge_scrim, 0xFFFFFFFF);
             let ratio = contrast_ratio(color_rgb(palette.accent_text), background);
             assert!(
-                ratio >= 3.0,
+                ratio >= TEXT_HARD_FLOOR,
                 "badge glyph contrast on its scrim is too low: {ratio:.2}:1"
             );
         }
     }
 
     /// The close button's hover chip fills with `destructive` while keeping the white glyph, so
-    /// that pairing has to clear the 3:1 non-text floor in both modes -- the glyph is the whole
-    /// affordance. (Turning the glyph red over the chip's mid grey instead measured ~1.4:1.)
+    /// that pairing has to clear the 3.5:1 hard floor in both modes -- the glyph is the whole
+    /// affordance. (Turning the glyph red over the chip's mid grey instead measured ~1.4:1; dark
+    /// `destructive` was deepened for exactly this bound.)
     #[test]
     fn hovered_close_chip_glyph_meets_contrast_on_its_destructive_fill() {
         for palette in [ui_palette_for_mode(false), ui_palette_for_mode(true)] {
@@ -2808,7 +3091,7 @@ mod tests {
                 color_rgb(palette.destructive),
             );
             assert!(
-                ratio >= 3.0,
+                ratio >= TEXT_HARD_FLOOR,
                 "hovered close glyph contrast is too low: {ratio:.2}:1"
             );
         }
@@ -3008,6 +3291,18 @@ mod tests {
         );
     }
 
+    /// A size of 0 means "no footer band", but the empty-overlay hint is still drawn through this
+    /// accessor. It must stay readable rather than collapsing to the 1pt floor.
+    #[test]
+    fn a_hidden_footer_still_renders_the_empty_state_hint_at_the_base_size() {
+        assert_eq!(status_bar_text_size_for(0.0), STATUS_BAR_TEXT_BASE_SIZE);
+        assert_eq!(status_bar_text_size_for(-3.0), STATUS_BAR_TEXT_BASE_SIZE);
+        assert_eq!(status_bar_text_size_for(1.0), 1.0);
+        assert_eq!(status_bar_text_size_for(12.0), 12.0);
+        assert_eq!(status_bar_text_size_for(20.0), 20.0);
+        assert_eq!(status_bar_text_size_for(21.0), 20.0);
+    }
+
     #[test]
     fn thumbnail_caption_never_exceeds_a_third_of_its_card() {
         for card_h in [24.0, 60.0, 90.0, 160.0, 260.0] {
@@ -3025,7 +3320,8 @@ mod tests {
         assert_eq!(radii.selection_ring, RADIUS_PANEL);
         assert_eq!(radii.thumbnail_preview, 0.0);
         assert_eq!(radii.thumbnail_icon, RADIUS_CONTROL);
-        assert_eq!(radii.close_button, 8.0);
+        // Concentric: the button sits 8pt inside a RADIUS_PANEL corner (18 - 8 = 10).
+        assert_eq!(radii.close_button, RADIUS_PANEL - 8.0);
         assert_eq!(rounded_inset_radius(24.0, 20.0, 18.0), 9.0);
     }
 
@@ -3102,15 +3398,8 @@ mod tests {
         assert!(!sidebar_hover.contains("Animation"));
         assert!(!sidebar_hover.contains("setDuration:"));
         assert!(!components.contains("move_hover_highlight"));
-        let filter_style = include_str!("clipboard/text_style.rs")
-            .split("pub(super) fn update_filter_pill_style")
-            .nth(1)
-            .unwrap()
-            .split("pub(super) fn ")
-            .next()
-            .unwrap();
-        assert!(!filter_style.contains("addAnimation"));
-        assert!(!filter_style.contains("setDuration:"));
+        // The filter pill underline is gone (the options popover replaced the chip row); its
+        // style fn carried no animation, so there is nothing left to pin here.
     }
 
     #[test]

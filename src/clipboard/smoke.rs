@@ -16,6 +16,243 @@ pub(crate) fn set_smoke_mode() {
     SMOKE_MODE.store(true, Ordering::SeqCst);
 }
 
+/// The (tag, top offset) of every filter row in the options popover, read from the live view tree.
+/// The view tree is the source of truth: a row list the module keeps could agree with itself while
+/// the rows the user sees are ordered differently.
+unsafe fn popover_filter_rows(popover: *mut AnyObject) -> Vec<(isize, f64)> {
+    let mut rows = Vec::new();
+    let subviews: *mut AnyObject = msg_send![popover, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let responds: bool = msg_send![view, respondsToSelector: sel!(action)];
+        if !responds {
+            continue;
+        }
+        let action: Sel = msg_send![view, action];
+        if action != sel!(popoverFilterSelected:) {
+            continue;
+        }
+        let tag: isize = msg_send![view, tag];
+        let frame: NSRect = msg_send![view, frame];
+        let children: *mut AnyObject = msg_send![view, subviews];
+        let decoration: *mut AnyObject = msg_send![children, lastObject];
+        assert!(!decoration.is_null(), "menu rows need column content");
+        let hit: *mut AnyObject = msg_send![decoration, hitTest: NSPoint::new(12.0, 12.0)];
+        assert!(hit.is_null(), "menu decoration must preserve row clicks");
+        let columns: *mut AnyObject = msg_send![decoration, subviews];
+        let column_count: usize = msg_send![columns, count];
+        assert!(
+            column_count >= 3,
+            "symbol, label and count must be independent views"
+        );
+        let label: *mut AnyObject = msg_send![columns, objectAtIndex: 1usize];
+        let counter: *mut AnyObject = msg_send![columns, objectAtIndex: 2usize];
+        let label_frame: NSRect = msg_send![label, frame];
+        let counter_frame: NSRect = msg_send![counter, frame];
+        assert!(label_frame.origin.x + label_frame.size.width <= counter_frame.origin.x);
+        let alignment: isize = msg_send![counter, alignment];
+        assert_eq!(alignment, 2, "menu counts must align to the trailing edge");
+        rows.push((tag, frame.origin.y));
+    }
+    rows.sort_by_key(|row| row.0);
+    rows
+}
+
+/// How many date-heading clear buttons the list container holds; the design places clearing in
+/// the options menu.
+unsafe fn date_heading_clear_button_count(container: *mut AnyObject) -> usize {
+    let subviews: *mut AnyObject = msg_send![container, subviews];
+    let count: usize = msg_send![subviews, count];
+    let mut buttons = 0;
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let responds: bool = msg_send![view, respondsToSelector: sel!(action)];
+        if !responds {
+            continue;
+        }
+        let action: Sel = msg_send![view, action];
+        if action == sel!(clearDayGroup:) {
+            buttons += 1;
+        }
+    }
+    buttons
+}
+
+/// Detail and list belong to the same visible panel. Read their actual AppKit ownership and
+/// frames so the smoke catches a detached detail or a desktop layout that hides the list.
+unsafe fn assert_detail_uses_picker_panel() {
+    let picker = (*PICKER_WINDOW.lock().unwrap())
+        .expect("an open detail requires the picker window")
+        .0;
+    let parent = (*PICKER_CONTENT_PARENT.lock().unwrap())
+        .expect("the picker must have a content parent")
+        .0;
+    let detail = (*DETAIL_CONTENT.lock().unwrap())
+        .expect("an open detail requires its content view")
+        .0;
+    let detail_parent: *mut AnyObject = msg_send![detail, superview];
+    let detail_window: *mut AnyObject = msg_send![detail, window];
+    let hidden: bool = msg_send![detail, isHiddenOrHasHiddenAncestor];
+    assert_eq!(
+        detail_parent, parent,
+        "detail must be inside picker content"
+    );
+    assert_eq!(detail_window, picker, "detail must share the picker window");
+    assert!(!hidden, "open detail content must be visible");
+    if let Some(legacy_window) = (*DETAIL_WINDOW.lock().unwrap()).map(|window| window.0) {
+        let visible: bool = msg_send![legacy_window, isVisible];
+        assert!(!visible, "detail must not create a second visible window");
+    }
+    let bounds: NSRect = msg_send![parent, bounds];
+    let frame: NSRect = msg_send![detail, frame];
+    assert!(
+        frame.size.width > 0.0
+            && frame.size.height > 0.0
+            && frame.origin.x >= -0.5
+            && frame.origin.y >= -0.5
+            && frame.origin.x + frame.size.width <= bounds.size.width + 0.5
+            && frame.origin.y + frame.size.height <= bounds.size.height + 0.5,
+        "detail must fit inside picker content: detail {frame:?}, parent {bounds:?}"
+    );
+    assert!(
+        (bounds.size.width - super::picker::picker_panel_width()).abs() <= 0.5,
+        "the live panel width must describe its actual content"
+    );
+    let detail_bounds: NSRect = msg_send![detail, bounds];
+    {
+        let scroll = (*DETAIL_SCROLL_VIEW.lock().unwrap())
+            .expect("an open detail must install its scroll view on the first open")
+            .0;
+        let scroll_frame: NSRect = msg_send![scroll, frame];
+        let scroll_bounds: NSRect = msg_send![scroll, bounds];
+        let clip: *mut AnyObject = msg_send![scroll, contentView];
+        let clip_bounds: NSRect = msg_send![clip, bounds];
+        let document: *mut AnyObject = msg_send![scroll, documentView];
+        assert!(
+            !document.is_null(),
+            "detail scroll view must have a document"
+        );
+        let document_flipped: bool = msg_send![document, isFlipped];
+        assert!(
+            document_flipped,
+            "detail document must place text and metadata from its top edge"
+        );
+        let document_frame: NSRect = msg_send![document, frame];
+        let document_visible: NSRect = msg_send![document, visibleRect];
+        let text_geometry = (*DETAIL_TEXT_VIEW.lock().unwrap()).map(|text| {
+            let text_frame: NSRect = msg_send![text.0, frame];
+            let text_visible: NSRect = msg_send![text.0, visibleRect];
+            (text_frame, text_visible)
+        });
+        let geometry = format!(
+            "content frame={frame:?} bounds={detail_bounds:?}; scroll frame={scroll_frame:?} bounds={scroll_bounds:?}; clip bounds={clip_bounds:?}; document frame={document_frame:?} visible={document_visible:?}; text={text_geometry:?}"
+        );
+        assert!(
+            (detail_bounds.size.width - frame.size.width).abs() <= 0.5
+                && (detail_bounds.size.height - frame.size.height).abs() <= 0.5,
+            "reparented detail must use its current viewport size: {geometry}"
+        );
+        assert!(
+            scroll_frame.size.width > 0.0
+                && scroll_frame.size.height > 0.0
+                && scroll_frame.origin.x >= detail_bounds.origin.x - 0.5
+                && scroll_frame.origin.y >= detail_bounds.origin.y - 0.5
+                && scroll_frame.origin.x + scroll_frame.size.width
+                    <= detail_bounds.origin.x + detail_bounds.size.width + 0.5
+                && scroll_frame.origin.y + scroll_frame.size.height
+                    <= detail_bounds.origin.y + detail_bounds.size.height + 0.5,
+            "detail scroll viewport must remain positive and fit its parent on the first open: {geometry}"
+        );
+        assert!(
+            document_visible.size.width > 0.0 && document_visible.size.height > 0.0,
+            "detail document must intersect the visible viewport: {geometry}"
+        );
+        if let Some((_, text_visible)) = text_geometry {
+            assert!(
+                text_visible.size.width > 0.0 && text_visible.size.height > 0.0,
+                "detail text must intersect the visible viewport at open: {geometry}"
+            );
+        }
+    }
+    if !super::picker::picker_shows_detail_in_pane() {
+        let scroll = (*SCROLL_VIEW.lock().unwrap())
+            .expect("desktop detail must retain the list scroll view")
+            .0;
+        let list_window: *mut AnyObject = msg_send![scroll, window];
+        let list_hidden: bool = msg_send![scroll, isHiddenOrHasHiddenAncestor];
+        let list_frame: NSRect = msg_send![scroll, frame];
+        assert_eq!(
+            list_window, picker,
+            "desktop list must remain in the picker"
+        );
+        assert!(!list_hidden, "desktop detail must keep the list visible");
+        assert!(
+            (super::picker::picker_list_width() - 340.0).abs() <= 0.5,
+            "desktop detail must use the design's compact list column"
+        );
+        assert!(
+            list_frame.origin.x + list_frame.size.width <= frame.origin.x + 0.5,
+            "list and detail columns must not overlap: list {list_frame:?}, detail {frame:?}"
+        );
+        assert!(
+            (frame.origin.x + frame.size.width - bounds.size.width).abs() <= 0.5,
+            "desktop detail must extend to the panel's right edge"
+        );
+    }
+}
+
+/// Cache a transparent view's first text line and count painted pixels. The empty-view
+/// counterexample below prevents the panel material from being mistaken for visible text.
+unsafe fn detail_text_ink_pixels(view: *mut AnyObject) -> usize {
+    let bounds: NSRect = msg_send![view, bounds];
+    let rect = NSRect::new(
+        bounds.origin,
+        NSSize::new(bounds.size.width.min(300.0), bounds.size.height.min(40.0)),
+    );
+    let bitmap: *mut AnyObject = msg_send![view, bitmapImageRepForCachingDisplayInRect: rect];
+    assert!(
+        !bitmap.is_null(),
+        "detail text must support display caching"
+    );
+    let width: usize = msg_send![bitmap, pixelsWide];
+    let height: usize = msg_send![bitmap, pixelsHigh];
+    let bytes_per_row: usize = msg_send![bitmap, bytesPerRow];
+    let data: *mut u8 = msg_send![bitmap, bitmapData];
+    assert!(!data.is_null(), "cached detail bitmap must have pixels");
+    std::ptr::write_bytes(data, 0, bytes_per_row * height);
+    let _: () = msg_send![view, cacheDisplayInRect: rect, toBitmapImageRep: bitmap];
+    let mut painted = 0;
+    for y in 0..height {
+        for x in 0..width {
+            let color: *mut AnyObject = msg_send![bitmap, colorAtX: x, y: y];
+            if !color.is_null() {
+                let alpha: f64 = msg_send![color, alphaComponent];
+                painted += usize::from(alpha > 0.1);
+            }
+        }
+    }
+    painted
+}
+
+unsafe fn assert_short_detail_text_paints(text: *mut AnyObject) {
+    let bounds: NSRect = msg_send![text, bounds];
+    let blank: *mut AnyObject = msg_send![class!(NSTextView), alloc];
+    let blank: *mut AnyObject = msg_send![blank, initWithFrame: bounds];
+    let _: () = msg_send![blank, setDrawsBackground: false];
+    let blank_ink = detail_text_ink_pixels(blank);
+    release_obj(blank);
+    let text_ink = detail_text_ink_pixels(text);
+    assert_eq!(
+        blank_ink, 0,
+        "empty transparent text view must paint no ink"
+    );
+    assert!(
+        text_ink > 20,
+        "short detail text must actually paint glyphs, found {text_ink} ink pixels"
+    );
+}
+
 /// --smoke-clipboard entry (called on the main thread): inject two entries, then show/hide
 /// the picker twice to exercise rebuild_rows' row-cleanup path -- the site of a double-release
 /// UAF that once segfaulted on the second summon. Returns true on success; a crash is a failure.
@@ -106,7 +343,7 @@ pub(crate) fn smoke_runner() -> bool {
                 );
                 assert!(
                     colour_matches,
-                    "the outline is not drawn in the card_border token"
+                    "the outline is not drawn in the material's outline token"
                 );
             }
             None => assert!(
@@ -119,11 +356,13 @@ pub(crate) fn smoke_runner() -> bool {
             "the outline decoration must never be the hit-test result: it would swallow every click on the panel"
         );
         // The outline's colour must be the palette token, not whatever the layer happened to hold: the
-        // theme's `card_border` differs per mode, so a stale value is a visibly wrong stroke. Only checked
+        // theme's outline token (`glass_rim` on frost, `card_border` elsewhere) differs per mode and
+        // material, so a stale value is a visibly wrong stroke. Only checked
         // when the outline is expected -- `--panel-outline=off` is a legitimate launch, and requiring a view
         // there would fail the very smoke that verifies the switch.
         if crate::glass::panel_outline_enabled() {
-            let token = crate::theme::ui_palette().card_border;
+            let token =
+                crate::glass::panel_outline_color(backdrop.material, &crate::theme::ui_palette());
             let expected = crate::ffi::hex_to_cg_color(token);
             let outline = crate::glass::outline_view_for_smoke(&backdrop)
                 .expect("the outline view exists while the switch is on");
@@ -134,7 +373,7 @@ pub(crate) fn smoke_runner() -> bool {
                         crate::ffi::layer_border_color(layer),
                         expected as *const c_void
                     ),
-                "the outline must be drawn in the current theme's card_border"
+                "the outline must be drawn in the current theme's outline token"
             );
         }
 
@@ -187,7 +426,7 @@ pub(crate) fn smoke_runner() -> bool {
     );
     // An active detail icon is a filled chip, so its glyph has to be readable *against its own
     // fill*. Measured on the pixels rather than on the tokens, because the failure was a wrong
-    // role: the fill was `primary_text` while the glyph stayed `accent_text`, which is 13.91:1 in
+    // role: the fill was `primary_text` while the glyph stayed `accent_ink`, which is 13.91:1 in
     // light mode but 1.09:1 in dark mode, where the icon became a blank white disc.
     unsafe {
         assert!(
@@ -196,14 +435,10 @@ pub(crate) fn smoke_runner() -> bool {
         );
     }
 
-    /// The clear actions must show the scope the current filter, query and "separate clear all"
-    /// setting describe, in the locale in effect, and each button's width must hug its CURRENT
-    /// title. Runs on the main thread: the state lives behind `MainThreadSlot`s. Every path that
-    /// can change the scope, the setting or the locale has to leave this true.
+    /// The clear-action label model must follow the current filter, query, setting, and locale.
+    /// When the optional buttons are built, their titles and geometry must follow that model too.
     unsafe fn assert_clear_actions_match_scope() {
-        let applied =
-            || super::text_style::clear_action_applied().expect("the clear actions applied");
-        let state = applied();
+        let state = super::text_style::clear_action_applied().expect("the clear actions applied");
         let (clear, clear_all, widths, show_all) = (
             state.clear.clone(),
             state.clear_all.clone(),
@@ -219,85 +454,69 @@ pub(crate) fn smoke_runner() -> bool {
             expected,
             "the clear actions must name the scope they clear"
         );
-        let titles: Vec<String> = {
-            let buttons = (*CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap())
-                .expect("persistent clear action buttons must be built");
-            buttons
-                .iter()
-                .map(|button| {
-                    let title: *mut AnyObject = msg_send![button.0, title];
-                    crate::ffi::nsstring_to_rust(title)
-                })
-                .collect()
-        };
-        assert_eq!(
-            titles,
-            vec![expected.0.clone(), expected.1.clone()],
-            "the buttons must show the scope they clear"
-        );
-        // The width hugs the CURRENT title: measured text plus the shared click slack — not the
-        // widest variant (the old reservation left a wide pill around the short "clear").
-        let measured: [f64; 2] = [
-            super::localized_string_width(&titles[0], crate::theme::FONT_CAPTION),
-            super::localized_string_width(&titles[1], crate::theme::FONT_CAPTION),
-        ]
-        .map(|width| width + super::CLEAR_ACTION_CLICK_SLACK);
-        assert!(
-            widths[0] == measured[0] && widths[1] == measured[1],
-            "widths {widths:?} must hug the current titles {measured:?}"
-        );
-        // The second button's visibility is the setting's decision; the hidden button parks with a
-        // zero-size frame while the plain clear keeps its full text-hugging width.
-        let buttons = (*CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap()).unwrap();
-        let hidden: bool = msg_send![buttons[1].0, isHidden];
-        assert_eq!(
-            !hidden, show_all,
-            "the clear-all button's visibility must follow the setting"
-        );
-        let frames: [NSRect; 2] = buttons.map(|button| msg_send![button.0, frame]);
-        assert!(
-            (frames[0].size.width - widths[0]).abs() < 0.5,
-            "the plain clear must keep its text-hugging width in both visibility states"
-        );
-        if show_all {
-            assert!(
-                frames[1].size.width >= widths[1],
-                "the visible clear-all button must fit its title"
+        let buttons = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap();
+        if let Some(buttons) = buttons {
+            let titles: Vec<String> = {
+                buttons
+                    .iter()
+                    .map(|button| {
+                        let title: *mut AnyObject = msg_send![button.0, title];
+                        crate::ffi::nsstring_to_rust(title)
+                    })
+                    .collect()
+            };
+            assert_eq!(
+                titles,
+                vec![expected.0.clone(), expected.1.clone()],
+                "the buttons must show the scope they clear"
             );
-        }
-        // The hover tracking area keeps the rect it was created with, so every resize must have
-        // rebuilt it: after the initial layout AND after any label change it must cover the
-        // button's current bounds (the width used to stay at the 1pt build placeholder). A
-        // tracking rect lives in the button's own coordinate system, so compare it to bounds.
-        for button in buttons.iter() {
-            let bounds: NSRect = msg_send![button.0, bounds];
-            let areas: *mut AnyObject = msg_send![button.0, trackingAreas];
-            let count: usize = msg_send![areas, count];
-            let covered = (0..count).any(|i| {
-                let ta: *mut AnyObject = msg_send![areas, objectAtIndex: i];
-                let rect: NSRect = msg_send![ta, rect];
-                (rect.size.width - bounds.size.width).abs() < 0.5
-                    && (rect.size.height - bounds.size.height).abs() < 0.5
-            });
-            assert!(
-                covered,
-                "a tracking area must cover the clear button's current bounds {bounds:?} (found {count})"
+            let hidden: bool = msg_send![buttons[1].0, isHidden];
+            assert_eq!(
+                !hidden, show_all,
+                "the clear-all button's visibility must follow the setting"
             );
+            let frames: [NSRect; 2] = buttons.map(|button| msg_send![button.0, frame]);
+            assert!(
+                (frames[0].size.width - widths[0]).abs() < 0.5,
+                "the plain clear must keep its text-hugging width"
+            );
+            if show_all {
+                assert!(
+                    frames[1].size.width >= widths[1],
+                    "the visible clear-all button must fit its title"
+                );
+            }
+            for button in buttons.iter() {
+                let bounds: NSRect = msg_send![button.0, bounds];
+                let areas: *mut AnyObject = msg_send![button.0, trackingAreas];
+                let count: usize = msg_send![areas, count];
+                let covered = (0..count).any(|i| {
+                    let ta: *mut AnyObject = msg_send![areas, objectAtIndex: i];
+                    let rect: NSRect = msg_send![ta, rect];
+                    (rect.size.width - bounds.size.width).abs() < 0.5
+                        && (rect.size.height - bounds.size.height).abs() < 0.5
+                });
+                assert!(
+                    covered,
+                    "a tracking area must cover the clear button's current bounds {bounds:?} (found {count})"
+                );
+            }
         }
     }
 
-    /// The handle view inside the header strip, found by its class name (the theme check needs it).
-    unsafe fn grip_view_in_header() -> *mut AnyObject {
-        let header = (*super::PICKER_HEADER_STRIP.lock().unwrap())
-            .expect("the picker header strip must be built")
+    /// The blank-area drag surface over the picker content, found by its class name. It is what makes
+    /// every inert region of the panel draggable now that the three-dot handle is gone.
+    unsafe fn drag_surface_in_content() -> *mut AnyObject {
+        let parent = (*super::PICKER_CONTENT_PARENT.lock().unwrap())
+            .expect("the picker content parent must be built")
             .0;
-        let subviews: *mut AnyObject = msg_send![header, subviews];
+        let subviews: *mut AnyObject = msg_send![parent, subviews];
         let count: usize = msg_send![subviews, count];
         for index in 0..count {
             let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
             let class: *mut AnyObject = msg_send![view, class];
             let name = crate::ffi::nsstring_to_rust(msg_send![class, description]);
-            if name == "OhMyTabClipboardGripView" {
+            if name == "OhMyTabClipboardDragSurface" {
                 return view;
             }
         }
@@ -308,26 +527,7 @@ pub(crate) fn smoke_runner() -> bool {
     /// a label captured at build time keeps the language that was active when it was built (and VoiceOver
     /// keeps announcing it). Reads the live properties back, which is also what an assistive client sees.
     unsafe fn assert_header_strings_are_localized() {
-        let grip = grip_view_in_header();
-        assert!(!grip.is_null(), "the handle view must be in the header");
-        let label: *mut AnyObject = msg_send![grip, accessibilityLabel];
-        assert!(
-            !label.is_null(),
-            "the handle must carry an accessibility label"
-        );
-        assert_eq!(
-            crate::ffi::nsstring_to_rust(label),
-            super::t("clipboard.grip_label"),
-            "the handle's accessibility label must follow the locale"
-        );
-        let tooltip: *mut AnyObject = msg_send![grip, toolTip];
-        assert!(!tooltip.is_null(), "the handle must carry a tooltip");
-        assert_eq!(
-            crate::ffi::nsstring_to_rust(tooltip),
-            super::t("clipboard.grip_tooltip"),
-            "the handle's tooltip must follow the locale"
-        );
-        if let Some(button) = *super::PICKER_SETTINGS_BUTTON.lock().unwrap() {
+        if let Some(button) = *super::PICKER_OPTIONS_ORB.lock().unwrap() {
             let label: *mut AnyObject = msg_send![button.0, accessibilityLabel];
             assert!(
                 !label.is_null(),
@@ -441,22 +641,20 @@ pub(crate) fn smoke_runner() -> bool {
             "unpinning must not restore the window properties while the panel is still visible"
         );
 
-        // The unpin -> FIRST detail open path: a detail created now must inherit what the picker is
-        // actually carrying (the pinned properties, retained by design), not recompute from the pin -
-        // recomputing was the second half of the same defect.
+        // This is the smoke's first detail open: verify the initial viewport before any reuse
+        // can repair stale autoresizing geometry, as well as retained picker window properties.
         super::rebuild_rows();
         show_detail_for_sel();
         assert!(
             super::detail_visible(),
             "the detail must open for this check"
         );
-        if let Some(detail) = (*super::DETAIL_WINDOW.lock().unwrap()).map(|w| w.0) {
-            let detail_hides: bool = msg_send![detail, hidesOnDeactivate];
-            assert_eq!(
-                detail_hides, after_unpin,
-                "a detail opened after unpin must inherit the picker's retained properties, not the defaults"
-            );
-        }
+        assert_detail_uses_picker_panel();
+        let detail_hides: bool = msg_send![window, hidesOnDeactivate];
+        assert_eq!(
+            detail_hides, after_unpin,
+            "opening detail after unpin must retain the picker's window properties"
+        );
         // Close the detail again; the smoke continues from a quiet panel.
         hide_detail();
 
@@ -614,70 +812,100 @@ pub(crate) fn smoke_runner() -> bool {
         crate::clipboard::apply_backdrop_material();
     }
 
-    /// The header's two new controls must exist in the LIVE view tree, not merely as geometry in a
-    /// pure function: the handle the A2 drag scenario grabs, and a settings button wired to the
-    /// action that opens the settings page. Both are found by class/action, so a rename that
-    /// silently left the header without them fails here.
+    /// The drag surface and the header controls must exist in the LIVE view tree, not merely as
+    /// geometry in a pure function: the blank-area surface the A2 drag scenario presses, and a
+    /// settings button wired to the action that opens the settings page. The surface is found by
+    /// class and then exercised through its own `hitTest:`, so a surface that exists but accepts
+    /// (or declines) the wrong regions fails here.
     unsafe fn assert_header_controls_are_live() {
         let header = (*super::PICKER_HEADER_STRIP.lock().unwrap())
             .expect("the picker header strip must be built")
             .0;
-        let (search, pin, gear, close) = super::picker_header_frames();
-        let grip = super::picker_grip_frame();
+        let (search, options, detail, pin, close) = super::picker_header_frames();
+        let band = super::picker_drag_band_frame();
 
         let subviews: *mut AnyObject = msg_send![header, subviews];
         let count: usize = msg_send![subviews, count];
-        let mut found_grip = false;
         let mut found_settings: *mut AnyObject = std::ptr::null_mut();
         let mut found_close = false;
         for index in 0..count {
             let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-            let class: *mut AnyObject = msg_send![view, class];
-            let name: *mut AnyObject = msg_send![class, description];
-            let name = crate::ffi::nsstring_to_rust(name);
-            if name == "OhMyTabClipboardGripView" {
-                found_grip = true;
-                let frame: NSRect = msg_send![view, frame];
-                assert_eq!(
-                    frame, grip,
-                    "the handle must sit on the band the geometry names"
-                );
-                // A handle with no tracking area never shows the hand cursor, and one whose frame
-                // drifts from its tracking rect stops responding where it is drawn.
-                let areas: *mut AnyObject = msg_send![view, trackingAreas];
-                let area_count: usize = msg_send![areas, count];
-                let covered = (0..area_count).any(|i| {
-                    let area: *mut AnyObject = msg_send![areas, objectAtIndex: i as isize];
-                    let rect: NSRect = msg_send![area, rect];
-                    (rect.size.width - grip.size.width).abs() < 0.5
-                        && (rect.size.height - grip.size.height).abs() < 0.5
-                });
-                assert!(covered, "the handle needs a tracking area over its band");
-            }
             let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
             if !is_button {
                 continue;
             }
             let action: Sel = msg_send![view, action];
-            if action == sel!(openClipboardSettings:) {
+            if action == sel!(toggleFilterPopover:) {
                 found_settings = view;
             } else if action == sel!(pickerClose:) {
                 found_close = true;
             }
         }
-        assert!(found_grip, "the header must carry the drag handle");
         assert!(found_close, "the header must still carry the close button");
         assert!(
             !found_settings.is_null(),
-            "the header's settings button must exist and target openClipboardSettings:"
+            "the header's options orb must exist and target toggleFilterPopover:"
+        );
+        // The blank-area drag surface must be the topmost content subview and cover the whole
+        // content, accept the blank top band and decline the search field. A surface that exists but
+        // is buried (or one that hit-tests everything) leaves the panel undraggable or swallows the
+        // controls, and neither shows up in the pure geometry.
+        let surface = drag_surface_in_content();
+        assert!(
+            !surface.is_null(),
+            "the panel must carry the blank-area drag surface"
+        );
+        let parent = (*super::PICKER_CONTENT_PARENT.lock().unwrap())
+            .expect("the picker content parent must be built")
+            .0;
+        let parent_subviews: *mut AnyObject = msg_send![parent, subviews];
+        let parent_count: usize = msg_send![parent_subviews, count];
+        let topmost: *mut AnyObject =
+            msg_send![parent_subviews, objectAtIndex: parent_count as isize - 1];
+        assert_eq!(
+            topmost, surface,
+            "the drag surface must be the topmost content subview"
+        );
+        let content_bounds: NSRect = msg_send![parent, bounds];
+        let surface_frame: NSRect = msg_send![surface, frame];
+        assert_eq!(
+            surface_frame, content_bounds,
+            "the drag surface must cover the whole content"
+        );
+        // The band and the search field live in the flipped header strip; the hit test takes a point
+        // in the content parent's (non-flipped) coordinates.
+        let header_frame: NSRect = msg_send![header, frame];
+        let to_parent = |local: NSPoint| -> NSPoint {
+            NSPoint::new(
+                header_frame.origin.x + local.x,
+                header_frame.origin.y + header_frame.size.height - local.y,
+            )
+        };
+        let band_point = to_parent(NSPoint::new(
+            band.origin.x + band.size.width / 2.0,
+            band.origin.y + band.size.height / 2.0,
+        ));
+        let hit_blank: *mut AnyObject = msg_send![surface, hitTest: band_point];
+        assert_eq!(
+            hit_blank, surface,
+            "the blank top band must resolve to the drag surface"
+        );
+        let search_point = to_parent(NSPoint::new(
+            search.origin.x + search.size.width / 2.0,
+            search.origin.y + search.size.height / 2.0,
+        ));
+        let hit_search: *mut AnyObject = msg_send![surface, hitTest: search_point];
+        assert!(
+            hit_search.is_null(),
+            "the search field must keep its own click; the drag surface must decline it"
         );
         // The pin is the corner row's third glyph. It is found by ACTION, so a rename that left the
         // header without a working pin fails here, and its frame is checked against the geometry
         // that no-overlap proof is written against.
         let found_pin = (0..count).any(|index| {
             let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-            // Only buttons answer action; the grip is a plain NSView, and asking it would be a
-            // "method not found" crash exactly like the loop above avoids.
+            // Only buttons answer action; the header strip is a plain NSView, and asking it would
+            // be a "method not found" crash.
             let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
             if !is_button {
                 return false;
@@ -702,17 +930,19 @@ pub(crate) fn smoke_runner() -> bool {
             found_pin,
             "the header must carry a pin button targeting togglePanelPin:"
         );
-        let gear_frame: NSRect = msg_send![found_settings, frame];
+        let options_frame: NSRect = msg_send![found_settings, frame];
         assert_eq!(
-            gear_frame, gear,
-            "the settings button must sit in the frame the geometry reserves for it"
+            options_frame, options,
+            "the options orb must sit in the frame the geometry reserves for it"
         );
-        // The three controls share the search row and may not overlap: the search field gives up
-        // both buttons' width, and the button frames are the ones the geometry names.
-        assert!(search.origin.x + search.size.width <= gear.origin.x);
-        assert!(gear.origin.x + gear.size.width <= close.origin.x);
-        let settings_hidden: bool = msg_send![found_settings, isHidden];
-        assert!(!settings_hidden, "the settings button must be visible");
+        // The controls share the search row and may not overlap: the search field gives up
+        // their width, and the frames are the ones the geometry names.
+        assert!(search.origin.x + search.size.width <= options.origin.x);
+        assert!(options.origin.x + options.size.width <= detail.origin.x);
+        assert!(detail.origin.x + detail.size.width <= pin.origin.x);
+        assert!(pin.origin.x + pin.size.width <= close.origin.x);
+        let options_hidden: bool = msg_send![found_settings, isHidden];
+        assert!(!options_hidden, "the options orb must be visible");
     }
 
     // Footer shortcut legends must survive the fonts they are drawn with, in every shipped
@@ -782,82 +1012,248 @@ pub(crate) fn smoke_runner() -> bool {
             );
         }
     }
+    // Delete keeps the detail open: with the detail expanded, Backspace removes the selected
+    // row and the panel follows the selection onto the entry that took its slot -- it must not
+    // collapse (the mock's `detailOpen && !currentItem()` rule). Restored with Cmd+Z so the
+    // fixtures survive for the later steps.
+    unsafe {
+        let c_opt = *PICKER_CONTAINER.lock().unwrap();
+        if let Some(c) = c_opt {
+            // Display index 1 is a text entry (0 is the image fixture, which has no
+            // detail text view): selecting it keeps every content assertion below a
+            // real check instead of a skipped `if let`.
+            set_picker_selection(1);
+            rebuild_rows();
+            super::picker::show_detail_for_sel();
+            assert!(
+                super::detail_visible(),
+                "the detail must open before the delete under test"
+            );
+            // The selection stays on the slot, so the entry at display index 2 before the
+            // delete is what the retargeted detail must show afterwards. The fixtures put
+            // text entries at both indices; a missing or empty target must fail, not skip.
+            let (deleted_marker, next_marker) = {
+                let hist = CLIP_HISTORY.lock().unwrap();
+                let marker = |i: usize| {
+                    with_clipboard_ui(|ui| ui.filtered.get(i).copied())
+                        .and_then(|h| hist.get(h))
+                        .map(|e| e.text.chars().take(24).collect::<String>())
+                };
+                (
+                    marker(1).expect("fixture entry 1 must carry text"),
+                    marker(2).expect("fixture entry 2 must carry text"),
+                )
+            };
+            let probe_of = |marker: &str| {
+                let probe = marker
+                    .split_whitespace()
+                    .max_by_key(|w| w.len())
+                    .unwrap_or(marker)
+                    .to_owned();
+                assert!(!probe.is_empty(), "the detail probe must not be empty");
+                probe
+            };
+            let deleted_probe = probe_of(&deleted_marker);
+            let next_probe = probe_of(&next_marker);
+            // The detail renders code with visible-space formatting, so a fragment of the
+            // raw entry text, not the whole rendered string, is the check.
+            let assert_detail_text = |expected: &str| {
+                let text_view = (*DETAIL_TEXT_VIEW.lock().unwrap())
+                    .map(|v| v.0)
+                    .expect("a text entry's detail must own a text view");
+                let string: *mut AnyObject = msg_send![text_view, string];
+                let rendered = nsstring_to_rust(string);
+                assert!(
+                    rendered.contains(expected),
+                    "the detail must show the selected entry (missing {expected:?})"
+                );
+            };
+            let ev_delete = make_key_event(51);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev_delete as *mut c_void);
+            assert!(
+                super::detail_visible(),
+                "backspace must keep the detail open on the next entry"
+            );
+            assert_detail_text(&next_probe);
+            // Cmd+Z restores the deleted entry and re-selects it: the open detail must
+            // follow the selection back to the restored entry, not stay on the retarget.
+            let ev_undo = make_key_event_with_modifiers(6, 0x0010_0000);
+            container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev_undo as *mut c_void);
+            assert!(
+                super::detail_visible(),
+                "undo must keep the detail open on the restored entry"
+            );
+            assert_detail_text(&deleted_probe);
+            super::hide_detail();
+        }
+    }
     // Clear-entry GUI smoke: the plain clear is always visible; the opt-in "clear all" appears
     // beside it only with the setting on, and both remain hit-testable in either state. Clear
     // scopes are covered by pure logic tests so this smoke retains all fixtures for the
     // subsequent detail path.
     unsafe {
-        let buttons = (*CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap())
-            .expect("persistent clear action buttons must be built");
-        // Hit-test from the window's content view, with the point converted to window
-        // coordinates. (The panel's elevation-outline work nested the content parent inside a
-        // padded container, so hit-testing `parent` directly with parent-local coordinates
-        // silently tested a point shifted by that container's origin.)
-        let content: *mut AnyObject = {
-            let win: *mut AnyObject = msg_send![buttons[0].0, window];
-            msg_send![win, contentView]
-        };
-        let is_hit_testable = |button: *mut AnyObject| -> bool {
-            let bounds: NSRect = msg_send![button, bounds];
-            let in_window: NSRect = msg_send![button, convertRect: bounds, toView: std::ptr::null_mut::<objc2::runtime::AnyObject>()];
-            let center = NSPoint::new(
-                in_window.origin.x + in_window.size.width / 2.0,
-                in_window.origin.y + in_window.size.height / 2.0,
-            );
-            let hit: *mut AnyObject = msg_send![content, hitTest: center];
-            hit == button
-        };
-        let original_separate = CONFIG.read().unwrap().clipboard.separate_clear_all;
-        // Setting off (the default): only the plain clear is visible and hit-testable; the
-        // clear-all button is hidden with a zero-size frame so it can never catch a click.
-        CONFIG.write().unwrap().clipboard.separate_clear_all = false;
+        // The clear actions live in the options popover now (step C): the label state is
+        // still computed, and the orb the popover anchors to must exist.
         update_clear_action_labels();
-        let frame0: NSRect = msg_send![buttons[0].0, frame];
-        let hidden1: bool = msg_send![buttons[1].0, isHidden];
+        assert!(clear_action_applied().is_some());
         assert!(
-            hidden1,
-            "clear-all button must hide while the setting is off"
+            (*PICKER_OPTIONS_ORB.lock().unwrap()).is_some(),
+            "the options orb must exist for the popover to anchor to"
         );
-        assert!(
-            frame0.size.width > 0.0,
-            "the plain clear must keep a real frame while the setting is off"
-        );
-        assert!(
-            is_hit_testable(buttons[0].0),
-            "the plain clear must remain directly hit-testable (frame0={frame0:?})"
-        );
-        // Setting on: both buttons visible side by side (plain clear left, clear-all right) with
-        // the shared gap, and both hit-testable.
-        CONFIG.write().unwrap().clipboard.separate_clear_all = true;
-        update_clear_action_labels();
-        let frames: [NSRect; 2] = buttons.map(|button| msg_send![button.0, frame]);
-        assert!(frames[0].origin.x < frames[1].origin.x);
-        assert_eq!(frames[0].origin.y, frames[1].origin.y);
-        assert_eq!(
-            frames[1].origin.x - (frames[0].origin.x + frames[0].size.width),
-            super::CLEAR_ACTION_GAP
-        );
-        for button in buttons {
+        let buttons = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap();
+        if let Some(buttons) = buttons {
+            // Hit-test from the window's content view, with the point converted to window
+            // coordinates. (The panel's elevation-outline work nested the content parent inside a
+            // padded container, so hit-testing `parent` directly with parent-local coordinates
+            // silently tested a point shifted by that container's origin.)
+            let content: *mut AnyObject = {
+                let win: *mut AnyObject = msg_send![buttons[0].0, window];
+                msg_send![win, contentView]
+            };
+            let is_hit_testable = |button: *mut AnyObject| -> bool {
+                let bounds: NSRect = msg_send![button, bounds];
+                let in_window: NSRect = msg_send![button, convertRect: bounds, toView: std::ptr::null_mut::<objc2::runtime::AnyObject>()];
+                let center = NSPoint::new(
+                    in_window.origin.x + in_window.size.width / 2.0,
+                    in_window.origin.y + in_window.size.height / 2.0,
+                );
+                let hit: *mut AnyObject = msg_send![content, hitTest: center];
+                hit == button
+            };
+            let original_separate = CONFIG.read().unwrap().clipboard.separate_clear_all;
+            // Setting off (the default): only the plain clear is visible and hit-testable; the
+            // clear-all button is hidden with a zero-size frame so it can never catch a click.
+            CONFIG.write().unwrap().clipboard.separate_clear_all = false;
+            update_clear_action_labels();
+            let frame0: NSRect = msg_send![buttons[0].0, frame];
+            let hidden1: bool = msg_send![buttons[1].0, isHidden];
             assert!(
-                is_hit_testable(button.0),
-                "clear action button must remain directly hit-testable"
+                hidden1,
+                "clear-all button must hide while the setting is off"
+            );
+            assert!(
+                frame0.size.width > 0.0,
+                "the plain clear must keep a real frame while the setting is off"
+            );
+            assert!(
+                is_hit_testable(buttons[0].0),
+                "the plain clear must remain directly hit-testable (frame0={frame0:?})"
+            );
+            // Setting on: both buttons visible side by side (plain clear left, clear-all right) with
+            // the shared gap, and both hit-testable.
+            CONFIG.write().unwrap().clipboard.separate_clear_all = true;
+            update_clear_action_labels();
+            let frames: [NSRect; 2] = buttons.map(|button| msg_send![button.0, frame]);
+            assert!(frames[0].origin.x < frames[1].origin.x);
+            assert_eq!(frames[0].origin.y, frames[1].origin.y);
+            assert_eq!(
+                frames[1].origin.x - (frames[0].origin.x + frames[0].size.width),
+                super::CLEAR_ACTION_GAP
+            );
+            for button in buttons {
+                assert!(
+                    is_hit_testable(button.0),
+                    "clear action button must remain directly hit-testable"
+                );
+            }
+            CONFIG.write().unwrap().clipboard.separate_clear_all = original_separate;
+            update_clear_action_labels();
+            let orb = (*PICKER_OPTIONS_ORB.lock().unwrap()).expect("the options orb must exist");
+            let hidden: bool = msg_send![orb.0, isHidden];
+            assert!(!hidden, "the options orb must remain visible");
+        }
+    }
+    // Options-popover smoke: open it through the real entry point and check the view the user gets.
+    // - Every row's label colour goes through the shared hex helper; an unknown selector here
+    //   (`+[NSColor colorWithHex:]`) aborted the whole build at first paint, and only building the
+    //   real popover can show that.
+    // - Building must NOT clear the open flag: the state drives outside-click dismissal, keyboard
+    //   navigation and `--e2e-state`, and a rebuild used to close the popover it was building.
+    // - The popover is flipped and laid out downwards from POPOVER_TOP inside a bottom-up parent,
+    //   so its top edge really sits under the orbs and its rows run in filter order.
+    unsafe {
+        dismiss_filter_popover();
+        assert!(!super::filter_popover_open());
+        super::toggle_filter_popover();
+        assert!(
+            super::filter_popover_open(),
+            "building the options popover must leave it open"
+        );
+        let popover = (*FILTER_POPOVER.lock().unwrap())
+            .expect("opening the options popover must build its view")
+            .0;
+        let parent = (*super::PICKER_CONTENT_PARENT.lock().unwrap())
+            .expect("the picker content parent must be built")
+            .0;
+        let superview: *mut AnyObject = msg_send![popover, superview];
+        assert_eq!(superview, parent, "the popover must be a content subview");
+        let popover_flipped: objc2::runtime::Bool = msg_send![popover, isFlipped];
+        assert!(
+            popover_flipped.as_bool(),
+            "the popover must be flipped so its rows stack top-down"
+        );
+        let parent_bounds: NSRect = msg_send![parent, bounds];
+        let parent_flipped: objc2::runtime::Bool = msg_send![parent, isFlipped];
+        let frame: NSRect = msg_send![popover, frame];
+        let popover_top = super::detail::top_offset_of(
+            frame.origin.y,
+            parent_bounds.size.height,
+            frame.size.height,
+            parent_flipped.as_bool(),
+        );
+        assert_eq!(
+            popover_top,
+            super::detail::filter_popover_top(parent_bounds.size.height, frame.size.height),
+            "the popover's top edge must sit at its anchor offset below the panel's top"
+        );
+        assert!(
+            popover_top + frame.size.height <= parent_bounds.size.height + 0.001,
+            "the whole popover menu must fit inside the panel (top={popover_top}, h={}, panel_h={})",
+            frame.size.height,
+            parent_bounds.size.height
+        );
+        // Row order: index 0 (the first filter) is the topmost, and the tags are the filter order.
+        let rows = popover_filter_rows(popover);
+        assert_eq!(
+            rows.len(),
+            super::CLIP_FILTER_ROWS.len(),
+            "every filter row must exist"
+        );
+        for pair in rows.windows(2) {
+            assert!(
+                pair[0].1 < pair[1].1,
+                "filter rows must stack downwards in index order (got {rows:?})"
+            );
+            assert_eq!(
+                pair[1].0,
+                pair[0].0 + 1,
+                "row tags must follow the filter order"
             );
         }
-        CONFIG.write().unwrap().clipboard.separate_clear_all = original_separate;
-        update_clear_action_labels();
-        let pills: Vec<*mut AnyObject> = FILTER_PILLS
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|pill| pill.0)
-            .collect();
+        dismiss_filter_popover();
         assert!(
-            pills.iter().all(|pill| {
-                let hidden: bool = msg_send![*pill, isHidden];
-                !hidden
-            }),
-            "filter tabs must remain visible beside clear actions"
+            !super::filter_popover_open(),
+            "dismissing must clear the open flag"
         );
+        assert!(
+            FILTER_POPOVER.lock().unwrap().is_none(),
+            "dismissing must remove the view"
+        );
+    }
+    // The date headings no longer carry a destructive clear button: history clearing is grouped
+    // into the options menu, matching the design.
+    unsafe {
+        if let Some(container) = picker_container_ptr() {
+            rebuild_rows();
+            for round in 0..2 {
+                rebuild_rows();
+                assert_eq!(
+                    date_heading_clear_button_count(container),
+                    0,
+                    "rebuild {round} left a date-heading clear button outside the options menu"
+                );
+            }
+        }
     }
     // Clear-action scope smoke: a typed query renames the plain clear to the "current" wording
     // (and the opt-in clear-all to "all results"); clearing the query through the shared path
@@ -868,35 +1264,31 @@ pub(crate) fn smoke_runner() -> bool {
         assert_pin_button_reflects_state();
         assert_paste_handback_state_is_bounded();
         assert_shortcut_reopens_appkit_hidden_panel();
-        // The handle's dots must follow a theme switch: the picker window is reused across showings, so an
-        // ink captured when the handle was built kept the previous mode's colour. This drives the real
-        // refresh (the coordinator the settings switch runs) and reads the layer the dots are painted with.
+        // A theme switch must repaint the picker in place without disturbing the drag surface or the
+        // pin: the surface is the topmost content subview, and a refresh that rebuilt content on top of
+        // it (or that read as a pin change) would silently disable the drag.
         {
-            let grip = grip_view_in_header();
-            assert!(!grip.is_null(), "the handle view must be in the header");
-            let first_dot_color = |grip: *mut AnyObject| -> Vec<f64> {
-                let marks: *mut AnyObject = msg_send![grip, subviews];
-                let count: usize = msg_send![marks, count];
-                assert!(count >= 3, "the handle must hold its three dots");
-                let mark: *mut AnyObject = msg_send![marks, objectAtIndex: 0isize];
-                let layer: *mut AnyObject = msg_send![mark, layer];
-                let color = crate::ffi::layer_background_color(layer);
-                assert!(!color.is_null(), "a dot must be painted");
-                let number = crate::ffi::CGColorGetNumberOfComponents(color as *const c_void);
-                let components = crate::ffi::CGColorGetComponents(color as *const c_void);
-                (0..number).map(|i| *components.add(i)).collect()
-            };
             let original_theme = CONFIG.read().unwrap().appearance.theme.clone();
-            CONFIG.write().unwrap().appearance.theme = "light".to_string();
-            crate::ui_coordinator::apply_theme_and_locale_refresh();
-            let light = first_dot_color(grip);
-            CONFIG.write().unwrap().appearance.theme = "dark".to_string();
-            crate::ui_coordinator::apply_theme_and_locale_refresh();
-            let dark = first_dot_color(grip);
-            assert!(
-                light != dark,
-                "the handle's dots must be repainted on a theme switch (light {light:?} vs dark {dark:?})"
-            );
+            for theme in ["light", "dark"] {
+                CONFIG.write().unwrap().appearance.theme = theme.to_string();
+                crate::ui_coordinator::apply_theme_and_locale_refresh();
+                let surface = drag_surface_in_content();
+                assert!(
+                    !surface.is_null(),
+                    "the drag surface must survive a {theme} theme refresh"
+                );
+                let parent = (*super::PICKER_CONTENT_PARENT.lock().unwrap())
+                    .expect("the picker content parent must be built")
+                    .0;
+                let subviews: *mut AnyObject = msg_send![parent, subviews];
+                let count: usize = msg_send![subviews, count];
+                let topmost: *mut AnyObject =
+                    msg_send![subviews, objectAtIndex: count as isize - 1];
+                assert_eq!(
+                    topmost, surface,
+                    "a {theme} theme refresh must leave the drag surface topmost"
+                );
+            }
             CONFIG.write().unwrap().appearance.theme = original_theme;
             crate::ui_coordinator::apply_theme_and_locale_refresh();
             // A theme/locale/material refresh repaints the picker in place; it must NOT read as (or
@@ -912,10 +1304,10 @@ pub(crate) fn smoke_runner() -> bool {
         }
         // The moved position lasts exactly one showing and never reaches the configuration file (the
         // A2 drag scenario asserts the across-a-relaunch half of the same promise).
-        super::grip::set_session_origin(NSPoint::new(42.0, 42.0));
-        super::grip::on_picker_hidden();
+        super::drag::set_session_origin(NSPoint::new(42.0, 42.0));
+        super::drag::on_picker_hidden();
         assert!(
-            super::grip::session_origin().is_none(),
+            super::drag::session_origin().is_none(),
             "hiding the picker must forget the dragged position"
         );
         super::with_clipboard_ui(|ui| ui.search_query = "apple".to_string());
@@ -995,7 +1387,7 @@ pub(crate) fn smoke_runner() -> bool {
             }
         }
     }
-    // The drag handle end to end: move the panel through the real gesture path, then check every claim
+    // Blank-area drag end to end: move the panel through the real gesture path, then check every claim
     // the feature makes -- the window follows, the detail round trip keeps the dragged position, the
     // double-click reset returns to the configured one, and a hidden-then-reshown picker is back at the
     // configured position (the "one showing" promise, through the REAL hide path rather than the
@@ -1006,9 +1398,9 @@ pub(crate) fn smoke_runner() -> bool {
             super::picker_frame_top_left().expect("the picker must have a frame while it is shown")
         };
         let baseline = panel_rect();
-        // Grab the handle's own band, so the gesture goes through the same containment check a real
+        // Grab the reported drag band, so the gesture goes through the same containment check a real
         // press does: the band is reported in the panel's points, top-left based.
-        let grip = super::picker_grip_rect_top_left().expect("the handle must be built");
+        let grip = super::picker_grip_rect_top_left().expect("the picker must have a drag band");
         let screen_height = crate::overlay::hover::primary_screen_frame()
             .expect("a primary screen")
             .size
@@ -1024,14 +1416,13 @@ pub(crate) fn smoke_runner() -> bool {
         let dy = 60.0;
         let to = NSPoint::new(from.x + dx, from.y - dy);
 
-        // The whole top bar is the handle, not the three dots: a press near the band's LEFT end must drag
-        // the panel too (before this change only the centered 48pt band was a target, so this point was
-        // inert). Reset afterwards so the rest of this block measures from the configured position.
-        // 20pt from the PANEL's left edge, deliberately NOT derived from the band: the band this used to
-        // be started at (PICKER_W - 48)/2 = 256pt, so a point taken relative to the band would have been
-        // inside it in both geometries and would have proved nothing.
+        // A blank press near the panel's LEFT edge must drag the panel too: the gesture is not tied to
+        // the reported band, to a centered mark, or to the middle of the panel. 20pt from the PANEL's
+        // left edge, deliberately NOT derived from the band, so the point cannot move with the geometry
+        // it is meant to test. Reset afterwards so the rest of this block measures from the configured
+        // position.
         let near_left = to_appkit(baseline.0 + 20.0, baseline.1 + grip.1 + grip.3 / 2.0);
-        super::grip::e2e_drag(
+        super::drag::e2e_drag(
             near_left,
             NSPoint::new(near_left.x + 25.0, near_left.y - 15.0),
         );
@@ -1052,22 +1443,22 @@ pub(crate) fn smoke_runner() -> bool {
             "the reset after the edge drag must return the panel to the configured position"
         );
 
-        // A click on the handle, and a wobble under the threshold: neither may move the panel, and neither
+        // A blank click, and a wobble under the threshold: neither may move the panel, and neither
         // may leave the closed hand pushed (the press does that regardless of travel).
         let before_click = panel_rect();
-        super::grip::e2e_drag(from, from);
+        super::drag::e2e_drag(from, from);
         assert!(
-            !super::grip::e2e_cursor_is_closed(),
-            "a click on the handle must not leave the closed hand cursor held"
+            !super::drag::e2e_cursor_is_closed(),
+            "a blank click must not leave the closed hand cursor held"
         );
         assert_eq!(
             panel_rect(),
             before_click,
-            "a click on the handle must not move the panel"
+            "a blank click must not move the panel"
         );
-        super::grip::e2e_drag(from, NSPoint::new(from.x + 1.0, from.y - 1.0));
+        super::drag::e2e_drag(from, NSPoint::new(from.x + 1.0, from.y - 1.0));
         assert!(
-            !super::grip::e2e_cursor_is_closed(),
+            !super::drag::e2e_cursor_is_closed(),
             "a wobble under the drag threshold must not leave the closed hand cursor held"
         );
         assert_eq!(
@@ -1076,12 +1467,12 @@ pub(crate) fn smoke_runner() -> bool {
             "a wobble under the drag threshold must not move the panel"
         );
 
-        super::grip::e2e_drag(from, to);
+        super::drag::e2e_drag(from, to);
         let dragged = panel_rect();
         assert!(
             (dragged.0 - (baseline.0 + dx)).abs() < 1.5
                 && (dragged.1 - (baseline.1 + dy)).abs() < 1.5,
-            "the panel must follow the handle: dragged to ({},{}), expected ({},{})",
+            "the panel must follow the drag: dragged to ({},{}), expected ({},{})",
             dragged.0,
             dragged.1,
             baseline.0 + dx,
@@ -1090,11 +1481,10 @@ pub(crate) fn smoke_runner() -> bool {
         // The anchor is what a detail panel's close restores, so it has to be where the drag ENDED. It is a
         // point in AppKit screen coordinates (bottom-left origin, the panel's bottom edge), while the
         // reported rect is top-left based, so the comparison converts the dragged rect's top edge back.
-        let anchor = super::grip::session_origin().expect("a finished drag must leave an anchor");
+        let anchor = super::drag::session_origin().expect("a finished drag must leave an anchor");
         let dragged_appkit_origin_y = screen_height - dragged.1 - dragged.3;
         assert!(
-            (anchor.x - dragged.0).abs() < 1.5
-                && (anchor.y - dragged_appkit_origin_y).abs() < 1.5,
+            (anchor.x - dragged.0).abs() < 1.5 && (anchor.y - dragged_appkit_origin_y).abs() < 1.5,
             "the anchor must be the dragged position ({} ,{}), not the press-time one (panel top-left {},{})",
             anchor.x,
             anchor.y,
@@ -1122,6 +1512,8 @@ pub(crate) fn smoke_runner() -> bool {
             super::detail_visible(),
             "the detail panel must open for the selected entry"
         );
+        // Check before the repeated open can repair stale initial autoresizing geometry.
+        assert_detail_uses_picker_panel();
         // The origin a close restores: this is the wiring that returns the panel to where the drag ended.
         let restore_origin = (*super::DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap())
             .expect("opening the detail must capture the origin its close restores");
@@ -1135,33 +1527,35 @@ pub(crate) fn smoke_runner() -> bool {
         );
         super::picker::show_detail_for_sel();
         let opened = panel_rect();
-        // The rule the layout must follow with an anchor: keep the anchor, and move the picker left ONLY by
-        // what the group needs to fit inside the screen's edge margins. Stated as arithmetic here rather
-        // than by calling the layout again -- a test that re-runs its subject proves nothing.
-        let detail_w = super::DETAIL_WINDOW
-            .lock()
-            .unwrap()
-            .map(|window| crate::glass::panel_frame_of(window.0).size.width)
-            .expect("the detail window must exist while its panel is open");
-        let group_w = super::PICKER_W + super::DETAIL_GAP + detail_w;
-        let screen_w = crate::overlay::hover::primary_screen_frame()
-            .expect("a primary screen")
-            .size
-            .width;
-        let fitted =
-            (screen_w - super::PICKER_EDGE_MARGIN - group_w).max(super::PICKER_EDGE_MARGIN);
-        let expected_x = if dragged.0 + group_w <= screen_w - super::PICKER_EDGE_MARGIN {
-            dragged.0
+        assert_detail_uses_picker_panel();
+        // Widening keeps the panel's centre (the mock's `.is-expanded` grows symmetrically):
+        // the expanded panel's x shifts left by half the added width, clamped at the screen
+        // edge when the centred frame would overflow. The panel width is measured from the
+        // live rect, not the layout helper.
+        let panel_w = opened.2;
+        let screen = crate::overlay::hover::primary_screen_frame().expect("a primary screen");
+        let centred_x = dragged.0 + (dragged.2 - panel_w) / 2.0;
+        let min_x = screen.origin.x + super::PICKER_EDGE_MARGIN;
+        let max_x = screen.origin.x + screen.size.width - super::PICKER_EDGE_MARGIN;
+        let expected_x = if panel_w >= screen.size.width {
+            min_x
         } else {
-            fitted
+            centred_x.max(min_x).min(max_x - panel_w)
         };
         assert!(
             (opened.0 - expected_x).abs() < 1.5,
-            "a layout with the detail open must keep the dragged x {} unless the group needs room (expected {}, found {})",
-            dragged.0,
+            "an expanded panel must keep the centre (expected x {}, found {})",
             expected_x,
             opened.0
         );
+        if expected_x == centred_x {
+            assert!(
+                ((opened.0 + panel_w / 2.0) - (dragged.0 + dragged.2 / 2.0)).abs() < 1.5,
+                "an expanded panel that fits must keep its centre x ({}, found {})",
+                dragged.0 + dragged.2 / 2.0,
+                opened.0 + panel_w / 2.0
+            );
+        }
         super::hide_detail();
         assert!(
             !super::detail_visible(),
@@ -1182,11 +1576,11 @@ pub(crate) fn smoke_runner() -> bool {
 
         // The lifecycle: drag, hide through the real path, summon again -- the configured position decides
         // again, and nothing of the drag survives.
-        super::grip::e2e_drag(from, to);
-        assert!(super::grip::session_origin().is_some());
+        super::drag::e2e_drag(from, to);
+        assert!(super::drag::session_origin().is_some());
         super::hide_picker();
         assert!(
-            super::grip::session_origin().is_none(),
+            super::drag::session_origin().is_none(),
             "hiding the picker must forget the dragged position through the real hide path"
         );
         super::show_picker();
@@ -1200,7 +1594,7 @@ pub(crate) fn smoke_runner() -> bool {
             reshown.1
         );
 
-        // A detail closed a moment ago, then a grab of the handle before its queued orderOut runs: the queued
+        // A detail closed a moment ago, then a blank grab before its queued orderOut runs: the queued
         // call belongs to a detail the app already considers closed, so it must still complete. Cancelling it
         // (what the first version of the drag did) left the window ordered front, transparent and collapsed
         // with nothing left to retry. This runs last because the run-loop turn below can also deliver the
@@ -1208,7 +1602,7 @@ pub(crate) fn smoke_runner() -> bool {
         super::picker::show_detail_for_sel();
         super::hide_detail();
         let detail_window = super::DETAIL_WINDOW.lock().unwrap().map(|w| w.0);
-        super::grip::e2e_drag(from, to);
+        super::drag::e2e_drag(from, to);
         let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), currentRunLoop];
         let limit: *mut AnyObject = msg_send![class!(NSDate), dateWithTimeIntervalSinceNow: 0.6f64];
         let _: () = msg_send![run_loop, runUntilDate: limit];
@@ -1216,7 +1610,7 @@ pub(crate) fn smoke_runner() -> bool {
             let visible: bool = msg_send![window, isVisible];
             assert!(
                 !visible,
-                "the detail window must be ordered out after its close, even when the handle is grabbed before the queued call runs"
+                "the detail window must be ordered out after its close, even when a blank region is grabbed before the queued call runs"
             );
         }
     }
@@ -1236,6 +1630,7 @@ pub(crate) fn smoke_runner() -> bool {
                 super::detail_visible(),
                 "right arrow must open the detail panel"
             );
+            assert_detail_uses_picker_panel();
             // Down: the detail follows the selection (stays open); the selection moves to a
             // text entry -> the full-text branch.
             let ev = make_key_event(125);
@@ -1244,6 +1639,26 @@ pub(crate) fn smoke_runner() -> bool {
                 super::detail_visible(),
                 "the detail must stay open while navigating"
             );
+            assert_detail_uses_picker_panel();
+            let row = ROW_HOVER_VIEWS
+                .lock()
+                .unwrap()
+                .iter()
+                .find_map(|row| {
+                    let tag: isize = msg_send![row.content.0, tag];
+                    (tag >= 0 && tag as usize == super::picker_selection()).then_some(row.content.0)
+                })
+                .expect("the selected long-code row must be materialized");
+            let attributed: *mut AnyObject = msg_send![row, attributedTitle];
+            let key = make_nsstring("NSParagraphStyle");
+            let paragraph: *mut AnyObject = msg_send![attributed, attribute: key, atIndex: 0usize, effectiveRange: std::ptr::null_mut::<NSRange>()];
+            CFRelease(key as *const c_void);
+            assert!(
+                !paragraph.is_null(),
+                "long row must carry its paragraph style"
+            );
+            let line_break: isize = msg_send![paragraph, lineBreakMode];
+            assert_eq!(line_break, 4, "long single-line row must truncate its tail");
             // An overflowing text detail must use stable full layout plus the native scroller
             // and open at AppKit's actual top. Simulate bounds crossing both endpoints; the
             // notification callback only refreshes the capsules and must never rewrite the
@@ -1253,8 +1668,12 @@ pub(crate) fn smoke_runner() -> bool {
                 .unwrap()
                 .expect("text detail must install a scroll view")
                 .0;
-            let wrapped_doc: *mut AnyObject = msg_send![wrapped_scroll, documentView];
-            let wrapped_string: *mut AnyObject = msg_send![wrapped_doc, string];
+            // The scroll document also holds the code gutter and metadata; text APIs belong
+            // to its NSTextView child, not the enclosing NSView.
+            let wrapped_text = (*DETAIL_TEXT_VIEW.lock().unwrap())
+                .expect("wrapped detail must install a text view")
+                .0;
+            let wrapped_string: *mut AnyObject = msg_send![wrapped_text, string];
             let wrapped_horizontal: bool = msg_send![wrapped_scroll, hasHorizontalScroller];
             assert!(
                 !wrapped_horizontal,
@@ -1289,7 +1708,10 @@ pub(crate) fn smoke_runner() -> bool {
                 .expect("no-wrap detail must rebuild its scroll view")
                 .0;
             let no_wrap_doc: *mut AnyObject = msg_send![no_wrap_scroll, documentView];
-            let no_wrap_string: *mut AnyObject = msg_send![no_wrap_doc, string];
+            let no_wrap_text = (*DETAIL_TEXT_VIEW.lock().unwrap())
+                .expect("no-wrap detail must install a text view")
+                .0;
+            let no_wrap_string: *mut AnyObject = msg_send![no_wrap_text, string];
             let no_wrap_horizontal: bool = msg_send![no_wrap_scroll, hasHorizontalScroller];
             let no_wrap_frame: NSRect = msg_send![no_wrap_doc, frame];
             let no_wrap_clip: *mut AnyObject = msg_send![no_wrap_scroll, contentView];
@@ -1340,8 +1762,10 @@ pub(crate) fn smoke_runner() -> bool {
             let autohides: bool = msg_send![detail_scroll, autohidesScrollers];
             let scroller_style: isize = msg_send![detail_scroll, scrollerStyle];
             let elasticity: isize = msg_send![detail_scroll, verticalScrollElasticity];
-            let detail_doc: *mut AnyObject = msg_send![detail_scroll, documentView];
-            let layout: *mut AnyObject = msg_send![detail_doc, layoutManager];
+            let detail_text = (*DETAIL_TEXT_VIEW.lock().unwrap())
+                .expect("wrapped detail must retain its text view")
+                .0;
+            let layout: *mut AnyObject = msg_send![detail_text, layoutManager];
             let noncontiguous: bool = msg_send![layout, allowsNonContiguousLayout];
             let background: bool = msg_send![layout, backgroundLayoutEnabled];
             assert!(
@@ -1449,6 +1873,30 @@ pub(crate) fn smoke_runner() -> bool {
             container_key_down(c.0 as *mut c_void, sel!(keyDown:), ev as *mut c_void);
             assert!(!super::detail_visible(), "Esc must close the detail first");
         }
+        // A short document must remain visible as well: a long document can intersect the
+        // viewport even when an incorrect inherited bounds origin clips an entire short one.
+        let short_index = {
+            let history = CLIP_HISTORY.lock().unwrap();
+            with_clipboard_ui(|ui| {
+                ui.filtered.iter().position(|&index| {
+                    history
+                        .get(index)
+                        .is_some_and(|entry| entry.text == "banana bread")
+                })
+            })
+        }
+        .expect("the short-text fixture must remain available");
+        super::set_picker_selection(short_index);
+        rebuild_rows();
+        super::picker::show_detail_for_sel();
+        assert_detail_uses_picker_panel();
+        let short_text = (*DETAIL_TEXT_VIEW.lock().unwrap())
+            .expect("short detail needs a text view")
+            .0;
+        let short_string: *mut AnyObject = msg_send![short_text, string];
+        assert_eq!(nsstring_to_rust(short_string), "banana bread");
+        assert_short_detail_text_paints(short_text);
+        super::hide_detail();
         // Image entry: locate its display index, → expands it -> the lazy .detail preview is
         // generated and cached.
         let img_h = {
@@ -1566,7 +2014,10 @@ pub(crate) fn smoke_runner() -> bool {
                 "the button must re-read the key"
             );
             assert!(
-                (frame.origin.x + frame.size.width / 2.0 - super::PICKER_W / 2.0).abs() <= 0.5,
+                (frame.origin.x + frame.size.width / 2.0
+                    - super::picker::picker_list_width() / 2.0)
+                    .abs()
+                    <= 0.5,
                 "the button must be centred in the panel (x {} w {})",
                 frame.origin.x,
                 frame.size.width
@@ -1757,7 +2208,7 @@ unsafe fn make_key_event_with_modifiers(keycode: u16, modifiers: u64) -> *mut An
 }
 
 /// Rasterise an active detail icon and verify its two halves: the chip is filled with the accent
-/// and its glyph is drawn in `accent_text` over it. Reading the pixels catches a mismatched role
+/// and its glyph is drawn in `accent_ink` over it. Reading the pixels catches a mismatched role
 /// (a fill the glyph cannot be seen against), which a token-level check cannot express.
 unsafe fn active_detail_icon_glyph_is_legible_on_its_fill() -> bool {
     // Both appearances, not just the one this process resolves to: the defect was dark-only.
@@ -1773,7 +2224,7 @@ unsafe fn active_detail_icon_glyph_is_legible_on_its_fill() -> bool {
 /// Render an active detail icon and require its glyph to be legible *against its own fill*.
 ///
 /// Measured from the pixels because the defect was a wrong role: the chip was filled with
-/// `primary_text` while the glyph stayed `accent_text`. In light mode that is a dark chip with a
+/// `primary_text` while the glyph stayed `accent_ink`. In light mode that is a dark chip with a
 /// white glyph (13.91:1, fine), but dark `primary_text` is near-white, so the glyph measured
 /// 1.09:1 and the icon showed as a blank disc. A token-level check cannot express "these two
 /// roles are readable together"; the dominant colour is the fill, and the glyph is whatever
@@ -1796,8 +2247,22 @@ unsafe fn active_detail_icon_glyph_is_legible_for_mode(dark: bool) -> bool {
         release_obj(image);
         return false;
     }
+    // `pixelsWide`/`pixelsHigh` live on NSBitmapImageRep, not on every NSImageRep: a receiver
+    // that is not one (NSImage can answer with a private geometry proxy) traps on the send, so
+    // the class is checked before the pixels are asked for.
+    let is_bitmap: bool = msg_send![rep, isKindOfClass: class!(NSBitmapImageRep)];
+    if !is_bitmap {
+        release_obj(rep);
+        release_obj(image);
+        return false;
+    }
     let width: usize = msg_send![rep, pixelsWide];
     let height: usize = msg_send![rep, pixelsHigh];
+    if width == 0 || height == 0 {
+        release_obj(rep);
+        release_obj(image);
+        return false;
+    }
     let mut histogram: Vec<([f64; 3], usize)> = Vec::new();
     for y in 0..height {
         for x in 0..width {

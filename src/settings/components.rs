@@ -9,7 +9,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::sync::{LazyLock, Mutex};
 
 use crate::ffi::release_obj;
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 
 use super::{
     settings_page_identity, settings_page_ids, tooltip::SettingsTooltip, widgets, SettingsPageId,
@@ -64,9 +64,15 @@ const RESTORE_TRIGGER_INSET: f64 = 8.0;
 const RESTORE_CONTAINER_ORIGIN: f64 = 16.0;
 const RESTORE_SIDEBAR_OUTER_INSET: f64 = RESTORE_CONTAINER_ORIGIN + RESTORE_TRIGGER_INSET;
 const RESTORE_ACTION_ROW_GAP: f64 = 16.0;
+const SIDEBAR_VERSION_BOTTOM_INSET: f64 = 12.0;
+const SIDEBAR_VERSION_HORIZONTAL_INSET: f64 = 8.0;
+const SIDEBAR_VERSION_GAP: f64 = 8.0;
+const SIDEBAR_VERSION_HEIGHT: f64 = 14.0;
 
-/// Gap between a card's internal divider and the top edge of the row below it (`separator_above_row`).
-const SEPARATOR_ABOVE_ROW_GAP: f64 = 4.0;
+/// Gap between a card's internal divider and the top edge of the row below it
+/// (`separator_above_row`). Contiguous rows put the hairline on the shared edge, which is the
+/// mockup's `.setting-row + .setting-row { border-top: 1px solid var(--settings-divider) }`.
+const SEPARATOR_ABOVE_ROW_GAP: f64 = 0.0;
 
 /// Standard rows keep their label and control as sibling views in the card, so retain the
 /// association here instead of forcing every SettingsUi field to grow a second label pointer.
@@ -87,17 +93,24 @@ pub(super) struct SettingsLayout {
     pub row_gap: f64,
     /// Legacy page frame inset below the last row; normalized by SettingsSection.
     pub card_bottom_inset: f64,
-    /// Gap between a section header and the card top edge.
-    pub card_header_gap: f64,
 }
 
 impl SettingsLayout {
     /// Standard visual height of one settings row; controls remain shorter and center inside it.
-    pub(super) const SINGLE_LINE_ROW_H: f64 = 52.0;
+    ///
+    /// The mockup's `.setting-row { min-height: 56px; padding: 12px 16px }` is a 32pt control plus
+    /// 12pt of padding above and below.
+    pub(super) const SINGLE_LINE_ROW_H: f64 = 56.0;
     pub(super) const CONTROL_H: f64 = 32.0;
+    /// Distance from a card's last row to its own bottom edge. The mock's `.settings-group` has
+    /// no vertical padding: the card is exactly its rows' bounding box (its height is the rows
+    /// plus the 1px border on each edge). The symbol stays so a restored inset lands in every
+    /// reader at once.
+    pub(super) const CARD_BOTTOM_INSET: f64 = 0.0;
 
     pub(super) fn new(content_w: f64) -> Self {
-        let control_w = 200.0;
+        // `.select-wrap { width: 180px }` in the mock.
+        let control_w = 180.0;
         Self {
             label_x: 16.0,
             label_w: 220.0,
@@ -107,15 +120,26 @@ impl SettingsLayout {
             // Detailed subtitles are no longer rendered; described rows use the same compact
             // height as every other single-line row.
             described_row_h: Self::SINGLE_LINE_ROW_H,
-            section_step: super::SETTINGS_SECTION_HEADER_GAP + 24.0,
-            row_gap: 8.0,
-            card_bottom_inset: 8.0,
-            card_header_gap: super::SETTINGS_SECTION_CARD_GAP,
+            // The card's top edge sits CARD_BOTTOM_INSET above the first row (it used to tuck 4pt
+            // under the row top), so the step grows by that delta to keep the same visible gap
+            // between a card's bottom and the next section's heading. The heading term is its box
+            // height, so the step follows `add_header` instead of a second number.
+            section_step: super::SETTINGS_SECTION_HEADER_GAP
+                + widgets::SECTION_HEADER_H
+                + Self::CARD_BOTTOM_INSET
+                + super::SETTINGS_SECTION_CARD_GAP,
+            // The mockup's rows are contiguous inside a group; a `border-top` divides them rather
+            // than a gap (`.setting-row + .setting-row`).
+            row_gap: 0.0,
+            card_bottom_inset: Self::CARD_BOTTOM_INSET,
         }
     }
 
+    /// The card's top edge: the first row's top plus the same inset the bottom edge keeps, so a
+    /// row band sits centered inside the card instead of reading high (top inset used to be
+    /// `-card_header_gap`, i.e. the first row poked 4pt out of the card).
     pub(super) fn card_top(self, header_y: f64) -> f64 {
-        header_y - self.card_header_gap
+        header_y + Self::CARD_BOTTOM_INSET
     }
 }
 
@@ -152,22 +176,27 @@ impl SettingsPage {
 }
 
 /// Page header component: the design system's page title (`26px`) plus its
-/// distance from the pane top (`.content { padding: 42px 0 72px }`), plus the gap down to the
-/// first section heading. Owns the whole page-top block so pages neither hardcode its metrics nor
-/// drift apart: one call returns the cursor that first heading hangs from.
+/// distance from the pane top (the mockup's `.page-header { padding: var(--sp-6) var(--sp-7) var(--sp-4) }`
+/// below a 36px titlebar), plus the gap down to the first section heading. Owns the whole page-top
+/// block so pages neither hardcode its metrics nor drift apart: one call returns the cursor that
+/// first heading hangs from.
 pub(super) struct SettingsPageHeader;
 
 impl SettingsPageHeader {
-    /// Distance from the pane top to the title's frame. The HTML mockup's `.content` padding is
-    /// 42px, but the 26pt title's frame is taller than its ink, so the visible gap was tighter than
-    /// the mockup's; 48 keeps `TOP_PADDING + FIRST_SECTION_GAP` unchanged (everything below the
-    /// title stays where it was) while giving the title the intended breathing room.
-    pub(super) const TOP_PADDING: f64 = 48.0;
+    /// Distance from the pane top to the title's frame. The pane top is the bottom edge of the
+    /// 36pt title bar band (the window's layout starts under the band, exactly like the mock's
+    /// `.settings-layout`); the mock's `.page-header` uses 24pt of top padding. Keep this metric
+    /// here so every settings page moves together when the page header spacing changes.
+    pub(super) const TOP_PADDING: f64 = 24.0;
 
-    /// HTML `.content`'s bottom padding, i.e. the space the page must keep below its last element.
-    /// Page documents keep this much space below their lowest content; overshooting it is the dead
-    /// scroll space users see as "the page scrolls far past its content".
-    pub(super) const BOTTOM_PADDING: f64 = 72.0;
+    /// Space the page keeps below its lowest content.
+    ///
+    /// The mockup puts the restore control in a footer with `padding: 0 var(--sp-7) var(--sp-7)`
+    /// (28px below it). The settings pages embed that control in the scrolling document, whose
+    /// shell already leaves an 8pt inset below the button, so the document's own bottom padding is
+    /// that 28px minus the inset. Overshooting it is the dead scroll space users see as "the page
+    /// scrolls far past its content".
+    pub(super) const BOTTOM_PADDING: f64 = 20.0;
 
     /// Empty space between the title's frame and the first section heading's box below it.
     ///
@@ -413,19 +442,29 @@ impl SettingsRow {
         label
     }
 
+    fn control_origin_y(y: f64, row_h: f64, control_h: f64) -> f64 {
+        y + (row_h - control_h).max(0.0) / 2.0
+    }
+
     /// Center a native control by its view frame.
     unsafe fn center_control(child: *mut AnyObject, y: f64, row_h: f64) {
         if child.is_null() {
             return;
         }
         let mut frame: NSRect = objc2::msg_send![child, frame];
-        frame.origin.y = y + (row_h - frame.size.height).max(0.0) / 2.0;
+        frame.origin.y = Self::control_origin_y(y, row_h, frame.size.height);
         let _: () = objc2::msg_send![child, setFrame: frame];
     }
 
     /// NSTextField's glyphs are top-biased when its frame is taller than the measured cell.
     /// Fit the frame to the cell's measured height before centering it, so the glyph baseline
     /// shares the same center line as the trailing control.
+    ///
+    /// A forced line height (`ffi::set_text_field_line_height`) adds its extra leading above the
+    /// glyphs, so inside a centred line box the ink still sits low; the frame is shifted by exactly
+    /// that leading-derived offset, signed for the superview's axis (see
+    /// `ffi::text_field_line_height_correction`). A field whose line height was never forced
+    /// reports 0 and is centred by its box alone, unchanged.
     unsafe fn center_label(child: *mut AnyObject, y: f64, row_h: f64) {
         if child.is_null() {
             return;
@@ -445,6 +484,9 @@ impl SettingsRow {
         let mut frame: NSRect = objc2::msg_send![child, frame];
         frame.origin.y = y + (row_h - measured.height).max(0.0) / 2.0;
         frame.size.height = measured.height;
+        // A positive correction moves the ink toward the row's centre line, whichever direction
+        // the superview's y axis points.
+        frame.origin.y += crate::ffi::text_field_line_height_correction(child);
         let _: () = objc2::msg_send![child, setFrame: frame];
     }
 
@@ -880,6 +922,9 @@ impl SettingsMappingActionIcon {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum SettingsButtonRole {
     Action,
+    /// Filled neutral surface used by value controls that also accept clicks, such as a
+    /// recorded shortcut. This shares the control-field palette with dropdown triggers.
+    ControlField,
     Footer,
     Primary,
     Destructive,
@@ -888,7 +933,7 @@ pub(crate) enum SettingsButtonRole {
 impl SettingsButtonRole {
     /// The role for a list row's trailing Edit / Delete buttons.
     ///
-    /// It is the design system's **secondary** action surface (`button_bg` + `card_border`), which is
+    /// It is the design system's **secondary** action surface (`field_bg` + `card_border`), which is
     /// what style doc §6 assigns to a button and what the pages' references draw for these two.
     ///
     /// It exists as its own name because the surface it replaced was wrong in a way the role list did
@@ -904,9 +949,13 @@ impl SettingsButtonRole {
     /// hover/exit fills, so the two mappings must stay in one place.
     pub(super) fn style(self, palette: crate::theme::UiPalette) -> (u32, u32, isize) {
         match self {
-            Self::Action => (palette.button_bg, palette.button_text, -3),
+            // The mock's `.btn` fill is `--field` (a dark wash over the card), not the
+            // raised white of `.restore-btn`: on the light card an opaque white fill reads
+            // as no fill at all, which is why these buttons looked borderless.
+            Self::Action => (palette.field_bg, palette.button_text, -3),
+            Self::ControlField => (palette.field_bg, palette.button_text, -6),
             Self::Footer => (palette.footer_button_bg, palette.button_text, -1),
-            Self::Primary => (palette.accent, palette.accent_text, -2),
+            Self::Primary => (palette.accent, palette.accent_ink, -2),
             Self::Destructive => (palette.destructive, palette.accent_text, -4),
         }
     }
@@ -1004,9 +1053,9 @@ fn restore_shell_frame(collapsed_surface: NSRect, height: f64) -> NSRect {
     )
 }
 
-fn restore_sidebar_container_frame(sidebar_width: f64, height: f64) -> NSRect {
+fn restore_sidebar_container_frame(sidebar_width: f64, height: f64, origin_y: f64) -> NSRect {
     NSRect::new(
-        NSPoint::new(RESTORE_CONTAINER_ORIGIN, RESTORE_CONTAINER_ORIGIN),
+        NSPoint::new(RESTORE_CONTAINER_ORIGIN, origin_y),
         NSSize::new(
             (sidebar_width - RESTORE_CONTAINER_ORIGIN * 2.0).max(1.0),
             height,
@@ -1065,8 +1114,17 @@ impl RestoreDefaultsControl {
             &trigger_title,
             target,
             objc2::sel!(handleRestoreDefaults:),
-            SettingsButtonRole::Action,
+            // The sidebar restore trigger follows `.restore-btn` in index.html: a quieter
+            // raised surface with secondary ink and the compact 12pt label.
+            SettingsButtonRole::Footer,
         );
+        let trigger_font: *mut AnyObject = objc2::msg_send![
+            objc2::class!(NSFont),
+            systemFontOfSize: crate::theme::FONT_CAPTION
+        ];
+        let _: () = objc2::msg_send![trigger, setFont: trigger_font];
+        let trigger_ink = crate::ffi::hex_to_ns_color(widgets::settings_palette().secondary_text);
+        let _: () = objc2::msg_send![trigger, setContentTintColor: trigger_ink];
         let confirm = SettingsButton::action(
             button_frame,
             &confirm_title,
@@ -1097,7 +1155,52 @@ impl RestoreDefaultsControl {
         let collapsed_h = button_h + RESTORE_SHELL_INSET * 2.0;
         let expanded_h = button_h * 2.0 + RESTORE_ACTION_ROW_GAP + RESTORE_SHELL_INSET * 2.0;
         let confirm_y = RESTORE_TRIGGER_INSET + button_h + RESTORE_ACTION_ROW_GAP;
-        let container_y = RESTORE_CONTAINER_ORIGIN;
+        // `.sidebar-version` sits below the restore button in the HTML footer: 12pt from the
+        // sidebar bottom, then 8pt before the button. Keep the existing 12pt gap above the rule.
+        let version_label: *mut AnyObject = objc2::msg_send![objc2::class!(NSTextField), alloc];
+        let version_frame = NSRect::new(
+            NSPoint::new(
+                RESTORE_CONTAINER_ORIGIN + RESTORE_TRIGGER_INSET + SIDEBAR_VERSION_HORIZONTAL_INSET,
+                SIDEBAR_VERSION_BOTTOM_INSET,
+            ),
+            NSSize::new(
+                (sidebar_width
+                    - (RESTORE_CONTAINER_ORIGIN
+                        + RESTORE_TRIGGER_INSET
+                        + SIDEBAR_VERSION_HORIZONTAL_INSET)
+                        * 2.0)
+                    .max(1.0),
+                SIDEBAR_VERSION_HEIGHT,
+            ),
+        );
+        let version_label: *mut AnyObject = objc2::msg_send![
+            version_label,
+            initWithFrame: version_frame
+        ];
+        widgets::set_field(
+            version_label,
+            tf(
+                "settings.version_label",
+                &[("version", env!("CARGO_PKG_VERSION"))],
+            ),
+        );
+        let _: () = objc2::msg_send![version_label, setBezeled: false];
+        let _: () = objc2::msg_send![version_label, setDrawsBackground: false];
+        let _: () = objc2::msg_send![version_label, setEditable: false];
+        let _: () = objc2::msg_send![version_label, setSelectable: false];
+        let version_font: *mut AnyObject = objc2::msg_send![
+            objc2::class!(NSFont),
+            systemFontOfSize: 11.0f64
+        ];
+        let _: () = objc2::msg_send![version_label, setFont: version_font];
+        let version_ink = crate::ffi::hex_to_ns_color(widgets::settings_palette().muted_text);
+        let _: () = objc2::msg_send![version_label, setTextColor: version_ink];
+        let _: () = objc2::msg_send![version_label, setAutoresizingMask: 36u64];
+        let _: () = objc2::msg_send![parent, addSubview: version_label];
+
+        let container_y =
+            SIDEBAR_VERSION_BOTTOM_INSET + SIDEBAR_VERSION_HEIGHT + SIDEBAR_VERSION_GAP
+                - RESTORE_TRIGGER_INSET;
         let separator_x = RESTORE_SIDEBAR_OUTER_INSET;
         let separator: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let separator: *mut AnyObject = objc2::msg_send![
@@ -1155,7 +1258,8 @@ impl RestoreDefaultsControl {
         let _: () = objc2::msg_send![surface, setAlphaValue: 0.0f64];
         let _: () = objc2::msg_send![parent, addSubview: surface];
 
-        let container_frame = restore_sidebar_container_frame(sidebar_width, collapsed_h);
+        let container_frame =
+            restore_sidebar_container_frame(sidebar_width, collapsed_h, container_y);
         let container: *mut AnyObject = objc2::msg_send![objc2::class!(NSView), alloc];
         let container: *mut AnyObject = objc2::msg_send![
             container,
@@ -1187,6 +1291,7 @@ impl RestoreDefaultsControl {
         let _: () = objc2::msg_send![container, addSubview: cancel];
 
         crate::ffi::CFRelease(separator as *const std::ffi::c_void);
+        crate::ffi::CFRelease(version_label as *const std::ffi::c_void);
         crate::ffi::CFRelease(surface as *const std::ffi::c_void);
         crate::ffi::CFRelease(container as *const std::ffi::c_void);
         crate::ffi::CFRelease(trigger as *const std::ffi::c_void);
@@ -1947,17 +2052,24 @@ impl SettingsSidebarIcon {
     }
 }
 
+/// Vertical gap between two sidebar items, from the mockup's
+/// `.settings-nav { gap: 2px }`.
+pub(super) const SIDEBAR_ROW_GAP: f64 = 2.0;
+
 fn sidebar_item_frames(w: f64, row_h: f64) -> (NSRect, NSRect) {
-    const ICON_X: f64 = 16.0;
-    const ICON_SIZE: f64 = 18.0;
-    const LABEL_X: f64 = 48.0;
     let icon_frame = NSRect::new(
-        objc2_foundation::NSPoint::new(ICON_X, (row_h - ICON_SIZE) / 2.0),
-        objc2_foundation::NSSize::new(ICON_SIZE, ICON_SIZE),
+        objc2_foundation::NSPoint::new(
+            widgets::SIDEBAR_ITEM_PAD_X,
+            (row_h - widgets::SIDEBAR_ICON_SIZE) / 2.0,
+        ),
+        objc2_foundation::NSSize::new(widgets::SIDEBAR_ICON_SIZE, widgets::SIDEBAR_ICON_SIZE),
     );
     let label_frame = NSRect::new(
-        objc2_foundation::NSPoint::new(LABEL_X, 0.0),
-        objc2_foundation::NSSize::new((w - LABEL_X - 8.0).max(1.0), row_h),
+        objc2_foundation::NSPoint::new(widgets::SIDEBAR_LABEL_X, 0.0),
+        objc2_foundation::NSSize::new(
+            (w - widgets::SIDEBAR_LABEL_X - widgets::SIDEBAR_LABEL_TRAILING_INSET).max(1.0),
+            row_h,
+        ),
     );
     (icon_frame, label_frame)
 }
@@ -1969,7 +2081,7 @@ fn sidebar_item_frames(w: f64, row_h: f64) -> (NSRect, NSRect) {
 /// entry outside the tracker, so leaving the sidebar through that last row produced
 /// no exit event and left its hover fill active.
 fn sidebar_tracking_rect(x: f64, y_top: f64, w: f64, row_h: f64, row_count: usize) -> NSRect {
-    let row_step = row_h + 4.0;
+    let row_step = row_h + SIDEBAR_ROW_GAP;
     let spanned = row_count.saturating_sub(1) as f64;
     NSRect::new(
         objc2_foundation::NSPoint::new(x, y_top - spanned * row_step),
@@ -2018,7 +2130,7 @@ impl SettingsSidebar {
     ) -> [*mut AnyObject; SETTINGS_PAGE_COUNT] {
         // The entries come from the page identity table: title key, icon and tag order all follow
         // `SETTINGS_PAGES`, so a page move cannot leave a hand-written sidebar behind.
-        let row_step = row_h + 4.0;
+        let row_step = row_h + SIDEBAR_ROW_GAP;
         widgets::make_sidebar_hover_tracking(
             parent,
             sidebar_tracking_rect(x, y0, w, row_h, SETTINGS_PAGE_COUNT),
@@ -2084,17 +2196,18 @@ mod tests {
         SettingsLayout, SettingsRow, SettingsSelect, RESTORE_ACTION_ROW_GAP,
         RESTORE_CONTAINER_ORIGIN, RESTORE_SHELL_INSET, RESTORE_SIDEBAR_OUTER_INSET,
         RESTORE_TRIGGER_INSET, ROW_ACTION_BTN_H, SEPARATOR_ABOVE_ROW_GAP, SETTINGS_PAGE_COUNT,
-        SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
+        SIDEBAR_ROW_GAP, SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
     };
     use crate::settings::SETTINGS_CONTROL_TRAILING_INSET;
 
     #[test]
     fn restore_sidebar_trigger_and_shell_are_centered() {
         let sidebar_width = 220.0;
-        let container = restore_sidebar_container_frame(sidebar_width, 48.0);
+        let container = restore_sidebar_container_frame(sidebar_width, 48.0, 26.0);
         let trigger = restore_sidebar_trigger_frame(sidebar_width, 32.0);
         let collapsed = restore_surface_frame(container.origin, trigger);
         assert_eq!(container.origin.x, RESTORE_CONTAINER_ORIGIN);
+        assert_eq!(container.origin.y, 26.0);
         assert_eq!(
             container.origin.x + container.size.width,
             sidebar_width - RESTORE_CONTAINER_ORIGIN
@@ -2126,7 +2239,7 @@ mod tests {
     #[test]
     fn sidebar_tracking_rect_spans_every_row() {
         let row_h = 40.0;
-        let row_step = row_h + 4.0;
+        let row_step = row_h + SIDEBAR_ROW_GAP;
         let y0 = 300.0;
         let rect = sidebar_tracking_rect(0.0, y0, 240.0, row_h, SETTINGS_PAGE_COUNT);
         // Top edge = row 0's top; bottom edge = the last row's bottom.
@@ -2150,11 +2263,15 @@ mod tests {
             600.0 - SETTINGS_CONTROL_TRAILING_INSET
         );
         assert_eq!(layout.row_h, 32.0);
-        assert_eq!(layout.described_row_h, 52.0);
+        // `.setting-row { min-height: 56px }`: 32pt control + 12pt padding on each side.
+        assert_eq!(layout.described_row_h, 56.0);
         assert_eq!(SettingsLayout::CONTROL_H, 32.0);
-        assert_eq!(SettingsLayout::SINGLE_LINE_ROW_H, 52.0);
-        assert_eq!(layout.section_step, 48.0);
-        assert_eq!(layout.row_gap, 8.0);
+        assert_eq!(SettingsLayout::SINGLE_LINE_ROW_H, 56.0);
+        // The mock's section rhythm: 20pt previous card bottom to title top + a 15pt title box +
+        // 8pt title bottom to card top, with no card padding.
+        assert_eq!(layout.section_step, 43.0);
+        // `.setting-row + .setting-row` is a hairline, not a gap.
+        assert_eq!(layout.row_gap, 0.0);
         // `card_top`/`card_bottom` moved into the page layout owner (`settings::page_canvas`).
     }
 
@@ -2162,7 +2279,7 @@ mod tests {
     fn settings_select_metrics_keep_trigger_and_row_on_the_fixed_grid() {
         let metrics = SettingsSelect::metrics();
         assert_eq!(metrics.control_h, 32.0);
-        assert_eq!(metrics.row_h, 52.0);
+        assert_eq!(metrics.row_h, 56.0);
     }
 
     #[test]
@@ -2181,6 +2298,16 @@ mod tests {
         );
     }
 
+    #[test]
+    fn switches_selects_and_sliders_share_the_row_centerline() {
+        let y = 120.0;
+        let row_h = SettingsLayout::SINGLE_LINE_ROW_H;
+        for control_h in [20.0, 32.0, 36.0] {
+            let origin = SettingsRow::control_origin_y(y, row_h, control_h);
+            assert!((origin + control_h / 2.0 - (y + row_h / 2.0)).abs() < 1e-9);
+        }
+    }
+
     /// The page-top rhythm -- title, first heading, its card and that card's first row -- is owned
     /// by `SettingsPageHeader` plus the standard card metrics. Pinning the pieces the six pages
     /// share makes a reintroduced per-page offset fail here instead of only showing up as an
@@ -2189,16 +2316,14 @@ mod tests {
     fn page_top_rhythm_keeps_the_first_card_symmetric() {
         use super::SettingsPageHeader;
 
-        // What positions every page below the title is the *sum* of the top padding and the gap
-        // under the title, not either value alone: the title's frame is taller than its ink, so
-        // moving the title down must shrink the gap by the same amount and leave this constant
-        // (`PageCanvas` re-places the title at `doc_height - TOP_PADDING - title_height`).
+        // Every page shares these two metrics, so the title and first section stay aligned across
+        // pages while the top inset follows the 24pt padding in the reference.
         assert_eq!(
             SettingsPageHeader::TOP_PADDING + SettingsPageHeader::FIRST_SECTION_GAP,
-            56.0
+            32.0
         );
         // The title sits clearly below the pane top and clearly above the first card's heading.
-        assert_eq!(SettingsPageHeader::TOP_PADDING, 48.0);
+        assert_eq!(SettingsPageHeader::TOP_PADDING, 24.0);
         assert_eq!(SettingsPageHeader::FIRST_SECTION_GAP, 8.0);
 
         let layout = SettingsLayout::new(600.0);
@@ -2207,17 +2332,33 @@ mod tests {
         let row_h = SettingsLayout::SINGLE_LINE_ROW_H;
         let row_bottom = heading_cursor - layout.row_gap - row_h;
         let row_top = row_bottom + row_h;
-        // Single-row card: the row starts 4pt under the heading and the card keeps its 8pt bottom
-        // inset below the row.
-        let card_top = heading_cursor - layout.card_header_gap;
-        assert_eq!(card_top - row_top, 4.0);
+        // Single-row card: contiguous rows start on the heading cursor, so the row box reaches the
+        // card's top inset while the card keeps the same 8pt inset below the row -- the row band
+        // sits centered inside the card.
+        let card_top = heading_cursor + SettingsLayout::CARD_BOTTOM_INSET;
+        assert_eq!(card_top - row_top, layout.card_bottom_inset);
         let card_visible_bottom = super::widgets::settings_card_rect(super::NSRect::new(
             super::NSPoint::new(0.0, row_bottom - layout.card_bottom_inset),
             super::NSSize::new(1.0, 1.0),
         ))
         .origin
         .y;
-        assert_eq!(row_bottom - card_visible_bottom, 8.0);
+        assert_eq!(row_bottom - card_visible_bottom, layout.card_bottom_inset);
+    }
+
+    /// The section rhythm is the mock's, end to end: 20pt card bottom to title top, a 15pt title
+    /// box, 8pt title bottom to card top, and no card padding.
+    #[test]
+    fn section_step_is_the_mock_rhythm() {
+        let layout = SettingsLayout::new(600.0);
+        assert_eq!(layout.section_step, 43.0);
+        assert_eq!(
+            layout.section_step,
+            super::super::SETTINGS_SECTION_HEADER_GAP
+                + super::super::widgets::SECTION_HEADER_H
+                + super::super::SETTINGS_SECTION_CARD_GAP
+                + layout.card_bottom_inset
+        );
     }
 
     #[test]
@@ -2239,7 +2380,7 @@ mod tests {
             layout.described_row_h,
             layout.row_gap,
             layout.card_bottom_inset,
-            layout.card_header_gap,
+            super::super::SETTINGS_SECTION_CARD_GAP,
             SETTINGS_CONTROL_TRAILING_INSET,
             super::super::SETTINGS_CONTROL_LABEL_GAP,
             super::SettingsPageHeader::TOP_PADDING,
@@ -2254,8 +2395,9 @@ mod tests {
         let icon_center = icon.origin.y + icon.size.height / 2.0;
         let label_center = label.origin.y + label.size.height / 2.0;
         assert_eq!(icon_center, label_center);
-        assert_eq!(icon.origin.x, 16.0);
-        assert_eq!(label.origin.x, 48.0);
+        // `.nav-item { padding: 0 var(--sp-2); gap: var(--sp-2) }` plus the 17pt nav icon.
+        assert_eq!(icon.origin.x, 8.0);
+        assert_eq!(label.origin.x, 8.0 + 17.0 + 8.0);
     }
 
     #[test]
@@ -2266,7 +2408,7 @@ mod tests {
         ] {
             assert_eq!(
                 SettingsButtonRole::Action.style(palette),
-                (palette.button_bg, palette.button_text, -3)
+                (palette.field_bg, palette.button_text, -3)
             );
             assert_eq!(
                 SettingsButtonRole::Footer.style(palette),
@@ -2274,7 +2416,7 @@ mod tests {
             );
             assert_eq!(
                 SettingsButtonRole::Primary.style(palette),
-                (palette.accent, palette.accent_text, -2)
+                (palette.accent, palette.accent_ink, -2)
             );
             assert_eq!(
                 SettingsButtonRole::Destructive.style(palette),
@@ -2346,6 +2488,7 @@ mod tests {
                 // exists so a page states *why* it wants that surface.
                 let Some(role) = [
                     SettingsButtonRole::Action,
+                    SettingsButtonRole::ControlField,
                     SettingsButtonRole::Footer,
                     SettingsButtonRole::Primary,
                     SettingsButtonRole::Destructive,

@@ -67,8 +67,8 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
     if search_has_query() {
         return;
     }
-    let chip_w = 27.0;
-    let chip_h = 21.0;
+    let chip_w = 25.0;
+    let chip_h = 18.0;
     let chip_rect = NSRect::new(
         NSPoint::new(
             cell_frame.origin.x + cell_frame.size.width - chip_w - SEARCH_PAD_IN,
@@ -85,8 +85,7 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
     let cap_bg = crate::ffi::hex_to_ns_color(clipboard_palette().field_bg);
     let _: () = msg_send![cap_bg, set];
     let _: () = msg_send![path, fill];
-    let chip_font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let chip_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0f64];
     let chip_attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
     let chip_attrs: *mut AnyObject = msg_send![chip_attrs, init];
     let font_key = make_nsstring("NSFont");
@@ -147,8 +146,7 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font_key = make_nsstring("NSFont");
     let color_key = make_nsstring("NSColor");
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: SEARCH_FONT_SIZE];
     let color: *mut AnyObject = if hovered {
         msg_send![
             class!(NSColor),
@@ -207,7 +205,7 @@ unsafe fn draw_search_placeholder(cell_frame: NSRect) {
     };
     let len: usize = msg_send![hint.0, length];
     // "⌕  " occupies the first three UTF-16 units; the remainder retains its existing
-    // 14pt/40%-black attributes.
+    // search-font and secondary-ink attributes.
     if len <= 3 {
         return;
     }
@@ -382,6 +380,8 @@ extern "C" fn search_cell_draw_with_frame(
             let editor: *mut AnyObject = msg_send![control_view, currentEditor];
             !editor.is_null()
         };
+        // The rounded field surface is a sibling NSView behind NSSearchField. AppKit's cell
+        // drawing pass repaints its backing layer, so painting the surface here gets covered.
         if editing {
             let str_obj: *mut AnyObject = msg_send![_self, stringValue];
             let str_len: usize = msg_send![str_obj, length];

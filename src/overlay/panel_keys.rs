@@ -428,7 +428,9 @@ pub(crate) unsafe fn smoke_panel_key_equivalent() -> bool {
         return false;
     }
     let _ = selector;
-    log_info!("[smoke-panel-keys] handler registration, eligibility and consumption rules hold (system dispatch is the A2 layer's job)");
+    log_info!(
+        "[smoke-panel-keys] handler registration, eligibility and consumption rules hold (system dispatch is the A2 layer's job)"
+    );
     true
 }
 

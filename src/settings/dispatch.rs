@@ -1,5 +1,6 @@
 //! Control-event dispatch, live CONFIG writes, and dependent enable/refresh logic.
 
+use super::sidebar;
 use super::*;
 
 // Every change is written to the in-memory CONFIG immediately with a debounced disk write;
@@ -438,6 +439,9 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
             });
         }
         refresh_dependent_control_visibility(field);
+        if sidebar::settings_search_is_active() {
+            sidebar::schedule_search_refresh();
+        }
     }
 }
 
@@ -1595,15 +1599,14 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 0isize
             };
             let _: () = msg_send![u.focused_thumbnail_prewarm, setState: prewarm_state];
-            // The footer title switch follows a reload / defaults restore like every other control:
-            // without this the page keeps showing the old state after the config file moved, while
-            // the overlay already draws with the new one.
-            let footer_title_state = if cfg.layout.show_footer_title {
-                1isize
-            } else {
-                0isize
-            };
-            let _: () = msg_send![u.show_footer_title, setState: footer_title_state];
+            // The band is driven by the size, so the slider and its readout are the controls that must
+            // follow a reload; without this the page keeps showing the old point size (or 13 after a
+            // saved 0) while the overlay already draws the new band.
+            let size_value = super::status_bar_size_slider_value(cfg.fonts.status_bar_size);
+            let _: () = msg_send![u.status_bar_text_size, setIntegerValue: size_value];
+            let readout = make_nsstring(&format!("{size_value}"));
+            let _: () = msg_send![u.status_bar_text_size_value_label, setStringValue: readout];
+            CFRelease(readout as *const c_void);
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
             // Key bindings: an external change (a menu toggle, a reloaded file) has to reach the
@@ -1812,6 +1815,9 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
 pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     // Navigating away also cancels an unfinished destructive confirmation.
     collapse_restore_confirmations(true);
+    // A nav click means "show me this page": it leaves the search results first, or the query
+    // stays active and keeps the pages covered.
+    sidebar::clear_settings_search();
     let btn = sender as *mut AnyObject;
     let tag: isize = unsafe { msg_send![btn, tag] };
     select_sidebar(tag as usize);
@@ -2483,4 +2489,48 @@ mod tests {
         assert_eq!(smooth_slider_display(8.04, 0.0, 8.0), "8.0");
         assert_eq!(smooth_slider_display(f64::NAN, 0.0, 2.0), "0.0");
     }
+}
+
+// MARK: - Settings search
+
+/// The sidebar search field's text changed: filter the settings live.
+pub(crate) extern "C" fn handle_settings_search_changed(
+    _self: *mut c_void,
+    _cmd: Sel,
+    notification: *mut c_void,
+) {
+    unsafe {
+        let field: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
+        sidebar::settings_search_field_changed(field);
+    }
+}
+
+/// The search field began editing: the shell switches to the mock's focused ring.
+pub(crate) extern "C" fn handle_settings_search_began_editing(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _notification: *mut c_void,
+) {
+    sidebar::set_settings_search_focused(true);
+}
+
+/// The search field stopped editing: the shell drops the ring.
+///
+/// Returning YES lets AppKit's end-of-editing notification continue normally.
+pub(crate) extern "C" fn handle_settings_search_ended_editing(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _notification: *mut c_void,
+) -> objc2::runtime::Bool {
+    sidebar::set_settings_search_focused(false);
+    objc2::runtime::Bool::YES
+}
+
+/// The search field's clear chip: empty the query and restore the page content.
+pub(crate) extern "C" fn handle_settings_search_clear(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    sidebar::clear_settings_search();
 }

@@ -110,3 +110,16 @@
 | 45 | `super` 派发「`defined` 传错类」这一失败模式**没有机器可检的断言**：`for_defined_class` 接受任何非 null 类，把定义类错写成其父类时，真实调用仍是同一条实现（`setEnabled:` 无论从哪一级开始都解析到 NSButton），因此行为断言区分不出来 | AppKit 调用层硬化，代码审查 R2–R3，GUI 验证轮实测 | MEDIUM（覆盖缺口） | 实测结论：在 `settings_select_set_enabled` 里把 `settings_select_class()` 换成 `class!(NSButton)` 后，新增的 `settings_select_super_dispatch_reaches_nsbutton` 仍然通过——那条断言只覆盖「dispatch 不递归/不崩溃/确实到达父类」，不覆盖「defined 指对了类」。后者只能靠逐点审查：这是类型系统的能力边界（`StaticClass` 无法区分「定义类」与「父类」），不是仪器缺失 | 若要机器化：注册期把每个 override 的「定义类」与 selector 一起登记成表，并在 `for_defined_class` 里校验。下次改动 `ObjcSuper` 或注册助手时评估；或首次出现 super 跳级导致的用户可见缺陷时 |
 | 46 | `layout.show_app_name_in_cards`（缩略图卡片标题是否带应用名）不在 `needs_in_place_control_sync` 的成员列表里（`runtime_config.rs`），`refresh_switcher_keystroke_and_mouse_controls_from_config`（`settings/dispatch.rs`）也没有回填该开关的 `setState:`。于是设置窗口已打开时改配置文件或点「恢复默认」，页面仍显示旧值，而浮窗已按新值渲染 | 编写 `docs/settings-field-checklist.md` 时的静态核对（2026-10-19），读 `src/runtime_config.rs:59-68` 与 `src/settings/dispatch.rs:1493-1605` 得到，未实机复现 | MEDIUM（用户可见行为：设置页与运行状态不一致，正属 AGENTS.md 的 in-scope 类别） | 本次任务是文档改动，用户明确限定为文档、不要求评审，因此不在本次修；修法就是把该标志加进 `needs_in_place_control_sync` 并在就地刷新函数里补一次 `setState:`，属于一个独立的小改动，应连带一条 A1 断言（`--smoke-settings-state-sync` 里经 `apply_config_change` 双向切换，确认开关跟随）。其余 13 个同类布尔开关（如 `focused_thumbnail_prewarm`）都已完整接线，可作对照 | 下次改动 `show_app_name_in_cards`、`needs_in_place_control_sync` 或 `refresh_switcher_keystroke_and_mouse_controls_from_config` 时；或首次报告「改了配置/恢复默认后设置页开关没跟着变」时 |
 | 47 | 切换浮窗页脚标题开关（`layout.show_footer_title`）的三项覆盖缺口：(1) 运行期接线（`ChangeFlags` → `reset_switcher`、`needs_in_place_control_sync` → 就地 `setState:`）只有纯函数层面的几何断言，没有经真实 `apply_config_change` 入口的断言；(2) A1 GUI 与 A2 场景均未运行（`--smoke-overlay`、`--smoke-settings-layout`、`--smoke-settings-state-sync`），关闭标题且窗口列表为空时的居中空态提示只有"不 panic"的纯函数保护；(3) 该开关改变面板高度，未验证"配置 reload 时正在显示的面板被收起、下一次召唤按新几何排版"这条路径 | 页脚标题开关实现审查 R1–R3（见 `.agent-review/tasks/footer-title-toggle/`） | MEDIUM（未运行覆盖 + 断言缺口） | 用户在实现阶段明确要求先不写测试、先看效果，随后才送审；三轮审查预算已用尽，本轮只补了纯函数与布局输出断言（零带子行高、reserve 阈值、卡片与浮动控件不相交、面板不超宽预算、开关→带子映射、配置兼容），这些都是 headless 可跑的；GUI runner 需要图形会话且会改动真实窗口，未在本次执行 | 下次改动该开关、`footer_band_h`、`footer_control_*_reserve` 或 `overlay::update_status_label` 时；或交付/发布前跑 A1/A2 门禁时 |
+
+## glass-ui-refresh (2026-10-20)
+
+- **Round 2/3 — MEDIUM — the clipboard light-mode tokens are not registered in the style document.**
+  `row_selected/hover`, `field_bg(+focus)`, `hairline`, `glass_line`, `accent` now have clipboard-local
+  light values that disagree with §3's table, and §3's contrast numbers were measured on the old values.
+  Deferred on purpose: writing the new values into the normative table would present unverified contrast
+  as verified. Revisit trigger: the first run of `scripts/e2e/panel-contrast.sh` against the new tokens
+  (which is also what the palette decision in the report is waiting on).
+- **Round 2 — MEDIUM — the clipboard drag surface has no A2 coverage.** `drag.rs` is exercised only by
+  A1 smoke assertions (`OhMyTabClipboardDragSurface` topmost, `hitTest:` accept/reject) plus the existing
+  `panel-drag.sh`; a real pointer drag over a blank top bar and a double-click reset are not asserted.
+  Revisit trigger: the next `scripts/e2e/run-all.sh --include-focus` run.

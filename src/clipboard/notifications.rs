@@ -188,8 +188,26 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
-                sel!(filterPillClicked:),
-                filter_pill_clicked as *mut c_void,
+                sel!(toggleFilterPopover:),
+                toggle_filter_popover as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(clearDayGroup:),
+                clear_day_group as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(popoverFilterSelected:),
+                popover_filter_selected as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(toggleDetailPanel:),
+                toggle_detail_panel as *mut c_void,
                 types.as_ptr(),
             );
             // The detail-text cursor (delivered by the tracking area owned by this
@@ -853,6 +871,45 @@ pub(super) extern "C" fn clipboard_window_send_event(
 ) {
     unsafe {
         let window = _self as *mut AnyObject;
+        // The options popover dismisses on any click outside its frame (the event still goes
+        // through, so the clicked control behaves normally).
+        if crate::clipboard::filter_popover_open() {
+            let etype: u64 = msg_send![event, type];
+            // Left=1, Right=3, OtherMouse=4 mouse-down events.
+            if matches!(etype, 1 | 3 | 4) {
+                let point: NSPoint = msg_send![event, locationInWindow];
+                let inside = if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
+                    let frame: NSRect = msg_send![popover.0, frame];
+                    let superview: *mut AnyObject = msg_send![popover.0, superview];
+                    // The frame is in the (flipped) parent's coords; convert to window space.
+                    let in_window: NSRect = msg_send![
+                        superview,
+                        convertRect: frame,
+                        toView: std::ptr::null::<AnyObject>()
+                    ];
+                    crate::clipboard::rect_contains_point(in_window, point)
+                } else {
+                    false
+                };
+                // The options orb sits outside the popover. Keep its click for the orb's own
+                // toggle; dismissing here first would make the toggle reopen the menu.
+                let on_options_orb = if let Some(orb) = *PICKER_OPTIONS_ORB.lock().unwrap() {
+                    let frame: NSRect = msg_send![orb.0, frame];
+                    let superview: *mut AnyObject = msg_send![orb.0, superview];
+                    let in_window: NSRect = msg_send![
+                        superview,
+                        convertRect: frame,
+                        toView: std::ptr::null::<AnyObject>()
+                    ];
+                    crate::clipboard::rect_contains_point(in_window, point)
+                } else {
+                    false
+                };
+                if !inside && !on_options_orb {
+                    super::detail::dismiss_filter_popover();
+                }
+            }
+        }
         type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
         // The class that defined sendEvent:, recorded when the picker window was registered.
         let defined = *crate::clipboard::picker_window_class();
@@ -1488,15 +1545,15 @@ pub(super) fn undo_deleted_clipboard_entry() -> Option<ClipEntry> {
     present.then_some(restored)
 }
 
-pub(super) fn picker_filters_y() -> f64 {
-    TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
-}
-
-extern "C" fn clear_clipboard_history(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+pub(super) extern "C" fn clear_clipboard_history(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
     clear_clipboard_history_scope(false);
 }
 
-extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+pub(super) extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     clear_clipboard_history_scope(true);
 }
 
@@ -1717,6 +1774,18 @@ pub(super) extern "C" fn open_clipboard_settings(
 /// entries that went away, then rewrite the file and refresh the list. The plain clear keeps the
 /// pinned entries; only the explicit "clear all" button takes them.
 fn clear_clipboard_history_scope(clear_all: bool) {
+    clear_clipboard_scope(clear_all, None);
+}
+
+/// Clear one day group (the group header's "clear" button). The group is an ADDITIONAL narrowing on
+/// top of the visible scope, so this goes through the same deletion flow as the header's clear
+/// instead of filtering the history by date on its own: the image cache, the revision, the detail
+/// pane and the file all stay in step, and hidden entries are never taken with it.
+fn clear_clipboard_day_group(group: DayGroup) {
+    clear_clipboard_scope(false, Some(group));
+}
+
+fn clear_clipboard_scope(clear_all: bool, group: Option<DayGroup>) {
     discard_deleted_clipboard_entry();
     cancel_clipboard_undo_timer();
     DELETED_CLIPBOARD_GENERATION.fetch_add(1, Ordering::SeqCst);
@@ -1726,7 +1795,10 @@ fn clear_clipboard_history_scope(clear_all: bool) {
     let filter = *CLIP_FILTER.lock().unwrap();
     let query = with_clipboard_ui(|ui| ui.search_query.clone());
     let mut history = CLIP_HISTORY.lock().unwrap();
-    let removed_entries = remove_history_scope(&mut history, clear_all, filter, &query);
+    let removed_entries = match group {
+        Some(group) => remove_day_group_scope(&mut history, clear_all, filter, &query, group),
+        None => remove_history_scope(&mut history, clear_all, filter, &query),
+    };
     let removed_hashes: HashSet<u64> = removed_entries
         .iter()
         .filter_map(|entry| entry.image.as_ref().map(|image| image.hash))
@@ -1741,8 +1813,9 @@ fn clear_clipboard_history_scope(clear_all: bool) {
     hide_detail();
     unsafe { rebuild_rows() };
     log_info!(
-        "Clipboard history cleared by user (clear_all={}, filter={:?}, query={}, kept_entries={})",
+        "Clipboard history cleared by user (clear_all={}, group={:?}, filter={:?}, query={}, kept_entries={})",
         clear_all,
+        group,
         filter as u8,
         !query.is_empty(),
         kept_count
@@ -1802,6 +1875,11 @@ extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_v
 /// NSSearchField's Esc (cancelOperation:): a query gets cleared and the full list restored
 /// (scheme A, level one); with no query the picker closes (level two).
 pub(super) extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
+    // A live options menu owns the first Escape press regardless of which field has focus.
+    if crate::clipboard::filter_popover_open() {
+        super::detail::dismiss_filter_popover();
+        return;
+    }
     // Same rule as the list-focus Esc: a pinned panel ignores the key before it can clear a query.
     if super::is_pinned() {
         return;
@@ -1899,19 +1977,29 @@ pub(super) extern "C" fn search_field_mouse_down(
     }
 }
 
-/// The search field's fill/ring helper (raw FFI for the layer background). Focus strengthens
-/// only the inner ring and keeps the frosted fill stable.
-pub(super) unsafe fn style_search_field(field: *mut AnyObject, focused: bool) {
+/// The search field's fill/ring helper (raw FFI for the layer background). Focus strengthens the
+/// fill and the ring together, as the v2 mock's `.search-field:focus-within` does; the palette
+/// supplies both values in dark mode.
+pub(super) unsafe fn style_search_field(field: *mut AnyObject, _focused: bool) {
     let layer: *mut AnyObject = msg_send![field, layer];
-    let palette = clipboard_palette();
-    let background = crate::ffi::hex_to_cg_color(palette.field_bg);
-    crate::ffi::layer_set_background(layer, background);
-    let ring = if focused {
-        palette.accent
-    } else {
-        palette.card_border
-    };
-    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(ring));
+    if !layer.is_null() {
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0));
+        let _: () = msg_send![layer, setBorderWidth: 0.0f64];
+    }
+    if let Some(surface) = *SEARCH_FIELD_SURFACE.lock().unwrap() {
+        let surface_layer: *mut AnyObject = msg_send![surface.0, layer];
+        if !surface_layer.is_null() {
+            crate::ffi::layer_set_background(
+                surface_layer,
+                crate::ffi::hex_to_cg_color(picker_field_fill(_focused)),
+            );
+            crate::ffi::layer_set_border(
+                surface_layer,
+                crate::ffi::hex_to_cg_color(picker_field_ring(_focused)),
+            );
+        }
+    }
+    let _: () = msg_send![field, setNeedsDisplay: true];
 }
 
 /// Editing begins: keep the default 4.5% frosted fill and use only a 10% inner ring for focus,
@@ -2059,6 +2147,53 @@ pub(super) unsafe fn timer_target() -> *mut AnyObject {
     });
     let obj: *mut AnyObject = msg_send![cls.0 as *const AnyObject, new];
     obj
+}
+
+/// The options orb: toggles the filter/options popover (the flag flips here so `--e2e-state`
+/// reports it even while the view is being created).
+pub(super) extern "C" fn toggle_filter_popover(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    crate::clipboard::toggle_filter_popover();
+}
+
+/// The detail-toggle orb: expands the selected entry's detail pane, or closes it when open
+/// (the same semantics the Right-arrow key path uses).
+pub(super) extern "C" fn toggle_detail_panel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    unsafe {
+        if detail_visible() {
+            hide_detail();
+        } else {
+            show_detail_for_sel();
+        }
+    }
+}
+
+/// A filter row in the options popover: its tag indexes `CLIP_FILTER_ROWS`. Choosing a row
+/// applies the filter and dismisses the popover.
+pub(super) extern "C" fn popover_filter_selected(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+    let Some(&f) = CLIP_FILTER_ROWS.get(tag as usize) else {
+        return;
+    };
+    super::detail::dismiss_filter_popover();
+    apply_clip_filter(f);
+}
+
+/// A group label's "清除" button: drops that day group's *visible* entries through the ordinary
+/// clear flow (pinned entries stay, the image cache and the detail pane follow).
+pub(super) extern "C" fn clear_day_group(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
+    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+    let Some(group) = model::day_group_from_tag(tag) else {
+        return;
+    };
+    clear_clipboard_day_group(group);
 }
 
 #[cfg(test)]

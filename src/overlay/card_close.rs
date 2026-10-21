@@ -274,7 +274,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         // The panel height is only computed in `thumb_close_panel_metrics`, which reuses the normal
         // layout's `thumb_panel_metrics`; building the formula here again is what re-introduced the
         // "panel grows while closing" bug (measured 901 > 875).
-        let (final_panel_h, final_content_inset) = thumb_close_panel_metrics(
+        let (theme_panel_h, final_content_inset) = thumb_close_panel_metrics(
             final_row_ranges.len(),
             final_overflowed,
             card_h,
@@ -289,8 +289,18 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             gap,
             final_content_inset,
         );
+        // The summon's no-footer bottom room is part of the panel and the document, so the reflow
+        // has to carry it the same way: the stored `document_h` above already includes it (that is
+        // why the placements carry it), and the panel and document heights recomputed here would
+        // otherwise drop it and shrink the panel by that room on the first close.
+        let bottom_slack = if widths.is_empty() {
+            0.0
+        } else {
+            no_footer_bottom_slack()
+        };
+        let final_panel_h = theme_panel_h + bottom_slack;
         let final_viewport_h = (final_panel_h - footer_band_h()).max(1.0);
-        let final_document_h = content_h.max(final_viewport_h).max(1.0);
+        let final_document_h = (content_h + bottom_slack).max(final_viewport_h).max(1.0);
         let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
         let (final_document_h, final_scroll_max_offset, final_scroll_offset, _) =
             rebase_thumb_scroll_after_document_resize(

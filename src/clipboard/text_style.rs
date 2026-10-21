@@ -2,6 +2,11 @@
 
 use super::*;
 
+// Clipboard V2 typography is local to this surface; shared settings/control sizes stay unchanged.
+const ROW_TEXT_SIZE: f64 = 12.5;
+const ROW_CODE_SIZE: f64 = 11.5;
+const FOOTER_TEXT_SIZE: f64 = 10.5;
+
 /// The material an attributed string's ink was resolved for. The ink comes from `glass::panel_ink`, which
 /// picks a *different colour object* per material (a dynamic system colour for frost, a palette colour
 /// otherwise), so a cache keyed on the palette tokens alone hands back the previous material's ink after a
@@ -49,11 +54,13 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
     let pstyle: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
     let pstyle: *mut AnyObject = msg_send![pstyle, init];
     let _: () = msg_send![pstyle, setAlignment: -1isize]; // NSTextAlignmentNatural
-    let _: () = msg_send![pstyle, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-    let line_height = crate::theme::line_height(
-        crate::theme::FONT_CONTROL,
-        crate::theme::LINE_HEIGHT_BODY_RATIO,
-    );
+    let _: () = msg_send![pstyle, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    let font_size = if kind == TextKind::Code {
+        ROW_CODE_SIZE
+    } else {
+        ROW_TEXT_SIZE
+    };
+    let line_height = crate::theme::line_height(font_size, crate::theme::LINE_HEIGHT_BODY_RATIO);
     let _: () = msg_send![pstyle, setMinimumLineHeight: line_height];
     let _: () = msg_send![pstyle, setMaximumLineHeight: line_height];
 
@@ -61,9 +68,9 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
     let attrs: *mut AnyObject = msg_send![attrs, init];
     let font: *mut AnyObject = match kind {
         TextKind::Code => {
-            msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR]
+            msg_send![class!(NSFont), monospacedSystemFontOfSize: font_size, weight: crate::theme::FONT_WEIGHT_REGULAR]
         }
-        _ => msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL],
+        _ => msg_send![class!(NSFont), systemFontOfSize: font_size],
     };
     // Every panel text role goes through `glass::panel_ink`, which picks the ink per material; the accent
     // roles (a URL's link colour) stay palette-based. The `--clipboard-ink=vibrant` switch that used to
@@ -128,139 +135,8 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
     attr
 }
 
-/// The meta line (attributed): a 13px source-app icon (text attachment) + "app · time",
-/// 10px 30% black. With source display off or no icon, it shows time only.
-pub(super) unsafe fn make_meta_footer_attributed(
-    entry: &ClipEntry,
-    show_source: bool,
-) -> *mut AnyObject {
-    let total: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
-    let empty_ns = make_nsstring("");
-    let total: *mut AnyObject = msg_send![total, initWithString: empty_ns];
-    CFRelease(empty_ns as *const c_void);
-
-    // With the setting off, neither load nor attach the source icon so it hides together
-    // with the source text.
-    let icon = if should_show_source_icon(show_source, entry) {
-        load_source_icon(entry, META_ICON)
-    } else {
-        std::ptr::null_mut()
-    };
-    if !icon.is_null() {
-        // The 13px icon as a text attachment, baseline-aligned with a trailing space.
-        let attachment: *mut AnyObject = msg_send![class!(NSTextAttachment), alloc];
-        let attachment: *mut AnyObject = msg_send![attachment, init];
-        let _: () = msg_send![attachment, setImage: icon];
-        let _: () = msg_send![attachment, setBounds: NSRect::new(
-            NSPoint::new(0.0, -2.0),
-            NSSize::new(META_ICON, META_ICON)
-        )];
-        // attributedStringWithAttachment: returns a +0 (autoreleased) object; releasing it
-        // over-releases and crashes on pool drain (same discipline as rebuild_search_hint).
-        let att_str: *mut AnyObject = msg_send![
-            class!(NSAttributedString),
-            attributedStringWithAttachment: attachment
-        ];
-        release_obj(attachment);
-        let _: () = msg_send![total, appendAttributedString: att_str];
-        let sp = make_nsstring(" ");
-        let sp_attr: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let sp_attr: *mut AnyObject = msg_send![sp_attr, initWithString: sp];
-        CFRelease(sp as *const c_void);
-        let _: () = msg_send![total, appendAttributedString: sp_attr];
-        release_obj(sp_attr);
-        release_obj(icon);
-    }
-
-    let meta = build_meta_text(entry, show_source);
-    if !meta.is_empty() {
-        let attrs: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-        let attrs: *mut AnyObject = msg_send![attrs, init];
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-        let color = crate::glass::panel_ink(
-            clipboard_palette().muted_text,
-            crate::glass::PanelInk::Muted,
-        );
-        let font_key = make_nsstring("NSFont");
-        let color_key = make_nsstring("NSColor");
-        let _: () = msg_send![attrs, setObject: font, forKey: font_key];
-        let _: () = msg_send![attrs, setObject: color, forKey: color_key];
-        CFRelease(font_key as *const c_void);
-        CFRelease(color_key as *const c_void);
-        let ns = make_nsstring(&meta);
-        let part: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-        let part: *mut AnyObject = msg_send![part, initWithString: ns, attributes: attrs];
-        CFRelease(ns as *const c_void);
-        release_obj(attrs);
-        let _: () = msg_send![total, appendAttributedString: part];
-        release_obj(part);
-    }
-    total
-}
-
-/// Load the source app's small icon (pre-scaled to `size` in points; null when uncached).
-unsafe fn load_source_icon(entry: &ClipEntry, size: f64) -> *mut AnyObject {
-    if entry.source_key.is_empty() {
-        return std::ptr::null_mut();
-    }
-    let icon_path = crate::icon_cache::small_icon_path_for_key(&entry.source_key);
-    let metadata = match std::fs::metadata(&icon_path) {
-        Ok(metadata) => metadata,
-        Err(_) => {
-            let key = (entry.source_key.clone(), size.to_bits());
-            if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
-                release_obj(cached.image.0);
-            }
-            return std::ptr::null_mut();
-        }
-    };
-    let modified = metadata.modified().ok();
-    if !metadata.is_file() {
-        let key = (entry.source_key.clone(), size.to_bits());
-        if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
-            release_obj(cached.image.0);
-        }
-        return std::ptr::null_mut();
-    }
-
-    let key = (entry.source_key.clone(), size.to_bits());
-    {
-        let cache = SOURCE_ICON_CACHE.lock().unwrap();
-        if let Some(cached) = cache.get(&key) {
-            if cached.modified == modified {
-                let image = cached.image.0;
-                let _: *mut AnyObject = msg_send![image, retain];
-                return image;
-            }
-        }
-    }
-
-    if let Some(cached) = SOURCE_ICON_CACHE.lock().unwrap().remove(&key) {
-        release_obj(cached.image.0);
-    }
-    let ns_path = make_nsstring(&icon_path);
-    let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let img: *mut AnyObject = msg_send![img, initWithContentsOfFile: ns_path];
-    CFRelease(ns_path as *const c_void);
-    if !img.is_null() {
-        let _: () = msg_send![img, setSize: NSSize::new(size, size)];
-        SOURCE_ICON_CACHE.lock().unwrap().insert(
-            key,
-            CachedSourceIcon {
-                image: ObjPtr::new(img),
-                modified,
-            },
-        );
-        let _: *mut AnyObject = msg_send![img, retain];
-    }
-    img
-}
-
-/// Compose the content button's left canvas (NSImage): only image rows get a 72x44
-/// rounded thumbnail box (faint fill + inner ring, the new mockup's .image-preview);
-/// text rows return null. The source icon no longer sits at the row's left -- it appears
-/// as a small glyph in the meta line (see make_meta_footer_attributed).
+/// Compose image rows' rounded thumbnail well; text rows return null.
+/// The dimensions come from the same layout tokens as the row's reserved image column.
 pub(super) unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let Some(img) = &entry.image else {
         return std::ptr::null_mut();
@@ -294,16 +170,16 @@ pub(super) unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
         release_obj(im);
         return std::ptr::null_mut();
     }
-    // fit-contain into the 72x44 box.
+    // Fit-contain into the reserved thumbnail well.
     let scale = (THUMB_W / s.width).min(THUMB_H / s.height);
     let w = s.width * scale;
     let h = s.height * scale;
     let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
     let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(THUMB_W, THUMB_H)];
     let _: () = msg_send![target, lockFocus];
-    // Reuse the settings field surface for thumbnail boxes so light and dark themes share one
-    // grayscale system.
-    let fill = crate::ffi::hex_to_ns_color(palette.field_bg);
+    // The v2 mock's `.row-thumb`: a translucent white well with a glass-line ring (the light
+    // palette keeps its measured values in dark mode).
+    let fill = crate::ffi::hex_to_ns_color(super::picker_thumb_fill());
     let _: () = msg_send![fill, set];
     let box_path: *mut AnyObject = msg_send![
         class!(NSBezierPath),
@@ -322,7 +198,7 @@ pub(super) unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let op: usize = 1; // NSCompositingOperationCopy
     let _: () = msg_send![im, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
     // the inset ring.
-    let ring = crate::ffi::hex_to_ns_color(palette.card_border);
+    let ring = crate::ffi::hex_to_ns_color(super::picker_thumb_ring());
     let _: () = msg_send![ring, set];
     let _: () = msg_send![box_path, setLineWidth: 1.0f64];
     let _: () = msg_send![box_path, stroke];
@@ -410,11 +286,11 @@ unsafe fn make_detail_action_icon_with(
         palette.secondary_text
     };
     // An active icon is a *filled* chip, so both halves of that pair have to be chosen together:
-    // the accent fill with `accent_text` on top (design-style §3.1). The fill used to be
-    // `primary_text` while the glyph stayed `accent_text` -- 13.91:1 in light mode but, because
+    // the accent fill with `accent_ink` on top (design-style §3.1). The fill used to be
+    // `primary_text` while the glyph stayed the light ink -- 13.91:1 in light mode but, because
     // dark `primary_text` is near-white, 1.09:1 in dark mode, where the icon read as a blank disc.
     let (circle_role, glyph_role) = if active {
-        (palette.accent, palette.accent_text)
+        (palette.accent, palette.accent_ink)
     } else {
         (icon_color, icon_color)
     };
@@ -536,15 +412,62 @@ fn panel_hover_wash_for(palette: crate::theme::UiPalette) -> u32 {
     (palette.hover_bg & 0xFFFF_FF00) | if palette.dark { 0x28 } else { 0x18 }
 }
 
-/// The header's settings button. It is a glyph-only control in the corner next to the close
-/// button, so it keeps that button's family -- no bezel, no border -- and differs only in tint: a
-/// neutral ink that darkens with the same wash the text actions use, never the close button's
-/// destructive red. See the corner-glyph-button exception in `docs/design-style-en.md` §10.
+/// Clipboard header orbs use the V2 glass fill and circular outline. Menu actions
+/// continue using the shared borderless glyph recipe.
 pub(super) unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: bool) {
     // The shared corner-glyph recipe. The picker already applied the mode-tuned wash (its own
     // panel_hover_wash, numerically the same value); routing all three through one function is what
     // makes them provably one family rather than three copies that happen to agree.
     crate::ui::corner_glyph::set_glyph_button_style(button, clipboard_palette(), hovered);
+    if !button.is_null() {
+        let action: Sel = msg_send![button, action];
+        if action == sel!(toggleFilterPopover:) || action == sel!(toggleDetailPanel:) {
+            let active = if action == sel!(toggleDetailPanel:) {
+                detail_visible()
+            } else {
+                filter_popover_open()
+            };
+            set_header_orb_surface(button, active, hovered);
+        }
+    }
+}
+
+/// Local to the clipboard toolbar; the close glyph and other surfaces stay borderless.
+unsafe fn set_header_orb_surface(button: *mut AnyObject, active: bool, hovered: bool) {
+    let palette = clipboard_palette();
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if layer.is_null() {
+        return;
+    }
+    let fill = if palette.dark {
+        if active || hovered {
+            palette.hover_bg
+        } else {
+            palette.field_bg
+        }
+    } else if active {
+        0xFFFF_FF8C
+    } else if hovered {
+        0xFFFF_FF70
+    } else {
+        0xFFFF_FF33
+    };
+    let border = if palette.dark {
+        if active {
+            palette.accent
+        } else {
+            palette.card_border
+        }
+    } else if active {
+        0xFFFF_FFCC
+    } else {
+        0xFFFF_FF85
+    };
+    let bounds: NSRect = msg_send![button, bounds];
+    let _: () = msg_send![layer, setCornerRadius: bounds.size.width.min(bounds.size.height) / 2.0];
+    let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+    crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(border));
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(fill));
 }
 
 /// The header's pin button. It is the corner row's third glyph and keeps that family - no bezel,
@@ -587,15 +510,7 @@ pub(super) unsafe fn set_pin_button_style(button: *mut AnyObject, pinned: bool, 
         let _: () = msg_send![button, setImage: image];
     }
     let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
-    let layer: *mut AnyObject = msg_send![button, layer];
-    if !layer.is_null() {
-        let background = if hovered {
-            panel_hover_wash()
-        } else {
-            0x00000000
-        };
-        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(background));
-    }
+    set_header_orb_surface(button, pinned, hovered);
     // The state must be readable without seeing the glyph: a filled/outline pin is a colour
     // distinction, so the label is what actually states it (design review, round 1 CONCERN 3).
     let label_key = if pinned {
@@ -627,24 +542,63 @@ pub(super) unsafe fn set_detail_action_style(button: *mut AnyObject, active: boo
     set_action_button_surface(button, hovered);
 }
 
-/// Toggling detail does not rebuild the list, so refresh existing detail-action active states.
+/// Keep the header detail orb's persistent selected state in sync with its pane.
 pub(super) fn refresh_detail_action_visuals() {
-    let visible = detail_visible();
-    let selected = picker_selection();
-    let indices = ROW_VIEW_INDICES.lock().unwrap().clone();
-    let views = ROW_HOVER_VIEWS.lock().unwrap().clone();
-    unsafe {
-        for (slot, view) in views.iter().enumerate() {
-            let Some(&row) = indices.get(slot) else {
-                continue;
-            };
-            set_detail_action_style(
-                view.details.0,
-                detail_action_is_active(visible, selected, row),
-                false,
-            );
+    let button = *PICKER_DETAIL_BUTTON.lock().unwrap();
+    if let Some(button) = button {
+        unsafe { set_header_detail_style(button.0, false) };
+    }
+}
+
+unsafe fn set_header_detail_style(button: *mut AnyObject, hovered: bool) {
+    if button.is_null() {
+        return;
+    }
+    let active = super::detail_visible();
+    let _: () = msg_send![button, setState: if active { 1isize } else { 0isize }];
+    let mut image = std::ptr::null_mut::<AnyObject>();
+    for symbol in if active {
+        ["sidebar.right.fill", "sidebar.right"]
+    } else {
+        ["sidebar.right", "sidebar.right"]
+    } {
+        let name = make_nsstring(symbol);
+        image = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: name,
+            accessibilityDescription: std::ptr::null::<AnyObject>()
+        ];
+        CFRelease(name as *const c_void);
+        if !image.is_null() {
+            break;
         }
     }
+    if !image.is_null() {
+        let config: *mut AnyObject = msg_send![
+            class!(NSImageSymbolConfiguration),
+            configurationWithPointSize: PICKER_GEAR_GLYPH_SIZE,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        let configured: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+        if !configured.is_null() {
+            let _: () = msg_send![configured, setTemplate: true];
+            let _: () = msg_send![button, setImage: configured];
+        }
+    }
+    set_settings_button_style(button, hovered);
+    if active {
+        let palette = clipboard_palette();
+        let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(
+            palette.primary_text,
+            crate::glass::PanelInk::Primary
+        )];
+        set_header_orb_surface(button, true, hovered);
+    }
+    // This remains the existing right-arrow toggle, including while detail is open.
+    let label = make_nsstring(&format!("{} (→)", t("clipboard.kbd_detail")));
+    let _: () = msg_send![button, setToolTip: label];
+    let _: () = msg_send![button, setAccessibilityLabel: label];
+    CFRelease(label as *const c_void);
 }
 
 /// A per-row action button (pin/delete): an SF Symbol icon, borderless, its alpha
@@ -652,7 +606,7 @@ pub(super) fn refresh_detail_action_visuals() {
 /// A hover-aware button class (an NSButton subclass overriding mouseEntered:/mouseExited:):
 /// the hover style is picked by the action selector -- pin darkens with a faint fill,
 /// delete/clear turn red, filters only darken. On exit the state is restored (filters go
-/// through update_filter_pill_style so the active tint is never clobbered).
+/// delete/clear turn red, filters only darken; on exit the state is restored).
 pub(super) unsafe fn hover_button_class() -> *mut AnyObject {
     hover_button_class_handle().0 as *mut AnyObject
 }
@@ -686,6 +640,83 @@ fn hover_button_class_handle() -> StaticClass {
     })
 }
 
+/// Draw the save-as icon (download into a tray): a downward arrow plus a bottom tray,
+/// stroked with the same parameters as the other icon buttons -- no SF Symbol variant.
+pub(super) unsafe fn make_detail_save_icon(engaged: bool) -> *mut AnyObject {
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithSize: NSSize::new(18.0, 18.0)];
+    // Same role convention as its sibling icon buttons: secondary normally, primary when engaged.
+    // A literal black (or an alpha on it) cannot invert, which left this glyph both too faint and
+    // invisible in dark mode.
+    let palette = clipboard_palette();
+    let role = if engaged {
+        palette.primary_text
+    } else {
+        palette.secondary_text
+    };
+    let color = crate::ffi::hex_to_ns_color(role);
+    let _: () = msg_send![image, lockFocus];
+    let _: () = msg_send![color, set];
+
+    // AppKit's origin is bottom-left: visual "down" means smaller y. The tray hugs the
+    // bottom with its opening up; the arrow points into it.
+    let tray: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![tray, moveToPoint: NSPoint::new(4.5, 7.5)];
+    let _: () = msg_send![tray, lineToPoint: NSPoint::new(4.5, 4.5)];
+    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 4.5)];
+    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 7.5)];
+
+    let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![stem, moveToPoint: NSPoint::new(9.0, 14.5)];
+    let _: () = msg_send![stem, lineToPoint: NSPoint::new(9.0, 7.5)];
+
+    let head: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+    let _: () = msg_send![head, moveToPoint: NSPoint::new(6.2, 10.2)];
+    let _: () = msg_send![head, lineToPoint: NSPoint::new(9.0, 7.4)];
+    let _: () = msg_send![head, lineToPoint: NSPoint::new(11.8, 10.2)];
+
+    for path in [tray, stem, head] {
+        let _: () = msg_send![path, setLineWidth: 1.45f64];
+        let _: () = msg_send![path, setLineCapStyle: 1isize]; // NSLineCapStyleRound
+        let _: () = msg_send![path, setLineJoinStyle: 1isize]; // NSLineJoinStyleRound
+        let _: () = msg_send![path, stroke];
+    }
+    let _: () = msg_send![image, unlockFocus];
+    let _: () = msg_send![image, setTemplate: false];
+    image
+}
+
+/// Find a direct child of the detail panel by its action selector. The panel is rebuilt on every
+/// browse step, and the actions are re-located by what they do rather than by frame or tag, so a
+/// layout change cannot make this return a different control.
+pub(super) unsafe fn detail_action_button(content: *mut AnyObject, action: Sel) -> *mut AnyObject {
+    let subviews: *mut AnyObject = msg_send![content, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+        if !is_button {
+            continue;
+        }
+        let view_action: Sel = msg_send![view, action];
+        if view_action == action {
+            return view;
+        }
+    }
+    std::ptr::null_mut()
+}
+
+/// The code soft-wrap switch in the detail panel, or null when this entry has none (the switch
+/// only exists for code; the smoke runner asserts that pairing).
+pub(super) unsafe fn detail_wrap_button(content: *mut AnyObject) -> *mut AnyObject {
+    detail_action_button(content, sel!(toggleDetailSoftWrap:))
+}
+
+/// The save-as button in the detail panel (present for every entry).
+pub(super) unsafe fn detail_save_as_button(content: *mut AnyObject) -> *mut AnyObject {
+    detail_action_button(content, sel!(detailSaveAs:))
+}
+
 /// The save-as button's hover/pressed state.
 ///
 /// It follows its sibling icon buttons exactly: the glyph is `secondary_text` normally and
@@ -706,12 +737,23 @@ unsafe fn set_detail_share_style(button: *mut AnyObject, engaged: bool) {
 extern "C" fn hover_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     unsafe {
         let b = _self;
+        if super::detail::event_is_over_filter_popover(_event) && !is_popover_child(b) {
+            // Tracking areas on covered list controls still report mouseEntered. The menu owns
+            // the pointer region, so never apply a hover wash to controls behind it.
+            return;
+        }
         let action: Sel = msg_send![b, action];
         if is_clear_history_action_button(b) {
             set_clear_confirmation_button_style(b, true);
             return;
         }
-        if action == sel!(openClipboardSettings:) {
+        if action == sel!(toggleDetailPanel:) {
+            set_header_detail_style(b, true);
+            return;
+        }
+        if (action == sel!(openClipboardSettings:) && !is_popover_child(b))
+            || action == sel!(toggleFilterPopover:)
+        {
             set_settings_button_style(b, true);
             return;
         }
@@ -723,6 +765,38 @@ extern "C" fn hover_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mu
         }
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(b, true);
+            return;
+        }
+        if (action == sel!(popoverFilterSelected:)
+            || action == sel!(clearClipboardHistory:)
+            || action == sel!(clearClipboardAll:)
+            || action == sel!(openClipboardSettings:))
+            && is_popover_child(b)
+        {
+            // Popover rows (the mock's `.filter-row:hover` / `.clean-row:hover`): a wash
+            // under the pointer, no layout change. Scoped to popover children: the same
+            // selectors exist on the header orb and banner buttons, which keep their own
+            // hover styles. The active filter's hover is the mock's
+            // `.filter-row.is-active:hover`: a deeper accent wash, not the generic one.
+            let tag: isize = msg_send![b, tag];
+            let active = action == sel!(popoverFilterSelected:)
+                && tag >= 0
+                && CLIP_FILTER_ROWS.get(tag as usize) == Some(&*CLIP_FILTER.lock().unwrap());
+            let palette = clipboard_palette();
+            let wash = if active {
+                picker_popover_active_hover_bg(palette)
+            } else {
+                super::popover_hover_bg(palette, action == sel!(clearClipboardAll:))
+            };
+            let layer: *mut AnyObject = msg_send![b, layer];
+            if !layer.is_null() {
+                crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(wash));
+            }
+            return;
+        }
+        if action == sel!(clearDayGroup:) {
+            // The group clear keeps its accent ink; no fill (the mock's `.list-meta button`
+            // only underlines, and underline-drawing is not worth a layer).
             return;
         }
         if action == sel!(showItemDetails:) {
@@ -749,13 +823,17 @@ extern "C" fn hover_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mu
             let c = crate::glass::panel_ink(palette.primary_text, crate::glass::PanelInk::Primary);
             let _: () = msg_send![b, setContentTintColor: c];
             set_action_button_surface(b, true);
-        } else if action == sel!(filterPillClicked:) {
-            let c = crate::glass::panel_ink(
-                clipboard_palette().primary_text,
-                crate::glass::PanelInk::Primary,
-            );
-            let _: () = msg_send![b, setContentTintColor: c];
         }
+    }
+}
+
+/// Whether a button is a direct child of the options popover (hover styles differ there).
+unsafe fn is_popover_child(button: *mut AnyObject) -> bool {
+    let parent: *mut AnyObject = msg_send![button, superview];
+    if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
+        !popover.0.is_null() && parent == popover.0
+    } else {
+        false
     }
 }
 
@@ -769,7 +847,39 @@ extern "C" fn hover_button_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut 
             set_clear_confirmation_button_style(b, false);
             return;
         }
-        if action == sel!(openClipboardSettings:) {
+        if action == sel!(toggleDetailPanel:) {
+            set_header_detail_style(b, false);
+            return;
+        }
+        if is_popover_child(b) {
+            let tag: isize = msg_send![b, tag];
+            let active = action == sel!(popoverFilterSelected:)
+                && tag >= 0
+                && CLIP_FILTER_ROWS.get(tag as usize) == Some(&*CLIP_FILTER.lock().unwrap());
+            let index = if action == sel!(popoverFilterSelected:) {
+                tag as usize
+            } else if action == sel!(openClipboardSettings:) {
+                CLIP_FILTER_ROWS.len()
+            } else if action == sel!(clearClipboardHistory:) {
+                CLIP_FILTER_ROWS.len() + 1
+            } else {
+                CLIP_FILTER_ROWS.len() + 2
+            };
+            let keyboard = index == POPOVER_KEY_ROW.load(Ordering::SeqCst);
+            let layer: *mut AnyObject = msg_send![b, layer];
+            if !layer.is_null() {
+                crate::ffi::layer_set_background(
+                    layer,
+                    crate::ffi::hex_to_cg_color(if active || keyboard {
+                        picker_popover_active_bg(clipboard_palette())
+                    } else {
+                        0
+                    }),
+                );
+            }
+            return;
+        }
+        if action == sel!(openClipboardSettings:) || action == sel!(toggleFilterPopover:) {
             set_settings_button_style(b, false);
             return;
         }
@@ -793,27 +903,6 @@ extern "C" fn hover_button_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut 
         }
         if action == sel!(detailSaveAs:) {
             set_detail_share_style(b, false);
-            return;
-        }
-        if action == sel!(filterPillClicked:) {
-            let tag: isize = msg_send![b, tag];
-            let active_tag = match *CLIP_FILTER.lock().unwrap() {
-                ClipFilter::All => 0isize,
-                ClipFilter::Text => 1,
-                ClipFilter::Image => 2,
-                ClipFilter::Link => 3,
-                ClipFilter::Code => 4,
-            };
-            let palette = clipboard_palette();
-            // Route through the material's ink like the enter/update paths on this same control, or the
-            // pill snaps back to the static palette colour once the pointer leaves (visible on frost).
-            let (tint, role) = if tag == active_tag {
-                (palette.primary_text, crate::glass::PanelInk::Primary)
-            } else {
-                (palette.secondary_text, crate::glass::PanelInk::Secondary)
-            };
-            let c = crate::glass::panel_ink(tint, role);
-            let _: () = msg_send![b, setContentTintColor: c];
             return;
         }
         if action == sel!(showItemDetails:) {
@@ -857,7 +946,9 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut AnyObject, _cmd: Sel, event:
         // Pressed state for the settings button: it shares hover's wash (see
         // `set_settings_button_style`), and setting it here keeps the state explicit rather than
         // relying on whatever the borderless button would draw on its own.
-        if action == sel!(openClipboardSettings:) {
+        if (action == sel!(openClipboardSettings:) && !is_popover_child(button))
+            || action == sel!(toggleFilterPopover:)
+        {
             set_settings_button_style(button, true);
         }
 
@@ -899,6 +990,33 @@ pub(super) unsafe fn make_action_button(
     let _: () = msg_send![b, setTag: tag];
     let _: () = msg_send![b, setTarget: row_target()];
     let _: () = msg_send![b, setAction: action];
+    let symbol = if action == sel!(togglePin:) {
+        Some(if title == "★" { "pin.fill" } else { "pin" })
+    } else if action == sel!(deleteEntry:) {
+        Some("trash")
+    } else {
+        None
+    };
+    if let Some(symbol) = symbol {
+        let name = make_nsstring(symbol);
+        let image: *mut AnyObject = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: name,
+            accessibilityDescription: std::ptr::null::<AnyObject>()
+        ];
+        CFRelease(name as *const c_void);
+        if !image.is_null() {
+            let config: *mut AnyObject = msg_send![
+                class!(NSImageSymbolConfiguration),
+                configurationWithPointSize: 12.0f64,
+                weight: crate::theme::FONT_WEIGHT_REGULAR
+            ];
+            let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+            let _: () = msg_send![image, setTemplate: true];
+            let _: () = msg_send![b, setImage: image];
+            let _: () = msg_send![b, setImagePosition: 1isize]; // NSImageOnly
+        }
+    }
     // Tint = the new mockup's .action 32% black; visibility is carried by alpha.
     let tint = crate::glass::panel_ink(
         clipboard_palette().secondary_text,
@@ -933,35 +1051,6 @@ pub(super) fn localized_string_width(s: &str, font_size: f64) -> f64 {
     }
 }
 
-/// Create a filter pill (bare text; its style is refreshed centrally by
-/// update_filter_pill_style according to the active filter).
-pub(super) unsafe fn make_filter_pill(
-    label: &str,
-    tag: isize,
-    x: f64,
-    y: f64,
-    w: f64,
-) -> *mut AnyObject {
-    let b: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    let b: *mut AnyObject = msg_send![
-        b,
-        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, FILTERS_H))
-    ];
-    let _: () = msg_send![b, setBordered: false];
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-    let _: () = msg_send![b, setFont: font];
-    let label_ns = make_nsstring(label);
-    let _: () = msg_send![b, setTitle: label_ns];
-    CFRelease(label_ns as *const c_void);
-    let _: () = msg_send![b, setTag: tag];
-    let _: () = msg_send![b, setTarget: observer()];
-    let _: () = msg_send![b, setAction: sel!(filterPillClicked:)];
-    // hover darkens (the mockup's .filter:hover).
-    add_hover_tracking(b);
-    b
-}
-
 /// What the two clear actions show right now, written by `update_clear_action_labels`. See
 /// `clear_action_applied`.
 #[derive(Clone)]
@@ -976,7 +1065,7 @@ static CLEAR_ACTION_APPLIED: Mutex<Option<ClearActionState>> = Mutex::new(None);
 
 /// Whether the opt-in second button ("clear all", which also takes pinned entries) is shown.
 /// Pure config read so every layout path agrees on the visibility rule.
-fn clear_all_button_visible() -> bool {
+pub(super) fn clear_all_button_visible() -> bool {
     CONFIG.read().unwrap().clipboard.separate_clear_all
 }
 
@@ -1013,7 +1102,12 @@ pub(crate) fn update_clear_action_labels() {
     let visible_widths: [f64; 2] = [widths[0], if show_all { widths[1] } else { 0.0 }];
     let total_width =
         visible_widths.iter().sum::<f64>() + if show_all { CLEAR_ACTION_GAP } else { 0.0 };
-    let mut x = PICKER_W - SEARCH_PAD_X - total_width;
+    let parent_width = unsafe {
+        let parent: *mut AnyObject = msg_send![buttons[0].0, superview];
+        let bounds: NSRect = msg_send![parent, bounds];
+        bounds.size.width
+    };
+    let mut x = parent_width - SEARCH_PAD_X - total_width;
     for (index, ((button, label), width)) in buttons
         .iter()
         .zip([clear, clear_all])
@@ -1052,74 +1146,6 @@ pub(crate) fn update_clear_action_labels() {
 /// until the first apply.
 pub(super) fn clear_action_applied() -> Option<ClearActionState> {
     CLEAR_ACTION_APPLIED.lock().unwrap().clone()
-}
-
-/// Refresh the filter styling: the active item is 78% black with a 16x2 underline below;
-/// the rest are 38% black (the mockup's .filter). The underline is one shared little view
-/// repositioned under the active button (created on the first style pass).
-pub(super) fn update_filter_pill_style(_animate_underline: bool) {
-    let active = *CLIP_FILTER.lock().unwrap();
-    unsafe {
-        let active_tag = match active {
-            ClipFilter::All => 0isize,
-            ClipFilter::Text => 1,
-            ClipFilter::Image => 2,
-            ClipFilter::Link => 3,
-            ClipFilter::Code => 4,
-        };
-        let mut active_frame: Option<NSRect> = None;
-        let palette = clipboard_palette();
-        let pills = FILTER_PILLS.lock().unwrap();
-        for p in pills.iter() {
-            let tag: isize = msg_send![p.0, tag];
-            let color: *mut AnyObject = if tag == active_tag {
-                active_frame = Some(msg_send![p.0, frame]);
-                crate::glass::panel_ink(palette.primary_text, crate::glass::PanelInk::Primary)
-            } else {
-                crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary)
-            };
-            let _: () = msg_send![p.0, setContentTintColor: color];
-        }
-        drop(pills);
-        // The underline: 16x2, radius 2, 45% black, 9px under the active item's text.
-        if let Some(frame) = active_frame {
-            let parent: *mut AnyObject = {
-                let p0 = FILTER_PILLS.lock().unwrap()[0];
-                msg_send![p0.0, superview]
-            };
-            let ux = frame.origin.x + (frame.size.width - FILTER_UNDERLINE_W) / 2.0;
-            // Flipped coords: the button is 38pt tall with centered text; the underline
-            // sits 9px under the text ≈ 3pt above the row's bottom.
-            let uy = frame.origin.y + FILTERS_H - 3.0;
-            let mut guard = FILTER_UNDERLINE.lock().unwrap();
-            if let Some(u) = *guard {
-                let target_frame = NSRect::new(
-                    NSPoint::new(ux, uy),
-                    NSSize::new(FILTER_UNDERLINE_W, FILTER_UNDERLINE_H),
-                );
-                let _: () = msg_send![u.0, setFrame: target_frame];
-            } else {
-                let u: *mut AnyObject = msg_send![class!(NSView), alloc];
-                let u: *mut AnyObject = msg_send![
-                    u,
-                    initWithFrame: NSRect::new(
-                        NSPoint::new(ux, uy),
-                        NSSize::new(FILTER_UNDERLINE_W, FILTER_UNDERLINE_H)
-                    )
-                ];
-                let _: () = msg_send![u, setWantsLayer: true];
-                let ulayer: *mut AnyObject = msg_send![u, layer];
-                crate::ffi::layer_set_background(
-                    ulayer,
-                    crate::ffi::hex_to_cg_color(palette.secondary_text),
-                );
-                let _: () = msg_send![ulayer, setCornerRadius: FILTER_UNDERLINE_H / 2.0];
-                let _: () = msg_send![parent, addSubview: u];
-                release_obj(u);
-                *guard = Some(ObjPtr::new(u));
-            }
-        }
-    }
 }
 
 /// the footer's entry-count label.
@@ -1237,9 +1263,11 @@ pub(super) fn show_toast(msg: &str) {
         let _: () = msg_send![label, setStringValue: text];
         CFRelease(text as *const c_void);
         // width follows the text, horizontally centered.
-        let w = localized_string_width(msg, 11.0) + 24.0;
+        let parent: *mut AnyObject = msg_send![label, superview];
+        let bounds: NSRect = msg_send![parent, bounds];
+        let w = (localized_string_width(msg, 11.5) + 24.0).min((bounds.size.width - 32.0).max(1.0));
         let label_frame: NSRect = msg_send![label, frame];
-        let x = (PICKER_W - w) / 2.0;
+        let x = (bounds.size.width - w) / 2.0;
         let _: () = msg_send![label, setFrame: NSRect::new(
             NSPoint::new(x, label_frame.origin.y),
             NSSize::new(w, label_frame.size.height)
@@ -1279,6 +1307,22 @@ pub(super) fn refresh_footer_count(total: usize) {
     }
 }
 
+/// Rebuild the footer when the panel width or locale changes.
+/// Call without holding `CLIP_HISTORY`: the count is restored from the current history.
+pub(super) unsafe fn relayout_footer(parent: *mut AnyObject, width: f64) {
+    let old_footer = FOOTER_VIEW.lock().unwrap().take();
+    *FOOTER_COUNT.lock().unwrap() = None;
+    *FOOTER_COUNT_LABEL.lock().unwrap() = None;
+    FOOTER_LEGENDS.lock().unwrap().clear();
+    if let Some(footer) = old_footer {
+        let _: () = msg_send![footer.0, removeFromSuperview];
+    }
+    build_footer(parent, width);
+    let total = CLIP_HISTORY.lock().unwrap().len();
+    refresh_footer_count(total);
+    super::drag::raise_drag_surface(parent);
+}
+
 /// Build the footer (the mockup's .footer): a top hairline + the entry count + shortcut
 /// legends (kbd keycaps). Non-flipped coords (y=0 at the bottom), 43pt tall, pinned to the
 /// window's bottom edge.
@@ -1308,7 +1352,7 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let llayer: *mut AnyObject = msg_send![line, layer];
     crate::ffi::layer_set_background(
         llayer,
-        crate::ffi::hex_to_cg_color(clipboard_palette().separator),
+        crate::ffi::hex_to_cg_color(super::picker_hairline()),
     );
     let _: () = msg_send![parent, addSubview: line];
     release_obj(line);
@@ -1328,8 +1372,7 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let _: () = msg_send![count_label, setSelectable: false];
     let _: () = msg_send![count_label, setUsesSingleLineMode: true];
     let _: () = msg_send![count_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-    let cf: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let cf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: FOOTER_TEXT_SIZE];
     let _: () = msg_send![count_label, setFont: cf];
     let cc = crate::glass::panel_ink(
         clipboard_palette().muted_text,
@@ -1354,12 +1397,9 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
     let kbd_h = 19.0;
     // Group gap between a key symbol and its label, reused by the width reservation below.
     const KBD_LABEL_GAP: f64 = 5.0;
-    // A legend holds one short symbol ("↵", "⌫", "→", "←") or the word "Tab". Only the word
-    // needs more than the minimum: a centered single-line field reserves cell padding on top of
-    // the text, so "Tab" needs 28.37pt of cell for 20.37pt of text and renders "T…" at anything
-    // less. Measure it rather than hardcoding a width.
+    // Reserve the actual glyph width plus the native text cell's padding.
     let key_w_for = |key: &str| -> f64 {
-        (localized_string_width(key, crate::theme::FONT_CAPTION) + KBD_CELL_PADDING).max(kbd_min_w)
+        (localized_string_width(key, FOOTER_TEXT_SIZE) + KBD_CELL_PADDING).max(kbd_min_w)
     };
     // Reserve each label's frame from the font it is drawn with. The frame is allocated before
     // the font is assigned, so deriving it from any other size silently under-reserves: the
@@ -1407,8 +1447,7 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _: () = msg_send![key_label, setEditable: false];
         let _: () = msg_send![key_label, setSelectable: false];
         let _: () = msg_send![key_label, setAlignment: 1isize]; // Center on arm64
-        let kf: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+        let kf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: FOOTER_TEXT_SIZE];
         let _: () = msg_send![key_label, setFont: kf];
         // Single-line like the hint: the glyph field is one line high, so the default wrapping
         // would drop the tail invisibly rather than show it was clipped.
@@ -1433,6 +1472,41 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let key_ns = make_nsstring(key);
         let _: () = msg_send![key_label, setStringValue: key_ns];
         CFRelease(key_ns as *const c_void);
+        if i == 1 {
+            // The design uses a small trash glyph inside the delete keycap rather than a
+            // backspace character. Keep the existing key label as the measured layout anchor,
+            // but hide it and draw the SF Symbol at the same 10pt size as the HTML icon.
+            let _: () = msg_send![key_label, setHidden: true];
+            let symbol_name = make_nsstring("trash");
+            let image: *mut AnyObject = msg_send![
+                class!(NSImage),
+                imageWithSystemSymbolName: symbol_name,
+                accessibilityDescription: std::ptr::null::<AnyObject>()
+            ];
+            CFRelease(symbol_name as *const c_void);
+            if !image.is_null() {
+                let config: *mut AnyObject = msg_send![
+                    class!(NSImageSymbolConfiguration),
+                    configurationWithPointSize: 10.0f64,
+                    weight: crate::theme::FONT_WEIGHT_REGULAR
+                ];
+                let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+                let _: () = msg_send![image, setTemplate: true];
+                let icon: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+                let icon: *mut AnyObject = msg_send![
+                    icon,
+                    initWithFrame: NSRect::new(
+                        NSPoint::new((key_w - 10.0) / 2.0, (kbd_h - 10.0) / 2.0),
+                        NSSize::new(10.0, 10.0)
+                    )
+                ];
+                let _: () = msg_send![icon, setImage: image];
+                let _: () = msg_send![icon, setImageScaling: 3u64]; // proportional
+                let _: () = msg_send![icon, setContentTintColor: kc];
+                let _: () = msg_send![cap, addSubview: icon];
+                release_obj(icon);
+            }
+        }
         let _: () = msg_send![cap, addSubview: key_label];
         release_obj(key_label);
         let _: () = msg_send![parent, addSubview: cap];
@@ -1440,8 +1514,7 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         // The hint's frame already reserves the text plus FOOTER_LABEL_SLACK; its height uses
         // the font's real line height and is centered. The old fixed 16pt NSTextField drew
         // from its top, making the hint sit slightly above the keycap glyph.
-        let hf: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+        let hf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: FOOTER_TEXT_SIZE];
         let hint_asc: f64 = msg_send![hf, ascender];
         let hint_desc: f64 = msg_send![hf, descender];
         // Same slack as the keycap: a frame of exactly the line height truncates the tail.
@@ -1492,6 +1565,9 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let _ = i;
     }
     *FOOTER_LEGENDS.lock().unwrap() = legends;
+    // A locale/text-size refresh replaces the footer by appending the new one, which would put it
+    // above the panel's drag surface; re-raise the surface so the footer keeps dragging.
+    super::drag::raise_drag_surface(parent);
 }
 
 /// Width one shortcut label needs when drawn with the font it is actually assigned, plus the
@@ -1499,7 +1575,7 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
 /// allocated before the font is set, so a size that disagrees with the drawn font silently
 /// reserves too little and the label wraps out of its one-line-high field.
 unsafe fn legend_required_width(label: &str) -> f64 {
-    localized_string_width(label, crate::theme::FONT_CAPTION) + FOOTER_LABEL_SLACK
+    localized_string_width(label, FOOTER_TEXT_SIZE) + FOOTER_LABEL_SLACK
 }
 
 /// Whether a label renders completely inside the frame it was given. Two independent ways to
@@ -1740,10 +1816,9 @@ pub(super) unsafe fn footer_legends_layout_is_sane() -> bool {
 pub fn refresh_localized_ui() {
     unsafe {
         rebuild_search_hint();
-        // The two header controls this change added carry translated strings too, and their view survives a
-        // locale switch: without this the tooltip and the accessibility label keep the previous language.
-        super::grip::refresh_grip_strings();
-        if let Some(button) = *PICKER_SETTINGS_BUTTON.lock().unwrap() {
+        // The header controls carry translated strings too, and their view survives a locale
+        // switch: without this the tooltip and the accessibility label keep the previous language.
+        if let Some(button) = *PICKER_OPTIONS_ORB.lock().unwrap() {
             let label = make_nsstring(&t("clipboard.open_settings"));
             let _: () = msg_send![button.0, setAccessibilityLabel: label];
             CFRelease(label as *const c_void);
@@ -1762,55 +1837,32 @@ pub fn refresh_localized_ui() {
             return;
         }
 
-        let labels = localized_filter_labels();
-        let pills: Vec<*mut AnyObject> = FILTER_PILLS
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|pill| pill.0)
-            .collect();
-        if pills.len() == labels.len() {
-            let filters_y = TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y;
-            let mut x = FILTERS_PAD_X;
-            for (pill, label) in pills.iter().zip(labels.iter()) {
-                let title = make_nsstring(label);
-                let _: () = msg_send![*pill, setTitle: title];
-                CFRelease(title as *const c_void);
-                let width = localized_string_width(label, 12.0) + 12.0;
-                let _: () = msg_send![
-                    *pill,
-                    setFrame: NSRect::new(
-                        NSPoint::new(x, filters_y),
-                        NSSize::new(width, FILTERS_H)
-                    )
-                ];
-                x += width + FILTER_GAP;
-            }
-            update_filter_pill_style(false);
-
-            if CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap().is_some() {
-                // The locale changed, so the labels and their text-hugging widths changed:
-                // update_clear_action_labels re-measures, retitles and re-right-aligns the pair
-                // (the old code reset both to the two short labels, dropping the category or the
-                // search scope).
-                update_clear_action_labels();
-            }
-        }
+        let _ = localized_filter_labels();
+        update_clear_action_labels();
 
         // English footer legends have different widths; replace the whole footer to rerun its
         // right-to-left layout.
-        let old_footer = *FOOTER_VIEW.lock().unwrap();
-        if let Some(footer) = old_footer {
-            let _: () = msg_send![footer.0, removeFromSuperview];
-        }
-        *FOOTER_VIEW.lock().unwrap() = None;
-        *FOOTER_COUNT.lock().unwrap() = None;
-        *FOOTER_COUNT_LABEL.lock().unwrap() = None;
-        FOOTER_LEGENDS.lock().unwrap().clear();
         if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
-            build_footer(parent.0, PICKER_W);
+            let bounds: NSRect = msg_send![parent.0, bounds];
+            relayout_footer(parent.0, bounds.size.width);
         }
         rebuild_rows();
+        // Rebuilding the footer appends it after the transparent drag surface. Raise the surface
+        // again so blank areas remain draggable after locale/theme refreshes.
+        if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
+            super::drag::raise_drag_surface(parent.0);
+        }
+    }
+}
+
+/// The options orb's accent dot (the mock's `.orb-dot`): shown only while the active filter is
+/// not "All". Called at build and on every filter change.
+pub(super) fn sync_options_orb_dot() {
+    let active = *CLIP_FILTER.lock().unwrap();
+    if let Some(dot) = *OPTIONS_ORB_DOT.lock().unwrap() {
+        unsafe {
+            let _: () = msg_send![dot.0, setHidden: active == ClipFilter::All];
+        }
     }
 }
 
@@ -1821,24 +1873,9 @@ pub(super) fn apply_clip_filter(filter: ClipFilter) {
         hide_detail();
     }
     *CLIP_FILTER.lock().unwrap() = filter;
-    update_filter_pill_style(true);
+    sync_options_orb_dot();
     update_clear_action_labels();
     unsafe { rebuild_rows() };
-}
-
-/// Filter-pill click: switch the filter and rebuild the list (an out-of-range selection
-/// self-heals in rebuild_rows).
-pub(super) extern "C" fn filter_pill_clicked(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    let f = match tag {
-        0 => ClipFilter::All,
-        1 => ClipFilter::Text,
-        2 => ClipFilter::Image,
-        3 => ClipFilter::Link,
-        4 => ClipFilter::Code,
-        _ => return,
-    };
-    apply_clip_filter(f);
 }
 
 /// Attach a hover tracking area to a row button (header/body): hovering selects the row

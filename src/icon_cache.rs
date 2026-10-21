@@ -313,6 +313,7 @@ pub(crate) fn extract_small_icon_for_identity(pid: i32, id: &AppIdentity) -> Opt
 }
 
 /// The clipboard small-icon path (for existence checks; key = resolve_app_identity's key).
+#[allow(dead_code)] // only reachable from the crate's unit tests: the recording path resolves a PID, not a key
 pub fn small_icon_path_for_key(key: &str) -> String {
     cache_path_for_key_suffix(key, ".small")
 }

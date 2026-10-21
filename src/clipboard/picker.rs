@@ -3,6 +3,142 @@
 use super::*;
 use crate::overlay::reset_close_button_hover;
 
+/// Desktop columns share one panel; narrow screens replace the list with detail.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct PickerLayout {
+    pub panel_w: f64,
+    pub list_w: f64,
+    pub detail_w: f64,
+    pub split: bool,
+}
+
+pub(super) fn picker_layout(available_width: f64, expanded: bool) -> PickerLayout {
+    let available = (available_width - PICKER_EDGE_MARGIN * 2.0).max(1.0);
+    let split = expanded && available_width > DETAIL_IN_PANE_BELOW_W;
+    let panel_w = if split {
+        DETAIL_SIDE_PANEL_MAX_W
+    } else {
+        PICKER_W
+    }
+    .min(available);
+    let list_w = if split { 340.0 } else { panel_w };
+    PickerLayout {
+        panel_w,
+        list_w,
+        detail_w: if split {
+            panel_w - list_w - 1.0
+        } else {
+            panel_w
+        },
+        split,
+    }
+}
+
+static DETAIL_SPLIT: AtomicBool = AtomicBool::new(false);
+static DETAIL_DIVIDER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+
+pub(super) fn picker_panel_width() -> f64 {
+    let window = *PICKER_WINDOW.lock().unwrap();
+    window.map_or(PICKER_W, |window| unsafe {
+        crate::glass::panel_frame_of(window.0).size.width
+    })
+}
+
+pub(super) fn picker_list_width() -> f64 {
+    if DETAIL_SPLIT.load(Ordering::SeqCst) {
+        340.0
+    } else {
+        picker_panel_width()
+    }
+}
+
+/// Reflow chrome from the live panel geometry; row layout uses its own list width.
+unsafe fn layout_picker_chrome(size: NSSize) {
+    let (search, options, detail, pin, close) = picker_header_frames_for(size.width);
+    for (view, frame) in [
+        (*SEARCH_FIELD_SURFACE.lock().unwrap(), search),
+        (*SEARCH_FIELD.lock().unwrap(), search),
+        (*PICKER_OPTIONS_ORB.lock().unwrap(), options),
+        (*PICKER_DETAIL_BUTTON.lock().unwrap(), detail),
+        (*PICKER_PIN_BUTTON.lock().unwrap(), pin),
+        (*PICKER_CLOSE_BUTTON.lock().unwrap(), close),
+    ] {
+        if let Some(view) = view {
+            let _: () = msg_send![view.0, setFrame: frame];
+        }
+    }
+    if let Some(clear) = *SEARCH_CLEAR_BUTTON.lock().unwrap() {
+        let _: () = msg_send![clear.0, setFrameOrigin: NSPoint::new(search.origin.x + search.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W, search.origin.y + (SEARCH_H - ACTION_H) / 2.0)];
+    }
+    if let Some(strip) = *PICKER_HEADER_STRIP.lock().unwrap() {
+        let _: () = msg_send![strip.0, setFrame: NSRect::new(NSPoint::new(0.0, size.height - header_strip_h()), NSSize::new(size.width, header_strip_h()))];
+    }
+    let list_scroll = *SCROLL_VIEW.lock().unwrap();
+    if let Some(scroll) = list_scroll {
+        let _: () = msg_send![scroll.0, setAutoresizingMask: 0u64];
+        let _: () = msg_send![scroll.0, setFrame: NSRect::new(NSPoint::new(0.0, FOOTER_H), NSSize::new(picker_list_width(), (size.height - header_strip_h() - FOOTER_H).max(0.0)))];
+    }
+    let content_parent = *PICKER_CONTENT_PARENT.lock().unwrap();
+    if let Some(parent) = content_parent {
+        // Rebuild only when the footer width changes; selection changes must not recreate chrome.
+        static FOOTER_WIDTH: AtomicU64 = AtomicU64::new(PICKER_W.to_bits());
+        if FOOTER_WIDTH.swap(size.width.to_bits(), Ordering::SeqCst) != size.width.to_bits() {
+            relayout_footer(parent.0, size.width);
+        }
+    }
+    update_scroll_indicator();
+}
+
+unsafe fn install_detail_divider(parent: *mut AnyObject, body: NSRect, list_w: f64, visible: bool) {
+    let existing = *DETAIL_DIVIDER.lock().unwrap();
+    let divider = if let Some(view) = existing {
+        view.0
+    } else {
+        let view: *mut AnyObject = msg_send![class!(NSView), new];
+        let _: () = msg_send![view, setWantsLayer: true];
+        let _: () = msg_send![parent, addSubview: view];
+        release_obj(view);
+        *DETAIL_DIVIDER.lock().unwrap() = Some(ObjPtr::new(view));
+        view
+    };
+    let _: () = msg_send![divider, setFrame: NSRect::new(NSPoint::new(list_w, body.origin.y), NSSize::new(1.0, body.size.height))];
+    let layer: *mut AnyObject = msg_send![divider, layer];
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(picker_hairline()));
+    let _: () = msg_send![divider, setHidden: !visible];
+}
+
+extern "C" fn detail_back_action(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
+    crate::callback_guard::void("clipboard_detail_back", hide_detail);
+}
+
+unsafe fn add_detail_back_button(content: *mut AnyObject) {
+    static TARGET: OnceLock<CallbackTarget> = OnceLock::new();
+    let target = TARGET
+        .get_or_init(|| {
+            let cls =
+                crate::ffi::build_class(c"OhMyTabClipboardBack", class!(NSObject), |builder| {
+                    builder.add_method::<AnyObject, _>(
+                        sel!(goBack:),
+                        detail_back_action as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                });
+            let obj: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, new];
+            CallbackTarget::new(obj)
+        })
+        .0;
+    let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let button: *mut AnyObject = msg_send![button, initWithFrame: NSRect::new(NSPoint::new(18.0, 6.0), NSSize::new(76.0, 28.0))];
+    let text = make_nsstring(&t("clipboard.detail_back"));
+    let _: () = msg_send![button, setTitle: text];
+    CFRelease(text as *const c_void);
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setTarget: target];
+    let _: () = msg_send![button, setAction: sel!(goBack:)];
+    let _: () = msg_send![content, addSubview: button];
+    release_obj(button);
+    add_hover_tracking(button);
+}
+
 /// The picker's offset from the cursor (16pt to the bottom-right; flips to the left/top
 /// when there isn't room).
 pub(super) const PICKER_CURSOR_OFF: f64 = 16.0;
@@ -58,6 +194,7 @@ pub(super) fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) 
 
 /// Pure: keep the detail panel on the picker's right and align it to the selected row within
 /// the picker's vertical bounds, so neither detail edge can exceed the picker.
+#[cfg(test)]
 pub(super) fn detail_frame_for(
     picker: NSRect,
     align_top_y: f64,
@@ -80,7 +217,13 @@ pub(super) fn detail_frame_for(
     // clamp within the picker's top and bottom edges.
     let picker_min_y = picker.origin.y;
     let picker_max_y = picker.origin.y + picker.size.height;
-    debug_assert!(h <= picker.size.height);
+    // Only finiteness is an invariant. A pane minimum can exceed a SHORT picker (this app's meta
+    // table is 317pt tall, the shortest picker is 280pt), so a height above the picker is a layout
+    // fact the caller caps, never a reason to abort the callback that asked for the pane.
+    debug_assert!(
+        h.is_finite() && w.is_finite(),
+        "detail frame size is not finite"
+    );
     let y = (align_top_y - h).max(picker_min_y).min(picker_max_y - h);
 
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
@@ -92,6 +235,7 @@ pub(super) fn detail_frame_for(
 /// drag ended on this showing — and `None` means "derive it": centered on the main screen, or centered
 /// on the cursor. Ignoring the anchor here was a real defect: dragging the panel and then opening the
 /// detail snapped it back to the derived x, and so did every selection change while the detail was open.
+#[cfg(test)]
 pub(super) fn detail_group_frames(
     picker: NSRect,
     align_top_y: f64,
@@ -142,8 +286,8 @@ pub(super) unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
 }
 
 /// Where `clipboard.picker_position` puts the picker: `(centered on the main screen, the cursor,
-/// the target screen's visible frame)`. One derivation shared by the summon and by the drag
-/// handle's reset, so the two can never disagree about what "the configured position" is.
+/// the target screen's visible frame)`. One derivation shared by the summon and by the blank-area
+/// double-click's reset, so the two can never disagree about "the configured position".
 pub(super) fn configured_picker_area() -> (bool, NSPoint, NSRect) {
     unsafe {
         let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
@@ -199,7 +343,7 @@ pub(super) fn configured_picker_frame(
     }
 }
 
-/// Put the picker back where the configuration asks for it, at its current size: the drag handle's
+/// Put the picker back where the configuration asks for it, at its current size: the blank-area
 /// double-click, i.e. the undo for "the panel is somewhere awkward now".
 ///
 /// With the detail panel open the pair is laid out again from the configured origin instead of
@@ -211,7 +355,7 @@ pub(super) fn reset_picker_to_configured_position() {
     // (and the detail group lay out from that stale x). The double-click path relied on clearing it
     // itself before this call, which left any other caller -- the smoke runner drives this directly --
     // with a stale anchor. One owner: this function.
-    super::grip::forget_session_position();
+    super::drag::forget_session_position();
     unsafe {
         let Some(picker_win) = PICKER_WINDOW.lock().unwrap().map(|w| w.0) else {
             return;
@@ -219,127 +363,17 @@ pub(super) fn reset_picker_to_configured_position() {
         let size = crate::glass::panel_frame_of(picker_win).size;
         let (center_on_main, cursor, screen_frame) = configured_picker_area();
         let target = configured_picker_frame(center_on_main, cursor, screen_frame, size);
-        let detail_win = if detail_visible() {
-            DETAIL_WINDOW.lock().unwrap().map(|w| w.0)
-        } else {
-            None
-        };
-        if let Some(detail_win) = detail_win {
-            if let Some(align_top_y) = selected_row_screen_y(target) {
-                let detail_size = crate::glass::panel_frame_of(detail_win).size;
-                let (picker_frame, detail_frame) = detail_group_frames(
-                    target,
-                    align_top_y,
-                    screen_frame,
-                    detail_size,
-                    None,
-                    center_on_main,
-                    cursor.x,
-                );
-                crate::glass::set_panel_frame(picker_win, picker_frame, true);
-                crate::glass::set_panel_frame(detail_win, detail_frame, true);
-                // The origin the detail's close restores is the anchor, not the shifted frame the
-                // group layout produced for the picker.
-                *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(target.origin);
-                // The reset moved the panel too, so the state document has to say where it is (same
-                // reason as the end of a drag; see `grip::finish_drag`).
-                crate::e2e_state::record("clipboard_picker_reset");
-                return;
-            }
-        }
         crate::glass::set_panel_frame(picker_win, target, true);
         *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = None;
         // The reset moved the panel too, so the state document has to say where it is (same reason as
-        // the end of a drag; see `grip::finish_drag`).
+        // the end of a drag; see `drag::finish_drag`).
         crate::e2e_state::record("clipboard_picker_reset");
     }
 }
 
-/// The selected row's screen y (AppKit coords -- where the detail panel's top aligns):
-/// the window top + the header strip + the row's flipped y within the document - the
-/// current scroll offset. Locks are taken only to copy pointers/values, never held
-/// across msg_send calls.
-fn selected_row_screen_y(picker: NSRect) -> Option<f64> {
-    let sel = picker_selection();
-    if sel == NO_SELECTION {
-        return None;
-    }
-    let pitches = ROW_PITCHES.lock().unwrap();
-    if pitches.is_empty() {
-        return None;
-    }
-    let row_idx = sel.min(pitches.len() - 1);
-    // The group header is part of the row pitch but not the record content; align the detail
-    // with the content block instead of the top of the group header.
-    let group_header_h = {
-        let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-        let history = CLIP_HISTORY.lock().unwrap();
-        let &history_idx = filtered.get(row_idx)?;
-        let entry = history.get(history_idx)?;
-        let current_group = day_group(entry.copied_at);
-        let previous_group = filtered[..row_idx]
-            .iter()
-            .rev()
-            .find_map(|&idx| history.get(idx).map(|e| day_group(e.copied_at)));
-        if previous_group != Some(current_group) {
-            GROUP_H
-        } else {
-            0.0
-        }
-    };
-    let row_flipped = header_strip_h() + row_top(row_idx, &pitches) + group_header_h;
-    drop(pitches);
-    // Scroll offset: the clip view's bounds.origin.y (flipped). Read via SCROLL_VIEW,
-    // NOT PICKER_CONTAINER: during key-driven scrollRectToVisible the container lock is
-    // still held by the if-let temporary guard -- locking it here would self-deadlock
-    // (a lesson this repo has already learned the hard way).
-    let scroll_offset = {
-        let sv = SCROLL_VIEW.lock().unwrap();
-        match *sv {
-            Some(s) => unsafe {
-                let clip: *mut AnyObject = msg_send![s.0, contentView];
-                if clip.is_null() {
-                    0.0
-                } else {
-                    let b: NSRect = msg_send![clip, bounds];
-                    b.origin.y
-                }
-            },
-            None => 0.0,
-        }
-    };
-    Some(picker.origin.y + picker.size.height - (row_flipped - scroll_offset))
-}
-
-/// Reposition the detail panel while it is open when the list scrolls (the selected row
-/// moves): recompute the alignment y and setFrame only, no content rebuild. Hooked onto
-/// the clip-view bounds-change notification; skipped during rebuild_rows -- its trailing
-/// scroll restore fires the notification synchronously while ROW_PITCHES is still held,
-/// and locking it here would self-deadlock on the same non-reentrant mutex.
+/// Single-panel columns move together without a separate alignment pass.
 pub(super) fn reposition_detail() {
-    if !detail_visible() || REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    unsafe {
-        let picker_win = match *PICKER_WINDOW.lock().unwrap() {
-            Some(w) => w.0,
-            None => return,
-        };
-        let detail_win = match *DETAIL_WINDOW.lock().unwrap() {
-            Some(w) => w.0,
-            None => return,
-        };
-        // Panel rects, not window frames: the two differ by the elevation padding, and aligning the
-        // detail against the padded rect would offset it by the padding on every side.
-        let pf = crate::glass::panel_frame_of(picker_win);
-        let Some(align_top_y) = selected_row_screen_y(pf) else {
-            return;
-        };
-        let cf = crate::glass::panel_frame_of(detail_win);
-        let sf = picker_screen_frame(picker_win);
-        let frame = detail_frame_for(pf, align_top_y, sf, cf.size.width, cf.size.height);
-        crate::glass::set_panel_frame(detail_win, frame, true);
-    }
+    // Both columns now share the picker window and move together.
 }
 
 /// Cancel a pending detail-close callback so a quick reopen cannot hide the new panel.
@@ -444,110 +478,22 @@ unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
     CFRelease(opacity_animation_key as *const c_void);
 }
 
-/// Open the detail panel by expanding a narrow panel horizontally while the picker moves to
-/// the final combined layout.
-unsafe fn animate_detail_open(
-    picker_window: *mut AnyObject,
-    detail_window: *mut AnyObject,
-    detail_content: *mut AnyObject,
-    target_picker_frame: NSRect,
-    target_detail_frame: NSRect,
-) {
-    if crate::theme::reduce_motion_enabled() {
-        crate::glass::set_panel_frame(picker_window, target_picker_frame, true);
-        crate::glass::set_panel_frame(detail_window, target_detail_frame, true);
-        let _: () = msg_send![detail_window, setAlphaValue: 1.0f64];
-        let _: () = msg_send![detail_window, orderFrontRegardless];
-        animate_detail_content(detail_content, true);
-        return;
-    }
-    let collapsed_frame = NSRect::new(
-        target_detail_frame.origin,
-        NSSize::new(1.0, target_detail_frame.size.height),
-    );
-    crate::glass::set_panel_frame(detail_window, collapsed_frame, false);
-    let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
-    let _: () = msg_send![detail_window, orderFrontRegardless];
-
-    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: crate::theme::ANIMATION_DURATION_MEDIUM];
-    let timing = crate::theme::ease_standard_timing_function();
-    if !timing.is_null() {
-        let _: () = msg_send![context, setTimingFunction: timing];
-    }
-
-    // Through the animator so the shadow carrier's `layout` sees every intermediate size: the panels are
-    // resized by the animation, and a path set only for the first and last frame would lag the panel.
-    crate::glass::animate_panel_frame(picker_window, target_picker_frame);
-    crate::glass::animate_panel_frame(detail_window, target_detail_frame);
-    let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
-    let _: () = msg_send![detail_animator, setAlphaValue: 1.0f64];
-    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
-
-    animate_detail_content(detail_content, true);
-}
-
-/// Close the detail panel by shrinking it to a sliver and fading it out before orderOut.
-unsafe fn animate_detail_close(
-    picker_window: *mut AnyObject,
-    detail_window: *mut AnyObject,
-    detail_content: *mut AnyObject,
-    restored_picker_frame: Option<NSRect>,
-) {
-    // The collapse is expressed as a *panel* rect: the detail window is padded too, and `set_panel_frame`
-    // re-adds the padding on the way out, so reading the window frame here would make the collapsed panel
-    // 1pt + the padding wide and drift its origin.
-    let current_detail_frame = crate::glass::panel_frame_of(detail_window);
-    let collapsed_frame = NSRect::new(
-        current_detail_frame.origin,
-        NSSize::new(1.0, current_detail_frame.size.height),
-    );
-
-    if crate::theme::reduce_motion_enabled() {
-        if let Some(frame) = restored_picker_frame {
-            crate::glass::set_panel_frame(picker_window, frame, true);
+/// Keep the list tree alive so keyboard focus and scroll position survive a narrow swap.
+pub(super) fn set_picker_pane_mode(mode: PickerPaneMode) {
+    *PICKER_PANE_MODE.lock().unwrap() = mode;
+    unsafe {
+        let list_scroll = *SCROLL_VIEW.lock().unwrap();
+        if let Some(scroll) = list_scroll {
+            let _: () = msg_send![scroll.0, setHidden: mode == PickerPaneMode::Detail];
         }
-        crate::glass::set_panel_frame(detail_window, collapsed_frame, false);
-        let _: () = msg_send![detail_window, setAlphaValue: 0.0f64];
-        animate_detail_content(detail_content, false);
-        detail_finish_close(
-            detail_window,
-            sel!(finishDetailClose:),
-            std::ptr::null_mut(),
-        );
-        return;
     }
-
-    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let exit_duration =
-        crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM);
-    let _: () = msg_send![context, setDuration: exit_duration];
-    let timing = crate::theme::ease_standard_timing_function();
-    if !timing.is_null() {
-        let _: () = msg_send![context, setTimingFunction: timing];
-    }
-
-    if let Some(frame) = restored_picker_frame {
-        crate::glass::animate_panel_frame(picker_window, frame);
-    }
-    crate::glass::animate_panel_frame(detail_window, collapsed_frame);
-    let detail_animator: *mut AnyObject = msg_send![detail_window, animator];
-    let _: () = msg_send![detail_animator, setAlphaValue: 0.0f64];
-    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
-
-    animate_detail_content(detail_content, false);
-    let _: () = msg_send![
-        detail_window,
-        performSelector: sel!(finishDetailClose:),
-        withObject: std::ptr::null::<AnyObject>(),
-        afterDelay: exit_duration
-    ];
 }
 
-/// Hide the detail window after the close animation; reopening during the delay keeps the old
-/// callback from hiding the new panel.
+/// Whether the picker body is currently showing the in-pane detail.
+pub(super) fn picker_shows_detail_in_pane() -> bool {
+    *PICKER_PANE_MODE.lock().unwrap() == PickerPaneMode::Detail
+}
+
 extern "C" fn detail_finish_close(this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     if detail_visible() {
         return;
@@ -591,11 +537,62 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
 /// Show the picker for the `--show-clipboard` development switch. Identical to the hotkey path
 /// except that a disabled clipboard module is not a refusal: the switch exists to inspect the
 /// laid-out UI, which must be verifiable regardless of the current config.
+/**
+ * Re-open the clipboard picker until the encrypted history has loaded.
+ *
+ * `--show-clipboard-detail` is a development entry point: on a cold start the panel can open
+ * before the history file is read, and the retry re-runs the same show (which resets the search
+ * and re-renders the rows) once an entry exists, then opens the detail pane on the first one.
+ */
+fn schedule_dev_detail_retry() {
+    std::thread::spawn(|| {
+        for _ in 0..40 {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let ready = {
+                let history = CLIP_HISTORY.lock().unwrap();
+                !history.is_empty()
+            };
+            if !ready {
+                continue;
+            }
+            let Some(controller) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+                return;
+            };
+            // The window work stays on the main thread, like every other picker entry.
+            unsafe {
+                let _: () = msg_send![
+                    controller,
+                    performSelectorOnMainThread: sel!(handleDevShowClipboardDetail:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    waitUntilDone: false
+                ];
+            }
+            return;
+        }
+    });
+}
+
+/// The retry's main-thread entry: show the picker (which re-renders the now-loaded rows) and open
+/// the detail pane on the first entry.
+pub(crate) fn show_picker_detail_for_development() {
+    show_picker();
+    set_picker_selection(0);
+    unsafe { show_detail_for_sel() };
+}
+
 pub(crate) fn show_picker_for_development() {
     if !CONFIG.read().unwrap().clipboard.enabled {
         crate::log_info!("[clip] --show-clipboard: clipboard module is disabled in config");
     }
     show_picker();
+    // The detail panel is reached through a key or the header's toggle, neither of which a script
+    // can press without taking focus from the panel, so the development switch can also open it
+    // directly: what it needs is the laid-out pane, not the gesture. The history is loaded
+    // asynchronously on first launch, so a panel that opened before it arrived reopens once it is
+    // there (a prewarmed picker reuses its rows and would otherwise stay empty).
+    if crate::dev_flags::present("show-clipboard-detail") {
+        schedule_dev_detail_retry();
+    }
 }
 
 /// The menu bar's "show and pin clipboard history": idempotent, never a toggle.
@@ -674,6 +671,7 @@ pub(super) fn show_picker() {
         };
         let filter = *CLIP_FILTER.lock().unwrap();
         let show_source = show_source_app();
+
         let render_key_started = Instant::now();
         let render_key = picker_rows_key(history_revision(), "", filter, show_source);
         let render_key_ms = render_key_started.elapsed().as_millis();
@@ -734,7 +732,7 @@ pub(super) fn show_picker() {
             center_on_main,
             cursor,
             screen_frame,
-            NSSize::new(PICKER_W, h),
+            NSSize::new(picker_layout(screen_frame.size.width, false).panel_w, h),
         );
         log_debug!(
             "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0}) mode={}",
@@ -747,6 +745,7 @@ pub(super) fn show_picker() {
             center_on_main
         );
         crate::glass::set_panel_frame(window, frame, true);
+        layout_picker_chrome(frame.size);
         let frame_ms = frame_started.elapsed().as_millis();
 
         let render_summary = if rows_ready {
@@ -859,7 +858,11 @@ pub(super) fn show_picker() {
                 summary.filtered_len,
                 summary.image_rows,
                 summary.code_rows,
-                if rows_ready { "cached_view" } else { "rebuilt_view" },
+                if rows_ready {
+                    "cached_view"
+                } else {
+                    "rebuilt_view"
+                },
                 rows_ready,
                 summary.empty,
                 summary.slowest_row_ms,
@@ -878,12 +881,13 @@ pub(super) fn hide_picker() {
     if let Some(button) = *PICKER_CLOSE_BUTTON.lock().unwrap() {
         unsafe { reset_close_button_hover(button.0) };
     }
-    if let Some(button) = *PICKER_SETTINGS_BUTTON.lock().unwrap() {
+    if let Some(button) = *PICKER_OPTIONS_ORB.lock().unwrap() {
         unsafe { set_settings_button_style(button.0, false) };
     }
-    // Same reason for the drag handle: an in-flight grab loses its mouseUp, the pushed hand cursor
-    // has to be popped by hand, and this showing's dragged position dies with the showing.
-    super::grip::on_picker_hidden();
+    dismiss_filter_popover();
+    // Same reason for a blank-area drag: an in-flight grab loses its mouseUp, the pushed hand
+    // cursor has to be popped by hand, and this showing's dragged position dies with the showing.
+    super::drag::on_picker_hidden();
     hide_detail();
     // The showing is over: a dismiss queued against it is stale from here on, the click monitor has
     // nothing to guard, and this is where the properties pinning changed are restored (never at
@@ -919,63 +923,50 @@ pub(super) fn hide_detail() {
     if !take_detail_visible() {
         return;
     }
-    // Remove the source row's filled detail icon on close without rebuilding the list.
-    refresh_detail_action_visuals();
-    // The picker may have shifted left for the combined layout; restore its original origin
-    // while preserving its current height.
-    let original_origin = DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap().take();
-    // The content views get removed once the panel hides; clear the text-view pointer so
-    // Cmd+C never dereferences a dangling one.
-    *DETAIL_TEXT_VIEW.lock().unwrap() = None;
-    *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = None;
-    *DETAIL_SOURCE_MAP.lock().unwrap() = None;
-    let win = *DETAIL_WINDOW.lock().unwrap();
-    let content = *DETAIL_CONTENT.lock().unwrap();
     unsafe {
-        if let (Some(w), Some(picker), Some(content)) =
-            (win, *PICKER_WINDOW.lock().unwrap(), content)
-        {
-            // If the cursor still sits on the text as the panel hides, restore the arrow
-            // explicitly (cursor regions re-evaluate only on mouse movement); skip when
-            // the cursor is elsewhere so the search field's own I-beam is never clobbered.
-            let loc: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-            // The panel the pointer can be on, not the padded window: the padding is not part of it.
-            let f = crate::glass::panel_frame_of(w.0);
-            if f.origin.x <= loc.x
-                && loc.x <= f.origin.x + f.size.width
-                && f.origin.y <= loc.y
-                && loc.y <= f.origin.y + f.size.height
-            {
-                let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
-                let _: () = msg_send![arrow, set];
-            }
-            // Panel rect again: `original_origin` was saved in panel coordinates, and the restored frame
-            // goes back through `set_panel_frame`, so mixing a window rect in here would add the padding
-            // twice and change the picker's size on close.
-            let current_picker = crate::glass::panel_frame_of(picker.0);
-            // The saved origin was taken while the picker stood alone, but the panel it belongs to is now
-            // opening back up as a standalone picker on whatever display the drag left it on. Clamping it
-            // there (rather than trusting the saved x) is what keeps a cross-display drag from restoring the
-            // panel past the new screen's edge; the session anchor follows, so the next grab starts from
-            // where the panel really is.
-            let restored_picker = original_origin.map(|origin| {
-                let clamped = super::grip::clamp_picker_origin(
-                    origin,
-                    current_picker.size,
-                    picker_screen_frame(picker.0),
-                );
-                if super::grip::session_origin().is_some() {
-                    super::grip::set_session_origin(clamped);
+        let detail_content = *DETAIL_CONTENT.lock().unwrap();
+        let picker_window = *PICKER_WINDOW.lock().unwrap();
+        if let (Some(content), Some(window)) = (detail_content, picker_window) {
+            let responder: *mut AnyObject = msg_send![window.0, firstResponder];
+            if !responder.is_null() {
+                let is_view: bool = msg_send![responder, isKindOfClass: class!(NSView)];
+                if is_view {
+                    let in_detail: bool = msg_send![responder, isDescendantOf: content.0];
+                    if in_detail {
+                        if let Some(container) = picker_container_ptr() {
+                            let _: bool = msg_send![window.0, makeFirstResponder: container];
+                        }
+                    }
                 }
-                NSRect::new(clamped, current_picker.size)
-            });
-            cancel_detail_close(w.0);
-            animate_detail_close(picker.0, w.0, content.0, restored_picker);
-        } else if let Some(w) = win {
-            cancel_detail_close(w.0);
-            let _: () = msg_send![w.0, orderOut: std::ptr::null::<AnyObject>()];
+            }
+            let _: () = msg_send![content.0, setHidden: true];
+        }
+        if let Some(divider) = *DETAIL_DIVIDER.lock().unwrap() {
+            let _: () = msg_send![divider.0, setHidden: true];
+        }
+        DETAIL_SPLIT.store(false, Ordering::SeqCst);
+        set_picker_pane_mode(PickerPaneMode::List);
+        let picker_window = *PICKER_WINDOW.lock().unwrap();
+        if let Some(window) = picker_window {
+            let mut frame = crate::glass::panel_frame_of(window.0);
+            let screen = picker_screen_frame(window.0);
+            frame.size.width =
+                PICKER_W.min((screen.size.width - PICKER_EDGE_MARGIN * 2.0).max(1.0));
+            let origin = DETAIL_PICKER_ORIGINAL_ORIGIN
+                .lock()
+                .unwrap()
+                .take()
+                .unwrap_or(frame.origin);
+            frame.origin = super::drag::clamp_picker_origin(origin, frame.size, screen);
+            crate::glass::set_panel_frame(window.0, frame, true);
+            layout_picker_chrome(frame.size);
+        }
+        rebuild_rows();
+        if let Some(container) = picker_container_ptr() {
+            scroll_selection_into_view(container, picker_selection());
         }
     }
+    refresh_detail_action_visuals();
 }
 
 /// The detail panel's window class, as a handle: it defines `finishDetailClose:`, the delayed
@@ -1036,7 +1027,8 @@ unsafe fn ensure_detail_window() {
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     let screen_frame: NSRect = msg_send![screen, visibleFrame];
     let w = DETAIL_MAX_W;
-    let h = (screen_frame.size.height - DETAIL_SCREEN_MARGIN * 2.0).max(DETAIL_PANEL_MIN_H);
+    let h = (screen_frame.size.height - DETAIL_SCREEN_MARGIN * 2.0)
+        .max(detail_pane_min_height(w, meta_table_row_count()));
     let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
     let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -1059,7 +1051,7 @@ unsafe fn ensure_detail_window() {
     let backdrop = crate::glass::install_backdrop(
         window,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
-        crate::glass::PANEL_CORNER_RADIUS,
+        super::PICKER_PANEL_RADIUS,
         crate::clipboard::detail_backdrop_options(),
     );
     *DETAIL_BACKDROP.lock().unwrap() = Some(backdrop);
@@ -1298,31 +1290,91 @@ pub(super) extern "C" fn detail_preview_ready(
     unsafe { show_detail_for_sel() };
 }
 
-unsafe fn add_detail_separator(content: *mut AnyObject, y: f64, width: f64) {
-    let line: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let line: *mut AnyObject = msg_send![
-        line,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, y), NSSize::new(width, 1.0))
-    ];
-    let _: () = msg_send![line, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![line, layer];
-    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0x0000000B));
-    let _: () = msg_send![content, addSubview: line];
-    release_obj(line);
+// ---------------------------------------------------------------------------------------------
+// Detail actions (floating, the mock's `.btn` treatment): the mock's detail pane has no
+// toolbar and no footer, but soft wrap and save-as are real features, so they float over the
+// top-right of the pane instead of reserving a strip. They sit in the mock's pane padding band,
+// so no body line is covered at rest; a long line scrolled under them keeps its text through a
+// translucent chip on the same glass material.
+// ---------------------------------------------------------------------------------------------
+
+/// A detail action's hit target and its chip for bubble layout.
+struct DetailActionSide {
+    control: *mut AnyObject,
+    chip: *mut AnyObject,
+    w: f64,
 }
 
-unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
+/// Build the detail actions for an entry: save-as always, the code soft-wrap switch only for
+/// code (it has nothing to switch for text or images).
+///
+/// They are views over the scrolling column, not floats inside it. The mock's `.detail-scroll`
+/// (the pane's only scroller) scrolls its content under everything above it, so a chip floating
+/// over the column would sit on the panel material while a body scrolled past it; outside the
+/// scroll they stay put, which is the mock's behaviour with no chrome of its own in the column.
+unsafe fn add_detail_actions(content: *mut AnyObject, entry: &ClipEntry, width: f64) {
+    let is_code = entry.image.is_none() && classify_text(&entry.text) == TextKind::Code;
+    let mut actions: Vec<DetailActionSide> = Vec::new();
+    if is_code {
+        if let Some(action) = add_wrap_action(content) {
+            actions.push(action);
+        }
+    }
+    actions.push(add_save_as_action(content, entry.image.is_some()));
+    // Trailing, right-aligned inside the pane's inset: save-as is the outer (rightmost) action.
+    let mut x = width - DETAIL_INSET_RIGHT;
+    for action in actions.iter().rev() {
+        x -= action.w;
+        let _: () = msg_send![action.control, setFrameOrigin: NSPoint::new(x, DETAIL_INSET_TOP)];
+        let _: () = msg_send![action.chip, setFrameOrigin: NSPoint::new(x, DETAIL_INSET_TOP)];
+        x -= DETAIL_ACTION_GAP;
+    }
+}
+
+/// A translucent chip behind a floating action (the mock's `.btn` background), so a line
+/// scrolled underneath keeps its contrast. Rebuilt with the action, so a mode change is a
+/// rebuild and the chip follows the new palette.
+unsafe fn add_chip(content: *mut AnyObject, width: f64) -> *mut AnyObject {
+    let chip: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let chip: *mut AnyObject = msg_send![
+        chip,
+        initWithFrame: NSRect::new(
+            NSPoint::new(0.0, DETAIL_INSET_TOP),
+            NSSize::new(width, DETAIL_ACTION_H)
+        )
+    ];
+    let _: () = msg_send![chip, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![chip, layer];
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(detail_action_fill()));
+    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
+    let _: () = msg_send![content, addSubview: chip];
+    chip
+}
+
+/// The floating actions' chip fill: a light glass wash over the panel material, or the palette's
+/// field fill in dark mode, so the chip never turns into a bright patch on the dark material.
+fn detail_action_fill() -> u32 {
+    if clipboard_palette().dark {
+        clipboard_palette().field_bg
+    } else {
+        DETAIL_ACTION_FILL_LIGHT
+    }
+}
+
+/// The soft-wrap switch, with its label as the tooltip: a 28pt pill inside the pane's padding
+/// band. Returns the switch and the chip behind it.
+unsafe fn add_wrap_action(content: *mut AnyObject) -> Option<DetailActionSide> {
     let enabled = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
-    let share_x = width - 42.0;
     // Reuse the existing switch during detail refreshes and create it only once, so rebuilding
     // the detail body cannot interrupt its animation.
     let button = detail_wrap_button(content);
     let newly_created = button.is_null();
+    let chip = add_chip(content, DETAIL_SWITCH_CHIP_W);
     let button = if newly_created {
         crate::settings::make_shared_switch(
-            share_x - 8.0,
-            0.0,
-            DETAIL_TOOLBAR_H,
+            DETAIL_SWITCH_CHIP_W - DETAIL_SWITCH_INSET,
+            DETAIL_INSET_TOP,
+            DETAIL_ACTION_H,
             enabled,
             observer(),
             sel!(toggleDetailSoftWrap:),
@@ -1330,108 +1382,35 @@ unsafe fn add_detail_wrap_control(content: *mut AnyObject, width: f64) {
     } else {
         button
     };
-    let button_frame: NSRect = msg_send![button, frame];
-    let x = button_frame.origin.x;
     let tooltip_key = if enabled {
         "clipboard.detail_soft_wrap_on"
     } else {
         "clipboard.detail_soft_wrap_off"
     };
-    let tooltip = make_nsstring(&t(tooltip_key));
-    let _: () = msg_send![button, setToolTip: tooltip];
-    CFRelease(tooltip as *const c_void);
+    let tooltip_ns = make_nsstring(&t(tooltip_key));
+    let _: () = msg_send![button, setToolTip: tooltip_ns];
+    CFRelease(tooltip_ns as *const c_void);
     if newly_created {
         let _: () = msg_send![content, addSubview: button];
         release_obj(button);
     }
-
-    // Label sits left of the switch, right-aligned; alpha raised to 0.5 so the
-    // label-to-switch association reads clearly.
-    const LABEL_H: f64 = 16.0;
-    let label_y = (DETAIL_TOOLBAR_H - LABEL_H) / 2.0;
-    let label_ns = make_nsstring(&t("clipboard.detail_soft_wrap"));
-    let label: *mut AnyObject = msg_send![class!(NSTextField), labelWithString: label_ns];
-    CFRelease(label_ns as *const c_void);
-    let _: () = msg_send![label, setFrame: NSRect::new(
-        NSPoint::new(x - 6.0 - 70.0, label_y),
-        NSSize::new(70.0, LABEL_H)
-    )];
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-    // A control's label, so it follows the theme instead of a literal black that vanishes on the
-    // dark panel.
-    let color = crate::glass::panel_ink(
-        clipboard_palette().secondary_text,
-        crate::glass::PanelInk::Secondary,
-    );
-    let _: () = msg_send![label, setFont: font];
-    let _: () = msg_send![label, setTextColor: color];
-    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
-                                                        // `systemFontOfSize:` / `colorWithWhite:alpha:` are convenience constructors (autoreleased,
-                                                        // +0); the label retains them, so releasing here would double-free at pool drain.
-    let _: () = msg_send![content, addSubview: label];
+    Some(DetailActionSide {
+        control: button,
+        chip,
+        w: DETAIL_SWITCH_CHIP_W,
+    })
 }
 
-/// Draw the save-as icon (download into a tray): a downward arrow plus a bottom tray,
-/// stroked with the same parameters as the other toolbar buttons -- no SF Symbol variant.
-pub(super) unsafe fn make_detail_save_icon(engaged: bool) -> *mut AnyObject {
-    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let image: *mut AnyObject = msg_send![image, initWithSize: NSSize::new(18.0, 18.0)];
-    // Same role convention as its sibling icon buttons: secondary normally, primary when engaged.
-    // A literal black (or an alpha on it) cannot invert, which left this glyph both too faint and
-    // invisible in dark mode.
-    let palette = clipboard_palette();
-    let role = if engaged {
-        palette.primary_text
-    } else {
-        palette.secondary_text
-    };
-    let color = crate::ffi::hex_to_ns_color(role);
-    let _: () = msg_send![image, lockFocus];
-    let _: () = msg_send![color, set];
-
-    // AppKit's origin is bottom-left: visual "down" means smaller y. The tray hugs the
-    // bottom with its opening up; the arrow points into it.
-    let tray: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![tray, moveToPoint: NSPoint::new(4.5, 7.5)];
-    let _: () = msg_send![tray, lineToPoint: NSPoint::new(4.5, 4.5)];
-    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 4.5)];
-    let _: () = msg_send![tray, lineToPoint: NSPoint::new(13.5, 7.5)];
-
-    let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![stem, moveToPoint: NSPoint::new(9.0, 14.5)];
-    let _: () = msg_send![stem, lineToPoint: NSPoint::new(9.0, 7.5)];
-
-    let head: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![head, moveToPoint: NSPoint::new(6.2, 10.2)];
-    let _: () = msg_send![head, lineToPoint: NSPoint::new(9.0, 7.4)];
-    let _: () = msg_send![head, lineToPoint: NSPoint::new(11.8, 10.2)];
-
-    for path in [tray, stem, head] {
-        let _: () = msg_send![path, setLineWidth: 1.45f64];
-        let _: () = msg_send![path, setLineCapStyle: 1isize]; // NSLineCapStyleRound
-        let _: () = msg_send![path, setLineJoinStyle: 1isize]; // NSLineJoinStyleRound
-        let _: () = msg_send![path, stroke];
-    }
-    let _: () = msg_send![image, unlockFocus];
-    let _: () = msg_send![image, setTemplate: false];
-    image
-}
-
-/// Reserve the share entry point: its placeholder action performs no business behavior while the
-/// button retains the mockup's hover feedback.
-/// Save-as button: the tooltip reads "save as text file" for text entries and "save as
-/// image file" for image entries.
-unsafe fn add_detail_save_as_button(content: *mut AnyObject, width: f64, is_image: bool) {
+/// The save-as button: the same glyph and hover behaviour as before, floated over the pane's
+/// top-right corner with a chip under it. Its tooltip says text or image file.
+unsafe fn add_save_as_action(content: *mut AnyObject, is_image: bool) -> DetailActionSide {
+    let chip = add_chip(content, DETAIL_ACTION_H);
     let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    // The y offset derives from the toolbar height for vertical centering (same logic as
-    // the soft-wrap switch) instead of a hardcoded value that drifts on resize.
-    let save_y = (DETAIL_TOOLBAR_H - 28.0) / 2.0;
     let button: *mut AnyObject = msg_send![
         button,
         initWithFrame: NSRect::new(
-            NSPoint::new(width - 42.0, save_y),
-            NSSize::new(28.0, 28.0)
+            NSPoint::new(0.0, DETAIL_INSET_TOP),
+            NSSize::new(DETAIL_ACTION_H, DETAIL_ACTION_H)
         )
     ];
     let empty = make_nsstring("");
@@ -1458,124 +1437,37 @@ unsafe fn add_detail_save_as_button(content: *mut AnyObject, width: f64, is_imag
     add_hover_tracking(button);
     let _: () = msg_send![content, addSubview: button];
     release_obj(button);
-}
-
-pub(super) unsafe fn detail_wrap_button(content: *mut AnyObject) -> *mut AnyObject {
-    let subviews: *mut AnyObject = msg_send![content, subviews];
-    let count: usize = msg_send![subviews, count];
-    for index in 0..count {
-        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-        if !is_button {
-            continue;
-        }
-        // The wrap control reuses the settings page's HTML switch; locate it by action so
-        // this remains valid when the detail panel is rebuilt.
-        let action: Sel = msg_send![view, action];
-        if action == sel!(toggleDetailSoftWrap:) {
-            return view;
-        }
-    }
-    std::ptr::null_mut()
-}
-
-pub(super) unsafe fn detail_save_as_button(content: *mut AnyObject) -> *mut AnyObject {
-    let subviews: *mut AnyObject = msg_send![content, subviews];
-    let count: usize = msg_send![subviews, count];
-    for index in 0..count {
-        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-        if is_button {
-            let action: Sel = msg_send![view, action];
-            if action == sel!(detailSaveAs:) {
-                return view;
-            }
-        }
-    }
-    std::ptr::null_mut()
-}
-
-/// Add the fixed toolbar and source/statistics footer. Without language detection, the toolbar's
-/// leading side intentionally remains empty.
-unsafe fn add_detail_chrome(
-    content: *mut AnyObject,
-    entry: &ClipEntry,
-    kind: TextKind,
-    width: f64,
-    height: f64,
-) {
-    add_detail_separator(content, DETAIL_TOOLBAR_H - 1.0, width);
-    add_detail_separator(content, height - DETAIL_FOOTER_H, width);
-
-    if kind == TextKind::Code {
-        add_detail_wrap_control(content, width);
-    }
-    // The save-as tooltip depends on the entry type: text saves as a text file, images as an image file.
-    add_detail_save_as_button(content, width, entry.image.is_some());
-
-    let source_attr = make_meta_footer_attributed(entry, true);
-    let source: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let source: *mut AnyObject = msg_send![source, initWithFrame: NSRect::new(
-        NSPoint::new(15.0, height - DETAIL_FOOTER_H + 12.0),
-        NSSize::new(width * 0.55, 18.0)
-    )];
-    let _: () = msg_send![source, setBezeled: false];
-    let _: () = msg_send![source, setEditable: false];
-    let _: () = msg_send![source, setSelectable: false];
-    let _: () = msg_send![source, setDrawsBackground: false];
-    let _: () = msg_send![source, setAttributedStringValue: source_attr];
-    release_obj(source_attr);
-    let _: () = msg_send![content, addSubview: source];
-    release_obj(source);
-
-    if entry.image.is_none() {
-        let line_count = entry.text.split('\n').count().max(1);
-        let char_count = entry.text.chars().count();
-        let lines = t_count("clipboard.detail_lines", line_count);
-        let chars = t_count("clipboard.detail_chars", char_count);
-        let stats_text = format!("{lines}  ·  {chars}");
-        let stats_ns = make_nsstring(&stats_text);
-        let stats: *mut AnyObject = msg_send![
-            class!(NSTextField),
-            labelWithString: stats_ns
-        ];
-        CFRelease(stats_ns as *const c_void);
-        let _: () = msg_send![stats, setFrame: NSRect::new(
-            NSPoint::new(width - 250.0, height - DETAIL_FOOTER_H + 12.0),
-            NSSize::new(235.0, 18.0)
-        )];
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-        // Same role as the source line next to it, which already uses `muted_text`.
-        let color = crate::glass::panel_ink(
-            clipboard_palette().muted_text,
-            crate::glass::PanelInk::Muted,
-        );
-        let _: () = msg_send![stats, setFont: font];
-        let _: () = msg_send![stats, setTextColor: color];
-        let _: () = msg_send![stats, setAlignment: 2isize]; // NSTextAlignmentRight
-        let _: () = msg_send![content, addSubview: stats];
+    DetailActionSide {
+        control: button,
+        chip,
+        w: DETAIL_ACTION_H,
     }
 }
 
-/// Open/refresh the detail panel: content follows the selected entry -- full untruncated
-/// text for text entries; the large detail preview (lazy `.detail`, see ensure_detail_preview)
-/// for images. It has a fixed width to the right of the picker, with its height and vertical
-/// position both contained within the picker.
-pub(super) unsafe fn show_detail_for_sel() {
-    // No-op without a selection (search-field focus) or an empty list.
+/// Select the entry the detail follows, or `None` when nothing is selected (search-field focus)
+/// or the list is empty.
+fn selected_detail_entry() -> Option<ClipEntry> {
     let sel = picker_selection();
     if sel == NO_SELECTION {
+        return None;
+    }
+    let h_idx = mapped_index(sel)?;
+    let history = CLIP_HISTORY.lock().unwrap();
+    history.get(h_idx).cloned()
+}
+
+/// Show the selected entry's detail: the expanding pane when [`detail_expands_in_pane`] says the
+/// panel is narrow, else the side panel right of the picker.
+pub(super) unsafe fn show_detail_for_sel() {
+    // Every step below sends AppKit messages, and objc2's debug `msg_send!` verification traps
+    // (a panic that cannot unwind out of the AppKit callback that called here, i.e. an abort)
+    // when a send lands off the main thread: an NSImage's size, for instance, only answers on
+    // it. Refusing here turns that abort into the no-op a caller already handles.
+    if !crate::is_main_thread() {
+        log_info!("[clip] detail open skipped: not on the main thread");
         return;
     }
-    let Some(h_idx) = mapped_index(sel) else {
-        return;
-    };
-    let entry = {
-        let hist = CLIP_HISTORY.lock().unwrap();
-        hist.get(h_idx).cloned()
-    };
-    let Some(entry) = entry else {
+    let Some(entry) = selected_detail_entry() else {
         return;
     };
     let detail_was_visible = detail_visible();
@@ -1593,11 +1485,66 @@ pub(super) unsafe fn show_detail_for_sel() {
         Some(w) => w.0,
         None => return,
     };
-    let screen_frame = picker_screen_frame(picker_win);
     // Panel coordinates: the picker's window is padded for its elevation shadow, and a detail sized or
     // aligned against the padded rect would be off by the padding and would re-add it on the way back.
     let picker_frame = crate::glass::panel_frame_of(picker_win);
-    let max_detail_h = detail_max_height(picker_frame);
+    if !detail_was_visible {
+        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(picker_frame.origin);
+    }
+    let screen_frame = picker_screen_frame(picker_win);
+    // The narrow panel expands INSIDE itself (the mock's `@media (max-width: 840px)` branch: the
+    // list is replaced by the detail in the same panel); any other panel keeps the side pane. Both
+    // lay the body out for a panel rect, which is the only difference between the two modes.
+    let layout = picker_layout(screen_frame.size.width, true);
+    let in_pane = !layout.split;
+    let width_changed = (picker_frame.size.width - layout.panel_w).abs() > 0.5
+        || DETAIL_SPLIT.load(Ordering::SeqCst) != layout.split;
+    DETAIL_SPLIT.store(layout.split, Ordering::SeqCst);
+    set_picker_pane_mode(if in_pane {
+        PickerPaneMode::Detail
+    } else {
+        PickerPaneMode::List
+    });
+    let mut target_frame = picker_frame;
+    target_frame.size.width = layout.panel_w;
+    // Widening keeps the panel's centre: the mock's `.panel` stays centred on `.desk` when it
+    // expands (`.is-expanded` grows 640 -> 960 symmetrically), so both edges move out rather
+    // than the detail pushing the whole panel right. Closing restores the captured origin.
+    // The shift applies only when the width actually changed: `picker_frame` is read back from
+    // AppKit, and arrow-key re-entries while the detail is open would otherwise accumulate
+    // sub-pixel frame-alignment error into a real drift.
+    if width_changed {
+        target_frame.origin.x += (picker_frame.size.width - layout.panel_w) / 2.0;
+    }
+    target_frame.origin =
+        super::drag::clamp_picker_origin(target_frame.origin, target_frame.size, screen_frame);
+    crate::glass::set_panel_frame(picker_win, target_frame, true);
+    layout_picker_chrome(target_frame.size);
+    let body = detail_content_frame(target_frame.size);
+    let target_w = layout.detail_w;
+    let target_h = body.size.height;
+    let detail_frame = NSRect::new(
+        NSPoint::new(
+            if layout.split {
+                layout.list_w + 1.0
+            } else {
+                0.0
+            },
+            FOOTER_H,
+        ),
+        NSSize::new(target_w, target_h),
+    );
+    let _: () = msg_send![content, setAutoresizingMask: 0u64];
+    let _: () = msg_send![content, setFrame: detail_frame];
+    let parent = PICKER_CONTENT_PARENT
+        .lock()
+        .unwrap()
+        .expect("picker content parent")
+        .0;
+    let _: () = msg_send![parent, addSubview: content];
+    let _: () = msg_send![content, setAutoresizingMask: 0u64];
+    let _: () = msg_send![content, setHidden: false];
+    let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
     let preserved_wrap_button =
         if entry.image.is_none() && classify_text(&entry.text) == TextKind::Code {
             detail_wrap_button(content)
@@ -1629,167 +1576,23 @@ pub(super) unsafe fn show_detail_for_sel() {
         let _: () = msg_send![v, removeFromSuperview];
     }
 
-    // Build the content: every branch uses the fixed width, computes only its dynamic height,
-    // fills the container, and falls through to the shared positioning code below.
-    let (w, h): (f64, f64);
-    if let Some(img) = &entry.image {
-        // Image entry: the detail preview, fit proportionally into the max box.
-        if let Some(png) = ensure_detail_preview(img) {
-            let data: *mut AnyObject = msg_send![
-                class!(NSData),
-                dataWithBytes: png.as_ptr() as *const c_void,
-                length: png.len()
-            ];
-            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-            let image: *mut AnyObject = msg_send![image, initWithData: data];
-            if image.is_null() {
-                return;
-            }
-            let img_size: NSSize = msg_send![image, size];
-            let (iw, ih) = (img_size.width, img_size.height);
-            // Keep the detail inside the picker height: the image's inner height is the
-            // picker's height minus the detail's vertical padding.
-            let max_image_h = (max_detail_h - DETAIL_CHROME_H - DETAIL_PAD * 2.0).max(0.0);
-            let fit_scale = (DETAIL_IMAGE_MAX_W / iw).min(max_image_h / ih).min(1.0);
-            let (fit_w, fit_h) = if iw > 0.0 && ih > 0.0 {
-                (iw * fit_scale, ih * fit_scale)
-            } else {
-                (DETAIL_IMAGE_MAX_W, max_image_h)
-            };
-            // Keep the outer panel fixed-width; scale the image inside its usable area.
-            w = DETAIL_MAX_W;
-            h = (fit_h + DETAIL_PAD * 2.0 + DETAIL_CHROME_H)
-                .clamp(DETAIL_PANEL_MIN_H, max_detail_h);
-            let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-            let view: *mut AnyObject = msg_send![
-                view,
-                initWithFrame: NSRect::new(
-                    NSPoint::new(DETAIL_PAD, DETAIL_TOOLBAR_H + DETAIL_PAD),
-                    NSSize::new(fit_w, fit_h)
-                )
-            ];
-            let _: () = msg_send![view, setImage: image];
-            let _: () = msg_send![view, setImageScaling: 3u64]; // NSImageScaleProportionallyUpOrDown
-            let _: () = msg_send![view, setEditable: false];
-            let _: () = msg_send![content, addSubview: view];
-            release_obj(view);
-            release_obj(image);
-        } else {
-            // Degenerate entry (no preview, no source file): the detail falls back to the
-            // filename text (same fallback as the row body).
-            let (tw, th) = detail_text_size(&entry.text, TextKind::Plain, max_detail_h);
-            add_detail_text(content, &entry.text, tw, th, TextKind::Plain, None, false);
-            w = tw;
-            h = th;
-        }
-    } else {
-        // Text entry: the full untruncated text; scrolls inside detail beyond picker height.
-        let kind = classify_text(&entry.text);
-        // Code-detail sizing and content share one Arc<PreparedCodeDisplay>; cache hits only
-        // increment the reference count instead of copying long text or its source map.
-        let code_soft_wrap =
-            kind == TextKind::Code && DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
-        // Both code-detail modes go through the preparation pipeline: soft wrap breaks at structural points
-        // and marks midpoints; no wrap stays on one line (horizontal scrolling) with the same markers plus a
-        // source map so copying stays lossless.
-        let prepared_code = if kind == TextKind::Code {
-            Some(if code_soft_wrap {
-                prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(DETAIL_CODE_MAX_W))
-            } else {
-                prepare_code_no_wrap_display(&entry.text)
-            })
-        } else {
-            None
-        };
-        let (tw, th) = if let Some(prepared) = &prepared_code {
-            detail_prepared_code_size(prepared, max_detail_h)
-        } else if kind == TextKind::Code {
-            detail_unwrapped_code_size(&entry.text, max_detail_h)
-        } else {
-            detail_text_size(&entry.text, kind, max_detail_h)
-        };
-        add_detail_text(
-            content,
-            &entry.text,
-            tw,
-            th,
-            kind,
-            prepared_code.as_deref(),
-            code_soft_wrap,
-        );
-        w = tw;
-        h = th;
-    }
-    let chrome_kind = if entry.image.is_some() {
-        TextKind::Plain
-    } else {
-        classify_text(&entry.text)
-    };
-    add_detail_chrome(content, &entry, chrome_kind, w, h);
+    // The pane body: shared by both modes, laid out at the target panel's width and height.
+    let (w, h) = build_detail_body(content, &entry, target_w, target_h);
 
-    // Position: right of the picker, top-aligned with the SELECTED ROW / flip / clamp.
-    // Row alignment instead of the window top: the top strip holds the search/clear bar
-    // and with few entries the window is floored at the min height, so a window-top
-    // alignment floats the panel above the row (user-reported misalignment).
-    //
-    // The x comes from the ANCHOR (the dragged position this showing, else the live rect), never
-    // from the live rect alone: a drag followed by opening the detail must not snap the panel back
-    // to where the configured mode would have put it.
-    let anchor = super::grip::anchor_origin(picker_frame.origin);
-    let anchor_frame = NSRect::new(
-        // The anchor supplies x; y stays the LIVE one, which is where the panel actually is (and
-        // where the row alignment below measures from).
-        NSPoint::new(anchor.x, picker_frame.origin.y),
-        picker_frame.size,
-    );
-    let Some(align_top_y) = selected_row_screen_y(anchor_frame) else {
-        return;
-    };
+    let _ = (w, h);
     if !detail_was_visible {
-        *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(anchor_frame.origin);
+        animate_detail_content(content, true);
     }
-    // Lay out the picker + detail as one group, keeping detail on the right and aligned to
-    // the selected row.
-    let center_on_main = CONFIG.read().unwrap().clipboard.picker_position == "main";
-    let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    let (target_picker_frame, target_detail_frame) = detail_group_frames(
-        anchor_frame,
-        align_top_y,
-        screen_frame,
-        NSSize::new(w, h),
-        super::grip::session_origin().map(|origin| origin.x),
-        center_on_main,
-        cursor.x,
-    );
-    if detail_was_visible {
-        crate::glass::set_panel_frame(picker_win, target_picker_frame, true);
-        crate::glass::set_panel_frame(window, target_detail_frame, true);
-        let _: () = msg_send![window, orderFrontRegardless];
-    } else {
-        animate_detail_open(
-            picker_win,
-            window,
-            content,
-            target_picker_frame,
-            target_detail_frame,
-        );
+    if width_changed {
+        rebuild_rows();
     }
-    log_debug!(
-        "[clip] detail group: picker=({:.0},{:.0}) detail=({:.0},{:.0}) {}x{}",
-        target_picker_frame.origin.x,
-        target_picker_frame.origin.y,
-        target_detail_frame.origin.x,
-        target_detail_frame.origin.y,
-        target_detail_frame.size.width,
-        target_detail_frame.size.height
-    );
-    // orderFrontRegardless: never takes key (canBecomeKeyWindow=NO keeps the picker key).
+    install_detail_divider(parent, body, layout.list_w, layout.split);
+    super::drag::raise_drag_surface(parent);
     set_detail_visible(true);
     // Once full document layout and the final window frame are both applied, unconditionally
     // set AppKit's actual constrained top. Mouse detail clicks, keyboard Right, and Up/Down
     // navigation while detail is open all converge here and therefore behave identically.
-    let detail_scroll = *DETAIL_SCROLL_VIEW.lock().unwrap();
-    if let Some(scroll) = detail_scroll {
+    if let Some(scroll) = *DETAIL_SCROLL_VIEW.lock().unwrap() {
         scroll_detail_to_top(scroll.0);
         let clip: *mut AnyObject = msg_send![scroll.0, contentView];
         let bounds: NSRect = msg_send![clip, bounds];
@@ -1805,23 +1608,147 @@ pub(super) unsafe fn show_detail_for_sel() {
     refresh_detail_action_visuals();
 }
 
-/// The detail-height cap equals the picker height, keeping both detail edges inside it.
-pub(super) fn detail_max_height(picker: NSRect) -> f64 {
-    picker.size.height.max(DETAIL_PANEL_MIN_H)
+/// Build the detail body into `content`: the full untruncated text for text entries, the large
+/// preview for images, then the floating actions. Returns the panel size the body asks for at
+/// the target panel width.
+unsafe fn build_detail_body(
+    content: *mut AnyObject,
+    entry: &ClipEntry,
+    panel_w: f64,
+    max_detail_h: f64,
+) -> (f64, f64) {
+    let pane = detail_pane_layout_with(
+        detail_insets(picker_shows_detail_in_pane(), panel_w),
+        panel_w,
+        max_detail_h,
+        meta_table_row_count(),
+    );
+    if let Some(img) = &entry.image {
+        let mut installed = false;
+        if let Some(png) = ensure_detail_preview(img) {
+            let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: png.as_ptr() as *const c_void, length: png.len()];
+            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            let image: *mut AnyObject = msg_send![image, initWithData: data];
+            if !image.is_null() {
+                let size: NSSize = msg_send![image, size];
+                add_detail_image(content, image, (size.width, size.height), &pane, entry);
+                release_obj(image);
+                installed = true;
+            }
+        }
+        if !installed {
+            add_detail_text(
+                content,
+                &entry.text,
+                panel_w,
+                max_detail_h,
+                DETAIL_LINE_H,
+                entry,
+                TextKind::Plain,
+                None,
+                false,
+                TextKind::Plain,
+            );
+        }
+    } else {
+        let kind = classify_text(&entry.text);
+        let wrap = kind == TextKind::Code && DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
+        let prepared = if kind == TextKind::Code {
+            Some(if wrap {
+                prepare_code_for_soft_wrap(&entry.text, detail_code_max_columns(panel_w))
+            } else {
+                prepare_code_no_wrap_display(&entry.text)
+            })
+        } else {
+            None
+        };
+        add_detail_text(
+            content,
+            &entry.text,
+            panel_w,
+            max_detail_h,
+            DETAIL_LINE_H,
+            entry,
+            TextKind::Plain,
+            prepared.as_deref(),
+            wrap,
+            kind,
+        );
+    }
+    add_detail_actions(content, entry, panel_w);
+    if picker_shows_detail_in_pane() {
+        add_detail_back_button(content);
+    }
+    (panel_w, max_detail_h)
 }
 
-/// Map the detail code width to soft-wrap sizing columns; no characters are inserted into
-/// the display. The budget uses the REAL container width (the scroll view extends to the
-/// panel's right edge, so container = panel width - left padding) and the measured
-/// `CODE_ADVANCE_PT`; SAFETY absorbs rounding and small font-metric drift.
+/// The responsive breakpoint is based on available screen width, as the HTML viewport is.
+#[cfg(test)]
+pub(super) fn detail_expands_at_width(available_width: f64) -> bool {
+    !picker_layout(available_width, true).split
+}
+
+/// The rect the picker body occupies, in the panel's flipped coordinates: under the header strip
+/// and above the footer. The list scroll view and the in-pane detail both stand in it, so switching
+/// between them moves the body from one surface to the other without moving the chrome.
+pub(super) fn detail_content_frame(panel: NSSize) -> NSRect {
+    NSRect::new(
+        NSPoint::new(0.0, FOOTER_H),
+        NSSize::new(
+            panel.width,
+            (panel.height - header_strip_h() - FOOTER_H).max(0.0),
+        ),
+    )
+}
+
+/// The detail pane's height cap: the picker's own height. A floor of the pane minimum
+/// (the mock's meta table plus a line of body) is NOT usable here: clamping the panel up to it
+/// produced a detail taller than the picker, and `detail_frame_for` asserts the opposite.
+#[cfg(test)]
+pub(super) fn detail_max_height(picker: NSRect) -> f64 {
+    picker.size.height
+}
+
+/// The panel height for a body whose preview is `content_h` tall: the pane minimum when there is
+/// room for it, otherwise the cap itself.
+///
+/// This maximizes before it minimizes. `clamp` panics when its floor exceeds its ceiling, and it
+/// really does: the pane minimum is the meta table's 317pt (five rows of two body lines, the
+/// mock's 28pt top pad and 11pt gaps) plus a 78pt body floor, so about 395pt, while the shortest
+/// picker is 280pt -- a cap smaller than the floor used to abort the whole open. The cap is a hard
+/// bound (`detail_frame_for` keeps the panel inside the picker), so it wins; the pane then has no
+/// body above the table, which the scrolling column already handles.
+
+/// The largest body section at a given panel height cap.
+#[cfg(test)]
+fn pane_max_body_h(max_detail_h: f64) -> f64 {
+    detail_pane_layout(DETAIL_MAX_W, max_detail_h, meta_table_row_count()).body_h
+}
+
+/// The body's own height for `lines` visual lines, capped at the pane's body share.
+#[cfg(test)]
+fn detail_body_height(lines: usize, max_height: f64) -> f64 {
+    (lines as f64 * DETAIL_LINE_H).min(pane_max_body_h(max_height))
+}
+
+/// Map the detail code column's width to soft-wrap sizing columns; no characters are inserted
+/// into the display. The budget uses the REAL code column (the content column minus the mock's
+/// 26pt gutter and 6pt gap) and the measured `CODE_ADVANCE_PT`; SAFETY absorbs rounding and
+/// small font-metric drift.
 fn detail_code_max_columns(width: f64) -> usize {
-    let container = width - DETAIL_PAD;
+    let container = width
+        - DETAIL_INSET_LEFT
+        - DETAIL_INSET_RIGHT
+        - DETAIL_CODE_GUTTER_W
+        - DETAIL_CODE_GUTTER_GAP;
     let columns = (container / CODE_ADVANCE_PT).floor().max(0.0) as usize;
     columns.saturating_sub(DETAIL_CODE_WRAP_SAFETY).max(24)
 }
 
 /// Size the panel from the prepared soft-wrap model. U+2028 already represents final visual
-/// wraps, so line widths are not scanned again.
+/// wraps, so line widths are not scanned again. The second value is the BODY's own height; the
+/// panel adds the meta table and the pane insets around it.
+#[cfg(test)]
 fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) -> (f64, f64) {
     let lines = prepared
         .text
@@ -1829,34 +1756,29 @@ fn detail_prepared_code_size(prepared: &PreparedCodeDisplay, max_height: f64) ->
         .filter(|ch| matches!(ch, '\n' | '\u{2028}'))
         .count()
         + 1;
-    let h =
-        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
-            .clamp(DETAIL_PANEL_MIN_H, max_height);
-    (DETAIL_CODE_MAX_W, h)
+    (DETAIL_CODE_MAX_W, detail_body_height(lines, max_height))
 }
 
 /// Size unwrapped code from hard lines only; native horizontal scrolling handles excess width.
+#[cfg(test)]
 pub(super) fn detail_unwrapped_code_size(text: &str, max_height: f64) -> (f64, f64) {
     let lines = text.split('\n').count().max(1);
-    let h =
-        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
-            .clamp(DETAIL_PANEL_MIN_H, max_height);
-    (DETAIL_CODE_MAX_W, h)
+    (DETAIL_CODE_MAX_W, detail_body_height(lines, max_height))
 }
 
-/// Compute detail text-panel dimensions (type-specific width, height capped by the picker).
+/// Compute detail text-panel dimensions (type-specific width, body height capped by the picker).
+#[cfg(test)]
 pub(super) fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (f64, f64) {
     if kind == TextKind::Code {
         let prepared = prepare_code_for_soft_wrap(text, detail_code_max_columns(DETAIL_CODE_MAX_W));
         return detail_prepared_code_size(&prepared, max_height);
     }
     let w = DETAIL_MAX_W;
-    let avail_w = w - DETAIL_PAD * 2.0;
+    // The wrap width is the CONTENT column, not the panel: the pane insets and the meta table's
+    // capsule clip are not text area (the mock's `.detail-text` lives inside the 22/26 padding).
+    let avail_w = detail_pane_layout(w, 0.0, meta_table_row_count()).content_w;
     let lines = estimate_lines(text, detail_text_units(avail_w));
-    let h =
-        (lines as f64 * DETAIL_LINE_H + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H)
-            .clamp(DETAIL_PANEL_MIN_H, max_height);
-    (w, h)
+    (w, detail_body_height(lines, max_height))
 }
 
 /// Build the detail text view: plain text wraps naturally; code inserts prioritized U+2028 soft
@@ -2119,6 +2041,9 @@ extern "C" fn detail_text_view_draw_rect(_self: *mut AnyObject, _cmd: Sel, rect:
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The pane's geometry lives in the clipboard module's own (re-exported) helpers; the tests
+    // pin against them so a padding or row-height change fails here rather than on screen.
+    use crate::clipboard::{detail_pane_layout, detail_pane_min_height, meta_table_row_count};
 
     #[test]
     fn ext_for_image_uti_maps_known_families_case_insensitively() {
@@ -2141,10 +2066,30 @@ mod tests {
 
     #[test]
     fn detail_code_max_columns_reserves_safety_and_floors_at_24() {
-        // floor((640 - 12) / 8.66) = 72, minus the 4-column safety reserve = 68.
-        assert_eq!(detail_code_max_columns(DETAIL_CODE_MAX_W), 68);
-        // floor((400 - 12) / 8.66) = 44, minus 4 = 40.
-        assert_eq!(detail_code_max_columns(400.0), 40);
+        // The code column is the content column minus the mock's gutter. The expected number is
+        // derived from the same constants the function reads, so a padding or gutter change
+        // updates both instead of leaving a hand-counted literal behind.
+        assert!(detail_code_max_columns(DETAIL_CODE_MAX_W) >= 24);
+        // The budget bounds the code column: its widest wrapped line must fit inside it.
+        assert!(
+            detail_code_max_columns(DETAIL_CODE_MAX_W) as f64 * CODE_ADVANCE_PT
+                <= DETAIL_CODE_MAX_W
+                    - DETAIL_INSET_LEFT
+                    - DETAIL_INSET_RIGHT
+                    - DETAIL_CODE_GUTTER_W
+                    - DETAIL_CODE_GUTTER_GAP
+        );
+        // The same rule at a narrow panel width, derived from the same terms: the four-column
+        // reserve is consumed twice over on the 48pt shorter column metric.
+        let narrow_budget = 400.0
+            - DETAIL_INSET_LEFT
+            - DETAIL_INSET_RIGHT
+            - DETAIL_CODE_GUTTER_W
+            - DETAIL_CODE_GUTTER_GAP;
+        let narrow_fitted =
+            (narrow_budget / CODE_ADVANCE_PT).floor() as usize - DETAIL_CODE_WRAP_SAFETY;
+        assert_eq!(detail_code_max_columns(400.0), narrow_fitted.max(24));
+        assert!(detail_code_max_columns(400.0) < detail_code_max_columns(DETAIL_CODE_MAX_W));
         // A zero or negative budget never underflows below the floor.
         assert_eq!(detail_code_max_columns(0.0), 24);
         assert_eq!(detail_code_max_columns(-100.0), 24);
@@ -2159,20 +2104,25 @@ mod tests {
         let one_line = prepare_code_for_soft_wrap("let x = 1;", columns);
         let (w, h) = detail_prepared_code_size(&one_line, cap);
         assert_eq!(w, DETAIL_CODE_MAX_W);
-        // One line sits below the panel minimum, so it clamps up to it.
-        assert_eq!(h, DETAIL_PANEL_MIN_H);
+        // The body reports its own height: one line. The panel adds the meta table around it
+        // (the old version folded the toolbar/footer into this value, which the mock has not).
+        assert_eq!(h, DETAIL_LINE_H);
 
-        let two_lines = prepare_code_for_soft_wrap("let x = 1;\nlet y = 2;", columns);
-        let (_, h_two) = detail_prepared_code_size(&two_lines, cap);
-        assert_eq!(
-            h_two,
-            DETAIL_LINE_H * 2.0 + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H
+        let two_lines = prepare_code_for_soft_wrap(
+            "let a = 1;\nlet b = 2;\nlet c = 3;\nlet d = 4;\nlet e = 5;\nlet f = 6;",
+            columns,
         );
-        assert!(h_two > h, "more hard lines must make the panel taller");
+        let (_, h_six) = detail_prepared_code_size(&two_lines, cap);
+        assert_eq!(h_six, DETAIL_LINE_H * 6.0);
+        assert!(h_six > h, "more hard lines must make the body taller");
 
-        // The cap still clamps downward.
-        let (_, capped) = detail_prepared_code_size(&two_lines, DETAIL_PANEL_MIN_H);
-        assert_eq!(capped, DETAIL_PANEL_MIN_H);
+        // The cap still clamps downward: never past what the pane leaves for the body.
+        let cap_at_min = detail_pane_min_height(DETAIL_CODE_MAX_W, meta_table_row_count());
+        let (_, capped) = detail_prepared_code_size(&two_lines, cap_at_min);
+        assert!(
+            capped <= pane_max_body_h(cap_at_min) + 1e-9,
+            "a capped body must fit the pane's body share, got {capped}"
+        );
 
         // Soft wraps insert U+2028, which the sizing must count as visual lines.
         let wrapped = prepare_code_for_soft_wrap(&"a".repeat(4000), columns);
@@ -2182,8 +2132,8 @@ mod tests {
         );
         let (_, h_wrapped) = detail_prepared_code_size(&wrapped, cap);
         assert!(
-            h_wrapped > h_two,
-            "visual wraps must add panel height at the same cap"
+            h_wrapped > h_six,
+            "visual wraps must add body height at the same cap"
         );
     }
 
@@ -2192,14 +2142,47 @@ mod tests {
         let cap = 2000.0;
         let (w, h) = detail_unwrapped_code_size("a\nb", cap);
         assert_eq!(w, DETAIL_CODE_MAX_W);
-        assert_eq!(
-            h,
-            DETAIL_LINE_H * 2.0 + DETAIL_PAD * 2.0 + DETAIL_TEXT_INSET_H + DETAIL_CHROME_H
-        );
+        assert_eq!(h, DETAIL_LINE_H * 2.0);
         // A long single line stays one line; native horizontal scrolling handles width.
         assert_eq!(
             detail_unwrapped_code_size(&"x".repeat(4000), cap).1,
-            DETAIL_PANEL_MIN_H
+            DETAIL_LINE_H
         );
+    }
+
+    /// The mock's detail pane has no toolbar and no footer: what the panel holds is the scrolling
+    /// column (inset by the pane padding) and the meta table at its bottom.
+    #[test]
+    fn detail_panel_is_a_padding_inset_column_with_a_bottom_meta_table() {
+        let cap = 900.0;
+        let pane_min_h = detail_pane_min_height(DETAIL_MAX_W, meta_table_row_count());
+        // A one-line body still sizes the panel to at least the table plus a minimum body.
+        let (w, body_h) = detail_text_size("hi", TextKind::Plain, cap);
+        let h = (body_h
+            + detail_pane_layout(w, cap, meta_table_row_count())
+                .meta
+                .height
+            + DETAIL_INSET_TOP
+            + DETAIL_INSET_BOTTOM)
+            .clamp(pane_min_h, cap);
+        let pane = detail_pane_layout(w, h, meta_table_row_count());
+        // The scrolling column is the panel minus the mock's padding on each side.
+        assert_eq!(pane.scroll.origin.x, DETAIL_INSET_LEFT);
+        assert_eq!(pane.scroll.origin.y, DETAIL_INSET_TOP);
+        assert_eq!(
+            pane.scroll.size.width,
+            DETAIL_MAX_W - DETAIL_INSET_LEFT - DETAIL_INSET_RIGHT
+        );
+        assert_eq!(
+            pane.scroll.size.height,
+            h - DETAIL_INSET_TOP - DETAIL_INSET_BOTTOM
+        );
+        // The document is exactly the pane for a short body: the table then rests on the bottom
+        // edge (the mock's margin-top: auto). The row frames that result are pinned where they
+        // live, in the detail module's own tests.
+        let doc_h = detail_document_height(pane.scroll.size.height, body_h, pane.meta.height);
+        assert_eq!(doc_h, pane.scroll.size.height);
+        assert!(pane.meta.height > 0.0);
+        assert!(pane.content_w > 0.0);
     }
 }

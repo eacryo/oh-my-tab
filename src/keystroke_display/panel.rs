@@ -4026,13 +4026,14 @@ mod tests {
         // chain -- backdrop -> wash -> cap -> text -- at both extremes, for both cap kinds.
         //
         // Keycap text is a recorded class of its own rather than `text_primary`'s 12:1 floor, which
-        // applies to text on `window_bg`/`card_bg`: the shipped accent keycaps measure 8.48:1 primary
-        // and 3.37:1 muted on the worst backdrop (a light cap over dark content), and the two floors
-        // below sit just under those. This is also why the light neutral cap keeps the inset surface
+        // applies to text on `window_bg`/`card_bg`. The muted floor is the §3.3 hard floor (3.5:1):
+        // an earlier translucent-cap build measured muted at 3.37:1 on the worst backdrop, which is
+        // why the caps are now opaque (see `opaque_over`) and why the floor can be the real one.
+        // This is also why the light neutral cap keeps the inset surface
         // (1.12:1 against the panel) even though it cannot reach 12:1: a cap dark enough to read as a
         // surface on a near-white panel cannot also carry 12:1 text.
         const KEYCAP_TEXT_PRIMARY_FLOOR: f64 = 8.0;
-        const KEYCAP_TEXT_MUTED_FLOOR: f64 = 3.25;
+        const KEYCAP_TEXT_MUTED_FLOOR: f64 = 3.5;
         for dark in [false, true] {
             let palette = crate::theme::ui_palette_for_mode(dark);
             let (fill, border) = neutral_keycap_surface(&palette);

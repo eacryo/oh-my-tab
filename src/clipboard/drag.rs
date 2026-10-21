@@ -1,10 +1,22 @@
-//! Clipboard subsystem · picker drag handle: the three dots on the panel's top edge, and the
-//! one-showing position they move the panel to.
+//! Clipboard subsystem · panel drag: any blank region of the panel moves it.
 //!
-//! The handle is deliberately its own view rather than "drag the panel anywhere": the picker is
-//! almost entirely buttons (rows, filter pills, the clear actions, the corner buttons), so a
-//! background drag would have almost no target and would compete with click-to-paste. A dedicated
-//! band keeps every existing click exactly as it was.
+//! The v2 design drops the three-dot handle. A dedicated grab band was the old shape because the
+//! picker is almost entirely controls; the opposite rule replaces it: EVERY inert blank region
+//! drags, and the ambiguous regions keep their own events by declining the gesture.
+//!
+//! Two views carry the gesture, so no region needs a hand-maintained exclusion list:
+//!
+//! - `OhMyTabClipboardDragSurface` is a transparent topmost view over the panel content. Its
+//!   `hitTest:` declines the list's viewport (rows, wheel scrolling, the scroll indicator) and every
+//!   control or text view, letting AppKit route those clicks exactly as before. Only a blank region
+//!   -- the top bar's padding, the header's gaps, the footer, the panel margins -- resolves to it.
+//! - `OhMyTabClipboardContainer` (the list's document view) extends the same gesture over the list's
+//!   own blank area below the last row. Its row subviews are controls, so a row click never reaches
+//!   these handlers; wheel events still bubble to the scroll view as before.
+//!
+//! Excluded by construction: the search field, every button (rows, filter pills, clear actions, the
+//! corner buttons, the scroll indicator) and selectable text. A sub-threshold press is a click with
+//! no action; a double-click on blank space keeps the old "put the panel back" reset.
 //!
 //! Scope of the moved position: **one showing**. The anchor lives in `SESSION_ORIGIN`, is cleared
 //! by `on_picker_hidden`, and is never written to the configuration, so the next summon puts the
@@ -12,13 +24,13 @@
 
 use super::*;
 
-/// One in-flight grab of the handle.
+/// One in-flight grab of a blank region.
 ///
 /// The drag measures the pointer in *screen* coordinates (`NSEvent.mouseLocation`) rather than
 /// `locationInWindow`: the window is what moves, so a window-relative point would travel with it
 /// and the delta would stay near zero.
 #[derive(Clone, Copy, Debug)]
-struct GripDrag {
+struct PanelDrag {
     /// The screen point (AppKit bottom-left origin) the press started at.
     mouse_down: NSPoint,
     /// The picker's panel rect when the press started; the drag is this rect plus the delta.
@@ -32,18 +44,17 @@ struct GripDrag {
     /// as one group, so `DETAIL_GAP` and the row alignment between them never change.
     detail: Option<NSRect>,
     /// Whether the pointer has travelled past `PICKER_DRAG_THRESHOLD` yet. Until it does, the grab
-    /// is a no-op (the handle has no click action, and a sub-threshold wobble must not move the
+    /// is a no-op (a blank region has no click action, and a sub-threshold wobble must not move the
     /// panel a pixel).
     moved: bool,
 }
 
-/// The pointer state the handle owns. `NSCursor` push/pop is a **global stack**, so every push has
-/// to be matched exactly once -- including when the panel disappears mid-drag, which is why the
-/// state is kept here rather than pushed blind.
+/// The pointer state a grab owns. `NSCursor` push/pop is a **global stack**, so every push has to
+/// be matched exactly once -- including when the panel disappears mid-drag, which is why the state
+/// is kept here rather than pushed blind.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum GripCursor {
+enum DragCursor {
     None,
-    Open,
     Closed,
 }
 
@@ -51,10 +62,11 @@ enum GripCursor {
 /// drag moves, and the origin the detail group layout derives from. `None` means "wherever
 /// `clipboard.picker_position` put it".
 static SESSION_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
-static DRAG: Mutex<Option<GripDrag>> = Mutex::new(None);
-static CURSOR: Mutex<GripCursor> = Mutex::new(GripCursor::None);
-/// The handle view: the theme refresh repaints its dots, and hiding it must not leave the cursor pushed.
-static GRIP_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DRAG: Mutex<Option<PanelDrag>> = Mutex::new(None);
+static CURSOR: Mutex<DragCursor> = Mutex::new(DragCursor::None);
+/// The blank-area surface, so a content rebuild can put it back on top (see
+/// [`raise_drag_surface`]).
+static DRAG_SURFACE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 
 // ---------------------------------------------------------------------------------------------
 // Position state
@@ -72,6 +84,7 @@ pub(super) fn set_session_origin(origin: NSPoint) {
 
 /// The origin to lay the detail group out from: the dragged anchor when there is one, otherwise
 /// the live rect's own origin (which is the configured position).
+#[cfg(test)]
 pub(super) fn anchor_origin(live: NSPoint) -> NSPoint {
     session_origin().unwrap_or(live)
 }
@@ -107,7 +120,7 @@ pub(super) fn forget_session_position() {
 pub(super) fn on_picker_hidden() {
     crate::debug_assert_main_thread();
     forget_session_position();
-    set_cursor(GripCursor::None);
+    set_cursor(DragCursor::None);
 }
 
 /// The correction a finished drag applies, so a panel the user left half off-screen stays usable.
@@ -147,9 +160,9 @@ pub(super) fn drag_release_correction(
     // correcting the picker's y corrects the pair.
     let mut dy = 0.0;
     if picker.size.height > visible.size.height {
-        // A panel taller than the screen cannot be wholly inside it. The handle sits at the panel's TOP
-        // edge, and a panel whose handle is off-screen cannot be dragged back -- so the top edge wins and
-        // the bottom overflows. The other order (bottom first) put the handle above the display.
+        // A panel taller than the screen cannot be wholly inside it. The top bar is what a user
+        // reaches for, so the top edge wins and the bottom overflows; the other order put the top
+        // bar above the display and left the panel unreachable.
         dy = max_y - (picker.origin.y + picker.size.height);
     } else {
         if picker.origin.y + picker.size.height > max_y {
@@ -168,7 +181,7 @@ pub(super) fn drag_release_correction(
 /// The detail panel's close restores a standalone origin that was saved while a GROUP was on screen. That
 /// group is wider than the picker, so after a drag to a narrower display the saved origin can sit past the
 /// new screen's right edge even though the group was clamped into it -- restoring it would put the panel
-/// (and the handle, and the corner buttons) off-screen. Pure.
+/// (and its corner buttons) off-screen. Pure.
 pub(super) fn clamp_picker_origin(origin: NSPoint, size: NSSize, visible: NSRect) -> NSPoint {
     let min_x = visible.origin.x + PICKER_EDGE_MARGIN;
     let max_x = visible.origin.x + visible.size.width - PICKER_EDGE_MARGIN;
@@ -180,7 +193,7 @@ pub(super) fn clamp_picker_origin(origin: NSPoint, size: NSSize, visible: NSRect
         origin.x.max(min_x).min(max_x - size.width)
     };
     let y = if size.height >= visible.size.height {
-        // Same rule as the release clamp: the handle is at the panel's top, so the top edge wins.
+        // Same rule as the release clamp: the top edge wins and the bottom overflows.
         max_y - size.height
     } else {
         origin.y.max(min_y).min(max_y - size.height)
@@ -189,108 +202,191 @@ pub(super) fn clamp_picker_origin(origin: NSPoint, size: NSSize, visible: NSRect
 }
 
 // ---------------------------------------------------------------------------------------------
-// The handle view
+// Hit testing: which blank regions start a drag
 // ---------------------------------------------------------------------------------------------
 
-/// Build the handle on the header strip and register it for the hide-time cleanup.
-pub(super) unsafe fn make_grip_view(header_strip: *mut AnyObject) {
-    let view: *mut AnyObject = msg_send![grip_view_class(), alloc];
-    let view: *mut AnyObject = msg_send![view, initWithFrame: picker_grip_frame()];
-    let _: () = msg_send![view, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![view, layer];
-    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000000));
+/// Whether a point in the content parent's coordinates falls in the list's viewport.
+///
+/// The whole viewport is declined by the drag surface: the scroll view owns wheel scrolling, its
+/// rows own their clicks, and the scroll indicator owns its drag. The blank area INSIDE the list is
+/// covered by the document view's own handlers instead (see [`drag_mouse_down`]), which is what
+/// keeps scrolling unchanged. Pure so the boundary is testable.
+fn point_in_list_region(point: NSPoint, scroll_frame: NSRect) -> bool {
+    rect_contains_point(scroll_frame, point)
+}
 
-    let dot_color = crate::ffi::hex_to_cg_color(clipboard_palette().secondary_text);
-    for dot in picker_grip_dot_frames() {
-        let mark: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let mark: *mut AnyObject = msg_send![mark, initWithFrame: dot];
-        let _: () = msg_send![mark, setWantsLayer: true];
-        let mark_layer: *mut AnyObject = msg_send![mark, layer];
-        // Round, like the keycap chips: the dots are a handle's texture, not three tiny squares.
-        let _: () = msg_send![mark_layer, setCornerRadius: (dot.size.height / 2.0)];
-        crate::ffi::layer_set_background(mark_layer, dot_color);
-        let _: () = msg_send![view, addSubview: mark];
-        release_obj(mark);
+/// Whether a view under the pointer owns the event in a way a blank-area drag must not take over:
+/// controls (buttons, fields, sliders -- `NSControl` covers every one of them), text views, and the
+/// scroll machinery itself. Everything else (the header strip, the footer, the document view, a
+/// label's plain container) is inert background.
+unsafe fn drag_target_owns_the_click(target: *mut AnyObject) -> bool {
+    if target.is_null() {
+        return false;
     }
+    for class in [
+        class!(NSControl),
+        class!(NSTextView),
+        class!(NSScrollView),
+        class!(NSClipView),
+        class!(NSScroller),
+    ] {
+        let owns: bool = msg_send![target, isKindOfClass: class];
+        if owns {
+            return true;
+        }
+    }
+    false
+}
 
-    // Hover feedback is what tells the user this band is grabbable, so the handle needs its own
-    // tracking area. ActiveAlways, like every other tracking area on this panel: its host app
-    // stays inactive behind the nonactivating panel, and ActiveInActiveApp delivers nothing.
-    let opts: u64 = 0x01 | 0x80; // NSTrackingMouseEnteredAndExited | ActiveAlways
-    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let bounds: NSRect = msg_send![view, bounds];
-    let tracking: *mut AnyObject = msg_send![
-        tracking,
-        initWithRect: bounds,
-        options: opts,
-        owner: view,
-        userInfo: std::ptr::null::<AnyObject>()
-    ];
-    let _: () = msg_send![view, addTrackingArea: tracking];
-    release_obj(tracking);
+/// The view AppKit would hit for `point` if the drag surface were not in the tree: the sibling
+/// subtrees are tested in AppKit's own back-to-front order, skipping the surface itself.
+///
+/// `point` is in the surface's superview coordinates, which is also the sibling views' parent
+/// coordinate space, so no conversion is involved.
+unsafe fn sibling_hit_below_drag_surface(
+    surface: *mut AnyObject,
+    superview: *mut AnyObject,
+    point: NSPoint,
+) -> *mut AnyObject {
+    let subviews: *mut AnyObject = msg_send![superview, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in (0..count).rev() {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if view == surface {
+            continue;
+        }
+        let hit: *mut AnyObject = msg_send![view, hitTest: point];
+        if !hit.is_null() {
+            return hit;
+        }
+    }
+    std::ptr::null_mut()
+}
 
-    // A handle is a drag target, not a button: the accessibility role says so, and the tooltip is
-    // where the double-click reset is stated (there is no room for it on the dots themselves).
-    // "AXHandle" is NSAccessibilityHandleRole, the role AppKit uses for draggable handles.
-    let role = make_nsstring("AXHandle");
-    let _: () = msg_send![view, setAccessibilityRole: role];
-    CFRelease(role as *const c_void);
-    let label = make_nsstring(&t("clipboard.grip_label"));
-    let _: () = msg_send![view, setAccessibilityLabel: label];
-    CFRelease(label as *const c_void);
-    let tooltip = make_nsstring(&t("clipboard.grip_tooltip"));
-    let _: () = msg_send![view, setToolTip: tooltip];
-    CFRelease(tooltip as *const c_void);
+// ---------------------------------------------------------------------------------------------
+// The drag surface
+// ---------------------------------------------------------------------------------------------
 
-    let _: () = msg_send![header_strip, addSubview: view];
-    *GRIP_VIEW.lock().unwrap() = Some(ObjPtr::new(view));
+/// Put the transparent drag surface over the panel content. Called once, when the picker window is
+/// built; a backdrop swap moves the content's subviews (this one included), so the surface survives
+/// a material change without being rebuilt.
+pub(super) unsafe fn install_drag_surface(content_parent: *mut AnyObject) {
+    let bounds: NSRect = msg_send![content_parent, bounds];
+    let view: *mut AnyObject = msg_send![drag_surface_class(), alloc];
+    let view: *mut AnyObject = msg_send![view, initWithFrame: bounds];
+    // Tracks the content parent on every resize (the panel is resized per summon).
+    let _: () = msg_send![view, setAutoresizingMask: 18u64];
+    // A gesture surface is not an accessibility element of its own: the panel's content already
+    // carries the labels, and a bare group would only add an unlabeled stop.
+    let _: () = msg_send![view, setAccessibilityElement: false];
+    let _: () = msg_send![content_parent, addSubview: view];
+    *DRAG_SURFACE.lock().unwrap() = Some(ObjPtr::new(view));
     release_obj(view);
+}
+
+/// Put the surface back on top after a content rebuild.
+///
+/// Only the footer is rebuilt in place (a locale or text-size change replaces the whole view), and
+/// `build_footer` appends the new footer to the content parent -- which would leave it ABOVE the
+/// surface and silently turn the footer's blank area non-draggable. `addSubview:positioned:relativeTo:`
+/// with `NSWindowAbove` and a nil relative view puts the existing subview back at the top of the
+/// sibling list; the scroll view's rows rebuild inside the scroll view and never reorder these
+/// siblings.
+pub(super) unsafe fn raise_drag_surface(content_parent: *mut AnyObject) {
+    let Some(surface) = *DRAG_SURFACE.lock().unwrap() else {
+        return;
+    };
+    if surface.0.is_null() {
+        return;
+    }
+    let superview: *mut AnyObject = msg_send![surface.0, superview];
+    if superview != content_parent {
+        return;
+    }
+    // NSWindowAbove = 1; a nil relative view means "the top of the subview list".
+    let _: () = msg_send![
+        content_parent,
+        addSubview: surface.0,
+        positioned: 1isize,
+        relativeTo: std::ptr::null::<AnyObject>()
+    ];
+}
+
+/// The surface's hit test: accept only a truly inert blank region, decline everything ambiguous.
+///
+/// Returning nil here is what preserves every existing click exactly: AppKit continues the same hit
+/// test with the remaining subviews, so the control, row, scroll view or text view under the
+/// pointer receives the event as it did before the surface existed.
+extern "C" fn drag_surface_hit_test(
+    self_view: *mut AnyObject,
+    _cmd: Sel,
+    point: NSPoint,
+) -> *mut AnyObject {
+    crate::callback_guard::event(
+        "clipboard_drag_surface_hit_test",
+        std::ptr::null_mut(),
+        || unsafe {
+            let superview: *mut AnyObject = msg_send![self_view, superview];
+            if superview.is_null() {
+                return std::ptr::null_mut();
+            }
+            let frame: NSRect = msg_send![self_view, frame];
+            if !rect_contains_point(frame, point) {
+                return std::ptr::null_mut();
+            }
+            if let Some(scroll) = (*SCROLL_VIEW.lock().unwrap()).map(|scroll| scroll.0) {
+                if !scroll.is_null() {
+                    let scroll_frame: NSRect = msg_send![scroll, frame];
+                    if point_in_list_region(point, scroll_frame) {
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+            let target = sibling_hit_below_drag_surface(self_view, superview, point);
+            if drag_target_owns_the_click(target) {
+                return std::ptr::null_mut();
+            }
+            self_view
+        },
+    )
 }
 
 // ---------------------------------------------------------------------------------------------
 // Drag interaction
 // ---------------------------------------------------------------------------------------------
 
-extern "C" fn grip_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    crate::callback_guard::void("clipboard_grip_mouse_down", || unsafe {
-        let click_count: isize = msg_send![event as *mut AnyObject, clickCount];
+/// A press on any accepted blank region (the surface or the list's document view).
+pub(super) extern "C" fn drag_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
+    crate::callback_guard::void("clipboard_drag_mouse_down", || unsafe {
+        let click_count: isize = msg_send![event, clickCount];
         let point: NSPoint = msg_send![class!(NSEvent), mouseLocation];
         begin_drag(point, click_count);
     });
 }
 
-extern "C" fn grip_mouse_dragged(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    crate::callback_guard::void("clipboard_grip_mouse_dragged", || {
+pub(super) extern "C" fn drag_mouse_dragged(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+    _event: *mut AnyObject,
+) {
+    crate::callback_guard::void("clipboard_drag_mouse_dragged", || {
         let point: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
         drag_to(point);
     });
 }
 
-extern "C" fn grip_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    crate::callback_guard::void("clipboard_grip_mouse_up", finish_drag);
-}
-
-extern "C" fn grip_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    crate::callback_guard::void("clipboard_grip_mouse_entered", || {
-        set_cursor(GripCursor::Open);
-    });
-}
-
-extern "C" fn grip_mouse_exited(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    crate::callback_guard::void("clipboard_grip_mouse_exited", || {
-        // A captured drag keeps the closed hand even if AppKit reports the pointer leaving while
-        // the window moves under it; popping here would unbalance the cursor stack mid-drag.
-        if DRAG.lock().unwrap().is_some() {
-            return;
-        }
-        set_cursor(GripCursor::None);
-    });
+pub(super) extern "C" fn drag_mouse_up(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    crate::callback_guard::void("clipboard_drag_mouse_up", finish_drag);
 }
 
 /// First mouse, so a grab works while the panel's host app is inactive -- the same reason the
 /// scroll indicator overrides it.
-extern "C" fn grip_accepts_first_mouse(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) -> bool {
-    true
+pub(super) extern "C" fn drag_accepts_first_mouse(
+    _self: *mut AnyObject,
+    _cmd: Sel,
+    _event: *mut AnyObject,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
 }
 
 fn begin_drag(point: NSPoint, click_count: isize) {
@@ -298,41 +394,41 @@ fn begin_drag(point: NSPoint, click_count: isize) {
     let Some(picker) = picker_panel_rect() else {
         return;
     };
-    // Defensive: the handler belongs to the handle, but a stale coordinate must not move a panel
-    // the user grabbed elsewhere.
-    let Some(band) = grip_screen_rect(picker) else {
-        return;
-    };
-    if !rect_contains_point(band, point) {
+    // Defensive: the handlers belong to blank regions, but a stale or forwarded coordinate must not
+    // move a panel that does not contain it.
+    if !rect_contains_point(picker, point) {
         return;
     }
     if click_count >= 2 {
-        // Double-click: put the panel back where the configuration asks for it. `reset` recomputes from
-        // the mode, forgets this showing's anchor (it owns that state) and re-lays the detail group out
-        // if it is open, so both windows move together.
+        // Double-click: put the panel back where the configuration asks for it. `reset` recomputes
+        // from the mode, forgets this showing's anchor (it owns that state) and re-lays the detail
+        // group out if it is open, so both windows move together.
         *DRAG.lock().unwrap() = None;
+        // The first click's release normally popped the hand; popping again is a no-op unless that
+        // mouseUp was lost, in which case this is the only place left that can balance the stack.
+        set_cursor(DragCursor::None);
         super::picker::reset_picker_to_configured_position();
-        set_cursor(GripCursor::Open);
         return;
     }
-    // A detail closed a moment ago keeps its queued `finishDetailClose:` when the user grabs the handle.
-    // Cancelling it here left that window ordered front, transparent and collapsed for good: its logical
-    // "visible" flag was already cleared, so nothing would retry. The queued call belongs to a detail the
-    // app already considers closed, so letting it finish IS the completion; cancelling a pending close is
-    // the OPEN path's job (a quick reopen must not hide the new panel), and it does that itself.
+    // A detail closed a moment ago keeps its queued `finishDetailClose:` when the user grabs a blank
+    // region. Cancelling it here left that window ordered front, transparent and collapsed for good:
+    // its logical "visible" flag was already cleared, so nothing would retry. The queued call belongs
+    // to a detail the app already considers closed, so letting it finish IS the completion; cancelling
+    // a pending close is the OPEN path's job (a quick reopen must not hide the new panel), and it does
+    // that itself.
     let detail = if detail_visible() {
         detail_panel_rect()
     } else {
         None
     };
-    *DRAG.lock().unwrap() = Some(GripDrag {
+    *DRAG.lock().unwrap() = Some(PanelDrag {
         mouse_down: point,
         picker,
         anchor: current_anchor(picker),
         detail,
         moved: false,
     });
-    set_cursor(GripCursor::Closed);
+    set_cursor(DragCursor::Closed);
 }
 
 fn drag_to(point: NSPoint) {
@@ -346,7 +442,7 @@ fn drag_to(point: NSPoint) {
     if !drag.moved && dx.hypot(dy) < PICKER_DRAG_THRESHOLD {
         return;
     }
-    *DRAG.lock().unwrap() = Some(GripDrag {
+    *DRAG.lock().unwrap() = Some(PanelDrag {
         moved: true,
         ..drag
     });
@@ -365,15 +461,15 @@ fn finish_drag() {
         return;
     };
     if !drag.moved {
-        // A click or a sub-threshold wobble never moved the window, but the press still swapped the cursor
-        // to the closed hand: restore it on the way out, or the panel keeps claiming it is being held until
-        // the pointer leaves the band.
-        finish_cursor_after_release(drag.picker);
+        // A click or a sub-threshold wobble never moved the window, but the press still swapped the
+        // cursor to the closed hand: restore it on the way out.
+        set_cursor(DragCursor::None);
         return;
     }
     // The release is where the clamp is applied: while the pointer is held the panel follows it
     // exactly (dragging past an edge is allowed), and letting go is what decides the final spot.
     let Some(picker) = picker_panel_rect() else {
+        set_cursor(DragCursor::None);
         return;
     };
     let detail = if detail_visible() {
@@ -389,6 +485,7 @@ fn finish_drag() {
             drag.anchor.x + (picker.origin.x - drag.picker.origin.x),
             drag.anchor.y + (picker.origin.y - drag.picker.origin.y),
         ));
+        set_cursor(DragCursor::None);
         crate::e2e_state::record("clipboard_picker_moved");
         return;
     };
@@ -425,62 +522,21 @@ fn finish_drag() {
     if detail.is_some() {
         *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = Some(corrected_anchor);
     }
-    // The pointer is still where the user let go.
-    finish_cursor_after_release(corrected_picker);
+    set_cursor(DragCursor::None);
     // The moved frame is a fact only the app can state, and the `--e2e-state` document is written on
     // events: without this the A2 drag scenario read the frame from before the gesture and called a
-    // working drag a failure. Recorded once, at the end -- the intermediate frames of a gesture are not
-    // state anyone reads, and each write collects the whole document.
+    // working drag a failure. Recorded once, at the end -- the intermediate frames of a gesture are
+    // not state anyone reads, and each write collects the whole document.
     crate::e2e_state::record("clipboard_picker_moved");
 }
 
-/// Re-apply the handle's localized label and tooltip. The picker window is reused across showings, so a
-/// string captured when the handle was built would keep the language that was active then (and VoiceOver
-/// would keep announcing it).
-pub(super) fn refresh_grip_strings() {
-    let Some(view) = *GRIP_VIEW.lock().unwrap() else {
-        return;
-    };
-    unsafe {
-        let label = make_nsstring(&t("clipboard.grip_label"));
-        let _: () = msg_send![view.0, setAccessibilityLabel: label];
-        CFRelease(label as *const c_void);
-        let tooltip = make_nsstring(&t("clipboard.grip_tooltip"));
-        let _: () = msg_send![view.0, setToolTip: tooltip];
-        CFRelease(tooltip as *const c_void);
-    }
-}
-
-/// Re-apply the material's ink to the handle's dots, and drop any hover state on the way.
-///
-/// The picker window is reused across showings, so a colour captured when the handle was built survives a
-/// light/dark switch and the dots keep the previous mode's ink. The clipboard theme refresh calls this with
-/// the gear's restyle: the two header controls it added are the ones it owns.
-pub(super) fn refresh_grip_style() {
-    let Some(view) = *GRIP_VIEW.lock().unwrap() else {
-        return;
-    };
-    unsafe {
-        let dot_color = crate::ffi::hex_to_cg_color(clipboard_palette().secondary_text);
-        let marks: *mut AnyObject = msg_send![view.0, subviews];
-        let count: usize = msg_send![marks, count];
-        for index in 0..count {
-            let mark: *mut AnyObject = msg_send![marks, objectAtIndex: index as isize];
-            let layer: *mut AnyObject = msg_send![mark, layer];
-            crate::ffi::layer_set_background(layer, dot_color);
-        }
-    }
-    if DRAG.lock().unwrap().is_none() {
-        set_cursor(GripCursor::None);
-    }
-}
-
-/// Drive one complete grab of the handle, from `from` to `to`, exactly as the mouse handlers do: the
-/// threshold, the window move, the release clamp and the anchor all run for real, on the real windows.
+/// Drive one complete grab of a blank region, from `from` to `to`, exactly as the mouse handlers do:
+/// the threshold, the window move, the release clamp and the anchor all run for real, on the real
+/// windows.
 ///
 /// The GUI smoke runner uses this instead of a synthetic input instrument, because no synthetic drag
 /// reaches a nonactivating floating panel from outside the process. What that leaves uncovered -- that
-/// AppKit delivers the real event stream to this view -- is asserted by the A2 scenario with a real
+/// AppKit delivers the real event stream to these views -- is asserted by the A2 scenario with a real
 /// pointer gesture, so the two tiers split the claim instead of one of them covering neither.
 pub(super) fn e2e_drag(from: NSPoint, to: NSPoint) {
     begin_drag(from, 1);
@@ -488,21 +544,10 @@ pub(super) fn e2e_drag(from: NSPoint, to: NSPoint) {
     finish_drag();
 }
 
-/// Whether the handle is still holding the closed hand, for the GUI smoke: a press that never crossed
-/// the drag threshold must not leave it behind (`finish_drag`'s early return used to skip the restore).
+/// Whether a grab is still holding the closed hand, for the GUI smoke: a press that never crossed
+/// the drag threshold must not leave it behind.
 pub(super) fn e2e_cursor_is_closed() -> bool {
-    *CURSOR.lock().unwrap() == GripCursor::Closed
-}
-
-/// The pointer is still where the user let go: over the band the hand stays open, elsewhere the band is
-/// no longer hovered. Shared by both release exits, because the press pushed the closed hand either way.
-fn finish_cursor_after_release(picker: NSRect) {
-    match grip_screen_rect(picker) {
-        Some(band) if rect_contains_point(band, current_cursor_point()) => {
-            set_cursor(GripCursor::Open)
-        }
-        _ => set_cursor(GripCursor::None),
-    }
+    *CURSOR.lock().unwrap() == DragCursor::Closed
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -528,7 +573,10 @@ unsafe fn picker_window() -> Option<*mut AnyObject> {
 }
 
 unsafe fn detail_window() -> Option<*mut AnyObject> {
-    DETAIL_WINDOW.lock().unwrap().map(|w| w.0)
+    DETAIL_WINDOW.lock().unwrap().and_then(|w| {
+        let visible: bool = msg_send![w.0, isVisible];
+        visible.then_some(w.0)
+    })
 }
 
 /// The picker's panel rect, or `None` before the window exists.
@@ -546,39 +594,22 @@ fn picker_visible_frame() -> Option<NSRect> {
     unsafe { picker_window().map(|window| super::picker::picker_screen_frame(window)) }
 }
 
-fn current_cursor_point() -> NSPoint {
-    unsafe { msg_send![class!(NSEvent), mouseLocation] }
-}
-
-/// The handle's hit band in screen coordinates, for the panel rect it currently sits on.
-fn grip_screen_rect(picker: NSRect) -> Option<NSRect> {
-    let local = picker_grip_frame();
-    Some(NSRect::new(
-        NSPoint::new(
-            picker.origin.x + local.origin.x,
-            picker.origin.y + picker.size.height - local.origin.y - local.size.height,
-        ),
-        local.size,
-    ))
-}
-
 // ---------------------------------------------------------------------------------------------
 // Cursor
 // ---------------------------------------------------------------------------------------------
 
-fn set_cursor(cursor: GripCursor) {
+fn set_cursor(cursor: DragCursor) {
     let mut current = CURSOR.lock().unwrap();
     if *current == cursor {
         return;
     }
     unsafe {
-        if *current != GripCursor::None {
+        if *current != DragCursor::None {
             let _: () = msg_send![class!(NSCursor), pop];
         }
         let object: *mut AnyObject = match cursor {
-            GripCursor::Open => msg_send![class!(NSCursor), openHandCursor],
-            GripCursor::Closed => msg_send![class!(NSCursor), closedHandCursor],
-            GripCursor::None => std::ptr::null_mut(),
+            DragCursor::Closed => msg_send![class!(NSCursor), closedHandCursor],
+            DragCursor::None => std::ptr::null_mut(),
         };
         if !object.is_null() {
             let _: () = msg_send![object, push];
@@ -591,34 +622,43 @@ fn set_cursor(cursor: GripCursor) {
 // Class
 // ---------------------------------------------------------------------------------------------
 
-unsafe fn grip_view_class() -> *mut AnyObject {
-    static GRIP_VIEW_CLASS: OnceLock<StaticClass> = OnceLock::new();
-    GRIP_VIEW_CLASS
-        .get_or_init(|| {
-            let name = CString::new("OhMyTabClipboardGripView").unwrap();
-            let superclass = class!(NSView) as *const _ as *mut AnyObject;
-            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
-            let types = CString::new("v@:@").unwrap();
-            for (selector, implementation) in [
-                (sel!(mouseDown:), grip_mouse_down as *mut c_void),
-                (sel!(mouseDragged:), grip_mouse_dragged as *mut c_void),
-                (sel!(mouseUp:), grip_mouse_up as *mut c_void),
-                (sel!(mouseEntered:), grip_mouse_entered as *mut c_void),
-                (sel!(mouseExited:), grip_mouse_exited as *mut c_void),
-            ] {
-                class_addMethod(cls, selector, implementation, types.as_ptr());
-            }
-            let types_first_mouse = CString::new("B@:@").unwrap();
-            class_addMethod(
-                cls,
-                sel!(acceptsFirstMouse:),
-                grip_accepts_first_mouse as *mut c_void,
-                types_first_mouse.as_ptr(),
-            );
-            objc_registerClassPair(cls);
-            StaticClass(cls as *const objc2::runtime::AnyClass)
-        })
-        .0 as *mut AnyObject
+unsafe fn drag_surface_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabClipboardDragSurface", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipboardDragSurface",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(hitTest:),
+                    drag_surface_hit_test
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    drag_mouse_down as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDragged:),
+                    drag_mouse_dragged as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseUp:),
+                    drag_mouse_up as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(acceptsFirstMouse:),
+                    drag_accepts_first_mouse
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            *mut AnyObject,
+                        ) -> objc2::runtime::Bool,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
 }
 
 #[cfg(test)]
@@ -704,7 +744,7 @@ mod tests {
     }
 
     /// A group wider than the display cannot satisfy both edges; the leading edge wins and the
-    /// picker -- which holds the handle -- stays whole.
+    /// picker -- which the user just grabbed -- stays whole.
     #[test]
     fn a_group_wider_than_the_screen_pins_the_picker_to_the_leading_edge() {
         let screen = rect(0.0, 0.0, 900.0, 860.0);
@@ -715,10 +755,10 @@ mod tests {
     }
 
     /// A panel taller than the target screen cannot fit, and the choice that matters is which edge keeps
-    /// its place: the handle is at the panel's TOP, and a handle off-screen cannot be grabbed again. The
-    /// earlier order aligned the bottom and left the handle above the display.
+    /// its place: the top bar is what a user reaches for, and a top bar above the display cannot be
+    /// grabbed again. The earlier order aligned the bottom and left the top edge above the display.
     #[test]
-    fn a_panel_taller_than_the_screen_keeps_its_handle_reachable() {
+    fn a_panel_taller_than_the_screen_keeps_its_top_edge_reachable() {
         let screen = rect(0.0, 0.0, 1440.0, 700.0);
         let picker = rect(400.0, 500.0, 560.0, 900.0);
         let correction = drag_release_correction(picker, None, screen);
@@ -729,11 +769,10 @@ mod tests {
             ),
             picker.size,
         );
-        // The top edge (the handle end, in AppKit coordinates) sits on the visible frame's top edge.
+        // The top edge (the drag band's end, in AppKit coordinates) sits on the visible frame's top edge.
         assert_eq!(moved.origin.y + moved.size.height, 700.0);
-        // And it is reachable: the band is far enough below the top edge to be inside the display.
-        let band_top_from_panel_top = picker_grip_frame().size.height;
-        assert!(moved.origin.y + moved.size.height - band_top_from_panel_top >= 0.0);
+        let band_height = picker_drag_band_frame().size.height;
+        assert!(moved.origin.y + moved.size.height - band_height >= 0.0);
         // The bottom is what overflows, not the top.
         assert!(moved.origin.y < 0.0);
     }
@@ -776,7 +815,7 @@ mod tests {
 
         // The position a drag produced must not outlive the showing: a hidden picker forgets it, so the
         // next summon goes back to the configured mode and nothing reaches the configuration file.
-        *DRAG.lock().unwrap() = Some(GripDrag {
+        *DRAG.lock().unwrap() = Some(PanelDrag {
             mouse_down: NSPoint::new(0.0, 0.0),
             picker: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0)),
             anchor: NSPoint::new(0.0, 0.0),
@@ -793,44 +832,17 @@ mod tests {
         );
     }
 
-    /// The handle's hit band is what §6.1 asks of a control, and the dots stay inside it AND centered
-    /// in it. The dot frames are measured from the BAND's top-left (they are its subviews), so they are
-    /// compared against the band's size, not its position in the strip. "Inside" alone is not enough:
-    /// the dots used to be placed from a fixed 48pt constant, so widening the band would have left them
-    /// at the left end while still being inside it.
+    /// The list's viewport is the one region the transparent surface always declines, because the
+    /// scroll view owns it (wheel, rows, the indicator); blank area inside it is the document view's
+    /// own gesture instead. The boundary is inclusive, like every other hit test in this panel.
     #[test]
-    fn the_grip_band_spans_the_top_bar_and_centers_its_dots() {
-        let band = picker_grip_frame();
-        assert!(band.size.width >= 28.0 && band.size.height >= 28.0);
-        // The whole top bar, flush with both edges of the panel, inside the header's top padding.
-        assert_eq!(band.origin.x, 0.0);
-        assert_eq!(band.size.width, PICKER_W);
-        assert_eq!(band.origin.y, 0.0);
-        assert_eq!(band.size.height, TOP_PAD_Y);
-        let dots = picker_grip_dot_frames();
-        for (index, dot) in dots.iter().enumerate() {
-            assert!(dot.origin.x >= 0.0 && dot.origin.y >= 0.0);
-            assert!(
-                dot.origin.x + dot.size.width <= band.size.width,
-                "dot {index} must stay inside the band horizontally"
-            );
-            assert!(
-                dot.origin.y + dot.size.height <= band.size.height,
-                "dot {index} must stay inside the band vertically"
-            );
-        }
-        // The middle dot sits on the band's center line, and the three run left to right without
-        // touching: a group that is off-center in the band would fail this.
-        let middle = &dots[1];
-        assert_eq!(
-            middle.origin.x + middle.size.width / 2.0,
-            band.size.width / 2.0
-        );
-        assert_eq!(
-            middle.origin.y + middle.size.height / 2.0,
-            band.size.height / 2.0
-        );
-        assert!(dots[0].origin.x + dots[0].size.width < dots[1].origin.x);
-        assert!(dots[1].origin.x + dots[1].size.width < dots[2].origin.x);
+    fn the_list_viewport_is_declined_by_the_drag_surface() {
+        let viewport = rect(0.0, 44.0, 560.0, 400.0);
+        assert!(point_in_list_region(NSPoint::new(0.0, 44.0), viewport));
+        assert!(point_in_list_region(NSPoint::new(280.0, 200.0), viewport));
+        assert!(point_in_list_region(NSPoint::new(560.0, 444.0), viewport));
+        assert!(!point_in_list_region(NSPoint::new(280.0, 43.9), viewport));
+        assert!(!point_in_list_region(NSPoint::new(280.0, 444.1), viewport));
+        assert!(!point_in_list_region(NSPoint::new(560.1, 200.0), viewport));
     }
 }

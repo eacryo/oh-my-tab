@@ -145,13 +145,16 @@ pub(super) unsafe fn refresh_settings_warning_banner(ui: &SettingsUi) {
     // adjusting whichever page was showing) keeps this idempotent: a page switch cannot leave one
     // page short and another long. The full height comes from the pages' parent, which is live:
     // a window resize must not be undone by the next refresh.
-    let parent: *mut AnyObject = msg_send![ui.page_view(SettingsPageId::General), superview];
-    let base_h = if parent.is_null() {
+    // The pages' parent spans the whole window, INCLUDING the title-bar band: a page sized to it
+    // would run up under the band again (the reason a page could draw through the title). The
+    // live page frame is the floored height, so that is what the banner reserves against.
+    let page = ui.page_view(SettingsPageId::General);
+    let base_h = if page.is_null() {
         ui.page_viewport_h
     } else {
-        let bounds: NSRect = msg_send![parent, bounds];
-        if bounds.size.height > 100.0 {
-            bounds.size.height
+        let frame: NSRect = msg_send![page, frame];
+        if frame.size.height > 100.0 {
+            frame.size.height
         } else {
             ui.page_viewport_h
         }
@@ -293,6 +296,12 @@ pub(super) fn select_sidebar(idx: usize) {
     // another page. This runs after the closure above, because the materialization re-borrows the settings
     // slot and a nested borrow would be swallowed by the reentrancy guard.
     crate::settings::materialize_mouse_page_if_visible();
+    // With a query active the pages are not what the pane shows: the results stand in for them, so
+    // the visibility just applied above has to be corrected (and a rebuild's results re-rendered
+    // from the current locale). Runs outside the closure for the same reentrancy reason.
+    if sidebar::settings_search_is_active() {
+        unsafe { sidebar::refresh_settings_search() };
+    }
     // A2 E2E: the selection and the highlight pill are parked, so write a geometry snapshot for
     // scripts/e2e. It must sit outside the with_settings_ui closure -- a nested borrow there is
     // silently swallowed by the reentrancy guard.
@@ -444,54 +453,6 @@ pub(crate) fn refresh_permission_ui_if_visible() {
             }
         }
     });
-}
-
-/// Traffic-light offset: restore the original down-right position.
-/// Window coordinates point up, so down-right = x+ / y-.
-const TRAFFIC_LIGHT_DX: f64 = 8.0;
-const TRAFFIC_LIGHT_DY: f64 = -6.0;
-static TRAFFIC_LIGHT_BASE_ORIGINS: LazyLock<Mutex<HashMap<usize, [Option<NSPoint>; 3]>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
-
-/// Nudge the three traffic-light buttons down-right: grab the button views via the public
-/// -standardWindowButton: and move their frames (no public API sets the traffic light position;
-/// the old private setTrafficLightPosition: etc. are gone on macOS 26, and this is the only
-/// reliable way -- verified on this machine). Note: the two-arg +standardWindowButton:forStyleMask:
-/// is a CLASS method; sending it to an instance trips objc2's method check and panics (a pitfall
-/// we hit) -- the one-arg instance method -standardWindowButton: must be used. Must run after the
-/// window's first layout pass: moves before layout are reset by AppKit, and resize also resets
-/// them, so the offset is re-applied on every show and resize (see show_settings and
-/// resizeSubviewsWithOldSize:). Original positions are captured once per window so repeated
-/// calls remain idempotent instead of accumulating the offset. Skips silently when a button is
-/// nil; works on older macOS too.
-pub(super) unsafe fn reposition_traffic_lights(window: *mut AnyObject) {
-    // NSWindowButton: Close=0, Miniaturize=1, Zoom=2
-    let base_origins = {
-        let mut all_origins = TRAFFIC_LIGHT_BASE_ORIGINS.lock().unwrap();
-        let origins = all_origins
-            .entry(window as usize)
-            .or_insert([None, None, None]);
-        for tag in 0..3isize {
-            let btn: *mut AnyObject = msg_send![window, standardWindowButton: tag];
-            if !btn.is_null() && origins[tag as usize].is_none() {
-                let f: NSRect = msg_send![btn, frame];
-                origins[tag as usize] = Some(f.origin);
-            }
-        }
-        *origins
-    };
-    for tag in 0..3isize {
-        let btn: *mut AnyObject = msg_send![window, standardWindowButton: tag];
-        if let (false, Some(base_origin)) = (btn.is_null(), base_origins[tag as usize]) {
-            let _: () = msg_send![
-                btn,
-                setFrameOrigin: NSPoint::new(
-                    base_origin.x + TRAFFIC_LIGHT_DX,
-                    base_origin.y + TRAFFIC_LIGHT_DY
-                )
-            ];
-        }
-    }
 }
 
 /// Center the settings window in the visible area of the screen under the cursor, excluding the
@@ -666,6 +627,43 @@ pub(crate) unsafe fn tighten_page_documents() -> bool {
     changed
 }
 
+/// Put a page's clip view at its own top (origin 0), whatever scroll offset an earlier layout
+/// pass or a preserved offset left behind.
+unsafe fn scroll_page_to_origin_top(scroll: *mut AnyObject) {
+    if scroll.is_null() {
+        return;
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let doc: *mut AnyObject = msg_send![scroll, documentView];
+    let doc_frame: NSRect = msg_send![doc, frame];
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    // The document is unflipped and the clip is at the TOP when the clip's origin sits at
+    // `document height - clip height` -- but AppKit clamps that against the document it has
+    // tiled so far. Until the page document is tiled down to the viewport height, that clamp
+    // stops short and leaves the page scrolled down; so the document is tiled first.
+    let _ = clip_bounds;
+    let viewport_h: f64 = {
+        let sv: NSRect = msg_send![scroll, frame];
+        sv.size.height
+    };
+    if viewport_h > 0.0 && doc_frame.size.height > viewport_h {
+        let _: () = msg_send![clip, setNeedsLayout: true];
+        let _: () = msg_send![scroll, layoutSubtreeIfNeeded];
+    }
+    let doc_after: NSRect = msg_send![doc, frame];
+    let origin = NSPoint::new(0.0, (doc_after.size.height - viewport_h).max(0.0));
+    let _: () = msg_send![clip, scrollToPoint: origin];
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+    let after: NSRect = msg_send![clip, bounds];
+    log_debug!(
+        "[settings] page top reset: clip_oy={:.1} doc_h={:.1} clip_h={:.1}",
+        after.origin.y,
+        doc_frame.size.height,
+        clip_bounds.size.height
+    );
+}
+
+#[allow(dead_code)] // kept for a caller that restores a per-page offset; today every open starts at the top
 unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; SETTINGS_PAGE_COUNT] {
     let scrolls = page_scroll_views(ui);
     scrolls.map(|scroll| {
@@ -675,6 +673,7 @@ unsafe fn capture_settings_scroll_offsets(ui: &SettingsUi) -> [NSPoint; SETTINGS
     })
 }
 
+#[allow(dead_code)] // see capture_settings_scroll_offsets
 unsafe fn restore_settings_scroll_offset(scroll: *mut AnyObject, origin: NSPoint) {
     if scroll.is_null() {
         return;
@@ -788,20 +787,17 @@ fn show_settings_inner(
                     // background order and focus without activating the app.
                     let _: () = msg_send![u.window, setFrame: frame, display: false];
                 }
-                // Offset the traffic lights only after the window's first layout pass, or AppKit
-                // resets them.
                 let _: () = msg_send![u.window, layoutIfNeeded];
-                reposition_traffic_lights(u.window);
-                if let Some(offsets) = preserved_scroll_offsets {
-                    let scrolls = page_scroll_views(u);
-                    for (scroll, origin) in scrolls.into_iter().zip(offsets) {
-                        restore_settings_scroll_offset(scroll, origin);
-                    }
-                } else {
-                    // Scroll the visible page (General on open) to the top after layout, so the
-                    // scrollbar starts at the top of the track instead of the middle.
-                    scroll_page_to_top(u.page_view(SettingsPageId::General));
-                }
+                // A preserved offset is only meaningful when the geometry it was read from is
+                // unchanged; the page now starts under the title-bar band, so an offset captured
+                // by another code path can scroll the page straight past its title. Every open
+                // therefore starts the visible page at its top.
+                let _ = preserved_scroll_offsets;
+                // Scroll the visible page (General on open) to the top after layout, so the
+                // scrollbar starts at the top of the track instead of the middle.
+                let g = u.page_view(SettingsPageId::General);
+                scroll_page_to_top(g);
+                scroll_page_to_origin_top(g);
                 refresh_settings_warning_banner(u);
             }
         });
@@ -941,7 +937,7 @@ pub(crate) fn refresh_system_appearance() {
         // is about to be rebuilt, so leaving one open would leave it pointing at a freed view.
         close_floating_editors();
         widgets::clear_sidebar_hover();
-        detach_settings_window_runtime(&old_ui, false);
+        detach_settings_window_runtime();
         rebuild_settings_content(old_ui.window);
         show_settings_preserving(frame, page, scroll_offsets);
     }
@@ -1110,7 +1106,9 @@ unsafe fn settings_style_tree_is_valid(
                 .map(|class| class.name().to_string_lossy().into_owned())
                 .unwrap_or_else(|| "<unknown>".to_string());
             let frame: NSRect = msg_send![view, frame];
-            log_info!("[smoke-settings-layout] unexpected rendered font size {size:.2}, page={page_name}, class={class_name}, control={is_control}, text={is_text_field}, button={is_button}, tag={tag}, value={value:?}, frame={frame:?}");
+            log_info!(
+                "[smoke-settings-layout] unexpected rendered font size {size:.2}, page={page_name}, class={class_name}, control={is_control}, text={is_text_field}, button={is_button}, tag={tag}, value={value:?}, frame={frame:?}"
+            );
             return false;
         }
     }
@@ -1406,7 +1404,10 @@ unsafe fn update_card_inside_document() -> bool {
         if !ok {
             log_info!(
                 "[smoke-settings-layout] update card outside the page: doc={:.1} card={:?} host={:?} padding={}",
-                doc_frame.size.height, card, host, super::UPDATE_CARD_BOTTOM_PADDING
+                doc_frame.size.height,
+                card,
+                host,
+                super::UPDATE_CARD_BOTTOM_PADDING
             );
         }
         ok
@@ -1467,6 +1468,7 @@ struct UpdateFlowState {
     button_hidden: bool,
     host_hidden: bool,
     divider_from_row_above: f64,
+    row_control_height: f64,
     card_rect_bottom_from_host_bottom: f64,
     /// The restore surface's offset from its container: the two are document siblings, so a re-flow
     /// has to move them together or the surface drifts out from under the control.
@@ -1499,6 +1501,7 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
             button_hidden,
             host_hidden,
             divider_from_row_above: divider.origin.y - row_above.origin.y,
+            row_control_height: row_above.size.height,
             card_rect_bottom_from_host_bottom: card.origin.y - host.origin.y,
             restore_surface_from_container: surface_frame.origin.y - container_frame.origin.y,
             restore_expanded: ui.page_restores[SETTINGS_ABOUT_PAGE_INDEX].expanded,
@@ -1556,7 +1559,9 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             };
             let settings_window = crate::settings::settings_window_ptr();
             if settings_window.is_null() {
-                log_info!("[smoke-settings-layout] no settings window for the scroller-notification smoke");
+                log_info!(
+                    "[smoke-settings-layout] no settings window for the scroller-notification smoke"
+                );
                 hide_settings();
                 return false;
             }
@@ -1592,7 +1597,9 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 defer: false
             ];
             if foreign_window.is_null() {
-                log_info!("[smoke-settings-layout] could not create a foreign window for the scroller-notification smoke");
+                log_info!(
+                    "[smoke-settings-layout] could not create a foreign window for the scroller-notification smoke"
+                );
                 CFRelease(become_key_name as *const c_void);
                 hide_settings();
                 return false;
@@ -1655,6 +1662,84 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         else {
             return false;
         };
+        // Keep the custom title bar band clear of the native AppKit window buttons.
+        struct TitlebarCheck {
+            found: bool,
+            band: NSRect,
+            host: NSRect,
+            sidebar_top: f64,
+            traffic_lights_ok: bool,
+        }
+        let titlebar = with_settings_ui(|ui| {
+            let zero = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+            let mut check = TitlebarCheck {
+                found: false,
+                band: zero,
+                host: zero,
+                sidebar_top: f64::NAN,
+                traffic_lights_ok: false,
+            };
+            let Some(ui) = ui.as_ref() else {
+                return check;
+            };
+            let host: *mut AnyObject = msg_send![window, contentView];
+            if host.is_null() {
+                return check;
+            }
+            // The band is a child of the custom root surface (the settings content), not of AppKit's
+            // content host: the root is what holds every surface the window paints.
+            let root = settings_root_view_for_host(host);
+            let band = settings_titlebar_view_for_host(root);
+            if band.is_null() {
+                return check;
+            }
+            check.found = true;
+            check.band = msg_send![band, frame];
+            check.host = msg_send![host, bounds];
+            let sidebar_content: *mut AnyObject =
+                msg_send![sidebar_buttons(ui)[SETTINGS_GENERAL_PAGE_INDEX], superview];
+            if !sidebar_content.is_null() {
+                let sidebar_frame: NSRect = msg_send![sidebar_content, frame];
+                check.sidebar_top = sidebar_frame.origin.y + sidebar_frame.size.height;
+            }
+            check.traffic_lights_ok = traffic_light_buttons(window).into_iter().all(|button| {
+                if button.is_null() {
+                    return false;
+                }
+                let hidden: bool = msg_send![button, isHiddenOrHasHiddenAncestor];
+                let alpha: f64 = msg_send![button, alphaValue];
+                let bounds: NSRect = msg_send![button, bounds];
+                let frame: NSRect = msg_send![button, convertRect: bounds, toView: host];
+                !hidden
+                    && alpha > 0.0
+                    && frame.size.width > 0.0
+                    && frame.size.height > 0.0
+                    && frame.origin.x >= 0.0
+                    && frame.origin.x + frame.size.width <= check.host.size.width
+                    && frame.origin.y >= check.host.size.height - TITLEBAR_H
+                    && frame.origin.y + frame.size.height <= check.host.size.height
+            });
+            check
+        });
+        let titlebar_ok = titlebar.found
+            && titlebar.traffic_lights_ok
+            && (titlebar.band.size.height - TITLEBAR_H).abs() <= 0.5
+            && (titlebar.band.origin.y + titlebar.band.size.height - titlebar.host.size.height)
+                .abs()
+                <= 0.5
+            && titlebar.sidebar_top <= titlebar.host.size.height - TITLEBAR_H + 0.5;
+        if !titlebar_ok {
+            log_info!(
+                "[smoke-settings-layout] title bar band does not match the mock: found={} band={:?} host={:?} sidebar_top={:.1} lights={}",
+                titlebar.found,
+                titlebar.band,
+                titlebar.host,
+                titlebar.sidebar_top,
+                titlebar.traffic_lights_ok
+            );
+            hide_settings();
+            return false;
+        }
         let sidebar_heading_absent = with_settings_ui(|ui| {
             let Some(ui) = ui.as_ref() else {
                 return false;
@@ -1733,7 +1818,9 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // below: the ordering is what the user asked for, and a card move is invisible to every
         // other check here.
         if !general_page_leads_with_startup_and_icon_cards() {
-            log_info!("[smoke-settings-layout] the General page does not lead with the startup then icon cards");
+            log_info!(
+                "[smoke-settings-layout] the General page does not lead with the startup then icon cards"
+            );
             hide_settings();
             return false;
         }
@@ -1790,7 +1877,9 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 }
                 if let Some(previous_frame) = previous {
                     let step = previous_frame.origin.y - frame.origin.y;
-                    if (step - (previous_frame.size.height + 4.0)).abs() > 0.5 {
+                    if (step - (previous_frame.size.height + components::SIDEBAR_ROW_GAP)).abs()
+                        > 0.5
+                    {
                         return Some(false);
                     }
                 }
@@ -2134,7 +2223,9 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         })
         .unwrap_or(false);
         if !clipboard_shortcut_layout_ok {
-            log_info!("[smoke-settings-layout] clipboard shortcut control has a blank row or invalid capture layout");
+            log_info!(
+                "[smoke-settings-layout] clipboard shortcut control has a blank row or invalid capture layout"
+            );
             hide_settings();
             return false;
         }
@@ -2479,13 +2570,19 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 (expanded_state.card_rect_bottom_from_host_bottom + 8.0).abs() <= 0.5
                     && (collapsed_state.card_rect_bottom_from_host_bottom + 8.0).abs() <= 0.5,
             ),
-            // The Update divider belongs to the check-button row (the boundary above the button), so
-            // it keeps its distance to the row above it in every state after the spacing-token update.
+            // The Update divider belongs on the shared row boundary. Compare its distance from the
+            // centered switch to the switch's half-row inset, derived from the live control frame and
+            // the row height; changing the mock's row height must not leave a stale pixel constant.
             (
                 "divider_glued_to_row_above",
                 [&compact_state, &expanded_state, &collapsed_state]
                     .iter()
-                    .all(|state| (state.divider_from_row_above + 15.0).abs() <= 0.5),
+                    .all(|state| {
+                        let expected = -(components::SettingsLayout::SINGLE_LINE_ROW_H
+                            - state.row_control_height)
+                            / 2.0;
+                        (state.divider_from_row_above - expected).abs() <= 0.5
+                    }),
             ),
             // Visibility belongs to the owners: the collapsed page shows the check button and hides
             // the update host, the running flow replaces the button with the host, and collapsing
@@ -2539,6 +2636,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             return false;
         }
         log_info!("[smoke-settings-layout] update flow passed");
+        // The sidebar search: a query from this locale's own copy has to find a row on any page,
+        // and the results (here: the empty state) have to cover the page area exactly.
+        if !sidebar::settings_search_smoke_check() {
+            log_info!("[smoke-settings-layout] sidebar search layout failed");
+            hide_settings();
+            return false;
+        }
         hide_settings();
         true
     }
@@ -3080,16 +3184,92 @@ pub(super) fn show_alert(title: &str, msg: &str) {
 }
 
 mod chrome;
+
+pub(crate) fn settings_vertical_zoom_smoke_runner() -> bool {
+    unsafe {
+        show_settings();
+        let Some(window) = with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window)) else {
+            return false;
+        };
+        let screen: *mut AnyObject = msg_send![window, screen];
+        if screen.is_null() {
+            hide_settings();
+            return false;
+        }
+        let visible: NSRect = msg_send![screen, visibleFrame];
+        let mut initial: NSRect = msg_send![window, frame];
+        // Start below the available height even on a small display, so the first click must grow.
+        let min: NSSize = msg_send![window, minSize];
+        initial.size.height = (visible.size.height * 0.6).max(min.height);
+        initial.origin.y = visible.origin.y + (visible.size.height - initial.size.height) / 2.0;
+        let _: () = msg_send![window, setFrame: initial, display: true];
+        let initial: NSRect = msg_send![window, frame];
+        let green = traffic_light_buttons(window)[2];
+        if green.is_null() {
+            hide_settings();
+            return false;
+        }
+        let _: () = msg_send![green, performClick: std::ptr::null::<AnyObject>()];
+        pump_run_loop_for(0.5);
+        let zoomed: NSRect = msg_send![window, frame];
+        let behavior: u64 = msg_send![window, collectionBehavior];
+        let style: u64 = msg_send![window, styleMask];
+        let expanded = (zoomed.origin.x - initial.origin.x).abs() < 0.5
+            && (zoomed.size.width - initial.size.width).abs() < 0.5
+            && (zoomed.origin.y - visible.origin.y).abs() < 0.5
+            && (zoomed.size.height - visible.size.height).abs() < 0.5
+            && behavior & SETTINGS_ZOOM_COLLECTION_BEHAVIOR == SETTINGS_ZOOM_COLLECTION_BEHAVIOR
+            && style & (1 << 14) == 0; // NSWindowStyleMaskFullScreen
+        let green = traffic_light_buttons(window)[2];
+        if green.is_null() {
+            hide_settings();
+            return false;
+        }
+        let _: () = msg_send![green, performClick: std::ptr::null::<AnyObject>()];
+        pump_run_loop_for(0.5);
+        let restored: NSRect = msg_send![window, frame];
+        let restored_ok = (restored.origin.x - initial.origin.x).abs() < 0.5
+            && (restored.origin.y - initial.origin.y).abs() < 0.5
+            && (restored.size.width - initial.size.width).abs() < 0.5
+            && (restored.size.height - initial.size.height).abs() < 0.5;
+        log_info!(
+            "[smoke-settings-vertical-zoom] expanded={expanded} restored={restored_ok} initial={initial:?} zoomed={zoomed:?} visible={visible:?} final={restored:?}"
+        );
+        hide_settings();
+        expanded && restored_ok
+    }
+}
+
 #[cfg(test)]
 pub(super) use chrome::settings_effective_corner_radius;
 pub(super) use chrome::{
-    apply_settings_root_surface, apply_settings_window_appearance, refresh_settings_root_corner,
-    settings_root_view_class, settings_root_view_for_host, settings_window_class,
-    settings_window_class_handle,
+    apply_settings_root_surface, apply_settings_window_appearance, build_settings_titlebar_band,
+    refresh_settings_root_corner, settings_root_view_class, settings_root_view_for_host,
+    settings_titlebar_view_for_host, settings_window_class, settings_window_class_handle,
+    traffic_light_buttons, SETTINGS_ZOOM_COLLECTION_BEHAVIOR, TITLEBAR_H,
 };
 
 fn create_settings_window() {
     create_settings_window_for(None);
+}
+
+/// The detail pane's page area inside the content view: from the title-bar band's bottom edge down
+/// to the window's own bottom edge.
+///
+/// The pages are built into this frame, and the search results that stand in for them use the same
+/// one, so the two can neither drift from the band nor leave a strip of unused pane below. The
+/// content view is not flipped, so origin 0 is the window's bottom edge and the band is what the
+/// height is measured against.
+pub(super) fn settings_page_frame(
+    page_x: f64,
+    page_width: f64,
+    band_h: f64,
+    content_h: f64,
+) -> NSRect {
+    NSRect::new(
+        NSPoint::new(page_x, 0.0),
+        NSSize::new(page_width, (content_h - band_h).max(1.0)),
+    )
 }
 
 /// Rebuilds the settings content (after a scroller-style change, to fit the new visible width).
@@ -3119,15 +3299,18 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // typography, spacing, controls, and grouped-card treatment.
         // Give the redesigned detail pane enough room for full labels, links, and wide fields
         // while keeping the sidebar and the existing window height unchanged.
-        let view_w = 820.0;
+        // The mock's `.settings-window` measures 815.39pt at full width; 816 is that width on the
+        // 4pt grid. It also feeds `setMinSize`/`setMaxSize`, so the fixed width stays consistent.
+        let view_w = 732.0;
         let card_margin = 0.0;
-        let card_w = SETTINGS_SIDEBAR_WIDTH;
-        let window_clip_radius = 26.0;
+        let card_w = sidebar::SIDEBAR_WIDTH;
+        // HTML `--radius-window: 18px`: the window's own corner follows the panel radius instead
+        // of the toolbar style's measured 26pt frame radius.
+        let window_clip_radius = crate::theme::RADIUS_PANEL;
         let card_radius = 0.0;
         let style: u64 = (1 << 0) | (1 << 1) | (1 << 2) | (1 << 3);
         // titled + closable + miniaturizable + resizable (all three traffic lights). resizable is
-        // required for the green zoom button to appear; the layout is absolute-positioned and
-        // doesn't adapt, so the window size is fixed below via min=max.
+        // required for the native zoom button; width is fixed and height remains adjustable.
         // The page content uses generous spacing and grouped cards so the controls remain easy
         // to scan without compressing the taller sections.
         // Initial position: centered on the primary display (screens[0]). Don't use
@@ -3158,29 +3341,29 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             msg_send![window, initWithContentRect: frame, styleMask: style, backing: 2u64, defer: false]
         };
         apply_settings_window_appearance(window);
+        // Empty areas of the settings content should remain usable as a drag surface, like the
+        // title-bar band. AppKit keeps controls and other interactive views in charge of their
+        // own mouse events while moving the window from its background.
+        let _: () = msg_send![window, setMovableByWindowBackground: true];
+        let _: () = msg_send![window, setCollectionBehavior: SETTINGS_ZOOM_COLLECTION_BEHAVIOR];
+        // NSWindow's delegate is weak. The window is its own delegate so the standard-frame
+        // callback has exactly the same lifetime, without another retained object or a cycle.
+        let _: () = msg_send![window, setDelegate: window];
         let ns_title = make_nsstring(&t("settings.window_title"));
         let _: () = msg_send![window, setTitle: ns_title];
         CFRelease(ns_title as *const c_void);
         if existing_window.is_none() {
             let _: () = msg_send![window, setReleasedWhenClosed: false];
             // Fixed width: min and max width both equal the designed width, height stays adjustable --
-            // same as System Settings (the width cannot be dragged).
+            // same as System Settings (the width cannot be dragged). The themed frame comes from the
+            // app's own band and root surface, not from an NSToolbar.
             let _: () = msg_send![window, setMinSize: NSSize::new(view_w, 400.0)];
             let _: () = msg_send![window, setMaxSize: NSSize::new(view_w, 10000.0)];
 
-            // Empty unified toolbar: NSWindowToolbarStyleUnified (3) raises the theme frame's corner
-            // radius from 16 to 26 (measured; that's how LinearMouse's settings window does it), and
-            // the top strip becomes a glass material strip with the traffic lights centered in it.
-            // An empty toolbar adds no responders, so performKeyEquivalent: (Cmd+Q) and page switching
-            // are unaffected. Must be set before measuring contentLayoutRect, which then automatically
-            // accounts for the toolbar strip (658 -> 624).
-            let tb: *mut AnyObject = msg_send![class!(NSToolbar), alloc];
-            let tb_id = make_nsstring("OhMyTabSettingsToolbar");
-            let tb: *mut AnyObject = msg_send![tb, initWithIdentifier: tb_id];
-            CFRelease(tb_id as *const c_void);
-            let _: () = msg_send![window, setToolbar: tb];
-            let _: () = msg_send![window, setToolbarStyle: 3isize]; // NSWindowToolbarStyleUnified
-            release_obj(tb);
+            // No NSToolbar: a unified toolbar paints a glass material strip across the top of the
+            // window. The mock's title bar band is an opaque, palette-colored strip instead
+            // (build_settings_titlebar_band), so the toolbar would only double-paint under it.
+            // Nothing else in the window needed it -- it carried no items and no responders.
         }
 
         let host: *mut AnyObject = msg_send![window, contentView];
@@ -3235,36 +3418,49 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 let _: () = msg_send![subview, removeFromSuperview];
             }
         }
-        // content_h is only used for full-height containers (they cover the whole window after
-        // the mask flip); top-anchored rows use layout_h measured after the flip (see below).
         let content_frame: NSRect = msg_send![content, frame];
         let content_h = content_frame.size.height;
 
-        // Remove the hairline under the traffic lights: with fullSizeContentView + a transparent
-        // title bar the content extends into the title bar and AppKit stops drawing the separator;
-        // the title text is hidden (System Settings look). The contentView must NOT be measured
-        // before the flip -- an unlaid-out window reports the full height (690 on macOS 26 in
-        // practice). After the flip, contentLayoutRect (macOS 11+; min target is 11.0) gives the
-        // real layout area below the traffic-light strip; .min() guards a degenerate result.
-        // All top-anchored rows are laid out against layout_h so nothing collides with the lights.
+        // Flip the content into the title bar before measuring: the mock draws its own band
+        // (.settings-titlebar, background var(--panel-solid), a 1pt --settings-divider under it)
+        // instead of AppKit's chrome, so AppKit's title, toolbar hairline and glass toolbars stay out
+        // of the window. AppKit retains ownership of the traffic lights and their layout.
         let _: () = msg_send![window, setTitlebarAppearsTransparent: true];
         let _: () = msg_send![window, setStyleMask: style | (1 << 15)]; // NSWindowStyleMaskFullSizeContentView
         let _: () = msg_send![window, setTitleVisibility: 1isize]; // NSWindowTitleHidden
-                                                                   // The scroll region spans the full window height (fullSizeContentView), so the content
-                                                                   // scrolls all the way up behind the traffic-light strip. There is no bottom footer bar
-                                                                   // anymore: each page embeds its own restore control at the end of its content.
-        let page_viewport_h = content_h;
+
+        // The mock's title bar band (`.settings-titlebar`, 36px) is not chrome the content may paint
+        // under: its layout starts BELOW the band, exactly like the mock's `.settings-layout` begins
+        // under it. The full-height containers are therefore measured from the band's bottom edge, and
+        // the band is painted once above them (see build_settings_titlebar_band). There is no bottom
+        // footer bar anymore: each page embeds its own restore control at the end of its content.
+        // The band is the mock's fixed 36pt (docs/design-style: "Settings title bar band | 36 tall,
+        // full window width"), not AppKit's measured title-bar area -- that measured 32pt here and
+        // left the page and the sidebar starting 4pt too high. The page and the sidebar both start
+        // under the band, exactly where the mock's .settings-layout starts.
+        let band_h = TITLEBAR_H;
+        let layout_h = (content_h - band_h).max(1.0);
+        let page_viewport_h = layout_h;
 
         // The root surface owns the window background and clipping. On macOS 27 it follows the
         // system's toolbar-window radius through container concentricity; older systems use the
         // measured fallback radius.
         apply_settings_root_surface(window, content, palette, window_clip_radius);
 
+        // The mock's band spans the whole window: over the sidebar column as an opaque strip
+        // (var(--panel-solid)) with a --settings-divider hairline under it, and over the detail pane
+        // the root surface's window_bg already is that strip. The title is the same 12pt muted label
+        // the mock centers there. Both are siblings of the sidebar, added before it.
+        build_settings_titlebar_band(content, content_h, band_h, view_w, palette);
+        // AppKit's own window title is hidden (setTitleVisibility:), so the band's centered label is
+        // the only title the window draws.
+
         let mut ui = SettingsUi {
             permission_warning_label: std::ptr::null_mut(),
             permission_warning_button: std::ptr::null_mut(),
             page_viewport_h,
             window,
+            settings_search: sidebar::SettingsSearch::EMPTY,
             sidebar_highlight: std::ptr::null_mut(),
             sidebar_buttons: [std::ptr::null_mut(); SETTINGS_PAGE_COUNT],
             page_views: [std::ptr::null_mut(); SETTINGS_PAGE_COUNT],
@@ -3382,7 +3578,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // backgrounds provide the visual split instead of an inset outer card.
         let content_x = card_w;
         let detail_w = view_w - content_x;
-        let page_inset = 32.0;
+        // HTML `.settings-content { padding: 0 var(--sp-7) var(--sp-6) }`: 28px horizontal.
+        let page_inset = super::SETTINGS_DETAIL_INSET;
         let page_x = content_x + page_inset;
         // A: reserve the *measured* scroller footprint (0 for overlay). If the system forces legacy
         // and B's re-assert does not stick, this keeps the content laid out to the visible width:
@@ -3398,7 +3595,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         sidebar::build_settings_sidebar(
             content,
             sidebar::SettingsSidebarGeometry {
-                content_h,
+                // The sidebar begins under the band, where the mock's .settings-layout starts.
+                content_h: layout_h,
                 view_w,
                 card_margin,
                 card_w,
@@ -3413,10 +3611,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // overlay scrollbar sits flush with the window edge (matching the OK/Cancel footer) and
         // no longer floats 32pt in from the right. The content keeps its 32pt gutter margins
         // inside the document, so only the scrollbar's position changes.
-        let page_frame = NSRect::new(
-            NSPoint::new(page_x, 0.0),
-            NSSize::new(detail_w - page_inset, page_viewport_h),
-        );
+        // The page viewport starts at the band's bottom edge: the mock's .settings-layout begins
+        // under its 36px .settings-titlebar, so no page content may scroll up under the band (it
+        // would draw through the title and read as a transparent bar).
+        let page_frame = settings_page_frame(page_x, detail_w - page_inset, band_h, content_h);
         let page_context = page_builder::SettingsPageBuildContext {
             content,
             content_w,
@@ -3490,6 +3688,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let key_bindings_view = page_view(SettingsPageId::KeyBindings);
         let keystroke_display_view = page_view(SettingsPageId::KeystrokeDisplay);
         let about_view = page_view(SettingsPageId::About);
+        // Every row the builders draw is recorded for the sidebar search, in one index per build:
+        // a locale or theme rebuild re-records the whole index from the strings it draws again.
+        page_builder::begin_settings_search_recording();
         // Each builder's content bottom lands at its own identity's slot, so the layout owner a
         // page is handed cannot be another page's.
         let mut page_bottoms = [0.0f64; SETTINGS_PAGE_COUNT];
@@ -3552,6 +3753,13 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             &mut ui,
         );
 
+        // The search results stand in for the pages while a query is active; they cover exactly
+        // the detail pane's page area and are added after the pages so a click lands on a result.
+        // The search results stand in for the pages while a query is active: they cover exactly
+        // the detail pane's page area (the same frame the pages were built into) and are added
+        // after the pages so a click lands on a result.
+        sidebar::build_settings_search_results(&mut ui.settings_search, content, page_frame);
+
         // --- Numeric text-field notifications: debounced apply while typing, immediate commit
         // on blur / Enter ---
         {
@@ -3589,6 +3797,35 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             }
         }
 
+        // --- Sidebar search field: live filtering, the focused shell ring, and the clear chip ---
+        if !ui.settings_search.field.is_null() {
+            let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+            for (name, selector) in [
+                (
+                    "NSControlTextDidChangeNotification",
+                    sel!(handleSettingsSearchChanged:),
+                ),
+                (
+                    "NSControlTextDidBeginEditingNotification",
+                    sel!(handleSettingsSearchBeganEditing:),
+                ),
+                (
+                    "NSControlTextDidEndEditingNotification",
+                    sel!(handleSettingsSearchEndedEditing:),
+                ),
+            ] {
+                let notification_name = make_nsstring(name);
+                let _: () = msg_send![
+                    center,
+                    addObserver: target,
+                    selector: selector,
+                    name: notification_name,
+                    object: ui.settings_search.field
+                ];
+                CFRelease(notification_name as *const c_void);
+            }
+        }
+
         with_settings_ui(|slot| *slot = Some(ui));
 
         // The window may be built while a page is already selected (SIDEBAR_SELECTED != 0, e.g.
@@ -3610,25 +3847,17 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 /// emptied, or a later hit-test messages a freed object and traps in objc's receiver check.
 ///
 /// One function so a newly added address-keyed registry cannot be wired into only some of the
-/// paths. `TRAFFIC_LIGHT_BASE_ORIGINS` is deliberately absent: it names the window, which survives
-/// an in-place rebuild.
+/// paths.
 fn clear_settings_content_registries() {
     SettingsRow::clear_runtime_registry();
+    sidebar::reset_settings_search_rows();
     widgets::clear_settings_select_registry();
     tooltip::SettingsTooltip::clear_runtime_registries();
     widgets::clear_sidebar_view_registries();
 }
 
 /// Detach global references owned by a settings window before it is released or replaced.
-/// Keep the traffic-light baseline for in-place redraws; remove it only when the window is
-/// actually released.
-unsafe fn detach_settings_window_runtime(ui: &SettingsUi, remove_traffic_light_origin: bool) {
-    if remove_traffic_light_origin {
-        TRAFFIC_LIGHT_BASE_ORIGINS
-            .lock()
-            .unwrap()
-            .remove(&(ui.window as usize));
-    }
+unsafe fn detach_settings_window_runtime() {
     // Detach the updater's host references before releasing the window so it never touches
     // a deallocated view.
     crate::updater::clear_update_host();
@@ -3644,7 +3873,7 @@ pub(crate) fn invalidate_settings_window() {
             // Before the runtime is detached: the panels' dim layers belong to this window's content
             // view, which is about to be released.
             close_floating_editors();
-            detach_settings_window_runtime(&u, true);
+            detach_settings_window_runtime();
             // The window is alloc +1 with setReleasedWhenClosed:false, so release once manually;
             // its subviews are retained by the parent view and dealloc with the window.
             let _: () = msg_send![u.window, orderOut: std::ptr::null::<AnyObject>()];
@@ -3659,9 +3888,27 @@ pub(crate) fn invalidate_settings_window() {
 #[cfg(test)]
 mod tests {
     use super::{
-        abandoned_page_editors, warning_for_page, PageEditor, PageWarning,
+        abandoned_page_editors, settings_page_frame, warning_for_page, PageEditor, PageWarning,
         SETTINGS_CLIPBOARD_PAGE_INDEX, SETTINGS_KEY_BINDINGS_PAGE_INDEX, SETTINGS_MOUSE_PAGE_INDEX,
     };
+
+    /// The detail pane's page area hangs from the band's bottom edge and fills down to the
+    /// window's own bottom edge: it is the frame the pages are built into AND the one the search
+    /// results stand in with. Insetting it by the band a second time left a strip of unused pane
+    /// below (and put the results' empty state off the page area).
+    #[test]
+    fn the_page_area_fills_the_pane_below_the_title_bar_band() {
+        let frame = settings_page_frame(240.0, 580.0, 36.0, 720.0);
+        assert_eq!(frame.origin.x, 240.0);
+        assert_eq!(frame.size.width, 580.0);
+        // Origin 0 is the window's bottom edge: the pane starts there...
+        assert_eq!(frame.origin.y, 0.0);
+        // ... and stops at the band's bottom edge.
+        assert_eq!(frame.size.height, 720.0 - 36.0);
+        assert_eq!(frame.origin.y + frame.size.height, 720.0 - 36.0);
+        // A window shorter than its band still yields a usable page.
+        assert_eq!(settings_page_frame(0.0, 100.0, 40.0, 30.0).size.height, 1.0);
+    }
 
     /// Switching away from a page has to wrap up that page's own editors, and only those: leaving
     /// the Key Bindings page closes its recording and its add panel but leaves the Mouse page's

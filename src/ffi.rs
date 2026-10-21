@@ -30,6 +30,9 @@ extern "C" {
     ) -> i32;
     pub(crate) static kCFRunLoopDefaultMode: *mut c_void;
 
+    /// The standard retain/release call-backs a CFArray needs to own CF-typed elements
+    /// (e.g. CGColorRefs handed to `CAGradientLayer.colors`).
+    pub(crate) static kCFTypeArrayCallBacks: c_void;
     pub(crate) fn CFArrayCreate(
         alloc: *const c_void,
         values: *const *const c_void,
@@ -740,6 +743,174 @@ pub(crate) unsafe fn set_text_field_line_height(field: *mut AnyObject, line_heig
     CFRelease(attributed as *const c_void);
     CFRelease(attributes as *const c_void);
     CFRelease(style as *const c_void);
+}
+
+/// Apply letter spacing (tracking) to a text field's rendered text, the mock's `letter-spacing`
+/// on `.section-title`. Same attributed-string approach as `set_text_field_line_height`: the
+/// field's font, colour, alignment and line-break mode are carried into the attributed value,
+/// which otherwise ignores the cell's own properties. No line-height forcing here -- callers that
+/// need it compose both helpers.
+pub(crate) unsafe fn set_text_field_kern(field: *mut AnyObject, kern: f64) {
+    if field.is_null() {
+        return;
+    }
+    let value: *mut AnyObject = msg_send![field, stringValue];
+    if value.is_null() {
+        return;
+    }
+    let length: usize = msg_send![value, length];
+    if length == 0 {
+        return;
+    }
+
+    let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+    let style: *mut AnyObject = msg_send![style, init];
+    let alignment: isize = msg_send![field, alignment];
+    let line_break_mode: isize = msg_send![field, lineBreakMode];
+    let _: () = msg_send![style, setAlignment: alignment];
+    let _: () = msg_send![style, setLineBreakMode: line_break_mode];
+
+    let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
+    let attributes: *mut AnyObject = msg_send![attributes, init];
+    let font: *mut AnyObject = msg_send![field, font];
+    let color: *mut AnyObject = msg_send![field, textColor];
+    let font_key = make_nsstring("NSFont");
+    let color_key = make_nsstring("NSColor");
+    let paragraph_key = make_nsstring("NSParagraphStyle");
+    let kern_key = make_nsstring("NSKern");
+    let kern_number: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: kern];
+    if !font.is_null() {
+        let _: () = msg_send![attributes, setObject: font, forKey: font_key];
+    }
+    if !color.is_null() {
+        let _: () = msg_send![attributes, setObject: color, forKey: color_key];
+    }
+    let _: () = msg_send![attributes, setObject: style, forKey: paragraph_key];
+    if !kern_number.is_null() {
+        let _: () = msg_send![attributes, setObject: kern_number, forKey: kern_key];
+    }
+    let attributed: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
+    let attributed: *mut AnyObject =
+        msg_send![attributed, initWithString: value, attributes: attributes];
+    let _: () = msg_send![field, setAttributedStringValue: attributed];
+
+    CFRelease(font_key as *const c_void);
+    CFRelease(color_key as *const c_void);
+    CFRelease(paragraph_key as *const c_void);
+    CFRelease(kern_key as *const c_void);
+    CFRelease(attributed as *const c_void);
+    CFRelease(attributes as *const c_void);
+    CFRelease(style as *const c_void);
+}
+
+/// The line height a paragraph style forced onto a text field's attributed string, or 0.0 when
+/// the field carries none -- `set_text_field_line_height` is the only producer, and a plain field
+/// reads back a zero `maximumLineHeight`. Callers must not hardcode the token: the field's own
+/// style is the only source that cannot drift from what is drawn.
+pub(crate) unsafe fn text_field_forced_line_height(field: *mut AnyObject) -> f64 {
+    if field.is_null() {
+        return 0.0;
+    }
+    let value: *mut AnyObject = msg_send![field, attributedStringValue];
+    if value.is_null() {
+        return 0.0;
+    }
+    let length: usize = msg_send![value, length];
+    if length == 0 {
+        return 0.0;
+    }
+    let key = make_nsstring("NSParagraphStyle");
+    if key.is_null() {
+        return 0.0;
+    }
+    let style: *mut AnyObject = msg_send![
+        value,
+        attribute: key,
+        atIndex: 0usize,
+        effectiveRange: std::ptr::null_mut::<objc2_foundation::NSRange>()
+    ];
+    CFRelease(key as *const c_void);
+    if style.is_null() {
+        return 0.0;
+    }
+    let height: f64 = msg_send![style, maximumLineHeight];
+    if height.is_finite() && height > 0.0 {
+        height
+    } else {
+        0.0
+    }
+}
+
+/// A font's natural line height, which is where the line fragments would put the glyphs without
+/// forcing. NSLayoutManager's `defaultLineHeightForFont:` is the value AppKit actually uses; a
+/// missing layout manager falls back to `ascender - descender + leading`, and anything unusable
+/// to 0.
+unsafe fn font_natural_line_height(font: *mut AnyObject) -> f64 {
+    // NSLayoutManager is not thread-safe; every caller is a main-thread settings builder, and
+    // this keeps it that way.
+    crate::debug_assert_main_thread();
+    if font.is_null() {
+        return 0.0;
+    }
+    let manager = {
+        // Shared and lazily created: the value is a property of the font, so one layout manager
+        // answers for every field that asks.
+        static SHARED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *SHARED.get_or_init(|| {
+            let manager: *mut AnyObject = msg_send![class!(NSLayoutManager), alloc];
+            let manager: *mut AnyObject = msg_send![manager, init];
+            manager as usize
+        }) as *mut AnyObject
+    };
+    if !manager.is_null() {
+        let height: f64 = msg_send![manager, defaultLineHeightForFont: font];
+        if height.is_finite() && height > 0.0 {
+            return height;
+        }
+    }
+    let ascender: f64 = msg_send![font, ascender];
+    let descender: f64 = msg_send![font, descender];
+    let leading: f64 = msg_send![font, leading];
+    let height = ascender - descender + leading;
+    if height.is_finite() && height > 0.0 {
+        height
+    } else {
+        0.0
+    }
+}
+
+/// How far a forced line box drops the field's glyphs below its frame's centre (see
+/// `theme::forced_line_height_offset`). Returns 0.0 for a field whose line height was never
+/// forced, which keeps centring callers a no-op on unforced labels.
+pub(crate) unsafe fn text_field_line_height_offset(field: *mut AnyObject) -> f64 {
+    let forced = text_field_forced_line_height(field);
+    if forced <= 0.0 {
+        return 0.0;
+    }
+    let font: *mut AnyObject = msg_send![field, font];
+    crate::theme::forced_line_height_offset(forced, font_natural_line_height(font))
+}
+
+/// `text_field_line_height_offset` expressed in the field's superview's coordinate space, for
+/// centring code that adds the result to the field's `frame.origin.y`. A flipped superview's y
+/// axis points down, so the same visual lift of the ink is a subtraction there. Returns 0.0 for a
+/// field with no superview -- a frame that is not positioned inside a parent has nothing to
+/// correct.
+pub(crate) unsafe fn text_field_line_height_correction(field: *mut AnyObject) -> f64 {
+    if field.is_null() {
+        return 0.0;
+    }
+    let superview: *mut AnyObject = msg_send![field, superview];
+    if superview.is_null() {
+        return 0.0;
+    }
+    let offset = text_field_line_height_offset(field);
+    let flipped: bool = msg_send![superview, isFlipped];
+    if flipped {
+        -offset
+    } else {
+        offset
+    }
 }
 
 /// Split a Rust string at Core Foundation's composed-character boundaries. CFString reports ranges

@@ -37,6 +37,8 @@ pub(super) unsafe fn build_switcher_page(
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    // The page's rows fall back to this page's title as their section until a card sets one.
+    begin_settings_search_page();
     let mut canvas = PageCanvas::new(
         switcher_view,
         content_w,
@@ -47,6 +49,12 @@ pub(super) unsafe fn build_switcher_page(
     );
     let y = canvas.next_row(described_row_h);
     // App-switcher master switch: off = Cmd+Tab passes through to the system.
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_windows_enabled"),
+        Some(&t("settings.desc_windows_enabled")),
+    );
     ui.windows_enabled = SettingsRow::described(
         switcher_view,
         label_x,
@@ -63,10 +71,17 @@ pub(super) unsafe fn build_switcher_page(
         setAction: sel!(handleWindowsEnabledToggle:)
     ];
     canvas.card(&t("settings.header_windows"));
+    set_settings_search_section(&t("settings.header_windows"));
     // The remaining window settings form a second card with its own section title.
     canvas.next_section();
     let y = canvas.next_row(described_row_h);
     // Let the label fill the space before the control column, adapting to the available page width.
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_show_minimized"),
+        None,
+    );
     ui.show_minimized = SettingsRow::tall_before_control(
         switcher_view,
         label_x,
@@ -80,6 +95,12 @@ pub(super) unsafe fn build_switcher_page(
     bind_control(target, ui.show_minimized);
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_show_hidden_app_windows"),
+        None,
+    );
     ui.show_hidden_app_windows = SettingsRow::tall_before_control(
         switcher_view,
         label_x,
@@ -95,6 +116,12 @@ pub(super) unsafe fn build_switcher_page(
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     // Described row: the switch carries real caveats (icon-only cards, the Screen Recording
     // dependency for titles, and the unreadable minimized state on another desktop).
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_show_other_desktops"),
+        Some(&t("settings.desc_show_other_desktops")),
+    );
     ui.show_other_desktops = SettingsRow::described(
         switcher_view,
         label_x,
@@ -120,6 +147,13 @@ pub(super) unsafe fn build_switcher_page(
     // Keep the trigger on the fixed 32pt control grid inside the standard 52pt settings row.
     let y = canvas.next_row(display_mode_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, display_mode_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_window_display_mode"),
+        None,
+    );
+    record_settings_search_options(&window_display_mode_refs);
     ui.thumbnails_enabled = SettingsRow::tall_with_height(
         switcher_view,
         label_x,
@@ -145,6 +179,12 @@ pub(super) unsafe fn build_switcher_page(
     canvas.group_begin(RowGroup::ThumbnailOnly);
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_focused_thumbnail_prewarm"),
+        None,
+    );
     let (_, prewarm_switch) = SettingsRow::tall_with_height(
         switcher_view,
         label_x,
@@ -161,6 +201,12 @@ pub(super) unsafe fn build_switcher_page(
     // already shows the app name on its own line below the title, so it is unaffected.
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_show_app_name_in_cards"),
+        None,
+    );
     let (_, app_name_switch) = SettingsRow::tall(
         switcher_view,
         label_x,
@@ -184,6 +230,13 @@ pub(super) unsafe fn build_switcher_page(
     let thumbnail_size_refs: Vec<&str> = thumbnail_size_labels.iter().map(|s| s.as_str()).collect();
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_thumbnail_size"),
+        Some(&t("settings.desc_thumbnail_size")),
+    );
+    record_settings_search_options(&thumbnail_size_refs);
     ui.thumbnail_size = SettingsRow::described(
         switcher_view,
         label_x,
@@ -205,6 +258,12 @@ pub(super) unsafe fn build_switcher_page(
     canvas.group_end();
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_card_text_size"),
+        Some(&t("settings.desc_card_text_size")),
+    );
     ui.card_text_size = SettingsRow::described(
         switcher_view,
         label_x,
@@ -229,23 +288,14 @@ pub(super) unsafe fn build_switcher_page(
     ui.card_text_size_value_label =
         SettingsRow::attach_slider_readout(switcher_view, ui.card_text_size, TEXT_SIZE_DEFAULT);
     bind_control(target, ui.card_text_size);
-    // Footer title: the switch hides the selected window's title line under the cards, and with it the
-    // whole footer band (the settings gear moves to the panel's bottom-right corner). It is not in the
-    // ThumbnailOnly group -- the footer exists in both display modes.
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    let (_, footer_title_switch) = SettingsRow::tall(
-        switcher_view,
-        label_x,
-        y,
-        220.0,
-        &t("settings.row_show_footer_title"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, true),
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_status_bar_text_size"),
+        Some(&t("settings.desc_status_bar_text_size")),
     );
-    ui.show_footer_title = footer_title_switch;
-    bind_control(target, ui.show_footer_title);
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
     ui.status_bar_text_size = SettingsRow::described(
         switcher_view,
         label_x,
@@ -259,7 +309,7 @@ pub(super) unsafe fn build_switcher_page(
             y + 10.0,
             SettingsRow::slider_width(ctrl_w),
             row_h,
-            TEXT_SIZE_MIN,
+            STATUS_BAR_SIZE_MIN,
             TEXT_SIZE_MAX,
             1,
             TEXT_SIZE_DEFAULT,
@@ -282,6 +332,13 @@ pub(super) unsafe fn build_switcher_page(
     let op_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(op_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, op_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_overlay_position"),
+        None,
+    );
+    record_settings_search_options(&op_label_refs);
     ui.overlay_position = SettingsRow::tall_with_height(
         switcher_view,
         label_x,
@@ -310,6 +367,13 @@ pub(super) unsafe fn build_switcher_page(
     let activation_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(activation_metrics.row_h);
     SettingsRow::separator_above_row(switcher_view, y, activation_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_activation_mode"),
+        None,
+    );
+    record_settings_search_options(&activation_label_refs);
     ui.activation_mode = SettingsRow::tall_with_height(
         switcher_view,
         label_x,
@@ -344,6 +408,12 @@ pub(super) unsafe fn build_switcher_page(
     for (title_key, desc_key) in panel_rows {
         let y = canvas.next_row(described_row_h);
         SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
+        record_settings_search_row(
+            SettingsPageId::Switcher,
+            canvas.last_row(),
+            &t(title_key),
+            Some(&t(desc_key)),
+        );
         let control = SettingsRow::described(
             switcher_view,
             label_x,
@@ -367,18 +437,8 @@ pub(super) unsafe fn build_switcher_page(
             _ => ui.panel_quit_enabled = control,
         }
     }
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    ui.corner_radius = SettingsRow::tall(
-        switcher_view,
-        label_x,
-        y,
-        label_w,
-        &t("settings.row_corner_radius"),
-        SettingsControl::text_input(ctrl_x, y + 10.0, ctrl_w, row_h, "64"),
-    )
-    .1;
     canvas.card(&t("settings.header_window_options"));
+    set_settings_search_section(&t("settings.header_window_options"));
     canvas.next_section();
     // Modifier popup items follow config::SWITCHER_MODIFIER_VALUES (option / command / control).
     let mod_labels = [
@@ -389,6 +449,13 @@ pub(super) unsafe fn build_switcher_page(
     let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
     let mod_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(mod_metrics.row_h);
+    record_settings_search_row(
+        SettingsPageId::Switcher,
+        canvas.last_row(),
+        &t("settings.row_modifier"),
+        None,
+    );
+    record_settings_search_options(&mod_label_refs);
     ui.modifier = SettingsRow::tall_with_height(
         switcher_view,
         label_x,
@@ -408,7 +475,9 @@ pub(super) unsafe fn build_switcher_page(
     .1;
     bind_control(target, ui.modifier);
     canvas.card(&t("settings.header_keyboard"));
+    set_settings_search_section(&t("settings.header_keyboard"));
 
+    sweep_unindexed_rows(&canvas, SettingsPageId::Switcher);
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_SWITCHER_PAGE_INDEX] = canvas;
     content_bottom
@@ -430,6 +499,8 @@ pub(super) unsafe fn build_keystroke_display_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
+    // The page's rows fall back to this page's title as their section until a card sets one.
+    begin_settings_search_page();
     let mut canvas = PageCanvas::new(
         keystroke_display_view,
         content_w,
@@ -440,6 +511,12 @@ pub(super) unsafe fn build_keystroke_display_page(
     );
 
     let y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::KeystrokeDisplay,
+        canvas.last_row(),
+        &t("settings.row_keystroke_display_enabled"),
+        Some(&t("settings.desc_keystroke_display_enabled")),
+    );
     ui.keystroke_display_enabled = SettingsRow::described(
         keystroke_display_view,
         label_x,
@@ -455,6 +532,7 @@ pub(super) unsafe fn build_keystroke_display_page(
     // the card boundary is what makes it read as the feature's on/off row instead of the first row
     // of the options list. The options below open a second card with their own header.
     canvas.card(&t("settings.header_keystroke_display"));
+    set_settings_search_section(&t("settings.header_keystroke_display"));
     canvas.next_section();
 
     let mode_labels = [
@@ -465,6 +543,13 @@ pub(super) unsafe fn build_keystroke_display_page(
     let mode_refs: Vec<&str> = mode_labels.iter().map(|s| s.as_str()).collect();
     let mode_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(mode_metrics.row_h);
+    record_settings_search_row(
+        SettingsPageId::KeystrokeDisplay,
+        canvas.last_row(),
+        &t("settings.row_keystroke_display_mode"),
+        None,
+    );
+    record_settings_search_options(&mode_refs);
     ui.keystroke_display_mode = SettingsRow::tall_with_height(
         keystroke_display_view,
         label_x,
@@ -492,6 +577,13 @@ pub(super) unsafe fn build_keystroke_display_page(
     let tap_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(tap_metrics.row_h);
     SettingsRow::separator_above_row(keystroke_display_view, y, tap_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::KeystrokeDisplay,
+        canvas.last_row(),
+        &t("settings.row_keystroke_display_tap_level"),
+        None,
+    );
+    record_settings_search_options(&tap_refs);
     ui.keystroke_display_tap_level = SettingsRow::tall_with_height(
         keystroke_display_view,
         label_x,
@@ -525,6 +617,13 @@ pub(super) unsafe fn build_keystroke_display_page(
         display_position_metrics.row_h,
         content_w,
     );
+    record_settings_search_row(
+        SettingsPageId::KeystrokeDisplay,
+        canvas.last_row(),
+        &t("settings.row_keystroke_display_position"),
+        None,
+    );
+    record_settings_search_options(&display_position_refs);
     ui.keystroke_display_position = SettingsRow::tall_with_height(
         keystroke_display_view,
         label_x,
@@ -560,6 +659,13 @@ pub(super) unsafe fn build_keystroke_display_page(
         initial_position_metrics.row_h,
         content_w,
     );
+    record_settings_search_row(
+        SettingsPageId::KeystrokeDisplay,
+        canvas.last_row(),
+        &t("settings.row_keystroke_display_initial_position"),
+        None,
+    );
+    record_settings_search_options(&initial_position_refs);
     ui.keystroke_display_initial_position = SettingsRow::tall_with_height(
         keystroke_display_view,
         label_x,
@@ -590,6 +696,12 @@ pub(super) unsafe fn build_keystroke_display_page(
     // itself uses the shared SINGLE_LINE_ROW_H like every other row on the page.
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(keystroke_display_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::KeystrokeDisplay,
+        canvas.last_row(),
+        &t("settings.row_keystroke_display_max_extent"),
+        None,
+    );
     ui.keystroke_display_max_extent = SettingsRow::tall(
         keystroke_display_view,
         label_x,
@@ -629,7 +741,9 @@ pub(super) unsafe fn build_keystroke_display_page(
     );
     bind_control(target, ui.keystroke_display_max_extent);
     canvas.card(&t("settings.header_keystroke_display_options"));
+    set_settings_search_section(&t("settings.header_keystroke_display_options"));
 
+    sweep_unindexed_rows(&canvas, SettingsPageId::KeystrokeDisplay);
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX] = canvas;
     content_bottom
@@ -692,6 +806,8 @@ pub(super) unsafe fn build_general_page(
     // The whole page-top block (title + first section heading) comes from the component; the
     // returned cursor is that heading's own cursor.
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    // The page's rows fall back to this page's title as their section until a card sets one.
+    begin_settings_search_page();
     let mut canvas = PageCanvas::new(
         general_view,
         content_w,
@@ -780,6 +896,12 @@ pub(super) unsafe fn build_general_page(
     // Startup card, first on the page: the two settings a new install most often needs.
     let y = canvas.next_row(described_row_h);
     // Launch-at-login switch: no title (the row label on the left already describes it).
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_launch_at_login"),
+        Some(&t("settings.desc_launch_at_login")),
+    );
     ui.launch_at_login = SettingsRow::described(
         general_view,
         label_x,
@@ -792,27 +914,38 @@ pub(super) unsafe fn build_general_page(
     );
     bind_control(target, ui.launch_at_login);
     canvas.card(&t("settings.header_startup"));
+    set_settings_search_section(&t("settings.header_startup"));
 
     // Menu-bar icon: its own card, because hiding the icon is a distinct decision from what the app
     // does at login — and the row has to say where Settings can still be reached without it.
     canvas.next_section();
-    let y = canvas.next_row(described_row_h);
+    let caption = t("settings.desc_hide_menu_bar_icon");
+    let caption_w = content_w - label_x * 2.0 - 58.0;
+    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
+    let y = canvas.next_row(caption_row_h);
     // `captioned`, not `described`: the latter never renders its subtitle, and this row has to carry
     // the "Settings can still be reached" promise that keeps a hidden icon from stranding the user
     // (asserted by --smoke-settings-layout).
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_hide_menu_bar_icon"),
+        Some(&caption),
+    );
     ui.hide_menu_bar_icon = SettingsRow::captioned(
         general_view,
         label_x,
         y,
-        content_w - label_x * 2.0 - 58.0,
-        described_row_h,
+        caption_w,
+        caption_row_h,
         &t("settings.row_hide_menu_bar_icon"),
-        &t("settings.desc_hide_menu_bar_icon"),
+        &caption,
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     )
     .2;
     bind_control(target, ui.hide_menu_bar_icon);
     canvas.card(&t("settings.header_menu_bar_icon"));
+    set_settings_search_section(&t("settings.header_menu_bar_icon"));
 
     canvas.next_section();
     let theme_items = [
@@ -823,6 +956,13 @@ pub(super) unsafe fn build_general_page(
     let theme_item_refs: Vec<&str> = theme_items.iter().map(String::as_str).collect();
     let theme_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(theme_metrics.row_h);
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_theme"),
+        Some(&t("settings.desc_theme")),
+    );
+    record_settings_search_options(&theme_item_refs);
     ui.theme = SettingsRow::described(
         general_view,
         label_x,
@@ -850,6 +990,13 @@ pub(super) unsafe fn build_general_page(
     let material_metrics = SettingsSelect::metrics();
     let y = canvas.next_block(material_metrics.row_h);
     SettingsRow::separator(general_view, y + material_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_panel_material"),
+        Some(&t("settings.desc_panel_material")),
+    );
+    record_settings_search_options(&material_item_refs);
     ui.panel_material = SettingsRow::described(
         general_view,
         label_x,
@@ -885,6 +1032,13 @@ pub(super) unsafe fn build_general_page(
     let glass_style_metrics = SettingsSelect::metrics();
     let y = canvas.next_block(glass_style_metrics.row_h);
     SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_glass_style"),
+        Some(&t("settings.desc_glass_style")),
+    );
+    record_settings_search_options(&glass_style_label_refs);
     ui.glass_style = SettingsRow::described(
         general_view,
         label_x,
@@ -905,10 +1059,18 @@ pub(super) unsafe fn build_general_page(
     bind_control(target, ui.glass_style);
     canvas.group_end();
     canvas.card(&t("settings.header_appearance"));
+    set_settings_search_section(&t("settings.header_appearance"));
 
     canvas.next_section();
     let locale_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(locale_metrics.row_h);
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_locale"),
+        None,
+    );
+    record_settings_search_options(&LOCALE_LABELS);
     ui.locale = SettingsRow::plain(
         general_view,
         label_x,
@@ -927,6 +1089,7 @@ pub(super) unsafe fn build_general_page(
     );
     bind_control(target, ui.locale);
     canvas.card(&t("settings.header_language"));
+    set_settings_search_section(&t("settings.header_language"));
 
     canvas.next_section();
     // Log level popup: items = [debug, info]; default index 1 (info).
@@ -934,6 +1097,13 @@ pub(super) unsafe fn build_general_page(
     let log_level_refs: Vec<&str> = log_levels.iter().map(String::as_str).collect();
     let log_level_metrics = SettingsSelect::metrics();
     let y = canvas.next_row(log_level_metrics.row_h);
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_log_level"),
+        Some(&t("settings.desc_log_level")),
+    );
+    record_settings_search_options(&log_level_refs);
     ui.log_level = SettingsRow::described(
         general_view,
         label_x,
@@ -967,6 +1137,12 @@ pub(super) unsafe fn build_general_page(
         target,
         sel!(handleExportLogs:),
     );
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_export_logs"),
+        Some(&t("settings.desc_export_logs")),
+    );
     SettingsRow::described(
         general_view,
         label_x,
@@ -978,12 +1154,16 @@ pub(super) unsafe fn build_general_page(
         export_btn,
     );
     canvas.card(&t("settings.header_logging"));
+    set_settings_search_section(&t("settings.header_logging"));
 
     // Backup: export the whole configuration to a file, or restore it on this or another Mac.
     // `captioned`, not `described`: the latter's subtitle is never rendered, and the import row has
     // to carry the "this replaces your settings" warning in place of a confirmation dialog.
     canvas.next_section();
-    let y = canvas.next_row(described_row_h);
+    let caption = t("settings.desc_export_settings");
+    let caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
+    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
+    let y = canvas.next_row(caption_row_h);
     let export_settings_btn = row_action_button(
         ctrl_x,
         ctrl_w,
@@ -992,18 +1172,26 @@ pub(super) unsafe fn build_general_page(
         target,
         sel!(handleExportSettings:),
     );
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_export_settings"),
+        Some(&caption),
+    );
     SettingsRow::captioned(
         general_view,
         label_x,
         y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
+        caption_w,
+        caption_row_h,
         &t("settings.row_export_settings"),
-        &t("settings.desc_export_settings"),
+        &caption,
         export_settings_btn,
     );
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(general_view, y, described_row_h, content_w);
+    let caption = t("settings.desc_import_settings");
+    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
+    let y = canvas.next_row(caption_row_h);
+    SettingsRow::separator_above_row(general_view, y, caption_row_h, content_w);
     let import_settings_btn = row_action_button(
         ctrl_x,
         ctrl_w,
@@ -1012,18 +1200,26 @@ pub(super) unsafe fn build_general_page(
         target,
         sel!(handleImportSettings:),
     );
+    record_settings_search_row(
+        SettingsPageId::General,
+        canvas.last_row(),
+        &t("settings.row_import_settings"),
+        Some(&caption),
+    );
     SettingsRow::captioned(
         general_view,
         label_x,
         y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
+        caption_w,
+        caption_row_h,
         &t("settings.row_import_settings"),
-        &t("settings.desc_import_settings"),
+        &caption,
         import_settings_btn,
     );
     canvas.card(&t("settings.header_backup"));
+    set_settings_search_section(&t("settings.header_backup"));
 
+    sweep_unindexed_rows(&canvas, SettingsPageId::General);
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_GENERAL_PAGE_INDEX] = canvas;
     content_bottom
@@ -1046,6 +1242,8 @@ pub(super) unsafe fn build_mouse_page(
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    // The page's rows fall back to this page's title as their section until a card sets one.
+    begin_settings_search_page();
     let mut canvas = PageCanvas::new(
         mouse_view,
         content_w,
@@ -1062,6 +1260,12 @@ pub(super) unsafe fn build_mouse_page(
     // its "Clipboard" heading with the "Clipboard History" title, and it never repeats the row's
     // "Enable mouse control". Its distance from the page title comes from SettingsPageHeader.
     let y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_enable_mouse"),
+        Some(&t("settings.desc_enable_mouse")),
+    );
     ui.enable_mouse = SettingsRow::described(
         mouse_view,
         label_x,
@@ -1076,6 +1280,7 @@ pub(super) unsafe fn build_mouse_page(
     let _: () = msg_send![ui.enable_mouse, setTarget: target];
     let _: () = msg_send![ui.enable_mouse, setAction: sel!(handleEnableMouseToggle:)];
     canvas.card(&t("settings.header_mouse"));
+    set_settings_search_section(&t("settings.header_mouse"));
 
     canvas.next_section();
     // Popup: items are rebuilt dynamically in load_settings_values (device list is mutable).
@@ -1088,10 +1293,19 @@ pub(super) unsafe fn build_mouse_page(
         device_labels.iter().map(|s| s.as_str()).collect()
     };
     let device_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(device_metrics.row_h);
+    let device_caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
+    // The caption is re-set in place when the popup selection changes, so the row height has
+    // to cover the longest caption any connected device can produce, not just the first.
+    let device_row_h = devices
+        .iter()
+        .map(|d| dispatch::device_info_caption(Some(d)))
+        .chain(std::iter::once(dispatch::device_info_caption(None)))
+        .map(|c| widgets::captioned_row_height(&c, device_caption_w))
+        .fold(device_metrics.row_h, f64::max);
+    let y = canvas.next_row(device_row_h);
     let dev_popup = SettingsControl::popup(
         ctrl_x,
-        y + (device_metrics.row_h - device_metrics.control_h) / 2.0,
+        y + (device_row_h - device_metrics.control_h) / 2.0,
         ctrl_w,
         device_metrics.control_h,
         &device_label_refs,
@@ -1102,12 +1316,19 @@ pub(super) unsafe fn build_mouse_page(
     // the selected device's effective values.
     let _: () = msg_send![dev_popup, setTarget: target];
     let _: () = msg_send![dev_popup, setAction: sel!(handleDeviceChanged:)];
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.header_mouse_device"),
+        None,
+    );
+    record_settings_search_options(&device_label_refs);
     let (_, device_info_caption, device_control) = SettingsRow::captioned(
         mouse_view,
         label_x,
         y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        device_metrics.row_h,
+        device_caption_w,
+        device_row_h,
         &t("settings.header_mouse_device"),
         &dispatch::device_info_caption(devices.first()),
         dev_popup,
@@ -1128,6 +1349,13 @@ pub(super) unsafe fn build_mouse_page(
         0,
     );
     style_flat_popup(scroll_popup);
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_scroll_mode"),
+        None,
+    );
+    record_settings_search_options(&scroll_mode_label_refs);
     ui.scroll_mode = SettingsRow::tall_with_height(
         mouse_view,
         label_x,
@@ -1148,6 +1376,12 @@ pub(super) unsafe fn build_mouse_page(
     canvas.group_begin(RowGroup::LineCount);
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_line_count"),
+        None,
+    );
     let (line_label, line_ctrl) = SettingsRow::tall(
         mouse_view,
         label_x,
@@ -1178,11 +1412,18 @@ pub(super) unsafe fn build_mouse_page(
     bind_control(target, ui.line_count);
     canvas.group_end();
     canvas.card(&t("settings.header_mouse_device"));
+    set_settings_search_section(&t("settings.header_mouse_device"));
 
     canvas.next_section();
     let y = canvas.next_row(described_row_h);
     // reverse_scroll switch: title + subtitle describe the scroll inversion; the switch
     // keeps the reference page's trailing inset.
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_reverse_scroll"),
+        Some(&t("settings.desc_reverse_scroll")),
+    );
     ui.reverse_scroll = SettingsRow::described(
         mouse_view,
         label_x,
@@ -1195,6 +1436,7 @@ pub(super) unsafe fn build_mouse_page(
     );
     bind_control(target, ui.reverse_scroll);
     canvas.card(&t("settings.header_mouse_scrolling"));
+    set_settings_search_section(&t("settings.header_mouse_scrolling"));
 
     canvas.next_section();
     canvas.group_begin(RowGroup::SmoothScrolling);
@@ -1214,6 +1456,13 @@ pub(super) unsafe fn build_mouse_page(
         0,
     );
     style_flat_popup(preset_popup);
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_mouse_smooth_preset"),
+        None,
+    );
+    record_settings_search_options(&preset_label_refs);
     let (_, preset_control) = SettingsRow::tall_with_height(
         mouse_view,
         label_x,
@@ -1273,6 +1522,7 @@ pub(super) unsafe fn build_mouse_page(
             default_value,
             Some(default_value),
         );
+        record_settings_search_row(SettingsPageId::Mouse, canvas.last_row(), &t(key), None);
         let (_, slider) = SettingsRow::tall_with_height(
             mouse_view,
             label_x,
@@ -1297,18 +1547,28 @@ pub(super) unsafe fn build_mouse_page(
     ui.smooth_scrolling_inertia_value = smooth_controls[3].1;
     canvas.group_end();
     canvas.card(&t("settings.header_mouse_smooth_scrolling"));
+    set_settings_search_section(&t("settings.header_mouse_smooth_scrolling"));
 
     canvas.next_section();
-    let y = canvas.next_row(described_row_h);
+    let caption = t("settings.desc_disable_pointer_accel");
+    let caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
+    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
+    let y = canvas.next_row(caption_row_h);
     // Keep the explanation in the caption instead of lengthening the setting label.
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_disable_pointer_accel"),
+        Some(&caption),
+    );
     let (_, _, pointer_accel_switch) = SettingsRow::captioned(
         mouse_view,
         label_x,
         y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
+        caption_w,
+        caption_row_h,
         &t("settings.row_disable_pointer_accel"),
-        &t("settings.desc_disable_pointer_accel"),
+        &caption,
         SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
     );
     ui.disable_pointer_accel = pointer_accel_switch;
@@ -1328,6 +1588,12 @@ pub(super) unsafe fn build_mouse_page(
     canvas.group_begin(RowGroup::PointerAccel);
     let y = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(mouse_view, y, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_pointer_tracking_speed"),
+        None,
+    );
     let (pointer_accel_label, pointer_accel_slider) = SettingsRow::tall_with_height(
         mouse_view,
         label_x,
@@ -1362,6 +1628,7 @@ pub(super) unsafe fn build_mouse_page(
     canvas.group_end();
 
     canvas.card(&t("settings.header_mouse_pointer"));
+    set_settings_search_section(&t("settings.header_mouse_pointer"));
 
     // Button mappings: an "Enable button mappings" described row + a nested table card
     // (rounded sub-table + the add-mapping button).
@@ -1369,6 +1636,12 @@ pub(super) unsafe fn build_mouse_page(
     // "Enable button mappings" described row (HTML card top), replacing the old switch
     // that sat on the section-header row's right edge.
     let y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::Mouse,
+        canvas.last_row(),
+        &t("settings.row_mapping_enable"),
+        None,
+    );
     ui.mapping_enabled = SettingsRow::described(
         mouse_view,
         label_x,
@@ -1382,6 +1655,7 @@ pub(super) unsafe fn build_mouse_page(
     let _: () = msg_send![ui.mapping_enabled, setTarget: target];
     let _: () = msg_send![ui.mapping_enabled, setAction: sel!(handleMappingEnabledChanged:)];
     canvas.card(&t("settings.header_mouse_mappings"));
+    set_settings_search_section(&t("settings.header_mouse_mappings"));
 
     // A 24pt gap under the section card, then the binding table itself: a block the canvas owns
     // (the mapping list resizes it as its rows change, see `render_mapping_rows_locked`). The
@@ -1512,6 +1786,7 @@ pub(super) unsafe fn build_mouse_page(
     ui.mapping_doc = card_bg;
     // Settle the page and publish it before the mapping rows render: the table's block has to be
     // part of the layout for `render_mapping_rows` to hand over its height.
+    sweep_unindexed_rows(&canvas, SettingsPageId::Mouse);
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_MOUSE_PAGE_INDEX] = canvas;
     // Render the current device's mappings initially.
@@ -1537,6 +1812,8 @@ pub(super) unsafe fn build_clipboard_page(
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
     // The page's layout owner: rows, cards, the title and the document height all follow from it.
+    // The page's rows fall back to this page's title as their section until a card sets one.
+    begin_settings_search_page();
     let mut canvas = PageCanvas::new(
         clipboard_view,
         content_w,
@@ -1545,20 +1822,29 @@ pub(super) unsafe fn build_clipboard_page(
         clipboard_doc_h,
         context.page_frame.size.height,
     );
-    let cy = canvas.next_row(described_row_h);
+    let caption = t("settings.desc_clipboard_enabled");
+    let caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
+    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
+    let cy = canvas.next_row(caption_row_h);
     // English "Enable clipboard history" (measured 146pt) plus cell padding sits on
     // the label_w=150 edge; widen to 225 along with the clear_on_quit/move_used_to_top rows.
     // `captioned`, not `described`: the latter's subtitle is not rendered at all, and this row has to
     // state that turning the feature off deletes the saved records -- that line is the only warning
     // the user gets, so it must actually be drawn (asserted by the settings layout smoke).
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_enabled"),
+        Some(&caption),
+    );
     let (_, _, ui_clipboard_enabled) = SettingsRow::captioned(
         clipboard_view,
         label_x,
         cy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
+        caption_w,
+        caption_row_h,
         &t("settings.row_clipboard_enabled"),
-        &t("settings.desc_clipboard_enabled"),
+        &caption,
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
     ui.clipboard_enabled = ui_clipboard_enabled;
@@ -1568,6 +1854,7 @@ pub(super) unsafe fn build_clipboard_page(
         setAction: sel!(handleClipboardEnabledToggle:)
     ];
     canvas.card(&t("settings.header_clipboard"));
+    set_settings_search_section(&t("settings.header_clipboard"));
     // Keep the history controls in a second titled card, matching the switcher layout.
     canvas.next_section();
     let active_shortcut = crate::config::CONFIG
@@ -1579,6 +1866,12 @@ pub(super) unsafe fn build_clipboard_page(
     let shortcut_row_h = (row_h + 22.0).max(60.0);
     let cy = canvas.next_row(shortcut_row_h);
     ui.clipboard_shortcut_row_height = shortcut_row_h;
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_shortcut"),
+        None,
+    );
     ui.clipboard_shortcut = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1586,13 +1879,15 @@ pub(super) unsafe fn build_clipboard_page(
         220.0,
         shortcut_row_h,
         &t("settings.row_clipboard_shortcut"),
-        row_action_button(
-            ctrl_x,
-            ctrl_w,
+        SettingsControl::button(
+            ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
             cy + (shortcut_row_h - ROW_ACTION_BTN_H) / 2.0,
+            ROW_ACTION_BTN_W,
+            ROW_ACTION_BTN_H,
             &crate::mouse::shortcut::display_shortcut(&active_shortcut),
             target,
             sel!(handleClipboardShortcutRecord:),
+            SettingsButtonRole::ControlField,
         ),
     );
     ui.clipboard_shortcut_error =
@@ -1616,6 +1911,13 @@ pub(super) unsafe fn build_clipboard_page(
     ui.clipboard_row_gap = layout.row_gap;
     let cy = canvas.next_row(pin_metrics.row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, pin_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_pin_follow"),
+        None,
+    );
+    record_settings_search_options(&pin_label_refs);
     ui.clipboard_pin_follow = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1642,6 +1944,12 @@ pub(super) unsafe fn build_clipboard_page(
     // quit or shutdown" 214.2pt, zh-Hans 194.5pt, zh-Hant 222.3pt -- all past the default
     // label_w=150, and the Traditional label also past the 220 this row used before, so it reserves
     // 236 (the control column starts ~150pt further right, so nothing is squeezed).
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_clear_on_quit"),
+        None,
+    );
     ui.clipboard_clear_on_quit = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1657,6 +1965,12 @@ pub(super) unsafe fn build_clipboard_page(
     // Opt-in second header button in the history picker ("clear all"): it also takes the pinned
     // entries of the visible scope, so it stays off by default. The plain clear button never
     // touches pinned entries either way.
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_separate_clear_all"),
+        None,
+    );
     ui.clipboard_separate_clear_all = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1670,6 +1984,12 @@ pub(super) unsafe fn build_clipboard_page(
     let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // show the source app.
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_show_source_app"),
+        None,
+    );
     ui.clipboard_show_source_app = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1687,6 +2007,12 @@ pub(super) unsafe fn build_clipboard_page(
     // English "Move used entries to top" (measured 150.3pt) exceeds label_w=150 and
     // rendered truncated ("move used entries to" after switching to English), widened
     // to 225.
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_move_used_to_top"),
+        None,
+    );
     ui.clipboard_move_used_to_top = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1697,17 +2023,26 @@ pub(super) unsafe fn build_clipboard_page(
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
     bind_control(target, ui.clipboard_move_used_to_top);
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
+    let caption = t("settings.desc_clipboard_delete_after_paste");
+    let caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
+    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
+    let cy = canvas.next_row(caption_row_h);
+    SettingsRow::separator_above_row(clipboard_view, cy, caption_row_h, content_w);
     // The destructive shortcut remains opt-in; its gesture hint lives in the muted caption.
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_delete_after_paste"),
+        None,
+    );
     let (_, _, ui_control) = SettingsRow::captioned(
         clipboard_view,
         label_x,
         cy,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
+        caption_w,
+        caption_row_h,
         &t("settings.row_clipboard_delete_after_paste"),
-        &t("settings.desc_clipboard_delete_after_paste"),
+        &caption,
         SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
     );
     ui.clipboard_delete_after_paste = ui_control;
@@ -1719,6 +2054,12 @@ pub(super) unsafe fn build_clipboard_page(
     canvas.group_begin(RowGroup::ClipboardDeleteChild);
     let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_clear_system_pasteboard_after_paste"),
+        None,
+    );
     let (_, clear_pasteboard_switch) = SettingsRow::tall_with_height(
         clipboard_view,
         label_x + 18.0,
@@ -1734,6 +2075,12 @@ pub(super) unsafe fn build_clipboard_page(
     let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // max entries (number input).
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_max_entries"),
+        None,
+    );
     ui.clipboard_max_entries = SettingsRow::plain(
         clipboard_view,
         label_x,
@@ -1747,6 +2094,12 @@ pub(super) unsafe fn build_clipboard_page(
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // Auto-expire days slider: 0..=7, where 0 means never; the current value is shown on
     // the right.
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_auto_expire_days"),
+        None,
+    );
     let (_, auto_expire_slider) = SettingsRow::tall(
         clipboard_view,
         label_x,
@@ -1774,7 +2127,9 @@ pub(super) unsafe fn build_clipboard_page(
     );
     bind_control(target, ui.clipboard_auto_expire_days);
     canvas.card(&t("settings.header_clipboard_options"));
+    set_settings_search_section(&t("settings.header_clipboard_options"));
 
+    sweep_unindexed_rows(&canvas, SettingsPageId::Clipboard);
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_CLIPBOARD_PAGE_INDEX] = canvas;
     content_bottom
@@ -1800,6 +2155,8 @@ pub(super) unsafe fn build_key_bindings_page(
     let ctrl_x = layout.control_x;
     let row_h = layout.row_h;
     let described_row_h = layout.described_row_h;
+    // The page's rows fall back to this page's title as their section until a card sets one.
+    begin_settings_search_page();
     let mut canvas = PageCanvas::new(
         key_bindings_view,
         content_w,
@@ -1811,6 +2168,12 @@ pub(super) unsafe fn build_key_bindings_page(
 
     // ---- Master switch: its own card, like the mouse page's "Enable button mappings" ----
     let y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::KeyBindings,
+        canvas.last_row(),
+        &t("settings.row_key_bindings_enabled"),
+        Some(&t("settings.desc_key_bindings_enabled")),
+    );
     ui.key_bindings_enabled = SettingsRow::described(
         key_bindings_view,
         label_x,
@@ -1829,6 +2192,7 @@ pub(super) unsafe fn build_key_bindings_page(
     // The card closes over the rows registered *before* it, so the switch's card is closed here and
     // the list gets a card of its own below — the same split the mouse page's mappings use.
     canvas.card(&t("settings.header_key_bindings"));
+    set_settings_search_section(&t("settings.header_key_bindings"));
 
     // ---- The binding list: its own section, with its own header like every other card ----
     canvas.next_section();
@@ -1841,10 +2205,12 @@ pub(super) unsafe fn build_key_bindings_page(
     ui.key_bindings_doc = doc;
     ui.key_bindings_empty = empty;
     canvas.card(&t("settings.header_key_binding_list"));
+    set_settings_search_section(&t("settings.header_key_binding_list"));
 
     // Adding happens in the floating panel the card's footer ＋ opens, so the page is one list and
     // nothing else: choosing the action, recording the chord and agreeing to it all live in the
     // panel, where the user is already looking.
+    sweep_unindexed_rows(&canvas, SettingsPageId::KeyBindings);
     let content_bottom = canvas.finish();
     ui.page_canvases[super::SETTINGS_KEY_BINDINGS_PAGE_INDEX] = canvas;
     content_bottom
@@ -1923,6 +2289,8 @@ pub(super) unsafe fn build_about_page(
     // The About page draws its own header, so it hands the canvas the distance from the document's
     // top edge down to the first section cursor and pins the header views it creates below.
     let header_offset = ABOUT_HEADER_TOP + ABOUT_HEADER_BLOCK_H + layout.section_step;
+    // The page's rows fall back to this page's title as their section until a card sets one.
+    begin_settings_search_page();
     let mut canvas = PageCanvas::new_at(
         about_view,
         content_w,
@@ -2011,6 +2379,30 @@ pub(super) unsafe fn build_about_page(
     // other page); it used card_top - card_bottom_inset - described_row_h before, 6pt more than
     // the convention, which made this row look taller.
     let guide_y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.row_view_guide"),
+        None,
+    );
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.website_label"),
+        None,
+    );
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.github_label"),
+        None,
+    );
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.version_label_short"),
+        None,
+    );
     SettingsRow::plain(
         about_view,
         label_x,
@@ -2086,6 +2478,7 @@ pub(super) unsafe fn build_about_page(
         ),
     );
     canvas.card(&t("settings.section_app"));
+    set_settings_search_section(&t("settings.section_app"));
 
     canvas.next_section_with_offset(layout.card_bottom_inset);
     // The first row derives from the card top so it matches card_bottom_inset (10); the old
@@ -2103,6 +2496,12 @@ pub(super) unsafe fn build_about_page(
         &t("settings.permission_status_missing"),
     );
     let _: () = msg_send![accessibility_status, setAlignment: 1isize];
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.permission_accessibility_label"),
+        None,
+    );
     ui.accessibility_permission_status = SettingsRow::plain(
         about_view,
         label_x,
@@ -2139,6 +2538,12 @@ pub(super) unsafe fn build_about_page(
         &t("settings.permission_status_missing"),
     );
     let _: () = msg_send![screen_recording_status, setAlignment: 1isize];
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.permission_screen_recording_label"),
+        None,
+    );
     ui.screen_recording_permission_status = SettingsRow::plain(
         about_view,
         label_x,
@@ -2172,6 +2577,12 @@ pub(super) unsafe fn build_about_page(
         &t("settings.keychain_status_missing"),
     );
     let _: () = msg_send![keychain_status, setAlignment: 1isize];
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.permission_keychain_label"),
+        None,
+    );
     ui.keychain_access_status = SettingsRow::plain(
         about_view,
         label_x,
@@ -2196,9 +2607,16 @@ pub(super) unsafe fn build_about_page(
     ui.keychain_access_button = keychain_button;
     release_obj(keychain_button);
     canvas.card(&t("settings.section_permissions"));
+    set_settings_search_section(&t("settings.section_permissions"));
 
     canvas.next_section_with_offset(layout.card_bottom_inset);
     let update_row_y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.row_update_auto_check"),
+        None,
+    );
     ui.update_auto_check = SettingsRow::described(
         about_view,
         label_x,
@@ -2212,6 +2630,12 @@ pub(super) unsafe fn build_about_page(
     bind_control(target, ui.update_auto_check);
     // Automatically-download-and-install switch, between auto-check and the check button.
     let download_row_y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::About,
+        canvas.last_row(),
+        &t("settings.row_update_auto_download"),
+        None,
+    );
     ui.update_auto_download = SettingsRow::described(
         about_view,
         label_x,
@@ -2255,7 +2679,7 @@ pub(super) unsafe fn build_about_page(
     if !check_layer.is_null() {
         layer_set_background(
             check_layer,
-            crate::ffi::hex_to_cg_color(settings_palette().button_bg),
+            crate::ffi::hex_to_cg_color(settings_palette().field_bg),
         );
     }
     let _: () = msg_send![about_view, addSubview: check_button];
@@ -2285,6 +2709,8 @@ pub(super) unsafe fn build_about_page(
     // The collapsed card bottom hugs the check button with an 8pt inset; the inline area is
     // not reserved by default, avoiding a large blank.
     ui.update_card = canvas.card(&t("settings.section_updates")).card;
+    set_settings_search_section(&t("settings.section_updates"));
+    sweep_unindexed_rows(&canvas, SettingsPageId::About);
     let content_bottom = canvas.finish();
     ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX] = canvas;
     content_bottom
@@ -2333,6 +2759,129 @@ pub(super) unsafe fn finalize_settings_pages(
         }
         .validate(settings_page_name(index));
     }
+}
+
+// MARK: - Search index
+
+/// Complete every row's search text from the controls the page actually built. Manual annotations
+/// retain their useful labels and descriptions, while this pass includes unannotated captions,
+/// button labels and every dropdown choice, including choices that are not currently selected.
+pub(super) unsafe fn sweep_unindexed_rows(canvas: &PageCanvas, page: SettingsPageId) {
+    let page_index = settings_page_index(page);
+    let recorded = sidebar::recorded_search_rows(page_index);
+    let total = canvas.last_row() + 1;
+    for row in 0..total {
+        let mut text = Vec::new();
+        if let Some(views) = canvas.row_views(row) {
+            for &view in views {
+                collect_settings_search_text(view, &mut text);
+            }
+        }
+        if !recorded.contains(&row) {
+            let section = canvas.row_section_title(row);
+            let section = if section.is_empty() {
+                t(settings_page_identity(page_index).title_key())
+            } else {
+                section
+            };
+            let label = text.first().map(String::as_str).unwrap_or(&section);
+            // Use this row's own section, rather than the last card drawn on the page.
+            sidebar::record_settings_search_entry_sectioned(sidebar::SearchEntry::row(
+                page_index, row, label, None, &section,
+            ));
+        }
+        sidebar::extend_settings_search_row(page_index, row, &text);
+    }
+}
+
+/// Collect only the row's rendered subtree. Stop at native controls so AppKit's implementation
+/// subviews cannot contribute duplicate or unrelated internal labels. Dropdown items are read
+/// explicitly because their menu is not part of the view subtree.
+unsafe fn collect_settings_search_text(view: *mut AnyObject, text: &mut Vec<String>) {
+    if view.is_null() {
+        return;
+    }
+    let is_popup: bool = msg_send![view, isKindOfClass: class!(NSPopUpButton)];
+    let is_field: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+    let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+    if is_popup {
+        let count: isize = msg_send![view, numberOfItems];
+        for index in 0..count {
+            let title: *mut AnyObject = msg_send![view, itemTitleAtIndex: index];
+            push_settings_search_text(text, crate::ffi::nsstring_to_rust(title));
+        }
+    } else if is_field {
+        // A label's stringValue retains the full caption even when AppKit draws an ellipsis.
+        let value: *mut AnyObject = msg_send![view, stringValue];
+        push_settings_search_text(text, crate::ffi::nsstring_to_rust(value));
+    } else if is_button {
+        let title: *mut AnyObject = msg_send![view, title];
+        push_settings_search_text(text, crate::ffi::nsstring_to_rust(title));
+    }
+    let tooltip: *mut AnyObject = msg_send![view, toolTip];
+    if !tooltip.is_null() {
+        push_settings_search_text(text, crate::ffi::nsstring_to_rust(tooltip));
+    }
+    if is_popup || is_field || is_button {
+        return;
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        collect_settings_search_text(child, text);
+    }
+}
+
+fn push_settings_search_text(text: &mut Vec<String>, value: String) {
+    let value = value.trim();
+    if !value.is_empty() && !text.iter().any(|existing| existing == value) {
+        text.push(value.to_owned());
+    }
+}
+
+/// Clear the settings search index: the next build records every page's rows again.
+///
+/// Called once by the window build, before the first page: the index spans every page, so a page
+/// that cleared it would delete the rows of every page built before it.
+pub(super) fn begin_settings_search_recording() {
+    sidebar::begin_settings_search_index();
+}
+
+/// Start one page's part of the index: no row is waiting for a card header any more, so the
+/// page's first rows (drawn before any card) cannot adopt the previous page's last card.
+pub(super) fn begin_settings_search_page() {
+    sidebar::begin_settings_search_section();
+}
+
+/// Open a card: the rows drawn inside it are searched with `header`.
+pub(super) fn set_settings_search_section(header: &str) {
+    sidebar::apply_settings_search_section(header);
+}
+
+/// Attach the choices of the dropdown row recorded immediately before this call: they are part of
+/// what the search matches, so typing an option finds the setting that offers it.
+pub(super) fn record_settings_search_options(options: &[&str]) {
+    sidebar::set_search_options_for_last_row(options);
+}
+
+/// Record one row the page builder is about to draw at canvas row `row`.
+///
+/// The row's card header is not known here (the page closes the card after drawing it), so the
+/// entry is recorded without one; the page's following `set_settings_search_section` fills it in.
+pub(super) fn record_settings_search_row(
+    page: SettingsPageId,
+    row: usize,
+    label: &str,
+    desc: Option<&str>,
+) {
+    sidebar::record_settings_search_entry(sidebar::SearchEntry::row(
+        settings_page_index(page),
+        row,
+        label,
+        desc,
+        "",
+    ));
 }
 
 #[cfg(test)]

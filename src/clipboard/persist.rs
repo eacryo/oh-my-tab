@@ -907,7 +907,7 @@ fn load_encrypted_history(path: &std::path::Path, generation: u64) -> LoadOutcom
         Ok(bytes) => bytes,
         // Vanished between the existence check and the read: treat it as a first run.
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return empty_outcome(generation)
+            return empty_outcome(generation);
         }
         // Unreadable (permissions, I/O): NOT "no history". Starting empty would allow the sweep to
         // delete the images this index still references and the rewrite to replace it.
@@ -933,7 +933,9 @@ fn load_encrypted_history(path: &std::path::Path, generation: u64) -> LoadOutcom
                     let entries = match parse_history_classified(&text) {
                         ParsedHistory::Ok(entries) => entries,
                         ParsedHistory::UnsupportedVersion => {
-                            log_info!("Clipboard history load failed (version newer than this build); left untouched.");
+                            log_info!(
+                                "Clipboard history load failed (version newer than this build); left untouched."
+                            );
                             return outcome(
                                 generation,
                                 LoadDecision::Blocked(BlockedReason::UnsupportedVersion),
@@ -948,7 +950,9 @@ fn load_encrypted_history(path: &std::path::Path, generation: u64) -> LoadOutcom
                         }
                     };
                     if !referenced_cache_files_ok(&entries) {
-                        log_info!("Clipboard history left untouched: referenced cache files did not authenticate.");
+                        log_info!(
+                            "Clipboard history left untouched: referenced cache files did not authenticate."
+                        );
                         return outcome(generation, LoadDecision::Blocked(BlockedReason::Damaged));
                     }
                     // A legacy plaintext index next to a healthy encrypted one is superseded: its
@@ -1446,7 +1450,7 @@ fn migrate_legacy_history(legacy: &std::path::Path, generation: u64) -> LoadOutc
     let text = match std::fs::read_to_string(legacy) {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return empty_outcome(generation)
+            return empty_outcome(generation);
         }
         // Unreadable, or not valid UTF-8: never treat that as "no history" (the sweep would delete
         // the images it references).
@@ -1557,7 +1561,9 @@ fn migrate_legacy_history(legacy: &std::path::Path, generation: u64) -> LoadOutc
                 &key,
                 serialized.as_bytes(),
             ) {
-                log_info!("Clipboard migration could not publish the encrypted index; nothing was deleted.");
+                log_info!(
+                    "Clipboard migration could not publish the encrypted index; nothing was deleted."
+                );
                 return outcome(
                     generation,
                     LoadDecision::Blocked(BlockedReason::MigrationIncomplete),
@@ -1580,7 +1586,9 @@ fn migrate_legacy_history(legacy: &std::path::Path, generation: u64) -> LoadOutc
         Err(KeyUnavailable::Missing) if sealed == Some(true) => {
             // CONFIRMED sealed data without a key: unrecoverable by design (the plan's §4.5 row).
             // Isolate the whole set (file + cache) and start fresh, never deleting anything.
-            log_info!("Clipboard migration found no key with sealed data present; isolating and starting fresh.");
+            log_info!(
+                "Clipboard migration found no key with sealed data present; isolating and starting fresh."
+            );
             if !isolate_storage_set(generation) {
                 return outcome(generation, LoadDecision::Blocked(BlockedReason::Damaged));
             }

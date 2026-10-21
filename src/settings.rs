@@ -61,6 +61,9 @@ const LOCALE_VALUES: [&str; 5] = [
 #[cfg(not(any(debug_assertions, feature = "dev-long-text")))]
 const LOCALE_VALUES: [&str; 4] = ["auto", "en", "zh-Hans", "zh-Hant"];
 const TEXT_SIZE_MIN: i64 = 13;
+/// The footer text size's floor is 0, not 13: the far-left stop means "draw no footer at all", which
+/// is the switch this slider replaced. A 0 value hides the band (`theme::show_footer_title`).
+const STATUS_BAR_SIZE_MIN: i64 = 0;
 const TEXT_SIZE_MAX: i64 = 20;
 const TEXT_SIZE_DEFAULT: i64 = 15;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
@@ -156,16 +159,19 @@ pub(super) fn settings_page_identity(index: usize) -> SettingsPageId {
 /// Whether two identities are the same page: the const-time counterpart of `PartialEq`, which cannot
 /// be used in the const evaluation that derives the page-index constants.
 const fn same_page(a: SettingsPageId, b: SettingsPageId) -> bool {
-    match (a, b) {
-        (SettingsPageId::General, SettingsPageId::General) => true,
-        (SettingsPageId::Switcher, SettingsPageId::Switcher) => true,
-        (SettingsPageId::Mouse, SettingsPageId::Mouse) => true,
-        (SettingsPageId::Clipboard, SettingsPageId::Clipboard) => true,
-        (SettingsPageId::KeyBindings, SettingsPageId::KeyBindings) => true,
-        (SettingsPageId::KeystrokeDisplay, SettingsPageId::KeystrokeDisplay) => true,
-        (SettingsPageId::About, SettingsPageId::About) => true,
-        _ => false,
-    }
+    matches!(
+        (a, b),
+        (SettingsPageId::General, SettingsPageId::General)
+            | (SettingsPageId::Switcher, SettingsPageId::Switcher)
+            | (SettingsPageId::Mouse, SettingsPageId::Mouse)
+            | (SettingsPageId::Clipboard, SettingsPageId::Clipboard)
+            | (SettingsPageId::KeyBindings, SettingsPageId::KeyBindings)
+            | (
+                SettingsPageId::KeystrokeDisplay,
+                SettingsPageId::KeystrokeDisplay
+            )
+            | (SettingsPageId::About, SettingsPageId::About)
+    )
 }
 
 /// The sidebar index of a page, evaluated at const time so the index constants below are DERIVED
@@ -247,9 +253,6 @@ pub(super) const SETTINGS_MOUSE_PAGE_INDEX: usize = page_index_const(SettingsPag
 pub(super) const SETTINGS_KEY_BINDINGS_PAGE_INDEX: usize =
     page_index_const(SettingsPageId::KeyBindings);
 pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = page_index_const(SettingsPageId::About);
-
-/// Fixed width of the settings navigation pane, shared by layout and transient feedback.
-pub(crate) const SETTINGS_SIDEBAR_WIDTH: f64 = 220.0;
 
 /// Recording stage.
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -373,6 +376,9 @@ static REC_TAP: LazyLock<RecTapMutex> = LazyLock::new(|| RecTapMutex(Mutex::new(
 // Holds pointers to the settings window's controls (non-modal, reused, hidden not destroyed).
 pub(super) struct SettingsUi {
     window: *mut AnyObject,
+    /// The sidebar's search field, the detail pane's results view, and the query behind them (see
+    /// the search section of `settings::sidebar`).
+    pub(in crate::settings) settings_search: sidebar::SettingsSearch,
     sidebar_highlight: *mut AnyObject, // NSView: selected-row highlight background (layer-backed)
     /// The sidebar buttons, indexed by sidebar order. Keyed by POSITION and filled and read
     /// through the page identity (`settings_page_index`), so adding or moving a page changes no field
@@ -579,11 +585,17 @@ const MAPPING_ACTION_TOP: f64 = 12.0; // gap above the add-mapping button
 const MAPPING_ACTION_H: f64 = 32.0; // add-mapping button height
 const MAPPING_CARD_PAD_BOT: f64 = 8.0; // card bottom padding
 
-/// Gap from a section header to the top edge of its grouped card.
-const SETTINGS_SECTION_CARD_GAP: f64 = 4.0;
+/// Gap from a section header to the top edge of its grouped card (the mock's
+/// `.section-title` margin-bottom; measured 7.99pt).
+const SETTINGS_SECTION_CARD_GAP: f64 = 8.0;
+/// Horizontal padding of the settings detail content inside the pane (`.settings-content
+/// { padding: 0 var(--sp-7) }`). The page layout and the search results' page-style chunks both
+/// use it, so their cards share the same columns.
+pub(super) const SETTINGS_DETAIL_INSET: f64 = 28.0;
 
-/// Gap between the previous card's bottom edge and the next section header.
-const SETTINGS_SECTION_HEADER_GAP: f64 = 24.0;
+/// Gap between the previous card's bottom edge and the next section header (the mock's
+/// `.settings-section + .settings-section` margin-top; measured 19.99pt).
+const SETTINGS_SECTION_HEADER_GAP: f64 = 20.0;
 
 /// Optical trailing inset for row controls, matching the text's visible leading inset.
 const SETTINGS_CONTROL_TRAILING_INSET: f64 = 16.0;
@@ -755,7 +767,9 @@ pub(crate) use dispatch::{
     end_max_extent_preview, handle_clipboard_enabled_toggle, handle_device_changed,
     handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
     handle_export_settings_ready, handle_import_settings, handle_import_settings_ready,
-    handle_key_bindings_toggle, handle_windows_enabled_toggle, left_mouse_button_is_down,
+    handle_key_bindings_toggle, handle_settings_search_began_editing,
+    handle_settings_search_changed, handle_settings_search_clear,
+    handle_settings_search_ended_editing, handle_windows_enabled_toggle, left_mouse_button_is_down,
     on_control_changed, on_control_text_did_change, on_control_text_did_end_editing,
     on_sidebar_select, refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
     refresh_service_controls_from_config,
@@ -766,7 +780,7 @@ pub(crate) use window::{
     refresh_permission_ui_if_visible, refresh_system_appearance, reopen_for_app_activation,
     settings_collapsible_row_smoke_runner, settings_layout_smoke_runner,
     settings_mouse_profile_callback_smoke_runner, settings_state_sync_smoke_runner,
-    settings_window_is_visible,
+    settings_vertical_zoom_smoke_runner, settings_window_is_visible,
 };
 
 fn parse_f64(s: &str) -> Result<f64, ()> {
@@ -779,6 +793,17 @@ fn parse_usize(s: &str) -> Result<usize, ()> {
 fn text_size_slider_value(value: f64) -> i64 {
     if value.is_finite() {
         (value.round() as i64).clamp(TEXT_SIZE_MIN, TEXT_SIZE_MAX)
+    } else {
+        TEXT_SIZE_DEFAULT
+    }
+}
+
+/// The footer-title slider's own value: its floor is 0 ("no footer at all"), not `TEXT_SIZE_MIN`.
+/// Sharing `text_size_slider_value` here would clamp a saved 0 back to 13 on the next open, so the
+/// panel would draw no footer while the settings page claimed 13.
+fn status_bar_size_slider_value(value: f64) -> i64 {
+    if value.is_finite() {
+        (value.round() as i64).clamp(STATUS_BAR_SIZE_MIN, TEXT_SIZE_MAX)
     } else {
         TEXT_SIZE_DEFAULT
     }
@@ -1687,7 +1712,7 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             }
             set_field(ui.corner_radius, cfg.appearance.corner_radius);
             let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
-            let status_bar_text_size = text_size_slider_value(cfg.fonts.status_bar_size);
+            let status_bar_text_size = status_bar_size_slider_value(cfg.fonts.status_bar_size);
             let _: () = msg_send![ui.card_text_size, setIntegerValue: card_text_size as isize];
             set_field(ui.card_text_size_value_label, card_text_size);
             let _: () = msg_send![
@@ -1787,12 +1812,6 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 0isize
             };
             let _: () = msg_send![ui.show_app_name_in_cards, setState: app_name_state];
-            let footer_title_state = if cfg.layout.show_footer_title {
-                1isize
-            } else {
-                0isize
-            };
-            let _: () = msg_send![ui.show_footer_title, setState: footer_title_state];
             // overlay_position: popup index 0 = follow active window (active_window), 1 = main (main).
             let op_idx = match cfg.windows.overlay_position.as_str() {
                 "main" => 1,
@@ -1999,6 +2018,20 @@ pub(super) fn materialize_mouse_page_if_visible() {
     }
 }
 
+pub(super) fn materialize_mouse_page_for_search() {
+    if MOUSE_PAGE_MATERIALIZED.load(Ordering::SeqCst) && !MOUSE_PAGE_DIRTY.load(Ordering::SeqCst) {
+        return;
+    }
+    let cfg = CONFIG.read().unwrap().clone();
+    unsafe {
+        with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_mut() {
+                materialize_mouse_page(ui, &cfg);
+            }
+        });
+    }
+}
+
 /// Fill the mouse page's per-device controls (reverse/disable-accel/tracking-speed/mode/line-count).
 /// Shared by load_settings_from and handle_device_changed.
 unsafe fn fill_mouse_device_controls(
@@ -2102,6 +2135,12 @@ extern "C" fn settings_window_close(_self: *mut AnyObject, _cmd: Sel) {
 // Constants for Cmd+Q handling: NSEventModifierFlagCommand = 1 << 20, ANSI Q keyCode = 12.
 const NSEVENT_MODIFIER_FLAG_COMMAND: u64 = 1 << 20;
 const KEYCODE_Q: u16 = 12;
+/// ANSI F keyCode: the search field's focus shortcut (the `⌘F` hint in the sidebar's shell).
+const KEYCODE_F: u16 = 3;
+/// NSEventModifierFlagShift / NSEventModifierFlagOption: Cmd+F is the focus shortcut only in its
+/// bare form, so the editing chords the field relies on still reach it untouched.
+const NSEVENT_MODIFIER_FLAG_SHIFT: u64 = 1 << 17;
+const NSEVENT_MODIFIER_FLAG_OPTION: u64 = 1 << 19;
 const NSEVENT_TYPE_LEFT_MOUSE_DOWN: usize = 1;
 /// NSEventTypeLeftMouseUp. The panel size preview ends here: a slider drag can also finish outside
 /// the window, so the mouse-up is observed at the window's event-dispatch point rather than on the
@@ -2191,6 +2230,16 @@ extern "C" fn settings_window_perform_key_equivalent(
         if keycode == KEYCODE_Q && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0 {
             // Same path as the menu Quit item: restore pointer acceleration + terminate.
             crate::quit_from_settings();
+            return objc2::runtime::Bool::YES;
+        }
+        // Cmd+F focuses the sidebar search. The sidebar shell draws a `⌘F` hint, so the shortcut
+        // has to be real: a hint for a binding the window does not answer would be a promise the
+        // app breaks. Shift and option variants are left to super, as they belong to text editing.
+        if keycode == KEYCODE_F
+            && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0
+            && (flags & (NSEVENT_MODIFIER_FLAG_SHIFT | NSEVENT_MODIFIER_FLAG_OPTION)) == 0
+            && sidebar::focus_settings_search()
+        {
             return objc2::runtime::Bool::YES;
         }
         // Super dispatch names the class that DEFINED this override (OhMyTabSettingsWindow),
@@ -2507,7 +2556,6 @@ mod tests {
     use super::settings_effective_corner_radius;
     use super::{pointer_accel_display, pointer_accel_from_slider};
     use crate::config::MOUSE_ACCELERATION_MAX;
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
 
     #[test]
     fn mapping_row_interactive_views_match_the_registry_contract() {
@@ -2570,6 +2618,17 @@ mod tests {
             out.status.code(),
             String::from_utf8_lossy(&out.stderr)
         );
+    }
+
+    #[test]
+    #[ignore]
+    fn settings_vertical_zoom_smoke() {
+        let app = settings_smoke_app_binary();
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-settings-vertical-zoom")
+            .output()
+            .expect("failed to spawn app");
+        assert!(out.status.success(), "vertical zoom smoke failed: {out:?}");
     }
 
     #[test]

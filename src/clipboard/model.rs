@@ -5,6 +5,7 @@ use std::collections::HashSet;
 
 /// Conservative fallback for detail document height: explicit newlines start a new line. The
 /// character units are only used when AppKit measurement is unavailable and never truncate list content.
+#[cfg(test)]
 pub(super) fn estimate_lines(text: &str, max_units: usize) -> usize {
     let mut units = 0usize;
     let mut lines = 1usize;
@@ -27,15 +28,21 @@ pub(super) fn estimate_lines(text: &str, max_units: usize) -> usize {
 
 /// Detail-panel content width -> per-line width units, using the same estimate as the row
 /// buttons (50 units fit the row content width ≈ 346pt).
+#[cfg(test)]
 pub(super) fn detail_text_units(width: f64) -> usize {
-    let units_per_pt = LINE_MAX_UNITS as f64 / content_width();
-    ((width * units_per_pt).floor() as usize).max(1)
+    ((width / content_width() * LINE_MAX_UNITS as f64).floor() as usize).max(1)
 }
 
 /// The row content's usable width: window - both paddings - icon - icon gap - actions.
+#[cfg(test)]
 pub(super) fn content_width() -> f64 {
     // The content button's width: window - list margins - the row's L/R padding.
     PICKER_W - PAD_X * 2.0 - ROW_PAD_L - ROW_PAD_R
+}
+
+/// Row title width after reserving the non-overlapping pin/delete hit targets on its trailing edge.
+pub(super) fn row_content_width(row_w: f64) -> f64 {
+    (row_w - ROW_PAD_L - ROW_PAD_R - ACTION_BTN * 2.0 - ACTION_GAP - 4.0).max(1.0)
 }
 
 /// Whether the source app is shown (reads CONFIG; recording is always on, the toggle gates
@@ -44,63 +51,236 @@ pub(super) fn show_source_app() -> bool {
     CONFIG.read().unwrap().clipboard.show_source_app
 }
 
-/// The source icon and name share one display switch; without an icon-cache key there is no
-/// file to load either.
-pub(super) fn should_show_source_icon(show_source: bool, entry: &ClipEntry) -> bool {
-    show_source && !entry.source_key.is_empty()
+/// A payload's size as the mock's `sizeText` writes it: the byte count below 1 KiB, otherwise
+/// one decimal of KiB, then of MiB.
+///
+/// The numbers are the clipboard payload measured in bytes, but they are divided by 1000, as the
+/// mock does (`bytes / 1024` would print 1000 bytes as "1.0 KiB"; the mock prints "1.0 KB").
+/// The unit suffix is the locale's, so an English row reads "402 bytes" / "1.0 KB" -- the mock's
+/// own label, since the unit is part of the displayed number rather than a separate word.
+pub(super) fn format_byte_size(bytes: u64) -> String {
+    if bytes < 1000 {
+        return tf(
+            "clipboard.meta_size_bytes",
+            &[("count", &bytes.to_string())],
+        );
+    }
+    // The unit is chosen on the raw byte count, not on the rounded number: a payload below
+    // 1_000_000 reads in KB even when it rounds up to five digits ("1000.0 KB", not "1.0 MB").
+    let kb = bytes as f64 / 1000.0;
+    if bytes < 1_000_000 {
+        return tf("clipboard.meta_size_kb", &[("size", &format!("{kb:.1}"))]);
+    }
+    tf(
+        "clipboard.meta_size_mb",
+        &[("size", &format!("{:.1}", kb / 1000.0))],
+    )
 }
 
-/// The row's meta line (app · relative time · line count): the small text below the content,
-/// 10px light gray per the mockup. The kind cue moved INTO the content itself (blue URLs,
-/// monospaced code); the meta line carries no badge.
-pub(super) fn build_meta_text(entry: &ClipEntry, show_source: bool) -> String {
-    let mut parts: Vec<String> = Vec::new();
-    if show_source {
-        if entry.source_app.is_empty() {
-            parts.push(t("clipboard.unknown_source"));
-        } else {
-            parts.push(entry.source_app.clone());
+/// The value a meta row shows when the entry has nothing for it: the mock's `'—'`.
+fn meta_absent() -> String {
+    "—".to_string()
+}
+
+/// The detail pane's meta table (the v2 mock's `.meta-table`), in the mock's row order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum MetaField {
+    Source,
+    Type,
+    Dimensions,
+    Size,
+    CopiedAt,
+}
+
+impl MetaField {
+    /// Every field, in the mock's `renderDetail()` row order.
+    pub(super) const ALL: [MetaField; 5] = [
+        MetaField::Source,
+        MetaField::Type,
+        MetaField::Dimensions,
+        MetaField::Size,
+        MetaField::CopiedAt,
+    ];
+
+    /// The row's localized label key (`来源` / `类型` / ... / `复制时间`).
+    pub(super) fn label_key(self) -> &'static str {
+        match self {
+            MetaField::Source => "clipboard.meta_source",
+            MetaField::Type => "clipboard.meta_type",
+            MetaField::Dimensions => "clipboard.meta_dimensions",
+            MetaField::Size => "clipboard.meta_size",
+            MetaField::CopiedAt => "clipboard.meta_copied_at",
         }
     }
-    if let Some(ts) = entry.copied_at {
-        parts.push(relative_time_label(ts, now_secs()));
-    }
-    // Report only source line breaks; never mistake the list cell's soft wrapping for them.
-    if entry.image.is_none() {
-        if let Some(count) = physical_line_count(&entry.text) {
-            parts.push(tf(
-                if count == 1 {
-                    "clipboard.meta_lines_one"
+
+    /// The value for an entry, or the em dash when the entry has none.
+    pub(super) fn value(self, entry: &ClipEntry, show_source: bool) -> String {
+        let value = match self {
+            // Honours the "show source app" setting, as the row meta line always did.
+            MetaField::Source => show_source.then(|| {
+                if entry.source_app.is_empty() {
+                    t("clipboard.unknown_source")
                 } else {
-                    "clipboard.meta_lines_other"
-                },
-                &[("count", &count.to_string())],
-            ));
+                    entry.source_app.clone()
+                }
+            }),
+            MetaField::Type => Some(entry_kind_label(entry)),
+            // Only an image has pixel dimensions; text and code show no number here.
+            MetaField::Dimensions => entry.image.as_ref().and_then(|img| {
+                let (w, h) = image_dimensions(img)?;
+                Some(tf(
+                    "clipboard.meta_dimensions_wh",
+                    &[("width", &w.to_string()), ("height", &h.to_string())],
+                ))
+            }),
+            MetaField::Size => Some(format_byte_size(entry_payload_bytes(entry))),
+            // The full local date and time; a legacy entry without a timestamp shows the dash.
+            MetaField::CopiedAt => entry.copied_at.map(copied_at_label),
+        };
+        value.unwrap_or_else(meta_absent)
+    }
+}
+
+/// The meta table's rows: `(label, value)`, labels localized, values already formatted.
+pub(super) fn meta_table(entry: &ClipEntry, show_source: bool) -> Vec<(String, String)> {
+    MetaField::ALL
+        .into_iter()
+        .map(|field| (t(field.label_key()), field.value(entry, show_source)))
+        .collect()
+}
+
+/// The entry's kind as the detail pane names it (the mock's `typeMeta`: 文本/链接/图片/代码).
+pub(super) fn entry_kind_label(entry: &ClipEntry) -> String {
+    let key = if entry.image.is_some() {
+        "clipboard.filter_image"
+    } else {
+        match classify_text(&entry.text) {
+            TextKind::Url => "clipboard.filter_link",
+            TextKind::Code => "clipboard.filter_code",
+            TextKind::Plain => "clipboard.filter_text",
+        }
+    };
+    t(key)
+}
+
+/// The payload a "size" row describes: the original image bytes for an image entry, otherwise
+/// the text's UTF-8 encoding. `0` for an image whose bytes are not readable without touching the
+/// disk (a file copy), which then shows "0 bytes".
+pub(super) fn entry_payload_bytes(entry: &ClipEntry) -> u64 {
+    match &entry.image {
+        Some(img) => image_payload_bytes(img),
+        None => entry.text.len() as u64,
+    }
+}
+
+/// An image entry's original byte length (0 when it has to be read from disk or decoded).
+pub(super) fn image_payload_bytes(img: &ImageEntry) -> u64 {
+    std::fs::metadata(&img.data_path)
+        .map(|meta| meta.len())
+        .unwrap_or(0)
+}
+
+/// An image entry's pixel size for the meta table's "尺寸" row, or `None` (the em dash).
+///
+/// The preview PNG is decoded at both ends: its own header before any AppKit object exists
+/// (exact, and the only path a worker thread may take), then the decoded image's bitmap
+/// representation, which is what accounts for DPI and orientation.
+pub(crate) fn image_dimensions(img: &ImageEntry) -> Option<(usize, usize)> {
+    if let Some(pixels) = png_pixel_size(&img.preview_png) {
+        return Some(pixels);
+    }
+    // AppKit drawing is main-thread only, and this runs from the picker's rebuild, which is
+    // also where a background history write can call back into.
+    if !crate::is_main_thread() {
+        return None;
+    }
+    unsafe { bitmap_pixels(&img.preview_png) }
+}
+
+/// The "尺寸" row's value for an image whose pixel size is not known without touching the disk.
+///
+/// `bestRepresentationForRect:` answers with a private `NSImageRepGeometryProxy` on a PNG-backed
+/// image: the proxy's distance is reported for layout but it has no `pixelsWide`/`pixelsHigh`
+/// (sending one traps, and a trap inside an `extern "C"` callback aborts the process, so the
+/// whole app died on "展开详情"). Pixel size therefore comes from the bitmap representation the
+/// decoded image actually holds, or from the PNG's own header -- never from a geometry proxy.
+unsafe fn bitmap_pixels(png: &[u8]) -> Option<(usize, usize)> {
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: png.as_ptr() as *const c_void,
+        length: png.len()
+    ];
+    if data.is_null() {
+        return None;
+    }
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithData: data];
+    if image.is_null() {
+        return None;
+    }
+    let pixels = bitmap_representation_pixels(image);
+    release_obj(image);
+    pixels
+}
+
+/// The pixel grid of the first representation that really has one.
+unsafe fn bitmap_representation_pixels(image: *mut AnyObject) -> Option<(usize, usize)> {
+    let reps: *mut AnyObject = msg_send![image, representations];
+    if reps.is_null() {
+        return None;
+    }
+    let count: usize = msg_send![reps, count];
+    for index in 0..count {
+        let rep: *mut AnyObject = msg_send![reps, objectAtIndex: index as isize];
+        if rep.is_null() {
+            continue;
+        }
+        let is_bitmap: bool = msg_send![rep, isKindOfClass: class!(NSBitmapImageRep)];
+        if !is_bitmap {
+            continue;
+        }
+        // `pixelsWide`/`pixelsHigh` are NSBitmapImageRep's own declared properties; the type
+        // check above is what separates it from the geometry proxy that has neither.
+        let w: isize = msg_send![rep, pixelsWide];
+        let h: isize = msg_send![rep, pixelsHigh];
+        if w > 0 && h > 0 {
+            return Some((w as usize, h as usize));
         }
     }
-    parts.join(" · ")
+    None
 }
 
-/// Return physical line count when source newlines exist; omit it for ordinary single-line text.
-pub(super) fn physical_line_count(text: &str) -> Option<usize> {
-    if text.contains('\n') {
-        Some(text.split('\n').count().max(1))
-    } else {
-        None
+/// A PNG's pixel size from its IHDR chunk: 8-byte signature, 4-byte length, "IHDR", then width
+/// and height as big-endian `u32`. `None` for anything that is not a PNG.
+pub(crate) fn png_pixel_size(bytes: &[u8]) -> Option<(usize, usize)> {
+    const SIGNATURE: [u8; 8] = [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
+    if bytes.len() < 24 || bytes[..8] != SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
     }
+    let read =
+        |at: usize| u32::from_be_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]]);
+    let (w, h) = (read(16), read(20));
+    (w > 0 && h > 0).then_some((w as usize, h as usize))
 }
 
-/// Relative time: Just now / Today HH:mm / Yesterday HH:mm / older MM-dd HH:mm (local tz).
-pub(super) fn relative_time_label(ts: u64, now: u64) -> String {
-    if now.saturating_sub(ts) < 60 {
-        return t("clipboard.time_just_now");
-    }
-    let delta = day_no(ts) - day_no(now);
-    let hhmm = local_hhmm(ts);
-    match delta {
-        0 => tf("clipboard.time_today", &[("time", &hhmm)]),
-        1 => tf("clipboard.time_yesterday", &[("time", &hhmm)]),
-        _ => format_copied_at(ts),
+/// A copy timestamp for the detail pane, ordered as the mock writes it: date units from the
+/// largest to the smallest, then the time ("2026年10月19日 08:56"). The separators are localized,
+/// so the row reads as one phrase in every language; `format_copied_at` keeps its own compact
+/// form for the picker's narrow header.
+pub(super) fn copied_at_label(unix_secs: u64) -> String {
+    unsafe {
+        let mut tm: Tm = std::mem::zeroed();
+        let s = unix_secs as i64;
+        localtime_r(&s, &mut tm);
+        tf(
+            "clipboard.meta_copied_at_value",
+            &[
+                ("year", &(tm.tm_year + 1900).to_string()),
+                ("month", &(tm.tm_mon + 1).to_string()),
+                ("day", &tm.tm_mday.to_string()),
+                ("time", &format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)),
+            ],
+        )
     }
 }
 
@@ -114,16 +294,6 @@ pub(super) fn day_no(unix_secs: u64) -> i64 {
     }
 }
 
-/// timestamp -> local HH:mm.
-pub(super) fn local_hhmm(unix_secs: u64) -> String {
-    unsafe {
-        let mut tm: Tm = std::mem::zeroed();
-        let s = unix_secs as i64;
-        localtime_r(&s, &mut tm);
-        format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
-    }
-}
-
 /// Time group: Today / Yesterday / Earlier (by the local day ordinal). Legacy entries
 /// without a timestamp join Earlier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,11 +303,24 @@ pub(super) enum DayGroup {
     Earlier,
 }
 
+/// The group-clear button's tag (Today/Yesterday/Earlier -> 0/1/2).
+pub(super) fn day_group_from_tag(tag: isize) -> Option<DayGroup> {
+    match tag {
+        0 => Some(DayGroup::Today),
+        1 => Some(DayGroup::Yesterday),
+        2 => Some(DayGroup::Earlier),
+        _ => None,
+    }
+}
+
 pub(super) fn day_group(ts: Option<u64>) -> DayGroup {
     let Some(ts) = ts else {
         return DayGroup::Earlier;
     };
-    match day_no(ts) - day_no(now_secs()) {
+    // `day_no` grows with the calendar, so the difference has to be now-minus-then: a day that
+    // came BEFORE today is `+1`, not `-1` (the inverted form made `Yesterday` unreachable and
+    // filed every entry older than today under `Earlier`).
+    match day_no(now_secs()) - day_no(ts) {
         0 => DayGroup::Today,
         1 => DayGroup::Yesterday,
         _ => DayGroup::Earlier,
@@ -153,8 +336,7 @@ pub(super) fn group_label(g: DayGroup) -> String {
     }
 }
 
-/// The row content height: uniformly 61pt (the mockup's min-height 61px, content
-/// vertically centered).
+/// The row content height, shared by layout and row views.
 pub(super) fn row_content_h(_entry: &ClipEntry) -> f64 {
     ROW_H
 }
@@ -179,84 +361,89 @@ pub(super) fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
         .collect()
 }
 
-/// The fixed header strip's height: top padding + the search/filter/clear row + the gap
-/// to the list.
-/// The fixed header strip: the search zone (14 + 48 + 8) + the filters row (38).
+/// The fixed header strip's height: top padding + the search row + the gap under it (the mock's
+/// `.panel-head` 16/16/10 padding; the filters chip row is gone, its filters live in the
+/// options popover). Derived from the same constants the frames use, so a padding change cannot
+/// leave the strip and its controls disagreeing.
 pub(super) fn header_strip_h() -> f64 {
-    TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y + FILTERS_H
+    TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
 }
 
-/// The search field, the pin button, the settings button and the corner close button side by side
-/// in the header strip (flipped coordinates, measured from the strip's top-left). One source of
-/// truth so no two can ever overlap: the field gives up every button's size plus every gap on the
-/// right. Returns `(search, pin, gear, close)`, laid out left to right.
-pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect, NSRect) {
+/// The search field and the four header controls side by side in the header strip (flipped
+/// coordinates, measured from the strip's top-left): right-to-left close, pin, detail-toggle
+/// and the options orb -- the mock's `.panel-head` (`.orb`/`#detailToggle`/`.close-btn`).
+/// One source of truth so no two can ever overlap: the field gives up every button's size plus
+/// every gap on the right. Returns `(search, options, detail, pin, close)`, laid out left to right.
+pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect, NSRect, NSRect) {
+    picker_header_frames_for(PICKER_W)
+}
+
+pub(super) fn picker_header_frames_for(width: f64) -> (NSRect, NSRect, NSRect, NSRect, NSRect) {
     let close = NSRect::new(
         NSPoint::new(
-            PICKER_W - SEARCH_PAD_X - PICKER_CLOSE_BTN_SIZE,
+            width - SEARCH_PAD_X - PICKER_CLOSE_BTN_SIZE,
             TOP_PAD_Y + (SEARCH_H - PICKER_CLOSE_BTN_SIZE) / 2.0,
         ),
         NSSize::new(PICKER_CLOSE_BTN_SIZE, PICKER_CLOSE_BTN_SIZE),
     );
-    let gear = NSRect::new(
-        NSPoint::new(
-            close.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_CLOSE_BTN_SIZE,
-            close.origin.y,
-        ),
-        close.size,
-    );
     let pin = NSRect::new(
         NSPoint::new(
-            gear.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_CLOSE_BTN_SIZE,
-            gear.origin.y,
+            close.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_ORB_SIZE,
+            TOP_PAD_Y + (SEARCH_H - PICKER_ORB_SIZE) / 2.0,
         ),
-        gear.size,
+        NSSize::new(PICKER_ORB_SIZE, PICKER_ORB_SIZE),
     );
-    // Three buttons and three gaps are reserved on the right, so the pin can never be drawn over
-    // the query/⌘F keycap however long the widest locale's hint is.
+    let detail = NSRect::new(
+        NSPoint::new(
+            pin.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_ORB_SIZE,
+            pin.origin.y,
+        ),
+        pin.size,
+    );
+    let options = NSRect::new(
+        NSPoint::new(
+            detail.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_ORB_SIZE,
+            detail.origin.y,
+        ),
+        detail.size,
+    );
+    // Four controls and four gaps are reserved on the right, so the options orb can never be
+    // drawn over the query/⌘F keycap however long the widest locale's hint is.
     let search = NSRect::new(
         NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
         NSSize::new(
-            PICKER_W - SEARCH_PAD_X * 2.0 - (PICKER_CLOSE_BTN_SIZE + PICKER_CLOSE_BTN_GAP) * 3.0,
+            width
+                - SEARCH_PAD_X * 2.0
+                - (PICKER_ORB_SIZE + PICKER_CLOSE_BTN_GAP) * 3.0
+                - PICKER_CLOSE_BTN_SIZE
+                - PICKER_CLOSE_BTN_GAP,
             SEARCH_H,
         ),
     );
-    (search, pin, gear, close)
+    (search, options, detail, pin, close)
 }
 
-/// The drag handle's transparent hit band: the WHOLE top bar, i.e. the header strip's top padding across
-/// the panel's full width (flipped coordinates, measured from the strip's top-left). The user drags the
-/// panel by the top bar, not by the three dots alone; the dots stay centered in it as the visual hint.
-/// The band is the header's own top padding, so it covers no control: the search row starts below it.
-pub(super) fn picker_grip_frame() -> NSRect {
+/// The panel's top drag band: the header strip's top padding across the panel's full width
+/// (flipped coordinates, measured from the strip's top-left). It covers no control -- the search
+/// row starts below it -- so a press here always starts a panel drag (see `drag.rs`). Pure so a
+/// test can prove the band adds no height and never reaches the search row.
+///
+/// This is only the *reported* band (the A2 scenario's start area and the smoke runner's press
+/// point): the live gesture accepts any blank region of the panel, not just this one.
+pub(super) fn picker_drag_band_frame() -> NSRect {
     NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PICKER_W, TOP_PAD_Y))
 }
 
-/// The handle's three visible dots, centered in the hit band (flipped coordinates, measured from
-/// the band's top-left). Pure so a test can prove the dots stay inside the band they are drawn in --
-/// and that they are centered in the band they are given, whatever its width (the band grew from a
-/// fixed 48pt to the panel's full width, and dot positions computed from the old constant would have
-/// stayed at the left end).
-pub(super) fn picker_grip_dot_frames() -> [NSRect; 3] {
-    let band = picker_grip_frame().size;
-    let total = PICKER_GRIP_MARK * 3.0 + PICKER_GRIP_MARK_GAP * 2.0;
-    let start_x = (band.width - total) / 2.0;
-    let y = (band.height - PICKER_GRIP_MARK) / 2.0;
-    std::array::from_fn(|index| {
-        NSRect::new(
-            NSPoint::new(
-                start_x + index as f64 * (PICKER_GRIP_MARK + PICKER_GRIP_MARK_GAP),
-                y,
-            ),
-            NSSize::new(PICKER_GRIP_MARK, PICKER_GRIP_MARK),
-        )
-    })
-}
-
-/// Calculate the picker minimum from three same-group records and use it for every state, so it
-/// stays aligned when row or surrounding-region dimensions change.
+/// Reserve enough height for the complete options menu below the header, including clear-all
+/// when enabled, so an empty or short history cannot clip its final actions.
 pub(super) fn picker_min_height() -> f64 {
-    (header_strip_h() + GROUP_H + ROW_H * 3.0 + FOOTER_H + PAD_Y).max(PICKER_MIN_HEIGHT)
+    let menu_min = POPOVER_TOP
+        + super::detail::filter_popover_fixed_h()
+        + (CLIP_FILTER_ROWS.len() + 3) as f64 * POPOVER_MIN_ROW_H
+        + POPOVER_BOTTOM_INSET;
+    (header_strip_h() + GROUP_H + ROW_H * 3.0 + FOOTER_H + PAD_Y)
+        .max(PICKER_MIN_HEIGHT)
+        .max(menu_min)
 }
 
 /// The row list's top offset INSIDE the document: just the gap to the header strip (the strip is no
@@ -371,23 +558,6 @@ pub(super) fn now_secs() -> u64 {
 }
 
 // localtime_r and Tm now live in ffi.rs (one declaration shared with the logger).
-
-/// Copy timestamp -> "MM-dd HH:mm" (local time; the header bar is narrow, so the year is
-/// dropped). Pure function; the format is unit-tested.
-pub(super) fn format_copied_at(unix_secs: u64) -> String {
-    unsafe {
-        let mut tm: Tm = std::mem::zeroed();
-        let s = unix_secs as i64;
-        localtime_r(&s, &mut tm);
-        format!(
-            "{:02}-{:02} {:02}:{:02}",
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min
-        )
-    }
-}
 
 /// Copy timestamp -> "YYYY-MM-DD HH.MM.SS" (local time; the save-as suggested-filename suffix).
 /// The format itself lives in `ffi` so the settings export's filename stamp is the same string; the
@@ -591,10 +761,20 @@ pub(super) fn remove_history_scope(
     let visible: HashSet<usize> = filtered_indices(history, query, filter)
         .into_iter()
         .collect();
+    remove_scope_by_index(history, &visible, clear_all)
+}
+
+/// The one removal primitive every destructive clear funnels through: drop the entries whose
+/// history index is in `scope`, keeping pinned entries unless `clear_all` asks for them.
+fn remove_scope_by_index(
+    history: &mut Vec<ClipEntry>,
+    scope: &HashSet<usize>,
+    clear_all: bool,
+) -> Vec<ClipEntry> {
     let mut removed = Vec::new();
     let mut kept = Vec::with_capacity(history.len());
     for (index, entry) in history.drain(..).enumerate() {
-        if visible.contains(&index) && (clear_all || !entry.pinned) {
+        if scope.contains(&index) && (clear_all || !entry.pinned) {
             removed.push(entry);
         } else {
             kept.push(entry);
@@ -605,6 +785,37 @@ pub(super) fn remove_history_scope(
         super::bump_history_revision();
     }
     removed
+}
+
+/// The history indices a day-group clear would take: the entries of `group` that the active filter
+/// and query actually show. The group NARROWS the visible scope -- it never widens it -- so
+/// clearing "today" while the Image filter is on cannot delete the day's hidden text entries.
+/// Pure, unit-tested.
+pub(super) fn day_group_scope_indices(
+    history: &[ClipEntry],
+    filter: ClipFilter,
+    query: &str,
+    group: DayGroup,
+) -> Vec<usize> {
+    filtered_indices(history, query, filter)
+        .into_iter()
+        .filter(|&index| day_group(history[index].copied_at) == group)
+        .collect()
+}
+
+/// Remove one day group's visible entries and return them for the image-cache sweep. Same pinned
+/// rule as the plain scope clear: a pinned entry survives unless `clear_all` asks for it.
+pub(super) fn remove_day_group_scope(
+    history: &mut Vec<ClipEntry>,
+    clear_all: bool,
+    filter: ClipFilter,
+    query: &str,
+    group: DayGroup,
+) -> Vec<ClipEntry> {
+    let scope: HashSet<usize> = day_group_scope_indices(history, filter, query, group)
+        .into_iter()
+        .collect();
+    remove_scope_by_index(history, &scope, clear_all)
 }
 
 /// The header's two clear actions. The first ("clear") sweeps the visible scope but never takes
@@ -633,6 +844,7 @@ pub(super) fn clip_clear_labels(filter: ClipFilter, has_query: bool) -> (String,
             ClipFilter::Image => t("clipboard.filter_image"),
             ClipFilter::Link => t("clipboard.filter_link"),
             ClipFilter::Code => t("clipboard.filter_code"),
+            ClipFilter::Pinned => t("clipboard.filter_pinned"),
         };
         tf("clipboard.clear_scope_all", &[("kind", kind.as_str())])
     };
@@ -857,7 +1069,7 @@ pub(super) fn delete_entry(history: &mut Vec<ClipEntry>, idx: usize) {
     }
 }
 
-/// Picker filters: All / Text / Image / Link / Code.
+/// Picker filters: All / Text / Image / Link / Code / Pinned (the mock's `.filter-row` set).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClipFilter {
     All,
@@ -865,6 +1077,7 @@ pub(super) enum ClipFilter {
     Image,
     Link,
     Code,
+    Pinned,
 }
 
 /// the active filter.
@@ -880,16 +1093,29 @@ type FilterTextLowerCache = Option<(u64, Vec<String>, Vec<TextKind>)>;
 static FILTER_TEXT_LOWER_CACHE: LazyLock<Mutex<FilterTextLowerCache>> =
     LazyLock::new(|| Mutex::new(None));
 
-/// The Tab filter cycle: All -> Text -> Image -> Link -> Code -> All.
+/// The Tab filter cycle: All -> Text -> Image -> Link -> Code -> Pinned -> All.
 pub(super) fn next_clip_filter(filter: ClipFilter) -> ClipFilter {
     match filter {
         ClipFilter::All => ClipFilter::Text,
         ClipFilter::Text => ClipFilter::Image,
         ClipFilter::Image => ClipFilter::Link,
         ClipFilter::Link => ClipFilter::Code,
-        ClipFilter::Code => ClipFilter::All,
+        ClipFilter::Code => ClipFilter::Pinned,
+        ClipFilter::Pinned => ClipFilter::All,
     }
 }
+
+/// The options popover's filter rows, in display order (`.popover .filter-row`).
+/// Consumed by the popover in step C; pinned by unit tests today.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const CLIP_FILTER_ROWS: [ClipFilter; 6] = [
+    ClipFilter::All,
+    ClipFilter::Text,
+    ClipFilter::Image,
+    ClipFilter::Link,
+    ClipFilter::Code,
+    ClipFilter::Pinned,
+];
 
 /// Whether an entry matches the filter (cached-classification variant): avoids re-running
 /// classify_text for every entry on every keystroke.
@@ -900,7 +1126,23 @@ fn matches_filter_kind(e: &ClipEntry, kind: TextKind, f: ClipFilter) -> bool {
         ClipFilter::Text => e.image.is_none() && kind == TextKind::Plain,
         ClipFilter::Link => e.image.is_none() && kind == TextKind::Url,
         ClipFilter::Code => e.image.is_none() && kind == TextKind::Code,
+        ClipFilter::Pinned => e.pinned,
     }
+}
+
+/// Per-filter-row counts for the options popover (the `.filter-row .count` column), in
+/// `CLIP_FILTER_ROWS` order.
+pub(super) fn filter_row_counts(history: &[ClipEntry]) -> [usize; 6] {
+    let mut counts = [0usize; 6];
+    for entry in history {
+        let kind = classify_text(&entry.text);
+        for (i, f) in CLIP_FILTER_ROWS.iter().enumerate() {
+            if matches_filter_kind(entry, kind, *f) {
+                counts[i] += 1;
+            }
+        }
+    }
+    counts
 }
 
 /// Whether an entry matches the filter (simple, uncached-classification variant; tests only).

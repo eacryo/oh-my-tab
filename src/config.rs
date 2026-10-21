@@ -1325,7 +1325,7 @@ impl Config {
         }
 
         if !self.fonts.status_bar_size.is_finite()
-            || !(13.0..=20.0).contains(&self.fonts.status_bar_size)
+            || !(0.0..=20.0).contains(&self.fonts.status_bar_size)
         {
             errs.push(tf(
                 "errors.fonts_size_invalid",
@@ -2310,6 +2310,7 @@ pub(crate) fn parse_config_content(
     } else {
         loaded
     };
+    needs_persist |= config.migrate_footer_title_switch();
     // Reserved chords are only known once every other field has settled: the clipboard yields
     // first (an invalid value has fallen back to its default by now), then the bindings yield to
     // whatever the switcher and the clipboard finally own. Runs on every load, so a hand-edited
@@ -2426,6 +2427,28 @@ impl Config {
         Self::load_or_default_from(&path)
     }
 
+    /// Fold the retired `layout.show_footer_title` switch into the size that replaced it.
+    ///
+    /// The switch is gone from the UI and the band now follows `fonts.status_bar_size` (0 = no band),
+    /// so a config saved with the switch *off* and a positive size would silently get its footer back.
+    /// The switch is then re-armed to `true` so this runs exactly once and never overrides a size the
+    /// user picks later.
+    ///
+    /// Runs after per-field fallback (`merge_valid`), not on the pre-validation snapshot: a
+    /// *typed-invalid* size like `"bad"` is recorded as a field error and falls back to the default
+    /// in the merged config, and the 0 written here must still win over that default. Running it on
+    /// `loaded` instead would re-arm the switch and then let `merge_valid` restore the 15pt default.
+    pub(crate) fn migrate_footer_title_switch(&mut self) -> bool {
+        if self.layout.show_footer_title {
+            return false;
+        }
+        self.layout.show_footer_title = true;
+        // Unconditionally 0: this runs after fallback, so an invalid size has already become the
+        // 15pt default -- and the hidden footer must still win.
+        self.fonts.status_bar_size = 0.0;
+        true
+    }
+
     /// Migrate exact legacy defaults only. The old overlay medium weight (0.23) is no longer
     /// part of the built-in typography ladder; customized weight values are preserved. The
     /// previous title/app-name size migration remains gated on the complete old default combo.
@@ -2538,6 +2561,13 @@ pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::ne
 
 /// Return the effective glass style.
 pub fn effective_glass_style() -> String {
+    // Development channel: `--glass-style=regular|clear` A/Bs the material for one launch. An
+    // unrecognised value is ignored rather than rendered as nothing, like `--panel-material`.
+    if let Some(value) = crate::dev_flags::value("glass-style") {
+        if value == "regular" || value == "clear" {
+            return value;
+        }
+    }
     CONFIG.read().unwrap().appearance.glass_style.clone()
 }
 
@@ -3008,9 +3038,62 @@ mod tests {
     }
 
     #[test]
+    fn the_retired_footer_switch_folds_into_its_size_once() {
+        let mut cfg = Config::default();
+        cfg.layout.show_footer_title = false;
+        cfg.fonts.status_bar_size = 15.0;
+        assert!(cfg.migrate_footer_title_switch());
+        assert_eq!(cfg.fonts.status_bar_size, 0.0);
+        // Re-armed: a second load must not clobber a size the user chose after upgrading.
+        cfg.fonts.status_bar_size = 14.0;
+        assert!(!cfg.migrate_footer_title_switch());
+        assert_eq!(cfg.fonts.status_bar_size, 14.0);
+    }
+
+    #[test]
+    fn the_footer_switch_migrates_through_a_typed_invalid_size() {
+        let (config, errors, needs_persist) = parse_config_content(
+            "[layout]\nshow_footer_title = false\n[fonts]\nstatus_bar_size = \"bad\"\n",
+        )
+        .unwrap();
+        assert_eq!(config.fonts.status_bar_size, 0.0);
+        assert!(config.layout.show_footer_title);
+        assert!(needs_persist);
+        assert!(errors
+            .iter()
+            .any(|error| error.starts_with("fonts.status_bar_size")));
+    }
+
+    #[test]
+    fn the_footer_switch_migrates_through_a_negative_size() {
+        let (config, _, needs_persist) = parse_config_content(
+            "[layout]\nshow_footer_title = false\n[fonts]\nstatus_bar_size = -1.0\n",
+        )
+        .unwrap();
+        assert_eq!(config.fonts.status_bar_size, 0.0);
+        assert!(config.layout.show_footer_title);
+        assert!(needs_persist);
+    }
+
+    #[test]
+    fn a_round_trip_of_the_migrated_config_keeps_the_footer_hidden() {
+        let (config, _, _) = parse_config_content(
+            "[layout]\nshow_footer_title = false\n[fonts]\nstatus_bar_size = \"bad\"\n",
+        )
+        .unwrap();
+        let serialized = toml::to_string(&config).unwrap();
+        let (roundtripped, _, needs_persist) = parse_config_content(&serialized).unwrap();
+        assert_eq!(roundtripped.fonts.status_bar_size, 0.0);
+        assert!(!needs_persist);
+    }
+
+    #[test]
     fn validate_rejects_status_bar_text_size_outside_range() {
         let mut cfg = Config::default();
-        cfg.fonts.status_bar_size = 12.9;
+        // 0 is legal: the slider's far-left stop means "draw no footer" (the switch this replaced).
+        cfg.fonts.status_bar_size = 0.0;
+        assert_err_count(&cfg, 0);
+        cfg.fonts.status_bar_size = -0.1;
         assert_err_count(&cfg, 1);
         cfg.fonts.status_bar_size = 20.1;
         assert_err_count(&cfg, 1);
@@ -3113,10 +3196,6 @@ mod tests {
         assert_err_count(&cfg, 0);
     }
 
-    #[test]
-    /// The tint is validated as `RRGGBBAA` and, like every other field, falls back on its own: a typo in
-    /// this hex must not take the rest of the appearance section down with it.
-    #[test]
     /// The popup's index and the stored value must be inverses: the settings page fills the popup from
     /// the value, and the popup's action stores the index it reports. A drift here would display one
     /// material while persisting another -- the "the panel looks like frost but the settings say liquid
@@ -3713,11 +3792,13 @@ speed = 2.6
                 .speed,
             Some(2.6)
         );
-        assert!(loaded.mouse.profiles.iter().all(|profile| profile
-            .smooth_scrolling
-            .as_ref()
-            .map(|smooth| smooth.enabled.is_none())
-            .unwrap_or(true)));
+        assert!(loaded.mouse.profiles.iter().all(|profile| {
+            profile
+                .smooth_scrolling
+                .as_ref()
+                .map(|smooth| smooth.enabled.is_none())
+                .unwrap_or(true)
+        }));
     }
 
     #[test]

@@ -12,6 +12,12 @@ use crate::ffi::{
 };
 
 pub(crate) const PANEL_CORNER_RADIUS: f64 = 16.0;
+/// The clipboard picker and its detail panel draw a larger corner than the HUD.
+///
+/// The reference glass (a 720pt-wide macOS 26 panel) measures roughly 30-34pt of visible curvature, which
+/// is what makes the silhouette read as a sheet rather than a softened rectangle. The keystroke display
+/// keeps [`PANEL_CORNER_RADIUS`]: it is 54pt tall, where 28 would turn it into a pill.
+pub(crate) const CLIPBOARD_PANEL_RADIUS: f64 = 32.0;
 /// AppKit darkens Liquid Glass in passive panels; this alpha matches the clipboard detail panel.
 pub(crate) const INACTIVE_GLASS_COMPENSATION_ALPHA: u32 = 0x99;
 /// How a panel holds the contrast table for the text it draws.
@@ -360,7 +366,7 @@ unsafe fn build_backdrop(
     let size = frame.size;
     let material = PanelMaterial::effective();
     let compensation_alpha = options.compensation_alpha;
-    let floor = crate::config::effective_glass_floor();
+    let veil = effective_frost_veil();
     match material {
         PanelMaterial::LiquidGlass if AnyClass::get(c"NSGlassEffectView").is_some() => {
             let glass_class = AnyClass::get(c"NSGlassEffectView").unwrap();
@@ -571,7 +577,7 @@ unsafe fn build_backdrop(
                 let _: () = msg_send![effect, setMaskImage: mask];
                 release_obj(mask);
             }
-            install_floor_veil(effect, size, floor);
+            install_floor_veil(effect, size, veil);
             release_obj(effect);
             InstalledBackdrop {
                 material: PanelMaterial::Frost,
@@ -655,6 +661,80 @@ pub(crate) unsafe fn panel_ink(palette_token: u32, role: PanelInk) -> *mut AnyOb
     }
 }
 
+/// The panel outline's stroke token per material: frost gets the bright `glass_rim` -- a bright line
+/// reads as a glass edge, where the flat `card_border` stroke reads as a drawn rectangle. Opaque and
+/// the blur-only `Backdrop` keep `card_border`; Liquid Glass returns no outline at all
+/// (`install_panel_outline` refuses it upstream).
+pub(crate) fn panel_outline_color(
+    material: PanelMaterial,
+    palette: &crate::theme::UiPalette,
+) -> u32 {
+    match material {
+        PanelMaterial::Frost => palette.glass_rim,
+        _ => palette.card_border,
+    }
+}
+
+/// The frost light-mode veil's shape: the mock's three-stop gradient by default, or the flat white
+/// veil at one alpha while `--glass-floor` is given (it is the measurement instrument -- a gradient
+/// cannot be stated as one number).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum FrostVeil {
+    Gradient,
+    Flat(f64),
+}
+
+/// Resolve the veil shape: `--glass-floor=<a>` asks for the flat instrument veil (a <= 0 means no
+/// veil, exactly as the flat floor always behaved); anything else, or no flag, is the gradient.
+pub(crate) fn effective_frost_veil() -> FrostVeil {
+    match crate::dev_flags::value("glass-floor") {
+        Some(raw) => match raw.trim().parse::<f64>() {
+            Ok(alpha) if alpha.is_finite() => FrostVeil::Flat(alpha.clamp(0.0, 1.0)),
+            _ => FrostVeil::Flat(FROST_FLOOR_ALPHA),
+        },
+        None => FrostVeil::Gradient,
+    }
+}
+
+/// The frost veil's gradient, copied from the reference mock's `.panel` rule (values not
+/// re-measured): `linear-gradient(148deg, rgba(255,255,255,.58) 0%, rgba(255,255,255,.33) 46%,
+/// rgba(255,249,241,.42) 100%)` as (rrggbbaa, location) stops.
+pub(crate) const FROST_VEIL_STOPS: [(u32, f64); 3] =
+    [(0xFFFFFF94, 0.0), (0xFFFFFF54, 0.46), (0xFFF9F16B, 1.0)];
+
+/// The mock's gradient angle: `linear-gradient(148deg, ...)`.
+const FROST_VEIL_ANGLE_DEG: f64 = 148.0;
+
+/// The gradient line as CAGradientLayer start/end points, applying the CSS rule for the panel's own
+/// size -- a fixed pair only yields 148deg on a square, and the panels resize animatedly.
+///
+/// Derivation: CSS places the gradient line through the box's centre at angle theta, with its 0% and
+/// 100% stops where the perpendiculars through the nearest corners touch it, giving the line the
+/// length `L = |w*sin(theta)| + |h*cos(theta)|`. The physical direction toward the 100% end (CSS
+/// coordinates, y down, 0deg = up, clockwise) is `d = (sin(theta), -cos(theta))`, so the endpoints
+/// are `centre -/+ d * L/2`. To unit space, divide by (w, h) and flip y (`unit_y = 1 - css_y`),
+/// because CALayer's y is up. Endpoints may land outside [0,1] -- CA extends the gradient by clamping
+/// to the edge stops, exactly as CSS does, which is what puts the brightest white at the top-left.
+///
+/// A zero or negative size returns the square answer rather than NaN.
+pub(crate) fn frost_veil_gradient_points(size: NSSize) -> (NSPoint, NSPoint) {
+    if size.width <= 0.0 || size.height <= 0.0 {
+        return frost_veil_gradient_points(NSSize::new(1.0, 1.0));
+    }
+    let theta = FROST_VEIL_ANGLE_DEG.to_radians();
+    let (sin, cos) = theta.sin_cos();
+    // CSS y-down direction toward the 100% stop.
+    let (dx, dy) = (sin, -cos);
+    let length = (size.width * sin).abs() + (size.height * cos).abs();
+    let (cx, cy) = (size.width / 2.0, size.height / 2.0);
+    let (sx, sy) = (cx - dx * length / 2.0, cy - dy * length / 2.0);
+    let (ex, ey) = (cx + dx * length / 2.0, cy + dy * length / 2.0);
+    (
+        NSPoint::new(sx / size.width, 1.0 - sy / size.height),
+        NSPoint::new(ex / size.width, 1.0 - ey / size.height),
+    )
+}
+
 /// The blur-only surface's default radius. Five already blurs a half-point checkerboard to nothing on the
 /// controlled backdrop, and the lift does not grow with the radius, so this is a *look* choice rather than
 /// a masking one; `--glass-blur` overrides it.
@@ -689,6 +769,11 @@ const GLASS_TINT_DARK: &str = "1c1c1e99";
 /// contrast, so 0.4 keeps 60% of it, i.e. cuts it by 40%. `config::effective_glass_floor` resolves this
 /// value with the `--glass-floor` launch override.
 ///
+/// This flat alpha is now the `--glass-floor` instrument only: the default veil is the mock's gradient
+/// (`FROST_VEIL_STOPS`, `FrostVeil::Gradient`), whose piecewise-linear mean alpha is ~0.41 with a 0.33
+/// trough at the 46% stop -- the desktop keeps ~59% of its contrast on average and 67% at the trough.
+/// The flag still swaps in the flat veil at one alpha so the lift can be measured as a single number.
+///
 /// The value was chosen by eye while the override was being tuned on a dark backdrop: the lift is larger
 /// where the backdrop is darker, and 0.4 is the point where the panel stopped reading as dim. The checked-in
 /// instrument, `scripts/e2e/panel-contrast.sh`, has not been run against it; that gap is recorded in
@@ -705,6 +790,14 @@ const FLOOR_VEIL_TAG: isize = 0xF10A;
 
 /// The tint for the *resolved* mode.
 pub(crate) fn resolved_glass_tint_hex() -> u32 {
+    // Development channel: `--glass-tint=<rrggbbaa>` explores the veil without a rebuild. Only a
+    // well-formed, non-transparent value is accepted, so a typo leaves the measured constant in force.
+    if let Some(value) = crate::dev_flags::value("glass-tint") {
+        let parsed = crate::config::parse_hex8(&value);
+        if value.len() == 8 && parsed != 0 {
+            return parsed;
+        }
+    }
     let hex = if crate::theme::resolved_is_dark() {
         GLASS_TINT_DARK
     } else {
@@ -726,6 +819,17 @@ pub(crate) fn glass_style_index(style: &str) -> i64 {
 }
 
 pub(crate) fn frost_material() -> i64 {
+    // Development channel: `--frost-material=<N>` picks another of NSVisualEffectView's semantic
+    // materials for one launch (5 menu, 6 popover, 7 sidebar, 10 header, 11 sheet, 12 window,
+    // 13 hud, 15 fullscreen, 17 tip, 18 content, 21 under-window, 22 under-page). The blur radius is
+    // the system's; the material is the only knob, so this is how the look is compared.
+    if let Some(value) = crate::dev_flags::value("frost-material") {
+        if let Ok(n) = value.parse::<i64>() {
+            if (0..=22).contains(&n) {
+                return n;
+            }
+        }
+    }
     if crate::theme::resolved_is_dark() {
         FROST_MATERIAL_DARK
     } else {
@@ -736,7 +840,7 @@ pub(crate) fn frost_material() -> i64 {
 /// A rounded-rect mask template for NSVisualEffectView's `maskImage`, with cap insets
 /// sized to the corner radius so the image stretches to any view size while the four
 /// corners keep their exact shape. 128pt side leaves room for the largest panel radius
-/// (16) plus stretchable middle.
+/// (32, `CLIPBOARD_PANEL_RADIUS`) plus stretchable middle.
 pub(crate) unsafe fn rounded_effect_mask(corner_radius: f64) -> *mut AnyObject {
     const SIDE: f64 = 128.0;
     let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
@@ -895,7 +999,11 @@ extern "C" fn outline_drop(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyOb
 
 /// Create the outline decoration for `parent` (the material hierarchy's root, whose bounds are the panel
 /// rect), sized and rounded to it. Returns null when the view could not be created.
-unsafe fn make_panel_outline(parent: *mut AnyObject, corner_radius: f64) -> *mut AnyObject {
+unsafe fn make_panel_outline(
+    parent: *mut AnyObject,
+    corner_radius: f64,
+    border_hex: u32,
+) -> *mut AnyObject {
     let class = decoration_view_class();
     let view: *mut AnyObject = msg_send![class, alloc];
     let bounds: NSRect = msg_send![parent, bounds];
@@ -913,10 +1021,7 @@ unsafe fn make_panel_outline(parent: *mut AnyObject, corner_radius: f64) -> *mut
     // Not clipped: the stroke is the outermost thing the panel draws, and clipping the layer to its own
     // bounds would silently halve whichever half the platform draws outside.
     let _: () = msg_send![layer, setMasksToBounds: false];
-    layer_set_border(
-        layer,
-        hex_to_cg_color(crate::theme::ui_palette().card_border),
-    );
+    layer_set_border(layer, hex_to_cg_color(border_hex));
     let _: () = msg_send![layer, setBorderWidth: crate::theme::PANEL_OUTLINE_WIDTH];
     // Above the material: every material paints its own surface at the same rect, so a decoration below it
     // would be covered. The class's `hitTest:` is what keeps that from costing the panel its input.
@@ -926,7 +1031,7 @@ unsafe fn make_panel_outline(parent: *mut AnyObject, corner_radius: f64) -> *mut
 }
 
 /// Install the outline on an installed backdrop and return the decoration, which is kept so a live theme
-/// change can recolour it (`card_border` differs per mode).
+/// change can recolour it (the outline token differs per mode).
 pub(crate) unsafe fn install_panel_outline(
     backdrop: &InstalledBackdrop,
     corner_radius: f64,
@@ -934,10 +1039,21 @@ pub(crate) unsafe fn install_panel_outline(
     if !panel_outline_enabled() {
         return None;
     }
+    // System glass already draws a directional rim (bright along the lit top edge, fading inward). A
+    // uniform 1pt stroke on top of it flattens that rim into a flat line, which is what made the panel
+    // read as a drawn rectangle rather than a piece of glass. Frost and `opaque` have no rim of their
+    // own, so they keep the stroke.
+    if backdrop.material == PanelMaterial::LiquidGlass {
+        return None;
+    }
     // The *material* root's bounds are the panel rect; with a shadow carrier installed, `root` is the
     // padded window view and an outline hung there would sit at the window's edge instead of the panel's.
     let parent = backdrop.material_root?;
-    let view = make_panel_outline(parent.0, corner_radius);
+    let view = make_panel_outline(
+        parent.0,
+        corner_radius,
+        panel_outline_color(backdrop.material, &crate::theme::ui_palette()),
+    );
     if view.is_null() {
         return None;
     }
@@ -1188,7 +1304,10 @@ pub(crate) unsafe fn refresh_panel_outline(backdrop: &InstalledBackdrop) {
     }
     layer_set_border(
         layer,
-        hex_to_cg_color(crate::theme::ui_palette().card_border),
+        hex_to_cg_color(panel_outline_color(
+            backdrop.material,
+            &crate::theme::ui_palette(),
+        )),
     );
 }
 
@@ -1198,8 +1317,8 @@ pub(crate) fn outline_view_for_smoke(backdrop: &InstalledBackdrop) -> Option<*mu
 }
 
 /// A1: the installed outline's observable state -- its stroke width and whether its colour is the
-/// `card_border` token -- or `None` when there is no outline. Exists so a smoke runner can assert the
-/// panel's edge without re-implementing the decoration's structure.
+/// material's outline token (`panel_outline_color`) -- or `None` when there is no outline. Exists so a
+/// smoke runner can assert the panel's edge without re-implementing the decoration's structure.
 pub(crate) unsafe fn outline_state(backdrop: &InstalledBackdrop) -> Option<(f64, bool)> {
     let outline = backdrop.outline_view?;
     let layer: *mut AnyObject = msg_send![outline.0, layer];
@@ -1207,7 +1326,10 @@ pub(crate) unsafe fn outline_state(backdrop: &InstalledBackdrop) -> Option<(f64,
         return None;
     }
     let width: f64 = msg_send![layer, borderWidth];
-    let expected = hex_to_cg_color(crate::theme::ui_palette().card_border);
+    let expected = hex_to_cg_color(panel_outline_color(
+        backdrop.material,
+        &crate::theme::ui_palette(),
+    ));
     let matches = crate::ffi::CGColorEqualToColor(
         crate::ffi::layer_border_color(layer),
         expected as *const c_void,
@@ -1447,8 +1569,9 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         }
     }
     // The outline is a palette token, not a material one, so it is the one decoration a live appearance
-    // change has to recolour explicitly -- `card_border` is black at 10% in light mode and white at 10%
-    // in dark mode, and a stale value is a visibly wrong stroke rather than a missing one.
+    // change has to recolour explicitly -- `panel_outline_color` picks the token per material and mode
+    // (`glass_rim` on light frost, `card_border` elsewhere), and a stale value is a visibly wrong stroke
+    // rather than a missing one.
     refresh_panel_outline(&backdrop);
 }
 
@@ -1480,7 +1603,7 @@ impl MaterialTuning {
     /// The knobs as configured (each with its `--glass-*` launch override).
     ///
     /// The floor is deliberately not one of them: the veil it drives is installed and synced by the
-    /// theme path (`sync_floor_veil`), which reads `effective_glass_floor` where it needs it. A copy
+    /// theme path (`sync_floor_veil`), which reads `effective_frost_veil` where it needs it. A copy
     /// here would be a second source for one value, and the copy this replaced was never read.
     pub(crate) fn effective() -> Self {
         Self {
@@ -1637,18 +1760,28 @@ fn floor_veil_hex(alpha: f64) -> u32 {
 /// An `NSImageView`, not a plain `NSView`: `setTag:`/`viewWithTag:` are `NSControl`'s, and both the material
 /// swap and the live theme path have to find this one decoration again. `insertSubview:atIndex:0` keeps it
 /// under the panel's content, which the build path adds afterwards and the live path has already added.
-unsafe fn install_floor_veil(parent: *mut AnyObject, size: NSSize, alpha: f64) {
-    if alpha <= 0.0 || crate::theme::resolved_is_dark() || parent.is_null() {
+unsafe fn install_floor_veil(parent: *mut AnyObject, size: NSSize, veil_kind: FrostVeil) {
+    if let FrostVeil::Flat(alpha) = veil_kind {
+        if alpha <= 0.0 {
+            return;
+        }
+    }
+    if crate::theme::resolved_is_dark() || parent.is_null() {
         return;
     }
-    let veil: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let veil: *mut AnyObject = msg_send![frost_veil_view_class(), alloc];
     let veil: *mut AnyObject =
         msg_send![veil, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)];
     let _: () = msg_send![veil, setTag: FLOOR_VEIL_TAG];
     let _: () = msg_send![veil, setWantsLayer: true];
     let veil_layer: *mut AnyObject = msg_send![veil, layer];
     if !veil_layer.is_null() {
-        layer_set_background(veil_layer, hex_to_cg_color(floor_veil_hex(alpha)));
+        match veil_kind {
+            FrostVeil::Flat(alpha) => {
+                layer_set_background(veil_layer, hex_to_cg_color(floor_veil_hex(alpha)));
+            }
+            FrostVeil::Gradient => install_veil_gradient(veil_layer, size),
+        }
     }
     let _: () = msg_send![veil, setAutoresizingMask: 18u64];
     // `NSWindowBelow` (raw -1) with a nil sibling puts the veil under everything the parent already holds --
@@ -1662,7 +1795,137 @@ unsafe fn install_floor_veil(parent: *mut AnyObject, size: NSSize, alpha: f64) {
         relativeTo: std::ptr::null_mut::<AnyObject>()
     ];
     release_obj(veil); // the parent owns it
-    crate::log_debug!("[glass] floor veil installed on the frost: alpha={alpha:.2}");
+    match veil_kind {
+        FrostVeil::Flat(alpha) => {
+            crate::log_debug!("[glass] floor veil installed on the frost: veil=flat({alpha:.2})")
+        }
+        FrostVeil::Gradient => {
+            crate::log_debug!("[glass] floor veil installed on the frost: veil=gradient")
+        }
+    }
+}
+
+/// The gradient veil: a `CAGradientLayer` filling the tagged veil view, sized to it and following its
+/// resizes (the panels resize animatedly, so a fixed frame would go stale mid-animation). The mock's
+/// `linear-gradient(148deg, ...)` stops and direction are `FROST_VEIL_STOPS` /
+/// `frost_veil_gradient_points` -- values copied from the design sheet, not re-measured.
+unsafe fn install_veil_gradient(veil_layer: *mut AnyObject, size: NSSize) {
+    let gradient: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
+    if gradient.is_null() {
+        return;
+    }
+    let _: () = msg_send![
+        gradient,
+        setFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)
+    ];
+    // kCALayerWidthSizable | kCALayerHeightSizable: follow the veil view's resizes.
+    let _: () = msg_send![gradient, setAutoresizingMask: 18u32];
+    let cg_colors = [
+        hex_to_cg_color(FROST_VEIL_STOPS[0].0),
+        hex_to_cg_color(FROST_VEIL_STOPS[1].0),
+        hex_to_cg_color(FROST_VEIL_STOPS[2].0),
+    ];
+    // A CFArray with the type callbacks retains the CGColorRefs (they come from autoreleased
+    // NSColors); NSArray and CFArray are toll-free bridged, so the layer accepts it directly.
+    let colors = crate::ffi::CFArrayCreate(
+        std::ptr::null(),
+        cg_colors.as_ptr() as *const *const c_void,
+        cg_colors.len() as isize,
+        &crate::ffi::kCFTypeArrayCallBacks as *const c_void,
+    );
+    if colors.is_null() {
+        // `+layer` is autoreleased (+0): releasing it here would over-release on the pool drain.
+        return;
+    }
+    let _: () = msg_send![gradient, setColors: colors as *mut AnyObject];
+    crate::ffi::CFRelease(colors);
+    let location_values: [*mut AnyObject; 3] = [
+        msg_send![class!(NSNumber), numberWithDouble: FROST_VEIL_STOPS[0].1],
+        msg_send![class!(NSNumber), numberWithDouble: FROST_VEIL_STOPS[1].1],
+        msg_send![class!(NSNumber), numberWithDouble: FROST_VEIL_STOPS[2].1],
+    ];
+    let locations: *mut AnyObject = msg_send![class!(NSArray), alloc];
+    let locations: *mut AnyObject = msg_send![
+        locations,
+        initWithObjects: location_values.as_ptr(),
+        count: location_values.len()
+    ];
+    let _: () = msg_send![gradient, setLocations: locations];
+    release_obj(locations);
+    let (start, end) = frost_veil_gradient_points(size);
+    let _: () = msg_send![gradient, setStartPoint: start];
+    let _: () = msg_send![gradient, setEndPoint: end];
+    let _: () = msg_send![veil_layer, addSublayer: gradient];
+}
+
+/// The veil view's class: an `NSImageView` (keeps `tag`/`viewWithTag:` working) plus a `layout` that
+/// re-points the gradient at the current size. The gradient line is size-dependent (the CSS rule in
+/// `frost_veil_gradient_points`), and the veil view itself resizes with the panel via autoresizing,
+/// so the points set at install would be right for one frame only.
+fn frost_veil_view_class_handle() -> crate::ffi::StaticClass {
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabFrostVeilView", || {
+        crate::ffi::build_class(
+            c"OhMyTabFrostVeilView",
+            class!(NSImageView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(layout),
+                    frost_veil_layout as unsafe extern "C" fn(*mut AnyObject, Sel),
+                );
+            },
+        )
+    })
+}
+
+fn frost_veil_view_class() -> *mut AnyObject {
+    frost_veil_view_class_handle().0 as *mut AnyObject
+}
+
+extern "C" fn frost_veil_layout(this: *mut AnyObject, _cmd: Sel) {
+    unsafe {
+        // NSImageView's own layout runs first; the defined class is this subclass (see ObjcSuper).
+        type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> ();
+        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+            this as *mut c_void,
+            frost_veil_view_class_handle(),
+        );
+        let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+        send(&mut sup, sel!(layout));
+        sync_veil_gradient_points(this);
+    }
+}
+
+/// Re-point the veil's gradient sublayer at the view's current size. `CATransaction` actions are
+/// disabled so an animated panel resize does not animate the gradient's direction with it.
+unsafe fn sync_veil_gradient_points(veil: *mut AnyObject) {
+    let layer: *mut AnyObject = msg_send![veil, layer];
+    if layer.is_null() {
+        return;
+    }
+    let Some(gradient_class) = AnyClass::get(c"CAGradientLayer") else {
+        return;
+    };
+    let sublayers: *mut AnyObject = msg_send![layer, sublayers];
+    if sublayers.is_null() {
+        return;
+    }
+    let count: usize = msg_send![sublayers, count];
+    for index in 0..count {
+        let sublayer: *mut AnyObject = msg_send![sublayers, objectAtIndex: index as isize];
+        let is_gradient: bool = msg_send![sublayer, isKindOfClass: gradient_class];
+        if !is_gradient {
+            continue;
+        }
+        let bounds: NSRect = msg_send![veil, bounds];
+        let (start, end) = frost_veil_gradient_points(bounds.size);
+        let _: () = msg_send![class!(CATransaction), begin];
+        let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+        let _: () = msg_send![sublayer, setStartPoint: start];
+        let _: () = msg_send![sublayer, setEndPoint: end];
+        let _: () = msg_send![class!(CATransaction), commit];
+        return;
+    }
 }
 
 /// Add or drop the floor veil so it matches the *resolved* theme on a hierarchy that is already up.
@@ -1700,11 +1963,13 @@ unsafe fn sync_floor_veil(parent: *mut AnyObject) {
         return;
     }
     let existing: *mut AnyObject = msg_send![parent, viewWithTag: FLOOR_VEIL_TAG];
-    let alpha = crate::config::effective_glass_floor();
-    if !crate::theme::resolved_is_dark() && alpha > 0.0 {
+    let veil = effective_frost_veil();
+    let wanted = !crate::theme::resolved_is_dark()
+        && !matches!(veil, FrostVeil::Flat(alpha) if alpha <= 0.0);
+    if wanted {
         if existing.is_null() {
             let frame: NSRect = msg_send![parent, frame];
-            install_floor_veil(parent, frame.size, alpha);
+            install_floor_veil(parent, frame.size, veil);
         }
     } else if !existing.is_null() {
         let _: () = msg_send![existing, removeFromSuperview];
@@ -1717,9 +1982,11 @@ unsafe fn sync_floor_veil(parent: *mut AnyObject) {
 #[cfg(test)]
 mod tests {
     use super::{
-        carries_over, floor_veil_hex, glass_style_index, parse_dev_outline,
-        resolved_glass_tint_hex, DevOutline, PanelMaterial,
+        carries_over, floor_veil_hex, frost_veil_gradient_points, glass_style_index,
+        panel_outline_color, parse_dev_outline, resolved_glass_tint_hex, DevOutline, PanelMaterial,
+        CLIPBOARD_PANEL_RADIUS, FROST_FLOOR_ALPHA, FROST_VEIL_STOPS,
     };
+    use objc2_foundation::NSSize;
     use std::time::Duration;
 
     /// The outline switch decides whether the A2 measurement has a counter-example frame at all, so an
@@ -1745,11 +2012,118 @@ mod tests {
         assert_eq!(parse_dev_outline(""), None);
     }
 
-    /// The tint must not decide lightness: a tint that is far too light for dark mode (or too
-    /// dark for light mode) has to be re-lit into the range the palette's contrast table assumes,
-    /// while keeping the hue the user picked. Measured on the real panel, a tint resolved this
-    /// way lands the dark surface at (30,30,31) and the light one at (249,249,249) -- both clear
-    /// every floor in design-style §3.3, which the historical `eeeeee66` default did not in
+    /// The frost outline is the bright glass rim, and every other material that draws one keeps
+    /// `card_border` -- a flat stroke on frost read as a drawn rectangle.
+    #[test]
+    fn the_panel_outline_token_follows_the_material() {
+        for dark in [false, true] {
+            let palette = crate::theme::ui_palette_for_mode(dark);
+            assert_eq!(
+                panel_outline_color(PanelMaterial::Frost, &palette),
+                palette.glass_rim
+            );
+            for material in [
+                PanelMaterial::Opaque,
+                PanelMaterial::Backdrop,
+                PanelMaterial::LiquidGlass,
+            ] {
+                assert_eq!(panel_outline_color(material, &palette), palette.card_border);
+            }
+        }
+    }
+
+    /// The gradient stops are the mock's `linear-gradient(148deg, ...)` verbatim: alphas .58/.33/.42,
+    /// locations 0/.46/1, and the warm third stop rgba(255,249,241,.42). Values copied from the design
+    /// sheet, not re-measured.
+    #[test]
+    fn frost_veil_gradient_stops_follow_the_mock() {
+        let expected_alphas = [0.58, 0.33, 0.42];
+        let expected_locations = [0.0, 0.46, 1.0];
+        for (index, (hex, location)) in FROST_VEIL_STOPS.iter().enumerate() {
+            let alpha = f64::from(hex & 0xFF) / 255.0;
+            assert!(
+                (alpha - expected_alphas[index]).abs() < 0.005,
+                "stop {index} alpha {alpha} is not the mock's {}",
+                expected_alphas[index]
+            );
+            assert_eq!(*location, expected_locations[index]);
+        }
+        let third = FROST_VEIL_STOPS[2].0;
+        assert_eq!((third >> 24) & 0xFF, 255);
+        assert_eq!((third >> 16) & 0xFF, 249);
+        assert_eq!((third >> 8) & 0xFF, 241);
+    }
+
+    /// On a square the CSS rule gives the line length |sin|+|cos| = 1.378, so the endpoints sit
+    /// outside [0,1]: start (0.135, 1.084) -> end (0.865, -0.084) in CA's y-up unit space. The
+    /// regression this pins is the flip: the 0% stop -- the brightest white -- must be the one
+    /// above the TOP edge (start.y > 1), not the bottom.
+    #[test]
+    fn frost_veil_gradient_is_css_148deg_on_a_square() {
+        let (start, end) = frost_veil_gradient_points(NSSize::new(1.0, 1.0));
+        assert!((start.x - 0.135).abs() < 1e-3, "start.x={}", start.x);
+        assert!((start.y - 1.084).abs() < 1e-3, "start.y={}", start.y);
+        assert!((end.x - 0.865).abs() < 1e-3, "end.x={}", end.x);
+        assert!((end.y - (-0.084)).abs() < 1e-3, "end.y={}", end.y);
+        assert!(
+            start.y > end.y,
+            "the 0% stop must sit toward the top edge (brightest white up)"
+        );
+        assert!(start.x < end.x, "the gradient runs left to right");
+    }
+
+    /// CAGradientLayer points are unit-space, so the angle is only 148deg when the line is computed
+    /// for the panel's own size -- a fixed pair would render ~100deg on the 560x54 keystroke panel.
+    /// Convert the unit points back to physical pixels (x*w, flip y) and check both the angle and
+    /// the CSS line length |w*sin| + |h*cos|.
+    #[test]
+    fn frost_veil_gradient_holds_148deg_on_wide_and_tall_panels() {
+        let theta = 148.0f64.to_radians();
+        for (w, h) in [(560.0, 54.0), (54.0, 560.0), (640.0, 580.0), (1.0, 1.0)] {
+            let (start, end) = frost_veil_gradient_points(NSSize::new(w, h));
+            // Back to physical CSS coordinates (y down).
+            let (sx, sy) = (start.x * w, (1.0 - start.y) * h);
+            let (ex, ey) = (end.x * w, (1.0 - end.y) * h);
+            let (dx, dy) = (ex - sx, ey - sy);
+            let angle = dx.atan2(-dy).to_degrees();
+            assert!(
+                (angle - 148.0).abs() < 0.5,
+                "{w}x{h}: angle {angle:.2} is not 148deg"
+            );
+            let expected = (w * theta.sin()).abs() + (h * theta.cos()).abs();
+            let length = (dx * dx + dy * dy).sqrt();
+            assert!(
+                (length - expected).abs() < 1e-6,
+                "{w}x{h}: line length {length} is not the CSS {expected}"
+            );
+        }
+    }
+
+    /// The gradient replaces the flat floor, so its average lift has to sit at the level the flat
+    /// floor was tuned to: the piecewise-linear mean alpha over [0,1] must stay within 0.03 of
+    /// `FROST_FLOOR_ALPHA` (it computes to ~0.41).
+    #[test]
+    fn the_gradient_veil_averages_near_the_flat_floor() {
+        let mut mean = 0.0;
+        for pair in FROST_VEIL_STOPS.windows(2) {
+            let (a0, x0) = pair[0];
+            let (a1, x1) = pair[1];
+            let alpha0 = f64::from(a0 & 0xFF) / 255.0;
+            let alpha1 = f64::from(a1 & 0xFF) / 255.0;
+            mean += (alpha0 + alpha1) / 2.0 * (x1 - x0);
+        }
+        assert!(
+            (mean - FROST_FLOOR_ALPHA).abs() < 0.03,
+            "gradient mean alpha {mean:.3} is not near the flat floor {FROST_FLOOR_ALPHA}"
+        );
+    }
+
+    /// `rounded_effect_mask` clamps the radius to `SIDE / 2 - 1` = 63; a panel radius beyond that
+    /// would silently lose its shape, so the largest one must fit.
+    #[test]
+    fn the_largest_panel_radius_fits_the_effect_mask() {
+        assert!(CLIPBOARD_PANEL_RADIUS <= 128.0 / 2.0 - 1.0);
+    }
 
     /// The tint is per mode: light keeps the shipped value, dark takes the measured dark one. Both
     /// numbers are pinned so a later "adjustment" has to face the measurement that produced them.

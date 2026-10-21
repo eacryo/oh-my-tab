@@ -72,7 +72,7 @@ unsafe fn pattern_image(size: NSSize, scale: f64) -> *mut AnyObject {
         space,
         BITMAP_PREMULTIPLIED_LAST,
     );
-    CFRelease(space as *const c_void);
+    CFRelease(space);
     if context.is_null() {
         return std::ptr::null_mut();
     }

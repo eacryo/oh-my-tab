@@ -365,6 +365,12 @@ extern "C" fn on_dev_show_clipboard(_this: *mut c_void, _cmd: Sel, _sender: *mut
     });
 }
 
+extern "C" fn on_dev_show_clipboard_detail(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    callback_guard::void("on_dev_show_clipboard_detail", || {
+        crate::clipboard::show_picker_detail_for_development();
+    });
+}
+
 pub(crate) fn schedule_dev_blank_text(delay: std::time::Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(delay);
@@ -1732,6 +1738,12 @@ fn controller_class() -> StaticClass {
         );
         class_addMethod(
             cls,
+            sel!(handleDevShowClipboardDetail:),
+            on_dev_show_clipboard_detail as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handlePermissionRestartRequired:),
             restart::on_permission_restart_required as *mut c_void,
             types_v_obj.as_ptr(),
@@ -1938,6 +1950,8 @@ fn menu_target_class() -> StaticClass {
                 name.to_string_lossy()
             );
             let types = CString::new("v@:@").unwrap();
+            // NSControlTextDidEndEditingNotification asks its observer for a BOOL.
+            let edit_end_types = CString::new("B@:@").unwrap();
             class_addMethod(
                 cls,
                 sel!(handleQuit:),
@@ -2295,6 +2309,31 @@ fn menu_target_class() -> StaticClass {
                 sel!(handleRecordingCancelled:),
                 handle_recording_cancelled as *mut c_void,
                 types.as_ptr(),
+            );
+            // The sidebar search field's notifications and clear chip.
+            for (selector, implementation) in [
+                (
+                    sel!(handleSettingsSearchChanged:),
+                    handle_settings_search_changed as *mut c_void,
+                ),
+                (
+                    sel!(handleSettingsSearchBeganEditing:),
+                    handle_settings_search_began_editing as *mut c_void,
+                ),
+                (
+                    sel!(handleSettingsSearchClear:),
+                    handle_settings_search_clear as *mut c_void,
+                ),
+            ] {
+                class_addMethod(cls, selector, implementation, types.as_ptr());
+            }
+            // NSControlTextDidEndEditingNotification asks the observer for a BOOL, so it needs its
+            // own encoding and callback signature.
+            class_addMethod(
+                cls,
+                sel!(handleSettingsSearchEndedEditing:),
+                handle_settings_search_ended_editing as *mut c_void,
+                edit_end_types.as_ptr(),
             );
             objc_registerClassPair(cls);
             StaticClass::defining(cls)
@@ -2841,6 +2880,7 @@ pub fn run() {
             || arg == "--smoke-overlay"
             || arg == "--smoke-keystroke-display-panel"
             || arg == "--smoke-settings-layout"
+            || arg == "--smoke-settings-vertical-zoom"
             || arg == "--smoke-settings-state-sync"
             || arg == "--smoke-settings-collapsible-row"
             || arg == "--smoke-settings-mouse-profile-callback"
@@ -3447,13 +3487,26 @@ pub fn run() {
     // so it is exercised through the summon path above when both flags are given. Run alone, it
     // reports that it needs the window rather than silently passing.
     if std::env::args().any(|a| a == "--smoke-panel-keys") {
-        eprintln!("[smoke-panel-keys] needs the overlay window: run with --smoke-overlay --smoke-panel-keys");
+        eprintln!(
+            "[smoke-panel-keys] needs the overlay window: run with --smoke-overlay --smoke-panel-keys"
+        );
         std::process::exit(1);
     }
 
     // Settings layout smoke entry: open and traverse all eight pages on the real NSApplication
     // main thread so the runtime layout validator checks the final AppKit view tree. Requires a
     // GUI session; a panic/non-zero exit reports a failure.
+    if crate::dev_flags::present("smoke-settings-vertical-zoom") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        std::process::exit(if settings::settings_vertical_zoom_smoke_runner() {
+            0
+        } else {
+            1
+        });
+    }
     if std::env::args().any(|a| a == "--smoke-settings-layout") {
         unsafe {
             // The layout validator recognizes `--smoke-settings-layout` on its own; nothing is

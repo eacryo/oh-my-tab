@@ -60,42 +60,56 @@ auxiliary panels). Never inline a hex value in a view builder.
 
 | Token | Light | Dark | Used for |
 | --- | --- | --- | --- |
-| `window_bg` | `#F6F7F9` | `#1C1C1E` | Window / detail pane background |
-| `detail_bg` | `#F6F7F9` | `#1C1C1E` | Settings detail pane |
-| `sidebar_bg` | `#F1F2F4` | `#242426` | Sidebar column |
-| `sidebar_text` | `#68686F` | `#9E9EA6` | Sidebar item labels |
-| `card_bg` | `#FFFFFF` | `#2C2C2E` | Cards, grouped rows, popover panels |
-| `card_border` | `rgba(0,0,0,.10)` | `rgba(255,255,255,.10)` | Card and container outline; controls currently reuse it (see §3.3) |
-| `separator` | `rgba(0,0,0,.07)` | `rgba(255,255,255,.09)` | Row dividers inside a card |
-| `field_bg` | `rgba(118,118,128,.10)` | `rgba(255,255,255,.07)` | Text fields, read-only value boxes |
+| `window_bg` | `#ECECEC` | `#121215` | Window / detail pane background |
+| `detail_bg` | `#ECECEC` | `#121215` | Settings detail pane |
+| `sidebar_bg` | `#F5F5F5` | `#17171B` | Sidebar column |
+| `sidebar_text` | `#6B6862` | `#9E9EA6` | Sidebar item labels |
+| `card_bg` | `#F9F9F9` | `#1F1F24` | Cards, grouped rows, popover panels. The sheet's card is translucent; this is the composited opaque value (note below) |
+| `card_border` | `rgba(45,40,36,.10)` | `rgba(255,255,255,.09)` | Card and container outline; controls currently reuse it (see §3.3) |
+| `separator` | `rgba(45,40,36,.07)` | `rgba(255,255,255,.06)` | Row dividers inside a card |
+| `field_bg` | `rgba(60,52,46,.055)` | `rgba(255,255,255,.055)` | Text fields, read-only value boxes |
 | `button_bg` | `#FFFFFF` | `#2C2C2E` | Secondary settings actions |
 | `button_text` | `#2C2C30` | `#F5F5F7` | Text on secondary settings actions |
 | `footer_button_bg` | `#FFFFFF` | `#2C2C2E` | Settings footer actions |
-| `text_primary` | `#2C2C30` | `#F5F5F7` | Row labels, values, card titles |
-| `text_secondary` | `#4A4A52` | `#C7C7CC` | Section headers, descriptions, links' labels |
-| `text_muted` | `#68686F` | `#9E9EA6` | Version strings, subtitles, empty-state text |
-| `text_disabled` | `#9B9BA2` | `#7C7C84` | Disabled control labels |
+| `text_primary` | `#1D1C1A` | `#F4F4F5` | Row labels, values, card titles |
+| `text_secondary` | `#4F4C48` | `#C7C7CC` | Section headers, descriptions, links' labels |
+| `text_muted` | `#6B6862` | `#9E9EA6` | Version strings, subtitles, empty-state text |
+| `text_disabled` | `#7E7B83` | `#7C7C84` | Disabled control labels |
 | `scroll_indicator` | `rgba(0,0,0,.35)` | `rgba(255,255,255,.35)` | Custom scrollbar knobs |
-| `accent` | `#0A84FF` | `#0A84FF` | Switches, sliders, primary action, selection ring |
-| `accent_hover` | `#0077ED` | `#3D9BFF` | Pressed/hover state of the accent |
-| `link_text` | `#0068D6` | `#409CFF` | Link-colored body text (clipboard URL rows and their detail view, settings external links) |
-| `link_text_hover` | `#0058B8` | `#66ADFF` | Hover state of link text (settings external links) |
-| `destructive` | `#FF3B30` | `#FF453A` | Destructive actions and destructive-confirmation UI |
+| `accent` | `#2F6FED` | `#5B9BFF` | Switches, sliders, primary action, selection ring |
+| `accent_hover` | `#1F5CDA` | `#7DB2FF` | Pressed/hover state of the accent |
+| `link_text` | `#1F5CDA` | `#409CFF` | Link-colored body text (clipboard URL rows and their detail view, settings external links) |
+| `link_text_hover` | `#17439F` | `#66ADFF` | Hover state of link text (settings external links) |
+| `destructive` | `#FF3B30` | `#F53B30` | Destructive actions and destructive-confirmation UI |
 | `destructive_hover` | `#D70015` | `#D93630` | Hover state for destructive actions |
 | `symbol_shadow` | `rgba(0,0,0,.70)` | `rgba(0,0,0,.70)` | Visibility glyph shadow over arbitrary thumbnails |
 | `badge_scrim` | `rgba(0,0,0,.55)` | `rgba(0,0,0,.55)` | Circular chip behind overlay thumbnail corner badges |
-| `accent_text` | `#FFFFFF` | `#FFFFFF` | Text on accent and destructive fills |
+| `accent_text` | `#FFFFFF` | `#FFFFFF` | Text on the destructive fill, the badge scrim and the close chip — not used on accent fills any more |
+| `accent_ink` | `#FFFFFF` | `#08111F` | Ink on an accent fill (primary button, active accent chips) |
 | `keycap_accent_bg` | `rgba(10,132,255,.22)` | `rgba(10,132,255,.22)` | Modifier and indicator keycaps |
 | `keycap_accent_border` | `rgba(10,132,255,.69)` | `rgba(10,132,255,.69)` | Modifier and indicator keycap outline |
 | `keycap_accent_text` | `#2C2C30` | `#F8F9FA` | Modifier and indicator keycap text |
 | `switch_on_disabled_track` | `rgba(10,132,255,.45)` | `rgba(10,132,255,.45)` | Disabled on-state switch track |
-| `switch_off_track` | `#C7C7CC` | `#636366` | Off-state switch track |
+| `switch_off_track` | `rgba(60,52,46,.20)` | `rgba(255,255,255,.17)` | Off-state switch track |
 | `switch_off_disabled_track` | `rgba(199,199,204,.45)` | `rgba(99,99,102,.45)` | Disabled off-state switch track |
 | `switch_knob` | `rgba(255,255,255,.96)` | `rgba(245,245,247,.96)` | Switch knob |
-| `selection_bg` | `rgba(10,132,255,.08)` | `rgba(10,132,255,.22)` | Selected sidebar row, selected list tile |
-| `selection_plate_bg` | `rgba(10,132,255,.22)` | `rgba(10,132,255,.30)` | The switcher's icon plate. Heavier than a row wash because it carries a whole icon on translucent glass, where `.08` reads as nothing |
-| `hover_bg` | `rgba(118,118,128,.12)` | `rgba(255,255,255,.10)` | Hovered row / list item |
+| `selection_bg` | `rgba(47,111,237,.102)` | `rgba(91,155,255,.141)` | Selected list tile and pressed/hover indicator washes |
+| `nav_active_bg` | `#D7E3F8` | `#2A4A7D` | Selected sidebar row fill (mock `.nav-item.active`; copied from the mock, not re-measured) |
+| `nav_active_ink` | `#173A6B` | `#F4F4F5` | Icon and label on `nav_active_bg` |
+| `selection_plate_bg` | `rgba(47,111,237,.278)` | `rgba(91,155,255,.278)` | The switcher's icon plate. Heavier than a row wash because it carries a whole icon on translucent glass, where the row wash reads as nothing |
+| `hover_bg` | `rgba(118,118,128,.12)` | `rgba(255,255,255,.102)` | Hovered row / list item |
 | `shadow` | `rgba(0,0,0,.06)` | `rgba(0,0,0,.35)` | Elevation shadows (see §7) |
+
+**The sheet's translucent surfaces are stored composited.** The design sheet paints the light card as
+`rgba(255,255,255,.66)` over the page and the dark card as `rgba(32,32,37,.92)` over its page. The
+palette keeps the composited opaque values (`#F9F9F9` / `#1F1F24`) on purpose, because some consumers
+(the keycap chips) must be a real fill rather than a wash. Two sheet values did not clear this
+document's floors after the page moved to `#ECECEC`, so the shipped tokens are one step away from the
+sheet: the sheet's muted `#706D68` computes to **4.36:1** on the new page, under §3.3's 4.5:1 floor, so
+`text_muted` / `sidebar_text` ship `#6B6862` (computed **4.70:1**); the sheet's disabled grey `#9B9BA2`
+was recorded at **2.34:1** and its first fix `#93909A` at 2.65:1, both under the 3.5:1 hard floor, so
+`text_disabled` ships `#7E7B83` (computed **3.52:1** on `window_bg`, **3.95:1** on `card_bg`). These
+are WCAG-formula values over opaque tokens, not rendered-pixel measurements.
 
 Status colors (`success`, `warning`, `error`) are semantic, not decorative: use them for status
 text/icons and permission state only, never to label a category. Permission-granted text is
@@ -107,9 +121,11 @@ success-green; permission-missing text is warning/error — never the accent.
 | `warning_text` | `#A63D0A` | `#FF9F0A` |
 | `error_text` | `#B42318` | `#FF6961` |
 
-Against `window_bg`, measured contrast is respectively 6.12:1 / 8.42:1, 5.95:1 / 8.28:1, and
-6.13:1 / 6.03:1. The keycap accent text over its chip -- the accent fill flattened onto `card_bg`, so
-the chip is opaque -- measures 10.61:1 in light mode and 10.22:1 in dark mode.
+Against `window_bg`, the **previous palette's** measured contrast is respectively 6.12:1 / 8.42:1,
+5.95:1 / 8.28:1, and 6.13:1 / 6.03:1; the keycap accent text over its chip -- the accent fill
+flattened onto `card_bg`, so the chip is opaque -- measured 10.61:1 in light mode and 10.22:1 in dark
+mode on that palette too. Both are **old measurements / not re-measured**: the pages, cards and chip
+fills in §3.1 all changed with the design-sheet palette.
 
 ### 3.2 Surface hierarchy
 
@@ -121,29 +137,47 @@ a card, not a differently-shaded window.
 
 Measured with the composited (post-alpha) color against the surface the element actually sits on.
 
+**Table provenance: old measurement / not re-measured.** Every ratio in the table below was measured
+against the palette that preceded the design-sheet migration. `window_bg`, `card_bg`, the text greys
+and the control colors all changed in §3.1, and no rendered-pixel re-measurement of the new tokens has
+been recorded, so the numbers are the historical record, not a statement about the current values.
+Current-token values that can be computed exactly from the tokens (WCAG formula, **not** a pixel
+measurement) are: accent `#2F6FED` 4.32:1 on `card_bg` / 3.85:1 on `window_bg`, muted `#6B6862`
+4.70:1 on `window_bg`, disabled `#7E7B83` 3.52:1, primary `#1D1C1A` 14.41:1, secondary `#4F4C48`
+7.23:1. Re-measure a cell before quoting it as current.
+
 **Text**
 
-| Role | Minimum | Measured, light | Measured, dark |
+| Role | Minimum | Measured, light (previous palette) | Measured, dark (previous palette) |
 | --- | --- | --- | --- |
 | `text_primary` | 12:1 | 12.97:1 on `window_bg` | 15.63:1 |
 | `text_secondary` | 7:1 | 8.19:1 on `window_bg` | 10.10:1 |
 | `text_muted` | 4.5:1 | 5.16:1 on `window_bg`, 5.53:1 on `card_bg` | 6.40:1 / 5.24:1 |
 | `link_text` | 4.5:1 | 4.96:1 on `window_bg`, 5.31:1 on `card_bg` | 6.01:1 / 4.92:1 |
 | `link_text_hover` | 4.5:1 | 6.34:1 on `window_bg`, 6.80:1 on `card_bg` | 7.28:1 / 5.96:1 |
-| `text_disabled` | 2.5:1 | 2.58:1 on `window_bg`, 2.76:1 on `card_bg` | 4.11:1 / 3.37:1 |
+| `text_disabled` | 3.5:1 | 2.58:1 on `window_bg`, 2.76:1 on `card_bg` | 4.11:1 / 3.37:1 |
 
-Text on a *floating* panel's keycap is a recorded class of its own (`primary ≥8:1`, `muted ≥3.25:1`),
+**Hard floor 3.5:1.** The minimums above are the targets each role is designed to. A role may
+deviate below its target when the design sheet requires it, if the deviation is written here with
+its computed ratio — but no text or meaning-carrying glyph ships under 3.5:1 in either mode.
+Clause 2 boundaries keep their own 1.2:1 rule. `accent_ink` on `accent` is such a deviation
+(computed, not pixel-measured): **4.55:1** light normal, **5.83:1** light hover, **6.82:1** dark
+normal, **8.72:1** dark hover. Two pairings that could not clear the floor were re-tokened rather
+than documented as exceptions: `text_disabled` light `#7E7B83` computes **3.52:1** on `window_bg`
+and **3.95:1** on `card_bg`; white `accent_text` on dark `destructive` `#F53B30` computes
+**3.78:1** (the red as *text* on the dark surfaces stays at 4.94:1 / 4.34:1).
+
+Text on a *floating* panel's keycap is a recorded class of its own (`primary ≥8:1`, `muted ≥3.5:1`),
 because that surface is a chip the panel draws, not `window_bg` or `card_bg` — see the keystroke
 display in §9.
 
 `text_primary` has the smallest margin in the palette. Re-measure it whenever the primary color or
 `window_bg` changes; do not darken it for its own sake.
 
-The selected sidebar item's title keeps `accent` over its `selection_bg` wash: the blue names the
-selected state together with the wash, the row's position, and the icon tint. It is state text, not
-reading text -- like `text_disabled` it is held to 2.5:1 instead of 4.5:1 (measured 2.97:1 light /
-3.24:1 dark on the composited wash). Link-colored text never takes this exception: it always uses
-`link_text` / `link_text_hover`.
+The selected sidebar item is the mock's flat nav tint (`nav_active_bg`) with its own ink
+(`nav_active_ink`): an opaque pairing, held to the 3.5:1 hard floor (computed, not
+pixel-measured: **5.30:1** light, **4.92:1** dark). Link-colored text never takes a state
+exception: it always uses `link_text` / `link_text_hover`.
 
 `scroll_indicator` carries no meaning on its own, so it is not held to a text floor, but it must
 stay on the visible side of the surface in both modes: darker than a light panel, lighter than a
@@ -156,14 +190,16 @@ Two clauses, because they answer different questions.
 
 1. **State carried by color alone — floor 3:1.** Focus rings, selection rings, status dots, error and
    warning outlines, and any indicator whose meaning is lost when the color is removed. The accent is
-   `#0A84FF`: **3.65:1** on `card_bg`, 3.40:1 on `window_bg`. A new state indicator is measured before
-   it ships.
+   `#2F6FED`: **4.32:1** on `card_bg`, **3.85:1** on `window_bg` -- computed from the current tokens
+   (WCAG formula, not a rendered-pixel measurement). It replaced `#0A84FF`, which measured 3.65:1 /
+   3.40:1 on the previous greys. A new state indicator is measured before it ships.
 2. **Structural boundaries — floor 1.2:1, documented deviation.** Card outlines, control outlines,
    dividers and the switch track reinforce information that fill, shape, position and label already
    carry. They sit below WCAG 1.4.11's 3:1 on purpose: a 3:1 outline on `card_bg` requires
-   `rgba(0,0,0,.42)`, i.e. `#949494`, which reads as a heavy, non-native border. Measured:
-   `card_border` **1.25:1** on `card_bg`; switch off-track `#C7C7CC` (light) **1.68:1**, `#636366`
-   (dark) **2.33:1**.
+   `rgba(0,0,0,.42)`, i.e. `#949494`, which reads as a heavy, non-native border. Measured on the
+   **previous palette** (**old measurement / not re-measured**): `card_border` **1.25:1** on
+   `card_bg`; switch off-track `#C7C7CC` (light) **1.68:1**, `#636366` (dark) **2.33:1**. Both tokens
+   are now translucent washes (§3.1), so these numbers no longer describe the shipped colors.
 
    The deviation holds only while the boundary is **not the sole identifier** of the control. If a
    control would be unrecognizable without its outline — no fill, no label, no shape, no adjacent
@@ -178,8 +214,24 @@ not by its alpha.
 
 ### 3.4 Translucency
 
+The clipboard options menu follows `clipboard-v2-1.html`: an opaque warm fallback
+surface prevents underlying list controls from showing through sharply. Its owning tokens are
+`POPOVER_*`, `popover_muted`, `popover_danger` and `popover_hover_bg` in `src/clipboard.rs`.
+The menu deliberately uses the reference's compact text size and inner row radius rather than
+the general type ladder and concentric rule. Counts and checks occupy separate trailing columns;
+settings shortcuts and clear-action hints align to the trailing edge. Dark mode uses semantic
+palette colors. Reproduce the reference metrics with
+`sed -n '831,965p' /Users/ceres/Downloads/clipboard-v2-1.html` and inspect the shipped tokens with
+`rg -n 'POPOVER_|fn popover_' src/clipboard.rs`.
+
 Window and card backgrounds may be translucent so the desktop shows through the glass. The settings
-sidebar uses an opaque `sidebar_bg` surface so its color remains stable. **Text-bearing surfaces must
+sidebar uses an opaque `sidebar_bg` surface so its color remains stable, and the settings title bar band
+is an opaque `window_bg` strip over the sidebar's part with a `separator` hairline under it (the mock's
+`.settings-titlebar`: `background: var(--panel-solid); border-bottom: 1px solid var(--settings-divider)`).
+Over the detail pane the band paints nothing: the root surface (`window_bg`) already is that strip, so the
+band is not double-painted.
+
+**Text-bearing surfaces must
 remain opaque enough that the contrast table above still holds on the worst-case backdrop**. The
 overlay's glass is the exception: it is a transient surface over arbitrary content, and its text
 colors are chosen for the darkest and lightest backdrops it can ever cover.
@@ -190,23 +242,33 @@ The floating panels (switcher, clipboard, keystroke display) offer three materia
 | Material | Surface | Notes |
 | --- | --- | --- |
 | `liquid-glass` (default) | `NSGlassEffectView`, `glass_style` sub-option | Degrades to frost on macOS < 26 |
-| `frost` | `NSVisualEffectView`, behind-window, a material pinned per mode (legacy `light` in light, `ultraDark` in dark); it paints no surface of its own | Neutral system blur; the glass sub-options do not apply |
+| `frost` | `NSVisualEffectView`, behind-window, a material pinned per mode (`hudWindow` 13 in light, legacy `ultraDark` 9 in dark); it paints no surface of its own | Neutral system blur; the glass sub-options do not apply |
 | `opaque` | `window_bg` fill, no blur | Also the forced fallback while the system's Reduce Transparency accessibility setting is on |
 
 Material only ever changes which surface sits behind the panel content — text colors, spacing,
 radius, and the palette remain exactly as specified here.
 
 **The frost's light-mode brightness floor.** Frost composites the desktop through itself, so its own
-surface follows the backdrop: over a dark desktop it lands in the mid-luminance band, where `accent`
-(`#0A84FF`, WCAG relative luminance 0.238) sits — a selection rim drawn on such a surface measures ~1:1
-against it. So in light mode a flat white veil (`glass::FROST_FLOOR_ALPHA`, currently `0.4`, tunable with
-`--glass-floor`) is laid over the frost and under the panel's content. Its cost is one-for-one and stated
-rather than hidden: the desktop keeps `(1 - alpha)` of its visible contrast, so `0.4` keeps 60% of it. The scope
+surface follows the backdrop: over a dark desktop it lands in the mid-luminance band, where light-mode
+`accent` (`#2F6FED`, WCAG relative luminance 0.18) sits — a selection rim drawn on such a surface
+measures ~1:1 against it. So in light mode a veil is laid over the frost and under the panel's
+content: the mock's gradient (`glass::FROST_VEIL_STOPS` — `rgba(255,255,255,.58)` at 0%,
+`rgba(255,255,255,.33)` at 46%, `rgba(255,249,241,.42)` at 100%, along CSS 148deg; values copied
+from the mock / not re-measured, and the gradient line follows the CSS rule for the panel's own size
+(`glass::frost_veil_gradient_points`), so the angle holds on wide and tall panels). Its piecewise-linear mean alpha is ~0.41 with a 0.33 trough, so the
+desktop keeps ~59% of its visible contrast on average and 67% at the trough. The `--glass-floor=<a>`
+launch flag still swaps in the flat white veil at one alpha (`glass::FROST_FLOOR_ALPHA` `0.4` by
+default) — the measurement instrument, since a gradient cannot be stated as one number. The scope
 is **frost only** — Liquid Glass carries its own measured per-mode tints instead, and `opaque` has no
 backdrop to composite; dark mode is untouched, because its material already sits below the accent.
 
-The panel's outline is the same on all three materials: a 1pt inside stroke in `card_border` over the
-panel's own rounded rect. It is drawn as a decoration above the material rather than as a layer border
+The panel's outline is a 1pt inside stroke over the panel's own rounded rect, and the token follows
+the material: `glass_rim` on frost (light `#FFFFFF` at 50%, dark the same value as `card_border`), and
+`card_border` on `opaque` and the blur-only `backdrop` (values copied from the mock / not re-measured).
+**Liquid Glass is exempt** (`glass::install_panel_outline`): the system material
+already draws a directional rim (bright along the lit top edge, fading inward), and a uniform stroke over
+it flattens that rim into a drawn line — the difference between a piece of glass and a bordered rectangle.
+The shared contract is the *edge*, not the mechanism. It is drawn as a decoration above the material rather than as a layer border
 on the material itself, because the three material views differ (frost carries a rounded mask image,
 glass clips itself) and a border on any of them inherits that structure's behaviour. The *visual*
 contract is shared; only the implementation is material-specific where a material forces it.
@@ -286,6 +348,11 @@ layout, same material), captures again, and measures the pixels that differ -- t
 capture cannot separate from the material's own tonal noise. Each region holds one role: the filter row, and each
 footer caption separately, because the bounding box of all of them also spans the keycaps between them (that union
 measured a 1.12:1 "ink" identical for every material, the opaque control included -- the tell that it was not text).
+
+**Ink provenance: old measurement / not re-measured.** These captures were taken with the previous palette's
+`secondary_text`; the sheet migration changed it in light mode (`#4A4A52` → `#4F4C48`), which is the caption
+ink measured here. The light-mode contrast cells below are therefore the historical reading, while the material
+and tint findings they record still stand. Re-run the scenario before quoting a light-mode cell as current.
 Caption tier, 3:1, `filter row / footer captions`, black backdrop / white backdrop:
 
 | material | mode | contrast |
@@ -392,27 +459,82 @@ stated separately here. Everything drawn on `window_bg`/`card_bg` keeps the tabl
 **A translucent surface must be held to that.** Both blurring materials drift toward mid gray on
 their own: measured in dark mode, plain frost landed at `#868585` and liquid glass at `#6E6E6E`,
 against the `#1C1C1E` the palette assumes, which drops `text_primary`/`text_secondary`/`text_muted`
-from 15.63/10.10/6.40:1 to 3.38/2.18/1.38:1 and 4.68/3.03/1.92:1. No text color rescues a mid-gray
+from 15.63/10.10/6.40:1 to 3.38/2.18/1.38:1 and 4.68/3.03/1.92:1 (computed on the **previous**
+palette; not re-derived after the sheet migration). No text color rescues a mid-gray
 surface — the best any single color achieves there is 5.71:1, under this table's own 12:1 and 7:1
 floors — so the **surface** is what gets pinned:
 
 - `frost` pins its material per mode (`glass::FROST_MATERIAL_DARK` = legacy `ultraDark` 9,
-  `glass::FROST_MATERIAL_LIGHT` = legacy `light` 1) and paints no surface of its own: the material chooses the
+  `glass::FROST_MATERIAL_LIGHT` = `hudWindow` 13) and paints no surface of its own: the material chooses the
   tone and the dynamic system label ink carries the contrast (see the panel tier above). A `window_bg` wash over
   the blur would pull the surface toward `window_bg` and make `frost` and `opaque` read as one setting, which is
   why there is none.
-- `liquid-glass` takes its tint from `glass_tint` verbatim (default `eeeeee66`, a light neutral at 40%),
-  in both modes. There is no user-facing colour picker: the value is a config field, and a hue outside the
+- `liquid-glass` takes its tint from `glass_tint` verbatim (default `eeeeee66`, a light neutral at 40%)
+  in light mode and the fixed `glass::GLASS_TINT_DARK` (`1c1c1e99`) in dark mode (see the measured split
+  above). There is no user-facing colour picker: the value is a config field, and a hue outside the
   palette would invalidate the contrast table the vibrant ink is resolved against.
+
+### 3.5 Clipboard panel tokens (v2 mock)
+
+The clipboard picker and its detail panel take an additional, **light-mode-only** token group from
+the clipboard v2 mock (`clipboard-v2.html`). The shared token set lives in `theme.rs` and this
+subsystem does not own it, so the values are local constants in `src/clipboard.rs` (`PICKER_*`)
+until they are promoted into `UiPalette`. Dark mode keeps the shared palette values; the mock is
+light-only.
+
+| Clipboard token | Light | Dark (shared palette) | Used for |
+| --- | --- | --- | --- |
+| `PICKER_ROW_SELECTED_LIGHT` | `rgba(92,82,72,.16)` (`0x5C524829`) | `selection_bg` | Selected row wash |
+| `PICKER_ROW_HOVER_LIGHT` | `rgba(255,255,255,.32)` (`0xFFFFFF52`) | `hover_bg` | Hovered (not selected) row wash |
+| `PICKER_HAIRLINE_LIGHT` | `rgba(52,42,30,.09)` (`0x342A1E17`) | `separator` | Footer top hairline and the like |
+| `PICKER_FIELD_BG_LIGHT` / `PICKER_FIELD_BG_FOCUS_LIGHT` | `rgba(255,255,255,.38)` / `rgba(255,255,255,.58)` (`0xFFFFFF61` / `0xFFFFFF94`) | `field_bg` (no focus fill change) | Search field fill |
+| `PICKER_GLASS_LINE_LIGHT` | `rgba(255,255,255,.50)` (`0xFFFFFF80`) | `card_border` | Sheet edge and field border at rest |
+| `PICKER_ACCENT_LIGHT` | `#2F6FED` | `accent` | Selected row's bar, focused field ring |
+| `PICKER_THUMB_BG_LIGHT` | `rgba(255,255,255,.32)` (`0xFFFFFF52`) | `field_bg` | Image row's thumbnail well |
+
+- **The focused search field keeps the accent ring**, not the mock's strengthened glass line: the
+  native focus ring is switched off for this field so its rounded shape survives, which leaves the
+  stroke as the only keyboard-focus indication, and §10 makes accent the focus contract. The glass
+  line is the resting border.
+- **Scope is the clipboard only.** These are not general tokens: do not use them on settings, the
+  switcher overlay or a HUD.
+- **Provenance and measurement.** The values are copied from the v2 mock; their contrast has
+  **not been re-measured** (neither against the clipboard's glass variants nor over black/white
+  backdrops). Treat them as the mock's values, not as verified ratios.
+
+### 3.5.1 V2 layout and preserved operations
+
+`picker::picker_layout` owns the geometry. The list starts at 640pt wide. Expanded detail uses two
+columns inside the same `NSPanel`: a target panel width of 960pt, a 340pt list column, and detail in
+the remaining width. Panel width is capped by the screen's available area and margins. At an available
+screen width of 840pt or less, detail replaces the list. Height continues to follow content, capped at
+580pt and the available screen height.
+
+To follow the V2 mock, clipboard typography has an explicit local exception: search 13pt, plain list
+text 12.5pt, code list text 11.5pt, and footer 10.5pt. These fixed roles are exceptions to the shared
+sizes and minimum-size rule in §4. They do not change other surfaces' typography tokens or permit
+arbitrary shrinking to fit a container.
+
+This changes layout and appearance while preserving single-click paste, all existing keyboard rules,
+entry pinning, panel pinning, time groups and group clearing, search and categories, clearing scope,
+and the existing undo logic. The HTML's double-click paste, navigation rules, bulk undo and clear
+confirmation flows are outside this interaction contract. Dark mode keeps its existing palette.
+The geometry and sizes below are source values, not claims of runtime visual or contrast verification.
+
+Reproduce the geometry and font values from source with:
+
+```sh
+rg -n 'picker_layout|PICKER_W|PICKER_MAX_HEIGHT|DETAIL_IN_PANE_BELOW_W|DETAIL_SIDE_PANEL_MAX_W|ROW_TEXT_SIZE|ROW_CODE_SIZE|FOOTER_TEXT_SIZE|SEARCH_FONT_SIZE' src/clipboard.rs src/clipboard/picker.rs src/clipboard/text_style.rs
+```
 
 ## 4. Typography
 
-Four sizes. Anything else is a bug.
+Shared typography uses the roles below; see §3.5.1 for the explicit clipboard V2 exception.
 
 | Role | Size | Weight | Color | Notes |
 | --- | --- | --- | --- | --- |
 | `page-title` | 26 | 700 | primary | Settings page heading, one per page; tracking `-0.4` |
-| `sidebar-title` | 20 | 700 | primary | App name at the top of the sidebar |
+| `settings-title` | 12 | 500 | muted | The settings window's title in its title bar band (the mock's `.settings-title`) |
 | `section-header` | 12 | 600 | secondary | Card group title above a card |
 | `row-label` | 14 | 400 | primary | Settings row label, list primary text |
 | `control` | 14 | 400 | primary | Select value, field text, button title, switch/row secondary value |
@@ -427,7 +549,7 @@ Four sizes. Anything else is a bug.
   that wrap; it does not change single-line text boxes. Never set a line height manually where a role
   already defines one.
 - Do not shrink text to fit a control. Widen the container or move the content instead (§9, §11.2).
-- **12pt is the floor.** Do not introduce a smaller size for a badge, a keycap or a dense label. CJK
+- **12pt is the shared floor (the local clipboard V2 exception is in §3.5.1).** Do not introduce a smaller size for a badge, a keycap or a dense label. CJK
   glyphs carry their distinguishing detail in interior strokes at high spatial frequency (未/末,
   己/已/巳), so they need more pixels than Latin before they resolve at all; for this palette and
   these surfaces, 12pt is where that floor sits.
@@ -450,15 +572,20 @@ setting directly.
 | --- | --- | --- |
 | Card title (`fonts.title_size`) | yes | 13…20pt after scaling |
 | Card app name (`fonts.app_name_size`) | yes | 13…20pt after scaling |
-| Footer (`fonts.status_bar_size`) | no | configured 13…20pt |
+| Footer (`fonts.status_bar_size`) | no | configured 0…20pt; **0 = no footer** |
 
 - **Card captions share one multiplier.** Changing `layout.card_text_size` scales the title and app
   name together while preserving their relative sizes.
 - **The clamp applies to the result**, not to the multiplier and not to the configured base. A
   card-caption `fonts.*_size` value is a base, not a final size: with the 12pt title base the title
   lands on `card_text_size`; the app-name base scales proportionally and both are clamped to 13…20pt.
-- **The footer is independent.** Its size is exactly `fonts.status_bar_size` after the 13…20pt
-  validation clamp; card-caption scaling does not change it.
+- **The footer is independent.** Its size is exactly `fonts.status_bar_size` after the 0…20pt
+  validation clamp; card-caption scaling does not change it. The settings row is a **bottom title-bar
+  text size** slider whose floor is 0, not the shared 13pt text minimum: 0 hides the footer band
+  entirely (the band exists only while the size is above zero), 1…20 render at the configured size,
+  and the slider snaps to whole points. The retired `layout.show_footer_title` switch is gone from the
+  UI; a legacy config saved with it `false` is migrated once at load to a size of 0. The field remains
+  in the config only for older files and the export format.
 - **The rendered line height of any caption row is at most 1/3 of its card's height.**
 - **A caption is one line.** When it does not fit, it truncates with an ellipsis — it never wraps to a
   second line and never pushes the thumbnail out of its card.
@@ -476,8 +603,13 @@ Named layout metrics for the settings window (all on the grid):
 
 | Metric | Value | Where |
 | --- | --- | --- |
-| Sidebar width | 220 | `SETTINGS_SIDEBAR_WIDTH` |
+| Settings title bar band | 36 tall, full window width | `settings/window/chrome.rs` (`TITLEBAR_H`) |
+| Traffic lights | Native AppKit appearance, size, position, and interaction; no decorative overlays. Green toggles full available height and restores the previous frame, preserving width and horizontal position; full screen and full-screen tiling are disabled | `standardWindowButton:`, `scripts/cargo-test.sh settings_vertical_zoom_smoke -- --ignored --test-threads=1` |
+| Band title | 12pt medium in `muted_text`, centered on the window | `titlebar_title_frame`, key `settings.window_title` |
+| Band divider | 1pt `separator` under the band | `build_settings_titlebar_band` |
+| Sidebar width | 212 | `settings/sidebar.rs` (`SIDEBAR_WIDTH`) |
 | Sidebar item inset | 12 | `settings/sidebar.rs` (`btn_w = card_w - 24`) |
+| Brand row | 34pt icon 12pt in, name 8pt after it, 14pt/600; next nav row 16pt below the row | `brand_row_frames`, `sidebar_first_nav_row_top` |
 | Page top padding | 48 | `SettingsPageHeader::TOP_PADDING` |
 | Page bottom padding | 72 | `SettingsPageHeader::BOTTOM_PADDING` |
 | Section header gap | 24 | `SETTINGS_SECTION_HEADER_GAP` |
@@ -493,6 +625,13 @@ Named layout metrics for the settings window (all on the grid):
 Rule of thumb: **related things 8, groups 24, page edges 32–72.** Use the smaller step for internal
 density and the larger one to separate sections; never mix `12` and `14` for the same kind of gap.
 
+Settings search matches each row's label, full description, section title, rendered text and all
+dropdown choices, including unselected choices. Results retain the original section headings and
+shared card styling, containing only matching rows. They host the original live controls rather
+than inert copies, preserve each row's height, and restore the controls to their page when search
+ends. Rows normally hidden by a conditional group remain searchable; their normal page visibility
+is restored on exit. Verify with `scripts/cargo-test.sh settings_layout_smoke -- --ignored --test-threads=1`.
+
 ## 6. Radius
 
 | Token | Value | Applied to |
@@ -501,9 +640,10 @@ density and the larger one to separate sections; never mix `12` and `14` for the
 | `radius-legend-chip` | 5 | The chip behind a key symbol in a read-only shortcut legend |
 | `legend-chip-text-pad-x` | 2 | Inline padding either side of a legend chip's label; a long key name widens its own chip rather than becoming one chip per character |
 | `radius-card` | 12 | Cards, grouped row containers, list tiles, popover items |
-| `radius-panel` | 16 | Tooltips, dropdown panels, HUDs, notification cards |
+| `radius-panel` | 18 | Tooltips, dropdown panels, HUDs, notification cards; the clipboard sheet draws 32 (`glass::CLIPBOARD_PANEL_RADIUS`) because it is a large two-pane sheet, not a small panel |
 | `radius-full` | 9999 | Pills: badges, status dots, switch, scrollbar knob |
-| Window radius | platform-dependent (measured; currently 26) | The settings window itself |
+| Brand icon radius | 9 | The settings sidebar's 34pt app icon (the mock's `.brand img { border-radius: 9px }`); a 34pt square derives 9 from its own height, so neither the 8pt control radius nor the panel radius matches its curve |
+| Window radius | `radius-panel` (18) | The settings window itself (the mock's `--radius-window`) |
 
 **Concentric rule.** A rounded container with padding gives its inner element
 `max(0, outer_radius - padding)`. The switcher's selection ring is the deliberate exception: its frame
@@ -576,7 +716,7 @@ overlapping a neighbouring control), and the text beside it is what yields when 
 from the surface it sits on, in both modes. It is applied as a wash (darkening a light surface,
 lightening a dark one) rather than a fixed gray, so one value works in both.
 
-The overlay's card radius follows `appearance.corner_radius` up to `radius-panel` (16pt). Larger
+The overlay's card radius follows `appearance.corner_radius` up to `radius-panel` (18pt). Larger
 values remain available to glass and window surfaces, but do not make switcher cards excessively
 round. The captured window thumbnail itself keeps square corners; derive the close-button and
 selection-ring radii from the effective card radius so a settings change cannot leave stale geometry
@@ -596,477 +736,3 @@ Four levels. Pick by **how far the surface sits from the page**, not by how much
 The medium elevation is represented in `theme.rs` by one shared black shadow color, opacity, blur
 radius, and vertical offset. Use those constants for both dropdowns and tooltips. The high level is
 represented the same way (`ELEVATION_HIGH_*`), and the floating panels use it: the switcher, the
-clipboard picker and the detail panel all float over another app's content rather than over a page.
-The keystroke display keeps its native window shadow: it sits `PANEL_EDGE_MARGIN` from the visible
-edge, and a high-level shadow needs 64–76pt of window padding around the panel, which the window
-server then constrains back into the visible area — measured, that moved the panel by 26pt and
-changed what a saved position means. Giving the HUD its own shadow is a placement decision of its
-own (recorded in `docs/review-backlog.md`), not a second elevation level.
-
-**A panel's elevation shadow is drawn only outside the panel.** The padding exists because the
-window clips whatever exceeds its own frame, and it is sized from a measurement, not from the blur
-radius: `radius + |offset|` is where the shadow's core ends, not where it reaches zero, and padding
-by the radius alone left the tail 8 tone units dark at the window's outermost ring. The allowance
-that the measurement asked for is `ELEVATION_SHADOW_TAIL_ALLOWANCE`, and
-`scripts/e2e/panel-edge.sh` is the command that reproduces the verdict (the outer ring must read as
-the pinned backdrop, and the panel's interior must not change when the shadow is toggled). Thumbnail corner
-badges (fullscreen, minimized/hidden) are a circular `badge_scrim` chip carrying a white glyph; the
-chip uses the separately named `symbol_shadow` role and its shared geometry constants — that small
-contrast aid is not surface elevation. Its opacity is 0.85, blur radius 2pt, and vertical offset
-−1pt. The white glyph on the chip composited over a pure-white thumbnail measures 4.74:1, above the
-3:1 non-text floor.
-
-- Exactly one level per surface. Never stack shadows to make a surface "more elevated".
-- Cards in the settings page are `none`: hierarchy comes from `card_bg` + `card_border`. A large
-  soft shadow on a card inside a window is a bug — it implies the card floats over content it does
-  not float over.
-- Borders are `card_border`, not a shadow and not a darker background.
-- An inset accent ring is for input focus (2pt, as defined in §10); it is not elevation. A card or
-  tile selection may use an outer accent ring; derive its outer corner radius from the card radius
-  and the ring inset described in §6.
-
-## 8. Motion
-
-| Token | Value | Use |
-| --- | --- | --- |
-| `duration-fast` | 175 ms | Micro-interactions except the switch's component-specific press response |
-| `duration-medium` | 380 ms | Spatial change: panel open/close, expand/collapse, page transition |
-| `ease-standard` | `cubic-bezier(0.24, 1, 0.4, 1)` | Every animation unless there is a documented reason |
-| exit duration | 0.75 × the entrance duration, same curve | Closing panels, dismissing dialogs |
-
-Rules:
-
-- **Animate the entrance, not the exit, of contextual UI.** Tooltips, hover cards and dropdown
-  menus may disappear instantly; panels, dialogs and expanding rows animate both ways, and the exit
-  retraces the entrance direction.
-- **Never animate** hover fills, row highlights, selection while the user is moving, scrolling, or
-  anything the user triggers several times a minute. Those must be instant.
-- Motion must never block input: content that is already interactive stays interactive while it
-  animates.
-- Springs are allowed only where a physical feel is the point (switch knob, card close, panel
-  bounce). Use the single documented spring per component; do not tune stiffness/damping per call
-  site. Two components must not use different springs for the same gesture.
-- **Reduce Motion is mandatory and checked at animation time**, not cached at launch:
-  `NSWorkspace.accessibilityDisplayShouldReduceMotion` → replace the animation with an instant state
-  change. Every animated surface must do this, including the overlay, page transitions and the
-  settings shell.
-
-## 9. Components
-
-**Settings row.** Label on the left (14/primary), control on the right, right-aligned to the control
-column. Supports an optional `caption` line under the label (12/muted). One concept per row.
-
-- The control is exactly one line tall (32pt). A value that does not fit is truncated with an
-  ellipsis and exposes the full value as a tooltip — **a control never wraps to two lines.**
-- A row's label is a noun phrase, not a sentence. Explanations go in the caption line.
-- **A row's label reads in full in every shipped locale.** Truncation is not the fix for a label that
-  does not fit: widen the label column, shorten the string, or move detail to the caption line —
-  never shrink the type (§4).
-- **Truncation has an allow-list.** Only these may truncate by default: a control's value (select,
-  text field, read-only value), a `caption`, and user data (window titles, app names, clipboard
-  content). A control value exposes its full value in a tooltip; a truncated `caption` is available
-  on an associated surface that presents its full text; user data has a keyboard- and VoiceOver-
-  reachable full-content outlet that does not truncate again. An unrelated panel or the target window
-  is not an assumed outlet. A label, section header, button title, permission status and error cause
-  must fit in place; a tooltip does not exempt them. Rewrite the text or adjust the layout (§11.2).
-- **Do not fix an ambiguous design with a word.** If two actions need "only", "just" or "also" to be
-  told apart, the grouping or the ordering is wrong: separate them, or move the secondary action
-  away. An explanatory word belongs in the caption line or an accessibility label, never as the
-  thing that makes a control unambiguous.
-- Rows are separated by a full-bleed 1px `separator` inside the card; the first and last rows have no
-  divider at the card's edges.
-
-**Card.** Groups related rows. `radius-card`, `card_bg`, `card_border`, elevation `none`. A card has
-one section header above it. Do not wrap a single row in a card when it belongs to the neighbouring
-group.
-
-**Section header.** 12/600/secondary, 24 above the card, 4 below. Sentence case, no trailing colon.
-
-**Buttons.** Three roles: primary (accent fill, white text), secondary (card bg + border), destructive
-(red text/border, red fill only on the confirming action). One primary per view. In-row action
-buttons are 32pt tall and right-aligned to the control column. A button's hover/normal palette must
-not be encoded in its `tag` (see `AGENTS.md`).
-
-**Switch.** 38×22 with an 18pt knob; on = `accent`, off = `switch_off_track`. The
-whole row is not clickable; only the switch is. The knob uses its spring settling duration with an
-180 ms minimum; its press response lasts 220 ms with the keyframe's default timing. These
-component-specific values override the general fast-duration and easing tokens. The knob follows
-the pointer only within its 2pt inset.
-
-**Slider.** A setting that is **discrete** — whole units, or multiples of a step — uses a *stepped*
-slider: it may only rest on whole multiples of its step and therefore draws AppKit's tick marks and
-sets `allowsTickMarkValuesOnly`, because tick-mark values are the only snapping AppKit offers and
-the marks make the stops discoverable (the keystroke panel's 10% size stops, the mouse's lines per
-tick, the text-size and auto-delete-day rows). A **fractional** setting (pointer tracking speed,
-smooth-scrolling tuning) stays a continuous slider with **no tick marks**. The filled portion is
-`accent`; the knob is white with a 1px border. It is always paired with a right-aligned tabular
-readout of the current value, and that readout is the same width on every row of a group.
-
-**Select.** 200pt wide, one line, ellipsis on overflow, chevron on the right. The dropdown panel is
-`radius-panel` at elevation `med`; items use `radius-control` (8) with a `hover_bg` fill. The
-displayed option text is localized and human-readable; if the raw value is meaningful to a
-developer but not to a user (VID/PID, preset key), show a display name and move the raw value to the
-caption line.
-
-**Text field.** `field_bg`, `radius-control`, 32pt tall, focus shown by an inset accent ring.
-
-**Color well.** A swatch with a border plus the hex value as a `caption`. Never a bare gradient
-shape.
-
-**Tooltip.** `radius-panel`, elevation `med`, 14pt text, appears instantly on hover-delay and
-disappears instantly. A tooltip that exists to reveal text the surface could not fit (a truncated
-`caption`) wraps its text and sizes to its content, up to the wrap cap in `settings/tooltip.rs`; it
-never truncates that text a second time. The fixed-size hint and toast keep their single line.
-
-**Empty state.** Centered `caption` text in `text_muted`; no illustration unless the surface is a
-first-run surface (onboarding).
-
-**Keystroke display.** A chord splits into one keycap per key, in either stream, with no grouping
-tray: a modifier keeps its accent tint and the key it combines with stays neutral, and the keycaps
-are separated by the same stream gap as any two presses, so a chord reads as the keys it is made
-of. A horizontal stream (bottom/top placement) sizes each keycap to its content
-with a 32pt minimum so single-glyph keys have visual weight comparable to a Command modifier cell,
-and appends a merge count inline with no separator (`A×99`). A vertical stream (side placement)
-draws every keycap independently at ONE fixed width, so the rail — and the panel behind it — never
-changes as keys come and go. Each end of the stream is reserved from its own control — the leading
-handle's hit area plus a gap, the trailing gear's inset, width and gap — so a content-sized panel
-hugs its keycaps instead of carrying the gear's larger reserve as blank space at the handle. The
-drag handle has a transparent 48×20pt hit area (rotated for horizontal streams), larger than its
-three visible dots; it stays localized to the handle rather than making the whole panel draggable.
-In a column, the hit area starts 4pt inside the top edge while the visible dots sit an even inset
-in from the panel's edge, clear of the first keycap. The clipboard picker carries the same handle
-vocabulary in the same place — three dots in a
-transparent band, with the panel never dragging by its background — but its band is the **whole top
-bar**: the header strip's top padding, full width by 28pt tall, which is what §6.1 asks of a control's
-hit target and costs the panel no height it did not already reserve. The three dots sit centered in
-that band as the hint, and dragging anywhere along it moves the panel; the controls below it (search
-field, filter pills, settings and close buttons) keep their own clicks. Grabbing the bar shows the
-open hand, holding it the closed hand, and a double-click puts the panel back where the configured
-position wants it.
-In a column, a merge count takes its own small row below its keycap and
-freezes at ×99; in every placement the count renders
-in muted text, adjacent to the name when inline -- it is metadata about the press, not part of the
-key's name. Long legends are shortened at the
-string level ("Pg Dn", not "Page Down") so the fixed width holds every shipped key name; anything
-longer truncates inside its keycap.
-
-A neutral keycap's fill is **per mode**, and like every text-bearing surface on a floating panel it is
-measured over the **full alpha chain** — backdrop → frost wash (`window_bg` at `0xE9`) → keycap → text
-— at both extremes, because the panel floats over arbitrary content (a pure-white and a pure-black
-backdrop are the two ends; the light panel lands at `(247,248,250)` over white and `(225,226,228)`
-over black):
-
-| Mode | Keycap fill | Cap vs panel (white / black) | Text on the cap (white / black) |
-| --- | --- | --- | --- |
-| Light | `field_bg` (inset field surface) + `card_border` | 1.12:1 / 1.11:1 | 11.61 / 9.64 primary, 4.62 / 3.83 muted |
-| Dark | `card_bg` at 80% + `card_border` | 1.04:1 / 1.19:1 | 12.67 / 13.46 primary, 5.19 / 5.51 muted |
-
-**Keycap text is a recorded class**, not §3.3's 12:1 `text_primary` floor: that floor belongs to text
-on `window_bg` and `card_bg`, which do not move, while a cap sits on a translucent wash and therefore
-does. The shipped accent keycaps already measure as low as **8.48:1 primary / 3.37:1 muted** on the
-worst backdrop (a light cap over dark content), so the class floor is **primary ≥8:1, muted ≥3.25:1**,
-asserted for both cap kinds, both modes and both backdrop extremes in `keystroke_display::panel`'s
-tests. This is also why the light neutral cap keeps the inset surface even though it cannot reach
-12:1: a cap dark enough to read as a surface against a near-white panel (≤ ~`#E9E9EB`) cannot also
-carry 12:1 text (which needs ≥ ~`#F0F1F3`) — those ranges do not overlap, and the surface won, because
-a cap nobody can see is worse than a cap whose count reads 3.83:1.
-
-Dark keeps the darker 80% card fill: the same inset surface measured 9.77:1 primary / 4.00:1 muted
-there (light text needs a dark cap), and its cap-against-panel separation is 1.04:1 on a white
-backdrop — recorded; the dark cap is defined by its hairline.
-
-The panel's own surface is the frost wash / glass tint / `window_bg`, written from the palette, so
-**every path that changes the theme must repaint it**, and the keycaps re-read the palette on each
-render — a surface left in the previous theme showed light keycaps on a dark shell. Two entries exist
-and both must call the repaint: the config-change coordinator
-(`ui_coordinator::apply_theme_and_locale_refresh`, for explicit light/dark switches and locale changes)
-and the system-appearance notification (`apply_system_appearance_refresh`, the `theme = "auto"` path).
-
-**Thumbnail grid (overlay).** Thumbnail size is a dropdown (App Switcher page, **thumbnail mode
-only**): `Auto`, or a percent of the base card (`120% / 110% / 100% / 95% / 90% / 85% / 80% / 75%`).
-**A pinned percent is a fixed size** -- adding or removing windows only reflows rows and columns and
-scrolls; cards never shrink. `Auto` takes the **first step of the ladder whose count-based estimate
-fits**: the estimate is decided from the window **count** and the panel budget alone -- not from the
-order, not from the windows' shapes, and not from which of them is maximized -- so the same number of
-windows always gets the same size, no matter what was frontmost or how a window was resized. Shapes
-still decide how the cards wrap -- with their count, shapes and order -- so a set whose windows are
-much wider than the base preview ratio can need one row more than the estimate and scrolls at the chosen
-size. Pinning a percent fixes the size only; the wrapping still follows the windows. The log line
-`[overlay] layout mode=thumbnail scale=... card_h=... panel=...` is the only reproducible source for an
-observation.
-
-## 10. Interaction states
-
-Every custom-drawn control needs all six states, and each uses the token above, not a new color:
-
-| State | Treatment |
-| --- | --- |
-| normal | base tokens |
-| hover | `hover_bg` fill (instant, no transition) |
-| pressed | accent at ~85% for filled controls; `hover_bg` + slight inset for bordered ones |
-| selected | `selection_bg` fill for a row or list tile; a card or icon plate uses `selection_plate_bg` + an accent ring |
-| open | `hover_bg` fill, idle border; for a control that expands in place instead of opening a separate surface, `hover_bg` + slight inset. The open surface must be cleared when it collapses: the accent ring belongs to focus, not to "expanded" |
-| disabled | `text_disabled`, 50% opacity on the control's fill, no hover feedback |
-| focus (keyboard) | inset accent ring, 2pt, always visible against both `card_bg` and `window_bg` |
-
-Hit targets are at least 28×28; a text-only affordance needs padding to reach that. Hover and
-selection never change the layout (no size, no weight change) — only color.
-
-**Corner glyph buttons on a floating panel (exception).** Two groups of glyph buttons on these
-nonactivating panels carry no border and no focus ring, and have only normal/hover/pressed, with
-hover and pressed sharing one faint wash. Both groups share the same cause: the panel is
-nonactivating, its keyboard focus belongs to something else (the picker's search field, the
-switcher's card container), and the button has no selected or open state to express — so there is no
-keyboard focus ring to draw. Every other control keeps all six states of this section.
-
-- *The clipboard picker's top-right corner row* — the close ×, Clipboard Settings and the panel
-  **pin**. Here the reason is also grouping: the buttons share one 28pt corner and are each other's
-  neighbours, so giving one of them a border and fill would make it read as a different component
-  family than the ones beside it. (The close button still turns destructive red on hover; that is its
-  semantic colour, not part of this exception.)
-- *The pin is this exception's one stateful control.* The pin is a persistent switch — the panel is
-  either held open or not — so it keeps the family (no border, no focus ring, the shared faint hover
-  wash) but expresses its state through the glyph: outline while off, filled while on, with the
-  primary ink in both the on state and hover. Hover never overrides the on state: a pinned button
-  must not read as unpinned because the pointer is over it. Because a filled-versus-outline glyph is
-  a shape distinction a colour-blind user can still miss, the accessibility label states the state in
-  words ("keep this panel open" / "unpin this panel") rather than naming only the action. The state
-  is repainted from the live value on every locale/theme/material refresh, like the neighbouring
-  buttons' strings.
-- *The three settings gears* — the clipboard picker's, the switcher overlay's footer gear, and the
-  keystroke display's trailing gear. Each one is the panel's only settings entry and none of them has
-  a neighbouring glyph control to group with, so adjacency is **not** their justification: they are
-  a borderless glyph because a bordered 28pt control in these panels would read as primary chrome
-  competing with the content the panel exists to show. All three open a settings page, keep a neutral
-  (never destructive) ink, and carry an accessibility label plus a tooltip naming their target page.
-
-A gear's corner inset is computed, not fixed: the panel's rounded corner bounds the button's own
-bottom corner. `theme::footer_control_inset` models the corner arc with the radius clamped per axis
-to that axis's half-extent (`rx = min(r, w/2)`, `ry = min(r, h/2)`, each independently), and returns
-the smallest inset that keeps the button inside it. The footer's text reserves that inset **plus the
-button's width and gap on both sides**, so the button cannot be drawn over the title and the title's
-centre stays the panel's centre. The switcher footer band keeps a floor height
-(`theme::FOOTER_CONTROL_MIN_H`) so the control always has its vertical margin: the band otherwise
-follows the footer text size, which bottoms out below the 28pt control.
-
-That floor is the **control's**, not the text's, so it is not a band the title can vacate. With
-`layout.show_footer_title` off the band is gone (`theme::footer_band_h` returns zero) and the control
-anchors to the panel's bottom-right corner arc instead, `theme::FOOTER_FLOAT_MARGIN` above the bottom
-edge; the card viewport, the document, the scroller and the panel height all shrink with the band.
-Because the band is part of the geometry decided at summon time, changing the switch dismisses a
-standing panel rather than repainting it (`overlay::reset_switcher`), and the next summon lays out
-against the new band — nothing re-summons by itself. Two area reservations keep the floating control
-from taking another control's or a card's clicks, since it is added to the hierarchy before both: the
-scrollbar's track starts `theme::footer_control_bottom_reserve` above the bottom edge, and the card
-grid gives up `theme::footer_control_right_reserve` on the trailing side — zero at the shipped 32pt
-radius, where the arc-derived inset already fits inside `H_PADDING`, and growing as the configured
-radius pushes the control further in.
-
-Two limits are recorded rather than glossed. (1) The arc model is what the layout is computed
-against; the tests pin the model, not the shipped panels' actual clipped shape (frost stretches a
-cap-inset template, glass uses `setCornerRadius:`), so a material whose real clipping differed would
-need its own measurement before this could be called verified. (2) At an extreme configured
-`appearance.corner_radius` the symmetric reserve can consume the panel; the button then stays inside
-the corner but the footer title is squeezed to an unreadable width. That configuration has no agreed
-fallback yet, and it is recorded in `docs/review-backlog.md` as an open, user-visible behaviour.
-
-## 11. Accessibility and localization
-
-### 11.1 Rules that always apply
-
-- Contrast: see §3.3. Re-measure whenever a palette value changes.
-- Reduce Motion: see §8. Mandatory.
-- Every custom-drawn control sets an accessibility label and role through AppKit, so VoiceOver reads
-  the same information the pixels show. A control whose value is a number reads that number.
-- Every user-visible string goes through `t()` / `tf()` / `t_count()` and has a key in **all**
-  locales (`en`, `zh-Hans`, `zh-Hant`). A missing key renders the key itself, which is never
-  acceptable on screen.
-- Never put a config key, an enum name, a hex value, a VID/PID pair or an internal preset identifier
-  in a label or control value. A color well's caption is the sole exception for a user-owned color.
-- Layout must survive the pseudo-locale (`--pseudo-locale`) and the long-text fixture: no clipping,
-  no overlap, no truncation of a label that the user needs to read.
-- Text scaling: a user-configurable size never changes the *structure* of a row (no row grows a
-  second line because of it).
-
-The rest of this section is about **language tolerance**: what a string, a box or a keystroke costs in
-a language other than the one the surface was drawn in. A rule marked as a recorded gap in §11.7 is a
-gate for new and changed work, not a licence to leave an old surface as it is.
-
-### 11.2 Wrapping, minimum widths and truncation
-
-Every writing system has an atom, and the atom decides how narrow a box can get. English's atom is the
-word: variable-length and unbreakable, so a box stops shrinking at its longest word (`min-content` of
-"Internationalization"). CJK's atom is a single character, so the same box keeps going and a string's
-width comes close to a linear function of its character count. A design system built for the first
-case fills up with `min-width`, `max-width` and truncation policy — none of it free, and all of it a
-workaround for one writing system.
-
-- **Wrap before you truncate.** Let a label take the lines the string needs, and let the row, the list
-  and the pane grow to hold it. A truncating row is exactly as tall in German as it was in English
-  because it is not absorbing the extra length — it is throwing it away, and height is the only thing
-  a row has to spend.
-- **State a minimum width as a visual width.** A hard-coded width must be a measured (or
-  measured-then-rounded) point value — `72–280pt` for menu titles, `160pt` for the onboarding status
-  column — never a character count. `ch` is the advance width of `0` and `ex` is the x-height: both
-  are defined against Latin letterforms, and both are wrong for CJK.
-- **Never let a hard-coded width be the only thing holding a label.** Where the string is the only
-  content, the container derives from the measured string, not the other way round.
-- **Do not assume the platform breaks CJK on word boundaries.** AppKit's public strategies are
-  `none`, `pushOut` (avoids an orphan on the paragraph's last line — the proportions half),
-  `standard`, and `hangulWordPriority`, which is word priority for **Korean** and has no Chinese or
-  Japanese equivalent; the default also differs by field kind (non-editable/selectable text fields use
-  `standard`, editable ones use `none`), and we set no strategy of our own. Nothing therefore
-  guarantees that a Chinese word is not cut. What we control is the space: the width and the line
-  count the string needs, never a character count that decides where the cut lands (§11.5). Where a
-  cut word would change the reading — a short label, a heading — read the rendered result in that
-  locale instead of assuming it.
-
-**Running text (§11.4) cannot get the same treatment today.** The text system will not do the
-dictionary half for us: no strategy gives Chinese or Japanese word priority, and we set none. That is
-not the same as impossible. Apple publishes word segmenters for Chinese and Japanese
-(`CFStringTokenizer`, `NLTokenizer`), and both layout-manager delegates — TextKit 1's
-`layoutManager:shouldBreakLineByWordBeforeCharacterAtIndex:` and TextKit 2's
-`textLayoutManager:shouldBreakLineBeforeLocation:hyphenating:` — are asked to allow or prevent each
-candidate soft break, so a segmenter could steer break points without pre-inserting separators.
-Whether that is safe and affordable in these views is unverified, which makes this a recorded gap
-rather than a platform limit.
-
-**What stands in until that gap is closed.** Running text keeps its container's full content width, and
-a narrower measure for body copy needs a reason rather than being a default. A long CJK paragraph is
-read in the rendered UI at **each width its container can take**, not assumed to be fine; today that is
-one width per surface — the settings window pins its own width with min = max, and the panels are
-fixed-size — but a container that becomes width-resizable brings its whole range into the check. The
-one place we already break lines ourselves — the clipboard's code soft wrap, which prefers a structural
-break (comma, operator, member access, whitespace) and falls back to an arbitrary character boundary —
-is a monospaced-code model and must not be reused for prose, which would need a segmenter, not a column
-count (§11.5).
-
-**Documented deviation — the fixed settings grid.** Read literally, the rule above would make every
-settings row grow to hold its longest translation. This app keeps the settings grid instead (52pt
-rows, 32pt controls, §5) and truncates, because density is the product. The deviation is bounded:
-
-- only what §9's truncation allow-list permits may truncate; a label the user has to read may not;
-- anything that truncates exposes its full value — as a tooltip, or in the caption line;
-- when a localized label does not fit, the fix is a wider column, a shorter string or a moved detail.
-  Never a smaller type size, and never "it truncates, that is the policy".
-
-### 11.3 Hierarchy has to exist in the content language
-
-Latin letterforms encode rank inside the glyph: case gives three levels for free, then italic, weight,
-small caps and letterspacing. CJK has weight — the weakest of them, because bolding a dense glyph
-fills its counters instead of adding contrast against the surrounding whitespace — and no case at all.
-Where a Latin design signals importance with case or italic, a Chinese build has nothing left to
-signal it with.
-
-- Build hierarchy only from the channels the content language grants. §4 fixes the allowed set: size,
-  weight, color. No case, no italic, no small caps, no meaningful letterspacing.
-- When those channels run out, prefer enclosure and spacing over adding another color. A dense screen
-  that looks busy is usually a screen whose hierarchy had to be bought with color.
-- Never let a channel that disappears in translation carry meaning on its own.
-
-### 11.4 Density is spent in chrome, not in running text
-
-CJK is denser per character, and density buys area, not time: measured reading rates converge across
-languages (around 39 bit/s), so a dense script delivers the same meaning in less space rather than
-faster. The area advantage is real in chrome and close to nothing in running text, because dense
-glyphs carry their distinguishing detail in interior strokes at high spatial frequency (未/末,
-己/已/巳) and need more pixels before they resolve at all.
-
-- Spend the density advantage in chrome: row labels, sidebar items, section headers, keycaps, card
-  captions, footer text.
-- Do not bank it in running text. Onboarding body copy, release notes, error explanations and
-  clipboard detail keep their size and their full line height; a screen that fits more controls in
-  Chinese does not get to compress a paragraph.
-- 12pt is the floor for every locale, not only for the Latin ones. See §4.
-
-### 11.5 Direction, units and input
-
-- **Mirror the relationship, not the position.** Anything that encodes sequence mirrors — back
-  arrows, progress, sliders, step flows; anything depicting a convention or a physical object holds
-  still — clocks, playback controls, checkmarks. Numbers never mirror: Arabic numerals stay
-  left-to-right inside a right-to-left run, so one line can carry two directions at once and cursor
-  movement and selection stop meaning what you assumed. No RTL locale ships today, so new surfaces use
-  logical leading/trailing instead of left/right, and the audit stays cheap when one arrives (§11.7).
-- **Distrust character counts.** Widths come from measurement or from a measured constant (§11.2).
-  The same caution applies away from layout: never derive a truncation budget, a validation limit, a
-  sort order or a search decision from a character count — `len()`, `toUpperCase()` and "this field
-  fits 24 characters" all assume the language they were designed in. Length limits on user input count
-  grapheme clusters, and a counted budget is shown as a hint, never enforced as a silent cut.
-- **Price the input.** Eight Latin keystrokes produce eight glyphs; six pinyin keystrokes produce a
-  candidate menu that makes the user look away from the sentence to judge and pick one. So: text entry
-  goes through the platform text system and never consumes Return while an input method may be
-  composing; CJK search matches on the string itself, not on a Latin tokenization of it; and no
-  surface assumes typing is equally fast for both users.
-
-### 11.6 Voice
-
-Geometry has coordinates in every language; voice has none. Register, idiom and rhythm do not survive
-translation, and the stronger the voice, the more it loses.
-
-- **Split strings in two.** *Functional* strings — labels, field names, error causes, settings rows,
-  permission states, button titles — are translated and held to the rules above. A string that would
-  embarrass you coming back flat is *written fresh* in each locale instead of translated.
-- **Our voice is carried by wording, not by type.** Every surface is drawn in the system face, so a
-  translated build cannot silently lose a display font's missing CJK cut. Do not introduce a display
-  face for a localized string.
-- **Round-trip the loudest strings** — `en → zh-Hans → en` and `en → zh-Hant → en` — when a surface
-  introduces a new voice, and read what comes back in a language you can judge. Chinese is two shipped
-  locales, not one, and neither can be read off the other: Traditional is *not* uniformly longer (in
-  the shipped strings it is longer in fewer than a tenth of the keys, equal in most, and shorter in
-  some), but where it is longer it is often a short UI string that doubles via 應用程式 — `应用` →
-  `應用程式`, `立即重启` → `立即重新啟動` (a button title). Measure the locale; do not assume which one
-  overflows. If you cannot read the locale the product ships into, you cannot feel what arrived.
-
-### 11.7 Recorded gaps
-
-Three rules above are not yet satisfied by every existing surface. They are gates for new and changed
-work; leaving an old surface as it is needs a reason, not silence.
-
-- **Per-locale text fit.** No assertion covers full text fit across settings row labels, button titles,
-  section headers, captions, menu items, switcher cards and footer, clipboard details, keystroke
-  display, onboarding and update prompts. The §11.1 pseudo-locale and long-text rules are checked by
-  eye. Add assertions as these surfaces are touched; close this gap only after checking `en`,
-  `zh-Hans`, `zh-Hant`, pseudo-localization and long-text stress cases on every relevant surface.
-- **RTL.** No RTL locale ships and nothing is mirrored; §11.5 states the forward rule.
-- **CJK word-boundary breaking.** The platform gives us no CJK word priority and no breaker parameter.
-  A segmenter (`CFStringTokenizer`, `NLTokenizer`) plus a layout-manager delegate could supply one, but
-  whether that is safe and affordable in these views is unverified; until it is, §11.2's per-width
-  reading rule is what we have.
-
-## 12. Adding a token or a value
-
-1. Prefer an existing token. If two roles need slightly different colors, the roles are wrong — fix
-   the roles first.
-2. If a genuinely new value is needed, add it to `src/theme.rs` next to its siblings, give it a
-   semantic name, and fill in both light and dark.
-3. Measure the contrast of any new text color and record it in the table above.
-4. Update this document in the same change. A value that is not in this document does not exist.
-
-The font-weight values used by AppKit are named in `theme.rs`: regular `0.0`, semibold `0.3`, and
-bold `0.4`. The medium and high elevation constants correspond to the `med` and `high` rows above;
-`ELEVATION_SHADOW_TAIL_ALLOWANCE` is not a style value but a measured one (§7). The switcher ring
-inset is 3pt as specified in §6.
-
-## 13. Review checklist
-
-- [ ] No new literal color, font size, radius, spacing or duration in a view builder.
-- [ ] New/changed text roles meet their contrast minimum on every surface they can appear on.
-- [ ] Every new string has keys in `en`, `zh-Hans`, `zh-Hant`; no raw identifier on screen.
-- [ ] Controls are single-line; long values truncate and expose the full value.
-- [ ] Every new or changed label, button title and section header fits in `en`, `zh-Hans` and
-      `zh-Hant` without truncation, and nothing truncates that is not on the §9 allow-list.
-- [ ] No new width, truncation budget or input limit is derived from a character count (§11.2, §11.5).
-- [ ] New hierarchy uses size, weight and color only — no case, italic or letterspacing carries
-      meaning, and no size below 12pt is introduced (§4, §11.3).
-- [ ] New text entry leaves Return and unhandled commands to the platform text system, so an input
-      method can compose (§11.5).
-- [ ] Loud new strings are round-tripped; voice strings are written fresh, not translated (§11.6).
-- [ ] New CJK copy was read in the rendered UI — short labels at every supported width, a long
-      paragraph at each width its container can take — and not assumed to break on word boundaries
-      (§11.2).
-- [ ] Cards use border, not a large shadow; elevation level matches what the surface floats over.
-- [ ] A floating panel's outline is `card_border` on every material, its shadow falls outside the panel
-      only, and the window padding is the measured one (§7) — not the blur radius by arithmetic.
-- [ ] Radius comes from the three-step scale; derived radii are computed, not hardcoded.
-- [ ] Animations use the two durations and the standard curve, and honor Reduce Motion.
-- [ ] New code paths are covered by the appropriate tier-A test (see `AGENTS.md`).

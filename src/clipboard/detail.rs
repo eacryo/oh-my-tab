@@ -22,33 +22,56 @@ pub(crate) unsafe fn set_picker_glass_inactive(inactive: bool) {
     }
 }
 
+/// Build the detail body: one scrolling column inset by the mock's pane padding, holding the
+/// text view and, after it where the body section ends, the meta table.
+///
+/// `w`/`h` are the panel's size; `section_h` is the body's own height (what the preview needs),
+/// which the caller already clamped to what the pane leaves under the meta table. `style` picks
+/// the ink (link colour) and `kind` the layout (code); `style` wins for a link only, so the two
+/// agree for every entry except that a degenerate image falls back to plain text.
+#[allow(clippy::too_many_arguments)] // one call site, and the parts are all distinct layout facts
 pub(super) unsafe fn add_detail_text(
     content: *mut AnyObject,
     text: &str,
     w: f64,
     h: f64,
-    kind: TextKind,
+    section_h: f64,
+    entry: &ClipEntry,
+    style: TextKind,
     prepared_code: Option<&PreparedCodeDisplay>,
     code_soft_wrap: bool,
+    kind: TextKind,
 ) {
     let is_code = kind == TextKind::Code;
     debug_assert!(!code_soft_wrap || (is_code && prepared_code.is_some()));
-    // Extend the scroll view to the panel edge and keep right padding inside the text view for
-    // the native overlay scroller.
-    let scroll_w = w - DETAIL_PAD;
-    let body_h = (h - DETAIL_CHROME_H).max(DETAIL_LINE_H);
+    // The body is laid out on its own and the panel is sized around it (the caller clamps it to
+    // what the pane leaves for it), so a measured body keeps every line it needs.
+    let pane = detail_pane_layout_with(
+        detail_insets(picker_shows_detail_in_pane(), w),
+        w,
+        h,
+        meta_table_row_count(),
+    );
+    let body_h = section_h.max(DETAIL_LINE_H);
+    // The scroll view fills the pane; its insets are the mock's padding, so the content column
+    // starts 10pt below the panel top and ends 16pt above its bottom.
+    let scroll_w = pane.scroll.size.width;
+    let scroll_h = pane.scroll.size.height;
     let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
     let scroll: *mut AnyObject = msg_send![
         scroll,
         initWithFrame: NSRect::new(
-            NSPoint::new(DETAIL_PAD, DETAIL_TOOLBAR_H),
-            NSSize::new(scroll_w, body_h)
+            pane.scroll.origin,
+            NSSize::new(scroll_w, scroll_h)
         )
     ];
     let _: () = msg_send![scroll, setBorderType: 0u64]; // NSNoBorder
     let clear_background: *mut AnyObject = msg_send![class!(NSColor), clearColor];
     let _: () = msg_send![scroll, setBackgroundColor: clear_background];
     let _: () = msg_send![scroll, setDrawsBackground: false];
+    // The pane padding is the scroll view's inset: the column starts 10pt below the panel top
+    // and ends 16pt above its bottom, as the mock's `.detail-pane` padding says.
+    apply_scroll_pane_insets(scroll);
     // Use AppKit Overlay scrollers, which reserve no horizontal/vertical corner. NSScrollView
     // owns endpoints, dragging, and wheel phases; NSClipView also stops drawing its background
     // to avoid the default white corner.
@@ -83,13 +106,14 @@ pub(super) unsafe fn add_detail_text(
     // source or boundary array.
     *DETAIL_SOURCE_MAP.lock().unwrap() = prepared.and_then(|code| code.source_map.clone());
     let tv: *mut AnyObject = msg_send![detail_text_view_class(), alloc];
-    // The width must equal the real post-install width (scroll_w = clip width). Building
-    // narrower (avail_w) makes NSClipView stretch the document view on install; the width
-    // delta forces a full TextKit re-layout at display time and spawns the scroll animation
-    // that drags the viewport away from the top (the scrollbar-not-at-top-after-open bug).
+    // The width must equal the real post-install width (the content column's width, which the
+    // clip view enforces). Building narrower (avail_w) makes NSClipView stretch the document view
+    // on install; the width delta forces a full TextKit re-layout at display time and spawns the
+    // scroll animation that drags the viewport away from the top (scrollbar-not-at-top bug).
+    let column_w = pane.content_w.max(1.0);
     let tv: *mut AnyObject = msg_send![
         tv,
-        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(scroll_w, body_h))
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(column_w, body_h))
     ];
     *DETAIL_SOFT_WRAP_TEXT_VIEW.lock().unwrap() = code_soft_wrap.then_some(ObjPtr::new(tv));
     // Detail must finish layout before display. Non-contiguous/background layout grows the
@@ -109,7 +133,7 @@ pub(super) unsafe fn add_detail_text(
     // Link color, font, and paragraph styles mutate NSTextStorage. An outer transaction coalesces
     // TextKit invalidation/fix-up instead of repeatedly processing the soft-wrapped detail.
     let _: () = msg_send![storage, beginEditing];
-    apply_link_color(storage, display_text, kind, clipboard_palette().link_text);
+    apply_link_color(storage, display_text, style, clipboard_palette().link_text);
 
     let _: () = msg_send![tv, setEditable: false];
     // Selectable (it used to be disabled, so a part of a long text could never be
@@ -118,23 +142,28 @@ pub(super) unsafe fn add_detail_text(
     // the Cmd+C forwarding in the picker's container_key_down (see copy_detail_selection).
     let _: () = msg_send![tv, setSelectable: true];
     let _: () = msg_send![tv, setDrawsBackground: false];
-    // Plain detail text uses 14pt; code uses a 14pt monospaced font for stable columns/breaks.
+    // Plain detail text uses FONT_CONTROL; code uses the monospaced FONT_CONTROL for stable
+    // columns/breaks. The mock sets 13px/1.75 plain and 11.5px/1.7 mono; this panel keeps the
+    // shared reading size (the 14/12 scale step) and takes the mock's line-height ratio for
+    // plain text below, so the density matches while its type stays on the app's scale.
     let font: *mut AnyObject = if is_code {
-        msg_send![class!(NSFont), monospacedSystemFontOfSize: crate::theme::FONT_CONTROL, weight: crate::theme::FONT_WEIGHT_REGULAR]
+        msg_send![class!(NSFont), monospacedSystemFontOfSize: 11.5f64, weight: crate::theme::FONT_WEIGHT_REGULAR]
     } else {
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL]
+        msg_send![class!(NSFont), systemFontOfSize: 13.0f64]
     };
     let _: () = msg_send![tv, setFont: font];
+    let ink = crate::glass::panel_ink(
+        clipboard_palette().primary_text,
+        crate::glass::PanelInk::Primary,
+    );
+    let _: () = msg_send![tv, setTextColor: ink];
     if is_code {
         // Keep code line height and hanging indentation consistent in wrapped and unwrapped views.
         apply_code_paragraph_styles(storage, display_text);
     } else {
         let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
         let style: *mut AnyObject = msg_send![style, init];
-        let line_height = crate::theme::line_height(
-            crate::theme::FONT_CONTROL,
-            crate::theme::LINE_HEIGHT_BODY_RATIO,
-        );
+        let line_height = DETAIL_BODY_LINE_H;
         let _: () = msg_send![style, setMinimumLineHeight: line_height];
         let _: () = msg_send![style, setMaximumLineHeight: line_height];
         let _: () = msg_send![style, setLineBreakMode: 0isize];
@@ -149,20 +178,20 @@ pub(super) unsafe fn add_detail_text(
         apply_visible_space_markers(storage, display_text);
     }
     let _: () = msg_send![storage, endEditing];
-    // The detail frame aligns with the row content block; add the list's top padding inside
-    // the text view so the whole detail window does not shift downward.
-    let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, ROW_PAD_TOP)];
+    // The pane's padding is the scroll view's inset, so the text view needs none of its own: its
+    // document view starts at the content column's first line (the mock's `.detail-text` has no
+    // margin), and the code gutter below aligns with that same edge.
+    let _: () = msg_send![tv, setTextContainerInset: NSSize::new(0.0, 0.0)];
     let text_container: *mut AnyObject = msg_send![tv, textContainer];
-    if is_code {
-        // Remove NSTextView's default line padding so DETAIL_PAD controls the code boundary.
-        let _: () = msg_send![text_container, setLineFragmentPadding: 0.0f64];
-    }
+    // Zero line padding for both kinds: the mock's body starts on the content edge, and the
+    // gutter column (code) is the only thing to its left.
+    let _: () = msg_send![text_container, setLineFragmentPadding: 0.0f64];
     // Complete all TextKit layout at the final width, then freeze documentView height to the
     // full usedRect. Leaving NSTextView vertically resizable after display would still mutate
     // its frame asynchronously and push the viewport away from the top.
     let _: () = msg_send![text_container, setWidthTracksTextView: !no_wrap];
     // Keep this consistent with the real post-install width (see the initWithFrame note above).
-    let container_w = if no_wrap { 1_000_000_000.0 } else { scroll_w };
+    let container_w = if no_wrap { 1_000_000_000.0 } else { column_w };
     let _: () = msg_send![
         text_container,
         setContainerSize: NSSize::new(container_w, 1_000_000_000.0)
@@ -171,22 +200,31 @@ pub(super) unsafe fn add_detail_text(
     let _: () = msg_send![tv, setVerticallyResizable: true];
     let _: () = msg_send![layout, ensureLayoutForTextContainer: text_container];
     let used: NSRect = msg_send![layout, usedRectForTextContainer: text_container];
-    let document_w = if no_wrap {
-        (used.origin.x + used.size.width + DETAIL_PAD)
+    let text_w = if no_wrap {
+        (used.origin.x + used.size.width + DETAIL_TEXT_TRAILING_GAP)
             .ceil()
-            .max(scroll_w)
+            .max(column_w)
     } else {
-        scroll_w
+        column_w
     };
-    let document_h = (used.origin.y + used.size.height + ROW_PAD_TOP * 2.0)
-        .ceil()
-        .max(body_h);
-    let _: () = msg_send![tv, setFrameSize: NSSize::new(document_w, document_h)];
-    let _: () = msg_send![tv, setVerticallyResizable: false];
-    let _: () = msg_send![tv, setSelectedRange: NSRange::new(0, 0)];
-    let _: () = msg_send![scroll, setDocumentView: tv];
-    release_obj(tv);
-    *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr::new(tv));
+    // The meta table below the body is part of the same document (see `install_detail_column`),
+    // so the body's own height is complete here: never shorter than its share of the pane.
+    let text_h = (used.origin.y + used.size.height).ceil().max(body_h);
+    let text_view = install_text_section(
+        ObjPtr::new(scroll),
+        ColumnText {
+            tv,
+            w: text_w,
+            h: text_h,
+            gutter_numbers: (!no_wrap).then_some(text_line_numbers(display_text)),
+        },
+        scroll_h,
+        &pane,
+        entry,
+        is_code,
+    );
+    release_obj(text_view);
+    *DETAIL_TEXT_VIEW.lock().unwrap() = Some(ObjPtr::new(text_view));
 
     // Detail scrollbars are drawn by the custom capsules; the bounds notification only
     // refreshes capsule positions. Endpoint rubber banding is handled by native
@@ -208,6 +246,8 @@ pub(super) unsafe fn add_detail_text(
 
     // Native scrollers are fully disabled; NSScrollView/NSClipView still perform scrolling,
     // while the custom views handle visuals and thumb dragging, preventing double scrollbars.
+    // The capsule is a subview of the scroll view, so it starts on the scroll view's own edge
+    // (outside the content insets) and spans the pane's full visible height.
     let vertical_indicator: *mut AnyObject = msg_send![scroll_indicator_class(), alloc];
     let vertical_indicator: *mut AnyObject = msg_send![
         vertical_indicator,
@@ -218,13 +258,13 @@ pub(super) unsafe fn add_detail_text(
             ),
             NSSize::new(
                 SCROLL_INDICATOR_HIT_W,
-                body_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
+                scroll_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
             )
         )
     ];
     update_scroll_indicator_visual(
         vertical_indicator,
-        body_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
+        scroll_h - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
         false,
     );
     let _: () = msg_send![scroll, addSubview: vertical_indicator];
@@ -238,7 +278,7 @@ pub(super) unsafe fn add_detail_text(
             initWithFrame: NSRect::new(
                 NSPoint::new(
                     3.0,
-                    body_h - SCROLL_INDICATOR_HIT_W - 3.0,
+                    scroll_h - SCROLL_INDICATOR_HIT_W - 3.0,
                 ),
                 NSSize::new(
                     scroll_w
@@ -264,6 +304,7 @@ pub(super) unsafe fn add_detail_text(
     if no_wrap {
         update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
     }
+    let _: () = msg_send![scroll, setAutoresizingMask: 1u64 << 4]; // NSViewHeightSizable
     let _: () = msg_send![content, addSubview: scroll];
     release_obj(scroll);
 
@@ -315,6 +356,541 @@ pub(super) extern "C" fn detail_tv_cursor_exited(
         let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
         let _: () = msg_send![arrow, set];
     }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Detail pane geometry (pure; the v2 mock's `.detail-pane` / `.meta-table` / `.meta-row`)
+// ---------------------------------------------------------------------------------------------
+
+/// The image preview's drawn size (the mock's `.image-preview img`: `max-width: 100%`,
+/// `max-height: 300px`, kept in proportion). It shrinks further when the pane itself is shorter.
+pub(super) fn image_preview_fit(px_w: f64, px_h: f64, max_w: f64, pane_body_h: f64) -> (f64, f64) {
+    let (px_w, px_h) = if px_w > 0.0 && px_h > 0.0 {
+        (px_w, px_h)
+    } else {
+        (max_w, max_w)
+    };
+    let pane_scale = if pane_body_h > 0.0 {
+        pane_body_h / px_h
+    } else {
+        1.0
+    };
+    let scale = (max_w / px_w)
+        .min(DETAIL_IMAGE_PREVIEW_MAX_H / px_h)
+        .min(pane_scale)
+        .min(1.0);
+    (px_w * scale, px_h * scale)
+}
+
+/// A media body's placement: the section's height and the preview centred inside the content
+/// column.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct MediaBodyFrames {
+    pub(super) section_h: f64,
+    pub(super) media: NSRect,
+}
+
+/// Centre an image preview in the content column, inside a section at most `pane_body_h` tall.
+pub(super) fn media_body_frames(
+    px_w: f64,
+    px_h: f64,
+    content_w: f64,
+    pane_body_h: f64,
+) -> MediaBodyFrames {
+    let (w, h) = image_preview_fit(px_w, px_h, content_w, pane_body_h);
+    MediaBodyFrames {
+        section_h: h,
+        media: NSRect::new(
+            NSPoint::new(((content_w - w) / 2.0).max(0.0), 0.0),
+            NSSize::new(w, h),
+        ),
+    }
+}
+
+/// The body every meta table describes: five rows (see `MetaField::ALL`). The panel sizes
+/// itself before it knows which entry will be shown -- the detail follows the selection, and a
+/// rebuild must not make the panel jump -- so this is a constant, not a per-entry count.
+pub(super) fn meta_table_row_count() -> usize {
+    MetaField::ALL.len()
+}
+
+/// The panel's minimum height: `DETAIL_TEXT_MIN_H` of body above the meta table, plus the pane
+/// insets -- which is also the scroll view's height.
+/// The smallest panel that still shows the mock's pane: the body floor plus the meta table.
+///
+/// `detail_pane_layout` already derives the scroll column from the panel's height by taking the
+/// pane padding out, so the padding must not be added here a second time.
+pub(super) fn detail_pane_min_height(w: f64, meta_rows: usize) -> f64 {
+    let layout = detail_pane_layout(w, 0.0, meta_rows);
+    (DETAIL_TEXT_MIN_H + layout.meta.height).ceil()
+}
+
+/// The document height of the detail scroll view: the body's own height plus the meta table,
+/// but never less than the pane's visible height -- which is what lets the table rest on the
+/// pane's bottom edge for a short body (the mock's `margin-top: auto`).
+pub(super) fn detail_document_height(visible_h: f64, body_h: f64, meta_h: f64) -> f64 {
+    (body_h + meta_h).max(visible_h)
+}
+
+/// One meta table row's placement, in the content column's flipped coordinates.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct MetaRowFrames {
+    /// Padding above the first row (the mock's `.meta-table` padding-top).
+    pub(super) table_top: f64,
+    /// Each metadata row uses the mock's single value line.
+    pub(super) row_h: f64,
+    /// The label column's width (56pt, or 50pt in the compact layout).
+    pub(super) label_w: f64,
+    pub(super) gap: f64,
+    pub(super) row_gap: f64,
+    /// Number of metadata rows; long values retain their full text in tooltips.
+    pub(super) rows: usize,
+    /// The table's full height, padding included.
+    pub(super) height: f64,
+}
+
+/// Geometry of the meta table, measured from the TOP of the scrolling content column (so the
+/// table is the document's last block). `row_gap` is the mock's `.meta-table` gap.
+pub(super) fn meta_table_frames(content_w: f64, rows: usize) -> MetaRowFrames {
+    let label_w = if content_w < DETAIL_META_COMPACT_BELOW {
+        DETAIL_META_LABEL_W_COMPACT
+    } else {
+        DETAIL_META_LABEL_W
+    };
+    let rows = rows.max(1);
+    let row_h = DETAIL_META_LINE_H;
+    let height =
+        DETAIL_META_PADDING_TOP + rows as f64 * row_h + (rows as f64 - 1.0) * DETAIL_META_ROW_GAP;
+    MetaRowFrames {
+        table_top: DETAIL_META_PADDING_TOP,
+        row_h,
+        label_w,
+        gap: DETAIL_META_GAP,
+        row_gap: DETAIL_META_ROW_GAP,
+        rows,
+        height,
+    }
+}
+
+/// The value column's left x and width inside a content column `content_w` wide: the mock's
+/// 56px label column, its 10px gap, then the rest.
+#[cfg(test)] // only `meta_row_frames` reads it, and that is a test-only reader
+fn meta_value_column(frames: &MetaRowFrames, content_w: f64) -> (f64, f64) {
+    let x = frames.label_w + frames.gap;
+    (x, (content_w - x).max(0.0))
+}
+
+/// A meta row's frames inside the content column (flipped): the label column and the value. The
+/// table itself is painted into the document view, so only tests read the geometry back.
+#[cfg(test)]
+fn meta_row_frames(frames: &MetaRowFrames, index: usize, content_w: f64) -> (NSRect, NSRect) {
+    let y = frames.table_top + index as f64 * (frames.row_h + frames.row_gap);
+    let label = NSRect::new(
+        NSPoint::new(0.0, y),
+        NSSize::new(frames.label_w, frames.row_h),
+    );
+    let (value_x, value_w) = meta_value_column(frames, content_w);
+    let value = NSRect::new(NSPoint::new(value_x, y), NSSize::new(value_w, frames.row_h));
+    (label, value)
+}
+
+/// The scrolling column's placement and its meta table (flipped, measured from the content
+/// container's top-left).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct DetailPaneLayout {
+    /// The scroll view's frame in the content container.
+    pub(super) scroll: NSRect,
+    /// The content column's width inside the pane insets.
+    pub(super) content_w: f64,
+    pub(super) meta: MetaRowFrames,
+    /// The body's share of the scroll view's height: what is left once the table has its space.
+    pub(super) body_h: f64,
+}
+
+/// The `.detail-pane` padding for a mode: the mock's wide pane (`10px 22px 16px`) beside the
+/// picker, its narrow branch (`6px 18px 14px`, with the scroll's own 4px trailing pad) when the
+/// detail fills the panel.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct DetailInsets {
+    pub(super) top: f64,
+    pub(super) left: f64,
+    pub(super) right: f64,
+    pub(super) bottom: f64,
+}
+
+/// The pane padding for `in_pane` at a panel width `panel_w`.
+///
+/// The in-pane column is `panel_w - 18 - 22` wide so the scroll capsule keeps the same trailing
+/// room as the wide pane: the mock's narrow branch sets `padding: 6px 18px 14px` and lets its
+/// native scrollbar share the trailing 18px, while this pane draws its own 10pt track.
+pub(super) fn detail_insets(in_pane: bool, panel_w: f64) -> DetailInsets {
+    let _ = panel_w;
+    if in_pane {
+        DetailInsets {
+            top: DETAIL_NARROW_INSET_TOP + 34.0,
+            left: DETAIL_NARROW_INSET_LEFT,
+            right: DETAIL_NARROW_INSET_RIGHT,
+            bottom: DETAIL_NARROW_INSET_BOTTOM,
+        }
+    } else {
+        DetailInsets {
+            top: DETAIL_INSET_TOP,
+            left: DETAIL_INSET_LEFT,
+            right: DETAIL_INSET_RIGHT,
+            bottom: DETAIL_INSET_BOTTOM,
+        }
+    }
+}
+
+/// Lay out the detail pane: one scrolling column inset by the mode's `.detail-pane` padding,
+/// holding the preview body and the meta table after it.
+pub(super) fn detail_pane_layout(w: f64, h: f64, meta_rows: usize) -> DetailPaneLayout {
+    detail_pane_layout_with(detail_insets(false, w), w, h, meta_rows)
+}
+
+/// [`detail_pane_layout`] for an explicit padding (the narrow pane has its own).
+pub(super) fn detail_pane_layout_with(
+    inset: DetailInsets,
+    w: f64,
+    h: f64,
+    meta_rows: usize,
+) -> DetailPaneLayout {
+    let scroll = NSRect::new(
+        NSPoint::new(inset.left, inset.top),
+        NSSize::new(
+            (w - inset.left - inset.right).max(0.0),
+            (h - inset.top - inset.bottom).max(0.0),
+        ),
+    );
+    // The table is clipped to the column minus the custom scroll capsule's track, so a value is
+    // never drawn under it.
+    let content_w = (scroll.size.width - DETAIL_META_CLIP_INSET).max(0.0);
+    let meta = meta_table_frames(content_w, meta_rows);
+    DetailPaneLayout {
+        scroll,
+        content_w,
+        body_h: (scroll.size.height - meta.height).max(0.0),
+        meta,
+    }
+}
+
+/// The mock's scroll-pane padding as `NSScrollView` content insets: the text/document view keeps
+/// out of the padding while the wheel and the custom thumb still scroll the whole column.
+/// The mock's `.detail-pane` padding, applied to the CLIP VIEW rather than to `NSScrollView`
+/// content insets: content insets shrink the scroll view's clip view only when it owns a scroller
+/// (an inset scroll view without one keeps the insets for layout but reports a zero-height clip
+/// until it is scrolled), and this pane draws its own capsules. The text view already sits inside
+/// the insets, so inset the clip conservatively: AppKit clips it to the scroll view's bounds, which
+/// is the content the mock shows.
+unsafe fn apply_scroll_pane_insets(scroll: *mut AnyObject) {
+    let _: () = msg_send![scroll, setAutomaticallyAdjustsContentInsets: false];
+    let _: () = msg_send![
+        scroll,
+        setContentInsets: objc2_foundation::NSEdgeInsets {
+            top: 0.0,
+            left: 0.0,
+            bottom: 0.0,
+            right: 0.0,
+        }
+    ];
+}
+
+/// A text body to install: the view, its frame size, and (for code) the gutter's line numbers.
+struct ColumnText {
+    tv: *mut AnyObject,
+    w: f64,
+    h: f64,
+    gutter_numbers: Option<Vec<String>>,
+}
+
+/// The code gutter's numbers for a display text: one per hard line (the source lines the text
+/// was built from), so a soft wrap does not advance the count.
+pub(super) fn text_line_numbers(display_text: &str) -> Vec<String> {
+    let hard_lines = display_text.split('\n').count().max(1);
+    (1..=hard_lines).map(|n| n.to_string()).collect()
+}
+
+/// Document children use top-down coordinates, independently of NSClipView's orientation.
+unsafe fn detail_document_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabClipDocumentView", || {
+        crate::ffi::build_class(c"OhMyTabClipDocumentView", class!(NSView), |builder| {
+            builder.add_method::<AnyObject, _>(
+                sel!(isFlipped),
+                header_strip_is_flipped
+                    as extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+            );
+        })
+    })
+    .0 as *mut AnyObject
+}
+
+/// Install the text body and the meta table into the pane's scroll view. Returns the text view
+/// (the caller stores it; the document holds it from here on).
+unsafe fn install_text_section(
+    scroll: ObjPtr,
+    text: ColumnText,
+    visible_h: f64,
+    pane: &DetailPaneLayout,
+    entry: &ClipEntry,
+    is_code: bool,
+) -> *mut AnyObject {
+    let ColumnText {
+        tv,
+        w,
+        h,
+        gutter_numbers,
+    } = text;
+    let content_w = pane.content_w;
+    // The code gutter takes the mock's 26pt column plus its 6pt gap out of the code's line width,
+    // so the code column starts where the mock's `.lc` does.
+    let gutter = if is_code {
+        gutter_numbers.as_ref().map(|_| DETAIL_CODE_GUTTER_W)
+    } else {
+        None
+    };
+    let view_w = gutter.map_or(w, |g| w + g + DETAIL_CODE_GUTTER_GAP);
+    let _: () = msg_send![tv, setVerticallyResizable: false];
+    let _: () = msg_send![tv, setSelectedRange: NSRange::new(0, 0)];
+    let body_h = h;
+    let document_h = detail_document_height(visible_h, body_h, pane.meta.height);
+    let document: *mut AnyObject = msg_send![detail_document_class(), alloc];
+    let document: *mut AnyObject = msg_send![
+        document,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(content_w.max(view_w), document_h))
+    ];
+    // NSClipView owns clipping; keep the document in AppKit's normal drawing hierarchy.
+    // The document is flipped by its parent clip view, so a subview's frame here is measured
+    // from the top edge (the section starts at 0 whatever its height).
+    let x = gutter.map_or(0.0, |g| g + DETAIL_CODE_GUTTER_GAP);
+    let _: () = msg_send![
+        tv,
+        setFrame: NSRect::new(NSPoint::new(x, 0.0), NSSize::new(view_w, h))
+    ];
+    let _: () = msg_send![document, addSubview: tv];
+    if let (Some(g), Some(numbers)) = (gutter, gutter_numbers.as_ref()) {
+        paint_code_gutter(document, numbers, g, h);
+    }
+    paint_meta_table(document, pane, entry, content_w, document_h);
+    let _: () = msg_send![scroll.0, setDocumentView: document];
+    release_obj(document);
+    tv
+}
+
+/// Images use the same independently scrolling detail column as text.
+pub(super) unsafe fn add_detail_image(
+    content: *mut AnyObject,
+    image: *mut AnyObject,
+    pixels: (f64, f64),
+    pane: &DetailPaneLayout,
+    entry: &ClipEntry,
+) {
+    let scroll: *mut AnyObject = msg_send![class!(NSScrollView), alloc];
+    let scroll: *mut AnyObject = msg_send![scroll, initWithFrame: pane.scroll];
+    let _: () = msg_send![scroll, setDrawsBackground: false];
+    let _: () = msg_send![scroll, setBorderType: 0u64];
+    let _: () = msg_send![scroll, setHasVerticalScroller: false];
+    let _: () = msg_send![scroll, setHasHorizontalScroller: false];
+    apply_scroll_pane_insets(scroll);
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let _: () = msg_send![clip, setDrawsBackground: false];
+    let _: () = msg_send![clip, setPostsBoundsChangedNotifications: true];
+    let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
+    let name = make_nsstring("NSViewBoundsDidChangeNotification");
+    let _: () = msg_send![center, addObserver: observer(), selector: sel!(detailScrollIndicatorBoundsChanged:), name: name, object: clip];
+    CFRelease(name as *const c_void);
+    let view = install_image_section(scroll, image, pixels, pane.scroll.size.height, pane, entry);
+    release_obj(view);
+    let indicator: *mut AnyObject = msg_send![scroll_indicator_class(), new];
+    let _: () = msg_send![indicator, setHidden: true];
+    let _: () = msg_send![scroll, addSubview: indicator];
+    *DETAIL_SCROLL_INDICATOR.lock().unwrap() = Some(ObjPtr::new(indicator));
+    release_obj(indicator);
+    let _: () = msg_send![content, addSubview: scroll];
+    *DETAIL_SCROLL_VIEW.lock().unwrap() = Some(ObjPtr::new(scroll));
+    release_obj(scroll);
+}
+
+/// Install an image body: the centred preview in its well, then the meta table. Returns the
+/// image view the caller releases (the document owns it).
+pub(crate) unsafe fn install_image_section(
+    scroll: *mut AnyObject,
+    image: *mut AnyObject,
+    px: (f64, f64),
+    visible_h: f64,
+    pane: &DetailPaneLayout,
+    entry: &ClipEntry,
+) -> *mut AnyObject {
+    let content_w = pane.content_w;
+    let frames = media_body_frames(px.0, px.1, content_w, pane.body_h);
+    let body_h = frames.section_h.max(1.0);
+    let document_h = detail_document_height(visible_h, body_h, pane.meta.height);
+    let document: *mut AnyObject = msg_send![detail_document_class(), alloc];
+    let document: *mut AnyObject = msg_send![
+        document,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(content_w, document_h))
+    ];
+    // The preview's clipped, rounded well is a layer on the image view itself (radius 12, the
+    // mock's `.image-preview`), with the mock's soft shadow under it.
+    let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let view: *mut AnyObject = msg_send![view, initWithFrame: frames.media];
+    let _: () = msg_send![view, setImage: image];
+    let _: () = msg_send![view, setImageScaling: 3u64]; // NSImageScaleProportionallyUpOrDown
+    let _: () = msg_send![view, setEditable: false];
+    let _: () = msg_send![view, setWantsLayer: true];
+    style_preview_well(view);
+    let _: () = msg_send![document, addSubview: view];
+    paint_meta_table(document, pane, entry, content_w, document_h);
+    let _: () = msg_send![scroll, setDocumentView: document];
+    release_obj(document);
+    view
+}
+
+/// The mock's `.image-preview`: a 12pt rounded container, a translucent light well and a soft
+/// downward shadow. Dark mode swaps in the palette's own card surface and a darker shadow so
+/// the well does not glow on the dark material.
+unsafe fn style_preview_well(view: *mut AnyObject) {
+    let dark = clipboard_palette().dark;
+    let layer: *mut AnyObject = msg_send![view, layer];
+    let well = if dark {
+        PREVIEW_WELL_DARK
+    } else {
+        PREVIEW_WELL_LIGHT
+    };
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(well));
+    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CARD];
+    let _: () = msg_send![layer, setMasksToBounds: true];
+    let shadow = if dark {
+        PREVIEW_SHADOW_DARK
+    } else {
+        PREVIEW_SHADOW_LIGHT
+    };
+    crate::ffi::layer_set_shadow_color(layer, crate::ffi::hex_to_cg_color(shadow));
+    let _: () = msg_send![layer, setShadowRadius: PREVIEW_SHADOW_RADIUS];
+    let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -PREVIEW_SHADOW_OFFSET_Y)];
+    let _: () = msg_send![layer, setShadowOpacity: PREVIEW_SHADOW_OPACITY as f32];
+}
+
+/// Paint the code gutter: the mock's right-aligned line numbers in its 26pt column. Numbers are
+/// one per HARD line; a soft wrap continues the same number on the next visual line.
+unsafe fn paint_code_gutter(
+    document: *mut AnyObject,
+    numbers: &[String],
+    gutter_w: f64,
+    section_h: f64,
+) {
+    let line_h = DETAIL_LINE_H;
+    let font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        monospacedSystemFontOfSize: DETAIL_GUTTER_FONT,
+        weight: crate::theme::FONT_WEIGHT_REGULAR
+    ];
+    let color = crate::glass::panel_ink(
+        clipboard_palette().muted_text,
+        crate::glass::PanelInk::Muted,
+    );
+    for (index, number) in numbers.iter().enumerate() {
+        let y = index as f64 * line_h;
+        if y >= section_h {
+            break;
+        }
+        // The line box is DETAIL_LINE_H, the text view's own line height, so numbers share the
+        // code's baselines; the 4pt trailing pad keeps them off the gutter's right edge (the
+        // mock's `.ln { padding-right: 4px }`).
+        let label = make_meta_cell(
+            NSRect::new(
+                NSPoint::new(0.0, y),
+                NSSize::new(gutter_w - DETAIL_CODE_GUTTER_PAD, line_h),
+            ),
+            number,
+            font,
+            color,
+            2isize, // NSTextAlignmentRight
+        );
+        let _: () = msg_send![document, addSubview: label];
+        release_obj(label);
+    }
+}
+
+/// A row of the meta table: a quiet label in the 56pt column, its value beside it. Size, fonts
+/// and ink come from the palette roles, so a mode switch only needs a rebuild.
+unsafe fn paint_meta_table(
+    document: *mut AnyObject,
+    pane: &DetailPaneLayout,
+    entry: &ClipEntry,
+    content_w: f64,
+    document_h: f64,
+) {
+    let table_y = document_h - pane.meta.height;
+    let label_w = pane.meta.label_w;
+    let value_x = label_w + pane.meta.gap;
+    let value_w = (content_w - value_x).max(0.0);
+    for (index, (label, value)) in meta_table(entry, show_source_app()).into_iter().enumerate() {
+        let y =
+            table_y + pane.meta.table_top + index as f64 * (pane.meta.row_h + pane.meta.row_gap);
+        let color = crate::glass::panel_ink(
+            clipboard_palette().secondary_text,
+            crate::glass::PanelInk::Muted,
+        );
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+        let label_cell = make_meta_cell(
+            NSRect::new(NSPoint::new(0.0, y), NSSize::new(label_w, pane.meta.row_h)),
+            &label,
+            font,
+            color,
+            0,
+        );
+        let _: () = msg_send![document, addSubview: label_cell];
+        release_obj(label_cell);
+        let color = crate::glass::panel_ink(
+            clipboard_palette().primary_text,
+            crate::glass::PanelInk::Secondary,
+        );
+        let value_cell = make_meta_cell(
+            NSRect::new(
+                NSPoint::new(value_x, y),
+                NSSize::new(value_w, pane.meta.row_h),
+            ),
+            &value,
+            font,
+            color,
+            0,
+        );
+        // A long value (a URL-wrapped app name) truncates at the tail; the tooltip carries it.
+        let cell: *mut AnyObject = msg_send![value_cell, cell];
+        let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+        let tooltip = make_nsstring(&value);
+        let _: () = msg_send![value_cell, setToolTip: tooltip];
+        CFRelease(tooltip as *const c_void);
+        let _: () = msg_send![document, addSubview: value_cell];
+        release_obj(value_cell);
+    }
+}
+
+/// A borderless, background-less one-line label at `frame`.
+unsafe fn make_meta_cell(
+    frame: NSRect,
+    text: &str,
+    font: *mut AnyObject,
+    color: *mut AnyObject,
+    alignment: isize,
+) -> *mut AnyObject {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: frame];
+    let value = make_nsstring(text);
+    let _: () = msg_send![label, setStringValue: value];
+    CFRelease(value as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setAlignment: alignment];
+    let cell: *mut AnyObject = msg_send![label, cell];
+    let _: () = msg_send![cell, setUsesSingleLineMode: true];
+    label
 }
 
 /// Find a text entry's display index in the current filters. History deduplicates text
@@ -466,6 +1042,19 @@ pub(super) fn copy_detail_selection() {
 /// The picker's backdrop policy: its rows, group headers and footer bands carry their own text
 /// surfaces, so the material is left honest (design-style §3). The passive compensation layer is
 /// transparent while key and only tinted while a pinned picker remains visible after resigning key.
+///
+/// Elevation stays `HIGH`, and no outline request is added on this side, after reviewing what the
+/// v2 mock's own shadow and edge do:
+/// - The mock floats the sheet on a heavy drop shadow (`0 34px 84px` at 30%) *and* a 1px glass
+///   line. The shared `high` level is the design-system's shadow for floating panels, and the
+///   outline is what `glass::install_panel_outline` already adds for frost and `opaque` -- the two
+///   materials whose hierarchy carries no directional rim of its own. Liquid Glass is deliberately
+///   skipped there: the system draws its own rim, and a uniform 1pt stroke flattens it into a
+///   drawn rectangle (measured in `install_panel_outline`'s comment).
+/// - So the elevation is required for all three materials (a translucent sheet over a bright
+///   desktop has no silhouette without a shadow carrier, and frost/opaque have no rim at all), and
+///   the 1pt stroke is required exactly where the shared installer applies it. Neither is a request
+///   parameter this module can (or needs to) change.
 pub(crate) fn picker_backdrop_options() -> crate::glass::BackdropOptions {
     // `high`: the picker floats over another app's content exactly as the switcher does.
     // Keep a transparent compensation layer available so it can counter the system's passive
@@ -476,6 +1065,10 @@ pub(crate) fn picker_backdrop_options() -> crate::glass::BackdropOptions {
 
 /// The detail panel is a passive companion of the picker, so its Liquid Glass takes the inactive
 /// darkening compensation. It also scrims its own text.
+///
+/// It keeps the same elevation as the picker: the pair reads as one group only while both cast the
+/// same depth, and the detail sits on the same desktop edge. It has no outline request of its own --
+/// the shared installer's rule applies unchanged (frost/opaque stroke, Liquid Glass rim).
 pub(crate) const fn detail_backdrop_options() -> crate::glass::BackdropOptions {
     crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA))
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
@@ -529,7 +1122,7 @@ unsafe fn swap_backdrop_if_material_changed(
         window.0,
         &old,
         panel_rect,
-        crate::glass::PANEL_CORNER_RADIUS,
+        super::PICKER_PANEL_RADIUS,
         options,
     );
     *backdrop_slot.lock().unwrap() = Some(new);
@@ -550,11 +1143,9 @@ pub(crate) unsafe fn apply_theme() {
             set_clear_confirmation_button_style(button.0, false);
         }
     }
-    // The two header controls this change added are repainted here too: the picker window is reused
-    // across showings, so an ink captured at build time would keep the previous mode's colour (the
-    // handle's dots and the gear's tint). The rest of the header predates this and is a separate chore.
-    super::grip::refresh_grip_style();
-    if let Some(button) = *PICKER_SETTINGS_BUTTON.lock().unwrap() {
+    // The gear's ink is repainted here too: the picker window is reused across showings, so a tint
+    // captured at build time would keep the previous mode's colour.
+    if let Some(button) = *PICKER_OPTIONS_ORB.lock().unwrap() {
         set_settings_button_style(button.0, false);
     }
     // The pin's ink and glyph both come from the palette, and this is the system-appearance entry
@@ -654,7 +1245,7 @@ pub(super) unsafe fn ensure_picker_window() {
     let backdrop = crate::glass::install_backdrop(
         window,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
-        crate::glass::PANEL_CORNER_RADIUS,
+        super::PICKER_PANEL_RADIUS,
         picker_backdrop_options(),
     );
     *PICKER_BACKDROP.lock().unwrap() = Some(backdrop);
@@ -692,6 +1283,36 @@ pub(super) unsafe fn ensure_picker_window() {
                 sel!(mouseExited:),
                 container_mouse_exited as *mut c_void,
                 types_key.as_ptr(),
+            );
+            // Blank-area drag, the same gesture the transparent surface over the whole panel
+            // carries (see `drag.rs`): this extends it over the list's own empty space below the
+            // last row. Only a press that lands on the document view itself arrives here -- rows and
+            // the action buttons are controls with their own hit targets -- and the handlers claim
+            // the press, not the wheel, so scrolling still bubbles to the scroll view.
+            class_addMethod(
+                cls,
+                sel!(mouseDown:),
+                super::drag::drag_mouse_down as *mut c_void,
+                types_key.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseDragged:),
+                super::drag::drag_mouse_dragged as *mut c_void,
+                types_key.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseUp:),
+                super::drag::drag_mouse_up as *mut c_void,
+                types_key.as_ptr(),
+            );
+            let types_first_mouse = CString::new("B@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(acceptsFirstMouse:),
+                super::drag::drag_accepts_first_mouse as *mut c_void,
+                types_first_mouse.as_ptr(),
             );
             let types_bool = CString::new("B@:").unwrap();
             class_addMethod(
@@ -861,8 +1482,30 @@ pub(super) unsafe fn ensure_picker_window() {
     // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
     // with a 1px inner ring; the placeholder is left-aligned. The corner close button shares the
     // row, so the shared geometry gives the field the remaining width.
-    let (search_frame, pin_frame, gear_frame, close_frame) = picker_header_frames();
+    let (search_frame, options_frame, detail_orb_frame, pin_frame, close_frame) =
+        picker_header_frames();
     let search_w = search_frame.size.width;
+    let search_surface: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let search_surface: *mut AnyObject = msg_send![search_surface, initWithFrame: search_frame];
+    let _: () = msg_send![search_surface, setWantsLayer: true];
+    let surface_layer: *mut AnyObject = msg_send![search_surface, layer];
+    if !surface_layer.is_null() {
+        let _: () = msg_send![surface_layer, setCornerRadius: SEARCH_R];
+        let _: () = msg_send![surface_layer, setMasksToBounds: true];
+        crate::ffi::layer_set_background(
+            surface_layer,
+            crate::ffi::hex_to_cg_color(picker_field_fill(false)),
+        );
+        let _: () = msg_send![surface_layer, setBorderWidth: 1.0f64];
+        crate::ffi::layer_set_border(
+            surface_layer,
+            crate::ffi::hex_to_cg_color(picker_field_ring(false)),
+        );
+    }
+    let _: () = msg_send![header_strip, addSubview: search_surface];
+    release_obj(search_surface);
+    *SEARCH_FIELD_SURFACE.lock().unwrap() = Some(ObjPtr::new(search_surface));
+
     let search: *mut AnyObject = msg_send![search_cls, alloc];
     let search: *mut AnyObject = msg_send![search, initWithFrame: search_frame];
     // A custom cell: the placeholder = "magnifier SF Symbol + search hint" drawn at the
@@ -931,7 +1574,7 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![search, setWantsLayer: true];
     let search_layer: *mut AnyObject = msg_send![search, layer];
     style_search_field(search, false);
-    let _: () = msg_send![search_layer, setBorderWidth: 1.0f64];
+    let _: () = msg_send![search_layer, setBorderWidth: 0.0f64];
     let _: () = msg_send![search_layer, setCornerRadius: SEARCH_R];
     // Delegate = observer() (reusing the notification singleton): intercepts ↓ (the field
     // editor forwards moveDown:).
@@ -988,58 +1631,117 @@ pub(super) unsafe fn ensure_picker_window() {
     release_obj(close_button);
     *PICKER_CLOSE_BUTTON.lock().unwrap() = Some(ObjPtr::new(close_button));
 
-    // The drag handle: a transparent band centered on the panel's top edge, holding three dots.
-    // It is the ONLY way the panel moves -- the rows and the corner buttons keep their clicks.
-    super::grip::make_grip_view(header_strip);
-
-    // The settings button, immediately left of the ×: it opens the settings window on the
-    // clipboard page, so the switch a user is looking for is the one they land on. A borderless
-    // glyph button like its neighbour (see the corner-glyph-button exception in the style doc).
-    let gear_button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    let gear_button: *mut AnyObject = msg_send![gear_button, initWithFrame: gear_frame];
-    let _: () = msg_send![gear_button, setBordered: false];
-    let _: () = msg_send![gear_button, setWantsLayer: true];
-    let gear_layer: *mut AnyObject = msg_send![gear_button, layer];
-    if !gear_layer.is_null() {
-        let _: () = msg_send![gear_layer, setCornerRadius: PICKER_CLOSE_BTN_R];
-        let _: () = msg_send![gear_layer, setMasksToBounds: true];
+    // The options orb (the mock's `.orb.has-filter`): opens the filter/options popover. Its
+    // `orb-dot` sublayer is the mock's 5px accent dot, shown only while a non-All filter is
+    // active.
+    let options_button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let options_button: *mut AnyObject = msg_send![options_button, initWithFrame: options_frame];
+    let _: () = msg_send![options_button, setBordered: false];
+    let _: () = msg_send![options_button, setWantsLayer: true];
+    let options_layer: *mut AnyObject = msg_send![options_button, layer];
+    if !options_layer.is_null() {
+        // The mock's `.orb`: a circle, not the control radius.
+        let _: () = msg_send![options_layer, setCornerRadius: PICKER_ORB_SIZE / 2.0];
     }
-    // An SF Symbol sized by its own configuration: a symbol image is not sized by the button's
-    // font, so the point size is where the glyph's weight in the corner comes from.
-    let symbol_name = make_nsstring("gearshape");
-    let gear_image: *mut AnyObject = msg_send![
+    let symbol_name = make_nsstring("ellipsis");
+    let options_image: *mut AnyObject = msg_send![
         class!(NSImage),
         imageWithSystemSymbolName: symbol_name,
         accessibilityDescription: std::ptr::null::<AnyObject>()
     ];
     CFRelease(symbol_name as *const c_void);
-    if !gear_image.is_null() {
-        let gear_config: *mut AnyObject = msg_send![
+    if !options_image.is_null() {
+        let options_config: *mut AnyObject = msg_send![
             class!(NSImageSymbolConfiguration),
             configurationWithPointSize: PICKER_GEAR_GLYPH_SIZE,
             weight: crate::theme::FONT_WEIGHT_REGULAR
         ];
-        let gear_image: *mut AnyObject =
-            msg_send![gear_image, imageWithSymbolConfiguration: gear_config];
-        let _: () = msg_send![gear_image, setTemplate: true];
-        let _: () = msg_send![gear_button, setImage: gear_image];
+        let options_image: *mut AnyObject =
+            msg_send![options_image, imageWithSymbolConfiguration: options_config];
+        let _: () = msg_send![options_image, setTemplate: true];
+        let _: () = msg_send![options_button, setImage: options_image];
     }
-    let gear_title = make_nsstring("");
-    let _: () = msg_send![gear_button, setTitle: gear_title];
-    CFRelease(gear_title as *const c_void);
-    let _: () = msg_send![gear_button, setTarget: observer()];
-    let _: () = msg_send![gear_button, setAction: sel!(openClipboardSettings:)];
-    set_settings_button_style(gear_button, false);
-    add_hover_tracking(gear_button);
-    let gear_label = make_nsstring(&t("clipboard.open_settings"));
-    let _: () = msg_send![gear_button, setAccessibilityLabel: gear_label];
-    CFRelease(gear_label as *const c_void);
-    let gear_tooltip = make_nsstring(&t("clipboard.open_settings"));
-    let _: () = msg_send![gear_button, setToolTip: gear_tooltip];
-    CFRelease(gear_tooltip as *const c_void);
-    let _: () = msg_send![header_strip, addSubview: gear_button];
-    release_obj(gear_button);
-    *PICKER_SETTINGS_BUTTON.lock().unwrap() = Some(ObjPtr::new(gear_button));
+    let options_title = make_nsstring("");
+    let _: () = msg_send![options_button, setTitle: options_title];
+    CFRelease(options_title as *const c_void);
+    let _: () = msg_send![options_button, setTarget: observer()];
+    let _: () = msg_send![options_button, setAction: sel!(toggleFilterPopover:)];
+    set_settings_button_style(options_button, false);
+    add_hover_tracking(options_button);
+    let options_label = make_nsstring(&t("clipboard.options_button"));
+    let _: () = msg_send![options_button, setAccessibilityLabel: options_label];
+    CFRelease(options_label as *const c_void);
+    let options_tooltip = make_nsstring(&t("clipboard.options_button"));
+    let _: () = msg_send![options_button, setToolTip: options_tooltip];
+    CFRelease(options_tooltip as *const c_void);
+    // The orb-dot (`.orb-dot`): an accent dot pinned to the orb's top-right, drawn whenever the
+    // active filter is not "All".
+    if !options_layer.is_null() {
+        let dot: *mut AnyObject = msg_send![class!(CALayer), layer];
+        let _: () = msg_send![
+            dot,
+            setFrame: NSRect::new(
+                NSPoint::new(PICKER_ORB_SIZE - 8.0, 3.0),
+                NSSize::new(5.0, 5.0)
+            )
+        ];
+        let _: () = msg_send![dot, setCornerRadius: 2.5];
+        crate::ffi::layer_set_background(
+            dot,
+            crate::ffi::hex_to_cg_color(super::picker_accent(clipboard_palette())),
+        );
+        let _: () = msg_send![options_layer, addSublayer: dot];
+        *OPTIONS_ORB_DOT.lock().unwrap() = Some(ObjPtr::new(dot));
+    }
+    let _: () = msg_send![header_strip, addSubview: options_button];
+    release_obj(options_button);
+    *PICKER_OPTIONS_ORB.lock().unwrap() = Some(ObjPtr::new(options_button));
+    sync_options_orb_dot();
+
+    // The detail-toggle orb (the mock's `#detailToggle`): expands/collapses the selected
+    // entry's detail pane. Same glyph family and orb metrics as its neighbours.
+    let detail_button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let detail_button: *mut AnyObject = msg_send![detail_button, initWithFrame: detail_orb_frame];
+    let _: () = msg_send![detail_button, setBordered: false];
+    let _: () = msg_send![detail_button, setWantsLayer: true];
+    let detail_layer: *mut AnyObject = msg_send![detail_button, layer];
+    if !detail_layer.is_null() {
+        let _: () = msg_send![detail_layer, setCornerRadius: PICKER_ORB_SIZE / 2.0];
+    }
+    let detail_symbol = make_nsstring("sidebar.right");
+    let detail_image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: detail_symbol,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(detail_symbol as *const c_void);
+    if !detail_image.is_null() {
+        let detail_config: *mut AnyObject = msg_send![
+            class!(NSImageSymbolConfiguration),
+            configurationWithPointSize: PICKER_GEAR_GLYPH_SIZE,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        let detail_image: *mut AnyObject =
+            msg_send![detail_image, imageWithSymbolConfiguration: detail_config];
+        let _: () = msg_send![detail_image, setTemplate: true];
+        let _: () = msg_send![detail_button, setImage: detail_image];
+    }
+    let detail_title = make_nsstring("");
+    let _: () = msg_send![detail_button, setTitle: detail_title];
+    CFRelease(detail_title as *const c_void);
+    let _: () = msg_send![detail_button, setTarget: observer()];
+    let _: () = msg_send![detail_button, setAction: sel!(toggleDetailPanel:)];
+    set_settings_button_style(detail_button, false);
+    add_hover_tracking(detail_button);
+    let detail_label = make_nsstring(&t("clipboard.detail_toggle"));
+    let _: () = msg_send![detail_button, setAccessibilityLabel: detail_label];
+    CFRelease(detail_label as *const c_void);
+    let detail_tooltip = make_nsstring(&t("clipboard.detail_toggle"));
+    let _: () = msg_send![detail_button, setToolTip: detail_tooltip];
+    CFRelease(detail_tooltip as *const c_void);
+    let _: () = msg_send![header_strip, addSubview: detail_button];
+    release_obj(detail_button);
+    *PICKER_DETAIL_BUTTON.lock().unwrap() = Some(ObjPtr::new(detail_button));
 
     // The pin button, left of the gear: the corner row's third glyph. It toggles the WHOLE-panel
     // pin (a different thing from the per-row ☆), which is why it lives with the panel-level
@@ -1050,7 +1752,7 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![pin_button, setWantsLayer: true];
     let pin_layer: *mut AnyObject = msg_send![pin_button, layer];
     if !pin_layer.is_null() {
-        let _: () = msg_send![pin_layer, setCornerRadius: PICKER_CLOSE_BTN_R];
+        let _: () = msg_send![pin_layer, setCornerRadius: PICKER_ORB_SIZE / 2.0];
         let _: () = msg_send![pin_layer, setMasksToBounds: true];
     }
     let pin_title = make_nsstring("");
@@ -1098,57 +1800,10 @@ pub(super) unsafe fn ensure_picker_window() {
     ];
     CFRelease(end_name as *const c_void);
 
-    // The filters row (the mockup's .filters): bare 12pt text; the active one darkens and
-    // gains a 16x2 underline.
-    let filter_labels = localized_filter_labels();
-    let filters_y = picker_filters_y();
-    *FILTER_PILLS.lock().unwrap() = Vec::new();
-    let mut fx = FILTERS_PAD_X;
-    for (i, lab) in filter_labels.iter().enumerate() {
-        // Button width = the text + click slack; gaps per the mockup's 17px.
-        let w = localized_string_width(lab, 12.0) + 12.0;
-        let pill = make_filter_pill(lab, i as isize, fx, filters_y, w);
-        let _: () = msg_send![header_strip, addSubview: pill];
-        release_obj(pill);
-        FILTER_PILLS.lock().unwrap().push(ObjPtr::new(pill));
-        fx += w + FILTER_GAP;
-    }
-    update_filter_pill_style(false);
-
-    // Clear history: one compact text action beside the filters always ("clear", pinned entries
-    // stay), plus an opt-in second one ("clear all", settings switch, also takes the pinned
-    // entries). Their text names the scope they clear; `update_clear_action_labels` sizes each
-    // button to its CURRENT label, decides the second button's visibility and lays the pair out
-    // right-aligned, so the build below only needs placeholder frames.
-    let clear_actions = [sel!(clearClipboardHistory:), sel!(clearClipboardAll:)];
-    let mut clear_buttons = [std::ptr::null_mut(); 2];
-    for (i, action) in clear_actions.iter().enumerate() {
-        let frame = NSRect::new(NSPoint::new(0.0, filters_y + 8.0), NSSize::new(1.0, 20.0));
-        let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-        let button: *mut AnyObject = msg_send![button, initWithFrame: frame];
-        let _: () = msg_send![button, setBordered: false];
-        let _: () = msg_send![button, setWantsLayer: true];
-        let button_layer: *mut AnyObject = msg_send![button, layer];
-        if !button_layer.is_null() {
-            let _: () = msg_send![button_layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
-        }
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-        let _: () = msg_send![button, setFont: font];
-        let _: () = msg_send![button, setTarget: observer()];
-        let _: () = msg_send![button, setAction: *action];
-        set_clear_confirmation_button_style(button, false);
-        add_hover_tracking(button);
-        let _: () = msg_send![header_strip, addSubview: button];
-        release_obj(button);
-        clear_buttons[i] = button;
-    }
-    *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() =
-        Some([ObjPtr::new(clear_buttons[0]), ObjPtr::new(clear_buttons[1])]);
-    // Initial titles, text-hugging widths and visibility for the current filter and setting.
+    // Clear actions moved into the options popover (step C); their labels and
+    // handlers stay live through `update_clear_action_labels`, which no-ops on no buttons.
     update_clear_action_labels();
 
-    // (clear history now lives in the filters row).
     build_footer(content_parent, w);
     // The toast label (the new mockup's .toast): a dark rounded pill at the bottom center,
     // above the footer.
@@ -1165,21 +1820,27 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![toast_label, setEditable: false];
     let _: () = msg_send![toast_label, setSelectable: false];
     let _: () = msg_send![toast_label, setAlignment: 1isize]; // Center on arm64
-    let tf: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let tf: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.5];
     let _: () = msg_send![toast_label, setFont: tf];
-    let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+    let white = crate::glass::panel_ink(
+        clipboard_palette().primary_text,
+        crate::glass::PanelInk::Primary,
+    );
     let _: () = msg_send![toast_label, setTextColor: white];
     let _: () = msg_send![toast_label, setWantsLayer: true];
     let tlayer: *mut AnyObject = msg_send![toast_label, layer];
-    let tbg: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 30.0f64 / 255.0, alpha: 0.86f64];
+    let tbg = crate::ffi::hex_to_ns_color(clipboard_palette().card_bg);
     crate::ffi::layer_set_background(tlayer, crate::ffi::ns_color_to_cg(tbg));
-    let _: () = msg_send![tlayer, setCornerRadius: crate::theme::RADIUS_PANEL];
+    let _: () = msg_send![tlayer, setCornerRadius: 10.0f64];
     let _: () = msg_send![toast_label, setHidden: true];
     let _: () = msg_send![content_parent, addSubview: toast_label];
     release_obj(toast_label);
     *TOAST_LABEL.lock().unwrap() = Some(ObjPtr::new(toast_label));
+
+    // The blank-area drag surface goes on LAST so it is the topmost subview: every blank region of
+    // the panel then accepts the gesture, while `hitTest:` declines the controls, the list viewport
+    // and text, which keep the events they always had (see `drag.rs`).
+    super::drag::install_drag_surface(content_parent);
 
     // Outside clicks (the picker resigns key) -> auto-hide. Same as Win+V: any click after
     // summoning dismisses the picker.
@@ -1225,9 +1886,6 @@ struct RowSpec<'a> {
     has_header: bool,
     selected: bool,
     hovered: bool,
-    show_source: bool,
-    detail_open: bool,
-    sel_idx: usize,
 }
 
 /// The row backdrop wash for one selection/hover combination, shared by the row-build path
@@ -1246,9 +1904,9 @@ pub(super) fn row_backdrop_wash(
     hovered: bool,
 ) -> u32 {
     if selected {
-        palette.selection_bg
+        super::picker_row_selected(palette)
     } else if hovered {
-        palette.hover_bg
+        super::picker_row_hover(palette)
     } else {
         // An idle row paints nothing: the panel's material is the surface (its text stays legible through
         // the ink `glass::panel_ink` picks), and a surface here would band against the material wherever a
@@ -1275,18 +1933,16 @@ unsafe fn create_row_views(
         has_header,
         selected,
         hovered,
-        show_source,
-        detail_open,
-        sel_idx,
     } = spec;
     let i = display_index;
     let palette = clipboard_palette();
-    let row_w = PICKER_W - PAD_X * 2.0;
+    let row_w = picker_list_width() - PAD_X * 2.0;
     let hdr_h = if has_header { GROUP_H } else { 0.0 };
     let content_y = y + hdr_h;
 
     // The group header: 11px medium text, 27px tall, centered.
     let mut row_group_label = None;
+    let row_group_clear = None;
     if has_header {
         let g_label = make_nsstring(&group_label(day_group(entry.copied_at)));
         let g_frame = NSRect::new(
@@ -1310,6 +1966,8 @@ unsafe fn create_row_views(
         let _: () = msg_send![container, addSubview: g];
         release_obj(g);
         row_group_label = Some(ObjPtr::new(g));
+
+        // Clearing history lives in the options menu alongside the other housekeeping actions.
     }
 
     // The row backdrop (two distinct styles): hovered (not selected) = the palette's hover
@@ -1328,32 +1986,15 @@ unsafe fn create_row_views(
     // CGColor args/returns ('^{CGColor=}' vs '^v').
     crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(bg_hex));
     let _: () = msg_send![tile_layer, setCornerRadius: SEL_TILE_R];
-    // Prebuild the 2px selection bar for every row and hide it when unselected, so arrow
-    // navigation only toggles visibility instead of rebuilding rows.
-    let bar: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let bar: *mut AnyObject = msg_send![
-        bar,
-        initWithFrame: NSRect::new(
-            NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
-            NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
-        )
-    ];
-    let _: () = msg_send![bar, setWantsLayer: true];
-    let bar_layer: *mut AnyObject = msg_send![bar, layer];
-    crate::ffi::layer_set_background(bar_layer, crate::ffi::hex_to_cg_color(palette.accent));
-    let _: () = msg_send![bar_layer, setCornerRadius: SEL_BAR_W / 2.0];
-    let _: () = msg_send![bar, setHidden: !selected];
-    let _: () = msg_send![tile, addSubview: bar];
-    release_obj(bar);
     let _: () = msg_send![container, addSubview: tile];
     release_obj(tile);
 
-    // The content button: the row's upper zone (61pt), clickable (paste) + hover;
-    // image rows get a 72x44 thumbnail canvas + the filename; text rows show <=2
-    // styled lines. Borderless, backgroundless.
+    // The content button: the whole row, one truncated line -- the v2 mock's `.clip-row`
+    // (40px, single title line; the meta line moved to the detail pane's meta table).
+    // Borderless, backgroundless.
     let content_x = PAD_X + ROW_PAD_L;
-    let content_w = row_w - ROW_PAD_L - ROW_PAD_R;
-    let content_h = row_h - META_FOOTER_H; // the meta bar takes the bottom.
+    let content_w = model::row_content_width(row_w);
+    let content_h = row_h;
     let content_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
     let is_image = entry.image.is_some();
     if is_image {
@@ -1369,10 +2010,10 @@ unsafe fn create_row_views(
     let _: () = msg_send![content_btn, setBordered: false];
     let _: () = msg_send![content_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
     let cell: *mut AnyObject = msg_send![content_btn, cell];
-    let _: () = msg_send![cell, setUsesSingleLineMode: false];
+    let _: () = msg_send![cell, setUsesSingleLineMode: true];
     let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
     if msg_send![cell, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
-        let _: () = msg_send![cell, setMaximumNumberOfLines: 2isize];
+        let _: () = msg_send![cell, setMaximumNumberOfLines: 1isize];
     }
     let image_started = Instant::now();
     let row_img = make_row_image(entry);
@@ -1405,50 +2046,18 @@ unsafe fn create_row_views(
     let _: () = msg_send![container, addSubview: content_btn];
     release_obj(content_btn);
 
-    // The bottom meta button: a 17pt bar with [13px source icon] + app · time on the
-    // left; clickable (paste) and hover-tracked; the action buttons float on its right.
-    // Positioned ROW_PAD_BOT (8pt) above the row bottom, matching the mockup's
-    // .item padding-bottom 8px -- it used to sit flush with the bottom edge, leaving
-    // the meta bar and the delete/details/pin buttons too close to the bottom border.
-    let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
-    let meta_btn: *mut AnyObject = msg_send![row_button_class(), alloc];
-    let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
-    let meta_btn: *mut AnyObject = msg_send![
-        meta_btn,
-        initWithFrame: NSRect::new(
-            NSPoint::new(content_x, meta_y),
-            NSSize::new(meta_w, META_FOOTER_H)
-        )
-    ];
-    let _: () = msg_send![meta_btn, setBordered: false];
-    let _: () = msg_send![meta_btn, setAlignment: -1isize]; // NSTextAlignmentNatural
-    let mcell: *mut AnyObject = msg_send![meta_btn, cell];
-    let _: () = msg_send![mcell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-    let meta_started = Instant::now();
-    let meta_attr = make_meta_footer_attributed(entry, show_source);
-    stats.meta_ms += meta_started.elapsed().as_millis();
-    let _: () = msg_send![meta_btn, setAttributedTitle: meta_attr];
-    release_obj(meta_attr);
-    let _: () = msg_send![meta_btn, setTag: i as isize];
-    let _: () = msg_send![meta_btn, setTarget: row_target()];
-    let _: () = msg_send![meta_btn, setAction: sel!(handleClipboardRowClick:)];
-    add_hover_tracking(meta_btn);
-    let _: () = msg_send![container, addSubview: meta_btn];
-    release_obj(meta_btn);
-
-    // Action buttons (pin ☆/★ · details ⓘ · delete ⌫): ALWAYS visible on PINNED
-    // entries; on unpinned entries they appear only when the row is hovered or
-    // selected (the mockup's .actions opacity 0->1). Separate from the content/meta
-    // buttons; they never paste.
+    // Action buttons (pin ☆/★ · delete ⌫): ALWAYS visible on PINNED entries; on unpinned
+    // entries they appear only when the row is hovered or selected (the mock's
+    // `.row-actions` opacity 0.62->1). Vertically centred on the single-line row; they
+    // never paste. The ⓘ details button is gone: the detail orb in the header owns that.
     let act_alpha = if entry.pinned || selected || hovered {
         1.0
     } else {
-        0.0
+        0.62
     };
-    let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
-    let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
-    let x_details = x_del - ACTION_GAP - ACTION_BTN;
-    let x_pin = x_details - ACTION_GAP - ACTION_BTN;
+    let act_y = content_y + (row_h - ACTION_H) / 2.0;
+    let x_del = picker_list_width() - PAD_X - ROW_PAD_R - ACTION_BTN;
+    let x_pin = x_del - ACTION_GAP - ACTION_BTN;
     let pin_sym = if entry.pinned { "★" } else { "☆" };
     let pin_btn = make_action_button(
         pin_sym,
@@ -1462,24 +2071,6 @@ unsafe fn create_row_views(
         let _: () = msg_send![container, addSubview: pin_btn];
         release_obj(pin_btn);
     }
-    let details_btn = make_action_button(
-        "ⓘ",
-        sel!(showItemDetails:),
-        i as isize,
-        x_details,
-        act_y,
-        act_alpha,
-    );
-    // When detail is open for this selected row, show its active icon and own rounded fill.
-    set_detail_action_style(
-        details_btn,
-        detail_action_is_active(detail_open, sel_idx, i),
-        false,
-    );
-    if !details_btn.is_null() {
-        let _: () = msg_send![container, addSubview: details_btn];
-        release_obj(details_btn);
-    }
     let del_btn = make_action_button("⌫", sel!(deleteEntry:), i as isize, x_del, act_y, act_alpha);
     if !del_btn.is_null() {
         let _: () = msg_send![container, addSubview: del_btn];
@@ -1488,30 +2079,18 @@ unsafe fn create_row_views(
 
     RowHoverViews {
         group_label: row_group_label,
+        group_clear: row_group_clear,
         tile: ObjPtr::new(tile),
-        bar: ObjPtr::new(bar),
         content: ObjPtr::new(content_btn),
-        meta: ObjPtr::new(meta_btn),
         pin: ObjPtr::new(pin_btn),
-        details: ObjPtr::new(details_btn),
         del: ObjPtr::new(del_btn),
     }
 }
 
-/// Remove one row's views from the container (the bar is a tile subview and goes with it).
+/// Remove one row's views from the container (the bar is a tile subview and goes with it, and the
+/// per-row view list comes from `RowHoverViews::owned`, so nothing a row created can be left behind).
 unsafe fn remove_row_views(view: &RowHoverViews) {
-    for v in [
-        view.group_label,
-        Some(view.tile),
-        Some(view.content),
-        Some(view.meta),
-        Some(view.pin),
-        Some(view.details),
-        Some(view.del),
-    ]
-    .into_iter()
-    .flatten()
-    {
+    for v in view.owned().into_iter().flatten() {
         if !v.0.is_null() {
             let _: () = msg_send![v.0, removeFromSuperview];
         }
@@ -1593,7 +2172,7 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
         bounds.size.height
     };
     let doc_h = empty_state_doc_height(visible_h);
-    let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
+    let _: () = msg_send![container, setFrameSize: NSSize::new(picker_list_width(), doc_h)];
     // While the storage is unavailable the panel carries the path out of it: the action the state
     // admits (the same one the settings banner offers), centred under the sentence that says why
     // nothing can be recorded. The sentence and the button are centred as one block, so the panel
@@ -1604,18 +2183,19 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
     let block_gap = 10.0;
     // The hint: vertically centered within the visible list area (with the button, when present).
     let label_h = 40.0;
-    let block_h = if show_action {
-        label_h + block_gap + button_h
-    } else {
-        label_h
-    };
+    let block_h = 55.0
+        + if show_action {
+            label_h + block_gap + button_h
+        } else {
+            label_h
+        };
     // The container is flipped (y grows downward), so the sentence sits at the top of the block and
     // the way out under it -- reading order first, then the action.
     let block_y = (doc_h - block_h) / 2.0;
-    let label_y = block_y;
+    let label_y = block_y + 55.0;
     layout_empty_state_action(
         container,
-        block_y
+        label_y
             + if show_action {
                 label_h + block_gap
             } else {
@@ -1623,9 +2203,36 @@ pub(super) unsafe fn layout_empty_state(hint: &str) -> bool {
             },
         action,
     );
+    let existing_icon = *EMPTY_STATE_ICON.lock().unwrap();
+    let icon = if let Some(icon) = existing_icon {
+        icon.0
+    } else {
+        let icon: *mut AnyObject = msg_send![class!(NSImageView), new];
+        let _: () = msg_send![icon, setWantsLayer: true];
+        let _: () = msg_send![container, addSubview: icon];
+        release_obj(icon);
+        *EMPTY_STATE_ICON.lock().unwrap() = Some(ObjPtr::new(icon));
+        icon
+    };
+    let symbol = make_nsstring(if search_has_query() {
+        "magnifyingglass"
+    } else {
+        "doc.on.clipboard"
+    });
+    let image: *mut AnyObject = msg_send![class!(NSImage), imageWithSystemSymbolName: symbol, accessibilityDescription: std::ptr::null::<AnyObject>()];
+    CFRelease(symbol as *const c_void);
+    if !image.is_null() {
+        let config: *mut AnyObject = msg_send![class!(NSImageSymbolConfiguration), configurationWithPointSize: 19.0f64, weight: crate::theme::FONT_WEIGHT_REGULAR];
+        let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+        let _: () = msg_send![icon, setImage: image];
+    }
+    let _: () = msg_send![icon, setFrame: NSRect::new(NSPoint::new((picker_list_width() - 46.0) / 2.0, block_y), NSSize::new(46.0, 46.0))];
+    let layer: *mut AnyObject = msg_send![icon, layer];
+    let _: () = msg_send![layer, setCornerRadius: 23.0f64];
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(picker_thumb_fill()));
     let frame = NSRect::new(
         NSPoint::new(PAD_X, label_y),
-        NSSize::new(PICKER_W - PAD_X * 2.0, label_h),
+        NSSize::new(picker_list_width() - PAD_X * 2.0, label_h),
     );
     let hint_ns = make_nsstring(hint);
     let existing = *EMPTY_STATE_VIEW.lock().unwrap();
@@ -1703,7 +2310,7 @@ unsafe fn layout_empty_state_action(container: *mut AnyObject, y: f64, action: S
                 let _: () = msg_send![button.0, setAction: selector];
                 let width = localized_string_width(&title, crate::theme::FONT_CAPTION) + 28.0;
                 let frame = NSRect::new(
-                    NSPoint::new((PICKER_W - width) / 2.0, y),
+                    NSPoint::new((picker_list_width() - width) / 2.0, y),
                     NSSize::new(width, 26.0),
                 );
                 let _: () = msg_send![button.0, setFrame: frame];
@@ -1724,7 +2331,7 @@ unsafe fn layout_empty_state_action(container: *mut AnyObject, y: f64, action: S
     }
     let width = localized_string_width(&title, crate::theme::FONT_CAPTION) + 28.0;
     let frame = NSRect::new(
-        NSPoint::new((PICKER_W - width) / 2.0, y),
+        NSPoint::new((picker_list_width() - width) / 2.0, y),
         NSSize::new(width, 26.0),
     );
     let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
@@ -1828,6 +2435,10 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     }
     ROW_HOVER_VIEWS.lock().unwrap().clear();
     ROW_VIEW_INDICES.lock().unwrap().clear();
+    let empty_icon = EMPTY_STATE_ICON.lock().unwrap().take();
+    if let Some(icon) = empty_icon {
+        let _: () = msg_send![icon.0, removeFromSuperview];
+    }
     if let Some(empty) = EMPTY_STATE_VIEW.lock().unwrap().take() {
         if !empty.0.is_null() {
             let _: () = msg_send![empty.0, removeFromSuperview];
@@ -1934,7 +2545,7 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     // rows against the bottom edge.
     let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
         .max(picker_min_height() - header_strip_h() - FOOTER_H);
-    let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, doc_h)];
+    let _: () = msg_send![container, setFrameSize: NSSize::new(picker_list_width(), doc_h)];
     let (visible_start, visible_end) = picker_visible_row_range(&pitches, filtered.len());
 
     let sel_idx = picker_selection();
@@ -1978,9 +2589,6 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
                 has_header: has_hdr,
                 selected,
                 hovered,
-                show_source,
-                detail_open: detail_visible(),
-                sel_idx,
             },
             &mut stats,
         );
@@ -2098,8 +2706,6 @@ pub(super) unsafe fn sync_visible_rows() -> bool {
         hover_idx = effective_hover_row(false, hover_idx);
         *HOVER_ROW.lock().unwrap() = hover_idx;
     }
-    let show_source = show_source_app();
-    let detail_open = detail_visible();
     let mut stats = RowCreateStats::default();
     for i in start..end {
         if row_view_for_display_index(i).is_some() {
@@ -2131,9 +2737,6 @@ pub(super) unsafe fn sync_visible_rows() -> bool {
                 has_header: has_hdr,
                 selected: i == sel_idx,
                 hovered: i == hover_idx,
-                show_source,
-                detail_open,
-                sel_idx,
             },
             &mut stats,
         );
@@ -2240,7 +2843,7 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
         let has_header = previous_group.is_none() || previous_group != Some(group);
         previous_group = Some(group);
         let y = offsets[i];
-        let row_w = PICKER_W - PAD_X * 2.0;
+        let row_w = picker_list_width() - PAD_X * 2.0;
         let header_h = if has_header { GROUP_H } else { 0.0 };
         let content_y = y + header_h;
         let row_h = pitches[i] - header_h;
@@ -2254,32 +2857,16 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
             NSPoint::new(PAD_X, content_y),
             NSSize::new(row_w, row_h)
         )];
-        let _: () = msg_send![view.bar.0, setFrame: NSRect::new(
-            NSPoint::new(SEL_BAR_X, SEL_BAR_INSET_Y),
-            NSSize::new(SEL_BAR_W, row_h - SEL_BAR_INSET_Y * 2.0)
-        )];
         let content_x = PAD_X + ROW_PAD_L;
-        let content_w = row_w - ROW_PAD_L - ROW_PAD_R;
-        let content_h = row_h - META_FOOTER_H;
+        let content_w = model::row_content_width(row_w);
         let _: () = msg_send![view.content.0, setFrame: NSRect::new(
             NSPoint::new(content_x, content_y + ROW_PAD_TOP),
-            NSSize::new(content_w, content_h - ROW_PAD_TOP - ROW_PAD_BOT)
+            NSSize::new(content_w, row_h - ROW_PAD_TOP - ROW_PAD_BOT)
         )];
-        let meta_y = content_y + row_h - META_FOOTER_H - ROW_PAD_BOT;
-        let meta_w = row_w - ROW_PAD_L - ROW_PAD_R - ACTIONS_W - 4.0;
-        let _: () = msg_send![view.meta.0, setFrame: NSRect::new(
-            NSPoint::new(content_x, meta_y),
-            NSSize::new(meta_w, META_FOOTER_H)
-        )];
-        let act_y = meta_y + (META_FOOTER_H - ACTION_H) / 2.0;
-        let x_del = PICKER_W - PAD_X - ROW_PAD_R - ACTION_BTN;
-        let x_details = x_del - ACTION_GAP - ACTION_BTN;
-        let x_pin = x_details - ACTION_GAP - ACTION_BTN;
-        for (button, x) in [
-            (view.pin, x_pin),
-            (view.details, x_details),
-            (view.del, x_del),
-        ] {
+        let act_y = content_y + (row_h - ACTION_H) / 2.0;
+        let x_del = picker_list_width() - PAD_X - ROW_PAD_R - ACTION_BTN;
+        let x_pin = x_del - ACTION_GAP - ACTION_BTN;
+        for (button, x) in [(view.pin, x_pin), (view.del, x_del)] {
             if !button.0.is_null() {
                 let _: () = msg_send![button.0, setFrame: NSRect::new(
                     NSPoint::new(x, act_y),
@@ -2294,26 +2881,21 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
         let background = row_backdrop_wash(palette, selected, hovered);
         let tile_layer: *mut AnyObject = msg_send![view.tile.0, layer];
         crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(background));
-        let _: () = msg_send![view.bar.0, setHidden: !selected];
         if !entry.pinned {
-            let alpha = if selected || hovered { 1.0 } else { 0.0 };
-            for button in [view.pin, view.details, view.del] {
+            let alpha = if selected || hovered { 1.0 } else { 0.62 };
+            for button in [view.pin, view.del] {
                 if !button.0.is_null() {
                     let _: () = msg_send![button.0, setAlphaValue: alpha];
                 }
             }
         }
-        set_detail_action_style(
-            view.details.0,
-            detail_action_is_active(detail_visible(), selection, i),
-            false,
-        );
     }
 
     if let Some(container) = picker_container_ptr() {
         let document_h = (rows_top_offset() + pitches.iter().sum::<f64>() + PAD_Y)
             .max(picker_min_height() - header_strip_h() - FOOTER_H);
-        let _: () = msg_send![container, setFrameSize: NSSize::new(PICKER_W, document_h)];
+        let _: () =
+            msg_send![container, setFrameSize: NSSize::new(picker_list_width(), document_h)];
     }
     let rendered_key = picker_rows_key(history_revision(), &query, filter, show_source);
     with_clipboard_ui(|ui| ui.rendered_rows = Some(rendered_key));
@@ -2391,10 +2973,38 @@ unsafe fn hover_row_at_event(event: *mut c_void) -> usize {
         .unwrap_or(NO_SELECTION)
 }
 
+/// Whether an event's pointer is over the options menu. Tracking areas still report enters for
+/// covered list rows, so both list-wide and row-local hover handlers must treat the menu as the
+/// topmost surface.
+pub(super) unsafe fn event_is_over_filter_popover(event: *mut AnyObject) -> bool {
+    if event.is_null() || !crate::clipboard::filter_popover_open() {
+        return false;
+    }
+    let Some(popover) = *FILTER_POPOVER.lock().unwrap() else {
+        return false;
+    };
+    let frame: NSRect = msg_send![popover.0, frame];
+    let superview: *mut AnyObject = msg_send![popover.0, superview];
+    if superview.is_null() {
+        return false;
+    }
+    let in_window: NSRect = msg_send![
+        superview,
+        convertRect: frame,
+        toView: std::ptr::null::<AnyObject>()
+    ];
+    let point: NSPoint = msg_send![event, locationInWindow];
+    rect_contains_point(in_window, point)
+}
+
 /// Reconcile hover against the whole row backdrop on every picker mouse move. This prevents
 /// a stale style when the pointer leaves a content button through row padding and then exits.
 extern "C" fn container_mouse_moved(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     if REBUILDING.load(Ordering::SeqCst) {
+        return;
+    }
+    if unsafe { event_is_over_filter_popover(event) } {
+        set_hover_row(NO_SELECTION);
         return;
     }
     let row = unsafe { hover_row_at_event(event as *mut c_void) };
@@ -2455,9 +3065,6 @@ fn update_hover_visuals(prev: usize, new: usize) {
             let bg = row_backdrop_wash(palette, selected, hovered);
             let layer: *mut AnyObject = msg_send![rv.tile.0, layer];
             crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(bg));
-            if !rv.bar.0.is_null() {
-                let _: () = msg_send![rv.bar.0, setHidden: !selected];
-            }
             // Button alpha: pinned entries keep them always visible (fixed 1.0); unpinned
             // entries show them on hover/selection only.
             let pinned = filtered
@@ -2466,8 +3073,8 @@ fn update_hover_visuals(prev: usize, new: usize) {
                 .map(|e| e.pinned)
                 .unwrap_or(false);
             if !pinned {
-                let act_alpha: f64 = if selected || hovered { 1.0 } else { 0.0 };
-                for b in [rv.pin, rv.details, rv.del] {
+                let act_alpha: f64 = if selected || hovered { 1.0 } else { 0.62 };
+                for b in [rv.pin, rv.del] {
                     if !b.0.is_null() {
                         let _: () = msg_send![b.0, setAlphaValue: act_alpha];
                     }
@@ -2492,21 +3099,34 @@ fn set_hover_row(new: usize) {
 /// The picker smoke reads the resulting layer colors, so this tests the wiring as well as the
 /// pure precedence rule without scanning source text.
 pub(super) unsafe fn smoke_row_backdrop_paint_paths() -> bool {
-    let selection = picker_selection();
+    // The picker opens with the search field focused, so its intentional sentinel can mean
+    // "nothing selected". This smoke specifically exercises a selected+hovered row; establish
+    // that state explicitly instead of returning false before either paint path runs.
+    let previous_selection = picker_selection();
+    let selection = if previous_selection == NO_SELECTION {
+        set_picker_selection(0);
+        0
+    } else {
+        previous_selection
+    };
     let Some(row) = row_view_for_display_index(selection) else {
+        eprintln!("[smoke-clipboard] no materialized row for selected index {selection}");
         return false;
     };
     let Some(container) = picker_container_ptr() else {
+        eprintln!("[smoke-clipboard] picker has no row container");
         return false;
     };
     let Some(history_index) = with_clipboard_ui(|ui| ui.filtered.get(selection).copied()) else {
+        eprintln!("[smoke-clipboard] selected index {selection} is outside filtered history");
         return false;
     };
     let Some(entry) = CLIP_HISTORY.lock().unwrap().get(history_index).cloned() else {
+        eprintln!("[smoke-clipboard] selected history index {history_index} is missing");
         return false;
     };
 
-    let expected = clipboard_palette().selection_bg;
+    let expected = super::picker_row_selected(clipboard_palette());
     set_hover_row(NO_SELECTION);
     set_hover_row(selection);
     let repaint_layer: *mut AnyObject = msg_send![row.tile.0, layer];
@@ -2524,9 +3144,6 @@ pub(super) unsafe fn smoke_row_backdrop_paint_paths() -> bool {
             has_header: false,
             selected: true,
             hovered: true,
-            show_source: false,
-            detail_open: false,
-            sel_idx: selection,
         },
         &mut stats,
     );
@@ -2534,6 +3151,13 @@ pub(super) unsafe fn smoke_row_backdrop_paint_paths() -> bool {
     let create_ok = layer_matches_hex(create_layer, expected);
     remove_row_views(&created);
     set_hover_row(NO_SELECTION);
+    set_picker_selection(previous_selection);
+    if !repaint_ok || !create_ok {
+        eprintln!(
+            "[smoke-clipboard] row paint paths differ: repaint={repaint_ok} create={create_ok} expected={expected:#010x} palette_dark={}",
+            clipboard_palette().dark
+        );
+    }
     repaint_ok && create_ok
 }
 
@@ -2551,6 +3175,10 @@ unsafe fn layer_matches_hex(layer: *mut AnyObject, expected: u32) -> bool {
 extern "C" fn row_button_mouse_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     // Ignore enters dispatched during a rebuild (prevents infinite recursion; see REBUILDING).
     if REBUILDING.load(Ordering::SeqCst) {
+        return;
+    }
+    if unsafe { event_is_over_filter_popover(_event) } {
+        set_hover_row(NO_SELECTION);
         return;
     }
     let idx: isize = unsafe { msg_send![_self, tag] };
@@ -2732,6 +3360,30 @@ pub(super) extern "C" fn show_item_details_cb(_self: *mut c_void, _cmd: Sel, sen
     }
 }
 
+/// Keep an open detail panel on the selection after a delete: the selection stays in place and
+/// now points at the entry that slid into the removed row's slot (or the new tail), so refresh
+/// the panel in place instead of collapsing it -- the mock's `deleteItem` does the same
+/// (`detailOpen && !currentItem()` is the only close). An empty display list or no selection
+/// still closes it.
+///
+/// `ui.filtered` is current only when `try_delete_picker_row_incremental` handled the row.
+/// On the deferred path a synchronous `rebuild_rows` refreshes list, filtered list and
+/// selection together -- the queued refresh then finds the rows current and no-ops, and
+/// `ui.filtered` never stops describing the on-screen rows in between.
+unsafe fn retarget_detail_after_delete(incremental: bool) {
+    if !detail_visible() {
+        return;
+    }
+    if !incremental {
+        rebuild_rows();
+    }
+    if mapped_index(picker_selection()).is_some() {
+        show_detail_for_sel();
+    } else {
+        hide_detail();
+    }
+}
+
 pub(super) extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
     let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
     if idx < 0 {
@@ -2764,9 +3416,9 @@ pub(super) extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: 
         schedule_picker_refresh();
     }
     // The detail panel follows the selected entry; when the deleted row WAS the selection,
-    // close the panel (no stale content).
-    if deleted_selected && detail_visible() {
-        hide_detail();
+    // retarget it onto the entry that took the slot rather than collapsing it.
+    if deleted_selected {
+        unsafe { retarget_detail_after_delete(incremental) };
     }
 }
 
@@ -3074,6 +3726,12 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
         if is_clipboard_undo_shortcut(keycode, mods) {
             if undo_deleted_clipboard_entry().is_some() {
                 rebuild_rows();
+                // The undo restored the deleted entry and re-selected it; an open detail
+                // must follow it back (a retargeted-after-delete panel would otherwise
+                // keep showing the entry that took the slot).
+                if detail_visible() {
+                    show_detail_for_sel();
+                }
                 show_toast(&t("clipboard.toast_undo_delete"));
             }
             return;
@@ -3097,6 +3755,72 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 let _: bool = msg_send![window, makeFirstResponder: f.0];
             }
             return;
+        }
+        // Popover key navigation (the mock's menu semantics): while open, ↑/↓ move the
+        // highlighted row over the 6 filters + housekeeping rows and Enter picks it. Tab
+        // keeps its filter-cycle meaning (the footer legend stays true).
+        if crate::clipboard::filter_popover_open() {
+            match keycode {
+                126 | 125 => {
+                    let rows = CLIP_FILTER_ROWS.len() + super::popover_tail_row_count();
+                    let cur = POPOVER_KEY_ROW.load(Ordering::SeqCst);
+                    let next = if keycode == 125 {
+                        if cur == usize::MAX || cur + 1 >= rows {
+                            0
+                        } else {
+                            cur + 1
+                        }
+                    } else if cur == usize::MAX || cur == 0 {
+                        rows - 1
+                    } else {
+                        cur - 1
+                    };
+                    POPOVER_KEY_ROW.store(next, Ordering::SeqCst);
+                    // Rebuild so the highlight moves; a no-op otherwise.
+                    if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
+                        build_filter_popover(parent.0);
+                    }
+                    return;
+                }
+                36 | 76 => {
+                    let row = POPOVER_KEY_ROW.load(Ordering::SeqCst);
+                    if row < CLIP_FILTER_ROWS.len() {
+                        let f = CLIP_FILTER_ROWS[row];
+                        dismiss_filter_popover();
+                        apply_clip_filter(f);
+                    } else if row < CLIP_FILTER_ROWS.len() + super::popover_tail_row_count() {
+                        // Tail rows mirror the popover's own buttons.
+                        dismiss_filter_popover();
+                        let tail = row - CLIP_FILTER_ROWS.len();
+                        if tail == 1 {
+                            notifications::clear_clipboard_history(
+                                std::ptr::null_mut(),
+                                sel!(clearClipboardHistory:),
+                                std::ptr::null_mut(),
+                            );
+                        } else if tail == 2 && super::text_style::clear_all_button_visible() {
+                            notifications::clear_clipboard_all(
+                                std::ptr::null_mut(),
+                                sel!(clearClipboardAll:),
+                                std::ptr::null_mut(),
+                            );
+                        } else {
+                            notifications::open_clipboard_settings(
+                                std::ptr::null_mut(),
+                                sel!(openClipboardSettings:),
+                                std::ptr::null_mut(),
+                            );
+                        }
+                    }
+                    return;
+                }
+                _ => {
+                    dismiss_filter_popover();
+                    if keycode == 53 {
+                        return;
+                    }
+                }
+            }
         }
         // The selectable range is the current display list (post-filter; scrolling reveals
         // the rest).
@@ -3227,11 +3951,17 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 if !incremental {
                     schedule_picker_refresh();
                 }
-                // The detail panel follows the selected entry, which was just deleted ->
-                // close it, so no stale content lingers.
-                hide_detail();
+                // The detail panel follows the selected entry: the selection stayed in place
+                // and now points at the entry that slid into the removed row's slot, so
+                // retarget the panel instead of collapsing it (it closes only when nothing
+                // remains to show).
+                retarget_detail_after_delete(incremental);
             }
             53 => {
+                if crate::clipboard::filter_popover_open() {
+                    dismiss_filter_popover();
+                    return;
+                }
                 // Esc: a pinned panel ignores the key entirely (design decision R1). The check is
                 // HERE, above the existing actions, not inside hide_picker(): otherwise Esc would
                 // still close the detail or clear the query on the way to a hide it no longer does.
@@ -3336,6 +4066,598 @@ extern "C" fn picker_window_can_become_key(
     objc2::runtime::Bool::YES
 }
 
+/// The popover's frame inside the picker's content parent: anchored under the options orb at the
+/// mock's `.popover` offsets (right 14px, top below the head). `parent_h`/`parent_flipped` are the
+/// parent's own, so the top-anchored offset lands where the mock puts it whatever the view's
+/// coordinate convention is -- the content parent is a plain (bottom-up) `NSView`.
+/// Pure so the anchor math is testable.
+#[cfg(test)]
+pub(super) fn filter_popover_frame(parent_h: f64, parent_flipped: bool) -> NSRect {
+    filter_popover_frame_for(parent_h, parent_flipped, PICKER_W)
+}
+
+pub(super) fn filter_popover_frame_for(
+    parent_h: f64,
+    parent_flipped: bool,
+    panel_width: f64,
+) -> NSRect {
+    let h = filter_popover_height(parent_h);
+    NSRect::new(
+        NSPoint::new(
+            panel_width - POPOVER_RIGHT_INSET - POPOVER_W,
+            top_anchored_origin_y(filter_popover_top(parent_h, h), parent_h, h, parent_flipped),
+        ),
+        NSSize::new(POPOVER_W, h),
+    )
+}
+
+/// The popover's top offset below the panel's top edge: the mock's `POPOVER_TOP`, pulled up when
+/// the menu plus that offset would not fit the panel (the picker shrinks to `picker_min_height`
+/// when the list is short, and a menu hanging past the panel loses its housekeeping rows).
+pub(super) fn filter_popover_top(parent_h: f64, popover_h: f64) -> f64 {
+    let max_top = (parent_h - popover_h - POPOVER_BOTTOM_INSET).max(0.0);
+    POPOVER_TOP.min(max_top)
+}
+
+/// The popover's fixed vertical parts: padding, the eyebrow and the hairline.
+pub(super) fn filter_popover_fixed_h() -> f64 {
+    // Two section labels and two dividers; the five 1pt gaps between filter rows are fixed too.
+    POPOVER_PAD * 2.0 + POPOVER_TITLE_H * 2.0 + POPOVER_DIVIDER_H * 2.0 + 5.0
+}
+
+/// The menu's row height for a panel of `parent_h`: the mock's 32pt whenever the panel can hold the
+/// whole menu below the anchor, otherwise compressed just enough that every row -- including the
+/// housekeeping trio -- stays inside the panel. Clipping the last rows would hide "clear all" and
+/// "settings" from exactly the panels most likely to be short.
+pub(super) fn filter_popover_row_h(parent_h: f64) -> f64 {
+    let rows = (CLIP_FILTER_ROWS.len() + super::popover_tail_row_count()) as f64;
+    let room = parent_h - POPOVER_BOTTOM_INSET - POPOVER_TOP - filter_popover_fixed_h();
+    (room / rows).clamp(POPOVER_MIN_ROW_H, POPOVER_ROW_H)
+}
+
+/// The popover's height for a panel of `parent_h`: the fixed parts plus one row per filter and the
+/// two housekeeping rows, at the row height that panel allows.
+pub(super) fn filter_popover_height(parent_h: f64) -> f64 {
+    let rows = (CLIP_FILTER_ROWS.len() + super::popover_tail_row_count()) as f64;
+    filter_popover_fixed_h() + rows * filter_popover_row_h(parent_h)
+}
+
+/// Place a child `top` points below its container's top edge, in the container's own convention.
+/// One conversion for top-down layout: the picker's content parent is a plain (bottom-up) `NSView`
+/// while the list container and the popover are flipped, and a top-down offset must mean the same
+/// thing in both.
+pub(super) fn top_anchored_origin_y(
+    top: f64,
+    container_h: f64,
+    child_h: f64,
+    flipped: bool,
+) -> f64 {
+    if flipped {
+        top
+    } else {
+        container_h - top - child_h
+    }
+}
+
+/// The inverse of `top_anchored_origin_y`: a child's distance below its container's top edge.
+pub(super) fn top_offset_of(origin_y: f64, container_h: f64, child_h: f64, flipped: bool) -> f64 {
+    if flipped {
+        origin_y
+    } else {
+        container_h - origin_y - child_h
+    }
+}
+
+/// How many history entries each popover filter row would show (the `.filter-row .count`).
+pub(super) fn filter_popover_counts() -> [usize; 6] {
+    let hist = CLIP_HISTORY.lock().unwrap();
+    model::filter_row_counts(&hist)
+}
+
+unsafe fn add_popover_section_title(popover: *mut AnyObject, title: &str, y: f64) {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![
+        label,
+        initWithFrame: NSRect::new(
+            NSPoint::new(POPOVER_PAD + 8.0, y),
+            NSSize::new(POPOVER_W - POPOVER_PAD * 2.0 - 16.0, POPOVER_TITLE_H)
+        )
+    ];
+    let title_ns = make_nsstring(title);
+    let _: () = msg_send![label, setStringValue: title_ns];
+    CFRelease(title_ns as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: 12.0f64,
+        weight: crate::theme::FONT_WEIGHT_SEMIBOLD
+    ];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![
+        label,
+        setTextColor: crate::glass::panel_ink(
+            clipboard_palette().secondary_text,
+            crate::glass::PanelInk::Secondary
+        )
+    ];
+    let _: () = msg_send![popover, addSubview: label];
+    release_obj(label);
+}
+
+unsafe fn add_popover_divider(popover: *mut AnyObject, y: f64, width: f64) {
+    let divider: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let divider: *mut AnyObject = msg_send![
+        divider,
+        initWithFrame: NSRect::new(
+            NSPoint::new(POPOVER_PAD + 6.0, y + (POPOVER_DIVIDER_H - 1.0) / 2.0),
+            NSSize::new(width - 12.0, 1.0)
+        )
+    ];
+    let _: () = msg_send![divider, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![divider, layer];
+    crate::ffi::layer_set_background(
+        layer,
+        crate::ffi::hex_to_cg_color(clipboard_palette().separator),
+    );
+    let _: () = msg_send![popover, addSubview: divider];
+    release_obj(divider);
+}
+
+unsafe fn set_popover_symbol(
+    button: *mut AnyObject,
+    symbol: &str,
+    size: f64,
+    tint: *mut AnyObject,
+) {
+    let symbol_ns = make_nsstring(symbol);
+    let image: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: symbol_ns,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(symbol_ns as *const c_void);
+    if !image.is_null() {
+        let config: *mut AnyObject = msg_send![
+            class!(NSImageSymbolConfiguration),
+            configurationWithPointSize: size,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+        let _: () = msg_send![image, setTemplate: true];
+        let _: () = msg_send![button, setImage: image];
+        let _: () = msg_send![button, setImagePosition: 2isize]; // NSImageLeft
+    }
+    let _: () = msg_send![button, setContentTintColor: tint];
+}
+
+extern "C" fn popover_decoration_hit_test(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _point: NSPoint,
+) -> *mut AnyObject {
+    std::ptr::null_mut()
+}
+
+fn popover_decoration_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPopoverDecoration", || {
+        crate::ffi::build_class(
+            c"OhMyTabPopoverDecoration",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(hitTest:),
+                    popover_decoration_hit_test
+                        as extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
+}
+
+unsafe fn add_popover_text(
+    parent: *mut AnyObject,
+    text: &str,
+    frame: NSRect,
+    size: f64,
+    color: u32,
+    alignment: isize,
+) {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: frame];
+    let value = make_nsstring(text);
+    let _: () = msg_send![label, setStringValue: value];
+    let _: () = msg_send![label, setToolTip: value];
+    CFRelease(value as *const c_void);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: size];
+    let _: () = msg_send![label, setFont: font];
+    let _: () = msg_send![label, setTextColor: crate::ffi::hex_to_ns_color(color)];
+    let _: () = msg_send![label, setAlignment: alignment];
+    let cell: *mut AnyObject = msg_send![label, cell];
+    let _: () = msg_send![cell, setLineBreakMode: 4isize];
+    let _: () = msg_send![cell, setUsesSingleLineMode: true];
+    let _: () = msg_send![parent, addSubview: label];
+    release_obj(label);
+}
+
+unsafe fn add_popover_row_content(
+    row: *mut AnyObject,
+    label: &str,
+    trailing: &str,
+    symbol: &str,
+    filter: bool,
+    selected: bool,
+    danger: bool,
+) {
+    let palette = clipboard_palette();
+    let bounds: NSRect = msg_send![row, bounds];
+    // One decoration declines hit testing for its entire subtree, preserving the row's click target.
+    let content: *mut AnyObject = msg_send![popover_decoration_class(), alloc];
+    let content: *mut AnyObject = msg_send![content, initWithFrame: bounds];
+    let ink = if danger {
+        super::popover_danger(palette)
+    } else {
+        palette.primary_text
+    };
+    let muted = if danger {
+        ink
+    } else {
+        super::popover_muted(palette)
+    };
+    let icon: *mut AnyObject = msg_send![class!(NSButton), alloc];
+    let icon: *mut AnyObject = msg_send![icon, initWithFrame: NSRect::new(NSPoint::new(POPOVER_INSET, (bounds.size.height - POPOVER_GLYPH_W) / 2.0), NSSize::new(POPOVER_GLYPH_W, POPOVER_GLYPH_W))];
+    let _: () = msg_send![icon, setBordered: false];
+    set_popover_symbol(
+        icon,
+        symbol,
+        POPOVER_META_SIZE,
+        crate::ffi::hex_to_ns_color(if selected || danger {
+            ink
+        } else {
+            palette.secondary_text
+        }),
+    );
+    let _: () = msg_send![icon, setImagePosition: 1isize];
+    let _: () = msg_send![content, addSubview: icon];
+    release_obj(icon);
+    let end = bounds.size.width - POPOVER_INSET;
+    let check_x = end - POPOVER_GLYPH_W;
+    let trailing_end = if filter {
+        check_x - POPOVER_COLUMN_GAP
+    } else {
+        end
+    };
+    let trailing_w = localized_string_width(trailing, POPOVER_META_SIZE);
+    let text_x = POPOVER_INSET + POPOVER_GLYPH_W + POPOVER_COLUMN_GAP;
+    let trailing_x = (trailing_end - trailing_w - 4.0).max(text_x);
+    let text_y = (bounds.size.height - POPOVER_TEXT_H) / 2.0;
+    add_popover_text(
+        content,
+        label,
+        NSRect::new(
+            NSPoint::new(text_x, text_y),
+            NSSize::new(
+                (trailing_x - POPOVER_COLUMN_GAP - text_x).max(0.0),
+                POPOVER_TEXT_H,
+            ),
+        ),
+        POPOVER_TEXT_SIZE,
+        ink,
+        0,
+    );
+    add_popover_text(
+        content,
+        trailing,
+        NSRect::new(
+            NSPoint::new(trailing_x, text_y),
+            NSSize::new(trailing_end - trailing_x, POPOVER_TEXT_H),
+        ),
+        POPOVER_META_SIZE,
+        muted,
+        2,
+    );
+    if selected {
+        add_popover_text(
+            content,
+            "✓",
+            NSRect::new(
+                NSPoint::new(check_x, text_y),
+                NSSize::new(POPOVER_GLYPH_W, POPOVER_TEXT_H),
+            ),
+            POPOVER_META_SIZE,
+            super::popover_check_color(palette),
+            1,
+        );
+    }
+    let accessible = make_nsstring(&format!("{label}, {trailing}"));
+    let _: () = msg_send![row, setAccessibilityLabel: accessible];
+    let _: () = msg_send![row, setToolTip: accessible];
+    CFRelease(accessible as *const c_void);
+    let empty = make_nsstring("");
+    let _: () = msg_send![row, setTitle: empty];
+    CFRelease(empty as *const c_void);
+    let _: () = msg_send![row, setImage: std::ptr::null::<AnyObject>()];
+    let _: () = msg_send![row, addSubview: content];
+    release_obj(content);
+}
+
+/// Build (or rebuild) the options popover and add it to the picker's content parent, above the
+/// rows so its hit-tests win. The structure follows the v2.1 mock: two titled sections, leading
+/// symbols, active filter check, settings shortcut and the two clear actions.
+pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
+    // Remove any previous view WITHOUT closing the popover: the open flag was set by the caller
+    // (`toggle_filter_popover`) and must survive the rebuild, or the view would exist with the state
+    // reporting it closed -- outside clicks, keyboard navigation and `--e2e-state` all read that flag.
+    remove_filter_popover_views();
+    let palette = clipboard_palette();
+    let parent_bounds: NSRect = msg_send![parent, bounds];
+    let parent_flipped: objc2::runtime::Bool = msg_send![parent, isFlipped];
+    let frame = filter_popover_frame_for(
+        parent_bounds.size.height,
+        parent_flipped.as_bool(),
+        parent_bounds.size.width,
+    );
+    // Flipped, like the list container: the rows below are laid out top-down, so their visual order
+    // matches `POPOVER_KEY_ROW`'s index order and the maths stays the same as the mock's.
+    let popover: *mut AnyObject = msg_send![filter_popover_class(), alloc];
+    let popover: *mut AnyObject = msg_send![popover, initWithFrame: frame];
+    // NSViewMinYMargin (8): the bottom gap adapts, so a panel resize keeps the popover pinned to
+    // the top -- the same mask the header strip uses.
+    let _: () = msg_send![popover, setAutoresizingMask: 8u64];
+    let _: () = msg_send![popover, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![popover, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setCornerRadius: POPOVER_R];
+        let _: () = msg_send![layer, setMasksToBounds: false];
+        // Match the design's solid fallback surface (`--menu-solid`). This is a plain layer,
+        // not a backdrop-filter surface like the HTML mock: leaving it at 90% opacity exposes
+        // the list's pin/delete controls and hover washes through the menu as sharp ghosts.
+        let surface = if palette.dark {
+            palette.card_bg
+        } else {
+            PICKER_POPOVER_SURFACE_LIGHT
+        };
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(surface));
+        // The mock's menu sheen: `linear-gradient(180deg, rgba(255,255,255,.10), transparent
+        // 42%)` over the menu fill. The popover view is flipped, so the gradient's unit-space
+        // y=0 is the top edge, exactly like the CSS 180deg direction.
+        if !palette.dark {
+            let sheen: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
+            if !sheen.is_null() {
+                let _: () = msg_send![sheen, setFrame: NSRect::new(
+                    NSPoint::new(0.0, 0.0),
+                    frame.size
+                )];
+                let _: () = msg_send![sheen, setCornerRadius: POPOVER_R];
+                let _: () = msg_send![sheen, setMasksToBounds: true];
+                let cg_colors = [
+                    crate::ffi::hex_to_cg_color(0xFFFF_FF1A),
+                    crate::ffi::hex_to_cg_color(0xFFFF_FF00),
+                ];
+                let colors = crate::ffi::CFArrayCreate(
+                    std::ptr::null(),
+                    cg_colors.as_ptr() as *const *const c_void,
+                    cg_colors.len() as isize,
+                    &crate::ffi::kCFTypeArrayCallBacks as *const c_void,
+                );
+                if !colors.is_null() {
+                    let _: () = msg_send![sheen, setColors: colors as *mut AnyObject];
+                    crate::ffi::CFRelease(colors);
+                }
+                let _: () = msg_send![sheen, setStartPoint: NSPoint::new(0.5, 0.0)];
+                let _: () = msg_send![sheen, setEndPoint: NSPoint::new(0.5, 1.0)];
+                let _: () = msg_send![layer, addSublayer: sheen];
+            }
+        }
+        let _: () = msg_send![layer, setBorderWidth: 1.0];
+        let border = crate::ffi::hex_to_cg_color(if palette.dark {
+            palette.card_border
+        } else {
+            0x362E2429
+        });
+        crate::ffi::layer_set_border(layer, border);
+        // The mock's `0 18px 44px rgba(38,30,22,.17)` + `0 2px 8px rgba(38,30,22,.07)`, folded
+        // into the one layer shadow CALayer draws: radius ~blur/2, offset down (AppKit y-up).
+        let shadow = crate::ffi::hex_to_cg_color(if palette.dark {
+            0x00000080
+        } else {
+            0x261E_1633
+        });
+        crate::ffi::layer_set_shadow_color(layer, shadow);
+        let _: () = msg_send![layer, setShadowOpacity: 1.0f32];
+        let _: () = msg_send![layer, setShadowRadius: 20.0f64];
+        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -15.0)];
+    }
+
+    // `.pop-title`: the filter section label, followed by six 32px filter rows.
+    let labels = localized_filter_labels();
+    let counts = filter_popover_counts();
+    let active = *CLIP_FILTER.lock().unwrap();
+    let row_w = POPOVER_W - POPOVER_PAD * 2.0;
+    // The same row height the frame was measured with: a short panel compresses the rows so the
+    // housekeeping pair stays inside it.
+    let row_h = filter_popover_row_h(parent_bounds.size.height);
+    add_popover_section_title(popover, &t("clipboard.filter_section"), POPOVER_PAD);
+    let mut y = POPOVER_PAD + POPOVER_TITLE_H;
+    let key_row = POPOVER_KEY_ROW.load(Ordering::SeqCst);
+    for (i, f) in CLIP_FILTER_ROWS.iter().enumerate() {
+        let row_frame = NSRect::new(NSPoint::new(POPOVER_PAD, y), NSSize::new(row_w, row_h));
+        let row: *mut AnyObject = msg_send![hover_button_class(), alloc];
+        let row: *mut AnyObject = msg_send![row, initWithFrame: row_frame];
+        let _: () = msg_send![row, setBordered: false];
+        let _: () = msg_send![row, setWantsLayer: true];
+        let rl: *mut AnyObject = msg_send![row, layer];
+        if !rl.is_null() {
+            let _: () = msg_send![rl, setCornerRadius: POPOVER_ROW_R];
+            if *f == active || i == key_row {
+                crate::ffi::layer_set_background(
+                    rl,
+                    crate::ffi::hex_to_cg_color(picker_popover_active_bg(palette)),
+                );
+            }
+        }
+        let symbol = match f {
+            ClipFilter::All => "text.bubble",
+            ClipFilter::Text => "text.alignleft",
+            ClipFilter::Image => "photo",
+            ClipFilter::Link => "link",
+            ClipFilter::Code => "chevron.left.forwardslash.chevron.right",
+            ClipFilter::Pinned => "pin",
+        };
+        add_popover_row_content(
+            row,
+            &labels[i],
+            &counts[i].to_string(),
+            symbol,
+            true,
+            *f == active,
+            false,
+        );
+        let _: () = msg_send![row, setTag: i as isize];
+        let _: () = msg_send![row, setTarget: observer()];
+        let _: () = msg_send![row, setAction: sel!(popoverFilterSelected:)];
+        add_hover_tracking(row);
+        let _: () = msg_send![popover, addSubview: row];
+        release_obj(row);
+        y += row_h;
+        if i + 1 < CLIP_FILTER_ROWS.len() {
+            y += 1.0;
+        }
+    }
+
+    add_popover_divider(popover, y, row_w);
+    y += POPOVER_DIVIDER_H;
+    add_popover_section_title(popover, &t("clipboard.options_section"), y);
+    y += POPOVER_TITLE_H;
+
+    // Settings is grouped under the options heading, with the keyboard shortcut aligned trailing.
+    let mut tails = Vec::with_capacity(super::popover_tail_row_count());
+    tails.push((
+        "clipboard.open_settings",
+        sel!(openClipboardSettings:),
+        false,
+    ));
+    tails.push((
+        "clipboard.clear_button",
+        sel!(clearClipboardHistory:),
+        false,
+    ));
+    if super::text_style::clear_all_button_visible() {
+        tails.push(("clipboard.clear_all", sel!(clearClipboardAll:), true));
+    }
+    for (tail_index, (key, action, danger)) in tails.into_iter().enumerate() {
+        if tail_index == 1 {
+            add_popover_divider(popover, y, row_w);
+            y += POPOVER_DIVIDER_H;
+        }
+        let row_frame = NSRect::new(NSPoint::new(POPOVER_PAD, y), NSSize::new(row_w, row_h));
+        let row: *mut AnyObject = msg_send![hover_button_class(), alloc];
+        let row: *mut AnyObject = msg_send![row, initWithFrame: row_frame];
+        let _: () = msg_send![row, setBordered: false];
+        let _: () = msg_send![row, setWantsLayer: true];
+        let rl: *mut AnyObject = msg_send![row, layer];
+        if !rl.is_null() {
+            let _: () = msg_send![rl, setCornerRadius: POPOVER_ROW_R];
+            if CLIP_FILTER_ROWS.len() + tail_index == key_row {
+                crate::ffi::layer_set_background(
+                    rl,
+                    crate::ffi::hex_to_cg_color(picker_popover_active_bg(palette)),
+                );
+            }
+        }
+        let hint = match key {
+            "clipboard.open_settings" => t("clipboard.settings_shortcut"),
+            "clipboard.clear_button" => t("clipboard.clear_keep_pinned"),
+            "clipboard.clear_all" => t("clipboard.clear_include_pinned"),
+            _ => String::new(),
+        };
+        let symbol = if key == "clipboard.open_settings" {
+            "gearshape"
+        } else {
+            "trash"
+        };
+        add_popover_row_content(row, &t(key), &hint, symbol, false, false, danger);
+        let _: () = msg_send![row, setTarget: observer()];
+        let _: () = msg_send![row, setAction: action];
+        add_hover_tracking(row);
+        let _: () = msg_send![popover, addSubview: row];
+        release_obj(row);
+        y += row_h;
+    }
+
+    let _: () = msg_send![parent, addSubview: popover];
+    release_obj(popover);
+    *FILTER_POPOVER.lock().unwrap() = Some(ObjPtr::new(popover));
+}
+
+/// Keep the options popover in step with its open flag: build on open, remove on close. The
+/// flag flips in `toggle_filter_popover`, so `--e2e-state` always reports the intent.
+pub(super) unsafe fn sync_filter_popover(open: bool) {
+    if open {
+        if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
+            build_filter_popover(parent.0);
+        }
+    } else {
+        dismiss_filter_popover();
+    }
+}
+
+/// The popover class: flipped, so its rows are laid out downwards from the top edge like the mock's
+/// `.popover` (and like the list container, whose index order the keyboard highlight follows).
+fn filter_popover_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabClipboardPopoverView", || {
+        crate::ffi::build_class(
+            c"OhMyTabClipboardPopoverView",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(isFlipped),
+                    filter_popover_is_flipped
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
+}
+
+/// The popover is flipped: origin at its top-left, rows stack downwards.
+extern "C" fn filter_popover_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
+}
+
+/// Remove the popover's view without touching the open flag. `build_filter_popover` calls this so a
+/// rebuild cannot close the popover it is building; every closing path goes through
+/// `dismiss_filter_popover` instead, which does both.
+pub(super) fn remove_filter_popover_views() {
+    if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
+        unsafe {
+            let _: () = msg_send![popover.0, removeFromSuperview];
+        }
+    }
+    *FILTER_POPOVER.lock().unwrap() = None;
+}
+
+/// Close the popover: clear the open flag and remove the view (outside click, Esc, choice, panel
+/// hide).
+pub(super) fn dismiss_filter_popover() {
+    crate::clipboard::set_filter_popover_open(false);
+    POPOVER_KEY_ROW.store(usize::MAX, Ordering::SeqCst);
+    remove_filter_popover_views();
+    if let Some(parent) = *PICKER_CONTENT_PARENT.lock().unwrap() {
+        unsafe { super::drag::raise_drag_surface(parent.0) };
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3351,6 +4673,22 @@ mod tests {
         fn drop(&mut self) {
             (self.0)();
         }
+    }
+
+    /// The table's last row ends on the document's bottom edge: the mock's `margin-top: auto`
+    /// plus its own bottom padding is what pins a short body's table to the pane's bottom.
+    #[test]
+    fn last_meta_row_sits_on_the_document_bottom_edge() {
+        let pane = detail_pane_layout(DETAIL_MAX_W, 520.0, meta_table_row_count());
+        let doc_h = detail_document_height(pane.scroll.size.height, pane.body_h, pane.meta.height);
+        assert_eq!(doc_h, pane.scroll.size.height);
+        let (_, last_value) =
+            meta_row_frames(&pane.meta, meta_table_row_count() - 1, pane.content_w);
+        let table_y = doc_h - pane.meta.height;
+        assert!(
+            (table_y + last_value.origin.y + last_value.size.height - doc_h).abs() <= 1.0,
+            "the last meta row ends at the document's bottom edge, so it sits on the table's own bottom padding"
+        );
     }
 
     fn text_entry(text: &str) -> ClipEntry {
