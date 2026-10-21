@@ -137,6 +137,19 @@ cargo clippy
 
 完整发布流程（含 `--push`）、独立的开发渠道（bundle ID 为 `com.eacryo.oh-my-tab.dev`）、R2 上传、Sparkle 自动更新与代码签名见[发布流程](docs/releasing.md)。
 
+### 不打包为 .app 运行
+
+部分受管控的 Mac 只允许运行经过批准的 `.app`。`scripts/install-unbundled.sh` 把 oh-my-tab 作为普通可执行文件运行，由用户级 `launchd` 服务保持运行：
+
+```sh
+scripts/install-unbundled.sh install   # cargo build --release -> ~/.local/bin/oh-my-tab -> launchd 服务 -> 启动器
+scripts/install-unbundled.sh status    # 另有 start / stop / restart / launcher / uninstall
+```
+
+- **启动与退出**：登录时自动启动，只有崩溃后才会被重新拉起，因此从菜单选择“退出”后会保持退出状态。需要重新打开时，在访达或聚焦搜索中打开 `/Applications`（不可写时为 `~/Applications`）里的 **Oh My Tab**。它是一个带应用图标的 shell 脚本（`Oh My Tab.command`），不是应用：它会启动 launchd 服务，并关闭自己的终端窗口。在终端中运行 `scripts/install-unbundled.sh start` 效果相同。
+- **权限**：为 `~/.local/bin/oh-my-tab` 授予辅助功能和屏幕录制权限，然后运行 `scripts/install-unbundled.sh restart`。可执行文件优先使用 Developer ID 身份签名，其次是 `oh-my-tab-sign`（见[发布流程](docs/releasing.md)），都没有时使用 ad-hoc 签名；可用 `--identity` 指定。使用 ad-hoc 签名时，每次重新构建后 macOS 都会再次请求权限。
+- **与 `.app` 的区别**：没有 Sparkle 自动更新（拉取代码后重新运行 `install`）；设置中的“开机启动”不起作用（由 launchd 服务负责）；跳过引导页；版本号为空。配置文件和日志与 `.app` 相同。如果已安装的 `.app` 正在运行，launchd 服务启动的实例会直接正常退出，不会与之冲突。
+
 ## 日志
 
 默认日志路径为 `~/Library/Logs/oh-my-tab/oh-my-tab.log`。当前文件达到 10 MB 时会轮转出 `oh-my-tab.log.1` 到 `oh-my-tab.log.5`，保留最新 5 份备份；每次启动都会写入一行会话标记，启动时还会清理 30 天前的旧式单次日志与过期备份。需要排查问题时，可在设置窗口将日志级别切换为 Debug；日志不包含剪贴板内容和窗口画面。内存采样字段和开发调试说明见[开发环境说明](docs/developer-notes.md)。

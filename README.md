@@ -139,6 +139,19 @@ Both channels read their release notes from a file named after the `Cargo.toml` 
 
 The full release pipeline (`release.sh` / `release-dev.sh`, including `--push`), the isolated development channel (bundle ID `com.eacryo.oh-my-tab.dev`), the R2 upload flow, Sparkle automatic updates, and code signing are documented in [docs/releasing-en.md](docs/releasing-en.md).
 
+### Run without an app bundle
+
+Some managed Macs only allow approved `.app` bundles to launch. `scripts/install-unbundled.sh` runs oh-my-tab as a plain executable kept alive by a per-user `launchd` agent instead:
+
+> ```sh
+> scripts/install-unbundled.sh install   # cargo build --release -> ~/.local/bin/oh-my-tab -> launchd agent -> launcher
+> scripts/install-unbundled.sh status    # also: start / stop / restart / launcher / uninstall
+> ```
+
+- **Starting and quitting:** the agent starts oh-my-tab at login and restarts it only after a crash, so *Quit* from the menu keeps it quit. To start it again, open **Oh My Tab** from `/Applications` (or `~/Applications` when `/Applications` is not writable) in Finder or Spotlight. It is a shell script (`Oh My Tab.command`) with the app icon, not an app: it starts the agent and closes its own Terminal window. `scripts/install-unbundled.sh start` does the same from a shell.
+- **Permissions:** grant Accessibility and Screen Recording to `~/.local/bin/oh-my-tab`, then run `scripts/install-unbundled.sh restart`. The binary is signed with the Developer ID identity, else `oh-my-tab-sign` (see [docs/releasing-en.md](docs/releasing-en.md)), else ad-hoc; `--identity` overrides it. With ad-hoc signing, macOS asks for the permissions again after every rebuild.
+- **Differences from the `.app`:** no Sparkle updates (pull and re-run `install`), *Launch at login* in Settings has no effect (the agent handles it), the onboarding guide is skipped, and version strings are empty. Configuration and logs are the same files. If an installed `.app` is already running, the agent's instance exits cleanly instead of competing with it.
+
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 
 **Important for upgrades from 0.2.2 or earlier:** After installing the new version, manually remove the old Oh My Tab entry from both **Accessibility** and **Screen & System Audio Recording** (shown as **Screen Recording** on some macOS versions) under *System Settings → Privacy & Security*. In each list, select the old entry and click **−**, then click **+** and add the new `Oh-My-Tab.app` from Applications; turn on both permissions. Toggling the existing switches off and on is not enough. Restart Oh My Tab after re-adding it.
