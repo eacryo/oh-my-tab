@@ -411,9 +411,27 @@ bundle_identifier_of() {
     /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Contents/Info.plist" 2>/dev/null
 }
 
+# The unbundled install (scripts/install-unbundled.sh) runs this same binary as a plain executable
+# with no containing .app, so it has no bundle id for the loop below to classify it by, and it would
+# otherwise land in "an instance this run cannot account for" and stop every launch. It is identified
+# by the executable its launchd agent records instead, and parked in its own list: this script may
+# stop it like the packaged install, but it must not leave it restarted behind the dev build.
+unbundled_label="com.eacryo.oh-my-tab.unbundled"
+unbundled_domain="gui/$(id -u)"
+unbundled_plist="$HOME/Library/LaunchAgents/$unbundled_label.plist"
+unbundled_bin=""
+if [ -f "$unbundled_plist" ]; then
+    # PlistBuddy prints "Error Reading File: ..." on stdout when the plist is unreadable, so the exit
+    # status decides; otherwise that message would become the path this run compares against.
+    if ! unbundled_bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$unbundled_plist" 2>/dev/null)"; then
+        unbundled_bin=""
+    fi
+fi
+
 stopped_dev_pids=()
 stopped_dev_owners=()
 stopped_packaged_pids=()
+parked_unbundled_pids=()
 unknown_instances=()
 while IFS= read -r candidate; do
     [ -n "$candidate" ] || continue
@@ -434,6 +452,12 @@ while IFS= read -r candidate; do
             ;;
         *) ;;
     esac
+    # The unbundled install's own binary, checked before the bundle-id cases below so it is not
+    # reported as an instance this run cannot account for.
+    if [ -n "$unbundled_bin" ] && [ "$candidate_exe" = "$unbundled_bin" ]; then
+        parked_unbundled_pids+=("$candidate")
+        continue
+    fi
     candidate_bundle="$(bundle_identifier_of "$candidate_exe" || true)"
     case "$candidate_bundle" in
         "$dev_bundle_id")
@@ -463,6 +487,44 @@ while IFS= read -r candidate; do
             ;;
     esac
 done < <(pgrep -x 'oh-my-tab' 2>/dev/null || true)
+
+# The unbundled install is unloaded before the unknown-instance check below, because that check is
+# what decides whether this run may continue: an unbundled instance that will not go away has to
+# stop the launch like any other instance this run cannot clear.
+if [ ${#parked_unbundled_pids[@]} -gt 0 ]; then
+    # SIGTERM is not a successful exit for this app, and the agent holds it up with
+    # KeepAlive.SuccessfulExit=false, so killing the process alone only earns a fresh copy a moment
+    # later -- one that would grab the instance lock while the dev build is being verified. Unloading
+    # the agent first is the only way to keep it down.
+    launchctl bootout "$unbundled_domain/$unbundled_label" 2>/dev/null || true
+    for _ in $(seq 1 50); do
+        launchctl print "$unbundled_domain/$unbundled_label" >/dev/null 2>&1 || break
+        sleep 0.1
+    done
+    if launchctl print "$unbundled_domain/$unbundled_label" >/dev/null 2>&1; then
+        echo "restart FAILED: could not unload the unbundled install's agent ($unbundled_label)"
+        echo "hint: run: scripts/install-unbundled.sh stop"
+        exit 1
+    fi
+    # bootout normally ends the process itself, so a pid that is already gone counts as stopped --
+    # reporting it as a failure would skip the success message on the ordinary path.
+    unbundled_stopped_pids=()
+    for candidate in "${parked_unbundled_pids[@]}"; do
+        if kill -0 "$candidate" 2>/dev/null; then
+            if stop_pid_by_identity "$candidate" "$unbundled_bin"; then
+                unbundled_stopped_pids+=("$candidate")
+            else
+                unknown_instances+=("pid $candidate $unbundled_bin (could not be stopped)")
+            fi
+        else
+            unbundled_stopped_pids+=("$candidate")
+        fi
+    done
+    if [ ${#unbundled_stopped_pids[@]} -gt 0 ]; then
+        echo "stopped a running unbundled install (pid ${unbundled_stopped_pids[*]}) -- it shares the global shortcut"
+        echo "  unloaded its agent ($unbundled_label); start it again with: scripts/install-unbundled.sh start"
+    fi
+fi
 
 if [ ${#unknown_instances[@]} -gt 0 ]; then
     # Refusing beats killing: an instance this script cannot identify is not this run's to stop,
