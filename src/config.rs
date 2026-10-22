@@ -822,6 +822,9 @@ pub struct ClipboardSection {
     // (memory AND persistence); pinned entries never expire. Range 0..=7; 0 = never.
     // Default 3 days.
     pub auto_expire_days: u32,
+    // Image rows' height in the picker list, as a multiple of the 40pt text row: 1..=3.
+    // Default 1 (a thumbnail-sized image row like any other row).
+    pub image_rows: u32,
     // The clipboard picker position: "mouse" = follows the cursor, "main" = centered on
     // the main screen. Defaults to the center of the main screen.
     pub picker_position: String,
@@ -844,6 +847,7 @@ impl Default for ClipboardSection {
             delete_after_paste: false,
             clear_system_pasteboard_after_paste: false,
             auto_expire_days: 3,
+            image_rows: 1,
             picker_position: "main".to_string(),
             pin_follow_selection: true,
         }
@@ -1475,6 +1479,12 @@ impl Config {
                 &[("value", &self.clipboard.max_entries.to_string())],
             ));
         }
+        if !(1..=3).contains(&self.clipboard.image_rows) {
+            errs.push(tf(
+                "errors.clipboard_image_rows_invalid",
+                &[("value", &self.clipboard.image_rows.to_string())],
+            ));
+        }
         if self.clipboard.auto_expire_days > 7 {
             errs.push(tf(
                 "errors.clipboard_auto_expire_days_invalid",
@@ -1837,6 +1847,9 @@ impl Config {
             .any(|e| e.starts_with("clipboard.auto_expire_days"))
         {
             self.clipboard.auto_expire_days = other.clipboard.auto_expire_days;
+        }
+        if !errs.iter().any(|e| e.starts_with("clipboard.image_rows")) {
+            self.clipboard.image_rows = other.clipboard.image_rows;
         }
         if !errs
             .iter()
@@ -3147,6 +3160,23 @@ mod tests {
         assert_eq!(smooth.preset, None);
         assert_eq!(smooth.response, None);
         assert_eq!(smooth.speed, Some(2.4));
+    }
+
+    #[test]
+    fn an_invalid_image_rows_falls_back_without_losing_sibling_fields() {
+        let mut ours = Config::default();
+        ours.clipboard.image_rows = 2;
+        let mut other = Config::default();
+        other.clipboard.image_rows = 9;
+        other.clipboard.auto_expire_days = 5;
+        let errs = other.validate();
+        assert!(
+            errs.iter().any(|e| e.starts_with("clipboard.image_rows")),
+            "the field must be rejected with its own prefix: {errs:?}"
+        );
+        ours.merge_valid(other, &errs);
+        assert_eq!(ours.clipboard.image_rows, 2);
+        assert_eq!(ours.clipboard.auto_expire_days, 5);
     }
 
     #[test]

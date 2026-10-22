@@ -299,6 +299,7 @@ row_clipboard_clear_system_pasteboard_after_paste = "Delete system clipboard ite
 row_clipboard_show_source_app = "Show source app"
 row_clipboard_max_entries = "Max entries"
 row_clipboard_auto_expire_days = "Auto-delete days (0 = never)"
+row_clipboard_image_rows = "Image row height (in rows)"
 row_clipboard_pin_follow = "Selection after pinning"
 pin_follow_entry = "Follow the Pinned Entry"
 pin_keep_position = "Keep Current Position"
@@ -527,6 +528,7 @@ config_field_type_invalid = "{field}: invalid type {actual} (expected {expected}
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, smooth'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=100"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} must be 0..=7 (0 = never)"
+clipboard_image_rows_invalid = "clipboard.image_rows: {value} must be 1..=3"
 mouse_line_count_invalid = "line_count: {value} must be 1..=10"
 mouse_pointer_acceleration_invalid = "pointer.acceleration: {value} must be 0..=10"
 mouse_smooth_field_invalid = "smooth_scrolling.{field}: {value} is invalid or outside its allowed range"

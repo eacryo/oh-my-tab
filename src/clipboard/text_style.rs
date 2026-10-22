@@ -135,9 +135,20 @@ pub(super) unsafe fn make_content_attributed(content: &str, kind: TextKind) -> *
     attr
 }
 
-/// Compose image rows' rounded thumbnail well; text rows return null.
-/// The dimensions come from the same layout tokens as the row's reserved image column.
-pub(super) unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
+/// The preview's drawn size inside the row's content column: fit-contained into
+/// `avail_w` x `thumb_h`, so a wide source spans the column like text does (a fixed
+/// thumbnail-width implementation would always return its own constant here).
+pub(super) fn row_image_draw_size(px_w: f64, px_h: f64, avail_w: f64, thumb_h: f64) -> (f64, f64) {
+    if px_w <= 0.0 || px_h <= 0.0 || avail_w <= 0.0 || thumb_h <= 0.0 {
+        return (avail_w.max(1.0), thumb_h.max(1.0));
+    }
+    let scale = (avail_w / px_w).min(thumb_h / px_h);
+    (px_w * scale, px_h * scale)
+}
+
+/// Compose an image row's preview; text rows return null. The preview fills the row's content
+/// column (like text does), fit-contained into `avail_w` x `thumb_h()` and left-aligned.
+pub(super) unsafe fn make_row_image(entry: &ClipEntry, avail_w: f64) -> *mut AnyObject {
     let Some(img) = &entry.image else {
         return std::ptr::null_mut();
     };
@@ -149,6 +160,8 @@ pub(super) unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
         image_hash: img.hash,
         field_bg: palette.field_bg,
         card_border: palette.card_border,
+        thumb_h_bits: thumb_h().to_bits(),
+        thumb_w_bits: avail_w.to_bits(),
     };
     if let Some(cached) = ROW_IMAGE_CACHE.lock().unwrap().get_mut(&key) {
         cached.last_used = next_ui_cache_recency();
@@ -170,12 +183,12 @@ pub(super) unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
         release_obj(im);
         return std::ptr::null_mut();
     }
-    // Fit-contain into the reserved thumbnail well.
-    let scale = (THUMB_W / s.width).min(THUMB_H / s.height);
-    let w = s.width * scale;
-    let h = s.height * scale;
+    // Fit-contain into the row's whole content column, left-aligned like the text it replaces.
+    let thumb_h = thumb_h();
+    let avail_w = avail_w.max(1.0);
+    let (w, h) = row_image_draw_size(s.width, s.height, avail_w, thumb_h);
     let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
-    let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(THUMB_W, THUMB_H)];
+    let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(avail_w, thumb_h)];
     let _: () = msg_send![target, lockFocus];
     // The v2 mock's `.row-thumb`: a translucent white well with a glass-line ring (the light
     // palette keeps its measured values in dark mode).
@@ -183,17 +196,14 @@ pub(super) unsafe fn make_row_image(entry: &ClipEntry) -> *mut AnyObject {
     let _: () = msg_send![fill, set];
     let box_path: *mut AnyObject = msg_send![
         class!(NSBezierPath),
-        bezierPathWithRoundedRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(THUMB_W, THUMB_H)),
+        bezierPathWithRoundedRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w.max(THUMB_W).min(avail_w), thumb_h)),
         xRadius: THUMB_R,
         yRadius: THUMB_R
     ];
     let _: () = msg_send![box_path, fill];
     // clip to the rounded rect, then draw the image.
     let _: () = msg_send![box_path, addClip];
-    let dst = NSRect::new(
-        NSPoint::new((THUMB_W - w) / 2.0, (THUMB_H - h) / 2.0),
-        NSSize::new(w, h),
-    );
+    let dst = NSRect::new(NSPoint::new(0.0, (thumb_h - h) / 2.0), NSSize::new(w, h));
     let src_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
     let op: usize = 1; // NSCompositingOperationCopy
     let _: () = msg_send![im, drawInRect: dst, fromRect: src_rect, operation: op, fraction: 1.0f64];
@@ -2007,6 +2017,24 @@ mod tests {
             assert_eq!(wash & 0xFFFF_FF00, palette.hover_bg & 0xFFFF_FF00);
             assert_eq!(wash & 0xFF, if dark { 0x28 } else { 0x18 });
         }
+    }
+
+    #[test]
+    fn a_row_preview_uses_the_content_width_not_a_fixed_thumb_box() {
+        // The fix for the squeezed-thumbnail report: the drawn preview is fit-contained into
+        // the caller's content width, so a wide column yields a wide preview. A regression
+        // back to the fixed 30pt well would return its constant width and fail the bounds.
+        for avail in [120.0, 240.0, 480.0] {
+            let (w, h) = row_image_draw_size(1600.0, 900.0, avail, 110.0);
+            assert!(w <= avail + 0.001 && h <= 110.0 + 0.001);
+            assert!(
+                w > 30.0,
+                "a {avail}pt column must not render a 30pt preview"
+            );
+        }
+        // Degenerate source still yields a usable rect instead of a zero-size image.
+        let (w, h) = row_image_draw_size(0.0, 0.0, 240.0, 110.0);
+        assert!(w >= 1.0 && h >= 1.0);
     }
 
     #[test]

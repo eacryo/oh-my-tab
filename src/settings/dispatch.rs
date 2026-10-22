@@ -64,6 +64,7 @@ pub(super) enum ControlField {
     ClipboardClearSystemPasteboardAfterPaste,
     ClipboardMaxEntries,
     ClipboardAutoExpireDays,
+    ClipboardImageRows,
     ClipboardPinFollow,
     // The Key Bindings page's two group switches. The per-binding rows are dynamic and dispatch
     // through their own sender-pointer lookups (`handleBindingToggle:`/`handleBindingDelete:`), not
@@ -222,6 +223,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                     ControlField::ClipboardAutoExpireDays,
                 )
             })
+            .or_else(|| m(u.clipboard_image_rows, ControlField::ClipboardImageRows))
             .or_else(|| m(u.clipboard_pin_follow, ControlField::ClipboardPinFollow))
             .or_else(|| m(u.key_bindings_enabled, ControlField::KeyBindingsEnabled))
             .or_else(|| m(u.update_auto_check, ControlField::UpdateAutoCheck))
@@ -407,6 +409,9 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                 } else if ctrl == u.clipboard_auto_expire_days {
                     let val: isize = msg_send![ctrl, integerValue];
                     set_field(u.clipboard_auto_expire_days_value_label, val);
+                } else if ctrl == u.clipboard_image_rows {
+                    let val: isize = msg_send![ctrl, integerValue];
+                    set_field(u.clipboard_image_rows_value_label, val);
                 } else if ctrl == u.pointer_accel_slider {
                     // Pointer acceleration / tracking speed: the read-only value follows the drag
                     // in real time (2 decimals).
@@ -754,6 +759,10 @@ fn apply_control_field(field: ControlField) {
                         CLIPBOARD_AUTO_EXPIRE_MIN as isize,
                         CLIPBOARD_AUTO_EXPIRE_MAX as isize,
                     ) as u32;
+                }
+                ControlField::ClipboardImageRows => {
+                    let value: isize = msg_send![u.clipboard_image_rows, integerValue];
+                    cfg.clipboard.image_rows = (value as u32).clamp(1, 3);
                 }
                 ControlField::ClipboardMaxEntries => {
                     // Numeric text fields ride the NSControlText notification path.
@@ -1229,6 +1238,7 @@ pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
         ui.clipboard_clear_system_pasteboard_after_paste,
         ui.clipboard_max_entries,
         ui.clipboard_auto_expire_days,
+        ui.clipboard_image_rows,
         ui.clipboard_auto_expire_days_value_label,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
@@ -1614,6 +1624,11 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 make_nsstring(&format!("{}", super::status_bar_size_for_index(size_value)));
             let _: () = msg_send![u.status_bar_text_size_value_label, setStringValue: readout];
             CFRelease(readout as *const c_void);
+            // Same for the clipboard image-rows slider: the picker rebuilds its rows from the
+            // reloaded config, so the settings control must show the same stop.
+            let image_rows = (cfg.clipboard.image_rows as i64).clamp(1, 3);
+            let _: () = msg_send![u.clipboard_image_rows, setIntegerValue: image_rows];
+            set_field(u.clipboard_image_rows_value_label, image_rows);
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
             // Key bindings: an external change (a menu toggle, a reloaded file) has to reach the

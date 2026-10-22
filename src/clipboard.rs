@@ -321,9 +321,14 @@ const NSPASTEBOARD_TYPE_TIFF: &str = "public.tiff";
 /// The image rows' thumbnail box (72x44, control radius, faint fill + inner ring, mirroring the
 /// HTML mockup).
 /// The mock's `.row-thumb`: a 30×30 well (radius 8) holding the type icon or the image
-/// thumbnail.
+/// thumbnail. At image_rows > 1 the well keeps the row's padding and grows with the row:
+/// `ROW_H * n - (ROW_H - THUMB_H)`, i.e. 30/70/110pt for stops 1/2/3.
 const THUMB_W: f64 = 30.0;
 const THUMB_H: f64 = 30.0;
+/// The thumbnail well's height at the configured `clipboard.image_rows` multiplier.
+pub(crate) fn thumb_h() -> f64 {
+    ROW_H * model::image_row_multiplier() - (ROW_H - THUMB_H)
+}
 const THUMB_R: f64 = crate::theme::RADIUS_CONTROL;
 /// gap between the app icon and the thumb in the canvas.
 /// keycode used when synthesizing Cmd+V.
@@ -1027,6 +1032,11 @@ struct RowImageKey {
     image_hash: u64,
     field_bg: u32,
     card_border: u32,
+    /// The configured image-row height the cached bitmap was drawn at (the well's height changes
+    /// with `clipboard.image_rows`, so a cached 30pt bitmap must not serve a 110pt row).
+    thumb_h_bits: u64,
+    /// The content column width the bitmap was drawn for (the preview spans it like text).
+    thumb_w_bits: u64,
 }
 static ROW_IMAGE_CACHE: LazyLock<MainThreadSlot<HashMap<RowImageKey, CachedUiObject>>> =
     LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
@@ -1397,6 +1407,17 @@ pub(crate) fn set_filter_popover_open(open: bool) {
 
 /// Apply a reloaded clear-all preference without retaining a popover whose visible row order was
 /// built from the previous value.
+/// Rebuild the picker's row list when a row-geometry setting (`clipboard.image_rows`) changed.
+/// No-op while the picker is closed -- its next open rebuilds anyway.
+pub(crate) fn rebuild_rows_for_layout_change() {
+    if PICKER_WINDOW.lock().unwrap().is_none() {
+        return;
+    }
+    unsafe {
+        detail::rebuild_rows();
+    }
+}
+
 pub(crate) fn refresh_clear_actions_after_config_change() {
     if filter_popover_open() {
         detail::dismiss_filter_popover();
@@ -4080,6 +4101,25 @@ mod tests {
             );
         }
     }
+    #[test]
+    fn image_row_pitches_follow_the_configured_multiplier_and_the_budget_cap() {
+        use super::{compute_pitches_for, list_fill_for_budget, row_content_h_for, GROUP_H, ROW_H};
+        // The multiplier is an input, not a global read: a 3x image row is three text rows
+        // while a text row is unaffected, whatever config happens to say.
+        assert_eq!(row_content_h_for(&entry_image(b"png"), 3.0), ROW_H * 3.0);
+        assert_eq!(row_content_h_for(&entry("a"), 3.0), ROW_H);
+        // Once a filter drops the text row in front, display index 0 carries the image's
+        // pitch -- GROUP_H + an image row, not GROUP_H + ROW_H.
+        let texts = vec![entry("a"), entry_image(b"png")];
+        let filtered: Vec<&super::ClipEntry> = texts.iter().skip(1).collect();
+        let pitches = compute_pitches_for(filtered.iter().copied());
+        let n = crate::clipboard::model::image_row_multiplier();
+        assert_eq!(pitches[0], GROUP_H + ROW_H * n);
+        // Three 3x image rows do not fit a four-text-row budget: only one is kept whole.
+        let (count, used) = list_fill_for_budget(&[ROW_H * 3.0; 3], ROW_H * 4.0);
+        assert_eq!((count, used), (1, ROW_H * 3.0));
+    }
+
     #[test]
     fn compute_pitches_sizes_image_rows_for_the_thumbnail() {
         use super::{compute_pitches, GROUP_H, ROW_H, THUMB_H};

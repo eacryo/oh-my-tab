@@ -300,6 +300,7 @@ row_clipboard_clear_system_pasteboard_after_paste = "同时删除系统剪贴板
 row_clipboard_show_source_app = "显示来源应用"
 row_clipboard_max_entries = "最大条数"
 row_clipboard_auto_expire_days = "自动删除天数（0 表示不删除）"
+row_clipboard_image_rows = "图片行高度（行数）"
 row_clipboard_pin_follow = "置顶后选中项位置"
 pin_follow_entry = "跟随置顶"
 pin_keep_position = "保持当前位置"
@@ -528,6 +529,7 @@ config_field_type_invalid = "{field}：类型 {actual} 无效（应为 {expected
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" 不是 default、line、smooth 之一'
 clipboard_max_entries_invalid = "clipboard.max_entries: {value} 必须 1..=100"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} 必须 0..=7(0 = 永不过期)"
+clipboard_image_rows_invalid = "clipboard.image_rows: {value} 必须 1..=3"
 mouse_line_count_invalid = "line_count: {value} 必须 1..=10"
 mouse_pointer_acceleration_invalid = "pointer.acceleration: {value} 必须 0..=10"
 mouse_smooth_field_invalid = "smooth_scrolling.{field}: {value} 无效或超出允许范围"

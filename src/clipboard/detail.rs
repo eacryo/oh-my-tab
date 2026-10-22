@@ -2016,29 +2016,35 @@ unsafe fn create_row_views(
         let _: () = msg_send![cell, setMaximumNumberOfLines: 1isize];
     }
     let image_started = Instant::now();
-    let row_img = make_row_image(entry);
+    let row_img = make_row_image(entry, content_w);
     stats.image_ms += image_started.elapsed().as_millis();
-    if !row_img.is_null() {
+    let has_preview = !row_img.is_null();
+    if has_preview {
         let _: () = msg_send![content_btn, setImage: row_img];
-        let _: () = msg_send![content_btn, setImagePosition: 2isize]; // NSImageLeft
+        // The preview already fills the content column, so the row is image-only: a title
+        // would fight it for the same space (NSImageLeft + a filename pushed past the edge).
+        // Falling back to the text title remains the degenerate-image path below.
+        let _: () = msg_send![content_btn, setImagePosition: 1isize]; // NSImageOnly
         release_obj(row_img);
     }
-    // Keep the full string and let the native cell wrap/truncate using actual font metrics.
-    // Character-count heuristics break on emoji, combining marks, and long unbroken words.
-    let content = entry.text.as_str();
-    let kind = if is_image {
-        TextKind::Plain
-    } else {
-        classify_text(&entry.text)
-    };
-    if kind == TextKind::Code {
-        stats.code_rows += 1;
+    if !has_preview {
+        // Keep the full string and let the native cell wrap/truncate using actual font metrics.
+        // Character-count heuristics break on emoji, combining marks, and long unbroken words.
+        let content = entry.text.as_str();
+        let kind = if is_image {
+            TextKind::Plain
+        } else {
+            classify_text(&entry.text)
+        };
+        if kind == TextKind::Code {
+            stats.code_rows += 1;
+        }
+        let content_attributed_started = Instant::now();
+        let attr = make_content_attributed(content, kind);
+        stats.content_attributed_ms += content_attributed_started.elapsed().as_millis();
+        let _: () = msg_send![content_btn, setAttributedTitle: attr];
+        release_obj(attr);
     }
-    let content_attributed_started = Instant::now();
-    let attr = make_content_attributed(content, kind);
-    stats.content_attributed_ms += content_attributed_started.elapsed().as_millis();
-    let _: () = msg_send![content_btn, setAttributedTitle: attr];
-    release_obj(attr);
     let _: () = msg_send![content_btn, setTag: i as isize];
     let _: () = msg_send![content_btn, setTarget: row_target()];
     let _: () = msg_send![content_btn, setAction: sel!(handleClipboardRowClick:)];
@@ -2449,8 +2455,6 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     let remove_old_ms = remove_old_started.elapsed().as_millis();
 
     let prepare_started = Instant::now();
-    // Each row's button height / pitch derives from its wrapped line count.
-    *pitches = compute_pitches(&hist);
     let total = hist.len();
     // The footer's entry count follows the history (the search placeholder is now a
     // static string).
@@ -2461,6 +2465,11 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     let filtered_indices = filtered_indices(&hist, &query, filter);
     with_clipboard_ui(|ui| ui.filtered = filtered_indices);
     let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+    // Each row's button height / pitch derives from its wrapped line count. The sequence has
+    // to be the FILTERED one: image rows are taller than text rows, so a pitch index that
+    // aligned under a uniform height would read the wrong entry's row once a filter drops
+    // entries.
+    *pitches = compute_pitches_for(filtered.iter().map(|&i| &hist[i]));
     let show_source = show_source_app();
 
     // Clamp the selection into the fresh display list (out of range -> the tail;

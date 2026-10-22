@@ -3487,6 +3487,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             thumbnail_size: std::ptr::null_mut(),
             card_text_size: std::ptr::null_mut(),
             card_text_size_value_label: std::ptr::null_mut(),
+            clipboard_image_rows: std::ptr::null_mut(),
+            clipboard_image_rows_value_label: std::ptr::null_mut(),
             status_bar_text_size: std::ptr::null_mut(),
             status_bar_text_size_value_label: std::ptr::null_mut(),
             show_footer_title: std::ptr::null_mut(),

@@ -2128,6 +2128,39 @@ pub(super) unsafe fn build_clipboard_page(
         CLIPBOARD_AUTO_EXPIRE_DEFAULT,
     );
     bind_control(target, ui.clipboard_auto_expire_days);
+    let cy = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
+    // Image row height: how many text-row heights an image entry occupies in the picker
+    // (1 = thumbnail row like today, 2/3 = a taller preview row).
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_image_rows"),
+        None,
+    );
+    let (_, image_rows_slider) = SettingsRow::tall(
+        clipboard_view,
+        label_x,
+        cy,
+        label_w,
+        &t("settings.row_clipboard_image_rows"),
+        SettingsControl::stepped_slider(
+            ctrl_x,
+            cy + 10.0,
+            SettingsRow::slider_width(ctrl_w),
+            row_h,
+            1,
+            3,
+            1,
+            1,
+            // Double-click restores the default (1 row).
+            Some(1.0),
+        ),
+    );
+    ui.clipboard_image_rows = image_rows_slider;
+    ui.clipboard_image_rows_value_label =
+        SettingsRow::attach_slider_readout(clipboard_view, image_rows_slider, 1);
+    bind_control(target, ui.clipboard_image_rows);
     canvas.card(&t("settings.header_clipboard_options"));
     set_settings_search_section(&t("settings.header_clipboard_options"));
 

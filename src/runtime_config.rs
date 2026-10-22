@@ -44,6 +44,7 @@ struct ChangeFlags {
     clipboard_shortcut: bool,
     // The "separate clear all" switch: the picker header shows or hides its second button live.
     clipboard_clear_actions: bool,
+    clipboard_image_rows: bool,
     // The binding list or either group switch changed: the engine republishes its table and starts
     // or stops the tap. The two legacy switches (which used to own a tap each) are covered by this
     // one flag: one engine now serves both groups.
@@ -72,6 +73,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.thumbnail_size
         || flags.show_footer_title
         || flags.status_bar_size
+        || flags.clipboard_image_rows
         || flags.keystroke_display
         || flags.mouse
         || flags.key_bindings
@@ -131,6 +133,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
         clipboard_clear_actions: startup
             || old.clipboard.separate_clear_all != new.clipboard.separate_clear_all,
+        clipboard_image_rows: startup || old.clipboard.image_rows != new.clipboard.image_rows,
         key_bindings: startup || old.key_bindings != new.key_bindings,
         keystroke_display: startup || old.keystroke_display != new.keystroke_display,
         updates: startup
@@ -254,6 +257,9 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // The settled chord: the coordination above may have moved it, and the guide must name
         // the shortcut the app actually listens for.
         crate::onboarding::refresh_clipboard_shortcut(&effective.clipboard.shortcut);
+    }
+    if flags.clipboard_image_rows {
+        crate::clipboard::rebuild_rows_for_layout_change();
     }
     if flags.clipboard_clear_actions {
         crate::clipboard::refresh_clear_actions_after_config_change();
@@ -636,6 +642,16 @@ mod tests {
             !needs_in_place_control_sync(&ChangeFlags::default()),
             "an empty change set must not resync anything"
         );
+    }
+
+    #[test]
+    fn the_clipboard_image_rows_change_flags_the_rebuild_and_the_settings_sync() {
+        let old = crate::config::Config::default();
+        let mut new = old.clone();
+        new.clipboard.image_rows = 3;
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.clipboard_image_rows);
+        assert!(needs_in_place_control_sync(&flags));
     }
 
     #[test]

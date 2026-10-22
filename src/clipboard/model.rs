@@ -336,18 +336,42 @@ pub(super) fn group_label(g: DayGroup) -> String {
     }
 }
 
-/// The row content height, shared by layout and row views.
-pub(super) fn row_content_h(_entry: &ClipEntry) -> f64 {
-    ROW_H
+/// The configured image-row height as a multiple of the text row (1..=3 from
+/// `clipboard.image_rows`; anything else collapses to 1 so a bad value cannot stretch the list).
+pub(crate) fn image_row_multiplier() -> f64 {
+    let n = CONFIG.read().unwrap().clipboard.image_rows;
+    (n.clamp(1, 3)) as f64
+}
+
+/// The row height an entry takes at a given `image_rows` multiplier, with the configured value
+/// injected so callers (and tests) never depend on a global read.
+pub(crate) fn row_content_h_for(entry: &ClipEntry, image_rows: f64) -> f64 {
+    if entry.image.is_some() {
+        ROW_H * image_rows
+    } else {
+        ROW_H
+    }
+}
+
+/// The row content height, shared by layout and row views. Image entries occupy
+/// `image_rows` text-row heights; text rows are always one.
+pub(super) fn row_content_h(entry: &ClipEntry) -> f64 {
+    row_content_h_for(entry, image_row_multiplier())
 }
 
 /// Compute the per-row pitches. **Every entry keeps ONE fixed pitch** = content + row gap;
 /// a group-header height is inserted before the first row of each group (computed on the
 /// FILTERED display order, so time boundaries stay correct under filtering).
 pub(super) fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
+    compute_pitches_for(texts.iter())
+}
+
+/// The same pitches over the entries as they are actually displayed: callers must pass the
+/// FILTERED sequence, because image rows' height differs from text rows -- a pitch computed
+/// over the full history no longer aligns with display index `i` once a filter drops rows.
+pub(super) fn compute_pitches_for<'a>(entries: impl Iterator<Item = &'a ClipEntry>) -> Vec<f64> {
     let mut prev: Option<DayGroup> = None;
-    texts
-        .iter()
+    entries
         .map(|e| {
             let g = day_group(e.copied_at);
             let hdr = if prev.is_none() || prev != Some(g) {
@@ -359,6 +383,22 @@ pub(super) fn compute_pitches(texts: &[ClipEntry]) -> Vec<f64> {
             hdr + row_content_h(e)
         })
         .collect()
+}
+
+/// How much of the pitch sequence fits a list budget, floored at one row: image rows can
+/// occupy several text rows, so counting `budget / ROW_H` rows would overflow the panel.
+/// Returns (row count, height consumed).
+pub(crate) fn list_fill_for_budget(pitches: &[f64], budget: f64) -> (usize, f64) {
+    let mut used = 0.0;
+    let mut count = 0usize;
+    for pitch in pitches {
+        if count > 0 && used + pitch > budget {
+            break;
+        }
+        used += pitch;
+        count += 1;
+    }
+    (count.max(1), used)
 }
 
 /// The fixed header strip's height: top padding + the search row + the gap under it (the mock's

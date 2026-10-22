@@ -480,6 +480,8 @@ pub(super) struct SettingsUi {
     clipboard_max_entries: *mut AnyObject,                         // max history entries
     clipboard_auto_expire_days: *mut AnyObject,                    // auto-expire days (0 = never)
     clipboard_auto_expire_days_value_label: *mut AnyObject,        // auto-expire value
+    clipboard_image_rows: *mut AnyObject,                          // image row height (1..3 rows)
+    clipboard_image_rows_value_label: *mut AnyObject,              // image-rows value
     clipboard_show_source_app: *mut AnyObject,                     // show the source app
     clipboard_pin_follow: *mut AnyObject,                          // selection after pin
     // (follow the pinned entry / keep current position)
@@ -1971,6 +1973,12 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 setIntegerValue: auto_expire_days as isize
             ];
             set_field(ui.clipboard_auto_expire_days_value_label, auto_expire_days);
+            let image_rows = (cfg.clipboard.image_rows as i64).clamp(1, 3);
+            let _: () = msg_send![
+                ui.clipboard_image_rows,
+                setIntegerValue: image_rows as isize
+            ];
+            set_field(ui.clipboard_image_rows_value_label, image_rows);
             // pin_follow_selection: popup index 0 = follow, 1 = keep.
             let pin_idx: isize = if cfg.clipboard.pin_follow_selection {
                 0

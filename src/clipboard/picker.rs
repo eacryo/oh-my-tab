@@ -702,27 +702,21 @@ pub(super) fn show_picker() {
         let pad = crate::glass::panel_elevation_padding();
         let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0 - pad.top - pad.bottom);
         // The visible row count derives from the height cap, floored to whole rows (no
-        // half-cut row at the window's bottom). The estimate uses the plain (header-less)
-        // row pitch -- the first row carries a 26pt group header, which would undercount.
-        // The window height = the strip + the list + the bottom padding, so the list's
-        // budget = max_h - strip - padding.
-        // Rows are a uniform 61pt (ROW_H); the window height = the header + the list +
-        // the footer + padding.
-        let visible = if hist_len == 0 {
-            0
-        } else {
-            (((max_h - header_strip_h() - FOOTER_H - PAD_Y) / ROW_H).floor() as usize)
-                .min(hist_len)
-                .max(1)
-        };
-        // With an empty history the list area is one hint row tall.
+        // half-cut row at the window's bottom). Pitches are accumulated per actual row
+        // rather than estimated at ROW_H each: image entries can occupy several text rows
+        // (clipboard.image_rows), so a fixed-ROW_H estimate would let the panel exceed
+        // the cap once tall rows are in play.
+        let list_budget = max_h - header_strip_h() - FOOTER_H - PAD_Y;
         let list_h = if hist_len == 0 {
             40.0
         } else {
-            pitches.iter().take(visible).sum::<f64>()
+            list_fill_for_budget(&pitches, list_budget).1.max(ROW_H)
         };
-        // Use the same three-record visual minimum for every state, including one or zero rows.
-        let computed_h = (header_strip_h() + list_h + FOOTER_H + PAD_Y).max(picker_min_height());
+        // Use the same three-record visual minimum for every state, including one or zero rows,
+        // and never exceed the cap: enough tall image rows must not push the panel past max_h.
+        let computed_h = (header_strip_h() + list_h + FOOTER_H + PAD_Y)
+            .max(picker_min_height())
+            .min(max_h);
         // A pinned panel keeps the height it was pinned at (decision E): the row set can change
         // underneath it (a new copy, a filter, an expiry) without the panel resizing under the
         // pointer. The frozen value is a PANEL height, which is what the frame here is built from.
