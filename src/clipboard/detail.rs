@@ -1771,8 +1771,11 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![options_button, setWantsLayer: true];
     let options_layer: *mut AnyObject = msg_send![options_button, layer];
     if !options_layer.is_null() {
-        // The mock's `.orb`: a circle, not the control radius.
+        // The mock's `.orb`: a circle, not the control radius. The orb is a button filling a
+        // square frame, so its corner sublayers (the orb-dot below, and the hover sheen) would
+        // otherwise paint over the square corner instead of being clipped to the circle.
         let _: () = msg_send![options_layer, setCornerRadius: PICKER_ORB_SIZE / 2.0];
+        let _: () = msg_send![options_layer, setMasksToBounds: true];
     }
     let symbol_name = make_nsstring("ellipsis");
     let options_image: *mut AnyObject = msg_send![
@@ -1806,17 +1809,12 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![options_button, setToolTip: options_tooltip];
     CFRelease(options_tooltip as *const c_void);
     // The orb-dot (`.orb-dot`): an accent dot pinned to the orb's top-right, drawn whenever the
-    // active filter is not "All".
+    // active filter is not "All". Its frame comes from `options_orb_dot_frame`, which keeps the
+    // whole disc outside the orb's circular clip.
     if !options_layer.is_null() {
         let dot: *mut AnyObject = msg_send![class!(CALayer), layer];
-        let _: () = msg_send![
-            dot,
-            setFrame: NSRect::new(
-                NSPoint::new(PICKER_ORB_SIZE - 8.0, 3.0),
-                NSSize::new(5.0, 5.0)
-            )
-        ];
-        let _: () = msg_send![dot, setCornerRadius: 2.5];
+        let _: () = msg_send![dot, setFrame: options_orb_dot_frame()];
+        let _: () = msg_send![dot, setCornerRadius: PICKER_ORB_DOT_SIZE / 2.0];
         crate::ffi::layer_set_background(
             dot,
             crate::ffi::hex_to_cg_color(super::picker_accent(clipboard_palette())),

@@ -943,6 +943,35 @@ pub(crate) fn smoke_runner() -> bool {
         assert!(pin.origin.x + pin.size.width <= close.origin.x);
         let options_hidden: bool = msg_send![found_settings, isHidden];
         assert!(!options_hidden, "the options orb must be visible");
+        // The orb is a circle drawn with masksToBounds, and the "filter active" dot rides in its
+        // corner. The clip is what the dot has to clear, so both are asserted on the live layer
+        // tree: a corner radius without the mask leaves the dot painting over the square corner,
+        // and a dot frame drifting into the ring is what the report was about.
+        let orb_layer: *mut AnyObject = msg_send![found_settings, layer];
+        let clips: bool = msg_send![orb_layer, masksToBounds];
+        assert!(
+            clips,
+            "the options orb must clip its sublayers to its circle"
+        );
+        let corner_radius: f64 = msg_send![orb_layer, cornerRadius];
+        assert_eq!(
+            corner_radius,
+            super::PICKER_ORB_SIZE / 2.0,
+            "the orb's clip must be the circle its frame draws"
+        );
+        let dot = (*super::OPTIONS_ORB_DOT.lock().unwrap())
+            .expect("the options orb must carry its filter dot")
+            .0;
+        let dot_frame: NSRect = msg_send![dot, frame];
+        assert_eq!(
+            dot_frame,
+            super::options_orb_dot_frame(),
+            "the dot must sit in the frame the geometry reserves for it"
+        );
+        assert!(
+            super::orb_dot_is_drawn_in_full(super::PICKER_ORB_SIZE, dot_frame),
+            "the option orb's dot must be drawn whole inside the orb (frame {dot_frame:?})"
+        );
     }
 
     // Footer shortcut legends must survive the fonts they are drawn with, in every shipped

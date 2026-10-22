@@ -463,6 +463,40 @@ pub(super) fn picker_header_frames_for(width: f64) -> (NSRect, NSRect, NSRect, N
     (search, options, detail, pin, close)
 }
 
+/// The options orb's "filter active" dot, in the orb's own coordinates (origin top-left).
+/// The orb is a circle drawn with `masksToBounds`, so a dot inside its square corner is cut by
+/// the ring. Placing the dot `PICKER_ORB_DOT_GAP` from the top and right edges keeps it in the
+/// band between that ring and the square corner, where the whole disc stays visible.
+pub(super) fn options_orb_dot_frame() -> NSRect {
+    let inset = PICKER_ORB_DOT_GAP;
+    NSRect::new(
+        NSPoint::new(PICKER_ORB_SIZE - inset - PICKER_ORB_DOT_SIZE, inset),
+        NSSize::new(PICKER_ORB_DOT_SIZE, PICKER_ORB_DOT_SIZE),
+    )
+}
+
+/// Whether the whole dot is visible: inside the orb's bounds and entirely within its circle.
+///
+/// The orb is a circle drawn with `masksToBounds`, so whatever of the dot falls outside that
+/// circle is cut away. A circle of radius `orb_size / 2` contains a disc of radius `dot_radius`
+/// exactly when the two centres are at most `orb_size / 2 - dot_radius` apart, so that is what
+/// this asks -- no notion of an "inner corner", which depends on the axis direction.
+pub(super) fn orb_dot_is_drawn_in_full(orb_size: f64, dot: NSRect) -> bool {
+    // Tolerance for `sqrt` rounding at radius 17 (a few ulps, ~1e-14); far below a retina pixel.
+    const ROUNDING: f64 = 1e-6;
+    let radius: f64 = orb_size / 2.0;
+    let inside_bounds: bool = dot.origin.x >= 0.0
+        && dot.origin.y >= 0.0
+        && dot.origin.x + dot.size.width <= orb_size
+        && dot.origin.y + dot.size.height <= orb_size;
+    let dot_radius: f64 = dot.size.width.min(dot.size.height) / 2.0;
+    let dx: f64 = dot.origin.x + dot.size.width / 2.0 - radius;
+    let dy: f64 = dot.origin.y + dot.size.height / 2.0 - radius;
+    let centre_distance: f64 = (dx * dx + dy * dy).sqrt();
+    let fits_in_circle: bool = centre_distance <= radius - dot_radius + ROUNDING;
+    inside_bounds && fits_in_circle
+}
+
 /// The panel's top drag band: the header strip's top padding across the panel's full width
 /// (flipped coordinates, measured from the strip's top-left). It covers no control -- the search
 /// row starts below it -- so a press here always starts a panel drag (see `drag.rs`). Pure so a

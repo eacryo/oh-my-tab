@@ -434,6 +434,15 @@ const PICKER_CLOSE_BTN_GAP: f64 = 8.0;
 /// The pin/gear "orb" buttons: the mock's `.orb` -- 34×34 circles, so their corner radius is
 /// half their size rather than `RADIUS_CONTROL`.
 const PICKER_ORB_SIZE: f64 = 34.0;
+/// The options orb's "a filter is active" dot (the mock's `.orb-dot`). It hugs the orb's top-right
+/// corner, so it is a tiny satellite rather than a control of its own.
+pub(super) const PICKER_ORB_DOT_SIZE: f64 = 5.0;
+/// The dot's gap from the orb's top and right edges. The orb clips its sublayers to its circle, so
+/// the dot stays whole only while the disc fits inside it. Its centre is `17 - gap - 2.5` from the
+/// orb's centre on both axes, so the disc fits while `sqrt(2) * (14.5 - gap) + 2.5 <= 17`, which
+/// holds from `gap >= 14.5 - 14.5 / sqrt(2) = 4.2469...`. 6 leaves visible margin; the unit test
+/// pins both sides of that boundary so the number here cannot drift from the predicate.
+pub(super) const PICKER_ORB_DOT_GAP: f64 = 6.0;
 /// The settings button's SF Symbol point size. A symbol image carries its own size (it does not
 /// follow the button's font), so the corner's second glyph is sized here, a step above the close
 /// button's 12pt text × so the two read as the same weight.
@@ -1676,11 +1685,13 @@ mod tests {
 
     use super::{
         cache_generation, clip_image_detail_path, clip_image_path, effective_hover_row,
-        estimated_entry_bytes, fnv1a64, header_strip_h, picker_drag_band_frame,
-        picker_header_frames, rect_contains_point, run_image_cache_job, scroll_indicator_geometry,
+        estimated_entry_bytes, fnv1a64, header_strip_h, options_orb_dot_frame,
+        orb_dot_is_drawn_in_full, picker_drag_band_frame, picker_header_frames,
+        rect_contains_point, run_image_cache_job, scroll_indicator_geometry,
         wipe_cache_for_discard, ClipEntry, ImageCacheJob, ImageEntry, CLIP_HISTORY, NO_SELECTION,
-        NSPASTEBOARD_TYPE_PNG, PICKER_CLOSE_BTN_GAP, PICKER_CLOSE_BTN_SIZE, PICKER_ORB_SIZE,
-        PICKER_W, SCROLL_INDICATOR_CORNER_RESERVE, SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
+        NSPASTEBOARD_TYPE_PNG, PICKER_CLOSE_BTN_GAP, PICKER_CLOSE_BTN_SIZE, PICKER_ORB_DOT_GAP,
+        PICKER_ORB_DOT_SIZE, PICKER_ORB_SIZE, PICKER_W, SCROLL_INDICATOR_CORNER_RESERVE,
+        SCROLL_INDICATOR_EDGE, SEARCH_PAD_X, TOP_PAD_Y,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::sync::Arc;
@@ -1735,6 +1746,75 @@ mod tests {
             "the top drag band must stay a usable press target"
         );
     }
+    #[test]
+    fn options_orb_dot_is_drawn_whole_inside_the_orb_s_circle() {
+        let dot = options_orb_dot_frame();
+        assert!(
+            orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, dot),
+            "the orb-dot must be drawn whole, not cut by the orb's clip (frame {dot:?})"
+        );
+        // It still reads as the orb's corner satellite: inside the orb, in its top-right corner.
+        assert!(dot.origin.x > PICKER_ORB_SIZE / 2.0);
+        assert!(dot.origin.y < PICKER_ORB_SIZE / 2.0);
+        assert!(dot.origin.x + dot.size.width <= PICKER_ORB_SIZE);
+        assert!(dot.origin.y + dot.size.height <= PICKER_ORB_SIZE);
+        assert_eq!(dot.size.width, PICKER_ORB_DOT_SIZE);
+        assert_eq!(dot.size.height, PICKER_ORB_DOT_SIZE);
+        // The reported defect: pinned 3pt from the top and 8pt from the right, most of the disc
+        // was cut away by the orb's circular clip. That exact frame must stay rejected.
+        let reported = NSRect::new(
+            NSPoint::new(PICKER_ORB_SIZE - 8.0, 3.0),
+            NSSize::new(PICKER_ORB_DOT_SIZE, PICKER_ORB_DOT_SIZE),
+        );
+        assert!(
+            !orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, reported),
+            "the frame the clipping defect was reported against must not pass"
+        );
+        // Pinned flush to the orb's edge the disc hangs over the ring and is cut too.
+        let flush = NSRect::new(
+            NSPoint::new(PICKER_ORB_SIZE - PICKER_ORB_DOT_SIZE, 0.0),
+            NSSize::new(PICKER_ORB_DOT_SIZE, PICKER_ORB_DOT_SIZE),
+        );
+        assert!(!orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, flush));
+        // A dot hanging past the orb's bounds is clipped by the layer bounds as well.
+        let outside = NSRect::new(
+            NSPoint::new(PICKER_ORB_SIZE - 2.0, PICKER_ORB_DOT_GAP),
+            NSSize::new(PICKER_ORB_DOT_SIZE, PICKER_ORB_DOT_SIZE),
+        );
+        assert!(!orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, outside));
+        // The dot has to be visible as well as uncut: over the orb's centre the disc is inside
+        // the glyph, so a frame there is not a usable badge position.
+        let centred = NSRect::new(NSPoint::new(15.0, 15.0), NSSize::new(5.0, 5.0));
+        assert!(orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, centred));
+        // The constant's documented threshold, `14.5 - 14.5 / sqrt(2) = 4.2469...`: 4.2469pt is
+        // still cut and 4.247pt is not, so the 6pt in use is that boundary plus margin rather than
+        // a guess. Both sides are asserted so the comment on the constant cannot drift.
+        let frame_at = |gap: f64| {
+            NSRect::new(
+                NSPoint::new(PICKER_ORB_SIZE - gap - PICKER_ORB_DOT_SIZE, gap),
+                NSSize::new(PICKER_ORB_DOT_SIZE, PICKER_ORB_DOT_SIZE),
+            )
+        };
+        assert!(!orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, frame_at(4.22)));
+        assert!(!orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, frame_at(4.2469)));
+        assert!(orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, frame_at(4.247)));
+        assert!(orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, frame_at(5.0)));
+        assert!(orb_dot_is_drawn_in_full(
+            PICKER_ORB_SIZE,
+            frame_at(PICKER_ORB_DOT_GAP)
+        ));
+        for gap in [0.0, 1.0, 2.0] {
+            let frame = NSRect::new(
+                NSPoint::new(PICKER_ORB_SIZE - gap - PICKER_ORB_DOT_SIZE, gap),
+                NSSize::new(PICKER_ORB_DOT_SIZE, PICKER_ORB_DOT_SIZE),
+            );
+            assert!(
+                !orb_dot_is_drawn_in_full(PICKER_ORB_SIZE, frame),
+                "a {gap}pt gap still lets the orb's circular clip cut the dot"
+            );
+        }
+    }
+
     #[test]
     fn incremental_row_delete_declines_an_empty_result() {
         use super::detail::incremental_row_delete_applies;
