@@ -51,6 +51,9 @@ require_stable_signing=0
 allow_signing_fallback=0
 lock_wait_seconds=900
 check_mode=0
+ownership_probe=0
+ownership_expect_pid=""
+ownership_expect_start=""
 for arg in "$@"; do
     if [ "$after_separator" = "1" ]; then
         app_args+=("$arg")
@@ -67,6 +70,28 @@ for arg in "$@"; do
             # opposite of the interactive default. It leaves neither this run's process nor its
             # launchd job behind, and makes no claim about config, clipboard or cache state.
             check_mode=1
+            ;;
+        --whose-instance)
+            # A read-only query: no build, no launch, no stop, and no claim (see
+            # scripts/lib/dev-instance-ownership.sh for why the claim would be the wrong tool).
+            ownership_probe=1
+            ;;
+        --identity-expects=*)
+            # Re-check a snapshot an earlier --whose-instance returned: "is pid X, started at T,
+            # still the instance running this worktree's build?" A UI conclusion belongs to that
+            # identity, so it is only valid while the identity still holds.
+            ownership_probe=1
+            ownership_expect_pid="${arg#--identity-expects=}"
+            ownership_expect_start=""
+            case "$ownership_expect_pid" in
+                *,*) ownership_expect_start="${ownership_expect_pid#*,}"; ownership_expect_pid="${ownership_expect_pid%%,*}" ;;
+            esac
+            case "$ownership_expect_pid" in
+                ''|*[!0-9]*)
+                    echo "restart FAILED: --identity-expects needs <pid> or <pid>,<started>: $arg"
+                    exit 2
+                    ;;
+            esac
             ;;
         --lock-wait=*)
             lock_wait_seconds="${arg#--lock-wait=}"
@@ -88,6 +113,13 @@ for arg in "$@"; do
             echo "                            and TCC grants recorded for the Apple identity)"
             echo "  --no-onboarding  forward to the app and suppress the guide for this launch"
             echo "  --check    verify the launch, then stop it and its launchd job (leaves nothing running)"
+            echo "  --whose-instance  print which build is running and whether it came from this worktree;"
+            echo "             builds, launches and stops nothing, and takes no claim. Exit: 0 mine,"
+            echo "             1 not mine (or a stale build of this tree), 3 no instance, 4 unverified,"
+            echo "             5 contested by another instance, 6 this worktree has no built bundle."
+            echo "             Any non-zero verdict means a UI conclusion drawn now is not this tree's build."
+            echo "  --identity-expects=<pid>[,<started>]  re-check that pid is STILL this worktree's instance"
+            echo "             (same exit codes); use it after a UI check to show the instance was not replaced"
             echo "  --lock-wait=<sec>  wait this long for another worktree's build/test/launch transaction"
             echo "                     (default 900); the claim is released when this script returns, so the"
             echo "                     window it leaves is NOT protected from the next run"
@@ -126,6 +158,13 @@ if [ "$require_stable_signing" = "1" ] && [ "$allow_signing_fallback" = "1" ]; t
     echo "hint: permits the self-signed one when that identity cannot sign."
     exit 2
 fi
+# A query and a transaction are different answers to different questions; asking for both in one
+# run would either build under a flag that promises not to, or return a verdict nobody asked for.
+if [ "$ownership_probe" = "1" ] && { [ "$check_mode" = "1" ] || [ "${#app_args[@]}" -gt 0 ]; }; then
+    echo "restart FAILED: --whose-instance/--identity-expects cannot be combined with --check or app args"
+    echo "hint: run --whose-instance on its own; it builds, launches and stops nothing."
+    exit 2
+fi
 if [ "$build_profile" = "dev-opt" ]; then
     cargo_profile_args=(--profile dev-opt)
 fi
@@ -133,6 +172,19 @@ build_target_dir="$repo_dir/target/$build_profile"
 dev_app="$repo_dir/dist/Oh-My-Tab-Dev.app"
 dev_app_binary="$dev_app/Contents/MacOS/oh-my-tab"
 dev_bundle_id="com.eacryo.oh-my-tab.dev"
+
+# The ownership query runs BEFORE anything that could touch the repository or an instance: no
+# release-note requirement, no claim, no build. It answers a question about the machine's current
+# state, and a state that another run may be changing this very moment is exactly what it is for;
+# taking the claim would make it wait for the replacement it is trying to detect.
+if [ "$ownership_probe" = "1" ]; then
+    source "$repo_dir/scripts/lib/dev-instance-ownership.sh"
+    ownership_log="$HOME/Library/Logs/oh-my-tab/oh-my-tab.log"
+    omt_ownership_probe "$dev_app_binary" "$ownership_log" \
+        "$ownership_expect_pid" "$ownership_expect_start"
+    exit $?
+fi
+
 dev_version="$(awk -F'"' '/^version/ {print $2; exit}' "$repo_dir/Cargo.toml")"
 dev_release_doc="$repo_dir/release_doc_dev/${dev_version}.md"
 if [ ! -s "$dev_release_doc" ]; then

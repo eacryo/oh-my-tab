@@ -43,6 +43,24 @@ scripts/dev-restart.sh
   stops anything, and waits up to `--lock-wait=<sec>` (default 900) before failing with exit 75. The claim
   covers the transaction only: **the app the script leaves running is not protected**, and the next run may
   replace it. `scripts/dev-lock-selftest.sh` checks the claim offline, including the cross-worktree case.
+- **The claim protects the transaction, not the window — so prove the window is yours before drawing any
+  conclusion from it.** Because the claim is released when the transaction ends, another worktree may
+  legitimately replace the instance between this worktree's `restart ok` and this worktree's UI check; the
+  window then shows *that* worktree's build while both runs believe they verified their own. Before a UI, cua,
+  screenshot or latency conclusion, run `scripts/dev-restart.sh --whose-instance`: exit 0 means the running
+  instance is this worktree's build (and nothing competes for the shortcut), and **any other exit code means a
+  conclusion drawn now would describe something else** — 1 not this worktree's build (or an older build of
+  this tree), 3 nothing running, 4 the identity could not be established, 5 contested by another instance,
+  6 this worktree has no built bundle. It builds, launches and stops nothing and takes no claim (by design: a
+  query that queued on the claim would wait past the very replacement it exists to detect). Bind what you
+  observe to the `pid` and `started` it prints, and run
+  `scripts/dev-restart.sh --identity-expects=<pid>[,<started>]` afterwards: if that no longer reports `MINE`,
+  the instance was replaced and the observation is void. It is a snapshot, not protection — it cannot prove the
+  window belongs to the process, nor that the instance stayed put in between; see
+  `docs/dev-instance-ownership.md`.
+- **`--whose-instance` and `--identity-expects` are not substitutes for the claim.** They cannot be combined with
+  `--check` or app arguments (exit 2), and a run that needs a protected window for a while still has no hold-lock
+  option — use one transaction and re-check, rather than assuming the window stays.
 - **Stop instances by identity, never by name.** Enumerate, verify each pid's executable path, terminate that
   pid individually (TERM, then KILL only if it refuses), and name the pids in the output. A broad
   `pkill -x oh-my-tab` also reaches copies this run cannot account for. The packaged install under

@@ -98,6 +98,24 @@ else
     fail "a released claim was still held by the next run, or the acquisition failed (exit $leak_status)"
 fi
 
+# The release must not depend on a `lockf` flag this platform does not have. `lockf -u` is the
+# util-linux spelling of "unlock"; BSD/macOS `lockf` accepts only -k/-n/-s/-w/-t, so a release built
+# on `lockf -u` silently does nothing and passes only because the descriptor close also releases the
+# lock. Asserting the flag directly keeps that mistake from being reintroduced as "a redundant line
+# someone tidied away".
+if /usr/bin/lockf -u -k 9 >/dev/null 2>&1; then
+    fail "this platform's lockf accepts -u, so the release's assumptions need re-checking"
+else
+    pass "this platform's lockf rejects -u, so the release must close the descriptor"
+fi
+# Matched only in executable lines: the comment above explains the flag, and the explanation must
+# not read as the mistake it warns about.
+if grep -E '^[[:space:]]*[^#[:space:]].*lockf -u' "$lib" >/dev/null; then
+    fail "the library still calls 'lockf -u', which fails on this platform and hides its error"
+else
+    pass "the release does not call the non-existent 'lockf -u'"
+fi
+
 # The meta-counterexample: an acquire that always fails must make this suite fail. It is checked by
 # running the positive case against a shim that cannot take the claim.
 cat >"$workdir/broken-lib.sh" <<EOF

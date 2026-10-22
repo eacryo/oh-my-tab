@@ -86,7 +86,15 @@ omt_lock_acquire() {
 }
 
 # Release the claim explicitly, so the length of the claim is readable in the code that takes it.
+#
+# Closing the descriptor IS the release: BSD `lockf` holds the lock through `flock(2)` on that
+# descriptor, so closing it drops the lock. There is no `-u` to call -- macOS `lockf` accepts only
+# -k/-n/-s/-w/-t, and `-u` belongs to the unrelated util-linux tool. The previous version invoked
+# `lockf -u -k 9` and hid its failure with `2>/dev/null`; it never did anything, which is why the
+# `exec 9>&-` below is the only line that matters and must not be dropped as "the redundant one".
+#
+# The lock file itself is left in place on purpose: the inode is the thing every worktree agrees on,
+# and removing it would let two runs lock different inodes.
 omt_lock_release() {
-    /usr/bin/lockf -u -k 9 2>/dev/null || true
     exec 9>&- 2>/dev/null || true
 }
