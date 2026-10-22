@@ -156,7 +156,7 @@ static TAP_ACTIVE: AtomicBool = AtomicBool::new(false);
 // Shortcut mode: true = Command+Tab, false = Option+Tab (unless SHORTCUT_IS_CTRL is set)
 pub static SHORTCUT_IS_CMD: AtomicBool = AtomicBool::new(false);
 // Control+Tab mode. Takes precedence over SHORTCUT_IS_CMD; both are written together by
-// menu::set_shortcut_modifier.
+// menu::set_shortcut_mode.
 pub static SHORTCUT_IS_CTRL: AtomicBool = AtomicBool::new(false);
 
 /// The active switcher modifier as a CGEvent flag (same bit values as NSEvent modifier flags).
@@ -217,7 +217,10 @@ unsafe extern "C" fn event_tap_callback(
                         .map(|c| c.windows.enabled)
                         .unwrap_or(true)
                 {
-                    log_debug!("[kbd] Tab+Command passthrough (switcher disabled)");
+                    log_debug!(
+                        "[kbd] Tab+{} passthrough (switcher disabled)",
+                        switcher_modifier_name()
+                    );
                     return event;
                 }
                 let autorepeat = crate::event_tap::CGEventGetIntegerValueField(

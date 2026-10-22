@@ -57,6 +57,9 @@ LAUNCHER_NAME="Oh My Tab.command"
 BIN_DIR="$HOME/.local/bin"
 IDENTITY=""
 WANT_LAUNCHER=1
+# Whether --bin-dir was named. uninstall needs it: without the agent plist that is the only
+# statement of where the binary was installed.
+bin_dir_given=0
 
 COMMAND="${1:-}"
 [[ -n "$COMMAND" ]] && shift
@@ -64,8 +67,8 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --identity) IDENTITY="${2:?--identity needs a value}"; shift 2 ;;
         --identity=*) IDENTITY="${1#*=}"; shift ;;
-        --bin-dir) BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
-        --bin-dir=*) BIN_DIR="${1#*=}"; shift ;;
+        --bin-dir) BIN_DIR="${2:?--bin-dir needs a value}"; bin_dir_given=1; shift 2 ;;
+        --bin-dir=*) BIN_DIR="${1#*=}"; bin_dir_given=1; shift ;;
         --no-launcher) WANT_LAUNCHER=0; shift ;;
         -h|--help) usage; exit 0 ;;
         *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
@@ -115,7 +118,21 @@ install_binary() {
     fi
 }
 
+# XML-escape a string for a plist <string>. --bin-dir and $HOME are the caller's, so a path can
+# legitimately contain & or <, which would otherwise make the plist unparseable and stop bootstrap
+# from loading the agent at all.
+xml_escape() {
+    local s="$1"
+    s="${s//&/&amp;}"
+    s="${s//</&lt;}"
+    s="${s//>/&gt;}"
+    printf '%s' "$s"
+}
+
 write_plist() {
+    local bin_xml log_xml
+    bin_xml="$(xml_escape "$BIN")"
+    log_xml="$(xml_escape "$LAUNCHD_LOG")"
     mkdir -p "$(dirname "$PLIST")" "$LOG_DIR"
     # RunAtLoad starts it at login. KeepAlive restarts it only after an abnormal exit, so quitting
     # from the menu (exit 0) keeps it quit; a second instance also exits 0 when the instance lock
@@ -126,13 +143,13 @@ write_plist() {
 <plist version="1.0">
 <dict>
     <key>Label</key><string>$LABEL</string>
-    <key>ProgramArguments</key><array><string>$BIN</string><string>--no-onboarding</string></array>
+    <key>ProgramArguments</key><array><string>$bin_xml</string><string>--no-onboarding</string></array>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
     <key>ProcessType</key><string>Interactive</string>
     <key>LimitLoadToSessionType</key><string>Aqua</string>
-    <key>StandardOutPath</key><string>$LAUNCHD_LOG</string>
-    <key>StandardErrorPath</key><string>$LAUNCHD_LOG</string>
+    <key>StandardOutPath</key><string>$log_xml</string>
+    <key>StandardErrorPath</key><string>$log_xml</string>
 </dict>
 </plist>
 EOF
@@ -201,8 +218,20 @@ JXA
     echo "Installed launcher: $target"
 }
 
+# Whether this script's launcher is actually in place. The installed script declares the agent
+# label, so a file the user happened to give the same name is not removed by mistake.
+is_our_launcher() {
+    local target="$1"
+    # Fixed-string match: $LABEL holds dots, which a regular expression would accept as any character.
+    [[ -f "$target" ]] && /usr/bin/grep -Fqx "LABEL=\"$LABEL\"" "$target" 2>/dev/null
+}
+
 remove_launcher() {
-    rm -f "/Applications/$LAUNCHER_NAME" "$HOME/Applications/$LAUNCHER_NAME"
+    local target
+    for target in "/Applications/$LAUNCHER_NAME" "$HOME/Applications/$LAUNCHER_NAME"; do
+        is_our_launcher "$target" && rm -f "$target"
+    done
+    return 0
 }
 
 case "$COMMAND" in
@@ -224,16 +253,47 @@ case "$COMMAND" in
     status) status ;;
     launcher) install_launcher ;;
     uninstall)
-        stop_agent
-        # Remove the binary the agent points at, wherever --bin-dir put it at install time.
+        # The plist is the only record of what this script installed, so without it the default path
+        # is never assumed: the name is generic, and a binary there that this script did not install
+        # is not this script's to delete. An explicit --bin-dir is such a record. A plist that exists
+        # but cannot be read is treated the same way: it proves nothing, so nothing is deleted on its
+        # word -- not the binary and not the plist itself.
+        # PlistBuddy reports a read failure on stdout as "Error Reading File: ..." while exiting 1, so
+        # the exit status has to decide -- capturing its output alone would take that message as a path.
+        installed_bin=""
         if [[ -f "$PLIST" ]]; then
-            installed_bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null || true)"
-            [[ -n "$installed_bin" ]] && BIN="$installed_bin"
+            if ! installed_bin="$(/usr/libexec/PlistBuddy -c 'Print :ProgramArguments:0' "$PLIST" 2>/dev/null)"; then
+                installed_bin=""
+            fi
         fi
-        rm -f "$PLIST" "$BIN"
+        if [[ -z "$installed_bin" ]] && [[ "$bin_dir_given" == 1 ]]; then
+            installed_bin="$BIN"
+        fi
+        # Bootout first: with the agent still loaded, KeepAlive restarts the binary the moment it is
+        # killed, which both defeats the uninstall and races the deletion.
+        stop_agent
+        removed_anything=0
+        if [[ -n "$installed_bin" ]]; then
+            rm -f "$installed_bin"
+            removed_anything=1
+        fi
+        if [[ -f "$PLIST" ]]; then
+            if [[ -n "$installed_bin" ]]; then
+                rm -f "$PLIST"
+            else
+                echo "Kept $PLIST: its ProgramArguments could not be read, so the binary it points at"
+                echo "is unknown. Fix or delete it, then run: $0 uninstall --bin-dir $BIN_DIR"
+            fi
+        elif [[ "$removed_anything" == 0 ]]; then
+            echo "No agent plist at $PLIST, so there is no record of an installed binary."
+            echo "Nothing was removed. If one is there, pass it explicitly:"
+            echo "  $0 uninstall --bin-dir $BIN_DIR"
+        fi
         remove_launcher
-        echo "Uninstalled. ~/.config/oh-my-tab and $LOG_DIR are kept; remove $NAME from"
-        echo "Privacy & Security > Accessibility and Screen & System Audio Recording." ;;
+        if [[ "$removed_anything" == 1 ]]; then
+            echo "Uninstalled. ~/.config/oh-my-tab and $LOG_DIR are kept; remove $NAME from"
+            echo "Privacy & Security > Accessibility and Screen & System Audio Recording."
+        fi ;;
     -h|--help) usage ;;
     *) usage >&2; exit 2 ;;
 esac

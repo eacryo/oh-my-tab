@@ -53,6 +53,8 @@
 
 | 36 | `scripts/e2e/panel-contrast.sh` 的 `filter-row` 取景（`ROW_Y_PT=62`）在当前面板布局下对**所有**材质都报“11049/54000 像素成带状变化，不是文字”，因此该区域无法测量；只有逐个页脚 caption 区域仍可用 | frost 浅色修复，审查轮 4，2026-10-16 | MEDIUM（门禁） | 该失败与材质无关（frost 与 liquid-glass 一致），指向取景坐标陈旧（搜索框/筛选行的 y 与选定时不同），不是被测改动造成的对比度回归；页脚区域由实际标签坐标得到、仍然可用 | 下次改动剪贴板 picker 头部/筛选行布局时，或再次依赖该场景的 filter-row 判定时——用 `--e2e-state` 的实际控件 frame 重定 `ROW_*`，并确认差分只来自字形 |
 
+> **订正（2026-10-21，unbundled 安装交接审查）。** 审查轮 1 指出：杀掉 unbundled 实例（SIGTERM）不是成功退出，其 plist 设了 `KeepAlive.SuccessfulExit=false`，因此 launchd 会在大约 8 秒后拉起替代进程（实测 `state = spawn scheduled` → t+8s `state = running`，新 pid），而那时 dev 构建还没结束；替代进程随后占住实例锁，dev 版静默退出。当时我在 `--note` 里补了一句「已装的 `.app` 通过 SMAppService 登录项也有同样形态」，**这句是错的，在此撤回**。为判断这句而实测（与我们的代码无关，只关乎 launchd 语义）：一个临时 ad-hoc 签名的 `.app` 用真实 `SMAppService.mainApp` 注册成登录项（`status = 1`，`sfltool dumpbtm` 可见）后收到 SIGTERM，15 秒观察窗口内始终没有重启。普通 GUI app 的 job 是 `submitted by runningboardd`，出现在 `launchctl print` 但不在 `launchctl list`，随进程消失——它是瞬态的，且不带 `KeepAlive`。`SMAppService` 提供的是登录触发，不是运行期守护；只有 unbundled 的 plist 要求进程监督。因此 `dev-restart.sh` 对已装 `.app` 的既有处理本来就是对的，该 HIGH 只适用于 unbundled 路径，修复完整，`.app` 无需改动。测量用的临时 `.app` 已注销（`status` 回到 0）并删除：无进程、无 launchd job、无启用状态的登录项；`sfltool dumpbtm` 只留一条 `disabled` 的失效记录（bundle 已不在磁盘），无法启动任何东西。`/Applications/Oh-My-Tab.app` 的 BTM 记录未被触碰。
+
 ## 已在同一会话内关闭（不要重新打开）
 
 下列各轮都在预算政策存在之前就已在本会话内修完；记在这里只是为了后来的读者不必重新推导。修复都在树里，并带有各自的 A1 反例。
