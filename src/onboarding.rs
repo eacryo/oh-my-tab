@@ -494,7 +494,7 @@ unsafe fn ensure_window() {
     let window: *mut AnyObject = msg_send![
         window,
         initWithContentRect: frame,
-        styleMask: WINDOW_STYLE_TITLED,
+        styleMask: WINDOW_STYLE_MASK,
         backing: 2u64,
         defer: false
     ];
@@ -504,11 +504,49 @@ unsafe fn ensure_window() {
     // Closing must not release it: the pointer stays in the static slot for reuse (same
     // convention as the settings window).
     let _: () = msg_send![window, setReleasedWhenClosed: false];
-    apply_window_appearance();
+    // Custom chrome (the reference draws its own band and footer): transparent title bar, hidden
+    // title, full-height content. Same approach as the settings window; AppKit keeps the window
+    // title bar buttons functional and drawn above everything the app paints.
+    let _: () = msg_send![window, setTitlebarAppearsTransparent: true];
+    let _: () = msg_send![window, setStyleMask: WINDOW_STYLE_MASK | STYLE_MASK_FULL_SIZE_CONTENT];
+    let _: () = msg_send![window, setTitleVisibility: WINDOW_TITLE_HIDDEN];
+    // The app paints the window background itself, so AppKit's default keeps the desktop diff
+    // from showing through the (unchanged) window shadow.
+    let _: () = msg_send![window, setOpaque: false];
+    // The guide draws its own band and hides the standard window buttons, so without this the
+    // window would have no visible drag affordance at all: the empty background is the drag
+    // surface (the settings window's own convention in settings/window.rs). Controls keep
+    // consuming their own clicks; only untouched background (band, cards, page margins) drags.
+    let _: () = msg_send![window, setMovableByWindowBackground: true];
+
+    // The reference's dialog shows no traffic lights: hide the three standard window buttons.
+    // Hidden buttons keep the native title-bar drag strip; `band_leading_edge` skips hidden
+    // buttons so the leading row stays on the mock's 18pt.
+    for tag in 0isize..3 {
+        let button: *mut AnyObject = msg_send![window, standardWindowButton: tag];
+        if !button.is_null() {
+            let _: () = msg_send![button, setHidden: true];
+        }
+    }
     let _: () = msg_send![window, center];
     let content: *mut AnyObject = msg_send![window, contentView];
     *CONTENT.lock().unwrap() = Some(ObjPtr::new(content));
     *WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
+}
+
+/// Paint the window surface: `window_bg` fill clipped to `radius-panel` (the settings window's
+/// own root-surface convention). Called once per step render so a theme change while the guide
+/// is open repaints in the same pass as the content.
+unsafe fn paint_window_surface(content: *mut AnyObject) {
+    let palette = crate::theme::ui_palette();
+    let _: () = msg_send![content, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![content, layer];
+    if layer.is_null() {
+        return;
+    }
+    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(palette.window_bg));
+    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_PANEL];
+    let _: () = msg_send![layer, setMasksToBounds: true];
 }
 
 /// Removes every subview of the content view (each step rebuilds its content, like the clipboard
@@ -549,25 +587,92 @@ unsafe fn clear_content(content: *mut AnyObject) {
     }
 }
 
-/// Height `text` needs when wrapped inside `width` at `font_size` (AppKit measurement, no window
-/// required). Used by the layout assertions so a clipped label fails without a GUI.
-#[cfg(test)]
-unsafe fn wrapped_text_height(text: &str, width: f64, font_size: f64) -> f64 {
+/// Height `text` needs when wrapped inside `width` at the style's font and line height (AppKit
+/// measurement, no window required; runs on the main thread during a step render). Used to size
+/// the lede and the notes so the card below them keeps its exact 24pt gap instead of leaving the
+/// space a fixed three-line reserve would.
+///
+/// The paragraph carries the same explicit line height the drawn field gets through
+/// `ffi::set_text_field_line_height`, so measurement and drawing agree.
+unsafe fn measured_text_height(text: &str, width: f64, style: LabelStyle) -> f64 {
     use crate::ffi::CFRelease;
-    let value = make_nsstring(text);
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: font_size];
-    let key = make_nsstring("NSFont");
-    let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), dictionary];
-    let _: () = msg_send![attributes, setObject: font, forKey: key];
-    CFRelease(key as *const c_void);
+    let attributed = attributed_string(text, style, true);
     let bounds: NSRect = msg_send![
-        value,
+        attributed,
         boundingRectWithSize: NSSize::new(width, f64::MAX),
         options: 0x1u64 | 0x40u64, // usesLineFragmentOrigin | usesFontLeading
-        attributes: attributes
     ];
-    CFRelease(value as *const c_void);
+    CFRelease(attributed as *const c_void);
     bounds.size.height.ceil()
+}
+
+/// Width `text` needs on one line at the style's font, through AppKit's own `cellSize`. The
+/// cell's drawn width includes the small inset the cell lays its text out with — a raw
+/// glyph-advance measurement (attributed boundingRect) came back short of the drawn cell, and a
+/// truncated band title ("欢迎…" at exactly the measured width) was the result. Used to place
+/// centered band chrome and right-aligned trailing elements by geometry instead of alignment
+/// constants, whose numeric meaning differs between AppKit generations (see the settings
+/// titlebar note).
+unsafe fn single_line_text_width(text: &str, style: LabelStyle) -> f64 {
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![
+        field,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10000.0, 1.0))
+    ];
+    let value = make_nsstring(text);
+    let _: () = msg_send![field, setStringValue: value];
+    release_obj(value);
+    let _: () = msg_send![field, setBezeled: false];
+    let _: () = msg_send![field, setDrawsBackground: false];
+    let _: () = msg_send![field, setBordered: false];
+    let _: () = msg_send![field, setEditable: false];
+    let _: () = msg_send![field, setSelectable: false];
+    let _: () = msg_send![field, setUsesSingleLineMode: true];
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: style.size, weight: style.weight];
+    let _: () = msg_send![field, setFont: font];
+    let cell: *mut AnyObject = msg_send![field, cell];
+    let size: NSSize = msg_send![cell, cellSize];
+    release_obj(field);
+    size.width.ceil()
+}
+
+/// Attributed string of `text` at the style's font; with `line_height` the paragraph pins the
+/// style's drawn line height (min = max), without it the natural font leading is measured.
+unsafe fn attributed_string(text: &str, style: LabelStyle, line_height: bool) -> *mut AnyObject {
+    let value = make_nsstring(text);
+    let attributed: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let attributed: *mut AnyObject = msg_send![attributed, initWithString: value];
+    release_obj(value);
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: style.size, weight: style.weight];
+    let font_key = make_nsstring("NSFont");
+    let length: usize = msg_send![attributed, length];
+    let _: () = msg_send![
+        attributed,
+        addAttribute: font_key,
+        value: font,
+        range: NSRange::new(0, length)
+    ];
+    release_obj(font_key);
+    if line_height {
+        let paragraph: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+        let paragraph: *mut AnyObject = msg_send![paragraph, init];
+        let line = crate::theme::line_height(style.size, wrapped_line_height_ratio(style.size));
+        let _: () = msg_send![paragraph, setMinimumLineHeight: line];
+        let _: () = msg_send![paragraph, setMaximumLineHeight: line];
+        let _: () = msg_send![paragraph, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+        let paragraph_key = make_nsstring("NSParagraphStyle");
+        let _: () = msg_send![
+            attributed,
+            addAttribute: paragraph_key,
+            value: paragraph,
+            range: NSRange::new(0, length)
+        ];
+        release_obj(paragraph_key);
+        release_obj(paragraph);
+    }
+    attributed
 }
 
 unsafe fn add_label(
@@ -794,6 +899,839 @@ unsafe fn inline_icon_attachment_run(style: LabelStyle) -> Option<*mut AnyObject
     Some(mutable_icon)
 }
 
+/// Right inner edge of a card (row controls align here, 16pt from the card's right edge).
+fn card_trailing_x() -> f64 {
+    PAGE_PAD + CARD_W - CARD_INSET
+}
+
+/// Vertical center of a single caption-height line inside a row.
+fn row_caption_top(row_top: f64) -> f64 {
+    row_top + (ROW_H - CAPTION_LINE_H) / 2.0
+}
+
+/// Height of a row's leading two-line copy block (name + 4pt + description). The doc's 4px
+/// base grid forbids the mock's 2px between siblings, so the block uses 4.
+fn row_copy_block_h() -> f64 {
+    BODY_LINE_H + 4.0 + CAPTION_LINE_H
+}
+
+/// Space above the copy block inside a row.
+fn row_copy_top_offset() -> f64 {
+    (ROW_H - row_copy_block_h()) / 2.0
+}
+
+/// A layer-backed `NSView` with a background wash, an optional border, and a corner radius.
+/// The caller adds the returned view to a parent and releases it (alloc +1).
+unsafe fn make_surface_view(
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
+    bg: u32,
+    border: Option<(u32, f64)>,
+    radius: f64,
+) -> *mut AnyObject {
+    let view: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let view: *mut AnyObject = msg_send![
+        view,
+        initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+    ];
+    paint_surface_layer(view, bg, border, radius);
+    view
+}
+
+/// The layer painting `make_surface_view` does, applied to an already-allocated view (the
+/// segmented control allocates its own subclass, so the painting has to come separately).
+unsafe fn paint_surface_layer(
+    view: *mut AnyObject,
+    bg: u32,
+    border: Option<(u32, f64)>,
+    radius: f64,
+) {
+    let _: () = msg_send![view, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![view, layer];
+    if !layer.is_null() {
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(bg));
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        let _: () = msg_send![layer, setMasksToBounds: true];
+        if let Some((color, width)) = border {
+            crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(color));
+            let _: () = msg_send![layer, setBorderWidth: width];
+        }
+    }
+}
+
+/// A 1pt `separator` hairline (the band's bottom edge, the footer's top edge, the dividers
+/// between two rows sharing a card).
+unsafe fn add_hairline(content: *mut AnyObject, x: f64, y: f64, w: f64) {
+    let palette = crate::theme::ui_palette();
+    let line = make_surface_view(x, y, w, 1.0, palette.separator, None, 0.0);
+    let _: () = msg_send![content, addSubview: line];
+    release_obj(line);
+}
+
+/// The title band: a 1pt hairline under the 48pt strip, the window title centered by its own
+/// measured width (same reasoning as the settings titlebar), and the `1 / 4` step counter
+/// right-aligned in the chrome inset.
+/// The band's leading content edge on the borderless window: there are no traffic lights to
+/// measure (standardWindowButton returns no buttons), so the icon starts at the mock's
+/// `.bar { padding-left: 18px }` inset, like the reference.
+const BAND_LEADING_INSET: f64 = 18.0;
+/// The band's leading app icon (the reference's `.bar-icon`): 20pt wide with its own curve.
+const BAND_ICON_SIZE: f64 = 20.0;
+const BAND_ICON_RADIUS: f64 = 5.0;
+const BAND_GAP: f64 = 8.0;
+
+/// Where the band's content starts on this window: after any VISIBLE traffic lights (hidden
+/// buttons are skipped — the guide hides all three), else the mock's own 18pt inset. The
+/// measured support keeps a later chrome decision (buttons shown again) from silently
+/// overlapping the leading row.
+unsafe fn band_leading_edge(window: *mut AnyObject) -> f64 {
+    let mut right = 0.0f64;
+    // NSWindowButton order: Close=0, Miniaturize=1, Zoom=2.
+    for tag in 0isize..3 {
+        let button: *mut AnyObject = msg_send![window, standardWindowButton: tag];
+        if button.is_null() {
+            continue;
+        }
+        let hidden: bool = msg_send![button, isHidden];
+        if hidden {
+            continue;
+        }
+        let frame: NSRect = msg_send![button, frame];
+        right = right.max(frame.origin.x + frame.size.width);
+    }
+    if right > 0.0 {
+        right + BAND_GAP
+    } else {
+        BAND_LEADING_INSET
+    }
+}
+
+unsafe fn add_band(content: *mut AnyObject, index: usize, total: usize) {
+    add_hairline(content, 0.0, WINDOW_H - BAND_H - 1.0, WINDOW_W);
+    // The leading row: the 20pt app icon (mock's .bar-icon) with the title beside it, starting
+    // after the traffic lights. The icon view mirrors the settings sidebar's brand row.
+    let leading = if let Some(window) = *WINDOW.lock().unwrap() {
+        unsafe { band_leading_edge(window.0) }
+    } else {
+        BAND_LEADING_INSET
+    };
+    let icon_x = leading;
+    let icon_y = y_from_top((BAND_H - BAND_ICON_SIZE) / 2.0, BAND_ICON_SIZE);
+    let icon_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let icon_view: *mut AnyObject = msg_send![
+        icon_view,
+        initWithFrame: NSRect::new(
+            NSPoint::new(icon_x, icon_y),
+            NSSize::new(BAND_ICON_SIZE, BAND_ICON_SIZE)
+        )
+    ];
+    let image = crate::load_embedded_app_icon();
+    if !image.is_null() {
+        let _: () = msg_send![icon_view, setImage: image];
+        release_obj(image);
+    }
+    let _: () = msg_send![icon_view, setImageScaling: 3isize]; // NSImageScaleProportionallyUpOrDown
+    let _: () = msg_send![icon_view, setEditable: false];
+    let _: () = msg_send![icon_view, setWantsLayer: true];
+    let icon_layer: *mut AnyObject = msg_send![icon_view, layer];
+    if !icon_layer.is_null() {
+        // The mock's .bar-icon { border-radius: 5px }: its own height-derived curve, not the
+        // 8pt control radius (same derivation rule as the sidebar brand icon).
+        let _: () = msg_send![icon_layer, setCornerRadius: BAND_ICON_RADIUS];
+        let _: () = msg_send![icon_layer, setMasksToBounds: true];
+    }
+    let _: () = msg_send![content, addSubview: icon_view];
+    release_obj(icon_view);
+
+    let title_x = icon_x + BAND_ICON_SIZE + BAND_GAP;
+    let title = t("onboarding.window_title");
+    let title_w = single_line_text_width(&title, BAND_TITLE_STYLE).clamp(1.0, 240.0);
+    add_label(
+        content,
+        &title,
+        title_x,
+        y_from_top((BAND_H - BODY_LINE_H) / 2.0, BODY_LINE_H),
+        title_w,
+        BODY_LINE_H,
+        BAND_TITLE_STYLE,
+    );
+    let meta = tf(
+        "onboarding.step_counter",
+        &[
+            ("current", &(index + 1).to_string()),
+            ("total", &total.to_string()),
+        ],
+    );
+    let meta_w = single_line_text_width(&meta, META_STYLE).max(1.0);
+    add_label(
+        content,
+        &meta,
+        WINDOW_W - CHROME_PAD - meta_w,
+        y_from_top((BAND_H - CAPTION_LINE_H) / 2.0, CAPTION_LINE_H),
+        meta_w,
+        CAPTION_LINE_H,
+        META_STYLE,
+    );
+}
+
+/// A card plate (the reference's `.group`): `card_bg` fill, 1pt `card_border`, `radius-card`
+/// corners. Rows are added above it as content siblings — their frames already sit inside the
+/// plate, so the plate's corner clip cannot cut a corner through a label.
+unsafe fn add_card(content: *mut AnyObject, top: f64, h: f64) {
+    let palette = crate::theme::ui_palette();
+    let card = make_surface_view(
+        PAGE_PAD,
+        y_from_top(top, h),
+        CARD_W,
+        h,
+        palette.card_bg,
+        Some((palette.card_border, 1.0)),
+        crate::theme::RADIUS_CARD,
+    );
+    let _: () = msg_send![content, addSubview: card];
+    release_obj(card);
+}
+
+/// The 1pt divider between two rows sharing one card: a full-width `separator` line on the
+/// shared edge (§5: "the hairline on the shared edge").
+unsafe fn add_row_separator(content: *mut AnyObject, row_top: f64) {
+    add_hairline(content, PAGE_PAD, y_from_top(row_top - 1.0, 1.0), CARD_W);
+}
+
+/// The row's leading copy: 14pt name over a 12pt muted description.
+unsafe fn add_row_copy(content: *mut AnyObject, row_top: f64, w: f64, name: &str, desc: &str) {
+    let x = PAGE_PAD + CARD_INSET;
+    add_label(
+        content,
+        name,
+        x,
+        y_from_top(row_top + row_copy_top_offset(), BODY_LINE_H),
+        w,
+        BODY_LINE_H,
+        ROW_LABEL_STYLE,
+    );
+    add_label(
+        content,
+        desc,
+        x,
+        y_from_top(
+            row_top + row_copy_top_offset() + BODY_LINE_H + 4.0,
+            CAPTION_LINE_H,
+        ),
+        w,
+        CAPTION_LINE_H,
+        META_STYLE,
+    );
+}
+
+/// A trailing in-row action button (`Action` role: the secondary field surface).
+unsafe fn add_row_button(content: *mut AnyObject, row_top: f64, title: &str, tag: isize) {
+    add_button(
+        content,
+        title,
+        tag,
+        card_trailing_x() - BUTTON_W,
+        y_from_top(row_top + (ROW_H - BUTTON_H) / 2.0, BUTTON_H),
+        BUTTON_W,
+        crate::settings::components::SettingsButtonRole::Action,
+    );
+}
+
+/// A trailing status caption, right-aligned by its own measured width (truncated hard at the
+/// 160pt lane instead of a second text column).
+unsafe fn add_status_label(
+    content: *mut AnyObject,
+    row_top: f64,
+    text: &str,
+    color: LabelColorRole,
+) {
+    let width = single_line_text_width(text, status_style(color)).clamp(1.0, STATUS_MAX_W);
+    add_label(
+        content,
+        text,
+        card_trailing_x() - width,
+        y_from_top(row_caption_top(row_top), CAPTION_LINE_H),
+        width,
+        CAPTION_LINE_H,
+        status_style(color),
+    );
+}
+
+/// One per-logical-key chip (§6.1: fill wash, no border, `radius-legend-chip`), measured by its
+/// own label width.
+unsafe fn add_legend_chip(content: *mut AnyObject, row_top: f64, x: f64, w: f64, symbol: &str) {
+    let palette = crate::theme::ui_palette();
+    let y = y_from_top(row_top + (ROW_H - LEGEND_CHIP_H) / 2.0, LEGEND_CHIP_H);
+    let wash_base: u32 = if palette.dark {
+        0xFFFF_FFFF
+    } else {
+        0x0000_0000
+    };
+    let chip = make_surface_view(
+        x,
+        y,
+        w,
+        LEGEND_CHIP_H,
+        (wash_base & 0xFFFF_FF00) | crate::theme::LEGEND_CHIP_ALPHA,
+        None,
+        crate::theme::RADIUS_LEGEND_CHIP,
+    );
+    let _: () = msg_send![content, addSubview: chip];
+    release_obj(chip);
+    add_label(content, symbol, x, y, w, LEGEND_CHIP_H, chip_label_style());
+}
+
+/// The guide's legend-chip text style: muted ink on the wash.
+fn chip_label_style() -> LabelStyle {
+    LabelStyle {
+        size: crate::theme::FONT_CONTROL,
+        weight: crate::theme::FONT_WEIGHT_REGULAR,
+        color: LabelColorRole::Muted,
+        wrap: false,
+    }
+}
+
+/// The clipboard shortcut as one chip per logical key (shared `key_bindings` parser: one chip
+/// per modifier symbol, then the key itself — a key whose name is longer than one glyph is never
+/// split per character, §6.1).
+fn shortcut_chips(shortcut: &str) -> Vec<String> {
+    match crate::key_bindings::Trigger::parse(shortcut) {
+        Ok(trigger) => trigger.keycap_chips(),
+        Err(_) => vec![crate::mouse::shortcut::display_shortcut(shortcut)],
+    }
+}
+
+/// The shortcut legend run: chips laid as a unit, right-aligned against the card's inner right
+/// edge. Returns the run's left edge (the label column must stop before it).
+unsafe fn add_shortcut_chips(content: *mut AnyObject, row_top: f64, shortcut: &str) -> f64 {
+    let chips = shortcut_chips(shortcut);
+    let widths: Vec<f64> = chips
+        .iter()
+        .map(|symbol| {
+            let text_w = single_line_text_width(symbol, chip_label_style());
+            (text_w + 2.0 * crate::theme::LEGEND_CHIP_TEXT_PAD_X)
+                .clamp(LEGEND_CHIP_H, LEGEND_CHIP_H * 8.0)
+        })
+        .collect();
+    let run_w: f64 =
+        widths.iter().sum::<f64>() + LEGEND_CHIP_GAP * (widths.len().saturating_sub(1)) as f64;
+    let mut x = card_trailing_x() - run_w;
+    for (symbol, w) in chips.iter().zip(widths.iter()) {
+        add_legend_chip(content, row_top, x, *w, symbol);
+        x += *w + LEGEND_CHIP_GAP;
+    }
+    card_trailing_x() - run_w
+}
+
+/// A muted note under a card; returns the block's measured height.
+unsafe fn add_note(content: *mut AnyObject, top: f64, text: &str) -> f64 {
+    let h = measured_text_height(text, CARD_W, HINT_STYLE)
+        .clamp(CAPTION_LINE_H, 2.0 * CAPTION_LINE_H + 2.0);
+    add_label(
+        content,
+        text,
+        PAGE_PAD,
+        y_from_top(top, h),
+        CARD_W,
+        h,
+        HINT_STYLE,
+    );
+    h
+}
+
+// --- The display-mode segmented control ---
+//
+// The reference builds its segmented control by hand (a field container, two labeled segments,
+// the selected one a raised pill), which exact AppKit `NSSegmentedControl` does not track. This
+// is the same shape; it keeps the smoke contract: the container carries the ACTION_DISPLAY_MODE
+// tag, implements `selectedSegment`/`setSelectedSegment:`, and `on_action` maps a selected
+// segment to the icons/thumbnails actions exactly as the old control did.
+
+/// One rendered segmented control. Rebuilt per step render, like ACTION_TAGS.
+#[derive(Clone)]
+struct SegmentRecord {
+    container: usize,
+    children: Vec<(usize, usize)>, // (segment view, label view); index 0 icons, index 1 thumbnails
+    selected: usize,
+}
+static SEGMENTS: MainThreadSlot<Vec<SegmentRecord>> = MainThreadSlot::new(Vec::new());
+static SEGMENT_HOVER: MainThreadSlot<Option<usize>> = MainThreadSlot::new(None);
+static SEGMENT_FOCUS: MainThreadSlot<Option<usize>> = MainThreadSlot::new(None);
+
+fn segment_record_by_container(container: usize) -> Option<SegmentRecord> {
+    SEGMENTS
+        .lock()
+        .unwrap()
+        .iter()
+        .find(|record| record.container == container)
+        .cloned()
+}
+
+fn segment_record_of_child(child: usize) -> Option<(SegmentRecord, usize)> {
+    SEGMENTS.lock().unwrap().iter().find_map(|record| {
+        let index = record
+            .children
+            .iter()
+            .position(|(view, _)| *view == child)?;
+        Some((record.clone(), index))
+    })
+}
+
+/// Update the container's selection (main-thread map) and repaint its segments.
+fn segment_set_selected(container: usize, selected: usize) {
+    let Some(record) = segment_record_by_container(container) else {
+        return;
+    };
+    let selected = selected.min(record.children.len().saturating_sub(1));
+    let mut slot = SEGMENTS.lock().unwrap();
+    let Some(record_ref) = slot.iter_mut().find(|record| record.container == container) else {
+        return;
+    };
+    record_ref.selected = selected;
+    unsafe { segment_apply_visual(record_ref) };
+}
+
+extern "C" fn segment_container_get_selected(this: *mut AnyObject, _cmd: Sel) -> isize {
+    crate::callback_guard::event("onboarding_segment_get_selected", 0isize, || {
+        segment_record_by_container(this as usize)
+            .map(|record| record.selected as isize)
+            .unwrap_or(0)
+    })
+}
+
+extern "C" fn segment_container_set_selected(this: *mut AnyObject, _cmd: Sel, index: isize) {
+    crate::callback_guard::void("onboarding_segment_set_selected", || {
+        segment_set_selected(this as usize, index.max(0) as usize);
+    });
+}
+
+/// Click/keyboard selection: repaint, then dispatch through the container's
+/// ACTION_DISPLAY_MODE tag — the same path a programmatic selection takes, so a click and a
+/// smoke dispatch produce identical behavior.
+unsafe fn segmented_select(container: *mut AnyObject, selected: usize) {
+    segment_set_selected(container as usize, selected);
+    on_action(
+        std::ptr::null_mut(),
+        sel!(handleOnboardingAction:),
+        container,
+    );
+}
+
+extern "C" fn segment_container_class_handle() -> crate::ffi::StaticClass {
+    static CLASS: std::sync::OnceLock<crate::ffi::StaticClass> = std::sync::OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabOnboardingSegmented", || {
+        crate::ffi::build_class(
+            c"OhMyTabOnboardingSegmented",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(selectedSegment),
+                    segment_container_get_selected
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> isize,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(setSelectedSegment:),
+                    segment_container_set_selected
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, isize),
+                );
+            },
+        )
+    })
+}
+
+fn segment_child_class_handle() -> crate::ffi::StaticClass {
+    static CLASS: std::sync::OnceLock<crate::ffi::StaticClass> = std::sync::OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabOnboardingSegment", || {
+        crate::ffi::build_class(
+            c"OhMyTabOnboardingSegment",
+            class!(NSView),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseDown:),
+                    segment_mouse_down as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(keyDown:),
+                    segment_key_down as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    segment_mouse_entered
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    segment_mouse_exited
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(acceptsFirstResponder),
+                    segment_child_accepts_first_responder
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(becomeFirstResponder),
+                    segment_child_become_first_responder
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(resignFirstResponder),
+                    segment_child_resign_first_responder
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(accessibilityPerformPress),
+                    segment_accessibility_perform_press
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+                );
+            },
+        )
+    })
+}
+
+extern "C" fn segment_child_accepts_first_responder(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::YES
+}
+
+/// Pure key-down decision for one segment, so the keyboard logic is testable without an event:
+/// `Some(index)` selects that segment, `None` passes the key to the responder chain. Space,
+/// Return and the keypad Enter select the FOCUSED segment — the child's own index, never the
+/// record's current selection — and the arrows flip a two-option radio group.
+fn segment_key_selection(
+    code: u16,
+    selected_in_record: usize,
+    child_index: usize,
+) -> Option<usize> {
+    match code {
+        49 | 36 | 76 => Some(child_index), // Space, Return, keypad Enter
+        123..=126 => Some(1 - selected_in_record),
+        _ => None,
+    }
+}
+
+extern "C" fn segment_mouse_down(this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    crate::callback_guard::void("onboarding_segment_click", || unsafe {
+        let Some((record, index)) = segment_record_of_child(this as usize) else {
+            return;
+        };
+        segmented_select(record.container as *mut AnyObject, index);
+    });
+}
+
+extern "C" fn segment_key_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
+    crate::callback_guard::void("onboarding_segment_key", || unsafe {
+        // Space/Return select the focused segment; unhandled keys travel up the responder
+        // chain. See `segment_key_selection` for the full decision.
+        let Some((record, child_index)) = segment_record_of_child(this as usize) else {
+            return;
+        };
+        let code: u16 = msg_send![event, keyCode];
+        match segment_key_selection(code, record.selected, child_index) {
+            Some(selected) => {
+                segmented_select(record.container as *mut AnyObject, selected);
+            }
+            None => {
+                type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel, *mut AnyObject);
+                let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+                    this as *mut c_void,
+                    segment_child_class_handle(),
+                );
+                let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+                send(&mut sup, sel!(keyDown:), event);
+            }
+        }
+    });
+}
+
+/// VoiceOver's activation action routes through the same selection path a click takes.
+extern "C" fn segment_accessibility_perform_press(
+    this: *mut AnyObject,
+    _cmd: Sel,
+) -> objc2::runtime::Bool {
+    objc2::runtime::Bool::from(crate::callback_guard::bool(
+        "onboarding_segment_ax_press",
+        false,
+        || unsafe {
+            match segment_record_of_child(this as usize) {
+                Some((record, index)) => {
+                    segmented_select(record.container as *mut AnyObject, index);
+                    true
+                }
+                None => false,
+            }
+        },
+    ))
+}
+
+/// The segment's accessibility value must be a boolean NSNumber (the native radio-button
+/// contract), not a "0"/"1" string: the string left the checked state unreadable to
+/// VoiceOver. The convenience constructor is autoreleased (+0): do not release it.
+unsafe fn segment_a11y_value(checked: bool) -> *mut AnyObject {
+    let flag = objc2::runtime::Bool::from(checked);
+    msg_send![class!(NSNumber), numberWithBool: flag]
+}
+
+extern "C" fn segment_mouse_entered(this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    crate::callback_guard::void("onboarding_segment_hover_enter", || unsafe {
+        *SEGMENT_HOVER.lock().unwrap() = Some(this as usize);
+        if let Some(record) = segment_record_of_child(this as usize) {
+            segment_apply_visual(&record.0);
+        }
+    });
+}
+
+extern "C" fn segment_mouse_exited(this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    crate::callback_guard::void("onboarding_segment_hover_exit", || unsafe {
+        let mut slot = SEGMENT_HOVER.lock().unwrap();
+        if *slot == Some(this as usize) {
+            *slot = None;
+        }
+        drop(slot);
+        if let Some(record) = segment_record_of_child(this as usize) {
+            segment_apply_visual(&record.0);
+        }
+    });
+}
+
+extern "C" fn segment_child_become_first_responder(
+    this: *mut AnyObject,
+    _cmd: Sel,
+) -> objc2::runtime::Bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> objc2::runtime::Bool;
+        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+            this as *mut c_void,
+            segment_child_class_handle(),
+        );
+        let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(becomeFirstResponder));
+        if accepted.as_bool() {
+            *SEGMENT_FOCUS.lock().unwrap() = Some(this as usize);
+            if let Some(record) = segment_record_of_child(this as usize) {
+                segment_apply_visual(&record.0);
+            }
+        }
+        accepted
+    }
+}
+
+extern "C" fn segment_child_resign_first_responder(
+    this: *mut AnyObject,
+    _cmd: Sel,
+) -> objc2::runtime::Bool {
+    unsafe {
+        type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> objc2::runtime::Bool;
+        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+            this as *mut c_void,
+            segment_child_class_handle(),
+        );
+        let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+        let accepted = send(&mut sup, sel!(resignFirstResponder));
+        if accepted.as_bool() {
+            let mut slot = SEGMENT_FOCUS.lock().unwrap();
+            if *slot == Some(this as usize) {
+                *slot = None;
+            }
+            drop(slot);
+            if let Some(record) = segment_record_of_child(this as usize) {
+                segment_apply_visual(&record.0);
+            }
+        }
+        accepted
+    }
+}
+
+/// Repaint one record's segments to the current selection/hover/focus state. The selected
+/// segment is the raised pill (`button_bg` + 1pt `card_border`); unselected ones paint no
+/// surface and only their ink moves (`secondary_text`, primary on hover, like the reference).
+/// The focused segment's outline is the 2pt accent ring (state carried by color, defined by
+/// the accent's 3:1 non-text floor).
+unsafe fn segment_apply_visual(record: &SegmentRecord) {
+    let palette = crate::theme::ui_palette();
+    let hovered = *SEGMENT_HOVER.lock().unwrap();
+    let focused = *SEGMENT_FOCUS.lock().unwrap();
+    for (index, (view, label)) in record.children.iter().enumerate() {
+        let is_selected = index == record.selected;
+        let is_hovered = hovered == Some(*view);
+        let is_focused = focused == Some(*view);
+        let layer: *mut AnyObject = msg_send![(*view) as *mut AnyObject, layer];
+        if !layer.is_null() {
+            if is_selected {
+                crate::ffi::layer_set_background(
+                    layer,
+                    crate::ffi::hex_to_cg_color(palette.button_bg),
+                );
+                crate::ffi::layer_set_border(
+                    layer,
+                    crate::ffi::hex_to_cg_color(palette.card_border),
+                );
+                let _: () = msg_send![layer, setBorderWidth: 1.0f64];
+            } else {
+                crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0x00000000));
+                let _: () = msg_send![layer, setBorderWidth: 0.0f64];
+            }
+            if is_focused {
+                crate::ffi::layer_set_border(layer, crate::ffi::hex_to_cg_color(palette.accent));
+                let _: () = msg_send![layer, setBorderWidth: 2.0f64];
+            }
+        }
+        let ink = if is_selected || is_hovered {
+            palette.primary_text
+        } else {
+            palette.secondary_text
+        };
+        let _: () = msg_send![*label as *mut AnyObject, setTextColor: hex_to_ns_color(ink)];
+        // The AX checked value tracks the same state the pixels show.
+        let _: () = msg_send![
+            *view as *mut AnyObject,
+            setAccessibilityValue: segment_a11y_value(is_selected)
+        ];
+    }
+}
+
+/// The segmented control: a 320×30 field container with the two labeled segments inside, the
+/// selected one the raised pill.
+unsafe fn add_display_mode_control(
+    content: *mut AnyObject,
+    seg_top: f64,
+    thumbnails_enabled: bool,
+) {
+    let palette = crate::theme::ui_palette();
+    let segments: [&str; 2] = [
+        &t("onboarding.display_icons"),
+        &t("onboarding.display_thumbnails"),
+    ];
+    let selected = usize::from(thumbnails_enabled);
+    let container_class = segment_container_class_handle();
+    let container: *mut AnyObject = msg_send![container_class.0 as *mut AnyObject, alloc];
+    let container: *mut AnyObject = msg_send![
+        container,
+        initWithFrame: NSRect::new(
+            NSPoint::new(PAGE_PAD, y_from_top(seg_top, SEGMENTED_H)),
+            NSSize::new(SEGMENTED_W, SEGMENTED_H)
+        )
+    ];
+    paint_surface_layer(
+        container,
+        palette.field_bg,
+        Some((palette.card_border, 1.0)),
+        crate::theme::RADIUS_CONTROL,
+    );
+    let child_class = segment_child_class_handle();
+    let child_class_ptr = child_class.0 as *mut AnyObject;
+    // The container is not flipped, so its children's frames are bottom-up INSIDE the container.
+    let mut children: Vec<(usize, usize)> = Vec::with_capacity(2);
+    for (index, name) in segments.iter().enumerate() {
+        let x = SEGMENT_PAD + index as f64 * (SEGMENT_W + SEGMENT_PAD);
+        let view: *mut AnyObject = msg_send![child_class_ptr, alloc];
+        let view: *mut AnyObject = msg_send![
+            view,
+            initWithFrame: NSRect::new(
+                NSPoint::new(x, SEGMENT_PAD),
+                NSSize::new(SEGMENT_W, SEGMENT_H)
+            )
+        ];
+        // The visual state (selected pill / hover / focus) is painted by segment_apply_visual
+        // below and on state changes; the layer only needs its corner radius here.
+        let _: () = msg_send![view, setWantsLayer: true];
+        let layer: *mut AnyObject = msg_send![view, layer];
+        if !layer.is_null() {
+            let _: () =
+                msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL - SEGMENT_PAD]; // concentric: outer - padding
+            let _: () = msg_send![layer, setMasksToBounds: true];
+        }
+        // The label is centered inside the segment by its own measured width, truncating hard
+        // at the segment's leaf 16pt margin so even the longest translated label stays inside.
+        let label_w = (single_line_text_width(name, BODY_STYLE) + 1.0).clamp(1.0, SEGMENT_W - 16.0);
+        let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+        let label: *mut AnyObject = msg_send![
+            label,
+            initWithFrame: NSRect::new(
+                NSPoint::new(
+                    ((SEGMENT_W - label_w) / 2.0).max(4.0),
+                    (SEGMENT_H - BODY_LINE_H) / 2.0,
+                ),
+                NSSize::new(label_w, BODY_LINE_H)
+            )
+        ];
+        let value = make_nsstring(name);
+        let _: () = msg_send![label, setStringValue: value];
+        release_obj(value);
+        let _: () = msg_send![label, setBezeled: false];
+        let _: () = msg_send![label, setDrawsBackground: false];
+        let _: () = msg_send![label, setEditable: false];
+        let _: () = msg_send![label, setSelectable: false];
+        let font: *mut AnyObject = msg_send![
+            class!(NSFont),
+            systemFontOfSize: crate::theme::FONT_CONTROL
+        ];
+        let _: () = msg_send![label, setFont: font];
+        let _: () = msg_send![label, setUsesSingleLineMode: true];
+        let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+        let _: () = msg_send![view, addSubview: label];
+        // Retained by its segment view; the record holds the pointer until the next render
+        // clears it.
+        release_obj(label);
+
+        // One tracking area per segment: hover is a color-only move (§10), and active-always
+        // tracks hovers even when the guide window itself is not key.
+        let bounds: NSRect = msg_send![view, bounds];
+        let area: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let area: *mut AnyObject = msg_send![
+            area,
+            initWithRect: bounds,
+            options: 0x81u64, // NSTrackingMouseEnteredAndExited | NSTrackingActiveAlways
+            owner: view,
+            userInfo: std::ptr::null::<AnyObject>()
+        ];
+        let _: () = msg_send![view, addTrackingArea: area];
+        release_obj(area);
+
+        // Accessibility: a radio button with its choice's label and its checked value; the
+        // container reads as the radio group.
+        let child_ptr = view as usize;
+        let role = make_nsstring("AXRadioButton");
+        let _: () = msg_send![view, setAccessibilityRole: role];
+        release_obj(role);
+        let _: () = msg_send![view, setAccessibilityValue: segment_a11y_value(index == selected)];
+        let a11y_label = make_nsstring(name);
+        let _: () = msg_send![view, setAccessibilityLabel: a11y_label];
+        release_obj(a11y_label);
+
+        children.push((child_ptr, label as usize));
+        let _: () = msg_send![container, addSubview: view];
+        release_obj(view);
+    }
+    SEGMENTS.lock().unwrap().push(SegmentRecord {
+        container: container as usize,
+        children,
+        selected,
+    });
+    let record = SEGMENTS.lock().unwrap().last().unwrap().clone();
+    segment_apply_visual(&record);
+    // No target/action wiring: the container is a plain NSView subclass. A selection always
+    // dispatches through the ACTION_DISPLAY_MODE map entry (segmented_select from a click or a
+    // key; the smoke runner via setSelectedSegment + the shared selector), and the map entry is
+    // cleared on the next render like every other tag.
+    ACTION_TAGS
+        .lock()
+        .unwrap()
+        .push((container as usize, ACTION_DISPLAY_MODE));
+    let group_label = make_nsstring(&t("onboarding.display_title"));
+    let _: () = msg_send![container, setAccessibilityLabel: group_label];
+    release_obj(group_label);
+    let group_role = make_nsstring("AXRadioGroup");
+    let _: () = msg_send![container, setAccessibilityRole: group_role];
+    release_obj(group_role);
+    let _: () = msg_send![content, addSubview: container];
+    release_obj(container);
+}
+
 unsafe fn add_button(
     content: *mut AnyObject,
     title: &str,
@@ -856,42 +1794,63 @@ fn render_current_step() {
     };
     unsafe {
         clear_content(content);
-        // Rebuilding the content destroys every old button, so the action map is cleared with it
-        // (a page holds at most four buttons, so it cannot grow).
+        // Rebuilding the content destroys every old control, so the action (and segment) maps
+        // are cleared with it: a page holds a handful of controls, so neither can grow.
         ACTION_TAGS.lock().unwrap().clear();
-        let title = tf(
-            "onboarding.step_counter",
-            &[
-                ("current", &(state.index + 1).to_string()),
-                ("total", &total.to_string()),
-            ],
-        );
+        SEGMENTS.lock().unwrap().clear();
+        *SEGMENT_HOVER.lock().unwrap() = None;
+        *SEGMENT_FOCUS.lock().unwrap() = None;
+        paint_window_surface(content);
+        let (title_key, body) = step_copy(&state, step);
+        // The step title and the lede flow downward from the band; the measured lede height is
+        // what the card/field rows below follow (the reference's spacing rhythm: title, lede,
+        // then a 24pt step to the card). The body's measured height is bounded by BODY_MAX_H —
+        // the locale tests pin the shipped copy.
         add_label(
             content,
-            &title,
-            PAD,
-            WINDOW_H - COUNTER_TOP_INSET - COUNTER_H,
-            WINDOW_W - PAD * 2.0,
-            COUNTER_H,
-            COUNTER_STYLE,
+            &t(title_key),
+            PAGE_PAD,
+            y_from_top(TITLE_TOP, TITLE_LINE_H),
+            CARD_W,
+            TITLE_LINE_H,
+            STEP_TITLE_STYLE,
         );
+        let body_h = measured_text_height(&body, CARD_W, BODY_STYLE).clamp(1.0, BODY_MAX_H);
+        // The more-features body carries the inline menu-bar icon ({icon}); the plain-body
+        // builder falls back to a plain label for every other step.
+        add_menu_icon_label(
+            content,
+            &body,
+            PAGE_PAD,
+            y_from_top(LEDE_TOP, body_h),
+            CARD_W,
+            body_h + 2.0,
+            BODY_STYLE,
+        );
+        let card_row_top = LEDE_TOP + body_h + 24.0;
         match step {
             Step::PermissionsAndStartup => render_permissions_and_startup(
                 content,
+                card_row_top,
                 ax_granted,
                 crate::restart::restart_required(),
                 state.launch_at_login,
             ),
-            Step::DisplayMode => {
-                render_display_mode(content, state.thumbnails_enabled, screen_granted)
-            }
+            Step::DisplayMode => render_display_mode(
+                content,
+                card_row_top,
+                state.thumbnails_enabled,
+                screen_granted,
+            ),
             Step::ClipboardHistory => render_clipboard_history(
                 content,
+                card_row_top,
                 state.clipboard_enabled,
                 &state.clipboard_shortcut,
             ),
             Step::MoreFeatures => render_more_features(content),
         }
+        add_band(content, state.index, total);
         render_footer(content, state.index);
     }
     *LAST_SIGNATURE.lock().unwrap() = Some(permission_signature(&state));
@@ -908,96 +1867,86 @@ fn render_current_step() {
     }
 }
 
+/// The step's title key and lede copy. The clipboard body reflects the live draft so the
+/// toggle's own instruction stays true the moment it is picked.
+fn step_copy(state: &UiState, step: Step) -> (&'static str, String) {
+    match step {
+        Step::PermissionsAndStartup => (
+            "onboarding.permissions_title",
+            tf(
+                "onboarding.accessibility_body",
+                &[
+                    ("app", &app_display_name()),
+                    ("shortcut", &shortcut_label()),
+                ],
+            ),
+        ),
+        Step::DisplayMode => ("onboarding.display_title", t("onboarding.display_body")),
+        Step::ClipboardHistory => (
+            "onboarding.clipboard_title",
+            clipboard_shortcut_body(&state.clipboard_shortcut, state.clipboard_enabled),
+        ),
+        Step::MoreFeatures => ("onboarding.more_title", t("onboarding.more_body")),
+    }
+}
+
 unsafe fn render_permissions_and_startup(
     content: *mut AnyObject,
+    card_row_top: f64,
     ax_granted: bool,
     restart_required: bool,
     launch_at_login: bool,
 ) {
-    let app = app_display_name();
-    add_label(
+    add_card(content, card_row_top, ROW_H * 2.0);
+    // Row 1: the accessibility permission. The trailing slot carries the status caption while
+    // both are fine and the action button when they are not (grant via System Settings, or a
+    // restart to apply an already-granted permission that is pending).
+    let label_w = card_trailing_x() - (PAGE_PAD + CARD_INSET) - STATUS_MAX_W - 8.0;
+    add_row_copy(
         content,
-        &t("onboarding.permissions_title"),
-        PAD,
-        STEP_TITLE_Y,
-        WINDOW_W - PAD * 2.0,
-        TITLE_H,
-        STEP_TITLE_STYLE,
-    );
-    add_label(
-        content,
-        &tf(
-            "onboarding.accessibility_body",
-            &[("app", &app), ("shortcut", &shortcut_label())],
-        ),
-        PAD,
-        PERMISSIONS_BODY_Y,
-        WINDOW_W - PAD * 2.0,
-        PERMISSIONS_BODY_H,
-        BODY_STYLE,
-    );
-    let (status_key, status_color) = if restart_required {
-        (
-            "onboarding.status_restart_required",
-            LabelColorRole::Warning,
-        )
-    } else if ax_granted {
-        ("onboarding.status_granted", LabelColorRole::Success)
-    } else {
-        ("onboarding.status_missing", LabelColorRole::Warning)
-    };
-    add_label(
-        content,
+        card_row_top,
+        label_w,
         &t("onboarding.accessibility_label"),
-        PAD,
-        STATUS_ROW_Y,
-        STATUS_LABEL_W,
-        STATUS_H,
-        status_style(LabelColorRole::Secondary),
+        &t("onboarding.accessibility_desc"),
     );
-    add_label(
-        content,
-        &t(status_key),
-        PAD + STATUS_LABEL_W + STATUS_COLUMN_GAP,
-        STATUS_ROW_Y,
-        STATUS_COLUMN_W,
-        STATUS_H,
-        status_style(status_color),
-    );
-    if !ax_granted || restart_required {
-        let primary_action = if restart_required {
-            ACTION_RESTART_APP
-        } else {
-            ACTION_OPEN_ACCESSIBILITY
-        };
-        let primary_title = if restart_required {
-            tf("onboarding.btn_restart", &[("app", &app)])
-        } else {
-            t("onboarding.btn_open_settings")
-        };
-        add_button(
+    if restart_required {
+        add_row_button(
             content,
-            &primary_title,
-            primary_action,
-            WINDOW_W - PAD - BUTTON_W,
-            100.0,
-            BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Action,
+            card_row_top,
+            &tf("onboarding.btn_restart", &[("app", &app_display_name())]),
+            ACTION_RESTART_APP,
+        );
+    } else if ax_granted {
+        add_status_label(
+            content,
+            card_row_top,
+            &t("onboarding.status_granted"),
+            LabelColorRole::Success,
+        );
+    } else {
+        add_row_button(
+            content,
+            card_row_top,
+            &t("onboarding.btn_open_settings"),
+            ACTION_OPEN_ACCESSIBILITY,
         );
     }
-    add_label(
+    add_row_separator(content, card_row_top + ROW_H);
+    // Row 2: launch at login, an immediate draft whose toggle commits on Next (existing
+    // behavior; the switch itself is the whole control column).
+    let switch_label_w = card_trailing_x() - (PAGE_PAD + CARD_INSET) - 60.0;
+    add_row_copy(
         content,
+        card_row_top + ROW_H,
+        switch_label_w,
         &t("onboarding.launch_label"),
-        PAD,
-        60.0,
-        WINDOW_W - PAD * 2.0 - 58.0,
-        SWITCH_ROW_LABEL_H,
-        ROW_LABEL_STYLE,
+        &t("onboarding.launch_desc"),
     );
     add_switch(
         content,
-        WINDOW_W - PAD,
-        56.0,
+        card_trailing_x(),
+        y_from_top(card_row_top + ROW_H, ROW_H),
+        ROW_H,
         launch_at_login,
         ACTION_TOGGLE_LAUNCH_DRAFT,
         "onboarding.launch_label",
@@ -1006,132 +1955,128 @@ unsafe fn render_permissions_and_startup(
 
 unsafe fn render_display_mode(
     content: *mut AnyObject,
+    card_row_top: f64,
     thumbnails_enabled: bool,
     screen_granted: bool,
 ) {
+    // The segmented control: a field head (12pt semibold secondary label), 8pt below it the
+    // 320×30 container.
     add_label(
         content,
-        &t("onboarding.display_title"),
-        PAD,
-        STEP_TITLE_Y,
-        WINDOW_W - PAD * 2.0,
-        TITLE_H,
-        STEP_TITLE_STYLE,
+        &t("onboarding.display_mode_label"),
+        PAGE_PAD,
+        y_from_top(card_row_top, CAPTION_LINE_H),
+        200.0,
+        CAPTION_LINE_H,
+        FIELD_LABEL_STYLE,
     );
-    add_label(
-        content,
-        &t("onboarding.display_body"),
-        PAD,
-        DISPLAY_BODY_Y,
-        WINDOW_W - PAD * 2.0,
-        DISPLAY_BODY_H,
-        BODY_STYLE,
-    );
-    add_display_mode_control(content, thumbnails_enabled);
+    let seg_top = card_row_top + CAPTION_LINE_H + 8.0;
+    add_display_mode_control(content, seg_top, thumbnails_enabled);
+    // The live Screen Recording permission line sits right under the control (the reference
+    // mockup leaves this area empty; the app's flow needs the state made explicit).
+    // Granted → a success-colored caption; missing → a warning caption, plus (while the
+    // thumbnails mode is picked) the grant button on the same row.
+    let segment_bottom = seg_top + SEGMENTED_H;
+    let note_top = segment_bottom + 16.0;
+    let note_h = 2.0 * CAPTION_LINE_H + 2.0;
     let needs_screen_permission = thumbnails_enabled && !screen_granted;
+    let (key, color) = if screen_granted {
+        (
+            "onboarding.screen_permission_granted",
+            LabelColorRole::Success,
+        )
+    } else if needs_screen_permission {
+        (
+            "onboarding.screen_permission_needed",
+            LabelColorRole::Warning,
+        )
+    } else {
+        (
+            "onboarding.screen_permission_missing",
+            LabelColorRole::Warning,
+        )
+    };
+    let text_w = WINDOW_W
+        - PAGE_PAD * 2.0
+        - if needs_screen_permission {
+            BUTTON_W + 16.0
+        } else {
+            0.0
+        };
+    add_label(
+        content,
+        &t(key),
+        PAGE_PAD,
+        y_from_top(note_top, note_h),
+        text_w,
+        note_h,
+        status_style(color),
+    );
     if needs_screen_permission {
-        add_label(
-            content,
-            &t("onboarding.screen_permission_needed"),
-            PAD,
-            60.0,
-            WINDOW_W - PAD * 2.0 - BUTTON_W - GAP,
-            STATUS_H,
-            status_style(LabelColorRole::Warning),
-        );
         add_button(
             content,
             &t("onboarding.btn_open_settings"),
             ACTION_ALLOW_SCREEN,
-            WINDOW_W - PAD - BUTTON_W,
-            56.0,
+            WINDOW_W - PAGE_PAD - BUTTON_W,
+            y_from_top(note_top + (note_h - BUTTON_H) / 2.0, BUTTON_H),
             BUTTON_W,
             crate::settings::components::SettingsButtonRole::Action,
         );
     }
 }
 
-/// Clipboard-history step geometry (bottom-up, like the window's non-flipped content view). The
-/// persist row and its hint keep this place whether or not history is enabled, so toggling the
-/// master switch never moves the rows above it; they are only added to the view tree while history
-/// is on.
-struct ClipboardStepLayout {
-    title_y: f64,
-    body_y: f64,
-    body_h: f64,
-    shortcut_hint_y: f64,
-    shortcut_hint_h: f64,
-    enabled_row_y: f64,
-    disclosure_y: f64,
-    disclosure_h: f64,
-}
-
-const CLIPBOARD_STEP: ClipboardStepLayout = ClipboardStepLayout {
-    // The title keeps the same y as the other steps so moving between steps does not shift it.
-    title_y: STEP_TITLE_Y,
-    body_y: 156.0,
-    body_h: 40.0,
-    shortcut_hint_y: 140.0,
-    shortcut_hint_h: 16.0,
-    enabled_row_y: 104.0,
-    // The storage note is two lines in every locale (measured 30.0pt at the hint font inside
-    // 472pt), so it gets the height for both; 16pt clipped the second line, which is where the
-    // clear-on-quit option is named (see `clipboard_storage_note_fits_every_locale`).
-    disclosure_y: 56.0,
-    disclosure_h: 34.0,
-};
-
-/// Switch-row label height, and the width the label leaves for the switch on the trailing edge.
-const SWITCH_ROW_LABEL_H: f64 = 24.0;
-const SWITCH_ROW_LABEL_TRAILING: f64 = 56.0;
-
-unsafe fn render_clipboard_history(content: *mut AnyObject, enabled: bool, shortcut: &str) {
-    add_label(
+/// Clipboard-history step geometry. The card's two rows are the master toggle and the shortcut
+/// legend; the storage note follows the card, whose vertical position follows the measured lede,
+/// so a toggle never moves the rows relative to the card.
+unsafe fn render_clipboard_history(
+    content: *mut AnyObject,
+    card_row_top: f64,
+    enabled: bool,
+    shortcut: &str,
+) {
+    add_card(content, card_row_top, ROW_H * 2.0);
+    // Row 1: the master switch. The card cursor never moves on a toggle — only the trailing
+    // storage note appears/disappears under the card.
+    let switch_label_w = card_trailing_x() - (PAGE_PAD + CARD_INSET) - 60.0;
+    add_row_copy(
         content,
-        &t("onboarding.clipboard_title"),
-        PAD,
-        CLIPBOARD_STEP.title_y,
-        WINDOW_W - PAD * 2.0,
-        TITLE_H,
-        STEP_TITLE_STYLE,
+        card_row_top,
+        switch_label_w,
+        &t("onboarding.clipboard_label"),
+        &t("onboarding.clipboard_desc"),
     );
-    add_label(
+    add_switch(
         content,
-        &clipboard_shortcut_body(shortcut, enabled),
-        PAD,
-        CLIPBOARD_STEP.body_y,
-        WINDOW_W - PAD * 2.0,
-        CLIPBOARD_STEP.body_h,
-        BODY_STYLE,
-    );
-    add_label(
-        content,
-        &t("onboarding.clipboard_shortcut_hint"),
-        PAD,
-        CLIPBOARD_STEP.shortcut_hint_y,
-        WINDOW_W - PAD * 2.0,
-        CLIPBOARD_STEP.shortcut_hint_h,
-        HINT_STYLE,
-    );
-    add_switch_row(
-        content,
-        CLIPBOARD_STEP.enabled_row_y,
+        card_trailing_x(),
+        y_from_top(card_row_top, ROW_H),
+        ROW_H,
         enabled,
         ACTION_TOGGLE_CLIPBOARD_DRAFT,
         "onboarding.clipboard_label",
     );
-    // Where the history goes, stated once while the feature is on: it is written to disk while the
-    // app runs, and the settings page's clear-on-quit switch is the way to leave nothing behind.
+    add_row_separator(content, card_row_top + ROW_H);
+    // Row 2: the open shortcut, drawn as a legend run of one chip per key (right-aligned; the
+    // descs under it explain where the binding can change, by the shared hint key).
+    let chips_left = unsafe { add_shortcut_chips(content, card_row_top + ROW_H, shortcut) };
+    let chip_label_w = (chips_left - 8.0).max(0.0) - (PAGE_PAD + CARD_INSET);
+    add_row_copy(
+        content,
+        card_row_top + ROW_H,
+        chip_label_w,
+        &t("onboarding.clipboard_open_shortcut"),
+        &t("onboarding.clipboard_shortcut_hint"),
+    );
+    // Where the history goes, stated once while the feature is on: it is written to disk while
+    // the app runs, and the settings page's clear-on-quit switch is the way to leave nothing
+    // behind.
     if enabled {
-        add_label(
-            content,
-            &t("onboarding.clipboard_storage_note"),
-            PAD,
-            CLIPBOARD_STEP.disclosure_y,
-            WINDOW_W - PAD * 2.0,
-            CLIPBOARD_STEP.disclosure_h,
-            HINT_STYLE,
-        );
+        unsafe {
+            add_note(
+                content,
+                card_row_top + ROW_H * 2.0 + 12.0,
+                &t("onboarding.clipboard_storage_note"),
+            );
+        }
     }
 }
 
@@ -1147,77 +2092,22 @@ fn clipboard_shortcut_body(shortcut: &str, enabled: bool) -> String {
     )
 }
 
-unsafe fn render_more_features(content: *mut AnyObject) {
-    add_label(
-        content,
-        &t("onboarding.more_title"),
-        PAD,
-        STEP_TITLE_Y,
-        WINDOW_W - PAD * 2.0,
-        TITLE_H,
-        STEP_TITLE_STYLE,
-    );
-    add_menu_icon_label(
-        content,
-        &t("onboarding.more_body"),
-        PAD,
-        MORE_BODY_Y,
-        WINDOW_W - PAD * 2.0,
-        MORE_BODY_H,
-        BODY_STYLE,
-    );
-    add_button(
-        content,
-        &t("onboarding.btn_open_app_settings"),
-        ACTION_OPEN_SETTINGS,
-        PAD,
-        78.0,
-        WIDE_BUTTON_W,
-        crate::settings::components::SettingsButtonRole::Action,
-    );
-}
-
-unsafe fn add_display_mode_control(content: *mut AnyObject, thumbnails_enabled: bool) {
-    let control: *mut AnyObject = msg_send![class!(NSSegmentedControl), alloc];
-    let control: *mut AnyObject = msg_send![
-        control,
-        initWithFrame: NSRect::new(NSPoint::new(PAD, 96.0), NSSize::new(320.0, 32.0))
-    ];
-    let _: () = msg_send![control, setSegmentCount: 2isize];
-    let icons = make_nsstring(&t("onboarding.display_icons"));
-    let thumbnails = make_nsstring(&t("onboarding.display_thumbnails"));
-    let _: () = msg_send![control, setLabel: icons, forSegment: 0isize];
-    let _: () = msg_send![control, setLabel: thumbnails, forSegment: 1isize];
-    release_obj(icons);
-    release_obj(thumbnails);
-    let _: () =
-        msg_send![control, setSelectedSegment: if thumbnails_enabled { 1isize } else { 0isize }];
-    let Some(target) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
-        release_obj(control);
-        return;
-    };
-    let _: () = msg_send![control, setTarget: target];
-    let _: () = msg_send![control, setAction: sel!(handleOnboardingAction:)];
-    ACTION_TAGS
-        .lock()
-        .unwrap()
-        .push((control as usize, ACTION_DISPLAY_MODE));
-    let label = make_nsstring(&t("onboarding.display_title"));
-    let _: () = msg_send![control, setAccessibilityLabel: label];
-    release_obj(label);
-    let _: () = msg_send![content, addSubview: control];
-    release_obj(control);
+unsafe fn render_more_features(_content: *mut AnyObject) {
+    // The reference's final page: title, lede, and no in-page CTA — the footer's
+    // "Done and open Settings" button hands off to the settings window, which the About-page
+    // and menu entries can reopen just the same.
 }
 
 unsafe fn add_switch(
     content: *mut AnyObject,
     right_x: f64,
     y: f64,
+    slot_h: f64,
     checked: bool,
     action_tag: isize,
     label_key: &str,
 ) {
-    let switch = crate::settings::components::onboarding_switch(right_x, y, BUTTON_H, checked);
+    let switch = crate::settings::components::onboarding_switch(right_x, y, slot_h, checked);
     if switch.is_null() {
         return;
     }
@@ -1238,67 +2128,59 @@ unsafe fn add_switch(
     release_obj(switch);
 }
 
-/// One switch row: the label on the leading edge and the switch on the trailing edge, both placed
-/// from the row's bottom edge so the caller positions rows on one shared grid.
-unsafe fn add_switch_row(
-    content: *mut AnyObject,
-    row_y: f64,
-    checked: bool,
-    action_tag: isize,
-    label_key: &str,
-) {
-    add_label(
-        content,
-        &t(label_key),
-        PAD,
-        row_y + (BUTTON_H - SWITCH_ROW_LABEL_H) / 2.0,
-        WINDOW_W - PAD * 2.0 - SWITCH_ROW_LABEL_TRAILING,
-        SWITCH_ROW_LABEL_H,
-        ROW_LABEL_STYLE,
-    );
-    add_switch(
-        content,
-        WINDOW_W - PAD,
-        row_y,
-        checked,
-        action_tag,
-        label_key,
-    );
-}
-
 unsafe fn render_footer(content: *mut AnyObject, index: usize) {
+    // The footer: skip left by the chrome inset, previous + next right, under a 1pt separator
+    // hairline. The skip link disappears on the last step exactly like the reference does.
+    add_hairline(content, 0.0, FOOT_H, WINDOW_W);
     if index + 1 < steps_for().len() {
         add_text_button(
             content,
             &t("onboarding.btn_skip_guide"),
             ACTION_SKIP_GUIDE,
-            PAD,
+            CHROME_PAD,
         );
     }
-    let next_x = WINDOW_W - PAD - BUTTON_W;
+    // The final primary is the reference's "done and open Settings": the label is longer than
+    // Next's, so the button's width fits its own measured label (right edge pinned to the
+    // chrome inset) instead of clipping the translation into the fixed 132pt.
+    let last = index + 1 == steps_for().len();
+    let primary_title = if last {
+        t("onboarding.btn_finish")
+    } else {
+        t("onboarding.btn_next")
+    };
+    let primary_w = if last {
+        (single_line_text_width(&primary_title, FOOTER_BUTTON_LABEL_STYLE) + 2.0 * 16.0)
+            .max(BUTTON_W)
+    } else {
+        BUTTON_W
+    };
+    let primary_x = WINDOW_W - CHROME_PAD - primary_w;
     if index > 0 {
         add_button(
             content,
             &t("onboarding.btn_previous"),
             ACTION_BACK,
-            next_x - GAP - BUTTON_W,
+            primary_x - GAP - BUTTON_W,
             BUTTON_Y,
             BUTTON_W,
-            crate::settings::components::SettingsButtonRole::Action,
+            crate::settings::components::SettingsButtonRole::Footer,
         );
     }
-    let (title, action) = if index + 1 == steps_for().len() {
-        (t("onboarding.btn_finish"), ACTION_FINISH)
+    let action = if last {
+        // The guide completes AND hands off to Settings on the same click (the reference's
+        // footer); the page keeps no separate open-Settings button.
+        ACTION_OPEN_SETTINGS
     } else {
-        (t("onboarding.btn_next"), ACTION_NEXT)
+        ACTION_NEXT
     };
     add_button(
         content,
-        &title,
+        &primary_title,
         action,
-        next_x,
+        primary_x,
         BUTTON_Y,
-        BUTTON_W,
+        primary_w,
         crate::settings::components::SettingsButtonRole::Primary,
     );
 }
@@ -1310,7 +2192,10 @@ unsafe fn add_text_button(content: *mut AnyObject, title: &str, action_tag: isiz
     let button: *mut AnyObject = msg_send![class!(NSButton), alloc];
     let button: *mut AnyObject = msg_send![
         button,
-        initWithFrame: NSRect::new(NSPoint::new(x, BUTTON_Y), NSSize::new(100.0, BUTTON_H))
+        initWithFrame: NSRect::new(
+            NSPoint::new(x, BUTTON_Y),
+            NSSize::new(120.0, BUTTON_H)
+        )
     ];
     let title_ns = make_nsstring(title);
     let _: () = msg_send![button, setTitle: title_ns];
@@ -1750,40 +2635,92 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         && window_shown
 }
 
-const WINDOW_W: f64 = 520.0;
-const WINDOW_H: f64 = 280.0;
-const TITLE_H: f64 = 32.0;
-const STEP_TITLE_Y: f64 = 200.0;
-const COUNTER_H: f64 = 16.0;
-const COUNTER_TOP_INSET: f64 = 16.0;
-const WINDOW_STYLE_TITLED: u64 = 1;
-const PAD: f64 = 24.0;
+/// The guide's window: 640×510, the welcome reference's fixed dialog size. Step content is laid
+/// out top-down (like the reference) and converted once by `y_from_top` into the bottom-up
+/// origin AppKit uses.
+const WINDOW_W: f64 = 640.0;
+const WINDOW_H: f64 = 510.0;
+/// Titled | Closable | Miniaturizable (without Resizable — every layout constant assumes the
+/// fixed 640×510 dialog; see the mask test). The flow hides the three standard window buttons
+/// below, so the guide carries no visible traffic lights (the reference's mockup dialog has
+/// none either) while the window keeps what pure borderless takes away: keyboard eligibility
+/// and a native drag-capable window surface.
+const WINDOW_STYLE_MASK: u64 = (1 << 0) | (1 << 1) | (1 << 2);
+/// NSWindowStyleMaskFullSizeContentView: the content reaches the window edge so the guide draws
+/// its own title band and footer. Same chrome approach as the settings window; AppKit keeps the
+/// traffic lights on top.
+const STYLE_MASK_FULL_SIZE_CONTENT: u64 = 1 << 15;
+/// 1 = NSWindowTitleHidden.
+const WINDOW_TITLE_HIDDEN: isize = 1;
+
+/// Title band height (the reference's `.bar`), full window width.
+const BAND_H: f64 = 48.0;
+/// Footer height (the reference's `.foot`), under a 1pt separator hairline at its top edge.
+const FOOT_H: f64 = 60.0;
+/// Page side edge (§5 page edges); the band and footer use the smaller 24pt chrome inset, the
+/// same split the mock's bar/foot paddings make against the step padding.
+const PAGE_PAD: f64 = 32.0;
+const CHROME_PAD: f64 = 24.0;
+
+/// The footer buttons' label type (14pt regular, the §4 `control` role).
+const FOOTER_BUTTON_LABEL_STYLE: LabelStyle = LabelStyle {
+    size: crate::theme::FONT_CONTROL,
+    weight: crate::theme::FONT_WEIGHT_REGULAR,
+    color: LabelColorRole::Primary,
+    wrap: false,
+};
+/// Card geometry (§5 settings metrics: rows 52 tall, inner padding 16, card radius 12).
+const CARD_W: f64 = WINDOW_W - PAGE_PAD * 2.0;
+const ROW_H: f64 = 52.0;
+const CARD_INSET: f64 = 16.0;
+
 const GAP: f64 = 8.0;
 const BUTTON_H: f64 = 32.0;
 const BUTTON_W: f64 = 132.0;
-/// The wide action button ("Open App Settings"): 132pt wraps it to two lines and clips the second,
-/// so this keeps the label on one line (measured) with room for the CJK locales.
-const WIDE_BUTTON_W: f64 = 176.0;
-const BUTTON_Y: f64 = 20.0;
-/// Permissions-step status row: the label and the status share the width left of the action button.
-/// At 14pt, the English label and longest status each need about 160pt; the old 136pt label column
-/// truncated the label.
-const STATUS_ROW_Y: f64 = 104.0;
-const STATUS_LABEL_W: f64 = 160.0;
-const STATUS_COLUMN_GAP: f64 = 8.0;
-const STATUS_COLUMN_W: f64 = 160.0;
-/// Wrapped body copy reserves three 19.6pt lines; the former 46pt frames clipped English text.
+const BUTTON_Y: f64 = (FOOT_H - BUTTON_H) / 2.0;
+
+/// Title band bar height (the reference's `.bar`)
+const TITLE_LINE_H: f64 = crate::theme::line_height(
+    crate::theme::FONT_PAGE_TITLE,
+    crate::theme::LINE_HEIGHT_TITLE_RATIO,
+);
+/// Wrapped body copy: the measured lede height is what the card cursor uses (a longer locale
+/// pushes the card instead of clipping), but four wrapped lines is the budget every locale must
+/// stay inside so the card+note stack still clears the footer.
 const BODY_LINE_H: f64 = crate::theme::line_height(
     crate::theme::FONT_CONTROL,
     crate::theme::LINE_HEIGHT_BODY_RATIO,
 );
-const PERMISSIONS_BODY_Y: f64 = 132.0;
-const PERMISSIONS_BODY_H: f64 = 3.0 * BODY_LINE_H + 4.0;
-const DISPLAY_BODY_Y: f64 = 136.0;
-const DISPLAY_BODY_H: f64 = 3.0 * BODY_LINE_H;
-const MORE_BODY_Y: f64 = 136.0;
-const MORE_BODY_H: f64 = 3.0 * BODY_LINE_H;
-/// The guide only needs three text styles plus one status-line style, kept as constants so each
+const CAPTION_LINE_H: f64 = crate::theme::line_height(
+    crate::theme::FONT_CAPTION,
+    crate::theme::LINE_HEIGHT_CAPTION_RATIO,
+);
+const TITLE_TOP: f64 = BAND_H + 24.0;
+const LEDE_TOP: f64 = TITLE_TOP + TITLE_LINE_H + 8.0;
+const BODY_MAX_H: f64 = 4.0 * BODY_LINE_H;
+
+/// Trailing status lane inside a card row: both measured label widths fit 160pt, and the lane is
+/// what bounds the leading labels (see the measurement note in the tests).
+const STATUS_MAX_W: f64 = 160.0;
+/// Legend chip for the clipboard shortcut row: one chip per logical key (§6.1), 20pt tall.
+const LEGEND_CHIP_H: f64 = 20.0;
+const LEGEND_CHIP_GAP: f64 = 2.0;
+
+/// Display-mode segmented control (the reference's `.segmented`): a 320×30 field container with
+/// two 24pt segments inset by 2pt (a 2pt step inside the control's own geometry, §5).
+const SEGMENTED_W: f64 = 320.0;
+const SEGMENTED_H: f64 = 30.0;
+const SEGMENT_PAD: f64 = 2.0;
+const SEGMENT_H: f64 = SEGMENTED_H - 2.0 * SEGMENT_PAD;
+const SEGMENT_W: f64 = (SEGMENTED_W - 3.0 * SEGMENT_PAD) / 2.0;
+
+/// Bottom-up y for a top-down (flipped) `top` edge plus height: the window content is not
+/// flipped.
+fn y_from_top(top: f64, h: f64) -> f64 {
+    WINDOW_H - top - h
+}
+
+/// The guide only needs its step-copy labels plus the chrome styles, kept as constants so each
 /// call site does not repeat the parameters.
 #[derive(Clone, Copy)]
 struct LabelStyle {
@@ -1823,6 +2760,21 @@ const STEP_TITLE_STYLE: LabelStyle = LabelStyle {
     color: LabelColorRole::Primary,
     wrap: false,
 };
+/// The band's window title (the reference's `.bar-title`: 14pt semibold), centered on the window.
+const BAND_TITLE_STYLE: LabelStyle = LabelStyle {
+    size: crate::theme::FONT_CONTROL,
+    weight: crate::theme::FONT_WEIGHT_SEMIBOLD,
+    color: LabelColorRole::Primary,
+    wrap: false,
+};
+/// The band's `1 / 4` step counter (the reference's `.step-meta`), right-aligned.
+const META_STYLE: LabelStyle = LabelStyle {
+    size: crate::theme::FONT_CAPTION,
+    weight: crate::theme::FONT_WEIGHT_REGULAR,
+    color: LabelColorRole::Muted,
+    wrap: false,
+};
+/// Card row name (single line) and description under it (§4 caption role).
 const ROW_LABEL_STYLE: LabelStyle = LabelStyle {
     size: crate::theme::FONT_CONTROL,
     weight: crate::theme::FONT_WEIGHT_REGULAR,
@@ -1835,30 +2787,28 @@ const BODY_STYLE: LabelStyle = LabelStyle {
     color: LabelColorRole::Secondary,
     wrap: true,
 };
-const COUNTER_STYLE: LabelStyle = LabelStyle {
-    size: crate::theme::FONT_CAPTION,
-    weight: crate::theme::FONT_WEIGHT_REGULAR,
-    color: LabelColorRole::Muted,
-    wrap: false,
-};
-/// Small muted explanatory text under an option (e.g. the clipboard persist warning).
+/// Small muted explanatory text (row descriptions, notes under a card).
 const HINT_STYLE: LabelStyle = LabelStyle {
     size: crate::theme::FONT_CAPTION,
     weight: crate::theme::FONT_WEIGHT_REGULAR,
     color: LabelColorRole::Muted,
     wrap: true,
 };
+/// The `.field-label` over the segmented control (12pt semibold secondary).
+const FIELD_LABEL_STYLE: LabelStyle = LabelStyle {
+    size: crate::theme::FONT_CAPTION,
+    weight: crate::theme::FONT_WEIGHT_SEMIBOLD,
+    color: LabelColorRole::Secondary,
+    wrap: false,
+};
 fn status_style(color: LabelColorRole) -> LabelStyle {
     LabelStyle {
-        size: crate::theme::FONT_CONTROL,
-        weight: crate::theme::FONT_WEIGHT_REGULAR,
+        size: crate::theme::FONT_CAPTION,
+        weight: crate::theme::FONT_WEIGHT_SEMIBOLD,
         color,
         wrap: false,
     }
 }
-
-/// Body heights, chosen per page from its line count (the longest Chinese page sets the value).
-const STATUS_H: f64 = 24.0;
 
 #[cfg(test)]
 mod tests {
@@ -1868,14 +2818,23 @@ mod tests {
     fn onboarding_chrome_uses_the_shared_type_and_color_roles() {
         assert_eq!(
             [
-                COUNTER_STYLE.size,
+                META_STYLE.size,
                 HINT_STYLE.size,
                 ROW_LABEL_STYLE.size,
                 BODY_STYLE.size,
+                FIELD_LABEL_STYLE.size,
+                BAND_TITLE_STYLE.size,
                 status_style(LabelColorRole::Warning).size,
                 STEP_TITLE_STYLE.size,
             ],
-            [12.0, 12.0, 14.0, 14.0, 14.0, 26.0]
+            [12.0, 12.0, 14.0, 14.0, 12.0, 14.0, 12.0, 26.0]
+        );
+        // The status caption is semibold; the band title and the field label sit between the
+        // regular and bold families (the sheet's 600 weight).
+        assert_ne!(FIELD_LABEL_STYLE.weight, crate::theme::FONT_WEIGHT_REGULAR);
+        assert_eq!(
+            status_style(LabelColorRole::Warning).weight,
+            crate::theme::FONT_WEIGHT_SEMIBOLD
         );
 
         let light = crate::theme::ui_palette_for_mode(false);
@@ -1903,7 +2862,11 @@ mod tests {
             );
         }
         assert!((BODY_LINE_H - 19.6).abs() < f64::EPSILON * 128.0);
-        assert_eq!(STEP_TITLE_Y % 4.0, 0.0);
+        // The bottom-up conversion is exact; the title's top edge lands on the 4pt grid from
+        // the band's bottom edge (§5 spacing).
+        assert_eq!(y_from_top(TITLE_TOP, 0.0), WINDOW_H - TITLE_TOP);
+        assert_eq!(y_from_top(0.0, 10.0), WINDOW_H - 10.0);
+        assert_eq!(TITLE_TOP % 4.0, 0.0);
     }
 
     #[test]
@@ -1990,6 +2953,38 @@ mod tests {
         }
     }
 
+    /// Every color the guide paints is pinned to the welcome reference's own values
+    /// (/Users/ceres/Downloads/onboarding.html), so a palette edit that quietly shifts the
+    /// guide off the reference fails here (light mode; dark mode had no values in that HTML
+    /// and answers to the design document's dark sheet instead).
+    #[test]
+    fn onboarding_palette_matches_the_reference_colors() {
+        let light = crate::theme::ui_palette_for_mode(false);
+        assert_eq!(light.window_bg, 0xECECECFF, "--window #ECECEC");
+        assert_eq!(light.card_bg, 0xF9F9F9FF, "--surface #F9F9F9");
+        assert_eq!(light.primary_text, 0x1D1C1AFF, "--ink #1D1C1A");
+        assert_eq!(light.secondary_text, 0x4F4C48FF, "--ink-2 #4F4C48");
+        assert_eq!(light.muted_text, 0x6B6862FF, "--muted #6B6862");
+        assert_eq!(light.card_border, 0x2D28241A, "--border rgba(45,40,36,.10)");
+        assert_eq!(
+            light.separator, 0x2D282412,
+            "--separator rgba(45,40,36,.07)"
+        );
+        assert_eq!(light.field_bg, 0x3C342E0E, "--field rgba(60,52,46,.055)");
+        assert_eq!(
+            light.switch_off_track, 0x3C342E33,
+            "--switch-off rgba(60,52,46,.20)"
+        );
+        assert_eq!(light.accent, 0x2F6FEDFF, "--accent #2F6FED");
+        assert_eq!(light.accent_hover, 0x1F5CDAFF, "--accent-hover #1F5CDA");
+        assert_eq!(light.success_text, 0x176B3AFF, "--success #176B3A");
+        assert_eq!(
+            light.footer_button_bg, 0xFFFFFFFF,
+            ".btn.secondary background var(--white)"
+        );
+        assert_eq!(light.hover_bg, 0x7676801F, "--hover rgba(118,118,128,.12)");
+    }
+
     /// Embedded locale sources for the layout checks below; the assertions run over all three
     /// locales so a future translation is covered.
     const LOCALE_SOURCES: [(&str, &str); 3] = [
@@ -2006,30 +3001,28 @@ mod tests {
             .to_string()
     }
 
-    /// The previous AppKit 13.5pt measurements were about 154pt; at the 14pt control size the
-    /// status row reserves 160pt for both "Accessibility permission" and "Restart the app to
-    /// apply". The old 136pt label column truncated the English label
-    /// ("Accessibility permi... Granted"). Kept as constants: AppKit text measurement hangs when it
-    /// runs off the test thread, so a live measurement cannot be part of the headless gate.
-    const STATUS_LABEL_MIN_W: f64 = 160.0;
-    const STATUS_COLUMN_MIN_W: f64 = 160.0;
-
-    /// The permissions step's label/status columns must cover the measured widths and clear the
-    /// action button that shares the row.
+    /// The permissions row's trailing status lane is the measured minimum both status strings
+    /// were reserved at (160pt); the leading name column must clear it, and every locale must
+    /// define the strings the rows render.
     #[test]
-    fn onboarding_status_columns_fit_measured_label_widths() {
-        const {
-            assert!(STATUS_LABEL_W >= STATUS_LABEL_MIN_W);
-            assert!(STATUS_COLUMN_W >= STATUS_COLUMN_MIN_W);
-            assert!(
-                PAD + STATUS_LABEL_W + STATUS_COLUMN_GAP + STATUS_COLUMN_W
-                    <= WINDOW_W - PAD - BUTTON_W
-            );
-        };
-        // Every locale must still define the strings the row renders.
+    fn onboarding_row_copies_fit_the_trailing_lanes() {
+        // Status lane + inner paddings + a name column that fits the measured long labels
+        // (the name column alone has over 300pt of room for the longest translated label).
+        let inner_right = PAGE_PAD + CARD_W - CARD_INSET;
+        assert!(PAGE_PAD + CARD_INSET <= inner_right - STATUS_MAX_W - 8.0);
         for (locale, raw) in LOCALE_SOURCES {
             for key in [
                 "accessibility_label",
+                "accessibility_desc",
+                "launch_label",
+                "launch_desc",
+                "clipboard_label",
+                "clipboard_desc",
+                "clipboard_open_shortcut",
+                "display_mode_label",
+                "screen_permission_granted",
+                "screen_permission_missing",
+                "screen_permission_needed",
                 "status_granted",
                 "status_missing",
                 "status_restart_required",
@@ -2042,52 +3035,223 @@ mod tests {
         }
     }
 
-    /// The wide "Open App Settings" button must keep at least the measured single-line label width.
-    /// Measured: 132pt (116pt label budget) wrapped the English label to two lines and clipped the
-    /// second; 150pt (134pt budget) already fit on one line, so the wide width is the safe margin.
-    const BUTTON_LABEL_INSET: f64 = 16.0;
-    const OPEN_APP_SETTINGS_MIN_LABEL_W: f64 = 134.0;
-
+    /// The step stack must clear the footer in the worst case: the measured lede is bounded by
+    /// BODY_MAX_H, and a two-row card plus the storage note below it must end before the footer
+    /// hairline (top-down geometry; pure math so layout edits fail without a GUI).
     #[test]
-    fn onboarding_wide_button_keeps_open_app_settings_on_one_line() {
+    fn onboarding_step_stack_clears_the_footer() {
         const {
-            assert!(BUTTON_W - BUTTON_LABEL_INSET < OPEN_APP_SETTINGS_MIN_LABEL_W);
-            assert!(WIDE_BUTTON_W - BUTTON_LABEL_INSET >= OPEN_APP_SETTINGS_MIN_LABEL_W);
+            assert!(LEDE_TOP + BODY_MAX_H + 24.0 > TITLE_TOP + TITLE_LINE_H);
         };
-        for (locale, raw) in LOCALE_SOURCES {
-            let title = locale_onboarding_string(raw, "btn_open_app_settings");
+        let worst_body_bottom = LEDE_TOP + BODY_MAX_H;
+        let card_top = worst_body_bottom + 24.0;
+        let card_bottom = card_top + ROW_H * 2.0;
+        let note_top = card_bottom + 12.0;
+        // The storage note reserves two caption lines (§4 caption line height).
+        let note_bottom = note_top + 2.0 * CAPTION_LINE_H;
+        assert!(
+            note_bottom <= WINDOW_H - FOOT_H,
+            "the clipboard card+note stack reaches {note_bottom}pt: footer starts at {}",
+            WINDOW_H - FOOT_H
+        );
+        // The control's permission line follows the segmented control and clears the footer.
+        let segmented_bottom = card_top + CAPTION_LINE_H + 8.0 + SEGMENTED_H;
+        assert!(segmented_bottom <= WINDOW_H - FOOT_H);
+        let permission_bottom = segmented_bottom + 16.0 + 2.0 * CAPTION_LINE_H + 2.0;
+        assert!(
+            permission_bottom <= WINDOW_H - FOOT_H,
+            "the display step's permission line reaches {permission_bottom}"
+        );
+    }
+
+    /// Shortcut chips: one chip per logical key via the shared trigger parser; an unparsable
+    /// value falls back to the raw display string as a single chip.
+    #[test]
+    fn shortcut_chips_are_one_chip_per_logical_key() {
+        assert_eq!(shortcut_chips("option+v"), vec!["⌥", "V"]);
+        assert_eq!(shortcut_chips("cmd+shift+v"), vec!["⌘", "⇧", "V"]);
+        assert_eq!(shortcut_chips("control+pageup"), vec!["⌃", "Page Up"]);
+        // The fallback is a single chip (never one chip per character, §6.1).
+        assert_eq!(shortcut_chips("no-such-chord"), vec!["no-such-chord"]);
+    }
+
+    /// The window mask must keep AppKit's traffic lights: the plain `1 << 0` (then named
+    /// "titled") is Borderless, which removed every standard window button, so the guide had
+    /// no close button and `band_leading_edge` always fell back to the constant.
+    #[test]
+    fn window_mask_is_dialog_fixed_and_buttonless() {
+        // Titled|Closable|Miniaturizable (7), no Resizable: titled keeps the window
+        // key-eligible (a borderless window cannot receive keyboard events at all) while the
+        // traffic lights are hidden by the flow; the fixed 640×510 layout must never be
+        // resizable, since there are no size constraints.
+        assert_eq!(
+            WINDOW_STYLE_MASK, 7,
+            "Titled|Closable|Miniaturizable, no Resizable bit"
+        );
+        assert_eq!(
+            WINDOW_STYLE_MASK & (1 << 3),
+            0,
+            "Resizable must stay off: the fixed-layout guide has no size constraints"
+        );
+        let supports: bool = unsafe {
+            msg_send![
+                class!(NSWindow),
+                instancesRespondToSelector: sel!(standardWindowButton:)
+            ]
+        };
+        assert!(
+            supports,
+            "band_leading_edge measures the (hidden) traffic lights via standardWindowButton:"
+        );
+        // With all buttons hidden the leading row falls back to the mock's own 18pt padding.
+        assert_eq!(BAND_LEADING_INSET, 18.0);
+    }
+
+    /// Keyboard activation must select the FOCUSED segment, never the record's current
+    /// selection (space on the non-selected segment used to re-select the already-selected
+    /// one and could never reach the new mode); arrows flip the group; other keys pass
+    /// through. Pure decider, so `segment_key_down` only plugs the event in.
+    #[test]
+    fn segment_keys_select_the_focused_segment() {
+        let space = segment_key_selection(49, 0, 1);
+        assert_eq!(
+            space,
+            Some(1),
+            "space must select the focused child, not {space:?}"
+        );
+        assert_eq!(segment_key_selection(36, 0, 1), Some(1), "return too");
+        assert_eq!(segment_key_selection(76, 1, 0), Some(0), "keypad enter too");
+        // Arrows flip a two-option radio group regardless of which child is focused.
+        assert_eq!(segment_key_selection(123, 0, 0), Some(1));
+        assert_eq!(segment_key_selection(124, 0, 1), Some(1));
+        assert_eq!(segment_key_selection(125, 1, 0), Some(0));
+        assert_eq!(segment_key_selection(126, 1, 1), Some(0));
+        // Unhandled keys pass through.
+        assert_eq!(segment_key_selection(48, 0, 0), None);
+        assert_eq!(segment_key_selection(51, 1, 1), None);
+    }
+
+    /// VoiceOver needs an activation action and a boolean checked value on the custom radio
+    /// segments; both are registered on the class and the value helper produces a boolean
+    /// NSNumber of the given state (headless: class/method checks, no instance needed).
+    #[test]
+    fn segment_accessibility_contract_is_registered() {
+        let responds: bool = unsafe {
+            msg_send![
+                segment_child_class_handle().0,
+                instancesRespondToSelector: sel!(accessibilityPerformPress)
+            ]
+        };
+        assert!(
+            responds,
+            "the segment class must expose accessibilityPerformPress"
+        );
+        unsafe {
+            // objc2 decodes ObjC BOOL ('c' on arm64) correctly as `runtime::Bool`; a plain
+            // `bool` read of the same message was measured wrong here.
+            let on_value = segment_a11y_value(true);
+            let is_number: objc2::runtime::Bool =
+                msg_send![on_value, isKindOfClass: class!(NSNumber)];
             assert!(
-                !title.is_empty(),
-                "{locale}: onboarding.btn_open_app_settings is empty"
+                is_number.as_bool(),
+                "the checked value must be an NSNumber, not a string"
+            );
+            let bool_value: objc2::runtime::Bool = msg_send![on_value, boolValue];
+            assert!(
+                bool_value.as_bool(),
+                "a checked segment's value must be true"
+            );
+            let off_value = segment_a11y_value(false);
+            let off: objc2::runtime::Bool = msg_send![off_value, boolValue];
+            assert!(!off.as_bool(), "an unchecked segment's value must be false");
+        }
+    }
+
+    /// The segmented control's geometry: the two segments with their 2pt insets and gap fill the
+    /// container exactly, and the inner radius derives from the outer (concentric rule).
+    #[test]
+    fn segmented_geometry_fills_the_container() {
+        assert_eq!(2.0 * SEGMENT_W + 3.0 * SEGMENT_PAD, SEGMENTED_W);
+        assert!(SEGMENT_W > 100.0, "labels need room to stay on one line");
+        assert_eq!(SEGMENT_H, SEGMENTED_H - 2.0 * SEGMENT_PAD);
+        assert_eq!(
+            crate::theme::RADIUS_CONTROL - SEGMENT_PAD,
+            6.0,
+            "the segment radius derives from the 8pt control radius minus the 2pt inset"
+        );
+    }
+
+    /// The final footer CTA ("Done and open Settings") must keep every locale's label on one
+    /// line: the button width is measured per render, so the test asserts the same measurement
+    /// stays inside a sane cap (and that the two footer copy keys exist for every locale).
+    #[test]
+    fn footer_final_cta_labels_fit_the_measured_width() {
+        unsafe {
+            for (locale, raw) in LOCALE_SOURCES {
+                for key in ["btn_finish", "btn_skip_guide"] {
+                    let title = locale_onboarding_string(raw, key);
+                    assert!(!title.is_empty(), "{locale}: onboarding.{key} is empty");
+                    let label_w = single_line_text_width(&title, FOOTER_BUTTON_LABEL_STYLE);
+                    assert!(
+                        label_w <= WINDOW_W - 2.0 * CHROME_PAD - BUTTON_W - GAP,
+                        "{locale}: the {key} label measures {label_w}pt and would not fit the footer"
+                    );
+                }
+            }
+        }
+        // Next keeps the fixed width; the final CTA is what grows to its own label.
+        let btn_next = locale_onboarding_string(LOCALE_SOURCES[0].1, "btn_next");
+        unsafe {
+            assert!(
+                single_line_text_width(&btn_next, FOOTER_BUTTON_LABEL_STYLE) <= BUTTON_W - 16.0
             );
         }
     }
 
-    /// Each body frame must hold at least three wrapped lines and must not collide with the rows
-    /// around it (pure geometry). The English screenshots showed the 46pt frames ending
-    /// mid-sentence, so the height check is the regression guard.
+    /// Every locale's band title and step counter must render inside its band geometry; the
+    /// measured width is capped so the centered title never collides with the right-aligned
+    /// counter (AppKit heights measured live, since the helper needs no window).
     #[test]
-    fn onboarding_body_frames_leave_room_for_three_lines() {
-        for (name, body_y, body_h) in [
-            ("permissions", PERMISSIONS_BODY_Y, PERMISSIONS_BODY_H),
-            ("display", DISPLAY_BODY_Y, DISPLAY_BODY_H),
-            ("more features", MORE_BODY_Y, MORE_BODY_H),
-        ] {
+    fn band_chrome_measured_sizes_fit_the_48pt_band() {
+        unsafe {
+            for (locale, raw) in LOCALE_SOURCES {
+                let title = locale_onboarding_string(raw, "window_title");
+                let title_w = single_line_text_width(&title, BAND_TITLE_STYLE);
+                assert!(
+                    title_w <= 240.0,
+                    "{locale}: the band title measures {title_w}pt, over the clamp"
+                );
+                let counter = locale_onboarding_string(raw, "step_counter");
+                assert!(counter.contains("{current}"));
+            }
+        }
+        const {
+            assert!((BAND_H - BODY_LINE_H) / 2.0 > 0.0);
+            assert!((BAND_H - CAPTION_LINE_H) / 2.0 > 0.0);
+            assert!((FOOT_H - BUTTON_H) / 2.0 > 0.0);
+        };
+    }
+
+    /// The clipboard storage note is two caption lines at most in every locale, so the
+    /// card-note stack measured by `onboarding_step_stack_clears_the_footer` stays honest (the
+    /// runtime sizes the note by this same measurement; this test is the locale gate). Measured
+    /// note of 34pt used to be the fixed box; the note now follows the measurement, so the cap
+    /// pinning the stack is the guard.
+    #[test]
+    fn clipboard_storage_note_fits_every_locale() {
+        let box_w = CARD_W;
+        for (locale, raw) in LOCALE_SOURCES {
+            let note = locale_onboarding_string(raw, "clipboard_storage_note");
             assert!(
-                body_h >= 3.0 * BODY_LINE_H,
-                "{name} body {body_h}pt holds fewer than three lines"
+                !note.is_empty(),
+                "{locale}: onboarding.clipboard_storage_note is empty"
             );
-            assert!(body_y > 0.0, "{name} body sits below the window");
+            let measured = unsafe { measured_text_height(note.as_str(), box_w, HINT_STYLE) };
             assert!(
-                body_y + body_h <= STEP_TITLE_Y,
-                "{name} body overlaps the shared title row"
+                measured <= 2.0 * CAPTION_LINE_H + 2.0,
+                "{locale}: the storage note needs {measured:.1}pt but the stack budget is two lines"
             );
         }
-        // The permissions status row and the two action buttons sit below their bodies.
-        const {
-            assert!(PERMISSIONS_BODY_Y > STATUS_ROW_Y + STATUS_H);
-            assert!(MORE_BODY_Y > 78.0 + BUTTON_H);
-        };
     }
 
     #[test]
@@ -2193,44 +3357,13 @@ mod tests {
         assert_eq!(display.clipboard.enabled, old.clipboard.enabled);
     }
 
-    /// The storage note must fit its box in every locale: it wraps to two lines, and a box sized
-    /// for one line silently clipped the half that names the clear-on-quit option.
-    #[test]
-    fn clipboard_storage_note_fits_every_locale() {
-        let box_w = WINDOW_W - PAD * 2.0;
-        for (locale, raw) in LOCALE_SOURCES {
-            let note = locale_onboarding_string(raw, "clipboard_storage_note");
-            assert!(
-                !note.is_empty(),
-                "{locale}: onboarding.clipboard_storage_note is empty"
-            );
-            let measured = unsafe { wrapped_text_height(&note, box_w, crate::theme::FONT_CAPTION) };
-            assert!(
-                measured <= CLIPBOARD_STEP.disclosure_h,
-                "{locale}: the storage note needs {measured:.1}pt but the box is {:.1}pt",
-                CLIPBOARD_STEP.disclosure_h
-            );
-        }
-    }
-
     /// The clipboard page's rows must not overlap: the storage note clears the footer buttons, the
     /// master row sits above the note, and the shortcut hint and body sit above the master row.
     /// Kept as a pure check so layout edits fail without a GUI.
     #[test]
     fn clipboard_step_rows_stay_ordered_and_clear_the_footer() {
-        let step = CLIPBOARD_STEP;
-        assert!(
-            step.disclosure_y > BUTTON_Y + BUTTON_H,
-            "the storage note must clear the footer buttons"
-        );
-        assert!(step.enabled_row_y >= step.disclosure_y + step.disclosure_h);
-        assert!(step.shortcut_hint_y >= step.enabled_row_y + BUTTON_H);
-        assert!(step.body_y >= step.shortcut_hint_y + step.shortcut_hint_h);
-        assert!(step.title_y >= step.body_y + step.body_h);
-        assert!(
-            step.title_y + TITLE_H <= WINDOW_H - COUNTER_TOP_INSET - COUNTER_H,
-            "the title must clear the step counter pinned near the top edge"
-        );
+        // The clipboard card carries exactly two rows: the master switch above the shortcut
+        // legend, and the storage note follows the card while the rows never move.
         for (locale, raw) in LOCALE_SOURCES {
             for key in ["clipboard_body", "clipboard_body_enabled"] {
                 assert!(
@@ -2242,7 +3375,16 @@ mod tests {
                 !locale_onboarding_string(raw, "clipboard_shortcut_hint").is_empty(),
                 "{locale}: shortcut-change hint is missing"
             );
+            assert!(
+                !locale_onboarding_string(raw, "clipboard_desc").is_empty(),
+                "{locale}: master-switch row description is missing"
+            );
         }
+        // The INFO keys the two rows show must exist and differ semantically where they should.
+        assert_ne!(
+            locale_onboarding_string(LOCALE_SOURCES[0].1, "clipboard_open_shortcut"),
+            locale_onboarding_string(LOCALE_SOURCES[0].1, "clipboard_label"),
+        );
     }
 
     /// Builds one launch situation; each test names only the fields its story is about so the
