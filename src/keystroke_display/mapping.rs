@@ -136,11 +136,36 @@ fn resolve_layout_glyph(
     modifiers: u64,
 ) -> Option<String> {
     match translation {
-        Ok(Some(text)) => Some(text),
+        Ok(Some(text)) => Some(key_cap_text(&text)),
         Ok(None) if modifiers == 0 => {
-            is_printable(event_unicode).then(|| event_unicode.to_string())
+            is_printable(event_unicode).then(|| key_cap_text(event_unicode))
         }
         Ok(None) | Err(()) => None,
+    }
+}
+
+/// The label drawn on a keycap: the key legend, upper-cased when the character has a single-character
+/// upper form.
+///
+/// The legend is the **physical key**, not the produced character -- that is why a chord ignores what
+/// Shift did to the character and shows the unmodified translation. Writing that legend in lower case
+/// mixed the two readings: hardware keycaps print A-Z, and every shortcut this UI names reads `⌘Q`, not
+/// `⌘q`. Only the DISPLAY goes through here: `ANSI_KEY_GLYPHS` and `translate_unmodified` stay lower
+/// case because `keycode_for_character` matches them against a character the user intends.
+///
+/// Multi-character expansions are left alone (`ß` -> `SS` would widen the cap for a key that no longer
+/// fits its own glyph); scripts without case (CJK) and symbols are unchanged.
+fn key_cap_text(text: &str) -> String {
+    let mut chars = text.chars();
+    match (chars.next(), chars.next()) {
+        (Some(only), None) => {
+            let mut upper = only.to_uppercase();
+            match (upper.next(), upper.next()) {
+                (Some(one), None) => one.to_string(),
+                _ => only.to_string(),
+            }
+        }
+        _ => text.to_string(),
     }
 }
 
@@ -509,13 +534,35 @@ mod tests {
 
     #[test]
     fn event_unicode_is_used_only_when_layout_data_is_unavailable() {
-        assert_eq!(resolve_layout_glyph("q", Ok(None), 0).as_deref(), Some("q"));
+        assert_eq!(resolve_layout_glyph("q", Ok(None), 0).as_deref(), Some("Q"));
         assert_eq!(
             resolve_layout_glyph("Q", Ok(Some("q".into())), keyboard::FLAG_OPTION).as_deref(),
-            Some("q")
+            Some("Q")
         );
         assert_eq!(resolve_layout_glyph("Q", Err(()), 0), None);
         assert_eq!(resolve_layout_glyph("", Ok(None), 0), None);
+    }
+
+    /// The keycap label is the key legend in upper case, so a shortcut reads the way it is written
+    /// (`⌘Q`) and a chord's letter agrees with the hardware keycap. The counter-examples matter as
+    /// much: a legend that expands to several characters keeps its single-char form, a script without
+    /// case is untouched, and named keys keep their localized names.
+    #[test]
+    fn keycap_labels_upper_case_a_single_character_legend() {
+        assert_eq!(key_cap_text("q"), "Q");
+        assert_eq!(key_cap_text("Q"), "Q");
+        assert_eq!(key_cap_text("é"), "É");
+        assert_eq!(key_cap_text("ñ"), "Ñ");
+        // Uppercase expands these to two characters: the cap keeps the single glyph it was measured for.
+        assert_eq!(key_cap_text("ß"), "ß");
+        assert_eq!(key_cap_text("ﬀ"), "ﬀ");
+        // No case, or not a letter: unchanged.
+        assert_eq!(key_cap_text("中"), "中");
+        assert_eq!(key_cap_text("⇥"), "⇥");
+        assert_eq!(key_cap_text("1"), "1");
+        // Multi-character legends are not a single key glyph; leave them as the layout produced.
+        assert_eq!(key_cap_text("œæ"), "œæ");
+        assert_eq!(key_cap_text(""), "");
     }
 
     #[test]
@@ -532,9 +579,11 @@ mod tests {
         }
         assert_eq!(
             resolve_layout_glyph("œ", Ok(Some("q".into())), keyboard::FLAG_OPTION).as_deref(),
-            Some("q")
+            Some("Q")
         );
-        assert_eq!(resolve_layout_glyph("œ", Ok(None), 0).as_deref(), Some("œ"));
+        // The display layer upper-cases a single-character legend; the event's own character is used
+        // here only because the layout could not translate the key.
+        assert_eq!(resolve_layout_glyph("œ", Ok(None), 0).as_deref(), Some("Œ"));
     }
 
     #[test]

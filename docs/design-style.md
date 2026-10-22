@@ -368,6 +368,14 @@ tint**（`glass::GLASS_TINT_DARK`；单一 tint 无法兼顾两种模式——�
 面下 vibrant 墨把标题落在 6.57:1、caption 落在 4.67:1，而固定 token 是 6.04:1/2.47:1——小字提升很大，但仍
 低于上表，因此单独列档。画在 `window_bg`/`card_bg` 上的一切仍受上表约束。
 
+**这份墨按窗口的 appearance 解析，所以窗口必须带着它。** 动态标签色跟随它所在视图树的 appearance，而不是面板
+所绘的调色板。面板画的是深色调色板、窗口却沿用从 App 继承来的 appearance（浅色系统上是 Aqua）时，墨会解析成近黑
+色、画在深色表面上。按键显示的设置齿轮就是这样：浅色系统 + `theme = dark` 时齿轮在深色面板上被画成近黑色，窗口
+报出的是 `NSAppearanceNameAqua`，而其余面板报的是 vibrant 名。因此每个浮动面板都要在**创建时**以及**每次重绘调色
+板时**（窗口会比它创建时的模式活得更久）用 `glass::vibrant_appearance_name(resolved_is_dark())` 设置窗口
+appearance；按键显示的 A1 面板 smoke 会在明暗两种模式下、主题切换与系统外观两条路径上都断言窗口的
+`effectiveAppearance`。
+
 **半透明表面必须被约束到这个前提下。** 两种模糊材质本身都会漂向中灰：深色模式下实测，纯 frost 落在
 `#868585`、liquid glass 落在 `#6E6E6E`，而调色板假定的是 `#1C1C1E`，于是
 `text_primary`/`text_secondary`/`text_muted` 从 15.63/10.10/6.40:1 掉到 3.38/2.18/1.38:1 与

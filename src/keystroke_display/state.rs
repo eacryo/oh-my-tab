@@ -924,7 +924,8 @@ mod tests {
             glyph: KeyGlyph::Mapped(match keycode {
                 keyboard::VK_SPACE => "Space".to_string(),
                 123 => "←".to_string(),
-                12 => unicode.to_lowercase(),
+                // The layout translation is lower case; the keycap label upper-cases it (mapping::key_cap_text).
+                12 => unicode.to_uppercase(),
                 _ => unicode.to_string(),
             }),
         }
@@ -953,7 +954,7 @@ mod tests {
         );
         assert_eq!(state.badges().len(), 1);
         assert_eq!(state.badges()[0].kind, BadgeKind::Chord);
-        assert_eq!(state.badges()[0].text, "⌘⇧q");
+        assert_eq!(state.badges()[0].text, "⌘⇧Q");
         assert_eq!(state.deadline(), Some(now + Duration::from_millis(1820)));
     }
 
@@ -1050,12 +1051,12 @@ mod tests {
         );
         let badge = &state.badges()[0];
         assert_eq!(badge.kind, BadgeKind::Chord);
-        assert_eq!(badge.text, "⌘q");
+        assert_eq!(badge.text, "⌘Q");
         assert_eq!(
             badge.cells,
             [
                 BadgeCell::Modifier("⌘".to_string()),
-                BadgeCell::Key("q".to_string())
+                BadgeCell::Key("Q".to_string())
             ]
         );
     }
@@ -1142,7 +1143,7 @@ mod tests {
             now + Duration::from_millis(4),
         );
         assert_eq!(state.badges().len(), 1);
-        assert_eq!(state.badges()[0].text, "⌘q");
+        assert_eq!(state.badges()[0].text, "⌘Q");
         assert_eq!(state.badges()[0].repeats, 4);
         state.apply(
             down(12, keyboard::FLAG_COMMAND, "q"),
@@ -1228,7 +1229,7 @@ mod tests {
         );
         assert_eq!(modifier_change.badges()[0].repeats, 1);
         assert_eq!(modifier_change.badges()[1].repeats, 1);
-        assert_eq!(modifier_change.badges()[3].text, "⌘⌥q");
+        assert_eq!(modifier_change.badges()[3].text, "⌘⌥Q");
         assert_eq!(modifier_change.badges()[3].repeats, 1);
 
         let mut changed_chord = StateMachine::default();
@@ -1245,7 +1246,7 @@ mod tests {
             now + Duration::from_millis(3),
         );
         assert_eq!(changed_chord.badges().len(), 4);
-        assert_eq!(changed_chord.badges()[3].text, "⌘⌥q");
+        assert_eq!(changed_chord.badges()[3].text, "⌘⌥Q");
         assert_eq!(changed_chord.badges()[3].repeats, 1);
 
         let mut paused = StateMachine::default();
@@ -1399,7 +1400,7 @@ mod tests {
             now,
         );
         assert_eq!(commands.badges().len(), 1);
-        assert_eq!(commands.badges()[0].text, "⌘q");
+        assert_eq!(commands.badges()[0].text, "⌘Q");
     }
 
     #[test]

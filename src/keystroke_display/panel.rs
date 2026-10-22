@@ -1118,7 +1118,7 @@ pub(super) fn smoke_runner() -> bool {
         crate::event_tap::keyboard::FLAG_OPTION,
     )
     .as_deref()
-        == Some("q");
+        == Some("Q");
     let (initial_position, saved_position) = {
         let config = crate::config::CONFIG.read().unwrap();
         (
@@ -1300,6 +1300,9 @@ pub(super) fn smoke_runner() -> bool {
                 // The palette surface is painted by the shipped materials; the development-only blur
                 // surface paints nothing (its own check is the backdrop layer in `backdrop_structure_valid`).
                 && (dev_only_material_forced || backdrop_surface_matches_palette())
+                // The window's appearance is what the gear's dynamic ink resolves against; without it the
+                // panel shows its palette surface while the gear stays the inherited (Light) glyph.
+                && panel_appearance_matches_mode()
                 && centroid_offsets.as_ref().is_some_and(|offsets| {
                     offsets.len() == cjk_badges.len()
                         && offsets.iter().all(|(offset, pixels)| {
@@ -1398,6 +1401,10 @@ pub(super) fn smoke_runner() -> bool {
         }
         crate::ui_coordinator::apply_theme_and_locale_refresh();
         let mut changed = unsafe { backdrop_surface_matches_palette() };
+        // The gear's ink follows the window's appearance, which must follow the palette: a cached
+        // window that kept the previous mode's appearance rendered a near-black gear on the dark
+        // panel (and a near-white one on the light panel).
+        changed &= unsafe { panel_appearance_matches_mode() };
         // Render once so the keys and the surface are both drawn in the new theme.
         let probe_badge = Badge {
             text: "⌘⇧Q".into(),
@@ -1439,6 +1446,7 @@ pub(super) fn smoke_runner() -> bool {
             crate::apply_system_appearance_refresh();
             changed &= unsafe { backdrop_surface_matches_palette() };
             changed &= unsafe { backdrop_floor_veil_valid() };
+            changed &= unsafe { panel_appearance_matches_mode() };
         }
         {
             let mut config = crate::config::CONFIG.write().unwrap();
@@ -1557,10 +1565,10 @@ pub(super) fn smoke_runner() -> bool {
             })
             .collect();
         long_stream.push(Badge {
-            text: "⌥q".into(),
+            text: "⌥Q".into(),
             kind: BadgeKind::Chord,
             repeats: 1,
-            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("q".into())],
+            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("Q".into())],
         });
         let _ = render(
             &long_stream,
@@ -1649,10 +1657,10 @@ pub(super) fn smoke_runner() -> bool {
         // count rides it. A row also keeps content-sized keycaps, so neither cap may land on the
         // column rail width.
         let chord = Badge {
-            text: "⌥q".into(),
+            text: "⌥Q".into(),
             kind: BadgeKind::Chord,
             repeats: 1,
-            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("q".into())],
+            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("Q".into())],
         };
         // Hide first: the panel keeps its size for the rest of a shown session once the stream
         // has hit the cap, and the earlier rail render is long enough to pin it.
@@ -1730,10 +1738,10 @@ pub(super) fn smoke_runner() -> bool {
         // is two keycaps plus a gap. A panel pinned by a longer stream is not the shape being
         // measured, hence the hide first.
         let chord = Badge {
-            text: "⌥q".into(),
+            text: "⌥Q".into(),
             kind: BadgeKind::Chord,
             repeats: 1,
-            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("q".into())],
+            cells: vec![BadgeCell::Modifier("⌥".into()), BadgeCell::Key("Q".into())],
         };
         let _ = render(
             &[],
@@ -2393,6 +2401,25 @@ pub(crate) unsafe fn refresh_cached_controls() {
     });
 }
 
+/// Put the HUD on the vibrant appearance for the resolved mode, like the other floating panels.
+///
+/// The gear draws through `glass::panel_ink`, which under frost resolves to the dynamic system label
+/// colours -- and those follow the WINDOW's appearance. Without this the panel kept whatever appearance
+/// it inherited from the app (Aqua on a Light system), so with the dark palette the gear resolved to a
+/// near-black ink on a dark surface: an invisible affordance. The keycaps never showed it because they
+/// paint absolute palette tokens. `apply_glass_properties` re-applies it on every palette repaint,
+/// because the cached window outlives the mode it was built in.
+unsafe fn apply_panel_appearance(window: *mut AnyObject) {
+    let name = make_nsstring(crate::glass::vibrant_appearance_name(
+        crate::theme::resolved_is_dark(),
+    ));
+    let appearance: *mut AnyObject = msg_send![class!(NSAppearance), appearanceNamed: name];
+    CFRelease(name as *const c_void);
+    if !appearance.is_null() {
+        let _: () = msg_send![window, setAppearance: appearance];
+    }
+}
+
 /// Normal/hover for the HUD's settings gear: a neutral ink over one faint wash, matching the other
 /// floating panels' corner glyph buttons.
 unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: bool) {
@@ -2477,6 +2504,8 @@ unsafe fn create_panel(
         backing: 2u64,
         defer: false
     ];
+    // Before any content is built: the gear's dynamic ink resolves against this appearance.
+    apply_panel_appearance(panel);
     let _: () = msg_send![panel, setLevel: 3isize];
     let _: () = msg_send![panel, setOpaque: false];
     // The HUD keeps its native window shadow: it is placed `PANEL_EDGE_MARGIN` (18pt) from the visible
@@ -2972,7 +3001,51 @@ unsafe fn view_contains_subview(parent: *mut AnyObject, candidate: *mut AnyObjec
     })
 }
 
+/// Whether the panel window runs the vibrant appearance for the *resolved* mode -- the one that makes
+/// the gear's dynamic ink resolve to a light glyph on the dark palette.
+///
+/// Read back from the window's `effectiveAppearance`, not from the constant the setter passed: the
+/// defect this guards was a window that kept the app's inherited (Light) appearance while the panel
+/// painted the dark palette, which made the gear a near-black glyph on a dark surface. Comparing the
+/// constant would pass with the setter never having run.
+pub(super) unsafe fn panel_appearance_matches_mode() -> bool {
+    PANEL.with(|panel| {
+        let state = panel.borrow();
+        let Some(window) = state.panel else {
+            return false;
+        };
+        let appearance: *mut AnyObject = msg_send![window, effectiveAppearance];
+        if appearance.is_null() {
+            return false;
+        }
+        let name: *mut AnyObject = msg_send![appearance, name];
+        if name.is_null() {
+            return false;
+        }
+        let actual = crate::ffi::nsstring_to_rust(name);
+        let expected = crate::glass::vibrant_appearance_name(crate::theme::resolved_is_dark());
+        if actual != expected {
+            eprintln!(
+                "[keystroke-display-smoke] panel appearance is {actual}, expected {expected} for dark={}",
+                crate::theme::resolved_is_dark()
+            );
+        }
+        actual == expected
+    })
+}
+
 pub(super) unsafe fn apply_glass_properties() {
+    // The window's appearance decides what a dynamic panel ink (the gear) resolves to, so it follows
+    // every palette repaint -- including the "auto" theme's system-appearance entry point, which does
+    // not run the config-change coordinator (see `apply_panel_appearance`).
+    //
+    // `try_borrow`, not `borrow`: `render` holds this state mutably for its whole body and `create_panel`
+    // (which calls here) runs inside it, where the window is already being styled explicitly. A hard
+    // borrow there would panic on the first summon.
+    let window = PANEL.with(|panel| panel.try_borrow().ok().and_then(|state| state.panel));
+    if let Some(window) = window {
+        apply_panel_appearance(window);
+    }
     let Some(backdrop) = installed_backdrop() else {
         return;
     };

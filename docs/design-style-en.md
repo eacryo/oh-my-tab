@@ -456,6 +456,16 @@ desktop lands the title at 6.57:1 and the caption at 4.67:1 with vibrant ink, ag
 a fixed token — a large gain for small text, and still short of this table, which is why the tier is
 stated separately here. Everything drawn on `window_bg`/`card_bg` keeps the table above unchanged.
 
+**That ink resolves against the WINDOW's appearance, so the window must carry one.** A dynamic label color
+follows the appearance of the view tree it is drawn in, not the palette the panel painted. A panel that paints
+the dark palette while its window keeps the appearance it inherited from the app (Aqua on a Light system) draws
+a near-black ink on a dark surface. That happened to the keystroke HUD's settings gear: with `theme = dark` on a
+Light system the gear drew near-black on the dark panel, and the window reported `NSAppearanceNameAqua` where the
+other panels report the vibrant name. Every floating panel therefore sets
+`glass::vibrant_appearance_name(resolved_is_dark())` on its window when it is created **and on every palette
+repaint** (the window outlives the mode it was built in); the keystroke HUD's A1 panel smoke asserts the window's
+`effectiveAppearance` in both modes, on both the theme-switch and the system-appearance paths.
+
 **A translucent surface must be held to that.** Both blurring materials drift toward mid gray on
 their own: measured in dark mode, plain frost landed at `#868585` and liquid glass at `#6E6E6E`,
 against the `#1C1C1E` the palette assumes, which drops `text_primary`/`text_secondary`/`text_muted`
