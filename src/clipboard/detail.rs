@@ -50,7 +50,7 @@ pub(super) unsafe fn add_detail_text(
         detail_insets(picker_shows_detail_in_pane(), w),
         w,
         h,
-        meta_table_row_count(),
+        meta_table_field_count(),
     );
     let body_h = section_h.max(DETAIL_LINE_H);
     // The scroll view fills the pane; its insets are the mock's padding, so the content column
@@ -407,10 +407,12 @@ pub(super) fn media_body_frames(
     }
 }
 
-/// The body every meta table describes: five rows (see `MetaField::ALL`). The panel sizes
-/// itself before it knows which entry will be shown -- the detail follows the selection, and a
-/// rebuild must not make the panel jump -- so this is a constant, not a per-entry count.
-pub(super) fn meta_table_row_count() -> usize {
+/// The body every meta table describes: `MetaField::ALL`'s field count. The panel sizes itself
+/// before it knows which entry will be shown -- the detail follows the selection, and a rebuild
+/// must not make the panel jump -- so this is a constant, not a per-entry count. The layout
+/// resolves it into visual rows by width: two fields per row, or one below the two-column
+/// minimum.
+pub(super) fn meta_table_field_count() -> usize {
     MetaField::ALL.len()
 }
 
@@ -443,6 +445,12 @@ pub(super) struct MetaRowFrames {
     pub(super) label_w: f64,
     pub(super) gap: f64,
     pub(super) row_gap: f64,
+    /// The right column's x: the second label+value pair of each row lives right of it.
+    /// Equals `content_w` in the single-column fallback, so the left value keeps the row.
+    pub(super) right_x: f64,
+    /// Whether two fields share each row; false below the two-column minimum width, where a
+    /// squeezed second column would only render an empty value cell.
+    pub(super) two_col: bool,
     /// Number of metadata rows; long values retain their full text in tooltips.
     pub(super) rows: usize,
     /// The table's full height, padding included.
@@ -450,47 +458,73 @@ pub(super) struct MetaRowFrames {
 }
 
 /// Geometry of the meta table, measured from the TOP of the scrolling content column (so the
-/// table is the document's last block). `row_gap` is the mock's `.meta-table` gap.
-pub(super) fn meta_table_frames(content_w: f64, rows: usize) -> MetaRowFrames {
+/// table is the document's last block). `fields` is the field count; the layout turns it into
+/// visual rows by width. `row_gap` is the row spacing.
+pub(super) fn meta_table_frames(content_w: f64, fields: usize) -> MetaRowFrames {
     let label_w = if content_w < DETAIL_META_COMPACT_BELOW {
         DETAIL_META_LABEL_W_COMPACT
     } else {
         DETAIL_META_LABEL_W
     };
-    let rows = rows.max(1);
+    // `fields` is a field count, not a row count: the layout packs two per visual row when the
+    // column has room, and falls back to one field per row below the two-column minimum so the
+    // second column never collapses to a zero-width value.
+    let two_col = content_w >= DETAIL_META_TWO_COL_MIN;
+    let rows = (if two_col { fields.div_ceil(2) } else { fields }).max(1);
     let row_h = DETAIL_META_LINE_H;
     let height =
         DETAIL_META_PADDING_TOP + rows as f64 * row_h + (rows as f64 - 1.0) * DETAIL_META_ROW_GAP;
+    // The right pair's column: a split of the content width, floored so the left value keeps a
+    // usable width on narrow panes. In the fallback it sits at the content edge -- no right pair
+    // is ever painted in that mode.
+    let right_x = if two_col {
+        (content_w * DETAIL_META_RIGHT_SPLIT)
+            .max(label_w + DETAIL_META_GAP + 80.0 + DETAIL_META_COLUMN_GAP)
+            .min(content_w)
+    } else {
+        content_w
+    };
     MetaRowFrames {
         table_top: DETAIL_META_PADDING_TOP,
         row_h,
         label_w,
         gap: DETAIL_META_GAP,
         row_gap: DETAIL_META_ROW_GAP,
+        right_x,
+        two_col,
         rows,
         height,
     }
 }
 
-/// The value column's left x and width inside a content column `content_w` wide: the mock's
-/// 56px label column, its 10px gap, then the rest.
-#[cfg(test)] // only `meta_row_frames` reads it, and that is a test-only reader
-fn meta_value_column(frames: &MetaRowFrames, content_w: f64) -> (f64, f64) {
-    let x = frames.label_w + frames.gap;
-    (x, (content_w - x).max(0.0))
-}
-
-/// A meta row's frames inside the content column (flipped): the label column and the value. The
-/// table itself is painted into the document view, so only tests read the geometry back.
+/// A meta FIELD's frames inside the content column (flipped): the label column and the value.
+/// Fields pair two per visual row -- even indices in the left column, odd in the right column at
+/// `right_x`; a trailing unpaired field (the copied-at row today) lets its value span the row's
+/// full width. The table itself is painted into the document view, so only tests read the
+/// geometry back.
 #[cfg(test)]
 fn meta_row_frames(frames: &MetaRowFrames, index: usize, content_w: f64) -> (NSRect, NSRect) {
-    let y = frames.table_top + index as f64 * (frames.row_h + frames.row_gap);
+    let (row, col) = if frames.two_col {
+        (index / 2, index % 2)
+    } else {
+        (index, 0)
+    };
+    let y = frames.table_top + row as f64 * (frames.row_h + frames.row_gap);
+    let col_x = if col == 0 { 0.0 } else { frames.right_x };
     let label = NSRect::new(
-        NSPoint::new(0.0, y),
+        NSPoint::new(col_x, y),
         NSSize::new(frames.label_w, frames.row_h),
     );
-    let (value_x, value_w) = meta_value_column(frames, content_w);
-    let value = NSRect::new(NSPoint::new(value_x, y), NSSize::new(value_w, frames.row_h));
+    let value_x = col_x + frames.label_w + frames.gap;
+    let value_end = if col == 1 || !frames.two_col || index == MetaField::ALL.len() - 1 {
+        content_w
+    } else {
+        frames.right_x - DETAIL_META_COLUMN_GAP
+    };
+    let value = NSRect::new(
+        NSPoint::new(value_x, y),
+        NSSize::new((value_end - value_x).max(0.0), frames.row_h),
+    );
     (label, value)
 }
 
@@ -823,49 +857,146 @@ unsafe fn paint_meta_table(
 ) {
     let table_y = document_h - pane.meta.height;
     let label_w = pane.meta.label_w;
-    let value_x = label_w + pane.meta.gap;
-    let value_w = (content_w - value_x).max(0.0);
-    for (index, (label, value)) in meta_table(entry, show_source_app()).into_iter().enumerate() {
-        let y =
-            table_y + pane.meta.table_top + index as f64 * (pane.meta.row_h + pane.meta.row_gap);
-        let color = crate::glass::panel_ink(
-            clipboard_palette().secondary_text,
-            crate::glass::PanelInk::Muted,
-        );
-        let font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-        let label_cell = make_meta_cell(
-            NSRect::new(NSPoint::new(0.0, y), NSSize::new(label_w, pane.meta.row_h)),
-            &label,
+    let pitch = pane.meta.row_h + pane.meta.row_gap;
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let label_color = crate::glass::panel_ink(
+        clipboard_palette().secondary_text,
+        crate::glass::PanelInk::Muted,
+    );
+    let value_color = crate::glass::panel_ink(
+        clipboard_palette().primary_text,
+        crate::glass::PanelInk::Secondary,
+    );
+    // Fields pair two per row (the user's compact table): even indices at the left column, odd
+    // at `right_x`; a trailing unpaired field lets its value span the row. Below the two-column
+    // minimum the layout emits one field per row and never reaches the right column.
+    let show_source = show_source_app();
+    let step = if pane.meta.two_col { 2 } else { 1 };
+    for (index, pair) in meta_table(entry, show_source).chunks(step).enumerate() {
+        let y = table_y + pane.meta.table_top + index as f64 * pitch;
+        let left_end = if pair.len() == 1 {
+            content_w
+        } else {
+            pane.meta.right_x - DETAIL_META_COLUMN_GAP
+        };
+        paint_meta_pair(
+            document,
             font,
-            color,
-            0,
+            label_color,
+            value_color,
+            0.0,
+            left_end,
+            label_w,
+            pane.meta.gap,
+            pane.meta.row_h,
+            y,
+            &pair[0].0,
+            &pair[0].1,
+            // The source row (the very first field) carries the source app's icon.
+            if index == 0 {
+                meta_source_icon_key(entry, show_source)
+            } else {
+                None
+            },
         );
-        let _: () = msg_send![document, addSubview: label_cell];
-        release_obj(label_cell);
-        let color = crate::glass::panel_ink(
-            clipboard_palette().primary_text,
-            crate::glass::PanelInk::Secondary,
-        );
-        let value_cell = make_meta_cell(
-            NSRect::new(
-                NSPoint::new(value_x, y),
-                NSSize::new(value_w, pane.meta.row_h),
-            ),
-            &value,
-            font,
-            color,
-            0,
-        );
-        // A long value (a URL-wrapped app name) truncates at the tail; the tooltip carries it.
-        let cell: *mut AnyObject = msg_send![value_cell, cell];
-        let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-        let tooltip = make_nsstring(&value);
-        let _: () = msg_send![value_cell, setToolTip: tooltip];
-        CFRelease(tooltip as *const c_void);
-        let _: () = msg_send![document, addSubview: value_cell];
-        release_obj(value_cell);
+        if let Some(right) = pair.get(1) {
+            paint_meta_pair(
+                document,
+                font,
+                label_color,
+                value_color,
+                pane.meta.right_x,
+                content_w,
+                label_w,
+                pane.meta.gap,
+                pane.meta.row_h,
+                y,
+                &right.0,
+                &right.1,
+                None,
+            );
+        }
     }
+}
+
+/// The source row's icon key, and only while the "show source app" setting is on: the icon
+/// would leak the same app the hidden name withholds.
+fn meta_source_icon_key(entry: &ClipEntry, show_source: bool) -> Option<&str> {
+    (show_source && !entry.source_key.is_empty()).then_some(entry.source_key.as_str())
+}
+
+/// One label+value pair of the meta table at `col_x`, the value clipped at `value_end`. When
+/// `icon_key` names a cached small icon, the value text steps aside for it (the mock's
+/// `.meta-v img`).
+#[allow(clippy::too_many_arguments)]
+unsafe fn paint_meta_pair(
+    document: *mut AnyObject,
+    font: *mut AnyObject,
+    label_color: *mut AnyObject,
+    value_color: *mut AnyObject,
+    col_x: f64,
+    value_end: f64,
+    label_w: f64,
+    gap: f64,
+    row_h: f64,
+    y: f64,
+    label: &str,
+    value: &str,
+    icon_key: Option<&str>,
+) {
+    let label_cell = make_meta_cell(
+        NSRect::new(NSPoint::new(col_x, y), NSSize::new(label_w, row_h)),
+        label,
+        font,
+        label_color,
+        0,
+    );
+    let _: () = msg_send![document, addSubview: label_cell];
+    release_obj(label_cell);
+    let value_x = col_x + label_w + gap;
+    let mut text_x = value_x;
+    if let Some(key) = icon_key.filter(|key| !key.is_empty()) {
+        let icon_path = crate::icon_cache::small_icon_path_for_key(key);
+        let path = make_nsstring(&icon_path);
+        let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let img: *mut AnyObject = msg_send![img, initWithContentsOfFile: path];
+        CFRelease(path as *const c_void);
+        if !img.is_null() {
+            let icon_view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+            let icon_view: *mut AnyObject = msg_send![
+                icon_view,
+                initWithFrame: NSRect::new(
+                    NSPoint::new(value_x, y + (row_h - DETAIL_META_ICON) / 2.0),
+                    NSSize::new(DETAIL_META_ICON, DETAIL_META_ICON)
+                )
+            ];
+            let _: () = msg_send![icon_view, setImage: img];
+            let _: () = msg_send![icon_view, setImageScaling: 3u64];
+            let _: () = msg_send![document, addSubview: icon_view];
+            release_obj(icon_view);
+            text_x += DETAIL_META_ICON + DETAIL_META_ICON_GAP;
+        }
+        release_obj(img);
+    }
+    let value_cell = make_meta_cell(
+        NSRect::new(
+            NSPoint::new(text_x, y),
+            NSSize::new((value_end - text_x).max(0.0), row_h),
+        ),
+        value,
+        font,
+        value_color,
+        0,
+    );
+    // A long value (a URL-wrapped app name) truncates at the tail; the tooltip carries it.
+    let cell: *mut AnyObject = msg_send![value_cell, cell];
+    let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    let tooltip = make_nsstring(value);
+    let _: () = msg_send![value_cell, setToolTip: tooltip];
+    CFRelease(tooltip as *const c_void);
+    let _: () = msg_send![document, addSubview: value_cell];
+    release_obj(value_cell);
 }
 
 /// A borderless, background-less one-line label at `frame`.
@@ -4688,15 +4819,46 @@ mod tests {
     /// plus its own bottom padding is what pins a short body's table to the pane's bottom.
     #[test]
     fn last_meta_row_sits_on_the_document_bottom_edge() {
-        let pane = detail_pane_layout(DETAIL_MAX_W, 520.0, meta_table_row_count());
+        let pane = detail_pane_layout(DETAIL_MAX_W, 520.0, meta_table_field_count());
         let doc_h = detail_document_height(pane.scroll.size.height, pane.body_h, pane.meta.height);
         assert_eq!(doc_h, pane.scroll.size.height);
-        let (_, last_value) =
-            meta_row_frames(&pane.meta, meta_table_row_count() - 1, pane.content_w);
+        let (_, last_value) = meta_row_frames(&pane.meta, MetaField::ALL.len() - 1, pane.content_w);
         let table_y = doc_h - pane.meta.height;
         assert!(
             (table_y + last_value.origin.y + last_value.size.height - doc_h).abs() <= 1.0,
             "the last meta row ends at the document's bottom edge, so it sits on the table's own bottom padding"
+        );
+    }
+
+    /// The source icon is gated by the same "show source app" switch as the name: off means no
+    /// icon key at all, so a hidden source cannot leak through its icon.
+    #[test]
+    fn meta_source_icon_key_follows_the_show_source_switch() {
+        let mut entry = text_entry("x");
+        entry.source_key = "com.example.app".to_string();
+        assert_eq!(meta_source_icon_key(&entry, true), Some("com.example.app"));
+        assert_eq!(meta_source_icon_key(&entry, false), None);
+        entry.source_key.clear();
+        assert_eq!(meta_source_icon_key(&entry, true), None);
+    }
+
+    /// Below the two-column minimum the table falls back to one field per row rather than
+    /// squeezing the second column into a zero-width value.
+    #[test]
+    fn meta_table_falls_back_to_one_column_when_narrow() {
+        let fields = meta_table_field_count();
+        let wide = meta_table_frames(DETAIL_META_TWO_COL_MIN + 100.0, fields);
+        assert!(wide.two_col);
+        assert_eq!(wide.rows, fields.div_ceil(2));
+        let narrow = meta_table_frames(DETAIL_META_TWO_COL_MIN - 1.0, fields);
+        assert!(!narrow.two_col);
+        assert_eq!(narrow.rows, fields);
+        // The fallback's right_x sits at the content edge, so no right pair can draw and the
+        // single column's value keeps the full row.
+        let (_, value) = meta_row_frames(&narrow, 1, DETAIL_META_TWO_COL_MIN - 1.0);
+        assert_eq!(
+            value.origin.x + value.size.width,
+            DETAIL_META_TWO_COL_MIN - 1.0
         );
     }
 

@@ -682,9 +682,20 @@ const DETAIL_NARROW_INSET_BOTTOM: f64 = 14.0;
 /// The mock's `.meta-row` grid: a 56px label column, a 10px gap, then the value.
 const DETAIL_META_LABEL_W: f64 = 56.0;
 const DETAIL_META_GAP: f64 = 10.0;
-/// The mock's `.meta-table` `padding-top: 28px` above the first row and `gap: 11px` between rows.
+/// The mock's `.meta-table` `padding-top: 28px` above the first row; the row gap is tighter
+/// than the mock's 11px because two label+value pairs now share each row.
 const DETAIL_META_PADDING_TOP: f64 = 28.0;
-const DETAIL_META_ROW_GAP: f64 = 11.0;
+const DETAIL_META_ROW_GAP: f64 = 6.0;
+/// The meta table packs two label+value pairs per row: the right pair's column starts at this
+/// fraction of the content width, with this much room kept after the left value.
+const DETAIL_META_RIGHT_SPLIT: f64 = 0.45;
+const DETAIL_META_COLUMN_GAP: f64 = 16.0;
+/// Below this content width the table falls back to one field per row: two label+value columns
+/// cannot both stay legible, and a zero-width value is worse than a taller table.
+const DETAIL_META_TWO_COL_MIN: f64 = 280.0;
+/// The source app icon in the first meta value (the mock's `.meta-v img`, 13px + 6px gap).
+const DETAIL_META_ICON: f64 = 13.0;
+const DETAIL_META_ICON_GAP: f64 = 6.0;
 /// The mock's `.meta-v` `line-height: 1.45` at 12px.
 const DETAIL_META_LINE_H: f64 =
     crate::theme::line_height(crate::theme::FONT_CAPTION, DETAIL_META_LINE_HEIGHT_RATIO);
@@ -5058,7 +5069,7 @@ mod tests {
     fn detail_text_size_reports_body_height_capped_by_the_pane() {
         use super::TextKind;
         use crate::clipboard::{
-            detail_max_height, detail_pane_layout, detail_text_size, meta_table_row_count,
+            detail_max_height, detail_pane_layout, detail_text_size, meta_table_field_count,
         };
         use objc2_foundation::{NSPoint, NSRect, NSSize};
         let picker = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 400.0));
@@ -5071,7 +5082,7 @@ mod tests {
         // meta table (which can be zero here -- a 400pt picker is shorter than the table alone).
         assert_eq!(
             max_height,
-            detail_pane_layout(super::DETAIL_MAX_W, max_height, meta_table_row_count())
+            detail_pane_layout(super::DETAIL_MAX_W, max_height, meta_table_field_count())
                 .scroll
                 .size
                 .height
@@ -5090,7 +5101,7 @@ mod tests {
         // that share at every supported width: a JSON-style indented document gives enough lines
         // without a megabyte of input (estimate_lines floors a very long single line to one).
         let long = "{\n  \"key\": \"value\",\n  \"list\": [1, 2, 3]\n},\n".repeat(2_500);
-        let pane = detail_pane_layout(super::DETAIL_MAX_W, max_height, meta_table_row_count());
+        let pane = detail_pane_layout(super::DETAIL_MAX_W, max_height, meta_table_field_count());
         let long_h = detail_text_size(&long, TextKind::Plain, max_height).1;
         assert_eq!(
             long_h, pane.body_h,

@@ -1022,7 +1022,7 @@ unsafe fn ensure_detail_window() {
     let screen_frame: NSRect = msg_send![screen, visibleFrame];
     let w = DETAIL_MAX_W;
     let h = (screen_frame.size.height - DETAIL_SCREEN_MARGIN * 2.0)
-        .max(detail_pane_min_height(w, meta_table_row_count()));
+        .max(detail_pane_min_height(w, meta_table_field_count()));
     let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
     let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
     let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
@@ -1615,7 +1615,7 @@ unsafe fn build_detail_body(
         detail_insets(picker_shows_detail_in_pane(), panel_w),
         panel_w,
         max_detail_h,
-        meta_table_row_count(),
+        meta_table_field_count(),
     );
     if let Some(img) = &entry.image {
         let mut installed = false;
@@ -1716,7 +1716,7 @@ pub(super) fn detail_max_height(picker: NSRect) -> f64 {
 /// The largest body section at a given panel height cap.
 #[cfg(test)]
 fn pane_max_body_h(max_detail_h: f64) -> f64 {
-    detail_pane_layout(DETAIL_MAX_W, max_detail_h, meta_table_row_count()).body_h
+    detail_pane_layout(DETAIL_MAX_W, max_detail_h, meta_table_field_count()).body_h
 }
 
 /// The body's own height for `lines` visual lines, capped at the pane's body share.
@@ -1770,7 +1770,7 @@ pub(super) fn detail_text_size(text: &str, kind: TextKind, max_height: f64) -> (
     let w = DETAIL_MAX_W;
     // The wrap width is the CONTENT column, not the panel: the pane insets and the meta table's
     // capsule clip are not text area (the mock's `.detail-text` lives inside the 22/26 padding).
-    let avail_w = detail_pane_layout(w, 0.0, meta_table_row_count()).content_w;
+    let avail_w = detail_pane_layout(w, 0.0, meta_table_field_count()).content_w;
     let lines = estimate_lines(text, detail_text_units(avail_w));
     (w, detail_body_height(lines, max_height))
 }
@@ -2037,7 +2037,7 @@ mod tests {
     use super::*;
     // The pane's geometry lives in the clipboard module's own (re-exported) helpers; the tests
     // pin against them so a padding or row-height change fails here rather than on screen.
-    use crate::clipboard::{detail_pane_layout, detail_pane_min_height, meta_table_row_count};
+    use crate::clipboard::{detail_pane_layout, detail_pane_min_height, meta_table_field_count};
 
     #[test]
     fn ext_for_image_uti_maps_known_families_case_insensitively() {
@@ -2111,7 +2111,7 @@ mod tests {
         assert!(h_six > h, "more hard lines must make the body taller");
 
         // The cap still clamps downward: never past what the pane leaves for the body.
-        let cap_at_min = detail_pane_min_height(DETAIL_CODE_MAX_W, meta_table_row_count());
+        let cap_at_min = detail_pane_min_height(DETAIL_CODE_MAX_W, meta_table_field_count());
         let (_, capped) = detail_prepared_code_size(&two_lines, cap_at_min);
         assert!(
             capped <= pane_max_body_h(cap_at_min) + 1e-9,
@@ -2149,17 +2149,17 @@ mod tests {
     #[test]
     fn detail_panel_is_a_padding_inset_column_with_a_bottom_meta_table() {
         let cap = 900.0;
-        let pane_min_h = detail_pane_min_height(DETAIL_MAX_W, meta_table_row_count());
+        let pane_min_h = detail_pane_min_height(DETAIL_MAX_W, meta_table_field_count());
         // A one-line body still sizes the panel to at least the table plus a minimum body.
         let (w, body_h) = detail_text_size("hi", TextKind::Plain, cap);
         let h = (body_h
-            + detail_pane_layout(w, cap, meta_table_row_count())
+            + detail_pane_layout(w, cap, meta_table_field_count())
                 .meta
                 .height
             + DETAIL_INSET_TOP
             + DETAIL_INSET_BOTTOM)
             .clamp(pane_min_h, cap);
-        let pane = detail_pane_layout(w, h, meta_table_row_count());
+        let pane = detail_pane_layout(w, h, meta_table_field_count());
         // The scrolling column is the panel minus the mock's padding on each side.
         assert_eq!(pane.scroll.origin.x, DETAIL_INSET_LEFT);
         assert_eq!(pane.scroll.origin.y, DETAIL_INSET_TOP);
