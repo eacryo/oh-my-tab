@@ -362,6 +362,12 @@ reviewer and the settings it ran under, including whether Codex declined the req
 
 ## Architecture and invariants
 
+- **`ARCHITECTURE.md` (repository root) is the map of the source tree and the ownership rules.** Read it before
+  adding a source file, moving a responsibility between files, or wiring a feature into an existing surface: it
+  lists every module file by file with what each owns, states the layering and threading rules, and says where a
+  change of each kind belongs. When a file is added, renamed or removed, update its tree in the same edit — a
+  tree that disagrees with `src/` is worse than no tree. `docs/developer-notes-en.md` holds the deeper
+  per-subsystem behaviour this file and `ARCHITECTURE.md` link to rather than repeat.
 - AppKit UI and dynamically registered Objective-C callbacks run on the main thread. Global input and device observers run on dedicated threads and marshal events back to main.
 - Preserve existing mutex/RwLock ownership and raw Objective-C/Core Foundation lifetimes.
 - The overlay supports icon-only and thumbnail cards. Thumbnail capture needs Screen Recording permission and must degrade gracefully to icons/fallbacks without it. Keep layout helpers pure where possible for unit testing.
