@@ -701,6 +701,96 @@ pub(crate) fn smoke_runner() -> bool {
         );
     }
 
+    /// A press anywhere outside the search field must end its editing session. The picker's other
+    /// surfaces never take first responder on a press (rows are buttons, blank regions start a
+    /// drag, the header/footer controls are buttons), so AppKit left the field editor in place: the
+    /// caret and the focused ring stayed, and the next keystroke kept filtering instead of driving
+    /// the list. A press on the field itself must NOT end it -- caret placement and the drawn clear
+    /// × belong to the field.
+    unsafe fn assert_press_outside_search_field_ends_editing() {
+        let window = (*super::PICKER_WINDOW.lock().unwrap())
+            .expect("the picker window must exist")
+            .0;
+        let container = (*super::PICKER_CONTAINER.lock().unwrap())
+            .expect("the picker container must exist")
+            .0;
+        let search = (*super::SEARCH_FIELD.lock().unwrap())
+            .expect("the search field must exist")
+            .0;
+        // Begin an editing session exactly as a press on the field does.
+        let started: bool = msg_send![window, makeFirstResponder: search];
+        assert!(started, "the search field must accept first responder");
+        let editor: *mut AnyObject = msg_send![search, currentEditor];
+        assert!(
+            !editor.is_null(),
+            "the search field must be editing for this check"
+        );
+        let bounds: NSRect = msg_send![search, bounds];
+        let bar: NSRect =
+            msg_send![search, convertRect: bounds, toView: std::ptr::null::<AnyObject>()];
+        // A press on the bar keeps editing (the click belongs to the field).
+        let inside = NSPoint::new(bar.origin.x + 4.0, bar.origin.y + bar.size.height / 2.0);
+        assert!(
+            !super::end_search_editing_for_press(inside),
+            "a press on the search field itself must not end its editing"
+        );
+        let still_editing: *mut AnyObject = msg_send![search, currentEditor];
+        assert!(
+            !still_editing.is_null(),
+            "a press on the search field must keep it editing"
+        );
+        // A press outside it (just below the bar) ends editing and returns the keyboard to the list.
+        let outside = NSPoint::new(bar.origin.x + bar.size.width / 2.0, bar.origin.y - 1.0);
+        assert!(
+            super::end_search_editing_for_press(outside),
+            "a press outside the search field must end its editing"
+        );
+        let editor_after: *mut AnyObject = msg_send![search, currentEditor];
+        assert!(
+            editor_after.is_null(),
+            "the search field must not be editing after an outside press"
+        );
+        let responder: *mut AnyObject = msg_send![window, firstResponder];
+        assert_eq!(
+            responder, container,
+            "the list must take the keyboard back after a press outside the search field"
+        );
+
+        // The same press delivered through the window's sendEvent: override: the wiring, not just
+        // the helper. A right-button press is used because the blank regions and the controls
+        // ignore it (a left press down there would start a panel drag or fire a control action),
+        // while the window hook treats every mouse-button press alike.
+        let reopened: bool = msg_send![window, makeFirstResponder: search];
+        assert!(
+            reopened,
+            "the search field must accept first responder again"
+        );
+        let number: isize = msg_send![window, windowNumber];
+        let event: *mut AnyObject = msg_send![
+            class!(NSEvent),
+            mouseEventWithType: 3u64,
+            location: outside,
+            modifierFlags: 0u64,
+            timestamp: 0.0f64,
+            windowNumber: number,
+            context: std::ptr::null::<AnyObject>(),
+            eventNumber: 0isize,
+            clickCount: 1isize,
+            pressure: 1.0f32
+        ];
+        super::clipboard_window_send_event(window as *mut c_void, sel!(sendEvent:), event);
+        let wired_editor: *mut AnyObject = msg_send![search, currentEditor];
+        assert!(
+            wired_editor.is_null(),
+            "a press delivered to the window must end the search field's editing"
+        );
+        let wired_responder: *mut AnyObject = msg_send![window, firstResponder];
+        assert_eq!(
+            wired_responder, container,
+            "the window's press path must return the keyboard to the list"
+        );
+    }
+
     /// Option+V must recover when AppKit has hidden the panel but the intent flag stayed true.
     /// This constructs that exact stale state and invokes the same callback the event bridge uses.
     unsafe fn assert_shortcut_reopens_appkit_hidden_panel() {
@@ -1292,6 +1382,7 @@ pub(crate) fn smoke_runner() -> bool {
         assert_header_controls_are_live();
         assert_pin_button_reflects_state();
         assert_paste_handback_state_is_bounded();
+        assert_press_outside_search_field_ends_editing();
         assert_shortcut_reopens_appkit_hidden_panel();
         // A theme switch must repaint the picker in place without disturbing the drag surface or the
         // pin: the surface is the topmost content subview, and a refresh that rebuilt content on top of

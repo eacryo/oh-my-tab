@@ -125,3 +125,15 @@
   A1 smoke assertions (`OhMyTabClipboardDragSurface` topmost, `hitTest:` accept/reject) plus the existing
   `panel-drag.sh`; a real pointer drag over a blank top bar and a double-click reset are not asserted.
   Revisit trigger: the next `scripts/e2e/run-all.sh --include-focus` run.
+
+## clipboard-search-blur (2026-10-22)
+
+- **Round 1 — HIGH/HIGH/MEDIUM/MEDIUM — all four findings are in the untracked `liquid-glass-rs/` prototype.**
+  Round 1 reviewed the whole working tree (the task diff was the three clipboard files), and its findings all
+  belong to `liquid-glass-rs/`: `app.rs:60` (`CGDisplayBounds` FFI signature returns `CGRect` by value, not
+  through an out-pointer), `app.rs:325` (an over-released `nextDrawable`), `app.rs:154` (a drawing view never
+  attached to its window) and `compositor.rs:485` (a drawable copied into but never presented). That directory is
+  UNTRACKED (`git status: ?? liquid-glass-rs/`), so it is another task's work-in-progress and not part of this
+  change; its correctness is not this change's to assert or fix. Deferred on purpose, and stated in the round's
+  `--note` so the reviewer judges the deferral. Revisit trigger: when `liquid-glass-rs/` is brought into the
+  repository (its own review must decide those findings), or if any build starts linking it.

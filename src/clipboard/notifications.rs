@@ -864,6 +864,79 @@ extern "C" fn window_did_become_key(_self: *mut c_void, _cmd: Sel, _note: *mut c
     unsafe { super::set_picker_glass_inactive(false) };
 }
 
+/// The NSEventType values that mean a mouse button went down: left, right, other.
+pub(super) fn is_mouse_press_type(event_type: u64) -> bool {
+    matches!(event_type, 1 | 3 | 25)
+}
+
+/// Whether a press at `point` (window base coordinates) lands on the search field, where the click
+/// belongs to the field itself (caret placement, the drawn clear ×).
+unsafe fn search_field_contains_window_point(point: NSPoint) -> bool {
+    let field = match *SEARCH_FIELD.lock().unwrap() {
+        Some(field) => field.0,
+        None => return false,
+    };
+    if field.is_null() {
+        return false;
+    }
+    let local: NSPoint =
+        msg_send![field, convertPoint: point, fromView: std::ptr::null::<AnyObject>()];
+    let bounds: NSRect = msg_send![field, bounds];
+    rect_contains_point(bounds, local)
+}
+
+/// End the search field's editing session and give the keyboard back to the list.
+///
+/// AppKit resigns a text control's field editor only when another view takes first responder, and
+/// this panel is built from surfaces that never do it on a press: the rows are buttons, the blank
+/// regions belong to the drag handlers, the header and footer controls are buttons. Without this
+/// the field editor stayed in place after a click elsewhere -- the caret and the focused ring
+/// stayed on, and every later keystroke kept filtering the list instead of driving it.
+///
+/// The handoff is the same one ↓ performs: `makeFirstResponder:` ends the edit (AppKit posts
+/// NSControlTextDidEndEditingNotification, which restores the unfocused ring) and leaves the list
+/// container owning the keyboard commands. Returns whether an editing session was ended.
+pub(super) fn end_search_editing() -> bool {
+    unsafe {
+        let field = match *SEARCH_FIELD.lock().unwrap() {
+            Some(field) => field.0,
+            None => return false,
+        };
+        if field.is_null() {
+            return false;
+        }
+        // `currentEditor` is non-nil exactly while this field's field editor is active.
+        let editor: *mut AnyObject = msg_send![field, currentEditor];
+        if editor.is_null() {
+            return false;
+        }
+        let window = match *PICKER_WINDOW.lock().unwrap() {
+            Some(window) => window.0,
+            None => return false,
+        };
+        let Some(container) = picker_container_ptr() else {
+            return false;
+        };
+        let accepted: bool = msg_send![window, makeFirstResponder: container];
+        let responder: *mut AnyObject = msg_send![window, firstResponder];
+        let ended = accepted && responder == container;
+        if ended {
+            log_debug!("[clip] search editing ended by a press outside the field");
+        }
+        ended
+    }
+}
+
+/// A press in the picker window that misses the search field ends its editing session; a press on
+/// the field keeps it (the field owns caret placement and its drawn clear ×). See
+/// [`end_search_editing`] for why the panel has to end the edit itself.
+pub(super) fn end_search_editing_for_press(point: NSPoint) -> bool {
+    if unsafe { search_field_contains_window_point(point) } {
+        return false;
+    }
+    end_search_editing()
+}
+
 pub(super) extern "C" fn clipboard_window_send_event(
     _self: *mut c_void,
     _cmd: Sel,
@@ -871,43 +944,49 @@ pub(super) extern "C" fn clipboard_window_send_event(
 ) {
     unsafe {
         let window = _self as *mut AnyObject;
+        let etype: u64 = msg_send![event, type];
+        // A press that misses the search field ends the field's editing session: none of the
+        // panel's other surfaces becomes first responder on a press (the rows are buttons, the
+        // blank regions start a drag, the header/footer controls are buttons), so AppKit would
+        // leave the field editor in place -- the caret and the focused ring would stay, and the
+        // next keystroke would keep filtering instead of driving the list.
+        if is_mouse_press_type(etype) {
+            let point: NSPoint = msg_send![event, locationInWindow];
+            end_search_editing_for_press(point);
+        }
         // The options popover dismisses on any click outside its frame (the event still goes
         // through, so the clicked control behaves normally).
-        if crate::clipboard::filter_popover_open() {
-            let etype: u64 = msg_send![event, type];
-            // Left=1, Right=3, OtherMouse=4 mouse-down events.
-            if matches!(etype, 1 | 3 | 4) {
-                let point: NSPoint = msg_send![event, locationInWindow];
-                let inside = if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
-                    let frame: NSRect = msg_send![popover.0, frame];
-                    let superview: *mut AnyObject = msg_send![popover.0, superview];
-                    // The frame is in the (flipped) parent's coords; convert to window space.
-                    let in_window: NSRect = msg_send![
-                        superview,
-                        convertRect: frame,
-                        toView: std::ptr::null::<AnyObject>()
-                    ];
-                    crate::clipboard::rect_contains_point(in_window, point)
-                } else {
-                    false
-                };
-                // The options orb sits outside the popover. Keep its click for the orb's own
-                // toggle; dismissing here first would make the toggle reopen the menu.
-                let on_options_orb = if let Some(orb) = *PICKER_OPTIONS_ORB.lock().unwrap() {
-                    let frame: NSRect = msg_send![orb.0, frame];
-                    let superview: *mut AnyObject = msg_send![orb.0, superview];
-                    let in_window: NSRect = msg_send![
-                        superview,
-                        convertRect: frame,
-                        toView: std::ptr::null::<AnyObject>()
-                    ];
-                    crate::clipboard::rect_contains_point(in_window, point)
-                } else {
-                    false
-                };
-                if !inside && !on_options_orb {
-                    super::detail::dismiss_filter_popover();
-                }
+        if crate::clipboard::filter_popover_open() && is_mouse_press_type(etype) {
+            let point: NSPoint = msg_send![event, locationInWindow];
+            let inside = if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
+                let frame: NSRect = msg_send![popover.0, frame];
+                let superview: *mut AnyObject = msg_send![popover.0, superview];
+                // The frame is in the (flipped) parent's coords; convert to window space.
+                let in_window: NSRect = msg_send![
+                    superview,
+                    convertRect: frame,
+                    toView: std::ptr::null::<AnyObject>()
+                ];
+                crate::clipboard::rect_contains_point(in_window, point)
+            } else {
+                false
+            };
+            // The options orb sits outside the popover. Keep its click for the orb's own
+            // toggle; dismissing here first would make the toggle reopen the menu.
+            let on_options_orb = if let Some(orb) = *PICKER_OPTIONS_ORB.lock().unwrap() {
+                let frame: NSRect = msg_send![orb.0, frame];
+                let superview: *mut AnyObject = msg_send![orb.0, superview];
+                let in_window: NSRect = msg_send![
+                    superview,
+                    convertRect: frame,
+                    toView: std::ptr::null::<AnyObject>()
+                ];
+                crate::clipboard::rect_contains_point(in_window, point)
+            } else {
+                false
+            };
+            if !inside && !on_options_orb {
+                super::detail::dismiss_filter_popover();
             }
         }
         type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);

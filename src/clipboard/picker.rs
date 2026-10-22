@@ -494,6 +494,23 @@ pub(super) fn picker_shows_detail_in_pane() -> bool {
     *PICKER_PANE_MODE.lock().unwrap() == PickerPaneMode::Detail
 }
 
+/// A press anywhere in the detail pane ends the picker's search editing session. The pane is a
+/// separate, never-key window, so the picker's own `sendEvent:` does not see its clicks; without
+/// this the search field would stay in its editing state while the user works in the detail.
+extern "C" fn detail_window_send_event(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
+    unsafe {
+        let event_type: u64 = msg_send![event, type];
+        if super::is_mouse_press_type(event_type) {
+            super::end_search_editing();
+        }
+        type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
+        let mut sup =
+            ObjcSuper::for_defined_class(this as *mut c_void, detail_window_class_handle());
+        let send_event: SendEvent = std::mem::transmute(objc_msgSendSuper as *const ());
+        send_event(&mut sup, sel!(sendEvent:), event);
+    }
+}
+
 extern "C" fn detail_finish_close(this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     if detail_visible() {
         return;
@@ -980,6 +997,13 @@ fn detail_window_class_handle() -> StaticClass {
                 builder.add_method::<AnyObject, _>(
                     sel!(finishDetailClose:),
                     detail_finish_close
+                        as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                // A press inside the detail pane is a press outside the picker's search field: the
+                // pane is a second window, so the picker's sendEvent: never sees these events.
+                builder.add_method::<AnyObject, _>(
+                    sel!(sendEvent:),
+                    detail_window_send_event
                         as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
                 );
             },
