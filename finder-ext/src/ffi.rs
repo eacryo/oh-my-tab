@@ -45,3 +45,18 @@ pub(crate) fn log(line: &str) {
         NSLog(format, message);
     }
 }
+
+/// Log a fixed marker whose text is a compile-time literal.
+///
+/// Unlike log(), the message is the format string itself and carries no arguments, so the unified
+/// log shows it in the clear. A formatted message goes through %@, which the system redacts as
+/// <private> for a sandboxed extension -- measured while debugging the click path.
+pub(crate) fn log_static(marker: &'static str) {
+    unsafe {
+        extern "C" {
+            fn NSLog(format: *mut AnyObject, ...);
+        }
+        let format = nsstring(marker);
+        NSLog(format);
+    }
+}

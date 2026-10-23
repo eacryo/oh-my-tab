@@ -817,8 +817,11 @@ pub(super) unsafe fn build_finder_menu_page(
     let _: () = msg_send![finder_menu_view, addSubview: status_button];
     release_obj(status_button);
 
-    // Master switch: it owns whether any of the items below reach Finder's context menu.
+    // Master switch: it owns whether any of the items below reach Finder's context menu. It shares
+    // the "访达集成" card with the status row above, so it carries the card's internal divider —
+    // the same separator every other multi-row card draws above its second and later rows.
     let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
     record_settings_search_row(
         SettingsPageId::FinderMenu,
         canvas.last_row(),

@@ -141,10 +141,14 @@ fn trigger_for_kind(kind: usize) -> Trigger {
 
 unsafe extern "C" fn handle_menu_click(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
     guard::void("handleMenuClick", || unsafe {
+        // A literal format string is not redacted in the unified log, unlike a formatted one, so
+        // these two markers are readable without any entitlements.
+        ffi::log_static("[finder-ext] menu item clicked");
         let Some(template) = menu::template_for(sender) else {
+            ffi::log_static("[finder-ext] menu item had no click template");
             return;
         };
-        log("menu item clicked");
         state::send_click(template);
+        ffi::log_static("[finder-ext] click posted");
     });
 }

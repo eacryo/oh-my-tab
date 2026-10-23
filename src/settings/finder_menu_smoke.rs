@@ -45,6 +45,54 @@ unsafe fn row_does_not_overlap(control: *mut AnyObject) -> bool {
     beside || above || below
 }
 
+/// Whether a grouped card's internal divider exists between two rows.
+///
+/// The divider is a 1pt NSView spanning the card width (widgets::add_row_separator), so the check
+/// is geometric and orientation-agnostic: the line's y must fall between the two rows' label
+/// frames, whichever way the document is flipped. A card whose rows were laid out without a
+/// separator fails this even though every row itself is present.
+unsafe fn has_separator_between(
+    container: *mut AnyObject,
+    upper_row: *mut AnyObject,
+    lower_row: *mut AnyObject,
+    content_w: f64,
+) -> bool {
+    let (Some(upper), Some(lower)) = (
+        SettingsRow::label_for(upper_row),
+        SettingsRow::label_for(lower_row),
+    ) else {
+        return false;
+    };
+    let upper_frame: NSRect = msg_send![upper, frame];
+    let lower_frame: NSRect = msg_send![lower, frame];
+    let lo = upper_frame.origin.y.min(lower_frame.origin.y);
+    let hi = (upper_frame.origin.y + upper_frame.size.height)
+        .max(lower_frame.origin.y + lower_frame.size.height);
+    let subviews: *mut AnyObject = msg_send![container, subviews];
+    if subviews.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![subviews, count];
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        if view.is_null() {
+            continue;
+        }
+        let is_plain: bool = msg_send![view, isKindOfClass: objc2::class!(NSView)];
+        if !is_plain {
+            continue;
+        }
+        let frame: NSRect = msg_send![view, frame];
+        // Cards inset their dividers, so "full width" is a generous fraction of the document.
+        if frame.size.height > 1.5 || frame.size.width < content_w * 0.5 {
+            continue;
+        }
+        if frame.origin.y > lo && frame.origin.y < hi {
+            return true;
+        }
+    }
+    false
+}
 /// The value a select renders. The control keeps its text in a dedicated child label (so the arrow
 /// keeps its own column), not in the button title.
 unsafe fn select_value(select: *mut AnyObject) -> String {
@@ -119,6 +167,16 @@ pub(crate) fn run() -> bool {
             if !laid_out(container, ui.finder_menu_enabled) || !row_does_not_overlap(ui.finder_menu_enabled)
             {
                 log_info!("[smoke-finder-menu] master switch is missing or collides with its label");
+                ok = false;
+            }
+            // Both rows share the card, so a divider must sit between them.
+            let bounds: NSRect = msg_send![container, bounds];
+            let content_w = bounds.size.width;
+            if !has_separator_between(container, ui.finder_menu_status, ui.finder_menu_enabled, content_w)
+            {
+                log_info!(
+                    "[smoke-finder-menu] the Finder Integration card has no divider between its two rows"
+                );
                 ok = false;
             }
 

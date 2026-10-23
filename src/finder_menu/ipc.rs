@@ -289,9 +289,19 @@ fn handle_message(json: &str) {
             trigger,
             ..
         } => {
+            log_info!(
+                "[finder-menu] click received: action={action:?} trigger={trigger:?} paths={} instance_match={}",
+                paths.len(),
+                host_instance == host.instance
+            );
             if protocol_version != finder_protocol::PROTOCOL_VERSION
                 || host_bundle_id != host.bundle_id
             {
+                log_info!(
+                    "[finder-menu] dropped a click: protocol {} vs {} / host {host_bundle_id}",
+                    protocol_version,
+                    finder_protocol::PROTOCOL_VERSION
+                );
                 return;
             }
             if host_instance != host.instance {

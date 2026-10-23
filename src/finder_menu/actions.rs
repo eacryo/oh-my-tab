@@ -15,6 +15,12 @@ use crate::log_info;
 /// Run one action. Called on the main thread.
 pub(crate) fn execute(action: MenuAction, paths: Vec<String>, context: Context) {
     let config = CONFIG.read().unwrap().clone();
+    // The paths are the user's own file names: the count is enough to diagnose, and the log
+    // stays free of them.
+    log_info!(
+        "[finder-menu] executing {action:?} ({} target(s))",
+        paths.len()
+    );
     if !config.finder_menu.enabled {
         log_info!("[finder-menu] ignored a click while the menu is disabled");
         return;
