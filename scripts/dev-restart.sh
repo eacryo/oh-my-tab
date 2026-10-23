@@ -244,6 +244,12 @@ owned_pid=""
 owned_job=0
 owned_launch_attempted=0
 app_pid_start=""
+# Whether register_finder_extension restarted Finder in this run: the "Finder caches the extension"
+# note would then be describing something that has just been done.
+finder_restarted=0
+# The extension process of this appex seen before the rebuild (empty when none was running). Set
+# below, before clear_finder_extension_records, and read when deciding whether Finder needs a restart.
+finder_extension_before=""
 # Whether a successful finish should announce the stop. Only --check stops what it started.
 announce_stop=0
 run_failed=0
@@ -610,7 +616,130 @@ fi
 if [ ${#stopped_packaged_pids[@]} -gt 0 ]; then
     echo "stopped a running packaged install (pid ${stopped_packaged_pids[*]}) -- it shares the global shortcut"
 fi
+# Finder Sync extension: launchd hygiene, registration, and an honest report of whether the
+# extension can actually start.
+#
+# Registering the appex is not the same as the extension working, and on 2026-10-23 this script
+# reported `finder extension: enabled` while Finder failed to start it on every right click: a
+# deleted worktree had left a launchd service instance pinned to its appex path, and launchd kept
+# answering "will use existing" with that dead path. See scripts/lib/finder-extension.sh.
+#
+# Two different moments, because they answer different questions:
+#   - BEFORE the rebuild (`clear_finder_extension_records`): remove the launchd instances pinned to
+#     appex paths that no longer exist. They can never start again, and clearing them early also works
+#     from a worktree that has never assembled a bundle (`git worktree add` writes
+#     .agents/worktrees/<name>/, which has no dist/ until its first run). Nothing whose program still
+#     exists is touched: a live extension of another appex or another worktree is Finder's to run.
+#   - AFTER the rebuild (`register_finder_extension`): register the NEW appex and stop THIS appex's
+#     extension process, so the next Finder request starts the new one. Finder may have started the
+#     previous build while cargo was running; that process is gone by the time this runs.
+# Finder is restarted only when the extension of this appex is provably not running afterwards -- a
+# restart closes every Finder window -- or when --reload-finder-extension asks for one.
+
+# remove stale Finder extension launchd instances, then reap a leftover process of this appex.
+clear_finder_extension_records() {
+    local removed="" clear_status=0
+    # Stale records only: reaping the extension process belongs to register_finder_extension, after
+    # the new appex exists. A process stopped here is one Finder can start again while cargo runs.
+    removed="$(omt_finder_ext_clear_instances "")"
+    clear_status=$?
+    # The capture also holds the lines the cleanup reported for records it LEFT alone; both blocks
+    # must show what was decided, and neither should print an empty indented line when it decided
+    # nothing printable.
+    if [ "$clear_status" -eq 2 ]; then
+        echo "restart FAILED: a stale Finder extension launchd record could not be removed:"
+        printf '%s\n' "$removed" | sed '/^$/d; s/^/  /'
+        echo "hint: run: launchctl print gui/$(id -u) | grep FinderSync"
+        exit 1
+    fi
+    if [ "$clear_status" -eq 1 ]; then
+        echo "Finder extension: launchd records that could no longer start were cleared:"
+        printf '%s\n' "$removed" | sed '/^$/d; s/^/  /'
+    fi
+}
+
+# Register the appex this run just assembled, then make sure no older build of it is still running.
+#
+# Finder only offers a plugin it has discovered. What PlugInKit reports is reported as what it is --
+# an election, not a running extension -- because the 2026-10-23 incident had `+` for an extension
+# that could not start at all.
+register_finder_extension() {
+    [ -d "$dev_appex" ] || return 0
+    # LaunchServices has to know the containing app before PlugInKit will accept the nested bundle.
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -f "$dev_app" >/dev/null 2>&1 || true
+    /usr/bin/pluginkit -a "$dev_appex" >/dev/null 2>&1 || true
+    if ! /usr/bin/pluginkit -m -A -D -p com.apple.FinderSync -i "$dev_appex_bundle_id" 2>/dev/null \
+        | /usr/bin/grep -q "$dev_appex_bundle_id"; then
+        echo "warning: the Finder extension is not registered with PlugInKit"
+    fi
+    local state
+    state="$(/usr/bin/pluginkit -m -p com.apple.FinderSync -i "$dev_appex_bundle_id" 2>/dev/null | head -1)"
+    case "$state" in
+        +*|\!*) echo "finder extension: elected by PlugInKit ($dev_appex_bundle_id)" ;;
+        -*)
+            echo "finder extension: DISABLED by the user -- enable it in System Settings > General >"
+            echo "                 Login Items & Extensions > Finder Extensions"
+            ;;
+        *) echo "finder extension: not elected yet -- enable it in System Settings > General >"
+           echo "                 Login Items & Extensions > Finder Extensions" ;;
+    esac
+    local other
+    other="$(/usr/bin/pluginkit -m -p com.apple.FinderSync 2>/dev/null | /usr/bin/grep -v "$dev_appex_bundle_id" | /usr/bin/grep 'oh-my-tab' || true)"
+    if [ -n "$other" ]; then
+        echo "note: another oh-my-tab Finder extension is also registered:"
+        printf '%s\n' "$other" | /usr/bin/sed 's/^/      /'
+    fi
+    # A process of THIS appex started before the rebuild is running the previous build. Stopping it
+    # is what makes the next request start the new one; a process of any other appex is left alone.
+    local pid after
+    while IFS= read -r pid; do
+        [ -n "$pid" ] || continue
+        if omt_finder_ext_stop_process "$pid" "$dev_appex_binary"; then
+            echo "stopped the previous Finder extension process (pid $pid)"
+        else
+            echo "warning: the previous Finder extension process (pid $pid) could not be stopped"
+        fi
+    done <<EOF
+$(omt_finder_ext_own_pids "$dev_appex_binary")
+EOF
+    local before="$finder_extension_before"
+    after="$(omt_finder_ext_alive_pid "$dev_appex_binary")"
+    # An extension that is now running still shows the PREVIOUS menu model until Finder asks again,
+    # so --reload-finder-extension restarts Finder whatever the process state; the conditional
+    # restart below covers only the case where the extension provably cannot start.
+    if omt_finder_ext_should_restart_finder "$after" "$before" || [ "$reload_finder_extension" = "1" ]; then
+        /usr/bin/killall Finder 2>/dev/null || true
+        finder_restarted=1
+        echo "Finder restarted so it asks launchd for the Finder extension again"
+        local _
+        for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
+            after="$(omt_finder_ext_alive_pid "$dev_appex_binary")"
+            [ -n "$after" ] && break
+            sleep 0.2
+        done
+        if [ -z "$after" ]; then
+            echo "warning: Finder was restarted but the Finder extension still did not start; the"
+            echo "warning: extension menu stays empty. Diagnostics:"
+            echo "warning:   log show --last 5m --predicate 'eventMessage CONTAINS \"${dev_appex_bundle_id}\"'"
+        fi
+    fi
+    if [ -n "$after" ]; then
+        echo "finder extension: running (pid $after)"
+    else
+        echo "finder extension: not running -- Finder starts it on the first right click in a folder"
+    fi
+}
+
 sleep 0.3
+# The library the Finder extension steps are built on. Sourced here, after the old instance is gone
+# and before the rebuild, because the stale-record cleanup runs before it. Registration is a later
+# step: it must name the appex this run assembles, not the one it replaces.
+source "$repo_dir/scripts/lib/finder-extension.sh"
+# The extension process of this appex as it is now (a pre-rebuild build). Whether Finder needs a
+# restart is decided against it after the new appex is registered.
+finder_extension_before="$(omt_finder_ext_alive_pid "$dev_appex_binary")"
+clear_finder_extension_records
 
 # 每次都删除旧的开发版 .app,避免旧资源或旧 Info.plist 混入新包。
 # 若现有包是 release-dev.sh 产出的发布渠道包,先提示会被本地开发包覆盖(两者共用同一
@@ -966,60 +1095,15 @@ if ! /usr/bin/codesign --verify --deep --strict "$dev_app"; then
 fi
 fi
 
+# The Finder Sync extension. Registration names the appex this run just signed, so it can only happen
+# here: registering it earlier would register the build this run is replacing.
+register_finder_extension
+
 
 # 应用参数:`--` 之后的 argv 通过 open --args 原样交给应用(open 会把它后面的一切都
 # 当作被启动应用的参数)。
 # App arguments: the argv after `--` reaches the app through `open --args` (open treats
 # everything after --args as arguments for the opened application).
-# Finder Sync extension registration. Finder only offers a plugin it has discovered, so the
-# assembled .appex is registered on every rebuild. --reload-finder-extension restarts Finder (which
-# drops the cached extension process); the default only reports the state.
-register_finder_extension() {
-    [ -d "$dev_appex" ] || return 0
-    # Stop only processes running THIS bundle's executable: another worktree's build and the packaged
-    # install share the extension name, and killing by name would reach them too.
-    local pid exe
-    for pid in $(/usr/bin/pgrep -f 'oh-my-tab-finder-ext' 2>/dev/null || true); do
-        exe="$(/bin/ps -p "$pid" -o comm= 2>/dev/null || true)"
-        if [ "$exe" = "$dev_appex_binary" ]; then
-            /bin/kill "$pid" 2>/dev/null || true
-            echo "stopped the previous Finder extension process (pid $pid)"
-        fi
-    done
-    # LaunchServices has to know the containing app before PlugInKit will accept the nested bundle.
-    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
-        -f "$dev_app" >/dev/null 2>&1 || true
-    /usr/bin/pluginkit -a "$dev_appex" >/dev/null 2>&1 || true
-    if ! /usr/bin/pluginkit -m -A -D -p com.apple.FinderSync -i "$dev_appex_bundle_id" 2>/dev/null \
-        | /usr/bin/grep -q "$dev_appex_bundle_id"; then
-        echo "warning: the Finder extension is not registered with PlugInKit"
-    fi
-    local state
-    state="$(/usr/bin/pluginkit -m -p com.apple.FinderSync -i "$dev_appex_bundle_id" 2>/dev/null | head -1)"
-    case "$state" in
-        +*|\!*) echo "finder extension: enabled ($dev_appex_bundle_id)" ;;
-        -*)
-            echo "finder extension: DISABLED by the user -- enable it in System Settings > General >"
-            echo "                 Login Items & Extensions > Finder Extensions"
-            ;;
-        *) echo "finder extension: not elected yet -- enable it in System Settings > General >"
-           echo "                 Login Items & Extensions > Finder Extensions" ;;
-    esac
-    local other
-    other="$(/usr/bin/pluginkit -m -p com.apple.FinderSync 2>/dev/null | /usr/bin/grep -v "$dev_appex_bundle_id" | /usr/bin/grep 'oh-my-tab' || true)"
-    if [ -n "$other" ]; then
-        echo "note: another oh-my-tab Finder extension is also registered:"
-        printf '%s\n' "$other" | /usr/bin/sed 's/^/      /'
-    fi
-    if [ "$reload_finder_extension" = "1" ]; then
-        /usr/bin/killall Finder 2>/dev/null || true
-        echo "Finder restarted (--reload-finder-extension)"
-    else
-        echo "note: Finder caches the extension; pass --reload-finder-extension to restart Finder"
-    fi
-}
-
-register_finder_extension
 
 open_command=(/usr/bin/open -W "$dev_app")
 if [ "${#app_args[@]}" -gt 0 ]; then
@@ -1203,6 +1287,11 @@ for _ in 1 2 3 4 5; do
                 ;;
         esac
         echo "build-profile: $build_profile"
+        if [ "$finder_restarted" = "1" ]; then
+            # The restart already happened (see register_finder_extension); the process it produced
+            # is a separate question from what this block used to say.
+            echo "Finder was restarted for the Finder extension"
+        fi
         if [ "$check_mode" -eq 1 ]; then
             # --check owns this instance, so it reports what it actually established. Three outcomes,
             # decided once: the launch failed, it could not be verified, or it was verified.

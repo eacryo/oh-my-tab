@@ -43,6 +43,18 @@ scripts/dev-restart.sh
   stops anything, and waits up to `--lock-wait=<sec>` (default 900) before failing with exit 75. The claim
   covers the transaction only: **the app the script leaves running is not protected**, and the next run may
   replace it. `scripts/dev-lock-selftest.sh` checks the claim offline, including the cross-worktree case.
+- **A registered Finder extension is not a working one.** Finder starts the extension through launchd, and a
+  per-request launchd instance (`<appex bundle id>.<uuid>`) pinned to an appex path that no longer exists makes
+  every request fail while `pluginkit` still reports the extension as elected (`+`) — the menu is then silently
+  empty and nothing else complains. So `scripts/dev-restart.sh` removes exactly those dead-path instances before
+  rebuilding, stops the extension process of *its own* appex after registering the new bundle, restarts Finder
+  only when that appex has no extension running, and reports whether the extension process is actually up
+  instead of letting `+` stand for "works". Never boot the host app's own launchd instance
+  (`application.<host bundle id>.<pid>.<pid>`), and never stop another appex's extension: doing the former on
+  2026-10-23 killed the app's log writers and invalidated `--whose-instance`.
+  `scripts/finder-extension-selftest.sh` asserts both rules offline and against throwaway launchd services it
+  creates itself: it reads the real launchd list but passes an allowlist of exactly its own labels, so it never
+  boots out an instance it did not create.
 - **The claim protects the transaction, not the window — so prove the window is yours before drawing any
   conclusion from it.** Because the claim is released when the transaction ends, another worktree may
   legitimately replace the instance between this worktree's `restart ok` and this worktree's UI check; the

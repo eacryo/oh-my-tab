@@ -370,6 +370,28 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
 设置窗口，且该回调返回 NO，避免 AppKit 再执行一次通用的 reopen。直接再启动二进制路径不是这条路径：
 第二个进程会被单实例锁拒绝并退出，运行中的实例根本看不到它。
 
+## Finder 上下文菜单的扩展生命周期
+
+**注册了扩展 ≠ 扩展能跑（2026-10-23 实测）。** Finder 并不直接运行 appex：它让 launchd 启动一个
+每次请求独立的服务实例 `gui/<uid>/<appex bundle id>.<request uuid>`，而 launchd 会缓存这个实例的
+可执行路径。某个 worktree 跑过一次扩展，就会留下一个指向**它自己** appex 路径的实例；把这个
+worktree 删掉之后，之后的每次请求都重新 bootstrap 同一个 bundle id，launchd 回 "will use existing"
+并沿用那条死路径，接着报 `Missing executable detected`，spawn 直接失败。此时 PlugInKit 仍然显示
+扩展已勾选（`+`），系统设置里的开关也还是开着的，菜单却静默为空——只有 unified log 里留着证据。
+`pluginkit -a` 修不了这个问题：它只是新增一条记录，不会替换一条被钉住路径的实例。
+
+因此 `scripts/lib/finder-extension.sh`（由 `dev-restart.sh` 引入，由
+`scripts/finder-extension-selftest.sh` 自测）**只在 launchd 为该实例钉住的程序路径已经不存在、launchd 也没有
+为它报告任何活动进程、且状态不是 running 时**才移除它——这正是 Finder 自己无法恢复、也是事故唯一出现过的
+形态；程序仍在的实例一律保留，不管属于谁。自测通过一个可选的标签允许清单把移除收窄到自己创建的实例
+（真实 launchd 列表照样读取），因此不会动别的 App 的服务。
+注册完新签名的 appex 之后，脚本会停掉**自己 appex** 的扩展进程（cargo 期间 Finder 可能已经拉起了旧版本）；
+只有当这个 appex 完全没有扩展进程时才重启 Finder（重启会关掉所有窗口），或由
+`--reload-finder-extension` 显式要求。有两样东西永远不碰：宿主应用自己的 launchd 实例
+（`application.<host bundle id>.<pid>.<pid>`——bootout 它会让应用继续运行但日志 fd 已 unlink，
+且 `--whose-instance` 会变成 UNVERIFIED）和属于别的 appex 的扩展进程（打包版、其他 worktree）。
+脚本会直接报告扩展进程在不在，而不是让"已勾选"冒充"能用"。
+
 ## 构建与测试
 
 开发期间常规的启动方式是 `scripts/dev-restart.sh`。它构建开发版 `.app`，**只在输入（构建产物、拷入包的内容、签名身份）变化时**重新组装并用 **Apple 签发**的身份签名（`CODESIGN_IDENTITY` 可覆盖；签名不带安全时间戳，所以本地构建不依赖 Apple 的时间戳服务），随后交给用户级 `launchd` 启动。**只接受 Apple 签发与自签名两种身份，ad-hoc 一律拒绝**；Apple 身份签名失败时**构建失败**（除非显式 `--allow-signing-fallback` 要求退回自签名）。签名身份稳定，辅助功能/屏幕录制授权与钥匙串项的授权才能跨重建保留；输入没变就复用现有包，重启不会重置这些授权。

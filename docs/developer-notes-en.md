@@ -531,6 +531,31 @@ window) is opt-in as `--reload-finder-extension`. A dev and a release extension 
 time put two copies of the menu in Finder; the script reports that rather than changing the user's
 choice.
 
+**A registered extension is not a working one (measured 2026-10-23).** Finder does not run the
+appex itself: it asks launchd for a per-request service instance named
+`gui/<uid>/<appex bundle id>.<request uuid>`, and launchd caches that instance's executable path.
+A worktree that ran the extension once leaves such an instance pointing at *its* appex; delete the
+worktree and every later request re-bootstraps the same bundle id, gets "will use existing" with the
+dead path, then `Missing executable detected`, and the spawn fails. PlugInKit still reports the
+extension as elected (`+`), System Settings still shows the switch on, and the menu is silently
+empty — nothing but the unified log says otherwise. `pluginkit -a` cannot repair that: it adds a
+record, it does not replace a pinned instance.
+
+`scripts/lib/finder-extension.sh` (sourced by `dev-restart.sh`, self-tested by
+`scripts/finder-extension-selftest.sh`) removes a per-request instance ***only* when the program path
+launchd has pinned for it no longer exists on disk, launchd does not report a live process for it, and
+its state is not `running`** (the self-test narrows removal to the labels it created through an optional
+allowlist, so the production rule can be exercised without touching another app's services) — the one state Finder cannot recover from, and
+the shape the incident had. An instance whose program still exists is left running, whoever owns it.
+What the script does do, after registering the freshly signed appex, is stop the extension process
+of *its own* appex (Finder may have started the previous build while cargo ran). Finder is restarted
+only when that appex then has no extension process at all — a restart closes every Finder window —
+or when `--reload-finder-extension` asks for one. Two things are never touched: the host app's own
+launchd instance (`application.<host bundle id>.<pid>.<pid>`; booting it out leaves the app running
+with unlinked log fds, and `--whose-instance` then reports UNVERIFIED) and an extension process of a
+different appex (the packaged install, another worktree). The script reports whether the extension
+process is up instead of letting "elected" stand for "works".
+
 **Terminal adapters.** Terminals differ in how they accept a directory: a running Terminal.app or
 iTerm2 opens a folder URL, while Ghostty/WezTerm/kitty/Alacritty need a fresh instance with their own
 argument. `finder_menu/terminals.rs` owns one adapter per known bundle id; `open_arguments` is pure and

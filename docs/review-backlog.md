@@ -147,3 +147,16 @@
   change; its correctness is not this change's to assert or fix. Deferred on purpose, and stated in the round's
   `--note` so the reviewer judges the deferral. Revisit trigger: when `liquid-glass-rs/` is brought into the
   repository (its own review must decide those findings), or if any build starts linking it.
+
+## finder-ext-launchd-stale (2026-10-24)
+
+**第 4/5 轮遗留项已在第 6 轮修复，条目保留作记录。**
+
+- **MEDIUM — `scripts/finder-extension-selftest.sh` 会按生产规则清理用户域中的其它陈旧服务。**
+  已修：`omt_finder_ext_clear_instances` 新增可选参数 `only_labels`（按整行精确匹配的允许清单）。
+  生产调用方不传（行为不变，仍然清理所有钉在已消失路径上的实例）；自测只传自己创建的三个标签，
+  清单外的实例被报告为 `skipped` 而不会被 bootout。**自测仍然读取真实的 launchd 列表**——平台格式、
+  `pipefail`、`state` 这些覆盖点一个不少——只有"移除的决定"被收窄，因此不存在"隔离性 ↔ 真实路径覆盖"的取舍。
+  新断言：`an empty allowlist allows every label` / `a listed label is allowed` /
+  `an unlisted label is refused` / `a prefix of a listed label is refused` /
+  `a listed label plus a suffix is refused` / `every launchd instance outside the allowlist is still registered`。
