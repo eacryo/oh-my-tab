@@ -86,21 +86,23 @@ const SIDEBAR_SEARCH_TO_NAV: f64 = 16.0;
 /// `.field-shell { padding: 0 var(--sp-2); gap: var(--sp-2) }`.
 const SIDEBAR_SEARCH_PAD_X: f64 = 8.0;
 const SIDEBAR_SEARCH_GAP_X: f64 = 8.0;
+/// How far an `NSTextFieldCell` inset its text from the field's own left edge.
+///
+/// The cell adds this before it draws the line, so a field placed `GAP_X` after the magnifier drew
+/// its placeholder `GAP_X + this` away from it (measured on screen: 20.5pt instead of 8). The box is
+/// moved left by it so the TEXT, not the invisible cell margin, keeps the gap.
+const SIDEBAR_SEARCH_TEXT_INSET: f64 = 12.5;
 /// `.field-shell > svg { width: 14px; height: 14px }`.
 const SIDEBAR_SEARCH_GLYPH: f64 = 14.0;
 /// The clear button's diameter (the mock's `kbd` chip is 18pt; the round clear chip is 16pt).
 const SIDEBAR_SEARCH_CLEAR_SIZE: f64 = 16.0;
-/// The mock's trailing `⌘F` key hint (`.field-shell kbd`): 18pt tall, 4pt side padding, a 1pt
-/// border, a 4pt radius and 10pt monospace ink. `⌘F` focuses this field (see
-/// `settings_window_perform_key_equivalent`), so the hint states a binding the app really has
-/// rather than decorating the shell.
+/// The trailing `⌘F` hint: bare 10pt monospace ink on the shell's midline, 4pt of side padding
+/// inside its own box, and no chip around it — a bordered box inside the field's shell read as a
+/// second control. `⌘F` focuses this field (see `settings_window_perform_key_equivalent`), so the
+/// hint states a binding the app really has rather than decorating the shell.
 const SIDEBAR_SEARCH_HINT_H: f64 = 18.0;
 const SIDEBAR_SEARCH_HINT_PAD_X: f64 = 4.0;
-const SIDEBAR_SEARCH_HINT_BORDER_W: f64 = 1.0;
 const SIDEBAR_SEARCH_HINT_FONT: f64 = 10.0;
-/// `.field-shell kbd { border-radius: 4px }`. Size-specific, not `radius-control` (8pt), which
-/// would read as a pill on an 18pt chip; see the legend-chip rule in the style doc §6.
-const SIDEBAR_SEARCH_HINT_RADIUS: f64 = 4.0;
 /// The narrowest the hint's chip can be, so a one-glyph hint is square rather than a sliver.
 const SIDEBAR_SEARCH_HINT_MIN_W: f64 = SIDEBAR_SEARCH_HINT_H;
 
@@ -108,9 +110,8 @@ const SIDEBAR_SEARCH_HINT_MIN_W: f64 = SIDEBAR_SEARCH_HINT_H;
 /// reserves the same space in both states and the text never shifts when a query appears. The
 /// hint's own width follows its label, which the caller measures.
 fn search_trailing_slot_width(hint_label_width: f64) -> f64 {
-    let hint_w = (hint_label_width
-        + (SIDEBAR_SEARCH_HINT_PAD_X + SIDEBAR_SEARCH_HINT_BORDER_W) * 2.0)
-        .max(SIDEBAR_SEARCH_HINT_MIN_W);
+    let hint_w =
+        (hint_label_width + SIDEBAR_SEARCH_HINT_PAD_X * 2.0).max(SIDEBAR_SEARCH_HINT_MIN_W);
     SIDEBAR_SEARCH_CLEAR_SIZE.max(hint_w)
 }
 /// The hint's text, from the same key-cap vocabulary the rest of the settings UI draws keycaps
@@ -123,23 +124,26 @@ const SIDEBAR_SEARCH_CLEAR_GAP: f64 = SIDEBAR_SEARCH_GAP_X;
 /// `border: 1px solid transparent`, so focusing never moves the text.
 const SIDEBAR_SEARCH_BORDER_W: f64 = 1.0;
 
-/// The trailing `⌘F` hint's frame inside `shell`: `.field-shell kbd` sits at the shell's right
-/// inner edge, vertically centred, with `--sp-1` (4pt) of padding on each side of its label and a
-/// 1pt border. The chip is `flex: none`, so its width follows the label.
+/// The trailing `⌘F` hint's frame inside `shell`: a box exactly one text line tall, centred on
+/// the shell's midline and sitting at the shell's right inner edge, with 4pt of padding around its
+/// label and no border. Its width follows the label.
 ///
-/// Pure so the hint's slot is assertable without a live window; the label width is measured by the
-/// caller (AppKit needs a live font to measure text), so it is a parameter here.
-fn search_hint_frame(shell: NSRect, label_width: f64) -> NSRect {
+/// The box IS the line: a taller box does not centre its text (`NSTextField` lays a single line
+/// out from the box's top edge, and the cell has no `setVerticallyCentered:` on this SDK), which is
+/// what drew the chord high inside the field.
+///
+/// Pure so the hint's slot is assertable without a live window; the label width and line height are
+/// measured by the caller (AppKit needs a live font to measure text), so both are parameters here.
+fn search_hint_frame(shell: NSRect, label_width: f64, line_h: f64) -> NSRect {
     let chip_w = search_trailing_slot_width(label_width);
-    // The border belongs to the box: the hint's frame is where the shell's padding ends.
+    // The hint's frame is where the shell's padding ends.
     let trailing_edge =
         shell.origin.x + shell.size.width - SIDEBAR_SEARCH_BORDER_W - SIDEBAR_SEARCH_PAD_X;
+    let line_h = line_h.max(1.0);
+    let mid_y = shell.origin.y + shell.size.height / 2.0;
     NSRect::new(
-        NSPoint::new(
-            trailing_edge - chip_w,
-            shell.origin.y + (shell.size.height - SIDEBAR_SEARCH_HINT_H) / 2.0,
-        ),
-        NSSize::new(chip_w, SIDEBAR_SEARCH_HINT_H),
+        NSPoint::new(trailing_edge - chip_w, mid_y - line_h / 2.0),
+        NSSize::new(chip_w, line_h),
     )
 }
 
@@ -179,7 +183,8 @@ fn search_shell_frames(
     } else {
         None
     };
-    let input_x = glyph.origin.x + SIDEBAR_SEARCH_GLYPH + SIDEBAR_SEARCH_GAP_X;
+    let input_x =
+        glyph.origin.x + SIDEBAR_SEARCH_GLYPH + SIDEBAR_SEARCH_GAP_X - SIDEBAR_SEARCH_TEXT_INSET;
     // The field ends before the trailing slot: the `⌘F` hint while the query is empty, the clear
     // chip once there is one, both at the shell's right inner edge. The slot is sized to the wider
     // of the two and keeps the shell's own 8pt gap to the text, so a query appearing never shifts
@@ -604,6 +609,23 @@ pub(super) unsafe fn build_settings_search_field(
     // whichever of the hint and the clear chip is wider, and the field's width follows from it.
     let hint_label_w =
         unsafe { measure_monospace_text_width(SIDEBAR_SEARCH_HINT, SIDEBAR_SEARCH_HINT_FONT) };
+    // The hint's box is one line tall, so the box has to be the height the font actually draws:
+    // `NSTextField` lays a single line out from its box's top edge, so a taller box draws it high.
+    let hint_line_h = unsafe {
+        let font: *mut AnyObject = msg_send![
+            class!(NSFont),
+            monospacedSystemFontOfSize: SIDEBAR_SEARCH_HINT_FONT,
+            weight: crate::theme::FONT_WEIGHT_REGULAR
+        ];
+        if font.is_null() {
+            SIDEBAR_SEARCH_HINT_FONT
+        } else {
+            // The layout manager's own line height, not the glyph box: the box has to be as tall as
+            // the line AppKit lays out, or the single line sits at the box's top and reads high.
+            let line_h: f64 = msg_send![font, defaultLineHeightForFont];
+            line_h.max(SIDEBAR_SEARCH_HINT_FONT)
+        }
+    };
     let (glyph_frame, input_frame, _) = search_shell_frames(shell_frame, false, hint_label_w);
     let glyph = make_search_glyph(NSRect::new(
         NSPoint::new(
@@ -661,7 +683,7 @@ pub(super) unsafe fn build_settings_search_field(
 
     // The mock's trailing `⌘F` hint, in the slot the clear chip takes over once a query exists:
     // the shell shows exactly one of the two, so the row never carries both.
-    let hint_frame = search_hint_frame(shell_frame, hint_label_w);
+    let hint_frame = search_hint_frame(shell_frame, hint_label_w, hint_line_h);
     let hint: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let hint: *mut AnyObject = msg_send![hint, initWithFrame: NSRect::new(
         NSPoint::new(
@@ -684,17 +706,8 @@ pub(super) unsafe fn build_settings_search_field(
     let _: () = msg_send![hint, setFont: hint_font];
     let hint_ink = crate::ffi::hex_to_ns_color(settings_palette().muted_text);
     let _: () = msg_send![hint, setTextColor: hint_ink];
-    let _: () = msg_send![hint, setWantsLayer: true];
-    let hint_layer: *mut AnyObject = msg_send![hint, layer];
-    if !hint_layer.is_null() {
-        let _: () = msg_send![hint_layer, setCornerRadius: SIDEBAR_SEARCH_HINT_RADIUS];
-        let _: () = msg_send![hint_layer, setMasksToBounds: true];
-        let _: () = msg_send![hint_layer, setBorderWidth: SIDEBAR_SEARCH_HINT_BORDER_W];
-        crate::ffi::layer_set_border(
-            hint_layer,
-            crate::ffi::hex_to_cg_color(settings_palette().card_border),
-        );
-    }
+    // No chip around the chord: a bordered box inside the field's own shell read as a second
+    // control, so the hint is bare ink centred on the shell's midline.
     let _: () = msg_send![hint, setAutoresizingMask: 8u64 | 2u64]; // top-anchored, left-anchored
     let _: () = msg_send![shell, addSubview: hint];
     release_obj(hint);
@@ -2297,16 +2310,19 @@ mod search_tests {
         rect.origin.y + rect.size.height / 2.0
     }
 
-    /// The mock's trailing `⌘F` hint: `flex: none`, 18pt tall, at the shell's right inner edge and
-    /// on the shell's midline. Its width follows its label, and it never reaches the text.
+    /// The trailing `⌘F` hint: bare ink in a box exactly one line tall, at the shell's right inner
+    /// edge and centred on the shell's midline. Its width follows its label, and it never reaches
+    /// the text. The height is the measured line box, not a fixed chip size: a taller box drew the
+    /// chord high inside the field (measured after the border was removed).
     #[test]
     fn the_trailing_hint_sits_in_the_slot_the_clear_chip_takes_over() {
         let shell = sidebar_search_shell_frame(sidebar_box(600.0));
-        let hint = search_hint_frame(shell, 16.0);
+        let line_h = 12.0;
+        let hint = search_hint_frame(shell, 16.0, line_h);
         let (_, _, clear) = search_shell_frames(shell, true, 16.0);
         let clear = clear.expect("a query shows the clear chip");
 
-        assert_eq!(hint.size.height, 18.0);
+        assert_eq!(hint.size.height, line_h);
         assert_eq!(
             hint.origin.x + hint.size.width,
             clear.origin.x + clear.size.width
@@ -2317,12 +2333,12 @@ mod search_tests {
         );
         // A label measured as zero still yields a square chip, and the field reserves at least the
         // clear chip's width either way, so the text never moves.
-        assert_eq!(search_hint_frame(shell, 0.0).size.width, 18.0);
+        assert_eq!(search_hint_frame(shell, 0.0, line_h).size.width, 18.0);
         assert_eq!(search_trailing_slot_width(0.0), 18.0);
         // A wider label widens both its chip and the reserved slot by the same amount, so the chip
         // can never grow left into the text.
         let wide_label = 40.0;
-        let wide = search_hint_frame(shell, wide_label);
+        let wide = search_hint_frame(shell, wide_label, line_h);
         let (_, input_wide, _) = search_shell_frames(shell, false, wide_label);
         assert!(wide.size.width > hint.size.width);
         assert_eq!(search_trailing_slot_width(wide_label), wide.size.width);
