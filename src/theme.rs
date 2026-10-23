@@ -51,6 +51,13 @@ pub(crate) const FONT_CONTROL: f64 = 14.0;
 pub(crate) const FONT_SIDEBAR_TITLE: f64 = 20.0;
 pub(crate) const FONT_PAGE_TITLE: f64 = 26.0;
 pub(crate) const LINE_HEIGHT_CAPTION_RATIO: f64 = 1.35;
+
+/// A settings row's description line (`.setting-desc` in the mock).
+///
+/// It shares the caption's 12pt face but not its line height: the mock sets 1.45 for these
+/// multi-line rows, while the caption role's 1.35 is tuned for single-line labels elsewhere.
+pub(crate) const FONT_SETTING_DESC: f64 = FONT_CAPTION;
+pub(crate) const LINE_HEIGHT_SETTING_DESC_RATIO: f64 = 1.45;
 pub(crate) const LINE_HEIGHT_BODY_RATIO: f64 = 1.4;
 pub(crate) const LINE_HEIGHT_TITLE_RATIO: f64 = 1.2;
 pub(crate) const fn line_height(size: f64, ratio: f64) -> f64 {
@@ -97,8 +104,13 @@ mod line_height_tests {
 }
 pub(crate) const FONT_WEIGHT_REGULAR: f64 = 0.0;
 pub(crate) const FONT_WEIGHT_MEDIUM: f64 = 0.23;
-/// The mock's setting labels use CSS weight 520, between SF's medium and semibold faces.
-pub(crate) const FONT_WEIGHT_SETTING_LABEL: f64 = 0.25;
+/// Settings row labels (`.setting-label` in the mock: CSS weight 520).
+///
+/// 520 sits just above SF's medium face, and at this UI's 14pt label size the semibold-leaning
+/// 0.25 drew labels visibly heavier than the rest of the row (measured stroke width 3.5-4.1px
+/// against 2.5px for the description beside them). SF medium (0.23) is the nearest face to 520
+/// that keeps the hierarchy by size and colour rather than by weight.
+pub(crate) const FONT_WEIGHT_SETTING_LABEL: f64 = 0.23;
 pub(crate) const FONT_WEIGHT_SEMIBOLD: f64 = 0.3;
 /// Visual match for the page title on the native Chinese fallback face; semibold still looked too heavy.
 pub(crate) const FONT_WEIGHT_PAGE_TITLE: f64 = 0.23;
@@ -393,6 +405,10 @@ pub(crate) struct UiPalette {
     pub(crate) secondary_text: u32,
     pub(crate) sidebar_text: u32,
     pub(crate) muted_text: u32,
+    /// A settings row's description line: the mock's `--text-3`. It is deliberately NOT
+    /// `muted_text`: that token is shared with version strings and subtitles, while the row
+    /// description has its own value in the sheet (light #706D68, dark #8B8B93).
+    pub(crate) setting_desc_text: u32,
     /// The custom scrollbar knob. A translucent neutral that must stay on the visible side of the
     /// surface in both modes: dark over a light panel, light over a dark one. A fixed black knob
     /// (as this once was) is invisible in dark mode.
@@ -484,6 +500,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             secondary_text: 0xC7C7CCFF,
             sidebar_text: 0x9E9EA6FF,
             muted_text: 0x9E9EA6FF,
+            setting_desc_text: 0x8B8B93FF,
             scroll_indicator: 0xFFFFFF59,
             disabled_text: 0x7C7C84FF,
             success_text: 0x30D158FF,
@@ -540,6 +557,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             secondary_text: 0x4F4C48FF,
             sidebar_text: 0x6B6862FF,
             muted_text: 0x6B6862FF,
+            setting_desc_text: 0x706D68FF,
             scroll_indicator: 0x00000059,
             // Two steps darker than the sheet's disabled grey: #9b9ba2 measured 2.34:1 and
             // #93909a 2.65:1 on the #ececec page -- both under the 3.5:1 hard floor every text

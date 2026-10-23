@@ -2208,7 +2208,7 @@ mod search_tests {
         results_panel_height, results_section_gap, search_hint_frame, search_shell_frames,
         search_trailing_slot_width, set_search_options_for_last_row, settings_search_index,
         sidebar_first_nav_row_top, sidebar_search_shell_frame, ResultRow, ResultSection,
-        SearchEntry, SIDEBAR_NAV_ROW_H,
+        SearchEntry, SIDEBAR_NAV_ROW_H, SIDEBAR_SEARCH_TEXT_INSET,
     };
     use crate::settings::SettingsLayout;
 
@@ -2241,7 +2241,13 @@ mod search_tests {
             glyph.origin.y + glyph.size.height / 2.0,
             shell.origin.y + shell.size.height / 2.0
         );
-        assert_eq!(input.origin.x, glyph.origin.x + 14.0 + 8.0);
+        // The FIELD starts inside the gap: it is placed `TEXT_INSET` early so that the placeholder,
+        // which the cell draws inset from the field's own edge, still sits one `GAP_X` after the
+        // magnifier. Asserting the field's raw origin keeps the two halves of that trade-off pinned.
+        assert_eq!(
+            input.origin.x,
+            glyph.origin.x + 14.0 + 8.0 - SIDEBAR_SEARCH_TEXT_INSET
+        );
         // Without a query the text runs to the shell's padding; with one the clear chip takes the
         // trailing inset.
         assert_eq!(clear, None);

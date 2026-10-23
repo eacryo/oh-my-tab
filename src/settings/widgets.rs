@@ -154,6 +154,9 @@ pub(super) enum SettingsTextRole {
     Secondary,
     Sidebar,
     Muted,
+    /// A settings row's description line (the mock's `.setting-desc`, `--text-3`). Distinct from
+    /// `Muted`, which is the shared subtitle/version-string ink.
+    SettingDesc,
     Disabled,
     /// The selected sidebar item's ink on its flat nav tint (`nav_active_bg`); the mock's
     /// `--nav-active-ink`, which replaces the accent-as-text role that used to sit there.
@@ -174,6 +177,7 @@ pub(super) fn settings_text_color(role: SettingsTextRole) -> *mut AnyObject {
         SettingsTextRole::Secondary => palette.secondary_text,
         SettingsTextRole::Sidebar => palette.sidebar_text,
         SettingsTextRole::Muted => palette.muted_text,
+        SettingsTextRole::SettingDesc => palette.setting_desc_text,
         SettingsTextRole::Disabled => palette.disabled_text,
         SettingsTextRole::NavActive => palette.nav_active_ink,
         SettingsTextRole::Link => palette.link_text,
@@ -3444,8 +3448,14 @@ pub(super) unsafe fn add_described_row(
         // Ellipsize instead of silently clipping text that overflows the fixed-height row.
         let _: () = msg_send![title_cell, setTruncatesLastVisibleLine: true];
     }
-    let title_font: *mut AnyObject =
-        msg_send![class!(NSFont), messageFontOfSize: crate::theme::FONT_CONTROL];
+    // Every settings row's title carries the design's one weight (§11: `.setting-label` is 520).
+    // `messageFontOfSize:` is the system's emphasis face and drew these rows heavier than the rows
+    // built by the other two constructors.
+    let title_font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: crate::theme::FONT_CONTROL,
+        weight: crate::theme::FONT_WEIGHT_SETTING_LABEL
+    ];
     let _: () = msg_send![title_label, setFont: title_font];
     crate::ffi::set_text_field_line_height(
         title_label,
@@ -3506,8 +3516,11 @@ pub(super) unsafe fn add_row_text_block(
     let _: () = msg_send![title_label, setSelectable: false];
     let _: () = msg_send![title_label, setUsesSingleLineMode: true];
     let _: () = msg_send![title_label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-    let title_font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CONTROL];
+    let title_font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: crate::theme::FONT_CONTROL,
+        weight: crate::theme::FONT_WEIGHT_SETTING_LABEL
+    ];
     let _: () = msg_send![title_label, setFont: title_font];
     apply_settings_text_role(title_label, SettingsTextRole::Primary);
     let _: () = msg_send![title_label, setAutoresizingMask: 4u64];
@@ -3538,10 +3551,24 @@ pub(super) unsafe fn add_row_text_block(
         if msg_send![caption_label, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
             let _: () = msg_send![caption_label, setMaximumNumberOfLines: 0isize];
         }
+        // The row description keeps the caption face but takes the sheet's own line height and ink
+        // (mock `.setting-desc`: 12px over 1.45, colour `--text-3`). Without the line height,
+        // AppKit's default packed these multi-line descriptions tighter than the design.
         let caption_font: *mut AnyObject =
-            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_SETTING_DESC];
         let _: () = msg_send![caption_label, setFont: caption_font];
-        apply_settings_text_role(caption_label, SettingsTextRole::Muted);
+        // Colour BEFORE the line height: `set_text_field_line_height` rebuilds the field's value as
+        // an attributed string and takes the font and colour from the cell at that moment. Setting
+        // the role afterwards was silently discarded -- the description rendered in the previous
+        // ink (measured (70,70,70) instead of the sheet's `--text-3` (112,109,104)).
+        apply_settings_text_role(caption_label, SettingsTextRole::SettingDesc);
+        crate::ffi::set_text_field_line_height(
+            caption_label,
+            crate::theme::line_height(
+                crate::theme::FONT_SETTING_DESC,
+                crate::theme::LINE_HEIGHT_SETTING_DESC_RATIO,
+            ),
+        );
         let _: () = msg_send![caption_label, setAutoresizingMask: 4u64];
         let _: () = msg_send![parent, addSubview: caption_label];
         release_obj(caption_label);
@@ -3576,7 +3603,7 @@ pub(super) unsafe fn wrapped_caption_height(text: &str, width: f64) -> f64 {
         return 0.0;
     }
     let font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_SETTING_DESC];
     let ns = make_nsstring(text);
     let len: usize = msg_send![ns, length];
     let storage: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
@@ -3590,6 +3617,33 @@ pub(super) unsafe fn wrapped_caption_height(text: &str, width: f64) -> f64 {
     let _: () =
         msg_send![storage, addAttribute: font_key, value: font, range: NSRange::new(0, len)];
     CFRelease(font_key as *const c_void);
+    // The drawn label carries the row description's line height, so the probe must too: measuring
+    // with the packed default under-reports every wrapped line by the extra leading and the row
+    // would clip its own last line.
+    let paragraph: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), new];
+    let _: () = msg_send![
+        paragraph,
+        setMinimumLineHeight: crate::theme::line_height(
+            crate::theme::FONT_SETTING_DESC,
+            crate::theme::LINE_HEIGHT_SETTING_DESC_RATIO,
+        )
+    ];
+    let _: () = msg_send![
+        paragraph,
+        setMaximumLineHeight: crate::theme::line_height(
+            crate::theme::FONT_SETTING_DESC,
+            crate::theme::LINE_HEIGHT_SETTING_DESC_RATIO,
+        )
+    ];
+    let paragraph_key = make_nsstring("NSParagraphStyle");
+    let _: () = msg_send![
+        storage,
+        addAttribute: paragraph_key,
+        value: paragraph,
+        range: NSRange::new(0, len)
+    ];
+    CFRelease(paragraph_key as *const c_void);
+    release_obj(paragraph);
     let laid_out: NSRect = msg_send![
         storage,
         boundingRectWithSize: NSSize::new(width.max(1.0), 1.0e4),
@@ -3713,8 +3767,13 @@ pub(super) unsafe fn add_tall_row(
     let _: () = msg_send![label, setAlignment: -1isize]; // NSTextAlignmentNatural
     let label_color = settings_text_color(SettingsTextRole::Primary);
     let _: () = msg_send![label, setTextColor: label_color];
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), messageFontOfSize: crate::theme::FONT_CONTROL];
+    // Same weight as every other settings row title (§11 `.setting-label` = 520); the system's
+    // emphasis face made the popup rows read heavier than the switch rows beside them.
+    let font: *mut AnyObject = msg_send![
+        class!(NSFont),
+        systemFontOfSize: crate::theme::FONT_CONTROL,
+        weight: crate::theme::FONT_WEIGHT_SETTING_LABEL
+    ];
     let _: () = msg_send![label, setFont: font];
     let _: () = msg_send![label, setUsesSingleLineMode: false];
     let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
