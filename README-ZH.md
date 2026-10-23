@@ -149,6 +149,7 @@ scripts/install-unbundled.sh status    # 另有 start / stop / restart / launche
 - **启动与退出**：登录时自动启动，只有崩溃后才会被重新拉起，因此从菜单选择“退出”后会保持退出状态。需要重新打开时，在访达或聚焦搜索中打开 `/Applications`（不可写时为 `~/Applications`）里的 **Oh My Tab**。它是一个带应用图标的 shell 脚本（`Oh My Tab.command`），不是应用：它会启动 launchd 服务，并关闭自己的终端窗口。在终端中运行 `scripts/install-unbundled.sh start` 效果相同。
 - **权限**：为 `~/.local/bin/oh-my-tab` 授予辅助功能和屏幕录制权限，然后运行 `scripts/install-unbundled.sh restart`。可执行文件优先使用 Developer ID 身份签名，其次是 `oh-my-tab-sign`（见[发布流程](docs/releasing.md)），都没有时使用 ad-hoc 签名；可用 `--identity` 指定。使用 ad-hoc 签名时，每次重新构建后 macOS 都会再次请求权限。
 - **与 `.app` 的区别**：没有 Sparkle 自动更新（拉取代码后重新运行 `install`）；设置中的“开机启动”不起作用（由 launchd 服务负责）；跳过引导页；版本号为空。配置文件和日志与 `.app` 相同。如果已安装的 `.app` 正在运行，launchd 服务启动的实例会直接正常退出，不会与之冲突。
+- **Finder 右键菜单：此模式下未验证。** Finder Sync 扩展位于 `.app` 的 `Contents/PlugIns` 中，且主程序只有在进程拥有 bundle id 时才会启动扩展桥接，因此这里预期没有右键菜单。目前还没有测试覆盖这一组合。
 
 ## 日志
 

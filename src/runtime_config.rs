@@ -58,6 +58,9 @@ struct ChangeFlags {
     // toggling the icon must not re-register the app with the system, and a login-item change must
     // not restyle the status item.
     menu_bar_icon: bool,
+    // Any Finder Menu field changed. The extension renders a model the main app pushes, so it has
+    // to be broadcast; an open Settings page has to follow in place like any other section.
+    finder_menu: bool,
 }
 
 /// Whether an already-open settings window has to re-read the config in place after this change.
@@ -77,6 +80,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.keystroke_display
         || flags.mouse
         || flags.key_bindings
+        || flags.finder_menu
 }
 
 /// Appearance fields that, when they change, require rebuilding the settings content: the window's
@@ -144,6 +148,9 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.windows.panel_minimize_enabled != new.windows.panel_minimize_enabled
             || old.windows.panel_hide_enabled != new.windows.panel_hide_enabled
             || old.windows.panel_quit_enabled != new.windows.panel_quit_enabled,
+        // Not tied to `startup`: the main app's startup path already owns the first broadcast, and
+        // the comparison is what makes an edit, a reload and a defaults restore reach the extension.
+        finder_menu: old.finder_menu != new.finder_menu,
     }
 }
 
@@ -380,6 +387,13 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     if flags.updates {
         crate::updater::set_automatic_checks(new.updates.automatically_check);
         crate::updater::set_automatic_downloads(new.updates.automatically_download);
+    }
+    // The menu model carries final titles, so a locale change has to rebuild it even though no
+    // finder_menu field changed: the extension would otherwise keep the previous language.
+    if flags.finder_menu || flags.locale {
+        // The extension renders the model the main app owns: push the rebuilt one so the next
+        // context menu reflects the new settings, without waiting for a restart.
+        crate::finder_menu::broadcast_model();
     }
 
     // Keep the status-bar service toggles current for changes made in Settings or by reload.
@@ -669,6 +683,52 @@ mod tests {
                 && !flags.thumbnails
                 && !flags.clipboard_enabled
         );
+    }
+
+    /// Every Finder Menu field is detected on its own: the extension only learns about a change
+    /// when the model is broadcast, and an open Settings page must follow in place.
+    #[test]
+    fn finder_menu_changes_broadcast_the_model_and_sync_the_open_page() {
+        let old = Config::default();
+        let mutate = |f: fn(&mut Config)| {
+            let mut new = old.clone();
+            f(&mut new);
+            new
+        };
+        // The default copy_path is on, so turning it off is the change.
+        let copy_path_off = mutate(|cfg| cfg.finder_menu.copy_path = false);
+        let cases = [
+            ("enabled", mutate(|cfg| cfg.finder_menu.enabled = true)),
+            (
+                "layout",
+                mutate(|cfg| cfg.finder_menu.layout = "flat".into()),
+            ),
+            ("copy path", copy_path_off),
+            (
+                "file types",
+                mutate(|cfg| {
+                    cfg.finder_menu
+                        .new_file_types
+                        .retain(|value| value != "json")
+                }),
+            ),
+            (
+                "terminals",
+                mutate(|cfg| {
+                    cfg.finder_menu.terminals =
+                        vec!["com.apple.Terminal".into(), "com.googlecode.iterm2".into()]
+                }),
+            ),
+        ];
+        for (label, new) in cases {
+            let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+            assert!(flags.finder_menu, "{label} must be detected");
+            assert!(
+                needs_in_place_control_sync(&flags),
+                "{label} must resync the open settings page"
+            );
+        }
+        assert!(!change_flags(&old, &old.clone(), ConfigChangeSource::Settings).finder_menu);
     }
 
     #[test]

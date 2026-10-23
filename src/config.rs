@@ -28,6 +28,8 @@ pub struct Config {
     pub quick_actions: QuickActionsSection,
     pub key_bindings: KeyBindingsSection,
     pub keystroke_display: KeystrokeDisplaySection,
+    /// Finder context-menu items, rendered by the Finder Sync app extension.
+    pub finder_menu: FinderMenuSection,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -447,6 +449,24 @@ impl Config {
         }
     }
 
+    /// Drop everything in `[finder_menu]` this build cannot honour, keeping the rest.
+    ///
+    /// Called on every load and on every runtime merge: an unknown layout falls back to the default
+    /// and unknown list entries are dropped, so a hand-edited file cannot produce a menu the
+    /// settings page cannot represent. A well-formed TOML file can still name a layout this build
+    /// does not implement, which is why this cannot live in validation alone.
+    pub(crate) fn normalize_finder_menu(&mut self) {
+        if !FINDER_MENU_LAYOUTS.contains(&self.finder_menu.layout.as_str()) {
+            self.finder_menu.layout = FinderMenuSection::default().layout;
+        }
+        self.finder_menu
+            .new_file_types
+            .retain(|extension| FINDER_MENU_FILE_TYPES.contains(&extension.as_str()));
+        self.finder_menu
+            .terminals
+            .retain(|bundle_id| FINDER_MENU_TERMINALS.contains(&bundle_id.as_str()));
+    }
+
     /// Seed `key_bindings` from the legacy sections and from the retired group switches. Called once
     /// per load, right after deserialization and before validation.
     ///
@@ -787,6 +807,58 @@ impl Default for UpdatesSection {
     }
 }
 
+/// Finder context-menu settings. The menu itself is rendered by the Finder Sync app extension in a
+/// sandboxed process; this section is the main app's own description of what the menu contains, and
+/// it is what every menu model is built from.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct FinderMenuSection {
+    /// Master switch. Off by default: the items intrude on every context menu.
+    pub enabled: bool,
+    /// How the items are arranged: one of FINDER_MENU_LAYOUTS.
+    pub layout: String,
+    /// Show "Copy Path" for the selected item or the current folder.
+    pub copy_path: bool,
+    /// File extensions offered under "New File", in menu order.
+    pub new_file_types: Vec<String>,
+    /// Bundle ids of the terminal applications offered under "Open in Terminal", in menu order.
+    pub terminals: Vec<String>,
+}
+
+impl Default for FinderMenuSection {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            layout: FINDER_MENU_DEFAULT_LAYOUT.to_string(),
+            copy_path: true,
+            new_file_types: FINDER_MENU_FILE_TYPES
+                .iter()
+                .map(|extension| extension.to_string())
+                .collect(),
+            terminals: vec![FINDER_MENU_TERMINALS[0].to_string()],
+        }
+    }
+}
+
+/// The three menu arrangements the settings page offers.
+pub(crate) const FINDER_MENU_LAYOUTS: [&str; 3] = ["flat", "grouped", "submenu"];
+pub(crate) const FINDER_MENU_DEFAULT_LAYOUT: &str = "grouped";
+
+/// The file types the menu can create. A type is an extension without the dot.
+pub(crate) const FINDER_MENU_FILE_TYPES: [&str; 3] = ["md", "txt", "json"];
+
+/// Known terminal applications, in menu order. Only the installed ones are offered; this list is
+/// the identity table the config is validated against, so an unknown bundle id in a hand-written
+/// file is dropped instead of producing a dead menu item.
+pub(crate) const FINDER_MENU_TERMINALS: [&str; 7] = [
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "com.mitchellh.ghostty",
+    "dev.warp.Warp-Stable",
+    "com.github.wez.wezterm",
+    "net.kovidgoyal.kitty",
+    "org.alacritty",
+];
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ClipboardSection {
@@ -1827,6 +1899,10 @@ impl Config {
         // updates (bool field needs no validation; Sparkle applies it at runtime).
         self.updates = other.updates;
 
+        // finder menu: booleans are always valid; the layout and the two lists are normalized.
+        self.finder_menu = other.finder_menu;
+        self.normalize_finder_menu();
+
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
         // show_source_app / persist / move_used_to_top / delete_after_paste /
@@ -2311,6 +2387,10 @@ pub(crate) fn parse_config_content(
     // may be taken over from the legacy sections. The two retired group switches are still accepted
     // here so an interim file migrates into the master switch instead of losing its state.
     loaded.seed_key_bindings(actual.get("key_bindings"));
+    // `[finder_menu]`'s layout and its two id lists are semantics, not types: normalizing them on
+    // every load keeps the runtime, the settings controls and the persisted file in agreement even
+    // when nothing else failed validation (merge_valid only runs on an error).
+    loaded.normalize_finder_menu();
     errors.extend(loaded.validate());
     let mut config = if !errors.is_empty() {
         // Any validation error means the repaired snapshot on disk differs from what was loaded --
@@ -4258,6 +4338,34 @@ acceleration = 41.0
         assert!(!errs.is_empty());
         assert_eq!(cfg.appearance.theme, Config::default().appearance.theme);
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
+    }
+
+    /// The Finder menu's layout and its two id lists are normalized on every load, not only when
+    /// some other field failed validation: a well-formed file naming an unknown layout or an
+    /// unknown terminal must not reach the runtime.
+    #[test]
+    fn load_normalizes_finder_menu_layout_and_lists() {
+        let content = r#"
+[finder_menu]
+enabled = true
+layout = "typo"
+copy_path = false
+new_file_types = ["md", "exe"]
+terminals = ["com.mitchellh.ghostty", "com.example.unknown"]
+"#;
+        let (config, errors, _) = parse_config_content(content).expect("config parses");
+        assert!(
+            errors.is_empty(),
+            "a semantic repair is not a type error: {errors:?}"
+        );
+        assert_eq!(config.finder_menu.layout, FINDER_MENU_DEFAULT_LAYOUT);
+        assert_eq!(config.finder_menu.new_file_types, vec!["md".to_string()]);
+        assert_eq!(
+            config.finder_menu.terminals,
+            vec!["com.mitchellh.ghostty".to_string()]
+        );
+        assert!(config.finder_menu.enabled);
+        assert!(!config.finder_menu.copy_path);
     }
 
     #[test]

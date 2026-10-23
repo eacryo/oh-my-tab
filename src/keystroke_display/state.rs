@@ -1292,7 +1292,13 @@ mod tests {
             state.apply(down(keycode, 0, "a"), DisplayMode::All, now);
         }
         assert_eq!(state.badges().len(), 42);
-        assert!(state.badges().iter().all(|badge| badge.text == "a"));
+        // The fixture's glyph for keycode 12 (Q) is upper-cased, like every letter keycap; the
+        // remaining keycodes keep the unicode the fixture was given.
+        assert!(state
+            .badges()
+            .iter()
+            .enumerate()
+            .all(|(index, badge)| badge.text == if index == 12 { "A" } else { "a" }));
     }
 
     #[test]

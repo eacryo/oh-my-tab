@@ -233,6 +233,24 @@ require_accepted_submission() {
 # earlier --staple (or --push) is left alone. --staple and --push share this so they cannot
 # disagree about what "stapled" means.
 staple_staged_app() {
+  # The nested Finder extension is its own bundle: deep verification proves its signature, but not
+  # that it still carries the sandbox entitlement Finder requires, nor that it belongs to the same
+  # team the notary expects for nested code.
+  APPEX="$STAGED_APP/Contents/PlugIns/Oh-My-Tab-Finder.appex"
+  if [ ! -d "$APPEX" ]; then
+    echo "error: the staged app has no Finder extension at $APPEX" >&2
+    exit 1
+  fi
+  if ! codesign -d --entitlements - "$APPEX" 2>&1 | grep -q 'app-sandbox'; then
+    echo "error: the staged Finder extension lost its sandbox entitlement" >&2
+    exit 1
+  fi
+  APP_TEAM="$(codesign --display --verbose=4 "$STAGED_APP" 2>&1 | awk -F= '$1 == "TeamIdentifier" { print $2; exit }')"
+  APPEX_TEAM="$(codesign --display --verbose=4 "$APPEX" 2>&1 | awk -F= '$1 == "TeamIdentifier" { print $2; exit }')"
+  if [ -z "$APP_TEAM" ] || [ "$APPEX_TEAM" != "$APP_TEAM" ]; then
+    echo "error: the Finder extension is signed by team '$APPEX_TEAM', the app by '$APP_TEAM'" >&2
+    exit 1
+  fi
   if ! codesign --verify --deep --strict "$STAGED_APP"; then
     echo "error: staged app signature verification failed" >&2
     exit 1

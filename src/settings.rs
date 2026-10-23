@@ -76,7 +76,7 @@ const TEXT_SIZE_DEFAULT: i64 = 15;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
 const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
-pub(super) const SETTINGS_PAGE_COUNT: usize = 7;
+pub(super) const SETTINGS_PAGE_COUNT: usize = 8;
 /// A page's identity, independent of its position. `SETTINGS_PAGES` holds the sidebar order and
 /// pairs each identity with its name; every control array is keyed by this identity, so a reorder
 /// cannot leave a hand-written index order pointing at the wrong control.
@@ -88,6 +88,7 @@ pub(crate) enum SettingsPageId {
     Clipboard,
     KeyBindings,
     KeystrokeDisplay,
+    FinderMenu,
     About,
 }
 
@@ -102,6 +103,7 @@ impl SettingsPageId {
             SettingsPageId::Clipboard => "settings.sidebar_clipboard",
             SettingsPageId::KeyBindings => "settings.sidebar_key_bindings",
             SettingsPageId::KeystrokeDisplay => "settings.sidebar_keystroke_display",
+            SettingsPageId::FinderMenu => "settings.sidebar_finder_menu",
             SettingsPageId::About => "settings.sidebar_about",
         }
     }
@@ -147,6 +149,10 @@ pub(crate) const SETTINGS_PAGES: [SettingsPageSpec; SETTINGS_PAGE_COUNT] = [
         name: "keystroke-display",
     },
     SettingsPageSpec {
+        id: SettingsPageId::FinderMenu,
+        name: "finder-menu",
+    },
+    SettingsPageSpec {
         id: SettingsPageId::About,
         name: "about",
     },
@@ -177,6 +183,7 @@ const fn same_page(a: SettingsPageId, b: SettingsPageId) -> bool {
                 SettingsPageId::KeystrokeDisplay,
                 SettingsPageId::KeystrokeDisplay
             )
+            | (SettingsPageId::FinderMenu, SettingsPageId::FinderMenu)
             | (SettingsPageId::About, SettingsPageId::About)
     )
 }
@@ -260,6 +267,15 @@ pub(super) const SETTINGS_MOUSE_PAGE_INDEX: usize = page_index_const(SettingsPag
 pub(super) const SETTINGS_KEY_BINDINGS_PAGE_INDEX: usize =
     page_index_const(SettingsPageId::KeyBindings);
 pub(super) const SETTINGS_ABOUT_PAGE_INDEX: usize = page_index_const(SettingsPageId::About);
+
+/// The Finder Menu page's read-only status line for the extension's System Settings state.
+pub(super) fn finder_menu_status_text(enabled: bool) -> String {
+    t(if enabled {
+        "settings.finder_menu.status_enabled"
+    } else {
+        "settings.finder_menu.status_disabled"
+    })
+}
 
 /// Recording stage.
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -530,6 +546,14 @@ pub(super) struct SettingsUi {
     /// The About page's keychain-access row: its status label and its "grant access" button.
     keychain_access_status: *mut AnyObject,
     keychain_access_button: *mut AnyObject,
+    // Finder Menu page. The status line is read-only; the two switch lists mirror the config's
+    // vec-backed fields (file types and terminal apps) in their identity-table order.
+    finder_menu_status: *mut AnyObject,
+    finder_menu_enabled: *mut AnyObject,
+    finder_menu_layout: *mut AnyObject,
+    finder_menu_new_file_switches: Vec<*mut AnyObject>,
+    finder_menu_terminal_switches: Vec<*mut AnyObject>,
+    finder_menu_copy_path: *mut AnyObject,
 }
 
 impl SettingsUi {
@@ -731,9 +755,15 @@ static SELECTED_DEVICE: Mutex<Option<Option<crate::mouse::device::DeviceKey>>> =
 #[allow(dead_code)]
 static AUTO_SWITCH_DEVICE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
+/// Run the Finder Menu page smoke (`--smoke-finder-menu`).
+pub(crate) fn finder_menu_page_smoke_runner() -> bool {
+    finder_menu_smoke::run()
+}
+
 pub(crate) mod bindings;
 pub(crate) mod components;
 mod dispatch;
+mod finder_menu_smoke;
 pub(crate) mod mapping;
 mod page_builder;
 pub(crate) mod page_canvas;
@@ -786,10 +816,11 @@ pub(crate) use dispatch::{
 };
 pub(crate) use window::{
     close_settings_from_switcher, e2e_presented_page, invalidate_settings_window,
-    refresh_permission_ui_if_visible, refresh_system_appearance, reopen_for_app_activation,
-    settings_collapsible_row_smoke_runner, settings_layout_smoke_runner,
-    settings_mouse_profile_callback_smoke_runner, settings_state_sync_smoke_runner,
-    settings_vertical_zoom_smoke_runner, settings_window_is_visible,
+    refresh_finder_menu_status_if_visible, refresh_permission_ui_if_visible,
+    refresh_system_appearance, reopen_for_app_activation, settings_collapsible_row_smoke_runner,
+    settings_layout_smoke_runner, settings_mouse_profile_callback_smoke_runner,
+    settings_state_sync_smoke_runner, settings_vertical_zoom_smoke_runner,
+    settings_window_is_visible,
 };
 
 fn parse_f64(s: &str) -> Result<f64, ()> {
@@ -1236,6 +1267,17 @@ pub(crate) extern "C" fn handle_open_github(_self: *mut c_void, _cmd: Sel, _send
     unsafe { open_external_url("https://github.com/eacryo/oh-my-tab") }
 }
 
+/// Open the System Settings pane where the Finder extension is enabled (the Finder Menu page's
+/// status row). Finder Sync is a system-managed extension, so the app can open the pane but cannot
+/// turn it on itself.
+pub(crate) extern "C" fn handle_open_finder_extension_management(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    crate::finder_menu::open_extension_management();
+}
+
 /// Log field-level changes submitted from Settings without recording clipboard contents.
 fn log_config_changes(old: &Config, new: &Config) {
     macro_rules! changed {
@@ -1529,6 +1571,32 @@ fn log_config_changes(old: &Config, new: &Config) {
         "clipboard.pin_follow_selection",
         old.clipboard.pin_follow_selection,
         new.clipboard.pin_follow_selection
+    );
+
+    changed!(
+        "finder_menu.enabled",
+        old.finder_menu.enabled,
+        new.finder_menu.enabled
+    );
+    changed!(
+        "finder_menu.layout",
+        old.finder_menu.layout,
+        new.finder_menu.layout
+    );
+    changed!(
+        "finder_menu.copy_path",
+        old.finder_menu.copy_path,
+        new.finder_menu.copy_path
+    );
+    changed!(
+        "finder_menu.new_file_types",
+        old.finder_menu.new_file_types,
+        new.finder_menu.new_file_types
+    );
+    changed!(
+        "finder_menu.terminals",
+        old.finder_menu.terminals,
+        new.finder_menu.terminals
     );
 
     changed!("mouse.enabled", old.mouse.enabled, new.mouse.enabled);
@@ -1987,6 +2055,9 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             };
             let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
             update_clipboard_controls_enabled(ui);
+            // Finder Menu page: the status line is read-only state from System Settings, and every
+            // switch mirrors the config's vec-backed fields (membership, not order).
+            fill_finder_menu_controls(ui, cfg);
             bindings::render_binding_rows(ui, cfg);
             bindings::update_binding_controls_enabled(ui);
         });
@@ -2389,6 +2460,7 @@ mod tests {
                 SettingsPageId::KeystrokeDisplay,
                 "settings.sidebar_keystroke_display",
             ),
+            (SettingsPageId::FinderMenu, "settings.sidebar_finder_menu"),
             (SettingsPageId::About, "settings.sidebar_about"),
         ];
         assert_eq!(
@@ -2669,6 +2741,31 @@ mod tests {
             .output()
             .expect("failed to spawn app");
         assert!(out.status.success(), "vertical zoom smoke failed: {out:?}");
+    }
+
+    /// The Finder Menu page's own A1 check. Separate from the all-pages layout smoke because that
+    /// runner stops on an earlier, pre-existing clipboard assertion (docs/review-backlog.md entry
+    /// 41) and would never reach any page's own assertions.
+    #[test]
+    #[ignore]
+    fn finder_menu_page_smoke() {
+        let app = settings_smoke_app_binary();
+        let out = std::process::Command::new(&app)
+            .arg("--smoke-finder-menu")
+            .output()
+            .expect("failed to spawn app");
+        assert!(
+            out.status.success(),
+            "finder menu page smoke failed (exit {:?})\nstderr:\n{}\nstdout tail:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr),
+            String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .rev()
+                .take(20)
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
     }
 
     #[test]

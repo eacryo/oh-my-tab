@@ -441,7 +441,7 @@ const ANSI_KEY_GLYPHS: &[(u16, &str)] = &[
 #[cfg(test)]
 mod tests {
     use super::{
-        ansi_key_glyph, fallback_to_ascii_then_ansi, is_printable, modifier_cells,
+        ansi_key_glyph, fallback_to_ascii_then_ansi, is_printable, key_cap_text, modifier_cells,
         modifier_event_cells, named_key, resolve_layout_glyph, MODIFIER_MASK,
     };
     use crate::event_tap::keyboard;

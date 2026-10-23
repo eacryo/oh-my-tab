@@ -751,6 +751,248 @@ pub(super) unsafe fn build_keystroke_display_page(
     content_bottom
 }
 
+/// Build the Finder Menu page and return its final card bottom.
+pub(super) unsafe fn build_finder_menu_page(
+    context: &SettingsPageBuildContext,
+    finder_menu_view: *mut AnyObject,
+    finder_menu_doc_h: f64,
+    ui: &mut SettingsUi,
+) -> f64 {
+    let content_w = context.content_w;
+    let layout = context.layout;
+    let target = context.target;
+    let label_x = layout.label_x;
+    let label_w = layout.label_w;
+    let ctrl_w = layout.control_w;
+    let ctrl_x = layout.control_x;
+    let row_h = layout.row_h;
+    let described_row_h = layout.described_row_h;
+    begin_settings_search_page();
+    let mut canvas = PageCanvas::new(
+        finder_menu_view,
+        content_w,
+        layout,
+        &t("settings.sidebar_finder_menu"),
+        finder_menu_doc_h,
+        context.page_frame.size.height,
+    );
+
+    // The status row reports the extension's System Settings state. The app cannot switch a Finder
+    // Sync extension on itself, so the row pairs the read-only value with the button that opens the
+    // pane where the user can.
+    let status_action_gap = 8.0;
+    let status_w = ctrl_w - ROW_ACTION_BTN_W - status_action_gap;
+    let status_y = canvas.next_row(described_row_h);
+    let status_value = SettingsControl::value_label(
+        ctrl_x,
+        status_y,
+        status_w,
+        row_h,
+        &super::finder_menu_status_text(crate::finder_menu::extension_enabled()),
+    );
+    let _: () = msg_send![status_value, setAlignment: 1isize];
+    record_settings_search_row(
+        SettingsPageId::FinderMenu,
+        canvas.last_row(),
+        &t("settings.finder_menu.row_status"),
+        Some(&t("settings.finder_menu.desc_status")),
+    );
+    ui.finder_menu_status = SettingsRow::plain(
+        finder_menu_view,
+        label_x,
+        status_y,
+        label_w,
+        described_row_h,
+        &t("settings.finder_menu.row_status"),
+        status_value,
+    );
+    let status_button = row_action_button(
+        ctrl_x,
+        ctrl_w,
+        status_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
+        &t("settings.finder_menu.open_extension_settings"),
+        target,
+        sel!(handleOpenFinderExtensionManagement:),
+    );
+    let _: () = msg_send![finder_menu_view, addSubview: status_button];
+    release_obj(status_button);
+
+    // Master switch: it owns whether any of the items below reach Finder's context menu.
+    let y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::FinderMenu,
+        canvas.last_row(),
+        &t("settings.finder_menu.row_enabled"),
+        Some(&t("settings.finder_menu.desc_enabled")),
+    );
+    ui.finder_menu_enabled = SettingsRow::described(
+        finder_menu_view,
+        label_x,
+        y,
+        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
+        described_row_h,
+        &t("settings.finder_menu.row_enabled"),
+        &t("settings.finder_menu.desc_enabled"),
+        SettingsControl::switch(
+            ctrl_x + ctrl_w,
+            y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
+            row_h,
+            false,
+        ),
+    );
+    bind_control(target, ui.finder_menu_enabled);
+    canvas.card(&t("settings.finder_menu.header_integration"));
+    set_settings_search_section(&t("settings.finder_menu.header_integration"));
+
+    // Arrangement popup: index order is FINDER_MENU_LAYOUTS.
+    canvas.next_section();
+    let layout_labels = [
+        t("settings.finder_menu.layout_flat"),
+        t("settings.finder_menu.layout_grouped"),
+        t("settings.finder_menu.layout_submenu"),
+    ];
+    let layout_refs: Vec<&str> = layout_labels.iter().map(|s| s.as_str()).collect();
+    let layout_metrics = SettingsSelect::metrics();
+    let y = canvas.next_row(layout_metrics.row_h);
+    record_settings_search_row(
+        SettingsPageId::FinderMenu,
+        canvas.last_row(),
+        &t("settings.finder_menu.row_layout"),
+        Some(&t("settings.finder_menu.desc_layout")),
+    );
+    record_settings_search_options(&layout_refs);
+    ui.finder_menu_layout = SettingsRow::tall_with_height(
+        finder_menu_view,
+        label_x,
+        y,
+        label_w,
+        layout_metrics.row_h,
+        &t("settings.finder_menu.row_layout"),
+        SettingsControl::popup(
+            ctrl_x,
+            y + (layout_metrics.row_h - layout_metrics.control_h) / 2.0,
+            ctrl_w,
+            layout_metrics.control_h,
+            &layout_refs,
+            0,
+        ),
+    )
+    .1;
+    bind_control(target, ui.finder_menu_layout);
+    canvas.card(&t("settings.finder_menu.header_layout"));
+    set_settings_search_section(&t("settings.finder_menu.header_layout"));
+
+    // "New File": one switch per extension the menu can create, in FINDER_MENU_FILE_TYPES order.
+    canvas.next_section();
+    let new_file_keys = [
+        "settings.finder_menu.new_file_md",
+        "settings.finder_menu.new_file_txt",
+        "settings.finder_menu.new_file_json",
+    ];
+    let mut new_file_switches = Vec::with_capacity(crate::config::FINDER_MENU_FILE_TYPES.len());
+    for (index, key) in new_file_keys.iter().enumerate() {
+        let y = canvas.next_row(described_row_h);
+        if index > 0 {
+            SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
+        }
+        record_settings_search_row(SettingsPageId::FinderMenu, canvas.last_row(), &t(key), None);
+        let switch = SettingsRow::tall_before_control(
+            finder_menu_view,
+            label_x,
+            y,
+            ctrl_x,
+            super::SETTINGS_CONTROL_LABEL_GAP,
+            &t(key),
+            SettingsControl::switch(
+                ctrl_x + ctrl_w,
+                y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
+                row_h,
+                false,
+            ),
+        )
+        .1;
+        bind_control(target, switch);
+        new_file_switches.push(switch);
+    }
+    ui.finder_menu_new_file_switches = new_file_switches;
+    canvas.card(&t("settings.finder_menu.header_new_file"));
+    set_settings_search_section(&t("settings.finder_menu.header_new_file"));
+
+    // "Open in Terminal": one switch per known terminal, in finder_menu::terminals() order. A row
+    // whose app is not installed is frozen with the shared "not installed" tooltip.
+    canvas.next_section();
+    let mut terminal_switches = Vec::with_capacity(crate::finder_menu::terminals().len());
+    for (index, spec) in crate::finder_menu::terminals().iter().enumerate() {
+        let y = canvas.next_row(described_row_h);
+        if index > 0 {
+            SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
+        }
+        // The terminal product name is data, not UI chrome, so it is not translated.
+        record_settings_search_row(
+            SettingsPageId::FinderMenu,
+            canvas.last_row(),
+            spec.name,
+            Some(&t("settings.finder_menu.header_open_in_terminal")),
+        );
+        let switch = SettingsRow::tall_before_control(
+            finder_menu_view,
+            label_x,
+            y,
+            ctrl_x,
+            super::SETTINGS_CONTROL_LABEL_GAP,
+            spec.name,
+            SettingsControl::switch(
+                ctrl_x + ctrl_w,
+                y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
+                row_h,
+                false,
+            ),
+        )
+        .1;
+        bind_control(target, switch);
+        terminal_switches.push(switch);
+    }
+    ui.finder_menu_terminal_switches = terminal_switches;
+    // Settle the master-switch freeze and the per-terminal installed gate now, so the page is
+    // already honest before the open-path fill runs.
+    update_finder_menu_controls_enabled(ui);
+    canvas.card(&t("settings.finder_menu.header_open_in_terminal"));
+    set_settings_search_section(&t("settings.finder_menu.header_open_in_terminal"));
+
+    // "Copy path" is the one non-creation item this page owns.
+    canvas.next_section();
+    let y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::FinderMenu,
+        canvas.last_row(),
+        &t("settings.finder_menu.row_copy_path"),
+        Some(&t("settings.finder_menu.desc_copy_path")),
+    );
+    ui.finder_menu_copy_path = SettingsRow::tall_before_control(
+        finder_menu_view,
+        label_x,
+        y,
+        ctrl_x,
+        super::SETTINGS_CONTROL_LABEL_GAP,
+        &t("settings.finder_menu.row_copy_path"),
+        SettingsControl::switch(
+            ctrl_x + ctrl_w,
+            y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
+            row_h,
+            false,
+        ),
+    )
+    .1;
+    bind_control(target, ui.finder_menu_copy_path);
+    canvas.card(&t("settings.finder_menu.header_menu_items"));
+    set_settings_search_section(&t("settings.finder_menu.header_menu_items"));
+
+    sweep_unindexed_rows(&canvas, SettingsPageId::FinderMenu);
+    let content_bottom = canvas.finish();
+    ui.page_canvases[settings_page_index(SettingsPageId::FinderMenu)] = canvas;
+    content_bottom
+}
+
 /// The keystroke panel cap slider range, in whole percent. Shared with dispatch.rs so the
 /// range is stated once.
 pub(super) fn max_extent_slider_min() -> i64 {
