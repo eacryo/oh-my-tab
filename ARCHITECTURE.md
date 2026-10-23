@@ -32,8 +32,8 @@ src/
 ├── event_monitor.rs             # switcher shortcut matching (Cmd/Opt/Ctrl+Tab) over event_tap
 ├── event_tap.rs                 # shared CGEventTap leaf: types, FFI, semantic constants, start helper
 ├── ffi.rs                       # CF/CG declarations, pointer wrappers, NSString, color/layer helpers
-├── finder_menu.rs               # Finder context menu root: config→model, extension IPC, click actions
-│   ├── finder_menu/             # (see "Finder context menu" below)
+├── finder_menu/                 # Finder context menu, directory module only (see below)
+│   ├── mod.rs                   # root: start/shutdown/broadcast_model/terminals/extension status
 ├── glass.rs                     # shared rounded material backdrop for passive floating panels
 ├── hash.rs                      # the one FNV-1a 64 implementation
 ├── i18n.rs                      # t()/tf()/t_count(), locale tables, language switching
@@ -212,7 +212,8 @@ clipboard/
   `components.rs` the semantic `SettingsSection`/`SettingsCard`/`SettingsRow`/`SettingsControl`/`SettingsButton`
   family; `widgets.rs` the concrete control classes; `select.rs` the custom select; `tooltip.rs` the
   disabled-setting hint; `dispatch.rs` the control-event dispatch and dependent enable/refresh;
-  `mapping.rs` the mouse-mapping rows and side-button recorder; `bindings.rs` the key-bindings page.
+  `mapping.rs` the mouse-mapping rows and side-button recorder; `bindings.rs` the key-bindings page;
+  `finder_menu_smoke.rs` the Finder Menu page's own A1 GUI smoke.
 - `restore.rs` is restore/reset, `portability.rs` is config import/export, `i18n`/`theme` reloads invalidate the
   cached window through `settings.rs`.
 - Configuration is loaded **per field**: an invalid value falls back individually without discarding valid
@@ -225,15 +226,15 @@ clipboard/
 
 ## Finder context menu
 
-`finder_menu.rs` is the root of the Finder right-click menu. The menu itself is drawn by a
+`finder_menu/` is the root of the Finder right-click menu. The menu itself is drawn by a
 **second binary in its own package**, `finder-ext/` (`oh-my-tab-finder-ext`, embedded as
 `Contents/PlugIns/Oh-My-Tab-Finder.appex`): Finder Sync extensions must be sandboxed, so the
 extension can create no file and launch no application. It is a renderer, and every privileged
 action stays in the main app.
 
 ```text
-finder_menu.rs            # root: what the module exposes (start/shutdown/broadcast/terminals/status)
 finder_menu/
+├── mod.rs                # root: what the module exposes (start/shutdown/broadcast_model/terminals/status)
 ├── model.rs              # Config + locale + installed terminals -> the menu tree the extension draws
 ├── ipc.rs                # DistributedNotificationCenter bridge, host identity, click dispatch
 ├── actions.rs            # executes a click: new file / open terminal / copy path (re-validated)
@@ -244,7 +245,8 @@ finder-ext/               # the sandboxed appex (own package: own entry point, o
 ├── src/main.rs           # registers the principal class, then runs Foundation's NSExtensionMain
 ├── src/menu.rs           # model -> NSMenu, one ClickTemplate per item
 ├── src/state.rs          # cached model, heartbeat/sync, selection paths, click forwarding
-└── src/ffi.rs            # NSString/NSMenu/NSLog helpers (the app's ffi module is not linked here)
+├── src/ffi.rs            # NSString/NSMenu/NSLog helpers (the app's ffi module is not linked here)
+└── src/guard.rs          # panic boundary for the callbacks Finder enters
 
 crates/finder-protocol/   # the wire contract both sides compile against (serde types + size cap)
 assets/FinderExtension/   # Info.plist and the sandbox entitlement the bundle scripts install
@@ -268,9 +270,15 @@ assets/FinderExtension/   # Info.plist and the sandbox entitlement the bundle sc
   the parent ("nested code is modified or invalid"). The bundle scripts therefore sign the appex with
   its entitlements, then sign the app *without* `--deep`; the parent records the extension by
   requirement and `--verify --deep --strict` still passes.
-- **A rebuild does not reload a running extension.** `scripts/dev-restart.sh` registers the appex and
-  reports its election state; only `--reload-finder-extension` restarts Finder, because that closes
-  every window.
+- **A registered extension is not a working one.** Finder starts the appex through launchd, and launchd
+  caches a per-request instance (`<appex bundle id>.<uuid>`) pinned to the executable path it started.
+  A worktree that is deleted leaves that instance pointing at nothing: every later request fails with
+  "Missing executable detected", while PlugInKit still reports the extension as elected and the menu is
+  silently empty. `scripts/lib/finder-extension.sh` (sourced by `scripts/dev-restart.sh`) removes only
+  the instances whose pinned program no longer exists and that launchd reports idle, reaps this appex's
+  own extension process after registering the new bundle, and restarts Finder only when that appex has
+  no extension running (or `--reload-finder-extension` asks, because a restart closes every window).
+  The host app's own instance and another appex's processes are never touched.
 - Finder Sync is not a general Finder-UI hook: `directoryURLs` decides where the menu exists, and
   observing volume roots repaints their sidebar icons. The settings page tells the user where to
   enable the extension; the app never turns it on itself.
