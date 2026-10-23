@@ -289,6 +289,9 @@ pub(super) fn action_button_hover_color(tag: isize, palette: crate::theme::UiPal
         -4 => palette.destructive_hover,
         // Field-family buttons deepen the same wash on hover (`.btn:hover`/`--field-hover`).
         -3 | -6 => palette.field_hover,
+        // The footer action deepens its own surface; `hover_bg` is the row wash, and painting it
+        // over an opaque button read as a different material rather than "this row is live".
+        -1 => palette.footer_button_hover,
         // The transparent role: a full-row hit target whose owner draws the only visual state (the
         // selection wash). Painting it on hover would add a second highlight the design does not have.
         -5 => 0x0000_0000,
@@ -4424,6 +4427,36 @@ mod tests {
         }
     }
 
+    /// The restore control that ends a page's document wears the page's ordinary control surface,
+    /// the same one its sibling buttons use, and keeps it in both modes: the opaque footer surface
+    /// is reserved for the window footer. Asserted against the `Action` role rather than the token
+    /// name alone, so a role change that quietly swapped surfaces fails here.
+    #[test]
+    fn the_page_restore_control_uses_the_page_control_surface_in_both_modes() {
+        use crate::settings::components::{page_restore_role, SettingsButtonRole};
+        for dark in [false, true] {
+            let palette = crate::theme::ui_palette_for_mode(dark);
+            let mode = if dark { "dark" } else { "light" };
+            assert_eq!(
+                page_restore_role(),
+                SettingsButtonRole::Action,
+                "the page restore control must keep the page's control role"
+            );
+            let (normal, text, tag) = page_restore_role().style(palette);
+            assert_eq!(
+                normal, palette.field_bg,
+                "{mode} mode: the page restore control must paint the field surface"
+            );
+            assert_eq!(tag, -3, "the Action role's hover tag");
+            let (footer_normal, footer_text, _) = SettingsButtonRole::Footer.style(palette);
+            assert_ne!(
+                normal, footer_normal,
+                "{mode} mode: the page restore control must not take the window footer's surface"
+            );
+            assert_eq!(text, footer_text, "both roles share the button text colour");
+        }
+    }
+
     /// Pins *which* hover token each role resolves to, not merely that it differs from its normal
     /// color. Distinctness alone is too weak: pointing a subtle field-family role at `accent` still
     /// differs from its normal, yet repaints the button in accent blue on hover.
@@ -4439,7 +4472,7 @@ mod tests {
             // deepen the same wash (`--field-hover`), so the wash stays on the card.
             let expected = [
                 (SettingsButtonRole::Action, palette.field_hover),
-                (SettingsButtonRole::Footer, palette.hover_bg),
+                (SettingsButtonRole::Footer, palette.footer_button_hover),
                 (SettingsButtonRole::Primary, palette.accent_hover),
                 (SettingsButtonRole::Destructive, palette.destructive_hover),
             ];

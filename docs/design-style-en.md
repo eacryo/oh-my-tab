@@ -67,10 +67,11 @@ auxiliary panels). Never inline a hex value in a view builder.
 | `card_bg` | `#F9F9F9` | `#1F1F24` | Cards, grouped rows, popover panels. The sheet's card is translucent; this is the composited opaque value (note below) |
 | `card_border` | `rgba(45,40,36,.10)` | `rgba(255,255,255,.09)` | Card and container outline; controls currently reuse it (see §3.3) |
 | `separator` | `rgba(45,40,36,.07)` | `rgba(255,255,255,.06)` | Row dividers inside a card |
-| `field_bg` | `rgba(60,52,46,.055)` | `rgba(255,255,255,.055)` | Text fields, read-only value boxes |
+| `field_bg` | `rgba(60,52,46,.055)` | `rgba(255,255,255,.102)` | Text fields, read-only value boxes, selects, secondary buttons. Dark mode takes a higher alpha than light: the same .055 wash over the near-black card measured 12/255 and read as no fill at all (screenshots, 2026-10-23), so the dark token is the step that keeps the control a visibly distinct surface |
 | `button_bg` | `#FFFFFF` | `#2C2C2E` | Secondary settings actions |
 | `button_text` | `#2C2C30` | `#F5F5F7` | Text on secondary settings actions |
 | `footer_button_bg` | `#FFFFFF` | `#2C2C2E` | Settings footer actions |
+| `footer_button_hover` | `#F0F0F0` | `#3A3A3C` | Hover state of a footer action. It deepens the button's own surface (1.14:1 light, 1.23:1 dark) rather than layering `hover_bg`, which is the row wash: on an opaque button that tint reads as a different material, not as "this control is live" |
 | `text_primary` | `#1D1C1A` | `#F4F4F5` | Row labels, values, card titles |
 | `text_secondary` | `#4F4C48` | `#C7C7CC` | Section headers, descriptions, links' labels |
 | `text_muted` | `#6B6862` | `#9E9EA6` | Version strings, subtitles, empty-state text |

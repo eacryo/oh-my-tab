@@ -407,6 +407,9 @@ pub(crate) struct UiPalette {
     pub(crate) button_bg: u32,
     pub(crate) button_text: u32,
     pub(crate) footer_button_bg: u32,
+    /// The footer action's own hover step, so it deepens its surface like every other button
+    /// instead of taking the row-hover wash (`hover_bg`), whose tint is a different material.
+    pub(crate) footer_button_hover: u32,
     pub(crate) accent_text: u32,
     /// Ink drawn on an `accent` fill (primary button, active accent chips). `accent_text` stays
     /// the ink for the destructive fill, the badge scrim and the close chip, which are not
@@ -471,8 +474,12 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             card_bg: 0x1F1F24FF,
             card_border: 0xFFFFFF17,
             separator: 0xFFFFFF0F,
-            field_bg: 0xFFFFFF0E,
-            field_hover: 0xFFFFFF17,
+            // .055 is the sheet's value, but the same alpha separates far less on a near-black
+            // card than on a white one (measured on screenshots: 5.5% white over #1F1F24 moved
+            // 12/255 and read as "no background"), so dark mode takes the next step up that keeps
+            // the control visibly its own surface: 8.6% white, and hover two steps past it.
+            field_bg: 0xFFFFFF1A,
+            field_hover: 0xFFFFFF26,
             primary_text: 0xF4F4F5FF,
             secondary_text: 0xC7C7CCFF,
             sidebar_text: 0x9E9EA6FF,
@@ -488,6 +495,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             button_bg: 0x2C2C2EFF,
             button_text: 0xF5F5F7FF,
             footer_button_bg: 0x2C2C2EFF,
+            footer_button_hover: 0x3A3A3CFF,
             accent_text: 0xFFFFFFFF,
             accent_ink: 0x08111FFF,
             glass_rim: 0xFFFFFF17,
@@ -547,6 +555,7 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
             button_bg: 0xFFFFFFFF,
             button_text: 0x2C2C30FF,
             footer_button_bg: 0xFFFFFFFF,
+            footer_button_hover: 0xF0F0F0FF,
             accent_text: 0xFFFFFFFF,
             accent_ink: 0xFFFFFFFF,
             glass_rim: 0xFFFFFF80,
@@ -2891,6 +2900,39 @@ mod tests {
         assert_eq!(OVERLAY_SYMBOL_SHADOW_OFFSET_Y, -1.0);
         assert_eq!(OVERLAY_BADGE_GLYPH, 22.0);
         assert_eq!(OVERLAY_BADGE_GLYPH_INSET, 4.0);
+    }
+
+    /// A control filled with `field_bg` must read as its own surface on the card it sits on.
+    ///
+    /// Dark mode measured 12/255 of separation at the sheet's .055 wash and looked unfilled, which
+    /// is why the dark token is raised; this bound is what keeps a later tidy-up from lowering it
+    /// back to a value the eye cannot see. Light mode is far above it, so the same bound covers
+    /// both.
+    /// The floors are per mode because the same ratio does not look the same on both: the sheet's
+    /// .055 light wash measures 1.10:1 and separates clearly, while the same alpha in dark mode
+    /// measured 1.165:1 and read as no fill at all. Each bound sits just under the shipped value.
+    fn field_on_card_floor(dark: bool) -> f64 {
+        if dark {
+            1.34
+        } else {
+            1.08
+        }
+    }
+
+    #[test]
+    fn field_fill_stays_visible_on_its_card_in_both_modes() {
+        for dark in [false, true] {
+            let palette = ui_palette_for_mode(dark);
+            let card = color_rgb(palette.card_bg);
+            let field = composite_on(palette.field_bg, card);
+            let ratio = contrast_ratio(field, card);
+            let floor = field_on_card_floor(dark);
+            assert!(
+                ratio >= floor,
+                "{} mode: field_bg over card_bg is {ratio:.3}:1, under the {floor:.2}:1 the control needs to read as its own surface",
+                if dark { "dark" } else { "light" }
+            );
+        }
     }
 
     /// The §3.3 hard floor: no text or meaning-carrying glyph ships under 3.5:1 in either mode.

@@ -965,6 +965,14 @@ impl SettingsButtonRole {
 /// sidebar tabs, clipboard actions, and the overlay close button keep their own interaction model.
 pub(crate) struct SettingsButton;
 
+/// The role of the restore control that finishes a page's document.
+///
+/// It wears the same surface as the page's other controls (`Action`): the page-document restore
+/// belongs to the page it resets, and the opaque footer surface is reserved for the window footer.
+pub(super) fn page_restore_role() -> SettingsButtonRole {
+    SettingsButtonRole::Action
+}
+
 impl SettingsButton {
     pub(crate) unsafe fn action(
         frame: NSRect,
@@ -1342,7 +1350,7 @@ impl RestoreDefaultsControl {
             &trigger_title,
             target,
             objc2::sel!(handlePageRestoreDefaults:),
-            SettingsButtonRole::Action,
+            page_restore_role(),
         );
         let confirm = SettingsButton::action(
             NSRect::new(
