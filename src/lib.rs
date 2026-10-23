@@ -2131,6 +2131,42 @@ fn menu_target_class() -> StaticClass {
             );
             class_addMethod(
                 cls,
+                sel!(handlePauseRecordingToggle:),
+                handle_pause_recording_toggle as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleClipboardExcludedAdd:),
+                handle_clipboard_excluded_add as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleClipboardExcludedRemove:),
+                handle_clipboard_excluded_remove as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleClipboardExcludedRestore:),
+                handle_clipboard_excluded_restore as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleRebuildSettingsContent:),
+                handle_rebuild_settings_content as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handlePauseClipboard:),
+                crate::menu::handle_pause_clipboard as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleClipboardShortcutRecord:),
                 settings::handle_clipboard_shortcut_record as *mut c_void,
                 types.as_ptr(),
@@ -2465,6 +2501,11 @@ fn setup_status_bar() {
         // state (the pin is in-process, not persisted configuration).
         let pin_item = build_clipboard_pin_item(menu, menu_target);
         with_menu_ui(|ui| ui.clipboard_pin = Some(pin_item));
+
+        // Clipboard pause/resume item: a persisted switch, but its two states read differently
+        // ("pause recording" / "resume recording"), so it swaps its title instead of a checkmark.
+        let pause_item = build_clipboard_pause_item(menu, menu_target);
+        with_menu_ui(|ui| ui.clipboard_pause = Some(pause_item));
 
         // Reload Config item
         let reload_title = make_nsstring(&t("menu.reload_config"));

@@ -485,6 +485,16 @@ pub(super) struct SettingsUi {
     clipboard_show_source_app: *mut AnyObject,                     // show the source app
     clipboard_pin_follow: *mut AnyObject,                          // selection after pin
     // (follow the pinned entry / keep current position)
+    clipboard_paused: *mut AnyObject, // pause recording (persisted, unlike the panel pin)
+    /// Per-row "remove" buttons of the excluded-applications list. The SENDER POINTER identifies
+    /// which entry to drop: a button's tag selects its hover/normal palette, so it must never carry
+    /// an action id.
+    clipboard_excluded_remove: Vec<*mut AnyObject>,
+    /// The "add a running app" popup and the candidates it currently lists, so a selection index
+    /// maps to an identifier without re-enumerating running apps.
+    clipboard_excluded_add: *mut AnyObject,
+    clipboard_excluded_candidates: Vec<(String, String)>,
+    clipboard_excluded_restore: *mut AnyObject,
     // Key-bindings page. The rows themselves are dynamic (added, deleted, toggled), so only the
     // fixed furniture lives here: the master switch, the flipped container the rows are rendered
     // into, and its empty-state hint. Adding happens in the footer's panel, not in page controls.
@@ -658,6 +668,92 @@ pub(crate) fn refresh_clipboard_separate_clear_all_switch_from_config() {
     dispatch::refresh_clipboard_separate_clear_all_switch_from_config();
 }
 
+/// Re-read the pause switch after a change that did not come from the switch itself (the menu item,
+/// a config reload, or a resume that failed and forced the persisted intent back to paused).
+pub(crate) fn refresh_clipboard_pause_switch_from_config() {
+    dispatch::refresh_clipboard_pause_switch_from_config();
+}
+
+/// Rebuild the settings content on the next run-loop turn.
+///
+/// The excluded-applications card is laid out from the current list, so adding or removing an entry
+/// has to rebuild the page. It must NOT be rebuilt inside the button's own action: the rebuild
+/// releases the button AppKit is currently dispatching to.
+pub(crate) fn rebuild_settings_content_deferred() {
+    // A plain request keeps any pending scroll record: whichever rebuild ends up running restores
+    // the position the user was looking at.
+    queue_settings_content_rebuild();
+}
+
+/// Take this run-loop turn's single rebuild slot. False means a rebuild is already queued and the
+/// new request must fold into it.
+///
+/// This is the arbitration the coalescing depends on, kept separate from the AppKit call so it can be
+/// asserted: without it, two requests queue two callbacks, the first consumes the scroll record and
+/// the second runs a plain rebuild that jumps the page back to the top.
+fn claim_rebuild_slot() -> bool {
+    !REBUILD_QUEUED.swap(true, std::sync::atomic::Ordering::SeqCst)
+}
+
+/// Open the next run-loop turn for a new request.
+fn release_rebuild_slot() {
+    REBUILD_QUEUED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Queue one rebuild for the next run-loop turn, at most once per turn.
+fn queue_settings_content_rebuild() {
+    if !claim_rebuild_slot() {
+        return;
+    }
+    unsafe {
+        let target = (*crate::MENU_TARGET.lock().unwrap()).map(|t| t.0);
+        let Some(target) = target else {
+            release_rebuild_slot();
+            return;
+        };
+        let _: () = msg_send![
+            target,
+            performSelectorOnMainThread: sel!(handleRebuildSettingsContent:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+/// Where the page was scrolled when a rebuild was requested. Captured BEFORE the page is torn down
+/// (the new page starts at the top) and consumed by the deferred handler.
+///
+/// The request is COALESCED with `REBUILD_PENDING`: several edits in one run-loop turn queue ONE
+/// rebuild. Without that, two queued callbacks would let the first consume the record and restore
+/// the position, and the second fall through to a plain rebuild that jumps back to the top.
+static PENDING_PAGE_SCROLL: std::sync::Mutex<Option<(SettingsPageId, f64)>> =
+    std::sync::Mutex::new(None);
+
+/// Whether a rebuild is already queued for this run-loop turn.
+static REBUILD_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Rebuild the content while keeping the clipboard page where the user left it: removing or
+/// restoring a row must not throw a long page back to its top.
+pub(crate) fn rebuild_settings_content_deferred_keeping_scroll(page: SettingsPageId) {
+    // Captured synchronously, before the queued rebuild tears the page down.
+    let distance = unsafe { window::page_scroll_distance_from_top(page) };
+    if let Ok(mut pending) = PENDING_PAGE_SCROLL.lock() {
+        *pending = distance.map(|d| (page, d));
+    }
+    queue_settings_content_rebuild();
+}
+
+/// Open the next run-loop turn for a new rebuild request and hand this one's scroll record to the
+/// handler. Clearing the queued flag FIRST is what makes a rebuild requested during this handler
+/// queue a fresh one instead of being swallowed.
+pub(crate) fn take_rebuild_request() -> Option<(SettingsPageId, f64)> {
+    release_rebuild_slot();
+    PENDING_PAGE_SCROLL
+        .lock()
+        .ok()
+        .and_then(|mut pending| pending.take())
+}
+
 /// Re-read the General appearance controls after a non-rebuilding appearance change (a panel-material
 /// change): the material and glass-style popups plus the dependent row's visibility.
 pub(crate) fn refresh_appearance_controls_from_config() {
@@ -773,14 +869,16 @@ use window::*;
 // Entry points exposed to the rest of the crate (implemented in child modules; main.rs
 // consumes them through use settings::*).
 pub(crate) use dispatch::{
-    end_max_extent_preview, handle_clipboard_enabled_toggle, handle_device_changed,
+    end_max_extent_preview, handle_clipboard_enabled_toggle, handle_clipboard_excluded_add,
+    handle_clipboard_excluded_remove, handle_clipboard_excluded_restore, handle_device_changed,
     handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
     handle_export_settings_ready, handle_import_settings, handle_import_settings_ready,
-    handle_key_bindings_toggle, handle_settings_search_began_editing,
-    handle_settings_search_changed, handle_settings_search_clear,
-    handle_settings_search_ended_editing, handle_windows_enabled_toggle, left_mouse_button_is_down,
-    on_control_changed, on_control_text_did_change, on_control_text_did_end_editing,
-    on_sidebar_select, refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
+    handle_key_bindings_toggle, handle_pause_recording_toggle, handle_rebuild_settings_content,
+    handle_settings_search_began_editing, handle_settings_search_changed,
+    handle_settings_search_clear, handle_settings_search_ended_editing,
+    handle_windows_enabled_toggle, left_mouse_button_is_down, on_control_changed,
+    on_control_text_did_change, on_control_text_did_end_editing, on_sidebar_select,
+    refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
     refresh_service_controls_from_config,
     refresh_switcher_keystroke_and_mouse_controls_from_config,
 };
@@ -1481,6 +1579,20 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.clipboard.enabled
     );
     changed!(
+        "clipboard.paused",
+        old.clipboard.paused,
+        new.clipboard.paused
+    );
+    // The list has no single scalar to print; the entry count is the change that matters for a log
+    // that must never carry clipboard content or identifiers.
+    if old.clipboard.excluded_apps != new.clipboard.excluded_apps {
+        crate::log_info!(
+            "[settings] clipboard.excluded_apps: {} -> {} entries",
+            old.clipboard.excluded_apps.len(),
+            new.clipboard.excluded_apps.len()
+        );
+    }
+    changed!(
         "clipboard.max_entries",
         old.clipboard.max_entries,
         new.clipboard.max_entries
@@ -1962,6 +2074,10 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             // The clipboard controls are populated after the initial conditional-row pass, so
             // apply visibility once more from the saved config here.
             update_clipboard_delete_dependent_visibility_from_config(ui, cfg);
+            let _: () = msg_send![
+                ui.clipboard_paused,
+                setState: if cfg.clipboard.paused { 1isize } else { 0isize }
+            ];
             set_field(
                 ui.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),
@@ -2332,6 +2448,40 @@ mod mouse_page_lazy_fill_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The coalescing contract: several rebuild requests in one run-loop turn queue ONE callback,
+    /// and the scroll record survives that folding. If the slot arbitration is removed (every request
+    /// queues its own callback), the second claim below returns true and this test fails -- which is
+    /// exactly the defect that let a second, scroll-less rebuild jump the page back to the top.
+    #[test]
+    fn rebuild_requests_coalesce_into_one_turn_and_keep_the_scroll_record() {
+        // Isolate the process-wide slot/record from any other test in this binary.
+        super::release_rebuild_slot();
+        *super::PENDING_PAGE_SCROLL.lock().unwrap() = None;
+
+        assert!(
+            super::claim_rebuild_slot(),
+            "the first request takes the slot"
+        );
+        assert!(
+            !super::claim_rebuild_slot(),
+            "a request in the same turn must fold into the queued rebuild"
+        );
+        *super::PENDING_PAGE_SCROLL.lock().unwrap() = Some((SettingsPageId::Clipboard, 120.0));
+
+        // The handler turns the record over exactly once...
+        assert_eq!(
+            super::take_rebuild_request(),
+            Some((SettingsPageId::Clipboard, 120.0))
+        );
+        assert_eq!(super::take_rebuild_request(), None, "consumed once");
+        // ...and opens the next turn, so a later edit still gets its own rebuild.
+        assert!(
+            super::claim_rebuild_slot(),
+            "the slot is free again for the next run-loop turn"
+        );
+        super::release_rebuild_slot();
+    }
+
     use super::{settings_ui_borrowed, with_settings_ui};
 
     fn settings_smoke_app_binary() -> std::path::PathBuf {

@@ -424,6 +424,21 @@ fn panel_hover_wash_for(palette: crate::theme::UiPalette) -> u32 {
 
 /// Clipboard header orbs use the V2 glass fill and circular outline. Menu actions
 /// continue using the shared borderless glyph recipe.
+/// Whether the pointer is currently over the recording orb.
+///
+/// The hover wash is re-applied from this state when the orb's glyph is refreshed on a state change:
+/// a click lands while the pointer is still inside the button, so refreshing with a hard-coded
+/// "not hovered" would drop the wash and the hover ink until the pointer leaves and re-enters.
+static PAUSE_ORB_HOVERED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(super) fn set_pause_orb_hovered(hovered: bool) {
+    PAUSE_ORB_HOVERED.store(hovered, std::sync::atomic::Ordering::SeqCst);
+}
+
+pub(super) fn pause_orb_hovered() -> bool {
+    PAUSE_ORB_HOVERED.load(std::sync::atomic::Ordering::SeqCst)
+}
+
 pub(super) unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: bool) {
     // The shared corner-glyph recipe. The picker already applied the mode-tuned wash (its own
     // panel_hover_wash, numerically the same value); routing all three through one function is what
@@ -431,9 +446,16 @@ pub(super) unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: 
     crate::ui::corner_glyph::set_glyph_button_style(button, clipboard_palette(), hovered);
     if !button.is_null() {
         let action: Sel = msg_send![button, action];
-        if action == sel!(toggleFilterPopover:) || action == sel!(toggleDetailPanel:) {
+        if action == sel!(toggleFilterPopover:)
+            || action == sel!(toggleDetailPanel:)
+            || action == sel!(togglePauseRecording:)
+        {
             let active = if action == sel!(toggleDetailPanel:) {
                 detail_visible()
+            } else if action == sel!(togglePauseRecording:) {
+                // A paused recorder is this orb's "on" state, exactly like an open popover is the
+                // filter orb's: the accent border is what tells the two states apart at a glance.
+                super::collection_paused()
             } else {
                 filter_popover_open()
             };
@@ -763,7 +785,11 @@ extern "C" fn hover_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mu
         }
         if (action == sel!(openClipboardSettings:) && !is_popover_child(b))
             || action == sel!(toggleFilterPopover:)
+            || action == sel!(togglePauseRecording:)
         {
+            if action == sel!(togglePauseRecording:) {
+                set_pause_orb_hovered(true);
+            }
             set_settings_button_style(b, true);
             return;
         }
@@ -889,7 +915,13 @@ extern "C" fn hover_button_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut 
             }
             return;
         }
-        if action == sel!(openClipboardSettings:) || action == sel!(toggleFilterPopover:) {
+        if action == sel!(openClipboardSettings:)
+            || action == sel!(toggleFilterPopover:)
+            || action == sel!(togglePauseRecording:)
+        {
+            if action == sel!(togglePauseRecording:) {
+                set_pause_orb_hovered(false);
+            }
             set_settings_button_style(b, false);
             return;
         }

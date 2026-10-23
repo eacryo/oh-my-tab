@@ -140,6 +140,12 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
             );
             class_addMethod(
                 cls,
+                sel!(togglePauseRecording:),
+                toggle_pause_recording as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(clipboardOutsideClick:),
                 clipboard_outside_click as *mut c_void,
                 types.as_ptr(),

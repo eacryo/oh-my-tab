@@ -54,10 +54,11 @@ pub(super) fn picker_list_width() -> f64 {
 
 /// Reflow chrome from the live panel geometry; row layout uses its own list width.
 unsafe fn layout_picker_chrome(size: NSSize) {
-    let (search, options, detail, pin, close) = picker_header_frames_for(size.width);
+    let (search, pause, options, detail, pin, close) = picker_header_frames_for(size.width);
     for (view, frame) in [
         (*SEARCH_FIELD_SURFACE.lock().unwrap(), search),
         (*SEARCH_FIELD.lock().unwrap(), search),
+        (*PICKER_PAUSE_BUTTON.lock().unwrap(), pause),
         (*PICKER_OPTIONS_ORB.lock().unwrap(), options),
         (*PICKER_DETAIL_BUTTON.lock().unwrap(), detail),
         (*PICKER_PIN_BUTTON.lock().unwrap(), pin),
@@ -894,6 +895,15 @@ pub(super) fn hide_picker() {
     }
     if let Some(button) = *PICKER_OPTIONS_ORB.lock().unwrap() {
         unsafe { set_settings_button_style(button.0, false) };
+    }
+    // The recording orb needs the same treatment AND its recorded hover state cleared: it is the one
+    // header orb whose style is re-applied later (on every pause/resume), so a stale "hovered" would
+    // keep painting the hover wash onto the next showing.
+    unsafe {
+        set_pause_orb_hovered(false);
+        if let Some(button) = *PICKER_PAUSE_BUTTON.lock().unwrap() {
+            set_settings_button_style(button.0, false);
+        }
     }
     dismiss_filter_popover();
     // Same reason for a blank-area drag: an in-flight grab loses its mouseUp, the pushed hand

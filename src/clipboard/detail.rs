@@ -1613,7 +1613,7 @@ pub(super) unsafe fn ensure_picker_window() {
     // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
     // with a 1px inner ring; the placeholder is left-aligned. The corner close button shares the
     // row, so the shared geometry gives the field the remaining width.
-    let (search_frame, options_frame, detail_orb_frame, pin_frame, close_frame) =
+    let (search_frame, pause_frame, options_frame, detail_orb_frame, pin_frame, close_frame) =
         picker_header_frames();
     let search_w = search_frame.size.width;
     let search_surface: *mut AnyObject = msg_send![class!(NSView), alloc];
@@ -1894,6 +1894,31 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![header_strip, addSubview: pin_button];
     release_obj(pin_button);
     *PICKER_PIN_BUTTON.lock().unwrap() = Some(ObjPtr::new(pin_button));
+
+    // The pause-recording orb, leftmost of the group: the panel's own entry point for stopping
+    // recording without turning the feature off. Its glyph swaps (pause <-> filled play) so the
+    // state is visible at a glance, and it drives the same persisted intent as the menu item and
+    // the settings switch.
+    let pause_button: *mut AnyObject = msg_send![hover_button_class(), alloc];
+    let pause_button: *mut AnyObject = msg_send![pause_button, initWithFrame: pause_frame];
+    let _: () = msg_send![pause_button, setBordered: false];
+    let _: () = msg_send![pause_button, setWantsLayer: true];
+    let pause_layer: *mut AnyObject = msg_send![pause_button, layer];
+    if !pause_layer.is_null() {
+        let _: () = msg_send![pause_layer, setCornerRadius: PICKER_ORB_SIZE / 2.0];
+        let _: () = msg_send![pause_layer, setMasksToBounds: true];
+    }
+    let pause_title = make_nsstring("");
+    let _: () = msg_send![pause_button, setTitle: pause_title];
+    CFRelease(pause_title as *const c_void);
+    let _: () = msg_send![pause_button, setTarget: observer()];
+    let _: () = msg_send![pause_button, setAction: sel!(togglePauseRecording:)];
+    set_settings_button_style(pause_button, false);
+    add_hover_tracking(pause_button);
+    let _: () = msg_send![header_strip, addSubview: pause_button];
+    release_obj(pause_button);
+    *PICKER_PAUSE_BUTTON.lock().unwrap() = Some(ObjPtr::new(pause_button));
+    refresh_pause_button();
 
     release_obj(search);
     *SEARCH_FIELD.lock().unwrap() = Some(ObjPtr::new(search));

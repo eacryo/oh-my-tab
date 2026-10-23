@@ -1070,6 +1070,22 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         crate::clipboard::legacy_index_leftover(),
         json_string(crate::clipboard::keychain_acl_label())
     ));
+    // The privacy controls: whether recording is paused right now, and which applications the
+    // exclusion list names. A scenario that copies while paused asserts this plus the history
+    // itself; the app's own claim is a hint, not evidence.
+    {
+        let (paused, excluded) = crate::clipboard::privacy_state_for_e2e();
+        let ids: Vec<String> = excluded
+            .iter()
+            .map(|entry| json_string(&entry.bundle_id))
+            .collect();
+        json.push_str(&format!(
+            "  \"clipboard_privacy\": {{\"paused\": {}, \"excluded_count\": {}, \"excluded_apps\": [{}]}},\n",
+            paused,
+            excluded.len(),
+            ids.join(", ")
+        ));
+    }
     // What each storage-notice surface ACTUALLY applied (the action on its button, or that it has no
     // such view): `state`/`reason` say what the state machine decided and cannot distinguish "the
     // button is hidden" from "the surface does not exist", nor a state whose action is offered from

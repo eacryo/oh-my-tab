@@ -144,8 +144,18 @@ pub(super) fn hold_key(key: MasterKey) {
 /// Ready with a key (the load path's success outcome).
 pub(super) fn set_ready(key: MasterKey) {
     let mut session = SESSION.lock().unwrap();
+    // Coming back from "could not record" is not the same as a first load: the copy made in that
+    // window was never recorded, and the next poll must not pick it up as a fresh one.
+    let recovering = matches!(
+        session.state,
+        StorageState::Unavailable(_) | StorageState::Blocked(_)
+    );
     session.state = StorageState::Ready;
     session.key = Some(key);
+    drop(session);
+    if recovering {
+        crate::clipboard::request_recovery_baseline();
+    }
 }
 
 /// No key this session.
@@ -509,6 +519,37 @@ mod tests {
                 session.state = StorageState::Uninitialized;
             }
         }
+    }
+
+    /// A first load may record the current pasteboard; coming back from "could not record" must
+    /// adopt a baseline instead, or the copy made in that window would be recorded afterwards.
+    #[test]
+    fn returning_from_unavailable_requests_a_recovery_baseline() {
+        let _guard = test_lock();
+        {
+            let mut session = SESSION.lock().unwrap();
+            session.state = StorageState::Uninitialized;
+        }
+        let _ = crate::clipboard::take_recovery_baseline_for_test();
+        set_ready(keyring::test_key());
+        assert!(
+            !crate::clipboard::take_recovery_baseline_for_test(),
+            "a first load must keep the documented record-current behaviour"
+        );
+
+        set_unavailable(KeyUnavailable::Missing);
+        set_ready(keyring::test_key());
+        assert!(
+            crate::clipboard::take_recovery_baseline_for_test(),
+            "recovering from an unavailable storage must request a baseline"
+        );
+
+        set_blocked(BlockedReason::Damaged);
+        set_ready(keyring::test_key());
+        assert!(
+            crate::clipboard::take_recovery_baseline_for_test(),
+            "recovering from a blocked storage must request a baseline too"
+        );
     }
 
     #[test]

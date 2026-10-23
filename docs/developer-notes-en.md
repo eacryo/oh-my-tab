@@ -273,6 +273,33 @@ Bluetooth keyboards are excluded even when their HID descriptors advertise point
 
 The device picker refreshes when devices connect or disconnect. These events are debounced, and delayed rechecks cover short BLE sleep and wake cycles.
 
+## Clipboard recording controls (pause, excluded applications)
+
+Two controls sit in front of every write path:
+
+- **Pause** (`clipboard.paused`, persisted) stops adding entries without turning the feature off. The
+  effective state is the runtime gate in `src/clipboard.rs` (`CollectionGate`), not the config field, and the
+  gate has three positions: `Active`, `Paused`, and `Baselining` (closed while a resume adopts its
+  baseline). A paused poll still advances `LAST_CHANGE_COUNT`, so content copied during the pause can never be
+  recorded afterwards; a resume re-reads the changeCount as a baseline WITHOUT reading the pasteboard, keeps
+  the gate closed until that succeeds, and leaves the intent -- config, menu title, settings switch, panel
+  glyph -- in the paused state when it fails. `paused` outranks `enabled`: pause -> disable -> enable still
+  records nothing, and a single config change that both enables and unpauses goes through the same baseline
+  path. An ordinary startup or enable keeps the documented record-current-pasteboard behaviour.
+- **Excluded applications** (`clipboard.excluded_apps`, a list of bundle identifiers) are matched in the poll
+  BEFORE the payload is read, so an excluded copy is never hashed, cached, drawn or icon-extracted. Two
+  signals are OR-ed: the frontmost application's bundle identifier, and the copier named by
+  `org.nspasteboard.source` when the pasteboard carries a well-formed identifier. The declared identifier is
+  self-reported by the writer, so it is only ever an ADDITIONAL signal -- it cannot override the frontmost
+  verdict. An empty identifier, a malformed one, or one over 255 bytes is ignored rather than allowed to
+  disable the frontmost check. The built-in list is short on purpose (only identifiers with a documented
+  source); a config written before the field existed receives it, an explicitly emptied list stays empty, and
+  later versions do NOT append new defaults to a saved list.
+
+`--e2e-state` reports `clipboard_privacy` (`paused`, `excluded_count`, `excluded_apps`) so a scenario can
+assert the controls without reading them off the UI; the history itself is still the evidence for "nothing was
+recorded".
+
 ## Clipboard history storage (encryption, states, migration)
 
 While the clipboard feature is on, every byte it persists is sealed: the history TOML, the original image bytes, the thumbnail preview and the detail preview all go through the envelope in `src/clipboard/crypto.rs` (AES-256-GCM; `magic | kind | key_id | object_id | nonce | ct+tag`, with the AAD binding magic, kind, key_id and object_id). The content format inside the envelope is unchanged, so the TOML schema and `HISTORY_VERSION` still describe the history itself. The reader recomputes `object_id` from the logical file name it asked for and rejects a file whose header disagrees, so two complete same-kind files cannot be swapped.

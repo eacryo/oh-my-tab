@@ -29,8 +29,8 @@ const BINDING_SWITCH_W: f64 = 44.0;
 /// 27pt: that page predates the rule, and copying it would have shrunk this row's only way to edit a
 /// binding below the size the style document promises. The band is one settings row (56pt) tall, so
 /// 28 fits with 14pt of slack above and below.
-const BINDING_BTN_W: f64 = 60.0;
-const BINDING_BTN_H: f64 = 28.0;
+pub(super) const BINDING_BTN_W: f64 = 60.0;
+pub(super) const BINDING_BTN_H: f64 = 28.0;
 const BINDING_BTN_GAP: f64 = 8.0;
 /// The keycap column's offset from the card's leading edge, so a row's chips align in a column
 /// after the action name rather than following the name's length.

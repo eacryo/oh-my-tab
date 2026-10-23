@@ -1509,6 +1509,52 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
     })
 }
 
+/// The clipboard page's exclusion rows must use the binding list's single-line row height.
+///
+/// They are a list of rows with a trailing row action, not a stack of page controls, so the 32pt
+/// control-height row the page's own rows use would cram the 28pt button. Measured off the live view
+/// tree: two consecutive delete buttons must sit exactly one shared row height apart. Returns false
+/// when the page does not currently carry at least two rows (nothing to measure).
+unsafe fn clipboard_exclusion_rows_use_the_shared_row_height() -> bool {
+    let scroll = with_settings_ui(|ui| {
+        ui.as_ref()
+            .map(|ui| ui.page_view(super::SettingsPageId::Clipboard))
+    });
+    let Some(scroll) = scroll else {
+        return false;
+    };
+    if scroll.is_null() {
+        return false;
+    }
+    let doc: *mut AnyObject = msg_send![scroll, documentView];
+    if doc.is_null() {
+        return false;
+    }
+    let subviews: *mut AnyObject = msg_send![doc, subviews];
+    let count: usize = msg_send![subviews, count];
+    let mut ys: Vec<f64> = Vec::new();
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+        if !is_button {
+            continue;
+        }
+        let action: Sel = msg_send![view, action];
+        if action != sel!(handleClipboardExcludedRemove:) {
+            continue;
+        }
+        let frame: NSRect = msg_send![view, frame];
+        ys.push(frame.origin.y);
+    }
+    if ys.len() < 2 {
+        return true;
+    }
+    ys.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+    let expected = super::SettingsLayout::SINGLE_LINE_ROW_H;
+    ys.windows(2)
+        .all(|pair| (pair[0] - pair[1] - expected).abs() < 0.5)
+}
+
 /// Run every settings page through the real AppKit layout path and debug validator, then exit.
 /// This is used by the ignored macOS smoke test; it deliberately exercises the same window
 /// builder as the interactive app instead of constructing a simplified test-only hierarchy.
@@ -1525,6 +1571,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         log_info!("[smoke-settings-layout] opening settings");
         show_settings();
         log_info!("[smoke-settings-layout] settings opened");
+        if !clipboard_exclusion_rows_use_the_shared_row_height() {
+            log_info!(
+                "[smoke-settings-layout] the clipboard exclusion rows do not use the shared row height"
+            );
+            hide_settings();
+            return false;
+        }
         // The engine's "is this app frontmost" flag drives a pass-through rule for window actions
         // (see `key_bindings::engine`). Two halves are assertable here; the third is not, and is
         // recorded in `docs/review-backlog.md` rather than faked:
@@ -3272,6 +3325,99 @@ pub(super) fn settings_page_frame(
     )
 }
 
+/// A page's current distance from the top of its content.
+///
+/// The settings documents are NOT flipped (see `scroll_page_to_top`: the top is `doc_h - clip_h`,
+/// not zero), so a raw `bounds.origin.y` is a *distance from the bottom* and cannot be restored
+/// verbatim once the document's height changes -- which is exactly what editing a list does. The
+/// distance from the top is the quantity that means "where the user was looking".
+pub(crate) unsafe fn page_scroll_distance_from_top(page: SettingsPageId) -> Option<f64> {
+    let scroll = with_settings_ui(|ui| ui.as_ref().map(|ui| ui.page_view(page)))?;
+    if scroll.is_null() {
+        return None;
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let doc: *mut AnyObject = msg_send![scroll, documentView];
+    if clip.is_null() || doc.is_null() {
+        return None;
+    }
+    let doc_frame: NSRect = msg_send![doc, frame];
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    Some(distance_from_top(
+        clip_bounds.origin.y,
+        doc_frame.size.height,
+        clip_bounds.size.height,
+    ))
+}
+
+/// Restore a page to the given distance from the top, converting it back into the flipped
+/// coordinate of the document that now exists.
+pub(crate) unsafe fn set_page_scroll_distance_from_top(page: SettingsPageId, distance: f64) {
+    let Some(scroll) = with_settings_ui(|ui| ui.as_ref().map(|ui| ui.page_view(page))) else {
+        return;
+    };
+    if scroll.is_null() {
+        return;
+    }
+    let clip: *mut AnyObject = msg_send![scroll, contentView];
+    let doc: *mut AnyObject = msg_send![scroll, documentView];
+    if clip.is_null() || doc.is_null() {
+        return;
+    }
+    // A freshly built document's height is provisional until AppKit lays it out, and a
+    // scrollToPoint issued before that pass is reset by it (the pitfall `scroll_page_to_top`
+    // documents). Lay out first, then compute the target from the settled height.
+    let window: *mut AnyObject = msg_send![scroll, window];
+    if !window.is_null() {
+        let content: *mut AnyObject = msg_send![window, contentView];
+        if !content.is_null() {
+            let _: () = msg_send![content, layoutSubtreeIfNeeded];
+        }
+    }
+    let doc_frame: NSRect = msg_send![doc, frame];
+    let clip_bounds: NSRect = msg_send![clip, bounds];
+    let target =
+        scroll_target_from_distance(distance, doc_frame.size.height, clip_bounds.size.height);
+    let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, target)];
+    let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+}
+
+/// How far a clip view's origin sits below the top of its content. Pure: unit-tested.
+///
+/// In an unflipped document the topmost origin is `doc_h - clip_h` (a document shorter than the
+/// viewport has exactly one origin, 0), so the distance is that value minus the current origin.
+pub(super) fn distance_from_top(origin_y: f64, doc_h: f64, clip_h: f64) -> f64 {
+    if !origin_y.is_finite() || !doc_h.is_finite() || !clip_h.is_finite() {
+        return 0.0;
+    }
+    let top = (doc_h - clip_h).max(0.0);
+    (top - origin_y).clamp(0.0, top)
+}
+
+/// The clip origin that shows the content `distance` below the top, clamped to the document now
+/// on screen. Pure: unit-tested.
+///
+/// Clamping matters because a rebuilt page can be SHORTER (a row was removed): the saved distance
+/// may no longer exist, and the closest visible position is the bottom of the new document.
+pub(super) fn scroll_target_from_distance(distance: f64, doc_h: f64, clip_h: f64) -> f64 {
+    let top = (doc_h - clip_h).max(0.0);
+    if !distance.is_finite() {
+        return top;
+    }
+    (top - distance.clamp(0.0, top)).clamp(0.0, top)
+}
+
+/// Rebuild the settings content in an existing window while keeping `page` where the user left it.
+pub(crate) unsafe fn rebuild_settings_content_now_keeping_scroll(
+    page: SettingsPageId,
+    distance_from_top: Option<f64>,
+) {
+    rebuild_settings_content_now();
+    if let Some(distance) = distance_from_top {
+        set_page_scroll_distance_from_top(page, distance);
+    }
+}
+
 /// Rebuilds the settings content (after a scroller-style change, to fit the new visible width).
 pub(crate) unsafe fn rebuild_settings_content_now() {
     if let Some(window) = with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window)) {
@@ -3564,6 +3710,11 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_auto_expire_days_value_label: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             clipboard_pin_follow: std::ptr::null_mut(),
+            clipboard_paused: std::ptr::null_mut(),
+            clipboard_excluded_remove: Vec::new(),
+            clipboard_excluded_add: std::ptr::null_mut(),
+            clipboard_excluded_candidates: Vec::new(),
+            clipboard_excluded_restore: std::ptr::null_mut(),
             add_mapping_button: std::ptr::null_mut(),
             mapping_enabled: std::ptr::null_mut(),
             mapping_empty: std::ptr::null_mut(),
@@ -3895,6 +4046,39 @@ mod tests {
         abandoned_page_editors, settings_page_frame, warning_for_page, PageEditor, PageWarning,
         SETTINGS_CLIPBOARD_PAGE_INDEX, SETTINGS_KEY_BINDINGS_PAGE_INDEX, SETTINGS_MOUSE_PAGE_INDEX,
     };
+
+    /// The scroll position restored after a list edit is a DISTANCE FROM THE TOP: the settings
+    /// documents are unflipped, so a raw clip origin means something different once the document's
+    /// height changes (adding or removing a row).
+    #[test]
+    fn page_scroll_round_trips_as_a_distance_from_the_top() {
+        // 900pt document, 500pt viewport: the topmost origin is 400.
+        assert_eq!(super::distance_from_top(400.0, 900.0, 500.0), 0.0);
+        assert_eq!(super::distance_from_top(300.0, 900.0, 500.0), 100.0);
+        assert_eq!(super::distance_from_top(0.0, 900.0, 500.0), 400.0);
+        // Unchanged document: the same distance maps back to the same origin.
+        assert_eq!(
+            super::scroll_target_from_distance(100.0, 900.0, 500.0),
+            300.0
+        );
+        // A SHORTER document (a row was removed) keeps the top distance, so the viewport does not
+        // drift with the document height.
+        assert_eq!(
+            super::scroll_target_from_distance(100.0, 800.0, 500.0),
+            200.0
+        );
+        // The saved distance is replaced by the bottom when the new document cannot scroll that far.
+        assert_eq!(super::scroll_target_from_distance(500.0, 800.0, 500.0), 0.0);
+        // A document that cannot scroll at all has exactly one position.
+        assert_eq!(super::distance_from_top(0.0, 400.0, 500.0), 0.0);
+        assert_eq!(super::scroll_target_from_distance(120.0, 400.0, 500.0), 0.0);
+        // Non-finite input never produces a NaN origin; it falls back to the top.
+        assert_eq!(super::distance_from_top(f64::NAN, 900.0, 500.0), 0.0);
+        assert_eq!(
+            super::scroll_target_from_distance(f64::NAN, 900.0, 500.0),
+            400.0
+        );
+    }
 
     /// The detail pane's page area hangs from the band's bottom edge and fills down to the
     /// window's own bottom edge: it is the frame the pages are built into AND the one the search

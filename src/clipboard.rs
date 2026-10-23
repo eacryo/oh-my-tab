@@ -57,7 +57,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::{c_void, CString};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 mod crypto;
@@ -827,6 +827,319 @@ pub(super) fn disarm_paste_delete_suppression() {
 fn paste_delete_suppression_hit(stored: Option<i64>, cc: i64, marker_present: bool) -> bool {
     stored == Some(cc) || (stored.is_some() && marker_present)
 }
+/// Set when the storage has just become writable again after being unavailable or blocked: the
+/// next poll must adopt a baseline instead of recording the copy made while nothing could be kept.
+static RECOVERY_BASELINE_PENDING: AtomicBool = AtomicBool::new(false);
+
+/// Record that a storage recovery needs a fresh baseline before recording resumes.
+pub(super) fn request_recovery_baseline() {
+    RECOVERY_BASELINE_PENDING.store(true, Ordering::SeqCst);
+}
+
+/// Whether a storage recovery still owes the session a baseline. The request is cleared by a
+/// SUCCESSFUL `establish_baseline`, never by merely reading it: if the pasteboard is unreadable at
+/// the moment the poll notices, recording must stay off until a baseline can actually be taken.
+fn recovery_baseline_pending() -> bool {
+    RECOVERY_BASELINE_PENDING.load(Ordering::SeqCst)
+}
+
+/// The poll's recovery step. Returns true when this tick must not record: a pending request either
+/// adopts its baseline (and drops this tick's content, which predates the recovery) or keeps
+/// collection off because the pasteboard is not readable yet.
+pub(super) fn handle_recovery_baseline() -> bool {
+    if !recovery_baseline_pending() {
+        return false;
+    }
+    if establish_baseline() {
+        log_debug!("[clip] storage recovered: baseline adopted, current pasteboard not recorded");
+    } else {
+        log_debug!(
+            "[clip] storage recovered but the pasteboard is unreadable: recording stays off"
+        );
+    }
+    true
+}
+
+/// Serializes every test that drives the process-wide collection gate or the baseline static.
+#[cfg(test)]
+pub(super) fn gate_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+#[cfg(test)]
+pub(super) fn last_change_count_for_test() -> i64 {
+    *LAST_CHANGE_COUNT.lock().unwrap()
+}
+
+#[cfg(test)]
+pub(super) fn take_recovery_baseline_for_test() -> bool {
+    RECOVERY_BASELINE_PENDING.swap(false, Ordering::SeqCst)
+}
+
+#[cfg(test)]
+pub(super) fn recovery_baseline_pending_for_test() -> bool {
+    recovery_baseline_pending()
+}
+
+#[cfg(test)]
+pub(super) fn request_recovery_baseline_for_test() {
+    request_recovery_baseline();
+}
+
+/// The runtime collection gate. The persisted `config.clipboard.paused` is the user's intent; this
+/// is the effective state the poll consults, and the two can differ for as long as a resume has not
+/// managed to establish its baseline.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CollectionGate {
+    /// Recording normally.
+    Active = 0,
+    /// Not recording. The poll keeps advancing the changeCount baseline, so a later resume cannot
+    /// backfill what was copied while paused.
+    Paused = 1,
+    /// Resuming: the gate stays closed until the baseline has been adopted, so a poll that runs in
+    /// between (or a synchronous pasteboard notification) cannot record the current content.
+    Baselining = 2,
+}
+
+static COLLECTION_GATE: AtomicU8 = AtomicU8::new(CollectionGate::Active as u8);
+
+fn collection_gate() -> CollectionGate {
+    match COLLECTION_GATE.load(Ordering::SeqCst) {
+        1 => CollectionGate::Paused,
+        2 => CollectionGate::Baselining,
+        _ => CollectionGate::Active,
+    }
+}
+
+/// Whether recording is currently off (paused or still establishing a resume baseline).
+pub(super) fn collection_paused() -> bool {
+    collection_gate() != CollectionGate::Active
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test override for the pasteboard's changeCount: the gate's contract is about the baseline, and
+    /// the real pasteboard cannot be read in a headless test.
+    static TEST_CHANGE_COUNT: std::cell::Cell<Option<i64>> = const { std::cell::Cell::new(None) };
+    /// The pasteboard is unreadable (the real read would otherwise succeed on the test machine).
+    static TEST_PASTEBOARD_UNAVAILABLE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(super) fn set_test_change_count(value: Option<i64>) {
+    TEST_CHANGE_COUNT.with(|cell| cell.set(value));
+}
+
+#[cfg(test)]
+pub(super) fn set_test_pasteboard_unavailable(unavailable: bool) {
+    TEST_PASTEBOARD_UNAVAILABLE.with(|cell| cell.set(unavailable));
+}
+
+/// The pasteboard's current changeCount (None when the pasteboard is unavailable).
+fn current_change_count() -> Option<i64> {
+    #[cfg(test)]
+    {
+        if TEST_PASTEBOARD_UNAVAILABLE.with(|cell| cell.get()) {
+            return None;
+        }
+        if let Some(value) = TEST_CHANGE_COUNT.with(|cell| cell.get()) {
+            return Some(value);
+        }
+    }
+    unsafe {
+        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pb.is_null() {
+            return None;
+        }
+        Some(msg_send![pb, changeCount])
+    }
+}
+
+/// Adopt the current changeCount as "already seen" WITHOUT reading the pasteboard's contents.
+fn establish_baseline() -> bool {
+    let Some(cc) = current_change_count() else {
+        return false;
+    };
+    *LAST_CHANGE_COUNT.lock().unwrap() = cc;
+    disarm_paste_delete_suppression();
+    // A successful baseline satisfies a pending storage-recovery request: whether the request came
+    // from a resume or from the recovery path itself, the copy made while nothing could be recorded
+    // is now "already seen". Clearing it here is what keeps a stale request from swallowing the
+    // first NORMAL copy after collection resumes.
+    RECOVERY_BASELINE_PENDING.store(false, Ordering::SeqCst);
+    true
+}
+
+/// Advance the baseline without recording: what a paused poll does. Returns whether the
+/// pasteboard actually changed (false also when it could not be read), so the caller logs once per
+/// real change instead of once per timer tick.
+pub(super) fn advance_baseline() -> bool {
+    let Some(cc) = current_change_count() else {
+        return false;
+    };
+    let mut last = LAST_CHANGE_COUNT.lock().unwrap();
+    let changed = *last != cc;
+    *last = cc;
+    changed
+}
+
+/// Whether a config change is a genuine pause -> resume transition, which must re-baseline. A
+/// startup or an ordinary enable deliberately keeps the documented "record the current pasteboard"
+/// behaviour, so it must not be treated as a resume.
+pub(super) fn is_resume_transition(old_paused: bool, new_paused: bool) -> bool {
+    old_paused && !new_paused
+}
+
+/// Pause or resume recording. Returns the **effective** paused state: `true` means recording stays
+/// off, which also happens when a resume cannot read the pasteboard -- the caller must then keep the
+/// persisted intent and every surface (config, menu, settings switch) in the paused state.
+pub(crate) fn set_collection_paused(paused: bool) -> bool {
+    if paused {
+        COLLECTION_GATE.store(CollectionGate::Paused as u8, Ordering::SeqCst);
+        disarm_paste_delete_suppression();
+        return true;
+    }
+    COLLECTION_GATE.store(CollectionGate::Baselining as u8, Ordering::SeqCst);
+    if establish_baseline() {
+        COLLECTION_GATE.store(CollectionGate::Active as u8, Ordering::SeqCst);
+        false
+    } else {
+        COLLECTION_GATE.store(CollectionGate::Paused as u8, Ordering::SeqCst);
+        true
+    }
+}
+
+/// Seed the gate from the persisted intent before the first poll of this process. An unpaused start
+/// goes straight to Active so `start()` can record the current pasteboard (the existing "the first
+/// summon is not empty" behaviour); a paused start adopts a baseline and records nothing.
+pub(super) fn init_collection_gate() {
+    let paused = CONFIG.read().map(|c| c.clipboard.paused).unwrap_or(false);
+    if paused {
+        COLLECTION_GATE.store(CollectionGate::Paused as u8, Ordering::SeqCst);
+        let _ = establish_baseline();
+    } else {
+        COLLECTION_GATE.store(CollectionGate::Active as u8, Ordering::SeqCst);
+    }
+}
+
+/// Mirror the recording state in the panel header's orb: the glyph swaps between pause and a
+/// filled play (the `set_pin_button_style` precedent for a stateful glyph), and the tooltip and
+/// accessibility label name the action the click performs.
+pub(super) fn refresh_pause_button() {
+    let paused = collection_paused() || CONFIG.read().map(|c| c.clipboard.paused).unwrap_or(false);
+    let Some(button) = (*PICKER_PAUSE_BUTTON.lock().unwrap()).map(|pointer| pointer.0) else {
+        return;
+    };
+    unsafe {
+        let symbol = make_nsstring(if paused {
+            "play.circle.fill"
+        } else {
+            "pause.circle"
+        });
+        let image: *mut AnyObject = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: symbol,
+            accessibilityDescription: std::ptr::null::<AnyObject>()
+        ];
+        CFRelease(symbol as *const c_void);
+        if !image.is_null() {
+            let config: *mut AnyObject = msg_send![
+                class!(NSImageSymbolConfiguration),
+                configurationWithPointSize: PICKER_GEAR_GLYPH_SIZE,
+                weight: crate::theme::FONT_WEIGHT_REGULAR
+            ];
+            let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+            let _: () = msg_send![image, setTemplate: true];
+            let _: () = msg_send![button, setImage: image];
+        }
+        let label = make_nsstring(&t(if paused {
+            "menu.resume_clipboard"
+        } else {
+            "menu.pause_clipboard"
+        }));
+        let _: () = msg_send![button, setAccessibilityLabel: label];
+        let _: () = msg_send![button, setToolTip: label];
+        CFRelease(label as *const c_void);
+        // Re-apply the orb surface: the accent border is what makes "paused" visible without reading
+        // the glyph, and the hover dispatch only runs on pointer movement. The hover state is re-read
+        // rather than assumed false: a click lands while the pointer is still over the orb, so a
+        // hard-coded `false` would drop the wash until the pointer left and came back.
+        set_settings_button_style(button, pause_orb_hovered());
+    }
+}
+
+/// Flip the persisted pause intent through the one apply pass every surface uses (menu, settings
+/// switch, panel orb), so the gate, the menu title, the settings switch and the panel glyph cannot
+/// disagree.
+pub(crate) fn toggle_paused_intent() {
+    let old_cfg = match CONFIG.read() {
+        Ok(cfg) => cfg.clone(),
+        Err(_) => return,
+    };
+    let mut new_cfg = old_cfg.clone();
+    new_cfg.clipboard.paused = !old_cfg.clipboard.paused;
+    if let Ok(mut current) = CONFIG.write() {
+        *current = new_cfg.clone();
+    }
+    crate::config::persist_config_now();
+    crate::runtime_config::apply_config_change(
+        &old_cfg,
+        &new_cfg,
+        crate::runtime_config::ConfigChangeSource::Menu,
+    );
+    refresh_pause_button();
+    crate::menu::refresh_clipboard_pause_item();
+    crate::settings::refresh_clipboard_pause_switch_from_config();
+    crate::log_info!(
+        "Clipboard collection: {}",
+        if new_cfg.clipboard.paused {
+            "paused"
+        } else {
+            "resumed"
+        }
+    );
+}
+
+/// The panel orb's action: same entry as the menu item.
+pub(super) extern "C" fn toggle_pause_recording(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    toggle_paused_intent();
+}
+
+/// The privacy controls as the running process sees them: the effective pause state and the
+/// exclusion list. Read by `--e2e-state` so a scenario can assert them without guessing from UI.
+pub(crate) fn privacy_state_for_e2e() -> (bool, Vec<crate::config::ExcludedApp>) {
+    let paused = collection_paused() || CONFIG.read().map(|c| c.clipboard.paused).unwrap_or(false);
+    let excluded = CONFIG
+        .read()
+        .map(|c| c.clipboard.excluded_apps.clone())
+        .unwrap_or_default();
+    (paused, excluded)
+}
+
+/// Whether a copy whose source identifiers are `frontmost` / `declared` must be skipped because
+/// the exclusion list names either of them.
+///
+/// The declared identifier comes from `org.nspasteboard.source`, which the WRITING application
+/// reports about itself; it is therefore only ever an ADDITIONAL signal. It never replaces the
+/// frontmost check: a writer could claim any identifier, and letting the claim override the
+/// frontmost verdict would re-admit a copy from an excluded app.
+pub(super) fn excluded_app_matches(
+    list: &[crate::config::ExcludedApp],
+    frontmost: Option<&str>,
+    declared: Option<&str>,
+) -> bool {
+    list.iter().any(|entry| {
+        let id = entry.bundle_id.trim();
+        !id.is_empty()
+            && (frontmost.is_some_and(|f| f.eq_ignore_ascii_case(id))
+                || declared.is_some_and(|d| d.eq_ignore_ascii_case(id)))
+    })
+}
 /// the polling timer (main thread).
 static POLL_TIMER: OnceLock<MainThreadSlot<ObjPtr>> = OnceLock::new();
 /// whether the picker is visible.
@@ -1115,6 +1428,8 @@ static PICKER_OPTIONS_ORB: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(
 /// The panel-level pin button (the corner row's third glyph). Distinct from the per-row entry pin.
 static PICKER_DETAIL_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static PICKER_PIN_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The panel header's pause-recording orb (a real control, unlike the pin's check state).
+static PICKER_PAUSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
 /// carries NO placeholder property, so the field editor never draws the placeholder
 /// left-aligned on a focused-but-empty field).
@@ -1649,6 +1964,210 @@ static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None
 static REBUILDING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
+
+    /// The collection gate is process-wide, so the tests that drive it must not overlap.
+    fn gate_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::gate_test_lock()
+    }
+
+    /// Every documented mark is present, and Handoff (a deliberate copy made on another device) is
+    /// not: that combination is the contract the poll depends on.
+    #[test]
+    fn sensitive_markers_cover_the_vendor_types_and_exclude_handoff() {
+        let markers = super::pasteboard::SENSITIVE_PASTEBOARD_TYPES;
+        for expected in [
+            "org.nspasteboard.TransientType",
+            "org.nspasteboard.ConcealedType",
+            "org.nspasteboard.AutoGeneratedType",
+            "com.typeit4me.clipping",
+            "de.petermaurer.TransientPasteboardType",
+            "Pasteboard generator type",
+            "com.agilebits.onepassword",
+        ] {
+            assert!(markers.contains(&expected), "missing marker: {expected}");
+        }
+        assert!(
+            !markers.contains(&"com.apple.is-remote-clipboard"),
+            "Handoff content is a user-intended copy and must still be recorded"
+        );
+    }
+
+    /// A recovery request survives an unreadable pasteboard: clearing it on mere observation would
+    /// let a stale baseline record the copy made while nothing could be kept.
+    #[test]
+    fn a_recovery_request_waits_for_a_baseline_that_succeeds() {
+        let _guard = gate_lock();
+        super::request_recovery_baseline_for_test();
+        super::set_test_pasteboard_unavailable(true);
+        assert!(super::handle_recovery_baseline());
+        assert!(
+            super::recovery_baseline_pending_for_test(),
+            "an unreadable pasteboard must not consume the request"
+        );
+        // The pasteboard comes back: the baseline is taken and the request completes.
+        super::set_test_pasteboard_unavailable(false);
+        super::set_test_change_count(Some(70));
+        assert!(super::handle_recovery_baseline());
+        assert!(!super::recovery_baseline_pending_for_test());
+        assert_eq!(*super::LAST_CHANGE_COUNT.lock().unwrap(), 70);
+        super::set_test_change_count(None);
+    }
+
+    /// A resume establishes a baseline, which must also satisfy a pending recovery request; otherwise
+    /// the stale request would eat the first normal copy after the resume.
+    #[test]
+    fn a_successful_resume_satisfies_the_recovery_request() {
+        let _guard = gate_lock();
+        super::set_test_change_count(Some(80));
+        assert!(!super::set_collection_paused(false));
+        assert!(super::set_collection_paused(true));
+        super::request_recovery_baseline_for_test();
+        // The user resumes while the request is still pending.
+        super::set_test_change_count(Some(81));
+        assert!(!super::set_collection_paused(false));
+        assert!(
+            !super::recovery_baseline_pending_for_test(),
+            "the resume adopted a baseline, so the old recovery request is satisfied"
+        );
+        // A genuine copy after the resume is therefore NOT consumed by handle_recovery_baseline.
+        super::set_test_change_count(Some(82));
+        assert!(!super::handle_recovery_baseline());
+        super::set_test_change_count(None);
+    }
+
+    /// The baseline is taken when writability is published, not at the next poll. Otherwise the first
+    /// copy made AFTER the recovery would become the baseline and be dropped.
+    #[test]
+    fn recovery_takes_its_baseline_before_collection_reopens() {
+        let _guard = gate_lock();
+        // The pre-recovery content is on the pasteboard when the recovery completes.
+        super::set_test_change_count(Some(90));
+        super::request_recovery_baseline_for_test();
+        assert!(super::handle_recovery_baseline());
+        assert_eq!(*super::LAST_CHANGE_COUNT.lock().unwrap(), 90);
+        // A copy made after the recovery is a NEW change: it must not be consumed by the stale
+        // request, so the next poll records it.
+        super::set_test_change_count(Some(91));
+        assert!(!super::handle_recovery_baseline());
+        assert_eq!(*super::LAST_CHANGE_COUNT.lock().unwrap(), 90);
+        super::set_test_change_count(None);
+    }
+
+    #[test]
+    fn only_a_pause_to_resume_transition_rebaselines() {
+        assert!(super::is_resume_transition(true, false));
+        // Startup and an ordinary enable keep the documented record-current behaviour.
+        assert!(!super::is_resume_transition(false, false));
+        assert!(!super::is_resume_transition(false, true));
+        assert!(!super::is_resume_transition(true, true));
+    }
+
+    /// The promise a pause makes: content copied while paused is not recorded later. The counter-example
+    /// that motivated the baseline is a copy landing AFTER the last paused poll and BEFORE the resume --
+    /// the changeCount is still unseen when collection resumes.
+    #[test]
+    fn resume_adopts_the_copy_made_while_paused_as_its_baseline() {
+        let _guard = gate_lock();
+        super::set_test_change_count(Some(41));
+        assert!(!super::set_collection_paused(false));
+        assert!(super::set_collection_paused(true));
+        // A copy lands while paused; no poll runs before the user resumes.
+        super::set_test_change_count(Some(42));
+        assert!(
+            !super::set_collection_paused(false),
+            "resume should succeed with a pasteboard"
+        );
+        assert_eq!(
+            *super::LAST_CHANGE_COUNT.lock().unwrap(),
+            42,
+            "the resume must adopt the paused copy as already seen, so it is never recorded"
+        );
+        super::set_test_change_count(None);
+    }
+
+    /// A resume that cannot read the pasteboard must leave recording off; the caller then keeps the
+    /// persisted intent and every surface in the paused state.
+    #[test]
+    fn resume_without_a_readable_pasteboard_reports_still_paused() {
+        let _guard = gate_lock();
+        super::set_test_change_count(Some(1));
+        assert!(super::set_collection_paused(true));
+        super::set_test_pasteboard_unavailable(true);
+        assert!(
+            super::set_collection_paused(false),
+            "an unreadable pasteboard must report the effective paused state"
+        );
+        assert!(super::collection_paused());
+        // Leave the process-wide gate usable for the rest of this binary.
+        super::set_test_pasteboard_unavailable(false);
+        super::set_test_change_count(Some(7));
+        assert!(!super::set_collection_paused(false));
+        super::set_test_change_count(None);
+    }
+
+    #[test]
+    fn excluded_app_matches_uses_frontmost_and_declared_union() {
+        let list = vec![crate::config::ExcludedApp::new("com.example.pm", "Example")];
+        // Either signal excludes the copy.
+        assert!(super::excluded_app_matches(
+            &list,
+            Some("com.example.pm"),
+            None
+        ));
+        assert!(super::excluded_app_matches(
+            &list,
+            Some("com.other"),
+            Some("com.example.pm")
+        ));
+        // Comparison is case-insensitive; a blank entry can never match, not even an empty string.
+        assert!(super::excluded_app_matches(
+            &list,
+            Some("COM.EXAMPLE.PM"),
+            None
+        ));
+        assert!(!super::excluded_app_matches(
+            &list,
+            Some("com.other"),
+            Some("com.third")
+        ));
+        assert!(!super::excluded_app_matches(
+            &[],
+            Some("com.example.pm"),
+            None
+        ));
+        let blank = vec![crate::config::ExcludedApp::new("  ", "Blank")];
+        assert!(!super::excluded_app_matches(&blank, Some(""), Some("")));
+        assert!(!super::excluded_app_matches(&blank, None, None));
+    }
+
+    /// `org.nspasteboard.source` is self-reported, so only a plausible bundle identifier may be
+    /// used at all: anything else must be ignored rather than allowed to influence a verdict.
+    #[test]
+    fn declared_source_bundle_id_accepts_only_plausible_identifiers() {
+        assert_eq!(
+            super::pasteboard::valid_source_bundle_id(" com.example.app "),
+            Some("com.example.app")
+        );
+        assert_eq!(super::pasteboard::valid_source_bundle_id(""), None);
+        assert_eq!(super::pasteboard::valid_source_bundle_id("   "), None);
+        assert_eq!(
+            super::pasteboard::valid_source_bundle_id("com.exa mple"),
+            None
+        );
+        assert_eq!(
+            super::pasteboard::valid_source_bundle_id("com.example/app"),
+            None
+        );
+        assert_eq!(
+            super::pasteboard::valid_source_bundle_id(&"a".repeat(256)),
+            None
+        );
+        assert_eq!(
+            super::pasteboard::valid_source_bundle_id(&"a".repeat(255)).map(str::len),
+            Some(255)
+        );
+    }
+
     /// The row-text and soft-wrap caches key on the material because `glass::panel_ink` returns a different
     /// colour object per material while the palette tokens stay identical: without that, a material switch kept
     /// serving the previous material's ink until a mode change or a restart (the panel's text surface is the
@@ -1697,7 +2216,7 @@ mod tests {
     use std::sync::Arc;
     #[test]
     fn picker_header_separates_the_four_corner_controls() {
-        let (search, options, detail, pin, close) = picker_header_frames();
+        let (search, pause, options, detail, pin, close) = picker_header_frames();
         // The row is inset symmetrically from the strip's edges and all three buttons are square.
         assert_eq!(search.origin.x, SEARCH_PAD_X);
         assert_eq!(search.origin.y, TOP_PAD_Y);
@@ -1711,12 +2230,19 @@ mod tests {
         assert_eq!(close.size.width, PICKER_CLOSE_BTN_SIZE);
         // Every control is clear of the one before it: the close button is never drawn over the
         // gear, the gear never over the pin, the pin never over the query/⌘F keycap, and none of
-        // the four overlap whichever label is longest.
-        assert!(search.origin.x + search.size.width < options.origin.x);
+        // the five overlap whichever label is longest. The pause orb is part of the same group and
+        // shares the orb metrics.
+        assert_eq!(pause.size, options.size);
+        assert!(search.origin.x + search.size.width < pause.origin.x);
+        assert!(pause.origin.x + pause.size.width < options.origin.x);
         assert!(options.origin.x + options.size.width < detail.origin.x);
         assert!(detail.origin.x + detail.size.width < pin.origin.x);
         assert!(pin.origin.x + pin.size.width < close.origin.x);
-        // The three buttons are evenly spaced by the one gap constant, so the row reads as a group.
+        // The four orbs are evenly spaced by the one gap constant, so the row reads as a group.
+        assert_eq!(
+            options.origin.x - (pause.origin.x + pause.size.width),
+            PICKER_CLOSE_BTN_GAP
+        );
         assert_eq!(
             detail.origin.x - (options.origin.x + options.size.width),
             PICKER_CLOSE_BTN_GAP
@@ -1729,9 +2255,9 @@ mod tests {
             close.origin.x - (pin.origin.x + pin.size.width),
             PICKER_CLOSE_BTN_GAP
         );
-        // All four stay inside the fixed strip (never over the filters row or the list).
+        // All five stay inside the fixed strip (never over the filters row or the list).
         let strip_bottom = header_strip_h();
-        for frame in [search, options, detail, pin, close] {
+        for frame in [search, pause, options, detail, pin, close] {
             assert!(frame.origin.y + frame.size.height <= strip_bottom);
         }
         // The drag band is the WHOLE top bar: it sits in the top padding the strip already reserves

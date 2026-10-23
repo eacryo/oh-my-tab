@@ -832,6 +832,56 @@ pub struct ClipboardSection {
     // new position; false = keep the current display position (pointing at the next
     // entry, convenient for batch pinning). Defaults to follow.
     pub pin_follow_selection: bool,
+    // Stop recording without turning the feature off. Persisted on purpose: a pause is a standing
+    // intent, so restarting the app must not silently resume collecting. While it is on, the timer
+    // keeps running and advances the changeCount baseline, so nothing copied during the pause is
+    // recorded afterwards (see clipboard::set_collection_paused).
+    pub paused: bool,
+    // Applications whose copies are never recorded. Matched by bundle identifier against the
+    // frontmost app and, when the pasteboard declares one, the copier named by
+    // `org.nspasteboard.source`. The built-in list is the default; an explicitly emptied list stays
+    // empty. New built-in entries added in later versions do NOT propagate into a list the user has
+    // already saved (there is no defaults-provenance marker by design: auto-adding an entry would
+    // re-introduce an app the user deliberately removed).
+    pub excluded_apps: Vec<ExcludedApp>,
+}
+
+/// One entry of `[clipboard] excluded_apps`. `bundle_id` is the only matching key; `name` is a
+/// display snapshot taken when the entry was added and is never compared, so an app that renames
+/// itself still matches.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
+pub struct ExcludedApp {
+    pub bundle_id: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+impl ExcludedApp {
+    pub(crate) fn new(bundle_id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            bundle_id: bundle_id.into(),
+            name: name.into(),
+        }
+    }
+}
+
+/// The built-in exclusion list: macOS's own credential stores plus the password managers whose
+/// bundle identifiers are stable and publicly documented.
+///
+/// The list stays short on purpose. A wrong identifier is harmless (it never matches) but a long
+/// list of unverified ones is not evidence of coverage, so only identifiers with a source are kept:
+/// `com.apple.Passwords` was read from `/System/Applications/Passwords.app/Contents/Info.plist`
+/// on macOS 26; `com.apple.keychainaccess` is the system Keychain Access bundle; the four
+/// third-party identifiers are the ones those vendors ship in their public macOS builds.
+pub(crate) fn default_excluded_apps() -> Vec<ExcludedApp> {
+    vec![
+        ExcludedApp::new("com.apple.keychainaccess", "Keychain Access"),
+        ExcludedApp::new("com.apple.Passwords", "Passwords"),
+        ExcludedApp::new("com.1password.1password", "1Password"),
+        ExcludedApp::new("com.agilebits.onepassword7", "1Password 7"),
+        ExcludedApp::new("com.bitwarden.desktop", "Bitwarden"),
+        ExcludedApp::new("org.keepassxc.keepassxc", "KeePassXC"),
+    ]
 }
 
 impl Default for ClipboardSection {
@@ -850,6 +900,8 @@ impl Default for ClipboardSection {
             image_rows: 1,
             picker_position: "main".to_string(),
             pin_follow_selection: true,
+            paused: false,
+            excluded_apps: default_excluded_apps(),
         }
     }
 }
@@ -1860,8 +1912,12 @@ impl Config {
         if !errs.iter().any(|e| e.starts_with("clipboard.shortcut")) {
             self.clipboard.shortcut = other.clipboard.shortcut.clone();
         }
-        // pin_follow_selection is a bool, always valid.
+        // pin_follow_selection and paused are bools, always valid.
         self.clipboard.pin_follow_selection = other.clipboard.pin_follow_selection;
+        self.clipboard.paused = other.clipboard.paused;
+        // A list of identifiers has no invalid member to fall back on: take it as written
+        // (duplicates are tolerated here and collapsed when the settings page adds an entry).
+        self.clipboard.excluded_apps = other.clipboard.excluded_apps.clone();
 
         // mouse: per-profile, per-field merge (continuing the per-field resilient pattern).
         // enabled and bool fields are always valid; each profile's fields are kept or dropped
@@ -2177,6 +2233,51 @@ fn sanitize_config_value(
             }
         }
         return Some(toml::Value::Table(sanitized));
+    }
+
+    // The exclusion list is user data: one malformed entry (a missing or non-string bundle_id,
+    // the only matching key) is dropped on its own instead of failing the whole file. The generic
+    // per-field path would leave the missing key out, and the required-field decode would then
+    // reject the ENTIRE config -- the opposite of the per-field tolerance invariant.
+    if path == "clipboard.excluded_apps" {
+        let Some(array) = actual.as_array() else {
+            errors.push(type_error(path, actual, schema));
+            return fallback.cloned();
+        };
+        let mut sanitized = Vec::with_capacity(array.len());
+        for (index, item) in array.iter().enumerate() {
+            let item_path = toml_path_index(path, index);
+            let Some(table) = item.as_table() else {
+                errors.push(type_error(&item_path, item, schema));
+                continue;
+            };
+            let Some(bundle_id) = table.get("bundle_id").and_then(toml::Value::as_str) else {
+                errors.push(format!("{item_path}: missing bundle_id"));
+                continue;
+            };
+            let bundle_id = bundle_id.trim();
+            if bundle_id.is_empty() {
+                errors.push(format!("{item_path}: empty bundle_id"));
+                continue;
+            }
+            let mut entry = toml::map::Map::new();
+            entry.insert(
+                "bundle_id".to_string(),
+                toml::Value::String(bundle_id.to_string()),
+            );
+            entry.insert(
+                "name".to_string(),
+                toml::Value::String(
+                    table
+                        .get("name")
+                        .and_then(toml::Value::as_str)
+                        .unwrap_or_default()
+                        .to_string(),
+                ),
+            );
+            sanitized.push(toml::Value::Table(entry));
+        }
+        return Some(toml::Value::Array(sanitized));
     }
 
     match (actual, schema) {
@@ -2880,6 +2981,75 @@ pub fn reload_config() -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The exclusion list's defaulting rule has three distinct cases and they must stay distinct:
+    /// a config written before the field existed gets the built-in list, an explicitly emptied list
+    /// stays empty (the user removed every entry), and an explicit list is taken as written.
+    #[test]
+    fn clipboard_excluded_apps_default_and_explicit_forms_stay_distinct() {
+        let defaults = Config::default();
+        assert!(!defaults.clipboard.paused);
+        assert!(defaults
+            .clipboard
+            .excluded_apps
+            .iter()
+            .any(|entry| entry.bundle_id == "com.apple.Passwords"));
+        assert!(defaults
+            .clipboard
+            .excluded_apps
+            .iter()
+            .any(|entry| entry.bundle_id == "com.apple.keychainaccess"));
+
+        let legacy: Config = toml::from_str("[clipboard]\nenabled = true\n").unwrap();
+        assert_eq!(legacy.clipboard.excluded_apps, default_excluded_apps());
+        assert!(!legacy.clipboard.paused);
+
+        let emptied: Config = toml::from_str("[clipboard]\nexcluded_apps = []\n").unwrap();
+        assert!(emptied.clipboard.excluded_apps.is_empty());
+
+        let custom: Config = toml::from_str(
+            "[[clipboard.excluded_apps]]\nbundle_id = \"com.example.one\"\nname = \"One\"\n",
+        )
+        .unwrap();
+        assert_eq!(custom.clipboard.excluded_apps.len(), 1);
+        assert_eq!(
+            custom.clipboard.excluded_apps[0].bundle_id,
+            "com.example.one"
+        );
+        assert_eq!(custom.clipboard.excluded_apps[0].name, "One");
+    }
+
+    /// One malformed exclusion entry must be dropped on its own: the list is user data, and failing
+    /// the whole file would discard every other valid setting.
+    #[test]
+    fn a_malformed_excluded_app_entry_does_not_reject_the_rest_of_the_config() {
+        let content = "[clipboard]\nenabled = true\n\n[[clipboard.excluded_apps]]\nname = \"Missing identifier\"\n\n[[clipboard.excluded_apps]]\nbundle_id = \"com.example.good\"\nname = \"Good\"\n";
+        let (config, errors, _needs_persist) =
+            parse_config_content(content).expect("the rest of the file must still load");
+        assert!(config.clipboard.enabled);
+        assert_eq!(
+            config.clipboard.excluded_apps,
+            vec![ExcludedApp::new("com.example.good", "Good")]
+        );
+        assert!(
+            !errors.is_empty(),
+            "the dropped entry must still be reported"
+        );
+    }
+
+    #[test]
+    fn merge_valid_takes_paused_and_the_excluded_list_verbatim() {
+        let mut ours = Config::default();
+        let mut other = Config::default();
+        other.clipboard.paused = true;
+        other.clipboard.excluded_apps = vec![ExcludedApp::new("com.example.pm", "PM")];
+        ours.merge_valid(other, &[]);
+        assert!(ours.clipboard.paused);
+        assert_eq!(
+            ours.clipboard.excluded_apps,
+            vec![ExcludedApp::new("com.example.pm", "PM")]
+        );
+    }
 
     #[test]
     fn parse_hex8_parses_valid_rgb_alpha() {
