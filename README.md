@@ -63,6 +63,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 - **Panel actions**: while the panel is open, Command+W / M / H / Q close the highlighted window, minimize it (or restore it when it is already minimized), hide its app, or ask that app to quit. Each is a separate switch, all off by default.
 - **Clipboard history**: once enabled, press **Option+V** to summon it; it supports both keyboard and mouse, and closes when you click outside.
 - **Key bindings**: open **Settings → Key Bindings** to edit the shortcut list. Every row can be changed, switched off or deleted; the picker offers actions that are not bound by default.
+- **Finder menu**: **Settings → Finder Menu** adds "New File" (Markdown / text / JSON) and "Open in Terminal" to Finder's right-click menu, in a flat, grouped or single-submenu layout. It needs the bundled Finder extension enabled once in **System Settings → General → Login Items & Extensions → Finder Extensions**; the settings page shows that state and opens the pane for you. Terminals are offered only once they are installed.
 - **Permissions**: window switching needs Accessibility permission; thumbnails need Screen Recording; clipboard history needs the keychain key it creates on first use. Without Screen Recording, switching still works and cards simply fall back to icons.
 
 ## <img height="16" src="docs/icons/copy.svg">&nbsp;&nbsp;Clipboard history
@@ -153,6 +154,7 @@ Some managed Macs only allow approved `.app` bundles to launch. `scripts/install
 - **Starting and quitting:** the agent starts oh-my-tab at login and restarts it only after a crash, so *Quit* from the menu keeps it quit. To start it again, open **Oh My Tab** from `/Applications` (or `~/Applications` when `/Applications` is not writable) in Finder or Spotlight. It is a shell script (`Oh My Tab.command`) with the app icon, not an app: it starts the agent and closes its own Terminal window. `scripts/install-unbundled.sh start` does the same from a shell.
 - **Permissions:** grant Accessibility and Screen Recording to `~/.local/bin/oh-my-tab`, then run `scripts/install-unbundled.sh restart`. The binary is signed with the Developer ID identity, else `oh-my-tab-sign` (see [docs/releasing-en.md](docs/releasing-en.md)), else ad-hoc; `--identity` overrides it. With ad-hoc signing, macOS asks for the permissions again after every rebuild.
 - **Differences from the `.app`:** no Sparkle updates (pull and re-run `install`), *Launch at login* in Settings has no effect (the agent handles it), the onboarding guide is skipped, and version strings are empty. Configuration and logs are the same files. If an installed `.app` is already running, the agent's instance exits cleanly instead of competing with it.
+- **Finder context menu: unverified in this mode.** The Finder Sync app extension lives inside a `.app`'s `Contents/PlugIns`, and the app only starts the extension bridge when the process has a bundle identifier, so the right-click menu is expected to be absent here. No test has exercised this combination yet.
 
 ## <img height="16" src="docs/icons/shield-lock.svg">&nbsp;&nbsp;Permissions & runtime caveats
 

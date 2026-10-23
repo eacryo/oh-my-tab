@@ -2018,6 +2018,7 @@ pub(super) enum SettingsSidebarIcon {
     Clipboard,
     KeyBindings,
     KeystrokeDisplay,
+    FinderMenu,
     About,
 }
 
@@ -2032,6 +2033,7 @@ impl SettingsSidebarIcon {
             SettingsPageId::Clipboard => Self::Clipboard,
             SettingsPageId::KeyBindings => Self::KeyBindings,
             SettingsPageId::KeystrokeDisplay => Self::KeystrokeDisplay,
+            SettingsPageId::FinderMenu => Self::FinderMenu,
             SettingsPageId::About => Self::About,
         }
     }
@@ -2047,6 +2049,9 @@ impl SettingsSidebarIcon {
             // A command-key square: the page is about key chords and the behaviours they run.
             Self::KeyBindings => "command.square",
             Self::KeystrokeDisplay => "keyboard",
+            // The Finder menu is a folder-bound integration; folder is an SF Symbol available in
+            // every macOS this app supports.
+            Self::FinderMenu => "folder",
             Self::About => "info.circle",
         }
     }

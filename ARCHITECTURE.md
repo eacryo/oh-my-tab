@@ -32,6 +32,8 @@ src/
 ├── event_monitor.rs             # switcher shortcut matching (Cmd/Opt/Ctrl+Tab) over event_tap
 ├── event_tap.rs                 # shared CGEventTap leaf: types, FFI, semantic constants, start helper
 ├── ffi.rs                       # CF/CG declarations, pointer wrappers, NSString, color/layer helpers
+├── finder_menu.rs               # Finder context menu root: config→model, extension IPC, click actions
+│   ├── finder_menu/             # (see "Finder context menu" below)
 ├── glass.rs                     # shared rounded material backdrop for passive floating panels
 ├── hash.rs                      # the one FNV-1a 64 implementation
 ├── i18n.rs                      # t()/tf()/t_count(), locale tables, language switching
@@ -45,6 +47,7 @@ src/
 ├── menu.rs                      # status-bar menu: item state, actions, title refresh
 ├── mouse.rs                     # mouse enhancement root: scroll modes, profiles, feature gate
 │   ├── mouse/                   # event tap, devices, scrolling, smoothing, pointer, shortcuts (see below)
+
 ├── onboarding.rs                # first-run onboarding window
 ├── overlay.rs                   # switcher overlay root: statics, callbacks, show/hide/refresh, raise
 │   ├── overlay/                 # cards, hover, cancel, card close, footer, panel keys (see below)
@@ -219,6 +222,58 @@ clipboard/
   dispatch and the control-pointer tables are, so "where is this field read" is answered with `grep`.
 - A `SettingsButton`'s `tag` **selects its hover/normal palette**; never carry an action id in `setTag:` — map
   the sender pointer to an action id instead, or the colour sticks after the pointer leaves.
+
+## Finder context menu
+
+`finder_menu.rs` is the root of the Finder right-click menu. The menu itself is drawn by a
+**second binary in its own package**, `finder-ext/` (`oh-my-tab-finder-ext`, embedded as
+`Contents/PlugIns/Oh-My-Tab-Finder.appex`): Finder Sync extensions must be sandboxed, so the
+extension can create no file and launch no application. It is a renderer, and every privileged
+action stays in the main app.
+
+```text
+finder_menu.rs            # root: what the module exposes (start/shutdown/broadcast/terminals/status)
+finder_menu/
+├── model.rs              # Config + locale + installed terminals -> the menu tree the extension draws
+├── ipc.rs                # DistributedNotificationCenter bridge, host identity, click dispatch
+├── actions.rs            # executes a click: new file / open terminal / copy path (re-validated)
+├── new_file.rs           # Finder-style collision-safe file creation (O_EXCL, "Untitled 2")
+└── terminals.rs          # known terminals, install detection, per-terminal launch adapters
+
+finder-ext/               # the sandboxed appex (own package: own entry point, own link args)
+├── src/main.rs           # registers the principal class, then runs Foundation's NSExtensionMain
+├── src/menu.rs           # model -> NSMenu, one ClickTemplate per item
+├── src/state.rs          # cached model, heartbeat/sync, selection paths, click forwarding
+└── src/ffi.rs            # NSString/NSMenu/NSLog helpers (the app's ffi module is not linked here)
+
+crates/finder-protocol/   # the wire contract both sides compile against (serde types + size cap)
+assets/FinderExtension/   # Info.plist and the sandbox entitlement the bundle scripts install
+```
+
+- **Channels are derived from the host bundle id** (`<bundle id>.finder.ext2app` / `.app2ext`), so the
+  dev and release extensions can never talk to the other channel's app. Every message carries the
+  host instance, so a click queued by a previous app process is dropped rather than executed
+  against a config it never saw. Each menu item carries the instance and model version it was built
+  from (in its `representedObject`), so a menu that outlives an app restart is rejected instead of
+  being re-attributed to the new process.
+- **Titles are localized in the app**, not in the extension: the model arrives with final strings.
+  The extension therefore has no locale files and no user-visible text of its own.
+- **The extension renders a model, not the config.** A menu already on screen therefore resolves
+  its own items through `representedObject` (a `ClickTemplate`), and the app re-validates the action
+  against the live config before doing anything — a settings change cannot turn a stale menu item
+  into an action the user no longer allows.
+- **Sign inside-out: the extension first, the app last.** `codesign --deep` on the app re-signs
+  nested code and strips the extension's sandbox entitlement (measured — Finder then refuses to load
+  it), and it seals the nested bundle by cdhash, so re-signing the extension afterwards invalidates
+  the parent ("nested code is modified or invalid"). The bundle scripts therefore sign the appex with
+  its entitlements, then sign the app *without* `--deep`; the parent records the extension by
+  requirement and `--verify --deep --strict` still passes.
+- **A rebuild does not reload a running extension.** `scripts/dev-restart.sh` registers the appex and
+  reports its election state; only `--reload-finder-extension` restarts Finder, because that closes
+  every window.
+- Finder Sync is not a general Finder-UI hook: `directoryURLs` decides where the menu exists, and
+  observing volume roots repaints their sidebar icons. The settings page tells the user where to
+  enable the extension; the app never turns it on itself.
 
 ## Global input
 

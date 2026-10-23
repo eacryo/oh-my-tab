@@ -1,0 +1,14 @@
+[package]
+name = "oh-my-tab-finder-ext"
+version = "0.2.5"
+edition = "2021"
+# The Finder Sync app extension is its own package because it is linked with a different process
+# entry point (-e _NSExtensionMain), which is a per-target link argument: keeping it separate
+# stops that argument from reaching the main app binary.
+
+[dependencies]
+finder-protocol = { path = "../crates/finder-protocol" }
+objc2 = { version = "0.6", features = ["exception"] }
+objc2-foundation = "0.3"
+
+[build-dependencies]

@@ -51,6 +51,7 @@ require_stable_signing=0
 allow_signing_fallback=0
 lock_wait_seconds=900
 check_mode=0
+reload_finder_extension=0
 ownership_probe=0
 ownership_expect_pid=""
 ownership_expect_start=""
@@ -65,6 +66,12 @@ for arg in "$@"; do
         --require-stable-signing) require_stable_signing=1 ;;
         --allow-signing-fallback) allow_signing_fallback=1 ;;
         --no-onboarding) app_args+=("$arg") ;;
+        --reload-finder-extension)
+            # Finder caches the extension's process and menu; restarting Finder is the only reliable
+            # way to make a rebuilt extension visible, and it closes every Finder window, so it is
+            # an explicit opt-in.
+            reload_finder_extension=1
+            ;;
         --check)
             # Verify a launch, then stop it: the shape an automated check wants, which is the
             # opposite of the interactive default. It leaves neither this run's process nor its
@@ -171,7 +178,12 @@ fi
 build_target_dir="$repo_dir/target/$build_profile"
 dev_app="$repo_dir/dist/Oh-My-Tab-Dev.app"
 dev_app_binary="$dev_app/Contents/MacOS/oh-my-tab"
+# The Finder Sync app extension: its own nested bundle, its own id (derived from the app's) and its
+# own sandbox entitlement.
+dev_appex="$dev_app/Contents/PlugIns/Oh-My-Tab-Finder.appex"
+dev_appex_binary="$dev_appex/Contents/MacOS/oh-my-tab-finder-ext"
 dev_bundle_id="com.eacryo.oh-my-tab.dev"
+dev_appex_bundle_id="$dev_bundle_id.FinderSync"
 
 # The ownership query runs BEFORE anything that could touch the repository or an instance: no
 # release-note requirement, no claim, no build. It answers a question about the machine's current
@@ -663,6 +675,11 @@ fi
 dev_inputs_fingerprint() {
     {
         shasum -a 256 "$build_target_dir/oh-my-tab" | awk '{ print $1 }'
+        # The extension is a second binary and a second bundle; both decide what gets signed.
+        shasum -a 256 "$build_target_dir/oh-my-tab-finder-ext" | awk '{ print $1 }'
+        find "$repo_dir/assets/FinderExtension" -type f 2>/dev/null | sort | while IFS= read -r asset; do
+            shasum -a 256 "$asset"
+        done
         printf 'profile=%s\nversion=%s\nfeed=%s\nkey=%s\nidentity=%s\n' \
             "$build_profile" "$dev_version" "$sparkle_feed_url" "${SPARKLE_PUBLIC_ED_KEY:-}" "$sign_identity"
         find "$repo_dir/assets/Info.plist" "$repo_dir/assets/AppIcon.icns" \
@@ -752,6 +769,16 @@ cp "$repo_dir/assets/AppIcon.icns" "$dev_app/Contents/Resources/AppIcon.icns"
 # buttons on a Chinese system (see the CFBundleLocalizations note in assets/Info.plist).
 # Copied before codesign so they are covered by the signature.
 cp -R "$repo_dir/assets/Resources/." "$dev_app/Contents/Resources/"
+# Finder Sync app extension (Contents/PlugIns/Oh-My-Tab-Finder.appex). Assembled unsigned: the
+# extension is signed inside-out before the app (see sign_dev_appex below), and the app is signed
+# without --deep so its seal records the extension by requirement rather than by cdhash.
+mkdir -p "$dev_appex/Contents/MacOS"
+cp "$build_target_dir/oh-my-tab-finder-ext" "$dev_appex_binary"
+cp "$repo_dir/assets/FinderExtension/Info.plist" "$dev_appex/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $dev_appex_bundle_id" \
+    "$dev_appex/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :OMTHostBundleIdentifier $dev_bundle_id" \
+    "$dev_appex/Contents/Info.plist"
 if [ -d "$repo_dir/assets/AppIcon.icon" ]; then
     cp -R "$repo_dir/assets/AppIcon.icon" "$dev_app/Contents/Resources/AppIcon.icon"
 fi
@@ -780,6 +807,10 @@ dev_build_version="${SPARKLE_BUILD_VERSION:-$(date -u +%Y%m%d%H%M%S)}"
     "$dev_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $dev_build_version" \
     "$dev_app/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $dev_version" \
+    "$dev_appex/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $dev_build_version" \
+    "$dev_appex/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :SUFeedURL $sparkle_feed_url" \
     "$dev_app/Contents/Info.plist"
 if [ -n "${SPARKLE_PUBLIC_ED_KEY:-}" ]; then
@@ -804,6 +835,30 @@ dev_inputs_fingerprint > "$dev_app/Contents/Resources/dev-inputs.txt"
 # rebuilds, and the keychain ACL *and* the TCC grants are judged against it, so one authorization
 # survives every later code change. A self-signed certificate has a stable DR *string* but the
 # keychain ACL is measured to judge it by the binary, so it stays a fallback only.
+# Sign the Finder extension. It must happen BEFORE the app that contains it: `codesign --deep`
+# re-signs nested code (dropping the extension's sandbox entitlement, which Finder then refuses) and
+# seals the nested bundle by cdhash, so re-signing the extension afterwards invalidates the parent
+# ("nested code is modified or invalid"). Signing inside-out, with the app signed without --deep,
+# satisfies both: the parent records the extension by requirement and the entitlement survives.
+sign_dev_appex() {
+    local identity="$1"
+    [ -d "$dev_appex" ] || return 0
+    if ! /usr/bin/codesign --force --options runtime --timestamp=none \
+        --sign "$identity" \
+        --identifier "$dev_appex_bundle_id" \
+        --entitlements "$repo_dir/assets/FinderExtension/FinderExtension.entitlements" \
+        "$dev_appex"; then
+        echo "restart FAILED: signing the Finder extension failed"
+        return 1
+    fi
+    # The entitlement is what makes Finder accept the extension at all; verify it is on the binary
+    # instead of trusting the signing command's exit status.
+    if ! /usr/bin/codesign -d --entitlements - "$dev_appex" 2>&1 | grep -q 'app-sandbox'; then
+        echo "restart FAILED: the Finder extension is missing its sandbox entitlement"
+        return 1
+    fi
+}
+
 signed_with=""
 sign_error=""
 if [ -n "$sign_identity" ]; then
@@ -811,13 +866,20 @@ if [ -n "$sign_identity" ]; then
     # denied key access) is a different problem from having no Apple identity at all, and falling back
     # changes the bundle's identity -- which invalidates the keychain item's grant and the TCC grants
     # that were recorded for the Apple identity.
-    if sign_error="$(/usr/bin/codesign --deep --force --timestamp=none \
+    # The extension is signed first, inside-out. Its failure is one of the reasons to fall back to
+    # the self-signed identity, so it must not exit here: the same fallback path below covers it.
+    appex_signed=1
+    sign_dev_appex "$sign_identity" || appex_signed=0
+    if [ "$appex_signed" = "1" ] && sign_error="$(/usr/bin/codesign --force --timestamp=none \
         --sign "$sign_identity" \
         --identifier "$dev_bundle_id" \
         "$dev_app" 2>&1)"; then
         signed_with="$sign_identity"
     else
         echo "restart FAILED: signing with '$sign_identity' failed:"
+        if [ -z "$sign_error" ]; then
+            echo "    the Finder extension could not be signed with this identity"
+        fi
         printf '%s\n' "$sign_error" | sed 's/^/    /'
         if [ "$allow_signing_fallback" != "1" ]; then
             # Deliberately not a warning: a fallback bundle has a DIFFERENT identity, so the keychain
@@ -838,7 +900,10 @@ if [ -n "$sign_identity" ]; then
             echo "               could not sign (see above)."
             exit 1
         fi
-        if /usr/bin/codesign --deep --force --timestamp=none \
+        if ! sign_dev_appex "oh-my-tab-sign"; then
+            sign_error="the self-signed fallback could not sign the Finder extension"
+            signed_with=""
+        elif /usr/bin/codesign --force --timestamp=none \
             --sign "oh-my-tab-sign" \
             --identifier "$dev_bundle_id" \
             "$dev_app" 2>/dev/null; then
@@ -857,11 +922,14 @@ if [ -z "$signed_with" ] && [ -z "$sign_error" ]; then
     fi
     echo "note: no Apple-issued signing identity is installed; using the self-signed 'oh-my-tab-sign'"
     echo "note: a self-signed build's keychain grant does NOT survive a rebuild - see docs/clipboard-encryption-plan.md fact 8"
-    if /usr/bin/codesign --deep --force \
+    if sign_dev_appex "oh-my-tab-sign" && /usr/bin/codesign --force \
         --sign "oh-my-tab-sign" \
         --identifier "$dev_bundle_id" \
         "$dev_app" 2>/dev/null; then
         signed_with="oh-my-tab-sign"
+    else
+        echo "restart FAILED: the self-signed identity could not sign the extension and the app"
+        exit 1
     fi
 fi
 if [ -z "$signed_with" ]; then
@@ -903,6 +971,56 @@ fi
 # 当作被启动应用的参数)。
 # App arguments: the argv after `--` reaches the app through `open --args` (open treats
 # everything after --args as arguments for the opened application).
+# Finder Sync extension registration. Finder only offers a plugin it has discovered, so the
+# assembled .appex is registered on every rebuild. --reload-finder-extension restarts Finder (which
+# drops the cached extension process); the default only reports the state.
+register_finder_extension() {
+    [ -d "$dev_appex" ] || return 0
+    # Stop only processes running THIS bundle's executable: another worktree's build and the packaged
+    # install share the extension name, and killing by name would reach them too.
+    local pid exe
+    for pid in $(/usr/bin/pgrep -f 'oh-my-tab-finder-ext' 2>/dev/null || true); do
+        exe="$(/bin/ps -p "$pid" -o comm= 2>/dev/null || true)"
+        if [ "$exe" = "$dev_appex_binary" ]; then
+            /bin/kill "$pid" 2>/dev/null || true
+            echo "stopped the previous Finder extension process (pid $pid)"
+        fi
+    done
+    # LaunchServices has to know the containing app before PlugInKit will accept the nested bundle.
+    /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+        -f "$dev_app" >/dev/null 2>&1 || true
+    /usr/bin/pluginkit -a "$dev_appex" >/dev/null 2>&1 || true
+    if ! /usr/bin/pluginkit -m -A -D -p com.apple.FinderSync -i "$dev_appex_bundle_id" 2>/dev/null \
+        | /usr/bin/grep -q "$dev_appex_bundle_id"; then
+        echo "warning: the Finder extension is not registered with PlugInKit"
+    fi
+    local state
+    state="$(/usr/bin/pluginkit -m -p com.apple.FinderSync -i "$dev_appex_bundle_id" 2>/dev/null | head -1)"
+    case "$state" in
+        +*|\!*) echo "finder extension: enabled ($dev_appex_bundle_id)" ;;
+        -*)
+            echo "finder extension: DISABLED by the user -- enable it in System Settings > General >"
+            echo "                 Login Items & Extensions > Finder Extensions"
+            ;;
+        *) echo "finder extension: not elected yet -- enable it in System Settings > General >"
+           echo "                 Login Items & Extensions > Finder Extensions" ;;
+    esac
+    local other
+    other="$(/usr/bin/pluginkit -m -p com.apple.FinderSync 2>/dev/null | /usr/bin/grep -v "$dev_appex_bundle_id" | /usr/bin/grep 'oh-my-tab' || true)"
+    if [ -n "$other" ]; then
+        echo "note: another oh-my-tab Finder extension is also registered:"
+        printf '%s\n' "$other" | /usr/bin/sed 's/^/      /'
+    fi
+    if [ "$reload_finder_extension" = "1" ]; then
+        /usr/bin/killall Finder 2>/dev/null || true
+        echo "Finder restarted (--reload-finder-extension)"
+    else
+        echo "note: Finder caches the extension; pass --reload-finder-extension to restart Finder"
+    fi
+}
+
+register_finder_extension
+
 open_command=(/usr/bin/open -W "$dev_app")
 if [ "${#app_args[@]}" -gt 0 ]; then
     open_command+=(--args "${app_args[@]}")

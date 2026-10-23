@@ -63,8 +63,21 @@ fi
 BIN="target/release/oh-my-tab"
 
 rm -rf "$APP"
-mkdir -p "$APP/Contents/MacOS"
+mkdir -p "$APP/Contents/MacOS" "$APP/Contents/PlugIns"
 cp "$BIN" "$APP/Contents/MacOS/oh-my-tab"
+
+# Finder Sync app extension: a second binary, its own bundle and its own sandbox entitlement. It is
+# assembled here and signed after the app, because `codesign --deep` on the parent re-signs nested
+# code and would drop that entitlement (measured).
+APPEX_BIN="target/release/oh-my-tab-finder-ext"
+APPEX="$APP/Contents/PlugIns/Oh-My-Tab-Finder.appex"
+if [ ! -x "$APPEX_BIN" ]; then
+  echo "error: $APPEX_BIN not found; the Finder extension must be built with the app" >&2
+  exit 1
+fi
+mkdir -p "$APPEX/Contents/MacOS"
+cp "$APPEX_BIN" "$APPEX/Contents/MacOS/oh-my-tab-finder-ext"
+cp assets/FinderExtension/Info.plist "$APPEX/Contents/Info.plist"
 cp assets/Info.plist "$APP/Contents/Info.plist"
 
 # The production defaults remain unchanged; the dev release wrapper overrides these values so
@@ -97,6 +110,18 @@ fi
 # SPARKLE_BUILD_VERSION is still available for deterministic release/test builds.
 BUILD_VERSION="${SPARKLE_BUILD_VERSION:-$(date -u +%Y%m%d%H%M%S)}"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VERSION" "$APP/Contents/Info.plist"
+
+# The extension is a nested bundle with its own identifier (the app's plus .FinderSync) and its own
+# version; both must track the app's, and OMTHostBundleIdentifier is what the extension uses to
+# derive the notification channel it talks to the app on.
+/usr/libexec/PlistBuddy -c "Set :CFBundleIdentifier $BUNDLE_ID.FinderSync" \
+  "$APPEX/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :OMTHostBundleIdentifier $BUNDLE_ID" \
+  "$APPEX/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $VERSION" \
+  "$APPEX/Contents/Info.plist"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $BUILD_VERSION" \
+  "$APPEX/Contents/Info.plist"
 
 # Optional release-time overrides. The public Ed25519 key is safe to ship in the app; the private
 # signing key must stay outside this repository and is only used when generating appcast.xml.
@@ -231,6 +256,21 @@ if [ "${RELEASE_SIGNING:-0}" = "1" ]; then
     echo "error: failed to sign embedded Sparkle code for notarization" >&2
     exit 1
   fi
+  # Inside-out: the extension is signed before the app that contains it. The notary rejects a
+  # nested bundle signed by a different team, and the extension's sandbox entitlement is what
+  # makes Finder accept it at all.
+  if ! codesign --force --options runtime --timestamp \
+    --sign "$CODESIGN_IDENTITY" \
+    --identifier "$BUNDLE_ID.FinderSync" \
+    --entitlements assets/FinderExtension/FinderExtension.entitlements \
+    "$APPEX"; then
+    echo "error: Developer ID signing failed for the Finder extension" >&2
+    exit 1
+  fi
+  if ! codesign -d --entitlements - "$APPEX" 2>&1 | grep -q 'app-sandbox'; then
+    echo "error: the signed Finder extension lost its sandbox entitlement" >&2
+    exit 1
+  fi
   if ! codesign --force --options runtime --timestamp \
     --sign "$CODESIGN_IDENTITY" "$APP"; then
     echo "error: Developer ID signing failed for $APP" >&2
@@ -269,6 +309,13 @@ else
     echo "error: SIGN_IDENTITY=- asks for ad-hoc signing, which is not accepted for development" >&2
     echo "       packages (it has no stable identity). Use the self-signed certificate or" >&2
     echo "       CODESIGN_IDENTITY / RELEASE_SIGNING=1 for a Developer ID build." >&2
+    exit 1
+  fi
+  if ! codesign --force --options runtime --sign "$SIGN_IDENTITY" \
+    --identifier "$BUNDLE_ID.FinderSync" \
+    --entitlements assets/FinderExtension/FinderExtension.entitlements \
+    "$APPEX"; then
+    echo "error: signing the Finder extension with '$SIGN_IDENTITY' failed" >&2
     exit 1
   fi
   if ! codesign --force --sign "$SIGN_IDENTITY" "$APP"; then

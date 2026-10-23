@@ -485,6 +485,57 @@ with that callback returning NO so AppKit does not also perform its generic reop
 binary path directly is not that path: a second process is refused by the single-instance lock and
 exits, so the running instance never sees it.
 
+## Finder context menu (Finder Sync extension)
+
+The right-click menu is the only feature with a **second process in its own bundle**. Finder Sync
+extensions must run sandboxed and Finder only draws them from a plug-in it discovered, so the
+extension can neither write a file nor launch an application. The split is therefore not a style
+choice: the app builds the menu, the extension draws it, and every click comes back to the app.
+
+**Message path.** The app pushes a `MenuModel` (titles already localized, icons as SF Symbol names,
+each leaf carrying its action) over `<host bundle id>.finder.app2ext`. The extension caches the last
+model, re-renders it per right-click, and reports a click over `.ext2app`. Both directions carry the
+host bundle id and the app's launch instance; anything from another channel or an earlier app
+process is dropped. A message larger than 64 KiB is refused before parsing.
+
+**Why a click is not trusted.** A distributed notification can be posted by any local process, and
+a menu can stay open across a settings change. The extension sends the action the user *clicked*
+(from the item's `representedObject`), and the app checks it against the live config (feature on,
+file type still offered, terminal still enabled) before doing anything. That is the security story
+of this feature: the action set is deliberately non-destructive (create an empty file in a folder
+the user right-clicked, open a configured terminal, write the clipboard), and the app re-validates
+rather than trusting the message.
+
+**Staleness / offline.** The extension syncs every 10 s. If no app message has arrived for 45 s the
+model is treated as stale and no items are offered — an idle app is not mistaken for a dead one
+because the sync itself keeps the timestamp fresh, and a crash expires the menu instead of leaving
+clickable items behind. On an orderly quit the app sends `quit` and the extension clears at once.
+
+**Localization.** All menu titles are localized in the app and shipped as strings, so the extension
+has no `.strings`/`.xcstrings` of its own and the three locales cannot drift between the two
+processes.
+
+**Signing.** The extension needs `com.apple.security.app-sandbox`; the app does not. Sign
+**inside-out**: the extension first, the app last, and the app **without** `--deep`. `codesign --deep`
+on the app re-signs nested code and drops that entitlement (measured: the appex comes out with no
+entitlements, and Finder then refuses to load it), and it seals the nested bundle by cdhash, so
+re-signing the extension afterwards makes the parent invalid ("nested code is modified or invalid").
+Inside-out leaves the parent recording the extension by requirement, so `--verify --deep --strict`
+passes. `scripts/release.sh` additionally proves the staged appex still carries the entitlement and
+shares the app's team.
+
+**Rebuilds.** Finder caches the extension process. `scripts/dev-restart.sh` registers the new appex
+with `pluginkit`, stops only the process whose executable is *this* worktree's appex, and prints the
+election state; restarting Finder (which makes a rebuilt menu appear reliably, but closes every
+window) is opt-in as `--reload-finder-extension`. A dev and a release extension enabled at the same
+time put two copies of the menu in Finder; the script reports that rather than changing the user's
+choice.
+
+**Terminal adapters.** Terminals differ in how they accept a directory: a running Terminal.app or
+iTerm2 opens a folder URL, while Ghostty/WezTerm/kitty/Alacritty need a fresh instance with their own
+argument. `finder_menu/terminals.rs` owns one adapter per known bundle id; `open_arguments` is pure and
+unit-tested, and the settings page only offers terminals LaunchServices reports as installed.
+
 ## Building and testing
 
 `scripts/dev-restart.sh` is the normal way to run the app during development. It builds the development `.app` and re-assembles and re-signs it only when its inputs change (the built binary, the bundled resources, the signing identity), using the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery; signing is done without a secure timestamp so a local build never depends on Apple's timestamp service), then launches it through the per-user `launchd` domain. **Only two identities are accepted -- the Apple-issued one and the self-signed one; ad-hoc is refused**, and a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` asks for the self-signed identity on purpose. A stable signing identity is what keeps the Accessibility, Screen Recording and keychain grants alive across rebuilds; when nothing changed the existing bundle is reused, so a restart does not reset them.
@@ -509,6 +560,11 @@ cargo test settings_layout_smoke -- --ignored
 ```
 
 It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits all seven pages, validates their descendant view frames, and exits.
+
+The Finder Menu settings page has its own smoke (`cargo test finder_menu_page_smoke -- --ignored`, or
+`./target/debug/oh-my-tab --smoke-finder-menu`): it opens the real window on that page and asserts the
+page's own contract against the live view tree. It is separate from the all-pages layout smoke because
+that runner currently stops on an earlier clipboard-page assertion (see `docs/review-backlog.md`).
 
 The overlay runtime path also has an ignored child-process smoke test. Run `cargo build` first, then `cargo test overlay_runtime_smoke -- --ignored`; its `--smoke-overlay` switch bypasses the single-instance guard so an already-running development app cannot turn the test into a false pass.
 

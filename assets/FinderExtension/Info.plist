@@ -1,0 +1,44 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <!-- The Finder Sync app extension. The bundle scripts copy this template into
+         Oh-My-Tab.app/Contents/PlugIns/Oh-My-Tab-Finder.appex and fill in the bundle id,
+         host id and versions, so the dev and release channels never share an extension id. -->
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>Oh-My-Tab Finder</string>
+    <key>CFBundleExecutable</key>
+    <string>oh-my-tab-finder-ext</string>
+    <key>CFBundleIdentifier</key>
+    <string>com.eacryo.oh-my-tab.FinderSync</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>Oh-My-Tab Finder</string>
+    <key>CFBundlePackageType</key>
+    <string>XPC!</string>
+    <key>CFBundleShortVersionString</key>
+    <string>0.2.5</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSExtension</key>
+    <dict>
+        <key>NSExtensionAttributes</key>
+        <dict/>
+        <key>NSExtensionPointIdentifier</key>
+        <string>com.apple.FinderSync</string>
+        <key>NSExtensionPrincipalClass</key>
+        <string>OhMyTabFinderSync</string>
+    </dict>
+    <!-- Read by the extension to derive its distributed-notification channel. Replaced with the
+         containing app's bundle id when the bundle is assembled. -->
+    <key>OMTHostBundleIdentifier</key>
+    <string>com.eacryo.oh-my-tab</string>
+</dict>
+</plist>

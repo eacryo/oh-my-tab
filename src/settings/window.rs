@@ -455,6 +455,32 @@ pub(crate) fn refresh_permission_ui_if_visible() {
     });
 }
 
+/// Refresh the Finder Menu page's extension status when the app regains focus.
+///
+/// The user enables the Finder extension in System Settings, which takes focus away from this app;
+/// coming back is the moment the state can have changed. Without this the row kept saying
+/// "未启用" until the window was rebuilt (measured: enabling the extension left the label stale).
+pub(crate) fn refresh_finder_menu_status_if_visible() {
+    let finder_page = settings_page_index(SettingsPageId::FinderMenu);
+    if SIDEBAR_SELECTED.load(Ordering::SeqCst) != finder_page {
+        return;
+    }
+    with_settings_ui(|ui| {
+        if let Some(ui) = ui.as_ref() {
+            unsafe {
+                let visible: bool = msg_send![ui.window, isVisible];
+                if !visible || ui.finder_menu_status.is_null() {
+                    return;
+                }
+                widgets::set_field(
+                    ui.finder_menu_status,
+                    finder_menu_status_text(crate::finder_menu::extension_enabled()),
+                );
+            }
+        }
+    });
+}
+
 /// Center the settings window in the visible area of the screen under the cursor, excluding the
 /// menu bar and Dock.
 unsafe fn center_settings_window(window: *mut AnyObject) {
@@ -3732,6 +3758,12 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             update_card: std::ptr::null_mut(),
             update_divider: std::ptr::null_mut(),
             update_card_expanded: false,
+            finder_menu_status: std::ptr::null_mut(),
+            finder_menu_enabled: std::ptr::null_mut(),
+            finder_menu_layout: std::ptr::null_mut(),
+            finder_menu_new_file_switches: Vec::new(),
+            finder_menu_terminal_switches: Vec::new(),
+            finder_menu_copy_path: std::ptr::null_mut(),
         };
 
         // The sidebar and detail pane meet directly at the original sidebar boundary; their
@@ -3802,6 +3834,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // themselves afterwards.
         let key_bindings_doc_h = 1500.0;
         let keystroke_display_doc_h = 650.0;
+        // The Finder Menu page: five cards (status + master, layout, file types, terminals, copy
+        // path), so its provisional height is generous before the first re-flow settles it.
+        let finder_menu_doc_h = 1180.0;
         let about_doc_h = 1300.0;
 
         // One page per identity, in `SETTINGS_PAGES` order. The provisional height is looked up by
@@ -3814,6 +3849,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsPageId::Clipboard => clipboard_doc_h,
             SettingsPageId::KeyBindings => key_bindings_doc_h,
             SettingsPageId::KeystrokeDisplay => keystroke_display_doc_h,
+            SettingsPageId::FinderMenu => finder_menu_doc_h,
             SettingsPageId::About => about_doc_h,
         };
         let mut page_roots = [std::ptr::null_mut::<AnyObject>(); SETTINGS_PAGE_COUNT];
@@ -3842,6 +3878,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let clipboard_view = page_view(SettingsPageId::Clipboard);
         let key_bindings_view = page_view(SettingsPageId::KeyBindings);
         let keystroke_display_view = page_view(SettingsPageId::KeystrokeDisplay);
+        let finder_menu_view = page_view(SettingsPageId::FinderMenu);
         let about_view = page_view(SettingsPageId::About);
         // Every row the builders draw is recorded for the sidebar search, in one index per build:
         // a locale or theme rebuild re-records the whole index from the strings it draws again.
@@ -3888,6 +3925,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 &page_context,
                 keystroke_display_view,
                 keystroke_display_doc_h,
+                &mut ui,
+            );
+
+        page_bottoms[settings_page_index(SettingsPageId::FinderMenu)] =
+            page_builder::build_finder_menu_page(
+                &page_context,
+                finder_menu_view,
+                finder_menu_doc_h,
                 &mut ui,
             );
 
@@ -4168,7 +4213,7 @@ mod tests {
             PageWarning::None
         );
         // Any other page stays clear, whatever the two facts are.
-        for page in 1..8 {
+        for page in 1..super::SETTINGS_PAGE_COUNT {
             if page == clipboard {
                 continue;
             }

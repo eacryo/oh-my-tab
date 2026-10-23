@@ -73,6 +73,14 @@ pub(super) enum ControlField {
     KeyBindingsEnabled,
     UpdateAutoCheck,
     UpdateAutoDownload,
+    // Finder Menu page. The two vec-backed lists carry the switch's catalog index: the control's
+    // identity is its entry in FINDER_MENU_FILE_TYPES / finder_menu::terminals(), and the config
+    // value is rebuilt in that order rather than in click order.
+    FinderMenuEnabled,
+    FinderMenuLayout,
+    FinderMenuNewFileType(usize),
+    FinderMenuTerminal(usize),
+    FinderMenuCopyPath,
 }
 
 /// Identify a field by its control pointer (the window is reused, pointers are stable).
@@ -230,6 +238,21 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             .or_else(|| m(u.key_bindings_enabled, ControlField::KeyBindingsEnabled))
             .or_else(|| m(u.update_auto_check, ControlField::UpdateAutoCheck))
             .or_else(|| m(u.update_auto_download, ControlField::UpdateAutoDownload))
+            .or_else(|| m(u.finder_menu_enabled, ControlField::FinderMenuEnabled))
+            .or_else(|| m(u.finder_menu_layout, ControlField::FinderMenuLayout))
+            .or_else(|| {
+                u.finder_menu_new_file_switches
+                    .iter()
+                    .position(|ctrl| *ctrl as usize == ptr)
+                    .map(ControlField::FinderMenuNewFileType)
+            })
+            .or_else(|| {
+                u.finder_menu_terminal_switches
+                    .iter()
+                    .position(|ctrl| *ctrl as usize == ptr)
+                    .map(ControlField::FinderMenuTerminal)
+            })
+            .or_else(|| m(u.finder_menu_copy_path, ControlField::FinderMenuCopyPath))
     })
 }
 
@@ -386,6 +409,106 @@ pub(super) unsafe fn bind_control(target: *mut AnyObject, ctrl: *mut AnyObject) 
     let _: () = msg_send![ctrl, setAction: sel!(handleControlChanged:)];
 }
 
+/// Whether a Finder Menu switch is on. A control that was never built counts as off, so reading
+/// the list can never dereference a null pointer.
+unsafe fn finder_menu_switch_on(control: *mut AnyObject) -> bool {
+    if control.is_null() {
+        return false;
+    }
+    let state: isize = msg_send![control, state];
+    state == 1
+}
+
+/// Rebuild a vec-backed config list from the page's switch states, in the identity table's order.
+///
+/// The checkbox decides membership only: the ids are the catalog (file types or terminal bundle
+/// ids) and the result follows it, never the order boxes were ticked, because the menu renders the
+/// stored vec as its item order.
+fn checked_ids<'a>(ids: impl IntoIterator<Item = &'a str>, states: &[bool]) -> Vec<String> {
+    ids.into_iter()
+        .zip(states.iter().copied())
+        .filter(|(_, checked)| *checked)
+        .map(|(id, _)| id.to_string())
+        .collect()
+}
+
+/// Fill every Finder Menu control from the config and settle the dependent enable states.
+///
+/// Shared by the ordinary open fill and the in-place config reload so the two cannot disagree
+/// about what the page shows: a switch is membership of its id in the config vec, in catalog order.
+pub(super) unsafe fn fill_finder_menu_controls(ui: &SettingsUi, cfg: &Config) {
+    set_field(
+        ui.finder_menu_status,
+        super::finder_menu_status_text(crate::finder_menu::extension_enabled()),
+    );
+    let layout_idx = crate::config::FINDER_MENU_LAYOUTS
+        .iter()
+        .position(|layout| *layout == cfg.finder_menu.layout.as_str())
+        .unwrap_or(0) as isize;
+    let _: () = msg_send![ui.finder_menu_layout, selectItemAtIndex: layout_idx];
+    let _: () = msg_send![
+        ui.finder_menu_enabled,
+        setState: if cfg.finder_menu.enabled { 1isize } else { 0isize }
+    ];
+    for (index, control) in ui.finder_menu_new_file_switches.iter().enumerate() {
+        let checked = crate::config::FINDER_MENU_FILE_TYPES
+            .get(index)
+            .is_some_and(|extension| {
+                cfg.finder_menu
+                    .new_file_types
+                    .iter()
+                    .any(|value| value == extension)
+            });
+        let _: () = msg_send![*control, setState: if checked { 1isize } else { 0isize }];
+    }
+    for (index, control) in ui.finder_menu_terminal_switches.iter().enumerate() {
+        let checked = crate::finder_menu::terminals()
+            .get(index)
+            .is_some_and(|spec| {
+                cfg.finder_menu
+                    .terminals
+                    .iter()
+                    .any(|bundle_id| bundle_id == spec.bundle_id)
+            });
+        let _: () = msg_send![*control, setState: if checked { 1isize } else { 0isize }];
+    }
+    let _: () = msg_send![
+        ui.finder_menu_copy_path,
+        setState: if cfg.finder_menu.copy_path {
+            1isize
+        } else {
+            0isize
+        }
+    ];
+    update_finder_menu_controls_enabled(ui);
+}
+
+/// Freeze the Finder Menu options below the master switch, and keep each terminal row gated by
+/// whether that app is installed. The page build also calls this after creating the rows.
+pub(super) unsafe fn update_finder_menu_controls_enabled(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.finder_menu_enabled, state];
+    let on = state == 1;
+    let master_tooltip = t("settings.finder_menu.tooltip_disabled");
+    let mut controls = vec![ui.finder_menu_layout, ui.finder_menu_copy_path];
+    controls.extend(ui.finder_menu_new_file_switches.iter().copied());
+    for ctrl in controls {
+        SettingsRow::set_enabled_with_tooltip(ctrl, on, &master_tooltip);
+    }
+    let not_installed = t("settings.finder_menu.terminal_not_installed");
+    for (index, control) in ui.finder_menu_terminal_switches.iter().enumerate() {
+        let installed = crate::finder_menu::terminals()
+            .get(index)
+            .is_some_and(|spec| crate::finder_menu::terminal_installed(spec.bundle_id));
+        if !on {
+            SettingsRow::set_enabled_with_tooltip(*control, false, &master_tooltip);
+        } else if installed {
+            SettingsRow::set_enabled_with_tooltip(*control, true, "");
+        } else {
+            SettingsRow::set_enabled_with_tooltip(*control, false, &not_installed);
+        }
+    }
+}
+
 /// The unified control callback (switches/popups/sliders/color well): identify the field and
 /// apply its value.
 pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
@@ -477,6 +600,11 @@ unsafe fn refresh_dependent_control_visibility(field: ControlField) {
             ControlField::ThumbnailsEnabled => {
                 // The App Switcher page's layout owner shows/hides the pair and settles the page.
                 update_display_mode_dependent_visibility(ui);
+            }
+            ControlField::FinderMenuEnabled => {
+                // The page's options are meaningless while the menu is off, like every other
+                // master switch on this page family.
+                update_finder_menu_controls_enabled(ui);
             }
             _ => {}
         }
@@ -789,6 +917,46 @@ fn apply_control_field(field: ControlField) {
                 ControlField::UpdateAutoDownload => {
                     let state: isize = msg_send![u.update_auto_download, state];
                     cfg.updates.automatically_download = state == 1;
+                }
+                ControlField::FinderMenuEnabled => {
+                    let state: isize = msg_send![u.finder_menu_enabled, state];
+                    cfg.finder_menu.enabled = state == 1;
+                }
+                ControlField::FinderMenuLayout => {
+                    let idx: isize = msg_send![u.finder_menu_layout, indexOfSelectedItem];
+                    cfg.finder_menu.layout = crate::config::FINDER_MENU_LAYOUTS
+                        .get(idx.max(0) as usize)
+                        .copied()
+                        .unwrap_or(crate::config::FINDER_MENU_DEFAULT_LAYOUT)
+                        .to_string();
+                }
+                ControlField::FinderMenuNewFileType(_) => {
+                    let states: Vec<bool> = u
+                        .finder_menu_new_file_switches
+                        .iter()
+                        .map(|control| finder_menu_switch_on(*control))
+                        .collect();
+                    cfg.finder_menu.new_file_types = checked_ids(
+                        crate::config::FINDER_MENU_FILE_TYPES.iter().copied(),
+                        &states,
+                    );
+                }
+                ControlField::FinderMenuTerminal(_) => {
+                    let states: Vec<bool> = u
+                        .finder_menu_terminal_switches
+                        .iter()
+                        .map(|control| finder_menu_switch_on(*control))
+                        .collect();
+                    cfg.finder_menu.terminals = checked_ids(
+                        crate::finder_menu::terminals()
+                            .iter()
+                            .map(|spec| spec.bundle_id),
+                        &states,
+                    );
+                }
+                ControlField::FinderMenuCopyPath => {
+                    let state: isize = msg_send![u.finder_menu_copy_path, state];
+                    cfg.finder_menu.copy_path = state == 1;
                 }
             }
         }
@@ -1818,6 +1986,9 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             let image_rows = (cfg.clipboard.image_rows as i64).clamp(1, 3);
             let _: () = msg_send![u.clipboard_image_rows, setIntegerValue: image_rows];
             set_field(u.clipboard_image_rows_value_label, image_rows);
+            // The finder menu page follows a reload or a defaults restore like every other page:
+            // switches, layout popup, status line and the master-switch freeze.
+            fill_finder_menu_controls(u, &cfg);
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
             // Key bindings: an external change (a menu toggle, a reloaded file) has to reach the
@@ -2651,7 +2822,7 @@ mod portability_ui_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        clipboard_delete_dependent_visibility_from_config, smooth_slider_display,
+        checked_ids, clipboard_delete_dependent_visibility_from_config, smooth_slider_display,
         smooth_slider_value, take_edited_field, text_field_bit, Config, Ordering, TextField,
     };
 
@@ -2691,6 +2862,37 @@ mod tests {
             Ordering::SeqCst,
         );
         assert!(take_edited_field(&mask, TextField::ClipboardMaxEntries));
+    }
+
+    /// The Finder Menu's vec-backed fields keep the catalog order however the boxes were ticked:
+    /// the menu renders the stored vec as its item order, so click order must never leak into it.
+    #[test]
+    fn finder_menu_checked_ids_keep_catalog_order() {
+        let file_types = ["md", "txt", "json"];
+        assert_eq!(
+            checked_ids(file_types, &[true, false, true]),
+            vec!["md".to_string(), "json".to_string()]
+        );
+        assert!(checked_ids(file_types, &[false, false, false]).is_empty());
+        // A states slice of a different length cannot invent or add ids.
+        assert_eq!(checked_ids(["md"], &[true, true]), vec!["md".to_string()]);
+        assert_eq!(
+            checked_ids(file_types, &[true, false]),
+            vec!["md".to_string()]
+        );
+        // Bundle ids go through the same function, so terminal order is the catalog order too.
+        let terminals: Vec<&str> = crate::finder_menu::terminals()
+            .iter()
+            .map(|spec| spec.bundle_id)
+            .collect();
+        let states: Vec<bool> = (0..terminals.len()).map(|index| index % 2 == 0).collect();
+        let expected: Vec<String> = terminals
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| index % 2 == 0)
+            .map(|(_, bundle_id)| bundle_id.to_string())
+            .collect();
+        assert_eq!(checked_ids(terminals.iter().copied(), &states), expected);
     }
 
     #[test]

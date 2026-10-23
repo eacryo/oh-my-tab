@@ -298,6 +298,9 @@ fn restored_config_for_page(old: &Config, page: SettingsPageId) -> Config {
         SettingsPageId::KeystrokeDisplay => {
             cfg.keystroke_display = d.keystroke_display;
         }
+        SettingsPageId::FinderMenu => {
+            cfg.finder_menu = d.finder_menu;
+        }
         SettingsPageId::About => {
             cfg.updates = d.updates;
         }
@@ -373,6 +376,7 @@ mod tests {
             SettingsPageId::Clipboard => expected.clipboard = d.clipboard,
             SettingsPageId::KeyBindings => expected.key_bindings = d.key_bindings,
             SettingsPageId::KeystrokeDisplay => expected.keystroke_display = d.keystroke_display,
+            SettingsPageId::FinderMenu => expected.finder_menu = d.finder_menu,
             SettingsPageId::About => expected.updates = d.updates,
         }
         expected

@@ -10,6 +10,7 @@ mod e2e_state;
 mod event_monitor;
 mod event_tap;
 mod ffi;
+mod finder_menu;
 mod glass;
 mod hash;
 mod i18n;
@@ -544,6 +545,7 @@ extern "C" fn on_self_resigned_active(_self: *mut c_void, _cmd: Sel, _notificati
 
 fn on_app_activated_inner(notification: *mut c_void) {
     settings::refresh_permission_ui_if_visible();
+    settings::refresh_finder_menu_status_if_visible();
     unsafe {
         let user_info: *mut AnyObject = msg_send![notification as *mut AnyObject, userInfo];
         if user_info.is_null() {
@@ -814,6 +816,7 @@ fn on_app_launched_inner(notification: *mut c_void) {
 /// equivalent call of its own).
 extern "C" fn on_will_terminate(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
     callback_guard::void("on_will_terminate", || {
+        crate::finder_menu::shutdown();
         crate::mouse::pointer::restore();
         // Cmd+Q, the menu-bar Quit item, logout and shutdown all land here, so one place covers
         // every orderly exit (a crash or SIGKILL posts no notification, by design).
@@ -2057,6 +2060,14 @@ fn menu_target_class() -> StaticClass {
                 onboarding::on_open_from_settings as *mut c_void,
                 types.as_ptr(),
             );
+            // The Finder-menu settings page opens System Settings' extension pane (the extension is
+            // enabled there, not by this app).
+            class_addMethod(
+                cls,
+                sel!(handleOpenFinderExtensionManagement:),
+                crate::settings::handle_open_finder_extension_management as *mut c_void,
+                types.as_ptr(),
+            );
             class_addMethod(
                 cls,
                 sel!(handleRestartForAccessibility:),
@@ -2921,6 +2932,7 @@ pub fn run() {
             || arg == "--smoke-overlay"
             || arg == "--smoke-keystroke-display-panel"
             || arg == "--smoke-settings-layout"
+            || arg == "--smoke-finder-menu"
             || arg == "--smoke-settings-vertical-zoom"
             || arg == "--smoke-settings-state-sync"
             || arg == "--smoke-settings-collapsible-row"
@@ -3062,6 +3074,12 @@ pub fn run() {
     // standard updater UI and automatic checks; the About page reports a clear setup hint when
     // the framework is not present yet.
     updater::initialize(CONFIG.read().unwrap().updates.automatically_check);
+
+    // 6b. Finder context-menu bridge: listens for extension clicks and publishes the menu model.
+    // Smoke/test processes must not answer real Finder clicks, so they stay out of it.
+    if !is_smoke_process {
+        finder_menu::start();
+    }
 
     // One-shot instrument for the synthetic Dock swipe (`--space-swipe=left|right`): it posts the
     // gesture after the app is up and logs the Space before and after, so the mechanism can be
@@ -3571,6 +3589,21 @@ pub fn run() {
             log_info!("[smoke-settings-layout] all pages survived in all locales");
             std::process::exit(0);
         }
+    }
+
+    // Finder Menu settings page: open the real window, select one page, assert its contract.
+    // Separate from --smoke-settings-layout because that runner currently stops earlier (see
+    // docs/review-backlog.md), so it would never reach a page's own checks.
+    if std::env::args().any(|a| a == "--smoke-finder-menu") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        std::process::exit(if settings::finder_menu_page_smoke_runner() {
+            0
+        } else {
+            1
+        });
     }
 
     if std::env::args().any(|a| a == "--smoke-smooth-scroll-event") {
