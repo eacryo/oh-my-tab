@@ -1467,6 +1467,48 @@ pub(crate) fn smoke_runner() -> bool {
                 "row tags must follow the filter order"
             );
         }
+        // The settings action must not advertise a chord. The panel does not listen for one --
+        // ⌘, only works from the menu bar -- and printing it promised a shortcut that does
+        // nothing on this surface (measured: the row showed "⌘ ," while the key did nothing).
+        let settings_label = super::t("clipboard.open_settings");
+        let mut settings_rows = 0;
+        let subviews: *mut AnyObject = msg_send![popover, subviews];
+        let subview_count: usize = msg_send![subviews, count];
+        for index in 0..subview_count {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            let responds: bool = msg_send![view, respondsToSelector: sel!(action)];
+            if !responds {
+                continue;
+            }
+            let action: Sel = msg_send![view, action];
+            if action != sel!(openClipboardSettings:) {
+                continue;
+            }
+            settings_rows += 1;
+            let accessible: *mut AnyObject = msg_send![view, accessibilityLabel];
+            let tooltip: *mut AnyObject = msg_send![view, toolTip];
+            assert!(!accessible.is_null() && !tooltip.is_null());
+            assert_eq!(
+                crate::ffi::nsstring_to_rust(accessible),
+                settings_label,
+                "the settings row must announce only its label, with no chord appended"
+            );
+            assert_eq!(crate::ffi::nsstring_to_rust(tooltip), settings_label);
+            // The chord lived in the trailing column; with no hint the row paints no trailing text.
+            let children: *mut AnyObject = msg_send![view, subviews];
+            let decoration: *mut AnyObject = msg_send![children, lastObject];
+            assert!(!decoration.is_null());
+            let columns: *mut AnyObject = msg_send![decoration, subviews];
+            let column_count: usize = msg_send![columns, count];
+            assert_eq!(
+                column_count, 2,
+                "the settings row must draw symbol + label only, never a trailing hint column"
+            );
+        }
+        assert_eq!(
+            settings_rows, 1,
+            "the options popover needs its settings row"
+        );
         dismiss_filter_popover();
         assert!(
             !super::filter_popover_open(),

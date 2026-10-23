@@ -4498,6 +4498,8 @@ unsafe fn add_popover_row_content(
     } else {
         end
     };
+    // A row without a trailing hint (the settings action: its ⌘, chord only works from the menu
+    // bar, so the panel must not advertise it) paints no trailing label at all.
     let trailing_w = localized_string_width(trailing, POPOVER_META_SIZE);
     let text_x = POPOVER_INSET + POPOVER_GLYPH_W + POPOVER_COLUMN_GAP;
     let trailing_x = (trailing_end - trailing_w - 4.0).max(text_x);
@@ -4516,17 +4518,19 @@ unsafe fn add_popover_row_content(
         ink,
         0,
     );
-    add_popover_text(
-        content,
-        trailing,
-        NSRect::new(
-            NSPoint::new(trailing_x, text_y),
-            NSSize::new(trailing_end - trailing_x, POPOVER_TEXT_H),
-        ),
-        POPOVER_META_SIZE,
-        muted,
-        2,
-    );
+    if !trailing.is_empty() {
+        add_popover_text(
+            content,
+            trailing,
+            NSRect::new(
+                NSPoint::new(trailing_x, text_y),
+                NSSize::new(trailing_end - trailing_x, POPOVER_TEXT_H),
+            ),
+            POPOVER_META_SIZE,
+            muted,
+            2,
+        );
+    }
     if selected {
         add_popover_text(
             content,
@@ -4540,7 +4544,11 @@ unsafe fn add_popover_row_content(
             1,
         );
     }
-    let accessible = make_nsstring(&format!("{label}, {trailing}"));
+    let accessible = if trailing.is_empty() {
+        make_nsstring(label)
+    } else {
+        make_nsstring(&format!("{label}, {trailing}"))
+    };
     let _: () = msg_send![row, setAccessibilityLabel: accessible];
     let _: () = msg_send![row, setToolTip: accessible];
     CFRelease(accessible as *const c_void);
@@ -4737,7 +4745,9 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
             }
         }
         let hint = match key {
-            "clipboard.open_settings" => t("clipboard.settings_shortcut"),
+            // No chord is shown for the settings action: the panel does not listen for one, so
+            // printing it here promised a shortcut that does nothing on this surface.
+            "clipboard.open_settings" => String::new(),
             "clipboard.clear_button" => t("clipboard.clear_keep_pinned"),
             "clipboard.clear_all" => t("clipboard.clear_include_pinned"),
             _ => String::new(),
