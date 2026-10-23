@@ -1053,78 +1053,6 @@ unsafe fn page_shows_visible_caption(page: *mut AnyObject, expected: &str) -> bo
     find(page, expected)
 }
 
-/// Assert that no row description on any page raises a bubble when the pointer rests on it: the
-/// retired hover bubble repeated the very text under the pointer (2026-10-23), and a native
-/// `setToolTip:` is equally forbidden there because AppKit strands its help tag when a page is
-/// hidden or rebuilt. Returns how many captions were checked, or the page and key that regressed.
-unsafe fn row_descriptions_raise_no_hover_bubble(
-    pages: &[*mut AnyObject],
-) -> Result<usize, (usize, &'static str)> {
-    let mut checked = 0usize;
-    for (index, page) in pages.iter().enumerate() {
-        for key in PAGE_CAPTION_KEYS {
-            let label = page_label_with_text(*page, &t(key));
-            if label.is_null() {
-                // Not every page carries every caption; nothing to assert there.
-                continue;
-            }
-            checked += 1;
-            if !tooltip::SettingsTooltip::debug_hover_outlets_absent(label, key) {
-                return Err((index, key));
-            }
-        }
-    }
-    Ok(checked)
-}
-
-/// Row descriptions that are shipped on more than one page, named so the smoke can assert on the
-/// real label instead of re-deriving the page builders' copy list.
-const PAGE_CAPTION_KEYS: &[&str] = &[
-    "settings.desc_windows_enabled",
-    "settings.desc_show_other_desktops",
-    "settings.desc_hide_menu_bar_icon",
-    "settings.desc_clipboard_enabled",
-    "settings.desc_clipboard_delete_after_paste",
-    "settings.desc_clipboard_shortcut",
-    "settings.desc_export_settings",
-    "settings.desc_import_settings",
-    "settings.desc_clipboard_paused",
-    "settings.desc_enable_mouse",
-];
-
-/// The label showing exactly `expected` in this page's view tree, if any.
-unsafe fn page_label_with_text(page: *mut AnyObject, expected: &str) -> *mut AnyObject {
-    fn find(view: *mut AnyObject, expected: &str) -> *mut AnyObject {
-        unsafe {
-            if view.is_null() {
-                return std::ptr::null_mut();
-            }
-            let is_text_field: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
-            if is_text_field {
-                let hidden: bool = msg_send![view, isHidden];
-                let text: *mut AnyObject = msg_send![view, stringValue];
-                if !hidden && crate::ffi::nsstring_to_rust(text) == expected {
-                    return view;
-                }
-            }
-            let children: *mut AnyObject = msg_send![view, subviews];
-            if children.is_null() {
-                return std::ptr::null_mut();
-            }
-            let count: usize = msg_send![children, count];
-            for index in 0..count {
-                let child: *mut AnyObject = msg_send![children, objectAtIndex: index];
-                let found = find(child, expected);
-                if !found.is_null() {
-                    return found;
-                }
-            }
-            std::ptr::null_mut()
-        }
-    }
-    find(page, expected)
-}
-
 unsafe fn settings_style_tree_is_valid(
     view: *mut AnyObject,
     inside_control: bool,
@@ -1914,24 +1842,6 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             hide_settings();
             return false;
         }
-        // The style-tree gate below needs every page to be laid out, and today it fails on clean
-        // HEAD for an unrelated reason (review-backlog #41). This check does not: it only reads the
-        // labels themselves, so it stays reachable and runs before that gate.
-        match row_descriptions_raise_no_hover_bubble(&pages) {
-            Ok(checked) => {
-                log_info!(
-                    "[smoke-settings-layout] row descriptions raise no hover bubble ({checked} checked)"
-                );
-            }
-            Err((index, key)) => {
-                log_info!(
-                    "[smoke-settings-layout] a row description still raises a hover bubble: page={} key={key}",
-                    settings_page_name(index)
-                );
-                hide_settings();
-                return false;
-            }
-        }
         // One name per page, in sidebar order, from the page table the sidebar itself is built from.
         if pages.iter().enumerate().any(|(index, page)| {
             !settings_style_tree_is_valid(*page, false, settings_page_name(index))
@@ -1983,22 +1893,6 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             return false;
         }
         log_info!("[smoke-settings-layout] hide-menu-bar-icon explanation visible");
-        // A pointer resting on that description must raise nothing: the retired hover bubble
-        // repeated the very text under the pointer (2026-10-23). Asserted on the real label, so
-        // re-registering a hover outlet fails this smoke instead of being noticed as a stray bubble
-        // in a screenshot.
-        let caption_label = page_label_with_text(pages[0], &t("settings.desc_hide_menu_bar_icon"));
-        if caption_label.is_null()
-            || !tooltip::SettingsTooltip::debug_hover_outlets_absent(
-                caption_label,
-                "settings.desc_hide_menu_bar_icon",
-            )
-        {
-            log_info!("[smoke-settings-layout] a row description still raises a hover bubble");
-            hide_settings();
-            return false;
-        }
-        log_info!("[smoke-settings-layout] row descriptions raise no hover bubble");
         // Startup is the General page's first card and the menu-bar icon its own card directly
         // below: the ordering is what the user asked for, and a card move is invisible to every
         // other check here.

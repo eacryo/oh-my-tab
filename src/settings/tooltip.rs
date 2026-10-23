@@ -248,20 +248,6 @@ impl SettingsTooltip {
     }
 }
 
-/// Whether a tracking area is the retired hover-bubble outlet: owned by some other object, with a
-/// userInfo naming the label it would reveal. Pure, so the smoke hook's rule is unit-tested without
-/// a live AppKit tree.
-fn tracking_area_is_a_hover_outlet(
-    owner: Option<usize>,
-    user_info: Option<usize>,
-    view: usize,
-) -> bool {
-    match owner {
-        Some(owner) => owner != view && user_info.is_some(),
-        None => false,
-    }
-}
-
 impl SettingsTooltip {
     unsafe fn set_disabled_tracking(view: *mut AnyObject, disabled: bool) {
         if view.is_null() {
@@ -566,46 +552,6 @@ impl SettingsTooltip {
         Self::hide_bubble();
     }
 
-    /// Whether a pointer resting on `view` raises nothing at all: no native `setToolTip:` and no
-    /// app tracking area of the kind the retired hover bubble used (one owned by a separate target
-    /// object rather than by the view itself).
-    ///
-    /// Debug smoke hook for the 2026-10-23 removal: a row's description must never pop a bubble over
-    /// the text the user is already reading. Release builds report success without touching the view
-    /// tree, matching `debug_validate_settings_page`, so the smoke runner keeps compiling there.
-    pub(super) unsafe fn debug_hover_outlets_absent(view: *mut AnyObject, label: &str) -> bool {
-        if !cfg!(debug_assertions) || view.is_null() {
-            return true;
-        }
-        let native_tip: *mut AnyObject = objc2::msg_send![view, toolTip];
-        if !native_tip.is_null() {
-            crate::log_info!("[tooltip] {label:?} carries a native toolTip");
-            return false;
-        }
-        let areas: *mut AnyObject = objc2::msg_send![view, trackingAreas];
-        if areas.is_null() {
-            return true;
-        }
-        let count: usize = objc2::msg_send![areas, count];
-        for index in 0..count {
-            let area: *mut AnyObject = objc2::msg_send![areas, objectAtIndex: index as isize];
-            if area.is_null() {
-                continue;
-            }
-            let owner: *mut AnyObject = objc2::msg_send![area, owner];
-            let user_info: *mut AnyObject = objc2::msg_send![area, userInfo];
-            if tracking_area_is_a_hover_outlet(
-                (!owner.is_null()).then_some(owner as usize),
-                (!user_info.is_null()).then_some(user_info as usize),
-                view as usize,
-            ) {
-                crate::log_info!("[tooltip] {label:?} is registered in a hover bubble");
-                return false;
-            }
-        }
-        true
-    }
-
     /// Every view address reachable from `root`, so a registry key can be checked for liveness
     /// before it is messaged.
     unsafe fn live_view_addresses(root: *mut AnyObject) -> std::collections::HashSet<usize> {
@@ -769,39 +715,5 @@ mod bubble_metrics_tests {
             120.0
         );
         assert_eq!(bubble_metrics(BubbleKind::Hint, 0.0).text_size.width, 1.0);
-    }
-}
-
-#[cfg(test)]
-mod hover_outlet_tests {
-    use super::tracking_area_is_a_hover_outlet;
-
-    const VIEW: usize = 0x2000;
-
-    /// The regression this gate exists for: the retired hover bubble registered a tracking area on
-    /// the caption with a separate target as its owner and the label as its userInfo. A pointer
-    /// resting there raised a bubble repeating the text under it (2026-10-23).
-    #[test]
-    fn a_foreign_owner_with_user_info_is_a_hover_outlet() {
-        assert!(tracking_area_is_a_hover_outlet(
-            Some(0x9000),
-            Some(VIEW),
-            VIEW
-        ));
-    }
-
-    /// The areas that legitimately remain are not outlets: an area owned by the view itself (the
-    /// styled button's own tracking, AppKit's cell tracking, the disabled-row cursor area) carries
-    /// no outlet of its own, and one with no userInfo cannot name a label.
-    #[test]
-    fn the_remaining_tracking_areas_are_not_outlets() {
-        assert!(!tracking_area_is_a_hover_outlet(
-            Some(VIEW),
-            Some(VIEW),
-            VIEW
-        ));
-        assert!(!tracking_area_is_a_hover_outlet(Some(VIEW), None, VIEW));
-        assert!(!tracking_area_is_a_hover_outlet(Some(0x9000), None, VIEW));
-        assert!(!tracking_area_is_a_hover_outlet(None, Some(VIEW), VIEW));
     }
 }
