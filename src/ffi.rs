@@ -1550,10 +1550,6 @@ mod dynamic_class_tests {
             },
             ConvertedGetter {
                 file: "settings/tooltip.rs",
-                getter: "hover_tooltip_target",
-            },
-            ConvertedGetter {
-                file: "settings/tooltip.rs",
                 getter: "disabled_cursor_target",
             },
             ConvertedGetter {

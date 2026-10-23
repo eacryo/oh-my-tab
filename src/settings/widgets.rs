@@ -3724,18 +3724,16 @@ pub(super) unsafe fn add_captioned_row(
     let (title_label, caption_label) =
         add_row_text_block(parent, x, y, text_w, row_h, title, Some(caption), false);
     let caption_label = caption_label.expect("a captioned row carries a caption");
-    // The caption is the row's truncatable text, so it is the one that carries the hover bubble;
-    // the title must read in full in every locale (design-style §9 -- a tooltip does not exempt a
-    // label) and deliberately gets none, so hovering the title never shows a second, redundant
-    // hint. Native `setToolTip:` is not used: AppKit's help-tag window is not dismissed when the
-    // page is hidden or rebuilt, so the tag can be stranded on screen (2026-10-04).
-    super::tooltip::SettingsTooltip::attach_hover(caption_label, caption);
+    // Neither label carries a tooltip outlet. A hover bubble over the caption repeated the text the
+    // user was already reading (removed on 2026-10-23), and native `setToolTip:` is not an option
+    // either: AppKit's help-tag window is not dismissed when the page is hidden or rebuilt, so the
+    // tag can be stranded on screen (2026-10-04).
     if cfg!(debug_assertions) {
         let caption_tip: *mut AnyObject = msg_send![caption_label, toolTip];
         let title_tip: *mut AnyObject = msg_send![title_label, toolTip];
         debug_assert!(
             caption_tip.is_null() && title_tip.is_null(),
-            "captioned row labels must use the app hover tooltip, not a native setToolTip:"
+            "captioned row labels must not carry a native setToolTip:"
         );
     }
     let _: () = msg_send![control, setAutoresizingMask: 2u64];

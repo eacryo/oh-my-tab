@@ -622,8 +622,8 @@ unsafe fn render_row(
     let toggle_name_ns = make_nsstring(&toggle_name);
     let _: () = msg_send![toggle, setAccessibilityLabel: toggle_name_ns];
     CFRelease(toggle_name_ns as *const c_void);
-    // The full action name while the pointer rests on the (truncating) label.
-    super::tooltip::SettingsTooltip::attach_hover(label, &text);
+    // The label truncates rather than growing a hover bubble (none exists in the settings window):
+    // the switch's accessible name above carries the full statement for assistive technologies.
 
     // The row's own actions, at the trailing edge before the switch. The pair mirrors the mouse
     // page's mapping rows (`settings/mapping.rs`), so a settings row's buttons read the same on both
