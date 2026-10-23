@@ -1304,6 +1304,39 @@ pub(crate) unsafe fn run_open_panel() -> Option<String> {
     result
 }
 
+/// Present an NSOpenPanel restricted to `.app` packages and return the chosen path.
+///
+/// Same lifetime rules as `run_open_panel`. `treatsFilePackagesAsDirectories` stays false so a
+/// bundle is SELECTED as a file instead of being entered, and the file-type filter keeps a plain
+/// document from being picked where an application is expected.
+pub(crate) unsafe fn run_open_panel_for_app() -> Option<String> {
+    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+    let panel: *mut AnyObject = msg_send![class!(NSOpenPanel), openPanel];
+    let _: () = msg_send![panel, setCanChooseFiles: true];
+    let _: () = msg_send![panel, setCanChooseDirectories: false];
+    let _: () = msg_send![panel, setAllowsMultipleSelection: false];
+    let _: () = msg_send![panel, setTreatsFilePackagesAsDirectories: false];
+    let extensions = make_nsstring("app");
+    let types: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: extensions];
+    CFRelease(extensions as *const c_void);
+    let _: () = msg_send![panel, setAllowedFileTypes: types];
+    let resp: isize = msg_send![panel, runModal]; // NSModalResponseOK == 1
+    let result = if resp == 1 {
+        let url: *mut AnyObject = msg_send![panel, URL];
+        if !url.is_null() {
+            let path_ns: *mut AnyObject = msg_send![url, path];
+            let path = nsstring_to_rust(path_ns);
+            (!path.is_empty()).then_some(path)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let _: () = msg_send![pool, drain];
+    result
+}
+
 /// Tests for the dynamic-class helpers: the properties this migration relies on, and the
 /// counter-examples that must keep failing if someone reverts a registration site to a
 /// hand-written `class_addMethod` with a wrong encoding.

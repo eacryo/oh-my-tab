@@ -747,6 +747,10 @@ fn apply_load_outcome(outcome: LoadOutcome) {
     match outcome.decision {
         LoadDecision::Entries { key, entries } => {
             storage::set_ready(key);
+            // The recovery baseline is taken HERE, on the main thread, before the load opens
+            // collection and refreshes the availability UI. Taking it lazily at the next poll could
+            // adopt a copy made AFTER the recovery and silently drop that one.
+            super::handle_recovery_baseline();
             merge_loaded_entries(entries);
             // Same as the empty branch: anything recorded while the load was deciding must be
             // written now (the merge's own save already covers the merged history; this catches
@@ -763,6 +767,7 @@ fn apply_load_outcome(outcome: LoadOutcome) {
         }
         LoadDecision::Empty { key } => {
             storage::set_ready(key);
+            super::handle_recovery_baseline();
             // Orphans from an earlier version are unreferenced now: the sweep is allowed because
             // the load succeeded (with nothing).
             let removed = sweep_current_clip_image_cache();
@@ -2637,6 +2642,42 @@ mod encryption_tests {
             "a completed isolation must not leave its marker behind"
         );
         let _ = std::fs::remove_dir_all(&aside_cache);
+        clean_disk();
+    }
+
+    /// The recovery baseline must be taken by the REAL load-application entry point. If the
+    /// `super::handle_recovery_baseline()` call is removed from `apply_load_outcome`, the request stays
+    /// pending and a copy made AFTER the recovery would later be adopted as the baseline and dropped
+    /// silently -- this assertion is written to fail in exactly that case.
+    #[test]
+    fn a_recovered_load_takes_its_baseline_before_writability_is_published() {
+        let _guard = guard();
+        let _gate = crate::clipboard::gate_test_lock();
+        clean_disk();
+        storage::set_unavailable(KeyUnavailable::AccessDenied);
+        // The pre-recovery content is on the pasteboard when the load lands.
+        crate::clipboard::set_test_change_count(Some(90));
+        apply_load_outcome(LoadOutcome {
+            generation: storage::generation(),
+            decision: LoadDecision::Empty {
+                key: keyring::test_key(),
+            },
+        });
+        assert_eq!(storage::state_label(), "encrypted");
+        assert!(
+            !crate::clipboard::recovery_baseline_pending_for_test(),
+            "the load-apply step must satisfy the recovery request"
+        );
+        assert_eq!(
+            crate::clipboard::last_change_count_for_test(),
+            90,
+            "the pre-recovery content must be adopted as already seen"
+        );
+        // A copy after the recovery is a NEW change: a stale request must not consume it.
+        crate::clipboard::set_test_change_count(Some(91));
+        assert!(!crate::clipboard::handle_recovery_baseline());
+        crate::clipboard::set_test_change_count(None);
+        storage::set_ready(keyring::test_key());
         clean_disk();
     }
 

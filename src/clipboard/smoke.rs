@@ -821,13 +821,15 @@ pub(crate) fn smoke_runner() -> bool {
         let header = (*super::PICKER_HEADER_STRIP.lock().unwrap())
             .expect("the picker header strip must be built")
             .0;
-        let (search, options, detail, pin, close) = super::picker_header_frames();
+        let (search, pause, options, detail, pin, close) = super::picker_header_frames();
         let band = super::picker_drag_band_frame();
 
         let subviews: *mut AnyObject = msg_send![header, subviews];
         let count: usize = msg_send![subviews, count];
         let mut found_settings: *mut AnyObject = std::ptr::null_mut();
         let mut found_close = false;
+        // Every header orb, keyed by its action, so the family's shared surface can be asserted.
+        let mut orbs: Vec<(&str, *mut AnyObject)> = Vec::new();
         for index in 0..count {
             let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
             let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
@@ -837,10 +839,97 @@ pub(crate) fn smoke_runner() -> bool {
             let action: Sel = msg_send![view, action];
             if action == sel!(toggleFilterPopover:) {
                 found_settings = view;
+                orbs.push(("options", view));
+            } else if action == sel!(toggleDetailPanel:) {
+                orbs.push(("detail", view));
+            } else if action == sel!(togglePanelPin:) {
+                orbs.push(("pin", view));
+            } else if action == sel!(togglePauseRecording:) {
+                orbs.push(("pause", view));
             } else if action == sel!(pickerClose:) {
                 found_close = true;
             }
         }
+        // The recording control is one of the corner orbs, not a bare glyph: it must carry the same
+        // 1pt orb border they do. A missing border is exactly the defect this family check exists
+        // for -- the pause orb shipped without one and read as a different kind of control.
+        assert_eq!(
+            orbs.len(),
+            4,
+            "the header must carry the four orbs (options, detail, pin, pause); got {:?}",
+            orbs.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+        );
+        let mut border_widths: Vec<(&str, f64)> = Vec::new();
+        for (name, button) in &orbs {
+            let layer: *mut AnyObject = msg_send![*button, layer];
+            assert!(!layer.is_null(), "the {name} orb must own a layer");
+            let width: f64 = msg_send![layer, borderWidth];
+            border_widths.push((name, width));
+        }
+        for (name, width) in &border_widths {
+            assert!(
+                (*width - 1.0).abs() < 0.01,
+                "the {name} orb must draw the shared 1pt orb border; measured {width} (all: {:?})",
+                border_widths
+            );
+        }
+        // A state change is applied while the pointer still sits on the orb (the click that caused
+        // it never left the button). The refresh must therefore keep the hover wash: refreshing with
+        // a hard-coded "not hovered" drops the fill and the hover ink until the pointer leaves and
+        // comes back, which is the defect this assertion exists for.
+        let pause_button = orbs
+            .iter()
+            .find(|(name, _)| *name == "pause")
+            .map(|(_, button)| *button)
+            .expect("the pause orb must be present");
+        let background = || -> *mut std::ffi::c_void {
+            let layer: *mut AnyObject = msg_send![pause_button, layer];
+            crate::ffi::layer_background_color(layer)
+        };
+        super::set_pause_orb_hovered(false);
+        super::refresh_pause_button();
+        let idle = background();
+        super::set_pause_orb_hovered(true);
+        super::refresh_pause_button();
+        let hovered = background();
+        assert!(
+            !idle.is_null() && !hovered.is_null(),
+            "the pause orb must keep a background colour in both states"
+        );
+        assert!(
+            !crate::ffi::CFEqual(idle as *const _, hovered as *const _),
+            "refreshing the pause orb while the pointer stays over it must keep the hover wash"
+        );
+        super::set_pause_orb_hovered(false);
+        super::refresh_pause_button();
+        // Hiding does not reliably deliver mouseExited to the buttons (see hide_picker), so the hide
+        // path must clear the recorded hover itself. Without that, the next summon paints the hover
+        // wash until the pointer happens to leave and re-enter the orb.
+        let live_background = |name: &str| -> *mut std::ffi::c_void {
+            let button = (*super::PICKER_PAUSE_BUTTON.lock().unwrap())
+                .map(|pointer| pointer.0)
+                .unwrap_or(std::ptr::null_mut());
+            assert!(!button.is_null(), "the {name} orb must stay live");
+            let layer: *mut AnyObject = msg_send![button, layer];
+            crate::ffi::layer_background_color(layer)
+        };
+        let idle_before_hide = live_background("pause");
+        super::set_pause_orb_hovered(true);
+        super::refresh_pause_button();
+        super::hide_picker();
+        assert!(
+            !super::pause_orb_hovered(),
+            "hiding the picker must clear the pause orb's recorded hover state"
+        );
+        assert!(
+            crate::ffi::CFEqual(
+                live_background("pause") as *const _,
+                idle_before_hide as *const _
+            ),
+            "hiding the picker must restore the pause orb's non-hover style"
+        );
+        super::show_picker();
+        super::refresh_pause_button();
         assert!(found_close, "the header must still carry the close button");
         assert!(
             !found_settings.is_null(),
@@ -930,6 +1019,34 @@ pub(crate) fn smoke_runner() -> bool {
             found_pin,
             "the header must carry a pin button targeting togglePanelPin:"
         );
+        // The recording control is found by ACTION too: a rename that left the panel without a
+        // working pause entry fails here, and its frame is checked against the geometry above.
+        let found_pause = (0..count).any(|index| {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+            if !is_button {
+                return false;
+            }
+            let action: Sel = msg_send![view, action];
+            if action != sel!(togglePauseRecording:) {
+                return false;
+            }
+            let frame: NSRect = msg_send![view, frame];
+            assert_eq!(
+                frame, pause,
+                "the pause orb must sit in the frame the geometry reserves for it"
+            );
+            let label: *mut AnyObject = msg_send![view, accessibilityLabel];
+            assert!(
+                !label.is_null(),
+                "the pause orb must state whether it pauses or resumes recording"
+            );
+            true
+        });
+        assert!(
+            found_pause,
+            "the header must carry a pause-recording orb targeting togglePauseRecording:"
+        );
         let options_frame: NSRect = msg_send![found_settings, frame];
         assert_eq!(
             options_frame, options,
@@ -937,7 +1054,8 @@ pub(crate) fn smoke_runner() -> bool {
         );
         // The controls share the search row and may not overlap: the search field gives up
         // their width, and the frames are the ones the geometry names.
-        assert!(search.origin.x + search.size.width <= options.origin.x);
+        assert!(search.origin.x + search.size.width <= pause.origin.x);
+        assert!(pause.origin.x + pause.size.width <= options.origin.x);
         assert!(options.origin.x + options.size.width <= detail.origin.x);
         assert!(detail.origin.x + detail.size.width <= pin.origin.x);
         assert!(pin.origin.x + pin.size.width <= close.origin.x);

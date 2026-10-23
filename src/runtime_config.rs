@@ -42,6 +42,10 @@ struct ChangeFlags {
     mouse: bool,
     clipboard_enabled: bool,
     clipboard_shortcut: bool,
+    /// The persisted pause intent changed (menu, settings switch, or an edited config file).
+    clipboard_paused: bool,
+    /// The excluded-applications list changed (the settings list, or an edited config file).
+    clipboard_excluded_apps: bool,
     // The "separate clear all" switch: the picker header shows or hides its second button live.
     clipboard_clear_actions: bool,
     clipboard_image_rows: bool,
@@ -74,6 +78,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.show_footer_title
         || flags.status_bar_size
         || flags.clipboard_image_rows
+        || flags.clipboard_paused
         || flags.keystroke_display
         || flags.mouse
         || flags.key_bindings
@@ -131,6 +136,9 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         mouse: startup || old.mouse != new.mouse,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
+        clipboard_paused: startup || old.clipboard.paused != new.clipboard.paused,
+        clipboard_excluded_apps: startup
+            || old.clipboard.excluded_apps != new.clipboard.excluded_apps,
         clipboard_clear_actions: startup
             || old.clipboard.separate_clear_all != new.clipboard.separate_clear_all,
         clipboard_image_rows: startup || old.clipboard.image_rows != new.clipboard.image_rows,
@@ -328,6 +336,44 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
                 crate::mouse::stop();
             }
         }
+    }
+
+    // The pause gate must be settled BEFORE the clipboard can poll. `start()` records the current
+    // pasteboard immediately (the existing "the first summon is not empty" behaviour), so a resume
+    // whose baseline has not been adopted yet would backfill exactly the content the pause
+    // promised to drop. Only a genuine pause->resume transition re-baselines; an ordinary startup
+    // and an ordinary "enable" keep their documented record-current behaviour.
+    if flags.clipboard_paused {
+        if new.clipboard.paused {
+            crate::clipboard::set_collection_paused(true);
+        } else if crate::clipboard::is_resume_transition(old.clipboard.paused, new.clipboard.paused)
+            && crate::clipboard::set_collection_paused(false)
+        {
+            // The baseline could not be established (no readable pasteboard). Keep every surface
+            // in the paused state instead of claiming that recording resumed.
+            if let Ok(mut w) = crate::config::CONFIG.write() {
+                w.clipboard.paused = true;
+            }
+            crate::config::persist_config_now();
+            crate::settings::refresh_clipboard_pause_switch_from_config();
+            crate::menu::refresh_clipboard_pause_item();
+            crate::log_info!(
+                "Clipboard collection: resume failed (pasteboard unreadable), staying paused"
+            );
+        }
+    }
+
+    if flags.clipboard_paused {
+        // The panel's orb is built with the window; keep its glyph and label in step with the
+        // effective state (a resume that failed above must leave it showing "paused"), and re-read
+        // the settings switch so neither surface can disagree with the gate.
+        crate::clipboard::refresh_pause_button();
+        crate::settings::refresh_clipboard_pause_switch_from_config();
+    }
+    if flags.clipboard_excluded_apps && !matches!(source, ConfigChangeSource::Settings) {
+        // The list card is laid out from the list, so a change from an edited config file has to
+        // rebuild the page. The settings UI's own edits already queue that rebuild themselves.
+        crate::settings::rebuild_settings_content_deferred();
     }
 
     if flags.clipboard_enabled {

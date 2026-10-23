@@ -32,6 +32,22 @@ pub(super) fn poll_clipboard() {
     if !CONFIG.read().unwrap().clipboard.enabled {
         return;
     }
+    // The pause gate. It is consulted before anything is read, and a paused poll only advances the
+    // changeCount baseline (a stale baseline is exactly what would make the next resume record the
+    // copy that happened during the pause). `Baselining` is also closed: a resume must adopt its
+    // baseline before a poll can record.
+    if collection_paused() {
+        if advance_baseline() {
+            log_debug!("[clip] change observed while paused: baseline advanced, nothing recorded");
+        }
+        return;
+    }
+    // A recovery from an unavailable or blocked storage adopts a fresh baseline: the copy made while
+    // nothing could be recorded must not be recorded now (the same promise the pause makes). A failed
+    // baseline leaves the request pending and keeps recording off.
+    if handle_recovery_baseline() {
+        return;
+    }
     // And stop while the storage is unavailable (no key, or the stored history cannot be read):
     // the settings page, the picker and the notification all say the feature is unavailable, so
     // it must not quietly keep collecting records that cannot be kept.
@@ -84,6 +100,14 @@ pub(super) fn poll_clipboard() {
         log_debug!("[clip] change skipped: our own paste write-back (move_used_to_top off)");
         return;
     }
+    // The exclusion list runs BEFORE the payload is read: an excluded copy must never have its
+    // content read, hashed, cached or icon-extracted. The frontmost app is resolved once here and
+    // reused for the recorded source, so the same lookup never happens twice.
+    let copy_source = crate::ffi::frontmost_app_info();
+    if copy_is_excluded(copy_source.1) {
+        log_debug!("[clip] change skipped: source application is on the exclusion list");
+        return;
+    }
     let mut history_changed = false;
     match unsafe { read_pasteboard_text() } {
         Some(text) => {
@@ -99,11 +123,26 @@ pub(super) fn poll_clipboard() {
             } else {
                 None
             };
+            let (file_img, file_pending) = match file_img {
+                Some((entry, pending)) => (Some(entry), Some(pending)),
+                None => (None, None),
+            };
+            // The capture boundary: the payload has been read, so re-check that the pasteboard still
+            // holds the change this candidate came from. Anything below has side effects (history,
+            // icon extraction, the deferred cache write), and none of them may run for a candidate
+            // another process has already replaced.
+            if !capture_boundary_holds(cc) {
+                log_debug!("[clip] change skipped: pasteboard changed while the copy was read");
+                return;
+            }
+            if let Some(pending) = file_pending {
+                pending.commit();
+            }
             let skip_file_text = has_file_url && file_img.is_none();
             let (source, source_key) = if skip_file_text {
                 (String::new(), String::new())
             } else {
-                record_source()
+                record_source(copy_source)
             };
             let mut hist = CLIP_HISTORY.lock().unwrap();
             if let Some(img) = &file_img {
@@ -145,8 +184,15 @@ pub(super) fn poll_clipboard() {
         }
         // No text -> try an image (text wins when both are present; a v1 tradeoff).
         None => match unsafe { read_pasteboard_image() } {
-            Some(img) => {
-                let (source, source_key) = record_source();
+            Some((img, pending)) => {
+                if !capture_boundary_holds(cc) {
+                    log_debug!(
+                        "[clip] change skipped: pasteboard changed while the image was read"
+                    );
+                    return;
+                }
+                pending.commit();
+                let (source, source_key) = record_source(copy_source);
                 let mut hist = CLIP_HISTORY.lock().unwrap();
                 if record_image(&mut hist, &img, &source, &source_key, max_entries()) {
                     history_changed = true;
@@ -176,12 +222,40 @@ pub(super) fn poll_clipboard() {
     }
 }
 
+/// Whether this copy's source is on the user's exclusion list.
+///
+/// Both signals are consulted and either match excludes: the frontmost application (the app the
+/// user was in when the copy happened) and, when present, the copier declared by
+/// `org.nspasteboard.source`. The declared identifier is self-reported by the writer, so it is an
+/// ADDITIONAL signal only -- it can never override the frontmost verdict, which would re-admit a
+/// copy from an excluded app that happened to declare another identifier.
+fn copy_is_excluded(front_pid: i32) -> bool {
+    // Clone the short list rather than hold the CONFIG read guard across Objective-C calls.
+    let list = CONFIG
+        .read()
+        .map(|c| c.clipboard.excluded_apps.clone())
+        .unwrap_or_default();
+    if list.is_empty() {
+        return false;
+    }
+    let frontmost = unsafe { crate::app_identity::bundle_id_for_pid(front_pid) };
+    let declared = unsafe { declared_source_bundle_id() };
+    excluded_app_matches(&list, frontmost.as_deref(), declared.as_deref())
+}
+
 /// Resolve the frontmost app at copy time: returns (app name, icon-cache key) and extracts
 /// the 16pt small icon. The app is alive now (the most reliable moment; failure only means
 /// no icon). Reuses the resolved identity so icon extraction never resolves the same PID
 /// twice (a duplicate NSRunningApplication lookup + executable stat).
-fn record_source() -> (String, String) {
-    let (source, pid) = crate::ffi::frontmost_app_info();
+/// Whether the pasteboard still holds the change a candidate was read from. A different count
+/// means another process replaced the content while the payload was being read, so the candidate is
+/// dropped rather than recorded (and its deferred cache write never happens).
+fn capture_boundary_holds(expected: i64) -> bool {
+    super::current_change_count() == Some(expected)
+}
+
+fn record_source(base: (String, i32)) -> (String, String) {
+    let (source, pid) = base;
     if pid <= 0 {
         return (source, String::new());
     }
@@ -232,6 +306,11 @@ pub(crate) fn start() {
         // run, so the storage state and the rows the smokes exercise are unchanged.
         let smoke = SMOKE_MODE.load(Ordering::SeqCst);
         if !smoke {
+            // Seed the effective state from the persisted intent BEFORE the first poll. A paused
+            // start adopts a baseline and records nothing; an unpaused start leaves the baseline
+            // unset on purpose, so the immediate poll records the current pasteboard (the existing
+            // "the first summon is not empty" behaviour).
+            init_collection_gate();
             poll_clipboard();
         }
         // Following Maccy's model, warm the long-lived panel and initial row tree while hidden;

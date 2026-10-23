@@ -1855,6 +1855,34 @@ pub(super) unsafe fn build_clipboard_page(
         ui.clipboard_enabled,
         setAction: sel!(handleClipboardEnabledToggle:)
     ];
+    // Pause recording. A persisted switch, unlike the panel pin: a pause is a standing intent, so
+    // a restart must not silently resume collecting. While it is on, the poll timer keeps running
+    // and advances the changeCount baseline, so nothing copied during the pause is recorded later.
+    let pause_caption = t("settings.desc_clipboard_paused");
+    let pause_row_h = widgets::captioned_row_height(&pause_caption, caption_w);
+    let cy = canvas.next_row(pause_row_h);
+    // Second row of its card: it needs the same hairline the rest of the page's rows carry, or the
+    // two switches read as one block.
+    SettingsRow::separator_above_row(clipboard_view, cy, pause_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_paused"),
+        Some(&pause_caption),
+    );
+    let (_, _, ui_clipboard_paused) = SettingsRow::captioned(
+        clipboard_view,
+        label_x,
+        cy,
+        caption_w,
+        pause_row_h,
+        &t("settings.row_clipboard_paused"),
+        &pause_caption,
+        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
+    );
+    ui.clipboard_paused = ui_clipboard_paused;
+    let _: () = msg_send![ui.clipboard_paused, setTarget: target];
+    let _: () = msg_send![ui.clipboard_paused, setAction: sel!(handlePauseRecordingToggle:)];
     canvas.card(&t("settings.header_clipboard"));
     set_settings_search_section(&t("settings.header_clipboard"));
     // Keep the history controls in a second titled card, matching the switcher layout.
@@ -2163,6 +2191,176 @@ pub(super) unsafe fn build_clipboard_page(
     bind_control(target, ui.clipboard_image_rows);
     canvas.card(&t("settings.header_clipboard_options"));
     set_settings_search_section(&t("settings.header_clipboard_options"));
+
+    // ---- Excluded applications ----
+    // Copies made by these apps are never recorded (matched inside the poll, before the payload is
+    // read). The list is a card of its own: it grows and shrinks, so it must not share a card with
+    // the fixed rows above. next_section opens the group and card closes it over the rows, which is
+    // the order every other page uses -- calling card first would re-title the rows above.
+    canvas.next_section();
+    let excluded = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .clipboard
+        .excluded_apps
+        .clone();
+    // One row height for the whole card: it follows the binding list's single-line row (tall enough
+    // for a 28pt row action with breathing room), not the 32pt control height the page's own rows
+    // use. The list rows AND the controls under them share it, so the card reads as one rhythm.
+    let excluded_row_h = described_row_h;
+    if excluded.is_empty() {
+        let cy = canvas.next_row(excluded_row_h);
+        record_settings_search_row(
+            SettingsPageId::Clipboard,
+            canvas.last_row(),
+            &t("settings.clipboard_excluded_empty"),
+            None,
+        );
+        let label = make_value_label(
+            label_x,
+            cy + 10.0,
+            content_w - label_x - 12.0,
+            18.0,
+            &t("settings.clipboard_excluded_empty"),
+        );
+        apply_settings_text_role(label, SettingsTextRole::Secondary);
+        let _: () = msg_send![clipboard_view, addSubview: label];
+        release_obj(label);
+    } else {
+        let last = excluded.len().saturating_sub(1);
+        for (index, entry) in excluded.iter().enumerate() {
+            let cy = canvas.next_row(excluded_row_h);
+            // The row style follows the Key Bindings list: a name and one trailing row action, with a
+            // divider between rows instead of a bordered control per row. The LAST row hands that
+            // boundary to the row below it (the add control draws its own), so the card never carries
+            // two overlapping lines at one edge.
+            if index < last {
+                SettingsRow::separator(clipboard_view, cy, content_w);
+            }
+            // The display name is a snapshot taken when the entry was added; the identifier is the
+            // only matching key and is shown when the snapshot is missing.
+            let display = if entry.name.is_empty() {
+                entry.bundle_id.clone()
+            } else {
+                entry.name.clone()
+            };
+            record_settings_search_row(
+                SettingsPageId::Clipboard,
+                canvas.last_row(),
+                &display,
+                None,
+            );
+            let btn_y = cy + (excluded_row_h - bindings::BINDING_BTN_H) / 2.0;
+            let delete = SettingsButton::action(
+                NSRect::new(
+                    NSPoint::new(ctrl_x + ctrl_w - bindings::BINDING_BTN_W, btn_y),
+                    NSSize::new(bindings::BINDING_BTN_W, bindings::BINDING_BTN_H),
+                ),
+                &t("settings.clipboard_excluded_remove"),
+                target,
+                sel!(handleClipboardExcludedRemove:),
+                SettingsButtonRole::ROW_ACTION,
+            );
+            // The returned control is the remove button: the handler finds the entry by comparing
+            // the sender pointer against this list.
+            // `tall_before_control`, not `plain`: the tall row measures its label for a single-line
+            // row, which is what keeps the name and the 28pt row action on one centre line. `plain`
+            // lays the label out for the page's 32pt control rows and sits low in a 56pt row.
+            let (_, remove) = SettingsRow::tall_before_control(
+                clipboard_view,
+                label_x,
+                cy,
+                ctrl_x + ctrl_w - bindings::BINDING_BTN_W,
+                super::SETTINGS_CONTROL_LABEL_GAP,
+                &display,
+                delete,
+            );
+            ui.clipboard_excluded_remove.push(remove);
+        }
+    }
+    // Add a running app. The candidates are captured here so the handler can map the popup's
+    // selection index back to an identifier without re-enumerating (and re-sorting) running apps
+    // between the click and the callback.
+    let running = crate::app_identity::running_apps_with_bundle_ids();
+    let listed: Vec<String> = excluded
+        .iter()
+        .map(|e| e.bundle_id.to_ascii_lowercase())
+        .collect();
+    let candidates: Vec<(String, String)> = running
+        .into_iter()
+        .filter(|(bundle_id, _)| !listed.contains(&bundle_id.to_ascii_lowercase()))
+        .collect();
+    // ONE add control. The popup lists the running candidates and carries a trailing "choose from
+    // disk" entry, the macOS "Other…" pattern: the same intent, reached from one place, instead of
+    // two rows that both mean "exclude an application".
+    let mut add_labels: Vec<String> = vec![t("settings.clipboard_excluded_add_placeholder")];
+    add_labels.extend(candidates.iter().map(|(_, name)| name.clone()));
+    add_labels.push(t("settings.clipboard_excluded_choose_from_disk"));
+    let add_label_refs: Vec<&str> = add_labels.iter().map(String::as_str).collect();
+    let add_metrics = SettingsSelect::metrics();
+    let cy = canvas.next_row(excluded_row_h);
+    // The list's last row handed this boundary over, so this is the one and only line here.
+    SettingsRow::separator_above_row(clipboard_view, cy, excluded_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_excluded_add"),
+        None,
+    );
+    let add_popup = SettingsControl::popup(
+        ctrl_x,
+        cy + (excluded_row_h - add_metrics.control_h) / 2.0,
+        ctrl_w,
+        add_metrics.control_h,
+        &add_label_refs,
+        0,
+    );
+    style_flat_popup(add_popup);
+    let _: () = msg_send![add_popup, setTarget: target];
+    let _: () = msg_send![add_popup, setAction: sel!(handleClipboardExcludedAdd:)];
+    ui.clipboard_excluded_add = SettingsRow::tall_before_control(
+        clipboard_view,
+        label_x,
+        cy,
+        ctrl_x,
+        super::SETTINGS_CONTROL_LABEL_GAP,
+        &t("settings.row_clipboard_excluded_add"),
+        add_popup,
+    )
+    .1;
+    ui.clipboard_excluded_candidates = candidates;
+    // (The disk picker lives inside the add popup above, as its trailing entry.)
+    // Restore the built-in list.
+    let cy = canvas.next_row(excluded_row_h);
+    SettingsRow::separator_above_row(clipboard_view, cy, excluded_row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_excluded_restore"),
+        None,
+    );
+    ui.clipboard_excluded_restore = SettingsRow::tall_before_control(
+        clipboard_view,
+        label_x,
+        cy,
+        ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
+        super::SETTINGS_CONTROL_LABEL_GAP,
+        &t("settings.row_clipboard_excluded_restore"),
+        SettingsControl::button(
+            ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
+            cy + (excluded_row_h - ROW_ACTION_BTN_H) / 2.0,
+            ROW_ACTION_BTN_W,
+            ROW_ACTION_BTN_H,
+            &t("settings.clipboard_excluded_restore_action"),
+            target,
+            sel!(handleClipboardExcludedRestore:),
+            SettingsButtonRole::ControlField,
+        ),
+    )
+    .1;
+
+    canvas.card(&t("settings.header_clipboard_excluded"));
+    set_settings_search_section(&t("settings.header_clipboard_excluded"));
 
     sweep_unindexed_rows(&canvas, SettingsPageId::Clipboard);
     let content_bottom = canvas.finish();

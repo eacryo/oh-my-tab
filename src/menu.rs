@@ -49,6 +49,9 @@ pub(crate) struct MenuUi {
     /// The clipboard pin item, tracked separately from the fixed-title items because its CHECK
     /// state changes at runtime (the pin), not only its title.
     pub(crate) clipboard_pin: Option<*mut AnyObject>,
+    /// The clipboard pause/resume item. Its TITLE and glyph swap with the paused state, so it is
+    /// tracked separately from the fixed-title items just like the pin.
+    pub(crate) clipboard_pause: Option<*mut AnyObject>,
     /// The status item itself, so "hide menu bar icon" can toggle it after setup. Kept here (and not
     /// only in `setup_status_bar`'s scope) because it outlives that function. The item is created
     /// once and only its visibility changes, so every pointer registered above stays valid for the
@@ -63,6 +66,7 @@ thread_local! {
         services: None,
         fixed: None,
         clipboard_pin: None,
+        clipboard_pause: None,
         status_item: None,
     }) };
 }
@@ -378,6 +382,9 @@ pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyOb
 /// unanchored help-tag window for an `NSMenuItem` tooltip and strands it at the screen origin. The
 /// clipboard warning it used to show lives as the visible caption on the Clipboard settings page.
 pub(crate) fn refresh_service_menu() {
+    // The pause item lives beside the service switches but carries its own state; refresh it here
+    // so enabling/disabling the module also updates whether it can be pressed.
+    refresh_clipboard_pause_item();
     let enabled: [bool; 5] = {
         let cfg = CONFIG.read().unwrap();
         std::array::from_fn(|index| {
@@ -464,6 +471,82 @@ pub(crate) fn refresh_clipboard_pin_item() {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// The clipboard pause menu item
+// ---------------------------------------------------------------------------------------------
+
+/// Title while recording is on: pressing the item pauses it.
+const CLIPBOARD_PAUSE_TITLE_PAUSE_KEY: &str = "menu.pause_clipboard";
+/// Title while recording is paused: pressing the item resumes it.
+const CLIPBOARD_PAUSE_TITLE_RESUME_KEY: &str = "menu.resume_clipboard";
+const CLIPBOARD_PAUSE_SYMBOL: &str = "pause.circle";
+const CLIPBOARD_RESUME_SYMBOL: &str = "play.circle";
+
+/// Add the "pause recording" / "resume recording" item.
+///
+/// The two states read differently, so this swaps its TITLE instead of carrying a checkmark: a
+/// check would only repeat what the title already says. Unlike the pin it is persisted
+/// (`clipboard.paused`): a pause is a standing intent, so a restart must not silently resume
+/// recording.
+pub(crate) unsafe fn build_clipboard_pause_item(
+    menu: *mut AnyObject,
+    target: *mut AnyObject,
+) -> *mut AnyObject {
+    let item = make_menu_item(
+        target,
+        &t(CLIPBOARD_PAUSE_TITLE_PAUSE_KEY),
+        sel!(handlePauseClipboard:),
+        0,
+        Some(CLIPBOARD_PAUSE_SYMBOL),
+    );
+    let _: () = msg_send![menu, addItem: item];
+    item
+}
+
+/// Mirror the paused state in the item: title, glyph and availability (the item follows the
+/// module switch, it never turns recording on as a side effect).
+pub(crate) fn refresh_clipboard_pause_item() {
+    let Some(item) = with_menu_ui(|ui| ui.clipboard_pause) else {
+        return;
+    };
+    let (paused, enabled) = {
+        let cfg = CONFIG.read().unwrap();
+        (cfg.clipboard.paused, cfg.clipboard.enabled)
+    };
+    unsafe {
+        let title_key = if paused {
+            CLIPBOARD_PAUSE_TITLE_RESUME_KEY
+        } else {
+            CLIPBOARD_PAUSE_TITLE_PAUSE_KEY
+        };
+        set_menu_item_full_title(item, &t(title_key));
+        set_menu_item_symbol(
+            item,
+            if paused {
+                CLIPBOARD_RESUME_SYMBOL
+            } else {
+                CLIPBOARD_PAUSE_SYMBOL
+            },
+        );
+        let _: () = msg_send![item, setEnabled: enabled];
+    }
+}
+
+/// The menu action: flip the persisted pause intent through the same apply pass every other
+/// switch uses, so the gate, the menu title and the settings switch cannot disagree.
+pub(crate) extern "C" fn handle_pause_clipboard(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        return;
+    }
+    // The panel orb, the menu item and the settings switch all flip the same persisted intent, and
+    // the apply pass keeps the three surfaces in step.
+    crate::clipboard::toggle_paused_intent();
+}
+
 /// The menu action: show and pin. Idempotent by design (see `build_clipboard_pin_item`).
 pub(crate) extern "C" fn handle_pin_clipboard(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     if !CONFIG.read().unwrap().clipboard.enabled {
@@ -530,6 +613,7 @@ pub(crate) fn toggle_service_to(service: ServiceToggle, enabled: bool) {
 pub(crate) fn refresh_menu_titles() {
     set_thumbnail_mode(CONFIG.read().unwrap().layout.thumbnails_enabled);
     refresh_service_menu();
+    refresh_clipboard_pause_item();
     unsafe {
         // shortcut item
         let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);

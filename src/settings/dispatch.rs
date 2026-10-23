@@ -56,6 +56,7 @@ pub(super) enum ControlField {
     SmoothScrollingInertia,
     MappingEnabled,
     ClipboardEnabled,
+    ClipboardPaused,
     ClipboardClearOnQuit,
     ClipboardSeparateClearAll,
     ClipboardShowSourceApp,
@@ -180,6 +181,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             })
             .or_else(|| m(u.mapping_enabled, ControlField::MappingEnabled))
             .or_else(|| m(u.clipboard_enabled, ControlField::ClipboardEnabled))
+            .or_else(|| m(u.clipboard_paused, ControlField::ClipboardPaused))
             .or_else(|| {
                 m(
                     u.clipboard_clear_on_quit,
@@ -728,6 +730,10 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.clipboard_enabled, state];
                     cfg.clipboard.enabled = state == 1;
                 }
+                ControlField::ClipboardPaused => {
+                    let state: isize = msg_send![u.clipboard_paused, state];
+                    cfg.clipboard.paused = state == 1;
+                }
                 ControlField::ClipboardClearOnQuit => {
                     let state: isize = msg_send![u.clipboard_clear_on_quit, state];
                     cfg.clipboard.clear_on_quit = state == 1;
@@ -1220,6 +1226,188 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
 }
 
 /// Freeze the clipboard-history options below the clipboard master switch.
+/// Re-read the pause switch from the live configuration. Used by the menu item and by the apply
+/// pass when a resume could not establish its baseline and the intent was forced back to paused.
+pub(super) fn refresh_clipboard_pause_switch_from_config() {
+    let paused = CONFIG.read().unwrap().clipboard.paused;
+    unsafe {
+        with_settings_ui(|ui| {
+            if let Some(u) = ui.as_ref() {
+                if !u.clipboard_paused.is_null() {
+                    let _: () = msg_send![u.clipboard_paused, setState: if paused { 1isize } else { 0isize }];
+                }
+            }
+        });
+    }
+}
+
+/// Apply the pause switch, then mirror the EFFECTIVE state back into it: a resume that could not
+/// read the pasteboard keeps recording off, and the switch must not claim otherwise.
+pub(crate) extern "C" fn handle_pause_recording_toggle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    apply_control_field(ControlField::ClipboardPaused);
+    refresh_clipboard_pause_switch_from_config();
+    crate::menu::refresh_clipboard_pause_item();
+}
+
+/// Mutate the excluded-applications list the way every other settings control commits: write the
+/// in-memory config, persist, run the apply pass, then rebuild the page (the card is laid out from
+/// the list). Duplicate and empty identifiers are collapsed so the list cannot grow entries that
+/// can never match.
+fn mutate_excluded_apps(mutate: impl FnOnce(&mut Vec<crate::config::ExcludedApp>)) {
+    let old_cfg = match CONFIG.read() {
+        Ok(cfg) => cfg.clone(),
+        Err(_) => return,
+    };
+    let mut new_cfg = old_cfg.clone();
+    mutate(&mut new_cfg.clipboard.excluded_apps);
+    let mut seen: Vec<String> = Vec::new();
+    new_cfg.clipboard.excluded_apps.retain(|entry| {
+        let id = entry.bundle_id.trim().to_ascii_lowercase();
+        if id.is_empty() || seen.contains(&id) {
+            return false;
+        }
+        seen.push(id);
+        true
+    });
+    if new_cfg == old_cfg {
+        return;
+    }
+    if let Ok(mut current) = CONFIG.write() {
+        *current = new_cfg.clone();
+    }
+    persist_config_now();
+    apply_config_change(&old_cfg, &new_cfg, ConfigChangeSource::Settings);
+    // Deferred: rebuilding inside the button's own action would release the button AppKit is
+    // currently dispatching to. The page keeps its scroll position, so editing a list of rows does
+    // not throw the user back to the top of the page.
+    crate::settings::rebuild_settings_content_deferred_keeping_scroll(SettingsPageId::Clipboard);
+}
+
+/// Add the running app selected in the add popup. Index 0 is the placeholder, so the candidate is
+/// (index - 1) in the list captured when the page was built.
+pub(crate) extern "C" fn handle_clipboard_excluded_add(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    if sender.is_null() {
+        return;
+    }
+    let index: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
+    if index <= 0 {
+        return;
+    }
+    // The popup's trailing entry is "choose from disk": the same intent, for an app that is not
+    // running. One add control, two sources.
+    let choose_from_disk = with_settings_ui(|ui| {
+        ui.as_ref()
+            .map(|u| index as usize == u.clipboard_excluded_candidates.len() + 1)
+            .unwrap_or(false)
+    });
+    if choose_from_disk {
+        add_excluded_app_from_disk();
+        return;
+    }
+    let candidate = with_settings_ui(|ui| {
+        ui.as_ref().and_then(|u| {
+            u.clipboard_excluded_candidates
+                .get((index - 1) as usize)
+                .cloned()
+        })
+    });
+    let Some((bundle_id, name)) = candidate else {
+        return;
+    };
+    mutate_excluded_apps(|list| {
+        if !list
+            .iter()
+            .any(|e| e.bundle_id.eq_ignore_ascii_case(&bundle_id))
+        {
+            list.push(crate::config::ExcludedApp::new(bundle_id, name));
+        }
+    });
+}
+
+/// Add an application chosen from disk, so an app that is not currently running can still be
+/// excluded (the popup only knows running applications).
+/// Pick an application bundle from disk and add it to the exclusion list. Reached from the add
+/// popup's trailing entry, so an app that is not running can still be excluded.
+fn add_excluded_app_from_disk() {
+    let Some(path) = (unsafe { crate::ffi::run_open_panel_for_app() }) else {
+        return;
+    };
+    let Some((bundle_id, name)) = (unsafe { crate::app_identity::bundle_identity_at_path(&path) })
+    else {
+        // Not an application bundle, or one without an identifier: nothing can be matched against
+        // it, so it is refused rather than stored as an inert entry.
+        crate::log_info!("[settings] excluded app ignored: not an application bundle");
+        return;
+    };
+    mutate_excluded_apps(|list| {
+        if !list
+            .iter()
+            .any(|e| e.bundle_id.eq_ignore_ascii_case(&bundle_id))
+        {
+            list.push(crate::config::ExcludedApp::new(bundle_id, name));
+        }
+    });
+}
+
+/// Remove the row whose remove button was pressed. The sender POINTER identifies the entry: a
+/// button tag is reserved for its hover/normal palette and must never carry an action id.
+pub(crate) extern "C" fn handle_clipboard_excluded_remove(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    if sender.is_null() {
+        return;
+    }
+    let index = with_settings_ui(|ui| {
+        ui.as_ref().and_then(|u| {
+            u.clipboard_excluded_remove
+                .iter()
+                .position(|pointer| *pointer == sender as *mut AnyObject)
+        })
+    });
+    let Some(index) = index else {
+        return;
+    };
+    mutate_excluded_apps(|list| {
+        if index < list.len() {
+            list.remove(index);
+        }
+    });
+}
+
+/// Restore the built-in exclusion list.
+pub(crate) extern "C" fn handle_clipboard_excluded_restore(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    mutate_excluded_apps(|list| *list = crate::config::default_excluded_apps());
+}
+
+/// Deferred page rebuild requested by settings::rebuild_settings_content_deferred.
+pub(crate) extern "C" fn handle_rebuild_settings_content(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    let pending = crate::settings::take_rebuild_request();
+    match pending {
+        Some((page, offset)) => unsafe {
+            super::window::rebuild_settings_content_now_keeping_scroll(page, Some(offset));
+        },
+        None => unsafe { super::window::rebuild_settings_content_now() },
+    }
+}
+
 pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
     let state: isize = msg_send![ui.clipboard_enabled, state];
     let on = state == 1;
@@ -1228,6 +1416,7 @@ pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
     // greys it out (whether it shows at all is decided by "delete entry after paste", see
     // update_clipboard_delete_dependent_visibility), so it no longer stacks a second condition.
     for &ctrl in &[
+        ui.clipboard_paused,
         ui.clipboard_shortcut,
         ui.clipboard_pin_follow,
         ui.clipboard_clear_on_quit,
