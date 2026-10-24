@@ -4094,7 +4094,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 fn clear_settings_content_registries() {
     SettingsRow::clear_runtime_registry();
     sidebar::reset_settings_search_rows();
-    widgets::clear_settings_select_registry();
+    widgets::clear_settings_select_registry(select::SelectOwner::SettingsPage);
     tooltip::SettingsTooltip::clear_runtime_registries();
     widgets::clear_sidebar_view_registries();
 }

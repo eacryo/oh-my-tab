@@ -4,7 +4,20 @@ use super::widgets::settings_palette;
 use super::*;
 use crate::callback_guard;
 
+/// Which window owns a select; see `SettingsSelectState::owner`.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SelectOwner {
+    SettingsPage,
+    Onboarding,
+}
+
 struct SettingsSelectState {
+    /// Which window owns this select. The registry is global but its two users are not: the settings
+    /// page rebuilds by clearing the whole table, and the onboarding guide re-renders a step by
+    /// removing its views. Without an owner the first user to rebuild would destroy the other's
+    /// selects, and a page that removed a select without forgetting it first would leave an address
+    /// that the next sweep sends `window` to.
+    owner: SelectOwner,
     items: Vec<String>,
     item_symbols: Vec<Option<String>>,
     selected: isize,
@@ -66,7 +79,7 @@ static SETTINGS_SELECT_ITEM_CLASS: OnceLock<SettingsSelectItemClass> = OnceLock:
 /// labels). A panel that owns a select and is about to be released must call this first: the maps
 /// outlive the views, so a stale key makes the next `close_open_settings_selects` send `window` to a
 /// freed address, and a recycled address can pair a new popup with an old label pointer.
-pub(super) unsafe fn forget_settings_select(button: *mut AnyObject) {
+pub(crate) unsafe fn forget_settings_select(button: *mut AnyObject) {
     if button.is_null() {
         return;
     }
@@ -105,27 +118,31 @@ pub(super) unsafe fn forget_settings_select(button: *mut AnyObject) {
 }
 
 /// Clear runtime state before the settings window and its controls are destroyed.
-pub(super) fn clear_settings_select_registry() {
-    // Close any popup windows first: once the registry is cleared they can never be found again and
-    // would linger on screen as orphans.
-    let popups: Vec<usize> = SETTINGS_SELECT_STATES
+/// Clear the runtime state of one window's selects. Each window clears only its own: the settings
+/// page used to clear the whole table, which also dropped the onboarding guide's select and left the
+/// live control with no state (its next click would then be read against another select's entry).
+/// How many selects `owner` currently has registered. The guide and the settings page share one
+/// table, so a test that re-renders one of them asserts through this: after a re-render the count is
+/// back to one per control the window actually shows, and the other owner's entries are untouched.
+pub(crate) fn registered_select_count(owner: SelectOwner) -> usize {
+    SETTINGS_SELECT_STATES
         .lock()
         .unwrap()
         .values()
-        .filter(|state| state.popup != 0)
-        .map(|state| state.popup)
+        .filter(|state| state.owner == owner)
+        .count()
+}
+pub(super) fn clear_settings_select_registry(owner: SelectOwner) {
+    let keys: Vec<usize> = SETTINGS_SELECT_STATES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, state)| state.owner == owner)
+        .map(|(key, _)| *key)
         .collect();
-    unsafe {
-        for popup in popups {
-            close_select_popup(popup as *mut AnyObject);
-        }
+    for key in keys {
+        unsafe { forget_settings_select(key as *mut AnyObject) };
     }
-    unsafe { remove_select_monitor() };
-    SETTINGS_SELECT_STATES.lock().unwrap().clear();
-    SETTINGS_SELECT_LABEL_VIEWS.lock().unwrap().clear();
-    SETTINGS_SELECT_ARROW_VIEWS.lock().unwrap().clear();
-    SETTINGS_SELECT_ITEM_LABEL_VIEWS.lock().unwrap().clear();
-    *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
 }
 
 unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
@@ -1689,7 +1706,8 @@ fn settings_select_class() -> *mut AnyObject {
 }
 
 /// Custom settings select with a bouncy, position-aware options panel (alloc +1).
-pub(super) unsafe fn make_popup(
+pub(crate) unsafe fn make_popup(
+    owner: SelectOwner,
     x: f64,
     y: f64,
     w: f64,
@@ -1716,6 +1734,7 @@ pub(super) unsafe fn make_popup(
     SETTINGS_SELECT_STATES.lock().unwrap().insert(
         popup as usize,
         SettingsSelectState {
+            owner,
             items: items.iter().map(|item| (*item).to_owned()).collect(),
             item_symbols: vec![None; items.len()],
             selected: selected as isize,
@@ -1791,6 +1810,10 @@ unsafe fn settings_select_required_option_row_height(width: f64, items: &[String
 mod tests {
     use super::settings_select_class;
     use super::{
+        clear_settings_select_registry, registered_select_count, SelectOwner, SettingsSelectState,
+        SETTINGS_SELECT_STATES,
+    };
+    use super::{
         settings_select_centered_text_geometry, settings_select_item_active_color,
         settings_select_panel_geometry, settings_select_panel_surface_color,
         settings_select_surface_color, settings_select_trigger_paint,
@@ -1799,6 +1822,55 @@ mod tests {
     use objc2::runtime::AnyObject;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
+    /// Each window clears only its own selects. The settings page rebuild used to clear the whole
+    /// table, which silently dropped the onboarding guide's live select and left its next click
+    /// reading another select's entry.
+    ///
+    /// This inserts registry entries directly instead of building controls: the default suite is
+    /// headless-safe, and `make_popup` creates AppKit views that belong on the main thread.
+    #[test]
+    fn clearing_one_owner_leaves_the_other_registered() {
+        fn state(owner: SelectOwner) -> SettingsSelectState {
+            SettingsSelectState {
+                owner,
+                items: vec!["A".to_string(), "B".to_string()],
+                item_symbols: vec![None, None],
+                selected: 0,
+                panel: 0,
+                popup: 0,
+                open: false,
+                focused: false,
+            }
+        }
+        let settings_key = 0x5e77_1000usize;
+        let guide_key = 0x0b0a_2000usize;
+        {
+            let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+            states.insert(settings_key, state(SelectOwner::SettingsPage));
+            states.insert(guide_key, state(SelectOwner::Onboarding));
+        }
+        assert!(registered_select_count(SelectOwner::SettingsPage) >= 1);
+        assert!(registered_select_count(SelectOwner::Onboarding) >= 1);
+        let guide_before = registered_select_count(SelectOwner::Onboarding);
+        clear_settings_select_registry(SelectOwner::SettingsPage);
+        assert_eq!(
+            registered_select_count(SelectOwner::SettingsPage),
+            0,
+            "the settings page cleared its own selects"
+        );
+        assert_eq!(
+            registered_select_count(SelectOwner::Onboarding),
+            guide_before,
+            "clearing the settings page must not touch the guide's select"
+        );
+        // Teardown through the same path a window uses.
+        clear_settings_select_registry(SelectOwner::Onboarding);
+        assert_eq!(registered_select_count(SelectOwner::Onboarding), 0);
+        assert!(!SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .contains_key(&guide_key));
+    }
     fn rect_inside(outer: NSRect, inner: NSRect, epsilon: f64) -> bool {
         inner.origin.x >= outer.origin.x - epsilon
             && inner.origin.y >= outer.origin.y - epsilon

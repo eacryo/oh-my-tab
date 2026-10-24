@@ -865,7 +865,7 @@ mod page_builder;
 pub(crate) mod page_canvas;
 pub(crate) mod portability;
 pub(crate) mod restore;
-mod select;
+pub(crate) mod select;
 mod sidebar;
 pub(crate) mod tooltip;
 pub(crate) mod widgets;

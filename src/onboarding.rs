@@ -60,6 +60,7 @@ const ACTION_OPEN_SETTINGS: isize = 16;
 const ACTION_BACK: isize = 17;
 const ACTION_TOGGLE_CLIPBOARD_DRAFT: isize = 18;
 const ACTION_DISPLAY_MODE: isize = 19;
+const ACTION_SELECT_MODIFIER: isize = 20;
 
 /// DISPLAY-only permission override. It affects the guide's decisions and copy and never reaches
 /// the event tap or the permission supervisor.
@@ -283,6 +284,9 @@ struct UiState {
     overrides: PermissionOverride,
     launch_at_login: bool,
     thumbnails_enabled: bool,
+    /// Draft index into `SWITCHER_MODIFIER_VALUES` for the switcher shortcut. Like every other
+    /// choice on the step it previews and `advance()` commits it.
+    modifier: usize,
     clipboard_enabled: bool,
     clipboard_shortcut: String,
 }
@@ -407,6 +411,7 @@ fn show_internal_at(overrides: PermissionOverride, start_index: usize) {
         overrides,
         launch_at_login: config.startup.launch_at_login,
         thumbnails_enabled: config.layout.thumbnails_enabled,
+        modifier: crate::config::switcher_modifier_index_of(&config.keyboard.modifier),
         clipboard_enabled: config.clipboard.enabled,
         clipboard_shortcut: config.clipboard.shortcut.clone(),
     };
@@ -584,6 +589,9 @@ unsafe fn clear_content(content: *mut AnyObject) {
     let count: isize = msg_send![subviews, count];
     for index in 0..count {
         let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index];
+        // A select registers itself in a global table by address; forgetting it before the view goes
+        // away is what keeps the next sweep from sending `window` to a freed address.
+        crate::settings::select::forget_settings_select(view);
         let _: () = msg_send![view, removeFromSuperview];
     }
 }
@@ -1621,6 +1629,47 @@ unsafe fn segment_apply_visual(record: &SegmentRecord) {
     }
 }
 
+/// The switcher-shortcut dropdown. It reuses the settings page's own select control rather than an
+/// `NSPopUpButton`: that class routes through AppKit's SwiftUI bridge, which aborts the process on
+/// `NSTextAlignment` (measured 2026-10-24: `Fatal error: New case in NSTextAlignment` the moment a
+/// popup is added to the guide's view tree). The step previews the choice; `advance()` commits it.
+unsafe fn add_modifier_control(content: *mut AnyObject, top: f64, selected: usize) {
+    let Some(target) = crate::CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        return;
+    };
+    // Labels follow the settings page's order, which is `SWITCHER_MODIFIER_VALUES` -- so the control
+    // index is the config index and needs no mapping.
+    let labels = [
+        t("settings.modifier_option"),
+        t("settings.modifier_command"),
+        t("settings.modifier_control"),
+    ];
+    let label_refs: Vec<&str> = labels.iter().map(String::as_str).collect();
+    let popup = crate::settings::select::make_popup(
+        crate::settings::select::SelectOwner::Onboarding,
+        PAGE_PAD,
+        y_from_top(top, SEGMENTED_H),
+        SEGMENTED_W,
+        SEGMENTED_H,
+        &label_refs,
+        selected.min(label_refs.len().saturating_sub(1)),
+    );
+    if popup.is_null() {
+        return;
+    }
+    let _: () = msg_send![popup, setTarget: target];
+    // The select sends this when a row is chosen; `on_action` maps the pointer to the tag below.
+    let _: () = msg_send![popup, setAction: sel!(handleOnboardingAction:)];
+    ACTION_TAGS
+        .lock()
+        .unwrap()
+        .push((popup as usize, ACTION_SELECT_MODIFIER));
+    let accessibility_label = make_nsstring(&t("settings.row_modifier"));
+    let _: () = msg_send![popup, setAccessibilityLabel: accessibility_label];
+    release_obj(accessibility_label);
+    let _: () = msg_send![content, addSubview: popup];
+    release_obj(popup);
+}
 /// The segmented control: a 320×30 field container with the two labeled segments inside, the
 /// selected one the raised pill.
 unsafe fn add_display_mode_control(
@@ -1867,6 +1916,7 @@ fn render_current_step() {
                 content,
                 card_row_top,
                 state.thumbnails_enabled,
+                state.modifier,
                 screen_granted,
             ),
             Step::ClipboardHistory => render_clipboard_history(
@@ -1904,6 +1954,9 @@ fn step_copy(state: &UiState, step: Step) -> (&'static str, String) {
                 "onboarding.accessibility_body",
                 &[
                     ("app", &app_display_name()),
+                    // The committed config, not the draft: this copy tells the user which shortcut
+                    // works right now. A drafted-but-unconfirmed modifier is not listening yet, and
+                    // naming it here would describe a key that does nothing.
                     ("shortcut", &shortcut_label()),
                 ],
             ),
@@ -1984,20 +2037,35 @@ unsafe fn render_display_mode(
     content: *mut AnyObject,
     card_row_top: f64,
     thumbnails_enabled: bool,
+    modifier: usize,
     screen_granted: bool,
 ) {
-    // The segmented control: a field head (12pt semibold secondary label), 8pt below it the
-    // 320×30 container.
+    // The switcher shortcut comes first: it is the more basic choice on this step, and the step's
+    // title covers both fields.
     add_label(
         content,
-        &t("onboarding.display_mode_label"),
+        &t("settings.row_modifier"),
         PAGE_PAD,
         y_from_top(card_row_top, CAPTION_LINE_H),
         200.0,
         CAPTION_LINE_H,
         FIELD_LABEL_STYLE,
     );
-    let seg_top = card_row_top + CAPTION_LINE_H + 8.0;
+    let modifier_top = card_row_top + CAPTION_LINE_H + 8.0;
+    add_modifier_control(content, modifier_top, modifier);
+    let display_top = modifier_top + SEGMENTED_H + 16.0;
+    // The segmented control: a field head (12pt semibold secondary label), 8pt below it the
+    // 320×30 container.
+    add_label(
+        content,
+        &t("onboarding.display_mode_label"),
+        PAGE_PAD,
+        y_from_top(display_top, CAPTION_LINE_H),
+        200.0,
+        CAPTION_LINE_H,
+        FIELD_LABEL_STYLE,
+    );
+    let seg_top = display_top + CAPTION_LINE_H + 8.0;
     add_display_mode_control(content, seg_top, thumbnails_enabled);
     // The live Screen Recording permission line sits right under the control (the reference
     // mockup leaves this area empty; the app's flow needs the state made explicit).
@@ -2298,6 +2366,15 @@ pub(crate) extern "C" fn on_action(_self: *mut c_void, _cmd: Sel, sender: *mut A
             });
             return;
         }
+        if tag == ACTION_SELECT_MODIFIER {
+            // The control's index IS the config index: both follow `SWITCHER_MODIFIER_VALUES`.
+            let index: isize = unsafe { msg_send![sender, indexOfSelectedItem] };
+            let index = usize::try_from(index).unwrap_or(0);
+            if let Some(state) = STATE.lock().unwrap().as_mut() {
+                state.modifier = index;
+            }
+            return;
+        }
         handle_action(tag);
     });
 }
@@ -2387,6 +2464,25 @@ pub(crate) fn handle_action(tag: isize) {
     }
 }
 
+/// Commit the drafted shortcut through the same path the settings page uses. Separate from
+/// `config_with_step_selection` on purpose: the display mode on that step applies on click, the
+/// shortcut applies when the user confirms the step.
+fn commit_modifier_selection() {
+    let modifier = {
+        let slot = STATE.lock().unwrap();
+        let Some(state) = slot.as_ref() else {
+            return;
+        };
+        crate::config::switcher_modifier_value_at(state.modifier).to_string()
+    };
+    let old = CONFIG.read().unwrap().clone();
+    if old.keyboard.modifier == modifier {
+        return;
+    }
+    let mut new = old.clone();
+    new.keyboard.modifier = modifier;
+    apply_config(&old, &new);
+}
 fn advance() {
     let current_step = {
         let slot = STATE.lock().unwrap();
@@ -2396,6 +2492,12 @@ fn advance() {
         state.steps[state.index]
     };
     commit_step_selection(current_step);
+    // The shortcut is confirmed by leaving the step. It is kept apart from the display mode because
+    // that one applies on click (it has to: picking thumbnails asks for Screen Recording then), and
+    // riding along with it would write a modifier the user never confirmed by leaving the step.
+    if current_step == Step::DisplayMode {
+        commit_modifier_selection();
+    }
     {
         let mut slot = STATE.lock().unwrap();
         let Some(state) = slot.as_mut() else {
@@ -2478,7 +2580,13 @@ fn config_with_step_selection(old: &Config, state: &UiState, step: Step) -> Conf
     let mut new = old.clone();
     match step {
         Step::PermissionsAndStartup => new.startup.launch_at_login = state.launch_at_login,
-        Step::DisplayMode => new.layout.thumbnails_enabled = state.thumbnails_enabled,
+        Step::DisplayMode => {
+            // The display mode applies the moment it is picked (picking thumbnails has to ask for
+            // Screen Recording then), so it commits on its own. The modifier is NOT part of that:
+            // it would ride along with a click that never said anything about the shortcut, and
+            // `advance()` is what commits it (see `modifier_step_selection`).
+            new.layout.thumbnails_enabled = state.thumbnails_enabled;
+        }
         Step::ClipboardHistory => {
             new.clipboard.enabled = state.clipboard_enabled;
         }
@@ -2557,6 +2665,11 @@ unsafe fn dispatch_display_mode_segment(segment: isize) -> bool {
 /// on and that the smoke run never asked for Screen Recording (a real run asks when thumbnails are
 /// picked). Runs as a subprocess on the real AppKit main thread (see the ignored test below).
 pub(crate) fn live_apply_smoke_runner() -> bool {
+    // The guide and the settings page share one select table, keyed by view address. A step that is
+    // re-rendered must leave exactly its own selects behind: a stale entry survives the view it names
+    // and the next sweep sends `window` to a freed address.
+    use crate::settings::select::{registered_select_count, SelectOwner};
+    let selects_before = registered_select_count(SelectOwner::Onboarding);
     let before_thumbnails = CONFIG.read().unwrap().layout.thumbnails_enabled;
     show_internal(PermissionOverride::default());
     // The resume marker must exist while the guide is on screen (an unexpected exit never delivers
@@ -2566,6 +2679,11 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
     // Step 1 -> 2. Committing step 1 is a no-op here: its draft mirrors the loaded config.
     advance();
     let resume_after_advance = peeking_resume_step() == Some(1);
+    // Step 2 is the only step with a select. One render must leave exactly one registration, and a
+    // re-render of the same step must replace it rather than add to it.
+    let selects_step_two = registered_select_count(SelectOwner::Onboarding);
+    render_current_step();
+    let selects_after_rerender = registered_select_count(SelectOwner::Onboarding);
     // Segment 0 = icons only, segment 1 = icons and thumbnails; pick the one that flips the value.
     let segment = if before_thumbnails { 0isize } else { 1isize };
     let expected_thumbnails = segment == 1;
@@ -2578,10 +2696,26 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         .as_ref()
         .map(|state| state.thumbnails_enabled);
 
-    // Step 2 -> 3. The persist row only exists while history is on, so bring the master switch to a
-    // known ON state first: the loaded config may start either way (the ignored test runs both), and
-    // a blind toggle from ON would turn it off and remove the very row this checks.
+    // The display mode applies on click; the shortcut next to it must not ride along. Pick a
+    // modifier that differs from the live one and check the config still holds the old value.
+    let before_modifier = CONFIG.read().unwrap().keyboard.modifier.clone();
+    let drafted_modifier = if before_modifier == "control" { 1 } else { 2 };
+    if let Some(state) = STATE.lock().unwrap().as_mut() {
+        state.modifier = drafted_modifier;
+    }
+    let segment_again = if expected_thumbnails { 0isize } else { 1isize };
+    let _ = unsafe { dispatch_display_mode_segment(segment_again) };
+    let modifier_held_by_display_click =
+        CONFIG.read().unwrap().keyboard.modifier == before_modifier;
+
+    // Leaving step 2 is what confirms the shortcut, so this is the one moment it may reach the
+    // config. Checked before the next `advance()`, which commits the clipboard step instead.
     advance();
+    let modifier_committed_on_advance = CONFIG.read().unwrap().keyboard.modifier
+        == crate::config::switcher_modifier_value_at(drafted_modifier);
+    // Step 3 (the clipboard step). Its persist row only exists while history is on, so bring the
+    // master switch to a known ON state first: the loaded config may start either way (the ignored
+    // test runs both), and a blind toggle from ON would turn it off and remove that very row.
     let before_clipboard = CONFIG.read().unwrap().clipboard.enabled;
     let master_switch_present =
         unsafe { dispatch_action_with_tag(ACTION_TOGGLE_CLIPBOARD_DRAFT).is_some() };
@@ -2645,6 +2779,28 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         resume_cleared,
         window_shown
     );
+    if !modifier_held_by_display_click || !modifier_committed_on_advance {
+        eprintln!(
+            "[smoke-onboarding-live-apply] shortcut ownership wrong: held_on_display_click={} committed_on_advance={}",
+            modifier_held_by_display_click, modifier_committed_on_advance
+        );
+    }
+    // One select on step 2, still one after a re-render: an accumulating or surviving registration is
+    // the stale-address case.
+    let select_registration_stable =
+        selects_before == 0 && selects_step_two == 1 && selects_after_rerender == 1;
+    // Leaving step 2 for a step with no select must release it. This is the page-turn path, not the
+    // window-close path: `hide()` only hides a cached window, so the zero measured here comes from
+    // step 3's render having forgotten step 2's control.
+    hide();
+    let selects_after_leaving_step_two = registered_select_count(SelectOwner::Onboarding);
+    let select_released_on_step_change = selects_after_leaving_step_two == 0;
+    if !select_registration_stable || !select_released_on_step_change {
+        eprintln!(
+            "[smoke-onboarding-live-apply] select registration wrong: before={} step_two={} after_rerender={} after_leaving_step_two={}",
+            selects_before, selects_step_two, selects_after_rerender, selects_after_leaving_step_two
+        );
+    }
     segment_dispatched
         && thumbnails_applied
         && thumbnails_draft == Some(expected_thumbnails)
@@ -2660,6 +2816,10 @@ pub(crate) fn live_apply_smoke_runner() -> bool {
         && resume_after_advance
         && resume_cleared
         && window_shown
+        && modifier_held_by_display_click
+        && modifier_committed_on_advance
+        && select_registration_stable
+        && select_released_on_step_change
 }
 
 /// The guide's window: 640×510, the welcome reference's fixed dialog size. Step content is laid
@@ -3329,6 +3489,7 @@ mod tests {
             overrides: PermissionOverride::default(),
             launch_at_login: true,
             thumbnails_enabled: false,
+            modifier: 1,
             clipboard_enabled: true,
             clipboard_shortcut: "option+v".into(),
         };
@@ -3363,6 +3524,38 @@ mod tests {
         assert_eq!(after_more, old);
     }
 
+    /// The display mode is committed when it is clicked (it has to be: picking thumbnails asks for
+    /// Screen Recording then). The shortcut must NOT ride along -- a user who picks a modifier and
+    /// then changes the display mode has said nothing about confirming the shortcut.
+    #[test]
+    fn the_display_mode_does_not_carry_the_drafted_shortcut() {
+        let old = Config::default();
+        let draft = UiState {
+            steps: steps_for(),
+            index: 1,
+            overrides: PermissionOverride::default(),
+            launch_at_login: false,
+            thumbnails_enabled: true,
+            modifier: crate::config::switcher_modifier_index_of("control"),
+            clipboard_enabled: false,
+            clipboard_shortcut: "option+v".into(),
+        };
+        let after = config_with_step_selection(&old, &draft, Step::DisplayMode);
+        assert!(after.layout.thumbnails_enabled);
+        assert_eq!(
+            after.keyboard.modifier, old.keyboard.modifier,
+            "the shortcut is confirmed by leaving the step, not by picking a display mode"
+        );
+    }
+
+    /// Leaving the step is what commits it, so the draft helper must resolve to the config value.
+    #[test]
+    fn the_drafted_shortcut_resolves_to_the_config_value() {
+        for value in ["option", "command", "control"] {
+            let index = crate::config::switcher_modifier_index_of(value);
+            assert_eq!(crate::config::switcher_modifier_value_at(index), value);
+        }
+    }
     /// The persist switch mirrors `config.clipboard.persist`: the clipboard step commits it, other
     /// steps leave it alone, and a disabled master switch keeps the draft so re-enabling history
     /// restores the previous choice instead of resetting it.
@@ -3375,6 +3568,7 @@ mod tests {
             overrides: PermissionOverride::default(),
             launch_at_login: false,
             thumbnails_enabled: false,
+            modifier: 1,
             clipboard_enabled: false,
             clipboard_shortcut: "option+v".into(),
         };

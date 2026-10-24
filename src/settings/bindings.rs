@@ -954,6 +954,7 @@ fn open_binding_panel_inner(editing: Option<usize>) {
                 .and_then(|binding| Action::from_config_id(&binding.action)),
         );
         let popup = make_popup(
+            crate::settings::select::SelectOwner::SettingsPage,
             PANEL_PAD + PANEL_LABEL_W,
             PANEL_ACTION_Y - 2.0,
             PANEL_W - PANEL_PAD * 2.0 - PANEL_LABEL_W,

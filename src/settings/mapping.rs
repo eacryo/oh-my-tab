@@ -1124,7 +1124,15 @@ pub(super) fn open_mapping_panel(btn: Option<u32>) {
             release_obj(a_label);
             let popup_items: Vec<String> = MAPPING_ACTION_KEYS.iter().map(|k| t(k)).collect();
             let popup_items: Vec<&str> = popup_items.iter().map(|s| s.as_str()).collect();
-            let action: *mut AnyObject = make_popup(130.0, 140.0, 290.0, 26.0, &popup_items, 0);
+            let action: *mut AnyObject = make_popup(
+                crate::settings::select::SelectOwner::SettingsPage,
+                130.0,
+                140.0,
+                290.0,
+                26.0,
+                &popup_items,
+                0,
+            );
             let _: () = msg_send![action, setTarget: target];
             let _: () = msg_send![action, setAction: sel!(handlePanelActionChanged:)];
             // Popup icons (same as the rows).

@@ -758,7 +758,15 @@ impl SettingsSelect {
         items: &[&str],
         selected: usize,
     ) -> *mut AnyObject {
-        widgets::make_popup(x, y, w, h, items, selected)
+        widgets::make_popup(
+            crate::settings::select::SelectOwner::SettingsPage,
+            x,
+            y,
+            w,
+            h,
+            items,
+            selected,
+        )
     }
 }
 
