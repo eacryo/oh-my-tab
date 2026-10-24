@@ -1493,6 +1493,9 @@ static PICKER_CLOSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new
 static PICKER_HEADER_STRIP: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The header's settings button, next to the close button (same persistence).
 static PICKER_OPTIONS_ORB: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+/// The options popover's "open settings" row. `PICKER_OPTIONS_ORB` only opens the
+/// popover, so a scenario that means "open settings" has to click this row instead.
+pub(super) static PICKER_SETTINGS_ROW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 /// The panel-level pin button (the corner row's third glyph). Distinct from the per-row entry pin.
 static PICKER_DETAIL_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 static PICKER_PIN_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -1793,6 +1796,10 @@ pub(crate) fn toggle_filter_popover() {
     }
     FILTER_POPOVER_OPEN.store(open, Ordering::SeqCst);
     unsafe { detail::sync_filter_popover(open) };
+    // The popover carries the row that opens the settings window, so a scenario that means
+    // to click it polls `--e2e-state` for the row rect and for this flag: the flag only
+    // changes here, and without a frame the poll would keep reading the previous state.
+    crate::e2e_state::record("clipboard_popover");
 }
 /// Record the popover's open state without a transition (panel hide / programmatic dismiss).
 pub(crate) fn set_filter_popover_open(open: bool) {
@@ -1954,6 +1961,49 @@ pub(crate) fn picker_settings_rect_top_left() -> Option<(f64, f64, f64, f64)> {
         Some((
             frame.origin.x,
             frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        ))
+    }
+}
+
+/// The options popover's "open settings" row, in the picker's own points with a top-left origin
+/// (None until the popover has been built or while it is closed).
+///
+/// This is the control that actually opens the settings window. `picker_settings_rect_top_left`
+/// reports the `...` orb, whose action only opens the popover -- a caller that clicked the orb
+/// expecting settings landed on the filter rows instead and never opened anything.
+pub(crate) fn picker_settings_row_rect_top_left() -> Option<(f64, f64, f64, f64)> {
+    if !filter_popover_open() {
+        return None;
+    }
+    let row = (*PICKER_SETTINGS_ROW.lock().unwrap())?;
+    if row.0.is_null() {
+        return None;
+    }
+    unsafe {
+        let frame: NSRect = msg_send![row.0, frame];
+        let popover = (*FILTER_POPOVER.lock().unwrap())?;
+        if popover.0.is_null() {
+            return None;
+        }
+        let popover_frame: NSRect = msg_send![popover.0, frame];
+        let parent = (*PICKER_CONTENT_PARENT.lock().unwrap())?;
+        let bounds: NSRect = msg_send![parent.0, bounds];
+        let parent_flipped: objc2::runtime::Bool = msg_send![parent.0, isFlipped];
+        // Three frames stack here: the row's, inside a FLIPPED popover (its rows are laid out
+        // top-down), inside the content parent (bottom-up on this platform). So the row's y is
+        // already a top-down offset inside the popover and must not be flipped again, while the
+        // popover's own origin is in the parent's bottom-up coordinates and must be.
+        let popover_top = detail::top_offset_of(
+            popover_frame.origin.y,
+            bounds.size.height,
+            popover_frame.size.height,
+            parent_flipped.as_bool(),
+        );
+        Some((
+            popover_frame.origin.x + frame.origin.x,
+            popover_top + frame.origin.y,
             frame.size.width,
             frame.size.height,
         ))

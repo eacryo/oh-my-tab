@@ -1,6 +1,6 @@
 #!/bin/bash
 # E2E_STEALS_FOCUS=1
-# A2: the clipboard picker's settings button opens the settings window fast, and the measurement can tell
+# A2: opening the settings window from the clipboard picker is fast, and the measurement can tell
 # the warm path from the cold one.
 #
 # The measurement is the app's own: from the timestamp the click's event carries (so the wait for the main
@@ -8,7 +8,7 @@
 # cannot see is the WindowServer's own compositing after the handler returns, and the scenario says so instead
 # of implying the number is pixel-arrival.
 #
-# Why this scenario exists: opening settings from the panel's gear used to take ~1s (the window was built
+# Why this scenario exists: opening settings from the panel used to take ~1s (the window was built
 # and every page's controls were filled inside the click), and nothing in the suite would have noticed it
 # coming back. The app publishes its own wall time for the open path as `settings_open_ms` in the
 # `--e2e-state` document, so the bound is asserted against a number the app states, not against a
@@ -136,6 +136,15 @@ PY
     return 1
 }
 
+# Move onto a control, give the panel's pointer poll a beat, then click it. A floating panel only
+# accepts mouse input once that poll has seen the cursor over the control, and the poll runs on the
+# panel's own 16ms timer; clicking from a standing start arrives too early and the gesture is lost.
+click_at() {  # <x px> <y px> <what>
+    cua move_cursor "{\"target\": {\"kind\": \"desktop\", \"display_id\": \"primary\"}, \"x\": $1, \"y\": $2}" >/dev/null || true
+    sleep 0.4
+    echo "  clicking $3 at desktop ($1,$2)" >&2
+    cua click "{\"target\": {\"kind\": \"desktop\", \"display_id\": \"primary\"}, \"x\": $1, \"y\": $2, \"delivery_mode\": \"foreground\"}" >/dev/null
+}
 # The gesture, and the number it produced, for one launch.
 measure_open() {  # <label> <extra app args...> -> prints "<ms> <seq>"
     local label="$1"; shift
@@ -181,25 +190,57 @@ print(
 PY
 )"
     read -r panel_x panel_y _panel_w _panel_h _win_x _win_y _win_w _win_h \
-        gear_x gear_y gear_w gear_h gear_reported baseline_seq <<<"$fields"
+        orb_x orb_y orb_w orb_h gear_reported baseline_seq <<<"$fields"
     if [ "$gear_reported" != "yes" ]; then
-        echo "settings-open-latency: the state reports no settings button ($label)" >&2
+        echo "settings-open-latency: the state reports no options orb ($label)" >&2
         exit 1
     fi
-    if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 0 or float(sys.argv[2]) <= 0 else 1)' "$gear_w" "$gear_h"; then
-        echo "settings-open-latency: the settings button has no usable rect ($label: ${gear_w}x${gear_h})" >&2
+    if python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) <= 0 or float(sys.argv[2]) <= 0 else 1)' "$orb_w" "$orb_h"; then
+        echo "settings-open-latency: the options orb has no usable rect ($label: ${orb_w}x${orb_h})" >&2
         exit 1
     fi
     local scale click_x click_y
     scale="$(cua get_screen_size '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["scale_factor"])')"
     click_xy="$(python3 -c 'import sys; p=sys.argv[1:8]; x,y,gx,gy,gw,gh,s=(float(v) for v in p); print(round((x+gx+gw/2.0)*s,1), round((y+gy+gh/2.0)*s,1))' \
-        "$panel_x" "$panel_y" "$gear_x" "$gear_y" "$gear_w" "$gear_h" "$scale")"
+        "$panel_x" "$panel_y" "$orb_x" "$orb_y" "$orb_w" "$orb_h" "$scale")"
     read -r click_x click_y <<<"$click_xy"
-    # Opening the window must not write the configuration: the prewarmed window holds AppKit's automatic
-    # initial first responder, and resigning a field the user never typed into must not persist anything.
+    # Setting the first responder without typing must not persist a config write.
     mtime_before="$(config_mtime)"
-    echo "  [$label] clicking the settings button at desktop (${click_x},${click_y})" >&2
-    cua click "{\"target\": {\"kind\": \"desktop\", \"display_id\": \"primary\"}, \"x\": $click_x, \"y\": $click_y, \"delivery_mode\": \"foreground\"}" >/dev/null
+    # TWO clicks reach the settings page, and getting this wrong is why this scenario measured 0ms
+    # for months: the orb at `settings` only opens the options popover (`toggleFilterPopover:`), and
+    # the control that opens the settings window is the 'open settings' ROW inside it. Clicking the
+    # orb alone opens a popover and never a window, so no settings-click time is ever published.
+    #
+    # A floating panel also only accepts mouse input once its own pointer poll has seen the cursor
+    # over the control, and the poll runs on the panel's 16ms timer: move onto the target and give
+    # the poll a beat first, exactly as a hand does on the way to a click (hud-settings.sh takes the
+    # same step for the same reason).
+    click_at "$click_x" "$click_y" "the options orb"
+    if ! wait_for_state "(s.get('clipboard_picker') or {}).get('filter_popover_open')"; then
+        echo "settings-open-latency: the options popover never opened ($label); the 'open settings' row is not on screen" >&2
+        exit 1
+    fi
+    fields="$(python3 - "$state" <<'PY'
+import json, sys
+p = json.load(open(sys.argv[1])).get("clipboard_picker") or {}
+r = p.get("settings_row") or {}
+print(p.get("x", 0), p.get("y", 0), r.get("x", 0), r.get("y", 0), r.get("w", 0), r.get("h", 0))
+PY
+)"
+    read -r panel_x panel_y row_x row_y row_w row_h <<<"$fields"
+    if ! python3 -c 'import sys; sys.exit(0 if float(sys.argv[1]) > 0 and float(sys.argv[2]) > 0 else 1)' "$row_w" "$row_h"; then
+        echo "settings-open-latency: the state reports no 'open settings' row rect ($label: ${row_w}x${row_h})" >&2
+        exit 1
+    fi
+    scale="$([[ -n "${scale:-}" ]] && echo "$scale" || cua get_screen_size '{}' | python3 -c 'import json,sys; print(json.load(sys.stdin)["scale_factor"])')"
+    # Read through a command substitution and a here-string, not `< <( ... )`: macOS ships bash 3.2,
+    # whose process-substitution scanner misfires on a body with parenthesised expressions (the same
+    # reason the field read above does it this way).
+    row_click_xy="$(python3 -c 'import sys; p=sys.argv[1:8]; x,y,rx,ry,rw,rh,s=(float(v) for v in p); print(round((x+rx+rw/2.0)*s,1), round((y+ry+rh/2.0)*s,1))' \
+        "$panel_x" "$panel_y" "$row_x" "$row_y" "$row_w" "$row_h" "$scale")"
+    read -r row_click_x row_click_y <<<"$row_click_xy"
+    echo "  [$label] clicking 'open settings' at desktop (${row_click_x},${row_click_y})" >&2
+    click_at "$row_click_x" "$row_click_y" "the 'open settings' row"
     if ! wait_for_state "s.get('seq', 0) > $baseline_seq and s.get('settings_click_ms', 0) > 0"; then
         echo "settings-open-latency: no state frame with a settings-click time after the click ($label); the click missed or the open did not happen" >&2
         exit 1

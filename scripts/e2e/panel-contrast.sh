@@ -20,8 +20,8 @@ set -euo pipefail
 # Nothing about this is inferred from the desktop: a solid window is pinned behind the panel
 # (`--panel-backdrop`), because a translucent surface's tone follows what is behind it.
 #
-# The measurement itself lives in lib/png_stats.py (see its --selftest for the nine synthetic cases it is held
-# to). Its limits, stated rather than implied: an ink whose own contribution is under DIFF_TONE tone units is
+# The measurement itself lives in lib/png_stats.py (see its --selftest: it reports every case it runs, and
+# "all cases match" is the verdict, so this comment names no case count that would drift). Its limits, stated rather than implied: an ink whose own contribution is under DIFF_TONE tone units is
 # not visible to it; the regions are the filter row and the footer legend band, so roles outside them are not
 # covered here; and the scenario rewrites the theme for its run, which is why run-all.sh gates it behind
 # --include-prefs. It also pins a full-screen backdrop behind the panel and captures the screen, which is

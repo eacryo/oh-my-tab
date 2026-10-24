@@ -63,6 +63,7 @@ src/
 │   ├── settings/                # pages, components, dispatch, sidebar, import/export (see below)
 ├── single_instance.rs           # instance lock (GUI launches share one; smoke processes do not)
 ├── skylight.rs                  # the one entry point for private-framework dlopen/dlsym
+├── smoke_verdict.rs             # the A1 smoke verdict channel: PASSED/NOT RUN plus the check count
 ├── space_groups.rs              # which desktop owns a fullscreen Space
 ├── space_swipe.rs               # synthetic Dock swipe used to commit a Space switch
 ├── space_transition.rs          # Space-change settling state shared by collection/refresh/capture
@@ -246,7 +247,8 @@ finder-ext/               # the sandboxed appex (own package: own entry point, o
 ├── src/menu.rs           # model -> NSMenu, one ClickTemplate per item
 ├── src/state.rs          # cached model, heartbeat/sync, selection paths, click forwarding
 ├── src/ffi.rs            # NSString/NSMenu/NSLog helpers (the app's ffi module is not linked here)
-└── src/guard.rs          # panic boundary for the callbacks Finder enters
+├── src/guard.rs          # panic boundary for the callbacks Finder enters
+└── build.rs              # rerun-if-changed only; Info.plist and the bundle live in assets/ and the bundle script
 
 crates/finder-protocol/   # the wire contract both sides compile against (serde types + size cap)
 assets/FinderExtension/   # Info.plist and the sandbox entitlement the bundle scripts install
@@ -319,9 +321,10 @@ and `system_action.rs` Dock/Exposé actions. Reconnects must reapply pointer set
   developer logs stay English; a raw key, config key, enum name, hex value, VID/PID or preset id must never reach
   the screen (`docs/design-style-en.md` §11).
 - `theme.rs` holds the token set: semantic colors with contrast floors, the type scale (`FONT_SECTION_TITLE`
-  11 … `FONT_PAGE_TITLE` 26, converging on the 12/14/20/26 scale `docs/ui-refresh-plan-en.md` tracks), the 4px
+  12 … `FONT_PAGE_TITLE` 26, which is the 12/14/20/26 scale `docs/ui-refresh-plan-en.md` tracks), the 4px
   spacing grid (`4 8 12 16 24 32`, `docs/design-style-en.md` §spacing), the radius scale (`RADIUS_CONTROL` 8,
-  `RADIUS_CARD` 12, `RADIUS_PANEL` 18), the elevations, and the animation durations. Never put a literal color,
+  `RADIUS_CARD` 12, `RADIUS_PANEL` 18 — the style document's 8/12/16 scale plus the 18 a tooltip or HUD uses
+  and the 32 the clipboard sheet draws), the elevations, and the animation durations. Never put a literal color,
   size, radius, spacing or duration at a call site: add the token, document it, use it.
 - `glass.rs` is the shared material backdrop for passive floating panels; `ui/corner_glyph.rs` the corner-glyph
   button family, so the footer gear and the picker header glyphs cannot drift apart; `scroller.rs` the

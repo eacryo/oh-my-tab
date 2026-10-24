@@ -12,8 +12,8 @@
 
 全文以 `layout.focused_thumbnail_prewarm` 为例——App Switcher 页上的一个布尔开关，控制浮窗隐藏时是否
 低频预热前台窗口的缩略图。选它做范例而不是更常见的 `show_app_name_in_cards`，原因是它**完整**：下表
-第 1–15 行的接线它一步不缺（第 16 行是测试）。`show_app_name_in_cards` 恰好漏了第 13、14 步，见
-"反例"一节。
+第 1–15 行的接线它一步不缺（第 16 行是测试）。`show_app_name_in_cards` 曾经恰好漏了第 13、14 步，
+教训见"示例"一节。
 
 ## 清单
 
@@ -36,7 +36,7 @@
 | 12 | `src/runtime_config.rs` 的 `ChangeFlags` + `change_flags` | 标志位与 `old != new` 比较 | 运行期毫无反应，只有重启才生效 |
 | 13 | `src/runtime_config.rs` 的 `needs_in_place_control_sync` | 该标志位，**如果**已打开的设置窗口需要重读它 | 配置文件重载或恢复默认后，页面还显示旧值 |
 | 14 | `src/settings/dispatch.rs` 的 `refresh_switcher_keystroke_and_mouse_controls_from_config` | 实际的 `setState:` / `selectItemAtIndex:` 就地写入 | 第 13 步触发了但没人去重读——最常见的"接了一半"的字段 |
-| 15 | 渲染点（如 `src/overlay.rs`、`src/overlay/cards.rs`） | 读这个字段并改变绘制 | 开关纯属装饰 |
+| 15 | 消费点：渲染它，或读它决定行为（本例是 `src/thumbnail/capture.rs`；纯浮窗绘制类字段才在 `src/overlay.rs`、`src/overlay/cards.rs`） | 读这个字段并改变绘制或行为 | 开关纯属装饰 |
 | 16 | 测试 | 见下一节 | 下次动这个模块时悄悄回归 |
 
 **第 13、14 步是一对，也是最常见的漏项**：`needs_in_place_control_sync` 只决定*要不要*跑同步，
@@ -48,20 +48,17 @@
 只隐藏或显示一个已经排好版的元素的字段**不需要**它，但需要渲染函数被调用（走 `visual` 标志与
 `ui_coordinator::apply_theme_and_locale_refresh`）。
 
-### 反例：`show_app_name_in_cards` 漏了第 13、14 步
+### 示例：一次"接了一半"的字段和一个完整的字段
 
-这个字段（缩略图卡片标题是否带应用名）很接近大多数"加一个显示开关"的需求，看起来像是可以直接照抄的
-范例，但它**不完整**：它不在 `needs_in_place_control_sync` 的成员列表里
-（`runtime_config.rs`，`fn needs_in_place_control_sync`），
-`refresh_switcher_keystroke_and_mouse_controls_from_config`（`settings/dispatch.rs`）里也没有回填它。
-结果是：设置窗口打开时改配置文件或点"恢复默认"，这个开关在页面上仍显示旧值，而浮窗已按新值渲染。
+第 13、14 步是一对，而且都不会在编译时暴露：漏掉它，页面刷新了除新行以外的一切，只在"设置窗口已开着、
+配置被外部改变"这一条路径上才看得出来。`layout.show_app_name_in_cards`（缩略图卡片标题是否带应用名）
+就是这样漏过一次的典型——`reset_switcher()` 接对了（标题格式是卡片签名的一部分），控件回填却漏了。
 
-它做对了另一半——`reset_switcher()` 在运行期应用路径里（因为标题格式是卡片签名的一部分）。
-所以它是"渲染接线正确、控件回填缺失"的典型，正好说明第 13、14 步为什么必须单独核对：
-它们不影响编译，也不影响刚打开页面时的显示，只在"窗口已开着、配置被外部改变"这一条路径上暴露。
-
-这条缺陷已记入 `docs/review-backlog.md`；修它时请一并确认本条清单的其余步骤都已覆盖。新增字段请以
-`focused_thumbnail_prewarm` 为准。
+这个缺陷已在 `docs/review-backlog.md` 关闭：该标志已加入 `needs_in_place_control_sync`
+（`src/runtime_config.rs` 的成员列表）和 `refresh_switcher_keystroke_and_mouse_controls_from_config`
+的回填列表（`src/settings/dispatch.rs` 的 `(u.show_app_name_in_cards, cfg.layout.show_app_name_in_cards)`
+一项），并有 A1 断言 `changing_only_the_card_switch_still_refreshes_the_settings_controls` 守着。
+新增字段仍以 `focused_thumbnail_prewarm` 为准：它第 1–15 步一步不缺。
 
 ## 已经免费的部分：验证，不要重写
 

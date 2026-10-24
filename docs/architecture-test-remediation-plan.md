@@ -1,25 +1,8 @@
 # 架构与测试整改方案（已评审通过）
 
-This file is the plan the design review agreed on (, revision 7, task: arch-test-plan (state: .agent-review/tasks/arch-test-plan, from --task)
-reviewer: codex (agent-review.toml)
-reviewer: model=gpt-6.1-sol (agent-review.toml), fast=off (agent-review.toml)
-reviewer: reasoning_effort=high (agent-review.toml)
-Resuming codex reviewer session:
-01a169b6-f06b-7632-9866-a27231d833ed
+本文件是设计评审（revision 7，task \`arch-test-plan\`）同意的实施方案，是本分支实现的依据；下文节号即方案节号。
 
-
-上一轮设计审查没有遗留发现。此前“固定容量无法保障查询竞态安全”的 MEDIUM 已在批准方案中 **RESOLVED（设计层面）**；实际实现尚无法验证。
-
-**MEDIUM — 整改文档未完成，且没有实现可供审查。**  
-位置：[docs/architecture-test-remediation-plan.md:1](/Users/ceres/RustroverProjects/oh-my-tab/docs/architecture-test-remediation-plan.md:1)。
-
-当前唯一改动是这个未跟踪文件，内容只有“架构与测试整改方案（已评审通过）”标题和空行。没有源码或脚本改动，无法核对已批准的门禁、实例身份、PID 回收及 FFI 防护是否落地。
-
-建议补齐正式文档中的已批准方案、验收条件和实施状态，完成实现后附实际门禁结果重新送审。设计通过不能作为实现通过的证据。
-
-本轮未修改文件、运行构建、测试或应用。当前实现不能判定通过审查。
-
-REVIEW-STATUS: FINDINGS). It is the source of truth for what this branch implements; the section numbers below are the ones the plan uses.
+实施状态见 §11。
 
 ## Revision 7 (agreed)
 
@@ -150,9 +133,15 @@ verdict can never upgrade it. Selftests: an in-process runner, a child runner, a
 permission-short-circuit runner each report through the same format and classify identically; a
 silent exit is NOT RUN; a signal is FAILED; a stale artifact is NOT RUN. The freshness helper is the
 existing `keystroke_display` one (`mod.rs:589-618`) promoted to a shared `test_support` module and
-used at **every** spawn site.
+used at **every** spawn site. **Not landed:** the promotion did not happen — `app_binary_is_fresh` and
+`binary_is_fresh_than_tree` are still private to `keystroke_display/mod.rs` and no `test_support`
+module exists, so other spawn sites keep their own freshness check.
 
-### 3.4 A2 — identity per phase, saved and never re-adopted
+### 3.4 A2 — identity per phase, saved and never re-adopted (not implemented)
+
+**Not landed:** `scripts/e2e/lib/` holds no `instance.sh`, and neither `omt_phase_begin` nor `omt_verify`
+appears anywhere under `scripts/`. The A2 scenarios therefore save no phase identity and cannot report a
+replacement, so this section is a design the branch still owes, not a description of the branch.
 
 `scripts/e2e/lib/instance.sh`:
 
@@ -387,6 +376,15 @@ exact-match engine cannot match a chord the listener claims via an extra modifie
 ## 11. Status
 
 Design rounds run: 6. The plan is revised after each round rather than defended; every finding of the
-first five rounds is either adopted or recorded as a retraction in §9 with the source evidence. When
-this revision is agreed, implementation starts on `dev/arch-test-remediation`, and the code review
-that follows is a separate requirement — this design round cannot stand in for it.
+first five rounds is either adopted or recorded as a retraction in §9 with the source evidence.
+
+Implementation (branch `dev/arch-test-remediation`). Landed, each with the record it left in
+`docs/review-backlog.md`: the A1 authority rule (§4.1), the switcher predicates (§4.3), the A2
+observation phase (§4.4), §4.6 and §4.7, and the per-pid generation ledger (§4.8, `PidRow` in
+`src/thumbnail/capture.rs`). Not landed: the A2 per-phase identity helper of §3.4
+(`scripts/e2e/lib/instance.sh`, `omt_phase_begin`/`omt_verify`) does not exist in the tree, so the
+A2 scenarios still adopt no saved identity; the shared `test_support` module of §3.3 was not
+extracted, and `keystroke_display`'s freshness helpers remain private to that module. The code review
+of the landed work is a requirement of its own, and this design round cannot stand in for it.
+
+

@@ -9,15 +9,15 @@
 #   4. 页面文档高度是否等于"内容 + 上下内边距"(修:手写常量高估导致下方大片死空白)。
 #
 # **与 UI 语言无关**:本场景不用任何界面文案做锚点(旧版本硬编码简体中文,英文 locale 下必挂)。
-# 锚点全是结构性的:视图类名(root = page_6_about / sidebar_highlight / sidebar_N_*)、父子关系,
-# 以及**布局步长约定**(0 = 同行标签+值,20 = 页头区块,43 = 分区标题→首行,62 = 行→行)。因此
+# 锚点全是结构性的:视图类名(root = page_7_about / sidebar_highlight / sidebar_N_*)、父子关系,
+# 以及**布局步长约定**(0 = 同行标签+值,20 = 页头区块,56 = 行→行,62.5 = 分区标题→首行)。因此
 # 切系统语言、改文案都不会让本场景变红;但**结构或布局约定改动会让它明确失败**(这是设计意图:
 # 这种改动需要人工确认)。
 #
 # Anchors are structural, never UI copy: view class (root names), parent/child relations, and the
-# layout step conventions (0 / 20 / 43 / 62). Switching the system language or editing copy cannot
-# turn this scenario red; changing the page structure or the layout convention makes it fail loudly,
-# which is intended (such a change needs a human ack).
+# layout step conventions (0 / 20 / 56 / 62.5 / 36.5 / 70). Switching the system language or
+# editing copy cannot turn this scenario red; changing the page structure or the layout
+# convention makes it fail loudly, which is intended (such a change needs a human ack).
 #
 # 本场景不注入输入,但**会抢焦点**:两次启动都用 `--open-settings=` 呈现设置窗口,而呈现会
 # 激活应用并把窗口置前(与 reopen-settings.sh 同类),所以按抢焦点场景声明,默认聚合运行会跳过它,
@@ -185,7 +185,7 @@ if pill and about_row and general_row:
 # Regression source (fixed 2026-09-22): when the system switches to legacy scrollers, the clip loses
 # 17pt and a self-drawn switch was squeezed from 38pt to 21pt. The page now adapts to the measured
 # footprint, so this scenario accepts overlay or legacy and checks the footprint and switch geometry.
-page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_6_about"), None)
+page = next((entry for entry in data.get("pages", []) if entry["root"] == "page_7_about"), None)
 check(page is not None, "the settings page's scroll geometry is in the snapshot")
 if page:
     footprint = round(page["self"][2] - page["clip"][2], 1)
@@ -203,7 +203,7 @@ if page:
     switches = [
         (round(n["frame"][2], 1), round(n["frame"][3], 1))
         for n in views
-        if n["root"] == "page_6_about" and n["class"] == "OhMyTabHtmlSwitch"
+        if n["root"] == "page_7_about" and n["class"] == "OhMyTabHtmlSwitch"
     ]
     check(len(switches) >= 2, "found the self-drawn switches", f"found={len(switches)}")
     # 胶囊比例:被压扁时宽会掉到接近高度(21/22),正常约 1.7。用比例判定,不写死像素。
@@ -222,7 +222,7 @@ if page:
 buttons = [
     geom(views[n["parent"]])
     for n in views
-    if n["root"] == "page_6_about"
+    if n["root"] == "page_7_about"
     and n["class"] == "NSButtonTextField"
     and views[n["parent"]]["class"] == "OhMyTabHtmlActionButton"
     and views[n["parent"]]["frame"][2] <= 140.0
@@ -259,7 +259,7 @@ if buttons:
     print(f"  info action buttons widths={sorted(widths)} right_edges={sorted(right_edges)}")
 
 # --- 3) 行距与分隔线(结构性、与文案无关) --------------------------------
-labels = [n for n in views if n["root"] == "page_6_about" and n["class"] == "NSTextField"]
+labels = [n for n in views if n["root"] == "page_7_about" and n["class"] == "NSTextField"]
 if labels:
     # 行标签共用同一个父视图(且它是标签最多的那个父视图);按 y 从高到低排。
     # Row labels share one parent, which is the parent holding the most labels.
@@ -267,29 +267,38 @@ if labels:
     rows = sorted([n for n in labels if n["parent"] == row_parent], key=lambda n: -n["frame"][1])
     ys = [round(n["frame"][1], 1) for n in rows]
     deltas = [round(ys[i] - ys[i + 1], 1) for i in range(len(ys) - 1)]
-    # 布局步长约定(见 components.rs 的 layout token):0 = 同一行的标签+值,20 = 页头区块,
-    # 43 = 分区标题→首行,60 = 行→行(52 行高 + 8 间隔)。任何别的步长都是排版漂移。
-    # 58.7 也落在行→行这一档:一行的**取值**标签比它的行标签高 1.3pt(实测 17.0 vs 19.6),
-    # 于是从取值标签量到下一行的取值标签是 60 - 1.3。
-    # Layout step conventions (the layout tokens in components.rs): 0 = label+value on one row,
-    # 20 = page header block, 43 = section header -> first row, 60 = row -> row (52pt + 8pt gap).
-    # 58.7 belongs to the same bucket: a row's *value* label sits 1.3pt higher than its row label
-    # (measured 17.0 vs 19.6), so measuring value-to-value gives 60 - 1.3.
-    # Any other step is layout drift.
+    # 布局步长约定。取值全部实测自 --e2e-state 的快照(2026-10-24,About 页 18 个行标签),并已对回
+    # src/settings/ 的常量。每个步长量的是**相邻两个标签的原点**:
+    # 0    = 同一行的行标签与它的取值子视图(原点相同),
+    # 20   = 页头:应用名 → 版本副标题,
+    # 36.5 = 分区标题 → 该区的第一行(56 − 行标签在本行内的原点偏移 19.5),
+    # 56   = 行 → 行(SINGLE_LINE_ROW_H 56,row_gap 0,行在卡片内连续),
+    # 62.5 = 上一区的末行 → 下一区的分区标题(section_step 43 + 行标签原点偏移 19.5),
+    # 70   = 版本副标题 → 第一个分区标题(section_step 43 + 27,其中 27 = 页头副标题块高 80 − 该标签原点偏移 53)。
+    # 任何别的步长都是排版漂移。
+    # Layout step conventions. Every value is measured from an --e2e-state snapshot (2026-10-24, the
+    # About page's 18 row labels) and traced back to the constants in src/settings/. Each step is the
+    # distance between two adjacent labels' ORIGINS: 0 = a row label and its value subview on the same
+    # row (same origin), 20 = the page header (app name -> version subtitle), 36.5 = a section header
+    # to that section's first row (56 minus the row label's 19.5pt origin offset inside its row),
+    # 56 = row -> row (SINGLE_LINE_ROW_H 56, row_gap 0, rows contiguous inside a card), 62.5 = the
+    # last row of one section to the next section's header (section_step 43 + the row label's 19.5pt
+    # origin offset), 70 = the version subtitle to the first section header (section_step 43 + 27,
+    # where 27 = the header subtitle block's 80pt minus that label's 53pt origin offset). Any other
+    # step is layout drift.
     # 步长与预期出现次数(次数是页面结构的钉子:结构变了就会红,需要人工确认)。
     # Steps and their expected occurrence counts; the counts pin the page structure, so a structural
     # change fails loudly and needs a human ack.
-    # 次数跟着上面的查看指南行 +1:同行标签+值 3 -> 4,行到行 5 -> 6。
-    # The counts follow the added View-guide row above: label+value on one row 3 -> 4, row to row 5 -> 6.
+    # 次数钉住页面结构:结构变了就会红,需要人工确认。全部实测于 2026-10-24 的 About 页(18 个行标签)。
+    # The counts pin the page structure, so a structural change fails loudly and needs a human ack.
+    # Every count was measured on the About page (18 row labels) on 2026-10-24.
     allowed = {
-        0.0: ("a label and its value on one row", 4),
-        20.0: ("the page header block (app name -> version)", 1),
-        43.0: ("a section header to its first row", 3),
-        60.0: ("row to row (52pt row + 8pt gap)", 6),
-        # 24 (section header gap) + 4 (title -> card) + 20 (header) + 16.2 (row label offset in a
-        # 52pt row) + 8 (card bottom inset) = 72.2, all documented tokens.
-        72.2: ("a card to the next section header", 2),
-        75.0: ("the app subtitle to the first section header", 1),
+        0.0: ("a row label and its value subview, same origin", 4),
+        20.0: ("the app name to the version subtitle", 1),
+        36.5: ("a section header to its first row", 3),
+        56.0: ("row to row (SINGLE_LINE_ROW_H 56, contiguous rows)", 6),
+        62.5: ("the last row of a section to the next section header", 2),
+        70.0: ("the version subtitle to the first section header", 1),
     }
     unexpected = [d for d in deltas if not any(abs(d - v) <= 1.5 for v in allowed)]
     check(
@@ -309,11 +318,11 @@ if labels:
     separators = sorted(
         round(n["frame"][1], 1)
         for n in views
-        if n["root"] == "page_6_about" and n["frame"][3] <= 1.5 and n["frame"][2] > 300
+        if n["root"] == "page_7_about" and n["frame"][3] <= 1.5 and n["frame"][2] > 300
     )
     missing = []
     for i, delta in enumerate(deltas):
-        if abs(delta - 60.0) <= 1.5:
+        if abs(delta - 56.0) <= 1.5:
             low, high = ys[i + 1], ys[i]
             if not any(low < separator < high for separator in separators):
                 missing.append((low, high))
@@ -334,11 +343,13 @@ else:
 # *below* it (the top always sat under the page-header padding), so scrolling to the end showed
 # nothing but blank and the scroller proportion was distorted (measured surplus: 140-474pt). The
 # documents are now tightened to "content + bottom padding"; these checks pin that rule.
-# Must equal SettingsPageHeader::TOP_PADDING (docs/design-style.md, "Page top padding"): the token
-# migrated 50 -> 48 (docs/ui-refresh-plan.md) and this constant was left behind, so the lower bound
-# rejected every page by 0.5pt.
-TOP_PADDING = 48.0
-BOTTOM_PADDING = 72.0
+# Must equal SettingsPageHeader::TOP_PADDING / BOTTOM_PADDING (docs/design-style.md, "Page top padding"
+# and "Page bottom padding"). Both were updated to the 2026-10 mock migration (50 -> 24 at the top,
+# 72 -> 20 at the bottom); this scenario had been left on the old pair, so it failed every page that
+# followed the design document. The pin lives in src/settings/components.rs
+# (`page_top_rhythm_keeps_the_first_card_symmetric`).
+TOP_PADDING = 24.0
+BOTTOM_PADDING = 20.0
 DOC_TOL = 1.5
 expected_pages = {
     "page_0_general",
@@ -347,13 +358,14 @@ expected_pages = {
     "page_3_clipboard",
     "page_4_key_bindings",
     "page_5_keystroke_display",
-    "page_6_about",
+    "page_6_finder_menu",
+    "page_7_about",
 }
 page_entries = data.get("pages", [])
 page_roots = {page.get("root") for page in page_entries}
 check(
     page_roots == expected_pages,
-    "all seven settings pages have geometry snapshots",
+    "all eight settings pages have geometry snapshots",
     f"missing={sorted(expected_pages - page_roots)} extra={sorted(page_roots - expected_pages)}",
 )
 
@@ -589,9 +601,9 @@ if page is not None:
     doc_h, content_top, content_bottom = page["doc"]
     clip_h = page["clip"][3]
     extent = content_top - content_bottom
-    # Same conventions as phase 1 (SettingsPageHeader::TOP_PADDING / the bottom padding token).
-    TOP_PADDING = 48.0
-    BOTTOM_PADDING = 72.0
+    # Same conventions as phase 1 (SettingsPageHeader::TOP_PADDING / BOTTOM_PADDING).
+    TOP_PADDING = 24.0
+    BOTTOM_PADDING = 20.0
     DOC_TOL = 1.5
     # 填充后才成立的钉子:文档高度必须容下真实内容,内容顶点必须落在页头内边距之下,
     # 内容底边必须正好压在底部内边距上(否则滚到底就是死空白)。

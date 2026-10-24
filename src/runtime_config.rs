@@ -201,6 +201,21 @@ pub(crate) fn pause_gate_action(old_paused: bool, new_paused: bool) -> PauseGate
     }
 }
 
+/// Whether a change to the exclusion list has to rebuild the settings content.
+///
+/// The settings UI's own edits queue that rebuild themselves, and startup is not a list change:
+/// `change_flags` marks this field true for every startup, so queueing there would leave a rebuild
+/// request behind that runs on a later run-loop turn -- possibly while someone is interacting with
+/// the page it replaces. A change from an edited config file, a restore, or the menu still is a list
+/// change and rebuilds.
+fn rebuilds_settings_for_excluded_list(list_changed: bool, source: ConfigChangeSource) -> bool {
+    list_changed
+        && !matches!(
+            source,
+            ConfigChangeSource::Settings | ConfigChangeSource::Startup
+        )
+}
+
 pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChangeSource) {
     let started = std::time::Instant::now();
     let flags = change_flags(old, new, source);
@@ -411,9 +426,12 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::clipboard::refresh_pause_button();
         crate::settings::refresh_clipboard_pause_switch_from_config();
     }
-    if flags.clipboard_excluded_apps && !matches!(source, ConfigChangeSource::Settings) {
+    if rebuilds_settings_for_excluded_list(flags.clipboard_excluded_apps, source) {
         // The list card is laid out from the list, so a change from an edited config file has to
-        // rebuild the page. The settings UI's own edits already queue that rebuild themselves.
+        // rebuild the page. The settings UI's own edits already queue that rebuild themselves, and
+        // startup is not a list change: `change_flags` marks this field true for every startup, so
+        // queueing here would leave a rebuild request behind that runs on a later run-loop turn --
+        // possibly while a smoke or the user is interacting with the page it replaces.
         crate::settings::rebuild_settings_content_deferred();
     }
 
@@ -500,6 +518,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn only_a_real_list_change_rebuilds_the_settings_content() {
+        // Startup sets `clipboard_excluded_apps` on every launch, so queueing a rebuild there left a
+        // request that ran on a later run-loop turn -- which replaced the settings page while a smoke
+        // (or the user) was interacting with it. The settings UI's own edits already queue theirs.
+        assert!(!rebuilds_settings_for_excluded_list(
+            false,
+            ConfigChangeSource::Reload
+        ));
+        assert!(!rebuilds_settings_for_excluded_list(
+            true,
+            ConfigChangeSource::Startup
+        ));
+        assert!(!rebuilds_settings_for_excluded_list(
+            true,
+            ConfigChangeSource::Settings
+        ));
+        // A real external change still rebuilds: an edited config file, a restore, or the menu.
+        assert!(rebuilds_settings_for_excluded_list(
+            true,
+            ConfigChangeSource::Reload
+        ));
+        assert!(rebuilds_settings_for_excluded_list(
+            true,
+            ConfigChangeSource::RestoreDefaults
+        ));
+        assert!(rebuilds_settings_for_excluded_list(
+            true,
+            ConfigChangeSource::Menu
+        ));
+    }
     #[test]
     fn a_panel_action_switch_changes_alone_and_republishes() {
         // Each of the four switches must be detected on its own: a flag that only fired when two

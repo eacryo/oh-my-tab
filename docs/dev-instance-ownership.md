@@ -68,6 +68,9 @@ VERDICT: NOT_MINE
 reason: the running dev build does not come from /Users/.../oh-my-tab/dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab
 ```
 
+`binary:` 是**正在运行**的实例的可执行文件路径（这里是 `oh-my-tab-worktree_one`），`reason:` 里的路径是**本 worktree**
+应该产出的那个（`oh-my-tab`）；两者不同正是判成 `NOT_MINE` 的依据。
+
 `MINE` 的输出额外带一条说明，提示这是**快照**，并给出复检方法。
 
 ## 3. 承诺与不承诺
@@ -177,7 +180,7 @@ scripts/dev-restart.sh --identity-expects=<pid>[,<started>]
 scripts/dev-instance-ownership-selftest.sh
 ```
 
-离线自测，不构建、不启动真实 app、不取真实锁。共 30 个用例，覆盖：
+离线自测，不构建、不启动真实 app、不取真实锁。用例数用 `scripts/dev-instance-ownership-selftest.sh | grep -c '^ok '` 现场数（当前为 30），覆盖：
 
 - **纯函数**：时间戳解析（偏移、毫秒可选、无法解析必须失败）、记录归属（早 20 秒与早 1 秒
   的记录都 = 过期、与启动同秒 = 可归属、晚于进程 = 可用、无记录 = 无答案、`executable` 为

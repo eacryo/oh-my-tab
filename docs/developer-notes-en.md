@@ -296,8 +296,9 @@ Two controls sit in front of every write path:
   source); a config written before the field existed receives it, an explicitly emptied list stays empty, and
   later versions do NOT append new defaults to a saved list.
 
-`--e2e-state` reports `clipboard_privacy` (`paused`, `excluded_count`, `excluded_apps`) so a scenario can
-assert the controls without reading them off the UI; the history itself is still the evidence for "nothing was
+`--e2e-state` reports `clipboard_privacy` (`paused`, `gate`, `excluded_count`, `excluded_apps`) so a scenario
+can assert the controls without reading them off the UI; `gate` is the three-state `CollectionGate` and is the
+direct evidence that a resume recorded nothing; the history itself is still the evidence for "nothing was
 recorded".
 
 ## Clipboard history storage (encryption, states, migration)
@@ -406,7 +407,8 @@ holds `action` / `trigger` / `enabled`.
   `resolve_edit_target` refuses the write with `errors.key_binding_edit_stale` unless that same binding
   is still at that index. Delete re-reads the config length for the same reason. An index thus never
   has to be invalidated the way the old selection did, and `key_bindings_selected` is published as
-  `null` -- kept only because the A2 schema requires the field to be present and typed.
+  `null` -- kept only because the A2 schema requires the field to be present, with no promise about its
+  type; an assertion on it must expect `null`.
 - **Edit and add share one panel.** The panel is the same surface in both modes: `BINDING_EDITING` holds
   the item being edited or `None` to append, and it decides only what confirm writes and what the
   fields start on. Prefill goes through pure helpers (`picker_index_for`, `chord_text_for`) so the rules
@@ -426,7 +428,7 @@ holds `action` / `trigger` / `enabled`.
 - **e2e state.** `--e2e-state` publishes `key_bindings_entries`, `key_bindings_live` and
   `key_bindings_enabled`, so a scenario can assert the migration and that nothing is live while the
   master switch is off. It also still publishes `key_bindings_selected`, always `null` now, because
-  the A2 schema requires the field to be present and typed.
+  the A2 schema requires the field to be present and makes no promise about its type.
 
 ## Switcher panel action keys (Cmd+W / M / H / Q)
 
@@ -494,9 +496,9 @@ choice: the app builds the menu, the extension draws it, and every click comes b
 
 **Message path.** The app pushes a `MenuModel` (titles already localized, icons as SF Symbol names,
 each leaf carrying its action) over `<host bundle id>.finder.app2ext`. The extension caches the last
-model, re-renders it per right-click, and reports a click over `.ext2app`. Both directions carry the
-host bundle id and the app's launch instance; anything from another channel or an earlier app
-process is dropped. A message larger than 64 KiB is refused before parsing.
+model, re-renders it per right-click, and reports a click over `<host bundle id>.finder.ext2app`.
+Both directions carry the host bundle id and the app's launch instance; anything from another channel
+or an earlier app process is dropped. A message larger than 64 KiB is refused before parsing.
 
 **Why a click is not trusted.** A distributed notification can be posted by any local process, and
 a menu can stay open across a settings change. The extension sends the action the user *clicked*
@@ -584,7 +586,7 @@ cargo build
 cargo test settings_layout_smoke -- --ignored
 ```
 
-It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits all seven pages, validates their descendant view frames, and exits.
+It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits all eight pages, validates their descendant view frames, and exits.
 
 The Finder Menu settings page has its own smoke (`cargo test finder_menu_page_smoke -- --ignored`, or
 `./target/debug/oh-my-tab --smoke-finder-menu`): it opens the real window on that page and asserts the

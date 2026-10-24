@@ -220,8 +220,8 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
   很短（只收录有据可查的标识符）；字段存在之前写下的配置会获得它，用户显式清空则保持为空，后续版本**不会**
   把新默认项追加进已保存的列表。
 
-`--e2e-state` 报告 `clipboard_privacy`（`paused`、`excluded_count`、`excluded_apps`），场景可以直接断言
-这两个控制而不必从界面反推；「什么都没记录」的证据仍然是历史文件本身。
+`--e2e-state` 报告 `clipboard_privacy`（`paused`、`gate`、`excluded_count`、`excluded_apps`），场景可以直接断言
+这些控制而不必从界面反推；`gate` 给出 `CollectionGate` 的三态，是「恢复期间仍不记录」的直接证据；「什么都没记录」的证据仍然是历史文件本身。
 
 ## 剪贴板历史落盘（加密、状态、迁移）
 
@@ -305,7 +305,7 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
   位置:`EditTarget` 记录面板打开时那一条的动作与快捷键,`resolve_edit_target` 只有在该下标仍然是
   同一条绑定时才放行,否则以 `errors.key_binding_edit_stale` 拒绝。删除同样会重新读取配置长度。
   下标因此不再需要像旧的选中那样被失效处理,`key_bindings_selected` 固定输出 `null`——保留它只是
-  因为 A2 的契约要求该字段存在且带类型。
+  因为 A2 的契约要求该字段存在；类型不作承诺，断言按 `null` 写。
 - **编辑与新增共用一个面板。** 两种模式是同一个面板:`BINDING_EDITING` 保存正在编辑的下标,或用
   `None` 表示追加;它只决定确定时写入什么、以及各字段的初值。预填走纯函数
   (`picker_index_for`、`chord_text_for`),因此规则不用开窗口就能测。有两个细节要紧:正在编辑的
@@ -321,7 +321,7 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
   view 的整棵子树,留着未清的槽就是悬垂指针。
 - **e2e 状态。** `--e2e-state` 会输出 `key_bindings_entries`、`key_bindings_live` 和
   `key_bindings_enabled`,场景因此可以断言迁移结果,以及「总开关关闭时没有任何绑定生效」。它还会
-  继续输出 `key_bindings_selected`,现在恒为 `null`,因为 A2 的契约要求该字段存在且带类型。
+  继续输出 `key_bindings_selected`,现在恒为 `null`,因为 A2 的契约只要求该字段存在,类型不作承诺。
 
 ## 切换浮窗的面板动作键（Cmd+W / M / H / Q）
 
@@ -415,7 +415,7 @@ cargo build
 cargo test settings_layout_smoke -- --ignored
 ```
 
-它会以 `--smoke-settings-layout` 启动 debug 二进制，在主线程打开真实设置窗口，遍历全部七个页面，校验其子视图 frame 后退出。
+它会以 `--smoke-settings-layout` 启动 debug 二进制，在主线程打开真实设置窗口，遍历全部八个页面，校验其子视图 frame 后退出。
 
 浮窗运行路径也有一个被忽略的子进程冒烟测试。先运行 `cargo build`，再执行 `cargo test overlay_runtime_smoke -- --ignored`；`--smoke-overlay` 会跳过单实例锁，避免已有开发版实例导致测试未执行却误判通过。
 

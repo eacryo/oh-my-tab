@@ -979,6 +979,16 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         }
         None => "null".to_string(),
     };
+    // The options popover's "open settings" row: the control that actually opens the settings window
+    // (`settings` above is the orb, whose action only opens this popover). Null while the popover is
+    // closed, so a scenario can tell "not on screen" from "at 0,0".
+    let settings_row = crate::clipboard::picker_settings_row_rect_top_left();
+    let settings_row_json = match settings_row {
+        Some((x, y, w, h)) => {
+            format!("{{\"x\": {x:.1}, \"y\": {y:.1}, \"w\": {w:.1}, \"h\": {h:.1}}}")
+        }
+        None => "null".to_string(),
+    };
     // The filters row's live union, for the same reason the footer captions report theirs: a constant
     // framed the row from the wrong y once the search field above it moved, and the A2 contrast capture
     // then covered the gap between two rows instead of text.
@@ -1030,7 +1040,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {
             Some((x, y, w, h)) => format!(
-                "{{\"visible\": {}, \"pinned\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"footer_hints\": {}, \"filter_row\": {}, \"filter_popover_open\": {}}}",
+                "{{\"visible\": {}, \"pinned\": {}, \"x\": {:.1}, \"y\": {:.1}, \"w\": {:.1}, \"h\": {:.1}, \"grip\": {}, \"settings\": {}, \"settings_row\": {}, \"footer_hints\": {}, \"filter_row\": {}, \"filter_popover_open\": {}}}",
                 crate::clipboard::picker_is_visible(),
                 crate::clipboard::is_pinned(),
                 x,
@@ -1039,6 +1049,7 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
                 h,
                 grip_json,
                 settings_json,
+                settings_row_json,
                 hints,
                 filter_row_json,
                 crate::clipboard::filter_popover_open()

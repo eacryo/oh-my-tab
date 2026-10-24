@@ -221,9 +221,9 @@ surface prevents underlying list controls from showing through sharply. Its owni
 The menu deliberately uses the reference's compact text size and inner row radius rather than
 the general type ladder and concentric rule. Counts and checks occupy separate trailing columns;
 settings shortcuts and clear-action hints align to the trailing edge. Dark mode uses semantic
-palette colors. Reproduce the reference metrics with
-`sed -n '831,965p' /Users/ceres/Downloads/clipboard-v2-1.html` and inspect the shipped tokens with
-`rg -n 'POPOVER_|fn popover_' src/clipboard.rs`.
+palette colors. Inspect the shipped metrics with `rg -n 'POPOVER_|fn popover_' src/clipboard.rs`; the
+reference mock lives outside the repository, so no command here reproduces it and none is quoted as
+if it did.
 
 Window and card backgrounds may be translucent so the desktop shows through the glass. The settings
 sidebar uses an opaque `sidebar_bg` surface so its color remains stable, and the settings title bar band
@@ -383,11 +383,12 @@ backdrop at all.
 
 **What this holds, and what it does not.** The scenario fails the run below 3:1. With the current `hudWindow`
 (13) light `frost` material the footer captions clear the tier in every cell measured on 2026-10-16 (black
-4.60-4.64:1, white 3.73-4.30:1, dark 4.64-5.16:1); the `filter-row` region itself is currently unmeasurable for
-every material, which is a stale sampling region rather than a contrast result (`docs/review-backlog.md` #36). The limits: an ink whose own contribution is under 3 tone units is not visible to the diff at all (far
+4.60-4.64:1, white 3.73-4.30:1, dark 4.64-5.16:1); the `filter-row` region is reported **not run** on every
+material, because the popover it lives in stays closed, so the scenario counts it as unrun rather than as a pass.
+The limits: an ink whose own contribution is under 3 tone units is not visible to the diff at all (far
 under this tier, but it is not a measurement); roles outside these two -- row titles, detail text, the keycap glyphs
 -- are targets, not enforced; and the scenario rewrites the theme, so `run-all.sh` runs it only with
-`--include-prefs`. `lib/png_stats.py --selftest` is the nine-case regression corpus, including the three
+`--include-prefs`. `lib/png_stats.py --selftest` is the regression corpus (45 cases today), including the three
 counterexamples that each defeated an earlier version of this measurement.
 
 | material | mode | filter row | footer band |
@@ -408,9 +409,11 @@ to 0.648, where the ink reached 2.45:1), and the **footer legend's text uses `se
 (5.0:1 / 4.7:1)", had compared it against the palette's own surface instead of the material it is drawn on).
 `opaque` is the control: it does not move with the backdrop at all.
 
-**What this enforces and what it does not.** The filter row and the footer captions, for the three materials, two
-modes and two backdrops above; everything else -- row titles, detail text, the keycap glyphs -- is a target, not an
-enforced floor.
+**What this enforces and what it does not.** The footer captions, for the three materials, two modes and two
+backdrops above. The filter row is reported **not run** in every current run: it lives in the options popover,
+which the scenario keeps closed, so `panel-contrast.sh` prints `check not run` and counts it as unrun instead of
+measuring it -- a green scenario is not evidence about the filter row. Everything else -- row titles, detail text,
+the keycap glyphs -- is a target, not an enforced floor.
 
 | mode | material | black backdrop | white backdrop |
 | --- | --- | --- | --- |
@@ -429,13 +432,15 @@ by reasoning: liquid glass takes a **dark tint in dark mode** (`glass::GLASS_TIN
 both modes -- the light tint left the surface mid-grey at 0.539, where the palette's caption ink cannot exceed
 2.07:1), and frost takes the legacy **ultraDark** material in dark mode instead of `hudWindow` (which a bright
 backdrop lifts to 0.648, where the same ink reached 2.45:1). `opaque` is the control that does not move with
-the backdrop at all. The scenario fails the run below 3:1, so this table is *not* enforced yet. The instrument exists (`scripts/e2e/panel-contrast.sh` plus
-`scripts/e2e/lib/png_stats.py --selftest`, a regression corpus of three synthetic cases), but measuring one
-frame cannot tell a glyph from the material's own tonal noise: on a dark translucent surface a single capture
-yields a dozen "inks" clustered at 1.03-1.13:1, so every translucent cell fails there for a measurement
-reason rather than for a contrast one. The numbers above came from that method, so treat them as indicative:
-the tier becomes enforced once the measurement isolates the glyph pixels themselves (a differential capture,
-with the text's ink transparent in one of the two frames).
+the backdrop at all.
+
+**How the numbers are measured.** `scripts/e2e/panel-contrast.sh` captures the panel twice from one launch:
+first with its text, then after it hides the text in place (`--clipboard-blank-text=after:N`), so the glyph
+pixels are the pixels that differ between the two frames and the material's own tonal noise cannot pass for
+text. That is why a single-capture figure was never trustworthy: on dark frost one frame yields a dozen "inks"
+clustered at 1.03-1.13:1. The sibling self-test, `python3 scripts/e2e/lib/png_stats.py --selftest`, holds the
+measurement to 45 cases and prints `all cases match`. The instrument's stated limit is one: an ink whose own
+contribution is under `DIFF_TONE` tone units is invisible to it.
 
 **A panel whose surface is its material answers to its own tier, not this table's.** A translucent material
 sits away from `window_bg` (measured in dark mode: liquid glass `#6E6E6E`, frost `#868585`, against the
@@ -612,7 +617,24 @@ level-two headings. Overlay base sizes, shared scaling, and result clamping are 
 Base unit **4px**. Allowed steps: `4 8 12 16 24 32`. A 2px step is allowed only *inside* a control's
 own geometry (knob inset, hairline offset), never between siblings.
 
-Named layout metrics for the settings window (all on the grid):
+Named layout metrics for the settings window (all on the grid). **These are a record of the shipped
+geometry, not a design target.** They changed in the 2026-10 mock migration (page padding and row rhythm
+were tightened), the constants in `settings/components.rs` and `settings.rs` are the source of truth, and a
+change to one of them updates this table in the same edit.
+
+**What the A2 scenario actually guards.** `scripts/e2e/settings-layout.sh` covers three of this table's rows,
+and the rest of the table has no hard assertion:
+
+- **Page top padding, as a range.** It asserts `TOP_PADDING - 1.5 <= gap <= TOP_PADDING + 54 + 1.5`, i.e. the
+  gap between the page header and the content stays between 22.5 and 79.5pt. That is a guard against a
+  collapsed or an inflated header, not a 1.5pt pin on the value.
+- **Page bottom padding, tightly.** A scrollable page's content must end within 1.5pt of `BOTTOM_PADDING`.
+- **Row and section rhythm, on the About page.** The steps between adjacent row labels (0 / 20 / 36.5 / 56 /
+  62.5 / 70) must each match a named convention, with a 1.5pt tolerance and an expected count per step.
+
+The control column width, the card insets and the title bar metrics recorded above are **not** asserted by
+any scenario; a change to one of those needs a human to check it, and this table is the record to check it
+against.
 
 | Metric | Value | Where |
 | --- | --- | --- |
@@ -623,16 +645,16 @@ Named layout metrics for the settings window (all on the grid):
 | Sidebar width | 212 | `settings/sidebar.rs` (`SIDEBAR_WIDTH`) |
 | Sidebar item inset | 12 | `settings/sidebar.rs` (`btn_w = card_w - 24`) |
 | Brand row | 34pt icon 12pt in, name 8pt after it, 14pt/600; next nav row 16pt below the row | `brand_row_frames`, `sidebar_first_nav_row_top` |
-| Page top padding | 48 | `SettingsPageHeader::TOP_PADDING` |
-| Page bottom padding | 72 | `SettingsPageHeader::BOTTOM_PADDING` |
-| Section header gap | 24 | `SETTINGS_SECTION_HEADER_GAP` |
-| Header → card gap | 4 | `SETTINGS_SECTION_CARD_GAP` |
-| Row gap | 8 | `SettingsLayout::row_gap` |
-| Rows | 52 tall, control 32 tall, vertically centred | `SettingsLayout` |
-| Control column | 200 wide, right-aligned, 16 from the card's right edge | `SettingsLayout` |
+| Page top padding | 24 | `SettingsPageHeader::TOP_PADDING` |
+| Page bottom padding | 20 | `SettingsPageHeader::BOTTOM_PADDING` |
+| Section header gap | 20 | `SETTINGS_SECTION_HEADER_GAP` |
+| Header → card gap | 8 | `SETTINGS_SECTION_CARD_GAP` |
+| Row gap | 0 | `SettingsLayout::row_gap` |
+| Rows | 56 tall, control 32 tall, vertically centred | `SettingsLayout` |
+| Control column | 180 wide, right-aligned, 16 from the card's right edge | `SettingsLayout` |
 | Card horizontal padding | 16 | row builders (`label_x`, `SETTINGS_CONTROL_TRAILING_INSET`) |
-| Card bottom inset | 8 | `SettingsLayout::card_bottom_inset` |
-| Divider above a row | 4 below the previous row's content | `SEPARATOR_ABOVE_ROW_GAP` |
+| Card bottom inset | 0 | `SettingsLayout::CARD_BOTTOM_INSET` |
+| Divider above a row | 0 below the previous row's content | `SEPARATOR_ABOVE_ROW_GAP` |
 | Slider readout | 44 wide, 8 gap | `SLIDER_READOUT_*` |
 
 Rule of thumb: **related things 8, groups 24, page edges 32–72.** Use the smaller step for internal
@@ -653,7 +675,8 @@ is restored on exit. Verify with `scripts/cargo-test.sh settings_layout_smoke --
 | `radius-legend-chip` | 5 | The chip behind a key symbol in a read-only shortcut legend |
 | `legend-chip-text-pad-x` | 2 | Inline padding either side of a legend chip's label; a long key name widens its own chip rather than becoming one chip per character |
 | `radius-card` | 12 | Cards, grouped row containers, list tiles, popover items |
-| `radius-panel` | 18 | Tooltips, dropdown panels, HUDs, notification cards; the clipboard sheet draws 32 (`glass::CLIPBOARD_PANEL_RADIUS`) because it is a large two-pane sheet, not a small panel |
+| `radius-panel` | 18 | Tooltips, dropdown panels, HUDs, notification cards |
+| `radius-sheet` | 32 | The clipboard picker and its detail sheet (`glass::CLIPBOARD_PANEL_RADIUS`), a large two-pane surface rather than a small panel |
 | `radius-full` | 9999 | Pills: badges, status dots, switch, scrollbar knob |
 | Brand icon radius | 9 | The settings sidebar's 34pt app icon (the mock's `.brand img { border-radius: 9px }`); a 34pt square derives 9 from its own height, so neither the 8pt control radius nor the panel radius matches its curve |
 | Window radius | `radius-panel` (18) | The settings window itself (the mock's `--radius-window`) |
@@ -737,7 +760,9 @@ behind. The small app icon in the caption uses `radius-control`.
 
 ## 7. Elevation
 
-Four levels. Pick by **how far the surface sits from the page**, not by how much shadow looks good.
+Two token levels, plus the absence of a shadow. Pick by **how far the surface sits from the page**, not
+by how much shadow looks good. `theme.rs` defines `ELEVATION_MED` and `ELEVATION_HIGH` only: `none` is a surface with
+no shadow, and a surface that needs `low` gets a new token rather than a literal.
 
 | Level | Shadow | Use |
 | --- | --- | --- |

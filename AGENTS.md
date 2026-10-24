@@ -16,12 +16,15 @@ scripts/gate.sh --offline       # the tiers that need no graphical session
 scripts/dev-restart.sh          # then launch the app (runtime changes only)
 ```
 
-The gate is `scripts/gate.sh`, and **it is the gate**: `fmt`, `check`, `clippy`, `release-check`,
-`cargo-test`, `selftests`, `a1` (the GUI smoke runners) and `a2` (the e2e scenarios). Each tier prints
-exactly one `gate: <tier> PASSED|FAILED|NOT RUN` line and the run ends with a table of them, so a tier
-that could not decide is never read as one that passed. Its exit status follows the same rule: 0 = every
-selected tier passed, 1 = at least one failed, **75 = incomplete** (nothing failed, but a tier did not run,
-for example `--offline` or no graphical session). A green `--offline` run is not a green gate.
+The gate is `scripts/gate.sh`, and **it is the gate**: `selftests`, `fmt`, `check`, `clippy`,
+`release-check`, `cargo-test`, `a1` (the GUI smoke runners) and `a2` (the e2e scenarios), in that order —
+cheapest and most likely to fail first. Each tier prints exactly one `gate: <tier> PASSED|FAILED|NOT RUN`
+line and the run ends with a table of them, so a tier that could not decide is never read as one that passed.
+Its exit status follows the same rule: 0 = every selected tier passed, 1 = at least one failed,
+**75 = incomplete** (nothing failed, but a tier did not run, for example `--offline` or no graphical
+session). An aggregator child (`smoke-runners.sh`, `run-all.sh`) that exits 75 is recorded as NOT RUN,
+not FAILED (`run_step` in `scripts/gate.sh`), because it could not decide. A green `--offline` run is not
+a green gate.
 
 - `scripts/cargo-test.sh` runs the suite and **fails when the run executed no test**. A plain `cargo test`
   exits 0 for a filter that matched nothing (measured: `running 0 tests ... ok`), so a typo in a filter reads
@@ -31,8 +34,11 @@ for example `--offline` or no graphical session). A green `--offline` run is not
 - `scripts/smoke-runners.sh --list|--run` is the A1 tier: it derives the runner list from the compiled
   `#[ignore]` tests instead of a transcribed list, refuses a `target/debug/oh-my-tab` older than `src/`,
   and classifies each runner by the `smoke-result:` line it prints. Silence is NOT RUN, never a pass.
-- `scripts/selftests.sh` runs every `scripts/*-selftest.sh` offline, so the gate helpers (the lock, the
-  Finder cleanup, the e2e disturbance gates, the reviewer script, the gate itself) are checked by something.
+- `scripts/selftests.sh` runs every `scripts/*-selftest.sh` offline, so the gate helpers are checked by
+  something: the dev-instance lock and ownership probe, the Finder extension cleanup, the e2e disturbance
+  gates, the reviewer script, the cargo-test wrapper, the launch codecs, the documentation statistics
+  (`scripts/doc-stats.py`: rule parity between the guide's two languages) and the gate itself; `ls
+  scripts/*-selftest.sh` lists them, and the run prints the count it ran.
 - The normal `cargo test` suite is headless-safe; GUI/permission-dependent smoke tests are marked `#[ignore]`.
 - Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
 - Cross-module, unsafe/FFI, concurrency, configuration, build, or release changes require the full gate above. Before handing off a completed feature, always run the full gate and keep all checks clean.
@@ -73,14 +79,16 @@ for example `--offline` or no graphical session). A green `--offline` run is not
   window then shows *that* worktree's build while both runs believe they verified their own. Before a UI, cua,
   screenshot or latency conclusion, run `scripts/dev-restart.sh --whose-instance`: exit 0 means the running
   instance is this worktree's build (and nothing competes for the shortcut), and **any other exit code means a
-  conclusion drawn now would describe something else** — 1 not this worktree's build (or an older build of
-  this tree), 3 nothing running, 4 the identity could not be established, 5 contested by another instance,
-  6 this worktree has no built bundle. It builds, launches and stops nothing and takes no claim (by design: a
-  query that queued on the claim would wait past the very replacement it exists to detect). Bind what you
-  observe to the `pid` and `started` it prints, and run
-  `scripts/dev-restart.sh --identity-expects=<pid>[,<started>]` afterwards: if that no longer reports `MINE`,
-  the instance was replaced and the observation is void. It is a snapshot, not protection — it cannot prove the
-  window belongs to the process, nor that the instance stayed put in between; see
+  conclusion drawn now would describe something else** — 1 a dev build from another worktree, an
+  unrecognised location, or an earlier build of this same tree (`VERDICT: STALE_BUILD`, which shares exit 1
+  with NOT_MINE because the running build is not this one), 3 nothing running, 4 the identity could not be
+  established, 5 contested by another instance, 6 this worktree has no built bundle. The version comparison
+  runs on the first query, so a replaced instance is reported then, not only by a later re-check. It builds,
+  launches and stops nothing and takes no claim (by design: a query that queued on the claim would wait past
+  the very replacement it exists to detect). Bind what you observe to the `pid` and `started` it prints, and
+  run `scripts/dev-restart.sh --identity-expects=<pid>[,<started>]` afterwards: if that no longer reports
+  `MINE`, the instance was replaced and the observation is void. It is a snapshot, not protection — it cannot
+  prove the window belongs to the process, nor that the instance stayed put in between; see
   `docs/dev-instance-ownership.md`.
 - **`--whose-instance` and `--identity-expects` are not substitutes for the claim.** They cannot be combined with
   `--check` or app arguments (exit 2), and a run that needs a protected window for a while still has no hold-lock
@@ -100,7 +108,7 @@ for example `--offline` or no graphical session). A green `--offline` run is not
 - Report the timestamp-based `build-version` printed by the script.
 - Pass development switches as argv through `scripts/dev-restart.sh` instead of editing code: any `--flag[=value]` it does not own is forwarded to the app (`-- <args>` forwards argv verbatim), and a switch applies to that launch only.
 - Reach otherwise hard-to-reproduce states (first-run onboarding, permission branches, update notices) with such a switch; a feature that only appears in one of them should expose a `--`-style flag parsed through `crate::dev_flags`.
-- Park the settings window on a page at launch with `--open-settings=<page>` (`general`, `switcher`, `mouse`, `clipboard`, `key-bindings`, `keystroke-display`, `about`; the names come from `SETTINGS_PAGES` in `src/settings.rs`). A bare/`1`/`true` value selects About, and an out-of-range index is refused rather than clamped. Use it instead of clicking through the sidebar when a script, cua, or a screenshot needs a specific page: `scripts/dev-restart.sh --no-onboarding --open-settings=key-bindings`. It opens the window, so it takes focus; pair it with `--no-onboarding` unless the guide is what is under test.
+- Park the settings window on a page at launch with `--open-settings=<page>` (`general`, `switcher`, `mouse`, `clipboard`, `key-bindings`, `keystroke-display`, `finder-menu`, `about`; the names come from `SETTINGS_PAGES` in `src/settings.rs`). A bare/`1`/`true` value selects About, and an out-of-range index is refused rather than clamped. Use it instead of clicking through the sidebar when a script, cua, or a screenshot needs a specific page: `scripts/dev-restart.sh --no-onboarding --open-settings=key-bindings`. It opens the window, so it takes focus; pair it with `--no-onboarding` unless the guide is what is under test.
   - `--show-clipboard[=after:N]` opens the clipboard picker and `--show-overlay` leaves the switcher standing; both exist because the real gesture steals focus, so a script cannot press it.
 - **The running app must not read or receive environment variables as configuration.** `crate::dev_flags` and the script's argv passthrough are the only runtime configuration channels. Build and release scripts may read explicitly named packaging inputs, but must not forward the caller's environment to the launched app, dump it, or print sensitive values — the caller's shell may hold cloud credentials.
 
@@ -351,8 +359,9 @@ scripts/agent-review-selftest.sh            # check the helper itself, against a
 
 The reviewer prompt carries a repository checklist (the patch-side view of the next four rules) and the prompt
 lives in the script. The reviewer is chosen by the top-level `reviewer` key in `agent-review.toml` at the
-repository root: `"codex"`, `"pi"` or `"none"`. It is required and has no default, so a missing file or a
-file without the key refuses the round; `"none"` is an explicit no-op that exits 0. codex settings live in
+repository root: `"codex"`, `"pi"` or `"none"`. There is no built-in default — this repository ships
+`agent-review.toml` with `reviewer = "codex"` — so a missing file or a file without the key refuses the
+round rather than guessing; `"none"` is an explicit no-op that exits 0. codex settings live in
 `[codex]` (`model` / `fast` / `reasoning_effort`) and pi settings in `[pi]` (`provider` / `model` /
 `thinking`), all three required when `reviewer = "pi"`. `OMT_REVIEW_REVIEWER`, `OMT_REVIEW_MODEL`,
 `OMT_REVIEW_FAST`, `OMT_REVIEW_REASONING_EFFORT`, `OMT_REVIEW_PI_PROVIDER`, `OMT_REVIEW_PI_MODEL` and
@@ -361,11 +370,12 @@ file without the key refuses the round; `"none"` is an explicit no-op that exits
 mode configured in `~/.codex/config.toml` cannot leak into a review. `reasoning_effort` is one of codex's own
 levels (`codex debug models` lists them); omitting it sends no flag, so the model default or a globally
 configured level stays in force. pi runs non-interactively in JSON mode with `edit` and `write` disabled and
-only `read/bash/grep/find/ls` enabled, so the tool list offers no file-writing tool; `bash` still runs with the
-account's permissions, so the prompt's no-modification rule is the remaining guard. pi resumes one session per
-task through `--session-id`. A configuration
-that cannot be read refuses the round rather than being ignored, and each round's outcome records the
-reviewer and the settings it ran under, including whether Codex declined the requested reasoning effort.
+only `read/bash/grep/find/ls` enabled, so it has no dedicated file-writing tool; `bash` can still write files
+and runs with the account's permissions, so the prompt's no-modification rule is the remaining guard. pi
+resumes one session per task through `--session-id`, and the `--session-id` flag is its only handle on the
+reviewer session. A configuration that cannot be read refuses the round rather than being ignored, and each
+round's outcome records the reviewer and the settings it ran under, including whether Codex declined the
+requested reasoning effort.
 
 ### What the reviewer is asked to weigh here
 
@@ -408,7 +418,7 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 ## UI design system
 
 - `docs/design-style-en.md` is the normative style for **every** surface the app draws; the Chinese version is `docs/design-style.md`. Any user-visible change must follow it. When code and that document disagree, the document wins and the code is the bug — fix the code, or change the document in the same change, with a reason.
-- It fixes the token set: semantic colors with measured contrast floors, the `12 / 14 / 20 / 26` type scale, a 4px spacing grid with named layout metrics, the `8 / 12 / 16` radius scale plus the concentric-derivation rule, four elevation levels, and two animation durations with one easing curve. Never introduce a literal color, font size, radius, spacing or duration at a call site: add the token in `src/theme.rs` (or the owning module), document it, then use it.
+- It fixes the token set: semantic colors with measured contrast floors, the `12 / 14 / 20 / 26` type scale, a 4px spacing grid with named layout metrics, the `8 / 12 / 16` radius scale plus the concentric-derivation rule, the `med` and `high` elevation tokens (a surface with no shadow needs no token), and two animation durations with one easing curve. Never introduce a literal color, font size, radius, spacing or duration at a call site: add the token in `src/theme.rs` (or the owning module), document it, then use it.
 - Cards and rows are defined by border and surface, not by shadow; hover and selection never change layout; controls stay single-line and truncate long values with a tooltip; every animated surface honors Reduce Motion when the animation runs.
 - `docs/ui-refresh-plan-en.md` (Chinese: `docs/ui-refresh-plan.md`) tracks the migration from the current values to those tokens, phase by phase. Follow its order, and keep its rule: every fix lands with a tier-A assertion, or with a state field that makes the fix assertable.
 
@@ -428,6 +438,7 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 ## Git and commits
 
 - Do not commit, push, stage, or rewrite history unless explicitly requested. `style` is for code-style changes, not UI styling.
+- **A release note that has already shipped is history, not a file to improve.** Both channels publish. `release_doc/` goes to the stable feed. `release_doc_dev/` goes to the dev feed. A version reaching one feed says nothing about the other. Before editing any note, establish three facts: the channel, the version, and whether that channel published it. An unpublished draft is editable. The rule lives in `docs/doc-style-en.md` §2.7–§2.8 and is not repeated here.
 - If the input is exactly `/cmsg` or `cmsg`, inspect `git diff --cached`, `git diff`, and `git diff HEAD`; base the result on the combined diff and return exactly one English Conventional Commits line: `type: description`. Check `AD` status against the combined diff before deciding scope. A commit is not the end of a review task, so **do not run `--finish` here**: if the task's reviewer session is still open, say so alongside the message and offer to close it (see *Independent reviewer*).
 - If the user replies exactly `allow commit` after a message was provided, recheck status and all three diffs, then commit only the intended changes with that exact message; ask if scope is ambiguous.
 - If the user replies exactly `allow push`, recheck the worktree, commit only intended changes with that exact message, and push the current branch to its configured upstream; ask if scope or upstream is ambiguous.

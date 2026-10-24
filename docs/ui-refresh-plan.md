@@ -8,8 +8,8 @@
 
 ## 1. 基本规则
 
-- 每个阶段交付前跑完整门禁（见 `AGENTS.md`）：
-  `cargo fmt` → `cargo check` → `cargo clippy` → `cargo test`，再跑 `scripts/dev-restart.sh --no-onboarding`。
+- 每个阶段交付前跑完整门禁 `scripts/gate.sh`（见 `AGENTS.md`；无图形会话时至少 `scripts/gate.sh --offline`，
+  并把未跑的层记成未跑而不是通过），再跑 `scripts/dev-restart.sh --no-onboarding`。
 - 涉及布局的阶段另跑 `--smoke-settings-layout`；涉及浮窗的另跑 `--smoke-overlay`；涉及剪贴板的另跑
   `--smoke-clipboard`。
 - **提升规则**：本次评审发现的每个问题，要么在 A 层补上断言，要么补一个让它可被断言的状态字段。没有断言
@@ -60,26 +60,16 @@
 
 - **现状**：`frost` 与 `liquid-glass` 的文字直接用动态系统标签色画在材质上，因此其对比度取决于 AppKit 如何把
   这些颜色合成到半透明表面上。tier-A 的 smoke 只能**记录**数值（"颜色 vs 常量"看不见合成），所以设计文档把
-  它们的档位写成**目标值**而非已执行的下限。**已完成（限于其范围）。**该 A2 场景在渲染像素上测表头筛选行与**逐个**页脚 caption，采用**同一次启动内**的差分帧（两张
-  截图之间由 app 就地把面板文字隐藏），低于 3:1 即判失败：`{frost, liquid-glass, opaque} × {浅色, 深色} × {黑, 白}背景` 十二种
-  组合全部达标（最低 3.58:1）。这两个角色之外（行标题、详情正文、键帽符号）仍是**目标值**；自身贡献低于 3 个色调单位的墨也超出
-  差分可视范围。此前的说法作废：本测量的"两次启动"形态已撤回。
+  它们的档位写成**目标值**而非已执行的下限。**已完成（限于其范围）。**该 A2 场景在渲染像素上测**逐个页脚 caption**，采用**同一次启动内**的差分帧（两张截图之间由 app 就地把面板文字隐藏），
+  低于 3:1 即判失败：`{frost, liquid-glass, opaque} × {浅色, 深色} × {黑, 白}背景` 十二种组合全部达标。**表头筛选行**报 `check not run`：
+  它位于选项弹出菜单内，场景让该菜单保持关闭，未运行的检查不算覆盖。这两个角色之外（行标题、详情正文、键帽符号）仍是**目标值**；
+  自身贡献低于 3 个色调单位的墨也超出差分可视范围。此前的说法作废：本测量的"两次启动"形态已撤回。
 - **目标**：新增一个 A2 场景——从 `--e2e-state` 的 `clipboard_picker` 读面板 frame，截取该区域，在**渲染像素**上
   断言档位（`text_primary` ≥ 4.5:1、caption ≥ 3:1），覆盖 `{frost, liquid-glass} × {浅色, 深色}`。其中**深色模式的
   玻璃**（表面 `#6E6E6E`）要优先测，因为 `NSGlassEffectView` 不提供保对比合成，三种动态标签色是它仅有的墨。
 - **文件**：新增 `scripts/e2e/*.sh` 场景及它需要的测量助手；`glass::panel_ink` 的分派；有数字之后再改
   `docs/design-style{,-en}.md` 的档位文字。
 - **验收**：当某材质的实测对比度低于档位时该场景失败；设计文档引用实测数字而不是目标值。
-
-### P0-2 · 预设下拉显示原始翻译 key
-
-- **现状**：`SmoothPreset::label_key()` 返回的 key 不带 `settings.` 前缀，而 locale 文件把这些键放在
-  `[settings]` 段下，于是 `t()` 逐级回退，最终把 key 本身渲染出来。
-- **目标**：下拉显示「缓入 / Ease In」，任何情况下都不显示 key。
-- **文件**：`mouse/smooth/presets.rs`、`settings/page_builder.rs:903–907`。
-- **验收**：单元测试断言每个 `label_key()` 在三个 locale 中都能解析（针对整个 `label_key` 家族回归，
-  而不只是这一个 preset）；再加一个通用 i18n 测试，防止调用点传入没有 `settings.` 前缀对应项的 key。
-  可考虑加 debug 断言：`t()` 对含 `_` 的 key 不得返回其入参本身。
 
 ### P0-3 · 本地化界面里的硬编码英文
 
@@ -109,6 +99,16 @@
 ## 4. 阶段 1 —— 建立 token 层
 
 这是结构性阶段：把规范定义的尺度建立起来，再将现有调用点映射过去。可见结果是界面不再「差一点点就对齐」。
+
+### P0-6 · 预设下拉显示原始翻译 key（已修复）
+
+- **现状**：`SmoothPreset::label_key()`（`src/mouse/smooth/presets.rs`）现在返回带 `settings.` 前缀的完整 key，
+  与 locale 文件中的 `[settings]` 段一致，`t()` 能解析，下拉显示「缓入 / Ease In」。原先缺少前缀的缺陷已消除。
+- **目标**：任何情况下都不显示 key；验收里的「每个 key 在三种 locale 下都能解析」测试保留。
+- **文件**：`mouse/smooth/presets.rs`、`settings/page_builder.rs:903–907`。
+- **验收**：单元测试断言每个 `label_key()` 在三个 locale 中都能解析（针对整个 `label_key` 家族回归，
+  而不只是这一个 preset）；再加一个通用 i18n 测试，防止调用点传入没有 `settings.` 前缀对应项的 key。
+  可考虑加 debug 断言：`t()` 对含 `_` 的 key 不得返回其入参本身。
 
 ### P1-1 · 字号收敛为 12 / 14 / 20 / 26
 
@@ -209,7 +209,8 @@
 ## 7. 每阶段的验证
 
 ```sh
-cargo fmt && cargo check && cargo clippy && cargo test
+scripts/gate.sh                                   # 完整门禁，每层一行 PASSED/FAILED/NOT RUN
+scripts/gate.sh --offline                         # 无图形会话时的可跑子集（不绿色等于未跑完）
 scripts/dev-restart.sh --no-onboarding            # 功能交接
 scripts/dev-restart.sh --no-onboarding --pseudo-locale   # 长文本布局
 scripts/dev-restart.sh --opt --no-onboarding      # 阶段 2 的手感/性能检查

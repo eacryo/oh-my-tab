@@ -9,8 +9,9 @@ behaviour a user would call a feature — it changes how the app looks and how i
 
 ## 1. Ground rules
 
-- Before handing off any phase, run the full gate from `AGENTS.md`:
-  `cargo fmt` → `cargo check` → `cargo clippy` → `cargo test`, then `scripts/dev-restart.sh --no-onboarding`.
+- Before handing off any phase, run the full gate `scripts/gate.sh` (see `AGENTS.md`; without a graphical
+  session at least `scripts/gate.sh --offline`, with every unrun tier reported as unrun rather than passed),
+  then `scripts/dev-restart.sh --no-onboarding`.
 - Layout-touching phases also run `--smoke-settings-layout`; overlay-touching phases also run
   `--smoke-overlay`; clipboard-touching phases also run `--smoke-clipboard`.
 - **Promotion rule**: every problem this review found is either fixed with an assertion in tier A, or
@@ -69,8 +70,10 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
   surface. The tier-A smoke can only *log* the numbers (a colour-vs-constant comparison cannot see the
   composite), and the style document states their tier as a target rather than an enforced floor. **Done, within its scope.** The A2 scenario measures the filter row and each footer caption on rendered pixels,
   in same-launch differential frames (the app hides the panel's text in place between the two captures), and it
-  fails below 3:1: all twelve `{frost, liquid-glass, opaque} x {light, dark} x {black, white}` combinations clear
-  the caption tier (lowest 3.58:1). Roles outside those two -- row titles, detail text, the keycap glyphs -- remain
+  fails below 3:1. What it actually measures is the **footer captions** on all twelve `{frost, liquid-glass,
+  opaque} x {light, dark} x {black, white}` combinations, each of which clears the 3:1 caption tier. The **filter
+  row** is reported `check not run`: it lives in the options popover, the scenario keeps that popover closed, and an
+  unrun check is not coverage. Roles outside those two -- row titles, detail text, the keycap glyphs -- remain
   targets, and an ink contributing under 3 tone units is below what the diff can see. Earlier claim, now void: the
   two-launch form of this measurement, retracted below.
 - **Target**: an A2 scenario that reads the panel's frame from `--e2e-state` (`clipboard_picker`), captures
@@ -82,17 +85,6 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
   the dispatch; the tier text in `docs/design-style{,-en}.md` once numbers exist.
 - **Acceptance**: the scenario fails when a material's measured contrast is below the tier, and the style
   document quotes the measured numbers instead of a target.
-
-### P0-2 · Preset dropdown shows a raw translation key
-
-- **Now**: `SmoothPreset::label_key()` returns keys without the `settings.` prefix while the locale
-  files store them under `[settings]`, so `t()` falls through to the key itself.
-- **Target**: the dropdown reads 缓入 / Ease In and never renders a key.
-- **Files**: `mouse/smooth/presets.rs`, `settings/page_builder.rs:903–907`.
-- **Acceptance**: a unit test asserting every `label_key()` resolves in all three locales (a
-  regression test for the whole `label_key` family, not just the one preset); plus a general
-  `i18n` test that no call site passes a key with no `settings.`-prefixed counterpart. Consider a
-  debug assertion that `t()` never returns its own input for keys containing `_`.
 
 ### P0-3 · Hardcoded English in a localized UI
 
@@ -128,6 +120,18 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
 
 This is the structural phase: introduce the scales the spec defines, then map existing call sites
 onto them. The visible result is a UI that stops looking almost-aligned.
+
+### P0-6 · Preset dropdown shows a raw translation key (fixed)
+
+- **Now**: `SmoothPreset::label_key()` (`src/mouse/smooth/presets.rs`) returns the full key with the
+  `settings.` prefix, matching the `[settings]` section of the locale files, so `t()` resolves it and the
+  dropdown reads 缓入 / Ease In. The missing prefix that made it fall through to the key is gone.
+- **Target**: a key is never rendered; the acceptance test that every key resolves in all three locales stays.
+- **Files**: `mouse/smooth/presets.rs`, `settings/page_builder.rs:903–907`.
+- **Acceptance**: a unit test asserting every `label_key()` resolves in all three locales (a
+  regression test for the whole `label_key` family, not just the one preset); plus a general
+  `i18n` test that no call site passes a key with no `settings.`-prefixed counterpart. Consider a
+  debug assertion that `t()` never returns its own input for keys containing `_`.
 
 ### P1-1 · Type scale 12 / 14 / 20 / 26
 
@@ -242,7 +246,8 @@ Each P3 item is independent and can ship on its own.
 ## 7. Verification per phase
 
 ```sh
-cargo fmt && cargo check && cargo clippy && cargo test
+scripts/gate.sh                                   # the whole gate: one PASSED/FAILED/NOT RUN line per tier
+scripts/gate.sh --offline                         # the headless subset; green here is not a green gate
 scripts/dev-restart.sh --no-onboarding            # functional handoff
 scripts/dev-restart.sh --no-onboarding --pseudo-locale   # long-text layout
 scripts/dev-restart.sh --opt --no-onboarding      # feel/perf check for Phase 2

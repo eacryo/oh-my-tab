@@ -4,9 +4,9 @@
 
 ## Homebrew cask 发布
 
-`scripts/release.sh` 是正式版发布流水线。不带动作参数时，它会在本地构建产物并生成 `dist/oh-my-tab.rb`。这份 Homebrew cask 包含 DMG 的 `sha256`、`Cargo.toml` 中的版本号，以及卸载时清理图标缓存、日志和应用数据的 `zap trash:` 配置。这份配置会删除 `~/Library/Caches/oh-my-tab-icons`、`~/Library/Logs/oh-my-tab` 与 `~/.config/oh-my-tab`——后者存放加密后的剪贴板历史索引，所以 `brew uninstall --zap` 能覆盖它——但**不会**删除 `~/Library/Caches/oh-my-tab-clip-images` 下的加密图片缓存，也不会删除 `~/Library/Application Support/oh-my-tab` 下的剪贴板清理标记；需要把机器恢复成「不留下这些东西」的状态时请手动删除。
+`scripts/release.sh` 是正式版发布流水线。不带动作参数时，它会在本地构建产物并生成 `dist/oh-my-tab.rb`。这份 Homebrew cask 包含 DMG 的 `sha256`、`Cargo.toml` 中的版本号，以及卸载时清理图标缓存、日志和应用数据的 `zap trash:` 配置。这份配置会删除 `~/Library/Caches/oh-my-tab-icons`、`~/Library/Logs/oh-my-tab` 与 `~/.config/oh-my-tab`——后者存放加密后的剪贴板历史索引，所以 `brew uninstall --zap` 能覆盖它——但**不会**删除 `~/Library/Caches/oh-my-tab-clip-images` 下的加密图片缓存，也不会删除 `~/Library/Application Support/oh-my-tab` 下的剪贴板清理标记；需要把机器恢复成「不留下这些东西」的状态时请手动删除。剪贴板主密钥也一样：它是登录钥匙串里的通用密码项 `com.eacryo.oh-my-tab.clipboard-history` / `master-key`，任何 zap 配置都删不掉，只能在「钥匙串访问」里删除。
 
-正式发布需要另外完成公证流程。Apple 接受公证提交后，再通过 `--push` 发布到 R2；如果希望在发布前先确认票据已贴上，可单独运行 `--staple`。
+正式发布需要另外完成公证流程。Apple 接受公证提交后，再通过 `--push` 发布到 R2；如果希望在发布前先确认票据已贴上，可单独运行 `--staple`。`--push` 在票据尚未贴上时会自己跑同一段贴票步骤，所以先 `--staple` 再 `--push` 不会重复贴。
 
 ```sh
 sh scripts/release.sh                    # 本地构建产物和 Homebrew cask

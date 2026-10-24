@@ -189,8 +189,8 @@ disabled `#7E7B83` 3.52:1；primary `#1D1C1A` 14.41:1；secondary `#4F4C48` 7.23
 所属 token 为 `src/clipboard.rs` 中的 `POPOVER_*`、`popover_muted`、`popover_danger` 和
 `popover_hover_bg`。此菜单有意采用设计稿的紧凑字号和行圆角，作为通用字号阶梯与同心圆角规则的例外。
 数量与勾选独立成列，设置快捷键和清除提示靠右对齐；深色模式使用语义调色板。
-设计稿尺寸可用 `sed -n '831,965p' /Users/ceres/Downloads/clipboard-v2-1.html` 重现，
-实现 token 可用 `rg -n 'POPOVER_|fn popover_' src/clipboard.rs` 查看。
+实现里的尺寸可用 `rg -n 'POPOVER_|fn popover_' src/clipboard.rs` 查看；参考设计稿不在仓库内，
+本文不给出一个在别的机器上重现不了它的命令。
 
 窗口和卡片背景可以半透明，以透出桌面形成玻璃感。设置页侧边栏使用不透明的 `sidebar_bg`，保证颜色稳定。设置窗口的标题栏条带在侧边栏那一侧是不透明的 `window_bg` 条，
 其下一条 `separator` 发丝线（原型 `.settings-titlebar`：`background: var(--panel-solid); border-bottom: 1px solid var(--settings-divider)`）。
@@ -277,7 +277,7 @@ disabled `#7E7B83` 3.52:1；primary `#1D1C1A` 14.41:1；secondary `#4F4C48` 7.23
 1.04:1 下限的 caption 整个丢掉、转而把它邻居的 11:1 当成该区域的答案；用**整区平均**当背景，会把 1.17:1 的局部对比度
 报成 7.52:1；而只差材质的两个画面会被当成字形，从一个**完全没有文字**的区域里报出 1.26:1 的"墨"。现在测量改用 3 个色调
 单位的阈值、对每个连通分量**取其周围像素的局部材质色**、并在差异像素超过区域三分之一时**拒绝**这组图而不是相信它；
-三个反例都在 `png_stats.py --selftest` 里（共九例，引用本节任何数字前先跑它）。
+三个反例都在 `png_stats.py --selftest` 里（该自测共 45 个用例，引用本节任何数字前先跑它）。
 
 **渲染像素实测：同一次启动、每个文字角色一个取景。**`scripts/e2e/panel-contrast.sh` 在面板后钉一块纯黑或纯白窗口（半透明表面的
 色调跟随其背后的内容），先拍带文字的面板，再让 app **就地**把面板文字隐藏（`--clipboard-blank-text=after:N`：同一窗口、同一布局、
@@ -310,10 +310,8 @@ tint**（`glass::GLASS_TINT_DARK`；单一 tint 无法兼顾两种模式——�
 改用 `secondary_text` 而非 `muted_text`**（原来那句"两种模式下都达标（5.0:1 / 4.7:1）"是拿调色板自身的表面算的，而文字并不画在
 那个表面上）。`opaque` 是不随背景变化的对照。
 
-**这套测量守住了什么、没守住什么。**场景在低于 3:1 时判失败。当前 `hudWindow`（13）的浅色 `frost` 在 2026-10-16 实测的每个页脚 cell 都过档（黑底 4.60–4.64:1、白底 3.73–4.30:1、深色 4.64–5.16:1）；`filter-row` 取景目前对所有材质都无法测量，那是取景陈旧、不是对比度结论（`docs/review-backlog.md` #36）。这两个角色在
-`{frost, liquid-glass, opaque} × {浅色, 深色} × {黑, 白}背景` 上成立 caption 档。边界：自身贡献低于 3 个色调单位的墨，差分
-**根本看不到**（远低于本档，但那确实不是测量）；这两个角色之外（行标题、详情正文、键帽符号）仍是**目标值**而非门禁；该场景会临时
-改写主题，因此 `run-all.sh` 只在 `--include-prefs` 下运行它。`lib/png_stats.py --selftest` 是九例回归集，含曾分别击败过这套测量
+**这套测量守住了什么、没守住什么。**场景在低于 3:1 时判失败。当前 `hudWindow`（13）的浅色 `frost` 在 2026-10-16 实测的每个页脚 cell 都过档（黑底 4.60–4.64:1、白底 3.73–4.30:1、深色 4.64–5.16:1）。边界：自身贡献低于 3 个色调单位的墨，差分
+**根本看不到**（远低于本档，但那确实不是测量）；该场景会临时改写主题，因此 `run-all.sh` 只在 `--include-prefs` 下运行它。`lib/png_stats.py --selftest` 是 45 例的回归集，含曾分别击败过这套测量
 早期版本的三个反例。
 
 | 材质 | 模式 | 筛选行 | 页脚图例带 |
@@ -332,8 +330,8 @@ tint**（`glass::GLASS_TINT_DARK`；单一 tint 无法兼顾两种模式——�
 它替代掉的那句备注"两种模式下都达标（5.0:1 / 4.7:1）"是拿调色板自身的表面算的，而文字并不画在那个表面上）。`opaque` 是
 不随背景变化的对照。
 
-**这套测量的边界。**上表覆盖的筛选行与页脚 caption、三种材质 × 两种模式 × 两种背景；其余（行标题、详情正文、键帽符号）仍是
-**目标值**而非门禁。
+**这套测量的边界。**上表覆盖的是**页脚 caption**，三种材质 × 两种模式 × 两种背景。**表头筛选行**每次运行都记为**未运行**
+（它位于选项弹出菜单内，场景让菜单保持关闭），场景通过不构成筛选行的证据；其余（行标题、详情正文、键帽符号）仍是**目标值**而非门禁。
 
 | 模式 | 材质 | 黑背景 | 白背景 |
 | --- | --- | --- | --- |
@@ -347,11 +345,16 @@ tint**（`glass::GLASS_TINT_DARK`；单一 tint 无法兼顾两种模式——�
 为达到这些数字，有两处表面是**有意调整**过的，而且两处都是被这套测量找出来的、不是推出来的：液态玻璃在深色
 模式下改用**深色 tint**（`glass::GLASS_TINT_DARK`；单一 tint 无法兼顾两种模式——浅色 tint 让表面停在中灰
 0.539，那里的 caption 墨最多 2.07:1）；磨砂在深色模式下改用 legacy **ultraDark** 材质而非 `hudWindow`
-（后者被明亮背景抬到 0.648，同一墨色只有 2.45:1）。`opaque` 是不随背景变化的对照。该场景在低于 3:1 时**判失败**，
-所以**这张表目前还没有被强制执行**。手段是有的（`scripts/e2e/panel-contrast.sh` 与
-`scripts/e2e/lib/png_stats.py --selftest`，后者是三个合成用例的回归集），但**单帧测量无法区分字形与材质自身的色调噪声**：
-深色半透明表面上单帧会给出十几个挤在 1.03–1.13:1 的"墨"，于是每个半透明格子都是因**测量**而非**对比度**而失败。
-上表数字出自该方法，因此请当作**参考值**：只有当测量直接隔离出字形像素本身（差分截图——两张图里有一张把文字墨设为透明）之后，这一档才真正成为门禁。
+（后者被明亮背景抬到 0.648，同一墨色只有 2.45:1）。`opaque` 是不随背景变化的对照。
+
+**这套测量守住了什么、没守住什么。** 守住的是上表里的**页脚 caption**：三种材质 × 两种模式 × 两种背景。**筛选行**在目前的每次运行里都是
+**未运行**：它位于选项弹出菜单内，而场景让该菜单保持关闭，于是 `panel-contrast.sh` 打印 `check not run` 并记为未跑，而不是去测量它——
+场景通过并不构成筛选行的证据。其余角色（行标题、详情正文、键帽符号）仍是**目标值**而非门禁。
+
+**这些数字怎么测出来的。**`scripts/e2e/panel-contrast.sh` 在同一次启动里拍两张：先拍带文字的面板，再让 app 就地隐藏文字
+（`--clipboard-blank-text=after:N`），于是字形像素就是两张之间不同的像素，材质自身的色调噪声冒充不了文字。这也是单帧数字
+从来不可信的原因：深色磨砂单帧会给出十几个挤在 1.03–1.13:1 的"墨"。测量旁的 `python3 scripts/e2e/lib/png_stats.py --selftest`
+用 45 个用例守住这套测量，并打印 `all cases match`。仪器只有一条已知边界：自身贡献低于 `DIFF_TONE` 个色调单位的墨，它看不见。
 
 ‡ 浅色 `frost` 那两行的数值是在 `underWindowBackground`（21）上测的。浅色 `frost` 现在用 `hudWindow`（13，`glass::FROST_MATERIAL_LIGHT`）；2026-10-16 实测页脚 caption 黑底 4.60–4.64:1、白底 3.73–4.30:1（见上方 ‡）。深色行未变（`ultraDark`，9）。
 
@@ -485,7 +488,18 @@ Markdown 更新说明的一级标题使用 `sidebar-title` 粗体，二级标题
 基准 **4px**。允许的步进：`4 8 12 16 24 32`。2px 仅允许出现在控件**内部**几何（滑块内缩、发丝线偏移），
 不得用于同级元素之间。
 
-设置窗口的具名布局度量（全部落在网格上）：
+设置窗口的具名布局度量（全部落在网格上）。**这张表记录的是已经实现的几何，不是设计目标。** 几何在 2026-10 的设计稿迁移中改过一次
+（页边距与行节奏被收紧），权威来源是 `settings/components.rs` 与 `settings.rs` 里的常量，改动常量时同一次改动里更新此表。
+
+**A2 场景实际守住的是哪几行。** `scripts/e2e/settings-layout.sh` 只覆盖这张表里的三行，其余各没有任何硬断言：
+
+- **页面顶部留白，按区间。** 它断言 `TOP_PADDING - 1.5 <= gap <= TOP_PADDING + 54 + 1.5`，即页头与内容之间的间隙落在 22.5 至
+  79.5pt 之间。这是防止页头塌陷或虚高的护栏，不是 1.5pt 钉住这个数值。
+- **页面底部留白，较紧。** 可滚动页面内容底边必须落在 `BOTTOM_PADDING` 的 1.5pt 之内。
+- **行与分区的节奏，只在关于页。** 相邻行标签之间的步长（0 / 20 / 36.5 / 56 / 62.5 / 70）既要对得上某个具名约定（容差 1.5pt），
+  也要满足每档的预期出现次数。
+
+上表记录的控件列宽、卡片内边距和标题栏度量**没有**任何场景断言；改动它们需要人工核对，核对时以这张表为准。
 
 | 度量 | 取值 | 位置 |
 | --- | --- | --- |
@@ -496,16 +510,16 @@ Markdown 更新说明的一级标题使用 `sidebar-title` 粗体，二级标题
 | 侧边栏宽度 | 212 | `settings/sidebar.rs`（`SIDEBAR_WIDTH`） |
 | 侧边栏条目内缩 | 12 | `settings/sidebar.rs`（`btn_w = card_w - 24`） |
 | 品牌行 | 34pt 图标距左 12，名称在其后 8，14pt/600；下一行导航条目距该行 16 | `brand_row_frames`、`sidebar_first_nav_row_top` |
-| 页面顶部留白 | 48 | `SettingsPageHeader::TOP_PADDING` |
-| 页面底部留白 | 72 | `SettingsPageHeader::BOTTOM_PADDING` |
-| 区块标题上方间距 | 24 | `SETTINGS_SECTION_HEADER_GAP` |
-| 标题 → 卡片间距 | 4 | `SETTINGS_SECTION_CARD_GAP` |
-| 行间距 | 8 | `SettingsLayout::row_gap` |
-| 行高 52，控件高 32，垂直居中 | | `SettingsLayout` |
-| 控件列 | 宽 200，右对齐，距卡片右边 16 | `SettingsLayout` |
+| 页面顶部留白 | 24 | `SettingsPageHeader::TOP_PADDING` |
+| 页面底部留白 | 20 | `SettingsPageHeader::BOTTOM_PADDING` |
+| 区块标题上方间距 | 20 | `SETTINGS_SECTION_HEADER_GAP` |
+| 标题 → 卡片间距 | 8 | `SETTINGS_SECTION_CARD_GAP` |
+| 行间距 | 0 | `SettingsLayout::row_gap` |
+| 行高 56，控件高 32，垂直居中 | | `SettingsLayout` |
+| 控件列 | 宽 180，右对齐，距卡片右边 16 | `SettingsLayout` |
 | 卡片左右内边距 | 16 | 行构造函数（`label_x`、`SETTINGS_CONTROL_TRAILING_INSET`） |
-| 卡片底部内边距 | 8 | `SettingsLayout::card_bottom_inset` |
-| 行上方分隔线的间距 | 4 | `SEPARATOR_ABOVE_ROW_GAP` |
+| 卡片底部内边距 | 0 | `SettingsLayout::CARD_BOTTOM_INSET` |
+| 行上方分隔线的间距 | 0 | `SEPARATOR_ABOVE_ROW_GAP` |
 | 滑杆读数 | 宽 44，间距 8 | `SLIDER_READOUT_*` |
 
 经验法则：**相关元素 8，分组之间 24，页面边缘 32–72。** 需要紧凑用小的那一档，需要分隔用大的那一档；
@@ -524,7 +538,8 @@ Markdown 更新说明的一级标题使用 `sidebar-title` 粗体，二级标题
 | `radius-legend-chip` | 5 | 只读快捷键图例中按键符号背后的底色块 |
 | `legend-chip-text-pad-x` | 2 | 图例色块内文字两侧的留白；长键名由自己的色块撑开，而不是按字符拆成多个色块 |
 | `radius-card` | 12 | 卡片、成组行容器、列表块、弹出项 |
-| `radius-panel` | 18 | tooltip、下拉面板、HUD、通知卡片；剪贴板那两栏大面板画 32（`glass::CLIPBOARD_PANEL_RADIUS`），它是一张大 sheet 而不是小面板 |
+| `radius-panel` | 18 | tooltip、下拉面板、HUD、通知卡片 |
+| `radius-sheet` | 32 | 剪贴板选择器与其详情面板（`glass::CLIPBOARD_PANEL_RADIUS`）：两栏大 surface，不是小面板 |
 | `radius-full` | 9999 | 胶囊：徽标、状态点、开关、滚动条滑块 |
 | 品牌图标圆角 | 9 | 设置侧边栏 34pt 应用图标（原型 `.brand img { border-radius: 9px }`）；34pt 方块由自身高度派生出 9，8pt 控件圆角和面板圆角都不符合它的曲率 |
 | 窗口圆角 | `radius-panel`（18） | 设置窗口本身（原型 `--radius-window`） |

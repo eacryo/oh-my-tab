@@ -4787,6 +4787,12 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
             "trash"
         };
         add_popover_row_content(row, &t(key), &hint, symbol, false, false, danger);
+        // Remember the settings row: it is the control that actually opens the settings window, and a
+        // scenario that wants to click it cannot derive its place from the orb (the orb's action opens
+        // this popover). The pointer is taken once, here, where the row is built.
+        if key == "clipboard.open_settings" {
+            *super::PICKER_SETTINGS_ROW.lock().unwrap() = Some(ObjPtr::new(row));
+        }
         let _: () = msg_send![row, setTarget: observer()];
         let _: () = msg_send![row, setAction: action];
         add_hover_tracking(row);
@@ -4851,6 +4857,9 @@ pub(super) fn remove_filter_popover_views() {
         }
     }
     *FILTER_POPOVER.lock().unwrap() = None;
+    // The settings row went away with the popover: drop its pointer here, so a reader can never
+    // dereference a released view between the removal and the next build.
+    *super::PICKER_SETTINGS_ROW.lock().unwrap() = None;
 }
 
 /// Close the popover: clear the open flag and remove the view (outside click, Esc, choice, panel

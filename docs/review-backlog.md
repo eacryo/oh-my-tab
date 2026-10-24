@@ -8,7 +8,6 @@
 
 | # | 事项 | 来源 | 严重度 | 为何延后 | 重新审视的触发条件 |
 | --- | --- | --- | --- | --- | --- |
-| 41 | `--smoke-settings-layout` 在本仓库 HEAD（`f6254dd`）上就是**红的**，且与 Finder 右键菜单无关：先因 section header 以 11pt 渲染（该 smoke 只接受 caption/control/sidebar-title/page-title 四个字号）在 General 页失败；跳过字号检查后在剪贴板页的 `clipboard shortcut control has a blank row or invalid capture layout` 失败（实测控件中心距 59.30pt，公式 `(60+56)/2 + row_gap` 给出 58.00，而 `layout.row_gap` 读出来是 0）。因此在同一次运行里，后段的「遍历所有页并校验几何」循环（包括本次新增的 Finder 菜单页）根本到不了 | Finder 右键菜单功能实现（2026-10-23 夜间），基线复现：临时 worktree 于 `f6254dd` 构建后运行同一 smoke，得到相同失败 | HIGH（门禁坏在基线） | 两条都属于**既有的**设置页排版/门禁缺陷，与本次功能无关：字号是 11 vs 设计文档 §4 的 12 这一历史偏差；剪贴板行距的 1.3pt 差值需要先判定「行高」还是「控件在行内居中」哪一侧是权威，属于设计决策而非本次改动的修补。为让本次改动仍拿到 A1 覆盖，新增了 `--smoke-finder-menu` 单独跑 Finder 菜单页的真实视图树断言 | 下次改动设置页字号 token / `SECTION_HEADER_H` / 剪贴板页行布局时，或 `--smoke-settings-layout` 再次阻断 A 层门禁时：先修字号（12pt + 16pt 行盒），再定位剪贴板行距差值，然后把 Finder 菜单页并入该 smoke 的全页循环 |
 | 40 | `scripts/e2e/panel-edge.sh` 的 check 3（material blur）**结果不可判定**：仪器返回 rc=5 `class=unobservable / reason=bands-disagree`，高低位带的读数无法归类 | 架构/性能审计（arch-perf-audit），2026-10-17 实跑 | MEDIUM（既有不可判定结果） | **证据**：改动前 HEAD=`24e9529` 上单独运行该场景得到相同失败，失败输出为 `carrier-on class=unobservable hf=0.214 lf=0.077 ... reason=bands-disagree`，启动 build-version 由进程自报为 `20261017140350`；带本次改动时为 `20261017140829` / `20261017141602`，结果一致。这只能支持「基线也失败」，**不能证明根因在测量仪器**——根因待查。按仓库规则「不能判定的门禁不算通过」，A2 因此不是全绿 | 排查面板材质/毛玻璃渲染或截图测量仪器时，或该 check 再次阻断 A2 全量门禁时 |
 | 34 | 设置写入路径（`settings/dispatch.rs`）对整份 `Config` 做三次 clone：`old_cfg`、`cfg`、写回时的 `*w = cfg.clone()`。一次 checkbox 切换会复制 `Vec<KeyBinding>`、多组 `ThemeColors` 与 mouse profiles | 架构/性能审计（`arch-perf-audit`） | LOW（用户交互频率，非热路径） | 试做的「把最后一次写回改成 move」并不成立：`apply_config_change(&old_cfg, &cfg, ..)` 在写回之后还要借用 `cfg`（dispatch.rs:1076-1081），保留副本后收益归零。要真正减少复制需要重排写入/应用的所有权顺序，没有测量收益支撑 | 下次改动 `settings/dispatch.rs` 的写入与应用顺序时，或一次设置变更的耗时可测时 |
 | 35 | `card_signature`（`overlay.rs:284`）为每张卡 clone `app_name`/`window_title`/`icon_path` 三个 String 并存入 `CARD_SIGNATURES` | 架构/性能审计（`arch-perf-audit`） | LOW（影响待测） | 这些副本可能承担「签名即当时值」的快照语义（卡片复用判定依赖它），直接改成 `Arc<str>` 或哈希前须先确认频率与复用收益；未测量前不改 | 下次改动卡片复用判定或 `CARD_SIGNATURES` 时，或 summon 耗时可测时 |
@@ -111,9 +110,7 @@
 | 43 | `StaticClass::register_once` 的 `_name` 参数未被使用（仅为调用点可读性保留） | AppKit 调用层硬化，代码审查 R2 | LOW（整洁） | 保留它是为了让调用点写明类名，与 `build_class` 的第一个参数呼应；删除后调用点会变成只有闭包，可读性下降。不影响行为 | 下次整理 `ffi.rs` 的注册助手时 |
 | 44 | `clipboard/detail.rs` 新增了本地 `raw_class` 助手，与 `ffi.rs` 的 `build_class` 职责重叠（前者走手写 `class_addMethod`，后者走 `ClassBuilder`） | AppKit 调用层硬化，代码审查 R2 | LOW（重复实现） | `detail.rs` 里三个类的回调在 `notifications.rs`、签名仍是 `*mut c_void`，迁到 `build_class` 必须同时改那个文件的签名；当时它与另一个并行子代理的文件冲突，因此先用本地助手做到幂等注册 + 冲突 panic，留住迁移路径 | 下次改动 `clipboard/detail.rs` 或 `notifications.rs` 的类注册时，把三个类迁到 `build_class` 并删除 `raw_class` |
 | 45 | `super` 派发「`defined` 传错类」这一失败模式**没有机器可检的断言**：`for_defined_class` 接受任何非 null 类，把定义类错写成其父类时，真实调用仍是同一条实现（`setEnabled:` 无论从哪一级开始都解析到 NSButton），因此行为断言区分不出来 | AppKit 调用层硬化，代码审查 R2–R3，GUI 验证轮实测 | MEDIUM（覆盖缺口） | 实测结论：在 `settings_select_set_enabled` 里把 `settings_select_class()` 换成 `class!(NSButton)` 后，新增的 `settings_select_super_dispatch_reaches_nsbutton` 仍然通过——那条断言只覆盖「dispatch 不递归/不崩溃/确实到达父类」，不覆盖「defined 指对了类」。后者只能靠逐点审查：这是类型系统的能力边界（`StaticClass` 无法区分「定义类」与「父类」），不是仪器缺失 | 若要机器化：注册期把每个 override 的「定义类」与 selector 一起登记成表，并在 `for_defined_class` 里校验。下次改动 `ObjcSuper` 或注册助手时评估；或首次出现 super 跳级导致的用户可见缺陷时 |
-| 46 | `layout.show_app_name_in_cards`（缩略图卡片标题是否带应用名）不在 `needs_in_place_control_sync` 的成员列表里（`runtime_config.rs`），`refresh_switcher_keystroke_and_mouse_controls_from_config`（`settings/dispatch.rs`）也没有回填该开关的 `setState:`。于是设置窗口已打开时改配置文件或点「恢复默认」，页面仍显示旧值，而浮窗已按新值渲染 | 编写 `docs/settings-field-checklist.md` 时的静态核对（2026-10-19），读 `src/runtime_config.rs:59-68` 与 `src/settings/dispatch.rs:1493-1605` 得到，未实机复现 | MEDIUM（用户可见行为：设置页与运行状态不一致，正属 AGENTS.md 的 in-scope 类别） | 本次任务是文档改动，用户明确限定为文档、不要求评审，因此不在本次修；修法就是把该标志加进 `needs_in_place_control_sync` 并在就地刷新函数里补一次 `setState:`，属于一个独立的小改动，应连带一条 A1 断言（`--smoke-settings-state-sync` 里经 `apply_config_change` 双向切换，确认开关跟随）。其余 13 个同类布尔开关（如 `focused_thumbnail_prewarm`）都已完整接线，可作对照 | 下次改动 `show_app_name_in_cards`、`needs_in_place_control_sync` 或 `refresh_switcher_keystroke_and_mouse_controls_from_config` 时；或首次报告「改了配置/恢复默认后设置页开关没跟着变」时 |
 | 48 | **A2 的 settings-layout.sh 在 master 上就是红的**：15 条断言失败，集中在**跨所有设置页**的页面内边距与行距约定（`content sits under the page header padding: gap=24.0`、`content ends on the bottom padding: bottom=20.0`，以及 `unexpected=[70, 36.5, 56.0, …]` 的垂直步长），而 `docs/design-style-en.md` 写的是页面顶部 48 / 底部 72 | A2 全量运行（`--include-focus`），2026-10-22；同一场景在干净 HEAD 工作树（`/private/tmp/omt-a2-base`，744f0fc）复跑，结果同为 `FAIL (26/42 checks)` | MEDIUM（门禁红；用户可见的页面留白与设计文档不一致） | 与本轮剪贴板改动无关（该改动只新增一张卡，不碰页面内边距），且**要先判定是应用没遵守设计文档还是场景的期望过期**——那是设置页间距的独立任务 | 下次改动设置页间距/页面画布时，或 A2 需要全绿才能发版时 |
-| 49 | **A2 的 settings-open-latency.sh 在 master 上就是红的**：warm 与 cold 都报 `no state frame with a settings-click time after the click`、`0ms`，点击没有命中设置按钮 | 同上一次 A2 全量运行；干净 HEAD 上同样失败 | MEDIUM（门禁红；延迟测量不可判定） | 与剪贴板改动无关；失败形态是"点击未命中/没有状态帧"，属于测量仪器或窗口几何漂移 | 下次改动设置窗口预热、设置按钮几何或该测量仪器时 |
 | 50 | **A2 的 tab-repeat.sh 在 master 上就是红的**：`each published forward step moves exactly one card: steps=14 mismatches=[(2, 2, 5)]` | 同一次 A2 全量运行；干净 HEAD 上同样失败 | MEDIUM（门禁红；可能是节流/发布顺序的真实缺陷，也可能是采样竞态） | 与剪贴板改动无关（未触碰切换器重复节流）；需要单独定位是逻辑还是采样 | 下次改动切换器重复/节流或该场景的采样式断言时 |
 | 51 | **A2 套件跨次运行不可重复**：`panel-action-keys.sh` 在 TextEdit 运行时直接失败，而 `switch-basic.sh` 会拉起 TextEdit 目标窗口却不清理，于是套件跑完一次后再跑就会在 `panel-action-keys` 失败 | A2 全量运行两次（本轮工作树 + 干净 HEAD 工作树），两次都命中同一前置条件 | LOW–MEDIUM（测试工具：A2 自称可重复） | 与剪贴板改动无关；修法要么让 `switch-basic` 结束时关掉自己拉起的 TextEdit，要么让 `panel-action-keys` 自己处理已运行的目标（并区分用户自己的 TextEdit）——需要先定所有权语义 | 下次改动 switch-basic.sh、panel-action-keys.sh 或 run-all.sh 时，或第二次全量运行 A2 时 |
 | 52 | 暂停收集与排除应用列表**没有 A2 场景**：面板 orb 的暂停/恢复、菜单栏两态标题、"暂停期间复制不进入历史"的端到端断言目前只有 A1 断言与**人工实机验证**（2026-10-22 已逐条跑过：暂停期间复制 → 日志 `baseline advanced, nothing recorded`；恢复后不补录、下一次新复制正常记录；排除 Finder 后复制 → 日志 `source application is on the exclusion list`，移出后同一操作恢复记录；菜单栏标题在"暂停记录剪贴板/恢复记录剪贴板"间正确翻转），A2 层仍无脚本 | 剪贴板隐私控制实现，2026-10-22 | MEDIUM（覆盖缺口） | 编写该场景需要真实全局快捷键（option+v）与真实复制，属于新增测试面而非修缺陷 | 下次改动暂停/排除逻辑或面板顶栏时，或补齐 A2 覆盖时 |
@@ -121,7 +118,54 @@
 | 54 | 设置页**行分隔线**在 A1 层没有任何断言：`--smoke-settings-layout` 的 `debug_validate_settings_page` 只收集有文字/交互的视图，分割线视图根本不在 `entries` 里（实测 dump 出 `thin views: []`）；唯一的分隔线检查在 A2 的 `settings-layout.sh`，且**只覆盖 About 页**（过滤条件写死 `page_6_about`）。剪贴板页因此少了一条 hairline 也无人报警——2026-10-23 用户在截图里发现「启用剪贴板历史 / 暂停记录」之间缺线，才补上 | GUI 验证轮，2026-10-23；修复为在 `build_clipboard_page` 补 `SettingsRow::separator_above_row` | LOW（视觉细节；修复已按该页其余 10 行的同一组件写法落地） | 想要机器可检，需要先让 `collect_debug_layout` 收录薄视图（它目前按文字/交互过滤），或把 A2 的分隔线检查从 About 页推广到所有页——两者都超出「补一条线」的范围，且 A2 场景本身因 #48 处于红态 | 下次改动 `collect_debug_layout`、`separator_above_row` 或修复 #48 让 A2 恢复绿时 |
 | 47 | 切换浮窗页脚标题开关（`layout.show_footer_title`）的三项覆盖缺口：(1) 运行期接线（`ChangeFlags` → `reset_switcher`、`needs_in_place_control_sync` → 就地 `setState:`）只有纯函数层面的几何断言，没有经真实 `apply_config_change` 入口的断言；(2) A1 GUI 与 A2 场景均未运行（`--smoke-overlay`、`--smoke-settings-layout`、`--smoke-settings-state-sync`），关闭标题且窗口列表为空时的居中空态提示只有"不 panic"的纯函数保护；(3) 该开关改变面板高度，未验证"配置 reload 时正在显示的面板被收起、下一次召唤按新几何排版"这条路径 | 页脚标题开关实现审查 R1–R3（见 `.agent-review/tasks/footer-title-toggle/`） | MEDIUM（未运行覆盖 + 断言缺口） | 用户在实现阶段明确要求先不写测试、先看效果，随后才送审；三轮审查预算已用尽，本轮只补了纯函数与布局输出断言（零带子行高、reserve 阈值、卡片与浮动控件不相交、面板不超宽预算、开关→带子映射、配置兼容），这些都是 headless 可跑的；GUI runner 需要图形会话且会改动真实窗口，未在本次执行 | 下次改动该开关、`footer_band_h`、`footer_control_*_reserve` 或 `overlay::update_status_label` 时；或交付/发布前跑 A1/A2 门禁时 |
 
+
+
 | 55 | **悬停气泡的移除没有 A1 断言**：2026-10-23 按用户要求删掉设置页每行描述的悬停气泡后，那次改动附带了一条「描述标签上没有悬停出口」的检查。该检查**被验证为无效并已删除**：它按 `t(key)` 的字符串在页面树里找标签，而描述标签位于 `NSScrollView` 的 document 里——按文本查找要么找不到，要么命中页面为其他用途保留的隐藏副本（实测「6 checked」里只有 3 条是用户实际能悬停的那一类，`clipboard_enabled`/`delete_after_paste`/`paused` 只存在于窗口树）。进一步实测：窗口 `contentView` 往下的子视图递归只覆盖 1043 个视图、165 个 tracking area，**不含任何页面标签**；对滚动视图 `documentView` 递归会在主线程卡死；`isKindOfClass:` 会打到 field editor 并崩。就结论而言，代码里没有一条既能在真实视图上判定、又能跑得到那一步的路径。用户选择「删除该断言 + 记 backlog」。当前唯一的保护是 `widgets.rs::add_captioned_row` 里的 `debug_assert!(caption_tip.is_null() && title_tip.is_null())`：它只覆盖**原生** `setToolTip:`，把自定义气泡重新加回来时它不会失败（这正是 2026-10-23 之前的形态，`attach_hover` 加进去时它也是绿的） | 悬停气泡移除（2026-10-23，提交 `4965711`），断言在 `fix:` 之后被验证无效并删除 | LOW（覆盖缺口：行为本身已由真机验证；缺的是回归门禁） | 可以做对的方向有三个，都需要先定机制：(a) 让检查只认 `OhMyTabHoverTooltipTarget` 这一类名持有的 tracking area，并先解决「如何在不卡死的前提下到达页面 document」；(b) 给 `--e2e-state` 增加一个「本窗口悬停出口数量」的状态字段，由视图层自己报告（AGENTS.md 的 promotion rule 允许这种替代）；(c) 改动 `collect_debug_layout`，让它收录 tracking area 并按页面归属分类，再把 `--smoke-settings-layout` 的页面遍历扩展到 document 层。三者都超出「删一个气泡」的范围，且当前的 `--smoke-settings-layout` 本身在风格门禁（#41）就红了 | 下次改动设置页的悬停/提示气泡路径、`add_captioned_row`、`--smoke-settings-layout` 的视图遍历，或修复 #41 让该 smoke 重新全绿时；或首次有人重新引入悬停气泡时 |
+## 2026-10-24 — #56 关闭：A2 的 settings-layout.sh 已与设计文档对齐
+
+`scripts/e2e/settings-layout.sh` 原先仍钉 `TOP_PADDING = 48` / `BOTTOM_PADDING = 72` 与 43/60/72.2 的步长表，而设计文档与
+`SettingsPageHeader` 早已是 24/20、行高 56。现在两者的常量与步长表都来自同一份实测几何，并已对回 `src/settings/` 的常量：
+页顶 24、页底 20、步长 0 / 20 / 36.5 / 56 / 62.5 / 70（每项在场景注释里注明它由哪些常量相加得到）。顺带把场景里其余随结构
+漂移的钉子一并更新：About 页根名 `page_6_about` 改为 `page_7_about`（访达菜单页占用了 6），页面清单补 `page_6_finder_menu`
+（七页改为八页）。
+
+A2 实跑：`scripts/e2e/settings-layout.sh` PASS（45/45，鼠标页 7/7）。同一次 `run-all.sh --include-focus` 里另有两项失败，
+归因如下（**都没有被消除，只是本改动不涉及**）：
+
+- `settings-open-latency.sh`：**已修复并关闭**（见下方 `#49 关闭` 一节）。根因是场景点了只打开筛选菜单的 `...` 按钮，从不打开设置窗口。
+- `panel-action-keys`：套件运行时报 `TextEdit is already running`，这是它自己的前置条件；按 pid 停掉该实例后单独跑 PASS。
+- `hud-settings`：**套件内失败、单独跑 PASS，根因未确定**。单跑通过只能说明存在运行条件或套件顺序上的差异，不能排除产品竞态或
+  场景间的状态泄漏（它失败时报 `the frontmost application could not be read`，紧接着 `pid … is still running with a development
+  switch after the restore`）；下一次运行套件时若复现，应按前者分诊。
+## 2026-10-24 — #57 关闭：折叠行 smoke 已修好，A1 全绿
+
+两处修复，结论是「测试没有走真实入口」而不是折叠算法有错（这个判断来自 Codex 的独立定位，我据此复核后采纳）：
+
+1. **smoke 用错了入口。** 自定义开关 `OhMyTabHtmlSwitch` 只在 `mouseDown:` 里翻转状态再 `sendAction:`；原 smoke 先 `setState: 1` 再 `performClick:`，而 `performClick:` 只发动作、不切换，于是回调读到旧状态。现在改为合成一次左键 `mouseDown:` 走真实入口，并在每次交互前重新从 `SettingsUi` 取控件（重建会换掉它，缓存指针会让第二次交互打到旧指针上），同时断言状态确实翻转，否则直接判失败而不是拿旧画面断言。
+2. **启动阶段排队了一次内容重建。** `change_flags` 对任何 Startup 都把 `clipboard_excluded_apps` 置真，于是 `apply_config_change` 在启动时排队一次设置内容重建，晚到某个 run loop 轮次执行，可能在交互中途替换页面。现在该处只对真正的外部列表变化（Reload / RestoreDefaults / Menu）排队，Startup 不再排队。
+
+**验证**：`settings_collapsible_row_geometry_smoke` 过了变异检查——把 `set_clipboard_delete_dependent_visibility` 改成「永不折叠」后该 smoke 立刻变红，恢复后变绿。A1 从 24/26 变为 **24/24 PASSED**。
+
+**完整门禁的状态（如实）**：本条的修复让 A1 从 24/26 变为 24/24，但**完整 `scripts/gate.sh` 仍然不是 PASSED**，原因是与本次修复无关的两件事，分别记录、不当作已解决：
+
+- `settings-open-latency.sh`：**已修复并关闭**（见下方 `#49 关闭` 一节）。根因是场景点了只打开筛选菜单的 `...` 按钮，从不打开设置窗口。
+- 完整 `scripts/gate.sh` 的最近一次结果是 **gate: INCOMPLETE（a2 NOT RUN）**：前七层全部 PASSED，A2 因为 14 个场景需要 `--include-focus/-screen/-prefs` 而报 NOT RUN。带 `--include-focus` 单独跑 A2 是 9 passed / 2 not run / 1 failed —— 那个 failed 是下面这条既有失败，不是 NOT RUN。两个 not run 的单项是本机没有别的桌面、未绑定移动 Space 的快捷键。
+- `panel_creation_and_badge_layout_smoke` 要求跑 A1 时没有 app 实例占用单实例锁：有 dev 实例在跑时报 `AlreadyRunning`。这是运行条件而非回归，但**它会让 A1 变红**，所以跑 A1 前必须确认没有实例在跑。
+## 2026-10-24 — #49 关闭：settings-open-latency 点错了按钮
+
+**根因（不是环境，不是点击没送达）**：场景点的是选择面板头部的 `...` 按钮，而它的 action 是 `toggleFilterPopover:`——只打开选项弹出框。「打开设置」是那个弹出框里的一**行**（`openClipboardSettings:`）。所以场景每天都点开一个筛选菜单、从不打开设置，`settings_click_ms` 永远是 0，warm 和 cold 都是 0ms。这解释了为什么它在干净 HEAD 上也红、为什么 warm/cold 数字相同。
+
+途中排除的错误假设：光标位置、屏幕坐标换算、被其它应用窗口遮挡、前台应用、cua 点击通路——都实测排除了（暂停按钮的一次点击**确实**生效，证明输入是通的）。
+
+**修复**：
+1. `--e2e-state` 新增 `clipboard_picker.settings_row`：弹出框里「打开设置」那一行的矩形（弹出框关闭时为 null）。旧字段 `settings` 是 `...` 按钮，保留但注明它只开弹出框。
+2. 弹出框开关现在发布一帧状态（`clipboard_popover`）：此前 `toggle_filter_popover` 只改原子变量，场景轮询会一直读到旧值。
+3. 场景改为两步交互：点 `...` → 等 `filter_popover_open` → 点 `settings_row`，并在两步之间做悬停（浮动面板的指针轮询需要先看到光标）。
+4. 顺带修了场景里两处 bash 3.2 陷阱（`< <(...)` 进程替换、`sys.argv[1:7]` 切片少一位）。
+
+**验证**：连续三次运行 PASS，warm 113 / 126 / 120ms（均 ≤ 400ms 上限），cold 512 / 561 / 556ms（均严格慢于 warm，反例成立）。A2 全量（`--include-focus`）：**10 passed, 2 not run, 0 failed**。完整 gate：前七层 PASSED，A2 因 14 个场景需 `--include-*` 而 NOT RUN（INCOMPLETE）。
+
+仍 NOT RUN 的两项是机器条件：本机没有别的普通桌面、未绑定移动 Space 的快捷键。
 
 ## glass-ui-refresh (2026-10-20)
 

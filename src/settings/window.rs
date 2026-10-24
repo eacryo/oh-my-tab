@@ -2995,6 +2995,47 @@ pub(crate) fn settings_mouse_profile_callback_smoke_runner() -> bool {
 }
 
 /// Verify that collapsing the clipboard child row leaves adjacent controls correctly laid out.
+/// Deliver one real left-mouse-down to the clipboard page's "delete entry after paste" switch and
+/// confirm the state moved the way the click asked. The switch is looked up on every call: a rebuild
+/// replaces the control, so a saved pointer cannot tell "the click did nothing" from "this pointer is
+/// old", and a click through `performClick:` dispatches the action without the toggle this control
+/// performs in `mouseDown:`.
+unsafe fn click_clipboard_delete_switch() -> bool {
+    let switch = with_settings_ui(|ui| ui.as_ref().map(|ui| ui.clipboard_delete_after_paste));
+    let Some(switch) = switch else {
+        return false;
+    };
+    if switch.is_null() {
+        return false;
+    }
+    let before: isize = msg_send![switch, state];
+    let event: *mut AnyObject = msg_send![
+        class!(NSEvent),
+        mouseEventWithType: 1isize,
+        location: NSPoint::new(1.0, 1.0),
+        modifierFlags: 0u64,
+        timestamp: 0.0f64,
+        windowNumber: 0isize,
+        context: std::ptr::null_mut::<AnyObject>(),
+        eventNumber: 0isize,
+        clickCount: 1isize,
+        pressure: 1.0f32
+    ];
+    if event.is_null() {
+        return false;
+    }
+    let _: () = msg_send![switch, mouseDown: event];
+    let after: isize = msg_send![switch, state];
+    // A click toggles: the state must land on the opposite of what it read before the event.
+    let wanted = before ^ 1;
+    if after != wanted {
+        eprintln!(
+            "[smoke-settings-collapsible-row] the switch did not reach the clicked state: before={before} after={after} wanted={wanted}"
+        );
+        return false;
+    }
+    true
+}
 pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
     unsafe {
         let mut cfg = CONFIG.read().unwrap().clone();
@@ -3030,13 +3071,10 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
                 let _: () = msg_send![ui.clipboard_delete_after_paste, setState: 1isize];
             }
         });
-        let clipboard_switch =
-            with_settings_ui(|ui| ui.as_ref().map(|ui| ui.clipboard_delete_after_paste));
-        let Some(clipboard_switch) = clipboard_switch else {
+        if !click_clipboard_delete_switch() {
             hide_settings();
             return false;
-        };
-        let _: () = msg_send![clipboard_switch, performClick: std::ptr::null::<AnyObject>()];
+        }
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_ref() {
                 let _: () = msg_send![ui.window, layoutIfNeeded];
@@ -3109,7 +3147,15 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
             return false;
         };
 
-        let _: () = msg_send![clipboard_switch, performClick: std::ptr::null::<AnyObject>()];
+        if !click_clipboard_delete_switch() {
+            hide_settings();
+            return false;
+        }
+        with_settings_ui(|ui| {
+            if let Some(ui) = ui.as_ref() {
+                let _: () = msg_send![ui.window, layoutIfNeeded];
+            }
+        });
         let expanded = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let previous: NSRect = msg_send![ui.clipboard_delete_after_paste, frame];
