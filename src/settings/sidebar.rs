@@ -1835,22 +1835,24 @@ pub(super) extern "C" fn search_result_row_mouse_down(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
-    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
-    // notification loses one refresh; an abort loses the app.
-    if crate::settings::settings_ui_borrowed() {
-        return;
-    }
-
-    unsafe {
-        let identifier: *mut AnyObject = msg_send![this, identifier];
-        if identifier.is_null() {
+    crate::callback_guard::void("search_result_row_mouse_down", || {
+        // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+        // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+        // notification loses one refresh; an abort loses the app.
+        if crate::settings::settings_ui_borrowed() {
             return;
         }
-        if let Ok(index) = crate::ffi::nsstring_to_rust(identifier).parse::<usize>() {
-            activate_settings_search_result(index);
+
+        unsafe {
+            let identifier: *mut AnyObject = msg_send![this, identifier];
+            if identifier.is_null() {
+                return;
+            }
+            if let Ok(index) = crate::ffi::nsstring_to_rust(identifier).parse::<usize>() {
+                activate_settings_search_result(index);
+            }
         }
-    }
+    });
 }
 
 fn search_results_view_class_handle() -> crate::ffi::StaticClass {
@@ -1878,7 +1880,7 @@ fn search_results_view_class() -> *mut AnyObject {
 /// live query against the new viewport. The refresh is deferred to the next run-loop turn so it
 /// never re-enters AppKit's layout pass.
 extern "C" fn search_results_view_set_frame_size(this: *mut AnyObject, _cmd: Sel, size: NSSize) {
-    unsafe {
+    crate::callback_guard::void("search_results_view_set_frame_size", || unsafe {
         type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel, NSSize);
         let mut sup = crate::ffi::ObjcSuper::for_defined_class(
             this as *mut std::ffi::c_void,
@@ -1887,7 +1889,7 @@ extern "C" fn search_results_view_set_frame_size(this: *mut AnyObject, _cmd: Sel
         let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
         send(&mut sup, sel!(setFrameSize:), size);
         schedule_search_refresh();
-    }
+    });
 }
 
 pub(super) fn schedule_search_refresh() {
@@ -1936,16 +1938,18 @@ extern "C" fn search_refresh_target_fired(
     _cmd: Sel,
     _argument: *mut AnyObject,
 ) {
-    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
-    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
-    // notification loses one refresh; an abort loses the app.
-    if crate::settings::settings_ui_borrowed() {
-        return;
-    }
+    crate::callback_guard::void("search_refresh_target_fired", || {
+        // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+        // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+        // notification loses one refresh; an abort loses the app.
+        if crate::settings::settings_ui_borrowed() {
+            return;
+        }
 
-    if settings_search_is_active() {
-        unsafe { refresh_settings_search() };
-    }
+        if settings_search_is_active() {
+            unsafe { refresh_settings_search() };
+        }
+    });
 }
 
 /// Build the results shell over the detail pane. Called once per settings build, after the pages
@@ -2101,17 +2105,19 @@ unsafe fn search_flash_target() -> *mut AnyObject {
 }
 
 extern "C" fn search_flash_timer_fired(_this: *mut AnyObject, _cmd: Sel, _timer: *mut AnyObject) {
-    // No settings_ui_borrowed() guard here: this callback never borrows SETTINGS_UI, and an early
-    // return would leave `flash.timer` pointing at a self-invalidated one-shot timer, which the
-    // next `clear_search_flash` would invalidate a second time.
-    unsafe {
-        let mut flash = SEARCH_FLASH.lock().unwrap();
-        if !flash.view.is_null() {
-            let _: () = msg_send![flash.view, removeFromSuperview];
+    crate::callback_guard::void("search_flash_timer_fired", || {
+        // No settings_ui_borrowed() guard here: this callback never borrows SETTINGS_UI, and an early
+        // return would leave `flash.timer` pointing at a self-invalidated one-shot timer, which the
+        // next `clear_search_flash` would invalidate a second time.
+        unsafe {
+            let mut flash = SEARCH_FLASH.lock().unwrap();
+            if !flash.view.is_null() {
+                let _: () = msg_send![flash.view, removeFromSuperview];
+            }
+            flash.view = std::ptr::null_mut();
+            flash.timer = std::ptr::null_mut();
         }
-        flash.view = std::ptr::null_mut();
-        flash.timer = std::ptr::null_mut();
-    }
+    });
 }
 
 /// Schedule the flash view's removal; `delay` is the fade time (a short hold under Reduce Motion).
@@ -2180,21 +2186,23 @@ pub(super) extern "C" fn settings_search_field_cancel(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
-    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
-    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
-    // notification loses one refresh; an abort loses the app.
-    if crate::settings::settings_ui_borrowed() {
-        return;
-    }
-
-    clear_settings_search();
-    unsafe {
-        let value: *mut AnyObject = msg_send![this, stringValue];
-        if !crate::ffi::nsstring_to_rust(value).is_empty() {
-            set_field(this, "");
-            apply_settings_search_query("");
+    crate::callback_guard::void("settings_search_field_cancel", || {
+        // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+        // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+        // notification loses one refresh; an abort loses the app.
+        if crate::settings::settings_ui_borrowed() {
+            return;
         }
-    }
+
+        clear_settings_search();
+        unsafe {
+            let value: *mut AnyObject = msg_send![this, stringValue];
+            if !crate::ffi::nsstring_to_rust(value).is_empty() {
+                set_field(this, "");
+                apply_settings_search_query("");
+            }
+        }
+    });
 }
 
 #[cfg(test)]

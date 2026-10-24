@@ -1627,7 +1627,10 @@ pub(super) fn smoke_runner() -> bool {
                     let field: *mut AnyObject = msg_send![subs, objectAtIndex: 0isize];
                     let value: *mut AnyObject = msg_send![field, stringValue];
                     let label = crate::ffi::nsstring_to_rust(value);
-                    if label == "⌥" || label == "q" {
+                    // `key_cap_text` upper-cases a keycap (mapping.rs asserts `key_cap_text("q") == "Q"`),
+                    // so the rendered label is "Q". Comparing against the lower-case source form counted the
+                    // modifier and missed the key, and the check then failed for a correct panel.
+                    if label == "⌥" || label.eq_ignore_ascii_case("q") {
                         split_cells += 1;
                     }
                     if (frame.size.width - KEYCAP_RAIL_W).abs() > 0.5 {

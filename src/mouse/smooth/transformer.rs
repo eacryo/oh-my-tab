@@ -219,9 +219,11 @@ impl SmoothTransformer {
 }
 
 unsafe extern "C" fn smooth_timer_callback(_timer: CFRunLoopTimerRef, info: *mut c_void) {
-    if !info.is_null() {
-        (&mut *(info as *mut SmoothTransformer)).tick();
-    }
+    crate::callback_guard::void("smooth_timer_callback", || {
+        if !info.is_null() {
+            (&mut *(info as *mut SmoothTransformer)).tick();
+        }
+    });
 }
 
 /// A1 smoke assertion for the SDK field IDs and the values written by the smooth event path.

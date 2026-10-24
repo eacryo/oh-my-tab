@@ -40,8 +40,10 @@ pub(crate) extern "C" fn handle_restore_defaults(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    set_page_restore_confirmation_expanded(false, true);
-    set_restore_confirmation_expanded(true, true);
+    crate::callback_guard::void("handle_restore_defaults", || {
+        set_page_restore_confirmation_expanded(false, true);
+        set_restore_confirmation_expanded(true, true);
+    });
 }
 
 /// Collapse the whole-app restore confirmation without changing any values.
@@ -50,7 +52,9 @@ pub(crate) extern "C" fn handle_restore_defaults_cancel(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    set_restore_confirmation_expanded(false, true);
+    crate::callback_guard::void("handle_restore_defaults_cancel", || {
+        set_restore_confirmation_expanded(false, true);
+    });
 }
 
 /// Confirm whole-app restore: write the default config in one shot and refresh the UI,
@@ -60,11 +64,13 @@ pub(crate) extern "C" fn handle_restore_defaults_confirm(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    // Collapse without animation: the window may be rebuilt right after (theme/locale
-    // defaults), so animating is pointless.
-    set_restore_confirmation_expanded(false, false);
-    restore_all_defaults();
-    show_restore_success(false);
+    crate::callback_guard::void("handle_restore_defaults_confirm", || {
+        // Collapse without animation: the window may be rebuilt right after (theme/locale
+        // defaults), so animating is pointless.
+        set_restore_confirmation_expanded(false, false);
+        restore_all_defaults();
+        show_restore_success(false);
+    });
 }
 
 /// Expand the "Restore Page Defaults" (bottom-right, current tab) inline confirmation card;
@@ -74,8 +80,10 @@ pub(crate) extern "C" fn handle_page_restore_defaults(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    set_restore_confirmation_expanded(false, true);
-    set_page_restore_confirmation_expanded(true, true);
+    crate::callback_guard::void("handle_page_restore_defaults", || {
+        set_restore_confirmation_expanded(false, true);
+        set_page_restore_confirmation_expanded(true, true);
+    });
 }
 
 /// Collapse the per-page restore confirmation without changing any values.
@@ -84,7 +92,9 @@ pub(crate) extern "C" fn handle_page_restore_defaults_cancel(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    set_page_restore_confirmation_expanded(false, true);
+    crate::callback_guard::void("handle_page_restore_defaults_cancel", || {
+        set_page_restore_confirmation_expanded(false, true);
+    });
 }
 
 /// Confirm per-page restore: reset every setting of the current sidebar tab in one shot and
@@ -94,11 +104,13 @@ pub(crate) extern "C" fn handle_page_restore_defaults_confirm(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    set_page_restore_confirmation_expanded(false, false);
-    restore_page_defaults(settings_page_identity(
-        SIDEBAR_SELECTED.load(Ordering::SeqCst),
-    ));
-    show_restore_success(true);
+    crate::callback_guard::void("handle_page_restore_defaults_confirm", || {
+        set_page_restore_confirmation_expanded(false, false);
+        restore_page_defaults(settings_page_identity(
+            SIDEBAR_SELECTED.load(Ordering::SeqCst),
+        ));
+        show_restore_success(true);
+    });
 }
 
 /// Show the post-reset success feedback after configuration and UI refreshes have completed.

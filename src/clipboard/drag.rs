@@ -23,6 +23,7 @@
 //! panel back where `clipboard.picker_position` asks for it.
 
 use super::*;
+use crate::callback_guard;
 
 /// One in-flight grab of a blank region.
 ///
@@ -322,7 +323,7 @@ extern "C" fn drag_surface_hit_test(
     _cmd: Sel,
     point: NSPoint,
 ) -> *mut AnyObject {
-    crate::callback_guard::event(
+    callback_guard::event(
         "clipboard_drag_surface_hit_test",
         std::ptr::null_mut(),
         || unsafe {
@@ -357,7 +358,7 @@ extern "C" fn drag_surface_hit_test(
 
 /// A press on any accepted blank region (the surface or the list's document view).
 pub(super) extern "C" fn drag_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    crate::callback_guard::void("clipboard_drag_mouse_down", || unsafe {
+    callback_guard::void("clipboard_drag_mouse_down", || unsafe {
         let click_count: isize = msg_send![event, clickCount];
         let point: NSPoint = msg_send![class!(NSEvent), mouseLocation];
         begin_drag(point, click_count);
@@ -369,14 +370,14 @@ pub(super) extern "C" fn drag_mouse_dragged(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    crate::callback_guard::void("clipboard_drag_mouse_dragged", || {
+    callback_guard::void("clipboard_drag_mouse_dragged", || {
         let point: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
         drag_to(point);
     });
 }
 
 pub(super) extern "C" fn drag_mouse_up(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    crate::callback_guard::void("clipboard_drag_mouse_up", finish_drag);
+    callback_guard::void("clipboard_drag_mouse_up", finish_drag);
 }
 
 /// First mouse, so a grab works while the panel's host app is inactive -- the same reason the
@@ -386,7 +387,11 @@ pub(super) extern "C" fn drag_accepts_first_mouse(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    callback_guard::value(
+        "drag_accepts_first_mouse",
+        objc2::runtime::Bool::YES,
+        || objc2::runtime::Bool::YES,
+    )
 }
 
 fn begin_drag(point: NSPoint, click_count: isize) {

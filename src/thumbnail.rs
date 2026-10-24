@@ -347,6 +347,9 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
     }
     schedule_focused_prewarm(pid, wid);
     let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
+    // This entry point can skip the enqueue below (the activation may already be stale), so the
+    // reclaim notice must be published here rather than left to a later enqueue that may not run.
+    crate::thumbnail::pregen::reclaim_if_growth_pending();
     let _ = std::thread::Builder::new()
         .name("oh-my-tab-thumb-activation".into())
         .spawn(move || {
@@ -416,6 +419,7 @@ fn schedule_blank_activation_retry(job: CaptureJob) {
             }
             let target_px_h = cached_target_px_height(key.pid, key.wid);
             let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(key.pid);
+            crate::thumbnail::pregen::reclaim_if_growth_pending();
             let Some(result) =
                 enqueue_blank_retry_job(key, target_px_h, activated_at, pid_generation)
             else {
@@ -444,7 +448,6 @@ fn schedule_blank_activation_retry(job: CaptureJob) {
 #[cfg(test)]
 mod tests {
     use super::*;
-
     static FOCUSED_PREWARM_LIFECYCLE_TEST_LOCK: LazyLock<Mutex<()>> =
         LazyLock::new(|| Mutex::new(()));
 
@@ -1081,16 +1084,17 @@ mod tests {
     fn capture_state_preserves_new_activation_freshness_independent_of_priority() {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
+        let gen = state.pid_generation(key.pid);
         let first_activation = Instant::now();
         let later_activation = first_activation + Duration::from_millis(1);
 
         assert_eq!(
-            state.request_activation(key, 512, first_activation, 0),
+            state.request_activation(key, 512, first_activation, gen),
             ActivationRequestResult::Enqueued
         );
         let first = state.take_next().unwrap();
         assert_eq!(
-            state.request_activation(key, 512, later_activation, 0),
+            state.request_activation(key, 512, later_activation, gen),
             ActivationRequestResult::Merged { running: true }
         );
         assert!(state.finish(first));
@@ -1623,9 +1627,10 @@ mod tests {
     fn capture_state_propagates_appearance_refresh_flag() {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
+        let gen = state.pid_generation(key.pid);
 
         // A standalone appearance request: the flag rides out with the job.
-        assert!(state.request_for_generation(key, 512, CapturePriority::Visible, 0, true));
+        assert!(state.request_for_generation(key, 512, CapturePriority::Visible, gen, true));
         let job = state.take_next().unwrap();
         assert!(job.appearance_refresh);
         assert!(!state.finish(job));
@@ -1639,7 +1644,7 @@ mod tests {
         // An appearance request merging into a pending ordinary job lights the
         // flag up (OR semantics).
         assert!(state.request(key, 512, CapturePriority::Startup));
-        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, 0, true));
+        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, gen, true));
         let job = state.take_next().unwrap();
         assert!(job.appearance_refresh);
         assert_eq!(job.priority, CapturePriority::Visible);
@@ -1647,7 +1652,7 @@ mod tests {
 
         // The activation path never carries the appearance flag.
         assert_eq!(
-            state.request_activation(key, 512, Instant::now(), 0),
+            state.request_activation(key, 512, Instant::now(), gen),
             ActivationRequestResult::Enqueued
         );
         let job = state.take_next().unwrap();
@@ -1658,13 +1663,14 @@ mod tests {
     fn capture_state_requeues_when_appearance_refresh_merges_into_running_job() {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
+        let gen = state.pid_generation(key.pid);
 
         // An ordinary job of the SAME priority is already running when the theme
         // refresh merges in -- none of the three regular fields change.
         assert!(state.request(key, 512, CapturePriority::Visible));
         let running = state.take_next().unwrap();
         assert!(!running.appearance_refresh);
-        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, 0, true));
+        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, gen, true));
 
         // Finishing the old job must keep the pending entry for the appearance
         // recapture instead of silently dropping it.
@@ -1681,10 +1687,11 @@ mod tests {
     fn capture_state_ignores_duplicate_activation_scheduling_for_the_same_token() {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
+        let gen = state.pid_generation(key.pid);
         let activated_at = Instant::now();
 
         assert_eq!(
-            state.request_activation(key, 512, activated_at, 0),
+            state.request_activation(key, 512, activated_at, gen),
             ActivationRequestResult::Enqueued
         );
         let running = state.take_next().unwrap();
@@ -1694,7 +1701,7 @@ mod tests {
         // merges into the running job without advancing freshness; finishing it
         // must not append a redundant follow-up capture.
         assert_eq!(
-            state.request_activation(key, 512, activated_at, 0),
+            state.request_activation(key, 512, activated_at, gen),
             ActivationRequestResult::Merged { running: true }
         );
         assert!(!state.finish(running));
@@ -1703,7 +1710,7 @@ mod tests {
         // A genuinely new activation (different token) still advances freshness.
         let later = activated_at + Duration::from_millis(1);
         assert_eq!(
-            state.request_activation(key, 512, later, 0),
+            state.request_activation(key, 512, later, gen),
             ActivationRequestResult::Enqueued
         );
         let job = state.take_next().unwrap();
@@ -1716,20 +1723,21 @@ mod tests {
     fn activation_request_reports_merge_and_rejection_separately() {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
+        let gen = state.pid_generation(key.pid);
         let activated_at = Instant::now();
 
         assert_eq!(
-            state.request_activation(key, 512, activated_at, 0),
+            state.request_activation(key, 512, activated_at, gen),
             ActivationRequestResult::Enqueued
         );
         assert_eq!(
-            state.request_activation(key, 512, activated_at, 0),
+            state.request_activation(key, 512, activated_at, gen),
             ActivationRequestResult::Merged { running: false }
         );
 
         let running = state.take_next().unwrap();
         assert_eq!(
-            state.request_activation(key, 512, activated_at, 0),
+            state.request_activation(key, 512, activated_at, gen),
             ActivationRequestResult::Merged { running: true }
         );
         assert!(!state.finish(running));
@@ -1745,8 +1753,9 @@ mod tests {
     fn blank_retry_marker_is_cleared_only_for_its_captured_job() {
         let mut state = CaptureState::default();
         let key = ThumbKey { pid: 10, wid: 20 };
+        let gen = state.pid_generation(key.pid);
         assert_eq!(
-            state.request_activation(key, 512, Instant::now(), 0),
+            state.request_activation(key, 512, Instant::now(), gen),
             ActivationRequestResult::Enqueued
         );
         state.desired.get_mut(&key).unwrap().blank_retry = true;
@@ -1761,6 +1770,212 @@ mod tests {
         state.desired.get_mut(&key).unwrap().blank_retry = true;
         assert!(!state.clear_blank_retry_marker(stale));
         assert!(state.desired.get(&key).unwrap().blank_retry);
+    }
+
+    /// The ledger's bound, stated as a set inclusion so it can FAIL: the ledger's own size is not on
+    /// the right-hand side. A build that never reclaims must violate it.
+
+    /// Every growth entry point reports growth, including the first generation query -- otherwise a
+    /// pid whose row was created by a query (before its launch notification) would never trigger a
+    /// reclaim for its whole lifecycle.
+    #[test]
+    fn the_first_generation_query_reports_growth() {
+        let mut state = CaptureState::default();
+        let (first, grew) = state.pid_generation_reporting_growth(9);
+        assert!(grew, "creating the row is growth");
+        let (again, grew_again) = state.pid_generation_reporting_growth(9);
+        assert!(!grew_again, "a repeat query must not scan");
+        assert_eq!(first, again);
+        // And the two older entry points still report their own growth.
+        assert!(state.cancel_pid(1000), "a new pid is growth");
+        assert!(!state.cancel_pid(1000), "an existing row is not");
+        assert!(state.activate_pid(1001));
+        assert!(!state.activate_pid(1001));
+    }
+
+    /// The trigger CHAIN, not just the helper: a first generation query through the public entry
+    /// point must leave the ledger asking for a reclaim, and consuming it must clear the request.
+    ///
+    /// An earlier version asserted only that `pid_generation_reporting_growth` returned `true`, which
+    /// is why a caller that dropped the flag went unnoticed.
+    #[test]
+    fn a_first_generation_query_leaves_a_reclaim_pending() {
+        let mut state = CaptureState::default();
+        assert!(
+            !state.growth_pending(),
+            "a new ledger has nothing to reclaim"
+        );
+        let _ = state.pid_generation(31);
+        assert!(
+            state.growth_pending(),
+            "minting a row through `pid_generation` must leave a reclaim pending"
+        );
+        // Repeating the query is the hot path: it must not ask for a scan.
+        let observed = state.generations_snapshot();
+        // Reclaim with the pid still live, so the row survives and the repeat sees it.
+        let live: std::collections::HashSet<i32> = [31].into_iter().collect();
+        state.reclaim(&observed, &live);
+        assert!(!state.growth_pending(), "the reclaim consumes the request");
+        let _ = state.pid_generation(31);
+        assert!(
+            !state.growth_pending(),
+            "a repeat query must not request a scan"
+        );
+    }
+
+    /// A row created WHILE the reclaim query ran was never observed, so the request it left
+    /// behind must survive the reclaim -- otherwise that growth never gets its own reclaim.
+    #[test]
+    fn a_reclaim_keeps_a_request_for_rows_it_did_not_observe() {
+        let mut state = CaptureState::default();
+        let _ = state.pid_generation(1);
+        let observed = state.generations_snapshot();
+        // A second pid appears after the query started.
+        let _ = state.pid_generation(2);
+        let live: std::collections::HashSet<i32> = [1].into_iter().collect();
+        state.reclaim(&observed, &live);
+        assert!(
+            state.has_row(2),
+            "a row the query never saw must not be reclaimed"
+        );
+        assert!(
+            state.growth_pending(),
+            "the unobserved growth must still be asking for a reclaim"
+        );
+    }
+
+    /// Every production site that mints a row must be paired with a reclaim notice, so no growth
+    /// can be left without one. The scan reads the source, because the pairing lives at call sites
+    /// rather than in a type.
+    #[test]
+    fn every_row_minting_site_publishes_a_reclaim_notice() {
+        let root = concat!(env!("CARGO_MANIFEST_DIR"), "/src/thumbnail");
+        let mut missing = Vec::new();
+        let mut checked = 0;
+        for file in ["capture.rs", "pregen.rs"] {
+            let path = format!("{root}/{file}");
+            let Ok(source) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let production = source.split("#[cfg(test)]").next().unwrap_or(&source);
+            let lines: Vec<&str> = production.lines().collect();
+            for (index, line) in lines.iter().enumerate() {
+                if !line.contains(".pid_generation(") || line.trim_start().starts_with("//") {
+                    continue;
+                }
+                checked += 1;
+                let window = lines[index..(index + 6).min(lines.len())].join("\n");
+                if !window.contains("reclaim_if_growth_pending") {
+                    missing.push(format!("{file}:{}", index + 1));
+                }
+            }
+        }
+        assert!(checked > 1, "the scan found only {checked} call sites");
+        assert!(
+            missing.is_empty(),
+            "a row-minting site with no reclaim notice: {missing:?}"
+        );
+    }
+    #[test]
+    fn the_ledger_stays_inside_its_bound_after_each_reclaim() {
+        let mut state = CaptureState::default();
+        // Thousands of launch/terminate cycles over distinct pids, reclaiming as production does.
+        for pid in 1..=2000i32 {
+            state.cancel_pid(pid);
+            // The query observes what exists now; nothing is live and nothing is referenced.
+            let observed = state.generations_snapshot();
+            state.reclaim(&observed, &std::collections::HashSet::new());
+        }
+        assert!(
+            state.ledger_pids().is_empty(),
+            "every terminated pid with no live answer and no reference must be reclaimed"
+        );
+        // The bound holds immediately after a reclaim, for a mixed set.
+        let mut state = CaptureState::default();
+        state.activate_pid(7);
+        state.cancel_pid(8);
+        let live: std::collections::HashSet<i32> = [7].into_iter().collect();
+        state.reclaim(&state.generations_snapshot(), &live);
+        assert_eq!(state.ledger_pids(), [7].into_iter().collect());
+    }
+
+    /// A reclaimed pid's next generation is greater than any it had, so an old job cannot be
+    /// re-admitted when the row comes back.
+    #[test]
+    fn a_reclaimed_pid_never_re_admits_an_old_job() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 42, wid: 1 };
+        let old_generation = state.pid_generation(42);
+        state.cancel_pid(42);
+        // Reclaim the row entirely, then the pid comes back as a new incarnation.
+        let observed = state.generations_snapshot();
+        state.reclaim(&observed, &std::collections::HashSet::new());
+        assert!(state.ledger_pids().is_empty(), "the row is gone");
+        state.activate_pid(42);
+        let new_generation = state.pid_generation(42);
+        assert!(
+            new_generation > old_generation,
+            "a reclaimed pid must get a higher generation, not restart at 0"
+        );
+        assert!(
+            !state.request_for_generation(
+                key,
+                100,
+                CapturePriority::Visible,
+                old_generation,
+                false
+            ),
+            "an old job for the previous incarnation must still be refused"
+        );
+        assert!(
+            state.request_for_generation(key, 100, CapturePriority::Visible, new_generation, false),
+            "the new incarnation is capturable"
+        );
+    }
+
+    /// The regression the reviewer found: a job that captured generation 0 before any row existed
+    /// stayed legal after a terminated row was reclaimed, because "no row" was read as "generation 0
+    /// is current". Minting the row on first use is what closes it.
+    #[test]
+    fn a_job_from_before_the_first_row_is_refused_after_reclaim() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 77, wid: 1 };
+        // The real entry point: a job takes its generation from the ledger, which mints the row.
+        let generation = state.pid_generation(77);
+        // The app terminates during the debounce, then the row is reclaimed.
+        state.cancel_pid(77);
+        let observed = state.generations_snapshot();
+        state.reclaim(&observed, &std::collections::HashSet::new());
+        assert!(state.ledger_pids().is_empty(), "the row is gone");
+        // The old job must still be refused: a missing row approves nothing.
+        assert!(
+            !state.request_for_generation(key, 100, CapturePriority::Visible, generation, false),
+            "an old job must not be re-admitted once its row has been reclaimed"
+        );
+    }
+
+    /// The stale-answer guard: a row created or bumped WHILE the query ran was never observed, so an
+    /// old "not live" answer must not delete it.
+    #[test]
+    fn a_query_answer_does_not_touch_rows_it_did_not_observe() {
+        let mut state = CaptureState::default();
+        state.cancel_pid(5);
+        // The query starts here and sees pid 5 at this generation...
+        let observed = state.generations_snapshot();
+        // ...but before the answer is applied, a new incarnation appears.
+        state.activate_pid(5);
+        let new_generation = state.pid_generation(5);
+        // Applying the old answer must leave the new row alone.
+        state.reclaim(&observed, &std::collections::HashSet::new());
+        assert!(
+            state.ledger_pids().contains(&5),
+            "a row whose generation moved after the query must not be reclaimed on the old answer"
+        );
+        assert_eq!(state.pid_generation(5), new_generation);
+        // Counter-example: with a fresh observation of the same state, the row IS reclaimed.
+        let observed = state.generations_snapshot();
+        state.reclaim(&observed, &std::collections::HashSet::new());
+        assert!(state.ledger_pids().is_empty());
     }
 
     #[test]
@@ -1816,7 +2031,10 @@ fn cgshwc_capture_smoke() {
     // call chain, and downscaling. Needs a GUI session + Screen Recording; CI
     // skips automatically without the permission.
     if !capture_allowed() {
-        eprintln!("[smoke] Screen Recording not granted; skipping capture smoke");
+        crate::smoke_verdict::report(
+            "cgshwc_capture_smoke",
+            crate::smoke_verdict::Verdict::NotRun("Screen Recording not granted".into()),
+        );
         return;
     }
     let pid: i32 = unsafe {
@@ -1870,4 +2088,8 @@ fn cgshwc_capture_smoke() {
     };
     assert!(!ns.is_null(), "nsimage_from_cgimage returned null");
     unsafe { CFRelease(t.img) };
+    crate::smoke_verdict::report(
+        "cgshwc_capture_smoke",
+        crate::smoke_verdict::Verdict::Passed { checks: 1 },
+    );
 }

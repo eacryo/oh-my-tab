@@ -20,6 +20,10 @@
 # 退出码:0 = 全部断言通过;非 0 = 失败(逐条打印原因)。
 # This scenario injects real global hotkeys and therefore steals focus.
 # E2E_STEALS_FOCUS=1
+# It also rewrites the real ~/.config/oh-my-tab/config.toml (key bindings) and restores it in
+# a trap. Restoring afterwards is not the same as being authorised to change it: the two
+# disturbances need their own switches, so this declares the second one too.
+# E2E_CHANGES_PREFS=1
 
 set -uo pipefail
 

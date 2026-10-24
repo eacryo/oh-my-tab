@@ -493,6 +493,7 @@ unsafe fn probe_wid(own_pid: i32, title: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoke_verdict::smoke_runner;
 
     fn sample(attributes: Option<u64>, tags: Option<u64>, ax_minimized: Option<bool>) -> Sample {
         Sample {
@@ -536,26 +537,13 @@ mod tests {
     #[test]
     #[ignore]
     fn space_state_matrix_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-space-state-matrix")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "space state matrix smoke failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("space_state_matrix_smoke", 1, {
+            // The child is the process that ran the assertions, so its recorded verdict is
+            // what this parent reports; it never infers one from the exit status.
+            crate::smoke_verdict::run_smoke_child(
+                "space_state_matrix_smoke",
+                &["--smoke-space-state-matrix"],
+            );
+        });
     }
 }

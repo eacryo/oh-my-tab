@@ -74,7 +74,11 @@ extern "C" fn settings_titlebar_view_is_flipped(
     _this: *mut AnyObject,
     _cmd: Sel,
 ) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    crate::callback_guard::value(
+        "settings_titlebar_view_is_flipped",
+        objc2::runtime::Bool::YES,
+        || objc2::runtime::Bool::YES,
+    )
 }
 
 extern "C" fn settings_titlebar_hit_test(
@@ -82,8 +86,10 @@ extern "C" fn settings_titlebar_hit_test(
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
-    // Decorative chrome must not intercept AppKit's native window buttons.
-    std::ptr::null_mut()
+    crate::callback_guard::nil("settings_titlebar_hit_test", || {
+        // Decorative chrome must not intercept AppKit's native window buttons.
+        std::ptr::null_mut()
+    })
 }
 
 /// Class of the title bar band. It is flipped for its children and declines every hit: AppKit paints
@@ -261,7 +267,7 @@ extern "C" fn settings_root_corner_configuration(
     _self: *mut AnyObject,
     _cmd: Sel,
 ) -> *mut AnyObject {
-    unsafe {
+    crate::callback_guard::nil("settings_root_corner_configuration", || unsafe {
         let Some(radius_cls) = AnyClass::get(c"NSViewCornerRadius") else {
             return std::ptr::null_mut();
         };
@@ -276,39 +282,44 @@ extern "C" fn settings_root_corner_configuration(
             return std::ptr::null_mut();
         }
         msg_send![config_cls, configurationWithRadius: radius]
-    }
+    })
 }
 
 extern "C" fn settings_root_view_did_change_effective_corner_radii(
     this: *mut AnyObject,
     _cmd: Sel,
 ) {
-    unsafe {
-        let view = this;
-        let radii: *mut AnyObject = msg_send![view, effectiveCornerRadii];
-        let radius = if radii.is_null() {
-            settings_effective_corner_radius(None, crate::theme::RADIUS_PANEL)
-        } else {
-            let top_left: f64 = msg_send![radii, topLeft];
-            let top_right: f64 = msg_send![radii, topRight];
-            let bottom_left: f64 = msg_send![radii, bottomLeft];
-            let bottom_right: f64 = msg_send![radii, bottomRight];
-            settings_effective_corner_radius(
-                Some([top_left, top_right, bottom_left, bottom_right]),
-                crate::theme::RADIUS_PANEL,
-            )
-        };
-        let layer: *mut AnyObject = msg_send![view, layer];
-        if !layer.is_null() {
-            let _: () = msg_send![layer, setCornerRadius: radius];
-            let _: () = msg_send![layer, setMasksToBounds: true];
-        }
-    }
+    crate::callback_guard::void(
+        "settings_root_view_did_change_effective_corner_radii",
+        || unsafe {
+            let view = this;
+            let radii: *mut AnyObject = msg_send![view, effectiveCornerRadii];
+            let radius = if radii.is_null() {
+                settings_effective_corner_radius(None, crate::theme::RADIUS_PANEL)
+            } else {
+                let top_left: f64 = msg_send![radii, topLeft];
+                let top_right: f64 = msg_send![radii, topRight];
+                let bottom_left: f64 = msg_send![radii, bottomLeft];
+                let bottom_right: f64 = msg_send![radii, bottomRight];
+                settings_effective_corner_radius(
+                    Some([top_left, top_right, bottom_left, bottom_right]),
+                    crate::theme::RADIUS_PANEL,
+                )
+            };
+            let layer: *mut AnyObject = msg_send![view, layer];
+            if !layer.is_null() {
+                let _: () = msg_send![layer, setCornerRadius: radius];
+                let _: () = msg_send![layer, setMasksToBounds: true];
+            }
+        },
+    );
 }
 
 extern "C" fn settings_window_key_down(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    // Unhandled keys should stop at the settings window instead of reaching NSApplication's
-    // terminal responder, whose default noResponderFor:keyDown: implementation beeps.
+    crate::callback_guard::void("settings_window_key_down", || {
+        // Unhandled keys should stop at the settings window instead of reaching NSApplication's
+        // terminal responder, whose default noResponderFor:keyDown: implementation beeps.
+    });
 }
 
 /// Root view used by the settings window so AppKit can resolve macOS 27's container-relative

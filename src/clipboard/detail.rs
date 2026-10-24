@@ -1,6 +1,7 @@
 //! Clipboard subsystem · detail: entry detail scroll view.
 
 use super::*;
+use crate::callback_guard;
 
 /// Whether the pinned picker has lost key status and needs to counter Liquid Glass's passive look.
 static PICKER_GLASS_INACTIVE: AtomicBool = AtomicBool::new(false);
@@ -340,10 +341,10 @@ pub(super) extern "C" fn detail_tv_cursor_entered(
     _cmd: Sel,
     _event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("detail_tv_cursor_entered", || unsafe {
         let ibeam: *mut AnyObject = msg_send![class!(NSCursor), IBeamCursor];
         let _: () = msg_send![ibeam, set];
-    }
+    });
 }
 
 /// The detail-text cursor: leaving -> back to the default arrow.
@@ -352,10 +353,10 @@ pub(super) extern "C" fn detail_tv_cursor_exited(
     _cmd: Sel,
     _event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("detail_tv_cursor_exited", || unsafe {
         let arrow: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
         let _: () = msg_send![arrow, set];
-    }
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -3083,12 +3084,16 @@ fn header_strip_class() -> *mut AnyObject {
 
 /// The header strip is flipped: the search/clear frames are top-anchored.
 extern "C" fn header_strip_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    callback_guard::value("header_strip_is_flipped", objc2::runtime::Bool::YES, || {
+        objc2::runtime::Bool::YES
+    })
 }
 
 /// Container is flipped: origin at top-left, rows stack from the top (newest first).
 extern "C" fn container_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    callback_guard::value("container_is_flipped", objc2::runtime::Bool::YES, || {
+        objc2::runtime::Bool::YES
+    })
 }
 
 /// Resolve the visible row actually under the event. Gate on the list scroll view first so
@@ -3163,23 +3168,27 @@ pub(super) unsafe fn event_is_over_filter_popover(event: *mut AnyObject) -> bool
 /// Reconcile hover against the whole row backdrop on every picker mouse move. This prevents
 /// a stale style when the pointer leaves a content button through row padding and then exits.
 extern "C" fn container_mouse_moved(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    if REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    if unsafe { event_is_over_filter_popover(event) } {
-        set_hover_row(NO_SELECTION);
-        return;
-    }
-    let row = unsafe { hover_row_at_event(event as *mut c_void) };
-    set_hover_row(row);
+    callback_guard::void("container_mouse_moved", || {
+        if REBUILDING.load(Ordering::SeqCst) {
+            return;
+        }
+        if unsafe { event_is_over_filter_popover(event) } {
+            set_hover_row(NO_SELECTION);
+            return;
+        }
+        let row = unsafe { hover_row_at_event(event as *mut c_void) };
+        set_hover_row(row);
+    });
 }
 
 /// Clear hover when leaving the whole picker. The fixed parent's InVisibleRect tracking area
 /// supplies this event independently of whether any row button receives mouseExited.
 extern "C" fn container_mouse_exited(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    if !REBUILDING.load(Ordering::SeqCst) {
-        set_hover_row(NO_SELECTION);
-    }
+    callback_guard::void("container_mouse_exited", || {
+        if !REBUILDING.load(Ordering::SeqCst) {
+            set_hover_row(NO_SELECTION);
+        }
+    });
 }
 
 /// Row-button class (NSButton subclass; mouseEntered: implements hover selection).
@@ -3336,25 +3345,27 @@ unsafe fn layer_matches_hex(layer: *mut AnyObject, expected: u32) -> bool {
 /// With search focus, the list has no keyboard-selected row, but filtered entries must still
 /// show their independent mouse-hover style.
 extern "C" fn row_button_mouse_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    // Ignore enters dispatched during a rebuild (prevents infinite recursion; see REBUILDING).
-    if REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    if unsafe { event_is_over_filter_popover(_event) } {
-        set_hover_row(NO_SELECTION);
-        return;
-    }
-    let idx: isize = unsafe { msg_send![_self, tag] };
-    if idx >= 0 {
-        // Hovering only sets the hovered row (the hover wash) and does NOT move the
-        // selection (the selection wash + the left bar) -- the selection moves via the
-        // keyboard arrows
-        // / clicks only. The two states stay independently visible, matching the mockup's
-        // separate .item:hover and .item.selected rules (auto-select-on-hover would always
-        // render the hovered row as the selected style, making them look identical).
-        // Incremental hover visuals, no rebuild.
-        set_hover_row(idx as usize);
-    }
+    callback_guard::void("row_button_mouse_entered", || {
+        // Ignore enters dispatched during a rebuild (prevents infinite recursion; see REBUILDING).
+        if REBUILDING.load(Ordering::SeqCst) {
+            return;
+        }
+        if unsafe { event_is_over_filter_popover(_event) } {
+            set_hover_row(NO_SELECTION);
+            return;
+        }
+        let idx: isize = unsafe { msg_send![_self, tag] };
+        if idx >= 0 {
+            // Hovering only sets the hovered row (the hover wash) and does NOT move the
+            // selection (the selection wash + the left bar) -- the selection moves via the
+            // keyboard arrows
+            // / clicks only. The two states stay independently visible, matching the mockup's
+            // separate .item:hover and .item.selected rules (auto-select-on-hover would always
+            // render the hovered row as the selected style, making them look identical).
+            // Incremental hover visuals, no rebuild.
+            set_hover_row(idx as usize);
+        }
+    });
 }
 
 /// Check whether the pointer is still inside the whole row, including its separate action buttons.
@@ -3391,16 +3402,18 @@ pub(super) fn clear_hover_row_if(idx: usize) {
 /// Mouse leaves a row button: clear hover only after leaving the whole row, so moving to the
 /// bottom-right action buttons does not hide them mid-transition.
 extern "C" fn row_button_mouse_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    if REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    let idx: isize = unsafe { msg_send![_self, tag] };
-    if idx >= 0 {
-        if unsafe { mouse_inside_row(event as *mut c_void, idx as usize) } {
+    callback_guard::void("row_button_mouse_exited", || {
+        if REBUILDING.load(Ordering::SeqCst) {
             return;
         }
-        clear_hover_row_if(idx as usize);
-    }
+        let idx: isize = unsafe { msg_send![_self, tag] };
+        if idx >= 0 {
+            if unsafe { mouse_inside_row(event as *mut c_void, idx as usize) } {
+                return;
+            }
+            clear_hover_row_if(idx as usize);
+        }
+    });
 }
 
 /// Row click (button tag = row index) -> paste that row; Option+click (when the setting
@@ -3412,64 +3425,68 @@ pub(super) extern "C" fn handle_clipboard_row_click(
     _cmd: Sel,
     sender: *mut c_void,
 ) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx >= 0 {
-        // NSEventModifierFlagOption (Alternate) = 1 << 19 = 0x08_0000. currentEvent is an
-        // INSTANCE method on NSApplication: go through sharedApplication first. Sending it
-        // to the Class object raises an unrecognized-selector exception that unwinds
-        // through AppKit's event loop and wedges the picker.
-        let option_held = unsafe {
-            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-            let ev: *mut AnyObject = if nsapp.is_null() {
-                std::ptr::null_mut()
-            } else {
-                msg_send![nsapp, currentEvent]
+    callback_guard::void("handle_clipboard_row_click", || {
+        let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        if idx >= 0 {
+            // NSEventModifierFlagOption (Alternate) = 1 << 19 = 0x08_0000. currentEvent is an
+            // INSTANCE method on NSApplication: go through sharedApplication first. Sending it
+            // to the Class object raises an unrecognized-selector exception that unwinds
+            // through AppKit's event loop and wedges the picker.
+            let option_held = unsafe {
+                let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+                let ev: *mut AnyObject = if nsapp.is_null() {
+                    std::ptr::null_mut()
+                } else {
+                    msg_send![nsapp, currentEvent]
+                };
+                if ev.is_null() {
+                    false
+                } else {
+                    let flags: u64 = msg_send![ev, modifierFlags];
+                    (flags & 0x0008_0000) != 0
+                }
             };
-            if ev.is_null() {
-                false
+            if option_held {
+                paste_at_ex(idx as usize, true);
             } else {
-                let flags: u64 = msg_send![ev, modifierFlags];
-                (flags & 0x0008_0000) != 0
+                paste_at(idx as usize);
             }
-        };
-        if option_held {
-            paste_at_ex(idx as usize, true);
-        } else {
-            paste_at(idx as usize);
         }
-    }
+    });
 }
 
 /// Pin-button callback (tag = display row index) -> mapped history index, pin/unpin, refresh.
 pub(super) extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx < 0 {
-        return;
-    }
-    let Some(h_idx) = mapped_index(idx as usize) else {
-        return;
-    };
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    let (now_pinned, new_h_idx) = toggle_pin_on(&mut hist, h_idx);
-    drop(hist);
-    save_history();
-    unsafe { rebuild_rows() };
-    // Follow-pin setting: select the toggled entry (the POST-REORDER index), then rebuild
-    // once more.
-    if selection_after_pin(new_h_idx) {
+    callback_guard::void("toggle_pin", || {
+        let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        if idx < 0 {
+            return;
+        }
+        let Some(h_idx) = mapped_index(idx as usize) else {
+            return;
+        };
+        let mut hist = CLIP_HISTORY.lock().unwrap();
+        let (now_pinned, new_h_idx) = toggle_pin_on(&mut hist, h_idx);
+        drop(hist);
+        save_history();
         unsafe { rebuild_rows() };
-    }
-    // Pinning changes the row position; reposition and refresh the detail panel from the
-    // current selection so it follows the reordered row.
-    if detail_visible() {
-        unsafe { show_detail_for_sel() };
-    }
-    let msg = if now_pinned {
-        t("clipboard.toast_pinned")
-    } else {
-        t("clipboard.toast_unpinned")
-    };
-    show_toast(&msg);
+        // Follow-pin setting: select the toggled entry (the POST-REORDER index), then rebuild
+        // once more.
+        if selection_after_pin(new_h_idx) {
+            unsafe { rebuild_rows() };
+        }
+        // Pinning changes the row position; reposition and refresh the detail panel from the
+        // current selection so it follows the reordered row.
+        if detail_visible() {
+            unsafe { show_detail_for_sel() };
+        }
+        let msg = if now_pinned {
+            t("clipboard.toast_pinned")
+        } else {
+            t("clipboard.toast_unpinned")
+        };
+        show_toast(&msg);
+    });
 }
 
 /// Move the selection after pin/unpin per `clipboard.pin_follow_selection`:
@@ -3503,24 +3520,26 @@ fn selection_after_pin(new_h_idx: usize) -> bool {
 /// detail); otherwise select the row and open/refresh the detail (a different row's click
 /// moves the detail along to the new row).
 pub(super) extern "C" fn show_item_details_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx < 0 {
-        return;
-    }
-    let previous = picker_selection();
-    // Detail already open AND the click is on the selected row -> this click cancels it.
-    let close = detail_visible() && previous == idx as usize;
-    set_picker_selection(idx as usize);
-    unsafe {
-        // A detail-button click only needs the incremental visual update for the old and new
-        // selection; rebuilding the entire clipboard list here made mouse opening feel slow.
-        refresh_selection(previous, idx as usize);
-        if close {
-            hide_detail();
-        } else {
-            show_detail_for_sel();
+    callback_guard::void("show_item_details_cb", || {
+        let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        if idx < 0 {
+            return;
         }
-    }
+        let previous = picker_selection();
+        // Detail already open AND the click is on the selected row -> this click cancels it.
+        let close = detail_visible() && previous == idx as usize;
+        set_picker_selection(idx as usize);
+        unsafe {
+            // A detail-button click only needs the incremental visual update for the old and new
+            // selection; rebuilding the entire clipboard list here made mouse opening feel slow.
+            refresh_selection(previous, idx as usize);
+            if close {
+                hide_detail();
+            } else {
+                show_detail_for_sel();
+            }
+        }
+    });
 }
 
 /// Keep an open detail panel on the selection after a delete: the selection stays in place and
@@ -3548,41 +3567,43 @@ unsafe fn retarget_detail_after_delete(incremental: bool) {
 }
 
 pub(super) extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    if idx < 0 {
-        return;
-    }
-    let Some(h_idx) = mapped_index(idx as usize) else {
-        return;
-    };
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    let Some(removed_entry) = remove_entry_for_undo(&mut hist, h_idx) else {
-        return;
-    };
-    // A deleted row ABOVE the selection shifts it down one (the same entry stays selected);
-    // deleting the selected row or a row below leaves it alone (the former points at the
-    // next entry). The no-selection sentinel (search-field focus) is untouched. The
-    // out-of-range clamp happens in rebuild_rows after FILTERED is recomputed -- this used
-    // to clamp the display index against hist.len(): correct only by coincidence without a
-    // search query, dimensionally wrong under a filter, and still past the list after
-    // deleting the tail (the lost highlight).
-    let previous = picker_selection();
-    let deleted_selected = previous != NO_SELECTION && previous == idx as usize;
-    if previous != NO_SELECTION && (idx as usize) < previous {
-        set_picker_selection(previous - 1);
-    }
-    drop(hist);
-    remember_deleted_clipboard_entry(removed_entry, h_idx);
-    let incremental = unsafe { try_delete_picker_row_incremental(idx as usize) };
-    save_history();
-    if !incremental {
-        schedule_picker_refresh();
-    }
-    // The detail panel follows the selected entry; when the deleted row WAS the selection,
-    // retarget it onto the entry that took the slot rather than collapsing it.
-    if deleted_selected {
-        unsafe { retarget_detail_after_delete(incremental) };
-    }
+    callback_guard::void("delete_entry_cb", || {
+        let idx: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        if idx < 0 {
+            return;
+        }
+        let Some(h_idx) = mapped_index(idx as usize) else {
+            return;
+        };
+        let mut hist = CLIP_HISTORY.lock().unwrap();
+        let Some(removed_entry) = remove_entry_for_undo(&mut hist, h_idx) else {
+            return;
+        };
+        // A deleted row ABOVE the selection shifts it down one (the same entry stays selected);
+        // deleting the selected row or a row below leaves it alone (the former points at the
+        // next entry). The no-selection sentinel (search-field focus) is untouched. The
+        // out-of-range clamp happens in rebuild_rows after FILTERED is recomputed -- this used
+        // to clamp the display index against hist.len(): correct only by coincidence without a
+        // search query, dimensionally wrong under a filter, and still past the list after
+        // deleting the tail (the lost highlight).
+        let previous = picker_selection();
+        let deleted_selected = previous != NO_SELECTION && previous == idx as usize;
+        if previous != NO_SELECTION && (idx as usize) < previous {
+            set_picker_selection(previous - 1);
+        }
+        drop(hist);
+        remember_deleted_clipboard_entry(removed_entry, h_idx);
+        let incremental = unsafe { try_delete_picker_row_incremental(idx as usize) };
+        save_history();
+        if !incremental {
+            schedule_picker_refresh();
+        }
+        // The detail panel follows the selected entry; when the deleted row WAS the selection,
+        // retarget it onto the entry that took the slot rather than collapsing it.
+        if deleted_selected {
+            unsafe { retarget_detail_after_delete(incremental) };
+        }
+    });
 }
 
 /// Paste the entry at display `idx` (mapped through FILTERED): close the picker + write back
@@ -3872,7 +3893,7 @@ pub(super) fn clamp_selection(sel: usize, len: usize) -> usize {
 /// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
 /// aborts the process), so it is contained here.
 pub(super) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    crate::callback_guard::void("container_key_down", || unsafe {
+    callback_guard::void("container_key_down", || unsafe {
         container_key_down_inner(_self, _cmd, event)
     });
 }
@@ -4219,14 +4240,22 @@ extern "C" fn container_accepts_first_responder(
     _cmd: Sel,
 ) -> objc2::runtime::Bool {
     // Objective-C BOOL, not Rust bool: this is what the class's "B@:" encoding declares.
-    objc2::runtime::Bool::YES
+    callback_guard::value(
+        "container_accepts_first_responder",
+        objc2::runtime::Bool::YES,
+        || objc2::runtime::Bool::YES,
+    )
 }
 
 extern "C" fn picker_window_can_become_key(
     _self: *mut AnyObject,
     _cmd: Sel,
 ) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    callback_guard::value(
+        "picker_window_can_become_key",
+        objc2::runtime::Bool::YES,
+        || objc2::runtime::Bool::YES,
+    )
 }
 
 /// The popover's frame inside the picker's content parent: anchored under the options orb at the
@@ -4401,7 +4430,7 @@ extern "C" fn popover_decoration_hit_test(
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
-    std::ptr::null_mut()
+    callback_guard::nil("popover_decoration_hit_test", std::ptr::null_mut)
 }
 
 fn popover_decoration_class() -> *mut AnyObject {
@@ -4805,7 +4834,11 @@ fn filter_popover_class() -> *mut AnyObject {
 
 /// The popover is flipped: origin at its top-left, rows stack downwards.
 extern "C" fn filter_popover_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    callback_guard::value(
+        "filter_popover_is_flipped",
+        objc2::runtime::Bool::YES,
+        || objc2::runtime::Bool::YES,
+    )
 }
 
 /// Remove the popover's view without touching the open flag. `build_filter_popover` calls this so a

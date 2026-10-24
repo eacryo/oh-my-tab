@@ -87,9 +87,11 @@ pub(crate) fn vibrant_label_class() -> *mut AnyObject {
 }
 
 extern "C" fn vibrant_label_allows_vibrancy(_self: *mut AnyObject, _cmd: Sel) -> Bool {
-    // The override returns Objective-C BOOL ('B' encoding on arm64), which objc2 models as
-    // `Bool`; a plain Rust `bool` has no `Encode` impl and cannot be a method return.
-    Bool::YES
+    crate::callback_guard::value("vibrant_label_allows_vibrancy", Bool::YES, || {
+        // The override returns Objective-C BOOL ('B' encoding on arm64), which objc2 models as
+        // `Bool`; a plain Rust `bool` has no `Encode` impl and cannot be a method return.
+        Bool::YES
+    })
 }
 
 /// Opacity of the theme-surface scrim.
@@ -984,17 +986,19 @@ extern "C" fn outline_hit_test(
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
-    // Never the hit-test result: the decoration must not intercept the panel's own input.
-    std::ptr::null_mut()
+    crate::callback_guard::nil("outline_hit_test", || {
+        // Never the hit-test result: the decoration must not intercept the panel's own input.
+        std::ptr::null_mut()
+    })
 }
 
 extern "C" fn outline_drop(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
-    unsafe {
+    crate::callback_guard::void("outline_drop", || unsafe {
         let layer: *mut AnyObject = msg_send![_self, layer];
         if !layer.is_null() {
             let _: () = msg_send![layer, setBorderWidth: 0.0f64];
         }
-    }
+    });
 }
 
 /// Create the outline decoration for `parent` (the material hierarchy's root, whose bounds are the panel
@@ -1154,11 +1158,13 @@ pub(crate) fn forget_carrier_shadow_path(carrier: *mut AnyObject) {
 }
 
 extern "C" fn carrier_layout(_self: *mut AnyObject, _cmd: Sel) {
-    unsafe { sync_carrier_shadow_path(_self) };
+    crate::callback_guard::void("carrier_layout", || {
+        unsafe { sync_carrier_shadow_path(_self) };
+    });
 }
 
 extern "C" fn carrier_drop_shadow(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
-    unsafe {
+    crate::callback_guard::void("carrier_drop_shadow", || unsafe {
         let Some(shadow_layer) = CARRIER_GEOMETRY
             .lock()
             .unwrap()
@@ -1168,7 +1174,7 @@ extern "C" fn carrier_drop_shadow(_self: *mut AnyObject, _cmd: Sel, _sender: *mu
             return;
         };
         let _: () = msg_send![shadow_layer as *mut AnyObject, setShadowOpacity: 0.0f32];
-    }
+    });
 }
 
 /// Wrap `root` (the material hierarchy's root, framed as the panel rect) in a shadow carrier. Returns the
@@ -1883,17 +1889,19 @@ fn frost_veil_view_class() -> *mut AnyObject {
 }
 
 extern "C" fn frost_veil_layout(this: *mut AnyObject, _cmd: Sel) {
-    unsafe {
-        // NSImageView's own layout runs first; the defined class is this subclass (see ObjcSuper).
-        type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> ();
-        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
-            this as *mut c_void,
-            frost_veil_view_class_handle(),
-        );
-        let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
-        send(&mut sup, sel!(layout));
-        sync_veil_gradient_points(this);
-    }
+    crate::callback_guard::void("frost_veil_layout", || {
+        unsafe {
+            // NSImageView's own layout runs first; the defined class is this subclass (see ObjcSuper).
+            type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> ();
+            let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+                this as *mut c_void,
+                frost_veil_view_class_handle(),
+            );
+            let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+            send(&mut sup, sel!(layout));
+            sync_veil_gradient_points(this);
+        }
+    });
 }
 
 /// Re-point the veil's gradient sublayer at the view's current size. `CATransaction` actions are

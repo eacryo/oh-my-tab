@@ -142,7 +142,7 @@ pub(crate) extern "C" fn overlay_window_perform_key_equivalent(
     _cmd: Sel,
     event: *mut AnyObject,
 ) -> bool {
-    crate::callback_guard::bool("overlay_window_perform_key_equivalent", false, || unsafe {
+    callback_guard::bool("overlay_window_perform_key_equivalent", false, || unsafe {
         overlay_perform_key_equivalent_inner(event)
     })
 }
@@ -319,7 +319,7 @@ fn schedule_panel_action_refresh() {
 /// sequence of actions costs one pass, and a slow or cancelled operation is corrected later by its
 /// own lifecycle notification.
 pub(crate) extern "C" fn on_panel_action_refresh(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    crate::callback_guard::void("on_panel_action_refresh", || {
+    callback_guard::void("on_panel_action_refresh", || {
         // The panel may have closed in the meantime: a refresh into a hidden overlay would be
         // wasted work, and the session is over anyway.
         if !with_tab_state(|state_opt| state_opt.as_ref().is_some_and(|state| state.visible)) {

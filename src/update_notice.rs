@@ -19,6 +19,7 @@ use std::ffi::{c_void, CString};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, Once, OnceLock};
 
+use crate::callback_guard;
 use crate::ffi::{
     bundle_info_string, make_nsstring, nsstring_to_rust, objc_msgSend, release_obj, CallbackTarget,
 };
@@ -88,25 +89,31 @@ unsafe extern "C" fn auth_completion(
     granted: bool,
     error: *mut c_void,
 ) {
-    if !granted {
-        log_debug!("[update-notice] notification authorization denied; skipping");
-        *PENDING_NOTICE.lock().unwrap() = None;
-        return;
-    }
-    if !error.is_null() {
-        log_debug!("[update-notice] authorization returned an error object despite granted=YES");
-    }
-    let Some((title, body, identifier)) = PENDING_NOTICE.lock().unwrap().take() else {
-        return;
-    };
-    add_notification_request(&title, &body, &identifier);
+    callback_guard::void("auth_completion", || {
+        if !granted {
+            log_debug!("[update-notice] notification authorization denied; skipping");
+            *PENDING_NOTICE.lock().unwrap() = None;
+            return;
+        }
+        if !error.is_null() {
+            log_debug!(
+                "[update-notice] authorization returned an error object despite granted=YES"
+            );
+        }
+        let Some((title, body, identifier)) = PENDING_NOTICE.lock().unwrap().take() else {
+            return;
+        };
+        add_notification_request(&title, &body, &identifier)
+    });
 }
 
 /// add completion: only logs failures.
 unsafe extern "C" fn add_completion(_block: *const AddCompletionBlock, error: *mut c_void) {
-    if !error.is_null() {
-        log_debug!("[update-notice] addNotificationRequest returned an error");
-    }
+    callback_guard::void("add_completion", || {
+        if !error.is_null() {
+            log_debug!("[update-notice] addNotificationRequest returned an error");
+        }
+    });
 }
 
 static AUTH_BLOCK: AuthCompletionBlock = AuthCompletionBlock {
@@ -137,34 +144,38 @@ unsafe extern "C" fn did_receive_notification_response(
     response: *mut c_void,
     completion: *mut c_void,
 ) {
-    let notification: *mut AnyObject = msg_send![response as *mut AnyObject, notification];
-    let request: *mut AnyObject = msg_send![notification, request];
-    let identifier: *mut AnyObject = msg_send![request, identifier];
-    let ours = make_nsstring(ID_UPDATE_AVAILABLE);
-    let matched: bool = msg_send![identifier, isEqualToString: ours];
-    release_obj(ours);
-    if matched {
-        let _: () = msg_send![_this as *mut AnyObject,
-            performSelectorOnMainThread: sel!(handleUpdateAvailableClick),
-            withObject: std::ptr::null::<AnyObject>(),
-            waitUntilDone: false
-        ];
-    }
-    if !completion.is_null() {
-        // A zero-argument block: call its invoke slot directly.
-        let invoke = *(completion as *const *const c_void).add(2);
-        let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(invoke);
-        f(completion);
-    }
+    callback_guard::void("did_receive_notification_response", || {
+        let notification: *mut AnyObject = msg_send![response as *mut AnyObject, notification];
+        let request: *mut AnyObject = msg_send![notification, request];
+        let identifier: *mut AnyObject = msg_send![request, identifier];
+        let ours = make_nsstring(ID_UPDATE_AVAILABLE);
+        let matched: bool = msg_send![identifier, isEqualToString: ours];
+        release_obj(ours);
+        if matched {
+            let _: () = msg_send![_this as *mut AnyObject,
+                performSelectorOnMainThread: sel!(handleUpdateAvailableClick),
+                withObject: std::ptr::null::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+        if !completion.is_null() {
+            // A zero-argument block: call its invoke slot directly.
+            let invoke = *(completion as *const *const c_void).add(2);
+            let f: unsafe extern "C" fn(*mut c_void) = std::mem::transmute(invoke);
+            f(completion);
+        }
+    });
 }
 
 /// Notification click (main thread): activate the app and run a user-initiated check in
 /// the Settings About page.
 unsafe extern "C" fn handle_update_available_click(_this: *mut c_void, _cmd: Sel) {
-    // Open the settings window's About page with an inline check; show_settings handles
-    // activation and raising (NSApplication's activateIgnoringOtherApps: still works on
-    // macOS 26, unlike the NSRunningApplication variants).
-    crate::settings::open_about_updates();
+    callback_guard::void("handle_update_available_click", || {
+        // Open the settings window's About page with an inline check; show_settings handles
+        // activation and raising (NSApplication's activateIgnoringOtherApps: still works on
+        // macOS 26, unlike the NSRunningApplication variants).
+        crate::settings::open_about_updates();
+    });
 }
 
 /// UNUserNotificationCenterDelegate.willPresentNotification:withCompletionHandler:.
@@ -177,20 +188,22 @@ unsafe extern "C" fn will_present_notification(
     _notification: *mut c_void,
     completion: *mut c_void,
 ) {
-    if completion.is_null() {
-        return;
-    }
-    // The selector carries THREE explicit arguments (center, notification, completion handler), so
-    // the callback must take all three: with only two, `completion` received the *notification*
-    // object and the hand-rolled invoke below called into it, which is what crashed with SIGBUS
-    // (2026-10-08). `--smoke-settings-layout` sends this selector with all three arguments and a
-    // real block, so an arity slip fails there instead of in the field.
-    // Logged because this callback only runs while the app is frontmost -- the one case the other
-    // evidence (the banner captured with another app frontmost) cannot cover.
-    log_debug!("[update-notice] willPresent: banner requested");
-    let block: &block2::Block<dyn Fn(usize)> =
-        unsafe { &*(completion as *const block2::Block<dyn Fn(usize)>) };
-    block.call((PRESENT_BANNER_SOUND,));
+    callback_guard::void("will_present_notification", || {
+        if completion.is_null() {
+            return;
+        }
+        // The selector carries THREE explicit arguments (center, notification, completion handler), so
+        // the callback must take all three: with only two, `completion` received the *notification*
+        // object and the hand-rolled invoke below called into it, which is what crashed with SIGBUS
+        // (2026-10-08). `--smoke-settings-layout` sends this selector with all three arguments and a
+        // real block, so an arity slip fails there instead of in the field.
+        // Logged because this callback only runs while the app is frontmost -- the one case the other
+        // evidence (the banner captured with another app frontmost) cannot cover.
+        log_debug!("[update-notice] willPresent: banner requested");
+        let block: &block2::Block<dyn Fn(usize)> =
+            unsafe { &*(completion as *const block2::Block<dyn Fn(usize)>) };
+        block.call((PRESENT_BANNER_SOUND,));
+    });
 }
 
 /// Smoke check (tier A, `--smoke-settings-layout`): send the delegate the exact

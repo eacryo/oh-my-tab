@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::Instant; // TIMING-DEBUG
 
+use crate::callback_guard;
 use crate::config::CONFIG;
 use crate::event_tap;
 use crate::event_tap::keyboard;
@@ -1154,6 +1155,7 @@ mod tests {
     use super::CardReconcileAction;
     use super::CardSignature;
     use super::CARD_AREA_TOP_INSET;
+    use crate::smoke_verdict::smoke_runner;
     use crate::window_collector::{MruMap, WindowInfo};
     use objc2_foundation::{NSPoint, NSRect, NSSize};
     use std::time::Instant;
@@ -1652,27 +1654,11 @@ mod tests {
     #[test]
     #[ignore]
     fn overlay_runtime_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-overlay")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "overlay runtime smoke failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("overlay_runtime_smoke", 1, {
+            // The child is the process that ran the assertions, so its recorded verdict is
+            // what this parent reports; it never infers one from the exit status.
+            crate::smoke_verdict::run_smoke_child("overlay_runtime_smoke", &["--smoke-overlay"]);
+        });
     }
 }
 
@@ -2037,8 +2023,10 @@ pub(crate) extern "C" fn on_display_reconfiguration(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    DISPLAY_RECONFIG_REFRESH_SCHEDULED.store(false, Ordering::SeqCst);
-    handle_display_reconfiguration();
+    callback_guard::void("on_display_reconfiguration", || {
+        DISPLAY_RECONFIG_REFRESH_SCHEDULED.store(false, Ordering::SeqCst);
+        handle_display_reconfiguration();
+    });
 }
 
 /// Single refresh entry after a display reconfiguration (external/built-in

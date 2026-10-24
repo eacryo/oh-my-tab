@@ -85,7 +85,7 @@ fn footer_settings_button_class_handle() -> StaticClass {
 }
 
 extern "C" fn footer_settings_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    crate::callback_guard::void("footer_settings_mouse_down", || unsafe {
+    callback_guard::void("footer_settings_mouse_down", || unsafe {
         arm();
         set_footer_settings_style(_self, true);
         // NSButton's own mouseDown: runs the highlight/press tracking loop without which the button
@@ -103,13 +103,13 @@ extern "C" fn footer_settings_mouse_down(_self: *mut AnyObject, _cmd: Sel, event
 }
 
 extern "C" fn footer_settings_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    crate::callback_guard::void("footer_settings_entered", || unsafe {
+    callback_guard::void("footer_settings_entered", || unsafe {
         set_footer_settings_style(_self, true);
     });
 }
 
 extern "C" fn footer_settings_exited(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    crate::callback_guard::void("footer_settings_exited", || unsafe {
+    callback_guard::void("footer_settings_exited", || unsafe {
         // Leaving the button during the press cancels the gesture: the action will still be sent on
         // mouseUp (AppKit tracks the press), so the arm flag is what tells it apart from a real click.
         disarm();

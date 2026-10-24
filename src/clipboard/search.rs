@@ -4,6 +4,7 @@
 //! controller. Keeping the drawing class here reduces the controller's UI surface area.
 
 use super::*;
+use crate::callback_guard;
 
 /// The search field cell class (an NSSearchFieldCell subclass overriding
 /// drawInteriorWithFrame:inView:), which centers the icon and placeholder as a group.
@@ -308,59 +309,61 @@ extern "C" fn search_cell_draw_interior(
     cell_frame: NSRect,
     control_view: *mut AnyObject,
 ) {
-    unsafe {
-        // Editing detection: a live field editor means editing (no placeholder; super).
-        let editing = if control_view.is_null() {
-            false
-        } else {
-            let editor: *mut AnyObject = msg_send![control_view, currentEditor];
-            !editor.is_null()
-        };
-        let str_obj: *mut AnyObject = msg_send![_self, stringValue];
-        let str_len: usize = msg_send![str_obj, length];
-        // An unfocused field may still retain a query after ↓ moves focus into the list. Draw
-        // the placeholder only while it is empty; otherwise super must draw the entered query.
-        if !editing && str_len > 0 {
-            draw_retained_search_query(cell_frame, str_obj);
-            return;
-        }
-        if editing && str_len > 0 {
-            // The field editor draws text; hand-draw the icon so NSSearchField's stock glyph
-            // never replaces the initial ⌕ after typing.
-            let _ = draw_search_icon_prefix(cell_frame);
-            draw_search_keycap(cell_frame);
-            draw_search_clear(cell_frame);
-            return;
-        }
-        if !editing && str_len == 0 {
-            // Center the three independent flex items (⌕, hint, ⌘F) by their own sizes in the
-            // 40pt field.
-            if draw_search_icon_prefix(cell_frame).is_some() {
-                draw_search_placeholder(cell_frame);
-                draw_search_keycap(cell_frame);
+    callback_guard::void("search_cell_draw_interior", || {
+        unsafe {
+            // Editing detection: a live field editor means editing (no placeholder; super).
+            let editing = if control_view.is_null() {
+                false
+            } else {
+                let editor: *mut AnyObject = msg_send![control_view, currentEditor];
+                !editor.is_null()
+            };
+            let str_obj: *mut AnyObject = msg_send![_self, stringValue];
+            let str_len: usize = msg_send![str_obj, length];
+            // An unfocused field may still retain a query after ↓ moves focus into the list. Draw
+            // the placeholder only while it is empty; otherwise super must draw the entered query.
+            if !editing && str_len > 0 {
+                draw_retained_search_query(cell_frame, str_obj);
                 return;
             }
+            if editing && str_len > 0 {
+                // The field editor draws text; hand-draw the icon so NSSearchField's stock glyph
+                // never replaces the initial ⌕ after typing.
+                let _ = draw_search_icon_prefix(cell_frame);
+                draw_search_keycap(cell_frame);
+                draw_search_clear(cell_frame);
+                return;
+            }
+            if !editing && str_len == 0 {
+                // Center the three independent flex items (⌕, hint, ⌘F) by their own sizes in the
+                // 40pt field.
+                if draw_search_icon_prefix(cell_frame).is_some() {
+                    draw_search_placeholder(cell_frame);
+                    draw_search_keycap(cell_frame);
+                    return;
+                }
+            }
+            // An empty editing string is fully drawn by outer drawWithFrame:, so do not draw it
+            // here again. With text (including a query retained after ↓ gives up focus), super draws
+            // the icon and field value.
+            if str_len == 0 {
+                return;
+            }
+            // Raw objc_msgSendSuper: objc2's msg_send! infinitely recurses in signature
+            // verification for the nested-struct encoding (observed stack overflow); CG
+            // structs must go through raw FFI (same as ffi::layer_set_*).
+            type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut AnyObject) -> ();
+            let mut sup =
+                ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
+            let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            f(
+                &mut sup,
+                sel!(drawInteriorWithFrame:inView:),
+                cell_frame,
+                control_view,
+            );
         }
-        // An empty editing string is fully drawn by outer drawWithFrame:, so do not draw it
-        // here again. With text (including a query retained after ↓ gives up focus), super draws
-        // the icon and field value.
-        if str_len == 0 {
-            return;
-        }
-        // Raw objc_msgSendSuper: objc2's msg_send! infinitely recurses in signature
-        // verification for the nested-struct encoding (observed stack overflow); CG
-        // structs must go through raw FFI (same as ffi::layer_set_*).
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut AnyObject) -> ();
-        let mut sup =
-            ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
-        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        f(
-            &mut sup,
-            sel!(drawInteriorWithFrame:inView:),
-            cell_frame,
-            control_view,
-        );
-    }
+    });
 }
 
 /// Outer drawing: with an empty editing string, do not call super (which would paint its
@@ -372,45 +375,47 @@ extern "C" fn search_cell_draw_with_frame(
     cell_frame: NSRect,
     control_view: *mut AnyObject,
 ) {
-    unsafe {
-        // Editing detection (same as drawInterior).
-        let editing = if control_view.is_null() {
-            false
-        } else {
-            let editor: *mut AnyObject = msg_send![control_view, currentEditor];
-            !editor.is_null()
-        };
-        // The rounded field surface is a sibling NSView behind NSSearchField. AppKit's cell
-        // drawing pass repaints its backing layer, so painting the surface here gets covered.
-        if editing {
-            let str_obj: *mut AnyObject = msg_send![_self, stringValue];
-            let str_len: usize = msg_send![str_obj, length];
-            if str_len == 0 {
-                // Focused with an empty stringValue -> draw ONLY the magnifier and the
-                // ⌘F keycap, never the placeholder text. During IME composition the
-                // pinyin lives in the field editor as marked text (stringValue stays
-                // empty), so this branch is active too -- drawing the placeholder here
-                // would put the pre-edit string right on top of "Search clipboard".
-                // The hint hides on focus (native search-field behavior); the keycap
-                // hugs the right edge away from the caret and stays.
-                let _ = draw_search_icon_prefix(cell_frame);
-                draw_search_keycap(cell_frame);
-                return;
+    callback_guard::void("search_cell_draw_with_frame", || {
+        unsafe {
+            // Editing detection (same as drawInterior).
+            let editing = if control_view.is_null() {
+                false
+            } else {
+                let editor: *mut AnyObject = msg_send![control_view, currentEditor];
+                !editor.is_null()
+            };
+            // The rounded field surface is a sibling NSView behind NSSearchField. AppKit's cell
+            // drawing pass repaints its backing layer, so painting the surface here gets covered.
+            if editing {
+                let str_obj: *mut AnyObject = msg_send![_self, stringValue];
+                let str_len: usize = msg_send![str_obj, length];
+                if str_len == 0 {
+                    // Focused with an empty stringValue -> draw ONLY the magnifier and the
+                    // ⌘F keycap, never the placeholder text. During IME composition the
+                    // pinyin lives in the field editor as marked text (stringValue stays
+                    // empty), so this branch is active too -- drawing the placeholder here
+                    // would put the pre-edit string right on top of "Search clipboard".
+                    // The hint hides on focus (native search-field behavior); the keycap
+                    // hugs the right edge away from the caret and stays.
+                    let _ = draw_search_icon_prefix(cell_frame);
+                    draw_search_keycap(cell_frame);
+                    return;
+                }
             }
+            // Raw objc_msgSendSuper (same as drawInterior; the struct encoding goes through
+            // raw FFI).
+            type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut AnyObject) -> ();
+            let mut sup =
+                ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
+            let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            f(
+                &mut sup,
+                sel!(drawWithFrame:inView:),
+                cell_frame,
+                control_view,
+            );
         }
-        // Raw objc_msgSendSuper (same as drawInterior; the struct encoding goes through
-        // raw FFI).
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect, *mut AnyObject) -> ();
-        let mut sup =
-            ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
-        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        f(
-            &mut sup,
-            sel!(drawWithFrame:inView:),
-            cell_frame,
-            control_view,
-        );
-    }
+    });
 }
 
 /// Edit-start positioning override: calls the superclass first (icon inset / selection
@@ -427,77 +432,80 @@ extern "C" fn search_cell_select_with_frame(
     sel_start: isize,
     sel_length: isize,
 ) {
-    unsafe {
-        // Raw objc_msgSendSuper (same as drawWithFrame; the struct encoding goes through
-        // raw FFI).
-        type F = unsafe extern "C" fn(
-            *mut ObjcSuper,
-            Sel,
-            NSRect,
-            *mut AnyObject,
-            *mut AnyObject,
-            *mut AnyObject,
-            isize,
-            isize,
-        ) -> ();
-        let mut sup =
-            ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
-        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        f(
-            &mut sup,
-            sel!(selectWithFrame:inView:editor:delegate:start:length:),
-            rect,
-            control_view,
-            editor,
-            delegate,
-            sel_start,
-            sel_length,
-        );
-        // The system resets the editor frame during later layout (so setFrame is ineffective),
-        // whereas textContainerInset persists. Typing must start after the 12pt field padding
-        // plus 22pt icon column, exactly matching draw_retained_search_query after ↓ moves
-        // focus to the list, so the text never shifts horizontally.
-        if !editor.is_null() && rect.size.height > 0.0 && !control_view.is_null() {
-            let font: *mut AnyObject = msg_send![_self, font];
-            if !font.is_null() {
-                // Force the live field editor to the same font as the hand-drawn unfocused
-                // query. Setting NSSearchField alone does not always override a reused shared
-                // field editor's default font.
-                let _: () = msg_send![editor, setFont: font];
-                // The caret/line-fragment height is the font's lineHeight (measured 17.0),
-                // not asc-desc+lead (16.49): centering by the latter leaves the 17pt-tall
-                // fragment/caret center at 20.25, 0.25pt off the field's center.
-                let line_h: f64 = msg_send![font, lineHeight];
-                if line_h > 0.0 && line_h < rect.size.height {
-                    // Vertical centering must be computed against the editor's TOP in the
-                    // field's coordinate system: the typed text's top edge = the editor's
-                    // top offset above the field + the inset, and the line box's center must
-                    // land on the field's vertical center. The old code ADDED the frame's
-                    // height excess to the inset, which inflated the shared field editor by
-                    // 2/4/8/16pt on every focus (a positive feedback loop -- the bigger the
-                    // inset, the taller it grew), drifting the text lower each cycle. Now the
-                    // editor's top offset (converted into field coordinates) is SUBTRACTED,
-                    // so the inset self-corrects against the editor's real position: the text
-                    // stays centered and the editor stops growing.
-                    let ed_bounds: NSRect = msg_send![editor, bounds];
-                    let in_field: NSRect =
-                        msg_send![control_view, convertRect: ed_bounds, fromView: editor];
-                    // How far the editor's top sits above the field's top (non-flipped:
-                    // the top edge is maxY).
-                    let top_offset = in_field.origin.y + in_field.size.height - rect.size.height;
-                    let vertical = ((rect.size.height - line_h) / 2.0 - top_offset).max(0.0);
-                    let _: () = msg_send![
-                        editor,
-                        setTextContainerInset: NSSize::new(SEARCH_PAD_IN + SEARCH_ICON_W, vertical)
-                    ];
-                    // NSTextContainer's default lineFragmentPadding = 2 pushes the typed text
-                    // 2pt right of the hand-drawn retained query's start (12 + 22 = 34),
-                    // making the text jump left on ↓. Zeroing it makes the glyphs start at
-                    // the container origin (the inset start), matching the hand-drawn x.
-                    let tc: *mut AnyObject = msg_send![editor, textContainer];
-                    let _: () = msg_send![tc, setLineFragmentPadding: 0.0];
+    callback_guard::void("search_cell_select_with_frame", || {
+        unsafe {
+            // Raw objc_msgSendSuper (same as drawWithFrame; the struct encoding goes through
+            // raw FFI).
+            type F = unsafe extern "C" fn(
+                *mut ObjcSuper,
+                Sel,
+                NSRect,
+                *mut AnyObject,
+                *mut AnyObject,
+                *mut AnyObject,
+                isize,
+                isize,
+            ) -> ();
+            let mut sup =
+                ObjcSuper::for_defined_class(_self as *mut c_void, search_cell_class_handle());
+            let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            f(
+                &mut sup,
+                sel!(selectWithFrame:inView:editor:delegate:start:length:),
+                rect,
+                control_view,
+                editor,
+                delegate,
+                sel_start,
+                sel_length,
+            );
+            // The system resets the editor frame during later layout (so setFrame is ineffective),
+            // whereas textContainerInset persists. Typing must start after the 12pt field padding
+            // plus 22pt icon column, exactly matching draw_retained_search_query after ↓ moves
+            // focus to the list, so the text never shifts horizontally.
+            if !editor.is_null() && rect.size.height > 0.0 && !control_view.is_null() {
+                let font: *mut AnyObject = msg_send![_self, font];
+                if !font.is_null() {
+                    // Force the live field editor to the same font as the hand-drawn unfocused
+                    // query. Setting NSSearchField alone does not always override a reused shared
+                    // field editor's default font.
+                    let _: () = msg_send![editor, setFont: font];
+                    // The caret/line-fragment height is the font's lineHeight (measured 17.0),
+                    // not asc-desc+lead (16.49): centering by the latter leaves the 17pt-tall
+                    // fragment/caret center at 20.25, 0.25pt off the field's center.
+                    let line_h: f64 = msg_send![font, lineHeight];
+                    if line_h > 0.0 && line_h < rect.size.height {
+                        // Vertical centering must be computed against the editor's TOP in the
+                        // field's coordinate system: the typed text's top edge = the editor's
+                        // top offset above the field + the inset, and the line box's center must
+                        // land on the field's vertical center. The old code ADDED the frame's
+                        // height excess to the inset, which inflated the shared field editor by
+                        // 2/4/8/16pt on every focus (a positive feedback loop -- the bigger the
+                        // inset, the taller it grew), drifting the text lower each cycle. Now the
+                        // editor's top offset (converted into field coordinates) is SUBTRACTED,
+                        // so the inset self-corrects against the editor's real position: the text
+                        // stays centered and the editor stops growing.
+                        let ed_bounds: NSRect = msg_send![editor, bounds];
+                        let in_field: NSRect =
+                            msg_send![control_view, convertRect: ed_bounds, fromView: editor];
+                        // How far the editor's top sits above the field's top (non-flipped:
+                        // the top edge is maxY).
+                        let top_offset =
+                            in_field.origin.y + in_field.size.height - rect.size.height;
+                        let vertical = ((rect.size.height - line_h) / 2.0 - top_offset).max(0.0);
+                        let _: () = msg_send![
+                            editor,
+                            setTextContainerInset: NSSize::new(SEARCH_PAD_IN + SEARCH_ICON_W, vertical)
+                        ];
+                        // NSTextContainer's default lineFragmentPadding = 2 pushes the typed text
+                        // 2pt right of the hand-drawn retained query's start (12 + 22 = 34),
+                        // making the text jump left on ↓. Zeroing it makes the glyphs start at
+                        // the container origin (the inset start), matching the hand-drawn x.
+                        let tc: *mut AnyObject = msg_send![editor, textContainer];
+                        let _: () = msg_send![tc, setLineFragmentPadding: 0.0];
+                    }
                 }
             }
         }
-    }
+    });
 }

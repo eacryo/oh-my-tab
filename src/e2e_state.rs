@@ -1080,8 +1080,9 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             .map(|entry| json_string(&entry.bundle_id))
             .collect();
         json.push_str(&format!(
-            "  \"clipboard_privacy\": {{\"paused\": {}, \"excluded_count\": {}, \"excluded_apps\": [{}]}},\n",
+            "  \"clipboard_privacy\": {{\"paused\": {}, \"gate\": \"{}\", \"excluded_count\": {}, \"excluded_apps\": [{}]}},\n",
             paused,
+            crate::clipboard::collection_gate_state(),
             excluded.len(),
             ids.join(", ")
         ));

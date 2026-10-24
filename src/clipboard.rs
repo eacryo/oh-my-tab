@@ -31,6 +31,7 @@
 //!   removes orphan files. Files are also removed in sync with delete/clear-all/trim. A separate `{hash}.detail` preview (longest
 //!   edge <= 1280px, pregenerated in the background at record time with a first-open
 //!   fallback, never held in RAM) feeds the detail panel and shares the same deletion lifecycle.
+use crate::callback_guard;
 use crate::clipboard_highlight::{
     apply_code_paragraph_styles, apply_link_color, apply_visible_space_markers, classify_text,
     prepare_code_display, prepare_code_for_soft_wrap, prepare_code_no_wrap_display,
@@ -984,13 +985,6 @@ pub(super) fn advance_baseline() -> bool {
     changed
 }
 
-/// Whether a config change is a genuine pause -> resume transition, which must re-baseline. A
-/// startup or an ordinary enable deliberately keeps the documented "record the current pasteboard"
-/// behaviour, so it must not be treated as a resume.
-pub(super) fn is_resume_transition(old_paused: bool, new_paused: bool) -> bool {
-    old_paused && !new_paused
-}
-
 /// Pause or resume recording. Returns the **effective** paused state: `true` means recording stays
 /// off, which also happens when a resume cannot read the pasteboard -- the caller must then keep the
 /// persisted intent and every surface (config, menu, settings switch) in the paused state.
@@ -1107,11 +1101,27 @@ pub(super) extern "C" fn toggle_pause_recording(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    toggle_paused_intent();
+    callback_guard::void("toggle_pause_recording", || {
+        toggle_paused_intent();
+    });
 }
 
 /// The privacy controls as the running process sees them: the effective pause state and the
 /// exclusion list. Read by `--e2e-state` so a scenario can assert them without guessing from UI.
+/// The effective collection gate as a word a scenario can assert: `paused`, `baselining` or `active`.
+///
+/// The ticker gate is the one place where an intent (`config.clipboard.paused`) and the effective
+/// state can legitimately differ -- while a resume has not yet adopted its baseline -- and that
+/// difference is invisible from the outside: both states refuse to record. A state field is what makes
+/// the difference assertable, which is the cheapest form of the promotion rule that fits here.
+pub(crate) fn collection_gate_state() -> &'static str {
+    match collection_gate() {
+        CollectionGate::Active => "active",
+        CollectionGate::Paused => "paused",
+        CollectionGate::Baselining => "baselining",
+    }
+}
+
 pub(crate) fn privacy_state_for_e2e() -> (bool, Vec<crate::config::ExcludedApp>) {
     let paused = collection_paused() || CONFIG.read().map(|c| c.clipboard.paused).unwrap_or(false);
     let excluded = CONFIG
@@ -1128,18 +1138,76 @@ pub(crate) fn privacy_state_for_e2e() -> (bool, Vec<crate::config::ExcludedApp>)
 /// reports about itself; it is therefore only ever an ADDITIONAL signal. It never replaces the
 /// frontmost check: a writer could claim any identifier, and letting the claim override the
 /// frontmost verdict would re-admit a copy from an excluded app.
-pub(super) fn excluded_app_matches(
-    list: &[crate::config::ExcludedApp],
-    frontmost: Option<&str>,
-    declared: Option<&str>,
-) -> bool {
-    list.iter().any(|entry| {
-        let id = entry.bundle_id.trim();
-        !id.is_empty()
-            && (frontmost.is_some_and(|f| f.eq_ignore_ascii_case(id))
-                || declared.is_some_and(|d| d.eq_ignore_ascii_case(id)))
-    })
+/// What the exclusion decision needs to know about a copy's source, resolved **once**.
+///
+/// Why an enum rather than `Option<String>`: `None` currently means both "this app has no bundle
+/// identifier" (a real, common state -- a non-bundled command-line tool) and "the lookup failed" (the
+/// app quit between the copy and the poll). The first must record; the second must not, because an
+/// excluded app whose lookup failed would otherwise slip through the very check that exists to stop it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum FrontmostSource {
+    /// The PID resolved to a running application.
+    Resolved {
+        /// Its bundle identifier, when it has one.
+        bundle_id: Option<String>,
+    },
+    /// The lookup could not prove anything about the PID.
+    LookupFailed,
 }
+
+/// The verdict for one copy, with the reason so the log can say why it was dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ExclusionVerdict {
+    /// Not excluded: the copy is recorded.
+    Record,
+    /// An excluded application made the copy; it is dropped before the payload is read.
+    Excluded,
+    /// The source identity could not be established, so the copy is dropped rather than risk
+    /// recording content from an excluded app.
+    Blocked,
+}
+
+/// Decide whether a copy from `source` may be recorded, given the exclusion `list` and the copier
+/// that declared itself through `org.nspasteboard.source`.
+///
+/// The table (and why each row is the way it is):
+///
+/// | list empty            | Record   -- nothing to protect, and a failed lookup must not cost the user copies |
+/// | resolved, id in list  | Excluded |
+/// | resolved, id not in   | Record   |
+/// | resolved, no id at all| Record   -- a real state (non-bundled tool), not a failed lookup |
+/// | declared id in list   | Excluded -- the declared source can only ADD exclusion, never remove it |
+/// | lookup failed         | Blocked  -- cannot prove the source is not excluded |
+pub(super) fn exclusion_decision(
+    list: &[crate::config::ExcludedApp],
+    source: &FrontmostSource,
+    declared: Option<&str>,
+) -> ExclusionVerdict {
+    let named = |id: &str| {
+        let id = id.trim();
+        !id.is_empty()
+            && list
+                .iter()
+                .any(|entry| entry.bundle_id.trim().eq_ignore_ascii_case(id))
+    };
+    // The declared id is checked first: it is an ADDITIONAL signal, and an excluded app that
+    // declared itself is excluded even when the frontmost lookup also failed.
+    if declared.is_some_and(named) {
+        return ExclusionVerdict::Excluded;
+    }
+    if list.is_empty() {
+        return ExclusionVerdict::Record;
+    }
+    match source {
+        FrontmostSource::Resolved { bundle_id } => match bundle_id {
+            Some(id) if named(id) => ExclusionVerdict::Excluded,
+            // Either a different app, or an app with no bundle identifier at all.
+            _ => ExclusionVerdict::Record,
+        },
+        FrontmostSource::LookupFailed => ExclusionVerdict::Blocked,
+    }
+}
+
 /// the polling timer (main thread).
 static POLL_TIMER: OnceLock<MainThreadSlot<ObjPtr>> = OnceLock::new();
 /// whether the picker is visible.
@@ -1671,20 +1739,11 @@ pub(crate) fn picker_filter_row_rect_top_left() -> Option<(f64, f64, f64, f64)> 
             return Some(rect);
         }
     }
-    let orb = (*PICKER_OPTIONS_ORB.lock().unwrap())?;
-    if orb.0.is_null() {
-        return None;
-    }
-    let frame: NSRect = unsafe { msg_send![orb.0, frame] };
-    if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
-        return None;
-    }
-    Some((
-        frame.origin.x,
-        frame.origin.y,
-        frame.size.width,
-        frame.size.height,
-    ))
+    // The filters exist only inside the popover: with it closed there is no filter row on screen, and
+    // this used to answer with the OPTIONS ORB's 34x34 rect instead. A scenario then measured the orb
+    // for glyph ink and reported "no text" for every material -- which reads as a contrast failure and
+    // is really the absence of the thing it meant to measure. Answer None so the caller can say so.
+    None
 }
 
 /// Whether the options popover is currently open (`--e2e-state`'s `filter_popover_open`).
@@ -1964,6 +2023,7 @@ static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None
 static REBUILDING: AtomicBool = AtomicBool::new(false);
 #[cfg(test)]
 mod tests {
+    use crate::smoke_verdict::smoke_runner;
 
     /// The collection gate is process-wide, so the tests that drive it must not overlap.
     fn gate_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -2053,13 +2113,22 @@ mod tests {
         super::set_test_change_count(None);
     }
 
+    /// The ordering: `paused` outranks the master switch, and only a genuine pause->resume
+    /// transition may try to resume.
+    ///
+    /// This is the decision `apply_config_change` acts on, so a regression that resumed on
+    /// re-enable cannot pass it. The former test asserted `is_resume_transition`, which the
+    /// decision now subsumes.
     #[test]
     fn only_a_pause_to_resume_transition_rebaselines() {
-        assert!(super::is_resume_transition(true, false));
+        use crate::runtime_config::{pause_gate_action, PauseGateAction};
+        assert_eq!(pause_gate_action(true, false), PauseGateAction::Resume);
         // Startup and an ordinary enable keep the documented record-current behaviour.
-        assert!(!super::is_resume_transition(false, false));
-        assert!(!super::is_resume_transition(false, true));
-        assert!(!super::is_resume_transition(true, true));
+        assert_eq!(pause_gate_action(false, false), PauseGateAction::Leave);
+        // A pause closes the gate, from either state, and a paused session that is re-enabled
+        // STAYS paused rather than resuming.
+        assert_eq!(pause_gate_action(false, true), PauseGateAction::Pause);
+        assert_eq!(pause_gate_action(true, true), PauseGateAction::Pause);
     }
 
     /// The promise a pause makes: content copied while paused is not recorded later. The counter-example
@@ -2105,39 +2174,65 @@ mod tests {
         super::set_test_change_count(None);
     }
 
+    /// The full decision table, including the cases the old union test could not express.
+    ///
+    /// Why this replaces `excluded_app_matches`: that predicate took `Option<&str>` and so could not
+    /// distinguish "this app has no bundle id" from "the lookup failed". The second is the leak it
+    /// exists to stop, and the first must still record or a copy made in a non-bundled tool is lost.
     #[test]
-    fn excluded_app_matches_uses_frontmost_and_declared_union() {
+    fn the_exclusion_decision_table_holds() {
+        use super::{exclusion_decision, ExclusionVerdict, FrontmostSource};
         let list = vec![crate::config::ExcludedApp::new("com.example.pm", "Example")];
-        // Either signal excludes the copy.
-        assert!(super::excluded_app_matches(
-            &list,
-            Some("com.example.pm"),
-            None
-        ));
-        assert!(super::excluded_app_matches(
-            &list,
-            Some("com.other"),
-            Some("com.example.pm")
-        ));
-        // Comparison is case-insensitive; a blank entry can never match, not even an empty string.
-        assert!(super::excluded_app_matches(
-            &list,
-            Some("COM.EXAMPLE.PM"),
-            None
-        ));
-        assert!(!super::excluded_app_matches(
-            &list,
-            Some("com.other"),
-            Some("com.third")
-        ));
-        assert!(!super::excluded_app_matches(
-            &[],
-            Some("com.example.pm"),
-            None
-        ));
+        let resolved = |id: Option<&str>| FrontmostSource::Resolved {
+            bundle_id: id.map(str::to_string),
+        };
+        // Resolved and excluded, by either signal.
+        assert_eq!(
+            exclusion_decision(&list, &resolved(Some("com.example.pm")), None),
+            ExclusionVerdict::Excluded
+        );
+        assert_eq!(
+            exclusion_decision(
+                &list,
+                &resolved(Some("com.other")),
+                Some("com.example.pm")
+            ),
+            ExclusionVerdict::Excluded,
+            "the declared source is an additional signal: it can exclude even when the front differs"
+        );
+        // Case-insensitive, like the list itself.
+        assert_eq!(
+            exclusion_decision(&list, &resolved(Some("COM.EXAMPLE.PM")), None),
+            ExclusionVerdict::Excluded
+        );
+        // Resolved and different: record.
+        assert_eq!(
+            exclusion_decision(&list, &resolved(Some("com.other")), Some("com.third")),
+            ExclusionVerdict::Record
+        );
+        // Resolved with NO bundle identifier at all: a real state (a non-bundled tool), not a
+        // failed lookup, so the copy is recorded rather than silently lost.
+        assert_eq!(
+            exclusion_decision(&list, &resolved(None), None),
+            ExclusionVerdict::Record
+        );
+        // The lookup failed with a non-empty list: blocked, whatever the declared id says.
+        assert_eq!(
+            exclusion_decision(&list, &FrontmostSource::LookupFailed, Some("com.third")),
+            ExclusionVerdict::Blocked,
+            "an unidentified source cannot be shown to be off the list"
+        );
+        // An EMPTY list protects nothing, so even a failed lookup must not cost the user copies.
+        assert_eq!(
+            exclusion_decision(&[], &FrontmostSource::LookupFailed, None),
+            ExclusionVerdict::Record
+        );
+        // A blank entry never matches, not even an empty identifier.
         let blank = vec![crate::config::ExcludedApp::new("  ", "Blank")];
-        assert!(!super::excluded_app_matches(&blank, Some(""), Some("")));
-        assert!(!super::excluded_app_matches(&blank, None, None));
+        assert_eq!(
+            exclusion_decision(&blank, &resolved(Some("")), Some("")),
+            ExclusionVerdict::Record
+        );
     }
 
     /// `org.nspasteboard.source` is self-reported, so only a plausible bundle identifier may be
@@ -5768,27 +5863,67 @@ mod tests {
     #[test]
     #[ignore]
     fn picker_rebuild_smoke() {
-        // Prerequisite: cargo build has produced target/debug/oh-my-tab.
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
+        smoke_runner!("picker_rebuild_smoke", 1, {
+            // The child is the process that ran the assertions, so its recorded verdict is
+            // what this parent reports; it never infers one from the exit status.
+            crate::smoke_verdict::run_smoke_child("picker_rebuild_smoke", &["--smoke-clipboard"]);
+        });
+    }
+    /// The promise in AGENTS.md, through the decision the reload path uses: a paused session that
+    /// is disabled and re-enabled still records nothing.
+    ///
+    /// `apply_config_change` itself cannot run here (it touches AppKit), so this asserts the
+    /// decision it branches on plus the gate the decision drives -- which is the part a regression
+    /// would break.
+    #[test]
+    fn a_paused_session_stays_paused_across_disable_and_enable() {
+        let _gate = gate_lock();
+        use crate::runtime_config::{pause_gate_action, PauseGateAction};
+        // Paused: the persisted intent and the gate both say so.
+        super::set_collection_paused(true);
+        assert_eq!(super::collection_gate_state(), "paused");
+        // Switching the feature OFF and back ON is a pause -> pause transition; neither may resume.
+        assert_eq!(
+            pause_gate_action(true, true),
+            PauseGateAction::Pause,
+            "disabling or re-enabling a paused session must not open the gate"
         );
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-clipboard")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "clipboard picker smoke failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
+        // Only an explicit resume opens it.
+        super::set_test_change_count(Some(5));
+        assert!(!super::set_collection_paused(false));
+        assert_eq!(super::collection_gate_state(), "active");
+        super::set_test_change_count(None);
+    }
+
+    /// A copy's recorded source must come from the snapshot taken at copy time, not from a second
+    /// lookup: an app that quits while the payload is being read must still be recorded under the
+    /// identity that was resolved when it was alive.
+    #[test]
+    fn the_recorded_source_uses_the_snapshot_taken_at_copy_time() {
+        // A snapshot whose PID no longer resolves still carries its identity.
+        let snapshot = crate::clipboard::monitor::SourceSnapshot {
+            name: "Example".to_string(),
+            pid: -1,
+            identity: Some(crate::app_identity::AppIdentity {
+                key: "com.example.app".to_string(),
+                fingerprint: None,
+                process_start_time_us: None,
+            }),
+        };
+        let (name, key) = crate::clipboard::monitor::record_source(&snapshot);
+        assert_eq!(name, "Example");
+        assert_eq!(
+            key, "com.example.app",
+            "the key must come from the snapshot, not from re-resolving a stale PID"
         );
+        // A snapshot with no identity (the lookup failed at copy time) records the name only.
+        let empty = crate::clipboard::monitor::SourceSnapshot {
+            name: "Gone".to_string(),
+            pid: -1,
+            identity: None,
+        };
+        let (name, key) = crate::clipboard::monitor::record_source(&empty);
+        assert_eq!(name, "Gone");
+        assert!(key.is_empty());
     }
 }

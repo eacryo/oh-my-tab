@@ -1030,7 +1030,9 @@ fn resolve_selected_from(cfg: &Config) -> crate::mouse::resolve::ResolvedMouse {
 }
 
 pub(crate) extern "C" fn on_settings_open(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    show_settings();
+    crate::callback_guard::void("on_settings_open", || {
+        show_settings();
+    });
 }
 
 /// Build the settings switch component for reuse by other native panels and bind the caller's
@@ -1057,7 +1059,9 @@ pub(crate) extern "C" fn handle_check_for_updates(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    start_inline_update_check();
+    crate::callback_guard::void("handle_check_for_updates", || {
+        start_inline_update_check();
+    });
 }
 
 /// Shared entry of the inline check: used by both the About-page button and the update
@@ -1357,12 +1361,16 @@ pub(crate) extern "C" fn handle_open_official_website(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    unsafe { open_external_url("https://oh-my-tab.app") }
+    crate::callback_guard::void("handle_open_official_website", || unsafe {
+        open_external_url("https://oh-my-tab.app")
+    });
 }
 
 /// Open the project's GitHub repository in the default browser.
 pub(crate) extern "C" fn handle_open_github(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe { open_external_url("https://github.com/eacryo/oh-my-tab") }
+    crate::callback_guard::void("handle_open_github", || unsafe {
+        open_external_url("https://github.com/eacryo/oh-my-tab")
+    });
 }
 
 /// Open the System Settings pane where the Finder extension is enabled (the Finder Menu page's
@@ -1373,7 +1381,9 @@ pub(crate) extern "C" fn handle_open_finder_extension_management(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    crate::finder_menu::open_extension_management();
+    crate::callback_guard::void("handle_open_finder_extension_management", || {
+        crate::finder_menu::open_extension_management();
+    });
 }
 
 /// Log field-level changes submitted from Settings without recording clipboard contents.
@@ -2352,11 +2362,15 @@ extern "C" fn settings_window_perform_close(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
-    hide_settings();
+    crate::callback_guard::void("settings_window_perform_close", || {
+        hide_settings();
+    });
 }
 
 extern "C" fn settings_window_close(_self: *mut AnyObject, _cmd: Sel) {
-    hide_settings();
+    crate::callback_guard::void("settings_window_close", || {
+        hide_settings();
+    });
 }
 
 // Constants for Cmd+Q handling: NSEventModifierFlagCommand = 1 << 20, ANSI Q keyCode = 12.
@@ -2451,41 +2465,48 @@ extern "C" fn settings_window_perform_key_equivalent(
     _cmd: Sel,
     event: *mut AnyObject,
 ) -> objc2::runtime::Bool {
-    unsafe {
-        let keycode: u16 = msg_send![event, keyCode];
-        let flags: u64 = msg_send![event, modifierFlags];
-        if keycode == KEYCODE_Q && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0 {
-            // Same path as the menu Quit item: restore pointer acceleration + terminate.
-            crate::quit_from_settings();
-            return objc2::runtime::Bool::YES;
-        }
-        // Cmd+F focuses the sidebar search. The sidebar shell draws a `⌘F` hint, so the shortcut
-        // has to be real: a hint for a binding the window does not answer would be a promise the
-        // app breaks. Shift and option variants are left to super, as they belong to text editing.
-        if keycode == KEYCODE_F
-            && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0
-            && (flags & (NSEVENT_MODIFIER_FLAG_SHIFT | NSEVENT_MODIFIER_FLAG_OPTION)) == 0
-            && sidebar::focus_settings_search()
-        {
-            return objc2::runtime::Bool::YES;
-        }
-        // Super dispatch names the class that DEFINED this override (OhMyTabSettingsWindow),
-        // never the superclass; see settings_window_send_event_inner.
-        // The selector's encoding is "B" (Objective-C BOOL), so the callback and the super
-        // dispatch both use objc2's Bool rather than a Rust bool.
-        type PerformKeyEquivalent = unsafe extern "C" fn(
-            *mut crate::ffi::ObjcSuper,
-            Sel,
-            *mut AnyObject,
-        ) -> objc2::runtime::Bool;
-        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
-            _self as *mut c_void,
-            window::settings_window_class_handle(),
-        );
-        let perform: PerformKeyEquivalent =
-            std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
-        perform(&mut sup, sel!(performKeyEquivalent:), event)
-    }
+    crate::callback_guard::value(
+        "settings_window_perform_key_equivalent",
+        objc2::runtime::Bool::NO,
+        || {
+            unsafe {
+                let keycode: u16 = msg_send![event, keyCode];
+                let flags: u64 = msg_send![event, modifierFlags];
+                if keycode == KEYCODE_Q && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0 {
+                    // Same path as the menu Quit item: restore pointer acceleration + terminate.
+                    crate::quit_from_settings();
+                    return objc2::runtime::Bool::YES;
+                }
+                // Cmd+F focuses the sidebar search. The sidebar shell draws a `⌘F` hint, so the shortcut
+                // has to be real: a hint for a binding the window does not answer would be a promise the
+                // app breaks. Shift and option variants are left to super, as they belong to text editing.
+                if keycode == KEYCODE_F
+                    && (flags & NSEVENT_MODIFIER_FLAG_COMMAND) != 0
+                    && (flags & (NSEVENT_MODIFIER_FLAG_SHIFT | NSEVENT_MODIFIER_FLAG_OPTION)) == 0
+                    && sidebar::focus_settings_search()
+                {
+                    return objc2::runtime::Bool::YES;
+                }
+                // Super dispatch names the class that DEFINED this override (OhMyTabSettingsWindow),
+                // never the superclass; see settings_window_send_event_inner.
+                // The selector's encoding is "B" (Objective-C BOOL), so the callback and the super
+                // dispatch both use objc2's Bool rather than a Rust bool.
+                type PerformKeyEquivalent = unsafe extern "C" fn(
+                    *mut crate::ffi::ObjcSuper,
+                    Sel,
+                    *mut AnyObject,
+                )
+                    -> objc2::runtime::Bool;
+                let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+                    _self as *mut c_void,
+                    window::settings_window_class_handle(),
+                );
+                let perform: PerformKeyEquivalent =
+                    std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+                perform(&mut sup, sel!(performKeyEquivalent:), event)
+            }
+        },
+    )
 }
 
 #[cfg(test)]
@@ -2519,6 +2540,7 @@ mod mouse_page_lazy_fill_tests {
 
 #[cfg(test)]
 mod tests {
+    use crate::smoke_verdict::smoke_runner;
     /// The coalescing contract: several rebuild requests in one run-loop turn queue ONE callback,
     /// and the scroll record survives that folding. If the slot arbitration is removed (every request
     /// queues its own callback), the second claim below returns true and this test fails -- which is
@@ -2554,42 +2576,6 @@ mod tests {
     }
 
     use super::{settings_ui_borrowed, with_settings_ui};
-
-    fn settings_smoke_app_binary() -> std::path::PathBuf {
-        let exe = std::env::current_exe().expect("current exe");
-        let profile_dir = exe
-            .parent()
-            .and_then(|path| path.parent())
-            .expect("test binary profile directory");
-        let app = profile_dir.join(env!("CARGO_PKG_NAME"));
-        let profile = profile_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("Cargo profile directory name");
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let mut build = std::process::Command::new(cargo);
-        build
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .arg("build")
-            .arg("--bin")
-            .arg(env!("CARGO_PKG_NAME"));
-        if profile == "release" {
-            build.arg("--release");
-        } else if profile != "debug" {
-            build.arg("--profile").arg(profile);
-        }
-        let status = build.status().expect("failed to build app smoke binary");
-        assert!(
-            status.success(),
-            "building app smoke binary failed: {status}"
-        );
-        assert!(
-            app.is_file(),
-            "app binary missing after build at {}",
-            app.display()
-        );
-        app
-    }
 
     /// The sidebar label is `t(title_key())`, and `t()` returns the key itself when no locale
     /// entry resolves it -- so a botched key is shown verbatim in the sidebar (regression: commit
@@ -2868,29 +2854,25 @@ mod tests {
     #[test]
     #[ignore]
     fn settings_layout_smoke_under_reduce_motion() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-settings-layout")
-            .arg("--reduce-motion")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "settings layout smoke under Reduce Motion failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("settings_layout_smoke_under_reduce_motion", 1, {
+            crate::smoke_verdict::run_smoke_child(
+                "settings_layout_smoke_under_reduce_motion",
+                &["--smoke-settings-layout", "--reduce-motion"],
+            );
+        });
     }
 
     #[test]
     #[ignore]
     fn settings_vertical_zoom_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-settings-vertical-zoom")
-            .output()
-            .expect("failed to spawn app");
-        assert!(out.status.success(), "vertical zoom smoke failed: {out:?}");
+        smoke_runner!("settings_vertical_zoom_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict
+            // through the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "settings_vertical_zoom_smoke",
+                &["--smoke-settings-vertical-zoom"],
+            );
+        });
     }
 
     /// The Finder Menu page's own A1 check. Separate from the all-pages layout smoke because that
@@ -2899,136 +2881,95 @@ mod tests {
     #[test]
     #[ignore]
     fn finder_menu_page_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-finder-menu")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "finder menu page smoke failed (exit {:?})\nstderr:\n{}\nstdout tail:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr),
-            String::from_utf8_lossy(&out.stdout)
-                .lines()
-                .rev()
-                .take(20)
-                .collect::<Vec<_>>()
-                .join("\n")
-        );
+        smoke_runner!("finder_menu_page_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict
+            // through the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "finder_menu_page_smoke",
+                &["--smoke-finder-menu"],
+            );
+        });
     }
 
     #[test]
     #[ignore]
     fn settings_layout_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-settings-layout")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "settings layout smoke failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("settings_layout_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict
+            // through the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "settings_layout_smoke",
+                &["--smoke-settings-layout"],
+            );
+        });
     }
 
     /// Call the registered NSApplication reopen delegate and verify custom handling opens Settings.
     #[test]
     #[ignore]
     fn application_reopen_delegate_opens_settings_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-app-reopen")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "application reopen smoke failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("application_reopen_delegate_opens_settings_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict
+            // through the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "application_reopen_delegate_opens_settings_smoke",
+                &["--smoke-app-reopen"],
+            );
+        });
     }
 
     /// Rebuilding settings content must not reset controls to their construction defaults.
     #[test]
     #[ignore]
     fn settings_state_sync_after_content_rebuild_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-settings-state-sync")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "settings state-sync smoke failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("settings_state_sync_after_content_rebuild_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict
+            // through the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "settings_state_sync_after_content_rebuild_smoke",
+                &["--smoke-settings-state-sync"],
+            );
+        });
     }
 
     /// Hiding a conditional clipboard row must preserve adjacent rows and close the layout gap.
     #[test]
     #[ignore]
     fn settings_collapsible_row_geometry_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-settings-collapsible-row")
-            .output()
-            .expect("failed to spawn app");
-        let stdout_tail = String::from_utf8_lossy(&out.stdout)
-            .lines()
-            .rev()
-            .take(20)
-            .collect::<Vec<_>>()
-            .into_iter()
-            .rev()
-            .collect::<Vec<_>>()
-            .join("\n");
-        assert!(
-            out.status.success(),
-            "settings collapsible-row smoke failed (exit {:?})\nstderr:\n{}\nstdout tail:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr),
-            stdout_tail
-        );
+        smoke_runner!("settings_collapsible_row_geometry_smoke", 1, {
+            // The child ran the geometry assertions; take the verdict it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "settings_collapsible_row_geometry_smoke",
+                &["--smoke-settings-collapsible-row"],
+            );
+        });
     }
 
     /// Mouse profile edits must leave the RefCell borrow before runtime refresh re-enters settings.
     #[test]
     #[ignore]
     fn settings_mouse_profile_callback_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-settings-mouse-profile-callback")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "settings mouse profile callback smoke failed (exit {:?})\nstderr:\n{}\nstdout:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr),
-            String::from_utf8_lossy(&out.stdout)
-        );
+        smoke_runner!("settings_mouse_profile_callback_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict
+            // through the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "settings_mouse_profile_callback_smoke",
+                &["--smoke-settings-mouse-profile-callback"],
+            );
+        });
     }
 
     /// Create a pixel-based continuous CGEvent and round-trip every field used by smooth scroll.
     #[test]
     #[ignore]
     fn smooth_scroll_synthetic_event_fields_smoke() {
-        let app = settings_smoke_app_binary();
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-smooth-scroll-event")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "smooth-scroll event smoke failed (exit {:?})\nstdout:\n{}\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stdout),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("smooth_scroll_synthetic_event_fields_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict
+            // through the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "smooth_scroll_synthetic_event_fields_smoke",
+                &["--smoke-smooth-scroll-event"],
+            );
+        });
     }
 }

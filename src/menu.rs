@@ -9,7 +9,7 @@ use std::cell::RefCell;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 
-use crate::config::{flush_config_sync, persist_config_now, reload_config, CONFIG};
+use crate::config::{persist_config_now, reload_config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
 use crate::ffi::*;
 use crate::i18n::t;
@@ -539,31 +539,37 @@ pub(crate) extern "C" fn handle_pause_clipboard(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    if !CONFIG.read().unwrap().clipboard.enabled {
-        return;
-    }
-    // The panel orb, the menu item and the settings switch all flip the same persisted intent, and
-    // the apply pass keeps the three surfaces in step.
-    crate::clipboard::toggle_paused_intent();
+    crate::callback_guard::void("handle_pause_clipboard", || {
+        if !CONFIG.read().unwrap().clipboard.enabled {
+            return;
+        }
+        // The panel orb, the menu item and the settings switch all flip the same persisted intent, and
+        // the apply pass keeps the three surfaces in step.
+        crate::clipboard::toggle_paused_intent();
+    });
 }
 
 /// The menu action: show and pin. Idempotent by design (see `build_clipboard_pin_item`).
 pub(crate) extern "C" fn handle_pin_clipboard(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    if !CONFIG.read().unwrap().clipboard.enabled {
-        // The entry follows the module switch; it never turns recording on as a side effect.
-        return;
-    }
-    crate::clipboard::show_and_pin_for_menu();
+    crate::callback_guard::void("handle_pin_clipboard", || {
+        if !CONFIG.read().unwrap().clipboard.enabled {
+            // The entry follows the module switch; it never turns recording on as a side effect.
+            return;
+        }
+        crate::clipboard::show_and_pin_for_menu();
+    });
 }
 pub(crate) extern "C" fn handle_toggle_service(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    if sender.is_null() {
-        return;
-    }
-    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    let Some(service) = ServiceToggle::from_tag(tag) else {
-        return;
-    };
-    toggle_service(service);
+    crate::callback_guard::void("handle_toggle_service", || {
+        if sender.is_null() {
+            return;
+        }
+        let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        let Some(service) = ServiceToggle::from_tag(tag) else {
+            return;
+        };
+        toggle_service(service);
+    });
 }
 
 /// Flip one service switch, the way both the menu and a `feature.toggle_*` binding do it: config
@@ -646,27 +652,42 @@ pub(crate) fn refresh_menu_titles() {
 }
 
 pub(crate) extern "C" fn handle_quit(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    log_info!("User quit via menu bar.");
-    quit_application();
+    crate::callback_guard::void("handle_quit", || {
+        log_info!("User quit via menu bar.");
+        quit_application();
+    });
 }
 
 /// Flush state, restore system pointer settings, and terminate the accessory application.
 pub(crate) fn quit_application() {
-    if let Err(e) = flush_config_sync() {
-        log_info!("Config flush before quit failed: {}", e);
-    }
-    // Restore pointer acceleration settings before quitting (otherwise the mouse stays
-    // linear until the user resets it manually).
-    crate::mouse::pointer::restore();
-    unsafe {
+    quit_application_with(|| unsafe {
         let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![nsapp, terminate: std::ptr::null::<AnyObject>()];
-    }
+    });
+}
+
+/// The menu quit route with its final step supplied by the caller.
+///
+/// The duties are shared with the terminate-notification route (logout, shutdown), so a config write
+/// made inside its debounce window cannot be lost by one route and kept by the other. The `terminate:`
+/// call is the only part a test cannot run, so it is the only part the test replaces -- the assertion
+/// then covers this function's own body rather than a copy of it.
+fn quit_application_with(terminate: impl FnOnce()) {
+    crate::orderly_exit_duties();
+    terminate();
+}
+
+/// Test-only entry to the menu quit route, with the application termination replaced.
+#[cfg(test)]
+pub(crate) fn quit_application_for_test() {
+    quit_application_with(|| {});
 }
 
 // Handler for the "Open Privacy & Security" button on the settings permission-warning banner.
 pub(crate) extern "C" fn handle_open_privacy(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    crate::open_privacy_accessibility();
+    crate::callback_guard::void("handle_open_privacy", || {
+        crate::open_privacy_accessibility();
+    });
 }
 
 pub(crate) extern "C" fn handle_open_screen_recording_privacy(
@@ -674,7 +695,9 @@ pub(crate) extern "C" fn handle_open_screen_recording_privacy(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    crate::open_privacy_screen_recording();
+    crate::callback_guard::void("handle_open_screen_recording_privacy", || {
+        crate::open_privacy_screen_recording();
+    });
 }
 
 pub(crate) extern "C" fn handle_toggle_shortcut(
@@ -682,28 +705,30 @@ pub(crate) extern "C" fn handle_toggle_shortcut(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let is_cmd = !SHORTCUT_IS_CMD.load(Ordering::SeqCst);
-    // Persist to config (matches theme toggle, so the choice survives restart).
-    let old_cfg = CONFIG.read().unwrap().clone();
-    let new_cfg = {
-        let mut cfg = old_cfg.clone();
-        cfg.keyboard.modifier = if is_cmd {
-            "command".to_string()
-        } else {
-            "option".to_string()
+    crate::callback_guard::void("handle_toggle_shortcut", || {
+        let is_cmd = !SHORTCUT_IS_CMD.load(Ordering::SeqCst);
+        // Persist to config (matches theme toggle, so the choice survives restart).
+        let old_cfg = CONFIG.read().unwrap().clone();
+        let new_cfg = {
+            let mut cfg = old_cfg.clone();
+            cfg.keyboard.modifier = if is_cmd {
+                "command".to_string()
+            } else {
+                "option".to_string()
+            };
+            if let Ok(mut current) = CONFIG.write() {
+                *current = cfg.clone();
+            }
+            cfg
         };
-        if let Ok(mut current) = CONFIG.write() {
-            *current = cfg.clone();
-        }
-        cfg
-    };
-    persist_config_now();
-    crate::runtime_config::apply_config_change(
-        &old_cfg,
-        &new_cfg,
-        crate::runtime_config::ConfigChangeSource::Menu,
-    );
-    log_info!("Shortcut: {}", if is_cmd { "Cmd+Tab" } else { "Opt+Tab" });
+        persist_config_now();
+        crate::runtime_config::apply_config_change(
+            &old_cfg,
+            &new_cfg,
+            crate::runtime_config::ConfigChangeSource::Menu,
+        );
+        log_info!("Shortcut: {}", if is_cmd { "Cmd+Tab" } else { "Opt+Tab" });
+    });
 }
 
 pub(crate) extern "C" fn handle_toggle_thumbnail(
@@ -711,62 +736,68 @@ pub(crate) extern "C" fn handle_toggle_thumbnail(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let thumbnails_enabled = !crate::theme::thumbnails_enabled();
-    let old_cfg = CONFIG.read().unwrap().clone();
-    let new_cfg = {
-        let mut cfg = old_cfg.clone();
-        cfg.layout.thumbnails_enabled = thumbnails_enabled;
-        if let Ok(mut current) = CONFIG.write() {
-            *current = cfg.clone();
-        }
-        cfg
-    };
-    persist_config_now();
-    // Drop the current card layout so the next summon rebuilds in the new mode; disabling
-    // thumbnails also releases the in-memory window images.
-    crate::runtime_config::apply_config_change(
-        &old_cfg,
-        &new_cfg,
-        crate::runtime_config::ConfigChangeSource::Menu,
-    );
-    log_info!(
-        "Window thumbnails: {}",
-        if thumbnails_enabled {
-            "enabled"
-        } else {
-            "disabled"
-        }
-    );
+    crate::callback_guard::void("handle_toggle_thumbnail", || {
+        let thumbnails_enabled = !crate::theme::thumbnails_enabled();
+        let old_cfg = CONFIG.read().unwrap().clone();
+        let new_cfg = {
+            let mut cfg = old_cfg.clone();
+            cfg.layout.thumbnails_enabled = thumbnails_enabled;
+            if let Ok(mut current) = CONFIG.write() {
+                *current = cfg.clone();
+            }
+            cfg
+        };
+        persist_config_now();
+        // Drop the current card layout so the next summon rebuilds in the new mode; disabling
+        // thumbnails also releases the in-memory window images.
+        crate::runtime_config::apply_config_change(
+            &old_cfg,
+            &new_cfg,
+            crate::runtime_config::ConfigChangeSource::Menu,
+        );
+        log_info!(
+            "Window thumbnails: {}",
+            if thumbnails_enabled {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
+    });
 }
 
 pub(crate) extern "C" fn handle_reload_config(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    let errs = reload_config();
-    if errs.is_empty() {
-        log_info!("Config reloaded successfully.");
-    } else {
-        log_info!("Config reload: {} error(s):", errs.len());
-        for e in &errs {
-            log_info!("  • {}", e);
+    crate::callback_guard::void("handle_reload_config", || {
+        let errs = reload_config();
+        if errs.is_empty() {
+            log_info!("Config reloaded successfully.");
+        } else {
+            log_info!("Config reload: {} error(s):", errs.len());
+            for e in &errs {
+                log_info!("  • {}", e);
+            }
         }
-    }
+    });
 }
 
 /// Clear icon and thumbnail caches: remove disk icons, clear in-memory window thumbnails, then
 /// re-extract icons for currently collected windows.
 pub(crate) extern "C" fn handle_clear_caches(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    clear_icon_cache();
-    crate::thumbnail::clear_runtime_cache();
-    // in-memory icon_path still points at deleted files; reset to None so cards re-extract.
-    with_tab_state(|state_opt| {
-        if let Some(state) = state_opt.as_mut() {
-            for window in &mut state.windows {
-                window.icon_path = None;
+    crate::callback_guard::void("handle_clear_caches", || {
+        clear_icon_cache();
+        crate::thumbnail::clear_runtime_cache();
+        // in-memory icon_path still points at deleted files; reset to None so cards re-extract.
+        with_tab_state(|state_opt| {
+            if let Some(state) = state_opt.as_mut() {
+                for window in &mut state.windows {
+                    window.icon_path = None;
+                }
             }
-        }
+        });
+        // Re-extract icons for currently-collected windows only (not all running apps).
+        extract_uncached_icons();
+        log_info!("Icon and thumbnail caches cleared.");
     });
-    // Re-extract icons for currently-collected windows only (not all running apps).
-    extract_uncached_icons();
-    log_info!("Icon and thumbnail caches cleared.");
 }
 
 #[cfg(test)]

@@ -3,6 +3,7 @@
 use block2::RcBlock;
 
 use super::*;
+use crate::callback_guard;
 
 pub(super) unsafe fn card_views_by_key(
     _windows: &[WindowInfo],
@@ -146,14 +147,16 @@ pub(super) unsafe fn restore_card_close_reflow(pending: &PendingCardClose) {
 
 /// Action of the card's top-right close button: animate the card first, then close the window.
 pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let card: *mut AnyObject = unsafe { msg_send![sender as *mut AnyObject, superview] };
-    if card.is_null() {
-        return;
-    }
-    let Some(idx) = get_card_index(card) else {
-        return;
-    };
-    begin_close_window_at(idx, card);
+    callback_guard::void("on_close_card", || {
+        let card: *mut AnyObject = unsafe { msg_send![sender as *mut AnyObject, superview] };
+        if card.is_null() {
+            return;
+        }
+        let Some(idx) = get_card_index(card) else {
+            return;
+        };
+        begin_close_window_at(idx, card);
+    });
 }
 
 /// Whether a close transition is active; structural refreshes must wait until it commits.
@@ -447,23 +450,27 @@ pub(super) fn finish_pending_card_close() {
 
 /// Exit-animation completion callback; AX may already be done or still be running in the worker.
 pub(crate) extern "C" fn on_card_close_finished(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
-        pending.animation_finished = true;
-    }
-    finish_pending_card_close();
+    callback_guard::void("on_card_close_finished", || {
+        if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
+            pending.animation_finished = true;
+        }
+        finish_pending_card_close();
+    });
 }
 
 /// AX worker result callback; joins the animation callback before triggering UI reflow.
 pub(crate) extern "C" fn on_card_close_ax_result(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    let Some((key, result)) = CARD_CLOSE_AX_RESULT.lock().unwrap().take() else {
-        return;
-    };
-    if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
-        if (pending.pid, pending.cgwid) == key {
-            pending.ax_result = Some(result);
+    callback_guard::void("on_card_close_ax_result", || {
+        let Some((key, result)) = CARD_CLOSE_AX_RESULT.lock().unwrap().take() else {
+            return;
+        };
+        if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
+            if (pending.pid, pending.cgwid) == key {
+                pending.ax_result = Some(result);
+            }
         }
-    }
-    finish_pending_card_close();
+        finish_pending_card_close();
+    });
 }
 
 /// Commit a successful close by removing one view only; surviving views are reused and rebound
@@ -603,37 +610,39 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
 }
 
 pub(crate) extern "C" fn on_cmd_released(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    schedule_cmd_release_diagnostic();
-    if card_close_in_progress() {
-        return;
-    }
-    // An action key was pressed during this summon: the user is operating the panel directly, so
-    // releasing the trigger modifier must not commit the card that happens to be highlighted.
-    // Return/card-click commit, Esc dismisses; every other exit clears the flag.
-    if is_sticky() {
-        log_debug!("[overlay] CmdReleased ignored: this summon is sticky after an action key");
-        return;
-    }
-    let visible = with_tab_state(|state_opt| {
-        let Some(state) = state_opt.as_mut() else {
-            return false;
-        };
-        if !state.visible {
-            if state.pending_first_show {
-                // The bridge delivered CmdReleased before the AX-backed first frame was ready.
-                // Latch it so apply_window_refresh can commit the eventual default target.
-                state.pending_first_release = true;
-                log_debug!("[overlay] CmdReleased latched while first snapshot is pending");
-            }
-            return false;
+    callback_guard::void("on_cmd_released", || {
+        schedule_cmd_release_diagnostic();
+        if card_close_in_progress() {
+            return;
         }
-        true
-    });
-    if !visible {
-        return;
-    }
+        // An action key was pressed during this summon: the user is operating the panel directly, so
+        // releasing the trigger modifier must not commit the card that happens to be highlighted.
+        // Return/card-click commit, Esc dismisses; every other exit clears the flag.
+        if is_sticky() {
+            log_debug!("[overlay] CmdReleased ignored: this summon is sticky after an action key");
+            return;
+        }
+        let visible = with_tab_state(|state_opt| {
+            let Some(state) = state_opt.as_mut() else {
+                return false;
+            };
+            if !state.visible {
+                if state.pending_first_show {
+                    // The bridge delivered CmdReleased before the AX-backed first frame was ready.
+                    // Latch it so apply_window_refresh can commit the eventual default target.
+                    state.pending_first_release = true;
+                    log_debug!("[overlay] CmdReleased latched while first snapshot is pending");
+                }
+                return false;
+            }
+            true
+        });
+        if !visible {
+            return;
+        }
 
-    commit_selected_window(true);
+        commit_selected_window(true);
+    });
 }
 
 const CMD_RELEASE_DIAGNOSTIC_DELAY: f64 = 0.03;
@@ -659,13 +668,15 @@ pub(crate) extern "C" fn on_cmd_release_diagnostic(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    let live_flags = event_tap::combined_session_flags();
-    let live_down = live_flags & crate::event_monitor::switcher_modifier_flag() != 0;
-    log_debug!(
-        "[overlay] post-release modifier state: shortcut={} down={} delay_ms=30",
-        crate::event_monitor::switcher_modifier_name(),
-        live_down
-    );
+    callback_guard::void("on_cmd_release_diagnostic", || {
+        let live_flags = event_tap::combined_session_flags();
+        let live_down = live_flags & crate::event_monitor::switcher_modifier_flag() != 0;
+        log_debug!(
+            "[overlay] post-release modifier state: shortcut={} down={} delay_ms=30",
+            crate::event_monitor::switcher_modifier_name(),
+            live_down
+        );
+    });
 }
 
 pub(super) fn commit_selected_window(overlay_was_visible: bool) {
@@ -889,9 +900,9 @@ pub(super) extern "C" fn close_button_mouse_entered(
     _cmd: Sel,
     _event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("close_button_mouse_entered", || unsafe {
         set_close_button_hover_style(_self as *mut AnyObject, true);
-    }
+    });
 }
 
 pub(super) extern "C" fn close_button_mouse_exited(
@@ -899,77 +910,81 @@ pub(super) extern "C" fn close_button_mouse_exited(
     _cmd: Sel,
     _event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("close_button_mouse_exited", || unsafe {
         set_close_button_hover_style(_self as *mut AnyObject, false);
-    }
+    });
 }
 
 pub(crate) extern "C" fn card_mouse_down(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    let Some(idx) = get_card_index(_self as *mut AnyObject) else {
-        return;
-    };
-    let action = with_tab_state(|state_opt| {
-        let state = state_opt.as_mut().unwrap();
-        if let Some(w) = state.windows.get(idx) {
-            let pid = w.pid;
-            let cgwid = w.window_id;
-            let minimized = w.minimized;
-            let on_other_desktop = w.on_other_desktop;
-            state.focus_key = Some((pid, cgwid));
-            bump_window_mru(&mut state.mru, pid, cgwid);
-            state.visible = false;
-            Some((pid, cgwid, minimized, on_other_desktop))
+    callback_guard::void("card_mouse_down", || {
+        let Some(idx) = get_card_index(_self as *mut AnyObject) else {
+            return;
+        };
+        let action = with_tab_state(|state_opt| {
+            let state = state_opt.as_mut().unwrap();
+            if let Some(w) = state.windows.get(idx) {
+                let pid = w.pid;
+                let cgwid = w.window_id;
+                let minimized = w.minimized;
+                let on_other_desktop = w.on_other_desktop;
+                state.focus_key = Some((pid, cgwid));
+                bump_window_mru(&mut state.mru, pid, cgwid);
+                state.visible = false;
+                Some((pid, cgwid, minimized, on_other_desktop))
+            } else {
+                state.visible = false;
+                None
+            }
+        });
+        if let Some((pid, cgwid, minimized, on_other_desktop)) = action {
+            // A card click commits too, so it ends the session exactly like Return and the release
+            // commit: clear sticky and the published claim now, while the visual order-out is deferred.
+            clear_sticky();
+            publish_panel_snapshot(false);
+            vanish_overlay();
+            // Same as on_cmd_released: no settings-window handling needed (see comment there);
+            // the raise is deferred by one runloop turn so the vanish commits first.
+            schedule_deferred_raise(pid, cgwid, minimized, on_other_desktop);
+            schedule_delayed_order_out();
         } else {
-            state.visible = false;
-            None
+            // Unreachable in practice (no cards when the list is empty); defensive dismiss,
+            // same as on_cmd_released.
+            hide_overlay();
         }
     });
-    if let Some((pid, cgwid, minimized, on_other_desktop)) = action {
-        // A card click commits too, so it ends the session exactly like Return and the release
-        // commit: clear sticky and the published claim now, while the visual order-out is deferred.
-        clear_sticky();
-        publish_panel_snapshot(false);
-        vanish_overlay();
-        // Same as on_cmd_released: no settings-window handling needed (see comment there);
-        // the raise is deferred by one runloop turn so the vanish commits first.
-        schedule_deferred_raise(pid, cgwid, minimized, on_other_desktop);
-        schedule_delayed_order_out();
-    } else {
-        // Unreachable in practice (no cards when the list is empty); defensive dismiss,
-        // same as on_cmd_released.
-        hide_overlay();
-    }
 }
 
 pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    // Ignore hover until the user has moved the mouse at least once.
-    // Prevents selecting the card under the cursor when the window first opens.
-    let Some(idx) = get_card_index(_self as *mut AnyObject) else {
-        return;
-    };
-    if !activates_on_hover() {
-        return;
-    }
-    if !MOUSE_MOVED.load(Ordering::Relaxed) {
-        log_debug!(
-            "[overlay] card {} mouseEntered (gated, mouse not moved yet)",
-            idx
-        );
-        return;
-    }
-    let changed = with_tab_state(|state_opt| {
-        let state = state_opt.as_mut().unwrap();
-        if state.selected != idx {
-            state.selected = idx;
-            mark_user_picked(state);
-            true
-        } else {
-            false
+    callback_guard::void("card_mouse_entered", || {
+        // Ignore hover until the user has moved the mouse at least once.
+        // Prevents selecting the card under the cursor when the window first opens.
+        let Some(idx) = get_card_index(_self as *mut AnyObject) else {
+            return;
+        };
+        if !activates_on_hover() {
+            return;
+        }
+        if !MOUSE_MOVED.load(Ordering::Relaxed) {
+            log_debug!(
+                "[overlay] card {} mouseEntered (gated, mouse not moved yet)",
+                idx
+            );
+            return;
+        }
+        let changed = with_tab_state(|state_opt| {
+            let state = state_opt.as_mut().unwrap();
+            if state.selected != idx {
+                state.selected = idx;
+                mark_user_picked(state);
+                true
+            } else {
+                false
+            }
+        });
+        if changed {
+            reset_thumbnail_nav_anchor();
+            refresh_highlight();
+            update_status_label();
         }
     });
-    if changed {
-        reset_thumbnail_nav_anchor();
-        refresh_highlight();
-        update_status_label();
-    }
 }

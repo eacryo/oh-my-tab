@@ -2745,8 +2745,27 @@ impl Config {
     }
 }
 
+/// What the first load of the config file had to say about it. The load happens once, in `CONFIG`'s
+/// initializer, and `run()` cannot repeat it: by then the value is the already-repaired config, so
+/// re-validating it reports nothing even when the file was unparseable and every field fell back to
+/// its default. Keeping the loader's own errors is what lets the startup report name the real problem
+/// (measured: a syntax error in the file produced an empty report and the app silently ran on
+/// defaults).
+static CONFIG_LOAD_ERRORS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// The errors the config loader reported when `CONFIG` initialised (empty for a healthy file or a
+/// first run). Safe to call from any thread after `CONFIG` has been touched.
+pub fn config_load_errors() -> Vec<String> {
+    CONFIG_LOAD_ERRORS.get().cloned().unwrap_or_else(|| {
+        // Force the one-time load so the answer does not depend on who asked first.
+        let _ = &*CONFIG;
+        CONFIG_LOAD_ERRORS.get().cloned().unwrap_or_default()
+    })
+}
+
 pub static CONFIG: std::sync::LazyLock<RwLock<Config>> = std::sync::LazyLock::new(|| {
-    let (cfg, _errs) = Config::load_or_default();
+    let (cfg, errs) = Config::load_or_default();
+    let _ = CONFIG_LOAD_ERRORS.set(errs);
     // Apply the locale from config (I18N init only used the system locale).
     // No cycle: I18N does not read CONFIG; see the note at the top of i18n.rs.
     i18n::apply_config_locale(&cfg.i18n.locale);
@@ -5762,6 +5781,131 @@ trigger = "option+i"
         assert_eq!(
             cfg.key_bindings.items.as_ref().unwrap()[0].trigger,
             "option+i"
+        );
+    }
+    /// A config file that cannot be parsed must not read as a healthy launch.
+    ///
+    /// Why this is a regression test: the loader discarded its own errors, and run() then
+    /// re-validated the already-repaired config, so a syntax error produced an **empty** report and
+    /// the app silently ran on defaults for every field -- shortcut back to Cmd+Tab, clipboard off,
+    /// theme default -- with nothing naming the file. These assertions pin the loader's half: the
+    /// error survives the call, and the per-field fallback still happens for one invalid value.
+    #[test]
+    fn a_syntax_error_is_reported_instead_of_disappearing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "this is [ not toml\n=== broken").unwrap();
+        let (_cfg, errs) = Config::load_or_default_from(&path);
+        assert!(
+            !errs.is_empty(),
+            "a file that cannot be parsed must produce at least one error for the startup report"
+        );
+    }
+
+    #[test]
+    fn an_invalid_field_falls_back_without_discarding_its_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        // Distinct non-default siblings, so a whole-section reset is visible rather than hidden
+        // by the defaults matching the expected answer.
+        let content = [
+            "[layout]",
+            "thumbnail_size = \"enormous\"",
+            "card_text_size = 14.0",
+            "",
+            "[keyboard]",
+            "modifier = \"option\"",
+            "",
+        ]
+        .join("\n");
+        std::fs::write(&path, content).unwrap();
+        let (cfg, errs) = Config::load_or_default_from(&path);
+        assert!(
+            !errs.is_empty(),
+            "the invalid thumbnail size must be reported"
+        );
+        assert_eq!(
+            cfg.layout.thumbnail_size,
+            crate::config::Layout::default().thumbnail_size,
+            "the invalid field falls back to its default"
+        );
+        assert_eq!(
+            cfg.layout.card_text_size, 14.0,
+            "a valid sibling keeps its value"
+        );
+        assert_eq!(
+            cfg.keyboard.modifier, "option",
+            "another section keeps its value"
+        );
+    }
+    /// The per-field fallback promise, tested through the real load path rather than a list of keys.
+    ///
+    /// Why one test per section instead of a registry: `validate` and `merge_valid` are joined by error
+    /// message prefixes, and a second list of keys would check the classifier rather than the promise.
+    /// Each case below writes a file with an INVALID value for one field and legal, NON-DEFAULT values
+    /// for its siblings, then asserts that only the invalid field fell back. Non-default siblings are
+    /// what make a whole-section reset visible -- with defaults on both sides it cannot be seen.
+    #[test]
+    fn an_invalid_field_falls_back_without_taking_its_section_with_it() {
+        fn load(content: &str) -> Config {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, content).unwrap();
+            Config::load_or_default_from(&path).0
+        }
+
+        // layout: one invalid size, a valid non-default sibling in the same section.
+        let cfg = load(
+            &[
+                "[layout]",
+                "thumbnail_size = \"enormous\"",
+                "card_text_size = 14.0",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(
+            cfg.layout.thumbnail_size,
+            Layout::default().thumbnail_size,
+            "the invalid field falls back to its default"
+        );
+        assert_eq!(
+            cfg.layout.card_text_size, 14.0,
+            "a valid sibling keeps its value: the section was not reset wholesale"
+        );
+
+        // appearance: an invalid enum, a valid non-default sibling.
+        let cfg = load(
+            &[
+                "[appearance]",
+                "theme = \"purple\"",
+                "corner_radius = 9.0",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(cfg.appearance.theme, Appearance::default().theme);
+        assert_eq!(
+            cfg.appearance.corner_radius, 9.0,
+            "a valid sibling keeps its value"
+        );
+
+        // keyboard: an invalid modifier, a valid non-default sibling in another section.
+        let cfg = load(
+            &[
+                "[keyboard]",
+                "modifier = \"hyper\"",
+                "",
+                "[layout]",
+                "card_text_size = 13.0",
+                "",
+            ]
+            .join("\n"),
+        );
+        assert_eq!(cfg.keyboard.modifier, Keyboard::default().modifier);
+        assert_eq!(
+            cfg.layout.card_text_size, 13.0,
+            "other sections keep theirs"
         );
     }
 }

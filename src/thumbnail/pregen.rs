@@ -92,7 +92,10 @@ pub(crate) fn start() {
     std::thread::Builder::new()
         .name("thumb-observer".into())
         .spawn(move || unsafe {
-            let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+            // The pool must drain even when the body panics: a long-lived observer thread that
+            // leaked one pool per notification would grow without bound, and a skipped drain
+            // also pops pools out of order. The guard drains it on both paths.
+            let _pool = AutoreleasePoolGuard(msg_send![class!(NSAutoreleasePool), new]);
             // Publish the command source/runloop before AX installation and prewarming.
             // Launch/Terminate commands arriving during startup keep the source signaled
             // and drain immediately once the runloop starts instead of waiting for a later wake.
@@ -138,36 +141,101 @@ pub(crate) fn start() {
                 CFRunLoopRun();
             }
             *OBSERVER_RL.0.lock().unwrap() = None;
-            let _: () = msg_send![pool, drain];
+            // `pool` drains once, in its Drop, after this line.
         })
         .expect("spawn thumb-observer thread");
 }
 
 /// The runloop source's perform: drains and executes the command queue.
 unsafe extern "C" fn drain_obs_commands(_info: *mut c_void) {
-    let Some(rx) = CMD_RX.get() else {
-        return;
-    };
-    while let Ok(cmd) = rx.try_recv() {
-        match cmd {
-            ObsCmd::Install(pid) => {
-                install_observer_for_pid(pid);
-                pregen_windows_for_pid(pid);
-            }
-            ObsCmd::Remove(pid) => {
-                if let Some((obs, src)) = INSTALLED.0.lock().unwrap().remove(&pid) {
-                    let rl = CFRunLoopGetCurrent();
-                    CFRunLoopRemoveSource(rl, src.0, kCFRunLoopDefaultMode);
-                    CFRelease(obs.0 as *const c_void);
+    crate::callback_guard::void("drain_obs_commands", || {
+        let Some(rx) = CMD_RX.get() else {
+            return;
+        };
+        while let Ok(cmd) = rx.try_recv() {
+            match cmd {
+                ObsCmd::Install(pid) => {
+                    install_observer_for_pid(pid);
+                    pregen_windows_for_pid(pid);
                 }
-                // Evict the dead app's cached frames too: they will never be shown
-                // again and would only crowd out live windows' frames.
-                let evicted = CACHE.lock().unwrap().remove_where(|(k, _)| k.pid == pid);
-                for t in evicted {
-                    CFRelease(t.img);
+                ObsCmd::Remove(pid) => {
+                    if let Some((obs, src)) = INSTALLED.0.lock().unwrap().remove(&pid) {
+                        let rl = CFRunLoopGetCurrent();
+                        CFRunLoopRemoveSource(rl, src.0, kCFRunLoopDefaultMode);
+                        CFRelease(obs.0 as *const c_void);
+                    }
+                    // Evict the dead app's cached frames too: they will never be shown
+                    // again and would only crowd out live windows' frames.
+                    let evicted = CACHE.lock().unwrap().remove_where(|(k, _)| k.pid == pid);
+                    for t in evicted {
+                        CFRelease(t.img);
+                    }
                 }
             }
         }
+    });
+}
+
+/// The pids currently alive, as a workspace answer computed WITHOUT holding `CAPTURE_STATE`.
+///
+/// The lock must not be held across Objective-C calls, so this runs first and its answer is passed
+/// into the ledger as a pure set. One autorelease pool for the whole sweep.
+fn live_pids_now(ledger_pids: std::collections::HashSet<i32>) -> std::collections::HashSet<i32> {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    if ledger_pids.is_empty() {
+        return ledger_pids;
+    }
+    unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let live: std::collections::HashSet<i32> = ledger_pids
+            .iter()
+            .copied()
+            .filter(|pid| {
+                let app: *mut AnyObject = msg_send![
+                    class!(NSRunningApplication),
+                    runningApplicationWithProcessIdentifier: *pid
+                ];
+                !app.is_null()
+            })
+            .collect();
+        let _: () = msg_send![pool, drain];
+        live
+    }
+}
+
+/// Reclaim the ledger if any entry point grew it, AFTER the callers released the lock.
+///
+/// `CAPTURE_STATE` is taken and released many times per event, so the growth flag cannot be consumed
+/// inside the helper that creates a row. Each production entry point calls this once it is done with
+/// the lock, which is what keeps "every growth entry point triggers reclaim" true without making each
+/// site pass the flag around.
+pub(super) fn reclaim_if_growth_pending() {
+    // A plain lock, NOT try_lock: giving up on contention loses the ONLY notice a growth event
+    // produces. The guard is dropped before any Objective-C work runs, so the wait is short.
+    let pending = match CAPTURE_STATE.lock() {
+        Ok(state) => state.growth_pending(),
+        Err(_) => return,
+    };
+    if pending {
+        reclaim_ledger_after_growth();
+    }
+}
+/// Reclaim the ledger after a growth, with the workspace query kept outside the lock.
+///
+/// Called only when an insert actually added a row: a repeated request for a known pid is the hot
+/// path and must not enumerate anything.
+fn reclaim_ledger_after_growth() {
+    // The observation is stamped with the generations it saw, so a row created or bumped while the
+    // query ran is left alone instead of being deleted on the strength of an answer that never
+    // looked at it.
+    let observed = match CAPTURE_STATE.lock() {
+        Ok(state) => state.generations_snapshot(),
+        Err(_) => return,
+    };
+    let live = live_pids_now(observed.keys().copied().collect());
+    if let Ok(mut state) = CAPTURE_STATE.lock() {
+        state.reclaim(&observed, &live);
     }
 }
 
@@ -176,7 +244,10 @@ unsafe extern "C" fn drain_obs_commands(_info: *mut c_void) {
 pub(crate) fn app_launched(pid: i32) {
     // Restore PID liveness even before the service starts, covering rapid exit/PID
     // reuse during startup.
-    CAPTURE_STATE.lock().unwrap().activate_pid(pid);
+    let grew = CAPTURE_STATE.lock().unwrap().activate_pid(pid);
+    if grew {
+        reclaim_ledger_after_growth();
+    }
     if !STARTED.load(Ordering::SeqCst) || pid == std::process::id() as i32 {
         return;
     }
@@ -200,12 +271,17 @@ pub(crate) fn app_terminated(pid: i32) {
     // lock; the observer thread then only needs to remove the AX source. This lock order
     // prevents a late capture from being inserted after cleanup.
     let mut state = CAPTURE_STATE.lock().unwrap();
-    state.cancel_pid(pid);
+    let grew = state.cancel_pid(pid);
     let evicted = CACHE
         .lock()
         .unwrap()
         .remove_where(|(key, _)| key.pid == pid);
     drop(state);
+    // Only a terminate mark that added a row grows the ledger; the workspace query then runs
+    // without the lock, as everywhere else.
+    if grew {
+        reclaim_ledger_after_growth();
+    }
     for thumb in evicted {
         unsafe {
             CFRelease(thumb.img);
@@ -250,7 +326,7 @@ fn signal_observer_runloop() {
 /// burn AX round-trips for nothing.
 fn regular_running_pids() -> Vec<i32> {
     unsafe {
-        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let _pool = AutoreleasePoolGuard(msg_send![class!(NSAutoreleasePool), new]);
         let mut out: Vec<i32> = Vec::new();
         let ws: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
         let running: *mut AnyObject = msg_send![ws, runningApplications];
@@ -264,7 +340,7 @@ fn regular_running_pids() -> Vec<i32> {
                 out.push(pid);
             }
         }
-        let _: () = msg_send![pool, drain];
+        // `pool` drains once, in its Drop.
         out
     }
 }
@@ -315,25 +391,27 @@ unsafe fn install_observer_for_pid(pid: i32) {
 fn current_prewarm_jobs() -> Vec<(i32, u32, u64)> {
     crate::with_tab_state(|state_opt| match state_opt.as_ref() {
         Some(state) => {
-            let capture_state = CAPTURE_STATE.lock().unwrap();
-            state
-                .windows
-                .iter()
-                .filter(|window| {
-                    !window.minimized
-                        && !window.on_other_desktop
-                        && window.window_id != 0
-                        && window.bounds.2 > 0.0
-                        && window.bounds.3 > 0.0
-                })
-                .map(|window| {
-                    (
-                        window.pid,
-                        window.window_id,
-                        capture_state.pid_generation(window.pid),
-                    )
-                })
-                .collect::<Vec<_>>()
+            let jobs = {
+                let mut capture_state = CAPTURE_STATE.lock().unwrap();
+                state
+                    .windows
+                    .iter()
+                    .filter(|window| {
+                        !window.minimized
+                            && !window.on_other_desktop
+                            && window.window_id != 0
+                            && window.bounds.2 > 0.0
+                            && window.bounds.3 > 0.0
+                    })
+                    .map(|window| {
+                        // A first query mints the row and flags growth; the lock is released first.
+                        let generation = capture_state.pid_generation(window.pid);
+                        (window.pid, window.window_id, generation)
+                    })
+                    .collect::<Vec<_>>()
+            };
+            reclaim_if_growth_pending();
+            jobs
         }
         None => Vec::new(),
     })
@@ -388,6 +466,9 @@ unsafe fn pregen_windows_for_pid(pid: i32) {
         return;
     }
     let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
+    // The row may have been minted just above, and this function has early returns: publish the
+    // pending reclaim before any of them can skip it.
+    reclaim_if_growth_pending();
     let Some(windows) = crate::window_collector::get_ax_windows_for_pid(pid) else {
         log_debug!("[thumb] pregen pid={}: AX query failed", pid);
         return;
@@ -419,36 +500,54 @@ unsafe extern "C" fn thumb_ax_observer(
     notification: *const c_void,
     _info: *mut c_void,
 ) {
-    let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-    // Notification names compare by string value (the literal equals the system
-    // constant; see AX_WINDOW_CREATED).
-    if !notification.is_null()
-        && unsafe { CFStringCompare(notification, AX_WINDOW_CREATED.ptr, 0) } == 0
-    {
-        let mut wid: u32 = 0;
-        if crate::window_collector::ax_window_cgwid(element).is_some_and(|resolved| {
-            wid = resolved;
-            wid != 0
-        }) {
-            let mut pid: i32 = 0;
-            AXUIElementGetPid(element, &mut pid);
-            if pid > 0 && crate::theme::thumbnails_enabled() {
-                let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
-                // Debounce 300ms: brand-new windows may still be laying out / blank.
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(300));
-                    if crate::theme::thumbnails_enabled() && capture_allowed() {
-                        enqueue_job_for_generation(
-                            pid,
-                            wid,
-                            BASE_TARGET_PX_H,
-                            CapturePriority::NewWindow,
-                            pid_generation,
-                        );
-                    }
-                });
+    crate::callback_guard::void("thumb_ax_observer", || {
+        let _pool = AutoreleasePoolGuard(unsafe { msg_send![class!(NSAutoreleasePool), new] });
+        // Notification names compare by string value (the literal equals the system
+        // constant; see AX_WINDOW_CREATED).
+        if !notification.is_null()
+            && unsafe { CFStringCompare(notification, AX_WINDOW_CREATED.ptr, 0) } == 0
+        {
+            let mut wid: u32 = 0;
+            if crate::window_collector::ax_window_cgwid(element).is_some_and(|resolved| {
+                wid = resolved;
+                wid != 0
+            }) {
+                let mut pid: i32 = 0;
+                AXUIElementGetPid(element, &mut pid);
+                if pid > 0 && crate::theme::thumbnails_enabled() {
+                    let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
+                    // The debounce task below can bail out (thumbnails off, no permission) without
+                    // enqueueing, so publish the reclaim notice here.
+                    reclaim_if_growth_pending();
+                    // Debounce 300ms: brand-new windows may still be laying out / blank.
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(300));
+                        if crate::theme::thumbnails_enabled() && capture_allowed() {
+                            enqueue_job_for_generation(
+                                pid,
+                                wid,
+                                BASE_TARGET_PX_H,
+                                CapturePriority::NewWindow,
+                                pid_generation,
+                            );
+                        }
+                    });
+                }
+            }
+        }
+        // `pool` is dropped at the end of the guarded body, on the normal and the panic path.
+    });
+}
+
+/// Drains an `NSAutoreleasePool` when it goes out of scope, including on unwind.
+struct AutoreleasePoolGuard(*mut AnyObject);
+
+impl Drop for AutoreleasePoolGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                let _: () = msg_send![self.0, drain];
             }
         }
     }
-    let _: () = msg_send![pool, drain];
 }

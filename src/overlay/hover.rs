@@ -1,6 +1,7 @@
 //! Hover machinery: hit-testing, the hover tick timer, and deferred scroll hover.
 
 use super::*;
+use crate::callback_guard;
 
 /// Select the card under a point in the overlay's window space (main thread).
 /// Two mouse sources converge here: the container's tracking area (mouseMoved:) and the
@@ -133,54 +134,56 @@ pub(super) unsafe extern "C" fn hover_tick_callback(
     _timer: event_tap::CFRunLoopTimerRef,
     _info: *mut c_void,
 ) {
-    // Read the cursor via CGEventCreate: independent of the mouseMoved stream (while a side
-    // button is held the system emits no mouseMoved, freezing NSEvent.mouseLocation;
-    // CGEventCreate queries the system state directly).
-    let ev = event_tap::CGEventCreate(std::ptr::null_mut());
-    if ev.is_null() {
-        return;
-    }
-    let pos = event_tap::CGEventGetLocation(ev);
-    CFRelease(ev as *const c_void);
-    // CGEventGetLocation uses the CG coordinate space (primary-display top-left origin),
-    // while window frames use AppKit's primary-display bottom-left origin. Flip y around the
-    // top of NSScreen.screens[0], never NSScreen.mainScreen (which follows the key window);
-    // otherwise the two hover sources hit different cards after switching to a secondary display.
-    let primary_frame = match primary_screen_frame() {
-        Some(frame) => frame,
-        None => return,
-    };
-    let pos = cg_to_appkit_point(NSPoint::new(pos.x, pos.y), primary_frame);
-    let container = match *CONTAINER.lock().unwrap() {
-        Some(c) => c.0,
-        None => return,
-    };
-    let win: *mut AnyObject = msg_send![container, window];
-    let win_frame: NSRect = msg_send![win, frame];
-    let loc = NSPoint::new(pos.x - win_frame.origin.x, pos.y - win_frame.origin.y);
-    update_thumbnail_pointer_state(loc);
-    let mut last = HOVER_TICK_POS.lock().unwrap();
-    match *last {
-        // First tick: no baseline yet -- record the position without selecting (keeping
-        // the "select only after a move" gate; the card under the cursor at summon time
-        // isn't auto-selected). The old code computed dx via map_or(pos), which made
-        // dx=dy=0 when None, forever tripping the <4.0 check -- the baseline was never
-        // stored and selection never fired (verified).
-        None => {
-            *last = Some((pos.x, pos.y));
+    callback_guard::void("hover_tick_callback", || unsafe {
+        // Read the cursor via CGEventCreate: independent of the mouseMoved stream (while a side
+        // button is held the system emits no mouseMoved, freezing NSEvent.mouseLocation;
+        // CGEventCreate queries the system state directly).
+        let ev = event_tap::CGEventCreate(std::ptr::null_mut());
+        if ev.is_null() {
             return;
         }
-        Some((px, py)) => {
-            let dx = pos.x - px;
-            let dy = pos.y - py;
-            if dx * dx + dy * dy < 4.0 {
+        let pos = event_tap::CGEventGetLocation(ev);
+        CFRelease(ev as *const c_void);
+        // CGEventGetLocation uses the CG coordinate space (primary-display top-left origin),
+        // while window frames use AppKit's primary-display bottom-left origin. Flip y around the
+        // top of NSScreen.screens[0], never NSScreen.mainScreen (which follows the key window);
+        // otherwise the two hover sources hit different cards after switching to a secondary display.
+        let primary_frame = match primary_screen_frame() {
+            Some(frame) => frame,
+            None => return,
+        };
+        let pos = cg_to_appkit_point(NSPoint::new(pos.x, pos.y), primary_frame);
+        let container = match *CONTAINER.lock().unwrap() {
+            Some(c) => c.0,
+            None => return,
+        };
+        let win: *mut AnyObject = msg_send![container, window];
+        let win_frame: NSRect = msg_send![win, frame];
+        let loc = NSPoint::new(pos.x - win_frame.origin.x, pos.y - win_frame.origin.y);
+        update_thumbnail_pointer_state(loc);
+        let mut last = HOVER_TICK_POS.lock().unwrap();
+        match *last {
+            // First tick: no baseline yet -- record the position without selecting (keeping
+            // the "select only after a move" gate; the card under the cursor at summon time
+            // isn't auto-selected). The old code computed dx via map_or(pos), which made
+            // dx=dy=0 when None, forever tripping the <4.0 check -- the baseline was never
+            // stored and selection never fired (verified).
+            None => {
+                *last = Some((pos.x, pos.y));
                 return;
             }
-            *last = Some((pos.x, pos.y));
+            Some((px, py)) => {
+                let dx = pos.x - px;
+                let dy = pos.y - py;
+                if dx * dx + dy * dy < 4.0 {
+                    return;
+                }
+                *last = Some((pos.x, pos.y));
+            }
         }
-    }
-    drop(last);
-    handle_hover_at(loc);
+        drop(last);
+        handle_hover_at(loc);
+    });
 }
 
 /// Start the hover poll timer while the overlay is shown (invalidating any stale one first).
@@ -236,7 +239,7 @@ pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _e
     // the coordinate is unreliable (verified: loc never changed while moving). Use the
     // screen coordinate (NSEvent.mouseLocation, bottom-left origin) converted into the
     // overlay's window space, the same base as the card frames.
-    unsafe {
+    callback_guard::void("container_mouse_moved", || unsafe {
         let mouse_screen: NSPoint = msg_send![class!(NSEvent), mouseLocation];
         let container = match *CONTAINER.lock().unwrap() {
             Some(c) => c.0,
@@ -250,7 +253,7 @@ pub(crate) extern "C" fn container_mouse_moved(_self: *mut c_void, _cmd: Sel, _e
         );
         update_thumbnail_pointer_state(loc);
         handle_hover_at(loc);
-    }
+    });
 }
 
 #[cfg(test)]
@@ -332,12 +335,15 @@ pub(crate) extern "C" fn on_deferred_scroll_hover(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    let visible = with_tab_state(|state_opt| state_opt.as_ref().is_some_and(|state| state.visible));
-    if visible {
-        container_mouse_moved(
-            std::ptr::null_mut(),
-            sel!(mouseMoved:),
-            std::ptr::null_mut(),
-        );
-    }
+    callback_guard::void("on_deferred_scroll_hover", || {
+        let visible =
+            with_tab_state(|state_opt| state_opt.as_ref().is_some_and(|state| state.visible));
+        if visible {
+            container_mouse_moved(
+                std::ptr::null_mut(),
+                sel!(mouseMoved:),
+                std::ptr::null_mut(),
+            );
+        }
+    });
 }

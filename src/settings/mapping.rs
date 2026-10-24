@@ -1,6 +1,7 @@
 //! Button mappings: mapping-row rendering, side-button recording (dedicated CGEventTap thread), and the edit panel.
 
 use super::*;
+use crate::callback_guard;
 
 /// Render the selected device's button-mapping rows into the scroll container (called after
 /// recording / deletion / device switch). Old rows are removed first, then rebuilt sorted by
@@ -746,12 +747,14 @@ pub(super) unsafe fn recording_thread() {
 /// The "Add mapping" button: opens the mapping edit panel (trigger/action/combo configured
 /// in one place, LinearMouse style).
 pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // Panel already open: close it first.
-    if EDIT_PANEL.lock().unwrap().is_some() {
-        close_mapping_panel();
-    }
-    open_mapping_panel(None);
-    log_debug!("[mouse] mapping panel opened (new mapping)");
+    callback_guard::void("handle_add_mapping", || {
+        // Panel already open: close it first.
+        if EDIT_PANEL.lock().unwrap().is_some() {
+            close_mapping_panel();
+        }
+        open_mapping_panel(None);
+        log_debug!("[mouse] mapping panel opened (new mapping)");
+    });
 }
 
 /// The row "Edit" callback: opens the panel prefilled for the sender's button number.
@@ -760,15 +763,97 @@ pub(crate) extern "C" fn handle_add_mapping(_self: *mut c_void, _cmd: Sel, _send
 /// component's hover/normal palette (AGENTS.md), so carrying the button number in it both froze the
 /// button's colour after the pointer left and made the handler read a field it does not own.
 pub(crate) extern "C" fn handle_mapping_edit(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    // Panel already open: close it first (the user expects a fresh panel, not silence).
-    if EDIT_PANEL.lock().unwrap().is_some() {
-        close_mapping_panel();
+    callback_guard::void("handle_mapping_edit", || {
+        // Panel already open: close it first (the user expects a fresh panel, not silence).
+        if EDIT_PANEL.lock().unwrap().is_some() {
+            close_mapping_panel();
+        }
+        let Some(btn) = super::mapping_control_button(sender as *mut AnyObject) else {
+            return;
+        };
+        open_mapping_panel(Some(btn));
+        log_debug!("[mouse] mapping panel opened (edit button {})", btn);
+    });
+}
+
+/// Start the recording thread, rolling the session back if the thread cannot be created.
+///
+/// Why this exists: the callers set `REC_STAGE`, `RECORDING` and the panel button BEFORE spawning,
+/// because the tap has to be live by the time the OS delivers the next button press. Before the
+/// panic boundary existed a failed `thread::spawn` (it panics on EAGAIN) aborted the process, so the
+/// inconsistent state never survived; with the boundary in place the panic is contained and the
+/// session would stay "recording" for ever -- `key_bindings::engine` then skips global bindings because
+/// a recording is believed to be in progress. A failed spawn is therefore rolled back to Idle, and the
+/// panel button is re-enabled, so the next attempt starts from a clean state.
+fn spawn_recording_thread() {
+    match std::thread::Builder::new()
+        .name("mouse-recording".into())
+        .spawn(|| unsafe { recording_thread() })
+    {
+        Ok(handle) => {
+            *RECORD_THREAD.lock().unwrap() = Some(handle);
+        }
+        Err(error) => {
+            log_info!("[mouse] recording thread could not start: {error}");
+            roll_back_recording_session();
+        }
     }
-    let Some(btn) = super::mapping_control_button(sender as *mut AnyObject) else {
-        return;
-    };
-    open_mapping_panel(Some(btn));
-    log_debug!("[mouse] mapping panel opened (edit button {})", btn);
+}
+
+/// Undo the state a caller sets up before `spawn_recording_thread`.
+fn roll_back_recording_session() {
+    // Read the mode BEFORE the state rollback clears it, then restore the surface that was live.
+    let mode = *REC_MODE.lock().unwrap();
+    roll_back_recording_state();
+    match mode {
+        RecMode::KeyBinding => {
+            // The page disables its controls while a recording is in flight.
+            super::bindings::update_panel_ok();
+        }
+        RecMode::ClipboardShortcut => {
+            // The clipboard row shows a recording prompt; put it back to idle.
+            super::set_clipboard_shortcut_recording_ui(false, None);
+        }
+        RecMode::PanelTrigger | RecMode::PanelCombo | RecMode::Idle => {
+            // The mapping panel's OK button was disabled for this session (and for Idle there is
+            // nothing to restore, but the button is harmless to re-enable).
+            unsafe {
+                if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
+                    let _: () = msg_send![o.0, setEnabled: true];
+                }
+            }
+        }
+    }
+    // The config was not changed by a failed start, so the controls' enabled state is re-read.
+    super::dispatch::refresh_switcher_keystroke_and_mouse_controls_from_config();
+}
+
+/// The part of the rollback that is pure state: the session returns to Idle and the global
+/// recording flag is cleared, so a failed start cannot leave shortcuts disabled.
+fn roll_back_recording_state() {
+    // Reuse the cancellation path's responsibilities rather than a subset: besides `REC_STAGE`,
+    // `RECORDING` and the cancel flag it clears the mode and the pending action, stops the recorder
+    // tap and run loop, and leaves any key-binding recording. Stopping at the three fields left
+    // `binding_recording_pending()` true (it reads `REC_MODE`), so the binding controls stayed
+    // disabled after a failed start.
+    // Read the mode BEFORE clearing it: the key-binding cleanup is guarded by the mode, so
+    // clearing it first makes that call a no-op (found in review).
+    let was_active = *REC_STAGE.lock().unwrap() != RecStage::Idle;
+    let was_binding = *REC_MODE.lock().unwrap() == RecMode::KeyBinding;
+    *REC_STAGE.lock().unwrap() = RecStage::Idle;
+    *REC_PENDING_ACTION.lock().unwrap() = None;
+    *REC_MODS.lock().unwrap() = 0;
+    REC_DESC.lock().unwrap().clear();
+    REC_COMPLETED_DESC.lock().unwrap().clear();
+    REC_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
+    if was_active {
+        disable_rec_tap();
+    }
+    if was_binding {
+        let _ = reset_key_binding_recording_state();
+    }
+    *REC_MODE.lock().unwrap() = RecMode::Idle;
 }
 
 /// The panel "Record trigger" button: records the side button.
@@ -777,24 +862,26 @@ pub(crate) extern "C" fn handle_panel_record_trigger(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
-        return;
-    }
-    *REC_BUTTON.lock().unwrap() = 0;
-    *REC_MODS.lock().unwrap() = 0;
-    REC_DESC.lock().unwrap().clear();
-    *REC_MODE.lock().unwrap() = RecMode::PanelTrigger;
-    *REC_STAGE.lock().unwrap() = RecStage::WaitingButton;
-    REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-    crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
-    // Disable the panel OK while recording.
-    unsafe {
-        if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
-            let _: () = msg_send![o.0, setEnabled: false];
+    callback_guard::void("handle_panel_record_trigger", || {
+        if *REC_STAGE.lock().unwrap() != RecStage::Idle {
+            return;
         }
-    }
-    log_debug!("[mouse] recording trigger (press a mouse button)");
-    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+        *REC_BUTTON.lock().unwrap() = 0;
+        *REC_MODS.lock().unwrap() = 0;
+        REC_DESC.lock().unwrap().clear();
+        *REC_MODE.lock().unwrap() = RecMode::PanelTrigger;
+        *REC_STAGE.lock().unwrap() = RecStage::WaitingButton;
+        REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
+        // Disable the panel OK while recording.
+        unsafe {
+            if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
+                let _: () = msg_send![o.0, setEnabled: false];
+            }
+        }
+        log_debug!("[mouse] recording trigger (press a mouse button)");
+        spawn_recording_thread();
+    });
 }
 
 /// The panel "Record combo" button: records the combo (Key Press action).
@@ -803,27 +890,29 @@ pub(crate) extern "C" fn handle_panel_record_combo(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
-        return;
-    }
-    // The trigger must exist first (for new mappings).
-    let Some(btn) = *EDIT_BUTTON.lock().unwrap() else {
-        return;
-    };
-    *REC_BUTTON.lock().unwrap() = btn;
-    *REC_MODS.lock().unwrap() = 0;
-    REC_DESC.lock().unwrap().clear();
-    *REC_MODE.lock().unwrap() = RecMode::PanelCombo;
-    *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
-    REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-    crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
-    unsafe {
-        if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
-            let _: () = msg_send![o.0, setEnabled: false];
+    callback_guard::void("handle_panel_record_combo", || {
+        if *REC_STAGE.lock().unwrap() != RecStage::Idle {
+            return;
         }
-    }
-    log_debug!("[mouse] recording combo (press the key combo)");
-    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+        // The trigger must exist first (for new mappings).
+        let Some(btn) = *EDIT_BUTTON.lock().unwrap() else {
+            return;
+        };
+        *REC_BUTTON.lock().unwrap() = btn;
+        *REC_MODS.lock().unwrap() = 0;
+        REC_DESC.lock().unwrap().clear();
+        *REC_MODE.lock().unwrap() = RecMode::PanelCombo;
+        *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
+        REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
+        unsafe {
+            if let Some(o) = *EDIT_PANEL_OK.lock().unwrap() {
+                let _: () = msg_send![o.0, setEnabled: false];
+            }
+        }
+        log_debug!("[mouse] recording combo (press the key combo)");
+        spawn_recording_thread();
+    });
 }
 
 /// The panel action popup changed: refresh the combo row and OK availability.
@@ -832,15 +921,17 @@ pub(crate) extern "C" fn handle_panel_action_changed(
     _cmd: Sel,
     sender: *mut c_void,
 ) {
-    let idx: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
-    *EDIT_ACTION_IDX.lock().unwrap() = idx;
-    // Leaving Key Press clears the recorded combo.
-    if idx != 2 {
-        EDIT_COMBO.lock().unwrap().clear();
-    }
-    unsafe {
-        update_mapping_panel();
-    }
+    callback_guard::void("handle_panel_action_changed", || {
+        let idx: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
+        *EDIT_ACTION_IDX.lock().unwrap() = idx;
+        // Leaving Key Press clears the recorded combo.
+        if idx != 2 {
+            EDIT_COMBO.lock().unwrap().clear();
+        }
+        unsafe {
+            update_mapping_panel();
+        }
+    });
 }
 
 /// The panel "OK": write to MAPPING_EDITS and close.
@@ -849,46 +940,48 @@ pub(crate) extern "C" fn handle_mapping_confirm(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let Some(btn) = *EDIT_BUTTON.lock().unwrap() else {
-        return;
-    };
-    let idx = *EDIT_ACTION_IDX.lock().unwrap();
-    let mut edits = MAPPING_EDITS.lock().unwrap();
-    match idx {
-        0 => {
-            // Default: same as delete (the list shows bound rows only).
-            edits.remove(&btn.to_string());
-        }
-        1 => {
-            edits.insert(btn.to_string(), "none".to_string());
-        }
-        2 => {
-            // Key Press: needs a recorded combo (OK is disabled otherwise).
-            let combo = EDIT_COMBO.lock().unwrap().clone();
-            if combo.is_empty() {
-                return;
+    callback_guard::void("handle_mapping_confirm", || {
+        let Some(btn) = *EDIT_BUTTON.lock().unwrap() else {
+            return;
+        };
+        let idx = *EDIT_ACTION_IDX.lock().unwrap();
+        let mut edits = MAPPING_EDITS.lock().unwrap();
+        match idx {
+            0 => {
+                // Default: same as delete (the list shows bound rows only).
+                edits.remove(&btn.to_string());
             }
-            edits.insert(btn.to_string(), combo);
-        }
-        7 => {
-            // Open the switcher.
-            edits.insert(btn.to_string(), "switcher".to_string());
-        }
-        i => {
-            if let Some(name) = crate::mouse::shortcut::SYSTEM_ACTIONS.get((i - 3) as usize) {
-                edits.insert(btn.to_string(), name.to_string());
+            1 => {
+                edits.insert(btn.to_string(), "none".to_string());
+            }
+            2 => {
+                // Key Press: needs a recorded combo (OK is disabled otherwise).
+                let combo = EDIT_COMBO.lock().unwrap().clone();
+                if combo.is_empty() {
+                    return;
+                }
+                edits.insert(btn.to_string(), combo);
+            }
+            7 => {
+                // Open the switcher.
+                edits.insert(btn.to_string(), "switcher".to_string());
+            }
+            i => {
+                if let Some(name) = crate::mouse::shortcut::SYSTEM_ACTIONS.get((i - 3) as usize) {
+                    edits.insert(btn.to_string(), name.to_string());
+                }
             }
         }
-    }
-    drop(edits);
-    commit_mapping_edits();
-    close_mapping_panel();
-    render_mapping_rows();
-    log_debug!(
-        "[mouse] mapping panel confirmed: button {} -> index {}",
-        btn,
-        idx
-    );
+        drop(edits);
+        commit_mapping_edits();
+        close_mapping_panel();
+        render_mapping_rows();
+        log_debug!(
+            "[mouse] mapping panel confirmed: button {} -> index {}",
+            btn,
+            idx
+        );
+    });
 }
 
 /// The panel "Cancel": close without changes.
@@ -897,8 +990,10 @@ pub(crate) extern "C" fn handle_mapping_cancel(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    close_mapping_panel();
-    log_debug!("[mouse] mapping panel cancelled");
+    callback_guard::void("handle_mapping_cancel", || {
+        close_mapping_panel();
+        log_debug!("[mouse] mapping panel cancelled");
+    });
 }
 
 /// The mappings master switch toggled: re-render the rows (greyed out and inert when off).
@@ -907,11 +1002,13 @@ pub(crate) extern "C" fn handle_mapping_enabled_changed(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    // The mappings master switch is per-device: write it back to the selected device's profile
-    // immediately (with a debounced persist), then re-render the row states.
-    unsafe { apply_mouse_profile_field(ControlField::MappingEnabled) };
-    render_mapping_rows();
-    log_debug!("[mouse] mappings master switch toggled");
+    callback_guard::void("handle_mapping_enabled_changed", || {
+        // The mappings master switch is per-device: write it back to the selected device's profile
+        // immediately (with a debounced persist), then re-render the row states.
+        unsafe { apply_mouse_profile_field(ControlField::MappingEnabled) };
+        render_mapping_rows();
+        log_debug!("[mouse] mappings master switch toggled");
+    });
 }
 
 /// Open the mapping edit panel. btn = the button being edited (Some = editing an existing
@@ -1215,13 +1312,15 @@ pub(super) fn close_mapping_panel() {
 /// The row "Delete" callback: removes the sender's mapping (its button number comes from the
 /// address-keyed registry, not from `tag` -- see `handle_mapping_edit`).
 pub(crate) extern "C" fn handle_delete_mapping(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let Some(btn) = super::mapping_control_button(sender as *mut AnyObject) else {
-        return;
-    };
-    MAPPING_EDITS.lock().unwrap().remove(&btn.to_string());
-    commit_mapping_edits();
-    render_mapping_rows();
-    log_debug!("[mouse] removed mapping for button {}", btn);
+    callback_guard::void("handle_delete_mapping", || {
+        let Some(btn) = super::mapping_control_button(sender as *mut AnyObject) else {
+            return;
+        };
+        MAPPING_EDITS.lock().unwrap().remove(&btn.to_string());
+        commit_mapping_edits();
+        render_mapping_rows();
+        log_debug!("[mouse] removed mapping for button {}", btn);
+    });
 }
 
 pub(crate) extern "C" fn handle_recording_finished(
@@ -1229,66 +1328,68 @@ pub(crate) extern "C" fn handle_recording_finished(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    let btn = *REC_BUTTON.lock().unwrap();
-    let mode = *REC_MODE.lock().unwrap();
-    let desc = REC_COMPLETED_DESC.lock().unwrap().clone();
-    match mode {
-        // No recording was in flight (a late callback): nothing to apply.
-        RecMode::Idle => return,
-        // The panel recorded the trigger: update the panel.
-        RecMode::PanelTrigger => {
-            *EDIT_BUTTON.lock().unwrap() = Some(btn);
-            unsafe {
-                update_mapping_panel();
-            }
-            log_debug!("[mouse] panel trigger recorded: button {}", btn);
-        }
-        // The panel recorded the combo: update the panel (Key Press action).
-        RecMode::PanelCombo => {
-            *EDIT_COMBO.lock().unwrap() = desc.clone();
-            unsafe {
-                update_mapping_panel();
-            }
-            log_debug!("[mouse] panel combo recorded");
-        }
-        RecMode::KeyBinding => finish_key_binding_recording(&desc),
-        RecMode::ClipboardShortcut => {
-            // The chord is checked against the effective config, so it cannot take a chord a
-            // binding holds or one the app switcher owns.
-            let status = {
-                let cfg = crate::config::CONFIG.read().unwrap();
-                crate::key_bindings::clipboard_shortcut_status(
-                    &desc,
-                    cfg.key_bindings.items.as_deref().unwrap_or(&[]),
-                    crate::key_bindings::modifier_flag(&cfg.keyboard.modifier),
-                )
-            };
-            let error = match status {
-                Ok(_) => {
-                    super::apply_recorded_clipboard_shortcut(&desc);
-                    None
+    callback_guard::void("handle_recording_finished", || {
+        let btn = *REC_BUTTON.lock().unwrap();
+        let mode = *REC_MODE.lock().unwrap();
+        let desc = REC_COMPLETED_DESC.lock().unwrap().clone();
+        match mode {
+            // No recording was in flight (a late callback): nothing to apply.
+            RecMode::Idle => return,
+            // The panel recorded the trigger: update the panel.
+            RecMode::PanelTrigger => {
+                *EDIT_BUTTON.lock().unwrap() = Some(btn);
+                unsafe {
+                    update_mapping_panel();
                 }
-                Err(crate::key_bindings::ClipboardStatus::Invalid) => Some(tf(
-                    "errors.clipboard_shortcut_invalid",
-                    &[(
-                        "value",
-                        crate::mouse::shortcut::display_shortcut(&desc).as_str(),
-                    )],
-                )),
-                Err(crate::key_bindings::ClipboardStatus::Conflict) => {
-                    Some(t("errors.clipboard_shortcut_conflict"))
+                log_debug!("[mouse] panel trigger recorded: button {}", btn);
+            }
+            // The panel recorded the combo: update the panel (Key Press action).
+            RecMode::PanelCombo => {
+                *EDIT_COMBO.lock().unwrap() = desc.clone();
+                unsafe {
+                    update_mapping_panel();
                 }
-            };
-            super::set_clipboard_shortcut_recording_ui(false, error.as_deref());
+                log_debug!("[mouse] panel combo recorded");
+            }
+            RecMode::KeyBinding => finish_key_binding_recording(&desc),
+            RecMode::ClipboardShortcut => {
+                // The chord is checked against the effective config, so it cannot take a chord a
+                // binding holds or one the app switcher owns.
+                let status = {
+                    let cfg = crate::config::CONFIG.read().unwrap();
+                    crate::key_bindings::clipboard_shortcut_status(
+                        &desc,
+                        cfg.key_bindings.items.as_deref().unwrap_or(&[]),
+                        crate::key_bindings::modifier_flag(&cfg.keyboard.modifier),
+                    )
+                };
+                let error = match status {
+                    Ok(_) => {
+                        super::apply_recorded_clipboard_shortcut(&desc);
+                        None
+                    }
+                    Err(crate::key_bindings::ClipboardStatus::Invalid) => Some(tf(
+                        "errors.clipboard_shortcut_invalid",
+                        &[(
+                            "value",
+                            crate::mouse::shortcut::display_shortcut(&desc).as_str(),
+                        )],
+                    )),
+                    Err(crate::key_bindings::ClipboardStatus::Conflict) => {
+                        Some(t("errors.clipboard_shortcut_conflict"))
+                    }
+                };
+                super::set_clipboard_shortcut_recording_ui(false, error.as_deref());
+            }
         }
-    }
-    *REC_COMPLETED_DESC.lock().unwrap() = String::new();
-    *REC_CAPTURED_KEY.lock().unwrap() = None;
-    REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
-    *REC_MODE.lock().unwrap() = RecMode::Idle;
-    *REC_STAGE.lock().unwrap() = RecStage::Idle;
-    // The mode is settled now, so the panel can be told the truth about its buttons.
-    refresh_panel_after_recording();
+        *REC_COMPLETED_DESC.lock().unwrap() = String::new();
+        *REC_CAPTURED_KEY.lock().unwrap() = None;
+        REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
+        *REC_MODE.lock().unwrap() = RecMode::Idle;
+        *REC_STAGE.lock().unwrap() = RecStage::Idle;
+        // The mode is settled now, so the panel can be told the truth about its buttons.
+        refresh_panel_after_recording();
+    });
 }
 
 /// Main-thread callback: recording cancelled/failed.
@@ -1297,21 +1398,23 @@ pub(crate) extern "C" fn handle_recording_cancelled(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    if *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut {
-        super::set_clipboard_shortcut_recording_ui(false, None);
-    }
-    // Unconditional: the caller may already have reset the mode (that is exactly what the
-    // background cancellation path does), and `recording_ended` is idempotent -- it clears a draft
-    // if one is waiting and puts the add row back otherwise.
-    super::bindings::recording_ended();
-    reset_key_binding_recording_state();
-    REC_COMPLETED_DESC.lock().unwrap().clear();
-    *REC_STAGE.lock().unwrap() = RecStage::Idle;
-    // Same ordering rule as the completed path: the panel's buttons depend on the recording mode,
-    // so they are refreshed only once it has been reset -- otherwise a cancelled recording leaves
-    // the record button disabled and the user cannot try again.
-    refresh_panel_after_recording();
-    log_debug!("[mouse] button-mapping recording cancelled");
+    callback_guard::void("handle_recording_cancelled", || {
+        if *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut {
+            super::set_clipboard_shortcut_recording_ui(false, None);
+        }
+        // Unconditional: the caller may already have reset the mode (that is exactly what the
+        // background cancellation path does), and `recording_ended` is idempotent -- it clears a draft
+        // if one is waiting and puts the add row back otherwise.
+        super::bindings::recording_ended();
+        reset_key_binding_recording_state();
+        REC_COMPLETED_DESC.lock().unwrap().clear();
+        *REC_STAGE.lock().unwrap() = RecStage::Idle;
+        // Same ordering rule as the completed path: the panel's buttons depend on the recording mode,
+        // so they are refreshed only once it has been reset -- otherwise a cancelled recording leaves
+        // the record button disabled and the user cannot try again.
+        refresh_panel_after_recording();
+        log_debug!("[mouse] button-mapping recording cancelled");
+    });
 }
 
 /// The clipboard settings action records one chord through the same HID tap used by mouse
@@ -1321,21 +1424,23 @@ pub(crate) extern "C" fn handle_clipboard_shortcut_record(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    if *REC_STAGE.lock().unwrap() != RecStage::Idle {
-        return;
-    }
-    REC_DESC.lock().unwrap().clear();
-    REC_COMPLETED_DESC.lock().unwrap().clear();
-    *REC_MODS.lock().unwrap() = 0;
-    *REC_MODE.lock().unwrap() = RecMode::ClipboardShortcut;
-    *REC_CAPTURED_KEY.lock().unwrap() = None;
-    REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
-    *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
-    REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
-    crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
-    super::set_clipboard_shortcut_recording_ui(true, None);
-    log_debug!("[settings] clipboard shortcut recording started");
-    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+    callback_guard::void("handle_clipboard_shortcut_record", || {
+        if *REC_STAGE.lock().unwrap() != RecStage::Idle {
+            return;
+        }
+        REC_DESC.lock().unwrap().clear();
+        REC_COMPLETED_DESC.lock().unwrap().clear();
+        *REC_MODS.lock().unwrap() = 0;
+        *REC_MODE.lock().unwrap() = RecMode::ClipboardShortcut;
+        *REC_CAPTURED_KEY.lock().unwrap() = None;
+        REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
+        *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
+        REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
+        super::set_clipboard_shortcut_recording_ui(true, None);
+        log_debug!("[settings] clipboard shortcut recording started");
+        spawn_recording_thread();
+    });
 }
 
 /// Start a recording for a new key binding: the Key Bindings page's "Record Shortcut".
@@ -1362,7 +1467,7 @@ pub(crate) unsafe fn start_key_binding_recording(action: crate::key_bindings::Ac
     super::bindings::set_add_message(None);
     super::bindings::update_panel_ok();
     log_debug!("[settings] key-binding recording started");
-    *RECORD_THREAD.lock().unwrap() = Some(std::thread::spawn(|| unsafe { recording_thread() }));
+    spawn_recording_thread();
 }
 
 /// Finish a key-binding recording: turn the chord into a draft the add row asks the user to
@@ -1685,5 +1790,25 @@ mod tests {
         std::thread::spawn(|| notify_main(sel!(handleRecordingFinished:)))
             .join()
             .expect("notify_main must not panic when called off the main thread");
+    }
+
+    /// A recording session that could not start must not stay "recording".
+    ///
+    /// Why this is a regression test: the callers set the session state and the global RECORDING
+    /// flag before spawning the thread, and while a failed spawn aborted the process the
+    /// inconsistent state could not survive. With the panic boundary in place it would, and
+    /// `key_bindings::engine` skips every global binding while a recording is believed to be in
+    /// progress -- so a single failed spawn would silently disable the user's shortcuts.
+    #[test]
+    fn a_failed_recording_spawn_returns_the_session_to_idle() {
+        // Reproduce the state a caller establishes before spawning.
+        *REC_STAGE.lock().unwrap() = RecStage::WaitingButton;
+        crate::mouse::event_tap::RECORDING.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::roll_back_recording_state();
+        assert_eq!(*REC_STAGE.lock().unwrap(), RecStage::Idle);
+        assert!(
+            !crate::mouse::event_tap::RECORDING.load(std::sync::atomic::Ordering::Relaxed),
+            "the global recording flag must be cleared when the session is rolled back"
+        );
     }
 }

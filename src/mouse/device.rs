@@ -884,7 +884,9 @@ unsafe extern "C" fn device_matching_callback(
     sender: *mut c_void,
     callback: *mut c_void,
 ) {
-    device_change_callback(context, result, sender, callback, false);
+    crate::callback_guard::void("device_matching_callback", || {
+        device_change_callback(context, result, sender, callback, false);
+    });
 }
 
 /// Wrapper for IOHIDManager removal (detach) callbacks, entering the shared handler with
@@ -895,7 +897,9 @@ unsafe extern "C" fn device_removal_callback(
     sender: *mut c_void,
     callback: *mut c_void,
 ) {
-    device_change_callback(context, result, sender, callback, true);
+    crate::callback_guard::void("device_removal_callback", || {
+        device_change_callback(context, result, sender, callback, true);
+    });
 }
 
 /// Start device plug/unplug monitoring: create an IOHIDManager, register attach/detach callbacks,

@@ -1505,64 +1505,37 @@ mod visibility_badge_tests {
 
 #[cfg(test)]
 mod badge_smoke_tests {
+    use crate::smoke_verdict::smoke_runner;
     /// Run the real card view tree on the AppKit main thread in a child process and assert that the
     /// preview-corner badges follow the card's state (including the icon-fallback branch).
     #[test]
     #[ignore]
     fn card_badge_runtime_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-card-badges")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "card badge smoke failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("card_badge_runtime_smoke", 1, {
+            crate::smoke_verdict::run_smoke_child(
+                "card_badge_runtime_smoke",
+                &["--smoke-card-badges"],
+            );
+        });
     }
 }
 
 #[cfg(test)]
 mod selection_ring_smoke_tests {
+    use crate::smoke_verdict::smoke_runner;
     /// Run the real card view tree on the AppKit main thread in a child process and assert that both
     /// card layouts build the documented selected-state ring. This is the regression guard for the
     /// icon-only layout, which used to build no ring at all.
     #[test]
     #[ignore]
     fn selection_ring_runtime_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
-        let out = std::process::Command::new(&app)
-            .arg("--smoke-selection-ring")
-            .output()
-            .expect("failed to spawn app");
-        assert!(
-            out.status.success(),
-            "selection ring smoke failed (exit {:?})\nstderr:\n{}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr)
-        );
+        smoke_runner!("selection_ring_runtime_smoke", 1, {
+            // The child ran the ring assertions; take its verdict, and fail when it failed.
+            crate::smoke_verdict::run_smoke_child(
+                "selection_ring_runtime_smoke",
+                &["--smoke-selection-ring"],
+            );
+        });
     }
 }
 

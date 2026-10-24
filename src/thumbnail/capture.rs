@@ -284,11 +284,31 @@ pub(super) enum GeometryDeferResult {
 /// Tracks the highest target, priority, and lifecycle token for queued/in-flight
 /// requests. The channel is only a count/wakeup mechanism; on each wake the worker
 /// selects the highest-priority job here instead of inheriting channel FIFO order.
+/// One row per PID: its incarnation counter and whether it was terminated.
+///
+/// Both live in one map so there is no second container to bound, and no capacity is used as race
+/// protection: correctness comes from `generation`, which a stale observation cannot move.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(super) struct PidRow {
+    pub(super) generation: u64,
+    pub(super) terminated: bool,
+}
+
+/// The process-local generation allocator. It only increases and is never reclaimed, so a reclaimed
+/// PID's next generation is greater than any it ever had -- which is what keeps a stale job from
+/// being re-admitted when its row comes back.
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
 #[derive(Default)]
 pub(super) struct CaptureState {
     pub(super) desired: HashMap<ThumbKey, PendingCapture>,
-    pid_generations: HashMap<i32, u64>,
-    terminated_pids: HashSet<i32>,
+    /// One row per PID: generation and terminate mark together (see `PidRow`).
+    ledger: HashMap<i32, PidRow>,
+    /// Set when an entry point created a row; the caller reclaims after releasing the lock.
+    grew_since_reclaim: bool,
     next_sequence: u64,
     next_token: u64,
     next_freshness_sequence: u64,
@@ -310,7 +330,7 @@ impl CaptureState {
         target_px_h: u32,
         priority: CapturePriority,
     ) -> bool {
-        let pid_generation = self.pid_generations.get(&key.pid).copied().unwrap_or(0);
+        let pid_generation = self.pid_generation(key.pid);
         self.request_for_generation(key, target_px_h, priority, pid_generation, false)
     }
 
@@ -322,9 +342,7 @@ impl CaptureState {
         pid_generation: u64,
         appearance_refresh: bool,
     ) -> bool {
-        if self.terminated_pids.contains(&key.pid)
-            || self.pid_generations.get(&key.pid).copied().unwrap_or(0) != pid_generation
-        {
+        if !self.job_is_current(key.pid, pid_generation) {
             return false;
         }
         let freshness_sequence = Self::next_counter(&mut self.next_freshness_sequence);
@@ -381,9 +399,7 @@ impl CaptureState {
         activated_at: Instant,
         pid_generation: u64,
     ) -> ActivationRequestResult {
-        if self.terminated_pids.contains(&key.pid)
-            || self.pid_generations.get(&key.pid).copied().unwrap_or(0) != pid_generation
-        {
+        if !self.job_is_current(key.pid, pid_generation) {
             return ActivationRequestResult::Rejected;
         }
         let inserted = self.request_for_generation(
@@ -468,7 +484,7 @@ impl CaptureState {
     }
 
     pub(super) fn is_current(&self, job: CaptureJob) -> bool {
-        self.pid_generations.get(&job.key.pid).copied().unwrap_or(0) == job.pid_generation
+        self.job_is_current(job.key.pid, job.pid_generation)
             && self
                 .desired
                 .get(&job.key)
@@ -600,30 +616,143 @@ impl CaptureState {
         true
     }
 
-    pub(super) fn cancel_pid(&mut self, pid: i32) {
-        let generation = self.pid_generations.entry(pid).or_default();
-        *generation = generation.wrapping_add(1);
-        self.terminated_pids.insert(pid);
+    /// Whether a job stamped with `generation` still describes the pid's current incarnation.
+    ///
+    /// The generation -- not the terminate mark alone -- is what decides: a reclaimed pid comes back
+    /// with a higher generation, so an old job cannot be re-admitted, and a terminated pid is refused
+    /// whatever its generation.
+    fn job_is_current(&self, pid: i32, generation: u64) -> bool {
+        // A MISSING row approves nothing. It used to mean "the pid was never seen, so generation 0
+        // is current", which re-admitted an old job after its terminated row was reclaimed: the
+        // job had captured generation 0 before any row existed, and the row's later removal made
+        // that value legal again. `pid_generation` now creates the row on first use (see below), so
+        // a caller that holds a generation is always paired with a row.
+        match self.ledger.get(&pid) {
+            Some(row) => !row.terminated && row.generation == generation,
+            None => false,
+        }
+    }
+
+    /// Whether the pid had no row before this call (the growth trigger for reclaim).
+    pub(super) fn cancel_pid(&mut self, pid: i32) -> bool {
+        let is_new = !self.ledger.contains_key(&pid);
+        let row = self.ledger.entry(pid).or_default();
+        row.generation = next_generation();
+        row.terminated = true;
         self.desired.retain(|key, _| key.pid != pid);
+        is_new
     }
 
     pub(super) fn invalidate_window(&mut self, key: ThumbKey) -> bool {
         self.desired.remove(&key).is_some()
     }
 
-    pub(super) fn activate_pid(&mut self, pid: i32) {
-        let generation = self.pid_generations.entry(pid).or_default();
-        *generation = generation.wrapping_add(1);
-        self.terminated_pids.remove(&pid);
+    /// Whether the pid had no row before this call.
+    pub(super) fn activate_pid(&mut self, pid: i32) -> bool {
+        let is_new = !self.ledger.contains_key(&pid);
+        let row = self.ledger.entry(pid).or_default();
+        row.generation = next_generation();
+        row.terminated = false;
         self.desired.retain(|key, _| key.pid != pid);
+        is_new
     }
 
     pub(super) fn cancel_all(&mut self) {
         self.desired.clear();
     }
 
-    pub(super) fn pid_generation(&self, pid: i32) -> u64 {
-        self.pid_generations.get(&pid).copied().unwrap_or(0)
+    /// The pid's current generation, minting a row (with a unique generation) on first use.
+    ///
+    /// Minting here is what makes "no row" unambiguous: a generation handed to a job always refers
+    /// to a row, so reclaiming that row can never make the value legal again.
+    /// The pid's current generation, minting a row (with a unique generation) on first use.
+    ///
+    /// Minting here is what makes "no row" unambiguous: a generation handed to a job always
+    /// refers to a row, so reclaiming that row can never make the value legal again.
+    ///
+    /// A NEW row is a growth event, so this triggers a reclaim once the caller releases the lock.
+    /// Doing it here rather than at each call site matters: this is the entry point every
+    /// ordinary enqueue, activation refresh, prewarm and AX notification uses, and a single
+    /// forgotten caller is how a pid's whole lifecycle ends up never reclaiming anything.
+    pub(super) fn pid_generation(&mut self, pid: i32) -> u64 {
+        let (generation, grew) = self.pid_generation_reporting_growth(pid);
+        if grew {
+            self.grew_since_reclaim = true;
+        }
+        generation
+    }
+
+    /// The pid's generation, and whether this call CREATED the row.
+    ///
+    /// Every growth entry point has to report growth, not just `activate_pid`/`cancel_pid`: a
+    /// first generation query can create a row before a launch notification arrives, and if only
+    /// those two triggered reclaim the pid's whole lifecycle would never reclaim anything.
+    pub(super) fn pid_generation_reporting_growth(&mut self, pid: i32) -> (u64, bool) {
+        match self.ledger.get(&pid) {
+            Some(row) => (row.generation, false),
+            None => {
+                let generation = next_generation();
+                self.ledger.insert(
+                    pid,
+                    PidRow {
+                        generation,
+                        terminated: false,
+                    },
+                );
+                (generation, true)
+            }
+        }
+    }
+
+    /// The ledger's pids, for the bound assertion.
+    #[cfg(test)]
+    pub(super) fn ledger_pids(&self) -> std::collections::HashSet<i32> {
+        self.ledger.keys().copied().collect()
+    }
+
+    /// Drop rows the observation proved dead, using a generation-stamped observation.
+    ///
+    /// `observed` records each row's generation AT QUERY TIME. A row is only eligible when its
+    /// generation still matches: a row created or bumped while the query ran was never looked at,
+    /// so acting on the old answer would delete a fresh incarnation or clear a newer terminate
+    /// mark. Without this the reclaim is itself a time-of-check / time-of-use hole.
+    pub(super) fn reclaim(
+        &mut self,
+        observed: &std::collections::HashMap<i32, u64>,
+        live_pids: &std::collections::HashSet<i32>,
+    ) {
+        // Clear the request that this query was started for, but keep any growth that happened WHILE
+        // it ran: those rows were never observed, so they still need a reclaim of their own.
+        // Ask BEFORE the retain: afterwards an unobserved row may already be gone, so the question
+        // would answer "nothing pending" exactly when something is.
+        let unobserved_growth = self.ledger.keys().any(|pid| !observed.contains_key(pid));
+        self.grew_since_reclaim = unobserved_growth;
+        let referenced: std::collections::HashSet<i32> =
+            self.desired.keys().map(|key| key.pid).collect();
+        self.ledger.retain(|pid, row| {
+            let unchanged = observed.get(pid) == Some(&row.generation);
+            // A row the query never saw, or one whose generation moved, stays.
+            !unchanged || live_pids.contains(pid) || referenced.contains(pid)
+        });
+    }
+
+    /// The generations as they are now, for a query to carry back and compare.
+    /// Whether an entry point created a row since the last reclaim.
+    pub(super) fn growth_pending(&self) -> bool {
+        self.grew_since_reclaim
+    }
+
+    /// Whether the pid has a row.
+    #[cfg(test)]
+    pub(super) fn has_row(&self, pid: i32) -> bool {
+        self.ledger.contains_key(&pid)
+    }
+
+    pub(super) fn generations_snapshot(&self) -> std::collections::HashMap<i32, u64> {
+        self.ledger
+            .iter()
+            .map(|(pid, row)| (*pid, row.generation))
+            .collect()
     }
 }
 
@@ -1157,6 +1286,8 @@ pub(crate) fn schedule_focused_prewarm(pid: i32, wid: u32) {
     // the worker resolve switchability and captureability off the main thread.
     let frontmost_pid = current_frontmost_pid().unwrap_or(pid);
     let target_pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(frontmost_pid);
+    // Publish the reclaim notice here: this path may return without enqueueing.
+    crate::thumbnail::pregen::reclaim_if_growth_pending();
     let mut target_guard = FOCUSED_PREWARM_TARGET.lock().unwrap();
     let same_target = target_guard.as_ref().filter(|target| {
         target.pid == frontmost_pid
@@ -1425,6 +1556,8 @@ pub(super) fn enqueue_activation_job(
         }
         return false;
     }
+    // A first generation query in this path mints a row; reclaim after release.
+    crate::thumbnail::pregen::reclaim_if_growth_pending();
     true
 }
 
@@ -1437,6 +1570,16 @@ pub(super) fn enqueue_blank_retry_job(
     activated_at: Instant,
     pid_generation: u64,
 ) -> Option<BlankRetryEnqueueResult> {
+    // Every exit path (including the early returns below) must publish a pending reclaim: a
+    // first generation query can mint a row here, and a dropped request would leave the ledger
+    // with no reclaim trigger at all.
+    struct ReclaimOnDrop;
+    impl Drop for ReclaimOnDrop {
+        fn drop(&mut self) {
+            crate::thumbnail::pregen::reclaim_if_growth_pending();
+        }
+    }
+    let _reclaim = ReclaimOnDrop;
     let tx = ensure_capture_worker();
     let mut state = CAPTURE_STATE.lock().unwrap();
     if !PENDING_BLANK_RETRIES.lock().unwrap().contains(&key) {
@@ -1511,6 +1654,8 @@ fn enqueue_job_inner(
         CAPTURE_STATE.lock().unwrap().desired.remove(&key);
         return false;
     }
+    // A first generation query above mints a row; reclaim once the lock is released.
+    crate::thumbnail::pregen::reclaim_if_growth_pending();
     true
 }
 
@@ -2137,6 +2282,7 @@ pub(super) struct CapturedWindow {
     source_h_px: u32,
     pub(super) thumb: CachedThumb,
 }
+static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 
 pub(super) unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
     let cap = *CGS_CAPTURE_LIST.as_ref()?;
@@ -2230,5 +2376,3 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
     CFRelease(ctx);
     out
 }
-
-static CONNECTION_ID: OnceLock<u32> = OnceLock::new();

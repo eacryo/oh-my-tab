@@ -38,9 +38,14 @@ pub(crate) const CARD_TEXT_SIZE_MIN: f64 = 13.0;
 pub(crate) const CARD_TEXT_SIZE_MAX: f64 = 20.0;
 const STATUS_BAR_TEXT_BASE_SIZE: f64 = 13.0;
 
-/// The mock's `--fs-11`: the small section headings above each settings card
+/// The small heading above each settings card.
 /// (`.section-title { font-size: 11px }`).
-pub(crate) const FONT_SECTION_TITLE: f64 = 11.0;
+/// The design system's `section-header` role: 12pt, 600, secondary.
+///
+/// It was 11.0, taken from the mock's `.section-title`, which is not on the 12/14/20/26 scale
+/// `docs/design-style-en.md` fixes and which `--smoke-settings-layout` rejects (that mismatch was
+/// backlog #41). The document wins: the code is the bug.
+pub(crate) const FONT_SECTION_TITLE: f64 = 12.0;
 pub(crate) const FONT_CAPTION: f64 = 12.0;
 /// The mock's `--fs-13`: field text and labels that sit one step above a caption and one below a
 /// control's own 14pt (`.field-shell input`, the settings search field). Kept as its own step rather

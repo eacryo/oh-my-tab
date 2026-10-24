@@ -1,6 +1,7 @@
 //! Clipboard subsystem · notifications: pasteboard notification observers.
 
 use super::*;
+use crate::callback_guard;
 
 /// A singleton notification observer carrying two callbacks:
 /// - NSPasteboardDidChangeNotification: record on every pasteboard change. Polling samples
@@ -265,63 +266,69 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
 /// Main-thread refresh of the settings window's permission rows (a silent keychain grant produces no
 /// activation event, so the About row has to be told).
 extern "C" fn refresh_permission_ui(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    crate::settings::refresh_permission_ui_if_visible();
+    callback_guard::void("refresh_permission_ui", || {
+        crate::settings::refresh_permission_ui_if_visible();
+    });
 }
 
 extern "C" fn picker_refresh_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    PICKER_REFRESH_PENDING.store(false, Ordering::SeqCst);
-    if PICKER_WINDOW.lock().unwrap().is_none() {
-        return;
-    }
-    // While hidden, keep only the model change and refresh before the next presentation so the
-    // pasteboard observer cannot occupy the main thread and slow the app switcher.
-    if !PICKER_VISIBLE.load(Ordering::SeqCst) {
-        with_clipboard_ui(|ui| ui.rendered_rows = None);
-        return;
-    }
+    callback_guard::void("picker_refresh_rows", || {
+        PICKER_REFRESH_PENDING.store(false, Ordering::SeqCst);
+        if PICKER_WINDOW.lock().unwrap().is_none() {
+            return;
+        }
+        // While hidden, keep only the model change and refresh before the next presentation so the
+        // pasteboard observer cannot occupy the main thread and slow the app switcher.
+        if !PICKER_VISIBLE.load(Ordering::SeqCst) {
+            with_clipboard_ui(|ui| ui.rendered_rows = None);
+            return;
+        }
 
-    let filter = *CLIP_FILTER.lock().unwrap();
-    let show_source = show_source_app();
-    let query = with_clipboard_ui(|ui| ui.search_query.clone());
-    let key = picker_rows_key(history_revision(), &query, filter, show_source);
-    let rows_current = with_clipboard_ui(|ui| {
-        ui.rendered_rows
-            .as_ref()
-            .is_some_and(|current| current == &key)
+        let filter = *CLIP_FILTER.lock().unwrap();
+        let show_source = show_source_app();
+        let query = with_clipboard_ui(|ui| ui.search_query.clone());
+        let key = picker_rows_key(history_revision(), &query, filter, show_source);
+        let rows_current = with_clipboard_ui(|ui| {
+            ui.rendered_rows
+                .as_ref()
+                .is_some_and(|current| current == &key)
+        });
+        if rows_current {
+            return;
+        }
+
+        unsafe {
+            rebuild_rows();
+        }
     });
-    if rows_current {
-        return;
-    }
-
-    unsafe {
-        rebuild_rows();
-    }
 }
 
 /// Main-thread refresh after coalescing search input: consecutive keystrokes rebuild the
 /// visible rows only once after typing pauses.
 extern "C" fn picker_refresh_search_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    PICKER_SEARCH_REFRESH_PENDING.store(false, Ordering::SeqCst);
-    if !PICKER_VISIBLE.load(Ordering::SeqCst)
-        || REBUILDING.load(Ordering::SeqCst)
-        || PICKER_WINDOW.lock().unwrap().is_none()
-    {
-        return;
-    }
-    let filter = *CLIP_FILTER.lock().unwrap();
-    let show_source = show_source_app();
-    let query = with_clipboard_ui(|ui| ui.search_query.clone());
-    let key = picker_rows_key(history_revision(), &query, filter, show_source);
-    let rows_current = with_clipboard_ui(|ui| {
-        ui.rendered_rows
-            .as_ref()
-            .is_some_and(|current| current == &key)
-    });
-    if !rows_current {
-        unsafe {
-            rebuild_rows();
+    callback_guard::void("picker_refresh_search_rows", || {
+        PICKER_SEARCH_REFRESH_PENDING.store(false, Ordering::SeqCst);
+        if !PICKER_VISIBLE.load(Ordering::SeqCst)
+            || REBUILDING.load(Ordering::SeqCst)
+            || PICKER_WINDOW.lock().unwrap().is_none()
+        {
+            return;
         }
-    }
+        let filter = *CLIP_FILTER.lock().unwrap();
+        let show_source = show_source_app();
+        let query = with_clipboard_ui(|ui| ui.search_query.clone());
+        let key = picker_rows_key(history_revision(), &query, filter, show_source);
+        let rows_current = with_clipboard_ui(|ui| {
+            ui.rendered_rows
+                .as_ref()
+                .is_some_and(|current| current == &key)
+        });
+        if !rows_current {
+            unsafe {
+                rebuild_rows();
+            }
+        }
+    });
 }
 
 /// Coalesce consecutive search notifications so the editor stays responsive while the list
@@ -342,15 +349,17 @@ unsafe fn schedule_picker_search_refresh() {
 /// Materialize the new viewport after a scroll-event burst instead of tearing down and
 /// rebuilding the whole physical row set for every bounds-change callback.
 extern "C" fn picker_refresh_visible_rows(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    PICKER_VISIBLE_ROWS_REFRESH_PENDING.store(false, Ordering::SeqCst);
-    if !PICKER_VISIBLE.load(Ordering::SeqCst) || REBUILDING.load(Ordering::SeqCst) {
-        return;
-    }
-    unsafe {
-        if picker_materialized_range_changed() {
-            sync_visible_rows();
+    callback_guard::void("picker_refresh_visible_rows", || {
+        PICKER_VISIBLE_ROWS_REFRESH_PENDING.store(false, Ordering::SeqCst);
+        if !PICKER_VISIBLE.load(Ordering::SeqCst) || REBUILDING.load(Ordering::SeqCst) {
+            return;
         }
-    }
+        unsafe {
+            if picker_materialized_range_changed() {
+                sync_visible_rows();
+            }
+        }
+    });
 }
 
 /// Coalesce consecutive scroll notifications, giving AppKit a short run-loop window to finish
@@ -599,43 +608,47 @@ pub(super) fn schedule_picker_refresh() {
 
 /// Pasteboard-change notification callback (any thread): record the current text immediately.
 extern "C" fn pasteboard_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    poll_clipboard();
+    callback_guard::void("pasteboard_changed", || {
+        poll_clipboard();
+    });
 }
 
 /// Delayed cleanup for a one-shot paste write-back; abort if changeCount or our marker changed.
 extern "C" fn clear_system_pasteboard_if_owned(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    let Some(note) = (!note.is_null()).then_some(note as *mut AnyObject) else {
-        return;
-    };
-    let scheduled: i64 = unsafe { msg_send![note, longLongValue] };
-    // Each delayed selector carries its own changeCount. An older queued callback must not
-    // consume the token belonging to a newer one-shot paste.
-    if *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() != Some(scheduled) {
-        log_debug!("[clip] system pasteboard clear skipped: stale task");
-        return;
-    }
-    if !clear_system_pasteboard_after_paste() {
-        *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
-        log_debug!("[clip] system pasteboard clear skipped: setting disabled");
-        return;
-    }
-    unsafe {
-        let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
-        let current: i64 = if pb.is_null() {
-            -1
-        } else {
-            msg_send![pb, changeCount]
+    callback_guard::void("clear_system_pasteboard_if_owned", || {
+        let Some(note) = (!note.is_null()).then_some(note as *mut AnyObject) else {
+            return;
         };
-        let marker_present = !pb.is_null() && pasteboard_has_paste_marker();
-        if pb.is_null() || !marker_present || current != scheduled {
-            *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
-            log_debug!("[clip] system pasteboard clear skipped: ownership changed");
+        let scheduled: i64 = unsafe { msg_send![note, longLongValue] };
+        // Each delayed selector carries its own changeCount. An older queued callback must not
+        // consume the token belonging to a newer one-shot paste.
+        if *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() != Some(scheduled) {
+            log_debug!("[clip] system pasteboard clear skipped: stale task");
             return;
         }
-        let _: isize = msg_send![pb, clearContents];
-    }
-    *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
-    log_debug!("[clip] system pasteboard cleared after one-shot paste");
+        if !clear_system_pasteboard_after_paste() {
+            *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
+            log_debug!("[clip] system pasteboard clear skipped: setting disabled");
+            return;
+        }
+        unsafe {
+            let pb: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+            let current: i64 = if pb.is_null() {
+                -1
+            } else {
+                msg_send![pb, changeCount]
+            };
+            let marker_present = !pb.is_null() && pasteboard_has_paste_marker();
+            if pb.is_null() || !marker_present || current != scheduled {
+                *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
+                log_debug!("[clip] system pasteboard clear skipped: ownership changed");
+                return;
+            }
+            let _: isize = msg_send![pb, clearContents];
+        }
+        *PENDING_SYSTEM_PASTEBOARD_CLEAR.lock().unwrap() = None;
+        log_debug!("[clip] system pasteboard cleared after one-shot paste");
+    });
 }
 
 /// Schedule delayed cleanup on the main thread and record the post-write changeCount as the
@@ -791,7 +804,7 @@ fn handle_outside_click_event(event: *mut AnyObject) {
 
 /// The deferred half: re-check that the world has not changed under the queued click.
 pub(super) extern "C" fn clipboard_outside_click(_self: *mut c_void, _cmd: Sel) {
-    crate::callback_guard::void("clipboard_outside_click", || {
+    callback_guard::void("clipboard_outside_click", || {
         let Some(generation) = super::take_pending_outside_click() else {
             return;
         };
@@ -854,20 +867,24 @@ unsafe fn panel_group_contains(point: NSPoint) -> bool {
 /// no notification can reach (an unpinned panel that is already non-key); this handles losing key
 /// while pinned, which is exactly the event the pin exists to ignore.
 extern "C" fn window_did_resign_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    if super::is_pinned() {
-        // A pinned panel can remain open while the user changes apps. Capture the new external app
-        // as focus leaves the panel so a later row click targets the app the user switched to.
-        super::paste_handback::capture_external_target();
-        unsafe { super::set_picker_glass_inactive(true) };
-        return;
-    }
-    hide_picker();
+    callback_guard::void("window_did_resign_key", || {
+        if super::is_pinned() {
+            // A pinned panel can remain open while the user changes apps. Capture the new external app
+            // as focus leaves the panel so a later row click targets the app the user switched to.
+            super::paste_handback::capture_external_target();
+            unsafe { super::set_picker_glass_inactive(true) };
+            return;
+        }
+        hide_picker();
+    });
 }
 
 /// A pinned picker remains visible after resigning key; remove its passive-look compensation when
 /// it becomes key again so its active material is exactly the configured Liquid Glass.
 extern "C" fn window_did_become_key(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    unsafe { super::set_picker_glass_inactive(false) };
+    callback_guard::void("window_did_become_key", || {
+        unsafe { super::set_picker_glass_inactive(false) };
+    });
 }
 
 /// The NSEventType values that mean a mouse button went down: left, right, other.
@@ -948,60 +965,62 @@ pub(super) extern "C" fn clipboard_window_send_event(
     _cmd: Sel,
     event: *mut AnyObject,
 ) {
-    unsafe {
-        let window = _self as *mut AnyObject;
-        let etype: u64 = msg_send![event, type];
-        // A press that misses the search field ends the field's editing session: none of the
-        // panel's other surfaces becomes first responder on a press (the rows are buttons, the
-        // blank regions start a drag, the header/footer controls are buttons), so AppKit would
-        // leave the field editor in place -- the caret and the focused ring would stay, and the
-        // next keystroke would keep filtering instead of driving the list.
-        if is_mouse_press_type(etype) {
-            let point: NSPoint = msg_send![event, locationInWindow];
-            end_search_editing_for_press(point);
-        }
-        // The options popover dismisses on any click outside its frame (the event still goes
-        // through, so the clicked control behaves normally).
-        if crate::clipboard::filter_popover_open() && is_mouse_press_type(etype) {
-            let point: NSPoint = msg_send![event, locationInWindow];
-            let inside = if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
-                let frame: NSRect = msg_send![popover.0, frame];
-                let superview: *mut AnyObject = msg_send![popover.0, superview];
-                // The frame is in the (flipped) parent's coords; convert to window space.
-                let in_window: NSRect = msg_send![
-                    superview,
-                    convertRect: frame,
-                    toView: std::ptr::null::<AnyObject>()
-                ];
-                crate::clipboard::rect_contains_point(in_window, point)
-            } else {
-                false
-            };
-            // The options orb sits outside the popover. Keep its click for the orb's own
-            // toggle; dismissing here first would make the toggle reopen the menu.
-            let on_options_orb = if let Some(orb) = *PICKER_OPTIONS_ORB.lock().unwrap() {
-                let frame: NSRect = msg_send![orb.0, frame];
-                let superview: *mut AnyObject = msg_send![orb.0, superview];
-                let in_window: NSRect = msg_send![
-                    superview,
-                    convertRect: frame,
-                    toView: std::ptr::null::<AnyObject>()
-                ];
-                crate::clipboard::rect_contains_point(in_window, point)
-            } else {
-                false
-            };
-            if !inside && !on_options_orb {
-                super::detail::dismiss_filter_popover();
+    callback_guard::void("clipboard_window_send_event", || {
+        unsafe {
+            let window = _self as *mut AnyObject;
+            let etype: u64 = msg_send![event, type];
+            // A press that misses the search field ends the field's editing session: none of the
+            // panel's other surfaces becomes first responder on a press (the rows are buttons, the
+            // blank regions start a drag, the header/footer controls are buttons), so AppKit would
+            // leave the field editor in place -- the caret and the focused ring would stay, and the
+            // next keystroke would keep filtering instead of driving the list.
+            if is_mouse_press_type(etype) {
+                let point: NSPoint = msg_send![event, locationInWindow];
+                end_search_editing_for_press(point);
             }
+            // The options popover dismisses on any click outside its frame (the event still goes
+            // through, so the clicked control behaves normally).
+            if crate::clipboard::filter_popover_open() && is_mouse_press_type(etype) {
+                let point: NSPoint = msg_send![event, locationInWindow];
+                let inside = if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
+                    let frame: NSRect = msg_send![popover.0, frame];
+                    let superview: *mut AnyObject = msg_send![popover.0, superview];
+                    // The frame is in the (flipped) parent's coords; convert to window space.
+                    let in_window: NSRect = msg_send![
+                        superview,
+                        convertRect: frame,
+                        toView: std::ptr::null::<AnyObject>()
+                    ];
+                    crate::clipboard::rect_contains_point(in_window, point)
+                } else {
+                    false
+                };
+                // The options orb sits outside the popover. Keep its click for the orb's own
+                // toggle; dismissing here first would make the toggle reopen the menu.
+                let on_options_orb = if let Some(orb) = *PICKER_OPTIONS_ORB.lock().unwrap() {
+                    let frame: NSRect = msg_send![orb.0, frame];
+                    let superview: *mut AnyObject = msg_send![orb.0, superview];
+                    let in_window: NSRect = msg_send![
+                        superview,
+                        convertRect: frame,
+                        toView: std::ptr::null::<AnyObject>()
+                    ];
+                    crate::clipboard::rect_contains_point(in_window, point)
+                } else {
+                    false
+                };
+                if !inside && !on_options_orb {
+                    super::detail::dismiss_filter_popover();
+                }
+            }
+            type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
+            // The class that defined sendEvent:, recorded when the picker window was registered.
+            let defined = *crate::clipboard::picker_window_class();
+            let mut sup = ObjcSuper::for_defined_class(window as *mut c_void, defined);
+            let send_event: SendEvent = std::mem::transmute(objc_msgSendSuper as *const ());
+            send_event(&mut sup, sel!(sendEvent:), event);
         }
-        type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
-        // The class that defined sendEvent:, recorded when the picker window was registered.
-        let defined = *crate::clipboard::picker_window_class();
-        let mut sup = ObjcSuper::for_defined_class(window as *mut c_void, defined);
-        let send_event: SendEvent = std::mem::transmute(objc_msgSendSuper as *const ());
-        send_event(&mut sup, sel!(sendEvent:), event);
-    }
+    });
 }
 
 /// The picker and detail share one custom indicator class; only the target scroll view differs.
@@ -1252,13 +1271,13 @@ extern "C" fn scroll_indicator_accepts_first_mouse(
     _cmd: Sel,
     _event: *mut c_void,
 ) -> bool {
-    true
+    callback_guard::bool("scroll_indicator_accepts_first_mouse", true, || true)
 }
 
 /// Convert thumb movement into document offset. The system scroller is disabled, so NSView
 /// does not provide this behavior automatically.
 extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
+    callback_guard::void("scroll_indicator_mouse_down", || unsafe {
         let Some(target) = scroll_target_for_indicator(_self as *mut AnyObject) else {
             return;
         };
@@ -1319,11 +1338,11 @@ extern "C" fn scroll_indicator_mouse_down(_self: *mut c_void, _cmd: Sel, event: 
             max_offset,
             thumb_travel,
         });
-    }
+    });
 }
 
 extern "C" fn scroll_indicator_mouse_dragged(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
+    callback_guard::void("scroll_indicator_mouse_dragged", || unsafe {
         let drag = match *SCROLL_DRAG.lock().unwrap() {
             Some(drag) => drag,
             None => return,
@@ -1357,11 +1376,13 @@ extern "C" fn scroll_indicator_mouse_dragged(_self: *mut c_void, _cmd: Sel, even
         };
         let _: () = msg_send![clip, setBoundsOrigin: origin];
         let _: () = msg_send![scroll, reflectScrolledClipView: clip];
-    }
+    });
 }
 
 extern "C" fn scroll_indicator_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    *SCROLL_DRAG.lock().unwrap() = None;
+    callback_guard::void("scroll_indicator_mouse_up", || {
+        *SCROLL_DRAG.lock().unwrap() = None;
+    });
 }
 
 /// Clip-view bounds-change notification callback (scrolling) -> update the indicator; with
@@ -1370,7 +1391,7 @@ extern "C" fn scroll_indicator_mouse_up(_self: *mut c_void, _cmd: Sel, _event: *
 /// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
 /// aborts the process), so it is contained here.
 extern "C" fn scroll_indicator_bounds_changed(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    crate::callback_guard::void("scroll_indicator_bounds_changed", || unsafe {
+    callback_guard::void("scroll_indicator_bounds_changed", || unsafe {
         scroll_indicator_bounds_changed_inner(_self, _cmd, _note)
     });
 }
@@ -1519,12 +1540,14 @@ pub(super) extern "C" fn detail_scroll_indicator_bounds_changed(
     _cmd: Sel,
     _note: *mut c_void,
 ) {
-    // update_scroll_indicator_for reads DETAIL_SCROLL_VIEW itself and returns silently
-    // when the view is gone.
-    unsafe {
-        update_scroll_indicator_for(ScrollTarget::Detail);
-        update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
-    }
+    callback_guard::void("detail_scroll_indicator_bounds_changed", || {
+        // update_scroll_indicator_for reads DETAIL_SCROLL_VIEW itself and returns silently
+        // when the view is gone.
+        unsafe {
+            update_scroll_indicator_for(ScrollTarget::Detail);
+            update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
+        }
+    });
 }
 pub(super) fn cancel_clipboard_undo_timer() {
     unsafe {
@@ -1589,7 +1612,9 @@ fn expire_deleted_clipboard_entry() {
 }
 
 extern "C" fn expire_clipboard_undo(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    expire_deleted_clipboard_entry();
+    callback_guard::void("expire_clipboard_undo", || {
+        expire_deleted_clipboard_entry();
+    });
 }
 
 pub(super) fn undo_deleted_clipboard_entry() -> Option<ClipEntry> {
@@ -1635,11 +1660,15 @@ pub(super) extern "C" fn clear_clipboard_history(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    clear_clipboard_history_scope(false);
+    callback_guard::void("clear_clipboard_history", || {
+        clear_clipboard_history_scope(false);
+    });
 }
 
 pub(super) extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    clear_clipboard_history_scope(true);
+    callback_guard::void("clear_clipboard_all", || {
+        clear_clipboard_history_scope(true);
+    });
 }
 
 /// The panel-level pin: toggle the whole-panel state and reflect it on the button.
@@ -1648,7 +1677,7 @@ pub(super) extern "C" fn clear_clipboard_all(_self: *mut c_void, _cmd: Sel, _sen
 /// why the height comes from the live panel rect rather than from the geometry constants. The pin
 /// does not move, resize or re-front the panel, and it never touches the entries.
 pub(super) extern "C" fn toggle_panel_pin(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    crate::callback_guard::void("toggle_panel_pin", || unsafe {
+    callback_guard::void("toggle_panel_pin", || unsafe {
         if super::is_pinned() {
             // Decision C: unpinning only flips the state. The panel stays visible and the next
             // outside click dismisses it. The window properties are NOT restored here: doing so on a
@@ -1770,14 +1799,16 @@ pub(super) unsafe fn apply_pin_window_properties() {
 /// This is the ONE path that clears the panel pin (design decision A): the x means the user is
 /// done with the panel, while every other dismissal only hides it.
 extern "C" fn picker_close(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    super::forget_pin();
-    unsafe {
-        refresh_pin_button();
-        apply_pin_window_properties();
-        sync_outside_click_monitor();
-    }
-    crate::menu::refresh_clipboard_pin_item();
-    hide_picker();
+    callback_guard::void("picker_close", || {
+        super::forget_pin();
+        unsafe {
+            refresh_pin_button();
+            apply_pin_window_properties();
+            sync_outside_click_monitor();
+        }
+        crate::menu::refresh_clipboard_pin_item();
+        hide_picker();
+    });
 }
 
 /// The header's settings button: leave the panel and land on the clipboard page of the settings
@@ -1811,48 +1842,50 @@ pub(super) extern "C" fn open_clipboard_settings(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    // Bring the settings window up FIRST, then take the panel down: the other order left a moment with
-    // neither surface on screen (the panel gone, the window not yet composed), which read as a stall on
-    // top of the window's own build cost.
-    let started = std::time::Instant::now();
-    // How long the click waited before this handler ran. `NSEvent.timestamp` and
-    // `NSProcessInfo.systemUptime` share the clock (seconds since boot), so the difference is the part of
-    // the response the handler itself cannot see -- measured rather than assumed to be zero.
-    let delivery_ms = unsafe {
-        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        let event: *mut AnyObject = msg_send![nsapp, currentEvent];
-        if event.is_null() {
-            0.0
-        } else {
-            let timestamp: f64 = msg_send![event, timestamp];
-            let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
-            let uptime: f64 = msg_send![info, systemUptime];
-            ((uptime - timestamp) * 1000.0).max(0.0)
+    callback_guard::void("open_clipboard_settings", || {
+        // Bring the settings window up FIRST, then take the panel down: the other order left a moment with
+        // neither surface on screen (the panel gone, the window not yet composed), which read as a stall on
+        // top of the window's own build cost.
+        let started = std::time::Instant::now();
+        // How long the click waited before this handler ran. `NSEvent.timestamp` and
+        // `NSProcessInfo.systemUptime` share the clock (seconds since boot), so the difference is the part of
+        // the response the handler itself cannot see -- measured rather than assumed to be zero.
+        let delivery_ms = unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let event: *mut AnyObject = msg_send![nsapp, currentEvent];
+            if event.is_null() {
+                0.0
+            } else {
+                let timestamp: f64 = msg_send![event, timestamp];
+                let info: *mut AnyObject = msg_send![class!(NSProcessInfo), processInfo];
+                let uptime: f64 = msg_send![info, systemUptime];
+                ((uptime - timestamp) * 1000.0).max(0.0)
+            }
+        };
+        crate::settings::show_clipboard_page();
+        let shown = started.elapsed();
+        // A pinned panel stays up and ordered front (decision R1): the gear is a navigation action, not
+        // a dismissal, so it must not take the pinned panel away with it.
+        if !super::is_pinned() {
+            hide_picker();
         }
-    };
-    crate::settings::show_clipboard_page();
-    let shown = started.elapsed();
-    // A pinned panel stays up and ordered front (decision R1): the gear is a navigation action, not
-    // a dismissal, so it must not take the pinned panel away with it.
-    if !super::is_pinned() {
-        hide_picker();
-    }
-    let total = started.elapsed();
-    // Debug-level, click-path timing, and the number the A2 latency scenario bounds: from the click the
-    // event carries to the moment the panel is down and the window is up. Only the WindowServer's own
-    // compositing after this point is outside what the app can measure.
-    SETTINGS_CLICK_DELIVERY_MS.store(delivery_ms.round() as u64, Ordering::SeqCst);
-    SETTINGS_CLICK_MS.store(
-        (total.as_millis() + delivery_ms.round() as u128).min(u64::MAX as u128) as u64,
-        Ordering::SeqCst,
-    );
-    log_debug!(
-        "[settings-timing] gear_click delivery={}ms show={}ms hide={}ms total={}ms",
-        delivery_ms.round() as u64,
-        shown.as_millis(),
-        total.as_millis().saturating_sub(shown.as_millis()),
-        total.as_millis() + delivery_ms.round() as u128
-    );
+        let total = started.elapsed();
+        // Debug-level, click-path timing, and the number the A2 latency scenario bounds: from the click the
+        // event carries to the moment the panel is down and the window is up. Only the WindowServer's own
+        // compositing after this point is outside what the app can measure.
+        SETTINGS_CLICK_DELIVERY_MS.store(delivery_ms.round() as u64, Ordering::SeqCst);
+        SETTINGS_CLICK_MS.store(
+            (total.as_millis() + delivery_ms.round() as u128).min(u64::MAX as u128) as u64,
+            Ordering::SeqCst,
+        );
+        log_debug!(
+            "[settings-timing] gear_click delivery={}ms show={}ms hide={}ms total={}ms",
+            delivery_ms.round() as u64,
+            shown.as_millis(),
+            total.as_millis().saturating_sub(shown.as_millis()),
+            total.as_millis() + delivery_ms.round() as u128
+        );
+    });
 }
 
 /// Clear the visible history scope (see `remove_history_scope`) and release the cache files of the
@@ -1932,59 +1965,65 @@ pub(super) fn clear_search() {
 
 /// Search-field text-change notification callback: update the query and rebuild the filter.
 extern "C" fn search_field_changed(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    let field: *mut AnyObject = unsafe { msg_send![note as *mut AnyObject, object] };
-    if field.is_null() {
-        return;
-    }
-    let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
-    let q = unsafe { nsstring_to_rust(s) };
-    let has_query = !q.is_empty();
-    with_clipboard_ui(|ui| ui.search_query = q);
-    if !has_query {
-        SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
-    }
-    unsafe { set_search_clear_button_visible(has_query) };
-    // The clear actions name their scope, which now includes "results" instead of a category.
-    update_clear_action_labels();
-    // The hand-drawn ⌘F keycap and right × are positioned from query state, so force a redraw
-    // whenever text changes.
-    unsafe {
-        let _: () = msg_send![field, setNeedsDisplay: true];
-    }
-    // Do NOT reset the selection: while editing (focus in the search field) it stays
-    // "no selection"; returning to the list (↓) resets it to the first entry in
-    // search_field_do_command.
-    unsafe { schedule_picker_search_refresh() };
+    callback_guard::void("search_field_changed", || {
+        let field: *mut AnyObject = unsafe { msg_send![note as *mut AnyObject, object] };
+        if field.is_null() {
+            return;
+        }
+        let s: *mut AnyObject = unsafe { msg_send![field, stringValue] };
+        let q = unsafe { nsstring_to_rust(s) };
+        let has_query = !q.is_empty();
+        with_clipboard_ui(|ui| ui.search_query = q);
+        if !has_query {
+            SEARCH_CLEAR_HOVERED.store(false, Ordering::SeqCst);
+        }
+        unsafe { set_search_clear_button_visible(has_query) };
+        // The clear actions name their scope, which now includes "results" instead of a category.
+        update_clear_action_labels();
+        // The hand-drawn ⌘F keycap and right × are positioned from query state, so force a redraw
+        // whenever text changes.
+        unsafe {
+            let _: () = msg_send![field, setNeedsDisplay: true];
+        }
+        // Do NOT reset the selection: while editing (focus in the search field) it stays
+        // "no selection"; returning to the list (↓) resets it to the first entry in
+        // search_field_do_command.
+        unsafe { schedule_picker_search_refresh() };
+    });
 }
 
 /// NSSearchField's Esc (cancelOperation:): a query gets cleared and the full list restored
 /// (scheme A, level one); with no query the picker closes (level two).
 pub(super) extern "C" fn search_field_cancel(_self: *mut c_void, _cmd: Sel) {
-    // A live options menu owns the first Escape press regardless of which field has focus.
-    if crate::clipboard::filter_popover_open() {
-        super::detail::dismiss_filter_popover();
-        return;
-    }
-    // Same rule as the list-focus Esc: a pinned panel ignores the key before it can clear a query.
-    if super::is_pinned() {
-        return;
-    }
-    let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
-    if has_query {
-        clear_search();
-        // Focus stays in the search field: keep "no selection" (no highlight returns).
-        unsafe { rebuild_rows() };
-    } else {
-        hide_picker();
-    }
+    callback_guard::void("search_field_cancel", || {
+        // A live options menu owns the first Escape press regardless of which field has focus.
+        if crate::clipboard::filter_popover_open() {
+            super::detail::dismiss_filter_popover();
+            return;
+        }
+        // Same rule as the list-focus Esc: a pinned panel ignores the key before it can clear a query.
+        if super::is_pinned() {
+            return;
+        }
+        let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
+        if has_query {
+            clear_search();
+            // Focus stays in the search field: keep "no selection" (no highlight returns).
+            unsafe { rebuild_rows() };
+        } else {
+            hide_picker();
+        }
+    });
 }
 
 /// The search field's right clear button: do not route through responder-chain cancelOperation:
 /// (which the field editor may intercept); clear the field and filter directly. Unlike Esc,
 /// clicking an already-empty field never closes the picker.
 pub(super) extern "C" fn search_clear_button(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    clear_search();
-    unsafe { rebuild_rows() };
+    callback_guard::void("search_clear_button", || {
+        clear_search();
+        unsafe { rebuild_rows() };
+    });
 }
 
 /// Hit-tests the custom search ×: intercept only the rightmost 18pt while queried and forward
@@ -2018,7 +2057,9 @@ pub(super) extern "C" fn search_field_mouse_moved(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe { update_search_clear_hover(_self as *mut AnyObject, event) }
+    callback_guard::void("search_field_mouse_moved", || unsafe {
+        update_search_clear_hover(_self as *mut AnyObject, event)
+    });
 }
 
 pub(super) extern "C" fn search_field_mouse_entered(
@@ -2026,7 +2067,9 @@ pub(super) extern "C" fn search_field_mouse_entered(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe { update_search_clear_hover(_self as *mut AnyObject, event) }
+    callback_guard::void("search_field_mouse_entered", || unsafe {
+        update_search_clear_hover(_self as *mut AnyObject, event)
+    });
 }
 
 pub(super) extern "C" fn search_field_mouse_exited(
@@ -2034,12 +2077,14 @@ pub(super) extern "C" fn search_field_mouse_exited(
     _cmd: Sel,
     _event: *mut c_void,
 ) {
-    if SEARCH_CLEAR_HOVERED.swap(false, Ordering::SeqCst) {
-        unsafe {
-            let field = _self as *mut AnyObject;
-            let _: () = msg_send![field, setNeedsDisplay: true];
+    callback_guard::void("search_field_mouse_exited", || {
+        if SEARCH_CLEAR_HOVERED.swap(false, Ordering::SeqCst) {
+            unsafe {
+                let field = _self as *mut AnyObject;
+                let _: () = msg_send![field, setNeedsDisplay: true];
+            }
         }
-    }
+    });
 }
 
 pub(super) extern "C" fn search_field_mouse_down(
@@ -2047,19 +2092,21 @@ pub(super) extern "C" fn search_field_mouse_down(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe {
-        let field = _self as *mut AnyObject;
-        if search_clear_contains_event(field, event) {
-            search_clear_button(_self, sel!(clearSearch:), event);
-            return;
+    callback_guard::void("search_field_mouse_down", || {
+        unsafe {
+            let field = _self as *mut AnyObject;
+            if search_clear_contains_event(field, event) {
+                search_clear_button(_self, sel!(clearSearch:), event);
+                return;
+            }
+            type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> ();
+            // The class that defined mouseDown: here (registered in detail.rs).
+            let defined = *crate::clipboard::search_field_class();
+            let mut sup = ObjcSuper::for_defined_class(_self, defined);
+            let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            f(&mut sup, sel!(mouseDown:), event);
         }
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut c_void) -> ();
-        // The class that defined mouseDown: here (registered in detail.rs).
-        let defined = *crate::clipboard::search_field_class();
-        let mut sup = ObjcSuper::for_defined_class(_self, defined);
-        let f: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        f(&mut sup, sel!(mouseDown:), event);
-    }
+    });
 }
 
 /// The search field's fill/ring helper (raw FFI for the layer background). Focus strengthens the
@@ -2090,30 +2137,34 @@ pub(super) unsafe fn style_search_field(field: *mut AnyObject, _focused: bool) {
 /// Editing begins: keep the default 4.5% frosted fill and use only a 10% inner ring for focus,
 /// avoiding a disruptive white transition while typing.
 extern "C" fn search_focus_began(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    unsafe {
-        let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
-        if !field.is_null() {
-            style_search_field(field, true);
-            // Focus transitions must explicitly redraw the cell: the placeholder is
-            // cell-drawn and hides on focus (during IME composition stringValue stays
-            // empty, so a stale placeholder would sit under the pre-edit pinyin).
-            // Layer background changes do not trigger cell redraws.
-            let _: () = msg_send![field, setNeedsDisplay: true];
+    callback_guard::void("search_focus_began", || {
+        unsafe {
+            let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
+            if !field.is_null() {
+                style_search_field(field, true);
+                // Focus transitions must explicitly redraw the cell: the placeholder is
+                // cell-drawn and hides on focus (during IME composition stringValue stays
+                // empty, so a stale placeholder would sit under the pre-edit pinyin).
+                // Layer background changes do not trigger cell redraws.
+                let _: () = msg_send![field, setNeedsDisplay: true];
+            }
         }
-    }
+    });
 }
 
 /// Editing ends: restore the default inner ring.
 extern "C" fn search_focus_ended(_self: *mut c_void, _cmd: Sel, note: *mut c_void) {
-    unsafe {
-        let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
-        if !field.is_null() {
-            style_search_field(field, false);
-            // Same as search_focus_began: restoring the placeholder on blur needs an
-            // immediate redraw.
-            let _: () = msg_send![field, setNeedsDisplay: true];
+    callback_guard::void("search_focus_ended", || {
+        unsafe {
+            let field: *mut AnyObject = msg_send![note as *mut AnyObject, object];
+            if !field.is_null() {
+                style_search_field(field, false);
+                // Same as search_focus_began: restoring the placeholder on blur needs an
+                // immediate redraw.
+                let _: () = msg_send![field, setNeedsDisplay: true];
+            }
         }
-    }
+    });
 }
 
 /// Whether the materialized rows already match the current history/query/filter (the same
@@ -2145,49 +2196,51 @@ pub(super) extern "C" fn search_field_do_command(
     _text_view: *mut c_void,
     command_selector: Sel,
 ) -> bool {
-    if command_selector != sel!(moveDown:) && command_selector != sel!(moveUp:) {
-        return false;
-    }
-    unsafe {
-        // The query/filter stays; only focus and the selection move to the list.
-        // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
-        // scrolled into view afterwards).
-        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
-        let sel = if command_selector == sel!(moveUp:) {
-            // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
-            display_len.saturating_sub(1)
-        } else {
-            0
-        };
-        let previous = picker_selection();
-        set_picker_selection(sel);
-        // When the rows already match the query, update only the two rows' highlights; right
-        // after a query change (the debounced refresh has not landed yet) a full rebuild is
-        // still required, otherwise the new list index is applied to stale rows.
-        if picker_rows_are_current() {
-            refresh_selection(previous, sel);
-        } else {
-            rebuild_rows();
+    callback_guard::bool("search_field_do_command", true, || {
+        if command_selector != sel!(moveDown:) && command_selector != sel!(moveUp:) {
+            return false;
         }
-        // With the detail open, its filled action icon must follow the new selection.
-        if detail_visible() {
-            refresh_detail_action_visuals();
-        }
-        // With ↑ the tail is selected while the viewport is still at the top: use the
-        // deterministic offset calculation to bring the selected row into view.
-        if let Some(container) = picker_container_ptr() {
-            scroll_selection_into_view(container, sel);
-        }
-        if let Some(container) = picker_container_ptr() {
-            let window = match *PICKER_WINDOW.lock().unwrap() {
-                Some(w) => w.0,
-                None => return true,
+        unsafe {
+            // The query/filter stays; only focus and the selection move to the list.
+            // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
+            // scrolled into view afterwards).
+            let display_len = with_clipboard_ui(|ui| ui.filtered.len());
+            let sel = if command_selector == sel!(moveUp:) {
+                // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
+                display_len.saturating_sub(1)
+            } else {
+                0
             };
-            // makeFirstResponder: returns BOOL ('B').
-            let _: bool = msg_send![window, makeFirstResponder: container];
+            let previous = picker_selection();
+            set_picker_selection(sel);
+            // When the rows already match the query, update only the two rows' highlights; right
+            // after a query change (the debounced refresh has not landed yet) a full rebuild is
+            // still required, otherwise the new list index is applied to stale rows.
+            if picker_rows_are_current() {
+                refresh_selection(previous, sel);
+            } else {
+                rebuild_rows();
+            }
+            // With the detail open, its filled action icon must follow the new selection.
+            if detail_visible() {
+                refresh_detail_action_visuals();
+            }
+            // With ↑ the tail is selected while the viewport is still at the top: use the
+            // deterministic offset calculation to bring the selected row into view.
+            if let Some(container) = picker_container_ptr() {
+                scroll_selection_into_view(container, sel);
+            }
+            if let Some(container) = picker_container_ptr() {
+                let window = match *PICKER_WINDOW.lock().unwrap() {
+                    Some(w) => w.0,
+                    None => return true,
+                };
+                // makeFirstResponder: returns BOOL ('B').
+                let _: bool = msg_send![window, makeFirstResponder: container];
+            }
         }
-    }
-    true
+        true
+    })
 }
 
 /// Whether the pasteboard-change notification has been registered (idempotent; start/stop
@@ -2241,19 +2294,21 @@ pub(super) extern "C" fn toggle_filter_popover(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    crate::clipboard::toggle_filter_popover();
+    callback_guard::void("toggle_filter_popover", || {
+        crate::clipboard::toggle_filter_popover();
+    });
 }
 
 /// The detail-toggle orb: expands the selected entry's detail pane, or closes it when open
 /// (the same semantics the Right-arrow key path uses).
 pub(super) extern "C" fn toggle_detail_panel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe {
+    callback_guard::void("toggle_detail_panel", || unsafe {
         if detail_visible() {
             hide_detail();
         } else {
             show_detail_for_sel();
         }
-    }
+    });
 }
 
 /// A filter row in the options popover: its tag indexes `CLIP_FILTER_ROWS`. Choosing a row
@@ -2263,22 +2318,26 @@ pub(super) extern "C" fn popover_filter_selected(
     _cmd: Sel,
     sender: *mut c_void,
 ) {
-    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    let Some(&f) = CLIP_FILTER_ROWS.get(tag as usize) else {
-        return;
-    };
-    super::detail::dismiss_filter_popover();
-    apply_clip_filter(f);
+    callback_guard::void("popover_filter_selected", || {
+        let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        let Some(&f) = CLIP_FILTER_ROWS.get(tag as usize) else {
+            return;
+        };
+        super::detail::dismiss_filter_popover();
+        apply_clip_filter(f);
+    });
 }
 
 /// A group label's "清除" button: drops that day group's *visible* entries through the ordinary
 /// clear flow (pinned entries stay, the image cache and the detail pane follow).
 pub(super) extern "C" fn clear_day_group(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
-    let Some(group) = model::day_group_from_tag(tag) else {
-        return;
-    };
-    clear_clipboard_day_group(group);
+    callback_guard::void("clear_day_group", || {
+        let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        let Some(group) = model::day_group_from_tag(tag) else {
+            return;
+        };
+        clear_clipboard_day_group(group);
+    });
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ extern "C" fn tooltip_bubble_hit_test(
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
-    std::ptr::null_mut()
+    crate::callback_guard::nil("tooltip_bubble_hit_test", std::ptr::null_mut)
 }
 
 struct DisabledCursorTarget(*mut AnyObject);
@@ -82,7 +82,7 @@ extern "C" fn disabled_cursor_mouse_entered(
     _cmd: Sel,
     event: *mut AnyObject,
 ) {
-    unsafe {
+    crate::callback_guard::void("disabled_cursor_mouse_entered", || unsafe {
         let view = tracking_area_view(event);
         let enabled = if view.is_null() {
             true
@@ -97,7 +97,7 @@ extern "C" fn disabled_cursor_mouse_entered(
                 objc2::msg_send![objc2::class!(NSCursor), operationNotAllowedCursor];
             let _: () = objc2::msg_send![cursor, set];
         }
-    }
+    });
 }
 
 extern "C" fn disabled_cursor_mouse_exited(
@@ -105,14 +105,14 @@ extern "C" fn disabled_cursor_mouse_exited(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    crate::callback_guard::void("disabled_cursor_mouse_exited", || unsafe {
         let cursor: *mut AnyObject = objc2::msg_send![objc2::class!(NSCursor), arrowCursor];
         let _: () = objc2::msg_send![cursor, set];
-    }
+    });
 }
 
 extern "C" fn tooltip_timeout(_self: *mut AnyObject, _cmd: Sel, timer: *mut AnyObject) {
-    unsafe {
+    crate::callback_guard::void("tooltip_timeout", || unsafe {
         let is_active = ACTIVE_TIMER
             .lock()
             .unwrap()
@@ -121,7 +121,7 @@ extern "C" fn tooltip_timeout(_self: *mut AnyObject, _cmd: Sel, timer: *mut AnyO
             ACTIVE_TIMER.lock().unwrap().take();
             SettingsTooltip::dismiss_bubble();
         }
-    }
+    });
 }
 
 fn disabled_cursor_target() -> *mut AnyObject {

@@ -93,22 +93,18 @@ pub(crate) unsafe fn running_apps_with_bundle_ids() -> Vec<(String, String)> {
     result
 }
 
-/// Just the bundle identifier of a running PID (None when the app has none or the pid is stale).
-/// Deliberately cheaper than `resolve_app_identity`: the clipboard's exclusion check runs before
-/// the payload is read, so it must not pay for an executable stat and fingerprint.
-pub(crate) unsafe fn bundle_id_for_pid(pid: i32) -> Option<String> {
-    if pid <= 0 {
-        return None;
-    }
-    let app: *mut AnyObject =
-        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+/// The bundle identifier of an `NSRunningApplication` object the caller already holds.
+///
+/// Separate from `bundle_id_for_pid` so a caller that needed the object anyway (to prove the PID is
+/// alive) reads the identifier from THAT object: a second `runningApplicationWithProcessIdentifier`
+/// can answer differently if the process quits in between.
+pub(crate) unsafe fn bundle_id_of(app: *mut AnyObject) -> Option<String> {
     if app.is_null() {
         return None;
     }
     let bid_obj: *mut AnyObject = msg_send![app, bundleIdentifier];
     read_nsstring(bid_obj).filter(|b| !b.is_empty())
 }
-
 /// Resolve a PID's cache identity. Key priority: bundleIdentifier (reverse-DNS,
 /// filename-safe) > hashed executable path > `pid_{pid}` fallback. Fingerprint is the
 /// executable mtime; an app update gets a new mtime -> forces re-extract. The clipboard
@@ -116,6 +112,15 @@ pub(crate) unsafe fn bundle_id_for_pid(pid: i32) -> Option<String> {
 pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
     let app: *mut AnyObject =
         msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    identity_of_app(app, pid)
+}
+
+/// The identity of an `NSRunningApplication` the caller ALREADY holds.
+///
+/// Why this exists: a caller that resolved the app for another purpose (the clipboard's exclusion
+/// test) must not resolve it a second time to record the source. Two lookups can answer differently
+/// when the process quits in between, and the record would then describe another application.
+pub(crate) unsafe fn identity_of_app(app: *mut AnyObject, pid: i32) -> AppIdentity {
     if app.is_null() {
         // PID stale (app just quit) -> fall back to pid key, no fingerprint (can't verify).
         return AppIdentity {

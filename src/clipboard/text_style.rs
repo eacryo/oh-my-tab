@@ -1,6 +1,7 @@
 //! Clipboard subsystem · text_style: text measurement and attributed-style helpers.
 
 use super::*;
+use crate::callback_guard;
 
 // Clipboard V2 typography is local to this surface; shared settings/control sizes stay unchanged.
 const ROW_TEXT_SIZE: f64 = 12.5;
@@ -767,100 +768,103 @@ unsafe fn set_detail_share_style(button: *mut AnyObject, engaged: bool) {
 /// Hover enter: color by action (the mockup's .action:hover / .clear-history:hover /
 /// .filter:hover).
 extern "C" fn hover_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    unsafe {
-        let b = _self;
-        if super::detail::event_is_over_filter_popover(_event) && !is_popover_child(b) {
-            // Tracking areas on covered list controls still report mouseEntered. The menu owns
-            // the pointer region, so never apply a hover wash to controls behind it.
-            return;
-        }
-        let action: Sel = msg_send![b, action];
-        if is_clear_history_action_button(b) {
-            set_clear_confirmation_button_style(b, true);
-            return;
-        }
-        if action == sel!(toggleDetailPanel:) {
-            set_header_detail_style(b, true);
-            return;
-        }
-        if (action == sel!(openClipboardSettings:) && !is_popover_child(b))
-            || action == sel!(toggleFilterPopover:)
-            || action == sel!(togglePauseRecording:)
-        {
-            if action == sel!(togglePauseRecording:) {
-                set_pause_orb_hovered(true);
+    callback_guard::void("hover_button_entered", || {
+        unsafe {
+            let b = _self;
+            if super::detail::event_is_over_filter_popover(_event) && !is_popover_child(b) {
+                // Tracking areas on covered list controls still report mouseEntered. The menu owns
+                // the pointer region, so never apply a hover wash to controls behind it.
+                return;
             }
-            set_settings_button_style(b, true);
-            return;
-        }
-        if action == sel!(togglePanelPin:) {
-            // The pinned state outranks hover: the wash still shows, but the glyph and ink stay in
-            // the selected form, so hovering cannot make a pinned button read as unpinned.
-            set_pin_button_style(b, super::is_pinned(), true);
-            return;
-        }
-        if action == sel!(detailSaveAs:) {
-            set_detail_share_style(b, true);
-            return;
-        }
-        if (action == sel!(popoverFilterSelected:)
-            || action == sel!(clearClipboardHistory:)
-            || action == sel!(clearClipboardAll:)
-            || action == sel!(openClipboardSettings:))
-            && is_popover_child(b)
-        {
-            // Popover rows (the mock's `.filter-row:hover` / `.clean-row:hover`): a wash
-            // under the pointer, no layout change. Scoped to popover children: the same
-            // selectors exist on the header orb and banner buttons, which keep their own
-            // hover styles. The active filter's hover is the mock's
-            // `.filter-row.is-active:hover`: a deeper accent wash, not the generic one.
-            let tag: isize = msg_send![b, tag];
-            let active = action == sel!(popoverFilterSelected:)
-                && tag >= 0
-                && CLIP_FILTER_ROWS.get(tag as usize) == Some(&*CLIP_FILTER.lock().unwrap());
-            let palette = clipboard_palette();
-            let wash = if active {
-                picker_popover_active_hover_bg(palette)
-            } else {
-                super::popover_hover_bg(palette, action == sel!(clearClipboardAll:))
-            };
-            let layer: *mut AnyObject = msg_send![b, layer];
-            if !layer.is_null() {
-                crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(wash));
+            let action: Sel = msg_send![b, action];
+            if is_clear_history_action_button(b) {
+                set_clear_confirmation_button_style(b, true);
+                return;
             }
-            return;
+            if action == sel!(toggleDetailPanel:) {
+                set_header_detail_style(b, true);
+                return;
+            }
+            if (action == sel!(openClipboardSettings:) && !is_popover_child(b))
+                || action == sel!(toggleFilterPopover:)
+                || action == sel!(togglePauseRecording:)
+            {
+                if action == sel!(togglePauseRecording:) {
+                    set_pause_orb_hovered(true);
+                }
+                set_settings_button_style(b, true);
+                return;
+            }
+            if action == sel!(togglePanelPin:) {
+                // The pinned state outranks hover: the wash still shows, but the glyph and ink stay in
+                // the selected form, so hovering cannot make a pinned button read as unpinned.
+                set_pin_button_style(b, super::is_pinned(), true);
+                return;
+            }
+            if action == sel!(detailSaveAs:) {
+                set_detail_share_style(b, true);
+                return;
+            }
+            if (action == sel!(popoverFilterSelected:)
+                || action == sel!(clearClipboardHistory:)
+                || action == sel!(clearClipboardAll:)
+                || action == sel!(openClipboardSettings:))
+                && is_popover_child(b)
+            {
+                // Popover rows (the mock's `.filter-row:hover` / `.clean-row:hover`): a wash
+                // under the pointer, no layout change. Scoped to popover children: the same
+                // selectors exist on the header orb and banner buttons, which keep their own
+                // hover styles. The active filter's hover is the mock's
+                // `.filter-row.is-active:hover`: a deeper accent wash, not the generic one.
+                let tag: isize = msg_send![b, tag];
+                let active = action == sel!(popoverFilterSelected:)
+                    && tag >= 0
+                    && CLIP_FILTER_ROWS.get(tag as usize) == Some(&*CLIP_FILTER.lock().unwrap());
+                let palette = clipboard_palette();
+                let wash = if active {
+                    picker_popover_active_hover_bg(palette)
+                } else {
+                    super::popover_hover_bg(palette, action == sel!(clearClipboardAll:))
+                };
+                let layer: *mut AnyObject = msg_send![b, layer];
+                if !layer.is_null() {
+                    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(wash));
+                }
+                return;
+            }
+            if action == sel!(clearDayGroup:) {
+                // The group clear keeps its accent ink; no fill (the mock's `.list-meta button`
+                // only underlines, and underline-drawing is not worth a layer).
+                return;
+            }
+            if action == sel!(showItemDetails:) {
+                let tag: isize = msg_send![b, tag];
+                let active = tag >= 0
+                    && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
+                set_detail_action_style(b, active, true);
+                return;
+            }
+            if is_clear_history_destructive_action(action) {
+                let palette = clipboard_palette();
+                let c = crate::ffi::hex_to_ns_color(palette.destructive_hover);
+                let _: () = msg_send![b, setContentTintColor: c];
+                set_action_button_surface(b, true);
+            } else if action == sel!(deleteEntry:) {
+                let palette = clipboard_palette();
+                let c = crate::ffi::hex_to_ns_color(palette.destructive);
+                let _: () = msg_send![b, setContentTintColor: c];
+                set_action_button_surface(b, true);
+            } else if action == sel!(togglePin:) {
+                // Pin hover darkens with a faint fill. Details use their dedicated SVG-style
+                // outlined/filled states and were handled at this function's start.
+                let palette = clipboard_palette();
+                let c =
+                    crate::glass::panel_ink(palette.primary_text, crate::glass::PanelInk::Primary);
+                let _: () = msg_send![b, setContentTintColor: c];
+                set_action_button_surface(b, true);
+            }
         }
-        if action == sel!(clearDayGroup:) {
-            // The group clear keeps its accent ink; no fill (the mock's `.list-meta button`
-            // only underlines, and underline-drawing is not worth a layer).
-            return;
-        }
-        if action == sel!(showItemDetails:) {
-            let tag: isize = msg_send![b, tag];
-            let active = tag >= 0
-                && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
-            set_detail_action_style(b, active, true);
-            return;
-        }
-        if is_clear_history_destructive_action(action) {
-            let palette = clipboard_palette();
-            let c = crate::ffi::hex_to_ns_color(palette.destructive_hover);
-            let _: () = msg_send![b, setContentTintColor: c];
-            set_action_button_surface(b, true);
-        } else if action == sel!(deleteEntry:) {
-            let palette = clipboard_palette();
-            let c = crate::ffi::hex_to_ns_color(palette.destructive);
-            let _: () = msg_send![b, setContentTintColor: c];
-            set_action_button_surface(b, true);
-        } else if action == sel!(togglePin:) {
-            // Pin hover darkens with a faint fill. Details use their dedicated SVG-style
-            // outlined/filled states and were handled at this function's start.
-            let palette = clipboard_palette();
-            let c = crate::glass::panel_ink(palette.primary_text, crate::glass::PanelInk::Primary);
-            let _: () = msg_send![b, setContentTintColor: c];
-            set_action_button_surface(b, true);
-        }
-    }
+    });
 }
 
 /// Whether a button is a direct child of the options popover (hover styles differ there).
@@ -876,96 +880,98 @@ unsafe fn is_popover_child(button: *mut AnyObject) -> bool {
 /// Hover exit: restore the base color; a filter only updates its own tint and never touches
 /// the shared underline.
 extern "C" fn hover_button_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    unsafe {
-        let b = _self;
-        let action: Sel = msg_send![b, action];
-        if is_clear_history_action_button(b) {
-            set_clear_confirmation_button_style(b, false);
-            return;
-        }
-        if action == sel!(toggleDetailPanel:) {
-            set_header_detail_style(b, false);
-            return;
-        }
-        if is_popover_child(b) {
-            let tag: isize = msg_send![b, tag];
-            let active = action == sel!(popoverFilterSelected:)
-                && tag >= 0
-                && CLIP_FILTER_ROWS.get(tag as usize) == Some(&*CLIP_FILTER.lock().unwrap());
-            let index = if action == sel!(popoverFilterSelected:) {
-                tag as usize
-            } else if action == sel!(openClipboardSettings:) {
-                CLIP_FILTER_ROWS.len()
-            } else if action == sel!(clearClipboardHistory:) {
-                CLIP_FILTER_ROWS.len() + 1
-            } else {
-                CLIP_FILTER_ROWS.len() + 2
-            };
-            let keyboard = index == POPOVER_KEY_ROW.load(Ordering::SeqCst);
-            let layer: *mut AnyObject = msg_send![b, layer];
-            if !layer.is_null() {
-                crate::ffi::layer_set_background(
-                    layer,
-                    crate::ffi::hex_to_cg_color(if active || keyboard {
-                        picker_popover_active_bg(clipboard_palette())
-                    } else {
-                        0
-                    }),
-                );
+    callback_guard::void("hover_button_exited", || {
+        unsafe {
+            let b = _self;
+            let action: Sel = msg_send![b, action];
+            if is_clear_history_action_button(b) {
+                set_clear_confirmation_button_style(b, false);
+                return;
             }
-            return;
-        }
-        if action == sel!(openClipboardSettings:)
-            || action == sel!(toggleFilterPopover:)
-            || action == sel!(togglePauseRecording:)
-        {
-            if action == sel!(togglePauseRecording:) {
-                set_pause_orb_hovered(false);
+            if action == sel!(toggleDetailPanel:) {
+                set_header_detail_style(b, false);
+                return;
             }
-            set_settings_button_style(b, false);
-            return;
-        }
-        if action == sel!(togglePanelPin:) {
-            set_pin_button_style(b, super::is_pinned(), false);
-            return;
-        }
-        if (action == sel!(showItemDetails:)
-            || action == sel!(deleteEntry:)
-            || action == sel!(togglePin:))
-            && !REBUILDING.load(Ordering::SeqCst)
-        {
-            // Action buttons are sibling views of the row, so leaving one does not trigger the
-            // row button's mouseExited; clear row hover only after the whole row is left.
-            let tag: isize = msg_send![b, tag];
-            if tag >= 0
-                && (event.is_null() || !mouse_inside_row(event as *mut c_void, tag as usize))
+            if is_popover_child(b) {
+                let tag: isize = msg_send![b, tag];
+                let active = action == sel!(popoverFilterSelected:)
+                    && tag >= 0
+                    && CLIP_FILTER_ROWS.get(tag as usize) == Some(&*CLIP_FILTER.lock().unwrap());
+                let index = if action == sel!(popoverFilterSelected:) {
+                    tag as usize
+                } else if action == sel!(openClipboardSettings:) {
+                    CLIP_FILTER_ROWS.len()
+                } else if action == sel!(clearClipboardHistory:) {
+                    CLIP_FILTER_ROWS.len() + 1
+                } else {
+                    CLIP_FILTER_ROWS.len() + 2
+                };
+                let keyboard = index == POPOVER_KEY_ROW.load(Ordering::SeqCst);
+                let layer: *mut AnyObject = msg_send![b, layer];
+                if !layer.is_null() {
+                    crate::ffi::layer_set_background(
+                        layer,
+                        crate::ffi::hex_to_cg_color(if active || keyboard {
+                            picker_popover_active_bg(clipboard_palette())
+                        } else {
+                            0
+                        }),
+                    );
+                }
+                return;
+            }
+            if action == sel!(openClipboardSettings:)
+                || action == sel!(toggleFilterPopover:)
+                || action == sel!(togglePauseRecording:)
             {
-                clear_hover_row_if(tag as usize);
+                if action == sel!(togglePauseRecording:) {
+                    set_pause_orb_hovered(false);
+                }
+                set_settings_button_style(b, false);
+                return;
             }
+            if action == sel!(togglePanelPin:) {
+                set_pin_button_style(b, super::is_pinned(), false);
+                return;
+            }
+            if (action == sel!(showItemDetails:)
+                || action == sel!(deleteEntry:)
+                || action == sel!(togglePin:))
+                && !REBUILDING.load(Ordering::SeqCst)
+            {
+                // Action buttons are sibling views of the row, so leaving one does not trigger the
+                // row button's mouseExited; clear row hover only after the whole row is left.
+                let tag: isize = msg_send![b, tag];
+                if tag >= 0
+                    && (event.is_null() || !mouse_inside_row(event as *mut c_void, tag as usize))
+                {
+                    clear_hover_row_if(tag as usize);
+                }
+            }
+            if action == sel!(detailSaveAs:) {
+                set_detail_share_style(b, false);
+                return;
+            }
+            if action == sel!(showItemDetails:) {
+                let tag: isize = msg_send![b, tag];
+                let active = tag >= 0
+                    && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
+                set_detail_action_style(b, active, false);
+                return;
+            }
+            if action == sel!(deleteEntry:)
+                || is_clear_history_destructive_action(action)
+                || action == sel!(togglePin:)
+            {
+                set_action_button_surface(b, false);
+            }
+            let c = crate::glass::panel_ink(
+                clipboard_palette().secondary_text,
+                crate::glass::PanelInk::Secondary,
+            );
+            let _: () = msg_send![b, setContentTintColor: c];
         }
-        if action == sel!(detailSaveAs:) {
-            set_detail_share_style(b, false);
-            return;
-        }
-        if action == sel!(showItemDetails:) {
-            let tag: isize = msg_send![b, tag];
-            let active = tag >= 0
-                && detail_action_is_active(detail_visible(), picker_selection(), tag as usize);
-            set_detail_action_style(b, active, false);
-            return;
-        }
-        if action == sel!(deleteEntry:)
-            || is_clear_history_destructive_action(action)
-            || action == sel!(togglePin:)
-        {
-            set_action_button_surface(b, false);
-        }
-        let c = crate::glass::panel_ink(
-            clipboard_palette().secondary_text,
-            crate::glass::PanelInk::Secondary,
-        );
-        let _: () = msg_send![b, setContentTintColor: c];
-    }
+    });
 }
 
 /// The share button uses the HTML mockup's 7.5% pressed fill; all other buttons retain native
@@ -973,7 +979,7 @@ extern "C" fn hover_button_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut 
 /// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
 /// aborts the process), so it is contained here.
 extern "C" fn hover_button_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    crate::callback_guard::void("hover_button_mouse_down", || unsafe {
+    callback_guard::void("hover_button_mouse_down", || unsafe {
         hover_button_mouse_down_inner(_self, _cmd, event)
     });
 }
@@ -1285,12 +1291,14 @@ unsafe fn toast_owner() -> *mut AnyObject {
 /// a dangling pointer (when the memory now holds some other object, objc2 panics with
 /// "method not found"; reproduced by a second ← press to unpin).
 extern "C" fn toast_dismiss(_self: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
-    *TOAST_TIMER.lock().unwrap() = None;
-    unsafe {
-        if let Some(label) = *TOAST_LABEL.lock().unwrap() {
-            let _: () = msg_send![label.0, setHidden: true];
+    callback_guard::void("toast_dismiss", || {
+        *TOAST_TIMER.lock().unwrap() = None;
+        unsafe {
+            if let Some(label) = *TOAST_LABEL.lock().unwrap() {
+                let _: () = msg_send![label.0, setHidden: true];
+            }
         }
-    }
+    });
 }
 
 /// Show a toast (the new mockup's .toast): a dark rounded pill at the bottom center,

@@ -1,6 +1,7 @@
 //! Click-outside cancel (local event monitor + focus-loss dismissal).
 
 use super::*;
+use crate::callback_guard;
 
 /// Register click-outside cancel: the overlay is the key panel, so clicking another app's
 /// window hands key to it and the panel fires NSWindowDidResignKeyNotification -> dismiss
@@ -80,7 +81,7 @@ unsafe fn overlay_observer() -> *mut AnyObject {
 /// A trigger release arriving after step 1 finds state.visible == false, so it neither commits a
 /// card nor opens settings a second time.
 extern "C" fn on_open_switcher_settings(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    crate::callback_guard::void("on_open_switcher_settings", open_switcher_settings_inner);
+    callback_guard::void("on_open_switcher_settings", open_switcher_settings_inner);
 }
 
 fn open_switcher_settings_inner() {
@@ -137,7 +138,7 @@ fn open_switcher_settings_inner() {
 
 /// The overlay lost key -> cancel the switch.
 extern "C" fn overlay_window_resigned(_self: *mut c_void, _cmd: Sel, _note: *mut c_void) {
-    crate::callback_guard::void("overlay_window_resigned", || {
+    callback_guard::void("overlay_window_resigned", || {
         overlay_window_resigned_inner();
     });
 }
@@ -369,7 +370,7 @@ pub(crate) fn vanish_overlay() {
 /// vanish_overlay, removing the overlay for real once the target window's activation has
 /// settled and WindowServer focus routing is stable.
 pub(crate) extern "C" fn on_delayed_order_out(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    crate::callback_guard::void("on_delayed_order_out", on_delayed_order_out_inner);
+    callback_guard::void("on_delayed_order_out", on_delayed_order_out_inner);
 }
 
 pub(super) fn delayed_order_out_should_hide(overlay_visible: bool) -> bool {
@@ -443,18 +444,20 @@ pub(super) fn schedule_deferred_raise(
 }
 
 pub(crate) extern "C" fn on_deferred_raise(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    let Some(job) = DEFERRED_RAISE.lock().unwrap().take() else {
-        return;
-    };
-    // Release-to-callback gap = the extra delay paid for committing the vanish first;
-    // normally a few milliseconds.
-    log_debug!(
-        "[raise] deferred fire: pid={} cgwid={} +{}ms after release",
-        job.pid,
-        job.cgwid,
-        job.scheduled_at.elapsed().as_millis()
-    );
-    activate_and_raise(job.pid, job.cgwid, job.minimized, job.on_other_desktop);
+    callback_guard::void("on_deferred_raise", || {
+        let Some(job) = DEFERRED_RAISE.lock().unwrap().take() else {
+            return;
+        };
+        // Release-to-callback gap = the extra delay paid for committing the vanish first;
+        // normally a few milliseconds.
+        log_debug!(
+            "[raise] deferred fire: pid={} cgwid={} +{}ms after release",
+            job.pid,
+            job.cgwid,
+            job.scheduled_at.elapsed().as_millis()
+        );
+        activate_and_raise(job.pid, job.cgwid, job.minimized, job.on_other_desktop);
+    });
 }
 
 pub(super) fn cancel_scheduled_order_out() {

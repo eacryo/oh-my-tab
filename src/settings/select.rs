@@ -2,6 +2,7 @@
 
 use super::widgets::settings_palette;
 use super::*;
+use crate::callback_guard;
 
 struct SettingsSelectState {
     items: Vec<String>,
@@ -570,35 +571,37 @@ pub(super) unsafe fn settings_select_focus_ring_smoke() -> bool {
 }
 
 extern "C" fn settings_select_finish_close(this: *mut c_void, _cmd: Sel, panel: *mut c_void) {
-    unsafe {
-        let button = this as *mut AnyObject;
-        let panel = panel as *mut AnyObject;
-        let (should_remove, popup) = {
-            let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
-            match states.get_mut(&(button as usize)) {
-                Some(state) if !state.open && state.panel == panel as usize => {
-                    state.panel = 0;
-                    let popup = state.popup as *mut AnyObject;
-                    state.popup = 0;
-                    (true, popup)
+    callback_guard::void("settings_select_finish_close", || {
+        unsafe {
+            let button = this as *mut AnyObject;
+            let panel = panel as *mut AnyObject;
+            let (should_remove, popup) = {
+                let mut states = SETTINGS_SELECT_STATES.lock().unwrap();
+                match states.get_mut(&(button as usize)) {
+                    Some(state) if !state.open && state.panel == panel as usize => {
+                        state.panel = 0;
+                        let popup = state.popup as *mut AnyObject;
+                        state.popup = 0;
+                        (true, popup)
+                    }
+                    _ => (false, std::ptr::null_mut()),
                 }
-                _ => (false, std::ptr::null_mut()),
+            };
+            if should_remove && !panel.is_null() {
+                settings_select_remove_item_labels(panel);
+                let _: () = msg_send![panel, removeFromSuperview];
             }
-        };
-        if should_remove && !panel.is_null() {
-            settings_select_remove_item_labels(panel);
-            let _: () = msg_send![panel, removeFromSuperview];
-        }
-        // Detaching the view is not enough: the popup window itself must be closed and released too
-        // (no view retains it; we hold its alloc +1).
-        if should_remove {
-            close_select_popup(popup);
-            // The monitor only serves the open dropdown: drop it once nothing is open.
-            if ACTIVE_SETTINGS_SELECT.lock().unwrap().is_none() {
-                remove_select_monitor();
+            // Detaching the view is not enough: the popup window itself must be closed and released too
+            // (no view retains it; we hold its alloc +1).
+            if should_remove {
+                close_select_popup(popup);
+                // The monitor only serves the open dropdown: drop it once nothing is open.
+                if ACTIVE_SETTINGS_SELECT.lock().unwrap().is_none() {
+                    remove_select_monitor();
+                }
             }
         }
-    }
+    });
 }
 
 /// A local event monitor installed while a dropdown is open: a click outside the popup panel and
@@ -777,15 +780,15 @@ extern "C" fn settings_select_item_mouse_entered(
     _cmd: Sel,
     _event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("settings_select_item_mouse_entered", || unsafe {
         settings_select_item_apply_background(this as *mut AnyObject, true);
-    }
+    });
 }
 
 extern "C" fn settings_select_item_mouse_exited(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    unsafe {
+    callback_guard::void("settings_select_item_mouse_exited", || unsafe {
         settings_select_item_apply_background(this as *mut AnyObject, false);
-    }
+    });
 }
 
 unsafe fn settings_select_remove_item_labels(panel: *mut AnyObject) {
@@ -802,7 +805,7 @@ extern "C" fn settings_select_item_accepts_first_mouse(
     _cmd: Sel,
     _event: *mut c_void,
 ) -> bool {
-    true
+    callback_guard::bool("settings_select_item_accepts_first_mouse", true, || true)
 }
 
 fn settings_select_item_class() -> *mut AnyObject {
@@ -1300,94 +1303,98 @@ pub(super) extern "C" fn settings_select_select_option(
     _cmd: Sel,
     sender: *mut c_void,
 ) {
-    unsafe {
-        let select = this as *mut AnyObject;
-        let item = sender as *mut AnyObject;
-        let index: isize = msg_send![item, tag];
-        let valid = SETTINGS_SELECT_STATES
-            .lock()
-            .unwrap()
-            .get(&(select as usize))
-            .is_some_and(|state| index >= 0 && (index as usize) < state.items.len());
-        if !valid {
-            return;
+    callback_guard::void("settings_select_select_option", || {
+        unsafe {
+            let select = this as *mut AnyObject;
+            let item = sender as *mut AnyObject;
+            let index: isize = msg_send![item, tag];
+            let valid = SETTINGS_SELECT_STATES
+                .lock()
+                .unwrap()
+                .get(&(select as usize))
+                .is_some_and(|state| index >= 0 && (index as usize) < state.items.len());
+            if !valid {
+                return;
+            }
+            if let Some(state) = SETTINGS_SELECT_STATES
+                .lock()
+                .unwrap()
+                .get_mut(&(select as usize))
+            {
+                state.selected = index;
+            }
+            settings_select_close(select);
+            // Defer the target/action callback until the option's mouse event has fully unwound.
+            // Locale changes rebuild the settings window; doing that inside the old popup's event
+            // stack lets AppKit order the newly rebuilt window out again when menu tracking ends.
+            let _: () = msg_send![
+                select,
+                performSelector: sel!(sendPendingAction),
+                withObject: std::ptr::null::<AnyObject>(),
+                afterDelay: 0.0f64
+            ];
         }
-        if let Some(state) = SETTINGS_SELECT_STATES
-            .lock()
-            .unwrap()
-            .get_mut(&(select as usize))
-        {
-            state.selected = index;
-        }
-        settings_select_close(select);
-        // Defer the target/action callback until the option's mouse event has fully unwound.
-        // Locale changes rebuild the settings window; doing that inside the old popup's event
-        // stack lets AppKit order the newly rebuilt window out again when menu tracking ends.
-        let _: () = msg_send![
-            select,
-            performSelector: sel!(sendPendingAction),
-            withObject: std::ptr::null::<AnyObject>(),
-            afterDelay: 0.0f64
-        ];
-    }
+    });
 }
 
 /// Dispatch a select action after the popup event has returned to the run loop.
 extern "C" fn settings_select_send_pending_action(this: *mut c_void, _cmd: Sel) {
-    unsafe {
+    callback_guard::void("settings_select_send_pending_action", || unsafe {
         let select = this as *mut AnyObject;
         let target: *mut AnyObject = msg_send![select, target];
         if !target.is_null() {
             let action: Sel = msg_send![select, action];
             let _: bool = msg_send![select, sendAction: action, to: target];
         }
-    }
+    });
 }
 
 extern "C" fn settings_select_mouse_down(this: *mut c_void, _cmd: Sel, _event: *mut c_void) {
-    unsafe {
-        let button = this as *mut AnyObject;
-        if !msg_send![button, isEnabled] {
-            return;
-        }
-        let (open, popup) = {
-            let states = SETTINGS_SELECT_STATES.lock().unwrap();
-            match states.get(&(button as usize)) {
-                Some(state) => (state.open, state.popup as *mut AnyObject),
-                None => (false, std::ptr::null_mut()),
+    callback_guard::void("settings_select_mouse_down", || {
+        unsafe {
+            let button = this as *mut AnyObject;
+            if !msg_send![button, isEnabled] {
+                return;
             }
-        };
-        // The popup is a child window of the host: it hides together with the host, and the `open`
-        // flag then goes stale. Treat it as closed and tidy up so this click opens a fresh popup --
-        // otherwise the click is spent closing something invisible (the control would need two
-        // clicks to open).
-        let stale = open && (popup.is_null() || !msg_send![popup, isVisible]);
-        if stale {
-            if let Some(state) = SETTINGS_SELECT_STATES
-                .lock()
-                .unwrap()
-                .get_mut(&(button as usize))
-            {
-                state.open = false;
-                state.panel = 0;
-                state.popup = 0;
+            let (open, popup) = {
+                let states = SETTINGS_SELECT_STATES.lock().unwrap();
+                match states.get(&(button as usize)) {
+                    Some(state) => (state.open, state.popup as *mut AnyObject),
+                    None => (false, std::ptr::null_mut()),
+                }
+            };
+            // The popup is a child window of the host: it hides together with the host, and the `open`
+            // flag then goes stale. Treat it as closed and tidy up so this click opens a fresh popup --
+            // otherwise the click is spent closing something invisible (the control would need two
+            // clicks to open).
+            let stale = open && (popup.is_null() || !msg_send![popup, isVisible]);
+            if stale {
+                if let Some(state) = SETTINGS_SELECT_STATES
+                    .lock()
+                    .unwrap()
+                    .get_mut(&(button as usize))
+                {
+                    state.open = false;
+                    state.panel = 0;
+                    state.popup = 0;
+                }
+                if *ACTIVE_SETTINGS_SELECT.lock().unwrap() == Some(button as usize) {
+                    *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
+                }
+                close_select_popup(popup);
+                settings_select_apply_visual(button, false);
             }
-            if *ACTIVE_SETTINGS_SELECT.lock().unwrap() == Some(button as usize) {
-                *ACTIVE_SETTINGS_SELECT.lock().unwrap() = None;
+            if open && !stale {
+                settings_select_close(button);
+            } else {
+                settings_select_open(button);
             }
-            close_select_popup(popup);
-            settings_select_apply_visual(button, false);
         }
-        if open && !stale {
-            settings_select_close(button);
-        } else {
-            settings_select_open(button);
-        }
-    }
+    });
 }
 
 extern "C" fn settings_select_key_down(this: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
+    callback_guard::void("settings_select_key_down", || unsafe {
         let button = this as *mut AnyObject;
         let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
         if matches!(key_code, 36 | 49 | 125 | 126) {
@@ -1413,11 +1420,11 @@ extern "C" fn settings_select_key_down(this: *mut c_void, _cmd: Sel, event: *mut
         }
         let events: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: event];
         let _: () = msg_send![button, interpretKeyEvents: events];
-    }
+    });
 }
 
 extern "C" fn settings_select_accepts_first_responder(_this: *mut c_void, _cmd: Sel) -> bool {
-    true
+    callback_guard::bool("settings_select_accepts_first_responder", true, || true)
 }
 
 /// Apply the focus flag and repaint the trigger surface without changing its selected value.
@@ -1436,33 +1443,35 @@ fn settings_select_set_focused(key: usize, focused: bool) {
 }
 
 extern "C" fn settings_select_become_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
-    unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
-        let mut sup = ObjcSuper::for_defined_class(
-            this,
-            crate::ffi::StaticClass::defining(settings_select_class()),
-        );
-        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        let accepted = send(&mut sup, sel!(becomeFirstResponder));
-        if accepted {
-            // The popup asks for the trigger's keys while its panel is up; that is not keyboard
-            // focus, so it must not draw the §10 ring. Genuine keyboard focus (a key view loop, an
-            // explicit request) arrives here with no panel open.
-            let popup_open = SETTINGS_SELECT_STATES
-                .lock()
-                .unwrap()
-                .get(&(this as usize))
-                .is_some_and(|state| state.open);
-            if !popup_open {
-                settings_select_set_focused(this as usize, true);
+    callback_guard::bool("settings_select_become_first_responder", false, || {
+        unsafe {
+            type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
+            let mut sup = ObjcSuper::for_defined_class(
+                this,
+                crate::ffi::StaticClass::defining(settings_select_class()),
+            );
+            let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            let accepted = send(&mut sup, sel!(becomeFirstResponder));
+            if accepted {
+                // The popup asks for the trigger's keys while its panel is up; that is not keyboard
+                // focus, so it must not draw the §10 ring. Genuine keyboard focus (a key view loop, an
+                // explicit request) arrives here with no panel open.
+                let popup_open = SETTINGS_SELECT_STATES
+                    .lock()
+                    .unwrap()
+                    .get(&(this as usize))
+                    .is_some_and(|state| state.open);
+                if !popup_open {
+                    settings_select_set_focused(this as usize, true);
+                }
             }
+            accepted
         }
-        accepted
-    }
+    })
 }
 
 extern "C" fn settings_select_resign_first_responder(this: *mut c_void, _cmd: Sel) -> bool {
-    unsafe {
+    callback_guard::bool("settings_select_resign_first_responder", false, || unsafe {
         type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> bool;
         let mut sup = ObjcSuper::for_defined_class(
             this,
@@ -1474,20 +1483,22 @@ extern "C" fn settings_select_resign_first_responder(this: *mut c_void, _cmd: Se
             settings_select_set_focused(this as usize, false);
         }
         accepted
-    }
+    })
 }
 
 extern "C" fn settings_select_index(this: *mut c_void, _cmd: Sel) -> isize {
-    SETTINGS_SELECT_STATES
-        .lock()
-        .unwrap()
-        .get(&(this as usize))
-        .map(|state| state.selected)
-        .unwrap_or(-1)
+    callback_guard::value("settings_select_index", -1, || {
+        SETTINGS_SELECT_STATES
+            .lock()
+            .unwrap()
+            .get(&(this as usize))
+            .map(|state| state.selected)
+            .unwrap_or(-1)
+    })
 }
 
 extern "C" fn settings_select_set_index(this: *mut c_void, _cmd: Sel, index: isize) {
-    unsafe {
+    callback_guard::void("settings_select_set_index", || unsafe {
         let button = this as *mut AnyObject;
         if let Some(state) = SETTINGS_SELECT_STATES
             .lock()
@@ -1504,11 +1515,11 @@ extern "C" fn settings_select_set_index(this: *mut c_void, _cmd: Sel, index: isi
             .get(&(button as usize))
             .is_some_and(|state| state.open);
         settings_select_apply_visual(button, open);
-    }
+    });
 }
 
 extern "C" fn settings_select_remove_all(this: *mut c_void, _cmd: Sel) {
-    unsafe {
+    callback_guard::void("settings_select_remove_all", || unsafe {
         let button = this as *mut AnyObject;
         let open = SETTINGS_SELECT_STATES
             .lock()
@@ -1528,11 +1539,11 @@ extern "C" fn settings_select_remove_all(this: *mut c_void, _cmd: Sel) {
             state.selected = -1;
         }
         settings_select_apply_visual(button, false);
-    }
+    });
 }
 
 extern "C" fn settings_select_add_item(this: *mut c_void, _cmd: Sel, title: *mut c_void) {
-    unsafe {
+    callback_guard::void("settings_select_add_item", || unsafe {
         let button = this as *mut AnyObject;
         let title = nsstring_to_rust(title as *mut AnyObject);
         if let Some(state) = SETTINGS_SELECT_STATES
@@ -1552,7 +1563,7 @@ extern "C" fn settings_select_add_item(this: *mut c_void, _cmd: Sel, title: *mut
             .get(&(button as usize))
             .is_some_and(|state| state.open);
         settings_select_apply_visual(button, open);
-    }
+    });
 }
 
 /// Attach an optional SF Symbol to one item in the next rendered options panel.
@@ -1567,7 +1578,7 @@ pub(super) fn settings_select_set_item_symbol(select: *mut AnyObject, index: usi
 }
 
 extern "C" fn settings_select_set_enabled(this: *mut c_void, _cmd: Sel, enabled: bool) {
-    unsafe {
+    callback_guard::void("settings_select_set_enabled", || unsafe {
         let mut sup = ObjcSuper::for_defined_class(
             this,
             crate::ffi::StaticClass::defining(settings_select_class()),
@@ -1581,7 +1592,7 @@ extern "C" fn settings_select_set_enabled(this: *mut c_void, _cmd: Sel, enabled:
             .get(&(this as usize))
             .is_some_and(|state| state.open);
         settings_select_apply_visual(this as *mut AnyObject, open);
-    }
+    });
 }
 
 fn settings_select_class() -> *mut AnyObject {

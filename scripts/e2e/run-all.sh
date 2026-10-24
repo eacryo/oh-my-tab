@@ -39,6 +39,7 @@ e2e_dir="$repo_dir/scripts/e2e"
 include_focus=0
 include_prefs=0
 include_screen=0
+gate_mode=0
 list_only=0
 
 for arg in "$@"; do
@@ -47,6 +48,7 @@ for arg in "$@"; do
         --include-prefs) include_prefs=1 ;;
         --include-screen) include_screen=1 ;;
         --list) list_only=1 ;;
+        --gate) gate_mode=1 ;;
         # The range tracks the header above: it ends where the prose ends and the script begins.
         -h|--help) sed -n '2,33p' "$0"; exit 0 ;;
         *) echo "unknown argument: $arg" >&2; exit 2 ;;
@@ -79,6 +81,7 @@ gate_refusal() {  # <focus> <prefs> <screen> -> prints the switch that would adm
 }
 
 scenarios=()
+nonexec_exec=0
 skipped=()
 skipped_prefs=()
 skipped_screen=()
@@ -88,7 +91,13 @@ for script in "$e2e_dir"/*.sh; do
     # The aggregator is not a scenario.
     [ "$name" = "run-all.sh" ] && continue
     [ -x "$script" ] || {
-        echo "warning: $name is not executable; skipping" >&2
+        if [ "$gate_mode" = "1" ]; then
+            # Under the gate a scenario that cannot run is not a scenario that passed.
+            echo "e2e run-all: $name is not executable; a scenario the gate cannot run is a failure" >&2
+            nonexec_exec=1
+        else
+            echo "warning: $name is not executable; skipping" >&2
+        fi
         continue
     }
     read -r mark_focus mark_prefs mark_screen <<<"$(scenario_marks "$script")"
@@ -173,5 +182,19 @@ if [ -n "$leftover" ]; then
     failures=$((failures + 1))
 fi
 
-echo "e2e run-all: $passed passed, $not_run not run, $failures failed, $(( ${#skipped[@]} + ${#skipped_screen[@]} + ${#skipped_prefs[@]} )) skipped (focus/screen/prefs)"
-[ "$failures" -eq 0 ]
+skipped_total=$(( ${#skipped[@]} + ${#skipped_screen[@]} + ${#skipped_prefs[@]} ))
+echo "e2e run-all: $passed passed, $not_run not run, $failures failed, $skipped_total skipped (focus/screen/prefs)"
+
+if [ "$failures" -ne 0 ] || [ "$nonexec_exec" -ne 0 ]; then
+    exit 1
+fi
+if [ "$gate_mode" = "1" ]; then
+    # Under the gate "incomplete" is its own outcome: nothing failed, but scenarios that declare a
+    # disturbance were skipped for want of consent, or a scenario reported NOT RUN. Counting that as
+    # success is how a bare run could pass while a third of the tier never ran.
+    if [ "$skipped_total" -gt 0 ] || [ "$not_run" -gt 0 ]; then
+        echo "e2e run-all: GATE INCOMPLETE ($skipped_total scenario(s) require --include-*, $not_run did not run)"
+        exit 75
+    fi
+fi
+exit 0

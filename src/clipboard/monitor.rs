@@ -104,9 +104,26 @@ pub(super) fn poll_clipboard() {
     // content read, hashed, cached or icon-extracted. The frontmost app is resolved once here and
     // reused for the recorded source, so the same lookup never happens twice.
     let copy_source = crate::ffi::frontmost_app_info();
-    if copy_is_excluded(copy_source.1) {
-        log_debug!("[clip] change skipped: source application is on the exclusion list");
-        return;
+    let (verdict, _frontmost, identity) = copy_exclusion(copy_source.1);
+    // Built ONCE here, before the payload is read, so the recorded source cannot describe a
+    // different application than the one the exclusion test saw.
+    let snapshot = SourceSnapshot {
+        name: copy_source.0.clone(),
+        pid: copy_source.1,
+        identity,
+    };
+    match verdict {
+        crate::clipboard::ExclusionVerdict::Record => {}
+        crate::clipboard::ExclusionVerdict::Excluded => {
+            log_debug!("[clip] change skipped: source application is on the exclusion list");
+            return;
+        }
+        crate::clipboard::ExclusionVerdict::Blocked => {
+            // The source could not be identified, so it cannot be shown to be off the list. Dropping
+            // the copy is the only answer that cannot leak content the user asked to exclude.
+            log_debug!("[clip] change skipped: the copy source could not be identified");
+            return;
+        }
     }
     let mut history_changed = false;
     match unsafe { read_pasteboard_text() } {
@@ -142,7 +159,7 @@ pub(super) fn poll_clipboard() {
             let (source, source_key) = if skip_file_text {
                 (String::new(), String::new())
             } else {
-                record_source(copy_source)
+                record_source(&snapshot)
             };
             let mut hist = CLIP_HISTORY.lock().unwrap();
             if let Some(img) = &file_img {
@@ -192,7 +209,7 @@ pub(super) fn poll_clipboard() {
                     return;
                 }
                 pending.commit();
-                let (source, source_key) = record_source(copy_source);
+                let (source, source_key) = record_source(&snapshot);
                 let mut hist = CLIP_HISTORY.lock().unwrap();
                 if record_image(&mut hist, &img, &source, &source_key, max_entries()) {
                     history_changed = true;
@@ -229,18 +246,70 @@ pub(super) fn poll_clipboard() {
 /// `org.nspasteboard.source`. The declared identifier is self-reported by the writer, so it is an
 /// ADDITIONAL signal only -- it can never override the frontmost verdict, which would re-admit a
 /// copy from an excluded app that happened to declare another identifier.
-fn copy_is_excluded(front_pid: i32) -> bool {
+/// Resolve the copy's source ONCE and decide whether it may be recorded.
+///
+/// The identity is resolved here and the result is what `record_source` is given later, so the
+/// exclusion test and the recorded source cannot describe two different applications (they used to be
+/// two separate lookups of the same PID).
+/// Resolve the copy's source ONCE and decide whether it may be recorded.
+///
+/// The identity comes from a single `NSRunningApplication` lookup, and the record path is given the
+/// SAME snapshot. Two separate lookups (one for the exclusion test, one for the recorded source) can
+/// describe two different applications when the process quits in between -- and the earlier shape had
+/// exactly that: the outer lookup succeeded, the inner `bundle_id_for_pid` re-queried, returned `None`,
+/// and the copy was admitted as an app with no identifier instead of a failed lookup.
+fn copy_exclusion(
+    front_pid: i32,
+) -> (
+    crate::clipboard::ExclusionVerdict,
+    crate::clipboard::FrontmostSource,
+    Option<crate::app_identity::AppIdentity>,
+) {
     // Clone the short list rather than hold the CONFIG read guard across Objective-C calls.
     let list = CONFIG
         .read()
         .map(|c| c.clipboard.excluded_apps.clone())
         .unwrap_or_default();
-    if list.is_empty() {
-        return false;
-    }
-    let frontmost = unsafe { crate::app_identity::bundle_id_for_pid(front_pid) };
+    // ONE lookup. The verdict and the recorded identity are built from the same application
+    // object, so they cannot describe different applications when the process quits in between.
+    let (source, identity) = resolve_frontmost_source(front_pid);
     let declared = unsafe { declared_source_bundle_id() };
-    excluded_app_matches(&list, frontmost.as_deref(), declared.as_deref())
+    let verdict = crate::clipboard::exclusion_decision(&list, &source, declared.as_deref());
+    (verdict, source, identity)
+}
+
+/// One `NSRunningApplication` lookup, turned into the enum the decision table needs.
+///
+/// The bundle identifier is read from the SAME application object that proved the PID is alive, so
+/// "no identifier" (a real state) and "the lookup failed" (the app is gone) cannot be confused.
+fn resolve_frontmost_source(
+    pid: i32,
+) -> (
+    crate::clipboard::FrontmostSource,
+    Option<crate::app_identity::AppIdentity>,
+) {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    if pid <= 0 {
+        return (crate::clipboard::FrontmostSource::LookupFailed, None);
+    }
+    unsafe {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            // The process is gone: a stale PID is a failed lookup, not an app without an id.
+            return (crate::clipboard::FrontmostSource::LookupFailed, None);
+        }
+        (
+            crate::clipboard::FrontmostSource::Resolved {
+                bundle_id: crate::app_identity::bundle_id_of(app),
+            },
+            // From the SAME object that answered the exclusion question.
+            Some(crate::app_identity::identity_of_app(app, pid)),
+        )
+    }
 }
 
 /// Resolve the frontmost app at copy time: returns (app name, icon-cache key) and extracts
@@ -254,15 +323,33 @@ fn capture_boundary_holds(expected: i64) -> bool {
     super::current_change_count() == Some(expected)
 }
 
-fn record_source(base: (String, i32)) -> (String, String) {
-    let (source, pid) = base;
-    if pid <= 0 {
-        return (source, String::new());
+/// The source identity captured ONCE at copy time, before the payload is read.
+///
+/// Why a value rather than a PID: `record_source` used to re-resolve the PID after the payload was
+/// read. If the app quit in between, the recorded source dropped to a `pid_*` cache key; if the PID was
+/// reused, the record could carry ANOTHER application's identity and icon. The exclusion verdict and the
+/// recorded source now come from one lookup.
+pub(super) struct SourceSnapshot {
+    /// Display name of the frontmost app.
+    pub(super) name: String,
+    /// Its PID, for icon extraction only.
+    pub(super) pid: i32,
+    /// The cache identity resolved at copy time, when the PID was known to be alive.
+    pub(super) identity: Option<crate::app_identity::AppIdentity>,
+}
+
+/// Record a copy's source from the snapshot taken before the payload was read.
+pub(super) fn record_source(snapshot: &SourceSnapshot) -> (String, String) {
+    let Some(identity) = &snapshot.identity else {
+        // The lookup failed at copy time, so there is no identity to attach; the copy is still
+        // recorded under the name only.
+        return (snapshot.name.clone(), String::new());
+    };
+    let key = identity.key.clone();
+    if snapshot.pid > 0 {
+        let _ = crate::icon_cache::extract_small_icon_for_identity(snapshot.pid, identity);
     }
-    let id = unsafe { crate::app_identity::resolve_app_identity(pid) };
-    let key = id.key.clone();
-    let _ = crate::icon_cache::extract_small_icon_for_identity(pid, &id);
-    (source, key)
+    (snapshot.name.clone(), key)
 }
 
 /// Timer tick callback (main thread): keep polling.

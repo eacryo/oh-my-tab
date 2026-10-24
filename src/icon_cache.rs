@@ -406,6 +406,7 @@ pub(crate) fn cache_running_app_icons_small() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoke_verdict::smoke_runner;
 
     #[test]
     fn small_icon_path_uses_dot_small_suffix() {
@@ -457,39 +458,44 @@ mod tests {
     #[test]
     #[ignore]
     fn icon_cache_roundtrip_smoke() {
-        if !crate::ffi::has_accessibility_permission() {
-            eprintln!("[smoke] Accessibility not granted; skipping icon roundtrip");
-            return;
-        }
-        // Use Finder (stable bundle id) for the roundtrip; the test binary itself is a bare
-        // exec whose identity resolution is unreliable.
-        let pid = unsafe {
-            let ns_key = crate::ffi::make_nsstring("com.apple.finder");
-            let apps: *mut AnyObject = msg_send![
-                class!(NSRunningApplication),
-                runningApplicationsWithBundleIdentifier: ns_key
-            ];
-            CFRelease(ns_key as *const c_void);
-            let count: usize = msg_send![apps, count];
-            let mut pid: i32 = 0;
-            if count > 0 {
-                let app: *mut AnyObject = msg_send![apps, objectAtIndex: 0usize];
-                pid = msg_send![app, processIdentifier];
+        smoke_runner!("icon_cache_roundtrip_smoke", 1, {
+            if !crate::ffi::has_accessibility_permission() {
+                crate::smoke_verdict::report(
+                    "icon_cache_roundtrip_smoke",
+                    crate::smoke_verdict::Verdict::NotRun("Accessibility not granted".into()),
+                );
+                return;
             }
-            pid
-        };
-        assert!(pid > 0, "Finder must be running in a GUI session");
-        // Start clean by clearing the cache (the smoke test re-extracts; acceptable side effect).
-        clear_icon_cache();
-        let path = extract_icon_to_cache(pid).expect("Finder icon extraction failed");
-        assert!(std::fs::metadata(&path).is_ok(), "extracted PNG must exist");
-        // A second query hits the cache; idempotent same path.
-        assert_eq!(check_icon_cache(pid).as_deref(), Some(path.as_str()));
-        assert_eq!(
-            extract_icon_to_cache(pid).as_deref(),
-            Some(path.as_str()),
-            "re-extract must short-circuit on a valid cache"
-        );
-        clear_icon_cache();
+            // Use Finder (stable bundle id) for the roundtrip; the test binary itself is a bare
+            // exec whose identity resolution is unreliable.
+            let pid = unsafe {
+                let ns_key = crate::ffi::make_nsstring("com.apple.finder");
+                let apps: *mut AnyObject = msg_send![
+                    class!(NSRunningApplication),
+                    runningApplicationsWithBundleIdentifier: ns_key
+                ];
+                CFRelease(ns_key as *const c_void);
+                let count: usize = msg_send![apps, count];
+                let mut pid: i32 = 0;
+                if count > 0 {
+                    let app: *mut AnyObject = msg_send![apps, objectAtIndex: 0usize];
+                    pid = msg_send![app, processIdentifier];
+                }
+                pid
+            };
+            assert!(pid > 0, "Finder must be running in a GUI session");
+            // Start clean by clearing the cache (the smoke test re-extracts; acceptable side effect).
+            clear_icon_cache();
+            let path = extract_icon_to_cache(pid).expect("Finder icon extraction failed");
+            assert!(std::fs::metadata(&path).is_ok(), "extracted PNG must exist");
+            // A second query hits the cache; idempotent same path.
+            assert_eq!(check_icon_cache(pid).as_deref(), Some(path.as_str()));
+            assert_eq!(
+                extract_icon_to_cache(pid).as_deref(),
+                Some(path.as_str()),
+                "re-extract must short-circuit on a valid cache"
+            );
+            clear_icon_cache();
+        });
     }
 }

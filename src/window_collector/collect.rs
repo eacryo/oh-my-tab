@@ -3367,4 +3367,60 @@ mod space_gate_tests {
             tab_group: None,
         }
     }
+
+    /// The three switcher predicates, as a truth table.
+    ///
+    /// Why their own tests: these decide what the overlay shows, and the failure mode is a window that
+    /// silently never appears -- nothing crashes and nothing logs. `None` (unknown) is a separate column
+    /// because treating "unknown" as "another desktop" hides windows AX merely failed to describe.
+    #[test]
+    fn the_switcher_predicates_hold_their_tables() {
+        // Hidden app: ADMISSION only, and an unknown hidden state never filters.
+        assert!(super::should_filter_hidden_app(false, Some(true)));
+        assert!(!super::should_filter_hidden_app(true, Some(true)));
+        assert!(!super::should_filter_hidden_app(false, Some(false)));
+        assert!(!super::should_filter_hidden_app(false, None));
+        // The Space table itself (the real admission function): minimized is admission-only and
+        // applies to every scope; Unknown is never admitted; another desktop needs the switch OR a
+        // fullscreen Space being current.
+        use super::{admits_space_scope, MembershipScope, WindowSpacePolicy};
+        let policy = |minimized: bool, show_min: bool, show_other: bool, fullscreen: bool| {
+            WindowSpacePolicy {
+                minimized,
+                show_minimized: show_min,
+                show_other_desktops: show_other,
+                current_space_is_fullscreen: fullscreen,
+            }
+        };
+        assert!(
+            !admits_space_scope(
+                MembershipScope::CurrentSpace,
+                policy(true, false, true, false)
+            ),
+            "a minimized window is refused in every scope unless the switch is on"
+        );
+        assert!(admits_space_scope(
+            MembershipScope::CurrentSpace,
+            policy(true, true, false, false)
+        ));
+        assert!(!admits_space_scope(
+            MembershipScope::OtherDesktop,
+            policy(false, false, false, false)
+        ));
+        assert!(admits_space_scope(
+            MembershipScope::OtherDesktop,
+            policy(false, false, true, false)
+        ));
+        assert!(
+            admits_space_scope(
+                MembershipScope::OtherDesktop,
+                policy(false, false, false, true)
+            ),
+            "inside a fullscreen Space the user expects everything"
+        );
+        assert!(
+            !admits_space_scope(MembershipScope::Unknown, policy(false, true, true, true)),
+            "an unknown Space is never admitted"
+        );
+    }
 }

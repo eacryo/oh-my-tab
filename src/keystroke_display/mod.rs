@@ -580,6 +580,7 @@ pub(crate) fn e2e_snapshot() -> E2eSnapshot {
 #[cfg(test)]
 mod tests {
     use crate::config::Config;
+    use crate::smoke_verdict::smoke_runner;
 
     #[test]
     fn development_overrides_do_not_require_environment_configuration() {
@@ -639,60 +640,42 @@ mod tests {
     #[test]
     #[ignore]
     fn panel_creation_and_badge_layout_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|parent| parent.parent())
-            .map(|parent| parent.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
-        assert!(
-            app_binary_is_fresh(&app),
-            "app binary {} is older than src/: run `cargo build` before this smoke, or it can pass \
-             against the previous implementation",
-            app.display()
-        );
-        let instance_guard = crate::single_instance::acquire()
-            .expect("panel smoke requires no running app instance for its refusal probe");
-        let refusal = std::process::Command::new(&app)
-            // Keep this a smoke launch so a lock refusal has a failing exit status, but use
-            // an entry point that remains protected by the single-instance guard.
-            .arg("--smoke-single-instance-probe")
-            .output()
-            .expect("failed to spawn single-instance refusal probe");
-        let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);
-        assert_eq!(
-            refusal.status.code(),
-            Some(1),
-            "panel smoke must fail when startup is refused; exit={:?}, stderr:\n{}",
-            refusal.status.code(),
-            refusal_stderr
-        );
-        assert!(
-            refusal_stderr.contains("[single-instance] startup refused")
-                && refusal_stderr.contains("another Oh-My-Tab instance is already running"),
-            "panel smoke refusal probe did not report the single-instance short-circuit:\n{refusal_stderr}"
-        );
-        drop(instance_guard);
-
-        let output = std::process::Command::new(&app)
-            .arg("--smoke-keystroke-display-panel")
-            .output()
-            .expect("failed to spawn app");
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            !stderr.contains("[single-instance] startup refused"),
-            "keystroke panel smoke short-circuited before panel logic:\n{stderr}"
-        );
-        assert!(
-            output.status.success(),
-            "keystroke panel smoke failed (exit {:?})\nstderr:\n{}",
-            output.status.code(),
-            stderr
-        );
+        smoke_runner!("panel_creation_and_badge_layout_smoke", 1, {
+            let app = crate::smoke_verdict::smoke_app_binary();
+            assert!(
+                app_binary_is_fresh(&app),
+                "app binary {} is older than src/: run `cargo build` before this smoke, or it can pass \
+                 against the previous implementation",
+                app.display()
+            );
+            // The refusal probe needs exclusive ownership of the single-instance lock.
+            let instance_guard = crate::single_instance::acquire()
+                .expect("panel smoke requires no running app instance for its refusal probe");
+            let refusal = std::process::Command::new(&app)
+                // Keep this a smoke launch so a lock refusal has a failing exit status, but use
+                // an entry point that remains protected by the single-instance guard.
+                .arg("--smoke-single-instance-probe")
+                .output()
+                .expect("failed to spawn single-instance refusal probe");
+            let refusal_stderr = String::from_utf8_lossy(&refusal.stderr);
+            assert_eq!(
+                refusal.status.code(),
+                Some(1),
+                "panel smoke must fail when startup is refused; exit={:?}, stderr:\n{}",
+                refusal.status.code(),
+                refusal_stderr
+            );
+            assert!(
+                refusal_stderr.contains("[single-instance] startup refused")
+                    && refusal_stderr.contains("another Oh-My-Tab instance is already running"),
+                "panel smoke refusal probe did not report the single-instance short-circuit:\n{refusal_stderr}"
+            );
+            drop(instance_guard);
+            // The child ran the panel assertions: take its verdict, and fail when it failed.
+            crate::smoke_verdict::run_smoke_child(
+                "panel_creation_and_badge_layout_smoke",
+                &["--smoke-keystroke-display-panel"],
+            );
+        });
     }
 }

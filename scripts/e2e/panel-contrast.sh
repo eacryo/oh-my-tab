@@ -134,6 +134,7 @@ trap 'exit 130' INT TERM
 
 # Initialised before any use: with `set -u` an unset `fail` would abort a *successful* run at `exit "$fail"`.
 fail=0
+filter_row_not_run=0
 
 
 # Run from anywhere: the launcher below is a repository-relative path, so the wrong cwd would take the panel
@@ -260,8 +261,12 @@ STATE
             # shellcheck disable=SC2086
             measure "filter-row" $row_rect
         else
-            echo "panel-contrast: $theme/$material/$shade: the e2e state carries no filter row to measure"
-            fail=1
+            # The filters live in the popover, so with it closed there is no filter row on screen to
+            # measure. That is an unrun check, not a contrast failure: the app now reports no rect
+            # instead of the options orb (which this scenario measured for glyph ink and then reported
+            # "no text" for every material). The footer captions below still cover the panel.
+            echo "panel-contrast: $theme/$material/$shade: no filter row is on screen (the popover is closed); check not run"
+            filter_row_not_run=$((filter_row_not_run + 1))
         fi
         if [ -n "$hints" ]; then
             # One region per caption: the union of them is a bounding box that also spans the keycaps, so a
@@ -280,4 +285,9 @@ STATE
         done
     done
 done
+# A check that could not run is reported, not counted as either outcome (the tier rule: an unrun check is
+# not a pass). The exit status stays 0 when every check that DID run held.
+if [ "$filter_row_not_run" -gt 0 ]; then
+    echo "panel-contrast: filter-row checks not run in $filter_row_not_run case(s): the popover was closed"
+fi
 exit "$fail"

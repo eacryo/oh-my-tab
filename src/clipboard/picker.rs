@@ -1,6 +1,7 @@
 //! Clipboard subsystem · picker: the history overlay (window, rows, keyboard navigation).
 
 use super::*;
+use crate::callback_guard;
 use crate::overlay::reset_close_button_hover;
 
 /// Desktop columns share one panel; narrow screens replace the list with detail.
@@ -109,7 +110,7 @@ unsafe fn install_detail_divider(parent: *mut AnyObject, body: NSRect, list_w: f
 }
 
 extern "C" fn detail_back_action(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
-    crate::callback_guard::void("clipboard_detail_back", hide_detail);
+    callback_guard::void("clipboard_detail_back", hide_detail);
 }
 
 unsafe fn add_detail_back_button(content: *mut AnyObject) {
@@ -499,7 +500,7 @@ pub(super) fn picker_shows_detail_in_pane() -> bool {
 /// separate, never-key window, so the picker's own `sendEvent:` does not see its clicks; without
 /// this the search field would stay in its editing state while the user works in the detail.
 extern "C" fn detail_window_send_event(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
-    unsafe {
+    callback_guard::void("detail_window_send_event", || unsafe {
         let event_type: u64 = msg_send![event, type];
         if super::is_mouse_press_type(event_type) {
             super::end_search_editing();
@@ -509,47 +510,51 @@ extern "C" fn detail_window_send_event(this: *mut AnyObject, _cmd: Sel, event: *
             ObjcSuper::for_defined_class(this as *mut c_void, detail_window_class_handle());
         let send_event: SendEvent = std::mem::transmute(objc_msgSendSuper as *const ());
         send_event(&mut sup, sel!(sendEvent:), event);
-    }
+    });
 }
 
 extern "C" fn detail_finish_close(this: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
-    if detail_visible() {
-        return;
-    }
-    unsafe {
-        let _: () = msg_send![this, orderOut: std::ptr::null::<AnyObject>()];
-        let _: () = msg_send![this, setAlphaValue: 1.0f64];
-    }
+    callback_guard::void("detail_finish_close", || {
+        if detail_visible() {
+            return;
+        }
+        unsafe {
+            let _: () = msg_send![this, orderOut: std::ptr::null::<AnyObject>()];
+            let _: () = msg_send![this, setAlphaValue: 1.0f64];
+        }
+    });
 }
 
 /// Toggle the picker on the configured global history shortcut (called on the main thread by the
 /// bridge).
 pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    // Ignore the summon when the master switch is off (the configured shortcut must not open the
-    // picker after the user disabled the feature in Settings).
-    if !CONFIG.read().unwrap().clipboard.enabled {
-        log_debug!("[clip] toggle ignored: clipboard history disabled");
-        return;
-    }
-    // Decision B: while pinned the shortcut does nothing at all - it neither hides nor unpins the
-    // panel. (An earlier design let it re-raise; the user chose a strict no-op.)
-    if is_pinned() {
-        log_debug!("[clip] toggle ignored: the panel is pinned");
-        return;
-    }
-    // `PICKER_VISIBLE` records our intent, but AppKit can hide an unpinned panel as the app loses
-    // activation without delivering the resign-key callback (for example, while it is already
-    // non-key). Treat the actual window state as authoritative so Option+V reopens a hidden panel
-    // instead of consuming the shortcut to hide it again.
-    if picker_is_visible() {
-        hide_picker();
-        return;
-    }
-    PICKER_VISIBLE.store(false, Ordering::SeqCst);
-    // Show the picker even with an empty history (the empty-state hint lives in
-    // rebuild_rows' empty branch).
-    set_picker_selection(0);
-    show_picker();
+    callback_guard::void("on_clipboard_toggle", || {
+        // Ignore the summon when the master switch is off (the configured shortcut must not open the
+        // picker after the user disabled the feature in Settings).
+        if !CONFIG.read().unwrap().clipboard.enabled {
+            log_debug!("[clip] toggle ignored: clipboard history disabled");
+            return;
+        }
+        // Decision B: while pinned the shortcut does nothing at all - it neither hides nor unpins the
+        // panel. (An earlier design let it re-raise; the user chose a strict no-op.)
+        if is_pinned() {
+            log_debug!("[clip] toggle ignored: the panel is pinned");
+            return;
+        }
+        // `PICKER_VISIBLE` records our intent, but AppKit can hide an unpinned panel as the app loses
+        // activation without delivering the resign-key callback (for example, while it is already
+        // non-key). Treat the actual window state as authoritative so Option+V reopens a hidden panel
+        // instead of consuming the shortcut to hide it again.
+        if picker_is_visible() {
+            hide_picker();
+            return;
+        }
+        PICKER_VISIBLE.store(false, Ordering::SeqCst);
+        // Show the picker even with an empty history (the empty-state hint lives in
+        // rebuild_rows' empty branch).
+        set_picker_selection(0);
+        show_picker();
+    });
 }
 
 /// Show the picker for the `--show-clipboard` development switch. Identical to the hotkey path
@@ -1120,18 +1125,28 @@ extern "C" fn detail_window_can_not_become_key(
 ) -> objc2::runtime::Bool {
     // The `B` encoding AppKit declares for this selector, not a Rust `bool`: objc2's signature
     // check compares the registered method with NSWindow's own before registering it.
-    objc2::runtime::Bool::NO
+    callback_guard::value(
+        "detail_window_can_not_become_key",
+        objc2::runtime::Bool::NO,
+        || objc2::runtime::Bool::NO,
+    )
 }
 
 /// The content container is flipped.
 extern "C" fn detail_content_is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    callback_guard::value(
+        "detail_content_is_flipped",
+        objc2::runtime::Bool::YES,
+        || objc2::runtime::Bool::YES,
+    )
 }
 
 /// Consume ordinary clicks on the detail container. NSTextView already consumes clicks for
 /// selection, whereas image clicks reach the container; both content kinds must behave alike
 /// and never accidentally dismiss the detail panel.
-extern "C" fn detail_content_mouse_down(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {}
+extern "C" fn detail_content_mouse_down(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    callback_guard::void("detail_content_mouse_down", || {});
+}
 
 /// Toggle code-detail soft wrapping and rebuild in place; the new scroll view naturally resets
 /// its horizontal position to the leading edge.
@@ -1140,8 +1155,10 @@ pub(super) extern "C" fn toggle_detail_soft_wrap(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
-    DETAIL_SOFT_WRAP_ENABLED.fetch_xor(true, Ordering::SeqCst);
-    unsafe { show_detail_for_sel() };
+    callback_guard::void("toggle_detail_soft_wrap", || {
+        DETAIL_SOFT_WRAP_ENABLED.fetch_xor(true, Ordering::SeqCst);
+        unsafe { show_detail_for_sel() };
+    });
 }
 
 /// Placeholder share action; the button currently provides visual and hover feedback only.
@@ -1233,30 +1250,32 @@ pub(super) extern "C" fn detail_save_as_action(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
-    let sel = picker_selection();
-    if sel == NO_SELECTION {
-        return;
-    }
-    let Some(h_idx) = mapped_index(sel) else {
-        return;
-    };
-    let Some(entry) = CLIP_HISTORY.lock().unwrap().get(h_idx).cloned() else {
-        return;
-    };
-    // This action is invoked synchronously inside the button's mouseDown tracking
-    // session; runModal must NOT start here (a nested modal leaves the save panel's
-    // name field without keyboard focus). Stash the entry and hop to the next runloop
-    // turn; detail_save_as_deferred runs once tracking has unwound.
-    *PENDING_SAVE_AS.lock().unwrap() = Some(entry);
-    let target = unsafe { observer() };
-    unsafe {
-        let _: () = msg_send![
-            target,
-            performSelectorOnMainThread: sel!(detailSaveAsDeferred:),
-            withObject: std::ptr::null_mut::<AnyObject>(),
-            waitUntilDone: false
-        ];
-    }
+    callback_guard::void("detail_save_as_action", || {
+        let sel = picker_selection();
+        if sel == NO_SELECTION {
+            return;
+        }
+        let Some(h_idx) = mapped_index(sel) else {
+            return;
+        };
+        let Some(entry) = CLIP_HISTORY.lock().unwrap().get(h_idx).cloned() else {
+            return;
+        };
+        // This action is invoked synchronously inside the button's mouseDown tracking
+        // session; runModal must NOT start here (a nested modal leaves the save panel's
+        // name field without keyboard focus). Stash the entry and hop to the next runloop
+        // turn; detail_save_as_deferred runs once tracking has unwound.
+        *PENDING_SAVE_AS.lock().unwrap() = Some(entry);
+        let target = unsafe { observer() };
+        unsafe {
+            let _: () = msg_send![
+                target,
+                performSelectorOnMainThread: sel!(detailSaveAsDeferred:),
+                withObject: std::ptr::null_mut::<AnyObject>(),
+                waitUntilDone: false
+            ];
+        }
+    });
 }
 
 /// Main-thread re-entry for save-as (arrives after hopping out of the button tracking
@@ -1267,18 +1286,20 @@ pub(super) extern "C" fn detail_save_as_deferred(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
-    let Some(entry) = PENDING_SAVE_AS.lock().unwrap().take() else {
-        return;
-    };
-    unsafe {
-        // An accessory app may be inactive; activate ourselves so the NSSavePanel can
-        // reliably establish its key window and field editor (the precondition for an
-        // editable name field). activateIgnoringOtherApps is deprecated yet still
-        // functional with no raw-FFI replacement.
-        let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![app, activateIgnoringOtherApps: true];
-        run_detail_save_as(&entry);
-    }
+    callback_guard::void("detail_save_as_deferred", || {
+        let Some(entry) = PENDING_SAVE_AS.lock().unwrap().take() else {
+            return;
+        };
+        unsafe {
+            // An accessory app may be inactive; activate ourselves so the NSSavePanel can
+            // reliably establish its key window and field editor (the precondition for an
+            // editable name field). activateIgnoringOtherApps is deprecated yet still
+            // functional with no raw-FFI replacement.
+            let app: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![app, activateIgnoringOtherApps: true];
+            run_detail_save_as(&entry);
+        }
+    });
 }
 
 /// Main-thread completion callback for a generated hi-res detail preview: re-validate
@@ -1291,31 +1312,33 @@ pub(super) extern "C" fn detail_preview_ready(
     _cmd: Sel,
     _sender: *mut AnyObject,
 ) {
-    // Read the slot under a scoped lock and release it before touching the slot again: this mutex is
-    // not reentrant, and a `match *SLOT.lock()` scrutinee keeps its guard alive for the whole match,
-    // so locking inside an arm deadlocks the main thread.
-    let (job_hash, generation, epoch) = {
-        let slot = DETAIL_PENDING_HD.lock().unwrap();
-        match slot.as_ref() {
-            Some((hash, generation, epoch, _)) => (*hash, *generation, *epoch),
-            None => return,
+    callback_guard::void("detail_preview_ready", || {
+        // Read the slot under a scoped lock and release it before touching the slot again: this mutex is
+        // not reentrant, and a `match *SLOT.lock()` scrutinee keeps its guard alive for the whole match,
+        // so locking inside an arm deadlocks the main thread.
+        let (job_hash, generation, epoch) = {
+            let slot = DETAIL_PENDING_HD.lock().unwrap();
+            match slot.as_ref() {
+                Some((hash, generation, epoch, _)) => (*hash, *generation, *epoch),
+                None => return,
+            }
+        };
+        // A preview generated before a discard belongs to a deleted entry: refuse it here as well, so
+        // the last step of the pipeline cannot show it (the bytes are released with the slot).
+        let wanted = detail_result_still_wanted(detail_visible(), detail_current_hash(), job_hash);
+        if !super::detail_slot_deliverable(
+            generation,
+            super::cache_generation(),
+            epoch,
+            super::current_hash_epoch(job_hash),
+            wanted,
+        ) {
+            // The disk cache keeps the data for a later open, so dropping the slot bytes is safe.
+            *DETAIL_PENDING_HD.lock().unwrap() = None;
+            return;
         }
-    };
-    // A preview generated before a discard belongs to a deleted entry: refuse it here as well, so
-    // the last step of the pipeline cannot show it (the bytes are released with the slot).
-    let wanted = detail_result_still_wanted(detail_visible(), detail_current_hash(), job_hash);
-    if !super::detail_slot_deliverable(
-        generation,
-        super::cache_generation(),
-        epoch,
-        super::current_hash_epoch(job_hash),
-        wanted,
-    ) {
-        // The disk cache keeps the data for a later open, so dropping the slot bytes is safe.
-        *DETAIL_PENDING_HD.lock().unwrap() = None;
-        return;
-    }
-    unsafe { show_detail_for_sel() };
+        unsafe { show_detail_for_sel() };
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1746,7 +1769,6 @@ pub(super) fn detail_max_height(picker: NSRect) -> f64 {
 /// picker is 280pt -- a cap smaller than the floor used to abort the whole open. The cap is a hard
 /// bound (`detail_frame_for` keeps the panel inside the picker), so it wins; the pane then has no
 /// body above the table, which the scrolling column already handles.
-
 /// The largest body section at a given panel height cap.
 #[cfg(test)]
 fn pane_max_body_h(max_detail_h: f64) -> f64 {
@@ -1841,7 +1863,9 @@ fn detail_text_view_class_handle() -> StaticClass {
 
 /// The native Copy menu must also pass through the source mapping, never copying formatted text.
 extern "C" fn detail_text_view_copy(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
-    copy_detail_selection();
+    callback_guard::void("detail_text_view_copy", || {
+        copy_detail_selection();
+    });
 }
 
 struct SoftWrapGlyphs {
@@ -1937,133 +1961,136 @@ unsafe fn build_soft_wrap_glyphs(dark: bool, material: u8) -> SoftWrapGlyphs {
 /// Draw soft-wrap markers after NSTextView finishes, reading layout results without modifying
 /// textStorage.
 extern "C" fn detail_text_view_draw_rect(_self: *mut AnyObject, _cmd: Sel, rect: NSRect) {
-    unsafe {
-        type Draw = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect);
-        // The class that defines this override, not NSTextView: objc_super starts its search there,
-        // so passing the superclass would skip the implementation that must run first.
-        let mut sup =
-            ObjcSuper::for_defined_class(_self as *mut c_void, detail_text_view_class_handle());
-        let draw: Draw = std::mem::transmute(objc_msgSendSuper as *const ());
-        draw(&mut sup, sel!(drawRect:), rect);
+    callback_guard::void("detail_text_view_draw_rect", || {
+        unsafe {
+            type Draw = unsafe extern "C" fn(*mut ObjcSuper, Sel, NSRect);
+            // The class that defines this override, not NSTextView: objc_super starts its search there,
+            // so passing the superclass would skip the implementation that must run first.
+            let mut sup =
+                ObjcSuper::for_defined_class(_self as *mut c_void, detail_text_view_class_handle());
+            let draw: Draw = std::mem::transmute(objc_msgSendSuper as *const ());
+            draw(&mut sup, sel!(drawRect:), rect);
 
-        let view = _self;
-        let is_code = DETAIL_SOFT_WRAP_TEXT_VIEW
-            .lock()
-            .unwrap()
-            .is_some_and(|code_view| code_view.0 == view);
-        if !is_code {
-            return;
-        }
-        let layout: *mut AnyObject = msg_send![view, layoutManager];
-        let container: *mut AnyObject = msg_send![view, textContainer];
-        let string: *mut AnyObject = msg_send![view, string];
-        let text_len: usize = msg_send![string, length];
-        let glyph_count: usize = msg_send![layout, numberOfGlyphs];
-        if glyph_count == 0 || text_len == 0 {
-            return;
-        }
-        let text_origin: NSPoint = msg_send![view, textContainerOrigin];
-        // Only inspect glyphs intersecting the invalidated rectangle, plus one preceding line
-        // to recover whether the first visible line is a soft-wrap continuation.
-        let layout_rect = NSRect::new(
-            NSPoint::new(rect.origin.x - text_origin.x, rect.origin.y - text_origin.y),
-            rect.size,
-        );
-        let visible_glyphs: NSRange = msg_send![
-            layout,
-            glyphRangeForBoundingRect: layout_rect,
-            inTextContainer: container
-        ];
-        if visible_glyphs.length == 0 {
-            return;
-        }
-        let mut glyph = visible_glyphs.location;
-        if glyph > 0 {
-            let mut previous = NSRange::new(0, 0);
-            let _: NSRect = msg_send![
-                layout,
-                lineFragmentUsedRectForGlyphAtIndex: glyph - 1,
-                effectiveRange: &mut previous
-            ];
-            glyph = previous.location;
-        }
-        let glyph_end = visible_glyphs
-            .location
-            .saturating_add(visible_glyphs.length)
-            .min(glyph_count);
-        let glyphs = soft_wrap_glyphs();
-        let end_attr = glyphs.end.0;
-        let continuation_attr = glyphs.continuation.0;
-        let mut continuation = false;
-        while glyph < glyph_end {
-            let mut effective = NSRange::new(0, 0);
-            let fragment: NSRect = msg_send![
-                layout,
-                lineFragmentUsedRectForGlyphAtIndex: glyph,
-                effectiveRange: &mut effective
-            ];
-            if effective.length == 0 {
-                glyph += 1;
-                continue;
+            let view = _self;
+            let is_code = DETAIL_SOFT_WRAP_TEXT_VIEW
+                .lock()
+                .unwrap()
+                .is_some_and(|code_view| code_view.0 == view);
+            if !is_code {
+                return;
             }
-            let character_range: NSRange = msg_send![
-                layout,
-                characterRangeForGlyphRange: effective,
-                actualGlyphRange: std::ptr::null_mut::<NSRange>()
-            ];
-            let char_start = character_range.location;
-            let char_end = character_range
-                .location
-                .saturating_add(character_range.length)
-                .min(text_len);
-            let line = NSRect::new(
-                NSPoint::new(
-                    fragment.origin.x + text_origin.x,
-                    fragment.origin.y + text_origin.y,
-                ),
-                fragment.size,
+            let layout: *mut AnyObject = msg_send![view, layoutManager];
+            let container: *mut AnyObject = msg_send![view, textContainer];
+            let string: *mut AnyObject = msg_send![view, string];
+            let text_len: usize = msg_send![string, length];
+            let glyph_count: usize = msg_send![layout, numberOfGlyphs];
+            if glyph_count == 0 || text_len == 0 {
+                return;
+            }
+            let text_origin: NSPoint = msg_send![view, textContainerOrigin];
+            // Only inspect glyphs intersecting the invalidated rectangle, plus one preceding line
+            // to recover whether the first visible line is a soft-wrap continuation.
+            let layout_rect = NSRect::new(
+                NSPoint::new(rect.origin.x - text_origin.x, rect.origin.y - text_origin.y),
+                rect.size,
             );
-            let visible = line.origin.y + line.size.height >= rect.origin.y
-                && line.origin.y <= rect.origin.y + rect.size.height;
-            if visible && continuation {
-                let x = (line.origin.x - glyphs.continuation_size.width - 2.0).max(0.0);
-                let y = line.origin.y + (line.size.height - glyphs.continuation_size.height) / 2.0;
-                let _: () = msg_send![continuation_attr, drawAtPoint: NSPoint::new(x, y)];
+            let visible_glyphs: NSRange = msg_send![
+                layout,
+                glyphRangeForBoundingRect: layout_rect,
+                inTextContainer: container
+            ];
+            if visible_glyphs.length == 0 {
+                return;
             }
-
-            // A soft wrap is a line-fragment boundary without a hard '\n' at either side.
-            let char_at_end: u16 = if char_end < text_len {
-                msg_send![string, characterAtIndex: char_end]
-            } else {
-                0
-            };
-            let char_before_end: u16 = if char_end > char_start {
-                msg_send![string, characterAtIndex: char_end - 1]
-            } else {
-                0
-            };
-            let hard_break = char_end >= text_len
-                || char_at_end == '\n' as u16
-                || char_before_end == '\n' as u16;
-            let soft_wrap = char_end < text_len && !hard_break;
-            if visible && soft_wrap {
-                // Draw the marker just OUTSIDE the fragment's right edge with a 2pt gap instead
-                // of on top of the trailing glyph -- the old right-aligned placement brushed
-                // against the last glyph and was most visible after commas. The wrap budget
-                // (68 columns) is deliberately below container capacity (~72 columns), so every
-                // soft-wrapped line keeps >= 4 spare columns: the marker can neither clip at the
-                // panel edge nor cover any content.
-                let x = line.origin.x + line.size.width + 2.0;
-                let y = line.origin.y + (line.size.height - glyphs.end_size.height) / 2.0;
-                let _: () = msg_send![end_attr, drawAtPoint: NSPoint::new(x, y)];
+            let mut glyph = visible_glyphs.location;
+            if glyph > 0 {
+                let mut previous = NSRange::new(0, 0);
+                let _: NSRect = msg_send![
+                    layout,
+                    lineFragmentUsedRectForGlyphAtIndex: glyph - 1,
+                    effectiveRange: &mut previous
+                ];
+                glyph = previous.location;
             }
-            continuation = soft_wrap;
-            glyph = effective
+            let glyph_end = visible_glyphs
                 .location
-                .saturating_add(effective.length)
-                .max(glyph.saturating_add(1));
+                .saturating_add(visible_glyphs.length)
+                .min(glyph_count);
+            let glyphs = soft_wrap_glyphs();
+            let end_attr = glyphs.end.0;
+            let continuation_attr = glyphs.continuation.0;
+            let mut continuation = false;
+            while glyph < glyph_end {
+                let mut effective = NSRange::new(0, 0);
+                let fragment: NSRect = msg_send![
+                    layout,
+                    lineFragmentUsedRectForGlyphAtIndex: glyph,
+                    effectiveRange: &mut effective
+                ];
+                if effective.length == 0 {
+                    glyph += 1;
+                    continue;
+                }
+                let character_range: NSRange = msg_send![
+                    layout,
+                    characterRangeForGlyphRange: effective,
+                    actualGlyphRange: std::ptr::null_mut::<NSRange>()
+                ];
+                let char_start = character_range.location;
+                let char_end = character_range
+                    .location
+                    .saturating_add(character_range.length)
+                    .min(text_len);
+                let line = NSRect::new(
+                    NSPoint::new(
+                        fragment.origin.x + text_origin.x,
+                        fragment.origin.y + text_origin.y,
+                    ),
+                    fragment.size,
+                );
+                let visible = line.origin.y + line.size.height >= rect.origin.y
+                    && line.origin.y <= rect.origin.y + rect.size.height;
+                if visible && continuation {
+                    let x = (line.origin.x - glyphs.continuation_size.width - 2.0).max(0.0);
+                    let y =
+                        line.origin.y + (line.size.height - glyphs.continuation_size.height) / 2.0;
+                    let _: () = msg_send![continuation_attr, drawAtPoint: NSPoint::new(x, y)];
+                }
+
+                // A soft wrap is a line-fragment boundary without a hard '\n' at either side.
+                let char_at_end: u16 = if char_end < text_len {
+                    msg_send![string, characterAtIndex: char_end]
+                } else {
+                    0
+                };
+                let char_before_end: u16 = if char_end > char_start {
+                    msg_send![string, characterAtIndex: char_end - 1]
+                } else {
+                    0
+                };
+                let hard_break = char_end >= text_len
+                    || char_at_end == '\n' as u16
+                    || char_before_end == '\n' as u16;
+                let soft_wrap = char_end < text_len && !hard_break;
+                if visible && soft_wrap {
+                    // Draw the marker just OUTSIDE the fragment's right edge with a 2pt gap instead
+                    // of on top of the trailing glyph -- the old right-aligned placement brushed
+                    // against the last glyph and was most visible after commas. The wrap budget
+                    // (68 columns) is deliberately below container capacity (~72 columns), so every
+                    // soft-wrapped line keeps >= 4 spare columns: the marker can neither clip at the
+                    // panel edge nor cover any content.
+                    let x = line.origin.x + line.size.width + 2.0;
+                    let y = line.origin.y + (line.size.height - glyphs.end_size.height) / 2.0;
+                    let _: () = msg_send![end_attr, drawAtPoint: NSPoint::new(x, y)];
+                }
+                continuation = soft_wrap;
+                glyph = effective
+                    .location
+                    .saturating_add(effective.length)
+                    .max(glyph.saturating_add(1));
+            }
         }
-    }
+    });
 }
 
 #[cfg(test)]

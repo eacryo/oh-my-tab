@@ -1354,7 +1354,9 @@ mod dynamic_class_tests {
     /// `cargo test --release` fail for a reason that is the dependency's designed behaviour.
     #[test]
     fn a_void_pointer_object_parameter_is_rejected_only_where_objc2_checks_encodings() {
-        extern "C" fn wrong(_this: *mut AnyObject, _cmd: Sel, _event: *mut c_void) {}
+        extern "C" fn wrong(_this: *mut AnyObject, _cmd: Sel, _event: *mut c_void) {
+            crate::callback_guard::void("wrong", || {});
+        }
 
         // The superclass must declare mouseDown: (NSView does, NSObject does not): objc2 only
         // compares encodings against an inherited method, so on NSObject this would be vacuous.
@@ -1381,7 +1383,9 @@ mod dynamic_class_tests {
     /// above is about the encoding and not about the selector or the class.
     #[test]
     fn an_object_parameter_registers_cleanly() {
-        extern "C" fn right(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {}
+        extern "C" fn right(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+            crate::callback_guard::void("right", || {});
+        }
         unsafe {
             let mut builder = ClassBuilder::new(c"OmTFfiTestRightPointer", class!(NSView)).unwrap();
             builder.add_method::<AnyObject, _>(
@@ -1397,7 +1401,9 @@ mod dynamic_class_tests {
     /// guarantee that also holds in release builds.
     #[test]
     fn a_callback_with_the_wrong_arity_is_rejected() {
-        extern "C" fn no_arguments(_this: *mut AnyObject, _cmd: Sel) {}
+        extern "C" fn no_arguments(_this: *mut AnyObject, _cmd: Sel) {
+            crate::callback_guard::void("no_arguments", || {});
+        }
         let rejected = std::panic::catch_unwind(|| unsafe {
             let mut builder = ClassBuilder::new(c"OmTFfiTestArity", class!(NSView)).unwrap();
             builder.add_method::<AnyObject, _>(
@@ -1797,13 +1803,15 @@ mod dynamic_class_tests {
     /// no fields" is not the same as "the allocation needs no release". Calling super is also what
     /// makes the test prove a real destroy rather than merely that the callback was entered.
     extern "C" fn probe_dealloc(this: *mut AnyObject, _cmd: Sel) {
-        DEALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let mut sup =
-            ObjcSuper::for_defined_class(this as *mut c_void, StaticClass(probe_class_ptr()));
-        type Dealloc = unsafe extern "C" fn(*mut ObjcSuper, Sel);
-        let send: Dealloc =
-            unsafe { std::mem::transmute(objc2::ffi::objc_msgSendSuper as *const ()) };
-        unsafe { send(&mut sup, sel!(dealloc)) };
+        crate::callback_guard::void("probe_dealloc", || {
+            DEALLOCS.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let mut sup =
+                ObjcSuper::for_defined_class(this as *mut c_void, StaticClass(probe_class_ptr()));
+            type Dealloc = unsafe extern "C" fn(*mut ObjcSuper, Sel);
+            let send: Dealloc =
+                unsafe { std::mem::transmute(objc2::ffi::objc_msgSendSuper as *const ()) };
+            unsafe { send(&mut sup, sel!(dealloc)) };
+        });
     }
 
     /// The class object itself, for the super dispatch above. It is registered by the time

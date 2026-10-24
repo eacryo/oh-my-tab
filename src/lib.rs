@@ -36,6 +36,7 @@ mod scroller;
 mod settings;
 mod single_instance;
 mod skylight;
+mod smoke_verdict;
 mod space_groups;
 mod space_swipe;
 mod space_transition;
@@ -647,48 +648,51 @@ fn schedule_activation_focus_result(result: ActivationFocusResult) {
 /// Main-thread consumer for background focus-query results. It updates AppState and starts
 /// the activation thumbnail refresh from one serialized state transition.
 extern "C" fn on_activation_focus_result(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    let Some(results) = ACTIVATION_FOCUS_RESULTS.get() else {
-        return;
-    };
-    let batch = {
-        let mut pending = results.lock().unwrap();
-        let batch = std::mem::take(&mut *pending);
-        ACTIVATION_FOCUS_RESULT_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
-        batch
-    };
-    for result in batch {
-        with_tab_state(|state_opt| {
-            if let Some(state) = state_opt.as_mut() {
-                window_refresh::best_effort_bump_focus_key(state, result.pid, result.cgwid);
-                log_debug!(
-                    "app-activated bump: pid={} cgwid={} attempt={}",
-                    result.pid,
-                    result.cgwid,
-                    result.attempt
-                );
-            }
-        });
-        thumbnail::refresh_after_activation(result.pid, result.cgwid, result.activated_at);
-    }
-    // A result may arrive just after take; check and schedule another batch so the flag
-    // transition cannot strand a notification.
-    if results.lock().unwrap().is_empty() {
-        return;
-    }
-    if !ACTIVATION_FOCUS_RESULT_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
-        let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
-            ACTIVATION_FOCUS_RESULT_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+    callback_guard::void("on_activation_focus_result", || {
+        let Some(results) = ACTIVATION_FOCUS_RESULTS.get() else {
             return;
         };
-        unsafe {
-            let _: () = msg_send![
-                controller,
-                performSelectorOnMainThread: sel!(handleActivationFocusResult:),
-                withObject: std::ptr::null::<AnyObject>(),
-                waitUntilDone: false
-            ];
+        let batch = {
+            let mut pending = results.lock().unwrap();
+            let batch = std::mem::take(&mut *pending);
+            ACTIVATION_FOCUS_RESULT_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+            batch
+        };
+        for result in batch {
+            with_tab_state(|state_opt| {
+                if let Some(state) = state_opt.as_mut() {
+                    window_refresh::best_effort_bump_focus_key(state, result.pid, result.cgwid);
+                    log_debug!(
+                        "app-activated bump: pid={} cgwid={} attempt={}",
+                        result.pid,
+                        result.cgwid,
+                        result.attempt
+                    );
+                }
+            });
+            thumbnail::refresh_after_activation(result.pid, result.cgwid, result.activated_at);
         }
-    }
+        // A result may arrive just after take; check and schedule another batch so the flag
+        // transition cannot strand a notification.
+        if results.lock().unwrap().is_empty() {
+            return;
+        }
+        if !ACTIVATION_FOCUS_RESULT_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+                ACTIVATION_FOCUS_RESULT_SCHEDULED
+                    .store(false, std::sync::atomic::Ordering::Release);
+                return;
+            };
+            unsafe {
+                let _: () = msg_send![
+                    controller,
+                    performSelectorOnMainThread: sel!(handleActivationFocusResult:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    waitUntilDone: false
+                ];
+            }
+        }
+    });
 }
 
 fn schedule_activation_focus(pid: i32, activated_at: std::time::Instant) {
@@ -809,6 +813,77 @@ fn on_app_launched_inner(notification: *mut c_void) {
     thumbnail::app_launched(pid);
 }
 
+/// How many times the orderly-exit duties have run in this process.
+///
+/// Exists for the assertion that both exit routes go through `orderly_exit_duties`: the defect it
+/// pins is that the terminate-notification route did not flush the config while the menu route did,
+/// which no test could see because each route was free to carry its own list.
+static ORDERLY_EXITS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Everything an *orderly* exit must do, in one place.
+///
+/// Why one function: the two exits did not agree. `menu::quit_application` flushed the debounced
+/// config write and restored the pointer; the `NSApplicationWillTerminateNotification` handler
+/// (logout, shutdown, and any `terminate:` from elsewhere) restored the pointer and cleared the
+/// clipboard history but never flushed the config -- so a settings change made inside the debounce
+/// window before a logout was lost, and the comment that claimed ``Cmd+Q, the menu-bar Quit item,
+/// logout and shutdown all land here'' was true only for the notification route. Both routes now call
+/// this, and every duty is idempotent so running it twice (a Quit that terminates, which then posts
+/// the notification) is harmless.
+///
+/// A crash or SIGKILL runs none of this, by design; nothing here can be trusted to run then.
+/// Test-only view of the orderly-exit counter (see ORDERLY_EXITS).
+#[cfg(test)]
+pub(crate) fn orderly_exit_count() -> usize {
+    ORDERLY_EXITS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Test-only entry that calls the REAL terminate handler, so the assertion covers the route the
+/// application actually takes (logout, shutdown) rather than a copy of its body.
+#[cfg(test)]
+pub(crate) fn run_terminate_duties_for_test() {
+    // A null selector is fine: the handler ignores `_cmd`.
+    on_will_terminate(
+        std::ptr::null_mut(),
+        sel!(willTerminate:),
+        std::ptr::null_mut(),
+    );
+}
+
+/// Leave a passing smoke entry: state the verdict, then exit 0.
+///
+/// Why every smoke entry goes through this: the harness sees only libtest
+/// `ok`, and several entries spawn the app and assert nothing about what the child checked.
+/// The process that ran the assertions is the only one that knows they ran, so it records
+/// its verdict through `smoke_verdict::report` -- the same file channel the A1 runners use.
+fn exit_smoke_passed() -> ! {
+    // The gate reads this file; without the write the runner reads as NOT RUN, which is the
+    // honest outcome but not the right one for a run whose checks held.
+    crate::smoke_verdict::record_for_child("PASSED 1");
+    std::process::exit(0);
+}
+
+pub(crate) fn orderly_exit_duties() {
+    ORDERLY_EXITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    // The config first: everything below may be recorded in it (the clipboard session state, the
+    // pointer values being restored), and a write after the flush would be lost.
+    if let Err(e) = crate::config::flush_config_sync() {
+        crate::log_info!("Config flush before quit failed: {}", e);
+    }
+    // Stop the Finder extension bridge before the process goes away, so the appex is not left
+    // waiting on a host instance that no longer exists.
+    crate::finder_menu::shutdown();
+    // Restore pointer acceleration settings (otherwise the mouse stays linear until the user
+    // resets it manually). Idempotent: restoring an already-restored system value is a no-op.
+    crate::mouse::pointer::restore();
+    // `clear_on_quit` clears the history file and the cached images on an orderly exit. The purge
+    // is a verified transaction and takes the writer's I/O lock, so a snapshot prepared before it
+    // cannot land afterwards.
+    if crate::clipboard::clear_on_quit_enabled() {
+        crate::clipboard::discard_history_on_disk();
+    }
+}
+
 /// Forwarding point for NSApplicationWillTerminateNotification (main thread): restore the macOS
 /// system pointer values and, when configured, clear the clipboard history before quitting,
 /// matching LinearMouse's applicationWillTerminate -- otherwise the linear switch and our tracking
@@ -816,13 +891,7 @@ fn on_app_launched_inner(notification: *mut c_void) {
 /// equivalent call of its own).
 extern "C" fn on_will_terminate(_self: *mut c_void, _cmd: Sel, _notification: *mut c_void) {
     callback_guard::void("on_will_terminate", || {
-        crate::finder_menu::shutdown();
-        crate::mouse::pointer::restore();
-        // Cmd+Q, the menu-bar Quit item, logout and shutdown all land here, so one place covers
-        // every orderly exit (a crash or SIGKILL posts no notification, by design).
-        if crate::clipboard::clear_on_quit_enabled() {
-            crate::clipboard::discard_history_on_disk();
-        }
+        crate::orderly_exit_duties();
     });
 }
 
@@ -889,56 +958,58 @@ pub(crate) extern "C" fn on_scroller_style_changed(
     _cmd: Sel,
     _note: *mut AnyObject,
 ) {
-    unsafe {
-        // Notification delivery thread isn't guaranteed to be main, but both re-asserting the style
-        // and re-laying out UI must run on main.
-        let is_main: bool = msg_send![class!(NSThread), isMainThread];
-        // Defer when a settings build is already in progress on this thread: the settings window
-        // becoming key (or the app activating) *inside* `with_settings_ui` delivers these
-        // notifications synchronously, and the resync below reads the settings UI. Re-entering that
-        // borrow panics, and a panic in an `extern "C"` callback aborts the process -- which is how
-        // the guide's final-step "Open App Settings" used to crash (2026-09-28, "RefCell already
-        // borrowed"). Deferring runs the resync right after the borrow is released.
-        if !is_main || crate::settings::settings_ui_borrowed() {
-            let _: () = msg_send![_self,
-                performSelectorOnMainThread: sel!(handleScrollerStyleChanged:),
-                withObject: std::ptr::null::<AnyObject>(),
-                waitUntilDone: false
-            ];
+    callback_guard::void("on_scroller_style_changed", || {
+        unsafe {
+            // Notification delivery thread isn't guaranteed to be main, but both re-asserting the style
+            // and re-laying out UI must run on main.
+            let is_main: bool = msg_send![class!(NSThread), isMainThread];
+            // Defer when a settings build is already in progress on this thread: the settings window
+            // becoming key (or the app activating) *inside* `with_settings_ui` delivers these
+            // notifications synchronously, and the resync below reads the settings UI. Re-entering that
+            // borrow panics, and a panic in an `extern "C"` callback aborts the process -- which is how
+            // the guide's final-step "Open App Settings" used to crash (2026-09-28, "RefCell already
+            // borrowed"). Deferring runs the resync right after the borrow is released.
+            if !is_main || crate::settings::settings_ui_borrowed() {
+                let _: () = msg_send![_self,
+                    performSelectorOnMainThread: sel!(handleScrollerStyleChanged:),
+                    withObject: std::ptr::null::<AnyObject>(),
+                    waitUntilDone: false
+                ];
+                return;
+            }
+        }
+        // Diagnostic: log which notification woke us up. A delivery that came through this handler's
+        // own performSelectorOnMainThread hop carries no notification object, and messaging nil panics
+        // inside an `extern "C"` callback (that aborted the app on 2026-09-28), so the note is
+        // optional here.
+        if !_note.is_null() {
+            let name: *mut AnyObject = unsafe { msg_send![_note, name] };
+            crate::log_debug!("[scroller] notification arrived: {}", unsafe {
+                crate::ffi::nsstring_to_rust(name)
+            });
+        }
+        // This handler is registered for window-did-become-key too, and that notification is delivered
+        // for *any* of our windows. Without this filter the switcher panel becoming key rebuilt the whole
+        // settings content synchronously inside the overlay show, so the panel only appeared once that
+        // finished. Only the settings window's own activation may drive the resync; an application object
+        // (app activation) and the object-less hop above still do.
+        let object = if _note.is_null() {
+            std::ptr::null_mut::<AnyObject>()
+        } else {
+            unsafe { msg_send![_note, object] }
+        };
+        let object_is_window: bool =
+            !object.is_null() && unsafe { msg_send![object, isKindOfClass: class!(NSWindow)] };
+        if !crate::scroller::resync_applies_to(
+            object_is_window,
+            object == crate::settings::settings_window_ptr(),
+        ) {
+            crate::log_debug!("[scroller] resync skipped: window is not the settings window");
             return;
         }
-    }
-    // Diagnostic: log which notification woke us up. A delivery that came through this handler's
-    // own performSelectorOnMainThread hop carries no notification object, and messaging nil panics
-    // inside an `extern "C"` callback (that aborted the app on 2026-09-28), so the note is
-    // optional here.
-    if !_note.is_null() {
-        let name: *mut AnyObject = unsafe { msg_send![_note, name] };
-        crate::log_debug!("[scroller] notification arrived: {}", unsafe {
-            crate::ffi::nsstring_to_rust(name)
-        });
-    }
-    // This handler is registered for window-did-become-key too, and that notification is delivered
-    // for *any* of our windows. Without this filter the switcher panel becoming key rebuilt the whole
-    // settings content synchronously inside the overlay show, so the panel only appeared once that
-    // finished. Only the settings window's own activation may drive the resync; an application object
-    // (app activation) and the object-less hop above still do.
-    let object = if _note.is_null() {
-        std::ptr::null_mut::<AnyObject>()
-    } else {
-        unsafe { msg_send![_note, object] }
-    };
-    let object_is_window: bool =
-        !object.is_null() && unsafe { msg_send![object, isKindOfClass: class!(NSWindow)] };
-    if !crate::scroller::resync_applies_to(
-        object_is_window,
-        object == crate::settings::settings_window_ptr(),
-    ) {
-        crate::log_debug!("[scroller] resync skipped: window is not the settings window");
-        return;
-    }
-    crate::scroller::note_resync_entered();
-    crate::scroller::on_activation_resync();
+        crate::scroller::note_resync_entered();
+        crate::scroller::on_activation_resync();
+    });
 }
 
 fn on_locale_changed_inner(_self: *mut c_void) {
@@ -2590,7 +2661,9 @@ pub(crate) extern "C" fn handle_retry_keychain_access(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    crate::clipboard::retry_keychain_access();
+    callback_guard::void("handle_retry_keychain_access", || {
+        crate::clipboard::retry_keychain_access();
+    });
 }
 
 /// The storage notice's "clear and restart" action (settings banner and picker empty state): delete
@@ -2602,7 +2675,9 @@ pub(crate) extern "C" fn handle_clear_clipboard_storage(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    crate::clipboard::clear_storage_and_restart();
+    callback_guard::void("handle_clear_clipboard_storage", || {
+        crate::clipboard::clear_storage_and_restart();
+    });
 }
 
 /// Open System Settings -> Privacy & Security -> Accessibility (deep link).
@@ -2745,22 +2820,28 @@ extern "C" fn on_application_should_handle_reopen(
     _application: *mut c_void,
     _has_visible_windows: AppKitBool,
 ) -> AppKitBool {
-    callback_guard::void("application_should_handle_reopen", || {
-        if is_main_thread() {
-            open_settings_for_reopen();
-        } else {
-            unsafe {
-                let _: () = msg_send![
-                    this as *mut AnyObject,
-                    performSelectorOnMainThread: sel!(handleAppReopenOnMainThread:),
-                    withObject: std::ptr::null::<AnyObject>(),
-                    waitUntilDone: false
-                ];
+    // The whole body is the guarded answer: returning `appkit_bool(false)` outside the guard
+    // left a panic path across the ABI boundary, which is what this boundary exists to remove.
+    // The callback performs the custom reopen action; NO suppresses AppKit's generic behaviour.
+    callback_guard::value(
+        "application_should_handle_reopen",
+        appkit_bool(false),
+        || {
+            if is_main_thread() {
+                open_settings_for_reopen();
+            } else {
+                unsafe {
+                    let _: () = msg_send![
+                        this as *mut AnyObject,
+                        performSelectorOnMainThread: sel!(handleAppReopenOnMainThread:),
+                        withObject: std::ptr::null::<AnyObject>(),
+                        waitUntilDone: false
+                    ];
+                }
             }
-        }
-    });
-    // The callback performs the custom reopen action; NO suppresses AppKit's generic behavior.
-    appkit_bool(false)
+            appkit_bool(false)
+        },
+    )
 }
 
 extern "C" fn on_app_reopen_on_main_thread(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
@@ -2978,7 +3059,7 @@ pub fn run() {
                 eprintln!("[smoke-clipboard] picker smoke failed");
                 std::process::exit(1);
             }
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3030,11 +3111,14 @@ pub fn run() {
         cache_running_app_icons_small();
     }
 
-    // 4b. Force CONFIG to initialise and report any validation errors
+    // 4b. Force CONFIG to initialise and report what the loader and the validator had to say.
     {
         let cfg = CONFIG.read().unwrap();
-        // First load already happened via LazyLock; re-run validate to report problems
-        let errs = cfg.validate();
+        // The load happened once in CONFIG's initializer, which is the only place that still holds
+        // the loader's errors: `cfg` below is already the repaired config, so validating it alone
+        // reports nothing for a file that could not be parsed at all.
+        let mut errs = crate::config::config_load_errors();
+        errs.extend(cfg.validate());
         if !errs.is_empty() {
             log_info!(
                 "Config errors in ~/.config/oh-my-tab/config.toml ({} issue(s)):",
@@ -3111,15 +3195,27 @@ pub fn run() {
         let ok = window_collector::run_space_state_probe(mode);
         if !ok {
             eprintln!("[space-state] the state matrix did not hold");
+            crate::smoke_verdict::report(
+                "space_state_matrix",
+                crate::smoke_verdict::Verdict::NotRun("the state matrix did not hold".into()),
+            );
             std::process::exit(1);
         }
         // The record mode makes no judgement, so it must not claim the matrix held.
         if recording {
             log_info!("[space-state] recording complete (no assertions were made)");
+            // Record mode makes no assertions, so it must NOT fall through to the passing exit,
+            // which would append a PASSED after this NOT RUN and be the line the gate reads.
+            crate::smoke_verdict::record_for_child("NOT RUN record mode makes no assertions");
+            std::process::exit(0);
         } else {
             log_info!("[space-state] the state matrix held");
+            crate::smoke_verdict::report(
+                "space_state_matrix",
+                crate::smoke_verdict::Verdict::Passed { checks: 1 },
+            );
         }
-        std::process::exit(0);
+        exit_smoke_passed();
     }
 
     // Smoke-test entry (--smoke-card-badges): build real cards from controlled window input and
@@ -3133,10 +3229,15 @@ pub fn run() {
         }
         if !overlay::smoke_card_badges() {
             eprintln!("[smoke-card-badges] the preview badges do not match the card state");
+            crate::smoke_verdict::report(
+                "card_badges",
+                crate::smoke_verdict::Verdict::NotRun("preview badges do not match".into()),
+            );
             std::process::exit(1);
         }
         log_info!("[smoke-card-badges] preview badges match the card state");
-        std::process::exit(0);
+        crate::smoke_verdict::report("smoke", crate::smoke_verdict::Verdict::Passed { checks: 1 });
+        exit_smoke_passed();
     }
 
     // Smoke-test entry (--smoke-selection-ring): build real cards from controlled window input in
@@ -3151,10 +3252,15 @@ pub fn run() {
             eprintln!(
                 "[smoke-selection-ring] a card layout is missing the documented selection ring"
             );
+            crate::smoke_verdict::report(
+                "selection_ring",
+                crate::smoke_verdict::Verdict::NotRun("selection ring missing".into()),
+            );
             std::process::exit(1);
         }
         log_info!("[smoke-selection-ring] both card layouts build the documented selection ring");
-        std::process::exit(0);
+        crate::smoke_verdict::report("smoke", crate::smoke_verdict::Verdict::Passed { checks: 1 });
+        exit_smoke_passed();
     }
 
     if crate::dev_flags::present("smoke-update-prompts") {
@@ -3164,10 +3270,15 @@ pub fn run() {
         }
         if !updater::smoke_update_prompt_layouts() {
             eprintln!("[smoke-update-prompts] one or more localized prompt buttons do not fit");
+            crate::smoke_verdict::report(
+                "update_prompts",
+                crate::smoke_verdict::Verdict::NotRun("prompt buttons do not fit".into()),
+            );
             std::process::exit(1);
         }
         log_info!("[smoke-update-prompts] all update prompt stages fit in all locales");
-        std::process::exit(0);
+        crate::smoke_verdict::report("smoke", crate::smoke_verdict::Verdict::Passed { checks: 1 });
+        exit_smoke_passed();
     }
 
     // Start bounded workers for post-activation AX focus queries so notification bursts do not
@@ -3538,7 +3649,7 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-overlay] summon survived");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3560,11 +3671,11 @@ pub fn run() {
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, finishLaunching];
         }
-        std::process::exit(if settings::settings_vertical_zoom_smoke_runner() {
-            0
-        } else {
-            1
-        });
+        {
+            let passed = settings::settings_vertical_zoom_smoke_runner();
+            crate::smoke_verdict::record_for_child(if passed { "PASSED 1" } else { "FAILED" });
+            std::process::exit(if passed { 0 } else { 1 });
+        }
     }
     if std::env::args().any(|a| a == "--smoke-settings-layout") {
         unsafe {
@@ -3587,7 +3698,7 @@ pub fn run() {
             i18n::apply_config_locale(&original_locale);
             settings::invalidate_settings_window();
             log_info!("[smoke-settings-layout] all pages survived in all locales");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3599,11 +3710,11 @@ pub fn run() {
             let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
             let _: () = msg_send![nsapp, finishLaunching];
         }
-        std::process::exit(if settings::finder_menu_page_smoke_runner() {
-            0
-        } else {
-            1
-        });
+        {
+            let passed = settings::finder_menu_page_smoke_runner();
+            crate::smoke_verdict::record_for_child(if passed { "PASSED 1" } else { "FAILED" });
+            std::process::exit(if passed { 0 } else { 1 });
+        }
     }
 
     if std::env::args().any(|a| a == "--smoke-smooth-scroll-event") {
@@ -3613,7 +3724,7 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-smooth-scroll-event] synthetic event fields passed");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3628,7 +3739,7 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-app-reopen] delegate returned NO and Settings is visible");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3644,7 +3755,7 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-keystroke-display-panel] glass, sizing, and grip behavior passed");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3660,7 +3771,7 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-settings-state-sync] settings state survived rebuild");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3672,11 +3783,14 @@ pub fn run() {
             let _: () = msg_send![nsapp, finishLaunching];
             let ok = settings::settings_collapsible_row_smoke_runner();
             if !ok {
+                // Record the failure: a child that exits 1 without a verdict is indistinguishable
+                // from one that never ran, so the gate could not report this as FAILED.
+                crate::smoke_verdict::record_for_child("FAILED conditional row geometry");
                 eprintln!("[smoke-settings-collapsible-row] conditional row geometry failed");
                 std::process::exit(1);
             }
             log_info!("[smoke-settings-collapsible-row] conditional row geometry is stable");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3692,7 +3806,7 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-settings-mouse-profile-callback] mouse controls applied safely");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3710,7 +3824,7 @@ pub fn run() {
                 std::process::exit(1);
             }
             log_info!("[smoke-onboarding-live-apply] guide choices applied without Next");
-            std::process::exit(0);
+            exit_smoke_passed();
         }
     }
 
@@ -3828,7 +3942,10 @@ pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{settings_prewarm_step, SettingsPrewarmStep, SETTINGS_PREWARM_MAX_ATTEMPTS};
+    use super::{
+        orderly_exit_count, settings_prewarm_step, SettingsPrewarmStep,
+        SETTINGS_PREWARM_MAX_ATTEMPTS,
+    };
 
     #[test]
     fn the_settings_warm_up_builds_only_at_a_quiet_moment_and_gives_up_after_the_cap() {
@@ -3862,6 +3979,33 @@ mod tests {
             settings_prewarm_step(false, true, SETTINGS_PREWARM_MAX_ATTEMPTS + 5),
             SettingsPrewarmStep::GiveUp,
             "a retry count past the cap must still give up"
+        );
+    }
+
+    /// Both exit routes must run the same duties, and running them twice must be harmless.
+    ///
+    /// Why this is a regression test: the menu route flushed the debounced config write and the
+    /// terminate-notification route (logout, shutdown) did not, so a settings change made inside the
+    /// debounce window before a logout was lost -- and the tests could not see it because each route
+    /// carried its own list. The assertion is deliberately about the routes reaching one function
+    /// rather than about the flush itself: `flush_config_sync` needs a persistence worker, and what
+    /// the defect was is "this route forgot a duty", not "the flush is broken".
+    #[test]
+    fn both_exit_routes_run_the_same_duties() {
+        let before = orderly_exit_count();
+        crate::menu::quit_application_for_test();
+        assert_eq!(
+            orderly_exit_count(),
+            before + 1,
+            "the menu quit route must run the shared exit duties"
+        );
+
+        let before = orderly_exit_count();
+        super::run_terminate_duties_for_test();
+        assert_eq!(
+            orderly_exit_count(),
+            before + 1,
+            "the terminate notification must run the same shared duties"
         );
     }
 }

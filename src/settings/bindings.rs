@@ -10,6 +10,7 @@
 //!   disabled-hint/tooltip registries are keyed by the view's address.
 
 use super::*;
+use crate::callback_guard;
 
 use crate::key_bindings::{Action, Trigger};
 
@@ -1255,25 +1256,27 @@ pub(crate) fn set_panel_message(message: Option<&str>) {
 
 /// The add panel "Record chord": start the recorder for the action the panel has selected.
 pub(crate) extern "C" fn handle_panel_record(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // Same predicate as the button's own enablement: a click can arrive after the switch changed.
-    if !panel_gates(
-        master_switch_on(),
-        has_draft(),
-        super::mapping::binding_recording_pending(),
-    )
-    .record
-    {
-        return;
-    }
-    // The chord must be recorded for the action the panel is showing *now*; a stale draft from an
-    // earlier action is dropped rather than confirmed against the new one.
-    clear_draft_state();
-    set_panel_message(None);
-    let Some(action) = panel_popup_action() else {
-        return;
-    };
-    unsafe { super::mapping::start_key_binding_recording(action) };
-    update_panel_ok();
+    callback_guard::void("handle_panel_record", || {
+        // Same predicate as the button's own enablement: a click can arrive after the switch changed.
+        if !panel_gates(
+            master_switch_on(),
+            has_draft(),
+            super::mapping::binding_recording_pending(),
+        )
+        .record
+        {
+            return;
+        }
+        // The chord must be recorded for the action the panel is showing *now*; a stale draft from an
+        // earlier action is dropped rather than confirmed against the new one.
+        clear_draft_state();
+        set_panel_message(None);
+        let Some(action) = panel_popup_action() else {
+            return;
+        };
+        unsafe { super::mapping::start_key_binding_recording(action) };
+        update_panel_ok();
+    });
 }
 
 /// The panel's action popup changed.
@@ -1290,22 +1293,24 @@ pub(crate) extern "C" fn handle_panel_action_changed(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    if let Some(action) = panel_popup_action() {
-        let editing = binding_editing().is_some();
-        let held = BINDING_DRAFT.lock().ok().and_then(|draft| draft.clone());
-        let entry_trigger = edited_binding().map(|binding| binding.trigger);
-        let next_draft = draft_after_action_change(editing, held, entry_trigger, action);
-        if let Ok(mut draft) = BINDING_DRAFT.lock() {
-            *draft = next_draft.clone();
+    callback_guard::void("handle_panel_action_changed", || {
+        if let Some(action) = panel_popup_action() {
+            let editing = binding_editing().is_some();
+            let held = BINDING_DRAFT.lock().ok().and_then(|draft| draft.clone());
+            let entry_trigger = edited_binding().map(|binding| binding.trigger);
+            let next_draft = draft_after_action_change(editing, held, entry_trigger, action);
+            if let Ok(mut draft) = BINDING_DRAFT.lock() {
+                *draft = next_draft.clone();
+            }
+            // The message must name the action confirm would actually write: leaving the recorded
+            // sentence in place would have the panel say one action while confirming another.
+            match message_after_action_change(&next_draft) {
+                Some(sentence) => set_panel_message(Some(&sentence)),
+                None => set_panel_message(None),
+            }
         }
-        // The message must name the action confirm would actually write: leaving the recorded
-        // sentence in place would have the panel say one action while confirming another.
-        match message_after_action_change(&next_draft) {
-            Some(sentence) => set_panel_message(Some(&sentence)),
-            None => set_panel_message(None),
-        }
-    }
-    update_panel_ok();
+        update_panel_ok();
+    });
 }
 
 /// What the draft becomes when the action popup changes.
@@ -1365,40 +1370,45 @@ fn edited_binding() -> Option<crate::key_bindings::KeyBinding> {
 
 /// The panel "OK": write the draft, adding a new binding or rewriting the one being edited.
 pub(crate) extern "C" fn handle_panel_confirm(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // Re-read here, not trusted from the button's state: a config reload can turn the feature off
-    // between the render and the click. Same predicate as the button's enablement.
-    if !panel_gates(
-        master_switch_on(),
-        has_draft(),
-        super::mapping::binding_recording_pending(),
-    )
-    .ok
-    {
-        return;
-    }
-    let Some((action, trigger)) = BINDING_DRAFT.lock().ok().and_then(|draft| draft.clone()) else {
-        return;
-    };
-    // Re-validate against the config as it is now, and against the action the popup is showing: the
-    // draft is only worth writing while those two still agree.
-    if panel_popup_action() != Some(action) {
-        clear_draft_state();
-        update_panel_ok();
-        return;
-    }
-    // The whole target, not just the index: the write path compares identity as well.
-    let editing = editing_target();
-    match write_binding(editing, action, &trigger) {
-        Ok(()) => {
-            close_binding_panel();
+    callback_guard::void("handle_panel_confirm", || {
+        // Re-read here, not trusted from the button's state: a config reload can turn the feature off
+        // between the render and the click. Same predicate as the button's enablement.
+        if !panel_gates(
+            master_switch_on(),
+            has_draft(),
+            super::mapping::binding_recording_pending(),
+        )
+        .ok
+        {
+            return;
         }
-        Err(error) => set_panel_message(Some(&error)),
-    }
+        let Some((action, trigger)) = BINDING_DRAFT.lock().ok().and_then(|draft| draft.clone())
+        else {
+            return;
+        };
+        // Re-validate against the config as it is now, and against the action the popup is showing: the
+        // draft is only worth writing while those two still agree.
+        if panel_popup_action() != Some(action) {
+            clear_draft_state();
+            update_panel_ok();
+            return;
+        }
+        // The whole target, not just the index: the write path compares identity as well.
+        let editing = editing_target();
+        match write_binding(editing, action, &trigger) {
+            Ok(()) => {
+                close_binding_panel();
+            }
+            Err(error) => set_panel_message(Some(&error)),
+        }
+    });
 }
 
 /// The panel "Cancel".
 pub(crate) extern "C" fn handle_panel_cancel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    close_binding_panel();
+    callback_guard::void("handle_panel_cancel", || {
+        close_binding_panel();
+    });
 }
 
 /// The action at one popup row, in the order the picker builds its menu.
@@ -1760,33 +1770,39 @@ fn validate_draft(action: Action, trigger: &str) -> Result<(), String> {
 
 /// Row switch: turn one binding on or off.
 pub(crate) extern "C" fn handle_binding_toggle(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let sender = sender as *mut AnyObject;
-    let Some(item) = control_item(sender) else {
-        return;
-    };
-    let state: isize = unsafe { msg_send![sender, state] };
-    toggle_binding(item, state == 1);
+    callback_guard::void("handle_binding_toggle", || {
+        let sender = sender as *mut AnyObject;
+        let Some(item) = control_item(sender) else {
+            return;
+        };
+        let state: isize = unsafe { msg_send![sender, state] };
+        toggle_binding(item, state == 1);
+    });
 }
 
 /// The footer's "Add binding" button: open the panel in its add mode.
 pub(crate) extern "C" fn handle_binding_add(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    // The control disables itself with the master switch, but a keyboard or programmatic invocation
-    // can still arrive, so the rule is checked here too.
-    if !master_switch_on() {
-        return;
-    }
-    open_binding_panel();
+    callback_guard::void("handle_binding_add", || {
+        // The control disables itself with the master switch, but a keyboard or programmatic invocation
+        // can still arrive, so the rule is checked here too.
+        if !master_switch_on() {
+            return;
+        }
+        open_binding_panel();
+    });
 }
 
 /// A row's "Edit" button: open the panel prefilled with that binding.
 pub(crate) extern "C" fn handle_binding_edit(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    if !master_switch_on() {
-        return;
-    }
-    let Some(item) = control_item(sender as *mut AnyObject) else {
-        return;
-    };
-    open_binding_edit_panel(item);
+    callback_guard::void("handle_binding_edit", || {
+        if !master_switch_on() {
+            return;
+        }
+        let Some(item) = control_item(sender as *mut AnyObject) else {
+            return;
+        };
+        open_binding_edit_panel(item);
+    });
 }
 
 /// A row's "Delete" button: remove that binding.
@@ -1795,21 +1811,23 @@ pub(crate) extern "C" fn handle_binding_edit(_self: *mut c_void, _cmd: Sel, send
 /// the button. A rebuild replaces every row and re-registers every index, so a stale sender cannot
 /// reach here — but the length check is the second lock on the same door, and it costs nothing.
 pub(crate) extern "C" fn handle_binding_delete(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    if !master_switch_on() {
-        return;
-    }
-    let Some(item) = control_item(sender as *mut AnyObject) else {
-        return;
-    };
-    let len = CONFIG
-        .read()
-        .map(|cfg| cfg.key_bindings.items.as_ref().map_or(0, Vec::len))
-        .unwrap_or(0);
-    if item >= len {
-        return;
-    }
-    log_debug!("[keybind] deleting row {}", item);
-    delete_binding(item);
+    callback_guard::void("handle_binding_delete", || {
+        if !master_switch_on() {
+            return;
+        }
+        let Some(item) = control_item(sender as *mut AnyObject) else {
+            return;
+        };
+        let len = CONFIG
+            .read()
+            .map(|cfg| cfg.key_bindings.items.as_ref().map_or(0, Vec::len))
+            .unwrap_or(0);
+        if item >= len {
+            return;
+        }
+        log_debug!("[keybind] deleting row {}", item);
+        delete_binding(item);
+    });
 }
 
 /// "Add": write the recorded draft.
@@ -1818,7 +1836,9 @@ pub(crate) extern "C" fn handle_binding_confirm(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    confirm_draft();
+    callback_guard::void("handle_binding_confirm", || {
+        confirm_draft();
+    });
 }
 
 /// "Cancel": drop the draft and go back to the record button.
@@ -1827,7 +1847,9 @@ pub(crate) extern "C" fn handle_binding_cancel(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    clear_draft();
+    callback_guard::void("handle_binding_cancel", || {
+        clear_draft();
+    });
 }
 
 #[cfg(test)]

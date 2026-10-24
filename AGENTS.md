@@ -11,16 +11,28 @@ The app is Rust-only and calls AppKit, CoreGraphics, and ApplicationServices thr
 ## Build, run, and verification
 
 ```sh
-cargo fmt
-cargo check
-cargo clippy
-scripts/cargo-test.sh
-scripts/dev-restart.sh
+scripts/gate.sh                 # the whole gate, one command, one outcome per tier
+scripts/gate.sh --offline       # the tiers that need no graphical session
+scripts/dev-restart.sh          # then launch the app (runtime changes only)
 ```
+
+The gate is `scripts/gate.sh`, and **it is the gate**: `fmt`, `check`, `clippy`, `release-check`,
+`cargo-test`, `selftests`, `a1` (the GUI smoke runners) and `a2` (the e2e scenarios). Each tier prints
+exactly one `gate: <tier> PASSED|FAILED|NOT RUN` line and the run ends with a table of them, so a tier
+that could not decide is never read as one that passed. Its exit status follows the same rule: 0 = every
+selected tier passed, 1 = at least one failed, **75 = incomplete** (nothing failed, but a tier did not run,
+for example `--offline` or no graphical session). A green `--offline` run is not a green gate.
 
 - `scripts/cargo-test.sh` runs the suite and **fails when the run executed no test**. A plain `cargo test`
   exits 0 for a filter that matched nothing (measured: `running 0 tests ... ok`), so a typo in a filter reads
-  as a pass; the wrapper makes that case a failure. Pass a filter as an argument and it keeps that guard.
+  as a pass; the wrapper makes that case a failure. Pass a filter as an argument and it keeps that guard;
+  add `--require-match` when the filter must match the `oh-my-tab` lib tests specifically (other workspace
+  targets legitimately run zero tests under a filter, so that is an opt-in rather than the default).
+- `scripts/smoke-runners.sh --list|--run` is the A1 tier: it derives the runner list from the compiled
+  `#[ignore]` tests instead of a transcribed list, refuses a `target/debug/oh-my-tab` older than `src/`,
+  and classifies each runner by the `smoke-result:` line it prints. Silence is NOT RUN, never a pass.
+- `scripts/selftests.sh` runs every `scripts/*-selftest.sh` offline, so the gate helpers (the lock, the
+  Finder cleanup, the e2e disturbance gates, the reviewer script, the gate itself) are checked by something.
 - The normal `cargo test` suite is headless-safe; GUI/permission-dependent smoke tests are marked `#[ignore]`.
 - Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
 - Cross-module, unsafe/FFI, concurrency, configuration, build, or release changes require the full gate above. Before handing off a completed feature, always run the full gate and keep all checks clean.

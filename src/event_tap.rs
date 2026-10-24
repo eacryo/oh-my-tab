@@ -471,21 +471,23 @@ pub(crate) struct TapWatchdog {
 /// Timeout disables are recoverable; explicit stop, permission loss, and UserInput disables are
 /// terminal for the affected tap and must never be undone by this watchdog.
 unsafe extern "C" fn tap_watchdog_callback(_timer: CFRunLoopTimerRef, info: *mut c_void) {
-    if info.is_null() {
-        return;
-    }
-    let context = &*(info as *const TapWatchdogContext);
-    let tap = context.tap;
-    if tap.is_null()
-        || context.stop_requested.load(Ordering::SeqCst)
-        || !crate::input_monitor::watchdog_may_enable_tap()
-    {
-        return;
-    }
-    if !CGEventTapIsEnabled(tap) {
-        CGEventTapEnable(tap, true);
-        log_info!("[tap] event tap was disabled by the system; re-enabled.");
-    }
+    crate::callback_guard::void("tap_watchdog_callback", || {
+        if info.is_null() {
+            return;
+        }
+        let context = &*(info as *const TapWatchdogContext);
+        let tap = context.tap;
+        if tap.is_null()
+            || context.stop_requested.load(Ordering::SeqCst)
+            || !crate::input_monitor::watchdog_may_enable_tap()
+        {
+            return;
+        }
+        if !CGEventTapIsEnabled(tap) {
+            CGEventTapEnable(tap, true);
+            log_info!("[tap] event tap was disabled by the system; re-enabled.");
+        }
+    });
 }
 
 /// Attach a 3s watchdog to a tap. The context stays alive until stop_tap_watchdog.

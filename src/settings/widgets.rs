@@ -1,6 +1,7 @@
 //! Control builders: button/text-field/switch/slider/popup custom classes plus card and row layout builders.
 
 use super::*;
+use crate::callback_guard;
 use objc2::runtime::Bool;
 
 #[link(name = "AppKit", kind = "framework")]
@@ -80,10 +81,10 @@ extern "C" fn settings_text_field_focus_did_begin(
     _cmd: Sel,
     notification: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("settings_text_field_focus_did_begin", || unsafe {
         let field: *mut AnyObject = msg_send![notification, object];
         apply_inset_focus_ring(field, true, 0, 0.0);
-    }
+    });
 }
 
 extern "C" fn settings_text_field_focus_did_end(
@@ -91,10 +92,10 @@ extern "C" fn settings_text_field_focus_did_end(
     _cmd: Sel,
     notification: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("settings_text_field_focus_did_end", || unsafe {
         let field: *mut AnyObject = msg_send![notification, object];
         apply_inset_focus_ring(field, false, 0, 0.0);
-    }
+    });
 }
 
 fn settings_text_field_delegate() -> *mut AnyObject {
@@ -144,7 +145,7 @@ pub(crate) fn flipped_settings_view_class() -> *mut AnyObject {
 }
 
 extern "C" fn flipped_settings_view_is_flipped(_this: *mut AnyObject, _cmd: Sel) -> Bool {
-    Bool::YES
+    callback_guard::value("flipped_settings_view_is_flipped", Bool::YES, || Bool::YES)
 }
 
 /// Semantic text roles used by every settings label and control.
@@ -326,7 +327,7 @@ pub(super) extern "C" fn html_action_button_mouse_entered(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("html_action_button_mouse_entered", || unsafe {
         let button = this;
         let tag: isize = msg_send![button, tag];
         let hover = action_button_hover_color(tag, settings_palette());
@@ -337,7 +338,7 @@ pub(super) extern "C" fn html_action_button_mouse_entered(
                 crate::ffi::hex_to_cg_color(themed_settings_color(hover)),
             );
         }
-    }
+    });
 }
 
 pub(super) extern "C" fn html_action_button_mouse_exited(
@@ -345,7 +346,7 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("html_action_button_mouse_exited", || unsafe {
         let button = this;
         let tag: isize = msg_send![button, tag];
         let normal = action_button_normal_color(tag, settings_palette());
@@ -356,36 +357,50 @@ pub(super) extern "C" fn html_action_button_mouse_exited(
                 crate::ffi::hex_to_cg_color(themed_settings_color(normal)),
             );
         }
-    }
+    });
 }
 
 extern "C" fn html_action_button_become_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
-    unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
-        let mut sup =
-            ObjcSuper::for_defined_class(this as *mut c_void, html_action_button_class_handle());
-        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        let accepted = send(&mut sup, sel!(becomeFirstResponder));
-        if accepted.as_bool() {
-            // Idle border is the 1pt card_border; focus swaps it for the 2pt accent ring.
-            apply_inset_focus_ring(this, true, settings_palette().card_border, 1.0);
-        }
-        accepted
-    }
+    callback_guard::value(
+        "html_action_button_become_first_responder",
+        Bool::NO,
+        || {
+            unsafe {
+                type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
+                let mut sup = ObjcSuper::for_defined_class(
+                    this as *mut c_void,
+                    html_action_button_class_handle(),
+                );
+                let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+                let accepted = send(&mut sup, sel!(becomeFirstResponder));
+                if accepted.as_bool() {
+                    // Idle border is the 1pt card_border; focus swaps it for the 2pt accent ring.
+                    apply_inset_focus_ring(this, true, settings_palette().card_border, 1.0);
+                }
+                accepted
+            }
+        },
+    )
 }
 
 extern "C" fn html_action_button_resign_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
-    unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
-        let mut sup =
-            ObjcSuper::for_defined_class(this as *mut c_void, html_action_button_class_handle());
-        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        let accepted = send(&mut sup, sel!(resignFirstResponder));
-        if accepted.as_bool() {
-            apply_inset_focus_ring(this, false, settings_palette().card_border, 1.0);
-        }
-        accepted
-    }
+    callback_guard::value(
+        "html_action_button_resign_first_responder",
+        Bool::NO,
+        || unsafe {
+            type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
+            let mut sup = ObjcSuper::for_defined_class(
+                this as *mut c_void,
+                html_action_button_class_handle(),
+            );
+            let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            let accepted = send(&mut sup, sel!(resignFirstResponder));
+            if accepted.as_bool() {
+                apply_inset_focus_ring(this, false, settings_palette().card_border, 1.0);
+            }
+            accepted
+        },
+    )
 }
 
 /// Create a settings action button with a semantic normal/hover style. All buttons use the same
@@ -699,12 +714,12 @@ pub(super) extern "C" fn external_link_mouse_entered(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("external_link_mouse_entered", || unsafe {
         let color = settings_text_color(SettingsTextRole::LinkHover);
         let _: () = msg_send![this, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
         let _: () = msg_send![cursor, set];
-    }
+    });
 }
 
 pub(super) extern "C" fn external_link_mouse_exited(
@@ -712,12 +727,12 @@ pub(super) extern "C" fn external_link_mouse_exited(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("external_link_mouse_exited", || unsafe {
         let color = settings_text_color(SettingsTextRole::Link);
         let _: () = msg_send![this, setTextColor: color];
         let cursor: *mut AnyObject = msg_send![class!(NSCursor), arrowCursor];
         let _: () = msg_send![cursor, set];
-    }
+    });
 }
 
 pub(super) extern "C" fn external_link_mouse_down(
@@ -725,7 +740,7 @@ pub(super) extern "C" fn external_link_mouse_down(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("external_link_mouse_down", || unsafe {
         let tag: isize = msg_send![this, tag];
         if tag == 1 {
             handle_open_github(
@@ -740,7 +755,7 @@ pub(super) extern "C" fn external_link_mouse_down(
                 std::ptr::null_mut(),
             );
         }
-    }
+    });
 }
 
 pub(super) static SIDEBAR_HOVER_TRACKER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
@@ -811,15 +826,17 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_entered(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
-        // Re-entering from the detail pane can skip a child button's mouseEntered callback. Use
-        // the current pointer location to restore the actual row instead of the stale last row.
-        if let Some(button) = sidebar_button_under_pointer() {
-            apply_sidebar_hover(button);
-        } else {
-            clear_sidebar_hover();
+    callback_guard::void("sidebar_hover_tracker_mouse_entered", || {
+        unsafe {
+            // Re-entering from the detail pane can skip a child button's mouseEntered callback. Use
+            // the current pointer location to restore the actual row instead of the stale last row.
+            if let Some(button) = sidebar_button_under_pointer() {
+                apply_sidebar_hover(button);
+            } else {
+                clear_sidebar_hover();
+            }
         }
-    }
+    });
 }
 
 pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
@@ -827,9 +844,9 @@ pub(super) extern "C" fn sidebar_hover_tracker_mouse_exited(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("sidebar_hover_tracker_mouse_exited", || unsafe {
         clear_sidebar_hover();
-    }
+    });
 }
 
 pub(super) fn sidebar_hover_tracker_class() -> *mut AnyObject {
@@ -1150,20 +1167,22 @@ pub(super) extern "C" fn sidebar_button_mouse_entered(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
-        let button = this;
-        // Tracking callbacks may arrive after the pointer has moved into another pane or row.
-        let current = sidebar_button_under_pointer();
-        if current != Some(button) {
-            if let Some(current) = current {
-                apply_sidebar_hover(current);
-            } else {
-                clear_sidebar_hover();
+    callback_guard::void("sidebar_button_mouse_entered", || {
+        unsafe {
+            let button = this;
+            // Tracking callbacks may arrive after the pointer has moved into another pane or row.
+            let current = sidebar_button_under_pointer();
+            if current != Some(button) {
+                if let Some(current) = current {
+                    apply_sidebar_hover(current);
+                } else {
+                    clear_sidebar_hover();
+                }
+                return;
             }
-            return;
+            apply_sidebar_hover(button);
         }
-        apply_sidebar_hover(button);
-    }
+    });
 }
 
 pub(super) extern "C" fn sidebar_button_mouse_exited(
@@ -1171,7 +1190,7 @@ pub(super) extern "C" fn sidebar_button_mouse_exited(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("sidebar_button_mouse_exited", || unsafe {
         let button = this;
         let tag: isize = msg_send![button, tag];
         if tag >= 0 && tag as usize == SIDEBAR_SELECTED.load(Ordering::SeqCst) {
@@ -1181,7 +1200,7 @@ pub(super) extern "C" fn sidebar_button_mouse_exited(
         SIDEBAR_HOVERED
             .compare_exchange(button as usize, 0, Ordering::SeqCst, Ordering::SeqCst)
             .ok();
-    }
+    });
 }
 
 pub(super) fn sidebar_button_class() -> *mut AnyObject {
@@ -1415,52 +1434,54 @@ pub(crate) extern "C" fn on_about_header_click(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let now = Instant::now();
-    let revealed = {
-        let mut clicks = ABOUT_HEADER_CLICKS.lock().unwrap();
-        let within_window = clicks
-            .1
-            .is_some_and(|last| now.duration_since(last) <= ABOUT_HEADER_CLICK_WINDOW);
-        clicks.0 = if within_window {
-            clicks.0.saturating_add(1)
-        } else {
-            1
+    callback_guard::void("on_about_header_click", || {
+        let now = Instant::now();
+        let revealed = {
+            let mut clicks = ABOUT_HEADER_CLICKS.lock().unwrap();
+            let within_window = clicks
+                .1
+                .is_some_and(|last| now.duration_since(last) <= ABOUT_HEADER_CLICK_WINDOW);
+            clicks.0 = if within_window {
+                clicks.0.saturating_add(1)
+            } else {
+                1
+            };
+            clicks.1 = Some(now);
+            if clicks.0 >= 5 {
+                clicks.0 = 0;
+                clicks.1 = None;
+                true
+            } else {
+                false
+            }
         };
-        clicks.1 = Some(now);
-        if clicks.0 >= 5 {
-            clicks.0 = 0;
-            clicks.1 = None;
-            true
-        } else {
-            false
-        }
-    };
 
-    if !revealed {
-        return;
-    }
-
-    unsafe {
-        let build_version = bundle_info_string("CFBundleVersion");
-        if build_version.is_empty() {
+        if !revealed {
             return;
         }
-        super::with_settings_ui(|ui| {
-            let Some(ui) = ui.as_ref() else {
+
+        unsafe {
+            let build_version = bundle_info_string("CFBundleVersion");
+            if build_version.is_empty() {
                 return;
-            };
-            set_field(
-                ui.about_subtitle,
-                tf(
-                    "settings.version_label_with_build",
-                    &[
-                        ("version", env!("CARGO_PKG_VERSION")),
-                        ("build", &build_version),
-                    ],
-                ),
-            );
-        });
-    }
+            }
+            super::with_settings_ui(|ui| {
+                let Some(ui) = ui.as_ref() else {
+                    return;
+                };
+                set_field(
+                    ui.about_subtitle,
+                    tf(
+                        "settings.version_label_with_build",
+                        &[
+                            ("version", env!("CARGO_PKG_VERSION")),
+                            ("build", &build_version),
+                        ],
+                    ),
+                );
+            });
+        }
+    });
 }
 
 pub(super) extern "C" fn about_header_click_view_mouse_down(
@@ -1468,7 +1489,9 @@ pub(super) extern "C" fn about_header_click_view_mouse_down(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    on_about_header_click(std::ptr::null_mut(), sel!(mouseDown:), std::ptr::null_mut());
+    callback_guard::void("about_header_click_view_mouse_down", || {
+        on_about_header_click(std::ptr::null_mut(), sel!(mouseDown:), std::ptr::null_mut());
+    });
 }
 
 /// Set a text field's value from anything Displayable, releasing the temp NSString.
@@ -1583,9 +1606,9 @@ pub(super) extern "C" fn centered_text_field_cell_draw_interior(
     bounds: NSRect,
     view: *mut AnyObject,
 ) {
-    unsafe {
+    callback_guard::void("centered_text_field_cell_draw_interior", || unsafe {
         centered_text_field_cell_super_draw(this, centered_text_field_cell_frame(bounds), view);
-    }
+    });
 }
 
 pub(super) extern "C" fn centered_text_field_cell_select(
@@ -1598,36 +1621,38 @@ pub(super) extern "C" fn centered_text_field_cell_select(
     start: isize,
     length: isize,
 ) {
-    unsafe {
-        type F = unsafe extern "C" fn(
-            *mut ObjcSuper,
-            Sel,
-            NSRect,
-            *mut AnyObject,
-            *mut AnyObject,
-            *mut AnyObject,
-            isize,
-            isize,
-        ) -> ();
-        let mut sup = ObjcSuper::for_defined_class(
-            this as *mut c_void,
-            centered_text_field_cell_class_handle(),
-        );
-        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        send(
-            &mut sup,
-            sel!(selectWithFrame:inView:editor:delegate:start:length:),
-            // `bounds` is the cell's full bounding rectangle. Do not pass the compact drawing
-            // rect here: AppKit reuses this method for double-click selection and positions the
-            // field editor from the rectangle it receives.
-            bounds,
-            view,
-            editor,
-            delegate,
-            start,
-            length,
-        );
-    }
+    callback_guard::void("centered_text_field_cell_select", || {
+        unsafe {
+            type F = unsafe extern "C" fn(
+                *mut ObjcSuper,
+                Sel,
+                NSRect,
+                *mut AnyObject,
+                *mut AnyObject,
+                *mut AnyObject,
+                isize,
+                isize,
+            ) -> ();
+            let mut sup = ObjcSuper::for_defined_class(
+                this as *mut c_void,
+                centered_text_field_cell_class_handle(),
+            );
+            let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            send(
+                &mut sup,
+                sel!(selectWithFrame:inView:editor:delegate:start:length:),
+                // `bounds` is the cell's full bounding rectangle. Do not pass the compact drawing
+                // rect here: AppKit reuses this method for double-click selection and positions the
+                // field editor from the rectangle it receives.
+                bounds,
+                view,
+                editor,
+                delegate,
+                start,
+                length,
+            );
+        }
+    });
 }
 
 /// Keep AppKit's field editor aligned with the cell's normal drawing baseline. The editor is an
@@ -1638,39 +1663,42 @@ pub(super) extern "C" fn centered_text_field_cell_setup_editor(
     _cmd: Sel,
     editor: *mut AnyObject,
 ) -> *mut AnyObject {
-    unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject) -> *mut AnyObject;
-        let mut sup = ObjcSuper::for_defined_class(
-            this as *mut c_void,
-            centered_text_field_cell_class_handle(),
-        );
-        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        let configured_editor = send(&mut sup, sel!(setUpFieldEditorAttributes:), editor);
+    callback_guard::nil("centered_text_field_cell_setup_editor", || {
+        unsafe {
+            type F = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject) -> *mut AnyObject;
+            let mut sup = ObjcSuper::for_defined_class(
+                this as *mut c_void,
+                centered_text_field_cell_class_handle(),
+            );
+            let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            let configured_editor = send(&mut sup, sel!(setUpFieldEditorAttributes:), editor);
 
-        let editor = configured_editor;
-        if editor.is_null() {
-            return configured_editor;
+            let editor = configured_editor;
+            if editor.is_null() {
+                return configured_editor;
+            }
+            let _: () = msg_send![editor, setAlignment: 0isize]; // NSTextAlignmentLeft
+            let _: () = msg_send![editor, setVerticallyResizable: false];
+            let _: () = msg_send![editor, setHorizontallyResizable: true];
+            if msg_send![editor, respondsToSelector: sel!(setTextContainerInset:)] {
+                // Match the editor's vertical inset to the idle cell's draw-rect origin so changing a
+                // control's height cannot shift its text between display and editing states.
+                let control_view: *mut AnyObject = msg_send![this, controlView];
+                let bounds = if control_view.is_null() {
+                    NSRect::new(
+                        NSPoint::new(0.0, 0.0),
+                        NSSize::new(1.0, super::components::SettingsLayout::CONTROL_H),
+                    )
+                } else {
+                    msg_send![control_view, bounds]
+                };
+                let vertical_inset = centered_text_field_editor_vertical_inset(bounds);
+                let _: () =
+                    msg_send![editor, setTextContainerInset: NSSize::new(8.0, vertical_inset)];
+            }
+            configured_editor
         }
-        let _: () = msg_send![editor, setAlignment: 0isize]; // NSTextAlignmentLeft
-        let _: () = msg_send![editor, setVerticallyResizable: false];
-        let _: () = msg_send![editor, setHorizontallyResizable: true];
-        if msg_send![editor, respondsToSelector: sel!(setTextContainerInset:)] {
-            // Match the editor's vertical inset to the idle cell's draw-rect origin so changing a
-            // control's height cannot shift its text between display and editing states.
-            let control_view: *mut AnyObject = msg_send![this, controlView];
-            let bounds = if control_view.is_null() {
-                NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(1.0, super::components::SettingsLayout::CONTROL_H),
-                )
-            } else {
-                msg_send![control_view, bounds]
-            };
-            let vertical_inset = centered_text_field_editor_vertical_inset(bounds);
-            let _: () = msg_send![editor, setTextContainerInset: NSSize::new(8.0, vertical_inset)];
-        }
-        configured_editor
-    }
+    })
 }
 
 /// Editable text field (alloc +1; caller owns or releases after adding to a parent).
@@ -1910,7 +1938,7 @@ unsafe fn html_switch_animate_press(button: *mut AnyObject) {
 }
 
 pub(super) extern "C" fn html_switch_set_state(this: *mut AnyObject, _cmd: Sel, state: isize) {
-    unsafe {
+    callback_guard::void("html_switch_set_state", || unsafe {
         let button = this;
         let previous_state: isize = msg_send![button, state];
         type SetState = unsafe extern "C" fn(*mut ObjcSuper, Sel, isize);
@@ -1918,7 +1946,7 @@ pub(super) extern "C" fn html_switch_set_state(this: *mut AnyObject, _cmd: Sel, 
         let send: SetState = std::mem::transmute(objc_msgSendSuper as *const ());
         send(&mut sup, sel!(setState:), state);
         html_switch_apply_visual(button, (previous_state != state).then_some(previous_state));
-    }
+    });
 }
 
 /// Set a custom switch's state without the spring transition.
@@ -1943,13 +1971,13 @@ pub(super) unsafe fn set_switch_state_immediate(button: *mut AnyObject, on: bool
 
 /// Refresh the custom switch track whenever its enabled state changes.
 pub(super) extern "C" fn html_switch_set_enabled(this: *mut AnyObject, _cmd: Sel, enabled: Bool) {
-    unsafe {
+    callback_guard::void("html_switch_set_enabled", || unsafe {
         let mut sup = ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
         type SetEnabled = unsafe extern "C" fn(*mut ObjcSuper, Sel, Bool);
         let send: SetEnabled = std::mem::transmute(objc_msgSendSuper as *const ());
         send(&mut sup, sel!(setEnabled:), enabled);
         html_switch_apply_visual(this, None);
-    }
+    });
 }
 
 /// The switch is rendered entirely by its layer, so toggle the state and dispatch the action
@@ -1959,26 +1987,28 @@ pub(super) extern "C" fn html_switch_mouse_down(
     _cmd: Sel,
     _event: *mut AnyObject,
 ) {
-    unsafe {
-        let button = this;
-        let enabled: bool = msg_send![button, isEnabled];
-        if !enabled {
-            return;
-        }
+    callback_guard::void("html_switch_mouse_down", || {
+        unsafe {
+            let button = this;
+            let enabled: bool = msg_send![button, isEnabled];
+            if !enabled {
+                return;
+            }
 
-        let current: isize = msg_send![button, state];
-        let next = if current == 0 { 1isize } else { 0isize };
-        html_switch_animate_press(button);
-        let _: () = msg_send![button, setState: next];
+            let current: isize = msg_send![button, state];
+            let next = if current == 0 { 1isize } else { 0isize };
+            html_switch_animate_press(button);
+            let _: () = msg_send![button, setState: next];
 
-        // Most settings switches only need their state collected when OK is pressed. The two
-        // switches with live behavior have an explicit target/action; dispatch those here.
-        let target: *mut AnyObject = msg_send![button, target];
-        if !target.is_null() {
-            let action: Sel = msg_send![button, action];
-            let _: bool = msg_send![button, sendAction: action, to: target];
+            // Most settings switches only need their state collected when OK is pressed. The two
+            // switches with live behavior have an explicit target/action; dispatch those here.
+            let target: *mut AnyObject = msg_send![button, target];
+            if !target.is_null() {
+                let action: Sel = msg_send![button, action];
+                let _: bool = msg_send![button, sendAction: action, to: target];
+            }
         }
-    }
+    });
 }
 
 /// Design-style §10 requires a hit target of at least 28x28 while §9 fixes the visible track at
@@ -1989,7 +2019,7 @@ pub(super) extern "C" fn html_switch_hit_test(
     _cmd: Sel,
     point: NSPoint,
 ) -> *mut AnyObject {
-    unsafe {
+    callback_guard::nil("html_switch_hit_test", || unsafe {
         let button = this;
         let superview: *mut AnyObject = msg_send![button, superview];
         let local: NSPoint = if superview.is_null() {
@@ -2008,7 +2038,7 @@ pub(super) extern "C" fn html_switch_hit_test(
         } else {
             std::ptr::null_mut()
         }
-    }
+    })
 }
 
 /// The switch's clickable rect: the visible 40x24 track, transparently padded to at least 28x28
@@ -2027,21 +2057,24 @@ pub(super) fn switch_hit_bounds(bounds: NSRect) -> NSRect {
 }
 
 extern "C" fn html_switch_become_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
-    unsafe {
-        type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
-        let mut sup = ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
-        let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
-        let accepted = send(&mut sup, sel!(becomeFirstResponder));
-        if accepted.as_bool() {
-            // The track layer has no idle border; the 2pt accent ring is the focus indicator.
-            apply_inset_focus_ring(this, true, 0, 0.0);
+    callback_guard::value("html_switch_become_first_responder", Bool::NO, || {
+        unsafe {
+            type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
+            let mut sup =
+                ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
+            let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
+            let accepted = send(&mut sup, sel!(becomeFirstResponder));
+            if accepted.as_bool() {
+                // The track layer has no idle border; the 2pt accent ring is the focus indicator.
+                apply_inset_focus_ring(this, true, 0, 0.0);
+            }
+            accepted
         }
-        accepted
-    }
+    })
 }
 
 extern "C" fn html_switch_resign_first_responder(this: *mut AnyObject, _cmd: Sel) -> Bool {
-    unsafe {
+    callback_guard::value("html_switch_resign_first_responder", Bool::NO, || unsafe {
         type F = unsafe extern "C" fn(*mut ObjcSuper, Sel) -> Bool;
         let mut sup = ObjcSuper::for_defined_class(this as *mut c_void, html_switch_class_handle());
         let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
@@ -2050,7 +2083,7 @@ extern "C" fn html_switch_resign_first_responder(this: *mut AnyObject, _cmd: Sel
             apply_inset_focus_ring(this, false, 0, 0.0);
         }
         accepted
-    }
+    })
 }
 
 /// The class handle, so the super dispatches can name the class that defined the overrides.
@@ -3240,7 +3273,7 @@ pub(super) extern "C" fn settings_decoration_hit_test(
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
-    std::ptr::null_mut()
+    callback_guard::nil("settings_decoration_hit_test", std::ptr::null_mut)
 }
 
 /// Flat detail-pane surface. The pane background is a solid `detail_bg` layer fill (no radial
@@ -3706,7 +3739,7 @@ extern "C" fn passthrough_label_hit_test(
     _cmd: Sel,
     _point: NSPoint,
 ) -> *mut AnyObject {
-    std::ptr::null_mut()
+    callback_guard::nil("passthrough_label_hit_test", std::ptr::null_mut)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4172,6 +4205,7 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 
 #[cfg(test)]
 mod tests {
+    use crate::smoke_verdict::smoke_runner;
 
     /// A settings row can be retired from the page while its refresher still walks every known
     /// control id: the handle is then null, and objc2 panics on a nil receiver. Writing to it used to
@@ -4550,28 +4584,31 @@ mod tests {
     #[test]
     #[ignore]
     fn slider_double_click_smoke() {
-        unsafe {
-            let slider = super::make_stepped_slider(0.0, 0.0, 120.0, 20.0, 0, 10, 1, 7, Some(3.0));
-            assert_eq!(super::slider_default_value(slider), Some(3.0));
+        smoke_runner!("slider_double_click_smoke", 1, {
+            unsafe {
+                let slider =
+                    super::make_stepped_slider(0.0, 0.0, 120.0, 20.0, 0, 10, 1, 7, Some(3.0));
+                assert_eq!(super::slider_default_value(slider), Some(3.0));
 
-            // A double-click (clickCount = 2) restores the default 3.
-            let double = make_click_event(2);
-            super::settings_slider_mouse_down(slider, sel!(mouseDown:), double);
-            let value: f64 = msg_send![slider, doubleValue];
-            assert_eq!(value, 3.0, "double-click must restore the default");
+                // A double-click (clickCount = 2) restores the default 3.
+                let double = make_click_event(2);
+                super::settings_slider_mouse_down(slider, sel!(mouseDown:), double);
+                let value: f64 = msg_send![slider, doubleValue];
+                assert_eq!(value, 3.0, "double-click must restore the default");
 
-            // A single click still goes to NSSlider (the value is untouched; with no window the
-            // superclass simply does not track anything).
-            let _: () = msg_send![slider, setDoubleValue: 7.0f64];
-            let single = make_click_event(1);
-            super::settings_slider_mouse_down(slider, sel!(mouseDown:), single);
-            let value: f64 = msg_send![slider, doubleValue];
-            assert_eq!(value, 7.0, "a single click must not reset");
+                // A single click still goes to NSSlider (the value is untouched; with no window the
+                // superclass simply does not track anything).
+                let _: () = msg_send![slider, setDoubleValue: 7.0f64];
+                let single = make_click_event(1);
+                super::settings_slider_mouse_down(slider, sel!(mouseDown:), single);
+                let value: f64 = msg_send![slider, doubleValue];
+                assert_eq!(value, 7.0, "a single click must not reset");
 
-            // The NSEvents come from a factory method (+0, autoreleased) and must not be released
-            // manually; a test has no autorelease pool, and this one-off leak is irrelevant.
-            release_obj(slider);
-        }
+                // The NSEvents come from a factory method (+0, autoreleased) and must not be released
+                // manually; a test has no autorelease pool, and this one-off leak is irrelevant.
+                release_obj(slider);
+            }
+        });
     }
 
     /// Smoke (GUI/AppKit): a stepped slider's own value only ever rests on a whole step. That is
@@ -4580,26 +4617,29 @@ mod tests {
     #[test]
     #[ignore]
     fn stepped_slider_rests_on_whole_steps_smoke() {
-        unsafe {
-            let slider = super::make_stepped_slider(0.0, 0.0, 120.0, 20.0, 10, 100, 10, 50, None);
-            let allows: bool = msg_send![slider, allowsTickMarkValuesOnly];
-            assert!(allows, "the control must enforce its own steps");
-            for probe in [55.0f64, 61.0, 99.0, 10.0, 100.0] {
-                let _: () = msg_send![slider, setDoubleValue: probe];
-                let value: f64 = msg_send![slider, doubleValue];
-                assert!(
-                    (value - value.round()).abs() < 1e-9 && (value as i64) % 10 == 0,
-                    "a probe of {probe} left the control on {value}, not a whole step"
-                );
-                // The nearest step, not the value the probe asked for: that also rules out a
-                // control that silently ignored the write and stayed where it was.
-                assert!(
-                    (value - probe).abs() <= 5.0 + 1e-9,
-                    "a probe of {probe} snapped to {value}, further than half a step away"
-                );
+        smoke_runner!("stepped_slider_rests_on_whole_steps_smoke", 1, {
+            unsafe {
+                let slider =
+                    super::make_stepped_slider(0.0, 0.0, 120.0, 20.0, 10, 100, 10, 50, None);
+                let allows: bool = msg_send![slider, allowsTickMarkValuesOnly];
+                assert!(allows, "the control must enforce its own steps");
+                for probe in [55.0f64, 61.0, 99.0, 10.0, 100.0] {
+                    let _: () = msg_send![slider, setDoubleValue: probe];
+                    let value: f64 = msg_send![slider, doubleValue];
+                    assert!(
+                        (value - value.round()).abs() < 1e-9 && (value as i64) % 10 == 0,
+                        "a probe of {probe} left the control on {value}, not a whole step"
+                    );
+                    // The nearest step, not the value the probe asked for: that also rules out a
+                    // control that silently ignored the write and stayed where it was.
+                    assert!(
+                        (value - probe).abs() <= 5.0 + 1e-9,
+                        "a probe of {probe} snapped to {value}, further than half a step away"
+                    );
+                }
+                release_obj(slider);
             }
-            release_obj(slider);
-        }
+        });
     }
 
     /// Build a left-mouse-down event (with the given clickCount) for the smoke test to feed into
@@ -4628,89 +4668,91 @@ mod tests {
     #[test]
     #[ignore]
     fn switch_hit_test_and_focus_ring_smoke() {
-        unsafe {
-            // Switch hit-test: the padded click rect answers, points outside it do not.
-            let sw = super::make_switch(200.0, 0.0, 52.0, false);
-            let inside: *mut AnyObject = msg_send![sw, hitTest: NSPoint::new(1.0, 1.0)];
-            assert_eq!(
-                inside, sw,
-                "a click inside the padded hit rect must reach the switch"
-            );
-            let outside: *mut AnyObject = msg_send![sw, hitTest: NSPoint::new(-200.0, -200.0)];
-            assert!(
-                outside.is_null(),
-                "a click far outside must miss the switch"
-            );
-            release_obj(sw);
+        smoke_runner!("switch_hit_test_and_focus_ring_smoke", 1, {
+            unsafe {
+                // Switch hit-test: the padded click rect answers, points outside it do not.
+                let sw = super::make_switch(200.0, 0.0, 52.0, false);
+                let inside: *mut AnyObject = msg_send![sw, hitTest: NSPoint::new(1.0, 1.0)];
+                assert_eq!(
+                    inside, sw,
+                    "a click inside the padded hit rect must reach the switch"
+                );
+                let outside: *mut AnyObject = msg_send![sw, hitTest: NSPoint::new(-200.0, -200.0)];
+                assert!(
+                    outside.is_null(),
+                    "a click far outside must miss the switch"
+                );
+                release_obj(sw);
 
-            // Select focus: become/resignFirstResponder run the super call and must not crash. The
-            // open/close focus behavior needs a real window on the AppKit main thread, so it is
-            // asserted by the in-app settings smoke (`--smoke-settings-layout`); creating a window
-            // here throws, because this test thread is not the main thread.
-            let popup = super::make_popup(0.0, 0.0, 200.0, 32.0, &["A", "B"], 0);
-            let _: bool = msg_send![popup, becomeFirstResponder];
-            let _: bool = msg_send![popup, resignFirstResponder];
-            release_obj(popup);
+                // Select focus: become/resignFirstResponder run the super call and must not crash. The
+                // open/close focus behavior needs a real window on the AppKit main thread, so it is
+                // asserted by the in-app settings smoke (`--smoke-settings-layout`); creating a window
+                // here throws, because this test thread is not the main thread.
+                let popup = super::make_popup(0.0, 0.0, 200.0, 32.0, &["A", "B"], 0);
+                let _: bool = msg_send![popup, becomeFirstResponder];
+                let _: bool = msg_send![popup, resignFirstResponder];
+                release_obj(popup);
 
-            // Switch focus: the 2pt accent ring is drawn on the track layer while focused.
-            let sw = super::make_switch(200.0, 0.0, 52.0, false);
-            let layer: *mut AnyObject = msg_send![sw, layer];
-            let _: bool = msg_send![sw, becomeFirstResponder];
-            let focused_width: f64 = msg_send![layer, borderWidth];
-            assert_eq!(
-                focused_width, 2.0,
-                "switch focus must draw the 2pt inset ring"
-            );
-            let _: bool = msg_send![sw, resignFirstResponder];
-            let idle_width: f64 = msg_send![layer, borderWidth];
-            assert_eq!(idle_width, 0.0, "switch blur must clear the ring");
-            release_obj(sw);
+                // Switch focus: the 2pt accent ring is drawn on the track layer while focused.
+                let sw = super::make_switch(200.0, 0.0, 52.0, false);
+                let layer: *mut AnyObject = msg_send![sw, layer];
+                let _: bool = msg_send![sw, becomeFirstResponder];
+                let focused_width: f64 = msg_send![layer, borderWidth];
+                assert_eq!(
+                    focused_width, 2.0,
+                    "switch focus must draw the 2pt inset ring"
+                );
+                let _: bool = msg_send![sw, resignFirstResponder];
+                let idle_width: f64 = msg_send![layer, borderWidth];
+                assert_eq!(idle_width, 0.0, "switch blur must clear the ring");
+                release_obj(sw);
 
-            // Action-button focus: idle 1pt card_border swaps to the 2pt accent ring and back.
-            let button = super::SettingsButton::action(
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(120.0, 32.0)),
-                "OK",
-                std::ptr::null_mut(),
-                sel!(noop:),
-                super::SettingsButtonRole::Action,
-            );
-            let layer: *mut AnyObject = msg_send![button, layer];
-            let idle_before: f64 = msg_send![layer, borderWidth];
-            assert_eq!(idle_before, 1.0);
-            let _: bool = msg_send![button, becomeFirstResponder];
-            let focused_width: f64 = msg_send![layer, borderWidth];
-            assert_eq!(
-                focused_width, 2.0,
-                "button focus must draw the 2pt inset ring"
-            );
-            let _: bool = msg_send![button, resignFirstResponder];
-            let idle_after: f64 = msg_send![layer, borderWidth];
-            assert_eq!(idle_after, 1.0, "button blur must restore the idle border");
-            release_obj(button);
+                // Action-button focus: idle 1pt card_border swaps to the 2pt accent ring and back.
+                let button = super::SettingsButton::action(
+                    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(120.0, 32.0)),
+                    "OK",
+                    std::ptr::null_mut(),
+                    sel!(noop:),
+                    super::SettingsButtonRole::Action,
+                );
+                let layer: *mut AnyObject = msg_send![button, layer];
+                let idle_before: f64 = msg_send![layer, borderWidth];
+                assert_eq!(idle_before, 1.0);
+                let _: bool = msg_send![button, becomeFirstResponder];
+                let focused_width: f64 = msg_send![layer, borderWidth];
+                assert_eq!(
+                    focused_width, 2.0,
+                    "button focus must draw the 2pt inset ring"
+                );
+                let _: bool = msg_send![button, resignFirstResponder];
+                let idle_after: f64 = msg_send![layer, borderWidth];
+                assert_eq!(idle_after, 1.0, "button blur must restore the idle border");
+                release_obj(button);
 
-            // Text-field focus ring: the shared delegate toggles the 2pt accent border.
-            let field = super::make_text_input(0.0, 0.0, 200.0, 32.0, "x");
-            let name = crate::ffi::make_nsstring("NSControlTextDidBeginEditingNotification");
-            let note: *mut AnyObject = msg_send![
-                class!(NSNotification),
-                notificationWithName: name,
-                object: field
-            ];
-            crate::ffi::CFRelease(name as *const c_void);
-            let delegate: *mut AnyObject = msg_send![field, delegate];
-            assert!(
-                !delegate.is_null(),
-                "the field must have the focus-ring delegate"
-            );
-            let _: () = msg_send![delegate, controlTextDidBeginEditing: note];
-            let layer: *mut AnyObject = msg_send![field, layer];
-            let focused_width: f64 = msg_send![layer, borderWidth];
-            assert_eq!(focused_width, 2.0, "focus must draw the 2pt inset ring");
-            let _: () = msg_send![delegate, controlTextDidEndEditing: note];
-            let idle_width: f64 = msg_send![layer, borderWidth];
-            assert_eq!(idle_width, 0.0, "losing focus must clear the ring");
-            release_obj(field);
-        }
+                // Text-field focus ring: the shared delegate toggles the 2pt accent border.
+                let field = super::make_text_input(0.0, 0.0, 200.0, 32.0, "x");
+                let name = crate::ffi::make_nsstring("NSControlTextDidBeginEditingNotification");
+                let note: *mut AnyObject = msg_send![
+                    class!(NSNotification),
+                    notificationWithName: name,
+                    object: field
+                ];
+                crate::ffi::CFRelease(name as *const c_void);
+                let delegate: *mut AnyObject = msg_send![field, delegate];
+                assert!(
+                    !delegate.is_null(),
+                    "the field must have the focus-ring delegate"
+                );
+                let _: () = msg_send![delegate, controlTextDidBeginEditing: note];
+                let layer: *mut AnyObject = msg_send![field, layer];
+                let focused_width: f64 = msg_send![layer, borderWidth];
+                assert_eq!(focused_width, 2.0, "focus must draw the 2pt inset ring");
+                let _: () = msg_send![delegate, controlTextDidEndEditing: note];
+                let idle_width: f64 = msg_send![layer, borderWidth];
+                assert_eq!(idle_width, 0.0, "losing focus must clear the ring");
+                release_obj(field);
+            }
+        });
     }
 
     #[test]

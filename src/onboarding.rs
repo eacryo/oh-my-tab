@@ -20,6 +20,7 @@ use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use std::ffi::c_void;
 
+use crate::callback_guard;
 use crate::config::{schedule_config_persist, Config, CONFIG};
 use crate::ffi::{hex_to_ns_color, make_nsstring, release_obj, MainThreadSlot, ObjPtr};
 use crate::i18n::{t, tf};
@@ -1319,7 +1320,15 @@ unsafe fn segmented_select(container: *mut AnyObject, selected: usize) {
     );
 }
 
-extern "C" fn segment_container_class_handle() -> crate::ffi::StaticClass {
+/// The class the segmented control container is an instance of, registered once.
+///
+/// Deliberately **not** an `extern "C"` callback: its only caller is Rust (`add_display_mode_control`),
+/// and registering a class can panic (a selector signature that asserts, a name already taken).
+/// Kept as an ordinary function the panic unwinds to that caller instead of crossing the C ABI,
+/// where it would abort the process from `panic_cannot_unwind`.
+/// `register_once` is idempotent, so a failed registration leaves the class unregistered and the
+/// next call retries rather than answering with a class that does not exist.
+fn segment_container_class_handle() -> crate::ffi::StaticClass {
     static CLASS: std::sync::OnceLock<crate::ffi::StaticClass> = std::sync::OnceLock::new();
     crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabOnboardingSegmented", || {
         crate::ffi::build_class(
@@ -1395,7 +1404,11 @@ extern "C" fn segment_child_accepts_first_responder(
     _this: *mut AnyObject,
     _cmd: Sel,
 ) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::YES
+    callback_guard::value(
+        "segment_child_accepts_first_responder",
+        objc2::runtime::Bool::YES,
+        || objc2::runtime::Bool::YES,
+    )
 }
 
 /// Pure key-down decision for one segment, so the keyboard logic is testable without an event:
@@ -1453,19 +1466,25 @@ extern "C" fn segment_accessibility_perform_press(
     this: *mut AnyObject,
     _cmd: Sel,
 ) -> objc2::runtime::Bool {
-    objc2::runtime::Bool::from(crate::callback_guard::bool(
-        "onboarding_segment_ax_press",
-        false,
-        || unsafe {
-            match segment_record_of_child(this as usize) {
-                Some((record, index)) => {
-                    segmented_select(record.container as *mut AnyObject, index);
-                    true
-                }
-                None => false,
-            }
+    callback_guard::value(
+        "segment_accessibility_perform_press",
+        objc2::runtime::Bool::YES,
+        || {
+            objc2::runtime::Bool::from(crate::callback_guard::bool(
+                "onboarding_segment_ax_press",
+                false,
+                || unsafe {
+                    match segment_record_of_child(this as usize) {
+                        Some((record, index)) => {
+                            segmented_select(record.container as *mut AnyObject, index);
+                            true
+                        }
+                        None => false,
+                    }
+                },
+            ))
         },
-    ))
+    )
 }
 
 /// The segment's accessibility value must be a boolean NSNumber (the native radio-button
@@ -1502,48 +1521,56 @@ extern "C" fn segment_child_become_first_responder(
     this: *mut AnyObject,
     _cmd: Sel,
 ) -> objc2::runtime::Bool {
-    unsafe {
-        type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> objc2::runtime::Bool;
-        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
-            this as *mut c_void,
-            segment_child_class_handle(),
-        );
-        let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
-        let accepted = send(&mut sup, sel!(becomeFirstResponder));
-        if accepted.as_bool() {
-            *SEGMENT_FOCUS.lock().unwrap() = Some(this as usize);
-            if let Some(record) = segment_record_of_child(this as usize) {
-                segment_apply_visual(&record.0);
+    callback_guard::value(
+        "segment_child_become_first_responder",
+        objc2::runtime::Bool::YES,
+        || unsafe {
+            type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> objc2::runtime::Bool;
+            let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+                this as *mut c_void,
+                segment_child_class_handle(),
+            );
+            let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+            let accepted = send(&mut sup, sel!(becomeFirstResponder));
+            if accepted.as_bool() {
+                *SEGMENT_FOCUS.lock().unwrap() = Some(this as usize);
+                if let Some(record) = segment_record_of_child(this as usize) {
+                    segment_apply_visual(&record.0);
+                }
             }
-        }
-        accepted
-    }
+            accepted
+        },
+    )
 }
 
 extern "C" fn segment_child_resign_first_responder(
     this: *mut AnyObject,
     _cmd: Sel,
 ) -> objc2::runtime::Bool {
-    unsafe {
-        type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> objc2::runtime::Bool;
-        let mut sup = crate::ffi::ObjcSuper::for_defined_class(
-            this as *mut c_void,
-            segment_child_class_handle(),
-        );
-        let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
-        let accepted = send(&mut sup, sel!(resignFirstResponder));
-        if accepted.as_bool() {
-            let mut slot = SEGMENT_FOCUS.lock().unwrap();
-            if *slot == Some(this as usize) {
-                *slot = None;
+    callback_guard::value(
+        "segment_child_resign_first_responder",
+        objc2::runtime::Bool::YES,
+        || unsafe {
+            type F = unsafe extern "C" fn(*mut crate::ffi::ObjcSuper, Sel) -> objc2::runtime::Bool;
+            let mut sup = crate::ffi::ObjcSuper::for_defined_class(
+                this as *mut c_void,
+                segment_child_class_handle(),
+            );
+            let send: F = std::mem::transmute(crate::ffi::objc_msgSendSuper as *const ());
+            let accepted = send(&mut sup, sel!(resignFirstResponder));
+            if accepted.as_bool() {
+                let mut slot = SEGMENT_FOCUS.lock().unwrap();
+                if *slot == Some(this as usize) {
+                    *slot = None;
+                }
+                drop(slot);
+                if let Some(record) = segment_record_of_child(this as usize) {
+                    segment_apply_visual(&record.0);
+                }
             }
-            drop(slot);
-            if let Some(record) = segment_record_of_child(this as usize) {
-                segment_apply_visual(&record.0);
-            }
-        }
-        accepted
-    }
+            accepted
+        },
+    )
 }
 
 /// Repaint one record's segments to the current selection/hover/focus state. The selected
@@ -2813,6 +2840,7 @@ fn status_style(color: LabelColorRole) -> LabelStyle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoke_verdict::smoke_runner;
 
     #[test]
     fn onboarding_chrome_uses_the_shared_type_and_color_roles() {
@@ -3459,43 +3487,13 @@ mod tests {
     #[test]
     #[ignore]
     fn onboarding_live_apply_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let app = exe
-            .parent()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("oh-my-tab"))
-            .expect("app binary path");
-        assert!(
-            app.exists(),
-            "app binary missing at {}: run `cargo build` first",
-            app.display()
-        );
-        for clipboard_enabled in [false, true] {
-            let home = std::env::temp_dir().join(format!(
-                "oh-my-tab-onboarding-smoke-{}-{clipboard_enabled}",
-                std::process::id()
-            ));
-            let _ = std::fs::remove_dir_all(&home);
-            let config_dir = home.join(".config/oh-my-tab");
-            std::fs::create_dir_all(&config_dir).expect("create smoke config dir");
-            std::fs::write(
-                config_dir.join("config.toml"),
-                format!("[clipboard]\nenabled = {clipboard_enabled}\n"),
-            )
-            .expect("write smoke config");
-            let out = std::process::Command::new(&app)
-                .arg("--smoke-onboarding-live-apply")
-                .env("HOME", &home)
-                .output()
-                .expect("failed to spawn app");
-            let _ = std::fs::remove_dir_all(&home);
-            assert!(
-                out.status.success(),
-                "onboarding live-apply smoke failed with clipboard.enabled={clipboard_enabled} (exit {:?})\nstdout:\n{}\nstderr:\n{}",
-                out.status.code(),
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
+        smoke_runner!("onboarding_live_apply_smoke", 1, {
+            // The child is the process that ran the assertions, so its recorded verdict is
+            // what this parent reports; it never infers one from the exit status.
+            crate::smoke_verdict::run_smoke_child(
+                "onboarding_live_apply_smoke",
+                &["--smoke-onboarding-live-apply"],
             );
-        }
+        });
     }
 }

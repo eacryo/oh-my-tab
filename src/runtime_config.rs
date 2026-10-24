@@ -78,6 +78,10 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.thumbnails
         || flags.focused_thumbnail_prewarm
         || flags.thumbnail_size
+        // The card switches live on the Switcher page and are re-read in place below. Without
+        // this a reload that only flips one of them updates the cards and leaves the switch showing
+        // the old value.
+        || flags.show_app_name_in_cards
         || flags.show_footer_title
         || flags.status_bar_size
         || flags.clipboard_image_rows
@@ -172,6 +176,31 @@ fn needs_reserved_shortcut_coordination(flags: &ChangeFlags) -> bool {
 }
 
 /// Apply all runtime side effects for a new configuration in one pass.
+/// What the reload path should do with the clipboard gate, from the two configs.
+///
+/// Pure so the ordering can be asserted without the AppKit main thread: `paused` outranks the master
+/// switch, so neither disabling nor re-enabling a paused session may open the gate -- only a genuine
+/// pause->resume transition may try, and even that can fail to baseline.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum PauseGateAction {
+    /// Leave the gate exactly as it is.
+    Leave,
+    /// The session became paused: close the gate.
+    Pause,
+    /// The session was paused and is now not: try to resume (which re-baselines).
+    Resume,
+}
+
+pub(crate) fn pause_gate_action(old_paused: bool, new_paused: bool) -> PauseGateAction {
+    if new_paused {
+        PauseGateAction::Pause
+    } else if old_paused {
+        PauseGateAction::Resume
+    } else {
+        PauseGateAction::Leave
+    }
+}
+
 pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChangeSource) {
     let started = std::time::Instant::now();
     let flags = change_flags(old, new, source);
@@ -351,22 +380,27 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     // promised to drop. Only a genuine pause->resume transition re-baselines; an ordinary startup
     // and an ordinary "enable" keep their documented record-current behaviour.
     if flags.clipboard_paused {
-        if new.clipboard.paused {
-            crate::clipboard::set_collection_paused(true);
-        } else if crate::clipboard::is_resume_transition(old.clipboard.paused, new.clipboard.paused)
-            && crate::clipboard::set_collection_paused(false)
-        {
-            // The baseline could not be established (no readable pasteboard). Keep every surface
-            // in the paused state instead of claiming that recording resumed.
-            if let Ok(mut w) = crate::config::CONFIG.write() {
-                w.clipboard.paused = true;
+        // The ordering lives in `pause_gate_action`: paused outranks the master switch, so a
+        // disable or a re-enable of a paused session is `Pause`/`Leave`, never a resume.
+        match pause_gate_action(old.clipboard.paused, new.clipboard.paused) {
+            PauseGateAction::Pause => {
+                crate::clipboard::set_collection_paused(true);
             }
-            crate::config::persist_config_now();
-            crate::settings::refresh_clipboard_pause_switch_from_config();
-            crate::menu::refresh_clipboard_pause_item();
-            crate::log_info!(
-                "Clipboard collection: resume failed (pasteboard unreadable), staying paused"
-            );
+            PauseGateAction::Resume if crate::clipboard::set_collection_paused(false) => {
+                // The baseline could not be established (no readable pasteboard). Keep every surface
+                // in the paused state instead of claiming that recording resumed.
+                if let Ok(mut w) = crate::config::CONFIG.write() {
+                    w.clipboard.paused = true;
+                }
+                crate::config::persist_config_now();
+                crate::settings::refresh_clipboard_pause_switch_from_config();
+                crate::menu::refresh_clipboard_pause_item();
+                crate::log_info!(
+                    "Clipboard collection: resume failed (pasteboard unreadable), staying paused"
+                );
+            }
+            PauseGateAction::Resume => {}
+            PauseGateAction::Leave => {}
         }
     }
 
@@ -785,5 +819,29 @@ mod tests {
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.keystroke_display);
         assert!(!flags.mouse && !flags.clipboard_enabled && !flags.key_bindings);
+    }
+    /// A reload that changes ONLY `layout.show_app_name_in_cards` must still ask for an in-place
+    /// refresh, or an open settings window keeps showing the old switch state while the cards
+    /// follow the new value.
+    #[test]
+    fn changing_only_the_card_switch_still_refreshes_the_settings_controls() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.layout.show_app_name_in_cards = !old.layout.show_app_name_in_cards;
+        let flags = change_flags(&old, &new, ConfigChangeSource::Reload);
+        assert!(
+            flags.show_app_name_in_cards,
+            "the change flag must see the switch and nothing else"
+        );
+        assert!(
+            needs_in_place_control_sync(&flags),
+            "a standalone card-switch change must refresh the settings controls"
+        );
+        // Counter-example: an unchanged config asks for no refresh at all.
+        assert!(!needs_in_place_control_sync(&change_flags(
+            &old,
+            &old.clone(),
+            ConfigChangeSource::Reload
+        )));
     }
 }

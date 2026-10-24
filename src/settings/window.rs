@@ -2259,7 +2259,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 && (button_frame.size.width - ROW_ACTION_BTN_W).abs() <= 0.5
                 && (button_frame.size.height - ROW_ACTION_BTN_H).abs() <= 0.5
                 && error_hidden
-                && (button_center - label_center).abs() <= 1.0
+                // The label frame carries `text_field_line_height_correction`, so its middle sits
+                // 1.3pt off the row middle by design: the GLYPHS are centred, not the box. Comparing a
+                // correctly-centred control against that corrected middle demands it be wrong.
+                && (button_center - label_center
+                    + crate::ffi::text_field_line_height_correction(button_label))
+                    .abs()
+                    <= 1.0
                 && (controls_center_gap - expected_center_gap).abs() <= 1.0;
 
             let current_shortcut = crate::config::CONFIG
@@ -2625,12 +2631,20 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 "collapse_exact",
                 (collapsed_state.document_height - compact_state.document_height).abs() <= 0.5,
             ),
-            // The card follows the host's bottom edge with the shared card inset (8pt), exactly
-            // like every other card follows its last row.
+            // The card follows the host's bottom edge by the SHARED card inset. This used to be a
+            // literal 8 while `SettingsLayout::CARD_BOTTOM_INSET` had become 0.0, so the check
+            // demanded an 8pt overhang no card draws any more; deriving it from the token keeps the
+            // two in step when the design system moves.
             (
                 "card_hugs_host",
-                (expanded_state.card_rect_bottom_from_host_bottom + 8.0).abs() <= 0.5
-                    && (collapsed_state.card_rect_bottom_from_host_bottom + 8.0).abs() <= 0.5,
+                (expanded_state.card_rect_bottom_from_host_bottom
+                    + components::SettingsLayout::CARD_BOTTOM_INSET)
+                    .abs()
+                    <= 0.5
+                    && (collapsed_state.card_rect_bottom_from_host_bottom
+                        + components::SettingsLayout::CARD_BOTTOM_INSET)
+                        .abs()
+                        <= 0.5,
             ),
             // The Update divider belongs on the shared row boundary. Compare its distance from the
             // centered switch to the switch's half-row inset, derived from the live control frame and

@@ -1,6 +1,7 @@
 //! Cmd+Tab keyboard/release callbacks and the first-summon state machine.
 
 use super::*;
+use crate::callback_guard;
 
 /// First-frame single-shot show: pick the initial selection over the (refreshed) window list and
 /// pop the overlay. Called by apply_window_refresh when it consumes pending_first_show so the
@@ -152,29 +153,31 @@ fn schedule_first_summon_timeout() {
 /// Main-thread deadline for a first summon. The callback is harmless when the real snapshot has
 /// already arrived because apply_window_refresh clears pending_first_show first.
 pub(crate) extern "C" fn on_first_summon_timeout(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    let request = with_tab_state(|state_opt| {
-        let state = state_opt.as_mut()?;
-        if !state.pending_first_show {
-            return None;
-        }
-        state.pending_first_show = false;
-        let backward = state.pending_first_backward;
-        let release_pending = state.pending_first_release;
-        state.pending_first_release = false;
-        Some((backward, release_pending))
-    });
+    callback_guard::void("on_first_summon_timeout", || {
+        let request = with_tab_state(|state_opt| {
+            let state = state_opt.as_mut()?;
+            if !state.pending_first_show {
+                return None;
+            }
+            state.pending_first_show = false;
+            let backward = state.pending_first_backward;
+            let release_pending = state.pending_first_release;
+            state.pending_first_release = false;
+            Some((backward, release_pending))
+        });
 
-    if let Some((backward, release_pending)) = request {
-        log_debug!(
-            "[overlay] first summon deadline reached (release_pending={})",
-            release_pending
-        );
-        if release_pending {
-            commit_first_summon(backward);
-        } else {
-            show_first_summon(backward);
+        if let Some((backward, release_pending)) = request {
+            log_debug!(
+                "[overlay] first summon deadline reached (release_pending={})",
+                release_pending
+            );
+            if release_pending {
+                commit_first_summon(backward);
+            } else {
+                show_first_summon(backward);
+            }
         }
-    }
+    });
 }
 
 /// User actively changed the selection (nav/click/hover): mark user_picked and pin to the newly
@@ -189,7 +192,9 @@ pub(super) fn mark_user_picked(state: &mut AppState) {
 }
 
 pub(crate) extern "C" fn on_cmd_tab_pressed(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
-    step_switcher(false);
+    callback_guard::void("on_cmd_tab_pressed", || {
+        step_switcher(false);
+    });
 }
 
 pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
@@ -197,7 +202,9 @@ pub(crate) extern "C" fn on_cmd_shift_tab_pressed(
     _cmd: Sel,
     _arg: *mut c_void,
 ) {
-    step_switcher(true);
+    callback_guard::void("on_cmd_shift_tab_pressed", || {
+        step_switcher(true);
+    });
 }
 
 /// Move clip bounds when selection leaves the viewport; both layouts share this path and never
@@ -357,115 +364,118 @@ pub(super) unsafe fn layer_set_translation_y(layer: *mut AnyObject, y: f64) {
 }
 
 pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
-        let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
-        let modifier_flags: u64 = msg_send![event as *mut AnyObject, modifierFlags];
-        let shift_pressed = modifier_flags & NSEVENT_MODIFIER_FLAG_SHIFT != 0;
-        // Collect navigation frames before borrowing runtime; reentrant AppKit calls happen
-        // only after the state borrow has been released.
-        let nav_rects = collect_card_rects();
-        enum KeyAction {
-            None,
-            RefreshSelection,
-            Vertical(bool),
-            Close(usize),
-            Activate {
-                pid: i32,
-                cgwid: u32,
-                minimized: bool,
-                on_other_desktop: bool,
-            },
-            Hide,
-        }
-        let action = with_tab_state(|state_opt| {
-            let state = state_opt.as_mut().unwrap();
-            if !state.visible {
-                return KeyAction::None;
+    callback_guard::void("container_key_down", || {
+        unsafe {
+            let key_code: u16 = msg_send![event as *mut AnyObject, keyCode];
+            let modifier_flags: u64 = msg_send![event as *mut AnyObject, modifierFlags];
+            let shift_pressed = modifier_flags & NSEVENT_MODIFIER_FLAG_SHIFT != 0;
+            // Collect navigation frames before borrowing runtime; reentrant AppKit calls happen
+            // only after the state borrow has been released.
+            let nav_rects = collect_card_rects();
+            enum KeyAction {
+                None,
+                RefreshSelection,
+                Vertical(bool),
+                Close(usize),
+                Activate {
+                    pid: i32,
+                    cgwid: u32,
+                    minimized: bool,
+                    on_other_desktop: bool,
+                },
+                Hide,
             }
-            match key_code {
-                KEY_TAB | KEY_RIGHT | KEY_LEFT if !state.windows.is_empty() => {
-                    let backward = key_code == KEY_LEFT || (key_code == KEY_TAB && shift_pressed);
-                    state.selected =
-                        horizontal_nav_index(state.selected, state.windows.len(), backward);
-                    mark_user_picked(state);
-                    KeyAction::RefreshSelection
+            let action = with_tab_state(|state_opt| {
+                let state = state_opt.as_mut().unwrap();
+                if !state.visible {
+                    return KeyAction::None;
                 }
-                KEY_UP if !state.windows.is_empty() => KeyAction::Vertical(true),
-                KEY_DOWN if !state.windows.is_empty() => KeyAction::Vertical(false),
-                KEY_DELETE if !state.windows.is_empty() => KeyAction::Close(state.selected),
-                KEY_RETURN => {
-                    if let Some(w) = state.windows.get(state.selected) {
-                        let action = KeyAction::Activate {
-                            pid: w.pid,
-                            cgwid: w.window_id,
-                            minimized: w.minimized,
-                            on_other_desktop: w.on_other_desktop,
-                        };
-                        state.focus_key = Some((w.pid, w.window_id));
-                        bump_window_mru(&mut state.mru, w.pid, w.window_id);
-                        state.visible = false;
-                        action
-                    } else {
+                match key_code {
+                    KEY_TAB | KEY_RIGHT | KEY_LEFT if !state.windows.is_empty() => {
+                        let backward =
+                            key_code == KEY_LEFT || (key_code == KEY_TAB && shift_pressed);
+                        state.selected =
+                            horizontal_nav_index(state.selected, state.windows.len(), backward);
+                        mark_user_picked(state);
+                        KeyAction::RefreshSelection
+                    }
+                    KEY_UP if !state.windows.is_empty() => KeyAction::Vertical(true),
+                    KEY_DOWN if !state.windows.is_empty() => KeyAction::Vertical(false),
+                    KEY_DELETE if !state.windows.is_empty() => KeyAction::Close(state.selected),
+                    KEY_RETURN => {
+                        if let Some(w) = state.windows.get(state.selected) {
+                            let action = KeyAction::Activate {
+                                pid: w.pid,
+                                cgwid: w.window_id,
+                                minimized: w.minimized,
+                                on_other_desktop: w.on_other_desktop,
+                            };
+                            state.focus_key = Some((w.pid, w.window_id));
+                            bump_window_mru(&mut state.mru, w.pid, w.window_id);
+                            state.visible = false;
+                            action
+                        } else {
+                            state.visible = false;
+                            KeyAction::Hide
+                        }
+                    }
+                    KEY_ESCAPE => {
                         state.visible = false;
                         KeyAction::Hide
                     }
+                    _ => KeyAction::None,
                 }
-                KEY_ESCAPE => {
-                    state.visible = false;
-                    KeyAction::Hide
+            });
+            match action {
+                KeyAction::RefreshSelection => {
+                    reset_thumbnail_nav_anchor();
+                    refresh_after_selection_change(false);
                 }
-                _ => KeyAction::None,
-            }
-        });
-        match action {
-            KeyAction::RefreshSelection => {
-                reset_thumbnail_nav_anchor();
-                refresh_after_selection_change(false);
-            }
-            KeyAction::Vertical(up) => navigate_thumbnail_vertical(&nav_rects, up),
-            KeyAction::Close(idx) => {
-                // Backspace: close the selected card's window; the overlay stays open.
-                let card = card_document().and_then(|document| {
-                    card_views(document)
-                        .into_iter()
-                        .find(|card| get_card_index(*card) == Some(idx))
-                });
-                if let Some(card) = card {
-                    begin_close_window_at(idx, card);
-                } else {
-                    close_window_at(idx);
+                KeyAction::Vertical(up) => navigate_thumbnail_vertical(&nav_rects, up),
+                KeyAction::Close(idx) => {
+                    // Backspace: close the selected card's window; the overlay stays open.
+                    let card = card_document().and_then(|document| {
+                        card_views(document)
+                            .into_iter()
+                            .find(|card| get_card_index(*card) == Some(idx))
+                    });
+                    if let Some(card) = card {
+                        begin_close_window_at(idx, card);
+                    } else {
+                        close_window_at(idx);
+                    }
                 }
+                KeyAction::Activate {
+                    pid,
+                    cgwid,
+                    minimized,
+                    on_other_desktop,
+                } => {
+                    // Commit ends the session: retire sticky and the published claim now (the visual
+                    // order-out is deferred), so a re-summon cannot inherit them.
+                    clear_sticky();
+                    publish_panel_snapshot(false);
+                    vanish_overlay();
+                    // Same as on_cmd_released: no settings-window handling needed (see comment
+                    // there); the raise is deferred by one runloop turn so the vanish commits first.
+                    schedule_deferred_raise(pid, cgwid, minimized, on_other_desktop);
+                    schedule_delayed_order_out();
+                }
+                KeyAction::Hide => hide_overlay(),
+                KeyAction::None => {}
             }
-            KeyAction::Activate {
-                pid,
-                cgwid,
-                minimized,
-                on_other_desktop,
-            } => {
-                // Commit ends the session: retire sticky and the published claim now (the visual
-                // order-out is deferred), so a re-summon cannot inherit them.
-                clear_sticky();
-                publish_panel_snapshot(false);
-                vanish_overlay();
-                // Same as on_cmd_released: no settings-window handling needed (see comment
-                // there); the raise is deferred by one runloop turn so the vanish commits first.
-                schedule_deferred_raise(pid, cgwid, minimized, on_other_desktop);
-                schedule_delayed_order_out();
-            }
-            KeyAction::Hide => hide_overlay(),
-            KeyAction::None => {}
         }
-    }
+    });
 }
 
 pub(crate) extern "C" fn container_accepts_first_responder(_self: *mut c_void, _cmd: Sel) -> bool {
-    crate::callback_guard::bool("container_accepts_first_responder", false, || true)
+    callback_guard::bool("container_accepts_first_responder", false, || true)
 }
 
 /// Both layouts handle mouse-wheel and trackpad scrolling, preserving point-level deltas instead
 /// of quantizing them to whole rows.
 pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
+    callback_guard::void("container_scroll_wheel", || unsafe {
         let delta_y: f64 = msg_send![event as *mut AnyObject, scrollingDeltaY];
         if delta_y.abs() < f64::EPSILON {
             return;
@@ -479,7 +489,7 @@ pub(crate) extern "C" fn container_scroll_wheel(_self: *mut c_void, _cmd: Sel, e
             const DISCRETE_SCROLL_STEP: f64 = 40.0;
             scroll_thumbnail_by_offset(-delta_y.signum() * DISCRETE_SCROLL_STEP);
         }
-    }
+    });
 }
 
 pub(crate) extern "C" fn container_mouse_entered(
@@ -487,17 +497,17 @@ pub(crate) extern "C" fn container_mouse_entered(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("container_mouse_entered", || unsafe {
         let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
         update_thumbnail_pointer_state(point);
-    }
+    });
 }
 
 pub(crate) extern "C" fn container_mouse_exited(_self: *mut c_void, _cmd: Sel, event: *mut c_void) {
-    unsafe {
+    callback_guard::void("container_mouse_exited", || unsafe {
         let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
         update_thumbnail_pointer_state(point);
-    }
+    });
 }
 
 pub(crate) extern "C" fn thumbnail_scroller_mouse_entered(
@@ -505,10 +515,10 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_entered(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("thumbnail_scroller_mouse_entered", || unsafe {
         let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
         update_thumbnail_pointer_state(point);
-    }
+    });
 }
 
 pub(crate) extern "C" fn thumbnail_scroller_mouse_moved(
@@ -516,10 +526,10 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_moved(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("thumbnail_scroller_mouse_moved", || unsafe {
         let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
         update_thumbnail_pointer_state(point);
-    }
+    });
 }
 
 pub(crate) extern "C" fn thumbnail_scroller_mouse_exited(
@@ -527,10 +537,10 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_exited(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("thumbnail_scroller_mouse_exited", || unsafe {
         let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
         update_thumbnail_pointer_state(point);
-    }
+    });
 }
 
 /// Visible thumb width from the HTML reference; the outer 14pt view remains the hit area.
@@ -643,7 +653,7 @@ pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
     _cmd: Sel,
     _dirty_rect: NSRect,
 ) {
-    unsafe {
+    callback_guard::void("thumbnail_scroller_draw_rect", || unsafe {
         let scroller = scroller as *mut AnyObject;
         let bounds: NSRect = msg_send![scroller, bounds];
         let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
@@ -682,7 +692,7 @@ pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
             yRadius: THUMB_SCROLLBAR_VISIBLE_W / 2.0
         ];
         let _: () = msg_send![path, fill];
-    }
+    });
 }
 
 /// A nonactivating panel must deliver the first click to the scroller, otherwise the initial
@@ -692,7 +702,7 @@ pub(crate) extern "C" fn thumbnail_scroller_accepts_first_mouse(
     _cmd: Sel,
     _event: *mut c_void,
 ) -> bool {
-    true
+    callback_guard::bool("thumbnail_scroller_accepts_first_mouse", true, || true)
 }
 
 /// Start dragging explicitly inside the nonactivating panel instead of relying on NSScroller tracking.
@@ -701,7 +711,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("thumbnail_scroller_mouse_down", || unsafe {
         let scroller = _self as *mut AnyObject;
         let location: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
         update_thumbnail_pointer_state(location);
@@ -738,7 +748,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
             thumb_travel: geometry.thumb_travel,
         });
         invalidate_thumbnail_scroller();
-    }
+    });
 }
 
 pub(crate) extern "C" fn thumbnail_scroller_mouse_dragged(
@@ -746,7 +756,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_dragged(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("thumbnail_scroller_mouse_dragged", || unsafe {
         let Some(drag) = *THUMB_SCROLL_DRAG.lock().unwrap() else {
             return;
         };
@@ -765,7 +775,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_dragged(
             drag.thumb_travel,
         );
         set_thumbnail_scroll_offset(next, drag.max_offset);
-    }
+    });
 }
 
 pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
@@ -773,12 +783,14 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
     _cmd: Sel,
     event: *mut c_void,
 ) {
-    *THUMB_SCROLL_DRAG.lock().unwrap() = None;
-    unsafe {
-        let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
-        update_thumbnail_pointer_state(point);
-    }
-    invalidate_thumbnail_scroller();
+    callback_guard::void("thumbnail_scroller_mouse_up", || {
+        *THUMB_SCROLL_DRAG.lock().unwrap() = None;
+        unsafe {
+            let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
+            update_thumbnail_pointer_state(point);
+        }
+        invalidate_thumbnail_scroller();
+    });
 }
 
 /// Update the scroller track, knob proportion, and position; hide it when there is no overflow.
@@ -818,7 +830,7 @@ pub(super) unsafe fn update_thumbnail_scroller(
 /// Override for the borderless overlay window: allow it to become key (otherwise it
 /// receives no keyboard events).
 pub(crate) extern "C" fn overlay_window_can_become_key(_self: *mut c_void, _cmd: Sel) -> bool {
-    true
+    callback_guard::bool("overlay_window_can_become_key", true, || true)
 }
 
 #[cfg(test)]

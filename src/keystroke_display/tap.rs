@@ -10,6 +10,16 @@ unsafe extern "C" fn callback(
     event: event_tap::CGEventRef,
     _user_info: *mut c_void,
 ) -> event_tap::CGEventRef {
+    crate::callback_guard::event("keystroke_display_tap_callback", event, || unsafe {
+        callback_inner(_proxy, event_type, event)
+    })
+}
+
+unsafe fn callback_inner(
+    _proxy: crate::event_tap::CGEventTapProxy,
+    event_type: crate::event_tap::CGEventType,
+    event: crate::event_tap::CGEventRef,
+) -> event_tap::CGEventRef {
     if crate::input_monitor::handle_disabled_event(
         event_type,
         "keystroke-display",

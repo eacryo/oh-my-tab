@@ -5,6 +5,7 @@
 //! while a bundled `.app` automatically gets the real updater when `Sparkle.framework` is copied
 //! into `Contents/Frameworks`.
 
+use crate::callback_guard;
 use crate::ffi::{
     bundle_info_string, class_addMethod, make_nsstring, objc_allocateClassPair, objc_msgSend,
     objc_msgSendSuper, objc_registerClassPair, CallbackTarget, ObjcSuper,
@@ -703,16 +704,17 @@ unsafe fn set_check_loading_frame(button: *mut AnyObject, frame: usize) {
 }
 
 extern "C" fn advance_check_loading_frame(_this: *mut c_void, _cmd: Sel, _timer: *mut c_void) {
-    let (button, frame) = {
+    callback_guard::void("advance_check_loading_frame", || {
         let mut ui = UPDATE_UI_STATE.lock().unwrap();
         if ui.check_loading_timer == 0 || ui.check_button == 0 {
             return;
         }
         let frame = ui.check_loading_frame;
         ui.check_loading_frame = (frame + 1) % CHECK_LOADING_FRAMES.len();
-        (ui.check_button as *mut AnyObject, frame)
-    };
-    unsafe { set_check_loading_frame(button, frame) };
+        let (button, frame) = (ui.check_button as *mut AnyObject, frame);
+        drop(ui);
+        unsafe { set_check_loading_frame(button, frame) };
+    });
 }
 
 /// NSTimer target used to cycle the button's Braille glyph on the main run loop.
@@ -862,11 +864,13 @@ pub(crate) fn begin_inline_check() {
 
 /// Recover the inline check on the main thread after Sparkle stays silent.
 extern "C" fn handle_update_check_timeout(_this: *mut c_void, _cmd: Sel) {
-    if CHECK_TIMER.lock().unwrap().is_none() {
-        return;
-    }
-    clear_inline_check();
-    set_check_button_status(&t("settings.btn_retry_update_check"), true);
+    callback_guard::void("handle_update_check_timeout", || {
+        if CHECK_TIMER.lock().unwrap().is_none() {
+            return;
+        }
+        clear_inline_check();
+        set_check_button_status(&t("settings.btn_retry_update_check"), true);
+    });
 }
 
 /// Clear the inline checking timer to mark that a result has arrived.
@@ -1231,15 +1235,21 @@ extern "C" fn show_update_permission(
     _request: *mut c_void,
     reply: *mut c_void,
 ) {
-    unsafe { make_custom_permission_window(this, reply) };
+    callback_guard::void("show_update_permission", || {
+        unsafe { make_custom_permission_window(this, reply) };
+    });
 }
 
 extern "C" fn allow_automatic_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe { answer_update_permission(true) };
+    callback_guard::void("allow_automatic_update", || {
+        unsafe { answer_update_permission(true) };
+    });
 }
 
 extern "C" fn defer_automatic_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe { answer_update_permission(false) };
+    callback_guard::void("defer_automatic_update", || {
+        unsafe { answer_update_permission(false) };
+    });
 }
 
 /// Build the custom update window's release-notes view from Sparkle's appcast item description.
@@ -2253,17 +2263,18 @@ unsafe fn choose_custom_update(choice: isize) {
 }
 
 extern "C" fn install_custom_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe { choose_custom_update(1) };
+    callback_guard::void("install_custom_update", || {
+        unsafe { choose_custom_update(1) };
+    });
 }
 
 extern "C" fn open_information_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe {
+    callback_guard::void("open_information_update", || unsafe {
         let (reply, url) = {
             let mut ui = UPDATE_UI_STATE.lock().unwrap();
-            (
-                std::mem::take(&mut ui.update_reply),
-                std::mem::take(&mut ui.information_url),
-            )
+            let reply = std::mem::take(&mut ui.update_reply);
+            let url = std::mem::take(&mut ui.information_url);
+            (reply, url)
         };
         crate::settings::collapse_update_section();
         close_custom_update_window();
@@ -2278,63 +2289,70 @@ extern "C" fn open_information_update(_this: *mut c_void, _cmd: Sel, _sender: *m
         }
         invoke_choice_reply(reply, 2);
         release_block(reply);
-    }
+    });
 }
 
 extern "C" fn skip_custom_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe { choose_custom_update(0) };
+    callback_guard::void("skip_custom_update", || {
+        unsafe { choose_custom_update(0) };
+    });
 }
 
 extern "C" fn dismiss_custom_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe { choose_custom_update(2) };
+    callback_guard::void("dismiss_custom_update", || {
+        unsafe { choose_custom_update(2) };
+    });
 }
 
 extern "C" fn cancel_custom_download(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe {
+    callback_guard::void("cancel_custom_download", || unsafe {
         let cancellation = {
             let mut ui = UPDATE_UI_STATE.lock().unwrap();
             let cancellation = ui.cancellation;
             ui.cancellation = 0;
+            drop(ui);
             cancellation
         };
         close_custom_update_window();
         crate::settings::collapse_update_section();
         invoke_block(cancellation);
         release_block(cancellation);
-    }
+    });
 }
 
 extern "C" fn show_download_initiated(this: *mut c_void, _cmd: Sel, cancellation: *mut c_void) {
-    unsafe { make_custom_download_window(this, cancellation) };
+    callback_guard::void("show_download_initiated", || {
+        unsafe { make_custom_download_window(this, cancellation) };
+    });
 }
 
 extern "C" fn show_download_expected_length(_this: *mut c_void, _cmd: Sel, length: u64) {
-    unsafe {
+    callback_guard::void("show_download_expected_length", || unsafe {
         let mut ui = UPDATE_UI_STATE.lock().unwrap();
         ui.expected_length = length;
         drop(ui);
         update_download_progress_ui();
-    }
+    });
 }
 
 extern "C" fn show_download_received_data(_this: *mut c_void, _cmd: Sel, length: u64) {
-    unsafe {
+    callback_guard::void("show_download_received_data", || unsafe {
         let mut ui = UPDATE_UI_STATE.lock().unwrap();
         ui.received_length = ui.received_length.saturating_add(length);
         drop(ui);
         update_download_progress_ui();
-    }
+    });
 }
 
 extern "C" fn show_download_started_extracting(_this: *mut c_void, _cmd: Sel) {
-    unsafe {
+    callback_guard::void("show_download_started_extracting", || unsafe {
         clear_download_cancellation();
         set_download_status(&t("settings.update_preparing"), true);
-    }
+    });
 }
 
 extern "C" fn show_extraction_progress(_this: *mut c_void, _cmd: Sel, progress: f64) {
-    unsafe {
+    callback_guard::void("show_extraction_progress", || unsafe {
         let progress_view = UPDATE_UI_STATE.lock().unwrap().progress;
         if progress_view != 0 {
             let progress_view = progress_view as *mut AnyObject;
@@ -2342,28 +2360,29 @@ extern "C" fn show_extraction_progress(_this: *mut c_void, _cmd: Sel, progress: 
             let _: () = msg_send![progress_view, setDoubleValue: progress.clamp(0.0, 1.0)];
         }
         set_download_status(&t("settings.update_extracting"), false);
-    }
+    });
 }
 
 extern "C" fn show_ready_to_install(this: *mut c_void, _cmd: Sel, reply: *mut c_void) {
-    unsafe {
+    callback_guard::void("show_ready_to_install", || unsafe {
         let app = app_display_name();
         let message = tf("settings.update_ready_message", &[("app", &app)]);
         make_custom_choice_window(this, reply, &t("settings.update_ready_title"), &message);
-    }
+    });
 }
 
 extern "C" fn retry_custom_installation(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe {
+    callback_guard::void("retry_custom_installation", || unsafe {
         let retry = {
             let mut ui = UPDATE_UI_STATE.lock().unwrap();
             let retry = ui.retry_termination;
             ui.retry_termination = 0;
+            drop(ui);
             retry
         };
         invoke_block(retry);
         release_block(retry);
-    }
+    });
 }
 
 extern "C" fn show_installing_update(
@@ -2372,44 +2391,49 @@ extern "C" fn show_installing_update(
     application_terminated: i8,
     retry_terminating_application: *mut c_void,
 ) {
-    unsafe {
-        // Installation starts: record the current version as the pending marker; the new
-        // instance announces via update_notice at startup (the Sparkle
-        // showUpdateInstalledAndRelaunched callback is unreachable for automatic installs).
-        crate::update_notice::mark_install_started(&bundle_info_string("CFBundleVersion"));
-        crate::update_notice::mark_permission_migration_source(&bundle_info_string(
-            "CFBundleShortVersionString",
-        ));
-        let app = app_display_name();
-        make_custom_download_window(this, std::ptr::null_mut());
-        let window_title = tf("settings.update_installing_window_title", &[("app", &app)]);
-        set_custom_window_title(&window_title);
-        let status_key = if application_terminated != 0 {
-            "settings.update_installing"
-        } else {
-            "settings.update_waiting_for_quit"
-        };
-        set_download_status(&t(status_key), true);
-
-        let (cancel_button, retry) = {
-            let mut ui = UPDATE_UI_STATE.lock().unwrap();
-            ui.retry_termination = copy_block(retry_terminating_application) as usize;
-            ui.waiting_for_quit = application_terminated == 0;
-            (ui.cancel_button, ui.retry_termination)
-        };
-        if cancel_button != 0 {
-            let button = cancel_button as *mut AnyObject;
-            if application_terminated != 0 {
-                let _: () = msg_send![button, setHidden: true];
+    callback_guard::void("show_installing_update", || {
+        unsafe {
+            // Installation starts: record the current version as the pending marker; the new
+            // instance announces via update_notice at startup (the Sparkle
+            // showUpdateInstalledAndRelaunched callback is unreachable for automatic installs).
+            crate::update_notice::mark_install_started(&bundle_info_string("CFBundleVersion"));
+            crate::update_notice::mark_permission_migration_source(&bundle_info_string(
+                "CFBundleShortVersionString",
+            ));
+            let app = app_display_name();
+            make_custom_download_window(this, std::ptr::null_mut());
+            let window_title = tf("settings.update_installing_window_title", &[("app", &app)]);
+            set_custom_window_title(&window_title);
+            let status_key = if application_terminated != 0 {
+                "settings.update_installing"
             } else {
-                let title = make_nsstring(&t("settings.btn_try_again"));
-                let _: () = msg_send![button, setTitle: title];
-                crate::ffi::CFRelease(title as *const c_void);
-                let _: () = msg_send![button, setEnabled: retry != 0];
-                let _: () = msg_send![button, setAction: sel!(retryCustomInstallation:)];
+                "settings.update_waiting_for_quit"
+            };
+            set_download_status(&t(status_key), true);
+
+            let (cancel_button, retry) = {
+                let mut ui = UPDATE_UI_STATE.lock().unwrap();
+                ui.retry_termination = copy_block(retry_terminating_application) as usize;
+                ui.waiting_for_quit = application_terminated == 0;
+                let cancel_button = ui.cancel_button;
+                let retry = ui.retry_termination;
+                drop(ui);
+                (cancel_button, retry)
+            };
+            if cancel_button != 0 {
+                let button = cancel_button as *mut AnyObject;
+                if application_terminated != 0 {
+                    let _: () = msg_send![button, setHidden: true];
+                } else {
+                    let title = make_nsstring(&t("settings.btn_try_again"));
+                    let _: () = msg_send![button, setTitle: title];
+                    crate::ffi::CFRelease(title as *const c_void);
+                    let _: () = msg_send![button, setEnabled: retry != 0];
+                    let _: () = msg_send![button, setAction: sel!(retryCustomInstallation:)];
+                }
             }
         }
-    }
+    });
 }
 
 extern "C" fn show_update_installed(
@@ -2418,25 +2442,27 @@ extern "C" fn show_update_installed(
     _relaunched: i8,
     acknowledgement: *mut c_void,
 ) {
-    unsafe {
-        log_debug!(
-            "[update-notice] driver callback showUpdateInstalledAndRelaunched fired (relaunched={})",
-            _relaunched
-        );
-        crate::settings::set_update_available(false);
-        // Sparkle calls this on the freshly relaunched instance after an install; besides
-        // the in-app result window, post a system notification so a menu-bar app that
-        // updated in the background is still visible to the user.
-        let app = app_display_name();
-        let version = bundle_info_string("CFBundleShortVersionString");
-        crate::update_notice::post_update_installed(&app, &version);
-        make_custom_result_window(
-            this,
-            acknowledgement,
-            &t("settings.update_installed_title"),
-            &t("settings.update_installed_message"),
-        );
-    }
+    callback_guard::void("show_update_installed", || {
+        unsafe {
+            log_debug!(
+                "[update-notice] driver callback showUpdateInstalledAndRelaunched fired (relaunched={})",
+                _relaunched
+            );
+            crate::settings::set_update_available(false);
+            // Sparkle calls this on the freshly relaunched instance after an install; besides
+            // the in-app result window, post a system notification so a menu-bar app that
+            // updated in the background is still visible to the user.
+            let app = app_display_name();
+            let version = bundle_info_string("CFBundleShortVersionString");
+            crate::update_notice::post_update_installed(&app, &version);
+            make_custom_result_window(
+                this,
+                acknowledgement,
+                &t("settings.update_installed_title"),
+                &t("settings.update_installed_message"),
+            );
+        }
+    });
 }
 
 extern "C" fn show_update_release_notes(
@@ -2444,9 +2470,11 @@ extern "C" fn show_update_release_notes(
     _cmd: Sel,
     _download_data: *mut c_void,
 ) {
+    callback_guard::void("show_update_release_notes", || {});
 }
 
 extern "C" fn show_update_release_notes_failed(_this: *mut c_void, _cmd: Sel, _error: *mut c_void) {
+    callback_guard::void("show_update_release_notes_failed", || {});
 }
 
 /// Which window a "bring the update prompt forward" request must raise: the host's settings window for a
@@ -2461,27 +2489,30 @@ fn focus_window_for_prompt(prompt_inline: bool, host_window: usize, popup_window
 }
 
 extern "C" fn show_update_in_focus(_this: *mut c_void, _cmd: Sel) {
-    unsafe {
-        let ui = UPDATE_UI_STATE.lock().unwrap();
-        // Where this prompt was rendered, not where a prompt would be rendered now: showing or hiding the
-        // settings window after the prompt appeared must not move the focus request to the other surface.
-        let window = focus_window_for_prompt(ui.prompt_inline, ui.host_window, ui.window);
-        let inline = ui.prompt_inline;
-        drop(ui);
-        if inline {
-            // The prompt lives in the About page, and the user may have switched to another page since it
-            // appeared: bringing the prompt forward means bringing its page forward too.
-            crate::settings::show_settings_page(crate::settings::SETTINGS_ABOUT_PAGE_INDEX);
+    callback_guard::void("show_update_in_focus", || {
+        unsafe {
+            let ui = UPDATE_UI_STATE.lock().unwrap();
+            // Where this prompt was rendered, not where a prompt would be rendered now: showing or hiding the
+            // settings window after the prompt appeared must not move the focus request to the other surface.
+            let window = focus_window_for_prompt(ui.prompt_inline, ui.host_window, ui.window);
+            let inline = ui.prompt_inline;
+            drop(ui);
+            if inline {
+                // The prompt lives in the About page, and the user may have switched to another page since it
+                // appeared: bringing the prompt forward means bringing its page forward too.
+                crate::settings::show_settings_page(crate::settings::SETTINGS_ABOUT_PAGE_INDEX);
+            }
+            if window != 0 {
+                let window = window as *mut AnyObject;
+                let _: () =
+                    msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
+            }
         }
-        if window != 0 {
-            let window = window as *mut AnyObject;
-            let _: () = msg_send![window, makeKeyAndOrderFront: std::ptr::null_mut::<AnyObject>()];
-        }
-    }
+    });
 }
 
 extern "C" fn toggle_automatic_update(_this: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    unsafe {
+    callback_guard::void("toggle_automatic_update", || unsafe {
         let sender = sender as *mut AnyObject;
         let checked: isize = msg_send![sender, state];
         let updater = state()
@@ -2496,7 +2527,7 @@ extern "C" fn toggle_automatic_update(_this: *mut c_void, _cmd: Sel, sender: *mu
                 checked != 0,
             );
         }
-    }
+    });
 }
 
 extern "C" fn show_user_initiated_update_check(
@@ -2504,26 +2535,28 @@ extern "C" fn show_user_initiated_update_check(
     _cmd: Sel,
     cancellation: *mut c_void,
 ) {
-    unsafe {
-        log_debug!("Sparkle update check started");
-        log_update_network_context();
-        // When inline, just switch the button to "Checking…" and disable it; no popup or extras.
-        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
-            begin_inline_check();
-            return;
-        }
-        make_custom_update_window(this, cancellation)
-    };
+    callback_guard::void("show_user_initiated_update_check", || {
+        unsafe {
+            log_debug!("Sparkle update check started");
+            log_update_network_context();
+            // When inline, just switch the button to "Checking…" and disable it; no popup or extras.
+            if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+                begin_inline_check();
+                return;
+            }
+            make_custom_update_window(this, cancellation)
+        };
+    });
 }
 
 extern "C" fn cancel_custom_update_check(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    unsafe {
+    callback_guard::void("cancel_custom_update_check", || unsafe {
         let cancellation = UPDATE_UI_STATE.lock().unwrap().cancellation;
         invoke_block(cancellation);
         close_custom_update_window();
         reset_check_button();
         crate::settings::collapse_update_section();
-    }
+    });
 }
 
 extern "C" fn acknowledge_custom_update_result(
@@ -2531,12 +2564,12 @@ extern "C" fn acknowledge_custom_update_result(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("acknowledge_custom_update_result", || unsafe {
         let acknowledgement = UPDATE_UI_STATE.lock().unwrap().acknowledgement;
         invoke_block(acknowledgement);
         close_custom_update_window();
         crate::settings::collapse_update_section();
-    }
+    });
 }
 
 extern "C" fn show_update_found(
@@ -2546,37 +2579,39 @@ extern "C" fn show_update_found(
     state: *mut c_void,
     reply: *mut c_void,
 ) {
-    unsafe {
-        let information_only: bool = msg_send![item as *mut AnyObject, isInformationOnlyUpdate];
-        let stage: isize = msg_send![state as *mut AnyObject, stage];
-        // A scheduled background check that finds an update must not pop a window: post a
-        // system notification instead and reply Later (reminded at the next check). Clicking
-        // the banner opens Settings > About and starts a user-initiated check there.
-        let user_initiated: bool = msg_send![state as *mut AnyObject, userInitiated];
-        // Informational updates have no installable payload; keep them out of the actionable badge.
-        crate::settings::set_update_available(!information_only);
-        let auto_download = crate::config::CONFIG
-            .read()
-            .unwrap()
-            .updates
-            .automatically_download;
-        if !user_initiated && (!auto_download || information_only) {
-            let app = app_display_name();
-            let display_version: *mut AnyObject =
-                msg_send![item as *mut AnyObject, displayVersionString];
-            let display_version = nsstring_to_string(display_version);
-            crate::update_notice::post_update_available(&app, &display_version);
-            invoke_choice_reply(reply as usize, 2); // Later / remind me later
-            return;
+    callback_guard::void("show_update_found", || {
+        unsafe {
+            let information_only: bool = msg_send![item as *mut AnyObject, isInformationOnlyUpdate];
+            let stage: isize = msg_send![state as *mut AnyObject, stage];
+            // A scheduled background check that finds an update must not pop a window: post a
+            // system notification instead and reply Later (reminded at the next check). Clicking
+            // the banner opens Settings > About and starts a user-initiated check there.
+            let user_initiated: bool = msg_send![state as *mut AnyObject, userInitiated];
+            // Informational updates have no installable payload; keep them out of the actionable badge.
+            crate::settings::set_update_available(!information_only);
+            let auto_download = crate::config::CONFIG
+                .read()
+                .unwrap()
+                .updates
+                .automatically_download;
+            if !user_initiated && (!auto_download || information_only) {
+                let app = app_display_name();
+                let display_version: *mut AnyObject =
+                    msg_send![item as *mut AnyObject, displayVersionString];
+                let display_version = nsstring_to_string(display_version);
+                crate::update_notice::post_update_available(&app, &display_version);
+                invoke_choice_reply(reply as usize, 2); // Later / remind me later
+                return;
+            }
+            // Inline found an update: end the checking phase and restore the button default; the
+            // update controls remain rendered in the About page.
+            if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+                clear_inline_check();
+                reset_check_button();
+            }
+            make_custom_update_found_window(this, item, stage, information_only, reply);
         }
-        // Inline found an update: end the checking phase and restore the button default; the
-        // update controls remain rendered in the About page.
-        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
-            clear_inline_check();
-            reset_check_button();
-        }
-        make_custom_update_found_window(this, item, stage, information_only, reply);
-    }
+    });
 }
 
 extern "C" fn show_update_not_found(
@@ -2585,25 +2620,27 @@ extern "C" fn show_update_not_found(
     _error: *mut c_void,
     acknowledgement: *mut c_void,
 ) {
-    unsafe {
-        log_sparkle_error("showUpdateNotFoundWithError", _error);
-        crate::settings::set_update_available(false);
-        // When inline, switch the button to "You're up to date" and re-enable it; no popup.
-        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
-            clear_inline_check();
-            set_check_button_status(&t("settings.btn_up_to_date"), true);
-            // Acknowledge the inline result so Sparkle can finish its session and accept later checks.
-            invoke_block(acknowledgement as usize);
-            crate::settings::collapse_update_section();
-            return;
+    callback_guard::void("show_update_not_found", || {
+        unsafe {
+            log_sparkle_error("showUpdateNotFoundWithError", _error);
+            crate::settings::set_update_available(false);
+            // When inline, switch the button to "You're up to date" and re-enable it; no popup.
+            if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+                clear_inline_check();
+                set_check_button_status(&t("settings.btn_up_to_date"), true);
+                // Acknowledge the inline result so Sparkle can finish its session and accept later checks.
+                invoke_block(acknowledgement as usize);
+                crate::settings::collapse_update_section();
+                return;
+            }
+            make_custom_result_window(
+                this,
+                acknowledgement,
+                &t("settings.update_up_to_date_title"),
+                &t("settings.update_up_to_date_message"),
+            );
         }
-        make_custom_result_window(
-            this,
-            acknowledgement,
-            &t("settings.update_up_to_date_title"),
-            &t("settings.update_up_to_date_message"),
-        );
-    }
+    });
 }
 
 extern "C" fn show_updater_error(
@@ -2612,32 +2649,34 @@ extern "C" fn show_updater_error(
     _error: *mut c_void,
     acknowledgement: *mut c_void,
 ) {
-    unsafe {
-        log_sparkle_error("showUpdaterError", _error);
-        // When inline, offer a retry on the button and re-enable it; no popup is shown.
-        if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
-            clear_inline_check();
-            set_check_button_status(&t("settings.btn_retry_update_check"), true);
-            // Acknowledge the inline error so Sparkle can finish its session and accept retries.
-            invoke_block(acknowledgement as usize);
-            crate::settings::collapse_update_section();
-            return;
+    callback_guard::void("show_updater_error", || {
+        unsafe {
+            log_sparkle_error("showUpdaterError", _error);
+            // When inline, offer a retry on the button and re-enable it; no popup is shown.
+            if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
+                clear_inline_check();
+                set_check_button_status(&t("settings.btn_retry_update_check"), true);
+                // Acknowledge the inline error so Sparkle can finish its session and accept retries.
+                invoke_block(acknowledgement as usize);
+                crate::settings::collapse_update_section();
+                return;
+            }
+            make_custom_result_window(
+                this,
+                acknowledgement,
+                &t("settings.update_check_error_title"),
+                &t("settings.update_check_error_message"),
+            );
         }
-        make_custom_result_window(
-            this,
-            acknowledgement,
-            &t("settings.update_check_error_title"),
-            &t("settings.update_check_error_message"),
-        );
-    }
+    });
 }
 
 extern "C" fn dismiss_update_installation(this: *mut c_void, _cmd: Sel) {
-    unsafe {
+    callback_guard::void("dismiss_update_installation", || unsafe {
         close_custom_update_window();
         crate::settings::collapse_update_section();
         call_super_no_arguments(this, sel!(dismissUpdateInstallation));
-    }
+    });
 }
 
 unsafe fn custom_driver_class() -> *mut AnyObject {
@@ -3061,6 +3100,7 @@ mod tests {
         teardown_closes_standalone, update_prompt_kind, RenderTarget, UpdatePromptKind,
         RELEASE_NOTES_LAYOUT_WIDTH,
     };
+    use crate::smoke_verdict::smoke_runner;
     use objc2::runtime::AnyObject;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
 
@@ -3197,40 +3237,14 @@ mod tests {
     #[test]
     #[ignore]
     fn update_prompt_button_layout_smoke() {
-        let exe = std::env::current_exe().expect("current exe");
-        let profile_dir = exe
-            .parent()
-            .and_then(|path| path.parent())
-            .expect("test binary profile directory");
-        let app = profile_dir.join(env!("CARGO_PKG_NAME"));
-        let profile = profile_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("Cargo profile directory name");
-        let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
-        let mut build = std::process::Command::new(cargo);
-        build
-            .current_dir(env!("CARGO_MANIFEST_DIR"))
-            .arg("build")
-            .arg("--bin")
-            .arg(env!("CARGO_PKG_NAME"));
-        if profile == "release" {
-            build.arg("--release");
-        } else if profile != "debug" {
-            build.arg("--profile").arg(profile);
-        }
-        let status = build.status().expect("failed to build app smoke binary");
-        assert!(status.success(), "failed to build app smoke binary");
-        let output = std::process::Command::new(app)
-            .arg("--smoke-update-prompts")
-            .output()
-            .expect("failed to start update prompt smoke process");
-        assert!(
-            output.status.success(),
-            "update prompt layout smoke failed (exit {:?})\nstderr:\n{}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        smoke_runner!("update_prompt_button_layout_smoke", 1, {
+            // The child is the process that ran the assertions, so its recorded verdict is
+            // what this parent reports; it never infers one from the exit status.
+            crate::smoke_verdict::run_smoke_child(
+                "update_prompt_button_layout_smoke",
+                &["--smoke-update-prompts"],
+            );
+        });
     }
 
     #[test]

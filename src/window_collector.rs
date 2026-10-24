@@ -1072,6 +1072,7 @@ mod ax_identity_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::smoke_verdict::smoke_runner;
 
     /// The subscription rule, and the counter-example that keeps it from being confused with the
     /// display list: a fully transparent layer-0 window is subscribed (it can become visible
@@ -1180,35 +1181,37 @@ mod tests {
     #[test]
     #[ignore]
     fn objc_exception_guard_contains_a_raise() {
-        use objc2::runtime::AnyObject;
-        use objc2::{class, msg_send};
-        unsafe {
-            let name = crate::ffi::make_nsstring("OhMyTabSmokeException");
-            let reason = crate::ffi::make_nsstring("raised by the smoke test");
-            let exception: *mut AnyObject = msg_send![
-                class!(NSException),
-                exceptionWithName: name,
-                reason: reason,
-                userInfo: std::ptr::null_mut::<AnyObject>()
-            ];
-            crate::ffi::CFRelease(name as *const c_void);
-            crate::ffi::CFRelease(reason as *const c_void);
-            assert!(!exception.is_null(), "NSException must be constructible");
+        smoke_runner!("objc_exception_guard_contains_a_raise", 1, {
+            use objc2::runtime::AnyObject;
+            use objc2::{class, msg_send};
+            unsafe {
+                let name = crate::ffi::make_nsstring("OhMyTabSmokeException");
+                let reason = crate::ffi::make_nsstring("raised by the smoke test");
+                let exception: *mut AnyObject = msg_send![
+                    class!(NSException),
+                    exceptionWithName: name,
+                    reason: reason,
+                    userInfo: std::ptr::null_mut::<AnyObject>()
+                ];
+                crate::ffi::CFRelease(name as *const c_void);
+                crate::ffi::CFRelease(reason as *const c_void);
+                assert!(!exception.is_null(), "NSException must be constructible");
 
-            let caught = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
-                let _: () = msg_send![exception, raise];
-                "unreachable"
-            }));
-            let err =
-                caught.expect_err("the raised exception must be caught, not abort the process");
-            // The Debug output carries the NSException's name for log-based diagnosis (the
-            // collection path logs the same way).
-            let text = format!("{err:?}");
-            assert!(
-                text.contains("OhMyTabSmokeException"),
-                "exception name must surface in the log text: {text}"
-            );
-        }
+                let caught = objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
+                    let _: () = msg_send![exception, raise];
+                    "unreachable"
+                }));
+                let err =
+                    caught.expect_err("the raised exception must be caught, not abort the process");
+                // The Debug output carries the NSException's name for log-based diagnosis (the
+                // collection path logs the same way).
+                let text = format!("{err:?}");
+                assert!(
+                    text.contains("OhMyTabSmokeException"),
+                    "exception name must surface in the log text: {text}"
+                );
+            }
+        });
     }
 
     #[test]
@@ -1822,37 +1825,42 @@ mod tests {
     #[test]
     #[ignore]
     fn collect_windows_smoke() {
-        // Skip (not fail) when Accessibility is not granted.
-        if !crate::ffi::has_accessibility_permission() {
-            eprintln!("[smoke] Accessibility not granted; skipping collect_windows");
-            return;
-        }
-        let mut mru = MruMap::new();
-        let wins = collect_windows(&mut mru);
-        // With a GUI session we should see at least a few windows (usually >2).
-        assert!(wins.len() >= 2, "expected >=2 windows, got {}", wins.len());
-        // Invariant 1: (pid, window_id) globally unique.
-        let mut seen: HashSet<(i32, u32)> = HashSet::new();
-        for w in &wins {
-            assert!(w.window_id != 0, "window_id must be nonzero");
+        smoke_runner!("collect_windows_smoke", 1, {
+            // Skip (not fail) when Accessibility is not granted.
+            if !crate::ffi::has_accessibility_permission() {
+                crate::smoke_verdict::report(
+                    "collect_windows_smoke",
+                    crate::smoke_verdict::Verdict::NotRun("Accessibility not granted".into()),
+                );
+                return;
+            }
+            let mut mru = MruMap::new();
+            let wins = collect_windows(&mut mru);
+            // With a GUI session we should see at least a few windows (usually >2).
+            assert!(wins.len() >= 2, "expected >=2 windows, got {}", wins.len());
+            // Invariant 1: (pid, window_id) globally unique.
+            let mut seen: HashSet<(i32, u32)> = HashSet::new();
+            for w in &wins {
+                assert!(w.window_id != 0, "window_id must be nonzero");
+                assert!(
+                    seen.insert((w.pid, w.window_id)),
+                    "duplicate window: pid={} wid={}",
+                    w.pid,
+                    w.window_id
+                );
+                assert!(!w.app_name.is_empty(), "app_name must not be empty");
+            }
+            // Invariant 2: the first window is marked active.
+            assert!(wins[0].is_active);
+            // Invariant 3: sorting relies on MRU — every display-list window must have an entry.
+            // The converse (every MRU entry in the display list) does NOT hold: the frontmost
+            // focused window is bumped via a separate system-API path and may be filtered out of
+            // the display list by AX pairing, so a reverse assertion would flake spuriously.
+            let all_have_mru = wins.iter().all(|w| mru.contains_key(&(w.pid, w.window_id)));
             assert!(
-                seen.insert((w.pid, w.window_id)),
-                "duplicate window: pid={} wid={}",
-                w.pid,
-                w.window_id
+                all_have_mru,
+                "some display windows lack MRU entries (sorting would fall back)"
             );
-            assert!(!w.app_name.is_empty(), "app_name must not be empty");
-        }
-        // Invariant 2: the first window is marked active.
-        assert!(wins[0].is_active);
-        // Invariant 3: sorting relies on MRU — every display-list window must have an entry.
-        // The converse (every MRU entry in the display list) does NOT hold: the frontmost
-        // focused window is bumped via a separate system-API path and may be filtered out of
-        // the display list by AX pairing, so a reverse assertion would flake spuriously.
-        let all_have_mru = wins.iter().all(|w| mru.contains_key(&(w.pid, w.window_id)));
-        assert!(
-            all_have_mru,
-            "some display windows lack MRU entries (sorting would fall back)"
-        );
+        });
     }
 }

@@ -6,6 +6,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use crate::callback_guard;
 use crate::ffi::{cg_overlay_window_level, release_obj, CallbackTarget};
 
 const SPOTLIGHT_DIAMETER: f64 = 144.0;
@@ -44,19 +45,22 @@ pub(crate) fn show() {
 
 /// Polling avoids installing another global event tap solely for this short-lived visual cue.
 unsafe extern "C" fn check_pointer(this: *mut AnyObject, _cmd: Sel, _arg: *mut AnyObject) {
-    if !ACTIVE.load(Ordering::Acquire) {
-        return;
-    }
-    let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    let (x, y) = *SPOTLIGHT_CENTER.lock().unwrap();
-    if cursor.x != x || cursor.y != y {
-        ACTIVE.store(false, Ordering::Release);
-        let window = this;
-        let _: () = msg_send![class!(NSObject), cancelPreviousPerformRequestsWithTarget: window];
-        let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
-    } else {
-        schedule_pointer_check(this);
-    }
+    callback_guard::void("check_pointer", || {
+        if !ACTIVE.load(Ordering::Acquire) {
+            return;
+        }
+        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let (x, y) = *SPOTLIGHT_CENTER.lock().unwrap();
+        if cursor.x != x || cursor.y != y {
+            ACTIVE.store(false, Ordering::Release);
+            let window = this;
+            let _: () =
+                msg_send![class!(NSObject), cancelPreviousPerformRequestsWithTarget: window];
+            let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
+        } else {
+            schedule_pointer_check(this);
+        }
+    });
 }
 
 unsafe fn schedule_pointer_check(window: *mut AnyObject) {
@@ -70,28 +74,30 @@ unsafe fn schedule_pointer_check(window: *mut AnyObject) {
 
 /// Draw the dimming mask and punch a transparent hole around the cursor.
 unsafe extern "C" fn draw_mask(this: *mut AnyObject, _cmd: Sel, _dirty_rect: NSRect) {
-    let view = this;
-    let bounds: NSRect = msg_send![view, bounds];
-    let (cursor_x, cursor_y) = *SPOTLIGHT_CENTER.lock().unwrap();
-    let window: *mut AnyObject = msg_send![view, window];
-    let window_frame: NSRect = msg_send![window, frame];
-    let hole = NSRect::new(
-        NSPoint::new(
-            cursor_x - window_frame.origin.x - SPOTLIGHT_DIAMETER / 2.0,
-            cursor_y - window_frame.origin.y - SPOTLIGHT_DIAMETER / 2.0,
-        ),
-        NSSize::new(SPOTLIGHT_DIAMETER, SPOTLIGHT_DIAMETER),
-    );
-    let mask_color: *mut AnyObject =
-        msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: MASK_ALPHA];
-    let _: () = msg_send![mask_color, set];
+    callback_guard::void("draw_mask", || {
+        let view = this;
+        let bounds: NSRect = msg_send![view, bounds];
+        let (cursor_x, cursor_y) = *SPOTLIGHT_CENTER.lock().unwrap();
+        let window: *mut AnyObject = msg_send![view, window];
+        let window_frame: NSRect = msg_send![window, frame];
+        let hole = NSRect::new(
+            NSPoint::new(
+                cursor_x - window_frame.origin.x - SPOTLIGHT_DIAMETER / 2.0,
+                cursor_y - window_frame.origin.y - SPOTLIGHT_DIAMETER / 2.0,
+            ),
+            NSSize::new(SPOTLIGHT_DIAMETER, SPOTLIGHT_DIAMETER),
+        );
+        let mask_color: *mut AnyObject =
+            msg_send![class!(NSColor), colorWithWhite: 0.0f64, alpha: MASK_ALPHA];
+        let _: () = msg_send![mask_color, set];
 
-    // Use an even-odd path so the spotlight is transparent in the same draw operation.
-    let path: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![path, appendBezierPathWithRect: bounds];
-    let _: () = msg_send![path, appendBezierPathWithOvalInRect: hole];
-    let _: () = msg_send![path, setWindingRule: 1isize];
-    let _: () = msg_send![path, fill];
+        // Use an even-odd path so the spotlight is transparent in the same draw operation.
+        let path: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+        let _: () = msg_send![path, appendBezierPathWithRect: bounds];
+        let _: () = msg_send![path, appendBezierPathWithOvalInRect: hole];
+        let _: () = msg_send![path, setWindingRule: 1isize];
+        let _: () = msg_send![path, fill];
+    });
 }
 
 unsafe fn desktop_frame() -> NSRect {

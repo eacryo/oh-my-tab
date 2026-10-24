@@ -2,6 +2,7 @@
 
 use super::sidebar;
 use super::*;
+use crate::callback_guard;
 
 // Every change is written to the in-memory CONFIG immediately with a debounced disk write;
 // no pending/staged state exists anymore. Numeric text fields may hold transient invalid
@@ -276,7 +277,14 @@ pub(super) unsafe fn set_clipboard_shortcut_capture_state(
         return;
     };
     let row_label_frame: NSRect = msg_send![row_label, frame];
-    let row_center = row_label_frame.origin.y + row_label_frame.size.height / 2.0;
+    // The LABEL's centre is not the ROW's centre: `center_label` adds
+    // `text_field_line_height_correction` so the glyphs sit optically centred, and that correction
+    // (1.30pt here) moves the label's frame away from the row's midline. The row's midline is the
+    // label's baseline position plus the correction the row itself applied, i.e. the uncorrected
+    // centre -- which is what a control centred in the row must use. Using the corrected centre
+    // pushed the button 1.30pt off and made `--smoke-settings-layout` fail for a correct panel.
+    let correction = crate::ffi::text_field_line_height_correction(row_label);
+    let row_center = row_label_frame.origin.y + row_label_frame.size.height / 2.0 - correction;
     if error.is_some() && !ui.clipboard_shortcut_error.is_null() {
         let mut error_frame: NSRect = msg_send![ui.clipboard_shortcut_error, frame];
         let row_origin = row_center - ui.clipboard_shortcut_row_height / 2.0;
@@ -512,70 +520,72 @@ pub(super) unsafe fn update_finder_menu_controls_enabled(ui: &SettingsUi) {
 /// The unified control callback (switches/popups/sliders/color well): identify the field and
 /// apply its value.
 pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    unsafe {
-        let ctrl = sender as *mut AnyObject;
-        // Refresh the slider value labels first (same as the old callbacks).
-        with_settings_ui(|ui| {
-            if let Some(u) = ui.as_ref() {
-                if ctrl == u.line_count {
-                    let val: isize = msg_send![ctrl, integerValue];
-                    set_field(u.line_count_value_label, val);
-                } else if ctrl == u.card_text_size || ctrl == u.status_bar_text_size {
-                    let val: isize = msg_send![ctrl, integerValue];
-                    if ctrl == u.card_text_size {
-                        set_field(u.card_text_size_value_label, val);
-                    } else {
-                        // Stop index -> point size: the readout shows "0" (hidden) or "13".."20".
-                        set_field(
-                            u.status_bar_text_size_value_label,
-                            super::status_bar_size_for_index(val as i64),
-                        );
-                    }
-                } else if ctrl == u.clipboard_auto_expire_days {
-                    let val: isize = msg_send![ctrl, integerValue];
-                    set_field(u.clipboard_auto_expire_days_value_label, val);
-                } else if ctrl == u.clipboard_image_rows {
-                    let val: isize = msg_send![ctrl, integerValue];
-                    set_field(u.clipboard_image_rows_value_label, val);
-                } else if ctrl == u.pointer_accel_slider {
-                    // Pointer acceleration / tracking speed: the read-only value follows the drag
-                    // in real time (2 decimals).
-                    let val: f64 = msg_send![ctrl, doubleValue];
-                    set_field(
-                        u.pointer_accel_value_label,
-                        pointer_accel_display(pointer_accel_from_slider(val)),
-                    );
-                } else if let Some((minimum, maximum, label)) = smooth_slider_spec(u, ctrl) {
-                    let val: f64 = msg_send![ctrl, doubleValue];
-                    set_field(label, smooth_slider_display(val, minimum, maximum));
-                }
-            }
-        });
-        let Some(field) = control_field_of(ctrl) else {
-            log_debug!("[settings] control change from an unknown sender ignored");
-            return;
-        };
-        // The geometry smoke exercises the real callback-to-reflow path without changing config
-        // or applying device side effects.
-        if !crate::dev_flags::present("smoke-settings-collapsible-row") {
-            apply_control_field(field);
-        }
-        if matches!(
-            field,
-            ControlField::ClipboardDeleteAfterPaste
-                | ControlField::ClipboardClearSystemPasteboardAfterPaste
-        ) {
+    callback_guard::void("on_control_changed", || {
+        unsafe {
+            let ctrl = sender as *mut AnyObject;
+            // Refresh the slider value labels first (same as the old callbacks).
             with_settings_ui(|ui| {
                 if let Some(u) = ui.as_ref() {
-                    update_clipboard_controls_enabled(u);
+                    if ctrl == u.line_count {
+                        let val: isize = msg_send![ctrl, integerValue];
+                        set_field(u.line_count_value_label, val);
+                    } else if ctrl == u.card_text_size || ctrl == u.status_bar_text_size {
+                        let val: isize = msg_send![ctrl, integerValue];
+                        if ctrl == u.card_text_size {
+                            set_field(u.card_text_size_value_label, val);
+                        } else {
+                            // Stop index -> point size: the readout shows "0" (hidden) or "13".."20".
+                            set_field(
+                                u.status_bar_text_size_value_label,
+                                super::status_bar_size_for_index(val as i64),
+                            );
+                        }
+                    } else if ctrl == u.clipboard_auto_expire_days {
+                        let val: isize = msg_send![ctrl, integerValue];
+                        set_field(u.clipboard_auto_expire_days_value_label, val);
+                    } else if ctrl == u.clipboard_image_rows {
+                        let val: isize = msg_send![ctrl, integerValue];
+                        set_field(u.clipboard_image_rows_value_label, val);
+                    } else if ctrl == u.pointer_accel_slider {
+                        // Pointer acceleration / tracking speed: the read-only value follows the drag
+                        // in real time (2 decimals).
+                        let val: f64 = msg_send![ctrl, doubleValue];
+                        set_field(
+                            u.pointer_accel_value_label,
+                            pointer_accel_display(pointer_accel_from_slider(val)),
+                        );
+                    } else if let Some((minimum, maximum, label)) = smooth_slider_spec(u, ctrl) {
+                        let val: f64 = msg_send![ctrl, doubleValue];
+                        set_field(label, smooth_slider_display(val, minimum, maximum));
+                    }
                 }
             });
+            let Some(field) = control_field_of(ctrl) else {
+                log_debug!("[settings] control change from an unknown sender ignored");
+                return;
+            };
+            // The geometry smoke exercises the real callback-to-reflow path without changing config
+            // or applying device side effects.
+            if !crate::dev_flags::present("smoke-settings-collapsible-row") {
+                apply_control_field(field);
+            }
+            if matches!(
+                field,
+                ControlField::ClipboardDeleteAfterPaste
+                    | ControlField::ClipboardClearSystemPasteboardAfterPaste
+            ) {
+                with_settings_ui(|ui| {
+                    if let Some(u) = ui.as_ref() {
+                        update_clipboard_controls_enabled(u);
+                    }
+                });
+            }
+            refresh_dependent_control_visibility(field);
+            if sidebar::settings_search_is_active() {
+                sidebar::schedule_search_refresh();
+            }
         }
-        refresh_dependent_control_visibility(field);
-        if sidebar::settings_search_is_active() {
-            sidebar::schedule_search_refresh();
-        }
-    }
+    });
 }
 
 /// Refresh conditional rows and their document geometry after a setting changes.
@@ -1109,7 +1119,7 @@ pub(crate) extern "C" fn on_control_text_did_change(
     _cmd: Sel,
     notification: *mut c_void,
 ) {
-    unsafe {
+    callback_guard::void("on_control_text_did_change", || unsafe {
         let obj: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
         let field = match text_field_of(obj) {
             Some(f) => f,
@@ -1126,7 +1136,7 @@ pub(crate) extern "C" fn on_control_text_did_change(
             "[settings] numeric field {:?} applied (debounced persist)",
             field
         );
-    }
+    });
 }
 
 /// On blur / Enter (NSControlTextDidEndEditing): commit immediately and persist now; when
@@ -1136,51 +1146,53 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
     _cmd: Sel,
     notification: *mut c_void,
 ) {
-    unsafe {
-        let obj: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
-        let field = match text_field_of(obj) {
-            Some(f) => f,
-            None => return,
-        };
-        match parse_text_field(field) {
-            Some((value, _)) => {
-                // Only a field the user actually typed into commits here. An untouched field is AppKit
-                // resigning the window's automatic initial first responder (see `EDITED_TEXT_FIELDS`), and
-                // committing it would rewrite the config file on every open.
-                if !take_edited_field(&EDITED_TEXT_FIELDS, field) {
-                    log_debug!(
-                        "[settings] numeric field {field:?} untouched on end editing; not persisted"
-                    );
-                    return;
-                }
-                write_text_field_config(field, value, true);
-                persist_config_now();
-                log_debug!(
-                    "[settings] numeric field {:?} committed on end editing",
-                    field
-                );
-            }
-            None => {
-                // The edit session is over either way, so the bit does not outlive it.
-                let _ = take_edited_field(&EDITED_TEXT_FIELDS, field);
-                // Do not commit invalid values; restore the last effective config value.
-                let cfg = CONFIG.read().unwrap().clone();
-                let text = match field {
-                    TextField::CornerRadius => cfg.appearance.corner_radius.to_string(),
-                    TextField::ClipboardMaxEntries => cfg.clipboard.max_entries.to_string(),
-                };
-                with_settings_ui(|ui| {
-                    if let Some(u) = ui.as_ref() {
-                        let ctrl = match field {
-                            TextField::CornerRadius => u.corner_radius,
-                            TextField::ClipboardMaxEntries => u.clipboard_max_entries,
-                        };
-                        set_field(ctrl, text);
+    callback_guard::void("on_control_text_did_end_editing", || {
+        unsafe {
+            let obj: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
+            let field = match text_field_of(obj) {
+                Some(f) => f,
+                None => return,
+            };
+            match parse_text_field(field) {
+                Some((value, _)) => {
+                    // Only a field the user actually typed into commits here. An untouched field is AppKit
+                    // resigning the window's automatic initial first responder (see `EDITED_TEXT_FIELDS`), and
+                    // committing it would rewrite the config file on every open.
+                    if !take_edited_field(&EDITED_TEXT_FIELDS, field) {
+                        log_debug!(
+                            "[settings] numeric field {field:?} untouched on end editing; not persisted"
+                        );
+                        return;
                     }
-                });
+                    write_text_field_config(field, value, true);
+                    persist_config_now();
+                    log_debug!(
+                        "[settings] numeric field {:?} committed on end editing",
+                        field
+                    );
+                }
+                None => {
+                    // The edit session is over either way, so the bit does not outlive it.
+                    let _ = take_edited_field(&EDITED_TEXT_FIELDS, field);
+                    // Do not commit invalid values; restore the last effective config value.
+                    let cfg = CONFIG.read().unwrap().clone();
+                    let text = match field {
+                        TextField::CornerRadius => cfg.appearance.corner_radius.to_string(),
+                        TextField::ClipboardMaxEntries => cfg.clipboard.max_entries.to_string(),
+                    };
+                    with_settings_ui(|ui| {
+                        if let Some(u) = ui.as_ref() {
+                            let ctrl = match field {
+                                TextField::CornerRadius => u.corner_radius,
+                                TextField::ClipboardMaxEntries => u.clipboard_max_entries,
+                            };
+                            set_field(ctrl, text);
+                        }
+                    });
+                }
             }
         }
-    }
+    });
 }
 
 /// Numeric text-field ids (separate from ControlField: they use notification callbacks, not
@@ -1416,9 +1428,11 @@ pub(crate) extern "C" fn handle_pause_recording_toggle(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    apply_control_field(ControlField::ClipboardPaused);
-    refresh_clipboard_pause_switch_from_config();
-    crate::menu::refresh_clipboard_pause_item();
+    callback_guard::void("handle_pause_recording_toggle", || {
+        apply_control_field(ControlField::ClipboardPaused);
+        refresh_clipboard_pause_switch_from_config();
+        crate::menu::refresh_clipboard_pause_item();
+    });
 }
 
 /// Mutate the excluded-applications list the way every other settings control commits: write the
@@ -1462,41 +1476,43 @@ pub(crate) extern "C" fn handle_clipboard_excluded_add(
     _cmd: Sel,
     sender: *mut c_void,
 ) {
-    if sender.is_null() {
-        return;
-    }
-    let index: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
-    if index <= 0 {
-        return;
-    }
-    // The popup's trailing entry is "choose from disk": the same intent, for an app that is not
-    // running. One add control, two sources.
-    let choose_from_disk = with_settings_ui(|ui| {
-        ui.as_ref()
-            .map(|u| index as usize == u.clipboard_excluded_candidates.len() + 1)
-            .unwrap_or(false)
-    });
-    if choose_from_disk {
-        add_excluded_app_from_disk();
-        return;
-    }
-    let candidate = with_settings_ui(|ui| {
-        ui.as_ref().and_then(|u| {
-            u.clipboard_excluded_candidates
-                .get((index - 1) as usize)
-                .cloned()
-        })
-    });
-    let Some((bundle_id, name)) = candidate else {
-        return;
-    };
-    mutate_excluded_apps(|list| {
-        if !list
-            .iter()
-            .any(|e| e.bundle_id.eq_ignore_ascii_case(&bundle_id))
-        {
-            list.push(crate::config::ExcludedApp::new(bundle_id, name));
+    callback_guard::void("handle_clipboard_excluded_add", || {
+        if sender.is_null() {
+            return;
         }
+        let index: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
+        if index <= 0 {
+            return;
+        }
+        // The popup's trailing entry is "choose from disk": the same intent, for an app that is not
+        // running. One add control, two sources.
+        let choose_from_disk = with_settings_ui(|ui| {
+            ui.as_ref()
+                .map(|u| index as usize == u.clipboard_excluded_candidates.len() + 1)
+                .unwrap_or(false)
+        });
+        if choose_from_disk {
+            add_excluded_app_from_disk();
+            return;
+        }
+        let candidate = with_settings_ui(|ui| {
+            ui.as_ref().and_then(|u| {
+                u.clipboard_excluded_candidates
+                    .get((index - 1) as usize)
+                    .cloned()
+            })
+        });
+        let Some((bundle_id, name)) = candidate else {
+            return;
+        };
+        mutate_excluded_apps(|list| {
+            if !list
+                .iter()
+                .any(|e| e.bundle_id.eq_ignore_ascii_case(&bundle_id))
+            {
+                list.push(crate::config::ExcludedApp::new(bundle_id, name));
+            }
+        });
     });
 }
 
@@ -1532,23 +1548,25 @@ pub(crate) extern "C" fn handle_clipboard_excluded_remove(
     _cmd: Sel,
     sender: *mut c_void,
 ) {
-    if sender.is_null() {
-        return;
-    }
-    let index = with_settings_ui(|ui| {
-        ui.as_ref().and_then(|u| {
-            u.clipboard_excluded_remove
-                .iter()
-                .position(|pointer| *pointer == sender as *mut AnyObject)
-        })
-    });
-    let Some(index) = index else {
-        return;
-    };
-    mutate_excluded_apps(|list| {
-        if index < list.len() {
-            list.remove(index);
+    callback_guard::void("handle_clipboard_excluded_remove", || {
+        if sender.is_null() {
+            return;
         }
+        let index = with_settings_ui(|ui| {
+            ui.as_ref().and_then(|u| {
+                u.clipboard_excluded_remove
+                    .iter()
+                    .position(|pointer| *pointer == sender as *mut AnyObject)
+            })
+        });
+        let Some(index) = index else {
+            return;
+        };
+        mutate_excluded_apps(|list| {
+            if index < list.len() {
+                list.remove(index);
+            }
+        });
     });
 }
 
@@ -1558,7 +1576,9 @@ pub(crate) extern "C" fn handle_clipboard_excluded_restore(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    mutate_excluded_apps(|list| *list = crate::config::default_excluded_apps());
+    callback_guard::void("handle_clipboard_excluded_restore", || {
+        mutate_excluded_apps(|list| *list = crate::config::default_excluded_apps());
+    });
 }
 
 /// Deferred page rebuild requested by settings::rebuild_settings_content_deferred.
@@ -1567,13 +1587,15 @@ pub(crate) extern "C" fn handle_rebuild_settings_content(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let pending = crate::settings::take_rebuild_request();
-    match pending {
-        Some((page, offset)) => unsafe {
-            super::window::rebuild_settings_content_now_keeping_scroll(page, Some(offset));
-        },
-        None => unsafe { super::window::rebuild_settings_content_now() },
-    }
+    callback_guard::void("handle_rebuild_settings_content", || {
+        let pending = crate::settings::take_rebuild_request();
+        match pending {
+            Some((page, offset)) => unsafe {
+                super::window::rebuild_settings_content_now_keeping_scroll(page, Some(offset));
+            },
+            None => unsafe { super::window::rebuild_settings_content_now() },
+        }
+    });
 }
 
 pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
@@ -1760,14 +1782,16 @@ pub(crate) extern "C" fn handle_enable_mouse_toggle(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    apply_control_field(ControlField::MouseEnabled);
-    unsafe {
-        with_settings_ui(|ui| {
-            if let Some(u) = ui.as_ref() {
-                update_mouse_controls_enabled(u);
-            }
-        });
-    }
+    callback_guard::void("handle_enable_mouse_toggle", || {
+        apply_control_field(ControlField::MouseEnabled);
+        unsafe {
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    update_mouse_controls_enabled(u);
+                }
+            });
+        }
+    });
 }
 
 /// Callback for the app-switcher master switch: apply immediately, then freeze/unfreeze the
@@ -1777,14 +1801,16 @@ pub(crate) extern "C" fn handle_windows_enabled_toggle(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    apply_control_field(ControlField::WindowsEnabled);
-    unsafe {
-        with_settings_ui(|ui| {
-            if let Some(u) = ui.as_ref() {
-                update_windows_controls_enabled(u);
-            }
-        });
-    }
+    callback_guard::void("handle_windows_enabled_toggle", || {
+        apply_control_field(ControlField::WindowsEnabled);
+        unsafe {
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    update_windows_controls_enabled(u);
+                }
+            });
+        }
+    });
 }
 
 /// Callback for the clipboard-history master switch: apply immediately, then freeze/unfreeze
@@ -1794,14 +1820,16 @@ pub(crate) extern "C" fn handle_clipboard_enabled_toggle(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    apply_control_field(ControlField::ClipboardEnabled);
-    unsafe {
-        with_settings_ui(|ui| {
-            if let Some(u) = ui.as_ref() {
-                update_clipboard_controls_enabled(u);
-            }
-        });
-    }
+    callback_guard::void("handle_clipboard_enabled_toggle", || {
+        apply_control_field(ControlField::ClipboardEnabled);
+        unsafe {
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    update_clipboard_controls_enabled(u);
+                }
+            });
+        }
+    });
 }
 
 /// Callback for the Key Bindings master switch: apply it, then freeze or unfreeze the binding rows
@@ -1811,14 +1839,16 @@ pub(crate) extern "C" fn handle_key_bindings_toggle(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    apply_control_field(ControlField::KeyBindingsEnabled);
-    unsafe {
-        with_settings_ui(|ui| {
-            if let Some(u) = ui.as_ref() {
-                super::bindings::update_binding_controls_enabled(u);
-            }
-        });
-    }
+    callback_guard::void("handle_key_bindings_toggle", || {
+        apply_control_field(ControlField::KeyBindingsEnabled);
+        unsafe {
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    super::bindings::update_binding_controls_enabled(u);
+                }
+            });
+        }
+    });
 }
 
 /// Refresh top-level service switches when they are changed from the status-bar menu.
@@ -1909,6 +1939,7 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 (u.panel_minimize_enabled, cfg.windows.panel_minimize_enabled),
                 (u.panel_hide_enabled, cfg.windows.panel_hide_enabled),
                 (u.panel_quit_enabled, cfg.windows.panel_quit_enabled),
+                (u.show_app_name_in_cards, cfg.layout.show_app_name_in_cards),
             ] {
                 let _: () = msg_send![control, setState: if on { 1isize } else { 0isize }];
             }
@@ -2155,85 +2186,91 @@ pub(crate) fn refresh_device_popup_if_open() {
 /// Device-popup selection-changed callback: update SELECTED_DEVICE and immediately refresh the
 /// other controls with the newly-selected device's effective values.
 pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    let popup = sender as *mut AnyObject;
-    let idx: isize = unsafe { msg_send![popup, indexOfSelectedItem] };
-    // DEVICE_POPUP_KEYS: Vec<DeviceKey>; get the key for the selected item (all concrete
-    // devices; no wildcard entry).
-    let new_dev = DEVICE_POPUP_KEYS.lock().unwrap().get(idx as usize).copied();
-    *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
-    // Only refresh the mouse page's per-device controls -- a full load_settings_from would
-    // reset the enable_mouse switch to the saved cfg.mouse.enabled, wiping the user's
-    // unsaved toggle (enable mouse control is a global setting; device switches must not
-    // touch it).
-    let cfg = CONFIG.read().unwrap().clone();
-    let resolved = resolve_selected_from(&cfg);
-    unsafe {
-        with_settings_ui(|ui_guard| {
-            if let Some(u) = ui_guard.as_mut() {
-                if !u.device_info_caption.is_null() {
-                    set_field(u.device_info_caption, device_info_caption_for_key(new_dev));
-                }
-                fill_mouse_device_controls(u, &resolved);
-                // Keep the user's current enable_mouse state; only recompute freeze + visibility.
-                update_mouse_controls_enabled(u);
-                update_mode_dependent_visibility(u);
-                update_pointer_accel_visibility(u);
-                super::note_mouse_page_materialized_after_direct_fill();
-                // Device switch: reload the in-edit mappings from the new device's own profile.
-                let dev = current_selected_device();
-                let prof_idx = find_profile_index(&cfg, dev);
-                *MAPPING_EDITS.lock().unwrap() = prof_idx
-                    .map(|i| cfg.mouse.profiles[i].button_mappings.clone())
-                    .unwrap_or_default();
+    callback_guard::void("handle_device_changed", || {
+        let popup = sender as *mut AnyObject;
+        let idx: isize = unsafe { msg_send![popup, indexOfSelectedItem] };
+        // DEVICE_POPUP_KEYS: Vec<DeviceKey>; get the key for the selected item (all concrete
+        // devices; no wildcard entry).
+        let new_dev = DEVICE_POPUP_KEYS.lock().unwrap().get(idx as usize).copied();
+        *SELECTED_DEVICE.lock().unwrap() = Some(new_dev);
+        // Only refresh the mouse page's per-device controls -- a full load_settings_from would
+        // reset the enable_mouse switch to the saved cfg.mouse.enabled, wiping the user's
+        // unsaved toggle (enable mouse control is a global setting; device switches must not
+        // touch it).
+        let cfg = CONFIG.read().unwrap().clone();
+        let resolved = resolve_selected_from(&cfg);
+        unsafe {
+            with_settings_ui(|ui_guard| {
+                if let Some(u) = ui_guard.as_mut() {
+                    if !u.device_info_caption.is_null() {
+                        set_field(u.device_info_caption, device_info_caption_for_key(new_dev));
+                    }
+                    fill_mouse_device_controls(u, &resolved);
+                    // Keep the user's current enable_mouse state; only recompute freeze + visibility.
+                    update_mouse_controls_enabled(u);
+                    update_mode_dependent_visibility(u);
+                    update_pointer_accel_visibility(u);
+                    super::note_mouse_page_materialized_after_direct_fill();
+                    // Device switch: reload the in-edit mappings from the new device's own profile.
+                    let dev = current_selected_device();
+                    let prof_idx = find_profile_index(&cfg, dev);
+                    *MAPPING_EDITS.lock().unwrap() = prof_idx
+                        .map(|i| cfg.mouse.profiles[i].button_mappings.clone())
+                        .unwrap_or_default();
 
-                render_mapping_rows_locked(u);
-            }
-        });
-    }
+                    render_mapping_rows_locked(u);
+                }
+            });
+        }
+    });
 }
 
 // Sidebar click callback: read the sender's tag and switch to that page.
 
 pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
-    // Navigating away also cancels an unfinished destructive confirmation.
-    collapse_restore_confirmations(true);
-    // A nav click means "show me this page": it leaves the search results first, or the query
-    // stays active and keeps the pages covered.
-    sidebar::clear_settings_search();
-    let btn = sender as *mut AnyObject;
-    let tag: isize = unsafe { msg_send![btn, tag] };
-    select_sidebar(tag as usize);
+    callback_guard::void("on_sidebar_select", || {
+        // Navigating away also cancels an unfinished destructive confirmation.
+        collapse_restore_confirmations(true);
+        // A nav click means "show me this page": it leaves the search results first, or the query
+        // stays active and keeps the pages covered.
+        sidebar::clear_settings_search();
+        let btn = sender as *mut AnyObject;
+        let tag: isize = unsafe { msg_send![btn, tag] };
+        select_sidebar(tag as usize);
+    });
 }
 
 /// The settings "export logs" button: copy the active log file to a user-chosen
 /// NSSavePanel destination. The read yields a point-in-time snapshot; the background
 /// writer keeps appending to the original file, so the two never interfere.
 pub(crate) extern "C" fn handle_export_logs(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    let Some(source) = crate::logger::active_log_path() else {
-        super::window::show_alert(
-            &t("settings.export_failed_title"),
-            &t("settings.export_failed_no_source"),
-        );
-        return;
-    };
-    // a cancelled save panel is a silent no-op
-    let destination = match unsafe { run_save_panel(&suggested_export_log_name()) } {
-        Some(dest) => dest,
-        None => return,
-    };
-    let outcome = std::fs::read(&source)
-        .map_err(|e| e.to_string())
-        .and_then(|bytes| std::fs::write(&destination, bytes).map_err(|e| e.to_string()));
-    match outcome {
-        Ok(()) => super::window::show_alert(
-            &t("settings.export_done_title"),
-            &tf("settings.export_done_msg", &[("path", &destination)]),
-        ),
-        Err(reason) => super::window::show_alert(
-            &t("settings.export_failed_title"),
-            &tf("settings.export_failed_msg", &[("reason", &reason)]),
-        ),
-    }
+    callback_guard::void("handle_export_logs", || {
+        let Some(source) = crate::logger::active_log_path() else {
+            super::window::show_alert(
+                &t("settings.export_failed_title"),
+                &t("settings.export_failed_no_source"),
+            );
+            return;
+        };
+        // a cancelled save panel is a silent no-op
+        let destination = match unsafe { run_save_panel(&suggested_export_log_name()) } {
+            Some(dest) => dest,
+            None => return,
+        };
+        let outcome = std::fs::read(&source)
+            .map_err(|e| e.to_string())
+            .and_then(|bytes| std::fs::write(&destination, bytes).map_err(|e| e.to_string()));
+        match outcome {
+            Ok(()) => super::window::show_alert(
+                &t("settings.export_done_title"),
+                &tf("settings.export_done_msg", &[("path", &destination)]),
+            ),
+            Err(reason) => super::window::show_alert(
+                &t("settings.export_failed_title"),
+                &tf("settings.export_failed_msg", &[("reason", &reason)]),
+            ),
+        }
+    });
 }
 
 /// Suggested export filename: oh-my-tab-YYYYMMDD-HHMMSS.log. The export is a point-in-time
@@ -2308,27 +2345,29 @@ pub(crate) extern "C" fn handle_export_settings(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let config = CONFIG.read().unwrap().clone();
-    let version = unsafe { bundle_info_string("CFBundleShortVersionString") };
-    let content = portability::export_toml(&config, &version, &local_timestamp_stamp());
-    // A cancelled save panel is a silent no-op.
-    let Some(destination) = (unsafe { run_save_panel(&suggested_export_config_name()) }) else {
-        return;
-    };
-    // No single-flight gate here: the exported bytes and the destination are both private to this
-    // call, so two exports cannot interfere and the later completion simply wins the toast.
-    if !spawn_worker("settings-export", move || {
-        let outcome =
-            crate::config::atomic_write(std::path::Path::new(&destination), content.as_bytes())
-                .map(|()| destination);
-        *PENDING_EXPORT.lock().unwrap() = Some(outcome);
-        notify_main(sel!(handleExportSettingsReady:));
-    }) {
-        show_alert(
-            &t("settings.export_settings_failed_title"),
-            &t("settings.worker_unavailable"),
-        );
-    }
+    callback_guard::void("handle_export_settings", || {
+        let config = CONFIG.read().unwrap().clone();
+        let version = unsafe { bundle_info_string("CFBundleShortVersionString") };
+        let content = portability::export_toml(&config, &version, &local_timestamp_stamp());
+        // A cancelled save panel is a silent no-op.
+        let Some(destination) = (unsafe { run_save_panel(&suggested_export_config_name()) }) else {
+            return;
+        };
+        // No single-flight gate here: the exported bytes and the destination are both private to this
+        // call, so two exports cannot interfere and the later completion simply wins the toast.
+        if !spawn_worker("settings-export", move || {
+            let outcome =
+                crate::config::atomic_write(std::path::Path::new(&destination), content.as_bytes())
+                    .map(|()| destination);
+            *PENDING_EXPORT.lock().unwrap() = Some(outcome);
+            notify_main(sel!(handleExportSettingsReady:));
+        }) {
+            show_alert(
+                &t("settings.export_settings_failed_title"),
+                &t("settings.worker_unavailable"),
+            );
+        }
+    });
 }
 
 /// Main-thread continuation of "Export settings": report where the file landed, or why it did not.
@@ -2337,22 +2376,24 @@ pub(crate) extern "C" fn handle_export_settings_ready(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    let Some(outcome) = PENDING_EXPORT.lock().unwrap().take() else {
-        return;
-    };
-    match outcome {
-        Ok(destination) => {
-            log_info!("[settings] exported configuration to {}", destination);
-            show_settings_toast(&t("settings.toast_settings_exported"));
-        }
-        Err(reason) => show_alert(
-            &t("settings.export_settings_failed_title"),
-            &tf(
-                "settings.export_settings_failed_msg",
-                &[("reason", &reason)],
+    callback_guard::void("handle_export_settings_ready", || {
+        let Some(outcome) = PENDING_EXPORT.lock().unwrap().take() else {
+            return;
+        };
+        match outcome {
+            Ok(destination) => {
+                log_info!("[settings] exported configuration to {}", destination);
+                show_settings_toast(&t("settings.toast_settings_exported"));
+            }
+            Err(reason) => show_alert(
+                &t("settings.export_settings_failed_title"),
+                &tf(
+                    "settings.export_settings_failed_msg",
+                    &[("reason", &reason)],
+                ),
             ),
-        ),
-    }
+        }
+    });
 }
 
 /// Start a background worker, reporting a spawn failure instead of panicking.
@@ -2383,48 +2424,50 @@ pub(crate) extern "C" fn handle_import_settings(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    // One import at a time, held from before the panel opens until the result has been applied and
-    // reported. Without this, two clicks start two workers that share one result slot: the slower
-    // one would overwrite the faster one's outcome, and whatever applied last would win rather than
-    // whichever the user chose last.
-    if IMPORT_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        return;
-    }
-    // The flag is released in exactly one place, the ready callback, which also covers "the user
-    // cancelled the panel" and every failure between here and the worker finishing.
-    // The panel runs its own modal loop; no CONFIG lock is held across it.
-    let Some(path) = (unsafe { run_open_panel() }) else {
-        IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
-        return;
-    };
-    if !spawn_worker("settings-import", move || {
-        // Read, parse and persist all happen here, off the main thread: the picked file may be on a
-        // slow volume, and committing waits for an fsync.
-        let outcome = match read_import_file(&path) {
-            Ok(content) => match portability::parse_export(&content) {
-                Ok(parsed) => match commit_imported_config(parsed, "file") {
-                    Ok((old, next, repaired)) => ImportOutcome::Committed {
-                        old: Box::new(old),
-                        next: Box::new(next),
-                        repaired,
-                    },
-                    Err(reason) => ImportOutcome::CommitFailed(reason),
-                },
-                Err(error) => ImportOutcome::Refused(error),
-            },
-            Err(error) => ImportOutcome::Unreadable(error),
+    callback_guard::void("handle_import_settings", || {
+        // One import at a time, held from before the panel opens until the result has been applied and
+        // reported. Without this, two clicks start two workers that share one result slot: the slower
+        // one would overwrite the faster one's outcome, and whatever applied last would win rather than
+        // whichever the user chose last.
+        if IMPORT_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        // The flag is released in exactly one place, the ready callback, which also covers "the user
+        // cancelled the panel" and every failure between here and the worker finishing.
+        // The panel runs its own modal loop; no CONFIG lock is held across it.
+        let Some(path) = (unsafe { run_open_panel() }) else {
+            IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
+            return;
         };
-        *PENDING_IMPORT.lock().unwrap() = Some(outcome);
-        // Wake the main thread; the outcome is picked up there. Reading MENU_TARGET off-main
-        // would trip the main-thread assertion, so this goes through the dispatch handle.
-        notify_main(sel!(handleImportSettingsReady:));
-    }) {
-        IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
-        show_alert(
-            &t("settings.import_settings_failed_title"),
-            &t("settings.worker_unavailable"),
-        );
-    }
+        if !spawn_worker("settings-import", move || {
+            // Read, parse and persist all happen here, off the main thread: the picked file may be on a
+            // slow volume, and committing waits for an fsync.
+            let outcome = match read_import_file(&path) {
+                Ok(content) => match portability::parse_export(&content) {
+                    Ok(parsed) => match commit_imported_config(parsed, "file") {
+                        Ok((old, next, repaired)) => ImportOutcome::Committed {
+                            old: Box::new(old),
+                            next: Box::new(next),
+                            repaired,
+                        },
+                        Err(reason) => ImportOutcome::CommitFailed(reason),
+                    },
+                    Err(error) => ImportOutcome::Refused(error),
+                },
+                Err(error) => ImportOutcome::Unreadable(error),
+            };
+            *PENDING_IMPORT.lock().unwrap() = Some(outcome);
+            // Wake the main thread; the outcome is picked up there. Reading MENU_TARGET off-main
+            // would trip the main-thread assertion, so this goes through the dispatch handle.
+            notify_main(sel!(handleImportSettingsReady:));
+        }) {
+            IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
+            show_alert(
+                &t("settings.import_settings_failed_title"),
+                &t("settings.worker_unavailable"),
+            );
+        }
+    });
 }
 
 /// Whether an import is currently in flight. A plain flag rather than a counter: the second
@@ -2463,49 +2506,51 @@ pub(crate) extern "C" fn handle_import_settings_ready(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    // Release the single-flight gate at the top, before any early return: the flag must not
-    // outlive this callback, or every later import would be refused as "already in flight".
-    IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
-    let Some(outcome) = PENDING_IMPORT.lock().unwrap().take() else {
-        return;
-    };
-    match outcome {
-        ImportOutcome::Refused(error) => show_alert(
-            &t("settings.import_settings_failed_title"),
-            &import_error_message(&error),
-        ),
-        ImportOutcome::Unreadable(error) => show_alert(
-            &t("settings.import_settings_failed_title"),
-            &read_error_message(&error),
-        ),
-        ImportOutcome::CommitFailed(reason) => show_alert(
-            &t("settings.import_settings_failed_title"),
-            &tf(
-                "settings.import_settings_failed_msg",
-                &[("reason", &reason)],
+    callback_guard::void("handle_import_settings_ready", || {
+        // Release the single-flight gate at the top, before any early return: the flag must not
+        // outlive this callback, or every later import would be refused as "already in flight".
+        IMPORT_IN_FLIGHT.store(false, Ordering::SeqCst);
+        let Some(outcome) = PENDING_IMPORT.lock().unwrap().take() else {
+            return;
+        };
+        match outcome {
+            ImportOutcome::Refused(error) => show_alert(
+                &t("settings.import_settings_failed_title"),
+                &import_error_message(&error),
             ),
-        ),
-        ImportOutcome::Committed {
-            old,
-            next,
-            repaired,
-        } => {
-            // The disk write already succeeded on the worker; only the runtime side effects and the
-            // window refresh are left for the main thread.
-            apply_imported_runtime(&old, &next);
-            // Partial success: the loader keeps every valid field and falls back on the rest, which
-            // the user has to be told. It gets the alert rather than the toast because the
-            // explanation does not fit the toast's fixed single line.
-            if repaired {
-                show_alert(
-                    &t("settings.import_settings_partial_title"),
-                    &t("settings.import_settings_partial_msg"),
-                );
-            } else {
-                show_settings_toast(&t("settings.toast_settings_imported"));
+            ImportOutcome::Unreadable(error) => show_alert(
+                &t("settings.import_settings_failed_title"),
+                &read_error_message(&error),
+            ),
+            ImportOutcome::CommitFailed(reason) => show_alert(
+                &t("settings.import_settings_failed_title"),
+                &tf(
+                    "settings.import_settings_failed_msg",
+                    &[("reason", &reason)],
+                ),
+            ),
+            ImportOutcome::Committed {
+                old,
+                next,
+                repaired,
+            } => {
+                // The disk write already succeeded on the worker; only the runtime side effects and the
+                // window refresh are left for the main thread.
+                apply_imported_runtime(&old, &next);
+                // Partial success: the loader keeps every valid field and falls back on the rest, which
+                // the user has to be told. It gets the alert rather than the toast because the
+                // explanation does not fit the toast's fixed single line.
+                if repaired {
+                    show_alert(
+                        &t("settings.import_settings_partial_title"),
+                        &t("settings.import_settings_partial_msg"),
+                    );
+                } else {
+                    show_settings_toast(&t("settings.toast_settings_imported"));
+                }
             }
         }
-    }
+    });
 }
 
 /// Upper bound on an imported file. A settings export is a few kilobytes; anything far past that
@@ -2902,6 +2947,119 @@ mod tests {
         assert_eq!(smooth_slider_display(8.04, 0.0, 8.0), "8.0");
         assert_eq!(smooth_slider_display(f64::NAN, 0.0, 2.0), "0.0");
     }
+    /// Every field a control can report must have exactly one apply branch, and every control the
+    /// freeze lists name must be one a control reports.
+    ///
+    /// Why a source scan: `control_field_of` matches control POINTERS by hand and `apply_control_field`
+    /// matches the enum by hand, so a field can be added to one and not the other with nothing failing
+    /// -- the setting then shows, animates and writes nothing (`on_control_changed` logs "unknown sender"
+    /// and returns). The pointer table is invisible to the type system, which is exactly why the
+    /// settings checklist exists; this makes its step 10/11 machine-checked.
+    #[test]
+    fn every_control_field_is_wired_in_both_directions() {
+        // Read the file instead of `include_str!`: the scan would otherwise see this test's own
+        // source, and the string literals below would satisfy its own search.
+        let source = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/src/settings/dispatch.rs"
+        ))
+        .expect("dispatch.rs");
+        // The enum's variants, from its declaration block.
+        let enum_start = source.find("pub(super) enum ControlField {").expect("enum");
+        let enum_end = source[enum_start..].find('}').expect("enum end") + enum_start;
+        let body = &source[enum_start + 1..enum_end];
+        let mut variants = Vec::new();
+        for line in body.lines() {
+            let line = line.trim();
+            if line.starts_with("//") || line.is_empty() {
+                continue;
+            }
+            // A variant line is `Name,` or `Name(Type)`: the identifier must START the line and be
+            // followed by a comma or a paren. Blanking the leading word only (as an earlier version
+            // did) picked `ub` out of a wrapped doc comment, and then reported a variant that does
+            // not exist.
+            let name: String = line
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            let rest = line[name.len()..].trim_start();
+            let looks_like_variant = line.starts_with(|c: char| c.is_ascii_alphabetic())
+                && name.starts_with(|c: char| c.is_ascii_uppercase())
+                && (rest.starts_with(',') || rest.starts_with('('));
+            if !name.is_empty() && looks_like_variant {
+                variants.push(name);
+            }
+        }
+        // Counter-example: a wrapped doc comment whose continuation line begins with a word
+        // must not be read as a variant. An earlier version of this parser reported `ub` out of
+        // "…`handleBindingDelete:`), not" and then failed for a variant that does not exist.
+        let mut found: Vec<&str> = variants.iter().map(String::as_str).collect();
+        found.sort_unstable();
+        assert!(
+            !found.contains(&"ub"),
+            "a doc-comment continuation must not parse as a variant: {found:?}"
+        );
+        assert!(found.contains(&"Theme") && found.contains(&"FinderMenuCopyPath"));
+        assert!(
+            found.contains(&"FinderMenuNewFileType"),
+            "a tuple variant counts"
+        );
+        variants.sort();
+        variants.dedup();
+        assert!(
+            variants.len() > 40,
+            "the enum parse found only {} variants; it cannot decide",
+            variants.len()
+        );
+
+        // Both blocks that must mention every variant: the pointer lookup and the apply match.
+        // Cut the source at the test module: everything past it is this test's own text, and the
+        // string literals below ("ControlField::…") would make every search find itself. An earlier
+        // version searched the whole file, so `lookup` ran past into `apply_control_field` and a
+        // deleted pointer mapping still passed.
+        let production = source
+            .split("#[cfg(test)]\nmod tests")
+            .next()
+            .expect("production code");
+        assert!(
+            production.len() < source.len(),
+            "the test module was not found; the scan would read its own literals"
+        );
+        let block_of = |start_marker: &str| -> String {
+            let start = production
+                .find(start_marker)
+                .unwrap_or_else(|| panic!("`{start_marker}` not found"));
+            // The function body ends at the first line that is exactly `}` at column 0.
+            let rest = &production[start..];
+            let end = rest.find("\n}\n").map(|end| end + 3).unwrap_or(rest.len());
+            rest[..end].to_string()
+        };
+        let lookup = block_of("fn control_field_of(");
+        let apply = block_of("fn apply_control_field(");
+        // Counter-example against a mis-cut range: the two blocks must be disjoint, or a variant
+        // found in one would satisfy the other.
+        assert!(
+            !apply.contains("fn control_field_of("),
+            "the apply range swallowed the lookup function; the scan cannot decide"
+        );
+        let mut missing = Vec::new();
+        for variant in &variants {
+            let token = format!("ControlField::{variant}");
+            if !lookup.contains(&token) {
+                missing.push(format!("{variant}: no control_field_of branch"));
+            }
+            // The apply match names the variant bare (`ControlField::Theme => {`), so search the
+            // qualified form there too.
+            if !apply.contains(&token) {
+                missing.push(format!("{variant}: no apply_control_field branch"));
+            }
+        }
+        assert!(
+            missing.is_empty(),
+            "a ControlField without a branch shows a setting that does nothing:\n  {}",
+            missing.join("\n  ")
+        );
+    }
 }
 
 // MARK: - Settings search
@@ -2912,17 +3070,19 @@ pub(crate) extern "C" fn handle_settings_search_changed(
     _cmd: Sel,
     notification: *mut c_void,
 ) {
-    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
-    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
-    // notification loses one refresh; an abort loses the app.
-    if crate::settings::settings_ui_borrowed() {
-        return;
-    }
+    callback_guard::void("handle_settings_search_changed", || {
+        // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+        // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+        // notification loses one refresh; an abort loses the app.
+        if crate::settings::settings_ui_borrowed() {
+            return;
+        }
 
-    unsafe {
-        let field: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
-        sidebar::settings_search_field_changed(field);
-    }
+        unsafe {
+            let field: *mut AnyObject = msg_send![notification as *mut AnyObject, object];
+            sidebar::settings_search_field_changed(field);
+        }
+    });
 }
 
 /// The search field began editing: the shell switches to the mock's focused ring.
@@ -2931,7 +3091,9 @@ pub(crate) extern "C" fn handle_settings_search_began_editing(
     _cmd: Sel,
     _notification: *mut c_void,
 ) {
-    sidebar::set_settings_search_focused(true);
+    callback_guard::void("handle_settings_search_began_editing", || {
+        sidebar::set_settings_search_focused(true);
+    });
 }
 
 /// The search field stopped editing: the shell drops the ring.
@@ -2942,8 +3104,14 @@ pub(crate) extern "C" fn handle_settings_search_ended_editing(
     _cmd: Sel,
     _notification: *mut c_void,
 ) -> objc2::runtime::Bool {
-    sidebar::set_settings_search_focused(false);
-    objc2::runtime::Bool::YES
+    callback_guard::value(
+        "handle_settings_search_ended_editing",
+        objc2::runtime::Bool::YES,
+        || {
+            sidebar::set_settings_search_focused(false);
+            objc2::runtime::Bool::YES
+        },
+    )
 }
 
 /// The search field's clear chip: empty the query and restore the page content.
@@ -2952,12 +3120,14 @@ pub(crate) extern "C" fn handle_settings_search_clear(
     _cmd: Sel,
     _sender: *mut c_void,
 ) {
-    // A rebuild/hide running inside `with_settings_ui` may deliver this callback
-    // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
-    // notification loses one refresh; an abort loses the app.
-    if crate::settings::settings_ui_borrowed() {
-        return;
-    }
+    callback_guard::void("handle_settings_search_clear", || {
+        // A rebuild/hide running inside `with_settings_ui` may deliver this callback
+        // re-entrantly (e.g. resigning a field's first responder). Borrow-check it: a dropped
+        // notification loses one refresh; an abort loses the app.
+        if crate::settings::settings_ui_borrowed() {
+            return;
+        }
 
-    sidebar::clear_settings_search();
+        sidebar::clear_settings_search();
+    });
 }

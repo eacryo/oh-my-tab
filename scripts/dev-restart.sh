@@ -7,7 +7,8 @@
 # 传递参数给应用(用于验证只在特定状态下出现的功能,如首次引导/权限分支):
 #   scripts/dev-restart.sh -- --force-onboarding   # `--` 之后的 argv 原样透传给应用
 #   scripts/dev-restart.sh --force-onboarding      # 脚本不认识的 --* 参数也照样透传
-#   scripts/dev-restart.sh --no-onboarding         # 跳过本次启动的引导
+#   scripts/devcat /tmp/marker.txt; echo done-ok
+#   -restart.sh --no-onboarding         # 跳过本次启动的引导
 # 开关只在本次启动生效:脚本每次先按身份停掉旧实例,不会残留。
 # 为什么不用环境变量:开发版由 launchd 启动,而 launchd 任务不继承调用者环境;以前靠白名单转发
 # OH_MY_TAB_*,一旦过滤写漏就会把整份环境(云凭证、代理)灌进任务与日志 —— 2026-09-22 出过这次
