@@ -1,5 +1,5 @@
 //! Status bar menu: menu-item state (SHORTCUT_ITEM / FIXED_MENU_ITEMS), menu action
-//! callbacks (handle_quit / toggle_shortcut / toggle_theme / reload_config), shortcut-mode
+//! callbacks (handle_quit / select_modifier / toggle_theme / reload_config), shortcut-mode
 //! switching, and menu-title refresh. setup_status_bar stays in main.rs (setup wiring).
 
 use objc2::runtime::{AnyObject, Sel};
@@ -12,7 +12,7 @@ use std::sync::atomic::Ordering;
 use crate::config::{persist_config_now, reload_config, CONFIG};
 use crate::event_monitor::SHORTCUT_IS_CMD;
 use crate::ffi::*;
-use crate::i18n::t;
+use crate::i18n::{t, tf};
 use crate::icon_cache::clear_icon_cache;
 use crate::overlay::extract_uncached_icons;
 // cross-module shared state (owned by main.rs)
@@ -20,8 +20,14 @@ use crate::log_debug;
 use crate::log_info;
 use crate::with_tab_state;
 
+/// The shortcut-mode submenu: the parent item whose title carries the current value, and the three
+/// modifier items below it.
 pub(crate) struct ShortcutState {
     pub(crate) item: *mut AnyObject,
+    /// Child items indexed by *config* value, not by display order: index i selects
+    /// `SWITCHER_MODIFIER_VALUES[i]`. The menu lists Command first, so the display order and this
+    /// index deliberately differ.
+    pub(crate) choices: [*mut AnyObject; 3],
 }
 
 pub(crate) struct ThumbnailState {
@@ -220,25 +226,79 @@ pub(crate) unsafe fn set_menu_item_title(item: *mut AnyObject, title: &str) {
     }
 }
 
-/// Set shortcut mode from the config modifier name ("command" / "option" / "control"), syncing
-/// the runtime SHORTCUT_IS_CMD / SHORTCUT_IS_CTRL flags and the menu label.
-pub(crate) fn set_shortcut_mode(modifier: &str) {
-    let is_cmd = modifier == "command";
-    SHORTCUT_IS_CMD.store(is_cmd, Ordering::SeqCst);
-    crate::event_monitor::SHORTCUT_IS_CTRL.store(modifier == "control", Ordering::SeqCst);
-    let key = if is_cmd {
-        "menu.toggle_shortcut.opt"
-    } else {
-        "menu.toggle_shortcut.cmd"
-    };
-    let item = with_menu_ui(|ui| ui.shortcut.as_ref().map(|state| state.item));
-    if let Some(item) = item {
-        unsafe {
-            set_menu_item_title(item, &t(key));
-        }
+/// Display order of the modifier submenu, as (config index, locale key). Command reads first
+/// because it is the default and the platform's own switch shortcut; the config array keeps its
+/// own order (the settings popup depends on it), so mapping is explicit rather than positional.
+pub(crate) const SHORTCUT_MENU_ORDER: [(usize, &str); 3] = [
+    (1, "menu.shortcut.command"),
+    (0, "menu.shortcut.option"),
+    (2, "menu.shortcut.control"),
+];
+
+/// The tag a submenu child carries: the config index it selects. Tags are resolved back through
+/// `SWITCHER_MODIFIER_VALUES`, never treated as a display position.
+pub(crate) fn shortcut_menu_tag(config_index: usize) -> isize {
+    config_index as isize
+}
+
+/// Resolve a submenu item's tag to a config index. `None` for a missing sender, a negative tag or a
+/// tag past the config array: an invalid choice is refused rather than silently meaning Option.
+fn shortcut_config_index_for_tag(tag: isize) -> Option<usize> {
+    usize::try_from(tag)
+        .ok()
+        .filter(|index| *index < crate::config::SWITCHER_MODIFIER_VALUES.len())
+}
+
+/// The current modifier as the menu renders it (`⌘Tab` / `⌥Tab` / `⌃Tab`).
+fn shortcut_menu_value(modifier: &str) -> String {
+    match modifier {
+        "option" => "⌥Tab".to_string(),
+        "control" => "⌃Tab".to_string(),
+        _ => "⌘Tab".to_string(),
     }
 }
 
+/// Render the shortcut submenu from the config: parent title, three child titles, and the one
+/// check mark. The single entry point for startup, a locale change and a modifier change -- a
+/// second writer is how the two-item label survived past the three-way config.
+pub(crate) fn refresh_shortcut_menu() {
+    let modifier = CONFIG
+        .read()
+        .map(|cfg| cfg.keyboard.modifier.clone())
+        .unwrap_or_default();
+    let current = crate::config::switcher_modifier_index_of(&modifier);
+    let handles = with_menu_ui(|ui| {
+        ui.shortcut
+            .as_ref()
+            .map(|state| (state.item, state.choices))
+    });
+    let Some((parent, choices)) = handles else {
+        return;
+    };
+    unsafe {
+        let parent_title = tf(
+            "menu.shortcut.current",
+            &[("shortcut", &shortcut_menu_value(&modifier))],
+        );
+        set_menu_item_full_title(parent, &parent_title);
+        for (config_index, key) in SHORTCUT_MENU_ORDER {
+            let item = choices[config_index];
+            if item.is_null() {
+                continue;
+            }
+            set_menu_item_full_title(item, &t(key));
+            let _: () =
+                msg_send![item, setState: if config_index == current { 1isize } else { 0isize }];
+        }
+    }
+}
+/// Set shortcut mode from the config modifier name ("command" / "option" / "control"), syncing
+/// the runtime SHORTCUT_IS_CMD / SHORTCUT_IS_CTRL flags and the submenu.
+pub(crate) fn set_shortcut_mode(modifier: &str) {
+    SHORTCUT_IS_CMD.store(modifier == "command", Ordering::SeqCst);
+    crate::event_monitor::SHORTCUT_IS_CTRL.store(modifier == "control", Ordering::SeqCst);
+    refresh_shortcut_menu();
+}
 /// Set the thumbnail menu item's title; the title describes the mode activated by the click.
 pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     let key = if thumbnails_enabled {
@@ -620,18 +680,10 @@ pub(crate) fn refresh_menu_titles() {
     set_thumbnail_mode(CONFIG.read().unwrap().layout.thumbnails_enabled);
     refresh_service_menu();
     refresh_clipboard_pause_item();
+    // The shortcut submenu reads the config through one function, so startup, a locale change
+    // and a modifier change cannot disagree about which modifier is current.
+    refresh_shortcut_menu();
     unsafe {
-        // shortcut item
-        let is_cmd = SHORTCUT_IS_CMD.load(Ordering::SeqCst);
-        let sc_key = if is_cmd {
-            "menu.toggle_shortcut.opt"
-        } else {
-            "menu.toggle_shortcut.cmd"
-        };
-        let shortcut = with_menu_ui(|ui| ui.shortcut.as_ref().map(|state| state.item));
-        if let Some(item) = shortcut {
-            set_menu_item_title(item, &t(sc_key));
-        }
         // fixed-title items
         let fixed = with_menu_ui(|ui| {
             ui.fixed
@@ -700,22 +752,34 @@ pub(crate) extern "C" fn handle_open_screen_recording_privacy(
     });
 }
 
-pub(crate) extern "C" fn handle_toggle_shortcut(
+pub(crate) extern "C" fn handle_select_modifier(
     _self: *mut c_void,
     _cmd: Sel,
-    _sender: *mut c_void,
+    sender: *mut c_void,
 ) {
-    crate::callback_guard::void("handle_toggle_shortcut", || {
-        let is_cmd = !SHORTCUT_IS_CMD.load(Ordering::SeqCst);
-        // Persist to config (matches theme toggle, so the choice survives restart).
+    crate::callback_guard::void("handle_select_modifier", || {
+        // Refuse before touching the config: an absent sender or an out-of-range tag names no
+        // modifier, and falling back to Option would silently rewrite the user's choice.
+        let tag: isize = if sender.is_null() {
+            log_info!("Shortcut: refused, no sender");
+            return;
+        } else {
+            unsafe { msg_send![sender as *mut AnyObject, tag] }
+        };
+        let Some(index) = shortcut_config_index_for_tag(tag) else {
+            log_info!("Shortcut: refused, tag {tag} names no modifier");
+            return;
+        };
+        let modifier = crate::config::switcher_modifier_value_at(index).to_string();
         let old_cfg = CONFIG.read().unwrap().clone();
+        if old_cfg.keyboard.modifier == modifier {
+            // Selecting the current value is a no-op: nothing to persist, nothing to re-apply.
+            refresh_shortcut_menu();
+            return;
+        }
         let new_cfg = {
             let mut cfg = old_cfg.clone();
-            cfg.keyboard.modifier = if is_cmd {
-                "command".to_string()
-            } else {
-                "option".to_string()
-            };
+            cfg.keyboard.modifier = modifier.clone();
             if let Ok(mut current) = CONFIG.write() {
                 *current = cfg.clone();
             }
@@ -727,10 +791,9 @@ pub(crate) extern "C" fn handle_toggle_shortcut(
             &new_cfg,
             crate::runtime_config::ConfigChangeSource::Menu,
         );
-        log_info!("Shortcut: {}", if is_cmd { "Cmd+Tab" } else { "Opt+Tab" });
+        log_info!("Shortcut: {modifier}");
     });
 }
-
 pub(crate) extern "C" fn handle_toggle_thumbnail(
     _self: *mut c_void,
     _cmd: Sel,
@@ -803,9 +866,62 @@ pub(crate) extern "C" fn handle_clear_caches(_self: *mut c_void, _cmd: Sel, _sen
 #[cfg(test)]
 mod tests {
     use super::{
-        capped_menu_title_width, compact_menu_title_by, MENU_TITLE_MAX_WIDTH, MENU_TITLE_MIN_WIDTH,
+        capped_menu_title_width, compact_menu_title_by, shortcut_config_index_for_tag,
+        shortcut_menu_tag, shortcut_menu_value, MENU_TITLE_MAX_WIDTH, MENU_TITLE_MIN_WIDTH,
+        SHORTCUT_MENU_ORDER,
     };
 
+    #[test]
+    fn every_modifier_reaches_the_menu_and_the_config() {
+        // The menu used to be a two-state toggle (Cmd<->Opt), so a Control+Tab user could not get
+        // back to Control from the menu at all. Drive all three choices through the same entry the
+        // menu item uses and check the whole chain: config, persistence and the runtime flags.
+        for (config_index, key) in SHORTCUT_MENU_ORDER {
+            let tag = shortcut_menu_tag(config_index);
+            let resolved = shortcut_config_index_for_tag(tag);
+            assert_eq!(
+                resolved,
+                Some(config_index),
+                "{key} must round-trip through its tag"
+            );
+            assert_eq!(
+                crate::config::switcher_modifier_value_at(config_index),
+                match config_index {
+                    0 => "option",
+                    1 => "command",
+                    _ => "control",
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn display_order_is_not_the_config_index() {
+        // Command reads first while `SWITCHER_MODIFIER_VALUES` starts with Option. Collapsing the
+        // two would make the submenu's second row select Command when it says Option.
+        let displayed: Vec<usize> = SHORTCUT_MENU_ORDER.iter().map(|(i, _)| *i).collect();
+        assert_eq!(displayed, vec![1, 0, 2]);
+        assert_eq!(crate::config::SWITCHER_MODIFIER_VALUES[0], "option");
+        assert_eq!(crate::config::SWITCHER_MODIFIER_VALUES[1], "command");
+        assert_eq!(crate::config::SWITCHER_MODIFIER_VALUES[2], "control");
+        assert_eq!(shortcut_config_index_for_tag(1), Some(1));
+    }
+
+    #[test]
+    fn an_invalid_tag_names_no_modifier() {
+        // A refusal, not a fallback: reading these as Option would silently rewrite the user's
+        // choice every time an unrelated item was mistaken for a submenu child.
+        assert_eq!(shortcut_config_index_for_tag(-1), None);
+        assert_eq!(shortcut_config_index_for_tag(3), None);
+        assert_eq!(shortcut_config_index_for_tag(isize::MAX), None);
+    }
+
+    #[test]
+    fn the_parent_title_shows_the_current_value() {
+        assert_eq!(shortcut_menu_value("command"), "⌘Tab");
+        assert_eq!(shortcut_menu_value("option"), "⌥Tab");
+        assert_eq!(shortcut_menu_value("control"), "⌃Tab");
+    }
     #[test]
     fn menu_title_width_stays_compact_until_the_maximum() {
         assert_eq!(capped_menu_title_width(40.0), MENU_TITLE_MIN_WIDTH);

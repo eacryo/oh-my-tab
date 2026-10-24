@@ -104,8 +104,10 @@ txt = "文本文件"
 json = "JSON 文件"
 
 [menu]
-toggle_shortcut.opt = "切换opt+tab"
-toggle_shortcut.cmd = "切换cmd+tab"
+shortcut.current = "应用切换浮窗快捷键：{shortcut}"
+shortcut.command = "Command+Tab"
+shortcut.option = "Option+Tab"
+shortcut.control = "Control+Tab"
 toggle_thumbnail_mode.to_thumbnails = "切换缩略图模式"
 toggle_thumbnail_mode.to_icons = "切换纯图标模式"
 settings = "设置"

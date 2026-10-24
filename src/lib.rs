@@ -2034,8 +2034,8 @@ fn menu_target_class() -> StaticClass {
             );
             class_addMethod(
                 cls,
-                sel!(handleToggleShortcut:),
-                handle_toggle_shortcut as *mut c_void,
+                sel!(handleSelectModifier:),
+                handle_select_modifier as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
@@ -2543,18 +2543,40 @@ fn setup_status_bar() {
         let _: () = msg_send![menu, addItem: service_separator];
 
         // Shortcut toggle item
-        let shortcut_title = make_nsstring(&t("menu.toggle_shortcut.cmd"));
+        // Shortcut mode: a parent item carrying the current value, with the three modifiers in a
+        // submenu. A single toggle item could only express two states, so a Control+Tab user had no
+        // way back to Control from the menu (the old handler flipped Cmd<->Opt only).
+        let mut choices: [*mut AnyObject; 3] = [std::ptr::null_mut(); 3];
+        let shortcut_title = make_nsstring(&t("menu.shortcut.current"));
         let shortcut_key = make_nsstring("");
         let shortcut_item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
-        let shortcut_item: *mut AnyObject = msg_send![shortcut_item, initWithTitle: shortcut_title, action: sel!(handleToggleShortcut:), keyEquivalent: shortcut_key];
+        let shortcut_item: *mut AnyObject = msg_send![shortcut_item, initWithTitle: shortcut_title, action: None::<Sel>, keyEquivalent: shortcut_key];
         CFRelease(shortcut_title as *const c_void);
         CFRelease(shortcut_key as *const c_void);
-        let _: () = msg_send![shortcut_item, setTarget: menu_target];
-        set_menu_item_title(shortcut_item, &t("menu.toggle_shortcut.cmd"));
+        // The menu tree retains the submenu and the submenu retains its items, so the pointers
+        // cached in ShortcutState stay valid for the life of the menu.
+        let submenu_title = make_nsstring("");
+        let submenu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let submenu: *mut AnyObject = msg_send![submenu, initWithTitle: submenu_title];
+        CFRelease(submenu_title as *const c_void);
+        for (config_index, _key) in crate::menu::SHORTCUT_MENU_ORDER {
+            let child_title = make_nsstring("");
+            let child_key = make_nsstring("");
+            let child: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+            let child: *mut AnyObject = msg_send![child, initWithTitle: child_title, action: sel!(handleSelectModifier:), keyEquivalent: child_key];
+            CFRelease(child_title as *const c_void);
+            CFRelease(child_key as *const c_void);
+            let _: () = msg_send![child, setTarget: menu_target];
+            let _: () = msg_send![child, setTag: crate::menu::shortcut_menu_tag(config_index)];
+            let _: () = msg_send![submenu, addItem: child];
+            choices[config_index] = child;
+        }
+        let _: () = msg_send![shortcut_item, setSubmenu: submenu];
         let _: () = msg_send![menu, addItem: shortcut_item];
         with_menu_ui(|ui| {
             ui.shortcut = Some(ShortcutState {
                 item: shortcut_item,
+                choices,
             });
         });
 

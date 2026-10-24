@@ -26,6 +26,28 @@ session). An aggregator child (`smoke-runners.sh`, `run-all.sh`) that exits 75 i
 not FAILED (`run_step` in `scripts/gate.sh`), because it could not decide. A green `--offline` run is not
 a green gate.
 
+**Match the gate to the change. A full run costs about 6.5 minutes, so it must not be the loop.**
+
+Measured on 2026-10-24 with a warm `target/`. `fmt`, `check`, `clippy`, `release-check` and `cargo-test`
+together take about 5s. `a1` takes 44s. `selftests` takes 99s, and most of that is `agent-review-selftest.sh`
+at 84s. `a2` takes 226s, more than half the total. `a2` also needs a focus baseline, another desktop and a
+bound Space shortcut, so it is the tier most exposed to the machine. Paying for it on every edit buys noise,
+not signal. A cold build adds its own compile time on top and belongs to none of these.
+
+| When | Run | Cost |
+| --- | --- | --- |
+| Iterating, nothing handed off | `cargo build` plus the tests for what changed | seconds |
+| Before a review round or a commit | `fmt`, `check`, `clippy`, `cargo-test`, `a1` | ~1.5 min |
+| Before handoff or release | the whole gate, `a2` included | ~6.5 min |
+
+The whole gate is also required for any change to FFI, concurrency, configuration, build or release code.
+
+`scripts/gate.sh --tier=<name>` selects tiers and may be repeated. The middle row is one command:
+`scripts/gate.sh --tier=fmt --tier=check --tier=clippy --tier=cargo-test --tier=a1`.
+
+Two rules bound that shortcut. Report every tier that did not run as NOT RUN in the handoff. Never report
+an unrun tier as green. The middle row suits a change whose blast radius is the code that was edited.
+
 - `scripts/cargo-test.sh` runs the suite and **fails when the run executed no test**. A plain `cargo test`
   exits 0 for a filter that matched nothing (measured: `running 0 tests ... ok`), so a typo in a filter reads
   as a pass; the wrapper makes that case a failure. Pass a filter as an argument and it keeps that guard;
@@ -41,7 +63,7 @@ a green gate.
   scripts/*-selftest.sh` lists them, and the run prints the count it ran.
 - The normal `cargo test` suite is headless-safe; GUI/permission-dependent smoke tests are marked `#[ignore]`.
 - Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
-- Cross-module, unsafe/FFI, concurrency, configuration, build, or release changes require the full gate above. Before handing off a completed feature, always run the full gate and keep all checks clean.
+- Pick the tier row from the table above rather than defaulting to the whole gate. A cross-module change, or one in unsafe/FFI, concurrency, configuration, build or release code, always takes the whole gate. So does any handoff.
 - Start the app with `scripts/dev-restart.sh`, never directly with `cargo run`.
 - `scripts/dev-restart.sh --check` verifies a launch and then **stops it**, leaving neither the process nor
   its launchd job behind; that is the shape an automated check wants. Use it when an A2 or GUI check needs a
@@ -99,7 +121,7 @@ a green gate.
   /Applications registers the same global shortcut, so it is stopped too — with its pids printed, because it
   is the user's own app — and nothing may quietly restore the two-instance situation that once made new
   features look dead.
-- For runtime changes, run `scripts/dev-restart.sh` after the full gate. If it reports `restart FAILED`,
+- For runtime changes, run `scripts/dev-restart.sh` after the gate for that change. If it reports `restart FAILED`,
   inspect the newest log under `~/Library/Logs/oh-my-tab/`, diagnose, and retry.
 - When the onboarding guide does not need verification, launch with `--no-onboarding` (for example, `scripts/dev-restart.sh --no-onboarding`) so it does not appear; only run without it when testing onboarding flows.
 - `scripts/dev-restart.sh` defaults to a **debug** build (`cargo build`): fast iteration with every debug assertion on. Use it for functional iteration and handoff. It re-assembles and re-signs the dev bundle only when the built binary, a bundled resource or the signing identity changed (an input fingerprint decides), and it signs with the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery) -- signing without a secure timestamp, so a local build never depends on Apple's timestamp service. The accepted development identities are the Apple-issued one and the self-signed `oh-my-tab-sign`; **ad-hoc is refused**, and a failure to sign with the Apple identity **aborts the build** unless `--allow-signing-fallback` asks for the self-signed identity on purpose (`--require-stable-signing` demands the Apple identity, both for a fresh build and when reusing an existing bundle). That stable designated requirement is what keeps the login-keychain ACL of the clipboard key and the TCC grants valid across rebuilds: with a self-signed or ad-hoc identity, macOS judges the ACL by the binary, so every rebuild re-prompts.

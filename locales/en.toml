@@ -103,8 +103,10 @@ txt = "Text File"
 json = "JSON File"
 
 [menu]
-toggle_shortcut.opt = "Switch to Option+Tab"
-toggle_shortcut.cmd = "Switch to Command+Tab"
+shortcut.current = "App switcher shortcut: {shortcut}"
+shortcut.command = "Command+Tab"
+shortcut.option = "Option+Tab"
+shortcut.control = "Control+Tab"
 toggle_thumbnail_mode.to_thumbnails = "Switch to Thumbnail Mode"
 toggle_thumbnail_mode.to_icons = "Switch to Icon-Only Mode"
 settings = "Settings"
