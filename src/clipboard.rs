@@ -515,8 +515,15 @@ fn clipboard_palette() -> crate::theme::UiPalette {
 const PICKER_PANEL_RADIUS: f64 = crate::glass::CLIPBOARD_PANEL_RADIUS;
 /// The selected row's wash: `rgba(92, 82, 72, 0.16)`.
 const PICKER_ROW_SELECTED_LIGHT: u32 = 0x5C52_4829;
-/// Hovered (not selected) row wash: `rgba(255, 255, 255, 0.32)`.
-const PICKER_ROW_HOVER_LIGHT: u32 = 0xFFFF_FF52;
+/// Hovered (not selected) row wash: `rgba(92, 82, 72, 0.10)`.
+///
+/// A downward wash, not the mock's upward one. The mock's `rgba(255,255,255,.32)` laid white over
+/// an already-pale material: it measured 1.05-1.06:1 on the light panel of all three materials and
+/// 1.00:1 over a white desktop, so hovering a row changed nothing the eye could see. Dark mode never
+/// had the problem because its wash already darkens. This keeps the mock's warm ink hue -- the same
+/// hue as the selected wash -- and only lowers the alpha, so hover reads at ~1.16:1 on every
+/// material while staying a clear step below selection (~1.26:1).
+const PICKER_ROW_HOVER_LIGHT: u32 = 0x5C52_481A;
 /// Hairline separators (footer top line and friends): `rgba(52, 42, 30, 0.09)`.
 const PICKER_HAIRLINE_LIGHT: u32 = 0x342A_1E17;
 /// Search field fill: `rgba(255, 255, 255, 0.38)`, focused `rgba(255, 255, 255, 0.58)`.
