@@ -704,11 +704,27 @@ struct AxWindowInfo {
     /// The native tab bar this window exposes (only the selected tab's window has one), used by
     /// collect::fold_tab_group to identify the group's windows.
     tab_group: Option<TabGroupInfo>,
-    /// Whether this entry came ONLY from the kAXFocusedWindow/kAXMainWindow slots (absent from
-    /// kAXWindows). Those slots can discover an app window even when its window list is empty;
-    /// normal identity, size, activatable-process, and Space-membership filters decide whether it
-    /// is published because the slots can also hand over helper overlays and child surfaces.
-    only_via_key_or_main: bool,
+    /// Which app-level AX read produced this entry. It is not a boolean any more because there
+    /// are three sources with different authority: kAXWindows is the app's own published list,
+    /// the app's AXChildren carry real windows the app does not publish there (a Finder with an
+    /// empty kAXWindows still hangs every window off AXChildren), and the key/main slots are a
+    /// last resort that can also hand over helper overlays and child surfaces.
+    origin: AxWindowOrigin,
+}
+
+/// Which app-level AX read produced a window entry. The distinction decides admission
+/// (published entries skip the recovered path's checks, recovered ones do not) and it is what
+/// `ax_published_pids` reports, so a source may never be silently upgraded to another.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AxWindowOrigin {
+    /// Named by the app's kAXWindows answer: the app's own list of its windows.
+    Published,
+    /// A direct AXChildren element whose AXRole is AXWindow, for an app whose kAXWindows did
+    /// not name it. Measured on Finder (2026-10-25): kAXWindows answers [] while AXChildren
+    /// lists every real window, so without this source all but the key/main window are lost.
+    Children,
+    /// Reached only through the kAXFocusedWindow/kAXMainWindow slots.
+    KeyOrMain,
 }
 
 // The short TTL only coalesces rapid summon/lifecycle refreshes; expiry still requests a fresh
@@ -1527,13 +1543,48 @@ mod tests {
 
     #[test]
     fn candidate_window_elements_keep_published_order_and_append_key_and_main() {
-        // The three slots fold into one candidate list: kAXWindows order first, then the focused
-        // and main slots; a window repeated in a later slot keeps its first occurrence and is not
-        // marked as coming only from the key/main slots.
+        // The sources fold into one candidate list: kAXWindows order first, then children, then
+        // the focused and main slots; a window repeated in a later source keeps its first
+        // occurrence, so its origin is the most authoritative source that named it.
         let published = [(10u32, 'a'), (11, 'b')];
         assert_eq!(
-            candidate_window_elements(&published, Some((11, 'B')), Some((12, 'c'))),
-            vec![(10, 'a', false), (11, 'b', false), (12, 'c', true)]
+            candidate_window_elements(&published, &[], Some((11, 'B')), Some((12, 'c'))),
+            vec![
+                (10, 'a', AxWindowOrigin::Published),
+                (11, 'b', AxWindowOrigin::Published),
+                (12, 'c', AxWindowOrigin::KeyOrMain),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidate_window_elements_recover_children_when_published_is_empty() {
+        // The measured Finder shape (2026-10-25): kAXWindows answers [], main and focused both
+        // name the same window, and AXChildren lists every real window. Before the children
+        // source existed this produced exactly one card.
+        let children = [(134030u32, 'o'), (133495, 'e'), (133456, 'p')];
+        assert_eq!(
+            candidate_window_elements(&[], &children, Some((134030, 'O')), Some((134030, 'M'))),
+            vec![
+                (134030, 'o', AxWindowOrigin::Children),
+                (133495, 'e', AxWindowOrigin::Children),
+                (133456, 'p', AxWindowOrigin::Children),
+            ]
+        );
+    }
+
+    #[test]
+    fn candidate_window_elements_published_wins_over_children_and_slots() {
+        // A window the app did publish keeps Published even when children and the slots also
+        // name it: admission differs by origin, so the source may not be downgraded by a merge.
+        let published = [(10u32, 'a')];
+        let children = [(10, 'A'), (11, 'b')];
+        assert_eq!(
+            candidate_window_elements(&published, &children, Some((11, 'B')), Some((10, 'x'))),
+            vec![
+                (10, 'a', AxWindowOrigin::Published),
+                (11, 'b', AxWindowOrigin::Children),
+            ]
         );
     }
 
@@ -1541,16 +1592,16 @@ mod tests {
     fn candidate_window_elements_survive_an_empty_published_list() {
         // An empty array is not "no windows": kAXWindows answers empty when every window lives
         // on another Space while focused/main still hand the window over, so returning early on
-        // empty would drop exactly the evidence that discovers it. Recovered entries carry a mark
-        // so callers can apply the normal discovery and Space-membership filters before publish.
+        // empty would drop exactly the evidence that discovers it. Recovered entries carry an
+        // origin so callers can apply the normal discovery and Space-membership filters.
         assert_eq!(
-            candidate_window_elements(&[], Some((7, 'k')), None),
-            vec![(7, 'k', true)]
+            candidate_window_elements(&[], &[], Some((7, 'k')), None),
+            vec![(7, 'k', AxWindowOrigin::KeyOrMain)]
         );
         // focused and main usually point at the same window, which must not become two cards.
         assert_eq!(
-            candidate_window_elements(&[], Some((7, 'k')), Some((7, 'm'))),
-            vec![(7, 'k', true)]
+            candidate_window_elements(&[], &[], Some((7, 'k')), Some((7, 'm'))),
+            vec![(7, 'k', AxWindowOrigin::KeyOrMain)]
         );
     }
 
@@ -1560,16 +1611,19 @@ mod tests {
         // queries are not repeated.
         let published = [(10u32, 'a'), (10, 'A'), (11, 'b')];
         assert_eq!(
-            candidate_window_elements(&published, Some((10, 'x')), Some((11, 'y'))),
-            vec![(10, 'a', false), (11, 'b', false)]
+            candidate_window_elements(&published, &[], Some((10, 'x')), Some((11, 'y'))),
+            vec![
+                (10, 'a', AxWindowOrigin::Published),
+                (11, 'b', AxWindowOrigin::Published),
+            ]
         );
         // Elements with no window id are deduped by the element itself.
         assert_eq!(
-            candidate_window_elements(&[(0u32, 'z')], Some((0, 'z')), None),
-            vec![(0, 'z', false)]
+            candidate_window_elements(&[(0u32, 'z')], &[], Some((0, 'z')), None),
+            vec![(0, 'z', AxWindowOrigin::Published)]
         );
-        // The window is only empty when all three slots are empty.
-        assert!(candidate_window_elements::<char>(&[], None, None).is_empty());
+        // The window is only empty when every source is empty.
+        assert!(candidate_window_elements::<char>(&[], &[], None, None).is_empty());
     }
 
     #[test]
@@ -1583,7 +1637,7 @@ mod tests {
                 is_fullscreen: Some(false),
                 is_custom_root: false,
                 is_floating_window: false,
-                only_via_key_or_main: false,
+                origin: AxWindowOrigin::Published,
                 tab_group: None,
             }
         }

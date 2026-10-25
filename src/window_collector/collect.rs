@@ -37,9 +37,11 @@ struct AxPartial {
     /// answer from a failed query during discovery; SkyLight membership decides which Space owns
     /// any key/main recovery.
     ax_empty_pids: HashSet<i32>,
-    /// Windows recovered ONLY from the key/main slots (absent from kAXWindows), kept per pid:
-    /// they can recover windows AX omits on another Space; activatable-process, size, and exact
-    /// Space-membership filters are applied before publication.
+    /// Windows no published `kAXWindows` named, kept per pid: the app's `AXChildren` entries
+    /// and the key/main-slot ones together (`AxWindowInfo::origin` says which). They recover
+    /// windows AX omits on another Space, and children recover every window of an app whose
+    /// published list is empty. Activatable-process, size, and exact Space-membership filters are
+    /// applied before publication.
     ax_recovered_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>>,
     ax_failed_pids: Vec<i32>,
     ax_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>>,
@@ -71,6 +73,7 @@ unsafe fn application_is_hidden(pid: i32) -> Option<bool> {
 unsafe fn ax_collect_chunk(
     chunk: &[i32],
     pid_names: &HashMap<i32, String>,
+    cg_layer0_ids: &HashMap<i32, HashSet<u32>>,
     show_hidden_app_windows: bool,
 ) -> AxPartial {
     let mut partial = AxPartial {
@@ -104,8 +107,12 @@ unsafe fn ax_collect_chunk(
         // 2026-09-17 22:20 crash). Caught here, that pid degrades to "no windows" with the
         // exception's name/reason logged, and the collection continues -- a process-wide crash
         // becomes one missing card.
+        // The WindowServer's layer-0 windows for this app. The AX read compares them with the
+        // app's published list to decide whether that list is COMPLETE: an answer naming fewer
+        // windows, or a different set, still has gaps that only AXChildren can fill.
+        let cg_layer0 = cg_layer0_ids.get(&pid).cloned().unwrap_or_default();
         let ax_wins = match objc2::exception::catch(std::panic::AssertUnwindSafe(|| {
-            get_ax_windows_for_pid_with_identity(pid, process_start_time_us)
+            get_ax_windows_for_pid_with_identity(pid, process_start_time_us, &cg_layer0)
         })) {
             Ok(windows) => windows,
             Err(exception) => {
@@ -133,11 +140,13 @@ unsafe fn ax_collect_chunk(
         }
         match ax_wins {
             Some(wins) if !wins.is_empty() => {
-                // Split by origin so key/main recovery remains explicit; exact SkyLight
-                // membership and normal-window filters are applied after CG/AX pairing.
+                // Split by origin so recovery remains explicit; exact SkyLight membership and
+                // normal-window filters are applied after CG/AX pairing. Both recovered sources
+                // (children and key/main) take that stricter path; only the app's own published
+                // list is authoritative.
                 let (recovered, published): (Vec<AxWindowInfo>, Vec<AxWindowInfo>) = wins
                     .into_iter()
-                    .partition(|window| window.only_via_key_or_main);
+                    .partition(|window| window.origin != AxWindowOrigin::Published);
                 let published = fold_tab_group(published);
                 if !published.is_empty() {
                     if windows_are_all_untitled(&published) {
@@ -276,19 +285,28 @@ unsafe fn collect_windows_for_pid_inner(
     let display_bounds = active_display_bounds();
 
     let identity = resolve_app_identity(pid);
-    let Some(ax_wins) = get_ax_windows_for_pid_with_identity(pid, identity.process_start_time_us)
-    else {
+    // No WindowServer evidence on this path, so the AX read falls back to its empty-list rule and
+    // never widens this refresh's admission (see the partition below).
+    let no_window_server_evidence: HashSet<u32> = HashSet::new();
+    let Some(ax_wins) = get_ax_windows_for_pid_with_identity(
+        pid,
+        identity.process_start_time_us,
+        &no_window_server_evidence,
+    ) else {
         CFRelease(array);
         return None;
     };
     // A directed (single-app) refresh honours only the kAXWindows answer: windows recovered from
     // the key/main slots are not Space-filtered and are often helper overlays, so they must not
-    // enter the list through this path. When the answer consists solely of recovered windows it
-    // counts as unanswered (None), so the caller keeps the existing cards instead of losing them.
+    // enter the list through this path. AXChildren windows are excluded here for the same reason
+    // the recovered path applies stricter admission: this path has no Space evidence of its own,
+    // so accepting a wider source would be a wider admission rule granted by accident.
+    // When the answer consists solely of recovered windows it counts as unanswered (None), so
+    // the caller keeps the existing cards instead of losing them.
     let mut published: Vec<AxWindowInfo> = Vec::with_capacity(ax_wins.len());
     let mut recovered_only = !ax_wins.is_empty();
     for window in ax_wins {
-        if window.only_via_key_or_main {
+        if window.origin != AxWindowOrigin::Published {
             continue;
         }
         recovered_only = false;
@@ -1006,6 +1024,11 @@ fn ax_wid_map(windows: Vec<AxWindowInfo>) -> HashMap<u32, AxWindowInfo> {
 pub(crate) enum WindowPairingSource {
     /// The app's `kAXWindows` answer named this window: full AX evidence.
     PublishedAx,
+    /// Recovered from the app's AXChildren: a real window element the app did not publish in
+    /// `kAXWindows`. It carries full AX evidence (title, minimized, a raise element) but was
+    /// discovered through a source that is not the app's own published list, so it takes the
+    /// recovered path's admission checks and is reported apart from both other recoveries.
+    ChildrenAx,
     /// Recovered from the key/main slots; discovery only, and never Space-filtered by AX.
     RecoveredAx,
     /// AX could not answer for this app at all.
@@ -1022,6 +1045,7 @@ impl WindowPairingSource {
     pub(crate) fn label(self) -> &'static str {
         match self {
             Self::PublishedAx => "published",
+            Self::ChildrenAx => "children",
             Self::RecoveredAx => "recovered",
             Self::AxUnavailable => "unavailable",
             Self::UnpublishedAx => "unpublished",
@@ -1036,6 +1060,83 @@ enum MembershipSource {
 }
 
 static SKYLIGHT_MEMBERSHIP_FALLBACK_LOGGED: AtomicBool = AtomicBool::new(false);
+
+/// One app's AX coverage numbers: published windows, children-recovered windows, and the
+/// layer-0 CG windows no AX source accounted for.
+type AxCoverageState = (usize, usize, usize);
+
+/// The last coverage gap reported per app, so the gap is logged on CHANGE instead of on every
+/// collection pass.
+static AX_COVERAGE_GAP_SEEN: LazyLock<Mutex<HashMap<i32, AxCoverageState>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Log one line when an app's AX sources no longer cover the layer-0 windows the WindowServer
+/// lists for it. Pure bookkeeping over numbers the caller already has; the log is the point.
+fn report_ax_coverage_gap(
+    pid_names: &HashMap<i32, String>,
+    array: *const c_void,
+    count: isize,
+    published: &HashMap<i32, HashMap<u32, AxWindowInfo>>,
+    recovered: &HashMap<i32, HashMap<u32, AxWindowInfo>>,
+) {
+    let mut current: HashMap<i32, AxCoverageState> = HashMap::new();
+    for (&pid, app_name) in pid_names {
+        let published_count = published.get(&pid).map_or(0, HashMap::len);
+        let children_count = recovered.get(&pid).map_or(0, |windows| {
+            windows
+                .values()
+                .filter(|info| info.origin == AxWindowOrigin::Children)
+                .count()
+        });
+        // The WindowServer's own layer-0 view of this app, which is what the user sees.
+        let mut cg_windows: HashSet<u32> = HashSet::new();
+        for i in 0..count {
+            let dict = unsafe { CFArrayGetValueAtIndex(array, i) };
+            if dict.is_null() || cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1) != pid {
+                continue;
+            }
+            if cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999) != 0 {
+                continue;
+            }
+            let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
+            if cgwid != 0 {
+                cg_windows.insert(cgwid);
+            }
+        }
+        let covered: HashSet<u32> = published
+            .get(&pid)
+            .into_iter()
+            .flat_map(|windows| windows.keys().copied())
+            .chain(
+                recovered
+                    .get(&pid)
+                    .into_iter()
+                    .flat_map(|windows| windows.keys().copied()),
+            )
+            .collect();
+        let uncovered = cg_windows.difference(&covered).count();
+        let state = (published_count, children_count, uncovered);
+        current.insert(pid, state);
+        let previous = AX_COVERAGE_GAP_SEEN.lock().unwrap().get(&pid).copied();
+        // One condition decides both transitions: there are WindowServer windows no AX source
+        // accounted for. "Not published" is reported separately from "still uncovered" so a gap
+        // that children closed is distinguishable from one that was never there.
+        let has_gap = uncovered > 0;
+        let was_gap = previous.is_some_and(|prev| prev.2 > 0);
+        if has_gap != was_gap {
+            log_debug!(
+                "[collect] ax coverage gap {}: pid={} app=\"{}\" published={} children={} uncovered_cg={}",
+                if has_gap { "opened" } else { "closed" },
+                pid,
+                app_name,
+                published_count,
+                children_count,
+                uncovered
+            );
+        }
+    }
+    *AX_COVERAGE_GAP_SEEN.lock().unwrap() = current;
+}
 fn select_membership_source(
     force_legacy: bool,
     skylight_query_succeeded: bool,
@@ -1574,8 +1675,19 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // by key into a result identical to the serial version. Wall clock drops from "sum of
     // all PIDs" to "slowest single PID" (apps like WeChat that stall on every AX question
     // used to dominate serial totals; up to 1.5s for one PID in logs).
+    // The WindowServer's own layer-0 window IDs per pid, computed BEFORE the AX phase. The ID SET,
+    // not a count: two sets can be the same size and still differ, and the difference is exactly
+    // the gap (an orderOut'd window published but not listed, or a listed window never published)
+    // that only AXChildren can fill.
+    let mut cg_layer0_ids: HashMap<i32, HashSet<u32>> = HashMap::new();
+    for (&(pid, cgwid), &layer) in cg_window_layers.iter() {
+        if layer == 0 {
+            cg_layer0_ids.entry(pid).or_default().insert(cgwid);
+        }
+    }
     let mut ax_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>> = HashMap::new();
-    // Windows recovered from the key/main slots (see AxPartial::ax_recovered_wid_to_info).
+    // Windows no AX source published: both the AXChildren recoveries and the key/main-slot ones
+    // (see AxPartial::ax_recovered_wid_to_info). The per-card `ax_pairing` tells them apart.
     let mut ax_recovered_wid_to_info: HashMap<i32, HashMap<u32, AxWindowInfo>> = HashMap::new();
     // Pids whose AX query succeeded but yielded nothing: collected separately, never condemned
     // here.
@@ -1613,7 +1725,12 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                             // as identity resolution); on an exception the chunk degrades to "no
                             // data" instead of terminating the process.
                             objc2::exception::catch(std::panic::AssertUnwindSafe(|| unsafe {
-                                ax_collect_chunk(chunk, &pid_names, show_hidden_app_windows)
+                                ax_collect_chunk(
+                                    chunk,
+                                    &pid_names,
+                                    &cg_layer0_ids,
+                                    show_hidden_app_windows,
+                                )
                             }))
                             .unwrap_or_else(|exception| {
                                 log_info!("[collect] ax exception (chunk) {:?}", exception);
@@ -1851,7 +1968,15 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 .and_then(|wid_map| wid_map.get(&cgwid))
                 .filter(|_| recovered_window_passes_size_filter(bounds))
             {
-                Some(info) => (Some(info), WindowPairingSource::RecoveredAx),
+                // The recovered map holds both sources; the entry's own origin, not the map it
+                // came from, decides which one this card is reported as.
+                Some(info) => (
+                    Some(info),
+                    match info.origin {
+                        AxWindowOrigin::Children => WindowPairingSource::ChildrenAx,
+                        _ => WindowPairingSource::RecoveredAx,
+                    },
+                ),
                 // AX named other windows of this app but not this one, and has never named this
                 // one: a secondary surface AX excludes, not a window of another desktop. Checked
                 // before the exception below, because an app whose list is Space-filtered while its
@@ -1913,7 +2038,9 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // surface AX refuses to name.
         if matches!(
             pairing_source,
-            WindowPairingSource::PublishedAx | WindowPairingSource::RecoveredAx
+            WindowPairingSource::PublishedAx
+                | WindowPairingSource::RecoveredAx
+                | WindowPairingSource::ChildrenAx
         ) {
             remember_ax_identity(owner_pid, owner_process_start_time_us, cgwid);
         }
@@ -2000,7 +2127,10 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         if is_off_current_space(space_scope) {
             crate::e2e_state::other_desktop_accepted();
         }
-        if pairing_source == WindowPairingSource::RecoveredAx {
+        if matches!(
+            pairing_source,
+            WindowPairingSource::RecoveredAx | WindowPairingSource::ChildrenAx
+        ) {
             crate::e2e_state::space_recovered_accepted();
         }
 
@@ -2312,6 +2442,18 @@ pub(crate) fn collect_windows_with_frontmost_bump(
             }
         }
     }
+    // Report an AX/CG coverage gap, but only when it CHANGES for an app: an app whose kAXWindows
+    // answered empty (or missing some windows) while the WindowServer lists more layer-0 windows
+    // is the shape that silently loses cards -- Finder answered empty on 2026-10-25 and nothing
+    // in the log said so. Fires once when the gap opens and once when it closes.
+    report_ax_coverage_gap(
+        &pid_names,
+        array,
+        count,
+        &ax_wid_to_info,
+        &ax_recovered_wid_to_info,
+    );
+
     let pruned = prune_mru(mru, &live_set);
     // Pruning is observable (debug tier): logged only when entries were dropped, so a
     // normal summon stays silent.
@@ -2319,11 +2461,14 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         log_debug!("[windows] pruned {} stale MRU entries", pruned);
     }
 
-    // Temporary trace for Ghostty's hidden-window path: compare CG candidates, both AX window
-    // sets, and final cards to locate losses in the system snapshot, AX pairing, or assembly.
+    // Per-app window trace: compare CG candidates, every AX source, and final cards to locate
+    // losses in the system snapshot, AX pairing, or assembly. It was hardcoded to Ghostty, which
+    // is why a Finder whose kAXWindows answered empty took a live AX probe to find (2026-10-25),
+    // so it is now selected by `--trace-ax=<app name>` instead. Silent unless asked for.
+    let trace_app = crate::dev_flags::value("trace-ax");
     for (&pid, app_name) in pid_names
         .iter()
-        .filter(|(_, name)| name.as_str() == "Ghostty")
+        .filter(|(_, name)| trace_app.as_deref() == Some(name.as_str()))
     {
         if !bump_frontmost {
             continue;
@@ -2352,14 +2497,14 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 .flat_map(|windows| windows.iter())
                 .map(|(id, info)| {
                     format!(
-                        "id={} title={:?} minimized={} main={} fullscreen={:?} custom_root={} recovered={}",
+                        "id={} title={:?} minimized={} main={} fullscreen={:?} custom_root={} origin={:?}",
                         id,
                         info.title,
                         info.minimized,
                         info.is_main,
                         info.is_fullscreen,
                         info.is_custom_root,
-                        info.only_via_key_or_main
+                        info.origin
                     )
                 })
                 .collect();
@@ -2632,7 +2777,7 @@ mod tab_group_fold_tests {
             is_fullscreen: Some(false),
             is_custom_root: false,
             is_floating_window: false,
-            only_via_key_or_main: false,
+            origin: AxWindowOrigin::Published,
             tab_group: tabs.map(|titles| TabGroupInfo {
                 titles: titles.iter().map(|title| title.to_string()).collect(),
             }),
@@ -3363,7 +3508,7 @@ mod space_gate_tests {
             is_fullscreen,
             is_custom_root: false,
             is_floating_window: false,
-            only_via_key_or_main: true,
+            origin: AxWindowOrigin::KeyOrMain,
             tab_group: None,
         }
     }

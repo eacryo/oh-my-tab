@@ -347,8 +347,12 @@ pub(crate) fn record_other_desktop_raise(outcome: RaiseOutcome) {
     ));
 }
 
-/// The pids whose `kAXWindows` answer was non-empty (`published`) and whose key/main slots named a
-/// window (`recovered`) in the collection the last accepted frame was built from.
+/// The pids whose `kAXWindows` answer was non-empty (`published`) and whose windows no published
+/// list named (`recovered`) in the collection the last accepted frame was built from.
+/// `recovered` holds BOTH recovery sources -- a window reached through the app's `AXChildren`
+/// and one reached only through the key/main slots. Which of the two applies to a given window is
+/// per card, in `ax_pairing` (`"children"` or `"recovered"`), so an assertion about children
+/// specifically must read that field rather than this pid list.
 ///
 /// A scenario needs both to tell the cross-desktop admission cases apart: an app with a published
 /// window may legitimately show a real window of another desktop (the CG-only exception), while an

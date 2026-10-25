@@ -1000,14 +1000,17 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
     let main_window = ax_slot_value(lookup_slots, 2)
         .filter(|element| CFGetTypeID(*element) == AXUIElementGetTypeID())
         .map(|element| (ax_window_cgwid(element).unwrap_or(0), element));
-    let candidates = candidate_window_elements(&published, focused_window, main_window);
+    // The re-find takes no children parameter: this path batches only the three slots, so a
+    // target that collection reached through AXChildren arrives here through the children walk
+    // below rather than as a candidate.
+    let candidates = candidate_window_elements(&published, &[], focused_window, main_window);
     let ax_window_ids = candidates
         .iter()
-        .filter_map(|(cgwid, _, only_from_slots)| (!only_from_slots).then_some(*cgwid))
+        .filter_map(|(cgwid, _, origin)| (*origin == AxWindowOrigin::Published).then_some(*cgwid))
         .collect::<Vec<_>>();
     let key_main_ids = candidates
         .iter()
-        .filter_map(|(cgwid, _, only_from_slots)| (*only_from_slots).then_some(*cgwid))
+        .filter_map(|(cgwid, _, origin)| (*origin == AxWindowOrigin::KeyOrMain).then_some(*cgwid))
         .collect::<Vec<_>>();
 
     let mut fullscreen_candidates = Vec::new();
@@ -1016,26 +1019,35 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
         job.cgwid,
         &ax_window_ids,
         &key_main_ids,
+        &[],
         &fullscreen_candidates,
     );
     let mut selected_element = selected_source.and_then(|source| {
         candidates
             .iter()
-            .find(|(cgwid, _, only_from_slots)| {
+            .find(|(cgwid, _, origin)| {
                 *cgwid == job.cgwid
                     && match source {
-                        RaiseMatchSource::AxWindows => !only_from_slots,
-                        RaiseMatchSource::KeyMainSlot => *only_from_slots,
-                        RaiseMatchSource::FullscreenSubrole => false,
+                        RaiseMatchSource::AxWindows => *origin == AxWindowOrigin::Published,
+                        RaiseMatchSource::KeyMainSlot => *origin == AxWindowOrigin::KeyOrMain,
+                        // Neither source is one of the three batched slots: the children walk
+                        // below finds that element. The initial match never produces this arm,
+                        // because it passes an empty children list.
+                        RaiseMatchSource::ChildrenWindow | RaiseMatchSource::FullscreenSubrole => {
+                            false
+                        }
                     }
             })
             .map(|(_, element, _)| *element)
     });
 
-    // If neither app list nor key/main names the target, inspect app children for fullscreen
-    // window candidates before reporting that no AX element can be matched.
+    // If neither app list nor key/main names the target, inspect app children: first a child
+    // that IS the target window (the source collection admits ordinary children windows through
+    // AXChildren when the app does not publish them), then fullscreen window candidates.
     let mut children_array: *const c_void = std::ptr::null();
     let mut children_key = std::ptr::null();
+    let mut child_target: Option<AXUIElementRef> = None;
+    let mut child_windows: Vec<u32> = Vec::new();
     if selected_element.is_none() {
         children_key = cf_string_new("AXChildren");
         if !children_key.is_null()
@@ -1044,35 +1056,57 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
             && CFGetTypeID(children_array) == CFArrayGetTypeID()
         {
             let subrole_key = cf_string_new("AXSubrole");
-            if !subrole_key.is_null() {
+            let role_key = cf_string_new("AXRole");
+            if !subrole_key.is_null() && !role_key.is_null() {
                 for index in 0..CFArrayGetCount(children_array) {
                     let element = CFArrayGetValueAtIndex(children_array, index);
                     if element.is_null() || CFGetTypeID(element) != AXUIElementGetTypeID() {
                         continue;
                     }
                     AXUIElementSetMessagingTimeout(element, AX_RAISE_MESSAGING_TIMEOUT);
+                    let Some(cgwid) = ax_window_cgwid(element) else {
+                        continue;
+                    };
+                    // The target itself: it must be an AXWindow, which is the same gate the
+                    // collection path applies before it admits a child.
+                    if cgwid == job.cgwid
+                        && child_target.is_none()
+                        && read_ax_role(element, role_key).as_deref() == Some("AXWindow")
+                    {
+                        child_target = Some(element);
+                        child_windows.push(cgwid);
+                        continue;
+                    }
                     let subrole = read_ax_subrole(element, subrole_key);
                     if ax_fullscreen_from_attributes(subrole.as_deref(), None) != Some(true) {
                         continue;
                     }
-                    if let Some(cgwid) = ax_window_cgwid(element) {
-                        fullscreen_candidates.push(cgwid);
-                        fullscreen_elements.push((cgwid, element));
-                    }
+                    fullscreen_candidates.push(cgwid);
+                    fullscreen_elements.push((cgwid, element));
                 }
+            }
+            if !subrole_key.is_null() {
                 CFRelease(subrole_key);
             }
+            if !role_key.is_null() {
+                CFRelease(role_key);
+            }
+            // The source and the element are decided together: the apply step below needs both,
+            // and a children match that set only the element would fall through as "no match".
             selected_source = raise_match_source(
                 job.cgwid,
                 &ax_window_ids,
                 &key_main_ids,
+                &child_windows,
                 &fullscreen_candidates,
             );
-            if selected_source == Some(RaiseMatchSource::FullscreenSubrole) {
-                selected_element = fullscreen_elements
+            selected_element = match selected_source {
+                Some(RaiseMatchSource::ChildrenWindow) => child_target,
+                Some(RaiseMatchSource::FullscreenSubrole) => fullscreen_elements
                     .iter()
-                    .find_map(|(cgwid, element)| (*cgwid == job.cgwid).then_some(*element));
-            }
+                    .find_map(|(cgwid, element)| (*cgwid == job.cgwid).then_some(*element)),
+                _ => None,
+            };
         }
     }
     if !children_key.is_null() {
@@ -1105,6 +1139,11 @@ unsafe fn raise_window_ax_job(job: &RaiseJob, started: Instant, force_ax_focus: 
                 RaiseMatchSource::AxWindows => {}
                 RaiseMatchSource::KeyMainSlot => log_debug!(
                     "[raise] ax matched via key/main slot: pid={} cgwid={}",
+                    job.pid,
+                    job.cgwid
+                ),
+                RaiseMatchSource::ChildrenWindow => log_debug!(
+                    "[raise] ax matched via children window: pid={} cgwid={}",
                     job.pid,
                     job.cgwid
                 ),
@@ -1258,6 +1297,11 @@ pub(super) fn ax_fullscreen_from_attributes(
 enum RaiseMatchSource {
     AxWindows,
     KeyMainSlot,
+    /// A direct AXChildren element whose AXRole is AXWindow and whose CGWindowID is the target.
+    /// This is the source collection admits a window through when the app does not publish it
+    /// (Finder answers kAXWindows with an empty array), so the re-find must be able to reach the
+    /// same window after its cached element went stale.
+    ChildrenWindow,
     FullscreenSubrole,
 }
 
@@ -1265,12 +1309,15 @@ fn raise_match_source(
     target_cgwid: u32,
     ax_windows: &[u32],
     key_main_slots: &[u32],
+    children_windows: &[u32],
     fullscreen_candidates: &[u32],
 ) -> Option<RaiseMatchSource> {
     if ax_windows.contains(&target_cgwid) {
         Some(RaiseMatchSource::AxWindows)
     } else if key_main_slots.contains(&target_cgwid) {
         Some(RaiseMatchSource::KeyMainSlot)
+    } else if children_windows.contains(&target_cgwid) {
+        Some(RaiseMatchSource::ChildrenWindow)
     } else if fullscreen_candidates.contains(&target_cgwid) {
         Some(RaiseMatchSource::FullscreenSubrole)
     } else {
@@ -1286,6 +1333,25 @@ unsafe fn read_ax_subrole(element: AXUIElementRef, subrole_key: *const c_void) -
         let subrole = cf_to_rust_string(value);
         CFRelease(value);
         subrole
+    } else {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        None
+    }
+}
+
+/// AXRole of one element. The raise path needs it to tell an app child that IS a window from a
+/// child that merely sits at a window's CGWindowID, before it hands the element to the focus
+/// backstop.
+unsafe fn read_ax_role(element: AXUIElementRef, role_key: *const c_void) -> Option<String> {
+    let mut value: *const c_void = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, role_key, &mut value) == K_AX_SUCCESS
+        && !value.is_null()
+    {
+        let role = cf_to_rust_string(value);
+        CFRelease(value);
+        role
     } else {
         if !value.is_null() {
             CFRelease(value);
@@ -1463,12 +1529,14 @@ pub(super) fn remember_non_normal_cg_windows_for_process(
 /// collect_windows and the thumbnail module's startup pre-generation.
 pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
     let process_start_time_us = unsafe { resolve_app_identity(pid).process_start_time_us };
-    get_ax_windows_for_pid_with_identity(pid, process_start_time_us).map(|windows| {
-        windows
-            .into_iter()
-            .map(|window| (window.cgwid, window.title, window.minimized))
-            .collect()
-    })
+    get_ax_windows_for_pid_with_identity(pid, process_start_time_us, &HashSet::new()).map(
+        |windows| {
+            windows
+                .into_iter()
+                .map(|window| (window.cgwid, window.title, window.minimized))
+                .collect()
+        },
+    )
 }
 
 /// kAXValueAXErrorType: the placeholder type a batch read uses for an attribute the app did
@@ -1535,6 +1603,52 @@ pub(super) fn ax_read_is_incomplete(
     window_elements == 0 && !has_focused && !has_main && any_slot_failed
 }
 
+/// Whether AXChildren has to be consulted: some layer-0 WindowServer window is not named by the
+/// app's published `kAXWindows` answer.
+///
+/// The comparison is over window IDs, not counts. Two sets can have the same size and still
+/// differ -- a published window the WindowServer does not list (an orderOut'd dialog, which the
+/// backfill path explicitly supports) can stand where a listed window was never published -- and
+/// that difference is exactly what children can fill. Published windows the WindowServer does not
+/// list are fine: they may simply be off screen. Only a listed window that no published id
+/// accounts for is a gap.
+///
+/// With no WindowServer evidence (paths that do not carry it) an empty published list is the only
+/// signal available, which keeps those paths at exactly the admission rule they had.
+/// Pure function, unit-tested.
+fn ax_sources_may_be_incomplete(published_cgwids: &[u32], cg_layer0: &HashSet<u32>) -> bool {
+    if cg_layer0.is_empty() {
+        return published_cgwids.iter().all(|cgwid| *cgwid == 0);
+    }
+    let published_ids: HashSet<u32> = published_cgwids
+        .iter()
+        .copied()
+        .filter(|cgwid| *cgwid != 0)
+        .collect();
+    !cg_layer0.is_subset(&published_ids)
+}
+
+/// Whether the four-source read learned nothing usable: no window element came back from any
+/// source AND some read failed. `ax_read_is_incomplete` decides the slot part; children are
+/// OR'd in here because a failed key/main read must not discard windows the app exposed through
+/// its children. The two directions are deliberately asymmetric: children can rescue an
+/// otherwise-incomplete read, but a failed children read never turns a good published answer
+/// into an incomplete one -- that decision is made from the three slots alone, so an app that
+/// published windows keeps them whatever the children read did.
+///
+/// An app that answered with no windows at all (`window_elements == 0` with complete reads)
+/// stays complete, which is the Stats shape documented on `ax_read_is_incomplete`: it answered,
+/// and it has no window. Pure function, unit-tested.
+fn ax_read_learned_nothing(
+    window_elements: usize,
+    has_focused: bool,
+    has_main: bool,
+    any_slot_failed: bool,
+    children: usize,
+) -> bool {
+    children == 0 && ax_read_is_incomplete(window_elements, has_focused, has_main, any_slot_failed)
+}
+
 /// Read one slot of a batch-read result, keeping the distinction the caller needs.
 pub(super) unsafe fn ax_slot_outcome(slots: *const c_void, index: isize) -> AxSlotOutcome {
     if slots.is_null() || index >= CFArrayGetCount(slots) {
@@ -1571,35 +1685,54 @@ unsafe fn ax_slot_value(slots: *const c_void, index: isize) -> Option<AXUIElemen
     }
 }
 
-/// Merges the window elements of the three attribute slots: `kAXWindows` order first, then the
-/// focused and main slots; a window (identified by its CGWindowID) keeps its first occurrence,
-/// while elements without an id are deduplicated by element. The three must be read together, and
-/// **an empty array is not "no windows"**: AppKit's `kAXWindows` is filtered by the CURRENT
-/// Space (it answers with an empty array when every window lives on another Space), whereas
-/// `kAXFocusedWindow`/`kAXMainWindow` read NSApplication's `_keyWindow`/`_mainWindow` weak refs
-/// with no Space filter and no active-state guard, so such an app still hands its key/main window
-/// back. Returning early on an empty `windows` here would throw away exactly the evidence that
-/// recovers those windows.
+/// Merges the window elements of the three attribute slots plus the app's AXChildren: the
+/// `kAXWindows` order first, then children, then the focused and main slots; a window
+/// (identified by its CGWindowID) keeps its first occurrence, so an entry's origin is always the
+/// most authoritative source that named it, while elements without an id are deduplicated by
+/// element. The sources must be read together, and **an empty array is not "no windows"**::
+/// AppKit's `kAXWindows` is filtered by the CURRENT Space (it answers with an empty array when
+/// every window lives on another Space), whereas `kAXFocusedWindow`/`kAXMainWindow` read
+/// NSApplication's `_keyWindow`/`_mainWindow` weak refs with no Space filter and no active-state
+/// guard, so such an app still hands its key/main window back. Returning early on an empty
+/// `windows` here would throw away exactly the evidence that recovers those windows.
+///
+/// AXChildren is the third source because a long-lived app can leave its publishing list empty
+/// while still hanging every window off children. Measured on Finder (2026-10-25): `kAXWindows`
+/// answered `[]` with a successful reply while AXChildren listed all four of its windows, and
+/// key/main both named the same one, so the app used to contribute a single card. Children are
+/// only candidates here; the role check that admits them lives in the caller.
 pub(super) fn candidate_window_elements<T>(
     published: &[(u32, T)],
+    children: &[(u32, T)],
     focused: Option<(u32, T)>,
     main: Option<(u32, T)>,
-) -> Vec<(u32, T, bool)>
+) -> Vec<(u32, T, AxWindowOrigin)>
 where
     T: Copy + Eq + std::hash::Hash,
 {
-    let mut result = Vec::with_capacity(published.len() + 2);
+    let mut result = Vec::with_capacity(published.len() + children.len() + 2);
     let mut seen_wids = HashSet::new();
     let mut seen_elements = HashSet::new();
-    // The last component marks "only from the key/main slots" (see
-    // AxWindowInfo::only_via_key_or_main).
+    // Order is the authority order: the app's own published list wins, then its AXChildren
+    // (real windows the app does not publish), then the key/main slots as a last resort. The
+    // origin travels with the entry because admission downstream differs by source.
     let candidates = published
         .iter()
         .copied()
-        .map(|entry| (entry, false))
-        .chain(focused.map(|entry| (entry, true)))
-        .chain(main.map(|entry| (entry, true)));
-    for ((wid, element), only_via_key_or_main) in candidates {
+        .map(|entry| (entry, AxWindowOrigin::Published))
+        .chain(
+            children
+                .iter()
+                .copied()
+                .map(|entry| (entry, AxWindowOrigin::Children)),
+        )
+        .chain(
+            focused
+                .map(|entry| (entry, AxWindowOrigin::KeyOrMain))
+                .into_iter()
+                .chain(main.map(|entry| (entry, AxWindowOrigin::KeyOrMain))),
+        );
+    for ((wid, element), origin) in candidates {
         // The slots repeat the same window as different objects; deduplicating by id saves the
         // duplicate per-element attribute reads.
         let duplicate = if wid != 0 {
@@ -1610,7 +1743,7 @@ where
         if duplicate {
             continue;
         }
-        result.push((wid, element, only_via_key_or_main));
+        result.push((wid, element, origin));
     }
     result
 }
@@ -1728,6 +1861,7 @@ unsafe fn read_ax_title(element: AXUIElementRef, title_key: *const c_void) -> Op
 pub(super) fn get_ax_windows_for_pid_with_identity(
     pid: i32,
     process_start_time_us: Option<u64>,
+    cg_layer0_windows: &HashSet<u32>,
 ) -> Option<Vec<AxWindowInfo>> {
     if let Some(windows) = cached_ax_snapshot(pid, process_start_time_us) {
         return Some(windows);
@@ -1744,12 +1878,19 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         // and let invisible windows through).
         AXUIElementSetMessagingTimeout(app, 0.05);
 
-        // One batched read of the three attributes (rationale and merge rules in
-        // candidate_window_elements).
+        // One batched read of the four attributes (rationale and merge rules in
+        // candidate_window_elements). AXChildren rides along in the same round trip: an app
+        // that answers kAXWindows normally pays one extra key, not a second IPC.
         let windows_key = cf_string_new("AXWindows");
         let focused_window_key = cf_string_new("AXFocusedWindow");
         let main_window_key = cf_string_new("AXMainWindow");
-        let keys = [windows_key, focused_window_key, main_window_key];
+        let children_key = cf_string_new("AXChildren");
+        let keys = [
+            windows_key,
+            focused_window_key,
+            main_window_key,
+            children_key,
+        ];
         // callbacks = null: the array is only a synchronous input to this call; `keys` keeps the
         // strings alive for its duration.
         let keys_array = CFArrayCreate(
@@ -1771,8 +1912,10 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         for key in keys {
             CFRelease(key);
         }
-        CFRelease(app);
+        // `app` stays alive until the end of this function: the children walk below reads
+        // through it, and the slot arrays it owns do not keep it alive.
         if err != K_AX_SUCCESS || slots.is_null() {
+            CFRelease(app);
             return None;
         }
         // Caller-owned: the guard releases it on every exit path below, including the early
@@ -1801,22 +1944,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             }
             _ => None,
         };
-        // Nothing usable came back and at least one of the three reads failed: the query is
-        // incomplete, so this must not be cached as "the app answered that it has no windows".
-        let any_slot_failed = matches!(windows_outcome, AxSlotOutcome::Failed)
-            || matches!(focused_outcome, AxSlotOutcome::Failed)
-            || matches!(main_outcome, AxSlotOutcome::Failed);
-        let window_elements =
-            windows_array.map_or(0, |array| CFArrayGetCount(array).max(0) as usize);
-        if ax_read_is_incomplete(
-            window_elements,
-            focused_window.is_some(),
-            main_window.is_some(),
-            any_slot_failed,
-        ) {
-            return None;
-        }
-
         let mut published: Vec<(u32, AXUIElementRef)> = Vec::new();
         if let Some(array) = windows_array {
             let count = CFArrayGetCount(array);
@@ -1828,8 +1955,81 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 }
             }
         }
+
+        // AXChildren is the third discovery source. Whether to walk it is decided from the
+        // WindowServer's own view, not from "did kAXWindows answer": a published list naming
+        // FEWER windows than the WindowServer shows at layer 0 is just as incomplete as an empty
+        // one, and its missing windows are reachable only as children. A healthy app therefore
+        // still pays nothing. Direct children only -- never recursive: a window's contents are
+        // not windows.
+        let mut children: Vec<(u32, AXUIElementRef)> = Vec::new();
+        let published_cgwids: Vec<u32> = published.iter().map(|(cgwid, _)| *cgwid).collect();
+        if ax_sources_may_be_incomplete(&published_cgwids, cg_layer0_windows) {
+            if let AxSlotOutcome::Value(array) = ax_slot_outcome(slots, 3) {
+                if CFGetTypeID(array) == CFArrayGetTypeID() {
+                    let count = CFArrayGetCount(array).max(0);
+                    let role_key = cf_string_new("AXRole");
+                    if !role_key.is_null() {
+                        for i in 0..count {
+                            let element = CFArrayGetValueAtIndex(array, i);
+                            if element.is_null() || CFGetTypeID(element) != AXUIElementGetTypeID() {
+                                continue;
+                            }
+                            // The role gate is required here, not optional: the admission loop
+                            // below keeps an element unconditionally when it has no subrole
+                            // ("no subrole means standard window"), which is right for an entry
+                            // kAXWindows named and wrong for an arbitrary child.
+                            AXUIElementSetMessagingTimeout(element, AX_WINDOW_MESSAGING_TIMEOUT);
+                            let mut role_value: *const c_void = std::ptr::null();
+                            let is_window =
+                                AXUIElementCopyAttributeValue(element, role_key, &mut role_value)
+                                    == K_AX_SUCCESS
+                                    && !role_value.is_null()
+                                    && {
+                                        let role = cf_to_rust_string(role_value);
+                                        CFRelease(role_value);
+                                        role.as_deref() == Some("AXWindow")
+                                    };
+                            if !is_window {
+                                continue;
+                            }
+                            let cgwid = ax_window_cgwid(element);
+                            // A child with no WindowServer id is mid-destruction or a
+                            // pre-registered surface; it cannot be paired or switched to.
+                            if let Some(cgwid) = cgwid {
+                                children.push((cgwid, element));
+                            }
+                        }
+                        CFRelease(role_key);
+                    }
+                }
+            }
+        }
+
+        // Nothing usable came back and at least one of the three reads failed: the query is
+        // incomplete, so this must not be cached as "the app answered that it has no windows".
+        // Children count as usable evidence: a failed key/main read must not discard windows the
+        // app did expose. The three failure flags are still what decides, so an app that simply
+        // answered with no windows keeps its empty (complete) answer.
+        let any_slot_failed = matches!(windows_outcome, AxSlotOutcome::Failed)
+            || matches!(focused_outcome, AxSlotOutcome::Failed)
+            || matches!(main_outcome, AxSlotOutcome::Failed);
+        let window_elements =
+            windows_array.map_or(0, |array| CFArrayGetCount(array).max(0) as usize);
+        if ax_read_learned_nothing(
+            window_elements,
+            focused_window.is_some(),
+            main_window.is_some(),
+            any_slot_failed,
+            children.len(),
+        ) {
+            CFRelease(app);
+            return None;
+        }
+
         let candidates = candidate_window_elements(
             &published,
+            &children,
             focused_window.map(|element| (ax_window_cgwid(element).unwrap_or(0), element)),
             main_window.map(|element| (ax_window_cgwid(element).unwrap_or(0), element)),
         );
@@ -1843,7 +2043,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         let main_key = cf_string_new("AXMain");
         let mut results = Vec::with_capacity(candidates.len());
 
-        for (cgwid, element, only_via_key_or_main) in candidates {
+        for (cgwid, element, origin) in candidates {
             // The 50ms on the app element does not carry over to the window elements; set it per
             // element, or an unresponsive app's window queries fall back to the system default
             // (~1.5s) and stall the whole collection pass.
@@ -1966,7 +2166,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 is_fullscreen,
                 is_custom_root: subrole.as_deref() == Some("AXUnknown"),
                 is_floating_window: subrole.as_deref() == Some("AXFloatingWindow"),
-                only_via_key_or_main,
+                origin,
                 tab_group,
             });
         }
@@ -1975,6 +2175,7 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         CFRelease(minimized_key);
         CFRelease(fullscreen_key);
         CFRelease(main_key);
+        CFRelease(app);
 
         cache_ax_snapshot(pid, process_start_time_us, &results);
         Some(results)
@@ -2015,12 +2216,12 @@ pub(crate) fn cf_to_rust_string(cf_string: *const c_void) -> Option<String> {
 
 #[cfg(test)]
 mod raise_match_tests {
-    use super::{raise_match_source, RaiseMatchSource};
+    use super::{ax_read_learned_nothing, raise_match_source, RaiseMatchSource};
 
     #[test]
     fn target_in_ax_windows_uses_the_normal_match() {
         assert_eq!(
-            raise_match_source(6865, &[61, 6865], &[6865], &[6865]),
+            raise_match_source(6865, &[61, 6865], &[6865], &[], &[6865]),
             Some(RaiseMatchSource::AxWindows)
         );
     }
@@ -2028,7 +2229,7 @@ mod raise_match_tests {
     #[test]
     fn target_missing_from_ax_windows_uses_key_or_main_slot() {
         assert_eq!(
-            raise_match_source(6865, &[61], &[6865], &[]),
+            raise_match_source(6865, &[61], &[6865], &[], &[]),
             Some(RaiseMatchSource::KeyMainSlot)
         );
     }
@@ -2036,13 +2237,121 @@ mod raise_match_tests {
     #[test]
     fn target_missing_from_lists_uses_fullscreen_subrole_candidate() {
         assert_eq!(
-            raise_match_source(6865, &[61], &[], &[6865]),
+            raise_match_source(6865, &[61], &[], &[], &[6865]),
             Some(RaiseMatchSource::FullscreenSubrole)
         );
     }
 
     #[test]
     fn target_missing_from_every_candidate_set_has_no_match() {
-        assert_eq!(raise_match_source(6865, &[61], &[], &[62]), None);
+        assert_eq!(raise_match_source(6865, &[61], &[], &[], &[62]), None);
+    }
+
+    #[test]
+    fn target_reachable_only_as_a_children_window_is_matched() {
+        // The Finder shape: kAXWindows empty, both slots naming another window, and the target
+        // present only among the app's children. It must resolve, or a window the switcher shows
+        // cannot be raised after its cached element goes stale.
+        assert_eq!(
+            raise_match_source(133495, &[], &[134030], &[133495], &[]),
+            Some(RaiseMatchSource::ChildrenWindow)
+        );
+    }
+
+    #[test]
+    fn published_sources_outrank_a_children_window() {
+        // A children entry for a window the app did publish is the same window, and the more
+        // authoritative source names it first.
+        assert_eq!(
+            raise_match_source(133495, &[133495], &[], &[133495], &[]),
+            Some(RaiseMatchSource::AxWindows)
+        );
+        assert_eq!(
+            raise_match_source(133495, &[], &[133495], &[133495], &[]),
+            Some(RaiseMatchSource::KeyMainSlot)
+        );
+    }
+
+    fn layer0(ids: &[u32]) -> std::collections::HashSet<u32> {
+        ids.iter().copied().collect()
+    }
+
+    #[test]
+    fn a_short_published_list_still_reads_children() {
+        // The measured loss shape: four windows at layer 0, kAXWindows naming none of them.
+        assert!(super::ax_sources_may_be_incomplete(
+            &[],
+            &layer0(&[10, 11, 12, 13])
+        ));
+        // A non-empty but short list: kAXWindows named one, the WindowServer shows three.
+        assert!(super::ax_sources_may_be_incomplete(
+            &[10],
+            &layer0(&[10, 11, 12])
+        ));
+    }
+
+    #[test]
+    fn a_same_size_but_different_set_still_reads_children() {
+        // The case a count comparison missed: the app publishes {A,D} while the WindowServer
+        // lists {A,B}. D is an orderOut'd window the collection may still publish, so the sizes
+        // match while B is genuinely missing -- B is reachable only as a child.
+        assert!(super::ax_sources_may_be_incomplete(
+            &[10, 14],
+            &layer0(&[10, 11])
+        ));
+        // Same trap the other way round: published is larger, and still misses a listed id.
+        assert!(super::ax_sources_may_be_incomplete(
+            &[10, 14, 15],
+            &layer0(&[10, 11])
+        ));
+    }
+
+    #[test]
+    fn a_published_list_that_covers_the_window_server_skips_children() {
+        // A healthy app pays nothing: every layer-0 window is accounted for. Extra published
+        // windows are fine -- they may be off screen or a window of another Space.
+        assert!(!super::ax_sources_may_be_incomplete(
+            &[10, 11],
+            &layer0(&[10, 11])
+        ));
+        assert!(!super::ax_sources_may_be_incomplete(
+            &[10, 11, 12, 13],
+            &layer0(&[10, 11])
+        ));
+    }
+
+    #[test]
+    fn without_window_server_evidence_only_an_empty_list_reads_children() {
+        // Paths that do not carry the CG set (directed refresh, probes) keep the old rule, so
+        // they never gain a wider admission than they had.
+        assert!(super::ax_sources_may_be_incomplete(&[], &layer0(&[])));
+        assert!(!super::ax_sources_may_be_incomplete(&[10], &layer0(&[])));
+    }
+
+    #[test]
+    fn children_rescue_an_otherwise_incomplete_read() {
+        // Every slot failed and nothing was published, but AXChildren answered with a window:
+        // the read learned something, so it must not be thrown away as a failed query.
+        assert!(!ax_read_learned_nothing(0, false, false, true, 1));
+    }
+
+    #[test]
+    fn a_failed_children_read_never_discards_a_published_answer() {
+        // Children contributed nothing; the app still published two windows and one slot failed.
+        // The published windows are the app's own answer and survive.
+        assert!(!ax_read_learned_nothing(2, false, false, true, 0));
+    }
+
+    #[test]
+    fn a_complete_empty_answer_is_not_a_failed_read() {
+        // Stats: AXWindows answered [], key/main unsupported (NoValue, not a failure), children
+        // empty. It answered, and it has no window -- this must stay a complete answer rather
+        // than sending the app to the AX-failed CG fallback.
+        assert!(!ax_read_learned_nothing(0, false, false, false, 0));
+    }
+
+    #[test]
+    fn nothing_from_any_source_and_a_failed_read_is_incomplete() {
+        assert!(ax_read_learned_nothing(0, false, false, true, 0));
     }
 }

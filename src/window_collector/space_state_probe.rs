@@ -464,6 +464,7 @@ unsafe fn read_sample(wid: u32, own_pid: i32) -> Sample {
     let ax = super::raiser::get_ax_windows_for_pid_with_identity(
         own_pid,
         identity.process_start_time_us,
+        &std::collections::HashSet::new(),
     )
     .and_then(|windows| windows.into_iter().find(|window| window.cgwid == wid));
     Sample {
@@ -483,6 +484,7 @@ unsafe fn probe_wid(own_pid: i32, title: &str) -> Option<u32> {
     let windows = super::raiser::get_ax_windows_for_pid_with_identity(
         own_pid,
         identity.process_start_time_us,
+        &std::collections::HashSet::new(),
     )?;
     windows
         .into_iter()
