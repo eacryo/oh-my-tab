@@ -892,6 +892,11 @@ pub(super) fn is_mouse_press_type(event_type: u64) -> bool {
     matches!(event_type, 1 | 3 | 25)
 }
 
+/// The NSEventType values that mean a mouse button came up: left, right, other.
+pub(super) fn is_mouse_release_type(event_type: u64) -> bool {
+    matches!(event_type, 2 | 4 | 26)
+}
+
 /// Whether a press at `point` (window base coordinates) lands on the search field, where the click
 /// belongs to the field itself (caret placement, the drawn clear ×).
 unsafe fn search_field_contains_window_point(point: NSPoint) -> bool {
@@ -979,7 +984,12 @@ pub(super) extern "C" fn clipboard_window_send_event(
                 end_search_editing_for_press(point);
             }
             // The options popover dismisses on any click outside its frame (the event still goes
-            // through, so the clicked control behaves normally).
+            // through, so the clicked control behaves normally). A DRAG of the panel is not an
+            // outside click even though its press lands outside the menu's frame: the blank region
+            // is how the panel is moved, and closing the menu under the user's hand would make them
+            // reopen it after every move. A press cannot tell a drag from a click yet, so the
+            // decision is made on the release: by then the drag has either passed its threshold
+            // (`moved`) or it was a plain click and the menu closes as before.
             if crate::clipboard::filter_popover_open() && is_mouse_press_type(etype) {
                 let point: NSPoint = msg_send![event, locationInWindow];
                 let inside = if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
@@ -1009,9 +1019,18 @@ pub(super) extern "C" fn clipboard_window_send_event(
                 } else {
                     false
                 };
-                if !inside && !on_options_orb {
-                    super::detail::dismiss_filter_popover();
-                }
+                // Not dismissed here even though the press is outside: a press that turns into a
+                // drag of the panel must leave the menu alone, and only the release can tell the
+                // two apart. The release resolves it (`drag::finish_popover_press`).
+                super::drag::note_popover_outside_press(!inside && !on_options_orb);
+            }
+            // The release half of the popover's outside-click rule. The drag's own mouseUp is
+            // delivered inside `super sendEvent:` below, so this runs FIRST: the grab is still
+            // recorded here, which is exactly what tells a drag (keep the menu) from a click
+            // (close it). Every release resolves it, so a press that never became a drag cannot
+            // leave a dismissal pending into the next gesture.
+            if is_mouse_release_type(etype) {
+                super::drag::finish_popover_press();
             }
             type SendEvent = unsafe extern "C" fn(*mut ObjcSuper, Sel, *mut AnyObject);
             // The class that defined sendEvent:, recorded when the picker window was registered.

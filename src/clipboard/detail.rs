@@ -1215,6 +1215,13 @@ pub(crate) unsafe fn apply_glass_properties() {
     if let Some(backdrop) = *DETAIL_BACKDROP.lock().unwrap() {
         crate::glass::apply_live_properties(backdrop, detail_backdrop_options());
     }
+    // An open menu must follow material, theme and passive-compensation changes with the picker.
+    if filter_popover_open() {
+        let parent = *PICKER_CONTENT_PARENT.lock().unwrap();
+        if let Some(parent) = parent {
+            build_filter_popover(parent.0);
+        }
+    }
 }
 
 /// Bring both panels' backdrops in line with the effective material. Called when the
@@ -4258,8 +4265,8 @@ extern "C" fn picker_window_can_become_key(
     )
 }
 
-/// The popover's frame inside the picker's content parent: anchored under the options orb at the
-/// mock's `.popover` offsets (right 14px, top below the head). `parent_h`/`parent_flipped` are the
+/// The popover's frame inside the picker's content parent, centered under the options orb.
+/// `parent_h`/`parent_flipped` are the
 /// parent's own, so the top-anchored offset lands where the mock puts it whatever the view's
 /// coordinate convention is -- the content parent is a plain (bottom-up) `NSView`.
 /// Pure so the anchor math is testable.
@@ -4274,9 +4281,13 @@ pub(super) fn filter_popover_frame_for(
     panel_width: f64,
 ) -> NSRect {
     let h = filter_popover_height(parent_h);
+    let (_, _, options, _, _, _) = picker_header_frames_for(panel_width);
+    let max_x = (panel_width - POPOVER_RIGHT_INSET - POPOVER_W).max(0.0);
+    let x = (options.origin.x + options.size.width / 2.0 - POPOVER_W / 2.0)
+        .clamp(POPOVER_RIGHT_INSET.min(max_x), max_x);
     NSRect::new(
         NSPoint::new(
-            panel_width - POPOVER_RIGHT_INSET - POPOVER_W,
+            x,
             top_anchored_origin_y(filter_popover_top(parent_h, h), parent_h, h, parent_flipped),
         ),
         NSSize::new(POPOVER_W, h),
@@ -4293,8 +4304,8 @@ pub(super) fn filter_popover_top(parent_h: f64, popover_h: f64) -> f64 {
 
 /// The popover's fixed vertical parts: padding, the eyebrow and the hairline.
 pub(super) fn filter_popover_fixed_h() -> f64 {
-    // Two section labels and two dividers; the five 1pt gaps between filter rows are fixed too.
-    POPOVER_PAD * 2.0 + POPOVER_TITLE_H * 2.0 + POPOVER_DIVIDER_H * 2.0 + 5.0
+    // One section label and two dividers; filter rows retain their inter-row gap.
+    POPOVER_PAD_V * 2.0 + POPOVER_TITLE_H + POPOVER_DIVIDER_H * 2.0 + 5.0
 }
 
 /// The menu's row height for a panel of `parent_h`: the mock's 32pt whenever the panel can hold the
@@ -4348,11 +4359,12 @@ pub(super) fn filter_popover_counts() -> [usize; 6] {
 
 unsafe fn add_popover_section_title(popover: *mut AnyObject, title: &str, y: f64) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let (span_x, span_w) = popover_row_span();
     let label: *mut AnyObject = msg_send![
         label,
         initWithFrame: NSRect::new(
-            NSPoint::new(POPOVER_PAD + 8.0, y),
-            NSSize::new(POPOVER_W - POPOVER_PAD * 2.0 - 16.0, POPOVER_TITLE_H)
+            NSPoint::new(span_x + 8.0, y),
+            NSSize::new(span_w - 16.0, POPOVER_TITLE_H)
         )
     ];
     let title_ns = make_nsstring(title);
@@ -4381,11 +4393,12 @@ unsafe fn add_popover_section_title(popover: *mut AnyObject, title: &str, y: f64
 
 unsafe fn add_popover_divider(popover: *mut AnyObject, y: f64, width: f64) {
     let divider: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let (span_x, _) = popover_row_span();
     let divider: *mut AnyObject = msg_send![
         divider,
         initWithFrame: NSRect::new(
-            NSPoint::new(POPOVER_PAD + 6.0, y + (POPOVER_DIVIDER_H - 1.0) / 2.0),
-            NSSize::new(width - 12.0, 1.0)
+            NSPoint::new(span_x + POPOVER_INSET, y + (POPOVER_DIVIDER_H - 1.0) / 2.0),
+            NSSize::new(width - POPOVER_INSET * 2.0, 1.0)
         )
     ];
     let _: () = msg_send![divider, setWantsLayer: true];
@@ -4456,7 +4469,7 @@ unsafe fn add_popover_text(
     text: &str,
     frame: NSRect,
     size: f64,
-    color: u32,
+    color: *mut AnyObject,
     alignment: isize,
 ) {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
@@ -4471,7 +4484,7 @@ unsafe fn add_popover_text(
     let _: () = msg_send![label, setSelectable: false];
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: size];
     let _: () = msg_send![label, setFont: font];
-    let _: () = msg_send![label, setTextColor: crate::ffi::hex_to_ns_color(color)];
+    let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setAlignment: alignment];
     let cell: *mut AnyObject = msg_send![label, cell];
     let _: () = msg_send![cell, setLineBreakMode: 4isize];
@@ -4511,11 +4524,13 @@ unsafe fn add_popover_row_content(
         icon,
         symbol,
         POPOVER_META_SIZE,
-        crate::ffi::hex_to_ns_color(if selected || danger {
-            ink
+        if danger {
+            crate::ffi::hex_to_ns_color(ink)
+        } else if selected {
+            crate::glass::panel_ink(ink, crate::glass::PanelInk::Primary)
         } else {
-            palette.secondary_text
-        }),
+            crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary)
+        },
     );
     let _: () = msg_send![icon, setImagePosition: 1isize];
     let _: () = msg_send![content, addSubview: icon];
@@ -4544,7 +4559,11 @@ unsafe fn add_popover_row_content(
             ),
         ),
         POPOVER_TEXT_SIZE,
-        ink,
+        if danger {
+            crate::ffi::hex_to_ns_color(ink)
+        } else {
+            crate::glass::panel_ink(ink, crate::glass::PanelInk::Primary)
+        },
         0,
     );
     if !trailing.is_empty() {
@@ -4556,7 +4575,11 @@ unsafe fn add_popover_row_content(
                 NSSize::new(trailing_end - trailing_x, POPOVER_TEXT_H),
             ),
             POPOVER_META_SIZE,
-            muted,
+            if danger {
+                crate::ffi::hex_to_ns_color(muted)
+            } else {
+                crate::glass::panel_ink(muted, crate::glass::PanelInk::Secondary)
+            },
             2,
         );
     }
@@ -4569,7 +4592,7 @@ unsafe fn add_popover_row_content(
                 NSSize::new(POPOVER_GLYPH_W, POPOVER_TEXT_H),
             ),
             POPOVER_META_SIZE,
-            super::popover_check_color(palette),
+            crate::ffi::hex_to_ns_color(super::popover_check_color(palette)),
             1,
         );
     }
@@ -4589,9 +4612,98 @@ unsafe fn add_popover_row_content(
     release_obj(content);
 }
 
+unsafe fn add_shared_popover_backdrop(
+    popover: *mut AnyObject,
+    size: NSSize,
+) -> crate::glass::InstalledBackdrop {
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), size);
+    let decoration: *mut AnyObject = msg_send![popover_decoration_class(), alloc];
+    let decoration: *mut AnyObject = msg_send![decoration, initWithFrame: bounds];
+    let _: () = msg_send![decoration, setAutoresizingMask: 18u64];
+    let options = picker_backdrop_options().with_elevation(None);
+    // `build_backdrop` already applied this material's live properties (tuning and glass tint) as it
+    // built them, so a freshly built hierarchy has nothing to re-apply here.
+    let backdrop = crate::glass::install_embedded_backdrop(decoration, bounds, POPOVER_R, options);
+    let _: () = msg_send![backdrop.content_parent, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![backdrop.content_parent, layer];
+    if !layer.is_null() {
+        let tint: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
+        let _: () = msg_send![tint, setFrame: bounds];
+        let _: () = msg_send![tint, setCornerRadius: POPOVER_R];
+        crate::ffi::layer_set_continuous_corner_curve(tint);
+        let palette = clipboard_palette();
+        let cg_colors = [
+            crate::ffi::hex_to_cg_color(if palette.dark {
+                POPOVER_LIFT_TOP_DARK
+            } else {
+                POPOVER_LIFT_TOP_LIGHT
+            }),
+            crate::ffi::hex_to_cg_color(if palette.dark {
+                0
+            } else {
+                POPOVER_LIFT_BOTTOM_LIGHT
+            }),
+        ];
+        let colors = crate::ffi::CFArrayCreate(
+            std::ptr::null(),
+            cg_colors.as_ptr() as *const *const c_void,
+            cg_colors.len() as isize,
+            &crate::ffi::kCFTypeArrayCallBacks as *const c_void,
+        );
+        if !colors.is_null() {
+            let _: () = msg_send![tint, setColors: colors as *mut AnyObject];
+            crate::ffi::CFRelease(colors);
+        }
+        // The shared backdrop's content parent is unflipped.
+        let _: () = msg_send![tint, setStartPoint: NSPoint::new(0.5, 1.0)];
+        let _: () = msg_send![tint, setEndPoint: NSPoint::new(0.5, 0.0)];
+        let _: () = msg_send![layer, addSublayer: tint];
+    }
+    let _: () = msg_send![popover, addSubview: decoration];
+    release_obj(decoration);
+    backdrop
+}
+
+/// Draw the menu's rim ABOVE its material.
+///
+/// A layer border on the popover itself is painted under its subviews, and the shared material
+/// fills the popover exactly, so that stroke is invisible wherever the material is opaque -- which
+/// is the one case where the rim has to do the separating (§3.4: the rim, not a whiter fill, is what
+/// marks the menu off from the panel). This adds a transparent decoration on top of the material and
+/// strokes its layer instead, so the rim is always the topmost thing the menu draws.
+unsafe fn add_popover_rim(popover: *mut AnyObject, size: NSSize) {
+    let palette = clipboard_palette();
+    let rim: *mut AnyObject = msg_send![popover_decoration_class(), alloc];
+    let rim: *mut AnyObject =
+        msg_send![rim, initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), size)];
+    let _: () = msg_send![rim, setAutoresizingMask: 18u64];
+    let _: () = msg_send![rim, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![rim, layer];
+    if !layer.is_null() {
+        let _: () = msg_send![layer, setCornerRadius: POPOVER_R];
+        crate::ffi::layer_set_continuous_corner_curve(layer);
+        let _: () = msg_send![layer, setBorderWidth: POPOVER_BORDER_W];
+        crate::ffi::layer_set_border(
+            layer,
+            crate::ffi::hex_to_cg_color(if palette.dark {
+                palette.card_border
+            } else {
+                PICKER_POPOVER_BORDER_LIGHT
+            }),
+        );
+    }
+    // Above every other subview, including the rows added after this call.
+    let _: () = msg_send![
+        popover,
+        addSubview: rim,
+        positioned: 1isize,
+        relativeTo: std::ptr::null::<AnyObject>()
+    ];
+    release_obj(rim);
+}
+
 /// Build (or rebuild) the options popover and add it to the picker's content parent, above the
-/// rows so its hit-tests win. The structure follows the v2.1 mock: two titled sections, leading
-/// symbols, active filter check, settings shortcut and the two clear actions.
+/// rows so its hit-tests win. Filters, settings and clearing actions form separate groups.
 pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
     // Remove any previous view WITHOUT closing the popover: the open flag was set by the caller
     // (`toggle_filter_popover`) and must survive the rebuild, or the view would exist with the state
@@ -4616,80 +4728,37 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
     let layer: *mut AnyObject = msg_send![popover, layer];
     if !layer.is_null() {
         let _: () = msg_send![layer, setCornerRadius: POPOVER_R];
+        crate::ffi::layer_set_continuous_corner_curve(layer);
         let _: () = msg_send![layer, setMasksToBounds: false];
-        // Match the design's solid fallback surface (`--menu-solid`). This is a plain layer,
-        // not a backdrop-filter surface like the HTML mock: leaving it at 90% opacity exposes
-        // the list's pin/delete controls and hover washes through the menu as sharp ghosts.
-        let surface = if palette.dark {
-            palette.card_bg
-        } else {
-            PICKER_POPOVER_SURFACE_LIGHT
-        };
-        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(surface));
-        // The mock's menu sheen: `linear-gradient(180deg, rgba(255,255,255,.10), transparent
-        // 42%)` over the menu fill. The popover view is flipped, so the gradient's unit-space
-        // y=0 is the top edge, exactly like the CSS 180deg direction.
-        if !palette.dark {
-            let sheen: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
-            if !sheen.is_null() {
-                let _: () = msg_send![sheen, setFrame: NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    frame.size
-                )];
-                let _: () = msg_send![sheen, setCornerRadius: POPOVER_R];
-                let _: () = msg_send![sheen, setMasksToBounds: true];
-                let cg_colors = [
-                    crate::ffi::hex_to_cg_color(0xFFFF_FF1A),
-                    crate::ffi::hex_to_cg_color(0xFFFF_FF00),
-                ];
-                let colors = crate::ffi::CFArrayCreate(
-                    std::ptr::null(),
-                    cg_colors.as_ptr() as *const *const c_void,
-                    cg_colors.len() as isize,
-                    &crate::ffi::kCFTypeArrayCallBacks as *const c_void,
-                );
-                if !colors.is_null() {
-                    let _: () = msg_send![sheen, setColors: colors as *mut AnyObject];
-                    crate::ffi::CFRelease(colors);
-                }
-                let _: () = msg_send![sheen, setStartPoint: NSPoint::new(0.5, 0.0)];
-                let _: () = msg_send![sheen, setEndPoint: NSPoint::new(0.5, 1.0)];
-                let _: () = msg_send![layer, addSublayer: sheen];
-            }
-        }
-        let _: () = msg_send![layer, setBorderWidth: 1.0];
-        let border = crate::ffi::hex_to_cg_color(if palette.dark {
-            palette.card_border
-        } else {
-            0x362E2429
-        });
-        crate::ffi::layer_set_border(layer, border);
-        // The mock's `0 18px 44px rgba(38,30,22,.17)` + `0 2px 8px rgba(38,30,22,.07)`, folded
-        // into the one layer shadow CALayer draws: radius ~blur/2, offset down (AppKit y-up).
-        let shadow = crate::ffi::hex_to_cg_color(if palette.dark {
-            0x00000080
-        } else {
-            0x261E_1633
-        });
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(0));
+        // The rim is NOT stroked here: a border on this layer is painted under the material, which
+        // fills the popover exactly, so an opaque material would hide it completely. It is drawn on
+        // its own topmost decoration instead (`add_popover_rim`), after the rows are in place.
+        // A menu floats at the style document's `med` elevation (§7), so it takes that level's
+        // shared shadow rather than a shadow of its own: the mock's `0 18px 44px` was a shadow for
+        // a surface 26pt above the page, and it is what made the menu look pasted on.
+        let shadow = crate::ffi::hex_to_cg_color(crate::theme::ELEVATION_MED_SHADOW_COLOR);
         crate::ffi::layer_set_shadow_color(layer, shadow);
-        let _: () = msg_send![layer, setShadowOpacity: 1.0f32];
-        let _: () = msg_send![layer, setShadowRadius: 20.0f64];
-        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, -15.0)];
+        let _: () = msg_send![layer, setShadowOpacity: crate::theme::ELEVATION_MED_SHADOW_OPACITY];
+        let _: () = msg_send![layer, setShadowRadius: crate::theme::ELEVATION_MED_SHADOW_RADIUS];
+        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, crate::theme::ELEVATION_MED_SHADOW_OFFSET_Y)];
     }
+
+    let backdrop = add_shared_popover_backdrop(popover, frame.size);
 
     // `.pop-title`: the filter section label, followed by six 32px filter rows.
     let labels = localized_filter_labels();
     let counts = filter_popover_counts();
     let active = *CLIP_FILTER.lock().unwrap();
-    let row_w = POPOVER_W - POPOVER_PAD * 2.0;
+    let (row_x, row_w) = popover_row_span();
     // The same row height the frame was measured with: a short panel compresses the rows so the
     // housekeeping pair stays inside it.
     let row_h = filter_popover_row_h(parent_bounds.size.height);
-    add_popover_section_title(popover, &t("clipboard.filter_section"), POPOVER_PAD);
-    let mut y = POPOVER_PAD + POPOVER_TITLE_H;
+    add_popover_section_title(popover, &t("clipboard.filter_section"), POPOVER_PAD_V);
+    let mut y = POPOVER_PAD_V + POPOVER_TITLE_H;
     let key_row = POPOVER_KEY_ROW.load(Ordering::SeqCst);
     for (i, f) in CLIP_FILTER_ROWS.iter().enumerate() {
-        let row_frame = NSRect::new(NSPoint::new(POPOVER_PAD, y), NSSize::new(row_w, row_h));
+        let row_frame = NSRect::new(NSPoint::new(row_x, y), NSSize::new(row_w, row_h));
         let row: *mut AnyObject = msg_send![hover_button_class(), alloc];
         let row: *mut AnyObject = msg_send![row, initWithFrame: row_frame];
         let _: () = msg_send![row, setBordered: false];
@@ -4735,10 +4804,10 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
 
     add_popover_divider(popover, y, row_w);
     y += POPOVER_DIVIDER_H;
-    add_popover_section_title(popover, &t("clipboard.options_section"), y);
-    y += POPOVER_TITLE_H;
+    let filter = *CLIP_FILTER.lock().unwrap();
+    let has_query = with_clipboard_ui(|ui| !ui.search_query.is_empty());
+    let (clear_label, clear_all_label) = model::popover_clear_labels(filter, has_query);
 
-    // Settings is grouped under the options heading, with the keyboard shortcut aligned trailing.
     let mut tails = Vec::with_capacity(super::popover_tail_row_count());
     tails.push((
         "clipboard.open_settings",
@@ -4758,7 +4827,7 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
             add_popover_divider(popover, y, row_w);
             y += POPOVER_DIVIDER_H;
         }
-        let row_frame = NSRect::new(NSPoint::new(POPOVER_PAD, y), NSSize::new(row_w, row_h));
+        let row_frame = NSRect::new(NSPoint::new(row_x, y), NSSize::new(row_w, row_h));
         let row: *mut AnyObject = msg_send![hover_button_class(), alloc];
         let row: *mut AnyObject = msg_send![row, initWithFrame: row_frame];
         let _: () = msg_send![row, setBordered: false];
@@ -4773,20 +4842,17 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
                 );
             }
         }
-        let hint = match key {
-            // No chord is shown for the settings action: the panel does not listen for one, so
-            // printing it here promised a shortcut that does nothing on this surface.
-            "clipboard.open_settings" => String::new(),
-            "clipboard.clear_button" => t("clipboard.clear_keep_pinned"),
-            "clipboard.clear_all" => t("clipboard.clear_include_pinned"),
-            _ => String::new(),
+        let label = match key {
+            "clipboard.clear_button" => clear_label.clone(),
+            "clipboard.clear_all" => clear_all_label.clone(),
+            _ => t(key),
         };
         let symbol = if key == "clipboard.open_settings" {
             "gearshape"
         } else {
             "trash"
         };
-        add_popover_row_content(row, &t(key), &hint, symbol, false, false, danger);
+        add_popover_row_content(row, &label, "", symbol, false, false, danger);
         // Remember the settings row: it is the control that actually opens the settings window, and a
         // scenario that wants to click it cannot derive its place from the orb (the orb's action opens
         // this popover). The pointer is taken once, here, where the row is built.
@@ -4801,7 +4867,21 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
         y += row_h;
     }
 
-    let _: () = msg_send![parent, addSubview: popover];
+    // The rim goes on last so it is the topmost thing the menu draws, above its own material.
+    add_popover_rim(popover, frame.size);
+
+    // Top of the sibling list, not the bottom: the blank-area drag surface is a sibling that
+    // covers the whole content parent, so a popover appended below it would be painted under the
+    // surface and receive no press at all -- the press would start a drag, and the drag surface's
+    // point is outside the popover's frame, so the window-wide click monitor closed the menu the
+    // user had just opened. NSWindowAbove = 1 with a nil relative view is "above everything".
+    let _: () = msg_send![
+        parent,
+        addSubview: popover,
+        positioned: 1isize,
+        relativeTo: std::ptr::null::<AnyObject>()
+    ];
+    crate::glass::finish_embedded_backdrop(backdrop, POPOVER_R);
     release_obj(popover);
     *FILTER_POPOVER.lock().unwrap() = Some(ObjPtr::new(popover));
 }
@@ -4865,6 +4945,7 @@ pub(super) fn remove_filter_popover_views() {
 /// Close the popover: clear the open flag and remove the view (outside click, Esc, choice, panel
 /// hide).
 pub(super) fn dismiss_filter_popover() {
+    super::drag::clear_pending_popover_dismiss();
     crate::clipboard::set_filter_popover_open(false);
     POPOVER_KEY_ROW.store(usize::MAX, Ordering::SeqCst);
     remove_filter_popover_views();

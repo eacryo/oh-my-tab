@@ -903,13 +903,22 @@ pub(super) fn remove_day_group_scope(
     remove_scope_by_index(history, &scope, clear_all)
 }
 
-/// The header's two clear actions. The first ("clear") sweeps the visible scope but never takes
-/// pinned entries, and its name follows what it keeps safe: a query is active -> "clear current";
-/// a category is selected -> "clear this category"; otherwise the plain "clear". The second
-/// ("clear all", shown only when the user opts in through the settings switch) also takes the
-/// pinned entries of the visible scope, so its name states the wider reach. One place so the
-/// button titles and the behaviour cannot drift apart.
-/// Pure, unit-tested.
+/// Menu labels state the pinned-entry policy without a separate trailing explanation.
+pub(super) fn popover_clear_labels(filter: ClipFilter, has_query: bool) -> (String, String) {
+    if filter == ClipFilter::All && !has_query {
+        return (
+            t("clipboard.menu_clear_unpinned"),
+            t("clipboard.menu_clear_all"),
+        );
+    }
+    let (clear, clear_all) = clip_clear_labels(filter, has_query);
+    (
+        tf("clipboard.menu_clear_scope_unpinned", &[("scope", &clear)]),
+        clear_all,
+    )
+}
+
+/// Header actions name the visible scope; only the second action also removes pinned entries.
 pub(super) fn clip_clear_labels(filter: ClipFilter, has_query: bool) -> (String, String) {
     let clear = if has_query {
         t("clipboard.clear_button_query")

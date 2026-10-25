@@ -288,6 +288,9 @@ done
 # A check that could not run is reported, not counted as either outcome (the tier rule: an unrun check is
 # not a pass). The exit status stays 0 when every check that DID run held.
 if [ "$filter_row_not_run" -gt 0 ]; then
-    echo "panel-contrast: filter-row checks not run in $filter_row_not_run case(s): the popover was closed"
+    # run-all.sh classifies the whole scenario as NOT RUN when this exact marker appears. The footer
+    # checks above still provide evidence, but they do not satisfy this scenario's filter-row claim;
+    # without the uppercase marker the A2 gate counted the partial scenario as a pass.
+    echo "panel-contrast: NOT RUN (filter-row checks not run in $filter_row_not_run case(s): the popover was closed)"
 fi
 exit "$fail"

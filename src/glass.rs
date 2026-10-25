@@ -364,6 +364,7 @@ unsafe fn build_backdrop(
     frame: NSRect,
     corner_radius: f64,
     options: BackdropOptions,
+    embedded_host: Option<*mut AnyObject>,
 ) -> InstalledBackdrop {
     let size = frame.size;
     let material = PanelMaterial::effective();
@@ -488,6 +489,13 @@ unsafe fn build_backdrop(
                 let _: () = msg_send![glass_layer, setCornerRadius: corner_radius];
                 let _: () = msg_send![glass_layer, setMasksToBounds: true];
             }
+            if let Some(host) = embedded_host {
+                let _: () = msg_send![host, addSubview: root];
+                release_obj(content);
+                if root != glass {
+                    release_obj(root);
+                }
+            }
             release_obj(glass);
             InstalledBackdrop {
                 material: PanelMaterial::LiquidGlass,
@@ -538,6 +546,10 @@ unsafe fn build_backdrop(
             let _: () = msg_send![content, setAutoresizingMask: 18u64];
             let _: () = msg_send![root, addSubview: content];
             release_obj(host);
+            if let Some(parent) = embedded_host {
+                let _: () = msg_send![parent, addSubview: root];
+                release_obj(content);
+            }
             release_obj(root);
             InstalledBackdrop {
                 material: PanelMaterial::Backdrop,
@@ -580,6 +592,9 @@ unsafe fn build_backdrop(
                 release_obj(mask);
             }
             install_floor_veil(effect, size, veil);
+            if let Some(host) = embedded_host {
+                let _: () = msg_send![host, addSubview: effect];
+            }
             release_obj(effect);
             InstalledBackdrop {
                 material: PanelMaterial::Frost,
@@ -604,6 +619,9 @@ unsafe fn build_backdrop(
             let _: () = msg_send![layer, setCornerRadius: corner_radius];
             let _: () = msg_send![layer, setMasksToBounds: true];
             layer_set_background(layer, hex_to_cg_color(crate::theme::ui_palette().window_bg));
+            if let Some(host) = embedded_host {
+                let _: () = msg_send![host, addSubview: plain];
+            }
             release_obj(plain);
             InstalledBackdrop {
                 material: PanelMaterial::Opaque,
@@ -1384,19 +1402,45 @@ pub(crate) unsafe fn outline_centre(backdrop: &InstalledBackdrop) -> NSPoint {
     NSPoint::new(bounds.size.width / 2.0, bounds.size.height / 2.0)
 }
 
-/// Install the shared backdrop for the effective material and return the view that owns
-/// panel content. `compensation_alpha` is applied only on macOS 26+, where passive Glass
-/// panels are darkened.
-///
-/// `frame` is the **panel** rect. When the panel has an elevation, the window is enlarged to the padded
-/// rect here, because a window clips whatever exceeds its own frame and the shadow needs the room.
+/// Attach the shared material behind an embedded surface without resizing its window or adding
+/// a shadow carrier. The host owns the returned hierarchy; it contains no panel foreground content.
+pub(crate) unsafe fn install_embedded_backdrop(
+    host: *mut AnyObject,
+    frame: NSRect,
+    corner_radius: f64,
+    options: BackdropOptions,
+) -> InstalledBackdrop {
+    // Attach inside the builder, before its alloc ownership is released.
+    build_backdrop(
+        frame,
+        corner_radius,
+        options.with_elevation(None),
+        Some(host),
+    )
+}
+
+/// Finish an embedded material after its outer host has entered the window. Realizing the
+/// layer earlier does not replace the post-hosting clip assertion required by Liquid Glass.
+pub(crate) unsafe fn finish_embedded_backdrop(backdrop: InstalledBackdrop, corner_radius: f64) {
+    if let Some(root) = backdrop.root {
+        let window: *mut AnyObject = msg_send![root.0, window];
+        debug_assert!(
+            !window.is_null(),
+            "embedded backdrop must be hosted before finalizing its clip"
+        );
+    }
+    reassert_glass_layer_clip(&backdrop, corner_radius);
+}
+
+/// Install the shared backdrop and any shadow carrier as a window's content view.
+/// `frame` is the panel rect; the window grows when its elevation needs shadow padding.
 pub(crate) unsafe fn install_backdrop(
     window: *mut AnyObject,
     frame: NSRect,
     corner_radius: f64,
     options: BackdropOptions,
 ) -> InstalledBackdrop {
-    let mut backdrop = build_backdrop(frame, corner_radius, options);
+    let mut backdrop = build_backdrop(frame, corner_radius, options, None);
     let insets = install_shadow_carrier(&mut backdrop, frame, corner_radius, options);
     adopt_window_root(
         window,
@@ -1450,7 +1494,7 @@ pub(crate) unsafe fn swap_backdrop(
     corner_radius: f64,
     options: BackdropOptions,
 ) -> InstalledBackdrop {
-    let mut new = build_backdrop(frame, corner_radius, options);
+    let mut new = build_backdrop(frame, corner_radius, options, None);
     // The veil is found by tag rather than by reading each child's tag: the panel's own content views are
     // plain `NSView`s, which do not answer `tag`.
     let retired_veil: *mut AnyObject = msg_send![old.content_parent, viewWithTag: FLOOR_VEIL_TAG];

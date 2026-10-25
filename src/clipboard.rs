@@ -1774,15 +1774,12 @@ fn filter_popover_rows_union() -> Option<(f64, f64, f64, f64)> {
         frame.size.height,
         parent_flipped.as_bool(),
     );
-    let rows_top = popover_top + POPOVER_PAD + POPOVER_TITLE_H;
-    let rows_h =
-        model::CLIP_FILTER_ROWS.len() as f64 * detail::filter_popover_row_h(bounds.size.height);
-    Some((
-        frame.origin.x + POPOVER_PAD,
-        rows_top,
-        frame.size.width - POPOVER_PAD * 2.0,
-        rows_h,
-    ))
+    let rows_top = popover_top + POPOVER_PAD_V + POPOVER_TITLE_H;
+    let rows_h = model::CLIP_FILTER_ROWS.len() as f64
+        * detail::filter_popover_row_h(bounds.size.height)
+        + (model::CLIP_FILTER_ROWS.len() - 1) as f64;
+    let (row_x, row_w) = popover_row_span();
+    Some((frame.origin.x + row_x, rows_top, row_w, rows_h))
 }
 /// The options orb's 5px accent dot (the mock's `.orb-dot`), shown only while the active
 /// filter is not "All".
@@ -1833,7 +1830,9 @@ pub(super) static POPOVER_KEY_ROW: std::sync::atomic::AtomicUsize =
 
 // Menu metrics follow clipboard-v2-1.html's .popover, .filter-row and .clean-row rules.
 pub(super) const POPOVER_W: f64 = 236.0;
+/// The menu's horizontal inset.
 pub(super) const POPOVER_PAD: f64 = 6.0;
+pub(super) const POPOVER_PAD_V: f64 = 12.0;
 pub(super) const POPOVER_R: f64 = 18.0;
 pub(super) const POPOVER_ROW_H: f64 = 32.0;
 /// The lowest the menu rows shrink in a short panel, preserving the documented 28pt hit target.
@@ -1873,7 +1872,7 @@ pub(super) fn popover_hover_bg(palette: crate::theme::UiPalette, danger: bool) -
 pub(super) const POPOVER_TITLE_H: f64 = 23.0;
 /// `.pop-divider` 1px hairline with 6px vertical margins.
 pub(super) const POPOVER_DIVIDER_H: f64 = 13.0;
-/// `.popover { right: 14px; top: 70px }` -- anchored to the panel edge under the orbs.
+/// Minimum clearance when centering the menu below its options button.
 pub(super) const POPOVER_RIGHT_INSET: f64 = 14.0;
 pub(super) const POPOVER_TOP: f64 = 70.0;
 /// The gap the popover keeps from the panel's bottom edge when the panel is too short to hold the
@@ -1883,15 +1882,43 @@ pub(super) const POPOVER_BOTTOM_INSET: f64 = 8.0;
 pub(super) fn popover_tail_row_count() -> usize {
     usize::from(text_style::clear_all_button_visible()) + 2
 }
-/// The popover's light-mode fill (`--menu-solid` in the mock), drawn in `build_filter_popover`
-/// and read by the check-on-wash contrast test so the two can never drift apart.
-pub(super) const PICKER_POPOVER_SURFACE_LIGHT: u32 = 0xD6D2CAFF;
+/// The shared light window surface, used as the opaque reference for menu ink tests.
+#[cfg(test)]
+pub(super) const PICKER_POPOVER_SURFACE_LIGHT: u32 = 0xECECECFF;
+/// A small lift over the shared panel material, rather than an independent opaque menu tint.
+pub(super) const POPOVER_LIFT_TOP_LIGHT: u32 = 0xFFFFFF0C;
+pub(super) const POPOVER_LIFT_BOTTOM_LIGHT: u32 = 0xFFFFFF04;
+pub(super) const POPOVER_LIFT_TOP_DARK: u32 = 0xFFFFFF08;
+/// The light popover's rim. The mock drew a neutral `#362E24` line, which belonged to the beige
+/// surface; over the white fill the rim is the sheet's `card_border` stroke, and it is the line
+/// (not the fill) that separates the menu from the panel behind it.
+pub(super) const PICKER_POPOVER_BORDER_LIGHT: u32 = 0x2D28241A;
+/// The popover's rim width. The layer's border stroke is drawn inward, so the row, label and
+/// divider insets are derived from it (`popover_row_span`) instead of assuming it away.
+pub(super) const POPOVER_BORDER_W: f64 = 1.0;
+
+/// The shared window surface for menu ink reference tests.
+#[cfg(test)]
+pub(super) fn popover_surface(palette: crate::theme::UiPalette) -> u32 {
+    palette.window_bg
+}
+
+/// A row's (x, width) inside the menu: the horizontal inset less the rim the layer's border draws
+/// inward, so the row wash stops at the rim's inner edge instead of sliding under it. Shared by the
+/// filter rows, the housekeeping rows and the section labels, which all sit on that inset.
+pub(super) fn popover_row_span() -> (f64, f64) {
+    let x = POPOVER_PAD - POPOVER_BORDER_W;
+    (x, POPOVER_W - x * 2.0)
+}
+
 /// The `.filter-row.is-active` wash and the hover wash (light only; dark keeps hover_bg).
+///
+/// The accent wash preserves the state contrast floor on the shared opaque reference surface.
 pub(super) fn picker_popover_active_bg(palette: crate::theme::UiPalette) -> u32 {
     if palette.dark {
         palette.hover_bg
     } else {
-        0x2F6FED1A
+        0x2F6FED28
     }
 }
 /// `.filter-row.is-active:hover`: the active row's hover deepens the accent wash
@@ -1900,16 +1927,17 @@ pub(super) fn picker_popover_active_hover_bg(palette: crate::theme::UiPalette) -
     if palette.dark {
         palette.hover_bg
     } else {
-        0x2F6FED29
+        0x2F6FED2C
     }
 }
 /// The `.filter-row .check` ink: the mock's `--accent-strong` (#2359c7). Dark keeps the
-/// accent -- the deeper blue reads as a shadow on the dark surface.
+/// accent -- the deeper blue reads as a shadow on the dark surface. The check identifies the
+/// active filter, so the contrast tests hold it to the text floor.
 pub(super) fn popover_check_color(palette: crate::theme::UiPalette) -> u32 {
     if palette.dark {
         palette.accent
     } else {
-        0x2359_C7FF
+        0x1F50_BAFF
     }
 }
 
@@ -4704,15 +4732,16 @@ mod tests {
     #[test]
     fn the_popover_frame_anchors_under_the_options_orb() {
         use super::detail::{filter_popover_frame, top_offset_of};
-        use super::{POPOVER_PAD, POPOVER_RIGHT_INSET, POPOVER_TOP, POPOVER_W, SEARCH_H};
+        use super::{POPOVER_TOP, POPOVER_W, SEARCH_H};
         // The picker's content parent is a plain (bottom-up) NSView: the top-anchored offset the
         // mock states is converted into its origin, so the popover's top edge really sits
         // POPOVER_TOP below the panel's top.
         let parent_h = 600.0;
         let frame = filter_popover_frame(parent_h, false);
+        let (_, _, options, _, _, _) = super::picker_header_frames();
         assert_eq!(
-            frame.origin.x + frame.size.width,
-            PICKER_W - POPOVER_RIGHT_INSET
+            frame.origin.x + frame.size.width / 2.0,
+            options.origin.x + options.size.width / 2.0
         );
         assert_eq!(frame.size.width, POPOVER_W);
         assert_eq!(
@@ -4727,7 +4756,6 @@ mod tests {
         assert!(frame.origin.y >= 0.0);
         assert!(frame.origin.y + frame.size.height <= parent_h);
         assert!(frame.origin.x >= 0.0);
-        let _ = POPOVER_PAD;
         // A flipped parent (the convention the list container uses) needs no conversion at all.
         let flipped = filter_popover_frame(parent_h, true);
         assert_eq!(flipped.origin.y, POPOVER_TOP);
@@ -4778,6 +4806,68 @@ mod tests {
         // allows; a degenerate panel pins the menu to the top rather than starting above it.
         assert!(top + h + POPOVER_BOTTOM_INSET >= min_h - 0.001);
         assert_eq!(filter_popover_top(10.0, h), 0.0);
+    }
+
+    /// The shared opaque reference surface keeps readable inks and a distinct selected row.
+    /// Its border and shadow, rather than a fill contrast threshold, separate it from the picker.
+    #[test]
+    fn the_menu_surface_and_its_inks_keep_the_palette_floors() {
+        use super::{
+            popover_check_color, popover_danger, popover_muted, popover_surface,
+            PICKER_POPOVER_SURFACE_LIGHT,
+        };
+        use crate::theme::{
+            color_rgb, composite_over, contrast_on, contrast_ratio, ui_palette_for_mode,
+        };
+        let light = ui_palette_for_mode(false);
+        let dark = ui_palette_for_mode(true);
+        assert_eq!(popover_surface(light), PICKER_POPOVER_SURFACE_LIGHT);
+        assert_eq!(popover_surface(dark), dark.window_bg);
+        // Ink on the fill: hard text floors, plus the active row's accent wash on top.
+        let surface = color_rgb(PICKER_POPOVER_SURFACE_LIGHT);
+        let active = composite_over(
+            super::picker_popover_active_bg(light),
+            PICKER_POPOVER_SURFACE_LIGHT,
+        );
+        for (ink, floor, name) in [
+            (light.primary_text, 4.5, "primary_text"),
+            (popover_muted(light), 4.5, "popover_muted"),
+            (popover_danger(light), 4.5, "popover_danger"),
+        ] {
+            for (bg, where_) in [(surface, "the fill"), (active, "the active row")] {
+                let ratio = contrast_on(ink, bg);
+                assert!(
+                    ratio >= floor,
+                    "{name} measures {ratio:.2}:1 on {where_} (min {floor}:1)"
+                );
+            }
+        }
+        let check = contrast_on(popover_check_color(light), active);
+        assert!(
+            check >= 4.5,
+            "the check measures {check:.2}:1 on the active row (min 4.5:1: it carries the state)"
+        );
+        // A selected row is a state, not decoration, so the wash itself has to be perceivable
+        // against the fill it lies on: the sheet's structural floor is 1.2:1.
+        let wash = contrast_ratio(active, surface);
+        assert!(
+            wash >= 1.2,
+            "the active row's wash measures {wash:.2}:1 against the menu fill (min 1.2:1)"
+        );
+    }
+
+    /// The layer's 1pt rim is drawn inward, so the rows sit `POPOVER_BORDER_W` inside
+    /// `POPOVER_PAD`: a row drawn at the nominal inset would tuck its wash under the rim, and the
+    /// two left edges would read as a 2pt step. Pinned so a rim-width change cannot desync them.
+    #[test]
+    fn menu_rows_clear_the_rim_inward() {
+        use super::{popover_row_span, POPOVER_BORDER_W, POPOVER_PAD, POPOVER_W};
+        let (x, w) = popover_row_span();
+        assert!(POPOVER_BORDER_W > 0.0);
+        assert_eq!(x, POPOVER_PAD - POPOVER_BORDER_W);
+        // Symmetric about the menu's centre: the rim eats the same 1pt on both sides.
+        assert!((x - (POPOVER_W - x - w)).abs() < 1e-9);
+        assert!(x > 0.0, "a row must not start outside the menu");
     }
 
     /// One conversion for top-down layout: placing a child at a top offset and reading that offset
@@ -4836,12 +4926,12 @@ mod tests {
         }
         assert_eq!(seen, CLIP_FILTER_ROWS);
     }
-    /// The active-row check sits on both accent washes (`.is-active` 10% and
-    /// `.is-active:hover` 16%): keep its composite contrast over the light menu surface
-    /// at the 3.5:1 meaning-bearing-glyph floor so a future token change cannot quietly
-    /// sink it (the hover wash currently leaves a ~0.03 margin).
+    /// The active-row check sits on both accent washes: keep its composite contrast over the light menu surface
+    /// at the 4.5:1 text floor so a future token change cannot quietly sink it. The check
+    /// says which filter is active -- it is text, not a decorative glyph, and the old
+    /// 3.5:1 ceiling let it sit at 3.76:1 on the previous menu fill.
     #[test]
-    fn popover_check_keeps_the_glyph_contrast_floor_on_both_washes() {
+    fn popover_check_keeps_the_contrast_floor_on_both_washes() {
         use super::{
             picker_popover_active_bg, picker_popover_active_hover_bg, popover_check_color,
             PICKER_POPOVER_SURFACE_LIGHT,
@@ -4858,8 +4948,8 @@ mod tests {
             let bg = composite_over(wash, surface);
             let ratio = contrast_ratio(color_rgb(check), bg);
             assert!(
-                ratio >= 3.5,
-                "check on the {name} wash measures {ratio:.2}:1 (min 3.5:1)"
+                ratio >= 4.5,
+                "check on the {name} wash measures {ratio:.2}:1 (min 4.5:1)"
             );
         }
     }

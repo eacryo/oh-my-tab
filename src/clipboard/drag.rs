@@ -73,6 +73,93 @@ static DRAG_SURFACE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
 // Position state
 // ---------------------------------------------------------------------------------------------
 
+/// Whether a grab is in flight (a press on a blank region, not yet released). The panel itself
+/// answers popover questions from `grab_travelled`; this is what the tests assert the recording
+/// against.
+#[cfg(test)]
+pub(super) fn drag_in_progress() -> bool {
+    DRAG.lock().unwrap().is_some()
+}
+
+/// Whether the recorded grab has travelled past its threshold -- a real drag of the panel, as
+/// opposed to the grab record every blank-region press creates whether or not it moves.
+fn grab_travelled() -> bool {
+    DRAG.lock().unwrap().as_ref().is_some_and(|drag| drag.moved)
+}
+
+/// An outside press that arrived while the options popover was open, held until the release says
+/// whether it was a drag (keep the menu) or a click (close it).
+///
+/// A press alone cannot answer that: every drag starts as a press on a blank region, and the
+/// popover's outside-click rule is evaluated in `sendEvent:` before the drag has moved. So the
+/// press is recorded here and the dismissal is decided from the recorded grab at the release --
+/// `moved` is the same threshold the drag itself uses, so a sub-threshold wobble behaves exactly
+/// like the click it is.
+static PENDING_POPOVER_DISMISS: Mutex<bool> = Mutex::new(false);
+
+/// Record what the press that just arrived means for the popover: `true` when it landed outside
+/// the menu (and not on the orb that toggles it), which is the case the release has to decide.
+/// An inside press clears any stale flag -- only the most recent press matters.
+pub(super) fn note_popover_outside_press(outside: bool) {
+    *PENDING_POPOVER_DISMISS.lock().unwrap() = outside;
+}
+
+/// Forget an outside press when its popover closes before the matching release arrives.
+/// The panel can be hidden mid-gesture, in which case AppKit does not deliver that release;
+/// carrying the flag into the next showing could dismiss a newly opened menu.
+pub(super) fn clear_pending_popover_dismiss() {
+    *PENDING_POPOVER_DISMISS.lock().unwrap() = false;
+}
+
+/// What the release of an outside press does to an open options menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PopoverRelease {
+    /// The press never happened outside an open menu: nothing to do.
+    Nothing,
+    /// A press that stayed put (a click): close the menu.
+    Dismiss,
+    /// A press that became a drag of the panel: the menu stays open.
+    Keep,
+}
+
+/// The decision itself, pure so it can be asserted: a press only dismisses the menu when it did
+/// NOT travel. `travelled` must be the drag threshold's answer, never "a grab exists" -- every
+/// blank-region press records a grab, so keying on that would turn every click into a keep.
+fn popover_release(pending: bool, travelled: bool) -> PopoverRelease {
+    match (pending, travelled) {
+        (false, _) => PopoverRelease::Nothing,
+        (true, true) => PopoverRelease::Keep,
+        (true, false) => PopoverRelease::Dismiss,
+    }
+}
+
+/// The release half: drop the pending press, dismissing the popover unless that press became a
+/// drag of the panel. Called for every press the window forwarded, whether or not one is pending.
+pub(super) fn finish_popover_press() {
+    finish_popover_press_with(dismiss_for_release);
+}
+
+/// The release half with the dismissal supplied by the caller, so a test can observe the *effect*
+/// (was the menu closed?) rather than the decision value.
+///
+/// The decision itself -- reading the pending press and asking whether the grab travelled -- stays
+/// INSIDE this function on purpose. A seam that took the finished decision as a parameter would let
+/// a test re-evaluate the decision in its own closure and still pass after the production call site
+/// regressed to "is a grab in progress?" (true for every blank press, clicks included), which is
+/// exactly the bug this guards. Only the dismissal is injected.
+fn finish_popover_press_with(dismiss: impl FnOnce()) {
+    let pending = std::mem::take(&mut *PENDING_POPOVER_DISMISS.lock().unwrap());
+    match popover_release(pending, grab_travelled()) {
+        PopoverRelease::Nothing | PopoverRelease::Keep => {}
+        PopoverRelease::Dismiss => dismiss(),
+    }
+}
+
+/// The shipped dismissal: AppKit work, main thread only.
+fn dismiss_for_release() {
+    crate::clipboard::detail::dismiss_filter_popover();
+}
+
 /// The dragged anchor for this showing, if the user has moved the panel.
 pub(super) fn session_origin() -> Option<NSPoint> {
     *SESSION_ORIGIN.lock().unwrap()
@@ -311,6 +398,23 @@ pub(super) unsafe fn raise_drag_surface(content_parent: *mut AnyObject) {
         positioned: 1isize,
         relativeTo: std::ptr::null::<AnyObject>()
     ];
+    // Raising the surface above a rebuild must not push it over the open options popover: the
+    // popover is built after this surface and would lose its presses (every blank press there
+    // would start a drag), and the window-wide click monitor then closes the menu the user had
+    // just opened. Put the popover back on top whenever it is present.
+    if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
+        if !popover.0.is_null() {
+            let popover_parent: *mut AnyObject = msg_send![popover.0, superview];
+            if popover_parent == content_parent {
+                let _: () = msg_send![
+                    content_parent,
+                    addSubview: popover.0,
+                    positioned: 1isize,
+                    relativeTo: std::ptr::null::<AnyObject>()
+                ];
+            }
+        }
+    }
 }
 
 /// The surface's hit test: accept only a truly inert blank region, decline everything ambiguous.
@@ -339,6 +443,19 @@ extern "C" fn drag_surface_hit_test(
                 if !scroll.is_null() {
                     let scroll_frame: NSRect = msg_send![scroll, frame];
                     if point_in_list_region(point, scroll_frame) {
+                        return std::ptr::null_mut();
+                    }
+                }
+            }
+            // The options popover is a sibling laid over the content, and a press that starts on it
+            // must reach it: the panel's window-wide click monitor dismisses the popover on a press
+            // outside its frame, so a blank region it covers has to stay a drag dead zone while it
+            // is open. Otherwise "click a blank strip, drag to move the panel" reads to the app as
+            // a press outside the menu and the menu closes under the grab.
+            if let Some(popover) = *FILTER_POPOVER.lock().unwrap() {
+                if !popover.0.is_null() {
+                    let popover_frame: NSRect = msg_send![popover.0, frame];
+                    if rect_contains_point(popover_frame, point) {
                         return std::ptr::null_mut();
                     }
                 }
@@ -810,6 +927,7 @@ mod tests {
 
     #[test]
     fn the_dragged_anchor_is_used_until_the_showing_hides() {
+        let _guard = popover_test_lock();
         // One test, not two: the anchor is process-global state, and two tests setting and clearing it
         // race each other under the harness's parallel threads (the failure that produced this shape).
         let origin = NSPoint::new(120.0, 340.0);
@@ -849,5 +967,167 @@ mod tests {
         assert!(!point_in_list_region(NSPoint::new(280.0, 43.9), viewport));
         assert!(!point_in_list_region(NSPoint::new(280.0, 444.1), viewport));
         assert!(!point_in_list_region(NSPoint::new(560.1, 200.0), viewport));
+    }
+
+    /// The behaviour end to end through the seam the window's release handler uses: a blank press
+    /// that did NOT travel must reach the dismissal, one that travelled must not.
+    ///
+    /// Driving the seam (not the pure decision) is what actually pins the original bug. Asserting
+    /// `popover_release` case by case still passes when the caller feeds it "is a grab in
+    /// progress?" instead of "did it travel?" -- every blank press records a grab, so clicks would
+    /// read as Keep -- which is exactly how "every blank click keeps the menu open" survived a
+    /// review round. Verified by mutation: reverting the caller to `drag_in_progress()` makes this
+    /// test fail and leaves the pure-decision assertions green.
+    #[test]
+    fn a_blank_click_dismisses_and_a_drag_does_not() {
+        let _guard = popover_test_lock();
+        let press = |moved: bool| {
+            *DRAG.lock().unwrap() = Some(PanelDrag {
+                mouse_down: NSPoint::new(0.0, 0.0),
+                picker: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0)),
+                anchor: NSPoint::new(0.0, 0.0),
+                detail: None,
+                moved,
+            });
+        };
+        // Drive the production entry point itself (`finish_popover_press` with only the dismissal
+        // injected) -- never a re-derivation of its decision, or this test would keep passing after
+        // the production call site regressed to "is a grab in progress?".
+        let release_through_caller = || {
+            let dismissals = std::cell::Cell::new(0);
+            finish_popover_press_with(|| dismissals.set(dismissals.get() + 1));
+            dismissals.get()
+        };
+
+        // Click on a blank area: the grab exists but never travelled, so the menu must close.
+        note_popover_outside_press(true);
+        press(false);
+        assert_eq!(
+            release_through_caller(),
+            1,
+            "a blank click must close the menu"
+        );
+
+        // Drag of the panel: the grab travelled, so the menu stays open.
+        note_popover_outside_press(true);
+        press(true);
+        assert_eq!(
+            release_through_caller(),
+            0,
+            "a drag must leave the menu open"
+        );
+
+        // A press inside the menu never pends, so it cannot close it either.
+        note_popover_outside_press(false);
+        assert_eq!(release_through_caller(), 0);
+
+        *DRAG.lock().unwrap() = None;
+    }
+
+    /// The decision, asserted case by case around the same seam.
+    #[test]
+    fn only_a_travelled_press_keeps_the_popover_open() {
+        let _guard = popover_test_lock();
+        assert_eq!(popover_release(false, false), PopoverRelease::Nothing);
+        assert_eq!(popover_release(false, true), PopoverRelease::Nothing);
+        // A click outside an open menu closes it -- the everyday gesture.
+        assert_eq!(popover_release(true, false), PopoverRelease::Dismiss);
+        // A drag of the panel leaves the menu open.
+        assert_eq!(popover_release(true, true), PopoverRelease::Keep);
+    }
+
+    /// The pending flag is consumed by exactly one release, and a press that did not travel reads
+    /// as a click. Drives the real `finish_popover_press` entry point, which is what the window's
+    /// `sendEvent:` calls; the dismiss itself is a main-thread AppKit call, so the decision it
+    /// acts on is asserted separately by `only_a_travelled_press_keeps_the_popover_open`.
+    #[test]
+    fn a_release_consumes_the_pending_press_once() {
+        let _guard = popover_test_lock();
+        let press = |moved: bool| {
+            *DRAG.lock().unwrap() = Some(PanelDrag {
+                mouse_down: NSPoint::new(0.0, 0.0),
+                picker: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0)),
+                anchor: NSPoint::new(0.0, 0.0),
+                detail: None,
+                moved,
+            });
+        };
+        // A press inside the menu (or on its orb) is not an outside press at all: nothing pends.
+        note_popover_outside_press(false);
+        assert!(!popover_press_pending());
+        // A press outside holds the decision, and the grab it starts is not yet a drag.
+        note_popover_outside_press(true);
+        press(false);
+        assert!(popover_press_pending());
+        assert!(drag_in_progress());
+        assert!(!grab_travelled(), "a fresh press has not travelled yet");
+        // A drag that travelled reads as Keep rather than Dismiss.
+        press(true);
+        assert!(grab_travelled());
+        assert_eq!(
+            popover_release(popover_press_pending(), grab_travelled()),
+            PopoverRelease::Keep
+        );
+        // The release consumes the decision; the grab itself is cleared by `finish_drag`.
+        *PENDING_POPOVER_DISMISS.lock().unwrap() = false;
+        *DRAG.lock().unwrap() = None;
+        assert!(!popover_press_pending());
+        assert!(!drag_in_progress());
+    }
+
+    #[test]
+    fn a_closed_popover_cannot_be_dismissed_by_a_late_release() {
+        let _guard = popover_test_lock();
+        note_popover_outside_press(true);
+        assert!(popover_press_pending());
+
+        // Closing the menu (including when its panel is hidden) consumes the old press. If a new
+        // menu opens before AppKit delivers the old release, that release has no dismissal to run.
+        // A grab is deliberately left in place: with the press consumed, the release must resolve
+        // to Nothing whatever the drag state says -- otherwise a stale press would close the menu
+        // the user reopened in the meantime.
+        *DRAG.lock().unwrap() = Some(PanelDrag {
+            mouse_down: NSPoint::new(0.0, 0.0),
+            picker: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(10.0, 10.0)),
+            anchor: NSPoint::new(0.0, 0.0),
+            detail: None,
+            moved: false,
+        });
+        clear_pending_popover_dismiss();
+        assert!(!popover_press_pending());
+        assert_eq!(
+            popover_release(popover_press_pending(), grab_travelled()),
+            PopoverRelease::Nothing
+        );
+        finish_popover_press();
+        assert!(!popover_press_pending());
+        *DRAG.lock().unwrap() = None;
+    }
+
+    /// Reads the pending flag for the test above without exposing the private mutex.
+    fn popover_press_pending() -> bool {
+        *PENDING_POPOVER_DISMISS.lock().unwrap()
+    }
+
+    /// Serializes the tests that drive the process-wide drag/pending state. They mutate the same
+    /// two statics the panel does, and `forget_session_position` clears the grab outright, so two
+    /// of them running at once would read each other's state (the same reason
+    /// `clipboard::gate_test_lock` exists).
+    fn popover_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The options popover covers part of the header strip, which is otherwise the panel's drag
+    /// area. While it is open a press there must reach the menu, not the drag surface: the press
+    /// is outside the menu's frame, so taking it would close the menu during a drag.
+    #[test]
+    fn the_popover_is_declined_by_the_drag_surface() {
+        let popover = rect(320.0, 250.0, 236.0, 334.0);
+        assert!(rect_contains_point(popover, NSPoint::new(320.0, 250.0)));
+        assert!(rect_contains_point(popover, NSPoint::new(438.0, 400.0)));
+        assert!(rect_contains_point(popover, NSPoint::new(556.0, 584.0)));
+        assert!(!rect_contains_point(popover, NSPoint::new(319.9, 400.0)));
+        assert!(!rect_contains_point(popover, NSPoint::new(438.0, 584.1)));
     }
 }

@@ -48,6 +48,23 @@ unsafe fn popover_filter_rows(popover: *mut AnyObject) -> Vec<(isize, f64)> {
         );
         let label: *mut AnyObject = msg_send![columns, objectAtIndex: 1usize];
         let counter: *mut AnyObject = msg_send![columns, objectAtIndex: 2usize];
+        let palette = clipboard_palette();
+        let label_color: *mut AnyObject = msg_send![label, textColor];
+        let counter_color: *mut AnyObject = msg_send![counter, textColor];
+        let expected_label =
+            crate::glass::panel_ink(palette.primary_text, crate::glass::PanelInk::Primary);
+        let expected_counter =
+            crate::glass::panel_ink(popover_muted(palette), crate::glass::PanelInk::Secondary);
+        let label_matches: bool = msg_send![label_color, isEqual: expected_label];
+        let counter_matches: bool = msg_send![counter_color, isEqual: expected_counter];
+        assert!(
+            label_matches,
+            "menu labels must follow the panel material's primary ink"
+        );
+        assert!(
+            counter_matches,
+            "menu counts must follow the panel material's secondary ink"
+        );
         let label_frame: NSRect = msg_send![label, frame];
         let counter_frame: NSRect = msg_send![counter, frame];
         assert!(label_frame.origin.x + label_frame.size.width <= counter_frame.origin.x);
@@ -330,7 +347,9 @@ pub(crate) fn smoke_runner() -> bool {
     unsafe {
         let backdrop = (*PICKER_BACKDROP.lock().unwrap())
             .expect("the picker's backdrop exists once the picker has been shown");
-        let expected = crate::glass::panel_outline_enabled();
+        let expected = crate::glass::panel_outline_enabled()
+            && backdrop.material != crate::glass::PanelMaterial::LiquidGlass
+            && backdrop.material_root.is_some();
         match crate::glass::outline_state(&backdrop) {
             Some((width, colour_matches)) => {
                 assert!(
@@ -348,7 +367,10 @@ pub(crate) fn smoke_runner() -> bool {
             }
             None => assert!(
                 !expected,
-                "the switch asked for an outline, but none was installed"
+                "the switch asked for an outline, but none was installed (material={:?}, root={}, enabled={})",
+                backdrop.material,
+                backdrop.material_root.is_some(),
+                crate::glass::panel_outline_enabled()
             ),
         }
         assert!(
@@ -360,7 +382,7 @@ pub(crate) fn smoke_runner() -> bool {
         // material, so a stale value is a visibly wrong stroke. Only checked
         // when the outline is expected -- `--panel-outline=off` is a legitimate launch, and requiring a view
         // there would fail the very smoke that verifies the switch.
-        if crate::glass::panel_outline_enabled() {
+        if expected {
             let token =
                 crate::glass::panel_outline_color(backdrop.material, &crate::theme::ui_palette());
             let expected = crate::ffi::hex_to_cg_color(token);
@@ -1518,6 +1540,32 @@ pub(crate) fn smoke_runner() -> bool {
             FILTER_POPOVER.lock().unwrap().is_none(),
             "dismissing must remove the view"
         );
+    }
+    // Build the real menu under each configured material, including a live transition while open.
+    unsafe {
+        let original_material = CONFIG.read().unwrap().appearance.panel_material.clone();
+        for material in ["liquid-glass", "frost", "opaque"] {
+            CONFIG.write().unwrap().appearance.panel_material = material.into();
+            super::detail::apply_backdrop_material();
+            super::toggle_filter_popover();
+            let popover = (*FILTER_POPOVER.lock().unwrap())
+                .expect("menu must be built")
+                .0;
+            let window: *mut AnyObject = msg_send![popover, window];
+            assert!(
+                !window.is_null(),
+                "menu must enter its window before finalizing its clip"
+            );
+            assert_eq!(popover_filter_rows(popover).len(), CLIP_FILTER_ROWS.len());
+            super::detail::apply_glass_properties();
+            let rebuilt = (*FILTER_POPOVER.lock().unwrap())
+                .expect("live updates keep the menu open")
+                .0;
+            assert_eq!(popover_filter_rows(rebuilt).len(), CLIP_FILTER_ROWS.len());
+            dismiss_filter_popover();
+        }
+        CONFIG.write().unwrap().appearance.panel_material = original_material;
+        super::detail::apply_backdrop_material();
     }
     // The date headings no longer carry a destructive clear button: history clearing is grouped
     // into the options menu, matching the design.

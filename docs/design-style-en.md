@@ -215,13 +215,40 @@ not by its alpha.
 
 ### 3.4 Translucency
 
-The clipboard options menu follows `clipboard-v2-1.html`: an opaque warm fallback
-surface prevents underlying list controls from showing through sharply. Its owning tokens are
-`POPOVER_*`, `popover_muted`, `popover_danger` and `popover_hover_bg` in `src/clipboard.rs`.
+The clipboard options menu uses `glass::install_embedded_backdrop`, sharing the picker's material builder and tuning.
+It creates a background-only material view rather than copying rendered picker content.
+The shared builder controls blur, glass tint, passive compensation and the opaque accessibility fallback.
+`POPOVER_LIFT_*` adds a light tint over that material instead of a fixed white surface.
+Its rim, `med` elevation shadow and that lift build the hierarchy; no surface-contrast threshold is
+claimed for the fill. Under all three materials the two surfaces are near-identical, so no "the menu
+must be whiter by N:1" floor holds here. The rim is stroked on a transparent decoration laid
+**above** the material (`add_popover_rim`): a border on the menu's own layer is painted under the
+material that fills it, which makes it invisible under the opaque material -- the one case that needs
+the boundary most. Under the opaque material the separation is therefore rim + shadow + lift alone,
+and no pixel measurement covers that promise yet (see `docs/review-backlog.md` #56).
+The menu has no independent within-window popover blur that samples the clipboard list.
+Its owning tokens are `POPOVER_*`, `popover_muted`,
+`popover_danger` and `popover_hover_bg` in `src/clipboard.rs`.
 The menu deliberately uses the reference's compact text size and inner row radius rather than
 the general type ladder and concentric rule. Counts and checks occupy separate trailing columns;
-settings shortcuts and clear-action hints align to the trailing edge. Dark mode uses semantic
-palette colors. Inspect the shipped metrics with `rg -n 'POPOVER_|fn popover_' src/clipboard.rs`; the
+clear actions state their scope in the label. Dark mode uses semantic palette colors.
+Menu labels, counts and ordinary icons use the same material-aware ink path as the picker.
+Destructive actions and the selection check keep their semantic colors.
+Liquid Glass clipping is finalized after the menu enters its window.
+
+The menu centers below its options button without a pointer.
+`POPOVER_R` controls its continuous outer corners independently of the picker.
+The filter heading remains. Dividers separate filters, settings and clearing actions without an options heading.
+Vertical padding uses `POPOVER_PAD_V`; the menu keeps its existing width and row heights.
+
+The shared light window surface's contrast floors, pinned by
+`the_menu_surface_and_its_inks_keep_the_palette_floors` and computed from the tokens with the WCAG
+formula (not measured from rendered pixels): `primary_text`, `popover_muted` and `popover_danger`
+are ≥4.5:1 on the fill and the selected row's wash. The check also has a 4.5:1 floor.
+The selected row's wash has a 1.2:1 floor against the fill.
+These token checks do not verify the rendered blur against different underlying content.
+Reproduce these checks with `scripts/cargo-test.sh the_menu_surface_and_its_inks_keep_the_palette_floors --require-match`.
+Inspect the shipped metrics with `rg -n 'POPOVER_|fn popover_' src/clipboard.rs`; the
 reference mock lives outside the repository, so no command here reproduces it and none is quoted as
 if it did.
 
