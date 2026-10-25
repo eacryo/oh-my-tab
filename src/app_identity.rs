@@ -54,6 +54,23 @@ pub(crate) unsafe fn bundle_identity_at_path(path: &str) -> Option<(String, Stri
     Some((bundle_id, name))
 }
 
+/// The application's user-visible name, for the menu bar's application menu.
+///
+/// The bundle's display name, so a development build reads "Oh-My-Tab Dev" and the installed build
+/// "Oh-My-Tab" for exactly the same code. The fixed name is the fallback for a process started
+/// outside a bundle, where the system would otherwise show the executable's name ("oh-my-tab").
+pub(crate) fn application_display_name() -> String {
+    for key in ["CFBundleDisplayName", "CFBundleName"] {
+        let name = unsafe { crate::ffi::bundle_info_string(key) }
+            .trim()
+            .to_string();
+        if !name.is_empty() {
+            return name;
+        }
+    }
+    "Oh My Tab".to_string()
+}
+
 /// Every running regular (Dock-visible) application that has a bundle identifier, sorted by
 /// display name, with this process excluded. Backs the clipboard exclusion list's "add a running
 /// app" control: only apps that can actually own a copy are offered.

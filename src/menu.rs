@@ -63,6 +63,9 @@ pub(crate) struct MenuUi {
     /// once and only its visibility changes, so every pointer registered above stays valid for the
     /// process lifetime and no menu object is ever detached from a live item.
     pub(crate) status_item: Option<*mut AnyObject>,
+    /// The app menu's item on the application's main menu; its title is the application name the
+    /// system shows in the menu bar while the app is .regular. See `install_main_menu`.
+    pub(crate) app_menu_item: Option<*mut AnyObject>,
 }
 
 thread_local! {
@@ -74,6 +77,7 @@ thread_local! {
         clipboard_pin: None,
         clipboard_pause: None,
         status_item: None,
+        app_menu_item: None,
     }) };
 }
 
@@ -110,6 +114,243 @@ pub(crate) fn set_status_item_visible(visible: bool) {
     };
     unsafe {
         let _: () = msg_send![item, setVisible: visible];
+    }
+}
+
+/// Development switch that hides the application menu item, so an automated check can assert what
+/// the menu bar really shows without a way to read the menu bar itself.
+pub(crate) const HIDE_APP_MENU_FLAG: &str = "hide-app-menu";
+
+/// Build the application's main menu: one item named after the app and an empty submenu.
+///
+/// The app is .regular only while Settings is open (`set_settings_activation_policy`), and that is
+/// when the system renders this menu: this item supplies the name in the menu bar. Reusing the
+/// status-bar dropdown for it instead made the menu bar show the shortcut item's title, which is a
+/// sentence, not an app name; Cmd+Q never depended on it (both panels intercept it in
+/// `performKeyEquivalent:`).
+///
+/// Measured on macOS 26: an EMPTY-TITLED application item cannot be used, because AppKit locates the
+/// application menu by title and the system then fills the blank with the executable's name.
+///
+/// The menu is always installed, whatever `NSApp.mainMenu` already holds (this build has no
+/// deployment target with a storyboard: AppKit installs an empty menu before `run`, and the app
+/// itself adds nothing). Installing keeps the three facts this module promises in one place: the
+/// item exists, its title is the application name, and `--hide-app-menu` applies to it.
+pub(crate) fn install_main_menu() {
+    unsafe {
+        let application: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        install_main_menu_on(application);
+    }
+}
+
+/// `install_main_menu` with its application object supplied, so the smoke runner can build the menu
+/// on a discarded application and prove the pre-existing-menu case instead of only the one launch
+/// order this build happens to take.
+pub(crate) unsafe fn install_main_menu_on(application: *mut AnyObject) {
+    unsafe {
+        if application.is_null() {
+            log_info!("[menu] no application object; the main menu was not installed");
+            return;
+        }
+        let title = crate::app_identity::application_display_name();
+        let root_title = make_nsstring("");
+        let root: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let root: *mut AnyObject = msg_send![root, initWithTitle: root_title];
+        CFRelease(root_title as *const c_void);
+
+        // AppKit locates the application menu by title, so the item and its submenu share the name.
+        let name = make_nsstring(&title);
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        // An empty NSString, never NULL: AppKit raises
+        // "Invalid parameter not satisfying: charCode != nil" and aborts the process for a nil
+        // key equivalent (measured here; the same rule holds for every item built in this module).
+        let no_key = make_nsstring("");
+        let item: *mut AnyObject =
+            msg_send![item, initWithTitle: name, action: None::<Sel>, keyEquivalent: no_key];
+        CFRelease(no_key as *const c_void);
+        let submenu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let submenu: *mut AnyObject = msg_send![submenu, initWithTitle: name];
+        CFRelease(name as *const c_void);
+        let _: () = msg_send![item, setSubmenu: submenu];
+        let _: () = msg_send![root, addItem: item];
+        // The main menu and its submenu retain their items; the two locals' +1 is dropped here and
+        // the tree owns them for the process lifetime.
+        release_obj(submenu);
+        release_obj(item);
+
+        let _: () = msg_send![application, setMainMenu: root];
+        release_obj(root);
+        with_menu_ui(|ui| ui.app_menu_item = Some(item));
+
+        if crate::dev_flags::present(HIDE_APP_MENU_FLAG) {
+            log_info!("[menu] application menu hidden by --{HIDE_APP_MENU_FLAG}");
+            set_application_menu_visible(false);
+        } else {
+            log_info!("[menu] application menu titled '{title}'");
+        }
+    }
+}
+
+/// Show or hide the application menu item on the main menu.
+///
+/// A hidden item disappears from the menu bar. The menu itself stays installed: it is the tree AppKit
+/// keeps key equivalents in, so it is never torn down, and hiding is reversible on the same object.
+pub(crate) fn set_application_menu_visible(visible: bool) {
+    let item = with_menu_ui(|ui| ui.app_menu_item);
+    let Some(item) = item else {
+        log_debug!("[menu] no application menu item yet");
+        return;
+    };
+    unsafe { set_menu_item_hidden(item, !visible) }
+}
+
+/// Hide or show one item, closing an open popup menu first so a hidden item cannot keep a menu on
+/// screen.
+unsafe fn set_menu_item_hidden(item: *mut AnyObject, hidden: bool) {
+    unsafe {
+        let _: () = msg_send![item, setHidden: hidden];
+        let submenu: *mut AnyObject = msg_send![item, submenu];
+        if !submenu.is_null() {
+            let _: () = msg_send![submenu, cancelTracking];
+        }
+    }
+}
+
+/// The title the application menu carries, for the automated check that the system would show the
+/// app's name rather than an internal string.
+pub(crate) fn application_menu_title() -> Option<String> {
+    with_menu_ui(|ui| ui.app_menu_item).and_then(|item| unsafe {
+        if item.is_null() {
+            return None;
+        }
+        let title: *mut AnyObject = msg_send![item, title];
+        Some(crate::ffi::nsstring_to_rust(title))
+    })
+}
+
+/// `--smoke-app-menu`: assert the application menu's shape on the real AppKit main thread.
+///
+/// Deliberately checks the two facts a screenshot cannot state: the menu bar draws a NAME (the title
+/// must equal the application's display name, not any menu-item string), and the submenu is the empty
+/// shape macOS 26 keeps visible; an empty-titled item is not an option, because AppKit locates the
+/// application menu by title and the system fills a blank title with the executable name.
+pub(crate) fn app_menu_smoke_runner() -> bool {
+    crate::debug_assert_main_thread();
+    unsafe {
+        let application: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let main_menu: *mut AnyObject = msg_send![application, mainMenu];
+        if main_menu.is_null() {
+            eprintln!("[smoke-app-menu] the application has no main menu");
+            return false;
+        }
+        let count: isize = msg_send![main_menu, numberOfItems];
+        if count != 1 {
+            eprintln!("[smoke-app-menu] main menu holds {count} items, expected exactly the application menu");
+            return false;
+        }
+        let item: *mut AnyObject = msg_send![main_menu, itemAtIndex: 0isize];
+        if item.is_null() {
+            eprintln!("[smoke-app-menu] the application menu item is missing");
+            return false;
+        }
+        let expected = crate::app_identity::application_display_name();
+        let title = application_menu_title().unwrap_or_default();
+        if title != expected {
+            eprintln!(
+                "[smoke-app-menu] application menu title {title:?} is not the application name {expected:?}"
+            );
+            return false;
+        }
+        // The menu bar is drawn from the item, so a hidden item takes the name out of it.
+        let hidden: bool = msg_send![item, isHidden];
+        if crate::dev_flags::present(HIDE_APP_MENU_FLAG) != hidden {
+            eprintln!(
+                "[smoke-app-menu] hidden={hidden} while --{}={}",
+                HIDE_APP_MENU_FLAG,
+                crate::dev_flags::present(HIDE_APP_MENU_FLAG)
+            );
+            return false;
+        }
+        let submenu: *mut AnyObject = msg_send![item, submenu];
+        if submenu.is_null() {
+            eprintln!("[smoke-app-menu] the application menu has no submenu");
+            return false;
+        }
+        let submenu_count: isize = msg_send![submenu, numberOfItems];
+        if submenu_count != 0 {
+            eprintln!(
+                "[smoke-app-menu] the application menu holds {submenu_count} items, expected none"
+            );
+            return false;
+        }
+        // The dropdown that the status item shows is a different menu and must be untouched.
+        let status_menu = with_menu_ui(|ui| ui.status_item).and_then(|status_item| {
+            let menu: *mut AnyObject = msg_send![status_item, menu];
+            (!menu.is_null()).then_some(menu)
+        });
+        match status_menu {
+            None => {
+                eprintln!("[smoke-app-menu] the status item lost its dropdown");
+                return false;
+            }
+            Some(menu) if menu == main_menu => {
+                eprintln!(
+                    "[smoke-app-menu] the status dropdown is installed as the main menu again"
+                );
+                return false;
+            }
+            Some(_) => {}
+        }
+        // The installer must replace a menu it did not create: AppKit installs an empty one before
+        // `run`, so "only install when the slot is empty" would silently skip the fix on some
+        // launch orders. Proven on a discarded application, which installs without touching the
+        // running app's menu bar.
+        if !discarded_application_install_replaces_a_foreign_menu(&expected) {
+            return false;
+        }
+        log_info!(
+            "[smoke-app-menu] application menu titled {title:?} (hidden={hidden}), dropdown separate"
+        );
+        true
+    }
+}
+
+/// Build a throwaway `NSApplication`, give it a menu the app never builds (the shape AppKit leaves
+/// behind), then run the installer on it and check it took over.
+unsafe fn discarded_application_install_replaces_a_foreign_menu(expected: &str) -> bool {
+    unsafe {
+        // A second NSApplication cannot be created in a process (AppKit aborts), so this borrows the
+        // real one and puts the app's own menu back afterwards. The install runs exactly as at
+        // launch: an existing menu is replaced rather than kept.
+        let application: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+        let saved_main_menu: *mut AnyObject = msg_send![application, mainMenu];
+        let _: *mut AnyObject = msg_send![saved_main_menu, retain];
+        let foreign_title = make_nsstring("Foreign");
+        let foreign: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+        let foreign: *mut AnyObject = msg_send![foreign, initWithTitle: foreign_title];
+        CFRelease(foreign_title as *const c_void);
+        let _: () = msg_send![application, setMainMenu: foreign];
+        release_obj(foreign);
+
+        install_main_menu_on(application);
+
+        let main_menu: *mut AnyObject = msg_send![application, mainMenu];
+        let count: isize = msg_send![main_menu, numberOfItems];
+        let item: *mut AnyObject = msg_send![main_menu, itemAtIndex: 0isize];
+        let installed_title: *mut AnyObject = msg_send![item, title];
+        let installed = crate::ffi::nsstring_to_rust(installed_title);
+        // Restore the running app's menu and the item this module tracks for it.
+        let _: () = msg_send![application, setMainMenu: saved_main_menu];
+        release_obj(saved_main_menu);
+        let restored_item: *mut AnyObject = msg_send![saved_main_menu, itemAtIndex: 0isize];
+        with_menu_ui(|ui| ui.app_menu_item = Some(restored_item));
+        if count != 1 || installed != expected {
+            eprintln!(
+                "[smoke-app-menu] a pre-existing main menu was not replaced (items={count}, title {installed:?})"
+            );
+            return false;
+        }
+        true
     }
 }
 
@@ -914,6 +1155,26 @@ mod tests {
         assert_eq!(shortcut_config_index_for_tag(-1), None);
         assert_eq!(shortcut_config_index_for_tag(3), None);
         assert_eq!(shortcut_config_index_for_tag(isize::MAX), None);
+    }
+
+    /// The application name is what the menu bar shows, so it must be a name and never a menu string.
+    #[test]
+    fn the_application_name_is_a_bundle_name_or_the_fixed_fallback() {
+        let name = crate::app_identity::application_display_name();
+        assert!(!name.trim().is_empty());
+        assert_ne!(
+            name,
+            crate::i18n::t("menu.shortcut.current").replace("{shortcut}", "")
+        );
+    }
+
+    /// The application menu on the real AppKit main thread; see `app_menu_smoke_runner`.
+    #[test]
+    #[ignore]
+    fn app_menu_smoke() {
+        crate::smoke_verdict::smoke_runner!("app_menu_smoke", 1, {
+            crate::smoke_verdict::run_smoke_child("app_menu_smoke", &["--smoke-app-menu"]);
+        });
     }
 
     #[test]

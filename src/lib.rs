@@ -2745,12 +2745,12 @@ fn setup_status_bar() {
 
         let _: () = msg_send![status_item, setMenu: menu];
 
-        // Also set as mainMenu so AppKit's Cmd+Q keyEquivalent dispatch can find the Quit item.
-        // An accessory app's mainMenu is NOT shown in the menu bar's app area (that only shows
-        // regular apps' menus), but key-equivalent routing still works -- same mechanism as
-        // LinearMouse's storyboard mainMenu.
-        let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![nsapp, setMainMenu: menu];
+        // The dropdown is deliberately NOT the main menu. While Settings is open the app is
+        // .regular and active, and the system renders its main menu; with this dropdown there, the
+        // menu bar showed the shortcut item's title ("应用切换浮窗快捷键：⌘Tab") in place of an app
+        // menu. Cmd+Q does not need it either: both the settings window and the switcher panel
+        // intercept it in performKeyEquivalent:. See crate::menu::install_main_menu.
+        crate::menu::install_main_menu();
 
         // Pump run loop to let SystemUIServer connect
         for _ in 0..10 {
@@ -3118,6 +3118,7 @@ pub fn run() {
             || arg == "--smoke-overlay"
             || arg == "--smoke-keystroke-display-panel"
             || arg == "--smoke-settings-layout"
+            || arg == "--smoke-app-menu"
             || arg == "--smoke-finder-menu"
             || arg == "--smoke-settings-vertical-zoom"
             || arg == "--smoke-settings-state-sync"
@@ -3827,6 +3828,20 @@ pub fn run() {
             settings::invalidate_settings_window();
             log_info!("[smoke-settings-layout] all pages survived in all locales");
             exit_smoke_passed();
+        }
+    }
+
+    // Application menu: while Settings is open the app is .regular, and the menu bar draws the
+    // application menu from the main menu. This asserts the shape the system depends on instead of
+    // leaving it to a screenshot: one item, titled with the application name (not a menu-item string),
+    // whose submenu is the empty shape macOS 26 keeps visible.
+    if std::env::args().any(|a| a == "--smoke-app-menu") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let passed = crate::menu::app_menu_smoke_runner();
+            crate::smoke_verdict::record_for_child(if passed { "PASSED 1" } else { "FAILED" });
+            std::process::exit(if passed { 0 } else { 1 });
         }
     }
 
