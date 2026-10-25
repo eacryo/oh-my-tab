@@ -211,6 +211,28 @@ pub(super) fn on_picker_hidden() {
     set_cursor(DragCursor::None);
 }
 
+/// Where the picker ends up when the pointer travels from `mouse_down` to `pointer`. Pure.
+///
+/// The travel is the pointer's own, measured between the two EVENT positions and added to the rect
+/// the press started from. That is the only correct source: those two positions are what the gesture
+/// asked for, whereas re-reading the window would report a frame the window server has not applied
+/// yet. Pure, so the defect this replaced -- a 110pt gesture that landed as 73pt -- is assertable
+/// without a pointer.
+pub(super) fn dragged_picker_rect(
+    picker_at_press: NSRect,
+    mouse_down: NSPoint,
+    pointer: NSPoint,
+) -> NSRect {
+    let travel = NSPoint::new(pointer.x - mouse_down.x, pointer.y - mouse_down.y);
+    NSRect::new(
+        NSPoint::new(
+            picker_at_press.origin.x + travel.x,
+            picker_at_press.origin.y + travel.y,
+        ),
+        picker_at_press.size,
+    )
+}
+
 /// The correction a finished drag applies, so a panel the user left half off-screen stays usable.
 /// Pure.
 ///
@@ -473,11 +495,37 @@ extern "C" fn drag_surface_hit_test(
 // Drag interaction
 // ---------------------------------------------------------------------------------------------
 
+/// The pointer position an event was generated at, in screen coordinates.
+///
+/// Deliberately the EVENT's position, not `NSEvent.mouseLocation`: the latter is where the pointer
+/// is when the handler runs, which is not where it was when the event was generated. A press held
+/// back by an event tap's latency, or an injected gesture that outruns delivery, then reports a
+/// start point the pointer had already left -- and the whole first stretch of the drag disappears.
+/// Measured 2026-10-25 with a 110pt injected drag: `mouseLocation` reported the press at (611.7,
+/// 620.3) although the gesture started at (575, 299), so the panel moved 73pt of the 110pt asked
+/// for while the window server showed every intermediate move. The event carries where it actually
+/// happened, so the travel measured from it is the travel the user made.
+unsafe fn drag_event_screen_point(event: *mut AnyObject) -> Option<NSPoint> {
+    if event.is_null() {
+        return None;
+    }
+    let window: *mut AnyObject = msg_send![event, window];
+    let point: NSPoint = msg_send![event, locationInWindow];
+    if window.is_null() {
+        // No window (an event seen from outside one): AppKit already reports it in screen space.
+        return Some(point);
+    }
+    // The drag moves the window itself, so a window-relative point travels with it: convert through
+    // the window that the event names to get a stable screen position.
+    Some(msg_send![window, convertPointToScreen: point])
+}
+
 /// A press on any accepted blank region (the surface or the list's document view).
 pub(super) extern "C" fn drag_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     callback_guard::void("clipboard_drag_mouse_down", || unsafe {
         let click_count: isize = msg_send![event, clickCount];
-        let point: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let point: NSPoint = drag_event_screen_point(event)
+            .unwrap_or_else(|| msg_send![class!(NSEvent), mouseLocation]);
         begin_drag(point, click_count);
     });
 }
@@ -485,16 +533,25 @@ pub(super) extern "C" fn drag_mouse_down(_self: *mut AnyObject, _cmd: Sel, event
 pub(super) extern "C" fn drag_mouse_dragged(
     _self: *mut AnyObject,
     _cmd: Sel,
-    _event: *mut AnyObject,
+    event: *mut AnyObject,
 ) {
-    callback_guard::void("clipboard_drag_mouse_dragged", || {
-        let point: NSPoint = unsafe { msg_send![class!(NSEvent), mouseLocation] };
+    callback_guard::void("clipboard_drag_mouse_dragged", || unsafe {
+        let point: NSPoint = drag_event_screen_point(event)
+            .unwrap_or_else(|| msg_send![class!(NSEvent), mouseLocation]);
         drag_to(point);
     });
 }
 
-pub(super) extern "C" fn drag_mouse_up(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    callback_guard::void("clipboard_drag_mouse_up", finish_drag);
+pub(super) extern "C" fn drag_mouse_up(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
+    callback_guard::void("clipboard_drag_mouse_up", || unsafe {
+        // Follow the release's own position before finishing: AppKit coalesces drags, so the last
+        // mouseDragged can be well short of where the button came up, and the panel must end where
+        // the gesture ended.
+        if let Some(point) = drag_event_screen_point(event) {
+            drag_to(point);
+        }
+        finish_drag();
+    });
 }
 
 /// First mouse, so a grab works while the panel's host app is inactive -- the same reason the
@@ -568,12 +625,9 @@ fn drag_to(point: NSPoint) {
         moved: true,
         ..drag
     });
-    let moved = |rect: NSRect| {
-        NSRect::new(
-            NSPoint::new(rect.origin.x + dx, rect.origin.y + dy),
-            rect.size,
-        )
-    };
+    // One derivation of "the rect for a pointer at `point`", shared with the release: the panel
+    // travels by the pointer's own displacement from the press, never by re-reading itself.
+    let moved = |rect: NSRect| dragged_picker_rect(rect, drag.mouse_down, point);
     apply_frames(Some(moved(drag.picker)), drag.detail.map(moved));
 }
 
@@ -794,6 +848,32 @@ mod tests {
     /// The screen a normal display offers, minus the dock/menu bar.
     fn screen() -> NSRect {
         rect(0.0, 0.0, 1440.0, 860.0)
+    }
+
+    /// The regression this replaced: a gesture whose press and release are known must move the
+    /// panel by exactly that travel. Measured 2026-10-25 from a live 110pt drag, the panel used to
+    /// end 73pt away because the press position was read as "where the pointer is now" instead of
+    /// "where this event happened".
+    #[test]
+    fn the_released_panel_moves_by_the_pointers_own_travel() {
+        let picker = rect(415.0, 291.0, 640.0, 408.0);
+        // AppKit screen space is bottom-left; the numbers are the live measurement.
+        let down = NSPoint::new(575.0, 657.0);
+        let up = NSPoint::new(685.0, 547.0);
+        let moved = dragged_picker_rect(picker, down, up);
+        // +110 in x; the pointer moved DOWN the screen, which is -110 in AppKit's bottom-left space.
+        assert_eq!(moved.origin.x, 525.0);
+        assert_eq!(moved.origin.y, 181.0);
+        assert_eq!(moved.size, picker.size);
+    }
+
+    /// Travel is the pointer's, not the window's: a release reporting the same point as the press
+    /// leaves the panel exactly where it was, however far the last intermediate move got.
+    #[test]
+    fn a_release_at_the_press_point_leaves_the_panel_alone() {
+        let picker = rect(415.0, 291.0, 640.0, 408.0);
+        let at = NSPoint::new(575.0, 657.0);
+        assert_eq!(dragged_picker_rect(picker, at, at), picker);
     }
 
     #[test]

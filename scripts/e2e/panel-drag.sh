@@ -297,7 +297,11 @@ fi
 
 echo "  panel (${panel_x},${panel_y}) ${panel_w}x${panel_h}; handle ${grip_w}x${grip_h} at (${grip_x},${grip_y})"
 echo "  gesture in desktop pixels: from (${from_x},${from_y}) by (${delta_x},${delta_y})pt"
-cua drag "{\"scope\": \"desktop\", \"from_x\": $from_x, \"from_y\": $from_y, \"to_x\": $to_x, \"to_y\": $to_y, \"duration_ms\": 800, \"steps\": 24, \"delivery_mode\": \"background\"}" >/dev/null
+# The gesture is paced like a hand, not snapped: 1s across 110pt with one move event per ~33ms.
+# The panel measures its travel from each EVENT's own position (see `drag_event_screen_point`), so
+# a gesture delivered faster than the app drains its queue still lands where it was aimed; the
+# pacing here only keeps the path a realistic one.
+cua drag "{\"scope\": \"desktop\", \"from_x\": $from_x, \"from_y\": $from_y, \"to_x\": $to_x, \"to_y\": $to_y, \"duration_ms\": 1000, \"steps\": 30, \"delivery_mode\": \"background\"}" >/dev/null
 
 # The WindowServer is read through a poll, not once: the gesture's release applies a cursor correction after
 # the last drag step, so a single read can catch the window one correction short (observed: 100pt of a
