@@ -1715,52 +1715,72 @@ pub(crate) fn smoke_selection_ring() -> bool {
 /// it builds the real card view for a window that has no cached frame (the icon-fallback branch a
 /// card of another desktop takes) and counts the badge chips in the resulting view tree.
 ///
+/// The corner badges belong to the thumbnail layout -- create_card_view draws them only when
+/// thumbnails are on -- so the runner states that precondition itself instead of inheriting the
+/// user's setting. Without it the runner asserts badges for a layout the configuration asked for
+/// and reports FAILED for a correctly configured app (measured 2026-10-25: thumbnails_enabled =
+/// false in ~/.config/oh-my-tab/config.toml failed this runner while the same binary passed with
+/// them on). Same save/restore shape as smoke_selection_ring.
+///
 /// The counter-example is built in: an ordinary card must draw neither badge, so a renderer that
 /// draws them unconditionally fails here. Needs a GUI session and the main thread.
 pub(crate) fn smoke_card_badges() -> bool {
     unsafe {
-        let base = WindowInfo {
-            pid: std::process::id() as i32,
-            window_id: 1,
-            app_name: "badge smoke".to_string(),
-            window_title: "badge smoke".to_string(),
-            icon_path: None,
-            is_active: false,
-            minimized: true,
-            app_hidden: false,
-            fullscreen: true,
-            on_other_desktop: true,
-            bounds: (0.0, 0.0, 640.0, 400.0),
-            state: Default::default(),
+        let previous = {
+            let mut config = CONFIG.write().unwrap();
+            let previous = config.layout.thumbnails_enabled;
+            config.layout.thumbnails_enabled = true;
+            previous
         };
-        let with_state = create_card_view(&base, 0, 220.0, 170.0, true);
-        let fullscreen_badges =
-            count_views_with_tag(with_state, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
-        let visibility_badges =
-            count_views_with_tag(with_state, crate::overlay::THUMB_VISIBILITY_BADGE_TAG);
-        release_obj(with_state);
-
-        let mut plain = base;
-        plain.minimized = false;
-        plain.fullscreen = false;
-        let plain_card = create_card_view(&plain, 1, 220.0, 170.0, true);
-        let plain_fullscreen =
-            count_views_with_tag(plain_card, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
-        let plain_visibility =
-            count_views_with_tag(plain_card, crate::overlay::THUMB_VISIBILITY_BADGE_TAG);
-        release_obj(plain_card);
-
-        log_info!(
-            "[smoke-card-badges] thumbnails={} fullscreen={} visibility={} plain_fullscreen={} plain_visibility={}",
-            crate::theme::thumbnails_enabled(),
-            fullscreen_badges,
-            visibility_badges,
-            plain_fullscreen,
-            plain_visibility
-        );
-        fullscreen_badges == 1
-            && visibility_badges == 1
-            && plain_fullscreen == 0
-            && plain_visibility == 0
+        let verdict = smoke_card_badges_in_thumbnail_layout();
+        CONFIG.write().unwrap().layout.thumbnails_enabled = previous;
+        verdict
     }
+}
+
+/// The badge assertions themselves, under the thumbnail layout the caller switched on.
+unsafe fn smoke_card_badges_in_thumbnail_layout() -> bool {
+    let base = WindowInfo {
+        pid: std::process::id() as i32,
+        window_id: 1,
+        app_name: "badge smoke".to_string(),
+        window_title: "badge smoke".to_string(),
+        icon_path: None,
+        is_active: false,
+        minimized: true,
+        app_hidden: false,
+        fullscreen: true,
+        on_other_desktop: true,
+        bounds: (0.0, 0.0, 640.0, 400.0),
+        state: Default::default(),
+    };
+    let with_state = create_card_view(&base, 0, 220.0, 170.0, true);
+    let fullscreen_badges =
+        count_views_with_tag(with_state, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
+    let visibility_badges =
+        count_views_with_tag(with_state, crate::overlay::THUMB_VISIBILITY_BADGE_TAG);
+    release_obj(with_state);
+
+    let mut plain = base;
+    plain.minimized = false;
+    plain.fullscreen = false;
+    let plain_card = create_card_view(&plain, 1, 220.0, 170.0, true);
+    let plain_fullscreen =
+        count_views_with_tag(plain_card, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
+    let plain_visibility =
+        count_views_with_tag(plain_card, crate::overlay::THUMB_VISIBILITY_BADGE_TAG);
+    release_obj(plain_card);
+
+    log_info!(
+        "[smoke-card-badges] thumbnails={} fullscreen={} visibility={} plain_fullscreen={} plain_visibility={}",
+        crate::theme::thumbnails_enabled(),
+        fullscreen_badges,
+        visibility_badges,
+        plain_fullscreen,
+        plain_visibility
+    );
+    fullscreen_badges == 1
+        && visibility_badges == 1
+        && plain_fullscreen == 0
+        && plain_visibility == 0
 }
