@@ -1197,7 +1197,7 @@ pub(super) fn clear_action_applied() -> Option<ClearActionState> {
 }
 
 /// the footer's entry-count label.
-static FOOTER_COUNT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static FOOTER_COUNT: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 /// One shortcut legend (keycap + its label), kept so the layout validator can measure what the
 /// footer actually reserved, instead of recomputing it from the constants that built it.
@@ -1208,7 +1208,8 @@ struct FooterLegend {
 }
 
 /// The legends of the live footer, left-to-right. Empty when no footer has been built.
-static FOOTER_LEGENDS: MainThreadSlot<Vec<FooterLegend>> = MainThreadSlot::new(Vec::new());
+static FOOTER_LEGENDS: MainThreadSlot<Vec<FooterLegend>> =
+    unsafe { MainThreadSlot::new(Vec::new()) };
 
 /// Each footer legend caption's own frame, in the picker's coordinates with a top-left origin.
 ///
@@ -1255,15 +1256,16 @@ pub(super) fn footer_hint_frames() -> Vec<(f64, f64, f64, f64)> {
 
 /// The footer's entry-count label. It is not a legend, but it shares the footer's line and owns
 /// the left edge the right-to-left legend row must clear, so the validator measures it too.
-static FOOTER_COUNT_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static FOOTER_COUNT_LABEL: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 /// The footer root: rebuilt on locale changes so shortcut legends reflow to their new widths.
-static FOOTER_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static FOOTER_VIEW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 /// the toast label (the new mockup's .toast).
-pub(super) static TOAST_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(super) static TOAST_LABEL: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// the toast's auto-hide timer.
-static TOAST_TIMER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static TOAST_TIMER: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// the toast timer's target.
 unsafe fn toast_owner() -> *mut AnyObject {
     static TOAST_OWNER: OnceLock<CallbackTarget> = OnceLock::new();

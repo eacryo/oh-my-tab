@@ -127,12 +127,88 @@ fn io_class(error: &std::io::Error) -> String {
     }
 }
 
-/// Seal `plaintext` and write it atomically to `dir/file_name` (temp file, read back and
-/// authenticate, then rename). The verification step is what makes a later "it was written" a
-/// fact rather than an assumption.
+/// Per-write serial, so two writes of the same object in one process (or one failed write followed
+/// by a retry) get different temp names. `config::atomic_write` keeps the same counter for the same
+/// reason.
+static TEMP_WRITE_SERIAL: AtomicU64 = AtomicU64::new(0);
+
+/// Test-only: make the next `write_sealed_file` report a failed sync after writing its temp file.
+///
+/// Not an environment variable and not a dev flag: this is reachable only from the test suite, so
+/// a shipped build has no way to turn it on.
+#[cfg(test)]
+static FAIL_NEXT_SYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn sync_fault_requested() -> bool {
+    FAIL_NEXT_SYNC.swap(false, Ordering::SeqCst)
+}
+
+/// The temp name this write uses: `{file_name}.tmp{pid}-{serial}`.
+///
+/// The shape is fixed by `is_history_temp_file_name`, which only recognises `.tmp<digits>-<digits>`
+/// (so a leftover is swept) and by `sweep_history_temp_files`, which deletes what it recognises. A
+/// different shape would leave every crashed write behind forever.
+///
+/// The second field used to be a constant `0`, which is also the name a crash leaves behind. Now
+/// that the write creates its temp file exclusively, a constant would mean one leftover -- from an
+/// earlier crash, a reused pid, or a failed write whose own cleanup also failed -- made every later
+/// write in the process fail with `AlreadyExists`, and the history would silently stop persisting.
+/// The serial is spent before the open, so even a failed attempt cannot hand its name to the next
+/// one. Every build uses it: a release build with the defect still in it is not made safer by the
+/// debug build beside it.
+fn temp_file_name(file_name: &str) -> String {
+    let serial = TEMP_WRITE_SERIAL.fetch_add(1, Ordering::Relaxed);
+    format!("{file_name}.tmp{}-{}", std::process::id(), serial)
+}
+
+/// Seal `plaintext` and write it atomically to `dir/file_name`.
+///
+/// The mechanism is the same one `config::atomic_write` uses, because the two answer the same
+/// question and must not drift apart: a temp file created with mode 600 in the same directory,
+/// the bytes written and *synced*, the content read back and authenticated, then `rename` into
+/// place. What that buys, stated so it is not overread:
+///
+/// - **Never a partial file.** `rename` is atomic on the volumes this app writes to, so a crash or
+///   a force quit leaves either the old object or the new one, never half of either.
+/// - **Never a corrupted one.** The read-back goes through `open`, so a torn or truncated write
+///   fails authentication and is discarded instead of replacing a good file.
+/// - **A synced file or no new file.** A failed `sync_all` is reported and does not publish: the
+///   previous object stays in place rather than being replaced by a write that may not be on the
+///   disk.
+///
+/// It does NOT promise durability across a power loss. The directory entry is synced on a
+/// best-effort basis (`sync_all` on the directory, failure ignored) exactly as `atomic_write` does,
+/// so on a sudden power loss the rename may not have reached the disk. Losing the newest clipboard
+/// entries that way is accepted; see `docs/clipboard-encryption-plan.md`, which keeps this
+/// boundary separate from the delete path's.
 fn write_sealed_file(
     dir: &std::path::Path,
     file_name: &str,
+    logical_name: &str,
+    kind: ObjectKind,
+    key: &MasterKey,
+    plaintext: &[u8],
+) -> bool {
+    write_sealed_file_as(
+        dir,
+        file_name,
+        &temp_file_name(file_name),
+        logical_name,
+        kind,
+        key,
+        plaintext,
+    )
+}
+
+/// `write_sealed_file` with the temp name supplied by the caller.
+///
+/// Split out so a test can occupy the exact name its next write will open; production always goes
+/// through the wrapper above, which spends a serial.
+fn write_sealed_file_as(
+    dir: &std::path::Path,
+    file_name: &str,
+    tmp_name: &str,
     logical_name: &str,
     kind: ObjectKind,
     key: &MasterKey,
@@ -155,8 +231,45 @@ fn write_sealed_file(
         return false;
     }
     let path = dir.join(file_name);
-    let tmp = dir.join(format!("{file_name}.tmp{}-0", std::process::id()));
-    if let Err(error) = std::fs::write(&tmp, &sealed) {
+    let tmp = dir.join(tmp_name);
+    // The temp file is created exclusively, so a leftover from an earlier crash is never
+    // truncated or deleted here: `create_new` fails and this call reports the failure rather
+    // than claiming an object it did not write. `temp_file_name` makes that collision practical
+    // rather than permanent.
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&tmp)
+    {
+        Ok(file) => file,
+        Err(error) => {
+            log_info!(
+                "Clipboard write failed (kind={}, stage=create, class={}).",
+                kind_label(kind),
+                io_class(&error)
+            );
+            return false;
+        }
+    };
+    // From here on the temp file is this call's own, and every failure path removes it.
+    let written = file.write_all(&sealed).and_then(|()| file.sync_all());
+    #[cfg(test)]
+    let written = if sync_fault_requested() {
+        // Fault injection for the "a failed sync must not publish" case. `sync_all` on an open
+        // file cannot be made to fail from outside the process (a read-only directory binds at
+        // open time, `chflags` does not apply, a full disk is not reachable from a test), so the
+        // failure is injected exactly where it matters: after the bytes are written, before
+        // anything is published.
+        written.and(Err(std::io::Error::from(std::io::ErrorKind::WriteZero)))
+    } else {
+        written
+    };
+    drop(file);
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
         log_info!(
             "Clipboard write failed (kind={}, stage=write, class={}).",
             kind_label(kind),
@@ -164,12 +277,6 @@ fn write_sealed_file(
         );
         return false;
     }
-    // Mode 600: owner-only access.
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
-    // Read back and authenticate before publishing: a torn or truncated write must never
-    // replace the previous file. The two failures are logged apart: a read-back that fails is an
-    // IO problem, not a cryptographic one.
     let verified = match std::fs::read(&tmp) {
         Ok(back) => {
             if open(key, kind, &object_id, &back).is_ok() {
@@ -204,7 +311,36 @@ fn write_sealed_file(
         );
         return false;
     }
+    // Best effort, exactly as `config::atomic_write` does it: the rename is durable on a
+    // filesystem that supports it, and a directory that will not sync must not turn a published
+    // object into a reported failure. What this cannot do is promise the rename survives a power
+    // loss -- see the doc comment.
+    if let Ok(dir_handle) = std::fs::File::open(dir) {
+        let _ = dir_handle.sync_all();
+    }
     true
+}
+
+/// Write one sealed object using exactly the temp name the caller names.
+///
+/// This is the seam a collision test needs: it can occupy the name first and then require the
+/// write to refuse it, without racing the serial.
+#[cfg(test)]
+fn write_sealed_object_as(
+    dir: &std::path::Path,
+    file_name: &str,
+    tmp_name: &str,
+    body: &[u8],
+) -> bool {
+    write_sealed_file_as(
+        dir,
+        file_name,
+        tmp_name,
+        "probe",
+        ObjectKind::History,
+        &keyring::test_key(),
+        body,
+    )
 }
 
 struct PersistJob {
@@ -1931,6 +2067,36 @@ pub(super) mod test_support {
     pub(in crate::clipboard) fn read_history_bytes() -> Option<Vec<u8>> {
         std::fs::read(history_file_path()).ok()
     }
+
+    /// Make the next sealed write report a failed `sync_all` after its bytes reached the temp file.
+    pub(super) fn fail_the_next_sync() {
+        super::FAIL_NEXT_SYNC.store(true, Ordering::SeqCst);
+    }
+
+    /// Write one sealed object into `dir` under `file_name`, the way the worker does.
+    pub(super) fn write_one(
+        dir: &std::path::Path,
+        file_name: &str,
+        logical: &str,
+        body: &[u8],
+    ) -> bool {
+        write_sealed_file(
+            dir,
+            file_name,
+            logical,
+            ObjectKind::History,
+            &keyring::test_key(),
+            body,
+        )
+    }
+
+    /// The permission bits of `path`, or `None` when it cannot be read.
+    pub(super) fn mode_of(path: &std::path::Path) -> Option<u32> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(path)
+            .ok()
+            .map(|m| m.permissions().mode() & 0o777)
+    }
 }
 
 #[cfg(test)]
@@ -3604,5 +3770,212 @@ mod encryption_tests {
                 "{lookalike} must not be treated as a temp file"
             );
         }
+    }
+
+    /// The temp name a write picks must stay within the sweep rule.
+    ///
+    /// The shape has to be recognised by `is_history_temp_file_name`, or a crashed write leaves a
+    /// file forever that nothing sweeps. The second field must move between writes, because the
+    /// write creates its temp file exclusively: a constant there is what turns one leftover into
+    /// every later write in the process failing.
+    #[test]
+    fn the_temp_name_is_sweepable_and_unique() {
+        let first = temp_file_name("clipboard-history.enc");
+        let second = temp_file_name("clipboard-history.enc");
+        for name in [&first, &second] {
+            assert!(
+                is_history_temp_file_name(name),
+                "{name} would never be swept"
+            );
+            assert!(
+                name.contains(&format!(".tmp{}-", std::process::id())),
+                "{name} does not name this process"
+            );
+        }
+        assert_ne!(first, second, "two writes picked the same temp file");
+    }
+
+    /// Both fields of the temp name's shape are digits, which is what the predicate reads.
+    #[test]
+    fn the_temp_name_shape_survives_a_large_serial() {
+        let name = format!(
+            "clipboard-history.enc.tmp{}-{}",
+            std::process::id(),
+            u64::MAX
+        );
+        assert!(
+            is_history_temp_file_name(&name),
+            "a large serial must still parse: {name}"
+        );
+    }
+
+    /// A real write publishes, with owner-only permissions, and leaves no temp file behind.
+    #[test]
+    fn a_real_write_publishes_with_mode_600_and_no_temp_left_over() {
+        let _guard = guard();
+        clean_disk();
+        let dir = history_dir();
+        drop(std::fs::create_dir_all(&dir));
+        let target = dir.join("clipboard-history.enc");
+        drop(std::fs::remove_file(&target));
+
+        assert!(
+            test_support::write_one(&dir, "clipboard-history.enc", "probe", b"payload"),
+            "a write into a writable directory must publish"
+        );
+        assert!(target.exists(), "the object was not published");
+        assert_eq!(
+            test_support::mode_of(&target),
+            Some(0o600),
+            "a published object must be owner-only"
+        );
+        assert!(
+            !any_temp_for(&dir, "clipboard-history.enc"),
+            "a successful write must not leave its temp file"
+        );
+        clean_disk();
+    }
+
+    /// The leftover check must be able to say yes, or the assertions that use it prove nothing.
+    ///
+    /// Counter-example for `any_temp_for`: it combines a name prefix with the sweep predicate, and
+    /// an earlier version used a probe file name the predicate does not recognise, so it answered
+    /// "no temp files" no matter what was on disk. This test plants exactly the file a crashed
+    /// write would leave and requires the check to see it.
+    #[test]
+    fn the_leftover_check_sees_a_real_leftover() {
+        let _guard = guard();
+        clean_disk();
+        let dir = history_dir();
+        drop(std::fs::create_dir_all(&dir));
+
+        assert!(
+            !any_temp_for(&dir, "clipboard-history.enc"),
+            "nothing has been written yet"
+        );
+        let planted = dir.join(format!("clipboard-history.enc.tmp{}-9", std::process::id()));
+        std::fs::write(&planted, b"leftover").unwrap();
+        let seen = any_temp_for(&dir, "clipboard-history.enc");
+        drop(std::fs::remove_file(&planted));
+        assert!(
+            seen,
+            "the leftover check did not see a temp file the sweep would recognise"
+        );
+        clean_disk();
+    }
+
+    /// What a write does with a temp name it did not create: refuse, publish nothing, touch nothing.
+    ///
+    /// Every failure path of `write_sealed_file` goes through the same helper, and this is the one a
+    /// real leftover produces -- an earlier crash, a reused pid, or a cleanup that also failed. The
+    /// collision is constructed deterministically by calling the same public helper the write spends
+    /// its serial from, so the occupied name IS the name the next write opens.
+    #[test]
+    fn a_taken_temp_name_fails_without_touching_the_file_or_the_object() {
+        let _guard = guard();
+        clean_disk();
+        let dir = history_dir();
+        drop(std::fs::create_dir_all(&dir));
+        let target = dir.join("sealed-probe.enc");
+        drop(std::fs::remove_file(&target));
+
+        // Name the temp file the way the write will, then take it: the collision is the one a real
+        // leftover produces, and it is deterministic rather than racing the serial.
+        let taken_name = temp_file_name("sealed-probe.enc");
+        let taken = dir.join(&taken_name);
+        std::fs::write(&taken, b"not mine").unwrap();
+
+        assert!(
+            !write_sealed_object_as(&dir, "sealed-probe.enc", &taken_name, b"first"),
+            "a write must fail when its temp name is taken, not overwrite the file holding it"
+        );
+        assert_eq!(
+            std::fs::read(&taken).ok().as_deref(),
+            Some(&b"not mine"[..]),
+            "the write touched a temp file it did not create"
+        );
+        assert!(!target.exists(), "a failed write must not publish");
+
+        // The retry spends the next serial: a fresh name, and the older leftover still untouched.
+        assert!(
+            test_support::write_one(&dir, "sealed-probe.enc", "probe", b"second"),
+            "the retry after a taken temp name must publish"
+        );
+        assert!(target.exists(), "the retry did not publish");
+        assert_eq!(
+            std::fs::read(&taken).ok().as_deref(),
+            Some(&b"not mine"[..]),
+            "the retry must leave the older leftover alone"
+        );
+        clean_disk();
+    }
+
+    /// A failed sync must not publish, and must not damage the object already there.
+    ///
+    /// This is the path with no external cause a test can arrange: `sync_all` on an open file
+    /// cannot be made to fail by a read-only directory, `chflags`, or a full disk. The failure is
+    /// injected at the point it would occur -- after the bytes are written, before anything is
+    /// published.
+    #[test]
+    fn a_failed_sync_leaves_the_previous_object_in_place() {
+        // The object name is the one `is_history_temp_file_name` recognises, so the leftover check
+        // below can actually fail. A probe name the predicate rejects would make the cleanup
+        // assertion vacuous -- that is exactly the defect this test used to have.
+        const NAME: &str = "clipboard-history.enc";
+        let _guard = guard();
+        clean_disk();
+        let dir = history_dir();
+        drop(std::fs::create_dir_all(&dir));
+        let target = dir.join(NAME);
+        drop(std::fs::remove_file(&target));
+
+        assert!(
+            test_support::write_one(&dir, NAME, "probe", b"good"),
+            "the baseline write must publish"
+        );
+        let published = std::fs::read(&target).expect("published object");
+        assert!(
+            !any_temp_for(&dir, NAME),
+            "a successful write must not leave a temp file; the check below cannot decide otherwise"
+        );
+
+        test_support::fail_the_next_sync();
+        assert!(
+            !test_support::write_one(&dir, NAME, "probe", b"would-be-new"),
+            "a write whose sync failed must report failure"
+        );
+        assert_eq!(
+            std::fs::read(&target).ok(),
+            Some(published),
+            "a failed sync must leave the previous object exactly as it was"
+        );
+        assert!(
+            !any_temp_for(&dir, NAME),
+            "a failed sync must clean up its own temp file"
+        );
+
+        // And the failure is not sticky: the next write publishes.
+        assert!(
+            test_support::write_one(&dir, NAME, "probe", b"after"),
+            "the write after a sync failure must publish"
+        );
+        clean_disk();
+    }
+
+    /// Whether any temp file for `file_name` is present in `dir`.
+    ///
+    /// Both halves matter: the prefix says which object this is, and `is_history_temp_file_name`
+    /// says whether the sweep would ever remove it. A check that skipped the predicate would report
+    /// a leftover for names nothing cleans up, and one whose probe name the predicate rejects
+    /// reports "clean" for everything (see `the_leftover_check_sees_a_real_leftover`).
+    fn any_temp_for(dir: &std::path::Path, file_name: &str) -> bool {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return false;
+        };
+        entries.flatten().any(|entry| {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            name.starts_with(&format!("{file_name}.tmp")) && is_history_temp_file_name(&name)
+        })
     }
 }

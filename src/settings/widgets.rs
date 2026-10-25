@@ -637,9 +637,9 @@ pub(super) fn sidebar_ink_measurement_count() -> usize {
 pub(super) static SIDEBAR_SELECTED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_HOVERED: AtomicUsize = AtomicUsize::new(0);
 pub(super) static SIDEBAR_TITLE_LABELS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
-    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+    LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
 pub(super) static SIDEBAR_ICON_VIEWS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
-    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+    LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
 
 /// A sidebar label's resolved geometry, with the inputs that determine it.
 ///
@@ -673,9 +673,9 @@ struct ResolvedSidebarLabel {
 }
 
 static SIDEBAR_LABEL_GEOMETRY: LazyLock<MainThreadSlot<HashMap<usize, ResolvedSidebarLabel>>> =
-    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+    LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
 pub(super) static SIDEBAR_UPDATE_DOTS: LazyLock<MainThreadSlot<HashMap<usize, ObjPtr>>> =
-    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+    LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
 
 /// Forget the hovered row WITHOUT messaging it.
 ///
@@ -758,7 +758,8 @@ pub(super) extern "C" fn external_link_mouse_down(
     });
 }
 
-pub(super) static SIDEBAR_HOVER_TRACKER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(super) static SIDEBAR_HOVER_TRACKER: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 
 /// Clear the active row fill when the settings window hides or changes pages.
 pub(super) unsafe fn clear_sidebar_hover() {

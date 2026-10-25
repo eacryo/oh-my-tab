@@ -148,7 +148,7 @@ static BINDING_DRAFT: LazyLock<Mutex<Option<(Action, String)>>> =
 /// confirm, `Some(index)` rewrites that entry in place. An index is only read while the panel is
 /// open, and every path that changes the list's shape closes the panel first, so it cannot outlive
 /// the list it was resolved against.
-static BINDING_EDITING: MainThreadSlot<Option<EditTarget>> = MainThreadSlot::new(None);
+static BINDING_EDITING: MainThreadSlot<Option<EditTarget>> = unsafe { MainThreadSlot::new(None) };
 
 /// The binding the open panel is editing: its index **and** the identity it had when the panel opened.
 ///
@@ -198,13 +198,13 @@ static ROW_CONTROLS: LazyLock<Mutex<HashMap<usize, usize>>> =
 /// `close_binding_panel` *before* the panel is released, because releasing the panel deallocates its
 /// content view's whole subtree. They live in `MainThreadSlot`s like the mouse page's panel slots,
 /// so a background thread cannot reach them and the borrow is checked at the call site.
-static PANEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static PANEL_ACTION: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static PANEL_CHORD_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static PANEL_RECORD: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static PANEL_MESSAGE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static PANEL_OK: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static PANEL_DIM: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PANEL: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static PANEL_ACTION: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static PANEL_CHORD_LABEL: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static PANEL_RECORD: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static PANEL_MESSAGE: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static PANEL_OK: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static PANEL_DIM: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 fn register_control(view: *mut AnyObject, item: usize) {
     if view.is_null() {

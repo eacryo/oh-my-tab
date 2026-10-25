@@ -183,6 +183,25 @@ pub(crate) fn with_tab_state<R>(f: impl FnOnce(&mut Option<AppState>) -> R) -> R
     APP_RUNTIME.with(|runtime| f(&mut runtime.borrow_mut().switcher))
 }
 
+/// Refuse an access to the main-thread runtime from any other thread, in every build.
+///
+/// `debug_assert_main_thread` is enough for state whose corruption only shows up as a wrong
+/// value; it is not enough for a `RefCell` borrow guard. `MainThreadSlot` hands out `&mut T`
+/// against a plain `RefCell`, so an off-main borrow is a data race in release as much as in
+/// debug, and a check that compiles away does not make the race unobservable. This one stays.
+///
+/// The panic is the intended outcome, and it is contained where it can be: every AppKit and
+/// event-tap callback in this crate runs inside a `callback_guard` boundary, which turns it into
+/// a log line instead of an unwind across `extern "C"`. A path that would trip this from off the
+/// main thread is a bug in that path, not a reason to widen the check.
+#[inline]
+pub(crate) fn assert_main_thread(what: &'static str) {
+    assert!(
+        is_main_thread(),
+        "{what} was touched off the AppKit main thread"
+    );
+}
+
 /// UI runtime must never be accessed from a worker thread.
 pub(crate) fn debug_assert_main_thread() {
     #[cfg(debug_assertions)]
@@ -236,7 +255,8 @@ static SETTINGS_PREWARM_SCHEDULED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
 /// Shared ObjC target object for menu items and settings buttons.
-pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(crate) static MENU_TARGET: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 
 /// Cross-thread dispatch handle for `MENU_TARGET`. The recording thread wakes the main-thread
 /// callback via performSelectorOnMainThread from the background, but MENU_TARGET is a
@@ -863,6 +883,69 @@ fn exit_smoke_passed() -> ! {
     std::process::exit(0);
 }
 
+/// `--smoke-main-thread-slot`: borrow a `MainThreadSlot` from the real AppKit main thread.
+///
+/// The unit tests prove the refusal side (a background thread is rejected in every build). They
+/// cannot prove the accept side: a libtest worker thread is not the AppKit main thread, so a
+/// borrow there is refused as well. This runs inside a real `NSApplication` and asserts that the
+/// same guard lets the main thread through -- the property every UI registry depends on. A guard
+/// that refused everything would pass the unit tests and break the app.
+pub(crate) fn smoke_main_thread_slot() -> bool {
+    // SAFETY: process-local slot, borrowed only on the thread that reaches it here.
+    static SLOT: crate::ffi::MainThreadSlot<u32> = unsafe { crate::ffi::MainThreadSlot::new(41) };
+    assert!(
+        crate::is_main_thread(),
+        "the smoke child is not on the AppKit main thread; the check could not decide"
+    );
+    match SLOT.lock() {
+        Ok(mut value) => *value += 1,
+        Err(_) => {
+            eprintln!("[smoke-main-thread-slot] the slot was already borrowed on the main thread");
+            return false;
+        }
+    }
+    // The written value is visible to the next borrow.
+    let reread = SLOT.lock().map(|value| *value).unwrap_or(0);
+    if reread != 42 {
+        eprintln!("[smoke-main-thread-slot] the written value came back as {reread}");
+        return false;
+    }
+    // Reentrancy is unchanged: a second borrow while one is held fails, not blocks. The guard has
+    // to be bound to a live binding -- `SLOT.lock().is_ok()` drops the `RefMut` at the end of that
+    // statement, which would leave nothing borrowed and make the nested attempt succeed.
+    let held = SLOT.lock();
+    let nested_refused = SLOT.lock().is_err();
+    let held = held.is_ok();
+    if !held || !nested_refused {
+        eprintln!(
+            "[smoke-main-thread-slot] the borrow rules changed (held={held}, nested_refused={nested_refused})"
+        );
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod main_thread_slot_smoke_tests {
+    use crate::smoke_verdict::smoke_runner;
+
+    /// Borrow a `MainThreadSlot` from the real AppKit main thread in a child process.
+    ///
+    /// The unit test next to the type only proves the refusal: a libtest worker thread is not the
+    /// AppKit main thread. Without this runner a guard that refused every borrow would pass the
+    /// whole suite while every UI registry in the app failed. The child runs the assertions; its
+    /// recorded verdict is what this reports.
+    #[test]
+    #[ignore]
+    fn main_thread_slot_runtime_smoke() {
+        smoke_runner!("main_thread_slot_runtime_smoke", 1, {
+            crate::smoke_verdict::run_smoke_child(
+                "main_thread_slot_runtime_smoke",
+                &["--smoke-main-thread-slot"],
+            );
+        });
+    }
+}
 pub(crate) fn orderly_exit_duties() {
     ORDERLY_EXITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The config first: everything below may be recorded in it (the clipboard session state, the
@@ -3048,6 +3131,7 @@ pub fn run() {
             || arg == "--smoke-selection-ring"
             || arg == "--smoke-space-state-matrix"
             || arg == "--smoke-panel-keys"
+            || arg == "--smoke-main-thread-slot"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -3258,6 +3342,28 @@ pub fn run() {
             std::process::exit(1);
         }
         log_info!("[smoke-card-badges] preview badges match the card state");
+        crate::smoke_verdict::report("smoke", crate::smoke_verdict::Verdict::Passed { checks: 1 });
+        exit_smoke_passed();
+    }
+
+    // Smoke-test entry (--smoke-main-thread-slot): borrow a MainThreadSlot from the real AppKit
+    // main thread and assert the guard admits it while keeping the reentrancy rule. The refusal
+    // side is a plain unit test; this is the half a test thread cannot reach.
+    if crate::dev_flags::present("smoke-main-thread-slot") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        if !smoke_main_thread_slot() {
+            crate::smoke_verdict::report(
+                "main_thread_slot",
+                crate::smoke_verdict::Verdict::NotRun("the main-thread slot check failed".into()),
+            );
+            std::process::exit(1);
+        }
+        log_info!(
+            "[smoke-main-thread-slot] the main thread reaches its slots and the borrow rules hold"
+        );
         crate::smoke_verdict::report("smoke", crate::smoke_verdict::Verdict::Passed { checks: 1 });
         exit_smoke_passed();
     }

@@ -67,7 +67,7 @@ static DRAG: Mutex<Option<PanelDrag>> = Mutex::new(None);
 static CURSOR: Mutex<DragCursor> = Mutex::new(DragCursor::None);
 /// The blank-area surface, so a content rebuild can put it back on top (see
 /// [`raise_drag_surface`]).
-static DRAG_SURFACE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DRAG_SURFACE: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 // ---------------------------------------------------------------------------------------------
 // Position state

@@ -103,17 +103,21 @@ const SELECTED_CARD_LIFT: f64 = 1.0;
 /// Duration of the slot-collapse/reflow animation; the whole transition stays in one AppKit transaction.
 const CARD_CLOSE_ANIMATION_DURATION: f64 = crate::theme::ANIMATION_DURATION_MEDIUM;
 
-pub(crate) static OVERLAY_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-pub(crate) static CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(crate) static OVERLAY_WINDOW: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
+pub(crate) static CONTAINER: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// Persistent card document view; scrolling moves CONTAINER bounds instead of rebuilding cards.
-pub(crate) static CARD_DOCUMENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-pub(crate) static STATUS_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(crate) static CARD_DOCUMENT: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
+pub(crate) static STATUS_LABEL: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// Native vertical scroller shown when the thumbnail rows overflow the viewport.
-pub(crate) static THUMB_SCROLLER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(crate) static THUMB_SCROLLER: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// The switcher panel's installed backdrop (glass / frost / opaque), kept for hot-reload
 /// property updates and material swaps.
 pub(crate) static OVERLAY_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
-    MainThreadSlot::new(None);
+    unsafe { MainThreadSlot::new(None) };
 pub(crate) static CARD_CLASS: Mutex<Option<StaticClass>> = Mutex::new(None);
 
 /// Copy a main-thread UI pointer out of its slot before calling AppKit.

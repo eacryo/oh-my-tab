@@ -372,15 +372,16 @@ static EDIT_ACTION_IDX: Mutex<isize> = Mutex::new(0);
 /// The combo recorded in the panel (Key Press action; empty = not recorded).
 static EDIT_COMBO: Mutex<String> = Mutex::new(String::new());
 /// The panel window and its controls.
-static EDIT_PANEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static EDIT_PANEL_BTN_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static EDIT_PANEL_ACTION: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static EDIT_PANEL_COMBO_BTN: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static EDIT_PANEL_COMBO_LABEL: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static EDIT_PANEL_OK: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EDIT_PANEL: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static EDIT_PANEL_BTN_LABEL: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static EDIT_PANEL_ACTION: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static EDIT_PANEL_COMBO_BTN: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static EDIT_PANEL_COMBO_LABEL: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
+static EDIT_PANEL_OK: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The window dim layer while the panel is open (a translucent gray overlay that dims the
 /// settings window, modal-style).
-static EDIT_DIM: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EDIT_DIM: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 /// Recording-cancel flag: set on cancel. It bails the tap-creation retry loop early (the
 /// recording thread may still be sleeping through permission-retries, where CFRunLoopStop

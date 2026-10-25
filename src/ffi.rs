@@ -578,31 +578,48 @@ pub(crate) fn build_class(
 }
 
 /// Main-thread slot for UI objects that must remain in a `static` registry for callback lookup.
-/// The slot is synchronized by the main-thread invariant, not by a cross-thread mutex.
+///
+/// The synchronization is the main-thread invariant, enforced at every borrow, not a cross-thread
+/// mutex. On a version whose guard was a `debug_assert!`, release builds entered the `RefCell`
+/// unchecked; `lock` now asserts in every build, before the `RefCell` is touched.
+///
+/// `Send`/`Sync` below are sound for exactly one shape of use, and `new` is unsafe so that the
+/// shape is stated at the construction site instead of inferred from the struct: a process-lifetime
+/// `static` (`static X: MainThreadSlot<T> = unsafe { MainThreadSlot::new(..) }`, or inside a
+/// `LazyLock`/`OnceLock` initializer that a main-thread path reaches first). Every borrow then
+/// happens on the main thread, and nothing moves the slot out of its static. A local instance, a
+/// value moved to a worker thread, or a slot dropped off the main thread is outside the contract:
+/// `Send` says a *cross-thread move* of the slot is fine, which is only true because that move
+/// never happens.
 pub(crate) struct MainThreadSlot<T> {
     value: RefCell<T>,
 }
 
 impl<T> MainThreadSlot<T> {
-    pub(crate) const fn new(value: T) -> Self {
+    /// # Safety
+    ///
+    /// The slot must live in a process-lifetime `static` that is only borrowed on the main thread,
+    /// and must never be moved out of it. All 85 construction sites are `static` items or
+    /// `LazyLock` initializers; a local binding is not supported.
+    pub(crate) const unsafe fn new(value: T) -> Self {
         Self {
             value: RefCell::new(value),
         }
     }
 
+    /// Borrow the value for mutation. Panics when reached from a thread other than the AppKit main
+    /// thread: an off-main borrow races with the main thread inside `RefCell`.
     pub(crate) fn lock(&self) -> Result<RefMut<'_, T>, BorrowMutError> {
-        crate::debug_assert_main_thread();
+        crate::assert_main_thread("a MainThreadSlot");
         self.value.try_borrow_mut()
     }
 }
 
-// The wrapper is only reachable through main-thread callbacks; the contained value is never
-// moved out to a worker thread. This is the one narrowly-scoped synchronization boundary for
-// legacy static UI registries, instead of marking every raw pointer as Send/Sync.
+// Sound only under the `new` contract above: the slot stays in a static, is borrowed on the main
+// thread, and is never moved across threads or dropped off-main. This is the one narrowly-scoped
+// synchronization boundary for legacy static UI registries, instead of marking every raw pointer
+// as Send/Sync. `Send` is required so the slot can live in a `LazyLock`/`OnceLock` at all.
 unsafe impl<T> Sync for MainThreadSlot<T> {}
-// The slot itself is a process-global registry cell and is never moved after initialization;
-// only its borrow guard is exposed. This permits `LazyLock`/`OnceLock` initialization while the
-// contained UI object remains non-Send.
 unsafe impl<T> Send for MainThreadSlot<T> {}
 
 /// A retained Objective-C callback target whose identity is handed to AppKit APIs such as
@@ -1925,6 +1942,59 @@ mod composed_character_tests {
                 vec!["e\u{301}".to_string(), "👩‍💻".to_string(), "x".to_string()]
             );
             assert!(composed_character_clusters("").is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod main_thread_slot_tests {
+    use super::MainThreadSlot;
+
+    /// A borrow from off the main thread must be refused in EVERY build, not only in debug.
+    ///
+    /// The guard used to be a `debug_assert!`, so a release build handed out `&mut T` against a
+    /// plain `RefCell` from whichever thread asked -- a data race the check could no longer see.
+    /// This test fails, in release as well as debug, if the guard becomes a debug-only one again.
+    ///
+    /// It uses its own slot, never a production registry: tripping the guard on a real UI slot
+    /// would borrow a live registry cell from the wrong thread, which is the defect under test.
+    #[test]
+    fn a_borrow_from_a_background_thread_is_refused() {
+        // SAFETY: test-local slot, only ever borrowed on the thread that reaches it below.
+        static SLOT: MainThreadSlot<usize> = unsafe { MainThreadSlot::new(7) };
+        let outcome = std::thread::spawn(|| SLOT.lock().map(|value| *value))
+            .join()
+            .expect_err("a borrow off the main thread must panic rather than succeed");
+        let message = outcome
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| outcome.downcast_ref::<&str>().copied())
+            .unwrap_or("<no message>");
+        assert!(
+            message.contains("off the AppKit main thread"),
+            "unexpected panic message: {message}"
+        );
+    }
+
+    /// Every attempt from off the main thread is refused, not only the first.
+    ///
+    /// What this proves is narrower than it looks. It shows the refusal is not a one-shot: a second
+    /// call from off-main is refused too. It does NOT prove the slot stays usable afterwards, and it
+    /// does NOT prove the check runs before `try_borrow_mut` -- the assertion fires before the borrow
+    /// is inspected either way, so a permanently dirtied borrow state would still panic here and
+    /// pass. The ordering is fixed by the statement order in `lock` and has to be read there; the
+    /// slot staying usable on the main thread is what the A1 runner
+    /// `main_thread_slot_runtime_smoke` covers, in a real NSApplication main thread.
+    #[test]
+    fn the_refusal_does_not_leave_the_slot_borrowed_off_main() {
+        // SAFETY: test-local slot.
+        static SLOT: MainThreadSlot<usize> = unsafe { MainThreadSlot::new(11) };
+        for _ in 0..2 {
+            let refused = std::thread::spawn(|| SLOT.lock().is_ok()).join().is_err();
+            assert!(
+                refused,
+                "every off-main attempt must be refused, not just the first"
+            );
         }
     }
 }

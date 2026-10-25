@@ -29,7 +29,7 @@ use crate::ffi::{MainThreadSlot, StaticClass};
 
 /// The footer gear button (kept for theme repaints and layout, like the status label).
 pub(crate) static FOOTER_SETTINGS_BUTTON: MainThreadSlot<Option<ObjPtr>> =
-    MainThreadSlot::new(None);
+    unsafe { MainThreadSlot::new(None) };
 
 /// Whether a press on the gear is in progress. The click owns the gesture from mouseDown to mouseUp:
 /// window input must stay enabled while it runs, and every session-ending path clears it.

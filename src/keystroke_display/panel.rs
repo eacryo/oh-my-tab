@@ -152,7 +152,7 @@ thread_local! {
 }
 
 static PANEL_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
-    MainThreadSlot::new(None);
+    unsafe { MainThreadSlot::new(None) };
 
 unsafe extern "C" fn timer_callback(_timer: event_tap::CFRunLoopTimerRef, _info: *mut c_void) {
     crate::callback_guard::void("keystroke_display_timer", super::timer_fired);

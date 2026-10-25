@@ -62,7 +62,7 @@ const NS_ACTIVITY_USER_INITIATED_ALLOWING_IDLE_SYSTEM_SLEEP: u64 =
 /// The activity token is owned by this process and only touched on the main thread.  The extra
 /// retain is intentional because `beginActivityWithOptions:reason:` returns an autoreleased
 /// token when called through the raw MRC bridge used by this project.
-static SWITCHER_ACTIVITY: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static SWITCHER_ACTIVITY: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 static SWITCHER_INTERACTION_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 /// Tell App Nap/sudden-termination policy that a user-visible switcher operation is in flight.

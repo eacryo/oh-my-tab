@@ -291,18 +291,20 @@ struct UiState {
     clipboard_shortcut: String,
 }
 
-static WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static CONTENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static TIMER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static STATE: MainThreadSlot<Option<UiState>> = MainThreadSlot::new(None);
+static WINDOW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static CONTENT: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static TIMER: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static STATE: MainThreadSlot<Option<UiState>> = unsafe { MainThreadSlot::new(None) };
 /// The permission signature rendered last; a 1s tick rebuilds only when it changes.
-static LAST_SIGNATURE: MainThreadSlot<Option<(bool, bool, bool)>> = MainThreadSlot::new(None);
+static LAST_SIGNATURE: MainThreadSlot<Option<(bool, bool, bool)>> =
+    unsafe { MainThreadSlot::new(None) };
 /// Button pointer to action tag. The action id must NOT ride `setTag:`: the SettingsButton hover
 /// handlers select their palette from that tag (`mouseEntered:` and `mouseExited:` both read it,
 /// mapping to the primary-blue / action / compact-grey palettes), so overwriting it breaks both the
 /// hover colour and the restore-to-normal colour (measured: the primary button stayed grey after
 /// the pointer left).
-static ACTION_TAGS: MainThreadSlot<Vec<(usize, isize)>> = MainThreadSlot::new(Vec::new());
+static ACTION_TAGS: MainThreadSlot<Vec<(usize, isize)>> =
+    unsafe { MainThreadSlot::new(Vec::new()) };
 
 fn override_ax(over: PermissionOverride) -> bool {
     over.ax
@@ -1265,9 +1267,9 @@ struct SegmentRecord {
     children: Vec<(usize, usize)>, // (segment view, label view); index 0 icons, index 1 thumbnails
     selected: usize,
 }
-static SEGMENTS: MainThreadSlot<Vec<SegmentRecord>> = MainThreadSlot::new(Vec::new());
-static SEGMENT_HOVER: MainThreadSlot<Option<usize>> = MainThreadSlot::new(None);
-static SEGMENT_FOCUS: MainThreadSlot<Option<usize>> = MainThreadSlot::new(None);
+static SEGMENTS: MainThreadSlot<Vec<SegmentRecord>> = unsafe { MainThreadSlot::new(Vec::new()) };
+static SEGMENT_HOVER: MainThreadSlot<Option<usize>> = unsafe { MainThreadSlot::new(None) };
+static SEGMENT_FOCUS: MainThreadSlot<Option<usize>> = unsafe { MainThreadSlot::new(None) };
 
 fn segment_record_by_container(container: usize) -> Option<SegmentRecord> {
     SEGMENTS

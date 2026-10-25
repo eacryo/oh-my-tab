@@ -41,7 +41,14 @@ fn state() -> &'static Mutex<Option<UpdaterState>> {
 }
 
 /// The custom progress window is owned by the user driver until Sparkle reports a result.
-/// Pointers are represented as usize so the mutex can safely cross Rust's static Sync boundary.
+///
+/// The pointers are erased to `usize` so this struct needs no `unsafe impl Send`/`Sync` of its own.
+/// That is an erasure, not a guarantee: nothing about the integer makes the object behind it safe to
+/// touch off the main thread, and the object is not retained by this struct -- the user driver, the
+/// timer or AppKit owns it, which is why a stale value here is a dangling pointer rather than a
+/// borrow error. What holds is narrower than "it is Send": every borrow of this struct is taken on
+/// the main thread, and the objects are created and invalidated in the same place. Storing an
+/// integer instead of a pointer must not be read as proof of thread safety.
 struct UpdateUiState {
     window: usize,
     /// Where the visible prompt was actually rendered: `true` inside the About page's host, `false` in the

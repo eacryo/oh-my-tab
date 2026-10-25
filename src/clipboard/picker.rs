@@ -36,7 +36,7 @@ pub(super) fn picker_layout(available_width: f64, expanded: bool) -> PickerLayou
 }
 
 static DETAIL_SPLIT: AtomicBool = AtomicBool::new(false);
-static DETAIL_DIVIDER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_DIVIDER: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 pub(super) fn picker_panel_width() -> f64 {
     let window = *PICKER_WINDOW.lock().unwrap();

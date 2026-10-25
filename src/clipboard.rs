@@ -1293,7 +1293,7 @@ struct ContentAttributedKey {
 }
 static CONTENT_ATTRIBUTED_CACHE: LazyLock<
     MainThreadSlot<HashMap<ContentAttributedKey, CachedUiObject>>,
-> = LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+> = LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
 const UI_CACHE_CAPACITY: usize = 128;
 static UI_CACHE_RECENCY: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Copy)]
@@ -1390,11 +1390,12 @@ impl RowHoverViews {
         ]
     }
 }
-static ROW_HOVER_VIEWS: MainThreadSlot<Vec<RowHoverViews>> = MainThreadSlot::new(Vec::new());
+static ROW_HOVER_VIEWS: MainThreadSlot<Vec<RowHoverViews>> =
+    unsafe { MainThreadSlot::new(Vec::new()) };
 /// Display indices for materialized row views; rows outside the viewport have no AppKit views.
-static ROW_VIEW_INDICES: MainThreadSlot<Vec<usize>> = MainThreadSlot::new(Vec::new());
+static ROW_VIEW_INDICES: MainThreadSlot<Vec<usize>> = unsafe { MainThreadSlot::new(Vec::new()) };
 /// the picker window.
-static PICKER_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_WINDOW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The picker window's dynamic class. Recorded at registration so an override's super dispatch can
 /// name the class that defined it, rather than recovering it from the instance.
 static PICKER_WINDOW_CLASS: std::sync::OnceLock<crate::ffi::StaticClass> =
@@ -1415,7 +1416,7 @@ pub(crate) fn search_field_class() -> &'static crate::ffi::StaticClass {
         .expect("the search field class is registered before its override can run")
 }
 /// the picker container (receives key events).
-static PICKER_CONTAINER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_CONTAINER: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// Copy the container pointer and end the slot borrow immediately; never hold a
 /// MainThreadSlot RefMut across an AppKit call.
 fn picker_container_ptr() -> Option<*mut AnyObject> {
@@ -1425,16 +1426,16 @@ fn picker_container_ptr() -> Option<*mut AnyObject> {
         .map(|container| container.0)
 }
 /// the localized footer in place.
-static PICKER_CONTENT_PARENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_CONTENT_PARENT: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The picker's installed backdrop, held for live material/tint updates and material swaps.
 static PICKER_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
-    MainThreadSlot::new(None);
+    unsafe { MainThreadSlot::new(None) };
 /// The empty-state hint view (shown when the history is empty / nothing matches). Tracked
 /// separately from row views so the next rebuild can remove it.
-static EMPTY_STATE_ICON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EMPTY_STATE_ICON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static EMPTY_STATE_VIEW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The empty state's "grant keychain access" button (only while the storage is unavailable).
-static EMPTY_STATE_ACTION: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static EMPTY_STATE_ACTION: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 struct RowImageKey {
     image_hash: u64,
@@ -1447,7 +1448,7 @@ struct RowImageKey {
     thumb_w_bits: u64,
 }
 static ROW_IMAGE_CACHE: LazyLock<MainThreadSlot<HashMap<RowImageKey, CachedUiObject>>> =
-    LazyLock::new(|| MainThreadSlot::new(HashMap::new()));
+    LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
 fn next_ui_cache_recency() -> u64 {
     UI_CACHE_RECENCY.fetch_add(1, Ordering::Relaxed) + 1
 }
@@ -1456,7 +1457,7 @@ static ROW_PITCHES: LazyLock<Mutex<Vec<f64>>> = LazyLock::new(|| Mutex::new(Vec:
 /// The filter pills' button pointers (one per tag; restyled on change/rebuild).
 /// Persistent clear-history action buttons, relaid out when the locale changes.
 static CLEAR_HISTORY_ACTION_BUTTONS: MainThreadSlot<Option<[ObjPtr; 2]>> =
-    MainThreadSlot::new(None);
+    unsafe { MainThreadSlot::new(None) };
 const CLIPBOARD_UNDO_WINDOW: Duration = Duration::from_secs(30);
 fn clipboard_undo_expired(expires_at: Instant, now: Instant) -> bool {
     expires_at <= now
@@ -1486,32 +1487,34 @@ pub(super) fn localized_filter_labels() -> [String; 6] {
     ]
 }
 /// the top search field.
-static SEARCH_FIELD: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static SEARCH_FIELD: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// Rounded search surface drawn behind NSSearchField, whose cell paints over its own layer.
-pub(super) static SEARCH_FIELD_SURFACE: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(super) static SEARCH_FIELD_SURFACE: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// The search field clear × hover state.
 static SEARCH_CLEAR_HOVERED: AtomicBool = AtomicBool::new(false);
 /// The real click button over the hand-drawn ×; rendering remains in the cell.
-static SEARCH_CLEAR_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static SEARCH_CLEAR_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The header's corner close button (persistent: the picker window is reused across summons).
-static PICKER_CLOSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_CLOSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The fixed header strip (search field, drag handle, settings and close buttons). Kept so the
 /// smoke runner can assert its controls against the live view tree, not just against geometry.
-static PICKER_HEADER_STRIP: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_HEADER_STRIP: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The header's settings button, next to the close button (same persistence).
-static PICKER_OPTIONS_ORB: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_OPTIONS_ORB: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The options popover's "open settings" row. `PICKER_OPTIONS_ORB` only opens the
 /// popover, so a scenario that means "open settings" has to click this row instead.
-pub(super) static PICKER_SETTINGS_ROW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(super) static PICKER_SETTINGS_ROW: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// The panel-level pin button (the corner row's third glyph). Distinct from the per-row entry pin.
-static PICKER_DETAIL_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static PICKER_PIN_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_DETAIL_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static PICKER_PIN_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The panel header's pause-recording orb (a real control, unlike the pin's check state).
-static PICKER_PAUSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static PICKER_PAUSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The centered "magnifier + search hint" attributed string (hand-drawn; the field itself
 /// carries NO placeholder property, so the field editor never draws the placeholder
 /// left-aligned on a focused-but-empty field).
-static SEARCH_HINT_TEXT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static SEARCH_HINT_TEXT: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// Rebuild the search field's placeholder (magnifier + "Search clipboard", 15pt): the
 /// placeholder is NOT set on the field (the field editor would draw it left-aligned on a
 /// focused-but-empty field); it lives in a static and is hand-drawn at the field's left
@@ -1585,14 +1588,15 @@ unsafe fn rebuild_search_hint() {
 /// modal blocks input while up).
 static PENDING_SAVE_AS: Mutex<Option<ClipEntry>> = Mutex::new(None);
 /// the scroll view.
-static SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// the custom scroll indicator view.
-static SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The detail text scroll view and its custom indicator; image details have no scroll area.
-static DETAIL_SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
-static DETAIL_SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_SCROLL_VIEW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+static DETAIL_SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 static DETAIL_HORIZONTAL_SCROLL_INDICATOR: MainThreadSlot<Option<ObjPtr>> =
-    MainThreadSlot::new(None);
+    unsafe { MainThreadSlot::new(None) };
 /// Drag state for the custom scroll indicator; once the system scroller is disabled, an
 /// NSView does not implement thumb dragging for us.
 #[derive(Clone, Copy)]
@@ -1611,12 +1615,13 @@ struct ScrollDragState {
 }
 static SCROLL_DRAG: Mutex<Option<ScrollDragState>> = Mutex::new(None);
 /// the detail panel window (right-arrow expands).
-static DETAIL_WINDOW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_WINDOW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// What the picker's body shows: the list, or the detail that took its place. The narrow panel
 /// expands INSIDE itself (the mock's `@media (max-width: 840px)` branch hides `.list-pane` and
 /// gives `.detail-pane` the whole panel), so the two are alternate contents of one rect and only
 /// one of them is ever installed.
-static PICKER_PANE_MODE: MainThreadSlot<PickerPaneMode> = MainThreadSlot::new(PickerPaneMode::List);
+static PICKER_PANE_MODE: MainThreadSlot<PickerPaneMode> =
+    unsafe { MainThreadSlot::new(PickerPaneMode::List) };
 
 /// See `PICKER_PANE_MODE`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1626,7 +1631,7 @@ pub(crate) enum PickerPaneMode {
 }
 /// The detail panel's installed backdrop (glass view + inactive compensation layer inside).
 static DETAIL_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
-    MainThreadSlot::new(None);
+    unsafe { MainThreadSlot::new(None) };
 /// Keep clipboard panels on the same resolved appearance as the settings window and switcher.
 unsafe fn apply_panel_appearance(window: *mut AnyObject) {
     // Vibrant, not plain: these panels draw their text on the user's material (see
@@ -1790,7 +1795,8 @@ fn filter_popover_rows_union() -> Option<(f64, f64, f64, f64)> {
 }
 /// The options orb's 5px accent dot (the mock's `.orb-dot`), shown only while the active
 /// filter is not "All".
-pub(super) static OPTIONS_ORB_DOT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(super) static OPTIONS_ORB_DOT: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// Toggle the options popover's open flag; the popover view is created/destroyed by the
 /// detail module on this transition.
 pub(crate) fn toggle_filter_popover() {
@@ -1830,7 +1836,8 @@ pub(crate) fn refresh_clear_actions_after_config_change() {
     text_style::update_clear_action_labels();
 }
 /// The options popover view itself (built lazily by `toggle_filter_popover`).
-pub(super) static FILTER_POPOVER: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+pub(super) static FILTER_POPOVER: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// The keyboard-highlighted row inside the open popover (usize::MAX = pointer/none).
 pub(super) static POPOVER_KEY_ROW: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(usize::MAX);
@@ -2061,7 +2068,7 @@ pub(crate) fn picker_is_visible() -> bool {
 
 /// The detail panel's content container (hosts the text scroll view / the image view;
 /// clicking anywhere on the panel dismisses it).
-static DETAIL_CONTENT: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_CONTENT: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The single slot for a freshly generated <=1280px hi-res detail preview (hash, bytes).
 //  First priority in show_detail_for_sel's byte lookup -- consumed (cleared) on a hash
 //  match so the disk is never re-read; misses fall through to the disk cache / 480px
@@ -2092,10 +2099,11 @@ static DETAIL_PICKER_ORIGINAL_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
 /// The detail panel's current text view (selectable; feeds "copy selection"). MUST be
 /// cleared when the old content is removed / the panel hides, or a dangling pointer would
 /// be dereferenced on Cmd+C (use-after-free).
-static DETAIL_TEXT_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_TEXT_VIEW: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The code text view using soft-wrap decorations; arrows are drawing-only, while U+2028
 /// separators are stripped through the source map.
-static DETAIL_SOFT_WRAP_TEXT_VIEW: MainThreadSlot<Option<ObjPtr>> = MainThreadSlot::new(None);
+static DETAIL_SOFT_WRAP_TEXT_VIEW: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
 /// Shared mapping from detail display text to source, ensuring U+2028 and other display-only
 /// characters never enter copied content.
 static DETAIL_SOURCE_MAP: Mutex<Option<Arc<DisplaySourceMap>>> = Mutex::new(None);

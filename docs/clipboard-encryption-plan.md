@@ -98,7 +98,9 @@ ct||tag   [..] AES-256-GCM(key, nonce, plaintext, AAD = magic || kind || key_id 
   **`object_id` 由读取方按它请求的逻辑名重新计算并作为 AAD**，绝不信任文件头里携带的那份（头部字段只用于诊断与快速识别）——否则互换两个完整密文文件时，攻击者只需连同头部一起搬运就能通过校验。
 - **内容格式不变**：解密后的字节仍是原来的 TOML（`version` + `entries`），`serialize_history` / `parse_history` 不动。
 - **文件命名**：历史改用 `clipboard-history.enc`（明文旧文件 `clipboard-history.toml` 迁移后删除）；图片文件**沿用 `{hash:016x}` 系列命名**（残留的元数据泄漏见 §2，决策点 2）。
-- **原子写、0600、临时文件清理全部沿用现有实现**：临时文件里现在是密文，`is_history_temp_file_name` / `sweep_history_temp_files` 语义不变。
+- **原子写、0600、临时文件清理全部沿用现有实现**：临时文件里现在是密文，`is_history_temp_file_name` / `sweep_history_temp_files` 语义不变。临时名形状是 `{name}.tmp{pid}-{serial}`（两个字段都是纯数字，能被清扫规则识别）；`serial` 在**所有构建**里都取进程内递增序号。它不能是固定值：写入用 `create_new` 独占创建临时文件，固定名会让一次崩溃残留（或一次清理也失败的写入）令该进程后续每次写入都以 `AlreadyExists` 失败。
+- **持久性边界（不要过度解读这一条）**：`write_sealed_file` 提供的保证是三句话，不多不少——(1) 读回认证成功才发布，所以被替换掉的旧对象要么完整、要么根本不被替换；(2) `rename` 原子，应用崩溃或强制退出后目录里不会出现半截文件；(3) 文件 `sync_all` 失败即拒绝发布。**目录同步是尽力而为**（与 `config::atomic_write` 一致），因此**不承诺突然断电后的持久性**：断电可能丢掉最后几次写入，剪贴板历史允许丢尾部条目。
+- **删除路径不给持久性承诺**：`clear_on_quit` / 清除历史只删文件，不做目录同步。它保证「删掉了」，不保证「断电后仍然删掉」——断电可能导致旧记录在下次启动时重新出现。要承诺后者需要的是一条带意图写入与撤销的顺序协议，不是一次额外的目录同步；本计划不做。
 - 图片缓存的加解密收口在 `image_cache.rs` 的读写助手（`cache_write_image` / `cache_read_image` / `cache_write_preview` / `cache_read_preview` / `cache_write_detail_preview` / `cache_read_detail_preview`），路径与 epoch/generation 逻辑不动。注意 `cache_write_image` 现有「文件已存在即返回成功」的短路**不能**用于迁移转换（§4.4）。
 
 ### 4.3 代码落点
