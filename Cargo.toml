@@ -1,5 +1,8 @@
 [workspace]
 members = ["finder-ext", "crates/finder-protocol"]
+# The R2 publisher is a standalone tool: it keeps its own Cargo.lock and target, and its AWS
+# dependencies must not join the app workspace or the gate.
+exclude = ["tools/r2-publisher"]
 default-members = [".", "finder-ext", "crates/finder-protocol"]
 
 [package]
