@@ -13,7 +13,7 @@ use crate::ffi::{
 use crate::i18n::{t, tf};
 use crate::skylight;
 use crate::{ffi::release_obj, log_debug, log_info};
-use objc2::runtime::{AnyClass, AnyObject, Sel};
+use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRange, NSRect, NSSize};
 use std::ffi::{c_char, c_void, CStr, CString};
@@ -65,6 +65,14 @@ struct UpdateUiState {
     acknowledgement: usize,
     update_reply: usize,
     information_url: String,
+    /// The prompt kind currently on screen (0 available, 1 downloaded, 2 installing, 3 information
+    /// only; -1 when none). The Skip button means "skip this version" during discovery and "cancel
+    /// the installation" once one is scheduled; the Finder-extension restore transaction must only
+    /// be revoked for the latter.
+    prompt_kind: isize,
+    /// The build this prompt's installation would install, so an install-phase Skip revokes only
+    /// that update's restore transaction.
+    prompt_target_build: String,
     permission_reply: usize,
     retry_termination: usize,
     waiting_for_quit: bool,
@@ -88,6 +96,8 @@ static UPDATE_UI_STATE: LazyLock<Mutex<UpdateUiState>> = LazyLock::new(|| {
         acknowledgement: 0,
         update_reply: 0,
         information_url: String::new(),
+        prompt_kind: -1,
+        prompt_target_build: String::new(),
         permission_reply: 0,
         retry_termination: 0,
         waiting_for_quit: false,
@@ -1584,6 +1594,16 @@ unsafe fn make_custom_update_found_window(
         version
     };
     let prompt_kind = update_prompt_kind(stage, information_only);
+    {
+        let mut state = UPDATE_UI_STATE.lock().unwrap();
+        state.prompt_kind = match prompt_kind {
+            UpdatePromptKind::Available => 0,
+            UpdatePromptKind::Downloaded => 1,
+            UpdatePromptKind::Installing => 2,
+            UpdatePromptKind::InformationOnly => 3,
+        };
+        state.prompt_target_build = update_item_build(item);
+    }
     let title_key = match prompt_kind {
         UpdatePromptKind::Available => "settings.update_available_title",
         UpdatePromptKind::Downloaded => "settings.update_downloaded_title",
@@ -2301,6 +2321,13 @@ extern "C" fn open_information_update(_this: *mut c_void, _cmd: Sel, _sender: *m
 
 extern "C" fn skip_custom_update(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
     callback_guard::void("skip_custom_update", || {
+        // Only the Installing prompt's button cancels an installation; the Downloaded prompt's Skip
+        // still only declines it, and neither may touch another update's transaction.
+        let (kind, target) = {
+            let state = UPDATE_UI_STATE.lock().unwrap();
+            (state.prompt_kind, state.prompt_target_build.clone())
+        };
+        crate::finder_menu::recovery::note_install_skipped(kind == 2, &target);
         unsafe { choose_custom_update(0) };
     });
 }
@@ -2590,6 +2617,16 @@ extern "C" fn show_update_found(
         unsafe {
             let information_only: bool = msg_send![item as *mut AnyObject, isInformationOnlyUpdate];
             let stage: isize = msg_send![state as *mut AnyObject, stage];
+            // Informational only: a found update is never a restore basis. Only Sparkle's install
+            // lifecycle (the updater delegate) may schedule a restore.
+            let target_build: *mut AnyObject = msg_send![item as *mut AnyObject, versionString];
+            let target_build = nsstring_to_string(target_build);
+            let display_version: *mut AnyObject =
+                msg_send![item as *mut AnyObject, displayVersionString];
+            crate::finder_menu::recovery::note_update_found(
+                &target_build,
+                &nsstring_to_string(display_version),
+            );
             // A scheduled background check that finds an update must not pop a window: post a
             // system notification instead and reply Later (reminded at the next check). Clicking
             // the banner opens Settings > About and starts a user-initiated check there.
@@ -2659,6 +2696,17 @@ extern "C" fn show_updater_error(
     callback_guard::void("show_updater_error", || {
         unsafe {
             log_sparkle_error("showUpdaterError", _error);
+            // Only an error that terminated a scheduled installation may revoke the Finder-extension
+            // restore transaction; a "no update" result or a later cycle must not (see recovery.rs).
+            let (error_code, error_domain) = if _error.is_null() {
+                (0, String::new())
+            } else {
+                let error = _error as *mut AnyObject;
+                let code: isize = msg_send![error, code];
+                let domain: *mut AnyObject = msg_send![error, domain];
+                (code, nsstring_to_string(domain))
+            };
+            crate::finder_menu::recovery::note_update_error(error_code, &error_domain);
             // When inline, offer a retry on the button and re-enable it; no popup is shown.
             if UPDATE_UI_STATE.lock().unwrap().host_view != 0 {
                 clear_inline_check();
@@ -2887,6 +2935,119 @@ unsafe fn custom_driver_class() -> *mut AnyObject {
     .0 as *mut AnyObject
 }
 
+/// The SPUUpdaterDelegate that records the install lifecycle for the Finder-extension restore.
+///
+/// Only the three methods the restore decision needs are implemented; everything else stays with
+/// Sparkle's defaults. The type-driven registration derives the per-architecture BOOL encoding
+/// ('B' on arm64, 'c' on Intel) instead of hard-coding one, and the encoding test below pins it.
+fn updater_delegate_class() -> *mut AnyObject {
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    let class = crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabUpdaterDelegate", || {
+        crate::ffi::build_class(
+            c"OhMyTabUpdaterDelegate",
+            class!(NSObject),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(updater:willInstallUpdate:),
+                    on_will_install_update
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                        ),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(updater:willInstallUpdateOnQuit:immediateInstallationBlock:),
+                    on_will_install_update_on_quit
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                        ) -> Bool,
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(updater:didAbortWithError:),
+                    on_updater_did_abort
+                        as unsafe extern "C" fn(
+                            *mut AnyObject,
+                            Sel,
+                            *mut AnyObject,
+                            *mut AnyObject,
+                        ),
+                );
+            },
+        )
+    });
+    class.0 as *mut AnyObject
+}
+
+/// The delegate instance, retained for the process lifetime: SPUUpdater holds only a weak reference.
+fn updater_delegate() -> *mut AnyObject {
+    static INSTANCE: OnceLock<usize> = OnceLock::new();
+    let instance = *INSTANCE.get_or_init(|| {
+        let class = updater_delegate_class();
+        let instance: *mut AnyObject = unsafe { msg_send![class, new] };
+        instance as usize
+    });
+    instance as *mut AnyObject
+}
+
+/// The build an appcast item will install: Sparkle's versionString is the CFBundleVersion.
+unsafe fn update_item_build(item: *mut AnyObject) -> String {
+    if item.is_null() {
+        return String::new();
+    }
+    let version: *mut AnyObject = msg_send![item, versionString];
+    nsstring_to_string(version)
+}
+
+extern "C" fn on_will_install_update(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _updater: *mut AnyObject,
+    item: *mut AnyObject,
+) {
+    callback_guard::void("updater_will_install_update", || unsafe {
+        crate::finder_menu::recovery::note_install_scheduled(&update_item_build(item));
+    });
+}
+
+/// Return NO so Sparkle keeps its own install scheduling and the termination sequence; the
+/// transaction is only recorded here.
+extern "C" fn on_will_install_update_on_quit(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _updater: *mut AnyObject,
+    item: *mut AnyObject,
+    _immediate_install: *mut AnyObject,
+) -> Bool {
+    callback_guard::value("updater_will_install_update_on_quit", Bool::NO, || unsafe {
+        crate::finder_menu::recovery::note_install_scheduled(&update_item_build(item));
+        Bool::NO
+    })
+}
+
+extern "C" fn on_updater_did_abort(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _updater: *mut AnyObject,
+    error: *mut AnyObject,
+) {
+    callback_guard::void("updater_did_abort", || unsafe {
+        let (code, domain) = if error.is_null() {
+            (0, String::new())
+        } else {
+            let code: isize = msg_send![error, code];
+            let domain: *mut AnyObject = msg_send![error, domain];
+            (code, nsstring_to_string(domain))
+        };
+        crate::finder_menu::recovery::note_update_error(code, &domain);
+    });
+}
+
 /// Start Sparkle if its framework is available in the current app bundle.
 ///
 /// This is idempotent. Returning `false` means the app is running without Sparkle (for example,
@@ -2982,7 +3143,7 @@ pub(crate) fn initialize(automatically_check: bool) -> bool {
             main_bundle,
             main_bundle,
             driver,
-            std::ptr::null_mut(),
+            updater_delegate(),
         );
         release_obj(driver);
         updater
@@ -3104,12 +3265,53 @@ mod tests {
         focus_window_for_prompt, inline_layout_scale, is_safe_update_info_url, prefers_inline,
         prompt_layout_scale_for, release_notes_heading_style, release_notes_measured_width,
         render_release_notes_markdown, scale_frame, select_release_notes_locale,
-        teardown_closes_standalone, update_prompt_kind, RenderTarget, UpdatePromptKind,
-        RELEASE_NOTES_LAYOUT_WIDTH,
+        teardown_closes_standalone, update_prompt_kind, updater_delegate_class, RenderTarget,
+        UpdatePromptKind, RELEASE_NOTES_LAYOUT_WIDTH,
     };
     use crate::smoke_verdict::smoke_runner;
     use objc2::runtime::AnyObject;
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    /// The Finder-extension restore hangs off two delegate methods, and an Objective-C method
+    /// registered with the wrong encoding fails at call time, not at registration. Pin the full
+    /// signatures: three explicit object arguments (updater, item, block) for the install-on-quit
+    /// hook, and the platform's own BOOL encoding rather than a hard-coded one.
+    #[test]
+    fn updater_delegate_registers_the_install_lifecycle_signatures() {
+        // objc2 keeps Method::types private; the runtime's own accessor is what a caller will see.
+        extern "C" {
+            fn method_getTypeEncoding(
+                method: *const objc2::runtime::Method,
+            ) -> *const std::ffi::c_char;
+        }
+        let class = updater_delegate_class();
+        let class_ref: &objc2::runtime::AnyClass = unsafe { &*(class as *const _) };
+        let encoding = |sel: objc2::runtime::Sel| -> String {
+            let method = class_ref
+                .instance_method(sel)
+                .unwrap_or_else(|| panic!("{sel:?} is registered"));
+            let raw = unsafe { method_getTypeEncoding(method as *const _) };
+            assert!(!raw.is_null(), "{sel:?} has a type encoding");
+            let text = unsafe { std::ffi::CStr::from_ptr(raw) }
+                .to_string_lossy()
+                .into_owned();
+            // Old-style encodings carry argument offsets as digits; those are not part of the
+            // signature this test pins.
+            text.chars().filter(|c| !c.is_ascii_digit()).collect()
+        };
+        assert_eq!(encoding(objc2::sel!(updater:willInstallUpdate:)), "v@:@@");
+        // Three explicit object arguments (updater, appcast item, install block).
+        let expected = if cfg!(target_arch = "aarch64") {
+            "B@:@@@"
+        } else {
+            "c@:@@@"
+        };
+        assert_eq!(
+            encoding(objc2::sel!(updater:willInstallUpdateOnQuit:immediateInstallationBlock:)),
+            expected
+        );
+        assert_eq!(encoding(objc2::sel!(updater:didAbortWithError:)), "v@:@@");
+    }
 
     /// Regression guard for the inline About-page release notes. `add_control` scales the layout
     /// frame by the host/window ratio, so `make_release_notes_view` must build and measure the text

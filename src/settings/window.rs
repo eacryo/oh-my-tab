@@ -474,7 +474,7 @@ pub(crate) fn refresh_finder_menu_status_if_visible() {
                 }
                 widgets::set_field(
                     ui.finder_menu_status,
-                    finder_menu_status_text(crate::finder_menu::extension_enabled()),
+                    finder_menu_status_text_now(crate::finder_menu::extension_enabled()),
                 );
             }
         }

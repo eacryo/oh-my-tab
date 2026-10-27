@@ -240,6 +240,7 @@ finder_menu/
 ├── ipc.rs                # DistributedNotificationCenter bridge, host identity, click dispatch
 ├── actions.rs            # executes a click: new file / open terminal / copy path (re-validated)
 ├── new_file.rs           # Finder-style collision-safe file creation (O_EXCL, "Untitled 2")
+├── recovery.rs           # restores the extension's system election after our own app update
 └── terminals.rs          # known terminals, install detection, per-terminal launch adapters
 
 finder-ext/               # the sandboxed appex (own package: own entry point, own link args)
@@ -254,6 +255,14 @@ crates/finder-protocol/   # the wire contract both sides compile against (serde 
 assets/FinderExtension/   # Info.plist and the sandbox entitlement the bundle scripts install
 ```
 
+- **The system election is restored once, and only with evidence.** Replacing the app disables the
+  extension; recovery.rs restores the election the user had enabled *before our own update*
+  replaced the bundle. The evidence is a transaction recorded in Sparkle's install lifecycle (the
+  SPUUpdaterDelegate hooks) carrying the expected target build; a manual replacement, a cancelled or
+  skipped installation, a build mismatch and an unsupported election ('!') never restore anything.
+  scripts/dev-restart.sh writes the same record before it replaces the dev bundle. The decision is
+  pure; pluginkit runs on a worker with timeouts and only after a path-identity preflight. Never turn
+  this into "enable it on every launch".
 - **Channels are derived from the host bundle id** (`<bundle id>.finder.ext2app` / `.app2ext`), so the
   dev and release extensions can never talk to the other channel's app. Every message carries the
   host instance, so a click queued by a previous app process is dropped rather than executed

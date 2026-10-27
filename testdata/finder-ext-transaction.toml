@@ -1,0 +1,4 @@
+source_build = "20260101000000"
+target_build = "20260102000000"
+appex_id = "com.example.app.FinderSync"
+enabled_before = true

@@ -526,6 +526,22 @@ Inside-out leaves the parent recording the extension by requirement, so `--verif
 passes. `scripts/release.sh` additionally proves the staged appex still carries the entitlement and
 shares the app's team.
 
+**Election after an update.** Replacing the app makes macOS disable the extension (the system keeps
+the user's election for the plugin instance it discovered, not for the new bundle). The main app
+restores it once, through `pluginkit -e use`, but only when it can prove the election belonged to the
+user before *our own* update: the SPUUpdaterDelegate install hooks (`willInstallUpdate:`,
+`willInstallUpdateOnQuit:`) record a transaction with the appcast item's CFBundleVersion as the
+expected target build, the election observed then, and the feature switch; the first launch whose
+build equals that target restores it and records the attempt. A cancelled installation (the
+install-phase Skip button, `SUInstallationCanceledError`) revokes the transaction; Later/Dismiss keeps
+it (the update may still install at quit). Manual replacement, a different build and a missing
+transaction are deliberately not restored: the user's post-quit changes are indistinguishable from an
+update's, so the app only restores what it can attribute to its own update. The dev channel writes
+the same record from `scripts/dev-restart.sh` before it deletes the bundle, sharing the bytes with the
+Rust parser through `testdata/finder-ext-transaction.toml`. `!` (the debug election) and unknown
+states are left alone. The settings row says "Disabled after the update" when the attempt failed, so
+the user still knows to act.
+
 **Rebuilds.** Finder caches the extension process. `scripts/dev-restart.sh` registers the new appex
 with `pluginkit`, stops only the process whose executable is *this* worktree's appex, and prints the
 election state; restarting Finder (which makes a rebuilt menu appear reliably, but closes every

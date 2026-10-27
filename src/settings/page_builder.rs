@@ -777,9 +777,11 @@ pub(super) unsafe fn build_finder_menu_page(
         context.page_frame.size.height,
     );
 
-    // The status row reports the extension's System Settings state. The app cannot switch a Finder
-    // Sync extension on itself, so the row pairs the read-only value with the button that opens the
-    // pane where the user can.
+    // The status row reports the extension's System Settings state. A Finder Sync extension cannot
+    // switch itself on: the app only restores an election the user had enabled *before our own
+    // update* replaced the bundle (finder_menu::recovery). First-time enabling and re-enabling after
+    // a deliberate disable stay the user's decision, so the row keeps the value read-only and pairs
+    // it with the button that opens the pane where the user can.
     let status_action_gap = 8.0;
     let status_w = ctrl_w - ROW_ACTION_BTN_W - status_action_gap;
     let status_y = canvas.next_row(described_row_h);
@@ -788,7 +790,7 @@ pub(super) unsafe fn build_finder_menu_page(
         status_y,
         status_w,
         row_h,
-        &super::finder_menu_status_text(crate::finder_menu::extension_enabled()),
+        &super::finder_menu_status_text_now(crate::finder_menu::extension_enabled()),
     );
     let _: () = msg_send![status_value, setAlignment: 1isize];
     record_settings_search_row(

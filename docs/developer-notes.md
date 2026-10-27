@@ -392,6 +392,17 @@ worktree 删掉之后，之后的每次请求都重新 bootstrap 同一个 bundl
 且 `--whose-instance` 会变成 UNVERIFIED）和属于别的 appex 的扩展进程（打包版、其他 worktree）。
 脚本会直接报告扩展进程在不在，而不是让"已勾选"冒充"能用"。
 
+**应用更新后的选举恢复。** 替换 .app 会让 macOS 关掉扩展（系统记住的是它发现的那个插件实例的选举，
+不是新 bundle 的）。主应用会通过 pluginkit -e use 恢复一次，但只在能证明"这个选举属于我们这次更新之前的
+用户选择"时才做：SPUUpdaterDelegate 的安装生命周期钩子（willInstallUpdate:、willInstallUpdateOnQuit:）
+把 appcast item 的 CFBundleVersion 作为预期目标 build，连同当时读到的选举和功能开关写成一条事务；第一个
+build 等于该目标的启动执行恢复并记下"已尝试"。安装阶段取消（安装弹窗里的 Skip，对应
+SUInstallationCanceledError）会撤销事务；Later/Dismiss 保留事务（退出时仍可能安装）。手动换包、build 不匹配、
+没有事务的路径一律不恢复——用户退出应用后的改动和更新造成的关闭无法区分，所以只恢复能归因于自己更新的那部分。
+开发渠道由 scripts/dev-restart.sh 在删除 bundle 之前写同一种记录，并与 Rust 解析器共用
+testdata/finder-ext-transaction.toml 这一份字节。调试选举（!）与未知状态保持原状。恢复失败时设置页显示
+"更新后未能自动恢复"，用户仍然知道要手动处理。
+
 ## 构建与测试
 
 开发期间常规的启动方式是 `scripts/dev-restart.sh`。它构建开发版 `.app`，**只在输入（构建产物、拷入包的内容、签名身份）变化时**重新组装并用 **Apple 签发**的身份签名（`CODESIGN_IDENTITY` 可覆盖；签名不带安全时间戳，所以本地构建不依赖 Apple 的时间戳服务），随后交给用户级 `launchd` 启动。**只接受 Apple 签发与自签名两种身份，ad-hoc 一律拒绝**；Apple 身份签名失败时**构建失败**（除非显式 `--allow-signing-fallback` 要求退回自签名）。签名身份稳定，辅助功能/屏幕录制授权与钥匙串项的授权才能跨重建保留；输入没变就复用现有包，重启不会重置这些授权。

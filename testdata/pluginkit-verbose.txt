@@ -1,0 +1,3 @@
+-    com.baidu.BaiduNetdisk-mac.FinderSync(8.5.6)	E185A411-F347-4F9E-9FFA-ED9568119446	2026-09-14 23:09:47 +0000	/Applications/BaiduNetdisk_mac.app/Contents/PlugIns/baiduNetdiskSync.appex
++    com.eacryo.oh-my-tab.FinderSync(0.2.5)	F7214905-F073-4D47-860B-49212501AECA	2026-10-27 13:14:51 +0000	/Applications/Oh-My-Tab.app/Contents/PlugIns/Oh-My-Tab-Finder.appex
+ (2 plug-ins)

@@ -953,6 +953,9 @@ pub(crate) fn orderly_exit_duties() {
     if let Err(e) = crate::config::flush_config_sync() {
         crate::log_info!("Config flush before quit failed: {}", e);
     }
+    // An install-on-quit update keeps the extension state the user leaves behind; refresh the
+    // restore transaction while the app is still here to read it.
+    crate::finder_menu::recovery::refresh_before_quit();
     // Stop the Finder extension bridge before the process goes away, so the appex is not left
     // waiting on a host instance that no longer exists.
     crate::finder_menu::shutdown();
@@ -3264,7 +3267,14 @@ pub fn run() {
     // framework. Release/dev bundles that contain Contents/Frameworks/Sparkle.framework get the
     // standard updater UI and automatic checks; the About page reports a clear setup hint when
     // the framework is not present yet.
+    // The smoke boundary must exist before Sparkle can deliver update callbacks into the recovery
+    // writers; kick() then decides from the same flag.
+    finder_menu::recovery::prepare(is_smoke_process);
     updater::initialize(CONFIG.read().unwrap().updates.automatically_check);
+
+    // One-shot: when the update that just replaced this app scheduled a Finder-extension restore,
+    // decide and run it now. The decision is pure; the system commands run on a worker thread.
+    finder_menu::recovery::kick();
 
     // 6b. Finder context-menu bridge: listens for extension clicks and publishes the menu model.
     // Smoke/test processes must not answer real Finder clicks, so they stay out of it.

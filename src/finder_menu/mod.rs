@@ -12,6 +12,7 @@ mod actions;
 mod ipc;
 mod model;
 mod new_file;
+pub(crate) mod recovery;
 mod terminals;
 
 pub(crate) use terminals::TerminalSpec;

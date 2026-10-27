@@ -447,7 +447,7 @@ fn checked_ids<'a>(ids: impl IntoIterator<Item = &'a str>, states: &[bool]) -> V
 pub(super) unsafe fn fill_finder_menu_controls(ui: &SettingsUi, cfg: &Config) {
     set_field(
         ui.finder_menu_status,
-        super::finder_menu_status_text(crate::finder_menu::extension_enabled()),
+        super::finder_menu_status_text_now(crate::finder_menu::extension_enabled()),
     );
     let layout_idx = crate::config::FINDER_MENU_LAYOUTS
         .iter()

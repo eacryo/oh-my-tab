@@ -277,6 +277,15 @@ pub(super) fn finder_menu_status_text(enabled: bool) -> String {
     })
 }
 
+/// The same line, told apart from a plain "disabled" when the automatic restore after an update
+/// failed: that is the one case where the user has to act because of something the app did.
+pub(super) fn finder_menu_status_text_now(enabled: bool) -> String {
+    if !enabled && crate::finder_menu::recovery::restore_failed() {
+        return t("settings.finder_menu.status_restore_failed");
+    }
+    finder_menu_status_text(enabled)
+}
+
 /// Recording stage.
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum RecStage {

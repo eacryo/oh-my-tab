@@ -737,6 +737,9 @@ sleep 0.3
 # and before the rebuild, because the stale-record cleanup runs before it. Registration is a later
 # step: it must name the appex this run assembles, not the one it replaces.
 source "$repo_dir/scripts/lib/finder-extension.sh"
+# The restore-transaction record this script writes before it replaces the bundle (the dev channel's
+# counterpart of Sparkle's install lifecycle in the app).
+source "$repo_dir/scripts/lib/finder-ext-state.sh"
 # The extension process of this appex as it is now (a pre-rebuild build). Whether Finder needs a
 # restart is decided against it after the new appex is registered.
 finder_extension_before="$(omt_finder_ext_alive_pid "$dev_appex_binary")"
@@ -875,6 +878,40 @@ bundle_reusable() {
 }
 
 dev_inputs_file="$dev_app/Contents/Resources/dev-inputs.txt"
+
+# Keep the dev bundle's display version aligned with Cargo and give each build a fresh UTC
+# timestamp build number. SPARKLE_BUILD_VERSION remains available for deterministic tests.
+# Computed here, before the old bundle is replaced, because the restore transaction has to name the
+# build this run will install.
+dev_build_version="${SPARKLE_BUILD_VERSION:-$(date -u +%Y%m%d%H%M%S)}"
+
+# Replacing the bundle makes macOS disable the Finder Sync extension. Record the election the user
+# leaves behind, in the same record shape Sparkle's install lifecycle writes
+# (src/finder_menu/recovery.rs), so the next launch can restore it once. No record on a fresh
+# install or on a reused bundle: without evidence, nothing is restored.
+write_finder_ext_transaction() {
+    [ -f "$dev_app/Contents/Info.plist" ] || return 0
+    local source_build marker enabled=false toml
+    source_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' \
+        "$dev_app/Contents/Info.plist" 2>/dev/null || true)"
+    [ -n "$source_build" ] || return 0
+    marker="$(/usr/bin/pluginkit -m -p com.apple.FinderSync -i "$dev_appex_bundle_id" 2>/dev/null | head -1)"
+    if omt_finder_ext_marker_enabled "$marker"; then
+        enabled=true
+    fi
+    toml="$(omt_finder_ext_transaction_toml "$source_build" "$dev_build_version" \
+        "$dev_appex_bundle_id" "$enabled")" || return 0
+    if ! /usr/bin/defaults write "$dev_bundle_id" oh-my-tab-finder-ext-transaction -string "$toml" \
+        >/dev/null 2>&1; then
+        echo "warning: the Finder extension restore transaction could not be recorded"
+        return 0
+    fi
+    # A new update transaction must not be blocked by the previous one's attempt.
+    /usr/bin/defaults delete "$dev_bundle_id" oh-my-tab-finder-ext-attempt >/dev/null 2>&1 || true
+    /usr/bin/defaults delete "$dev_bundle_id" oh-my-tab-finder-ext-result >/dev/null 2>&1 || true
+    echo "finder extension: restore transaction recorded ($source_build -> $dev_build_version, enabled before: $enabled)"
+}
+
 reuse_bundle=0
 if bundle_reusable; then
     reuse_bundle=1
@@ -882,6 +919,7 @@ if bundle_reusable; then
 fi
 
 if [ "$reuse_bundle" -eq 0 ]; then
+write_finder_ext_transaction
 if [ -d "$dev_app" ]; then
     rm -rf "$dev_app"
 fi
@@ -930,9 +968,6 @@ fi
     "$dev_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName Oh-My-Tab Dev" \
     "$dev_app/Contents/Info.plist"
-# Keep the dev bundle's display version aligned with Cargo and give each build a fresh UTC
-# timestamp build number. SPARKLE_BUILD_VERSION remains available for deterministic tests.
-dev_build_version="${SPARKLE_BUILD_VERSION:-$(date -u +%Y%m%d%H%M%S)}"
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $dev_version" \
     "$dev_app/Contents/Info.plist"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $dev_build_version" \
