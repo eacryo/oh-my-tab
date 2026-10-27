@@ -3128,45 +3128,36 @@ pub(super) unsafe fn build_about_page(
     // Keep the two update toggles visually grouped with the same inset divider used by other
     // multi-row cards. The rows are contiguous here, so the divider sits at their shared edge.
     SettingsRow::separator(about_view, update_row_y, content_w);
-    // Check for updates: a taller full-width button whose title switches between
-    // "Check for Updates…", "Checking…", and "You're up to date". It sits contiguous with the row
-    // above (no shared gap), so it is a block rather than a row -- and the Updates card's bottom
-    // edge then derives from its position like every other card.
-    let check_button_h = 38.0;
-    let check_button_y = canvas.next_block(check_button_h);
-    // Reuse the same full-width card divider as the boundary between grouped settings rows. It is
-    // created inside this block's capture -- the boundary above the button belongs to this row -- so
-    // the layout owner moves it together with the row it separates. It stays hidden while compact and
-    // is revealed only when the inline update result replaces the check button area, so the collapsed
-    // About page does not gain an empty separator.
+    // The divider that starts the card's action band. It is created while the download row is still
+    // the row being captured -- deliberately, so the line belongs to that row and not to the band:
+    // the update flow collapses the band to zero height, and a row's views travel with its origin, so
+    // a line captured by the band would slide up by a whole row height the moment a flow starts. It
+    // stays visible in every state; it is the boundary between the toggle rows and whatever occupies
+    // the action position (the check button, or the inline update panel).
     let update_divider = SettingsRow::separator(about_view, download_row_y, content_w);
-    let _: () = msg_send![update_divider, setHidden: true];
     ui.update_divider = update_divider;
-    let check_button = SettingsButton::action(
-        NSRect::new(
-            NSPoint::new(label_x, check_button_y),
-            NSSize::new(content_w - 2.0 * label_x, check_button_h),
-        ),
+    // Check for updates: a full-width action band on the shared row rhythm (56pt band, 32pt control,
+    // 12pt above and below) whose title switches between "Check for Updates…", "Checking…" and
+    // "You're up to date". It is a block rather than a row -- the control spans the card and its
+    // title is flow state, so there is no label to pair it with -- and the update flow replaces it
+    // in place by collapsing this block and growing the inline panel below.
+    let band_y = canvas.next_block(SettingsLayout::SINGLE_LINE_ROW_H);
+    let check_button = SettingsRow::action_band(
+        about_view,
+        label_x,
+        band_y,
+        content_w,
         &t("settings.btn_check_for_updates"),
         target,
         sel!(handleCheckForUpdates:),
-        SettingsButtonRole::Action,
     );
-    let _: () = msg_send![check_button, setTag: -3isize];
-    let check_layer: *mut AnyObject = msg_send![check_button, layer];
-    if !check_layer.is_null() {
-        layer_set_background(
-            check_layer,
-            crate::ffi::hex_to_cg_color(settings_palette().field_bg),
-        );
-    }
-    let _: () = msg_send![about_view, addSubview: check_button];
     ui.update_check_button = check_button;
+    ui.update_band_row = canvas.last_row();
     release_obj(check_button);
     // Inline update-flow host container: update status/progress/buttons render here instead of
-    // a separate NSWindow. Empty and hidden by default, so the About page stays compact; the flow
-    // hands its height to the layout owner (`set_row_consume`), which keeps the host's top edge on
-    // the check button and grows it downward.
+    // a separate NSWindow. Empty and hidden by default, so the About page stays compact; when a flow
+    // runs, the layout owner collapses the action band and grows this host downward from the
+    // divider, so the panel takes over the check button's position.
     let compact_host_h = 0.0;
     let host_top_y = canvas.next_block(compact_host_h);
     ui.update_host_row = canvas.last_row();

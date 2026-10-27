@@ -682,10 +682,21 @@ against.
 | Card horizontal padding | 16 | row builders (`label_x`, `SETTINGS_CONTROL_TRAILING_INSET`) |
 | Card bottom inset | 0 | `SettingsLayout::CARD_BOTTOM_INSET` |
 | Divider above a row | 0 below the previous row's content | `SEPARATOR_ABOVE_ROW_GAP` |
+| Card action band | A row's height (56) with a `CONTROL_H` (32) control, so 12 above and below; full card width minus 16 each side | `SettingsRow::action_band` |
 | Slider readout | 44 wide, 8 gap | `SLIDER_READOUT_*` |
 
 Rule of thumb: **related things 8, groups 24, page edges 32–72.** Use the smaller step for internal
 density and the larger one to separate sections; never mix `12` and `14` for the same kind of gap.
+
+A card may end in one **action band**: a row-shaped block whose single control spans the card (the
+About page's "Check for Updates" band is the only one). It carries the same 1pt `separator` above it
+as any row, and no row draws its own line below. The band's height is a row's and its control's height
+is `CONTROL_H`, so the 12pt above and below are derived from those two metrics rather than chosen per
+page. When a flow replaces the band's control with an inline panel, the band collapses to zero height
+and the panel takes the position over from the same divider; the panel is never appended below a band
+that is still occupying its row. Verify with
+`scripts/cargo-test.sh settings_layout_smoke -- --ignored --test-threads=1` (the band's divider
+visibility, its control's padding and the panel's top edge are asserted there).
 
 Settings search matches each row's label, full description, section title, rendered text and all
 dropdown choices, including unselected choices. Results retain the original section headings and

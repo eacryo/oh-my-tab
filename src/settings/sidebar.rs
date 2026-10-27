@@ -1607,6 +1607,24 @@ pub(super) fn clear_settings_search() {
     }
 }
 
+/// Whether the results view currently hosts the About page's update row.
+///
+/// That row owns the action band's divider, so a scenario that exits a search and then inspects the
+/// band proves nothing unless this row was actually borrowed: querying another row would leave the
+/// divider untouched on the page and the band check would pass for the wrong reason.
+pub(super) unsafe fn update_row_borrowed_into_results() -> bool {
+    with_settings_ui(|ui| {
+        ui.as_ref().is_some_and(|ui| {
+            let control = ui.update_auto_download;
+            !control.is_null() && !ui.settings_search.results_rows.is_null() && {
+                let inside: bool =
+                    msg_send![control, isDescendantOf: ui.settings_search.results_rows];
+                inside
+            }
+        })
+    })
+}
+
 /// A1 smoke check (`--smoke-settings-layout`): drive the live search through a real query and
 /// verify the two facts a screenshot had to catch before -- a row on any page is found (the index
 /// spans every page, not just the last one built), and the results/empty state occupy exactly the

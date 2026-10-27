@@ -470,6 +470,9 @@ pub(super) struct SettingsUi {
     mapping_layout_row: usize,
     /// The About page row the inline update host occupies (its height follows the flow).
     update_host_row: usize,
+    /// The About page row the check-updates action band occupies. The inline update flow collapses it
+    /// to zero height so the panel can take over the same position.
+    update_band_row: usize,
     mapping_scroll: *mut AnyObject,     // the bindings scroll view
     mapping_doc: *mut AnyObject,        // document view
     mapping_card: *mut AnyObject,       // the mappings outer card
@@ -549,7 +552,7 @@ pub(super) struct SettingsUi {
     update_host: *mut AnyObject,             // In-about update flow host container
     update_host_window: *mut AnyObject,      // host's settings window
     update_card: *mut AnyObject,             // Updates card (grows when expanded)
-    update_divider: *mut AnyObject,          // divider between update settings and result
+    update_divider: *mut AnyObject,          // divider between the update rows and the action band
     update_card_expanded: bool,              // whether expanded for a flow
     accessibility_permission_status: *mut AnyObject,
     accessibility_permission_button: *mut AnyObject,
@@ -1263,9 +1266,9 @@ const UPDATE_CARD_BOTTOM_PADDING: f64 = 32.0;
 /// status/progress/buttons fit within the following space.
 ///
 /// The page's layout owner places the host row, the card and the document: the flow only hands over
-/// the host's height (its row consumption) and the tighter bottom padding the expanded card keeps
-/// below it. The card follows the host's bottom edge on its own, exactly like every other card
-/// follows its last row, so no card geometry is computed here.
+/// the host's height (its row consumption), the collapse of the action band it replaces, and the
+/// tighter bottom padding the expanded card keeps. The card follows the host's bottom edge on its
+/// own, exactly like every other card follows its last row, so no card geometry is computed here.
 pub(crate) fn expand_update_section(window_h: f64) {
     with_settings_ui(|ui_guard| {
         let Some(ui) = ui_guard.as_mut() else {
@@ -1278,18 +1281,21 @@ pub(crate) fn expand_update_section(window_h: f64) {
             return;
         }
         unsafe {
-            // The flow owns these two views' visibility: the layout owner remembers the state it
-            // finds and never reveals them on its own (the update content replaces the button).
+            // The flow owns these views' visibility: the panel replaces the check button in the same
+            // position, so the band collapses out of the layout while the panel is shown. The divider
+            // the panel hangs from belongs to the page and stays visible in every state.
             let _: () = msg_send![ui.update_host, setHidden: false];
-            let _: () = msg_send![ui.update_divider, setHidden: false];
             let _: () = msg_send![ui.update_check_button, setHidden: true];
             ui.update_card_expanded = true;
             set_about_restore_control_visible_for_ui(ui, false);
 
             let canvas = &ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX];
             canvas.set_bottom_padding(UPDATE_CARD_BOTTOM_PADDING);
+            // The band's zero height is what glues the panel's top edge to the divider: without it the
+            // panel would start a whole row lower and leave the collapsed button's slot empty.
+            canvas.set_row_consume(ui.update_band_row, 0.0);
             // Each Sparkle phase may need a different height: the host grows downward from the
-            // check-button row, and the page re-flows around it.
+            // divider, and the page re-flows around it.
             canvas.set_row_consume(ui.update_host_row, window_h);
             let host_frame: NSRect = msg_send![ui.update_host, frame];
             let _: () = msg_send![
@@ -1329,15 +1335,16 @@ pub(crate) fn collapse_update_section() {
                 setFrameSize: NSSize::new(host_frame.size.width, 0.0)
             ];
             let _: () = msg_send![ui.update_host, setHidden: true];
-            let _: () = msg_send![ui.update_divider, setHidden: true];
             let _: () = msg_send![ui.update_check_button, setHidden: false];
             ui.update_card_expanded = false;
             set_about_restore_control_visible_for_ui(ui, true);
             if ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX].is_bound() {
                 let canvas = &ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX];
-                // Undo the flow's geometry: the host row shrinks back to nothing, the card returns
-                // to its derived height and the page keeps its usual bottom padding.
+                // Undo the flow's geometry: the host row shrinks back to nothing, the action band
+                // returns to the shared row height, the card returns to its derived height and the
+                // page keeps its usual bottom padding.
                 canvas.set_row_consume(ui.update_host_row, 0.0);
+                canvas.set_row_consume(ui.update_band_row, SettingsLayout::SINGLE_LINE_ROW_H);
                 canvas.set_bottom_padding(SettingsPageHeader::BOTTOM_PADDING);
             }
             let _: () = msg_send![ui.window, layoutIfNeeded];

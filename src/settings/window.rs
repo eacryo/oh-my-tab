@@ -1493,7 +1493,17 @@ struct UpdateFlowState {
     document_height: f64,
     button_hidden: bool,
     host_hidden: bool,
+    /// The action band's own divider. The page owns it, so it is visible in every state: the check
+    /// button and the inline panel are two occupants of the same position below it.
+    divider_hidden: bool,
     divider_from_row_above: f64,
+    /// The check button's distance below the divider while the band is compact: the band's top padding.
+    button_below_divider: f64,
+    /// ...and its distance above the card's bottom edge, i.e. the band's bottom padding.
+    button_above_card_bottom: f64,
+    /// The inline panel's top edge relative to the divider. Zero once the band has collapsed and the
+    /// panel has taken the position over; a band still occupying its row leaves the panel a row lower.
+    host_top_from_divider: f64,
     row_control_height: f64,
     card_rect_bottom_from_host_bottom: f64,
     /// The restore surface's offset from its container: the two are document siblings, so a re-flow
@@ -1516,8 +1526,10 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
         let host: NSRect = msg_send![ui.update_host, frame];
         let divider: NSRect = msg_send![ui.update_divider, frame];
         let row_above: NSRect = msg_send![ui.update_auto_download, frame];
+        let button: NSRect = msg_send![ui.update_check_button, frame];
         let button_hidden: bool = msg_send![ui.update_check_button, isHidden];
         let host_hidden: bool = msg_send![ui.update_host, isHidden];
+        let divider_hidden: bool = msg_send![ui.update_divider, isHidden];
         let container_frame: NSRect =
             msg_send![ui.page_restores[SETTINGS_ABOUT_PAGE_INDEX].container, frame];
         let surface_frame: NSRect =
@@ -1526,7 +1538,11 @@ unsafe fn update_flow_state() -> Option<UpdateFlowState> {
             document_height: doc_frame.size.height,
             button_hidden,
             host_hidden,
+            divider_hidden,
             divider_from_row_above: divider.origin.y - row_above.origin.y,
+            button_below_divider: divider.origin.y - (button.origin.y + button.size.height),
+            button_above_card_bottom: button.origin.y - card.origin.y,
+            host_top_from_divider: (host.origin.y + host.size.height) - divider.origin.y,
             row_control_height: row_above.size.height,
             card_rect_bottom_from_host_bottom: card.origin.y - host.origin.y,
             restore_surface_from_container: surface_frame.origin.y - container_frame.origin.y,
@@ -2527,6 +2543,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         let expanded = about_panel_snapshot();
         let first_inside = update_card_inside_document();
         debug_validate_settings_page(pages[SETTINGS_ABOUT_PAGE_INDEX], "about-expanded");
+        // A later Sparkle phase can ask for a different panel height (release notes, download
+        // progress). The panel has to stay glued to the divider while it grows and the band has to
+        // stay collapsed, or the page grows by a row that is not there.
+        crate::settings::expand_update_section(UPDATE_CARD_EXPANSION_REQUEST + 120.0);
+        let _: () = msg_send![window, layoutIfNeeded];
+        let stage_state = update_flow_state();
+        let stage = about_panel_snapshot();
         crate::settings::collapse_update_section();
         let _: () = msg_send![window, layoutIfNeeded];
         let collapsed_state = update_flow_state();
@@ -2566,6 +2589,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         let (
             Some(compact),
             Some(expanded),
+            Some(stage),
             Some(collapsed),
             Some(tall_compact),
             Some(tall_expanded),
@@ -2575,10 +2599,12 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             Some(reopened_collapsed),
             Some(compact_state),
             Some(expanded_state),
+            Some(stage_state),
             Some(collapsed_state),
         ) = (
             compact,
             expanded,
+            stage,
             collapsed,
             tall_compact,
             tall_expanded,
@@ -2588,6 +2614,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             reopened_collapsed,
             compact_state,
             expanded_state,
+            stage_state,
             collapsed_state,
         )
         else {
@@ -2597,7 +2624,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         };
         // The page layout owner grows only the card and the space below it, so the checks are about
         // the document, the card and the views inside -- not about the whole page travelling.
-        let inline_checks: [(&str, bool); 15] = [
+        let inline_checks: [(&str, bool); 20] = [
             // The notification delegate's selector, sent with all three arguments (see
             // `will_present_smoke_check`): an arity slip crashes the app on the first real notice.
             (
@@ -2675,6 +2702,52 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 "visibility_collapsed",
                 !collapsed_state.button_hidden && collapsed_state.host_hidden,
             ),
+            // The action band's divider is part of the page, not a state the flow toggles: the check
+            // button and the inline panel are two occupants of one position below it.
+            (
+                "band_divider_visible",
+                [
+                    &compact_state,
+                    &expanded_state,
+                    &stage_state,
+                    &collapsed_state,
+                ]
+                .iter()
+                .all(|state| !state.divider_hidden),
+            ),
+            // The band puts its control on the row rhythm: `action_band_padding()` below the divider
+            // and the same distance above the card's bottom. A control flush with the divider and the
+            // card bottom (the old 38pt block) fails here.
+            (
+                "band_geometry_compact",
+                [&compact_state, &collapsed_state].iter().all(|state| {
+                    let pad = SettingsRow::action_band_padding();
+                    (state.button_below_divider - pad).abs() <= 0.5
+                        && (state.button_above_card_bottom - pad).abs() <= 0.5
+                }),
+            ),
+            // Below the band the hidden panel is parked one band height lower, out of the rows.
+            (
+                "panel_parked_below_band",
+                [&compact_state, &collapsed_state].iter().all(|state| {
+                    (state.host_top_from_divider + components::SettingsLayout::SINGLE_LINE_ROW_H)
+                        .abs()
+                        <= 0.5
+                }),
+            ),
+            // Collapsing the band is what puts the panel on the divider. A band that keeps its row
+            // leaves the panel a full row lower, with the old button slot showing as empty card.
+            (
+                "panel_glued_to_divider",
+                expanded_state.host_top_from_divider.abs() <= 0.5
+                    && stage_state.host_top_from_divider.abs() <= 0.5,
+            ),
+            // The stage request asks for a 120pt taller panel: the document follows it exactly, so
+            // neither the collapsed band nor the panel adds slack of its own.
+            (
+                "panel_stage_grows",
+                (stage.document_height - expanded.document_height - 120.0).abs() <= 0.5,
+            ),
             // The restore control's surface is a document sibling of its container: every re-flow has
             // to carry it along, and the control's own collapsed state must survive the flow.
             (
@@ -2716,6 +2789,40 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // and the results (here: the empty state) have to cover the page area exactly.
         if !sidebar::settings_search_smoke_check() {
             log_info!("[smoke-settings-layout] sidebar search layout failed");
+            hide_settings();
+            return false;
+        }
+        // The action band's divider belongs to the row above it ("Automatically download and install
+        // updates"), and the search results borrow that row's views into their own card and hand them
+        // back. Query that row by its own label and prove it was really borrowed before exiting: the
+        // earlier fixtures matched other rows, so a band check after them would prove nothing about
+        // this ownership.
+        crate::settings::sidebar::apply_settings_search_query(&t(
+            "settings.row_update_auto_download",
+        ));
+        let update_row_borrowed = sidebar::update_row_borrowed_into_results();
+        crate::settings::sidebar::apply_settings_search_query("");
+        if !update_row_borrowed {
+            log_info!(
+                "[smoke-settings-layout] the update row was not borrowed into the search results"
+            );
+            hide_settings();
+            return false;
+        }
+        // A round trip must leave the band as it was: line visible, button back on the row rhythm,
+        // panel parked below the band.
+        let after_search = update_flow_state().is_some_and(|state| {
+            let pad = SettingsRow::action_band_padding();
+            !state.divider_hidden
+                && !state.button_hidden
+                && state.host_hidden
+                && (state.button_below_divider - pad).abs() <= 0.5
+                && (state.button_above_card_bottom - pad).abs() <= 0.5
+        });
+        if !after_search {
+            log_info!(
+                "[smoke-settings-layout] the update action band did not survive a search round trip"
+            );
             hide_settings();
             return false;
         }
@@ -3750,6 +3857,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             smooth_scrolling_inertia_value: std::ptr::null_mut(),
             mapping_layout_row: 0,
             update_host_row: 0,
+            update_band_row: 0,
             mapping_scroll: std::ptr::null_mut(),
             mapping_doc: std::ptr::null_mut(),
             mapping_card: std::ptr::null_mut(),

@@ -628,6 +628,48 @@ impl SettingsRow {
         control
     }
 
+    /// Vertical padding above and below a card's action-band control.
+    ///
+    /// It is the same amount that centres a `CONTROL_H` control in a `SINGLE_LINE_ROW_H` row, so an
+    /// action band reads on the row rhythm instead of as a block of its own.
+    pub(super) fn action_band_padding() -> f64 {
+        ((SettingsLayout::SINGLE_LINE_ROW_H - SettingsLayout::CONTROL_H) / 2.0).max(0.0)
+    }
+
+    /// Build the full-width control that ends a card as its **action band**.
+    ///
+    /// A band is row-shaped -- `SINGLE_LINE_ROW_H` tall with the control centred, i.e.
+    /// `action_band_padding()` above and below it -- but it is not a label/control row: the control
+    /// spans the card's content width and its title is flow state ("Checking…", "You're up to
+    /// date…"), so there is no label to pair it with. The page opens the band with
+    /// `PageCanvas::next_block` and hands its origin here as `band_y`.
+    ///
+    /// A flow that replaces the control (the About page's inline update panel) collapses that block
+    /// to zero height and takes the position over; this helper only owns the compact geometry, and
+    /// the caller keeps ownership of the returned button's +1 reference.
+    pub(super) unsafe fn action_band(
+        parent: *mut AnyObject,
+        x: f64,
+        band_y: f64,
+        content_w: f64,
+        title: &str,
+        target: *mut AnyObject,
+        action: Sel,
+    ) -> *mut AnyObject {
+        let button = SettingsButton::action(
+            NSRect::new(
+                NSPoint::new(x, band_y + Self::action_band_padding()),
+                NSSize::new((content_w - 2.0 * x).max(1.0), SettingsLayout::CONTROL_H),
+            ),
+            title,
+            target,
+            action,
+            SettingsButtonRole::Action,
+        );
+        let _: () = objc2::msg_send![parent, addSubview: button];
+        button
+    }
+
     /// One shortcut-legend cell: a symbol on a soft wash, vertically centred in the row.
     ///
     /// It is a *legend*, not a control (style doc §6.1): no border, no pointer state, no hit target.
@@ -2327,6 +2369,29 @@ mod tests {
             let origin = SettingsRow::control_origin_y(y, row_h, control_h);
             assert!((origin + control_h / 2.0 - (y + row_h / 2.0)).abs() < 1e-9);
         }
+    }
+
+    /// A card's action band is a row: its control is centred, so the padding above and below it is
+    /// derived from the row and control metrics instead of being picked at the call site. A band
+    /// whose control is not on the row rhythm (the About page's old 38pt check button, flush with
+    /// the divider) fails here.
+    #[test]
+    fn action_band_puts_its_control_on_the_row_rhythm() {
+        let pad = SettingsRow::action_band_padding();
+        assert!((pad - 12.0).abs() < 1e-9);
+        assert!(
+            (2.0 * pad + SettingsLayout::CONTROL_H - SettingsLayout::SINGLE_LINE_ROW_H).abs()
+                < 1e-9
+        );
+        let band_y = 288.0;
+        let origin = band_y + pad;
+        assert!((origin - 300.0).abs() < 1e-9);
+        assert!(
+            (origin + SettingsLayout::CONTROL_H
+                - (band_y + SettingsLayout::SINGLE_LINE_ROW_H - pad))
+                .abs()
+                < 1e-9
+        );
     }
 
     /// The page-top rhythm -- title, first heading, its card and that card's first row -- is owned
