@@ -214,8 +214,14 @@ pub(crate) fn parse_binding(desc: &str) -> Result<Binding, String> {
     parse_shortcut(desc).map(Binding::Key)
 }
 
-/// Keycode -> display name (capitalized letter/digit/special name).
-fn key_name(keycode: u16) -> String {
+/// Keycode -> display name (capitalized letter/digit/special name), or `None` when this app has no
+/// config spelling for the key.
+///
+/// `None` is not hypothetical: with the top row in its media mode, macOS reports an Apple private
+/// keycode for those keys (measured on this machine: the F4 position arrives as 177) instead of the
+/// standard function-key code. Nothing in the config grammar can name one, so the recorder reports
+/// the key as unbindable rather than inventing a token the trigger parser would then reject.
+fn key_name_opt(keycode: u16) -> Option<String> {
     for (name, kc) in [
         ("a", 0x00),
         ("s", 0x01),
@@ -245,7 +251,7 @@ fn key_name(keycode: u16) -> String {
         ("m", 0x2E),
     ] {
         if kc == keycode {
-            return name.to_uppercase();
+            return Some(name.to_uppercase());
         }
     }
     // Digit keycodes are non-contiguous; reverse lookup.
@@ -262,23 +268,23 @@ fn key_name(keycode: u16) -> String {
         ("9", 0x19),
     ] {
         if kc == keycode {
-            return name.to_string();
+            return Some(name.to_string());
         }
     }
     match keycode {
-        0x24 => "Return".into(),
-        0x30 => "Tab".into(),
-        0x31 => "Space".into(),
-        0x33 => "Delete".into(),
-        0x35 => "Esc".into(),
-        123 => "←".into(),
-        124 => "→".into(),
-        125 => "↓".into(),
-        126 => "↑".into(),
-        115 => "Home".into(),
-        119 => "End".into(),
-        116 => "Page Up".into(),
-        121 => "Page Down".into(),
+        0x24 => Some("Return".into()),
+        0x30 => Some("Tab".into()),
+        0x31 => Some("Space".into()),
+        0x33 => Some("Delete".into()),
+        0x35 => Some("Esc".into()),
+        123 => Some("←".into()),
+        124 => Some("→".into()),
+        125 => Some("↓".into()),
+        126 => Some("↑".into()),
+        115 => Some("Home".into()),
+        119 => Some("End".into()),
+        116 => Some("Page Up".into()),
+        121 => Some("Page Down".into()),
         k => {
             for (i, kc) in [
                 122, 120, 99, 118, 96, 97, 98, 100, 101, 109, 103, 111, 105, 107, 113, 106, 64, 79,
@@ -288,10 +294,10 @@ fn key_name(keycode: u16) -> String {
             .enumerate()
             {
                 if *kc == k {
-                    return format!("F{}", i + 1);
+                    return Some(format!("F{}", i + 1));
                 }
             }
-            format!("key#{}", k)
+            None
         }
     }
 }
@@ -318,14 +324,22 @@ pub(crate) fn modifier_display(flags: u32) -> String {
 /// Returns the input untouched on parse failure (validation reports the error; no panic here).
 pub(crate) fn display_shortcut(desc: &str) -> String {
     match parse_shortcut(desc) {
-        Ok(s) => format!("{}{}", modifier_display(s.flags), key_name(s.keycode)),
+        Ok(s) => match key_name_opt(s.keycode) {
+            Some(name) => format!("{}{}", modifier_display(s.flags), name),
+            // Unreachable for a parsed chord: the parser's vocabulary is the name table's.
+            None => desc.to_string(),
+        },
         Err(_) => desc.to_string(),
     }
 }
 
 /// Keycode + modifier bits -> description string (for serializing a recorded combo into the
 /// config, e.g. a ⌘⇧V event -> "cmd+shift+v"). Modifiers serialize in cmd,shift,alt,ctrl order.
-pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> String {
+///
+/// `None` when the key has no config spelling (see `key_name_opt`): the recorder must not turn such a
+/// key into trigger text, because the parser accepts only the named vocabulary and a made-up token
+/// would surface to the user as "invalid shortcut" instead of "this key cannot be bound".
+pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> Option<String> {
     let mut parts: Vec<&str> = Vec::new();
     if flags & FLAG_CMD != 0 {
         parts.push("cmd");
@@ -339,7 +353,7 @@ pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> String {
     if flags & FLAG_CTRL != 0 {
         parts.push("ctrl");
     }
-    let key = key_name(keycode).to_ascii_lowercase();
+    let key = key_name_opt(keycode)?.to_ascii_lowercase();
     // Special-key names lowercase to match the parser; single chars just lowercase.
     let key = match key.as_str() {
         "return" | "tab" | "space" | "delete" | "esc" | "home" | "end" | "page up"
@@ -369,7 +383,7 @@ pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> String {
         k => k,
     };
     parts.push(key);
-    parts.join("+")
+    Some(parts.join("+"))
 }
 
 /// Button-number display name (maps the 1-based number to a common name after 0-basing).
@@ -436,14 +450,80 @@ mod tests {
 
     #[test]
     fn display_roundtrip() {
-        let desc = describe_shortcut(0x09, FLAG_CMD | FLAG_SHIFT);
+        let desc = describe_shortcut(0x09, FLAG_CMD | FLAG_SHIFT).unwrap();
         assert_eq!(desc, "cmd+shift+v");
         assert_eq!(display_shortcut(&desc), "⌘⇧V");
         assert_eq!(parse_shortcut(&desc), parse_shortcut("shift+command+V"));
-        let captured = describe_shortcut(0x31, FLAG_ALT | FLAG_CTRL);
+        let captured = describe_shortcut(0x31, FLAG_ALT | FLAG_CTRL).unwrap();
         assert_eq!(
             parse_shortcut(&captured),
             parse_shortcut("control+option+space")
+        );
+    }
+
+    /// The recorder may only produce trigger text the parser accepts. A key with no config spelling
+    /// yields no description at all; the alternative (an invented token such as `key#177`) reached
+    /// the settings panel as "invalid shortcut" and blamed the user's chord for an app limitation.
+    #[test]
+    fn every_described_chord_parses_back() {
+        let mut named = 0;
+        for keycode in 0u16..=255 {
+            let Some(desc) = describe_shortcut(keycode, FLAG_CMD) else {
+                continue;
+            };
+            named += 1;
+            let parsed = parse_shortcut(&desc)
+                .unwrap_or_else(|error| panic!("{desc:?} (keycode {keycode}) must parse: {error}"));
+            assert_eq!(
+                parsed.keycode, keycode,
+                "{desc:?} must round-trip its keycode"
+            );
+            assert_eq!(
+                parsed.flags, FLAG_CMD,
+                "{desc:?} must round-trip its modifiers"
+            );
+        }
+        // The loop above is vacuous if the table shrinks, so the spellings users bind are pinned
+        // here and the count stops a silent loss of the rest.
+        for (keycode, expected) in [
+            (0x00u16, "cmd+a"),
+            (0x12, "cmd+1"),
+            (122, "cmd+f1"),
+            (0x24, "cmd+return"),
+            (123, "cmd+left"),
+            (0x31, "cmd+space"),
+        ] {
+            assert_eq!(
+                describe_shortcut(keycode, FLAG_CMD).as_deref(),
+                Some(expected),
+                "keycode {keycode}"
+            );
+        }
+        assert!(
+            named >= 60,
+            "the name table must still cover the standard keys (letters, digits, specials, F1-F20)"
+        );
+    }
+
+    /// The Apple private codes the top row reports in media mode have no name, and the fallback token
+    /// is gone: nothing here may look like `key#N`, because that string used to be shown to the user.
+    #[test]
+    fn media_mode_keycodes_cannot_be_described() {
+        // 177 is measured on this machine for the F4 position; the rest of the family is listed so a
+        // future name table cannot quietly start spelling one of them as if it were a standard key.
+        for keycode in [
+            131u16, 144, 145, 160, 173, 174, 175, 176, 177, 178, 179, 180,
+        ] {
+            assert_eq!(
+                describe_shortcut(keycode, FLAG_ALT),
+                None,
+                "keycode {keycode} must have no config spelling"
+            );
+        }
+        assert_eq!(
+            display_shortcut("177"),
+            "177",
+            "unparseable text stays untouched"
         );
     }
 
@@ -470,7 +550,7 @@ mod tests {
 
     #[test]
     fn display_special_keys() {
-        let desc = describe_shortcut(48, FLAG_ALT); // Tab + Option
+        let desc = describe_shortcut(48, FLAG_ALT).unwrap(); // Tab + Option
         assert_eq!(desc, "alt+tab");
         assert_eq!(display_shortcut(&desc), "⌥Tab");
     }

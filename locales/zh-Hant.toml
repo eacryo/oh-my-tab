@@ -606,6 +606,7 @@ key_binding_edit_stale = "這條綁定已在別處改變。請重新開啟列表
 key_binding_trigger_bare = '綁定至少需要包含 Command、Option 或 Control 其中一個："{value}"'
 key_binding_trigger_duplicate = '快速鍵 "{value}" 已被綁定（第 {index} 項）'
 key_binding_trigger_reserved = '快速鍵 "{value}" 屬於應用程式切換浮窗或剪貼板快速鍵'
+shortcut_key_unbindable = "亮度、音量等系統功能鍵不能用於快速鍵"
 
 [onboarding]
 window_title = "歡迎使用"

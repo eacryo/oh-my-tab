@@ -605,6 +605,7 @@ key_binding_edit_stale = "This binding changed elsewhere. Reopen the list and tr
 key_binding_trigger_bare = 'A binding needs at least one of Command, Option or Control: "{value}"'
 key_binding_trigger_duplicate = 'Shortcut "{value}" is already bound (entry {index})'
 key_binding_trigger_reserved = 'Shortcut "{value}" belongs to the app switcher or the clipboard shortcut'
+shortcut_key_unbindable = "Keys like brightness and volume can't be shortcuts"
 
 [onboarding]
 window_title = "Welcome"

@@ -308,6 +308,11 @@ static REC_BUTTON: Mutex<u32> = Mutex::new(0);
 static REC_DESC: Mutex<String> = Mutex::new(String::new());
 /// Completed combo payload handed off to the main-thread selector callback.
 static REC_COMPLETED_DESC: Mutex<String> = Mutex::new(String::new());
+/// Whether the chord just captured is a key with no config spelling (the top row in its media mode
+/// reports an Apple private keycode). Written by the recording thread at capture, read by the
+/// completion callback, and reset with the rest of the session state: such a key produces no trigger
+/// text at all, and every surface reports it as unbindable instead of validating an invented token.
+static REC_UNNAMED: AtomicBool = AtomicBool::new(false);
 /// The selected device's in-edit mappings (in-memory until OK; rebuilt from config when the
 /// device changes).
 static MAPPING_EDITS: LazyLock<Mutex<HashMap<String, String>>> =

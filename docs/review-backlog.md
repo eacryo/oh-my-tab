@@ -132,6 +132,8 @@
 
 
 
+| 66 | 鼠标按键映射面板（Key Press 动作）录制到无名键时**没有任何提示**：该面板布局里没有消息行，所以只记一条 debug 日志、不写入组合键（OK 保持禁用）。按键绑定面板与剪贴板快捷键行都显示 `errors.shortcut_key_unbindable` | 键盘无名字键拒绝路径（`key-unbindable-copy`），审查轮 1，2026-10-27 | LOW（用户可见提示缺口） | 加消息行要改鼠标映射编辑面板的布局与高度（`EDIT_PANEL` 的固定 frame 里没有空行），超出「改一句文案」的范围；现状仍比改动前好：之前会把 `key#177` 存进 `EDIT_COMBO`，落盘后被配置加载器静默丢弃 | 下次改动鼠标映射编辑面板的布局/高度或录制器时；或首次报告「录制组合键按了没反应、也没有提示」时 |
+
 | 55 | **悬停气泡的移除没有 A1 断言**：2026-10-23 按用户要求删掉设置页每行描述的悬停气泡后，那次改动附带了一条「描述标签上没有悬停出口」的检查。该检查**被验证为无效并已删除**：它按 `t(key)` 的字符串在页面树里找标签，而描述标签位于 `NSScrollView` 的 document 里——按文本查找要么找不到，要么命中页面为其他用途保留的隐藏副本（实测「6 checked」里只有 3 条是用户实际能悬停的那一类，`clipboard_enabled`/`delete_after_paste`/`paused` 只存在于窗口树）。进一步实测：窗口 `contentView` 往下的子视图递归只覆盖 1043 个视图、165 个 tracking area，**不含任何页面标签**；对滚动视图 `documentView` 递归会在主线程卡死；`isKindOfClass:` 会打到 field editor 并崩。就结论而言，代码里没有一条既能在真实视图上判定、又能跑得到那一步的路径。用户选择「删除该断言 + 记 backlog」。当前唯一的保护是 `widgets.rs::add_captioned_row` 里的 `debug_assert!(caption_tip.is_null() && title_tip.is_null())`：它只覆盖**原生** `setToolTip:`，把自定义气泡重新加回来时它不会失败（这正是 2026-10-23 之前的形态，`attach_hover` 加进去时它也是绿的） | 悬停气泡移除（2026-10-23，提交 `4965711`），断言在 `fix:` 之后被验证无效并删除 | LOW（覆盖缺口：行为本身已由真机验证；缺的是回归门禁） | 可以做对的方向有三个，都需要先定机制：(a) 让检查只认 `OhMyTabHoverTooltipTarget` 这一类名持有的 tracking area，并先解决「如何在不卡死的前提下到达页面 document」；(b) 给 `--e2e-state` 增加一个「本窗口悬停出口数量」的状态字段，由视图层自己报告（AGENTS.md 的 promotion rule 允许这种替代）；(c) 改动 `collect_debug_layout`，让它收录 tracking area 并按页面归属分类，再把 `--smoke-settings-layout` 的页面遍历扩展到 document 层。三者都超出「删一个气泡」的范围，且当前的 `--smoke-settings-layout` 本身在风格门禁（#41）就红了 | 下次改动设置页的悬停/提示气泡路径、`add_captioned_row`、`--smoke-settings-layout` 的视图遍历，或修复 #41 让该 smoke 重新全绿时；或首次有人重新引入悬停气泡时 |
 ## 2026-10-24 — #56 关闭：A2 的 settings-layout.sh 已与设计文档对齐
 

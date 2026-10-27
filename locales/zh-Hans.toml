@@ -606,6 +606,7 @@ key_binding_edit_stale = "这条绑定已在别处改变。请重新打开列表
 key_binding_trigger_bare = '绑定至少需要包含 Command、Option 或 Control 中的一个："{value}"'
 key_binding_trigger_duplicate = '快捷键 "{value}" 已被绑定（第 {index} 项）'
 key_binding_trigger_reserved = '快捷键 "{value}" 属于应用切换浮窗或剪贴板快捷键'
+shortcut_key_unbindable = "亮度、音量等系统功能键不能用作快捷键"
 
 [onboarding]
 window_title = "欢迎使用"

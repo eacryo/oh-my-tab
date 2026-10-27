@@ -567,6 +567,34 @@ number = 42
         }
     }
 
+    /// The copy shown when a recorded key has no config spelling. It replaces a message that quoted
+    /// an internal token (`key#177`), so this pins the two ways that defect could come back: the
+    /// message must exist in every locale, and it must never carry a made-up key identifier.
+    #[test]
+    fn the_unbindable_key_copy_names_no_internal_identifier() {
+        for (locale, raw) in [
+            ("en", EN_TOML),
+            ("zh-Hans", ZH_TOML),
+            ("zh-Hant", ZH_HANT_TOML),
+        ] {
+            let parsed: toml::Value = toml::from_str(raw).unwrap();
+            let mut map = HashMap::new();
+            flatten(&parsed, "", &mut map);
+            let text = map
+                .get("errors.shortcut_key_unbindable")
+                .unwrap_or_else(|| panic!("{locale}: the copy key is missing"));
+            assert!(!text.trim().is_empty(), "{locale}: empty copy");
+            assert!(
+                !text.contains("key#"),
+                "{locale}: the copy leaks an internal key token: {text}"
+            );
+            assert!(
+                !text.contains('{') && !text.contains('}'),
+                "{locale}: the copy takes no placeholder: {text}"
+            );
+        }
+    }
+
     #[test]
     fn placeholder_parity_across_locales() {
         // Placeholders ({name}) must match across locales for every key: a translation

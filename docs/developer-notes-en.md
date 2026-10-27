@@ -362,7 +362,12 @@ holds `action` / `trigger` / `enabled`.
   the captured key's repeats and release swallowed, decided by the pure `release_wait_step`); the
   engine passes every event through while `RECORDING` is set. A recorded chord becomes a *draft* in
   the add row, which asks for confirmation before writing, and a cancelled recording, a closed
-  window, a revoked permission or a page switch clears it.
+  window, a revoked permission or a page switch clears it. A key the config grammar cannot name — the
+  top row in its media mode reports an Apple private keycode instead of the standard function-key
+  code, measured here as 177 for the F4 position — produces no chord at all, rather than handing the
+  parser an invented token that read as "invalid shortcut". The Key Bindings panel and the clipboard
+  shortcut row report such a key as unbindable; the mouse mapping panel has no message line, so it
+  records nothing and leaves OK disabled (review backlog #66).
 - **Execution rules** live in `key_bindings::execute`, the only main-thread entry: the settings
   recorder wins (no binding runs while a chord is being recorded), an in-flight switcher session is
   cancelled first (its modifier release would otherwise commit the card selected before this

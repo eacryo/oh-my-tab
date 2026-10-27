@@ -657,7 +657,17 @@ unsafe fn recording_tap_callback_inner(
                     return std::ptr::null_mut();
                 }
                 let desc = describe_shortcut(keycode, mods);
-                *REC_DESC.lock().unwrap() = desc;
+                // A key the config grammar cannot spell keeps the session alive (the release wait
+                // below must still hold the engine suspended) but contributes no trigger text.
+                if desc.is_none() {
+                    // The keycode is the only diagnostic this case can carry: it is not a standard
+                    // virtual key code, so nothing else in the log would name the key.
+                    log_info!(
+                        "[settings] captured key has no config spelling (keycode={keycode}); it cannot become a binding"
+                    );
+                }
+                REC_UNNAMED.store(desc.is_none(), Ordering::SeqCst);
+                *REC_DESC.lock().unwrap() = desc.unwrap_or_default();
                 // Hold the recording open until the chord is released: the engine stays suspended
                 // for the whole press, and the captured key's own keyUp is swallowed with it (the
                 // app never saw its keyDown, so it must not see a bare release).
@@ -1340,6 +1350,9 @@ pub(crate) extern "C" fn handle_recording_finished(
         let btn = *REC_BUTTON.lock().unwrap();
         let mode = *REC_MODE.lock().unwrap();
         let desc = REC_COMPLETED_DESC.lock().unwrap().clone();
+        // A key with no config spelling produced no trigger text; the three chord modes report that
+        // instead of validating an empty chord (the button mode never reads it).
+        let unbindable = REC_UNNAMED.load(Ordering::SeqCst);
         match mode {
             // No recording was in flight (a late callback): nothing to apply.
             RecMode::Idle => return,
@@ -1353,13 +1366,34 @@ pub(crate) extern "C" fn handle_recording_finished(
             }
             // The panel recorded the combo: update the panel (Key Press action).
             RecMode::PanelCombo => {
-                *EDIT_COMBO.lock().unwrap() = desc.clone();
-                unsafe {
-                    update_mapping_panel();
+                // An unbindable key leaves the row as it was: this panel has no message line, so it
+                // says nothing rather than storing text the config loader would drop. (The Key
+                // Bindings panel, which has one, reports it there.)
+                if unbindable {
+                    log_debug!("[mouse] combo recording refused: the key has no config spelling");
+                } else {
+                    *EDIT_COMBO.lock().unwrap() = desc.clone();
+                    unsafe {
+                        update_mapping_panel();
+                    }
+                    log_debug!("[mouse] panel combo recorded");
                 }
-                log_debug!("[mouse] panel combo recorded");
             }
-            RecMode::KeyBinding => finish_key_binding_recording(&desc),
+            RecMode::KeyBinding => {
+                if unbindable {
+                    super::bindings::recording_unbindable(&t("errors.shortcut_key_unbindable"));
+                } else {
+                    finish_key_binding_recording(&desc);
+                }
+            }
+            RecMode::ClipboardShortcut if unbindable => {
+                // Same honest report as the Key Bindings panel: this row's error surface would
+                // otherwise quote an empty chord.
+                super::set_clipboard_shortcut_recording_ui(
+                    false,
+                    Some(&t("errors.shortcut_key_unbindable")),
+                );
+            }
             RecMode::ClipboardShortcut => {
                 // The chord is checked against the effective config, so it cannot take a chord a
                 // binding holds or one the app switcher owns.
@@ -1393,6 +1427,7 @@ pub(crate) extern "C" fn handle_recording_finished(
         *REC_COMPLETED_DESC.lock().unwrap() = String::new();
         *REC_CAPTURED_KEY.lock().unwrap() = None;
         REC_CAPTURED_KEY_UP.store(false, Ordering::SeqCst);
+        REC_UNNAMED.store(false, Ordering::SeqCst);
         *REC_MODE.lock().unwrap() = RecMode::Idle;
         *REC_STAGE.lock().unwrap() = RecStage::Idle;
         // The mode is settled now, so the panel can be told the truth about its buttons.

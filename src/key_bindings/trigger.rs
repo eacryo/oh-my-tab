@@ -52,7 +52,12 @@ impl Trigger {
     /// Serialize back to config form (the inverse of `parse` for every trigger this app writes).
     pub(crate) fn describe(&self) -> String {
         match self {
-            Self::Chord(chord) => shortcut::describe_shortcut(chord.keycode, chord.flags),
+            // Every key a chord can hold is one `parse` accepted, and the parser's vocabulary is the
+            // name table's, so a chord's key always has a spelling here. An empty string would be
+            // dropped by the loader rather than panicking on a broken invariant.
+            Self::Chord(chord) => {
+                shortcut::describe_shortcut(chord.keycode, chord.flags).unwrap_or_default()
+            }
             Self::DoubleModifier(flag) => DOUBLE_MODIFIERS
                 .iter()
                 .find(|(_, f)| f == flag)

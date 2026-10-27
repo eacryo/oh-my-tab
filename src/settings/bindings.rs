@@ -1614,6 +1614,18 @@ pub(crate) fn recording_ended() {
     clear_draft();
 }
 
+/// A capture that produced no trigger at all: the key has no config spelling (the top row in its
+/// media mode reports an Apple private keycode), so no chord can be written for it.
+///
+/// Reported in the same message line a refused chord uses — the panel asks the user to record
+/// something else rather than validating an invented token, which used to read as "invalid
+/// shortcut" and blamed a chord the user never typed.
+pub(crate) fn recording_unbindable(message: &str) {
+    clear_draft_state();
+    set_panel_message(Some(message));
+    update_panel_ok();
+}
+
 /// The recording captured a chord: hold it as a draft until the panel's OK writes it.
 pub(crate) fn recording_captured(action: Action, trigger: &str) -> Result<(), String> {
     // Validate before asking: telling the user now is kinder than after they press OK, and the
