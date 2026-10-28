@@ -7,7 +7,7 @@ default-members = [".", "finder-ext", "crates/finder-protocol"]
 
 [package]
 name = "oh-my-tab"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 
 [features]

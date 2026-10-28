@@ -1,6 +1,6 @@
 [package]
 name = "finder-protocol"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 # The wire contract shared by the app and its Finder Sync extension. Keeping it in its own crate
 # is what lets the sandboxed extension be built from the same types without linking the app.

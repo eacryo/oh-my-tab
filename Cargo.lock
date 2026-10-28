@@ -217,7 +217,7 @@ checksum = "d45db016d36b838f563236e9193d0ee6ce38f3f68b6c94e914b4929c96bbb890"
 
 [[package]]
 name = "finder-protocol"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "serde",
  "serde_json",
@@ -437,7 +437,7 @@ dependencies = [
 
 [[package]]
 name = "oh-my-tab"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "aes-gcm",
  "block2",
@@ -458,7 +458,7 @@ dependencies = [
 
 [[package]]
 name = "oh-my-tab-finder-ext"
-version = "0.2.5"
+version = "0.2.6"
 dependencies = [
  "finder-protocol",
  "objc2",
