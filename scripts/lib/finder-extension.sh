@@ -107,8 +107,23 @@ omt_finder_ext_own_pids() {
 }
 
 # The first such pid, or nothing.
+#
+# Answered by looking for the pid, not by filtering the list above through `head -1`: the filter
+# form writes every match into a reader that leaves after the first one, so a later match wrote into
+# a closed pipe -- printf failed, SIGPIPE took the loop down, and bash printed
+# `printf: write error: Broken pipe` on the caller's stderr. dev-restart.sh printed exactly that
+# between its stop step and `Compiling` whenever the extension had more than one process. Returning
+# at the first match sends no later write, and needs no reader.
 omt_finder_ext_alive_pid() {
-    omt_finder_ext_own_pids "$1" | head -1
+    local binary="$1"
+    [ -n "$binary" ] || return 0
+    local pid exe
+    for pid in $(/usr/bin/pgrep -f 'oh-my-tab-finder-ext' 2>/dev/null || true); do
+        exe="$(ps -p "$pid" -o comm= 2>/dev/null)"
+        [ "$exe" = "$binary" ] || continue
+        printf '%s\n' "$pid"
+        return 0
+    done
 }
 
 # The extension id a per-environment instance label carries, or nothing for a label that is not one.

@@ -21,10 +21,14 @@ set -uo pipefail
 script_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 lib="$script_dir/lib/finder-extension.sh"
 failures=0
+skipped=0
 created_labels=()
 
 pass() { printf 'ok   %s\n' "$1"; }
 fail() { printf 'FAIL %s\n' "$1"; failures=$((failures + 1)); }
+# 一条用例这一轮没能执行。它既不算通过,也不算失败:脚本最后按它决定退出码 75(无法判定),
+# 这样"没跑"不会被上层当成绿。只用在受控输入无法成立的反例上,真实函数的断言永远不进这里。
+skip() { printf 'SKIP %s\n' "$1"; skipped=$((skipped + 1)); }
 
 # This suite removes only the services it created, by the exact label it created.
 cleanup() {
@@ -165,6 +169,93 @@ wait "$guard_pid" 2>/dev/null || true
 # 否则"扩展在跑"就成了 `pgrep -f` 的同义词。
 expect_output "an unrelated appex path reports no live process" "" \
     omt_finder_ext_alive_pid "/nonexistent/oh-my-tab-finder-ext"
+
+# --- 首个 pid 不能靠管道过滤(受控输入,反例与修复同时断言) ---------------------------
+# 2026-10-28 事故:dev-restart.sh 打印 `finder-extension.sh: line 105: printf: write error: Broken pipe`。
+# 那时 alive_pid 是 `omt_finder_ext_own_pids "$1" | head -1`:head 读完首行即退出,写端随后写入就落进
+# 已关闭的管道,bash 对 printf 报 write error,`set -o pipefail` 把管道状态变成 141。
+#
+# 旧断言只用**不存在的**路径调用这个函数,它必然什么都不打印,于是"首个匹配之后还有一次写入"这条路径
+# 从未被执行过。这里改用受控输入,不依赖本机是否有扩展在跑(也就不会因为在跑的进程数量不同而误报):
+#   A. 与 own_pids 同形态、但匹配数已知的管线:必须得到 141,并拿到首个 pid —— 这就是缺陷本身;
+#   B. 修复后的函数:必须得到同一个 pid、状态 0,且 stderr 为空。
+# 两条都断言,所以 A 不是"事后必然成立"的填充用例:A 不再复现就说明反例失去了意义,B 变化就说明
+# 缺陷回来了。输入是两个真实的 /bin/sleep 进程,文件名与 appex 可执行文件同名,由真实函数自己的路径
+# 比对筛选(此前的用例已不依赖"复制过来的二进制能跑",这里也不依赖)。
+pipe_probe_dir=$(mktemp -d "${TMPDIR:-/tmp}/omt-pipe-probe.XXXXXX") || pipe_probe_dir=""
+if [ -z "$pipe_probe_dir" ]; then
+    fail "the broken-pipe probe needs a temporary directory"
+else
+    mkdir -p "$pipe_probe_dir/Contents/MacOS"
+    pipe_probe_binary="$pipe_probe_dir/Contents/MacOS/oh-my-tab-finder-ext"
+    ln -s /bin/sleep "$pipe_probe_binary" 2>/dev/null \
+        || cp /bin/sleep "$pipe_probe_binary" 2>/dev/null \
+        || pipe_probe_binary=""
+    if [ -z "$pipe_probe_binary" ]; then
+        rm -rf "$pipe_probe_dir"
+        fail "the broken-pipe probe could not place a process at an appex-shaped path"
+    else
+        # 必须通过 appex 形状的路径启动,让进程的 comm 就是这个路径;`/bin/sleep` 直接启动得到的是
+        # `/bin/sleep`,真实函数按路径比对就会筛选掉它(自测里"进程不是在跑"的那种静默失效)。
+        "$pipe_probe_binary" 60 >/dev/null 2>&1 &
+        pipe_probe_first=$!
+        "$pipe_probe_binary" 61 >/dev/null 2>&1 &
+        pipe_probe_second=$!
+        sleep 0.2
+        probe_out="$(omt_finder_ext_own_pids "$pipe_probe_binary")"
+        if [ "$probe_out" = "$(printf '%s\n%s' "$pipe_probe_first" "$pipe_probe_second")" ]; then
+            pass "a fixture with two matching processes is what the counter-example needs"
+            # 修复侧的断言在任何情况下都执行:它断言的是真实函数,不能因为反例是否复现而缺席。
+            fixed_err="$pipe_probe_dir/stderr"
+            fixed_out="$(omt_finder_ext_alive_pid "$pipe_probe_binary" 2>"$fixed_err")"
+            fixed_status=$?
+            fixed_noise="$(cat "$fixed_err" 2>/dev/null)"
+            if [ "$fixed_out" = "$pipe_probe_first" ] && [ "$fixed_status" -eq 0 ] && [ -z "$fixed_noise" ]; then
+                pass "the function reports the first pid with status 0 and nothing on stderr"
+            else
+                fail "the function reports the first pid with status 0 and nothing on stderr (status $fixed_status, stderr: $fixed_noise)"
+            fi
+            # 反例只在能证明读端确实已关闭时才算:(a) 两个进程仍以该路径在跑,才能说明路径比对本身没问题;
+            # (b) 管线没有读者时 write 只回 EBADF,所以"看到 Broken pipe"本身就证明 reader 已退出并关闭。
+            # 不满足就如实记为 SKIP,而不是 pass.脚本最后按 skipped 数决定退出码。
+            if [ "$(ps -p "$pipe_probe_first" -o comm= 2>/dev/null)" != "$pipe_probe_binary" ]; then
+                skip "the fixture's processes stopped matching the appex path, so the counter-example did not run"
+            else
+                # A. 缺陷形态,逐字复制修复前的实现:own_pids 的循环体,后面接一次写入。
+                defect_shape() {
+                    local pid exe
+                    for pid in $(/usr/bin/pgrep -f 'oh-my-tab-finder-ext' 2>/dev/null || true); do
+                        exe="$(ps -p "$pid" -o comm= 2>/dev/null)"
+                        [ "$exe" = "$1" ] || continue
+                        printf '%s\n' "$pid"
+                        sleep 0.05
+                    done
+                }
+                # bash 自己会对这次失败的写打一行 `printf: write error: Broken pipe`;把它连同管线
+                # 状态一起捕获,既让本套件自己的输出保持干净,也让"缺陷长什么样"成为断言的一部分。
+                defect_err="$pipe_probe_dir/defect-stderr"
+                defect_out="$(defect_shape "$pipe_probe_binary" 2>"$defect_err" | head -1)"
+                defect_status=$?
+                defect_noise="$(cat "$defect_err" 2>/dev/null)"
+                if [ "$defect_out" = "$pipe_probe_first" ] && printf '%s' "$defect_noise" | grep -q 'Broken pipe'; then
+                    if [ "$defect_status" -eq 141 ]; then
+                        pass "a write after the first line closes the pipe and fails (status 141, \"Broken pipe\"), which is the defect"
+                    else
+                        skip "the defect wrote after the reader left and failed, but the pipeline status was $defect_status"
+                    fi
+                else
+                    skip "the defect did not observe a write after the reader left (status $defect_status), so this run cannot exercise the counter-example"
+                fi
+            fi
+        else
+            fail "the fixture's two processes were not listed by the function (got: $probe_out)"
+        fi
+        kill "$pipe_probe_first" "$pipe_probe_second" >/dev/null 2>&1 || true
+        wait "$pipe_probe_first" 2>/dev/null || true
+        wait "$pipe_probe_second" 2>/dev/null || true
+        rm -rf "$pipe_probe_dir"
+    fi
+fi
 
 # --- 钉住路径的判定 ---------------------------------------------------------
 expect_ok "a path that does not exist is a dead pin" \
@@ -372,9 +463,13 @@ INNER
     fi
 fi
 
-if [ "$failures" -eq 0 ]; then
-    echo "finder-extension selftest: all cases held"
-    exit 0
+if [ "$failures" -ne 0 ]; then
+    echo "finder-extension selftest: $failures case(s) failed" >&2
+    exit 1
 fi
-echo "finder-extension selftest: $failures case(s) failed" >&2
-exit 1
+if [ "$skipped" -ne 0 ]; then
+    echo "finder-extension selftest: $skipped case(s) could not be decided, so the run is incomplete" >&2
+    exit 75
+fi
+echo "finder-extension selftest: all cases held"
+exit 0
