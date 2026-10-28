@@ -1260,10 +1260,7 @@ pub(super) unsafe fn update_scroll_indicator_for(target: ScrollTarget) {
     };
     let frame = if horizontal {
         NSRect::new(
-            NSPoint::new(
-                knob_pos,
-                clip_bounds.size.height - SCROLL_INDICATOR_HIT_W - 3.0,
-            ),
+            NSPoint::new(knob_pos, clip_bounds.size.height + 3.0),
             NSSize::new(knob_len, SCROLL_INDICATOR_HIT_W),
         )
     } else {
@@ -1274,6 +1271,12 @@ pub(super) unsafe fn update_scroll_indicator_for(target: ScrollTarget) {
             ),
             NSSize::new(SCROLL_INDICATOR_HIT_W, knob_len),
         )
+    };
+    let parent: *mut AnyObject = msg_send![indicator, superview];
+    let frame = if parent != scroll && !parent.is_null() {
+        msg_send![scroll, convertRect: frame, toView: parent]
+    } else {
+        frame
     };
     let _: () = msg_send![indicator, setFrame: frame];
     update_scroll_indicator_visual(indicator, knob_len, horizontal);

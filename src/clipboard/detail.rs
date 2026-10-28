@@ -47,12 +47,17 @@ pub(super) unsafe fn add_detail_text(
     debug_assert!(!code_soft_wrap || (is_code && prepared_code.is_some()));
     // The body is laid out on its own and the panel is sized around it (the caller clamps it to
     // what the pane leaves for it), so a measured body keeps every line it needs.
-    let pane = detail_pane_layout_with(
+    let no_wrap = is_code && !code_soft_wrap;
+    let mut pane = detail_pane_layout_with(
         detail_insets(picker_shows_detail_in_pane(), w),
         w,
         h,
         meta_table_field_count(),
     );
+    if no_wrap {
+        pane.scroll.size.height = (pane.scroll.size.height - SCROLL_INDICATOR_HIT_W - 6.0).max(0.0);
+        pane.body_h = (pane.scroll.size.height - pane.meta.height).max(0.0);
+    }
     let body_h = section_h.max(DETAIL_LINE_H);
     // The scroll view fills the pane; its insets are the mock's padding, so the content column
     // starts 10pt below the panel top and ends 16pt above its bottom.
@@ -76,7 +81,6 @@ pub(super) unsafe fn add_detail_text(
     // Use AppKit Overlay scrollers, which reserve no horizontal/vertical corner. NSScrollView
     // owns endpoints, dragging, and wheel phases; NSClipView also stops drawing its background
     // to avoid the default white corner.
-    let no_wrap = is_code && !code_soft_wrap;
     // Disable native scrollers so they cannot reappear during scrolling/layout and overlap the
     // always-visible custom capsules.
     let _: () = msg_send![scroll, setHasVerticalScroller: false];
@@ -294,19 +298,19 @@ pub(super) unsafe fn add_detail_text(
             scroll_w - (SCROLL_INDICATOR_EDGE * 2.0) - SCROLL_INDICATOR_CORNER_RESERVE,
             true,
         );
-        let _: () = msg_send![scroll, addSubview: horizontal_indicator];
+        let _: () = msg_send![content, addSubview: horizontal_indicator];
         *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() =
             Some(ObjPtr::new(horizontal_indicator));
         release_obj(horizontal_indicator);
     } else {
         *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap() = None;
     }
+    let _: () = msg_send![scroll, setAutoresizingMask: 1u64 << 4]; // NSViewHeightSizable
+    let _: () = msg_send![content, addSubview: scroll];
     update_scroll_indicator_for(ScrollTarget::Detail);
     if no_wrap {
         update_scroll_indicator_for(ScrollTarget::DetailHorizontal);
     }
-    let _: () = msg_send![scroll, setAutoresizingMask: 1u64 << 4]; // NSViewHeightSizable
-    let _: () = msg_send![content, addSubview: scroll];
     release_obj(scroll);
 
     // Show the I-beam over the detail text: cursor rects apply only to the KEY window

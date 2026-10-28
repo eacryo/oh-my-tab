@@ -333,6 +333,9 @@ unsafe fn drag_target_owns_the_click(target: *mut AnyObject) -> bool {
     if target.is_null() {
         return false;
     }
+    if msg_send![target, isKindOfClass: scroll_indicator_class()] {
+        return true;
+    }
     for class in [
         class!(NSControl),
         class!(NSTextView),

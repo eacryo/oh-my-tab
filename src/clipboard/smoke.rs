@@ -2191,6 +2191,37 @@ pub(crate) fn smoke_runner() -> bool {
                 "long source lines must overflow the horizontal viewport"
             );
 
+            for indicator in [
+                *DETAIL_SCROLL_INDICATOR.lock().unwrap(),
+                *DETAIL_HORIZONTAL_SCROLL_INDICATOR.lock().unwrap(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                let bounds: NSRect = msg_send![indicator.0, bounds];
+                let center = NSPoint::new(bounds.size.width / 2.0, bounds.size.height / 2.0);
+                let parent: *mut AnyObject = msg_send![detail_content, superview];
+                let point: NSPoint = msg_send![indicator.0, convertPoint: center, toView: parent];
+                let root: *mut AnyObject = msg_send![parent, superview];
+                let root_point: NSPoint = msg_send![parent, convertPoint: point, toView: root];
+                let hit: *mut AnyObject = msg_send![parent, hitTest: root_point];
+                assert_eq!(
+                    hit, indicator.0,
+                    "detail scrollbar must receive pointer events through the panel drag surface"
+                );
+            }
+            let horizontal = DETAIL_HORIZONTAL_SCROLL_INDICATOR
+                .lock()
+                .unwrap()
+                .unwrap()
+                .0;
+            let horizontal_frame: NSRect = msg_send![horizontal, frame];
+            let scroll_frame: NSRect = msg_send![no_wrap_scroll, frame];
+            assert!(
+                horizontal_frame.origin.y >= scroll_frame.origin.y + scroll_frame.size.height,
+                "horizontal scrollbar must sit below the content viewport"
+            );
+
             // Restore the default soft-wrap state before checking full layout and vertical bounds.
             let no_wrap_button = detail_wrap_button(detail_content);
             assert!(
