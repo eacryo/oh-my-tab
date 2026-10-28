@@ -1471,7 +1471,12 @@ unsafe fn add_detail_actions(entry: &ClipEntry, width: f64, height: f64) {
         .iter()
         .zip(frames.iter().skip(frames.len() - actions.len()))
     {
-        let _: () = msg_send![action.control, setFrameOrigin: *origin];
+        let control_frame: NSRect = msg_send![action.control, frame];
+        let control_origin = NSPoint::new(
+            origin.x,
+            origin.y + (DETAIL_ACTION_H - control_frame.size.height) / 2.0,
+        );
+        let _: () = msg_send![action.control, setFrameOrigin: control_origin];
         let _: () = msg_send![action.chip, setFrameOrigin: *origin];
     }
 }
@@ -1576,6 +1581,8 @@ unsafe fn add_wrap_action(parent: *mut AnyObject) -> Option<DetailActionSide> {
     // pale grey as that chip) looked dead. Its state lives in DETAIL_SOFT_WRAP_ENABLED instead, so
     // rebuilding it costs nothing but loses that whole class of ordering bug.
     let chip = add_chip(parent, DETAIL_SWITCH_CHIP_W);
+    // The switch already draws its own pill; a rectangular chip behind it protrudes at the edges.
+    let _: () = msg_send![chip, setHidden: true];
     let button = crate::settings::make_shared_switch(
         DETAIL_SWITCH_CHIP_W - DETAIL_SWITCH_INSET,
         DETAIL_INSET_TOP,
@@ -1605,6 +1612,7 @@ unsafe fn add_wrap_action(parent: *mut AnyObject) -> Option<DetailActionSide> {
 /// top-right corner with a chip under it. Its tooltip says text or image file.
 unsafe fn add_save_as_action(content: *mut AnyObject, is_image: bool) -> DetailActionSide {
     let chip = add_chip(content, DETAIL_ACTION_H);
+    let _: () = msg_send![chip, setHidden: true];
     let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
     let button: *mut AnyObject = msg_send![
         button,
