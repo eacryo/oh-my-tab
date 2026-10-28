@@ -1428,7 +1428,6 @@ pub(super) extern "C" fn detail_preview_ready(
 struct DetailActionSide {
     control: *mut AnyObject,
     chip: *mut AnyObject,
-    w: f64,
 }
 
 /// Build the detail actions for an entry: save-as always, the code soft-wrap switch only for
@@ -1438,23 +1437,103 @@ struct DetailActionSide {
 /// (the pane's only scroller) scrolls its content under everything above it, so a chip floating
 /// over the column would sit on the panel material while a body scrolled past it; outside the
 /// scroll they stay put, which is the mock's behaviour with no chrome of its own in the column.
-unsafe fn add_detail_actions(content: *mut AnyObject, entry: &ClipEntry, width: f64) {
+///
+/// Both share the "Size" meta row, trailing in the pane's right inset. That row's own value ends
+/// far short of them: the right column starts at `DETAIL_META_RIGHT_SPLIT` and its value column is
+/// narrow, so the two actions (48 + 6 + 28pt) never cover text. The frame comes from a pure
+/// function so a test can assert where a control lands, rather than recompute the arithmetic.
+unsafe fn add_detail_actions(entry: &ClipEntry, width: f64, height: f64) {
+    // The actions belong INSIDE the scrolling document, not on the pane: the meta table is
+    // painted at the document's bottom (`detail_document_height`), so a long body pushes that
+    // table -- and the row the actions sit on -- below the fold. Attached to the pane they would
+    // hang over the body at a fixed height instead, covering text.
+    let Some(document) = detail_document_view() else {
+        return;
+    };
     let is_code = entry.image.is_none() && classify_text(&entry.text) == TextKind::Code;
     let mut actions: Vec<DetailActionSide> = Vec::new();
     if is_code {
-        if let Some(action) = add_wrap_action(content) {
+        if let Some(action) = add_wrap_action(document) {
             actions.push(action);
         }
     }
-    actions.push(add_save_as_action(content, entry.image.is_some()));
-    // Trailing, right-aligned inside the pane's inset: save-as is the outer (rightmost) action.
-    let mut x = width - DETAIL_INSET_RIGHT;
-    for action in actions.iter().rev() {
-        x -= action.w;
-        let _: () = msg_send![action.control, setFrameOrigin: NSPoint::new(x, DETAIL_INSET_TOP)];
-        let _: () = msg_send![action.chip, setFrameOrigin: NSPoint::new(x, DETAIL_INSET_TOP)];
-        x -= DETAIL_ACTION_GAP;
+    actions.push(add_save_as_action(document, entry.image.is_some()));
+    // The document height is what the meta table was painted against; read it back from the view
+    // rather than recompute it, so the actions follow the same bottom the table was placed at.
+    let document_h: f64 = {
+        let frame: NSRect = msg_send![document, frame];
+        frame.size.height
+    };
+    let frames = detail_action_frames(width, height, document_h, picker_shows_detail_in_pane());
+    // `frames` runs switch-then-save; walk it in step with the actions actually built, so an
+    // entry with no switch still places its save-as on the save frame.
+    for (action, origin) in actions
+        .iter()
+        .zip(frames.iter().skip(frames.len() - actions.len()))
+    {
+        let _: () = msg_send![action.control, setFrameOrigin: *origin];
+        let _: () = msg_send![action.chip, setFrameOrigin: *origin];
     }
+}
+
+/// The scrolling detail document, or null while no body is installed.
+///
+/// The actions live inside it so they scroll with the meta table they annotate.
+unsafe fn detail_document_view() -> Option<*mut AnyObject> {
+    let scroll = (*DETAIL_SCROLL_VIEW.lock().unwrap()).as_ref()?.0;
+    let document: *mut AnyObject = msg_send![scroll, documentView];
+    (!document.is_null()).then_some(document)
+}
+/// Where the detail actions sit, in the DOCUMENT's flipped coordinates (y grows downward from
+/// its top): `[switch, save-as]`.
+///
+/// Pure, and the only place the placement is computed: the caller sends these origins to the
+/// views. A test therefore asserts where a control actually lands, instead of repeating the
+/// arithmetic the placement itself would do.
+///
+/// Both share the "Size" meta row, trailing inside the pane's right inset, with save-as outermost.
+fn detail_action_frames(width: f64, height: f64, document_h: f64, in_pane: bool) -> [NSPoint; 2] {
+    let pane = pane_for(width, height, in_pane);
+    let y = save_action_row_y(&pane, document_h);
+    // Trailing inside the DOCUMENT, which these views are children of. Its width is the pane's
+    // content column, not the panel width: using the panel width put them past the document's
+    // right edge, where the clip view cut them off.
+    let save_x = pane.content_w - DETAIL_ACTION_H;
+    let switch_x = save_x - DETAIL_ACTION_GAP - DETAIL_SWITCH_CHIP_W;
+    [NSPoint::new(switch_x, y), NSPoint::new(save_x, y)]
+}
+
+/// The pane geometry for a panel: one place resolves its insets and meta columns, so a caller
+/// cannot lay the table out with one set of inputs and place the actions with another.
+fn pane_for(width: f64, height: f64, in_pane: bool) -> DetailPaneLayout {
+    detail_pane_layout_with(
+        detail_insets(in_pane, width),
+        width,
+        height,
+        meta_table_field_count(),
+    )
+}
+/// The y of the "Size" meta row inside the scrolling DOCUMENT, where both actions sit.
+///
+/// `document_h` is the document's own height, and the table is painted as its last block at
+/// `document_h - meta.height`. Using the visible height here instead would pin the actions to the
+/// fold: with a long body the table scrolls below it, and the actions would sit over the text.
+///
+/// The row index follows the same `chunks(step)` the painter walks. Today every reachable pane
+/// width packs two fields per row -- the widest content column is well past
+/// `DETAIL_META_TWO_COL_MIN` -- but the one-column fallback is still resolved here rather than
+/// assumed away, so this cannot silently point at the wrong row if the pane ever narrows.
+fn save_action_row_y(pane: &DetailPaneLayout, document_h: f64) -> f64 {
+    let step = if pane.meta.two_col { 2 } else { 1 };
+    let row = MetaField::ALL
+        .iter()
+        .position(|field| *field == MetaField::Size)
+        .unwrap_or(0)
+        / step;
+    (document_h - pane.meta.height)
+        + pane.meta.table_top
+        + row as f64 * (pane.meta.row_h + pane.meta.row_gap)
+        + (pane.meta.row_h - DETAIL_ACTION_H) / 2.0
 }
 
 /// A translucent chip behind a floating action (the mock's `.btn` background), so a line
@@ -1489,25 +1568,22 @@ fn detail_action_fill() -> u32 {
 
 /// The soft-wrap switch, with its label as the tooltip: a 28pt pill inside the pane's padding
 /// band. Returns the switch and the chip behind it.
-unsafe fn add_wrap_action(content: *mut AnyObject) -> Option<DetailActionSide> {
+unsafe fn add_wrap_action(parent: *mut AnyObject) -> Option<DetailActionSide> {
     let enabled = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
-    // Reuse the existing switch during detail refreshes and create it only once, so rebuilding
-    // the detail body cannot interrupt its animation.
-    let button = detail_wrap_button(content);
-    let newly_created = button.is_null();
-    let chip = add_chip(content, DETAIL_SWITCH_CHIP_W);
-    let button = if newly_created {
-        crate::settings::make_shared_switch(
-            DETAIL_SWITCH_CHIP_W - DETAIL_SWITCH_INSET,
-            DETAIL_INSET_TOP,
-            DETAIL_ACTION_H,
-            enabled,
-            observer(),
-            sel!(toggleDetailSoftWrap:),
-        )
-    } else {
-        button
-    };
+    // Built fresh on every rebuild, like save-as. The switch used to be reused across rebuilds so
+    // its animation could finish, and the caller had to keep it alive while discarding every
+    // other subview; then a chip added above it swallowed its clicks, and an off switch (the same
+    // pale grey as that chip) looked dead. Its state lives in DETAIL_SOFT_WRAP_ENABLED instead, so
+    // rebuilding it costs nothing but loses that whole class of ordering bug.
+    let chip = add_chip(parent, DETAIL_SWITCH_CHIP_W);
+    let button = crate::settings::make_shared_switch(
+        DETAIL_SWITCH_CHIP_W - DETAIL_SWITCH_INSET,
+        DETAIL_INSET_TOP,
+        DETAIL_ACTION_H,
+        enabled,
+        observer(),
+        sel!(toggleDetailSoftWrap:),
+    );
     let tooltip_key = if enabled {
         "clipboard.detail_soft_wrap_on"
     } else {
@@ -1516,14 +1592,12 @@ unsafe fn add_wrap_action(content: *mut AnyObject) -> Option<DetailActionSide> {
     let tooltip_ns = make_nsstring(&t(tooltip_key));
     let _: () = msg_send![button, setToolTip: tooltip_ns];
     CFRelease(tooltip_ns as *const c_void);
-    if newly_created {
-        let _: () = msg_send![content, addSubview: button];
-        release_obj(button);
-    }
+    // Added AFTER its chip, so it is above it in `subviews` and receives the clicks.
+    let _: () = msg_send![parent, addSubview: button];
+    release_obj(button);
     Some(DetailActionSide {
         control: button,
         chip,
-        w: DETAIL_SWITCH_CHIP_W,
     })
 }
 
@@ -1566,7 +1640,6 @@ unsafe fn add_save_as_action(content: *mut AnyObject, is_image: bool) -> DetailA
     DetailActionSide {
         control: button,
         chip,
-        w: DETAIL_ACTION_H,
     }
 }
 
@@ -1671,13 +1744,6 @@ pub(super) unsafe fn show_detail_for_sel() {
     let _: () = msg_send![content, setAutoresizingMask: 0u64];
     let _: () = msg_send![content, setHidden: false];
     let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
-    let preserved_wrap_button =
-        if entry.image.is_none() && classify_text(&entry.text) == TextKind::Code {
-            detail_wrap_button(content)
-        } else {
-            std::ptr::null_mut()
-        };
-
     // Clear the old content: removeFromSuperview releases it (parent-owned; never released
     // again -- the same discipline as rebuild_rows). The detail text-view pointer is
     // cleared too (no dangling pointer).
@@ -1694,11 +1760,6 @@ pub(super) unsafe fn show_detail_for_sel() {
     let count: usize = msg_send![subs, count];
     for i in 0..count {
         let v: *mut AnyObject = msg_send![subs, objectAtIndex: i as isize];
-        // Preserve the toolbar switch while toggling code wrapping so the settings component
-        // can finish its state animation.
-        if v == preserved_wrap_button {
-            continue;
-        }
         let _: () = msg_send![v, removeFromSuperview];
     }
 
@@ -1801,7 +1862,7 @@ unsafe fn build_detail_body(
             kind,
         );
     }
-    add_detail_actions(content, entry, panel_w);
+    add_detail_actions(entry, panel_w, max_detail_h);
     if picker_shows_detail_in_pane() {
         add_detail_back_button(content);
     }
@@ -2192,6 +2253,101 @@ mod tests {
         assert_eq!(ext_for_image_uti("public.png"), "png");
         assert_eq!(ext_for_image_uti("com.example.foo"), "png");
         assert_eq!(ext_for_image_uti(""), "png");
+    }
+
+    /// Both detail actions sit on the "Size" meta row, trailing, and neither covers that row's
+    /// text. Counter-examples this is built to fail on: the old placement put both in the top
+    /// band, and an action shifted left far enough would run into the right column's value.
+    /// Both detail actions sit on the "Size" meta row inside the scrolling DOCUMENT, trailing,
+    /// and neither covers that row's text.
+    ///
+    /// Counter-examples this fails on: the old placement put both in the top band; a placement
+    /// computed from the VISIBLE height instead of the document height drifts once a long body
+    /// pushes the table below the fold, which is exactly what the long-body case below pins.
+    #[test]
+    fn detail_actions_share_the_size_row_without_covering_its_text() {
+        use crate::clipboard::detail_document_height;
+        use crate::clipboard::detail_insets;
+        use crate::clipboard::detail_pane_layout_with;
+        use crate::clipboard::MetaField;
+
+        let visible_h = 600.0;
+        let pane = detail_pane_layout_with(
+            detail_insets(false, DETAIL_MAX_W),
+            DETAIL_MAX_W,
+            visible_h,
+            meta_table_field_count(),
+        );
+        // A body tall enough that the table scrolls below the fold, and one that fits.
+        let tall_body = pane.body_h + 400.0;
+        for (label, body_h) in [
+            ("a body that fits", pane.body_h),
+            ("a long body", tall_body),
+        ] {
+            let document_h = detail_document_height(visible_h, body_h, pane.meta.height);
+            assert!(
+                document_h > pane.scroll.size.height,
+                "{label}: this case must scroll, so the two cases differ"
+            );
+
+            let step = if pane.meta.two_col { 2 } else { 1 };
+            let field = MetaField::ALL
+                .iter()
+                .position(|f| *f == MetaField::Size)
+                .expect("the Size field exists");
+            let row = field / step;
+            // Where the painter puts the table inside the document.
+            let row_top = document_h - pane.meta.height
+                + pane.meta.table_top
+                + row as f64 * (pane.meta.row_h + pane.meta.row_gap);
+            let row_bottom = row_top + pane.meta.row_h;
+
+            let frames = super::detail_action_frames(DETAIL_MAX_W, visible_h, document_h, false);
+            for (name, origin) in [("wrap switch", frames[0]), ("save-as", frames[1])] {
+                assert!(
+                    origin.y < row_bottom && origin.y + DETAIL_ACTION_H > row_top,
+                    "{label}: the {name} (y={}..{}) must overlap the Size row ({row_top}..{row_bottom})",
+                    origin.y,
+                    origin.y + DETAIL_ACTION_H
+                );
+            }
+            // And the actions must move WITH the table, not stay pinned to the fold.
+            assert!(
+                frames[1].y + DETAIL_ACTION_H > pane.scroll.size.height || body_h == pane.body_h,
+                "{label}: a long body must carry the actions below the fold, got y={}",
+                frames[1].y
+            );
+
+            // The two never overlap each other, and the pair is trailing inside the inset.
+            assert!(
+                frames[0].x + DETAIL_SWITCH_CHIP_W + DETAIL_ACTION_GAP <= frames[1].x,
+                "{label}: the switch must end before save-as starts"
+            );
+            // Trailing inside the DOCUMENT's content column. Computing this from the panel width
+            // instead put both actions past the document's right edge, where they were clipped.
+            assert_eq!(frames[1].x, pane.content_w - DETAIL_ACTION_H);
+            assert!(
+                frames[1].x + DETAIL_ACTION_H <= pane.content_w,
+                "{label}: save-as must fit inside the document's {}pt content column",
+                pane.content_w
+            );
+            assert!(
+                frames[0].x >= 0.0,
+                "{label}: the switch must start inside the document"
+            );
+
+            // The row's own text must stay clear of the switch.
+            let value_x = if pane.meta.two_col {
+                pane.meta.right_x + pane.meta.label_w + pane.meta.gap
+            } else {
+                pane.meta.label_w + pane.meta.gap
+            };
+            let value_room = frames[0].x - value_x;
+            assert!(
+                value_room >= 80.0,
+                "{label}: only {value_room}pt between the Size value and the switch"
+            );
+        }
     }
 
     #[test]

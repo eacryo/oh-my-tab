@@ -2124,6 +2124,38 @@ pub(crate) fn smoke_runner() -> bool {
                 !save_as_button.is_null(),
                 "detail toolbar must install a save-as button"
             );
+            // Both actions are children of the SCROLLING DOCUMENT now, so their frames are in the
+            // document's coordinates: one placed past its width is clipped away, which happened
+            // while the x still came from the panel width.
+            for (name, button) in [
+                ("the wrap switch", wrap_button),
+                ("save-as", save_as_button),
+            ] {
+                let container: *mut AnyObject = msg_send![button, superview];
+                let container_frame: NSRect = msg_send![container, frame];
+                let button_frame: NSRect = msg_send![button, frame];
+                assert!(
+                    button_frame.origin.x >= 0.0
+                        && button_frame.origin.x + button_frame.size.width
+                            <= container_frame.size.width,
+                    "{name} ({}..{}) must fit inside the document (width {})",
+                    button_frame.origin.x,
+                    button_frame.origin.x + button_frame.size.width,
+                    container_frame.size.width
+                );
+            }
+            // Hit-testing, not just performClick: the switch was once covered by the chip added
+            // above it, so a click never reached it while `performClick:` still worked. Only this
+            // shape catches that regression.
+            {
+                let container: *mut AnyObject = msg_send![wrap_button, superview];
+                let hit: *mut AnyObject =
+                    msg_send![container, hitTest: detail_hit_in_switch(wrap_button)];
+                assert_eq!(
+                    hit, wrap_button,
+                    "a click inside the wrap switch must reach the switch, not the chip over it"
+                );
+            }
             let _: () = msg_send![wrap_button, performClick: std::ptr::null::<AnyObject>()];
             let no_wrap_scroll = DETAIL_SCROLL_VIEW
                 .lock()
@@ -2165,6 +2197,20 @@ pub(crate) fn smoke_runner() -> bool {
                 !no_wrap_button.is_null(),
                 "rebuilt code detail must retain its wrap button"
             );
+            // The hit test for the state the defect lived in: this switch was built by the rebuild
+            // that turning it OFF caused, and it is off now. A chip added above it swallowed its
+            // clicks while `performClick:` kept working, so the hit test is the only evidence that
+            // a real click reaches it -- and it must be taken here, after the rebuild, not on the
+            // first-created switch.
+            {
+                let container: *mut AnyObject = msg_send![no_wrap_button, superview];
+                let hit: *mut AnyObject =
+                    msg_send![container, hitTest: detail_hit_in_switch(no_wrap_button)];
+                assert_eq!(
+                    hit, no_wrap_button,
+                    "after the rebuild that turning it off caused, a click must still reach the switch"
+                );
+            }
             let _: () = msg_send![no_wrap_button, performClick: std::ptr::null::<AnyObject>()];
             let detail_scroll = DETAIL_SCROLL_VIEW
                 .lock()
@@ -2606,6 +2652,16 @@ pub(crate) fn smoke_runner() -> bool {
 }
 
 /// Build an arrow-key NSEvent (for the smoke run).
+/// A point inside `button`, in its SUPERVIEW's coordinates: three quarters across, mid-height --
+/// where the knob sits when the switch is on, and empty track when it is off. The off state is the
+/// one a chip drawn over the switch used to swallow invisibly.
+unsafe fn detail_hit_in_switch(button: *mut AnyObject) -> NSPoint {
+    let frame: NSRect = msg_send![button, frame];
+    NSPoint::new(
+        frame.origin.x + frame.size.width * 0.75,
+        frame.origin.y + frame.size.height / 2.0,
+    )
+}
 unsafe fn make_key_event(keycode: u16) -> *mut AnyObject {
     make_key_event_with_modifiers(keycode, 0)
 }
