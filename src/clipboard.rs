@@ -1973,18 +1973,19 @@ pub(crate) fn picker_grip_rect_top_left() -> Option<(f64, f64, f64, f64)> {
     ))
 }
 
-/// The visible frame the configured position mode resolves to, top-left based, for `--e2e-state`.
+/// The visible frame the picker opens in -- the display under the pointer -- top-left based, for
+/// `--e2e-state`.
 ///
-/// With more than one display this is what tells "centred on the PRIMARY display" from "centred on the
-/// display the picker is on": the two are the same API apart (`NSScreen.screens[0]` vs `NSScreen.mainScreen`,
-/// which follows the key window) and identical on a single-display machine, so a scenario on such a machine
-/// cannot distinguish them -- the field is what makes the difference assertable where a second display exists.
-/// Each component is `None` until a picker window exists, since the mode is read with the window.
+/// This is the EXPECTATION a scenario compares `clipboard_picker` against, derived independently of the
+/// panel's own rect: with the panel dragged, pinned or placed by the detail layout, the two disagree, and
+/// that disagreement is exactly what a scenario asks about. On a single-display machine it can only prove
+/// "the panel is on the one display"; the field exists so a two-display machine can assert which one.
+/// `None` until a picker window exists, since the picker derives it at summon time.
 pub(crate) fn picker_configured_screen_top_left() -> Option<(f64, f64, f64, f64)> {
     if PICKER_WINDOW.lock().unwrap().is_none() {
         return None;
     }
-    let (_, _, screen_frame) = picker::configured_picker_area();
+    let (_, screen_frame) = picker::configured_picker_area();
     let primary = unsafe { crate::overlay::hover::primary_screen_frame()? };
     Some((
         screen_frame.origin.x,
@@ -5714,31 +5715,180 @@ mod tests {
         // Way out of range (accumulated deletions) -> the tail.
         assert_eq!(clamp_selection(5, 2), 1);
     }
+    /// The picker opens on the display the pointer is on, on a two-display desk.
+    ///
+    /// The regression this holds shut: every summon landed on the primary display whatever display
+    /// the pointer was on. The subtler half is the display-membership rule: it was decided from each
+    /// display's VISIBLE frame, so a pointer on a secondary display's menu bar or Dock (inside the
+    /// display, outside its visible area) fell back to the primary display too.
     #[test]
-    fn screen_containing_finds_the_cursor_screen() {
-        use super::screen_containing;
+    fn picker_host_screen_follows_the_cursor() {
+        use super::picker_host_screen;
+        use super::DisplayArea;
         use objc2_foundation::{NSPoint, NSRect, NSSize};
-        // Main screen at (0,0) 1440x900; a second screen to the left at (-800,0) 800x900.
-        let frames = [
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1440.0, 900.0)),
-            NSRect::new(NSPoint::new(-800.0, 0.0), NSSize::new(800.0, 900.0)),
-        ];
-        // cursor on the main screen.
+        let rect =
+            |x: f64, y: f64, w: f64, h: f64| NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+
+        // Primary at (0,0) 1440x900 with a 25pt menu bar, so its visible area starts at y=25.
+        let primary = DisplayArea {
+            frame: rect(0.0, 0.0, 1440.0, 900.0),
+            visible: rect(0.0, 0.0, 1440.0, 875.0),
+        };
+        // Secondary to the LEFT at (-800,0) 800x900, with its menu bar in the SAME global band.
+        let left = DisplayArea {
+            frame: rect(-800.0, 0.0, 800.0, 900.0),
+            visible: rect(-800.0, 0.0, 800.0, 875.0),
+        };
+        let side_by_side = [primary, left];
+        let primary_visible = primary.visible;
+
+        // On the secondary display the picker goes there (a negative x origin).
         assert_eq!(
-            screen_containing(NSPoint::new(700.0, 500.0), &frames),
-            Some(frames[0])
+            picker_host_screen(NSPoint::new(-400.0, 200.0), &side_by_side, primary_visible),
+            left.visible,
+            "the picker must open on the display the pointer is on"
         );
-        // cursor on the left second screen (negative x).
+        // On the primary display it goes there.
         assert_eq!(
-            screen_containing(NSPoint::new(-400.0, 200.0), &frames),
-            Some(frames[1])
+            picker_host_screen(NSPoint::new(700.0, 500.0), &side_by_side, primary_visible),
+            primary_visible
         );
-        // cursor off-screen -> None.
+        // The pointer on the SECONDARY display's menu bar is inside that display and outside its
+        // visible frame: it must still be reported as that display.
         assert_eq!(
-            screen_containing(NSPoint::new(3000.0, 500.0), &frames),
-            None
+            picker_host_screen(NSPoint::new(-400.0, 890.0), &side_by_side, primary_visible),
+            left.visible,
+            "a pointer on a secondary display's menu bar belongs to that display, not the primary"
+        );
+        // The primary display's own menu bar maps to the primary, and the placement derived from it
+        // is clamped inside the visible frame, never under the menu bar.
+        assert_eq!(
+            picker_host_screen(NSPoint::new(700.0, 890.0), &side_by_side, primary_visible),
+            primary_visible
+        );
+
+        // Vertically stacked displays share every x: only the y tells them apart.
+        let above = DisplayArea {
+            frame: rect(0.0, 900.0, 1440.0, 600.0),
+            visible: rect(0.0, 900.0, 1440.0, 575.0),
+        };
+        let stacked = [primary, above];
+        assert_eq!(
+            picker_host_screen(NSPoint::new(700.0, 1200.0), &stacked, primary_visible),
+            above.visible,
+            "a pointer on the display above must select that display"
+        );
+        assert_eq!(
+            picker_host_screen(NSPoint::new(700.0, 450.0), &stacked, primary_visible),
+            primary_visible
+        );
+
+        // A pointer on no display at all (a stale location during a display reconfiguration) falls
+        // back to the primary display instead of leaving the panel stranded.
+        assert_eq!(
+            picker_host_screen(NSPoint::new(5000.0, 5000.0), &side_by_side, primary_visible),
+            primary_visible
+        );
+        // No displays reported at all: the primary is the only answer there is.
+        assert_eq!(
+            picker_host_screen(NSPoint::new(-400.0, 200.0), &[], primary_visible),
+            primary_visible
         );
     }
+    /// The two `clipboard.picker_placement` modes, on the screen the pointer is on.
+    ///
+    /// The screen never differs between them -- `configured_picker_area` supplies the pointer's
+    /// display either way -- so what is asserted here is placement WITHIN that screen: "center" puts
+    /// the panel in the middle of the visible area (never under the menu bar), and "cursor" keeps the
+    /// pointer-relative offset with its edge flips. A panel larger than the screen is clamped to the
+    /// screen's origin rather than pushed off it.
+    #[test]
+    fn picker_placement_centers_or_follows_the_cursor_within_one_screen() {
+        use super::{picker_frame_centered, picker_frame_for};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        // A secondary display's visible area: its menu bar is carved out of the top.
+        let screen = NSRect::new(NSPoint::new(-1920.0, 0.0), NSSize::new(1920.0, 1055.0));
+        let size = NSSize::new(560.0, 400.0);
+
+        let centered = picker_frame_centered(screen, size);
+        assert_eq!(centered.size, size);
+        assert_eq!(
+            centered.origin.x,
+            screen.origin.x + (screen.size.width - size.width) / 2.0
+        );
+        assert_eq!(
+            centered.origin.y,
+            screen.origin.y + (screen.size.height - size.height) / 2.0
+        );
+        // It sits on the pointer's screen, not the primary one.
+        assert!(centered.origin.x < 0.0, "centered on the secondary display");
+        // And inside the visible area: the menu bar cannot cut it off.
+        assert!(centered.origin.y >= screen.origin.y);
+        assert!(centered.origin.y + size.height <= screen.origin.y + screen.size.height);
+
+        // "cursor" is the pointer-relative placement, unchanged.
+        let cursor = NSPoint::new(-1500.0, 500.0);
+        let followed = picker_frame_for(cursor, screen, size.width, size.height);
+        assert_ne!(
+            followed.origin, centered.origin,
+            "the two modes must not produce the same origin here, or this proves nothing"
+        );
+        assert!(followed.origin.x >= screen.origin.x);
+
+        // A panel wider than the screen is clamped to the screen's origin, not pushed off it.
+        let narrow = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(500.0, 400.0));
+        let huge = picker_frame_centered(narrow, NSSize::new(900.0, 700.0));
+        assert_eq!(huge.origin, NSPoint::new(0.0, 0.0));
+
+        // The counter-example the A1 runner depends on: the two modes CAN legitimately coincide, so
+        // "the origins differ" is not an assertion about the mode. A pointer up and left of the
+        // centred panel by exactly the cursor offset produces the centred frame from the
+        // pointer-relative placement. The runner therefore checks each mode against its own expected
+        // origin; this pins the case where a difference-based check would have failed a correct build.
+        let coincident_cursor = NSPoint::new(
+            centered.origin.x - super::PICKER_CURSOR_OFF,
+            centered.origin.y + size.height + super::PICKER_CURSOR_OFF,
+        );
+        let coincident = picker_frame_for(coincident_cursor, screen, size.width, size.height);
+        assert_eq!(
+            coincident.origin, centered.origin,
+            "the fixture must actually coincide, or it does not test the counter-example"
+        );
+        // ...and each mode still reports its own origin correctly at that pointer.
+        assert_eq!(
+            super::picker_placement_expected_origin("cursor", coincident_cursor, screen, size),
+            centered.origin
+        );
+        assert_eq!(
+            super::picker_placement_expected_origin("center", coincident_cursor, screen, size),
+            centered.origin
+        );
+        // MODE -> IMPLEMENTATION, pinned explicitly. Every other assertion here reads the shared
+        // `picker_placement_expected_origin`, which is only proved correct if something says which
+        // branch each mode must take: with the two branches of `configured_picker_frame` swapped, the
+        // coincident case still passes and a "the two differ" check still passes, because both the
+        // production path and the expectation moved together. These two comparisons are against the
+        // two implementations directly, so a swap fails here.
+        let elsewhere = NSPoint::new(screen.origin.x + 200.0, screen.origin.y + 800.0);
+        assert_eq!(
+            super::picker_placement_expected_origin("cursor", elsewhere, screen, size),
+            picker_frame_for(elsewhere, screen, size.width, size.height).origin,
+            "'cursor' must be the pointer-relative placement (picker_frame_for)"
+        );
+        assert_eq!(
+            super::picker_placement_expected_origin("center", elsewhere, screen, size),
+            picker_frame_centered(screen, size).origin,
+            "'center' must be the centred placement (picker_frame_centered)"
+        );
+        // ...and the two are actually different answers at this pointer, so the pair above is a
+        // discriminating fixture rather than two names for one value.
+        assert_ne!(
+            picker_frame_for(elsewhere, screen, size.width, size.height).origin,
+            picker_frame_centered(screen, size).origin,
+            "the fixture needs a pointer where the modes differ"
+        );
+    }
+
     #[test]
     fn picker_frame_follows_cursor_with_flips() {
         use super::{picker_frame_for, PICKER_CURSOR_OFF, PICKER_EDGE_MARGIN};

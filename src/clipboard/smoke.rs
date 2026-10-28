@@ -528,6 +528,101 @@ pub(crate) fn smoke_runner() -> bool {
 
     /// The blank-area drag surface over the picker content, found by its class name. It is what makes
     /// every inert region of the panel draggable now that the three-dot handle is gone.
+    /// The panel really opens on the pointer's display, in both `clipboard.picker_placement` modes.
+    ///
+    /// A1 because the screen and the placement are decided at summon time from live AppKit state: a
+    /// pure test proves the derivation, this proves `show_picker` uses it, that the panel it puts on
+    /// screen lands on the display the pointer is on, and that the two placements are actually
+    /// different frames on that display (a mode that silently fell back would pass a screen check
+    /// alone). On a one-display machine the screen half can only prove "the one display"; the
+    /// placement half is asserted on any machine.
+    unsafe fn assert_picker_placement_on_the_cursor_display() {
+        let original = CONFIG.read().unwrap().clipboard.picker_placement.clone();
+        let displays = super::picker::display_areas();
+        // Which display the panel actually sits in, from the live panel rect.
+        let placed_on = |panel: NSRect| {
+            displays
+                .iter()
+                .map(|display| display.visible)
+                .find(|visible| {
+                    visible.origin.x <= panel.origin.x + 0.5
+                        && panel.origin.x <= visible.origin.x + visible.size.width + 0.5
+                        && visible.origin.y <= panel.origin.y + 0.5
+                        && panel.origin.y <= visible.origin.y + visible.size.height + 0.5
+                })
+        };
+        let primary = crate::overlay::hover::primary_screen_visible_frame()
+            .expect("AppKit reports a primary display");
+
+        let mut origins = Vec::new();
+        for placement in ["cursor", "center"] {
+            CONFIG.write().unwrap().clipboard.picker_placement = placement.to_string();
+            // A fresh summon, through the same path Option+V takes.
+            super::hide_picker();
+            super::show_picker_for_development();
+            let window = (*super::PICKER_WINDOW.lock().unwrap())
+                .expect("the picker window exists once the picker has been shown")
+                .0;
+            // The expectation, from the same pointer the summon read.
+            let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+            let on_screen = super::picker::picker_host_screen(cursor, &displays, primary);
+            let panel = crate::glass::panel_frame_of(window);
+            assert_eq!(
+                placed_on(panel),
+                Some(on_screen),
+                "{placement}: the summoned panel {panel:?} must sit on the display under the \
+                 pointer {cursor:?} (expected visible frame {on_screen:?}, displays {displays:?})"
+            );
+            assert!(
+                on_screen.origin.x <= panel.origin.x + 0.5
+                    && panel.origin.x + panel.size.width
+                        <= on_screen.origin.x + on_screen.size.width + 0.5
+                    && on_screen.origin.y <= panel.origin.y + 0.5
+                    && panel.origin.y + panel.size.height
+                        <= on_screen.origin.y + on_screen.size.height + 0.5,
+                "{placement}: the panel {panel:?} must stay inside that screen's visible area \
+                 {on_screen:?}, not under its menu bar or off its edge"
+            );
+            origins.push(panel.origin);
+            // The reset (blank-area double-click) must not disagree with the summon.
+            super::picker::reset_picker_to_configured_position();
+            let reset_panel = crate::glass::panel_frame_of(window);
+            assert!(
+                (reset_panel.origin.x - panel.origin.x).abs() < 1.0
+                    && (reset_panel.origin.y - panel.origin.y).abs() < 1.0,
+                "{placement}: the reset moved the panel from {panel:?} to {reset_panel:?}; it must \
+                 land where a fresh summon would"
+            );
+        }
+        // Each mode is checked against ITS OWN expected frame, never against the other mode's: two
+        // origins that differ prove nothing (with the modes swapped they still differ), and two
+        // that coincide prove nothing either -- a pointer up and left of the centred panel puts the
+        // pointer-relative frame exactly on the centred one, so demanding a difference would fail a
+        // correct build depending on where the pointer happens to be. `picker_placement_expected_origin`
+        // is the same pure derivation the summon uses, which is what makes this an assertion about the
+        // mode rather than about the pointer.
+        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+        let on_screen = super::picker::picker_host_screen(cursor, &displays, primary);
+        for (index, placement) in ["cursor", "center"].iter().enumerate() {
+            let window = (*super::PICKER_WINDOW.lock().unwrap())
+                .expect("the picker window exists after the summons")
+                .0;
+            let size = crate::glass::panel_frame_of(window).size;
+            let expected =
+                super::picker::picker_placement_expected_origin(placement, cursor, on_screen, size);
+            let point = origins[index];
+            let (x, y) = (point.x, point.y);
+            assert!(
+                (x - expected.x).abs() < 1.0 && (y - expected.y).abs() < 1.0,
+                "{placement}: the panel opened at ({x:.1},{y:.1}) but this mode's own placement \
+                 puts it at ({:.1},{:.1}) on screen {on_screen:?} with pointer {cursor:?}",
+                expected.x,
+                expected.y
+            );
+        }
+        CONFIG.write().unwrap().clipboard.picker_placement = original;
+    }
+
     unsafe fn drag_surface_in_content() -> *mut AnyObject {
         let parent = (*super::PICKER_CONTENT_PARENT.lock().unwrap())
             .expect("the picker content parent must be built")
@@ -2548,6 +2643,9 @@ pub(crate) fn smoke_runner() -> bool {
         // process never ran the lifecycle that builds it, so `isVisible` here would test the harness,
         // not the button. What this process uniquely owns is the panel half (above) and that the
         // navigation parks the sidebar on the page the header promises.
+    }
+    unsafe {
+        assert_picker_placement_on_the_cursor_display();
     }
     hide_picker();
     true

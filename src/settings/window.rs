@@ -3887,6 +3887,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_auto_expire_days_value_label: std::ptr::null_mut(),
             clipboard_show_source_app: std::ptr::null_mut(),
             clipboard_pin_follow: std::ptr::null_mut(),
+            clipboard_picker_placement: std::ptr::null_mut(),
+            clipboard_picker_placement_row_height: 0.0,
             clipboard_paused: std::ptr::null_mut(),
             clipboard_excluded_remove: Vec::new(),
             clipboard_excluded_add: std::ptr::null_mut(),

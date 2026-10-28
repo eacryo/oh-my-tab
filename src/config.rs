@@ -897,9 +897,10 @@ pub struct ClipboardSection {
     // Image rows' height in the picker list, as a multiple of the 40pt text row: 1..=3.
     // Default 1 (a thumbnail-sized image row like any other row).
     pub image_rows: u32,
-    // The clipboard picker position: "mouse" = follows the cursor, "main" = centered on
-    // the main screen. Defaults to the center of the main screen.
-    pub picker_position: String,
+    // Where the picker opens ON ITS SCREEN: "cursor" = next to the pointer (bottom-right, flipping and
+    // clamping at the edges), "center" = the middle of that screen's visible area. The screen itself is
+    // not a choice -- it is always the one the pointer is on. Defaults to following the pointer.
+    pub picker_placement: String,
     // Where the selection lands after pin/unpin: true = follow the toggled entry to its
     // new position; false = keep the current display position (pointing at the next
     // entry, convenient for batch pinning). Defaults to follow.
@@ -970,7 +971,7 @@ impl Default for ClipboardSection {
             clear_system_pasteboard_after_paste: false,
             auto_expire_days: 3,
             image_rows: 1,
-            picker_position: "main".to_string(),
+            picker_placement: "cursor".to_string(),
             pin_follow_selection: true,
             paused: false,
             excluded_apps: default_excluded_apps(),
@@ -1615,10 +1616,10 @@ impl Config {
                 &[("value", &self.clipboard.auto_expire_days.to_string())],
             ));
         }
-        if !["mouse", "main"].contains(&self.clipboard.picker_position.as_str()) {
+        if !["cursor", "center"].contains(&self.clipboard.picker_placement.as_str()) {
             errs.push(tf(
-                "errors.clipboard_picker_position_invalid",
-                &[("value", &self.clipboard.picker_position)],
+                "errors.clipboard_picker_placement_invalid",
+                &[("value", &self.clipboard.picker_placement)],
             ));
         }
         match crate::key_bindings::clipboard_shortcut_status(
@@ -1981,9 +1982,9 @@ impl Config {
         }
         if !errs
             .iter()
-            .any(|e| e.starts_with("clipboard.picker_position"))
+            .any(|e| e.starts_with("clipboard.picker_placement"))
         {
-            self.clipboard.picker_position = other.clipboard.picker_position.clone();
+            self.clipboard.picker_placement = other.clipboard.picker_placement.clone();
         }
         if !errs.iter().any(|e| e.starts_with("clipboard.shortcut")) {
             self.clipboard.shortcut = other.clipboard.shortcut.clone();
@@ -3587,17 +3588,64 @@ mod tests {
         assert_eq!(cfg.clipboard.max_entries, 50);
     }
 
+    /// `clipboard.picker_placement` decides where the picker opens ON its screen; the screen itself
+    /// is always the pointer's. Defaults to following the pointer, and an unknown value is rejected
+    /// so a typo cannot silently leave the panel unplaced.
     #[test]
-    fn validate_rejects_unknown_clipboard_picker_position() {
-        // The picker position only accepts mouse / main.
+    fn picker_placement_defaults_to_the_cursor_and_rejects_unknown_values() {
         let mut cfg = Config::default();
-        assert_eq!(cfg.clipboard.picker_position, "main");
-        cfg.clipboard.picker_position = "top-right".into();
+        assert_eq!(cfg.clipboard.picker_placement, "cursor");
+        cfg.clipboard.picker_placement = "center".into();
+        assert_err_count(&cfg, 0);
+        cfg.clipboard.picker_placement = "middle".into();
         assert_err_count(&cfg, 1);
-        cfg.clipboard.picker_position = "mouse".into();
+        // A file written before the key existed loads as the default, not as an empty string.
+        let legacy: Config = toml::from_str("[clipboard]\nenabled = true\n").unwrap();
+        assert_eq!(legacy.clipboard.picker_placement, "cursor");
+        // ...and a chosen value round-trips.
+        let mut chosen = Config::default();
+        chosen.clipboard.picker_placement = "center".into();
+        let back: Config = toml::from_str(&toml::to_string_pretty(&chosen).unwrap()).unwrap();
+        assert_eq!(back.clipboard.picker_placement, "center");
+        // An invalid sibling in the same section must not discard the valid placement.
+        let mut edited = Config::default();
+        edited.clipboard.picker_placement = "center".into();
+        edited.clipboard.image_rows = 99;
+        let errs = edited.validate();
+        assert!(
+            errs.iter().any(|e| e.starts_with("clipboard.image_rows")),
+            "the fixture needs an invalid sibling, or it proves nothing: {errs:?}"
+        );
+        let mut merged = Config::default();
+        merged.merge_valid(edited, &errs);
+        assert_eq!(merged.clipboard.picker_placement, "center");
+    }
+
+    /// A config written while `clipboard.picker_position` existed still loads.
+    ///
+    /// The picker now always follows the cursor and the field is gone. Removing a field is only safe
+    /// because the sections tolerate unknown keys: a user whose file still carries the old key must
+    /// get a working config, not a parse error that silently drops every other setting in the file.
+    /// This is what lets the removal ship without a migration step.
+    #[test]
+    fn a_config_carrying_the_removed_picker_position_still_loads() {
+        let cfg: Config = toml::from_str(
+            "[clipboard]\nenabled = true\npicker_position = \"main\"\nmax_entries = 42\n",
+        )
+        .expect("a leftover clipboard.picker_position must not break the load");
+        assert!(cfg.clipboard.enabled);
+        assert_eq!(
+            cfg.clipboard.max_entries, 42,
+            "the settings around the removed key must survive, not fall back to defaults"
+        );
+        // The same file must still validate: the removed key takes no validation with it.
         assert_err_count(&cfg, 0);
-        cfg.clipboard.picker_position = "main".into();
-        assert_err_count(&cfg, 0);
+        // ...and re-saving drops it, so the stale key does not outlive the feature.
+        let resaved = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            !resaved.contains("picker_position"),
+            "the removed key must not be written back out"
+        );
     }
 
     #[test]

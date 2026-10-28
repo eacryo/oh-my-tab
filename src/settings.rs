@@ -519,6 +519,9 @@ pub(super) struct SettingsUi {
     clipboard_show_source_app: *mut AnyObject,                     // show the source app
     clipboard_pin_follow: *mut AnyObject,                          // selection after pin
     // (follow the pinned entry / keep current position)
+    clipboard_picker_placement: *mut AnyObject, // clipboard on the cursor screen
+    // (follow the cursor / screen center)
+    clipboard_picker_placement_row_height: f64,
     clipboard_paused: *mut AnyObject, // pause recording (persisted, unlike the panel pin)
     /// Per-row "remove" buttons of the excluded-applications list. The SENDER POINTER identifies
     /// which entry to drop: a button's tag selects its hover/normal palette, so it must never carry
@@ -1707,9 +1710,9 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.clipboard.auto_expire_days
     );
     changed!(
-        "clipboard.picker_position",
-        old.clipboard.picker_position,
-        new.clipboard.picker_position
+        "clipboard.picker_placement",
+        old.clipboard.picker_placement,
+        new.clipboard.picker_placement
     );
     changed!(
         "clipboard.pin_follow_selection",
@@ -2202,6 +2205,11 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 1
             };
             let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
+            // picker_placement: popup index 0 = follow the cursor, 1 = screen center. The same mapping
+            // `apply_control_field` writes back, so an untouched page cannot show one placement while
+            // the picker uses the other.
+            let placement_idx = dispatch::picker_placement_index(&cfg.clipboard.picker_placement);
+            let _: () = msg_send![ui.clipboard_picker_placement, selectItemAtIndex: placement_idx];
             update_clipboard_controls_enabled(ui);
             // Finder Menu page: the status line is read-only state from System Settings, and every
             // switch mirrors the config's vec-backed fields (membership, not order).
