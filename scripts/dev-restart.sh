@@ -202,13 +202,13 @@ dev_version="$(awk -F'"' '/^version/ {print $2; exit}' "$repo_dir/Cargo.toml")"
 # Every workspace member must carry the root manifest's version, checked HERE so a development
 # restart cannot launch the very inconsistency the packaging path refuses: the bundle takes its
 # version from the root manifest alone and writes it into both Info.plists, so bumping the root
-# and not the members ships an .app that says 0.2.6 while the Finder extension crate it embeds
-# still says 0.2.5. src/version_consistency.rs guards this too, but only in the cargo-test tier,
-# which a restart does not run; the restart is where the mismatch is actually made, so it is where
-# it has to be caught. Exit 75 is the gate's "could not decide", so an unreadable manifest is not
-# reported as either agreement or disagreement.
-# 所有 workspace 成员必须与根 manifest 版本一致:打包只读根版本并写入两个 Info.plist,只改根会用
-# 0.2.6 的 .app 带走 0.2.5 的 Finder 扩展 crate。cargo-test 档会抓,但重启不跑那一档,所以在这里先查。
+# and not the members ships an .app whose plists state the new version while the Finder extension
+# crate it embeds still states the old one. src/version_consistency.rs guards this too, but only in
+# the cargo-test tier, which a restart does not run; the restart is where the mismatch is actually
+# made, so it is where it has to be caught. Exit 75 is the gate's "could not decide", so an
+# unreadable manifest is not reported as either agreement or disagreement.
+# 所有 workspace 成员必须与根 manifest 版本一致:打包只读根版本并写入两个 Info.plist,只改根会让
+# 新版本的 .app 带走旧版本的 Finder 扩展 crate。cargo-test 档会抓,但重启不跑那一档,所以在这里先查。
 # The status is captured on its own line: inside `if ! cmd`, $? is the NEGATED status, so the
 # 1-versus-75 distinction below would silently become 0.
 version_report="$(python3 "$repo_dir/scripts/lib/workspace-versions.py" --root "$repo_dir" 2>&1)"
