@@ -76,6 +76,7 @@ src/
 │   └── corner_glyph.rs          # the corner-glyph button family (footer gear, picker header glyphs)
 ├── update_notice.rs             # post-install "update installed" notification
 ├── updater.rs                   # Sparkle 2 integration, loaded dynamically
+├── version_consistency.rs       # workspace release-version agreement (root Cargo.toml vs every member)
 ├── window_collector.rs          # switchable-window discovery + raising (see below)
 │   ├── window_collector/
 ├── window_management.rs         # Option+arrow tiling/moving window behaviours

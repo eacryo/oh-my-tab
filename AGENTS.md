@@ -60,7 +60,13 @@ an unrun tier as green. The middle row suits a change whose blast radius is the 
   something: the dev-instance lock and ownership probe, the Finder extension cleanup, the e2e disturbance
   gates, the reviewer script, the cargo-test wrapper, the launch codecs, the documentation statistics
   (`scripts/doc-stats.py`: rule parity between the guide's two languages) and the gate itself; `ls
-  scripts/*-selftest.sh` lists them, and the run prints the count it ran.
+  scripts/*-selftest.sh` lists them, and the run prints the count it ran. The version agreement between the
+  root `Cargo.toml` and every workspace member is asserted twice: `src/version_consistency.rs` in
+  `cargo-test`, and `scripts/version-consistency-selftest.sh` against `cargo metadata`. The packaging
+  steps take the version from the root manifest only, so a release that bumps it alone would ship an
+  `.app` whose embedded crates claim another version, with nothing else noticing. The packaging path
+  asserts the same agreement itself: `scripts/bundle.sh`'s `workspace_version_mismatches` refuses to
+  package a disagreeing workspace, so a release run that skips the gate is still covered.
 - The normal `cargo test` suite is headless-safe; GUI/permission-dependent smoke tests are marked `#[ignore]`.
 - Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
 - Pick the tier row from the table above rather than defaulting to the whole gate. A cross-module change, or one in unsafe/FFI, concurrency, configuration, build or release code, always takes the whole gate. So does any handoff.

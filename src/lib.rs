@@ -46,6 +46,7 @@ mod ui;
 mod ui_coordinator;
 mod update_notice;
 mod updater;
+mod version_consistency;
 mod window_collector;
 mod window_management;
 mod window_refresh;

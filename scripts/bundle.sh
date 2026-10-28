@@ -26,6 +26,61 @@ ZIP="dist/${APP_BASENAME}.zip"
 # 发布说明是发布契约的一部分，不是可选的上传附属物。在编译前校验版本文档，避免生成没有
 # 对应更新日志的安装包。
 VERSION=$(awk -F'"' '/^version/ {print $2; exit}' Cargo.toml)
+
+# The same check as a function so a selftest can exercise it without packaging anything.
+# Returns non-zero (and prints the disagreements) when any member disagrees with $1.
+workspace_version_mismatches() {
+  local want="$1" metadata_json members mismatches
+  metadata_json=$(mktemp)
+  if ! cargo metadata --no-deps --format-version 1 --offline >"$metadata_json" 2>/dev/null; then
+    echo "error: cannot read cargo metadata; refusing to package an unverified version" >&2
+    rm -f "$metadata_json"
+    return 1
+  fi
+  if ! members=$(python3 - "$metadata_json" <<'PY'
+import json, sys
+with open(sys.argv[1]) as fh:
+    meta = json.load(fh)
+for pkg in meta.get("packages", []):
+    print(pkg.get("name") + " " + pkg.get("version"))
+PY
+  ); then
+    echo "error: cannot read the workspace versions; refusing to package an unverified version" >&2
+    rm -f "$metadata_json"
+    return 1
+  fi
+  rm -f "$metadata_json"
+  if [ -z "$members" ]; then
+    # An empty read must not be mistaken for agreement: no packages means nothing was checked.
+    echo "error: cargo metadata reported no packages; refusing to package an unverified version" >&2
+    return 1
+  fi
+  # set -e is not in force inside a function called from `if !`, so the comparison's own status is
+  # checked here: a failed awk must read as "not verified", never as "nothing disagreed".
+  if ! mismatches=$(printf '%s\n' "$members" | awk -v want="$want" '$2 != want {printf "  %s: %s (expected %s)\n", $1, $2, want}'); then
+    echo "error: could not compare workspace versions; refusing to package an unverified version" >&2
+    return 1
+  fi
+  if [ -n "$mismatches" ]; then
+    echo "error: workspace members disagree with the root Cargo.toml version $want:" >&2
+    printf '%s\n' "$mismatches" >&2
+    echo "Bump every member's version together before packaging." >&2
+    return 1
+  fi
+  return 0
+}
+
+# Every workspace member must carry the same version. The bundle takes its version from the ROOT
+# manifest alone and writes it into both Info.plists, so a release that bumps only the root ships an
+# .app whose embedded crates (the Finder extension, its wire protocol) still claim the previous
+# version -- and nothing else in this script would notice. `cargo metadata` is read instead of the
+# manifests, so a member added under crates/ is covered without editing this check.
+# 所有 workspace 成员的版本必须与根 manifest 一致:打包只读根版本并写入两个 Info.plist,若只改根,
+# 内置的 Finder 扩展及其协议 crate 会停留在旧版本,脚本其余部分不会发现。
+if ! workspace_version_mismatches "$VERSION"; then
+  exit 1
+fi
+
 RELEASE_DOC_DIR="${RELEASE_DOC_DIR:-release_doc}"
 RELEASE_DOC="${RELEASE_DOC_DIR}/${VERSION}.md"
 if [ ! -s "$RELEASE_DOC" ]; then
