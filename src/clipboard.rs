@@ -404,8 +404,10 @@ const SEARCH_FONT_SIZE: f64 = 13.0;
 const ACTION_BTN: f64 = 22.0;
 const ACTION_H: f64 = 22.0;
 const ACTION_GAP: f64 = 1.0;
-/// Detail SVG-style icon canvas (16px in mockup).
-const DETAIL_ACTION_ICON: f64 = 16.0;
+/// The point size of the row action glyphs (detail/pin/trash). One constant for all three: the
+/// glyphs sit side by side in a row, so a different size for any one of them reads as a defect
+/// (the detail toggle used to be a hand-drawn circle on its own 16pt canvas and did exactly that).
+const ACTION_GLYPH_SIZE: f64 = 12.0;
 /// The time-group header zone height.
 const GROUP_H: f64 = 28.0;
 /// The group label's top offset (vertically centered).
@@ -448,9 +450,9 @@ pub(super) const PICKER_ORB_DOT_GAP: f64 = 6.0;
 /// follow the button's font), so the corner's second glyph is sized here, a step above the close
 /// button's 12pt text × so the two read as the same weight.
 const PICKER_GEAR_GLYPH_SIZE: f64 = 13.0;
-/// The pin button is the corner row's THIRD glyph, left of the gear: the same 28pt hit target and
-/// family as its two neighbours, so the row reads as one group. Its glyph size matches the gear's
-/// for the same reason (both are SF Symbols, which do not follow the button's font).
+/// The pin button sits left of the close button: the same 28pt hit target and family as the gear,
+/// so the row reads as one group. Its glyph size matches the gear's for the same reason (both are
+/// SF Symbols, which do not follow the button's font).
 const PICKER_PIN_GLYPH_SIZE: f64 = PICKER_GEAR_GLYPH_SIZE;
 /// The gap under the search bar (the v2 mock's `.panel-head` padding-bottom, 10px).
 const SEARCH_GAP_Y: f64 = 10.0;
@@ -1364,6 +1366,7 @@ struct RowHoverViews {
     group_clear: Option<ObjPtr>,
     tile: ObjPtr,
     content: ObjPtr,
+    detail: ObjPtr,
     pin: ObjPtr,
     del: ObjPtr,
 }
@@ -1371,12 +1374,13 @@ struct RowHoverViews {
 impl RowHoverViews {
     /// Every view this row owns. Destructured exhaustively on purpose: a new field stops compiling
     /// here until it is added to the list, so a view cannot be created without also being torn down.
-    fn owned(self) -> [Option<ObjPtr>; 6] {
+    fn owned(self) -> [Option<ObjPtr>; 7] {
         let RowHoverViews {
             group_label,
             group_clear,
             tile,
             content,
+            detail,
             pin,
             del,
         } = self;
@@ -1385,6 +1389,7 @@ impl RowHoverViews {
             group_clear,
             Some(tile),
             Some(content),
+            Some(detail),
             Some(pin),
             Some(del),
         ]
@@ -1506,8 +1511,6 @@ static PICKER_OPTIONS_ORB: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadS
 /// popover, so a scenario that means "open settings" has to click this row instead.
 pub(super) static PICKER_SETTINGS_ROW: MainThreadSlot<Option<ObjPtr>> =
     unsafe { MainThreadSlot::new(None) };
-/// The panel-level pin button (the corner row's third glyph). Distinct from the per-row entry pin.
-static PICKER_DETAIL_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 static PICKER_PIN_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 /// The panel header's pause-recording orb (a real control, unlike the pin's check state).
 static PICKER_PAUSE_BUTTON: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
@@ -2405,39 +2408,33 @@ mod tests {
     use std::sync::Arc;
     #[test]
     fn picker_header_separates_the_four_corner_controls() {
-        let (search, pause, options, detail, pin, close) = picker_header_frames();
+        let (search, pause, options, pin, close) = picker_header_frames();
         // The row is inset symmetrically from the strip's edges and all three buttons are square.
         assert_eq!(search.origin.x, SEARCH_PAD_X);
         assert_eq!(search.origin.y, TOP_PAD_Y);
         assert_eq!(close.origin.x + close.size.width, PICKER_W - SEARCH_PAD_X);
         assert_eq!(close.size.width, close.size.height);
-        // The mock's `.orb` trio (options/detail/pin) are equal 34pt circles; the close keeps
-        // its own smaller rect (`.close-btn` 30pt wide).
-        assert_eq!(options.size, detail.size);
-        assert_eq!(detail.size, pin.size);
+        // The header's `.orb` pair (options/pin) are equal 34pt circles; the close keeps its own
+        // smaller rect (`.close-btn` 30pt wide). The detail toggle lives on each row instead.
+        assert_eq!(options.size, pin.size);
         assert_eq!(pin.size.width, PICKER_ORB_SIZE);
         assert_eq!(close.size.width, PICKER_CLOSE_BTN_SIZE);
         // Every control is clear of the one before it: the close button is never drawn over the
-        // gear, the gear never over the pin, the pin never over the query/⌘F keycap, and none of
-        // the five overlap whichever label is longest. The pause orb is part of the same group and
+        // pin, the pin never over the gear, the gear never over the query/⌘F keycap, and none of
+        // them overlap whichever label is longest. The pause orb is part of the same group and
         // shares the orb metrics.
         assert_eq!(pause.size, options.size);
         assert!(search.origin.x + search.size.width < pause.origin.x);
         assert!(pause.origin.x + pause.size.width < options.origin.x);
-        assert!(options.origin.x + options.size.width < detail.origin.x);
-        assert!(detail.origin.x + detail.size.width < pin.origin.x);
+        assert!(options.origin.x + options.size.width < pin.origin.x);
         assert!(pin.origin.x + pin.size.width < close.origin.x);
-        // The four orbs are evenly spaced by the one gap constant, so the row reads as a group.
+        // The three orbs are evenly spaced by the one gap constant, so the row reads as a group.
         assert_eq!(
             options.origin.x - (pause.origin.x + pause.size.width),
             PICKER_CLOSE_BTN_GAP
         );
         assert_eq!(
-            detail.origin.x - (options.origin.x + options.size.width),
-            PICKER_CLOSE_BTN_GAP
-        );
-        assert_eq!(
-            pin.origin.x - (detail.origin.x + detail.size.width),
+            pin.origin.x - (options.origin.x + options.size.width),
             PICKER_CLOSE_BTN_GAP
         );
         assert_eq!(
@@ -2446,7 +2443,7 @@ mod tests {
         );
         // All five stay inside the fixed strip (never over the filters row or the list).
         let strip_bottom = header_strip_h();
-        for frame in [search, pause, options, detail, pin, close] {
+        for frame in [search, pause, options, pin, close] {
             assert!(frame.origin.y + frame.size.height <= strip_bottom);
         }
         // The drag band is the WHOLE top bar: it sits in the top padding the strip already reserves
@@ -4754,7 +4751,7 @@ mod tests {
         // POPOVER_TOP below the panel's top.
         let parent_h = 600.0;
         let frame = filter_popover_frame(parent_h, false);
-        let (_, _, options, _, _, _) = super::picker_header_frames();
+        let (_, _, options, _, _) = super::picker_header_frames();
         assert_eq!(
             frame.origin.x + frame.size.width / 2.0,
             options.origin.x + options.size.width / 2.0
@@ -4920,8 +4917,9 @@ mod tests {
             group_clear: Some(sentinel(2)),
             tile: sentinel(3),
             content: sentinel(4),
-            pin: sentinel(5),
-            del: sentinel(6),
+            detail: sentinel(5),
+            pin: sentinel(6),
+            del: sentinel(7),
         };
         let owned: Vec<usize> = view
             .owned()
@@ -4929,7 +4927,7 @@ mod tests {
             .flatten()
             .map(|ptr| ptr.0 as usize)
             .collect();
-        assert_eq!(owned, vec![1, 2, 3, 4, 5, 6]);
+        assert_eq!(owned, vec![1, 2, 3, 4, 5, 6, 7]);
     }
     #[test]
     fn the_options_popover_rows_match_the_filter_order() {

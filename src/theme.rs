@@ -314,15 +314,6 @@ fn relative_luminance(rgb: [f64; 3]) -> f64 {
         + 0.0722 * linear_channel(rgb[2])
 }
 
-/// Contrast ratio between two colours given as 0..1 components, in whatever space they were
-/// sampled from. The clipboard smoke reads rendered pixels, which are not in sRGB, so it compares
-/// two sampled colours with each other rather than against a token.
-pub(crate) fn contrast_ratio_srgb(a: [f64; 3], b: [f64; 3]) -> f64 {
-    let luminance = |c: [f64; 3]| relative_luminance([c[0] * 255.0, c[1] * 255.0, c[2] * 255.0]);
-    let (x, y) = (luminance(a), luminance(b));
-    (x.max(y) + 0.05) / (x.min(y) + 0.05)
-}
-
 /// WCAG contrast ratio between two already-composited (post-alpha) colors. Shared with the
 /// clipboard smoke runner, which measures legend text against the surface it is drawn on.
 pub(crate) fn contrast_ratio(foreground: [f64; 3], background: [f64; 3]) -> f64 {

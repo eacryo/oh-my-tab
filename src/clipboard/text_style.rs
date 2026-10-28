@@ -252,84 +252,41 @@ pub(super) fn detail_action_is_active(detail_visible: bool, selected: usize, row
     detail_visible && selected != NO_SELECTION && selected == row
 }
 
-/// Draw the mockup's detail icon: a dark outlined circle plus i normally, or a dark filled
-/// circle plus white i while active. Use a precolored NSImage instead of Unicode `ⓘ` so the
-/// ring, dot, and stem follow the mockup independently.
-pub(super) unsafe fn make_detail_action_icon(active: bool, hovered: bool) -> *mut AnyObject {
-    make_detail_action_icon_with(clipboard_palette(), active, hovered)
-}
-
-/// The icon for an explicit palette, so both appearances can be rendered and checked in one run.
-/// The failure this guards is mode-specific (dark mode only), and a test that only renders the
-/// mode it happens to run in would miss it -- exactly how the bug reached the screen.
-pub(super) unsafe fn make_detail_action_icon_for_mode(
-    dark: bool,
-    active: bool,
-    hovered: bool,
-) -> *mut AnyObject {
-    make_detail_action_icon_with(crate::theme::ui_palette_for_mode(dark), active, hovered)
-}
-
-unsafe fn make_detail_action_icon_with(
-    palette: crate::theme::UiPalette,
-    active: bool,
-    hovered: bool,
-) -> *mut AnyObject {
-    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+/// Build the expand toggle's icon: an SF Symbol, so it is drawn by the same symbol engine as the pin
+/// and trash glyphs beside it and therefore shares their optical size, stroke weight and baseline.
+/// The state is carried by the symbol's fill (chevron outline, chevron filled) and by the ink
+/// (secondary, primary on hover, `accent_ink` over the accent chip while open), exactly as the
+/// pin's is.
+///
+/// It used to be a hand-drawn NSBezierPath circle on a 16pt canvas. Measured from a screen capture
+/// of one row, that drew 13 x 13pt of ink against the pin's 10.5 x 13.5 and the trash's 11 x 13, and
+/// its bottom edge sat 1px above theirs: three different icon scales in one row.
+pub(super) unsafe fn detail_symbol_image(symbol: &str) -> *mut AnyObject {
+    let name = make_nsstring(symbol);
     let image: *mut AnyObject = msg_send![
-        image,
-        initWithSize: NSSize::new(DETAIL_ACTION_ICON, DETAIL_ACTION_ICON)
+        class!(NSImage),
+        imageWithSystemSymbolName: name,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
     ];
-    let _: () = msg_send![image, lockFocus];
-    let circle: *mut AnyObject = msg_send![
-        class!(NSBezierPath),
-        bezierPathWithOvalInRect: NSRect::new(
-            // HTML uses a 20 × 20 viewBox with a circle at 10/10 and r=7. On our 16pt
-            // canvas that is center 8 and radius 5.6; do not use the SVG's raw 7pt radius.
-            NSPoint::new(2.4, 2.4),
-            NSSize::new(11.2, 11.2)
-        )
-    ];
-    // Match the pin/delete buttons' theme text colors: secondary normally, primary on hover/active.
-    let icon_color = if active || hovered {
-        palette.primary_text
-    } else {
-        palette.secondary_text
-    };
-    // An active icon is a *filled* chip, so both halves of that pair have to be chosen together:
-    // the accent fill with `accent_ink` on top (design-style §3.1). The fill used to be
-    // `primary_text` while the glyph stayed the light ink -- 13.91:1 in light mode but, because
-    // dark `primary_text` is near-white, 1.09:1 in dark mode, where the icon read as a blank disc.
-    let (circle_role, glyph_role) = if active {
-        (palette.accent, palette.accent_ink)
-    } else {
-        (icon_color, icon_color)
-    };
-    let circle_color = crate::ffi::hex_to_ns_color(circle_role);
-    let _: () = msg_send![circle_color, set];
-    // Slightly strengthen the ring so its optical weight better matches the neighboring system glyphs.
-    let _: () = msg_send![circle, setLineWidth: 1.25f64];
-    if active {
-        let _: () = msg_send![circle, fill];
+    CFRelease(name as *const c_void);
+    if image.is_null() {
+        return image;
     }
-    let _: () = msg_send![circle, stroke];
-    let glyph_color = crate::ffi::hex_to_ns_color(glyph_role);
-    let _: () = msg_send![glyph_color, set];
-    // Coordinates convert the SVG view's flipped axis: the dot is above the stem.
-    let dot: *mut AnyObject = msg_send![
-        class!(NSBezierPath),
-        bezierPathWithOvalInRect: NSRect::new(NSPoint::new(7.2, 10.08), NSSize::new(1.6, 1.6))
+    let config: *mut AnyObject = msg_send![
+        class!(NSImageSymbolConfiguration),
+        configurationWithPointSize: ACTION_GLYPH_SIZE,
+        weight: crate::theme::FONT_WEIGHT_REGULAR
     ];
-    let _: () = msg_send![dot, fill];
-    let stem: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
-    let _: () = msg_send![stem, moveToPoint: NSPoint::new(8.0, 8.56)];
-    let _: () = msg_send![stem, lineToPoint: NSPoint::new(8.0, 4.8)];
-    let _: () = msg_send![stem, setLineWidth: 1.25f64];
-    let _: () = msg_send![stem, setLineCapStyle: 1isize]; // NSLineCapStyleRound
-    let _: () = msg_send![stem, stroke];
-    let _: () = msg_send![image, unlockFocus];
-    let _: () = msg_send![image, setTemplate: false];
-    image
+    let configured: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
+    if configured.is_null() {
+        return image;
+    }
+    let _: () = msg_send![configured, setTemplate: true];
+    // OWN the image: the configuration methods return autoreleased instances, and AppKit keeps them
+    // for as long as the button shows them. Without this, an autorelease-pool drain later released
+    // the image under a live button, and AppKit's key-view walk (a password-autofill heuristic)
+    // then retained the dangling pointer and crashed in NSButtonCell._imageSynthesizedForCheckOrRadio.
+    msg_send![configured, retain]
 }
 
 /// Apply the shared clipboard action-button state to its own rounded hover background.
@@ -447,13 +404,8 @@ pub(super) unsafe fn set_settings_button_style(button: *mut AnyObject, hovered: 
     crate::ui::corner_glyph::set_glyph_button_style(button, clipboard_palette(), hovered);
     if !button.is_null() {
         let action: Sel = msg_send![button, action];
-        if action == sel!(toggleFilterPopover:)
-            || action == sel!(toggleDetailPanel:)
-            || action == sel!(togglePauseRecording:)
-        {
-            let active = if action == sel!(toggleDetailPanel:) {
-                detail_visible()
-            } else if action == sel!(togglePauseRecording:) {
+        if action == sel!(toggleFilterPopover:) || action == sel!(togglePauseRecording:) {
+            let active = if action == sel!(togglePauseRecording:) {
                 // A paused recorder is this orb's "on" state, exactly like an open popover is the
                 // filter orb's: the accent border is what tells the two states apart at a glance.
                 super::collection_paused()
@@ -565,73 +517,54 @@ pub(super) unsafe fn set_detail_action_style(button: *mut AnyObject, active: boo
     if button.is_null() {
         return;
     }
-    let icon = make_detail_action_icon(active, hovered);
-    let empty = make_nsstring("");
-    let _: () = msg_send![button, setTitle: empty];
-    CFRelease(empty as *const c_void);
-    let _: () = msg_send![button, setImage: icon];
-    let _: () = msg_send![button, setImagePosition: 1isize]; // NSImageOnly
-    release_obj(icon);
+    // Follow the pin's recipe (set_pin_button_style): a template SF Symbol sized like the glyphs
+    // beside it, tinted through contentTintColor, with the selected row carrying the filled symbol
+    // over a tinted chip so the state is readable at a glance.
+    //
+    // The glyph is the "open a side pane" mark rather than an info mark or the expand arrows: the
+    // button opens the detail pane on the right, and the arrows read as a resize control at 12pt.
+    let symbol = "sidebar.right";
+    let icon = detail_symbol_image(symbol);
+    if !icon.is_null() {
+        let empty = make_nsstring("");
+        let _: () = msg_send![button, setTitle: empty];
+        CFRelease(empty as *const c_void);
+        let _: () = msg_send![button, setImage: icon];
+        let _: () = msg_send![button, setImagePosition: 1isize]; // NSImageOnly
+        release_obj(icon);
+    }
+    let palette = clipboard_palette();
+    let (tint, role) = if active {
+        (palette.accent_ink, crate::glass::PanelInk::Primary)
+    } else if hovered {
+        (palette.primary_text, crate::glass::PanelInk::Primary)
+    } else {
+        (palette.secondary_text, crate::glass::PanelInk::Secondary)
+    };
+    let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(tint, role)];
     set_action_button_surface(button, hovered);
 }
 
-/// Keep the header detail orb's persistent selected state in sync with its pane.
+/// Keep every materialized row's detail toggle in sync with its pane: the row whose entry the pane
+/// shows carries the selected glyph, every other row the outline. Rows are materialized lazily, so
+/// this walks the live list rather than one remembered button.
 pub(super) fn refresh_detail_action_visuals() {
-    let button = *PICKER_DETAIL_BUTTON.lock().unwrap();
-    if let Some(button) = button {
-        unsafe { set_header_detail_style(button.0, false) };
+    let visible = detail_visible();
+    let selection = picker_selection();
+    let rows: Vec<(usize, *mut AnyObject)> = {
+        let indices = ROW_VIEW_INDICES.lock().unwrap().clone();
+        let views = ROW_HOVER_VIEWS.lock().unwrap();
+        indices
+            .iter()
+            .zip(views.iter())
+            .filter(|(_, view)| !view.detail.0.is_null())
+            .map(|(index, view)| (*index, view.detail.0))
+            .collect()
+    };
+    for (row, button) in rows {
+        let active = detail_action_is_active(visible, selection, row);
+        unsafe { set_detail_action_style(button, active, false) };
     }
-}
-
-unsafe fn set_header_detail_style(button: *mut AnyObject, hovered: bool) {
-    if button.is_null() {
-        return;
-    }
-    let active = super::detail_visible();
-    let _: () = msg_send![button, setState: if active { 1isize } else { 0isize }];
-    let mut image = std::ptr::null_mut::<AnyObject>();
-    for symbol in if active {
-        ["sidebar.right.fill", "sidebar.right"]
-    } else {
-        ["sidebar.right", "sidebar.right"]
-    } {
-        let name = make_nsstring(symbol);
-        image = msg_send![
-            class!(NSImage),
-            imageWithSystemSymbolName: name,
-            accessibilityDescription: std::ptr::null::<AnyObject>()
-        ];
-        CFRelease(name as *const c_void);
-        if !image.is_null() {
-            break;
-        }
-    }
-    if !image.is_null() {
-        let config: *mut AnyObject = msg_send![
-            class!(NSImageSymbolConfiguration),
-            configurationWithPointSize: PICKER_GEAR_GLYPH_SIZE,
-            weight: crate::theme::FONT_WEIGHT_REGULAR
-        ];
-        let configured: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
-        if !configured.is_null() {
-            let _: () = msg_send![configured, setTemplate: true];
-            let _: () = msg_send![button, setImage: configured];
-        }
-    }
-    set_settings_button_style(button, hovered);
-    if active {
-        let palette = clipboard_palette();
-        let _: () = msg_send![button, setContentTintColor: crate::glass::panel_ink(
-            palette.primary_text,
-            crate::glass::PanelInk::Primary
-        )];
-        set_header_orb_surface(button, true, hovered);
-    }
-    // This remains the existing right-arrow toggle, including while detail is open.
-    let label = make_nsstring(&format!("{} (→)", t("clipboard.kbd_detail")));
-    let _: () = msg_send![button, setToolTip: label];
-    let _: () = msg_send![button, setAccessibilityLabel: label];
-    CFRelease(label as *const c_void);
 }
 
 /// A per-row action button (pin/delete): an SF Symbol icon, borderless, its alpha
@@ -797,10 +730,6 @@ extern "C" fn hover_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mu
                 set_clear_confirmation_button_style(b, true);
                 return;
             }
-            if action == sel!(toggleDetailPanel:) {
-                set_header_detail_style(b, true);
-                return;
-            }
             if (action == sel!(openClipboardSettings:) && !is_popover_child(b))
                 || action == sel!(toggleFilterPopover:)
                 || action == sel!(togglePauseRecording:)
@@ -902,10 +831,6 @@ extern "C" fn hover_button_exited(_self: *mut AnyObject, _cmd: Sel, event: *mut 
             let action: Sel = msg_send![b, action];
             if is_clear_history_action_button(b) {
                 set_clear_confirmation_button_style(b, false);
-                return;
-            }
-            if action == sel!(toggleDetailPanel:) {
-                set_header_detail_style(b, false);
                 return;
             }
             if is_popover_child(b) {
@@ -1072,7 +997,7 @@ pub(super) unsafe fn make_action_button(
         if !image.is_null() {
             let config: *mut AnyObject = msg_send![
                 class!(NSImageSymbolConfiguration),
-                configurationWithPointSize: 12.0f64,
+                configurationWithPointSize: ACTION_GLYPH_SIZE,
                 weight: crate::theme::FONT_WEIGHT_REGULAR
             ];
             let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];

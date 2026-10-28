@@ -211,12 +211,6 @@ pub(super) unsafe fn observer() -> *mut AnyObject {
                 popover_filter_selected as *mut c_void,
                 types.as_ptr(),
             );
-            class_addMethod(
-                cls,
-                sel!(toggleDetailPanel:),
-                toggle_detail_panel as *mut c_void,
-                types.as_ptr(),
-            );
             // The detail-text cursor (delivered by the tracking area owned by this
             // observer): enter -> I-beam, exit -> arrow. See detail_tv_cursor_entered.
             class_addMethod(
@@ -2318,18 +2312,6 @@ pub(super) extern "C" fn toggle_filter_popover(
 ) {
     callback_guard::void("toggle_filter_popover", || {
         crate::clipboard::toggle_filter_popover();
-    });
-}
-
-/// The detail-toggle orb: expands the selected entry's detail pane, or closes it when open
-/// (the same semantics the Right-arrow key path uses).
-pub(super) extern "C" fn toggle_detail_panel(_self: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
-    callback_guard::void("toggle_detail_panel", || unsafe {
-        if detail_visible() {
-            hide_detail();
-        } else {
-            show_detail_for_sel();
-        }
     });
 }
 

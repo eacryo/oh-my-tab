@@ -1625,8 +1625,7 @@ pub(super) unsafe fn ensure_picker_window() {
     // The search field (the mockup's .search): 48pt tall, radius 10, a 4.5% black fill
     // with a 1px inner ring; the placeholder is left-aligned. The corner close button shares the
     // row, so the shared geometry gives the field the remaining width.
-    let (search_frame, pause_frame, options_frame, detail_orb_frame, pin_frame, close_frame) =
-        picker_header_frames();
+    let (search_frame, pause_frame, options_frame, pin_frame, close_frame) = picker_header_frames();
     let search_w = search_frame.size.width;
     let search_surface: *mut AnyObject = msg_send![class!(NSView), alloc];
     let search_surface: *mut AnyObject = msg_send![search_surface, initWithFrame: search_frame];
@@ -1838,51 +1837,6 @@ pub(super) unsafe fn ensure_picker_window() {
     release_obj(options_button);
     *PICKER_OPTIONS_ORB.lock().unwrap() = Some(ObjPtr::new(options_button));
     sync_options_orb_dot();
-
-    // The detail-toggle orb (the mock's `#detailToggle`): expands/collapses the selected
-    // entry's detail pane. Same glyph family and orb metrics as its neighbours.
-    let detail_button: *mut AnyObject = msg_send![hover_button_class(), alloc];
-    let detail_button: *mut AnyObject = msg_send![detail_button, initWithFrame: detail_orb_frame];
-    let _: () = msg_send![detail_button, setBordered: false];
-    let _: () = msg_send![detail_button, setWantsLayer: true];
-    let detail_layer: *mut AnyObject = msg_send![detail_button, layer];
-    if !detail_layer.is_null() {
-        let _: () = msg_send![detail_layer, setCornerRadius: PICKER_ORB_SIZE / 2.0];
-    }
-    let detail_symbol = make_nsstring("sidebar.right");
-    let detail_image: *mut AnyObject = msg_send![
-        class!(NSImage),
-        imageWithSystemSymbolName: detail_symbol,
-        accessibilityDescription: std::ptr::null::<AnyObject>()
-    ];
-    CFRelease(detail_symbol as *const c_void);
-    if !detail_image.is_null() {
-        let detail_config: *mut AnyObject = msg_send![
-            class!(NSImageSymbolConfiguration),
-            configurationWithPointSize: PICKER_GEAR_GLYPH_SIZE,
-            weight: crate::theme::FONT_WEIGHT_REGULAR
-        ];
-        let detail_image: *mut AnyObject =
-            msg_send![detail_image, imageWithSymbolConfiguration: detail_config];
-        let _: () = msg_send![detail_image, setTemplate: true];
-        let _: () = msg_send![detail_button, setImage: detail_image];
-    }
-    let detail_title = make_nsstring("");
-    let _: () = msg_send![detail_button, setTitle: detail_title];
-    CFRelease(detail_title as *const c_void);
-    let _: () = msg_send![detail_button, setTarget: observer()];
-    let _: () = msg_send![detail_button, setAction: sel!(toggleDetailPanel:)];
-    set_settings_button_style(detail_button, false);
-    add_hover_tracking(detail_button);
-    let detail_label = make_nsstring(&t("clipboard.detail_toggle"));
-    let _: () = msg_send![detail_button, setAccessibilityLabel: detail_label];
-    CFRelease(detail_label as *const c_void);
-    let detail_tooltip = make_nsstring(&t("clipboard.detail_toggle"));
-    let _: () = msg_send![detail_button, setToolTip: detail_tooltip];
-    CFRelease(detail_tooltip as *const c_void);
-    let _: () = msg_send![header_strip, addSubview: detail_button];
-    release_obj(detail_button);
-    *PICKER_DETAIL_BUTTON.lock().unwrap() = Some(ObjPtr::new(detail_button));
 
     // The pin button, left of the gear: the corner row's third glyph. It toggles the WHOLE-panel
     // pin (a different thing from the per-row ☆), which is why it lives with the panel-level
@@ -2218,10 +2172,11 @@ unsafe fn create_row_views(
     let _: () = msg_send![container, addSubview: content_btn];
     release_obj(content_btn);
 
-    // Action buttons (pin ☆/★ · delete ⌫): ALWAYS visible on PINNED entries; on unpinned
-    // entries they appear only when the row is hovered or selected (the mock's
-    // `.row-actions` opacity 0.62->1). Vertically centred on the single-line row; they
-    // never paste. The ⓘ details button is gone: the detail orb in the header owns that.
+    // Action buttons (detail ▤ · pin ☆/★ · delete ⌫), trailing edge right-to-left: ALWAYS visible
+    // on PINNED entries; on unpinned entries they appear only when the row is hovered or selected
+    // (the mock's `.row-actions` opacity 0.62->1). Vertically centred on the single-line row; they
+    // never paste. The detail toggle sits left of the pin: it is a per-row control, so each row
+    // opens its own detail rather than the header acting on whichever row is selected.
     let act_alpha = if entry.pinned || selected || hovered {
         1.0
     } else {
@@ -2230,6 +2185,27 @@ unsafe fn create_row_views(
     let act_y = content_y + (row_h - ACTION_H) / 2.0;
     let x_del = picker_list_width() - PAD_X - ROW_PAD_R - ACTION_BTN;
     let x_pin = x_del - ACTION_GAP - ACTION_BTN;
+    let x_detail = x_pin - ACTION_GAP - ACTION_BTN;
+    let detail_active = detail_action_is_active(detail_visible(), picker_selection(), i);
+    let detail_btn = make_action_button(
+        "",
+        sel!(showItemDetails:),
+        i as isize,
+        x_detail,
+        act_y,
+        act_alpha,
+    );
+    if !detail_btn.is_null() {
+        set_detail_action_style(detail_btn, detail_active, false);
+        let label = make_nsstring(&t("clipboard.expand_toggle"));
+        let _: () = msg_send![detail_btn, setAccessibilityLabel: label];
+        CFRelease(label as *const c_void);
+        let tip = make_nsstring(&t("clipboard.expand_toggle"));
+        let _: () = msg_send![detail_btn, setToolTip: tip];
+        CFRelease(tip as *const c_void);
+        let _: () = msg_send![container, addSubview: detail_btn];
+        release_obj(detail_btn);
+    }
     let pin_sym = if entry.pinned { "★" } else { "☆" };
     let pin_btn = make_action_button(
         pin_sym,
@@ -2254,6 +2230,7 @@ unsafe fn create_row_views(
         group_clear: row_group_clear,
         tile: ObjPtr::new(tile),
         content: ObjPtr::new(content_btn),
+        detail: ObjPtr::new(detail_btn),
         pin: ObjPtr::new(pin_btn),
         del: ObjPtr::new(del_btn),
     }
@@ -3041,7 +3018,12 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
         let act_y = content_y + (row_h - ACTION_H) / 2.0;
         let x_del = picker_list_width() - PAD_X - ROW_PAD_R - ACTION_BTN;
         let x_pin = x_del - ACTION_GAP - ACTION_BTN;
-        for (button, x) in [(view.pin, x_pin), (view.del, x_del)] {
+        let x_detail = x_pin - ACTION_GAP - ACTION_BTN;
+        for (button, x) in [
+            (view.detail, x_detail),
+            (view.pin, x_pin),
+            (view.del, x_del),
+        ] {
             if !button.0.is_null() {
                 let _: () = msg_send![button.0, setFrame: NSRect::new(
                     NSPoint::new(x, act_y),
@@ -3058,7 +3040,7 @@ unsafe fn try_delete_picker_row_incremental(idx: usize) -> bool {
         crate::ffi::layer_set_background(tile_layer, crate::ffi::hex_to_cg_color(background));
         if !entry.pinned {
             let alpha = if selected || hovered { 1.0 } else { 0.62 };
-            for button in [view.pin, view.del] {
+            for button in [view.detail, view.pin, view.del] {
                 if !button.0.is_null() {
                     let _: () = msg_send![button.0, setAlphaValue: alpha];
                 }
@@ -3486,10 +3468,15 @@ pub(super) extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut 
         if selection_after_pin(new_h_idx) {
             unsafe { rebuild_rows() };
         }
-        // Pinning changes the row position; reposition and refresh the detail panel from the
-        // current selection so it follows the reordered row.
+        // Pinning changes the row position, and with "keep selection" the selection may stay on
+        // another entry; the row's own detail toggle is what the user pressed, so an open detail
+        // follows THAT entry to its new display position instead of the selection.
         if detail_visible() {
-            unsafe { show_detail_for_sel() };
+            let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+            if let Some(pos) = filtered.iter().position(|&h| h == new_h_idx) {
+                set_picker_selection(pos);
+                unsafe { show_detail_for_sel() };
+            }
         }
         let msg = if now_pinned {
             t("clipboard.toast_pinned")
@@ -4285,7 +4272,7 @@ pub(super) fn filter_popover_frame_for(
     panel_width: f64,
 ) -> NSRect {
     let h = filter_popover_height(parent_h);
-    let (_, _, options, _, _, _) = picker_header_frames_for(panel_width);
+    let (_, _, options, _, _) = picker_header_frames_for(panel_width);
     let max_x = (panel_width - POPOVER_RIGHT_INSET - POPOVER_W).max(0.0);
     let x = (options.origin.x + options.size.width / 2.0 - POPOVER_W / 2.0)
         .clamp(POPOVER_RIGHT_INSET.min(max_x), max_x);

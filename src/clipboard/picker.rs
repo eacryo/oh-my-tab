@@ -55,13 +55,12 @@ pub(super) fn picker_list_width() -> f64 {
 
 /// Reflow chrome from the live panel geometry; row layout uses its own list width.
 unsafe fn layout_picker_chrome(size: NSSize) {
-    let (search, pause, options, detail, pin, close) = picker_header_frames_for(size.width);
+    let (search, pause, options, pin, close) = picker_header_frames_for(size.width);
     for (view, frame) in [
         (*SEARCH_FIELD_SURFACE.lock().unwrap(), search),
         (*SEARCH_FIELD.lock().unwrap(), search),
         (*PICKER_PAUSE_BUTTON.lock().unwrap(), pause),
         (*PICKER_OPTIONS_ORB.lock().unwrap(), options),
-        (*PICKER_DETAIL_BUTTON.lock().unwrap(), detail),
         (*PICKER_PIN_BUTTON.lock().unwrap(), pin),
         (*PICKER_CLOSE_BUTTON.lock().unwrap(), close),
     ] {

@@ -40,9 +40,10 @@ pub(super) fn content_width() -> f64 {
     PICKER_W - PAD_X * 2.0 - ROW_PAD_L - ROW_PAD_R
 }
 
-/// Row title width after reserving the non-overlapping pin/delete hit targets on its trailing edge.
+/// Row title width after reserving the non-overlapping detail/pin/delete hit targets on its
+/// trailing edge.
 pub(super) fn row_content_width(row_w: f64) -> f64 {
-    (row_w - ROW_PAD_L - ROW_PAD_R - ACTION_BTN * 2.0 - ACTION_GAP - 4.0).max(1.0)
+    (row_w - ROW_PAD_L - ROW_PAD_R - ACTION_BTN * 3.0 - ACTION_GAP * 2.0 - 4.0).max(1.0)
 }
 
 /// Whether the source app is shown (reads CONFIG; recording is always on, the toggle gates
@@ -409,18 +410,17 @@ pub(super) fn header_strip_h() -> f64 {
     TOP_PAD_Y + SEARCH_H + SEARCH_GAP_Y
 }
 
-/// The search field and the five header controls side by side in the header strip (flipped
-/// coordinates, measured from the strip's top-left): right-to-left close, pin, detail-toggle,
-/// the options orb and the pause-recording orb.
+/// The search field and the four header controls side by side in the header strip (flipped
+/// coordinates, measured from the strip's top-left): right-to-left close, pin, the options orb and
+/// the pause-recording orb. The detail-toggle is not here: it belongs to each row, left of that
+/// row's pin button.
 /// One source of truth so no two can ever overlap: the field gives up every button's size plus
-/// every gap on the right. Returns `(search, pause, options, detail, pin, close)`.
-pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect, NSRect, NSRect, NSRect) {
+/// every gap on the right. Returns `(search, pause, options, pin, close)`.
+pub(super) fn picker_header_frames() -> (NSRect, NSRect, NSRect, NSRect, NSRect) {
     picker_header_frames_for(PICKER_W)
 }
 
-pub(super) fn picker_header_frames_for(
-    width: f64,
-) -> (NSRect, NSRect, NSRect, NSRect, NSRect, NSRect) {
+pub(super) fn picker_header_frames_for(width: f64) -> (NSRect, NSRect, NSRect, NSRect, NSRect) {
     let close = NSRect::new(
         NSPoint::new(
             width - SEARCH_PAD_X - PICKER_CLOSE_BTN_SIZE,
@@ -435,19 +435,12 @@ pub(super) fn picker_header_frames_for(
         ),
         NSSize::new(PICKER_ORB_SIZE, PICKER_ORB_SIZE),
     );
-    let detail = NSRect::new(
+    let options = NSRect::new(
         NSPoint::new(
             pin.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_ORB_SIZE,
             pin.origin.y,
         ),
         pin.size,
-    );
-    let options = NSRect::new(
-        NSPoint::new(
-            detail.origin.x - PICKER_CLOSE_BTN_GAP - PICKER_ORB_SIZE,
-            detail.origin.y,
-        ),
-        detail.size,
     );
     // The pause-recording orb sits leftmost of the group: it is the only control there that
     // changes what the panel DOES (recording on/off) rather than how it displays or closes.
@@ -458,20 +451,20 @@ pub(super) fn picker_header_frames_for(
         ),
         options.size,
     );
-    // Five controls and five gaps are reserved on the right, so the pause orb can never be drawn
+    // Four controls and four gaps are reserved on the right, so the pause orb can never be drawn
     // over the query/⌘F keycap however long the widest locale's hint is.
     let search = NSRect::new(
         NSPoint::new(SEARCH_PAD_X, TOP_PAD_Y),
         NSSize::new(
             width
                 - SEARCH_PAD_X * 2.0
-                - (PICKER_ORB_SIZE + PICKER_CLOSE_BTN_GAP) * 4.0
+                - (PICKER_ORB_SIZE + PICKER_CLOSE_BTN_GAP) * 3.0
                 - PICKER_CLOSE_BTN_SIZE
                 - PICKER_CLOSE_BTN_GAP,
             SEARCH_H,
         ),
     );
-    (search, pause, options, detail, pin, close)
+    (search, pause, options, pin, close)
 }
 
 /// The options orb's "filter active" dot, in the orb's own coordinates (origin top-left).

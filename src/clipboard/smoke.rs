@@ -446,15 +446,30 @@ pub(crate) fn smoke_runner() -> bool {
         unsafe { detail::smoke_row_backdrop_paint_paths() },
         "selected+hovered row backdrops must match in the build and runtime repaint paths"
     );
-    // An active detail icon is a filled chip, so its glyph has to be readable *against its own
-    // fill*. Measured on the pixels rather than on the tokens, because the failure was a wrong
-    // role: the fill was `primary_text` while the glyph stayed `accent_ink`, which is 13.91:1 in
-    // light mode but 1.09:1 in dark mode, where the icon became a blank white disc.
+    // The row's three action glyphs (detail / pin / trash) are ONE icon family: all SF Symbols at
+    // the shared ACTION_GLYPH_SIZE, with the detail toggle carrying the same filled/outline state
+    // pair the pin uses. The detail toggle used to be a hand-drawn circle on its own 16pt canvas,
+    // which measured 13 x 13pt against the pin's 10.5 x 13.5 and sat 1px above their baseline.
     unsafe {
-        assert!(
-            active_detail_icon_glyph_is_legible_on_its_fill(),
-            "an active detail icon must draw its glyph on its own fill"
-        );
+        for (symbol, what) in [
+            ("sidebar.right", "detail pane"),
+            ("pin", "pin outline"),
+            ("pin.fill", "pin filled"),
+            ("trash", "trash"),
+        ] {
+            let image = super::text_style::detail_symbol_image(symbol);
+            assert!(
+                !image.is_null(),
+                "the {what} row glyph ({symbol}) must resolve as an SF Symbol"
+            );
+            let symbol_size: NSSize = msg_send![image, size];
+            // Balanced by that helper's documented +1 retain for the button that shows it.
+            let _: *mut AnyObject = msg_send![image, release];
+            assert!(
+                symbol_size.width > 0.0 && symbol_size.height > 0.0,
+                "the {what} row glyph ({symbol}) must have a drawn size; got {symbol_size:?}"
+            );
+        }
     }
 
     /// The clear-action label model must follow the current filter, query, setting, and locale.
@@ -1028,7 +1043,7 @@ pub(crate) fn smoke_runner() -> bool {
         let header = (*super::PICKER_HEADER_STRIP.lock().unwrap())
             .expect("the picker header strip must be built")
             .0;
-        let (search, pause, options, detail, pin, close) = super::picker_header_frames();
+        let (search, pause, options, pin, close) = super::picker_header_frames();
         let band = super::picker_drag_band_frame();
 
         let subviews: *mut AnyObject = msg_send![header, subviews];
@@ -1047,8 +1062,6 @@ pub(crate) fn smoke_runner() -> bool {
             if action == sel!(toggleFilterPopover:) {
                 found_settings = view;
                 orbs.push(("options", view));
-            } else if action == sel!(toggleDetailPanel:) {
-                orbs.push(("detail", view));
             } else if action == sel!(togglePanelPin:) {
                 orbs.push(("pin", view));
             } else if action == sel!(togglePauseRecording:) {
@@ -1059,12 +1072,29 @@ pub(crate) fn smoke_runner() -> bool {
         }
         // The recording control is one of the corner orbs, not a bare glyph: it must carry the same
         // 1pt orb border they do. A missing border is exactly the defect this family check exists
-        // for -- the pause orb shipped without one and read as a different kind of control.
+        // for -- the pause orb shipped without one and read as a different kind of control. The
+        // detail toggle is no longer a header orb: it belongs to each row, left of that row's pin.
         assert_eq!(
             orbs.len(),
-            4,
-            "the header must carry the four orbs (options, detail, pin, pause); got {:?}",
+            3,
+            "the header must carry the three orbs (options, pin, pause); got {:?}",
             orbs.iter().map(|(name, _)| *name).collect::<Vec<_>>()
+        );
+        let mut detail_orbs = 0usize;
+        for index in 0..count {
+            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+            if !is_button {
+                continue;
+            }
+            let action: Sel = msg_send![view, action];
+            if action == sel!(toggleDetailPanel:) {
+                detail_orbs += 1;
+            }
+        }
+        assert_eq!(
+            detail_orbs, 0,
+            "the header strip must no longer carry a detail toggle; each row owns one"
         );
         let mut border_widths: Vec<(&str, f64)> = Vec::new();
         for (name, button) in &orbs {
@@ -1263,8 +1293,7 @@ pub(crate) fn smoke_runner() -> bool {
         // their width, and the frames are the ones the geometry names.
         assert!(search.origin.x + search.size.width <= pause.origin.x);
         assert!(pause.origin.x + pause.size.width <= options.origin.x);
-        assert!(options.origin.x + options.size.width <= detail.origin.x);
-        assert!(detail.origin.x + detail.size.width <= pin.origin.x);
+        assert!(options.origin.x + options.size.width <= pin.origin.x);
         assert!(pin.origin.x + pin.size.width <= close.origin.x);
         let options_hidden: bool = msg_send![found_settings, isHidden];
         assert!(!options_hidden, "the options orb must be visible");
@@ -2718,129 +2747,4 @@ unsafe fn make_key_event_with_modifiers(keycode: u16, modifiers: u64) -> *mut An
     ];
     CFRelease(chars as *const c_void);
     ev
-}
-
-/// Rasterise an active detail icon and verify its two halves: the chip is filled with the accent
-/// and its glyph is drawn in `accent_ink` over it. Reading the pixels catches a mismatched role
-/// (a fill the glyph cannot be seen against), which a token-level check cannot express.
-unsafe fn active_detail_icon_glyph_is_legible_on_its_fill() -> bool {
-    // Both appearances, not just the one this process resolves to: the defect was dark-only.
-    let mut ok = true;
-    for dark in [false, true] {
-        if !active_detail_icon_glyph_is_legible_for_mode(dark) {
-            ok = false;
-        }
-    }
-    ok
-}
-
-/// Render an active detail icon and require its glyph to be legible *against its own fill*.
-///
-/// Measured from the pixels because the defect was a wrong role: the chip was filled with
-/// `primary_text` while the glyph stayed `accent_ink`. In light mode that is a dark chip with a
-/// white glyph (13.91:1, fine), but dark `primary_text` is near-white, so the glyph measured
-/// 1.09:1 and the icon showed as a blank disc. A token-level check cannot express "these two
-/// roles are readable together"; the dominant colour is the fill, and the glyph is whatever
-/// other colour the drawing put on top of it.
-unsafe fn active_detail_icon_glyph_is_legible_for_mode(dark: bool) -> bool {
-    // The floor for a non-text indicator (design-style §3.3).
-    const MIN_GLYPH_CONTRAST: f64 = 3.0;
-    let image = super::text_style::make_detail_action_icon_for_mode(dark, true, false);
-    if image.is_null() {
-        return false;
-    }
-    let tiff: *mut AnyObject = msg_send![image, TIFFRepresentation];
-    if tiff.is_null() {
-        release_obj(image);
-        return false;
-    }
-    let rep: *mut AnyObject = msg_send![class!(NSBitmapImageRep), alloc];
-    let rep: *mut AnyObject = msg_send![rep, initWithData: tiff];
-    if rep.is_null() {
-        release_obj(image);
-        return false;
-    }
-    // `pixelsWide`/`pixelsHigh` live on NSBitmapImageRep, not on every NSImageRep: a receiver
-    // that is not one (NSImage can answer with a private geometry proxy) traps on the send, so
-    // the class is checked before the pixels are asked for.
-    let is_bitmap: bool = msg_send![rep, isKindOfClass: class!(NSBitmapImageRep)];
-    if !is_bitmap {
-        release_obj(rep);
-        release_obj(image);
-        return false;
-    }
-    let width: usize = msg_send![rep, pixelsWide];
-    let height: usize = msg_send![rep, pixelsHigh];
-    if width == 0 || height == 0 {
-        release_obj(rep);
-        release_obj(image);
-        return false;
-    }
-    let mut histogram: Vec<([f64; 3], usize)> = Vec::new();
-    for y in 0..height {
-        for x in 0..width {
-            let color: *mut AnyObject = msg_send![rep, colorAtX: x, y: y];
-            if color.is_null() {
-                continue;
-            }
-            let alpha: f64 = msg_send![color, alphaComponent];
-            if alpha < 0.9 {
-                continue;
-            }
-            let rgb: [f64; 3] = [
-                msg_send![color, redComponent],
-                msg_send![color, greenComponent],
-                msg_send![color, blueComponent],
-            ];
-            let mut bucket: Option<usize> = None;
-            for (index, (existing, _)) in histogram.iter().enumerate() {
-                if (0..3usize).all(|channel| (existing[channel] - rgb[channel]).abs() < 0.04) {
-                    bucket = Some(index);
-                    break;
-                }
-            }
-            match bucket {
-                Some(index) => histogram[index].1 += 1,
-                None => histogram.push((rgb, 1)),
-            }
-        }
-    }
-    release_obj(rep);
-    release_obj(image);
-    let Some((fill, fill_count)) = histogram.iter().max_by_key(|(_, count)| *count).cloned() else {
-        return false;
-    };
-    if fill_count < 20 {
-        eprintln!(
-            "[smoke-clipboard] active detail icon has no filled chip in {} mode",
-            if dark { "dark" } else { "light" }
-        );
-        return false;
-    }
-    // The glyph is the most prominent *other* colour: a solid disc with no visible glyph fails.
-    let glyph = histogram
-        .iter()
-        .filter(|(rgb, count)| *count >= 4 && (0..3usize).any(|c| (rgb[c] - fill[c]).abs() > 0.04))
-        .max_by(|(a, _), (b, _)| {
-            let ca = crate::theme::contrast_ratio_srgb(*a, fill);
-            let cb = crate::theme::contrast_ratio_srgb(*b, fill);
-            ca.partial_cmp(&cb).unwrap_or(std::cmp::Ordering::Equal)
-        })
-        .cloned();
-    let Some((glyph, _)) = glyph else {
-        eprintln!(
-            "[smoke-clipboard] active detail icon is a blank disc in {} mode",
-            if dark { "dark" } else { "light" }
-        );
-        return false;
-    };
-    let contrast = crate::theme::contrast_ratio_srgb(glyph, fill);
-    if contrast < MIN_GLYPH_CONTRAST {
-        eprintln!(
-            "[smoke-clipboard] active detail icon glyph measures {contrast:.2}:1 on its own fill in {} mode (min {MIN_GLYPH_CONTRAST})",
-            if dark { "dark" } else { "light" }
-        );
-        return false;
-    }
-    true
 }
