@@ -2212,6 +2212,42 @@ pub(super) unsafe fn build_clipboard_page(
         ),
     );
     bind_control(target, ui.clipboard_pin_follow);
+    // Where the picker opens ON the screen it opens on. The screen itself is not a choice -- it is the
+    // one the pointer is on -- so both items describe placement within that screen; the row sits next
+    // to the pin-selection popup because both answer "where does something appear".
+    let placement_labels = [
+        t("settings.picker_placement_cursor"),
+        t("settings.picker_placement_center"),
+    ];
+    let placement_label_refs: Vec<&str> = placement_labels.iter().map(|s| s.as_str()).collect();
+    let placement_metrics = SettingsSelect::metrics();
+    ui.clipboard_picker_placement_row_height = placement_metrics.row_h;
+    let cy = canvas.next_row(placement_metrics.row_h);
+    SettingsRow::separator_above_row(clipboard_view, cy, placement_metrics.row_h, content_w);
+    record_settings_search_row(
+        SettingsPageId::Clipboard,
+        canvas.last_row(),
+        &t("settings.row_clipboard_picker_placement"),
+        None,
+    );
+    record_settings_search_options(&placement_label_refs);
+    ui.clipboard_picker_placement = SettingsRow::plain(
+        clipboard_view,
+        label_x,
+        cy,
+        220.0,
+        placement_metrics.row_h,
+        &t("settings.row_clipboard_picker_placement"),
+        SettingsControl::popup(
+            ctrl_x,
+            cy + (placement_metrics.row_h - placement_metrics.control_h) / 2.0,
+            ctrl_w,
+            placement_metrics.control_h,
+            &placement_label_refs,
+            0,
+        ),
+    );
+    bind_control(target, ui.clipboard_picker_placement);
     let cy = canvas.next_row(described_row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
     // Persist switch (saved to disk, survives restarts; plaintext on disk -- the

@@ -49,6 +49,10 @@ struct ChangeFlags {
     // The "separate clear all" switch: the picker header shows or hides its second button live.
     clipboard_clear_actions: bool,
     clipboard_image_rows: bool,
+    // Where the picker opens on its screen ("cursor" / "center"). A standing panel keeps where it was
+    // summoned -- the rule the pointer-relative placement has always followed -- so this only has to
+    // reach an open Settings page; the next summon reads it.
+    clipboard_picker_placement: bool,
     // The binding list or either group switch changed: the engine republishes its table and starts
     // or stops the tap. The two legacy switches (which used to own a tap each) are covered by this
     // one flag: one engine now serves both groups.
@@ -86,6 +90,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.status_bar_size
         || flags.clipboard_image_rows
         || flags.clipboard_paused
+        || flags.clipboard_picker_placement
         || flags.keystroke_display
         || flags.mouse
         || flags.key_bindings
@@ -150,6 +155,8 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         clipboard_clear_actions: startup
             || old.clipboard.separate_clear_all != new.clipboard.separate_clear_all,
         clipboard_image_rows: startup || old.clipboard.image_rows != new.clipboard.image_rows,
+        clipboard_picker_placement: startup
+            || old.clipboard.picker_placement != new.clipboard.picker_placement,
         key_bindings: startup || old.key_bindings != new.key_bindings,
         keystroke_display: startup || old.keystroke_display != new.keystroke_display,
         updates: startup

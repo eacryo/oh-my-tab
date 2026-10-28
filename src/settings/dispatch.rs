@@ -68,6 +68,7 @@ pub(super) enum ControlField {
     ClipboardAutoExpireDays,
     ClipboardImageRows,
     ClipboardPinFollow,
+    ClipboardPickerPlacement,
     // The Key Bindings page's two group switches. The per-binding rows are dynamic and dispatch
     // through their own sender-pointer lookups (`handleBindingToggle:`/`handleBindingDelete:`), not
     // through this static control table.
@@ -236,6 +237,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
             })
             .or_else(|| m(u.clipboard_image_rows, ControlField::ClipboardImageRows))
             .or_else(|| m(u.clipboard_pin_follow, ControlField::ClipboardPinFollow))
+            .or_else(|| {
+                m(
+                    u.clipboard_picker_placement,
+                    ControlField::ClipboardPickerPlacement,
+                )
+            })
             .or_else(|| m(u.key_bindings_enabled, ControlField::KeyBindingsEnabled))
             .or_else(|| m(u.update_auto_check, ControlField::UpdateAutoCheck))
             .or_else(|| m(u.update_auto_download, ControlField::UpdateAutoDownload))
@@ -621,6 +628,32 @@ unsafe fn refresh_dependent_control_visibility(field: ControlField) {
     });
 }
 
+/// The two `clipboard.picker_placement` values, in popup order.
+const PICKER_PLACEMENT_VALUES: [&str; 2] = ["cursor", "center"];
+
+/// Pure: the popup index a stored placement selects.
+///
+/// An unrecognised stored value (a hand-edited file `validate` would fall back on) shows the field's
+/// own default, so the popup is never blank and never claims a mode the picker is not using.
+pub(super) fn picker_placement_index(value: &str) -> isize {
+    PICKER_PLACEMENT_VALUES
+        .iter()
+        .position(|candidate| *candidate == value)
+        .map_or_else(
+            || picker_placement_index(&crate::config::ClipboardSection::default().picker_placement),
+            |index| index as isize,
+        )
+}
+
+/// Pure: the placement a popup index stores. Out of range falls back to the default, which is what
+/// the control shows then, so saving what is shown cannot invent a mode.
+fn picker_placement_for_popup_index(index: isize) -> &'static str {
+    PICKER_PLACEMENT_VALUES
+        .get(index as usize)
+        .copied()
+        .unwrap_or(PICKER_PLACEMENT_VALUES[0])
+}
+
 /// Read the control value into the in-memory CONFIG, schedule the debounced persist, and run
 /// the field's immediate side effects.
 fn apply_control_field(field: ControlField) {
@@ -915,6 +948,11 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ClipboardPinFollow => {
                     let idx: isize = msg_send![u.clipboard_pin_follow, indexOfSelectedItem];
                     cfg.clipboard.pin_follow_selection = idx != 1;
+                }
+                ControlField::ClipboardPickerPlacement => {
+                    let idx: isize = msg_send![u.clipboard_picker_placement, indexOfSelectedItem];
+                    cfg.clipboard.picker_placement =
+                        picker_placement_for_popup_index(idx).to_string();
                 }
                 ControlField::KeyBindingsEnabled => {
                     let state: isize = msg_send![u.key_bindings_enabled, state];
@@ -1609,6 +1647,7 @@ pub(super) unsafe fn update_clipboard_controls_enabled(ui: &SettingsUi) {
         ui.clipboard_paused,
         ui.clipboard_shortcut,
         ui.clipboard_pin_follow,
+        ui.clipboard_picker_placement,
         ui.clipboard_clear_on_quit,
         ui.clipboard_separate_clear_all,
         ui.clipboard_show_source_app,
@@ -2017,6 +2056,17 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             let image_rows = (cfg.clipboard.image_rows as i64).clamp(1, 3);
             let _: () = msg_send![u.clipboard_image_rows, setIntegerValue: image_rows];
             set_field(u.clipboard_image_rows_value_label, image_rows);
+            // The pushback: selection after pinning, and where the picker opens on its screen, both
+            // follow an external edit or a defaults restore like every other control -- the next
+            // summon already uses the new value, and the open page must not claim otherwise.
+            let pin_follow_idx: isize = if cfg.clipboard.pin_follow_selection {
+                0
+            } else {
+                1
+            };
+            let _: () = msg_send![u.clipboard_pin_follow, selectItemAtIndex: pin_follow_idx];
+            let placement_idx = picker_placement_index(&cfg.clipboard.picker_placement);
+            let _: () = msg_send![u.clipboard_picker_placement, selectItemAtIndex: placement_idx];
             // The finder menu page follows a reload or a defaults restore like every other page:
             // switches, layout popup, status line and the master-switch freeze.
             fill_finder_menu_controls(u, &cfg);

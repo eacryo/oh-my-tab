@@ -20,7 +20,7 @@
 //!
 //! Scope of the moved position: **one showing**. The anchor lives in `SESSION_ORIGIN`, is cleared
 //! by `on_picker_hidden`, and is never written to the configuration, so the next summon puts the
-//! panel back where `clipboard.picker_position` asks for it.
+//! panel back where a fresh summon puts it -- next to the cursor, on the cursor's display.
 
 use super::*;
 use crate::callback_guard;
@@ -60,8 +60,8 @@ enum DragCursor {
 }
 
 /// The picker's top-left for the current showing, as if no detail panel were open: the anchor a
-/// drag moves, and the origin the detail group layout derives from. `None` means "wherever
-/// `clipboard.picker_position` put it".
+/// drag moves, and the origin the detail group layout derives from. `None` means "wherever a
+/// fresh summon put it" -- next to the cursor, on the cursor's display.
 static SESSION_ORIGIN: Mutex<Option<NSPoint>> = Mutex::new(None);
 static DRAG: Mutex<Option<PanelDrag>> = Mutex::new(None);
 static CURSOR: Mutex<DragCursor> = Mutex::new(DragCursor::None);

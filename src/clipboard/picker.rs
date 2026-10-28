@@ -147,16 +147,6 @@ pub(super) const PICKER_CURSOR_OFF: f64 = 16.0;
 /// minimum margin from the screen edge.
 pub(super) const PICKER_EDGE_MARGIN: f64 = 8.0;
 
-/// Pure: the screen frame containing the cursor (None when no screen contains it).
-pub(super) fn screen_containing(cursor: NSPoint, frames: &[NSRect]) -> Option<NSRect> {
-    frames.iter().copied().find(|f| {
-        f.origin.x <= cursor.x
-            && cursor.x < f.origin.x + f.size.width
-            && f.origin.y <= cursor.y
-            && cursor.y < f.origin.y + f.size.height
-    })
-}
-
 /// Pure: compute the picker frame -- offset to the cursor's bottom-right; flip to the
 /// left/top when the right/bottom side lacks room; clamp to the screen edge otherwise.
 /// Never placed outside the screen.
@@ -275,6 +265,46 @@ pub(super) fn detail_group_frames(
     (picker_frame, detail_frame)
 }
 
+/// One display as the configured-position derivation sees it: the FULL frame, which is what decides
+/// whether the pointer is on it, and the visible frame, which is what the panel is then placed in.
+///
+/// The two cannot be collapsed: a display's menu bar and Dock are carved out of the visible frame, so a
+/// pointer sitting on a secondary display's menu bar is inside the full frame and outside the visible one.
+/// Deciding membership from the visible frame therefore reported "no screen contains the cursor" and fell
+/// back to the primary display -- the picker appearing on the wrong display whenever the pointer was on
+/// another display's menu bar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct DisplayArea {
+    pub frame: NSRect,
+    pub visible: NSRect,
+}
+
+/// Pure: the VISIBLE frame of the display the pointer is on -- where the picker opens.
+///
+/// The display is decided by the FULL frame, and only the placement uses the visible one. Deciding
+/// membership from the visible frame instead was a real defect: a display's menu bar and Dock are carved
+/// out of its visible area, so a pointer resting there is inside the display and outside its visible
+/// frame, and the picker fell back to the primary display.
+///
+/// A pointer on no display at all (a stale `mouseLocation` during a display reconfiguration) falls back to
+/// the primary display rather than leaving the panel wherever it was.
+pub(super) fn picker_host_screen(
+    cursor: NSPoint,
+    displays: &[DisplayArea],
+    primary: NSRect,
+) -> NSRect {
+    displays
+        .iter()
+        .find(|display| {
+            display.frame.origin.x <= cursor.x
+                && cursor.x < display.frame.origin.x + display.frame.size.width
+                && display.frame.origin.y <= cursor.y
+                && cursor.y < display.frame.origin.y + display.frame.size.height
+        })
+        .map(|display| display.visible)
+        .unwrap_or(primary)
+}
+
 /// The frame of the picker's screen (follows it across screens; falls back to the main
 /// screen when unavailable).
 pub(super) unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
@@ -287,72 +317,111 @@ pub(super) unsafe fn picker_screen_frame(picker_win: *mut AnyObject) -> NSRect {
     }
 }
 
-/// Where `clipboard.picker_position` puts the picker: `(centered on the main screen, the cursor,
-/// the target screen's visible frame)`. One derivation shared by the summon and by the blank-area
-/// double-click's reset, so the two can never disagree about "the configured position".
-pub(super) fn configured_picker_area() -> (bool, NSPoint, NSRect) {
+/// Every display's full and visible frame, primary first (`NSScreen.screens` order). Read by the
+/// picker's own derivation and by the A1 smoke, so the runner asserts against the same desk the
+/// summon saw rather than re-enumerating the displays itself.
+pub(super) unsafe fn display_areas() -> Vec<DisplayArea> {
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    let count: usize = msg_send![screens, count];
+    let mut displays: Vec<DisplayArea> = Vec::with_capacity(count);
+    for i in 0..count {
+        // objectAtIndex: expects 'q' (signed long); pass isize.
+        let screen: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
+        displays.push(DisplayArea {
+            frame: msg_send![screen, frame],
+            visible: msg_send![screen, visibleFrame],
+        });
+    }
+    displays
+}
+
+/// Whether `clipboard.picker_placement` asks for the pointer ("cursor") or the screen's middle
+/// ("center"). Any other value can only come from a hand-edited file (`validate` rejects it) and falls
+/// back to the default, so a bad value cannot leave the panel unplaced.
+pub(super) fn picker_placement_centers() -> bool {
+    CONFIG.read().unwrap().clipboard.picker_placement == "center"
+}
+
+/// Where the picker opens: `(the cursor, the visible frame of the display the cursor is on)`.
+///
+/// The SCREEN is not configurable: the display the pointer is on is the display the user is working on,
+/// so it is derived. This returns that screen plus the pointer, and `configured_picker_frame` decides
+/// where on it the panel goes (`clipboard.picker_placement`). One derivation shared by the summon and by
+/// the blank-area double-click's reset, so the two can never disagree about where "home" is.
+pub(super) fn configured_picker_area() -> (NSPoint, NSRect) {
     unsafe {
         let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-        let center_on_main = CONFIG.read().unwrap().clipboard.picker_position == "main";
-        // The PRIMARY display, not `NSScreen.mainScreen`: that follows the key window, and the picker is a
-        // panel that becomes key -- so after a drag to a secondary display, `mainScreen` would be that
-        // display and "centred on the main screen" would centre the reset where the panel already is (the
-        // trap `overlay::hover::primary_screen_frame` documents). The fallback keeps the old behaviour if
-        // AppKit reports no screens at all.
-        let main_frame: NSRect = match crate::overlay::hover::primary_screen_visible_frame() {
-            Some(frame) => frame,
-            None => {
-                let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-                msg_send![main_screen, visibleFrame]
-            }
-        };
-        let screen_frame = if center_on_main {
-            main_frame
-        } else {
-            let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-            let count: usize = msg_send![screens, count];
-            let mut frames: Vec<NSRect> = Vec::with_capacity(count);
-            for i in 0..count {
-                // objectAtIndex: expects 'q' (signed long); pass isize.
-                let s: *mut AnyObject = msg_send![screens, objectAtIndex: i as isize];
-                frames.push(msg_send![s, visibleFrame]);
-            }
-            screen_containing(cursor, &frames).unwrap_or(main_frame)
-        };
-        (center_on_main, cursor, screen_frame)
+        let displays = display_areas();
+        // The primary display (index 0), not `NSScreen.mainScreen`: that follows the key window, and the
+        // picker is a panel that becomes key -- so `mainScreen` would answer "the display the picker is
+        // already on", making the fallback agree with whatever position the failure left behind (the trap
+        // `overlay::hover::primary_screen_frame` documents).
+        let primary = crate::overlay::hover::primary_screen_visible_frame().unwrap_or_else(|| {
+            let main_screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+            msg_send![main_screen, visibleFrame]
+        });
+        let screen_frame = picker_host_screen(cursor, &displays, primary);
+        (cursor, screen_frame)
     }
 }
 
-/// The frame the configured mode wants for a picker of `size`: centered on its screen, or offset
-/// from the cursor with the edge flip/clamp.
+/// Pure: the origin a placement produces for `cursor` on `screen`, given the panel's `size`.
+///
+/// The single answer to "where does this mode put the panel", shared by the summon (through
+/// `configured_picker_frame`) and by the A1 smoke, so the runner asserts each mode's own placement
+/// instead of comparing the two modes against each other -- those can legitimately coincide (a
+/// pointer up and left of the centred panel produces exactly the centred frame), and a comparison
+/// cannot tell a correct build from one that swapped them.
+pub(super) fn picker_placement_expected_origin(
+    placement: &str,
+    cursor: NSPoint,
+    screen: NSRect,
+    size: NSSize,
+) -> NSPoint {
+    configured_picker_frame(placement == "center", cursor, screen, size).origin
+}
+
+/// The frame the picker opens at, for a picker of `size`, on the screen the pointer is on.
+///
+/// The screen never varies here (`configured_picker_area` supplies the pointer's display); only the
+/// placement within it does. `center` puts the panel in the middle of that screen's VISIBLE area, so the
+/// menu bar and the Dock cannot cut it off.
 pub(super) fn configured_picker_frame(
-    center_on_main: bool,
+    center_on_screen: bool,
     cursor: NSPoint,
     screen_frame: NSRect,
     size: NSSize,
 ) -> NSRect {
-    if center_on_main {
-        // Always centered on the main screen; no flip/clamp.
-        NSRect::new(
-            NSPoint::new(
-                screen_frame.origin.x + (screen_frame.size.width - size.width) / 2.0,
-                screen_frame.origin.y + (screen_frame.size.height - size.height) / 2.0,
-            ),
-            size,
-        )
+    if center_on_screen {
+        picker_frame_centered(screen_frame, size)
     } else {
         picker_frame_for(cursor, screen_frame, size.width, size.height)
     }
 }
 
-/// Put the picker back where the configuration asks for it, at its current size: the blank-area
-/// double-click, i.e. the undo for "the panel is somewhere awkward now".
+/// Pure: the picker's frame centred in `screen`'s visible area.
 ///
-/// With the detail panel open the pair is laid out again from the configured origin instead of
-/// moving the picker alone, so the group stays intact and the origin restored when the detail
-/// closes is the configured one.
+/// Distinct from `picker_frame_for`'s edge flips: the pointer plays no part, and a panel narrower or
+/// taller than the screen is clamped to the screen's origin rather than pushed off it.
+pub(super) fn picker_frame_centered(screen: NSRect, size: NSSize) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            screen.origin.x + (screen.size.width - size.width).max(0.0) / 2.0,
+            screen.origin.y + (screen.size.height - size.height).max(0.0) / 2.0,
+        ),
+        size,
+    )
+}
+
+/// Put the picker back where a fresh summon would open it -- next to the cursor, on the display the
+/// cursor is on -- at its current size: the blank-area double-click, i.e. the undo for "the panel is
+/// somewhere awkward now".
+///
+/// With the detail panel open the pair is laid out again from that origin instead of moving the
+/// picker alone, so the group stays intact and the origin restored when the detail closes is the one
+/// the reset chose.
 pub(super) fn reset_picker_to_configured_position() {
-    // The reset means "this showing is back at the configured position", so the anchor a drag left has to
+    // The reset means "this showing is back at its home position", so the anchor a drag left has to
     // go with it: keeping it would make the next grab start from a position the panel is no longer at
     // (and the detail group lay out from that stale x). The double-click path relied on clearing it
     // itself before this call, which left any other caller -- the smoke runner drives this directly --
@@ -363,8 +432,9 @@ pub(super) fn reset_picker_to_configured_position() {
             return;
         };
         let size = crate::glass::panel_frame_of(picker_win).size;
-        let (center_on_main, cursor, screen_frame) = configured_picker_area();
-        let target = configured_picker_frame(center_on_main, cursor, screen_frame, size);
+        let (cursor, screen_frame) = configured_picker_area();
+        let target =
+            configured_picker_frame(picker_placement_centers(), cursor, screen_frame, size);
         crate::glass::set_panel_frame(picker_win, target, true);
         *DETAIL_PICKER_ORIGINAL_ORIGIN.lock().unwrap() = None;
         // The reset moved the panel too, so the state document has to say where it is (same reason as
@@ -713,10 +783,9 @@ pub(super) fn show_picker() {
             let hist = CLIP_HISTORY.lock().unwrap();
             compute_pitches(&hist)
         };
-        // Resolve the position mode first: "mouse" follows the cursor on its screen;
-        // "main" centers the picker on the main screen (the height cap uses that screen
-        // too).
-        let (center_on_main, cursor, screen_frame) = configured_picker_area();
+        // Resolve the cursor's display first: the picker opens next to the cursor, on the display
+        // the cursor is on, and the height cap is that display's (see `picker_host_screen`).
+        let (cursor, screen_frame) = configured_picker_area();
 
         // Max height: the 640pt hard cap, shrunk on small screens (120pt kept for the menu
         // bar / cursor offset / edge margins).
@@ -746,20 +815,26 @@ pub(super) fn show_picker() {
         let h = frozen_height().unwrap_or(computed_h);
 
         let frame = configured_picker_frame(
-            center_on_main,
+            picker_placement_centers(),
             cursor,
             screen_frame,
             NSSize::new(picker_layout(screen_frame.size.width, false).panel_w, h),
         );
         log_debug!(
-            "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0}) mode={}",
+            "[clip] picker frame: ({:.0},{:.0}) {}x{} on screen ({:.0},{:.0}) cursor ({:.0},{:.0}) placement={}",
             frame.origin.x,
             frame.origin.y,
             frame.size.width,
             frame.size.height,
             screen_frame.origin.x,
             screen_frame.origin.y,
-            center_on_main
+            cursor.x,
+            cursor.y,
+            if CONFIG.read().unwrap().clipboard.picker_placement == "center" {
+                "center"
+            } else {
+                "cursor"
+            }
         );
         crate::glass::set_panel_frame(window, frame, true);
         layout_picker_chrome(frame.size);
