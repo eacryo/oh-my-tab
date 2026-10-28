@@ -719,21 +719,37 @@ pub(super) unsafe fn make_detail_save_icon(engaged: bool) -> *mut AnyObject {
     image
 }
 
-/// Find a direct child of the detail panel by its action selector. The panel is rebuilt on every
+/// Find a descendant of the detail panel by its action selector. The panel is rebuilt on every
 /// browse step, and the actions are re-located by what they do rather than by frame or tag, so a
 /// layout change cannot make this return a different control.
+///
+/// The search descends into subviews rather than looking at direct children only: the actions live
+/// inside the scrolling document, because they annotate a meta row inside it and must scroll with
+/// it. Callers pass the panel's content view either way.
 pub(super) unsafe fn detail_action_button(content: *mut AnyObject, action: Sel) -> *mut AnyObject {
-    let subviews: *mut AnyObject = msg_send![content, subviews];
+    detail_action_button_in(content, action, 0)
+}
+
+/// [`detail_action_button`] at one nesting level. Bounded: the detail view tree is shallow, and an
+/// unbounded walk over a malformed tree would recurse until the stack ends.
+unsafe fn detail_action_button_in(view: *mut AnyObject, action: Sel, depth: u32) -> *mut AnyObject {
+    if view.is_null() || depth > 4 {
+        return std::ptr::null_mut();
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
     let count: usize = msg_send![subviews, count];
     for index in 0..count {
-        let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-        if !is_button {
-            continue;
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let is_button: bool = msg_send![child, isKindOfClass: class!(NSButton)];
+        if is_button {
+            let child_action: Sel = msg_send![child, action];
+            if child_action == action {
+                return child;
+            }
         }
-        let view_action: Sel = msg_send![view, action];
-        if view_action == action {
-            return view;
+        let found = detail_action_button_in(child, action, depth + 1);
+        if !found.is_null() {
+            return found;
         }
     }
     std::ptr::null_mut()
