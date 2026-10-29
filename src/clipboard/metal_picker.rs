@@ -565,6 +565,29 @@ unsafe fn orb_button(
         line,
         1.0,
     );
+    // Dimensional glass (the Control-Center look): a specular sheen over the
+    // orb's top half and a faint inner shade along the bottom edge.
+    let r = rect.size.height / 2.0 - 1.5;
+    ui.scene.fill_radii(
+        [
+            rect.origin.x + 1.5,
+            rect.origin.y + 1.5,
+            rect.size.width - 3.0,
+            rect.size.height * 0.52,
+        ],
+        [r, r, 0.0, 0.0],
+        [1.0, 1.0, 1.0, if dark { 0.10 } else { 0.18 }],
+    );
+    ui.scene.fill_radii(
+        [
+            rect.origin.x + 1.5,
+            rect.origin.y + rect.size.height * 0.52,
+            rect.size.width - 3.0,
+            rect.size.height * 0.46,
+        ],
+        [0.0, 0.0, r, r],
+        [0.0, 0.0, 0.0, 0.05],
+    );
     ui.centered_label(glyph, font, color, tag, rect);
     ui.clicked(rect)
 }
