@@ -543,51 +543,31 @@ unsafe fn orb_button(
     dark: bool,
 ) -> bool {
     let hot = ui.hot(rect);
-    let (fill, line) = if dark {
+    let (x, y, w, h) = (rect.origin.x, rect.origin.y, rect.size.width, rect.size.height);
+    let r = h / 2.0;
+    if dark {
         let base = if latched { 0.34 } else if hot { 0.24 } else { 0.10 };
-        ([1.0, 1.0, 1.0, base], [1.0, 1.0, 1.0, 0.28])
-    } else if latched {
-        (ORB_BG_ON, ORB_LINE_ON)
-    } else if hot {
-        (ORB_BG_HOT, ORB_LINE)
+        ui.scene.border([x, y, w, h], r, [1.0, 1.0, 1.0, base], [1.0, 1.0, 1.0, 0.28], 1.0);
     } else {
-        (ORB_BG, ORB_LINE)
-    };
-    ui.scene.border(
-        [
-            rect.origin.x,
-            rect.origin.y,
-            rect.size.width,
-            rect.size.height,
-        ],
-        rect.size.height / 2.0,
-        fill,
-        line,
-        1.0,
-    );
-    // Dimensional glass (the Control-Center look): a specular sheen over the
-    // orb's top half and a faint inner shade along the bottom edge.
-    let r = rect.size.height / 2.0 - 1.5;
-    ui.scene.fill_radii(
-        [
-            rect.origin.x + 1.5,
-            rect.origin.y + 1.5,
-            rect.size.width - 3.0,
-            rect.size.height * 0.52,
-        ],
-        [r, r, 0.0, 0.0],
-        [1.0, 1.0, 1.0, if dark { 0.16 } else { 0.34 }],
-    );
-    ui.scene.fill_radii(
-        [
-            rect.origin.x + 1.5,
-            rect.origin.y + rect.size.height * 0.52,
-            rect.size.width - 3.0,
-            rect.size.height * 0.46,
-        ],
-        [0.0, 0.0, r, r],
-        [0.0, 0.0, 0.0, 0.10],
-    );
+        // Frosted-milky orb (codex's recipe): a soft drop shadow, a near-solid
+        // white body, a cool-tinted lower half for the vertical falloff, a
+        // small top specular, and a thin bright rim — stacked solids, not a
+        // real gradient, but at ~30px the read is the same.
+        let body = if latched { 0.90 } else if hot { 0.86 } else { 0.80 };
+        ui.scene.fill([x - 0.5, y + 1.0, w + 1.0, h], r + 0.5, [0.0, 0.0, 0.0, 0.05]);
+        ui.scene.fill([x, y, w, h], r, [1.0, 1.0, 1.0, body]);
+        ui.scene.fill_radii(
+            [x + 1.0, y + h * 0.45, w - 2.0, h * 0.53],
+            [0.0, 0.0, r - 1.0, r - 1.0],
+            [245.0 / 255.0, 248.0 / 255.0, 1.0, 0.30],
+        );
+        ui.scene.fill_radii(
+            [x + 2.0, y + 1.5, w - 4.0, h * 0.34],
+            [r - 2.0, r - 2.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 0.15],
+        );
+        ui.scene.border([x, y, w, h], r, [0.0; 4], [1.0, 1.0, 1.0, 0.55], 1.0);
+    }
     ui.centered_label(glyph, font, color, tag, rect);
     ui.clicked(rect)
 }
@@ -849,11 +829,23 @@ unsafe fn draw_header(
             render::f4(picker_field_ring(focused)),
         )
     } else if focused {
-        (FIELD_BG_LG, [1.0, 1.0, 1.0, 0.58])
+        ([1.0, 1.0, 1.0, 0.80], [1.0, 1.0, 1.0, 0.50])
     } else {
-        (FIELD_BG_LG_IDLE, [1.0, 1.0, 1.0, 0.45])
+        ([1.0, 1.0, 1.0, 0.72], [1.0, 1.0, 1.0, 0.45])
     };
-    let _ = ACCENT_GLOW;
+    // The capsule's own drop shadow under the milky body.
+    if !palette.dark {
+        ui.scene.fill(
+            [
+                search.origin.x,
+                search.origin.y + 1.0,
+                search.size.width,
+                search.size.height,
+            ],
+            SEARCH_R.max(18.0),
+            [0.0, 0.0, 0.0, 0.05],
+        );
+    }
     ui.scene.border(
         [
             search.origin.x,
