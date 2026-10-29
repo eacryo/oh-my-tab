@@ -346,10 +346,24 @@ impl Renderer {
     /// whenever the scene changes; the drawable is acquired on the spot.
     pub(crate) unsafe fn render(&self, layer: *mut AnyObject, scene: &Scene) {
         if layer.is_null() || scene.is_empty() {
+            crate::log_info!(
+                "[metal] render skipped: layer_null={} insts={}",
+                layer.is_null(),
+                scene.insts.len()
+            );
             return;
         }
         let drawable: *mut AnyObject = msg_send![layer, nextDrawable];
         if drawable.is_null() {
+            let is_metal: bool =
+                msg_send![layer, isKindOfClass: class!(CAMetalLayer)];
+            let ds: objc2_foundation::NSSize = msg_send![layer, drawableSize];
+            crate::log_info!(
+                "[metal] nextDrawable nil: cametal={} drawable={}x{}",
+                is_metal,
+                ds.width,
+                ds.height
+            );
             return;
         }
         let drawable_texture: *mut AnyObject = msg_send![drawable, texture];
