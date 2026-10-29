@@ -129,7 +129,7 @@ cargo clippy
 ./scripts/dev-restart.sh
 ```
 
-`scripts/cargo-test.sh` 是对 `cargo test` 的包装：过滤器匹配不到任何测试时 `cargo test` 仍会以 0 退出并打印 `running 0 tests ... ok`，这个包装会把「一个测试都没跑」判为失败；把过滤器作为参数传给它时这层保护依然生效。常规套件不依赖 GUI；CG/AX 冒烟测试标记为 `#[ignore]`，需要 GUI 会话和辅助功能权限（`cargo test -- --ignored`）。在 macOS 图形会话中，`scripts/e2e/run-all.sh` 会用真实事件流跑 A2 场景；会抢焦点的场景默认跳过，需要显式加 `--include-focus`。
+`scripts/cargo-test.sh` 是对 `cargo test` 的包装：过滤器匹配不到任何测试时 `cargo test` 仍会以 0 退出并打印 `running 0 tests ... ok`，这个包装会把「一个测试都没跑」判为失败；把过滤器作为参数传给它时这层保护依然生效。常规套件不依赖 GUI，与那些可验证不启动应用、不抓屏、不注入输入的冒烟运行器一起，共同决定 **M1**——代码判定且不打扰用户，也就是日常门禁。CG/AX 冒烟测试标记为 `#[ignore]`，需要 GUI 会话和辅助功能权限（`cargo test -- --ignored`）。在 macOS 图形会话中，`scripts/e2e/run-all.sh` 会用真实事件流跑 **M2** 场景：同样由代码判定，但会打扰用户。焦点只是四个彼此独立的打扰标记之一（焦点、屏幕、偏好设置、替换实例），一项授权从不隐含另一项，因此会抢焦点的场景默认跳过，需要显式加 `--include-focus`。完整运行由用户在发布前手动触发；A 类（由 agent 判定）永远不作为门禁依据。
 
 `scripts/dev-restart.sh` 构建开发版 `.app`，**只在输入变化时**才重新组装与重签，然后交给用户级 `launchd` 启动。签名优先用 Apple 签发的身份（自签名证书是**唯一**允许的回退，**拒绝 ad-hoc**；Apple 身份签名失败即构建失败，除非显式 `--allow-signing-fallback`）。身份稳定，辅助功能、屏幕录制与钥匙串授权才能跨重建保留，因此没有改动的一次重启会复用现有包。启动是否成功由**运行中的进程自己**报告（pid、可执行路径、版本与 bundle）来校验，而不是读磁盘上的 plist；`--check` 会验证启动随后把它停掉，不留下任何进程。脚本在停任何东西之前先取得跨 worktree 的唯一构建/测试/启动事务，两个 worktree 因此不会争抢同一个开发实例；`--lock-wait=<秒>` 限定等待时间，且这份声明并不保护本次运行留下的应用。`--opt` 走 `dev-opt` profile（优化接近 release、保留 debug 断言），用于滚动/动画等体感与性能验证。脚本不认识的 `--flag[=value]` 会原样透传给应用，例如 `--open-settings=key-bindings` 或 `--no-onboarding`。布局 QA 夹具、调试期的布局断言和 GUI 冒烟测试见[开发环境说明](docs/developer-notes.md)。
 

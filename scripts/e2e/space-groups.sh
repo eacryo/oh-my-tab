@@ -19,6 +19,7 @@
 # 本场景会真的切到全屏、再切回桌面(抢焦点),故用标记声明;scripts/e2e/run-all.sh 默认跳过它。
 # This scenario enters a real fullscreen Space and switches back to the desktop, so it steals focus.
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 #
 # Exit code: 0 = 全部断言通过;非 0 = 失败(逐条打印原因)。
 

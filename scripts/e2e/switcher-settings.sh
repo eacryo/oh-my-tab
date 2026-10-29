@@ -17,6 +17,7 @@
 # The CLICK is what fronts the app: the gear goes through the product's own entry, which activates the
 # app and orders the Settings window front. That is the behaviour under test.
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 #
 # Exit code: 0 = every assertion passed; non-zero = failed, with the reason printed.
 set -euo pipefail

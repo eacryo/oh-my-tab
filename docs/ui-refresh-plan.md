@@ -8,12 +8,23 @@
 
 ## 1. 基本规则
 
-- 每个阶段交付前跑完整门禁 `scripts/gate.sh`（见 `AGENTS.md`；无图形会话时至少 `scripts/gate.sh --offline`，
-  并把未跑的层记成未跑而不是通过），再跑 `scripts/dev-restart.sh --no-onboarding`。
+- 每个阶段的日常门禁是 `scripts/gate.sh`（只跑 M1；见 `AGENTS.md`；无图形会话时至少
+  `scripts/gate.sh --offline`，并把未跑的步骤记成未跑而不是通过）。含 M2 的完整运行是
+  `scripts/gate.sh --full`，由你在发版前或需要时触发，agent 不自行运行。之后跑
+  `scripts/dev-restart.sh --no-onboarding`。
 - 涉及布局的阶段另跑 `--smoke-settings-layout`；涉及浮窗的另跑 `--smoke-overlay`；涉及剪贴板的另跑
   `--smoke-clipboard`。
-- **提升规则**：本次评审发现的每个问题，要么在 A 层补上断言，要么补一个让它可被断言的状态字段。没有断言
-  的修复不算完成。
+- **分类口径**：测试按两个彼此独立的维度划分——**谁给出结论**（M 由代码决定，A 由 agent 决定，A 类
+  永远不是门禁证据）与**是否打扰用户**（不打扰／会打扰：抢焦点、覆盖或立刻抓取屏幕、改动系统偏好、重启或
+  替换实例）。四格是 M1（代码判定且不打扰，**日常门禁**：headless 离线层、全部 `scripts/*-selftest.sh`，
+  以及经证实不启动应用、不在屏幕上放窗口、不抓屏、不注入输入、不重启实例的冒烟运行器）、M2（代码判定但
+  会打扰：其余冒烟运行器与 16 个 e2e 场景，只在 `--full` 下选中）、A1（agent 判定且不打扰：读状态或
+  **已存在的**截图文件，从不做实时抓屏）、A2（agent 判定且会打扰：必须实时观看，如实时 UI 复核与需要场景
+  当场运行的故障分诊）。日常跑 M1；完整运行由你在发版前或需要时手动触发；agent 不自行决定跑 M2。四种打扰
+  各自独立、各需自己的授权。M1 的边界看行为不看形态：`--smoke-overlay` 会召唤真实浮窗，
+  `--smoke-settings-layout` 会打开真实设置窗口，两者都是 M2。
+- **提升规则**：本次评审发现的每个问题，要么落一条 M 类断言（能非打扰地判定的落在 M1，需要真实界面的
+  落在 M2），要么补一个让它可被断言的状态字段。没有断言的修复不算完成。
 - 如果某阶段要改动布局校验器或几何测试里写死的值，**同时**更新常量和测试；绝不放宽断言来让它通过。
 - 任何阶段都不得让代码树停留在「渲染出原始翻译 key、原始标识符，或不属于该维度尺度的取值」的状态。
 
@@ -59,14 +70,16 @@
 ### P0-2 · 半透明面板材质的渲染像素对比度
 
 - **现状**：`frost` 与 `liquid-glass` 的文字直接用动态系统标签色画在材质上，因此其对比度取决于 AppKit 如何把
-  这些颜色合成到半透明表面上。tier-A 的 smoke 只能**记录**数值（"颜色 vs 常量"看不见合成），所以设计文档把
-  它们的档位写成**目标值**而非已执行的下限。**已完成（限于其范围）。**该 A2 场景在渲染像素上测**逐个页脚 caption**，采用**同一次启动内**的差分帧（两张截图之间由 app 就地把面板文字隐藏），
+  这些颜色合成到半透明表面上。headless 的 smoke（M1）只能**记录**数值（"颜色 vs 常量"看不见合成），所以设计文档把
+  它们的档位写成**目标值**而非已执行的下限。**已完成（限于其范围）。**该 M2 e2e 场景在渲染像素上测
+  **逐个页脚 caption**，采用**同一次启动内**的差分帧（两张截图之间由 app 就地把面板文字隐藏），
   低于 3:1 即判失败：`{frost, liquid-glass, opaque} × {浅色, 深色} × {黑, 白}背景` 十二种组合全部达标。**表头筛选行**报 `check not run`：
   它位于选项弹出菜单内，场景让该菜单保持关闭，未运行的检查不算覆盖。这两个角色之外（行标题、详情正文、键帽符号）仍是**目标值**；
   自身贡献低于 3 个色调单位的墨也超出差分可视范围。此前的说法作废：本测量的"两次启动"形态已撤回。
-- **目标**：新增一个 A2 场景——从 `--e2e-state` 的 `clipboard_picker` 读面板 frame，截取该区域，在**渲染像素**上
-  断言档位（`text_primary` ≥ 4.5:1、caption ≥ 3:1），覆盖 `{frost, liquid-glass} × {浅色, 深色}`。其中**深色模式的
-  玻璃**（表面 `#6E6E6E`）要优先测，因为 `NSGlassEffectView` 不提供保对比合成，三种动态标签色是它仅有的墨。
+- **目标**：新增一个 M2 场景——它会抓取屏幕，须拿到屏幕这枚打扰的授权（`--include-screen`）——从 `--e2e-state` 的
+  `clipboard_picker` 读面板 frame，截取该区域，在**渲染像素**上断言档位（`text_primary` ≥ 4.5:1、
+  caption ≥ 3:1），覆盖 `{frost, liquid-glass} × {浅色, 深色}`。其中**深色模式的玻璃**（表面
+  `#6E6E6E`）要优先测，因为 `NSGlassEffectView` 不提供保对比合成，三种动态标签色是它仅有的墨。
 - **文件**：新增 `scripts/e2e/*.sh` 场景及它需要的测量助手；`glass::panel_ink` 的分派；有数字之后再改
   `docs/design-style{,-en}.md` 的档位文字。
 - **验收**：当某材质的实测对比度低于档位时该场景失败；设计文档引用实测数字而不是目标值。
@@ -209,16 +222,17 @@
 ## 7. 每阶段的验证
 
 ```sh
-scripts/gate.sh                                   # 完整门禁，每层一行 PASSED/FAILED/NOT RUN
-scripts/gate.sh --offline                         # 无图形会话时的可跑子集（不绿色等于未跑完）
+scripts/gate.sh                                   # 日常门禁：只跑 M1，每步一行 PASSED/FAILED/NOT RUN
+scripts/gate.sh --offline                         # 无图形会话时的 M1 子集（不绿色等于未跑完）
+scripts/gate.sh --full                            # 含 M2 的完整运行：发版前或你要求时由你触发
 scripts/dev-restart.sh --no-onboarding            # 功能交接
 scripts/dev-restart.sh --no-onboarding --pseudo-locale   # 长文本布局
 scripts/dev-restart.sh --opt --no-onboarding      # 阶段 2 的手感/性能检查
-# GUI smoke（失败时以非零码退出）
+# GUI smoke（M2：会打开真实窗口；失败时以非零码退出）
 ./dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab --smoke-settings-layout
 ./dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab --smoke-overlay
 ./dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab --smoke-clipboard
-# A2 端到端（抢焦点，需先征得同意）
+# M2 e2e 场景（会打扰：抢焦点、抓屏等，每种打扰各需先征得同意）
 scripts/e2e/run-all.sh
 ```
 
@@ -240,5 +254,6 @@ scripts/e2e/run-all.sh
 
 - §2 的每一行要么已解决，要么在代码里记录了「接受偏离」的理由。
 - `docs/design-style.md` §13 的清单对每个表面都成立。
-- A 层为每个 P0 条目、以及 P1 的调色板与尺度不变量，都存在断言。
+- 每个 P0 条目、以及 P1 的调色板与尺度不变量，都有 M 类断言；能非打扰地判定的落在 M1（日常门禁），
+  需要真实界面的落在 M2（只由 `--full` 选中）。
 - 没有任何用户可见字符串会渲染出原始 key，没有任何控件会折成两行。

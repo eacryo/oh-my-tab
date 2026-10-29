@@ -19,6 +19,7 @@
 # app and orders the Settings window front (src/settings/window.rs, show_settings_inner). That is the
 # behaviour under test, so the scenario declares it instead of softening it.
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 #
 # Exit code: 0 = every assertion passed; non-zero = failed, with the reason printed.
 set -euo pipefail

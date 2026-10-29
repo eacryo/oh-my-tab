@@ -936,6 +936,9 @@ mod main_thread_slot_smoke_tests {
     /// AppKit main thread. Without this runner a guard that refused every borrow would pass the
     /// whole suite while every UI registry in the app failed. The child runs the assertions; its
     /// recorded verdict is what this reports.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child (--smoke-main-thread-slot).
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn main_thread_slot_runtime_smoke() {

@@ -3680,6 +3680,9 @@ mod tests {
     /// commits through the real apply path, which persists, so it gets a throwaway HOME. It is run
     /// once with clipboard history off and once with it on, because the persist row only exists
     /// while history is on and the runner must not assume the loaded config starts off.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and runs the live onboarding apply path.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn onboarding_live_apply_smoke() {

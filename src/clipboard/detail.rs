@@ -456,7 +456,7 @@ pub(super) struct MetaRowFrames {
     /// Whether two fields share each row; false below the two-column minimum width, where a
     /// squeezed second column would only render an empty value cell.
     pub(super) two_col: bool,
-    /// Number of metadata rows; long values retain their full text in tooltips.
+    /// Number of metadata rows.
     pub(super) rows: usize,
     /// The table's full height, padding included.
     pub(super) height: f64,
@@ -994,12 +994,8 @@ unsafe fn paint_meta_pair(
         value_color,
         0,
     );
-    // A long value (a URL-wrapped app name) truncates at the tail; the tooltip carries it.
     let cell: *mut AnyObject = msg_send![value_cell, cell];
     let _: () = msg_send![cell, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
-    let tooltip = make_nsstring(value);
-    let _: () = msg_send![value_cell, setToolTip: tooltip];
-    CFRelease(tooltip as *const c_void);
     let _: () = msg_send![document, addSubview: value_cell];
     release_obj(value_cell);
 }

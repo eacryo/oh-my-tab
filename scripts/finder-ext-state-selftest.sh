@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/lib/finder-ext-state.sh,scripts/finder-ext-state-selftest.sh,testdata/finder-ext-transaction.toml
 # Selftest for scripts/lib/finder-ext-state.sh: the transaction TOML the dev script writes must be
 # the same document the Rust recovery module parses (testdata/finder-ext-transaction.toml), and the
 # marker decision must not read any other election state as "enabled".

@@ -38,7 +38,7 @@ glass 的各个变体会把边缘画在 glass bounds 之外，因此按键显示
 裁剪自身），而 `swap_backdrop` 会迁移 `content_parent` 的子视图，装饰若放在那里就会被带进新层级、留下一条旧描边。
 它重写了 `hitTest:` 返回 nil，因为它覆盖整个面板，否则会吞掉所有本该给面板内容的点击。
 
-**开发开关。** `--panel-outline=off|after:N` 与 `--panel-shadow=off|med|high|after:N` 是给 A2 测量用的：每个都能
+**开发开关。** `--panel-outline=off|after:N` 与 `--panel-shadow=off|med|high|after:N` 是给 M2（e2e）测量用的：每个都能
 产出断言所需的对照帧，`after:N` 还能在同一次启动内产出（半透明材质跨启动不会渲染得完全一致，所以这一对必须来自
 同一次启动）。`--panel-shadow=off` 会完全移除载体，因此它同时是模糊保留门禁的「无载体」基线。这些开关都不允许留在
 运行中的实例上：`scripts/e2e/run-all.sh` 会连同 `--panel-backdrop`、`--clipboard-blank-text` 一起检查进程命令行。
@@ -114,7 +114,7 @@ WindowServer 字段。`--space-state-record` 让应用自建的 probe 窗口依�
   时就走它。
 
 跨桌面卡片的端到端断言——`minimized`／`fullscreen` 及其证据来源、`ordered_in`、`ax_pairing`、原始行字段——
-都在 `scripts/e2e/space-desktops.sh`（用 `--include-focus` 跑）；场景现在从 `keyboard.modifier` 推导要注入的
+都在 `scripts/e2e/space-desktops.sh`（M2 场景，用 `--include-focus` 跑）；场景现在从 `keyboard.modifier` 推导要注入的
 组合键，而不是假定某一个。
 
 最小化解码有意让 ordered-in 位压过最小化声明。参考实现实测的是**点 Dock** 的恢复：WindowServer 的 tag 会
@@ -124,7 +124,7 @@ WindowServer 字段。`--space-state-record` 让应用自建的 probe 窗口依�
 AX 完全不发布的窗口才看 WindowServer 的 tag。
 
 缩略图：这类卡片**不会请求**新的抓图（本应用使用的私有抓图调用 `SLSHWCaptureWindowList` 抓不到不在活跃
-桌面上的窗口，参考实现也不会去请求），但会显示缓存里已有的那一张——那是它还在自己桌面上时抓到的。生产端把它过滤掉，渲染端照旧读缓存；A2 快照为此发布
+桌面上的窗口，参考实现也不会去请求），但会显示缓存里已有的那一张——那是它还在自己桌面上时抓到的。生产端把它过滤掉，渲染端照旧读缓存；e2e（M2）快照为此发布
 `thumbnail_ready`，让这个行为可断言。连缓存帧一起拒绝是错的：两个桌面都去过的用户，大多数卡片本来就有
 一张，参考实现也是保留上一张缩略图。
 
@@ -246,7 +246,7 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
 
 **离线加载与耗时**：加载之所以放在主线程之外，是因为钥匙串读取可能阻塞（开发构建实测：读取本身约 11 秒，其余决策 0.2 秒；期间应用完全可用，这正是拆分的意义所在）；因此 `clipboard_storage.state` 在加载落地之前会读作 `uninitialized`，断言它的场景必须等待并触发一次新的快照。
 
-**钥匙串授权**（已实测、推断与未验证必须分清）：**2026-10-08 定位并修复**。判定规则（三个 C 探针 + 实机）：**钥匙串项的 ACL 按「创建该项的那个应用的签名身份」判定**。自签名/ad-hoc 构建创建的项，二进制一变就不再被承认（探针：重建同一路径、重新签名后读取即弹框）——这是历史现象，已不再适用于本机（2026-10-08 一次性重置后，项由 Developer ID 身份创建，重建后实测 67ms 静默读完）。Developer ID 构建创建的项跨同样的重建仍被承认（探针：静默；实机：重建后的开发包无弹框）。**注意不要把 ACL 的文本形态当成稳定性判据**：macOS 用废弃读取 API 对非 Apple 锚定的应用一律报「路径」，`--e2e-state` 的 `keychain_acl`（`requirement` / `foreign-requirement` / `path` / `none` / `unknown`）只是形态报告。**应用无法认领别人的项**：用 Developer ID 签名去删异签名创建的项返回 `errSecInvalidOwnerEdit`（-25244，实测），所以历史遗留项只能由用户删掉一次、再由应用新建（旧存储集合按设计改名保留为 `*.failed-<ts>`）。**未验证**：正式构建（Developer ID）安装在没有重置过的旧环境时的行为——「最多弹一次后静默」是预期而非保证。每个 `--smoke-*` 启动都已隔离（测试密钥 + 临时目录），A1 冒烟既不读钥匙串也不会弹框；其余纯 UI 验证可用 `--clip-no-keychain` 完全绕开钥匙串。
+**钥匙串授权**（已实测、推断与未验证必须分清）：**2026-10-08 定位并修复**。判定规则（三个 C 探针 + 实机）：**钥匙串项的 ACL 按「创建该项的那个应用的签名身份」判定**。自签名/ad-hoc 构建创建的项，二进制一变就不再被承认（探针：重建同一路径、重新签名后读取即弹框）——这是历史现象，已不再适用于本机（2026-10-08 一次性重置后，项由 Developer ID 身份创建，重建后实测 67ms 静默读完）。Developer ID 构建创建的项跨同样的重建仍被承认（探针：静默；实机：重建后的开发包无弹框）。**注意不要把 ACL 的文本形态当成稳定性判据**：macOS 用废弃读取 API 对非 Apple 锚定的应用一律报「路径」，`--e2e-state` 的 `keychain_acl`（`requirement` / `foreign-requirement` / `path` / `none` / `unknown`）只是形态报告。**应用无法认领别人的项**：用 Developer ID 签名去删异签名创建的项返回 `errSecInvalidOwnerEdit`（-25244，实测），所以历史遗留项只能由用户删掉一次、再由应用新建（旧存储集合按设计改名保留为 `*.failed-<ts>`）。**未验证**：正式构建（Developer ID）安装在没有重置过的旧环境时的行为——「最多弹一次后静默」是预期而非保证。每个 `--smoke-*` 启动都已隔离（测试密钥 + 临时目录），M1 冒烟既不读钥匙串也不会弹框；其余纯 UI 验证可用 `--clip-no-keychain` 完全绕开钥匙串。
 
 
 
@@ -305,7 +305,7 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
   位置:`EditTarget` 记录面板打开时那一条的动作与快捷键,`resolve_edit_target` 只有在该下标仍然是
   同一条绑定时才放行,否则以 `errors.key_binding_edit_stale` 拒绝。删除同样会重新读取配置长度。
   下标因此不再需要像旧的选中那样被失效处理,`key_bindings_selected` 固定输出 `null`——保留它只是
-  因为 A2 的契约要求该字段存在；类型不作承诺，断言按 `null` 写。
+  因为 e2e（M2）快照的契约要求该字段存在；类型不作承诺，断言按 `null` 写。
 - **编辑与新增共用一个面板。** 两种模式是同一个面板:`BINDING_EDITING` 保存正在编辑的下标,或用
   `None` 表示追加;它只决定确定时写入什么、以及各字段的初值。预填走纯函数
   (`picker_index_for`、`chord_text_for`),因此规则不用开窗口就能测。有两个细节要紧:正在编辑的
@@ -321,7 +321,7 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
   view 的整棵子树,留着未清的槽就是悬垂指针。
 - **e2e 状态。** `--e2e-state` 会输出 `key_bindings_entries`、`key_bindings_live` 和
   `key_bindings_enabled`,场景因此可以断言迁移结果,以及「总开关关闭时没有任何绑定生效」。它还会
-  继续输出 `key_bindings_selected`,现在恒为 `null`,因为 A2 的契约只要求该字段存在,类型不作承诺。
+  继续输出 `key_bindings_selected`,现在恒为 `null`,因为 e2e（M2）快照的契约只要求该字段存在,类型不作承诺。
 
 ## 切换浮窗的面板动作键（Cmd+W / M / H / Q）
 
@@ -430,7 +430,7 @@ cargo test settings_layout_smoke -- --ignored
 
 浮窗运行路径也有一个被忽略的子进程冒烟测试。先运行 `cargo build`，再执行 `cargo test overlay_runtime_smoke -- --ignored`；`--smoke-overlay` 会跳过单实例锁，避免已有开发版实例导致测试未执行却误判通过。
 
-**A2 场景**放在 `scripts/e2e/*.sh`，统一通过 `scripts/e2e/run-all.sh` 运行：它会自动发现该目录下所有可执行脚本，按顺序跑选中的那些。场景在头部声明自己会造成哪种打扰，每种打扰有独立开关，**互不代替、可叠加（全部满足才跑）**：`# E2E_STEALS_FOCUS=1`（经系统事件流注入真实全局热键，或把 app 激活到前台）需要 `--include-focus`；`# E2E_COVERS_SCREEN=1`（在屏幕上钉覆盖全屏的背景板或抓取屏幕内容）需要 `--include-screen`；`# E2E_CHANGES_PREFS=1`（改系统偏好或用户配置）需要 `--include-prefs`。标记必须独占一行，行尾带注释就不再是标记。`--list` 只打印本次会跑哪些场景。应用通过 `--e2e-state=<path>` 写出 JSON 快照，把脚本无法从辅助功能读到的内部事实自己讲出来；脚本对这些快照加真实 WindowServer 状态做断言；断言「已加密」的场景仍必须自己读磁盘文件，因为应用自述不算证据。
+**M2 的 e2e 场景**放在 `scripts/e2e/*.sh`，统一通过 `scripts/e2e/run-all.sh` 运行：它会自动发现该目录下所有可执行脚本，按顺序跑选中的那些。场景在头部声明自己会造成哪种打扰，每种打扰有独立开关，**互不代替、可叠加（全部满足才跑）**：`# E2E_STEALS_FOCUS=1`（经系统事件流注入真实全局热键，或把 app 激活到前台）需要 `--include-focus`；`# E2E_COVERS_SCREEN=1`（在屏幕上钉覆盖全屏的背景板或抓取屏幕内容）需要 `--include-screen`；`# E2E_CHANGES_PREFS=1`（改系统偏好或用户配置）需要 `--include-prefs`。标记必须独占一行，行尾带注释就不再是标记。`--list` 只打印本次会跑哪些场景。应用通过 `--e2e-state=<path>` 写出 JSON 快照，把脚本无法从辅助功能读到的内部事实自己讲出来；脚本对这些快照加真实 WindowServer 状态做断言；断言「已加密」的场景仍必须自己读磁盘文件，因为应用自述不算证据。
 
 ### 本地化与布局 QA
 

@@ -222,10 +222,12 @@
 | launchd 任务（launchd job） | 为 app 或其 Finder 扩展注册到 launchd 的任务 | 守护进程、服务、agent |
 | worktree | 本仓库的一个 git worktree。同一时刻全仓库只跑一次构建/测试/启动事务 | 检出、副本、克隆 |
 | 门禁（gate） | `scripts/gate.sh` 及其各层。每一层打印一行 PASSED、FAILED 或 NOT RUN | CI 运行、测试套件、检查 |
-| A1 层（tier A1） | 由脚本判定通过与否的 headless 测试与 GUI 冒烟运行器 | 冒烟层、单元测试 |
-| A2 层（tier A2） | 由脚本判定通过与否的 e2e 场景，位于 `scripts/e2e/` | 集成测试、UI 测试 |
-| B 层（tier B） | 由人或 Agent 判定的部分：手感、首轮界面审查、失败分诊、缺陷调查。它会判定，但不作为门禁证据，因此 B 层发现必须落成 A 层断言 | 手工测试 |
-| 冒烟运行器（smoke runner） | A1 层运行、按 `smoke-result:` 行分类的一个 `#[ignore]` 测试 | 冒烟测试、GUI 测试 |
+| M1 格（M1） | 代码判定且不打扰用户：headless 离线层、全部 `scripts/*-selftest.sh`，以及不启动应用、不在屏幕上放窗口、不抓屏、不注入输入、不重启实例的冒烟运行器。这就是日常门禁 | 冒烟层、单元测试、日常门禁 |
+| M2 格（M2） | 代码判定但会打扰用户：其余冒烟运行器，以及 `scripts/e2e/` 下的 e2e 场景。只有 `gate.sh --full` 会选中 | 集成测试、UI 测试、发版门禁 |
+| A1 格（A1） | Agent 判定且不打扰：读状态，或读**已存在的**截图文件。永远不作为门禁证据 | 人工审查 |
+| A2 格（A2） | Agent 判定且会打扰：必须实时观看（实时界面审查、实时分诊）。永远不作为门禁证据 | 人工审查 |
+| 干扰标记（disturbance marker） | 场景或运行器在头部声明的一类打扰：焦点、屏幕、系统偏好、替换实例。每个都要各自授权，互不牵连 | `E2E_*` / `SMOKE_CELL` 标记 |
+| 冒烟运行器（smoke runner） | 带且仅带一条 `SMOKE_CELL=M1\|M2` 声明、按 `smoke-result:` 行分类的一个 `#[ignore]` 测试 | 冒烟测试、GUI 测试 |
 | e2e 场景（e2e scenario） | 经 `scripts/e2e/run-all.sh` 运行的一个 `scripts/e2e/*.sh` 脚本 | e2e 测试、A2 测试 |
 | 干扰闸门（disturbance switch） | 「抢焦点」「覆盖屏幕」「改动系统偏好」三类干扰各自的授权开关：`--include-focus`、`--include-screen`、`--include-prefs` | 选项、开关 |
 | 审查会话（reviewer session） | 属于某个任务的唯一一个 `scripts/agent-review.sh` 会话 | 审查机器人、ChatGPT 会话 |

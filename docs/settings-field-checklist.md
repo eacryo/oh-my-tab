@@ -57,7 +57,8 @@
 这个缺陷已在 `docs/review-backlog.md` 关闭：该标志已加入 `needs_in_place_control_sync`
 （`src/runtime_config.rs` 的成员列表）和 `refresh_switcher_keystroke_and_mouse_controls_from_config`
 的回填列表（`src/settings/dispatch.rs` 的 `(u.show_app_name_in_cards, cfg.layout.show_app_name_in_cards)`
-一项），并有 A1 断言 `changing_only_the_card_switch_still_refreshes_the_settings_controls` 守着。
+一项），并有代码判定且按 M1 运行（不需要图形会话，也不启动应用、不抓屏、不注入输入）的断言
+`changing_only_the_card_switch_still_refreshes_the_settings_controls` 守着。
 新增字段仍以 `focused_thumbnail_prewarm` 为准：它第 1–15 步一步不缺。
 
 ## 已经免费的部分：验证，不要重写
@@ -76,25 +77,43 @@
 
 ## 新设置项应当携带的断言
 
-仓库规则是：用户可见的行为必须落地一条 tier-A 断言，或者一个让它可断言的 state 字段。
-对设置项来说至少是：
+先说明本文用到的分类口径。测试按**两个彼此独立的维度**划分，不是一个层级：
+**谁给出结论**——**M** 由代码决定（测试或脚本断言，它的结果就是结论；agent 只是运行脚本、读它的自动
+断言，仍算 M），**A** 由 agent 决定（品味、首轮 UI 复核、失败分诊、缺陷调查，A 类永远不是门禁证据）；
+**是否打扰用户**——这不打扰，或会打扰（抢焦点、覆盖或立刻抓取屏幕、改动系统偏好、重启或替换正在运行的
+应用实例）。两维交叉成四格：**M1** 代码判定且不打扰，是**日常门禁**——headless 离线层、全部
+`scripts/*-selftest.sh`，以及经证实不启动应用、不在屏幕上放窗口、不抓屏、不注入输入、不重启实例的冒烟
+运行器；**M2** 代码判定但会打扰——其余冒烟运行器与 16 个 e2e 场景，只由 `scripts/gate.sh --full` 选中；
+**A1** agent 判定且不打扰（读状态或**已存在的**截图文件，从不做实时抓屏，也不驱动应用）；**A2** agent
+判定且会打扰（必须实时观看，例如实时 UI 复核与需要场景当场运行的故障分诊）。日常跑 `scripts/gate.sh`，
+即 M1；完整运行由用户在发版前或需要时手动触发；agent 不自行决定跑 M2。四种打扰——焦点、屏幕、系统偏好、
+替换实例——各自独立、各需自己的授权，一个授权不牵连另一个。
+M1 的边界看的是行为而不是形态：`--smoke-overlay` 会召唤真实浮窗，`--smoke-settings-layout` 会打开真实
+的设置窗口，无论命令行看着多无头，两者都是 **M2**。
 
-1. **配置层**（纯函数，`cargo test`）：默认值；不含该键的旧文件载入为默认值；序列化往返；
+仓库规则是：用户可见的行为必须落地一条 **M 类**断言，或者一个让它可断言的 state 字段。对设置项来说
+至少是：
+
+1. **配置层**（纯函数，`cargo test`，M1）：默认值；不含该键的旧文件载入为默认值；序列化往返；
    同段兄弟字段非法时该值仍被 `merge_valid` 采纳。
-2. **渲染层**（A1，真实 view tree）：界面真的变了。对浮窗而言是 `--smoke-overlay` 驱动一次真实召唤并
-   读回 frame / 可见性。探针必须能证伪——仓库的惯例是：无法被证伪的探针不算门禁。
-3. **接线层**（A1，真实入口）：改动在界面**正在显示时**生效，且经由 `apply_config_change`，
+2. **渲染层**（M2，真实 view tree）：界面真的变了。对浮窗而言是 `--smoke-overlay` 驱动一次真实召唤并
+   读回 frame / 可见性——它召唤真实浮窗，因此是 M2。M1 只能断言它自己进程能触及的东西；"用户在浮窗里
+   看到的样子"属于 M2 的 runner 或 e2e 场景。探针必须能证伪——仓库的惯例是：无法被证伪的探针不算门禁。
+3. **接线层**（M2，真实入口）：改动在界面**正在显示时**生效，且经由 `apply_config_change`，
    而不是直接调渲染函数。直接调渲染函数只证明了渲染函数能用，完全没说明开关是否接到了它。
-4. **设置页**（A1）：`--smoke-settings-layout` 会在三种语言下走遍每一页，所以新行自动获得几何、
+4. **设置页**（M2）：`--smoke-settings-layout` 会在三种语言下走遍每一页，所以新行自动获得几何、
    字号 token 与标签关联的覆盖。"控件跟得上配置重载"属于 `--smoke-settings-state-sync`。
-5. **A2，只在行为确实只能靠真实输入触达时才加**。大多数设置项不是：它们从内部状态就能断言。
-   不要为了一个 A1 已经能判定的字段，去加一个抢焦点的场景。
+5. **额外再加一个"需要真实输入"的 e2e 场景，只在行为确实只能靠真实输入触达时才做**，而且它所声明的
+   每个打扰都要各自得到授权。上面第 2–4 条已经要求 M2 的 smoke 断言，它们不是额外的打扰；这里说的是**再
+   多加一个 e2e 场景**。大多数设置项不需要：它们从内部状态就能断言。不要为了一个 M2 smoke 已经能判定的
+   字段，去加一个抢焦点的 e2e 场景（那只会多出一个打扰）。`--smoke-update-prompts` 就是这样一例：它打开 12 个 key window 并抢焦点，
+   归 M2 且要焦点授权。
 
 ## 记两个坑
 
-- **隐藏不等于移除**。`setHidden:` 保留 view 的 frame，所以比较 frame 的几何断言（以及 A2 state 里
-  "这两个矩形不相交"）语义不变。当周围布局必须不动时用它。`removeFromSuperview` 会改变视图树，
-  让那些假设失效。
+- **隐藏不等于移除**。`setHidden:` 保留 view 的 frame，所以比较 frame 的几何断言（以及 e2e 场景从
+  `--e2e-state` 读到的"这两个矩形不相交"，它们都在 M2）语义不变。当周围布局必须不动时用它。`removeFromSuperview`
+  会改变视图树，让那些假设失效。
 - **控件的 `tag` 不是 action id**。`SettingsButton` 的 `tag` 决定它的悬停/常态配色。
   保留组件自己的 tag、把 sender 指针映射到 action id，否则指针离开后颜色会卡住
   （见 `AGENTS.md` 的 "Architecture and invariants"）。

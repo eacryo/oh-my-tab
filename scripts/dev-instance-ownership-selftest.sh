@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/lib/dev-instance-ownership.sh,scripts/dev-instance-ownership-selftest.sh
 # Offline self-test for scripts/lib/dev-instance-ownership.sh.
 #
 # The library asks a question about the machine's live processes, so this suite does two things:

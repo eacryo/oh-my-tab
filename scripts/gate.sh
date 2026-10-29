@@ -40,24 +40,61 @@ script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_dir="$(dirname -- "$script_dir")"
 
 offline=0
+full=0
+include_args=()
 requested_tiers=()
 selected=()
 for arg in "$@"; do
     case "$arg" in
         --offline) offline=1 ;;
+        --full) full=1 ;;
+        # The four disturbances are carried through to the M2 aggregator verbatim. gate.sh never
+        # decides for the operator that one authorization implies another; it only forwards what was
+        # asked for. They imply --full, because nothing else selects M2.
+        --include-focus|--include-screen|--include-prefs|--include-instance)
+            include_args+=("$arg")
+            full=1
+            ;;
         --tier=*) requested_tiers+=("${arg#--tier=}") ;;
-        -h|--help) sed -n '2,45p' "$0"; exit 0 ;;
+        -h|--help) sed -n '2,60p' "$0"; exit 0 ;;
         *) echo "gate: unknown argument: $arg" >&2; exit 2 ;;
     esac
 done
 
+# The two old tier names described the single-axis split (A1/A2/B) that the classification replaced.
+# Reinterpreting them as their new-name equivalents would let an existing command run a different set
+# than it used to, so they are refused outright instead of aliased (AGENTS.md, "Testing
+# classification").
+# bash 3.2 (macOS) misbehaves on "${array[@]:-}" for an empty array, and this loop runs on every
+# invocation, so it guards the count instead.
+if [ "${#requested_tiers[@]}" -gt 0 ]; then
+for tier in "${requested_tiers[@]}"; do
+    case "$tier" in
+        a1|a2)
+            echo "gate: --tier=$tier is no longer a tier name: the tiers are M1 (the daily gate) and" >&2
+            echo "      M2 (disturbing). Run scripts/gate.sh for M1, or scripts/gate.sh --full for" >&2
+            echo "      the complete run. The old name is refused rather than reinterpreted." >&2
+            exit 2
+            ;;
+    esac
+done
+fi
+
 # Which tiers run. The order is cheapest and most-likely-to-fail first, so a broken build does not
-# spend minutes in the GUI tiers before saying so.
-all_tiers=(selftests fmt check clippy release-check cargo-test a1 a2)
-if [ "${#requested_tiers[@]}" -eq 0 ]; then
+# spend minutes in the GUI tiers before saying so. m1 is the non-disturbing cells (the offline steps
+# plus the M1 smoke runners) and m2 is what disturbs the user; --full is the only way to select m2.
+all_tiers=(selftests fmt check clippy release-check cargo-test m1 m2)
+if [ "${#requested_tiers[@]}" -gt 0 ]; then
+    selected=("${requested_tiers[@]}")
+elif [ "$full" -eq 1 ]; then
     selected=("${all_tiers[@]}")
 else
-    selected=("${requested_tiers[@]}")
+    # No argument is the DAILY gate, not the complete one. The warning goes to stderr and to the
+    # summary so a reader of either learns which gate they just ran.
+    echo "gate: warning: no tier selected, running M1 only (the daily gate)." >&2
+    echo "gate: warning: the complete run is scripts/gate.sh --full." >&2
+    daily_default_warning=1
+    selected=(selftests fmt check clippy release-check cargo-test m1)
 fi
 
 for tier in "${selected[@]}"; do
@@ -135,8 +172,15 @@ is_graphical_session() {
 cd "$repo_dir" || { echo "gate: cannot enter $repo_dir" >&2; exit 1; }
 
 # --- selftests ------------------------------------------------------------------------------------
+# The daily gate selects by change; the complete run checks everything. The selection is visible in
+# the step's own output (each chosen selftest is named with the input that selected it, and a baseline
+# that cannot be resolved falls back to running them all).
 if wants_tier selftests; then
-    run_step selftests "${script_dir}/selftests.sh"
+    if [ "$full" -eq 1 ]; then
+        run_step selftests "${script_dir}/selftests.sh"
+    else
+        run_step selftests "${script_dir}/selftests.sh" --changed
+    fi
 fi
 
 # --- fmt ------------------------------------------------------------------------------------------
@@ -168,26 +212,40 @@ if wants_tier cargo-test; then
     run_step cargo-test "${script_dir}/cargo-test.sh"
 fi
 
-# --- A1: the GUI smoke runners --------------------------------------------------------------------
-if wants_tier a1; then
+# --- M1: the non-disturbing smoke runners ----------------------------------------------------------
+# Only the runners that declare M1 are selected here; smoke-runners.sh refuses a runner whose
+# declaration is missing or ambiguous rather than guessing it into a cell.
+if wants_tier m1; then
     if [ "$offline" -eq 1 ]; then
-        skip_step "offline: the GUI smoke runners need a graphical session" a1
+        skip_step "offline: the M1 smoke runners need a graphical session" m1
     elif ! is_graphical_session; then
-        skip_step "no graphical session (launchctl managername is not Aqua)" a1
+        skip_step "no graphical session (launchctl managername is not Aqua)" m1
     else
-        run_step a1 "${script_dir}/smoke-runners.sh" --run
+        run_step m1 "${script_dir}/smoke-runners.sh" --run --cell=M1
     fi
 fi
 
-# --- A2: the e2e scenarios ------------------------------------------------------------------------
-if wants_tier a2; then
+# --- M2: the disturbing smoke runners and the e2e scenarios ---------------------------------------
+# This step can disturb the user (focus, screen, preferences, or the running instance), so it is
+# selected only by --full. It asks run-all.sh for every disturbance the scenarios declare; any that
+# the operator has not authorized leaves the step incomplete instead of quietly skipping it.
+if wants_tier m2; then
     if [ "$offline" -eq 1 ]; then
-        skip_step "offline: the e2e scenarios drive a real app and real input" a2
+        skip_step "offline: the M2 tier disturbs the machine" m2
     elif ! is_graphical_session; then
-        skip_step "no graphical session (launchctl managername is not Aqua)" a2
+        skip_step "no graphical session (launchctl managername is not Aqua)" m2
     else
-        run_step a2 "${script_dir}/e2e/run-all.sh" --gate
+        # An empty array expands to nothing under bash 3.2 only via this count guard; passing
+        # "${include_args[@]:-}" would hand m2.sh one empty argument, which it rejects as unknown.
+        if [ "${#include_args[@]}" -gt 0 ]; then
+            run_step m2 "${script_dir}/m2.sh" "${include_args[@]}"
+        else
+            run_step m2 "${script_dir}/m2.sh"
+        fi
     fi
+else
+    # Outside the daily gate, but printed so a reader never mistakes "not selected" for "passed".
+    record m2 "NOT SELECTED" "outside the daily gate; --full selects it"
 fi
 
 # --- summary --------------------------------------------------------------------------------------

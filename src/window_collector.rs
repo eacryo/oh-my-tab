@@ -1194,6 +1194,8 @@ mod tests {
     /// exception terminates the process via `__rust_foreign_exception` (see the 2026-09-17 22:20
     /// crash report). Requires a GUI session, hence #[ignore]; run with
     /// `cargo test -- --ignored objc_exception_guard_contains_a_raise`.
+    // SMOKE_CELL=M1 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Raises an Objective-C exception inside a guard and asserts it is contained; in-process only.
     #[test]
     #[ignore]
     fn objc_exception_guard_contains_a_raise() {
@@ -1876,6 +1878,8 @@ mod tests {
         assert!(mru.contains_key(&(1, 42)));
     }
 
+    // SMOKE_CELL=M1 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Enumerates windows through Accessibility only: it starts no app, places no window, captures nothing.
     #[test]
     #[ignore]
     fn collect_windows_smoke() {

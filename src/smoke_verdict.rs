@@ -170,8 +170,43 @@ pub(crate) enum ChildVerdict {
 ///
 /// Passing the verdict on rather than leaving it unset matters: the wrapper records its own `PASSED`
 /// for a runner that did not report, so a NOT RUN the child wrote would otherwise be overwritten.
+/// The run scope the harness selected, in `OMT_SMOKE_CELL`: `M1` for the daily gate, `M2` for the
+/// complete one. Absent means a hand-run test, which is not constrained.
+#[cfg(test)]
+pub(crate) const CELL_ENV: &str = "OMT_SMOKE_CELL";
+
+/// Whether the selected scope permits starting an app child.
+///
+/// A runner's `SMOKE_CELL` declaration is text, and a runner declared M1 that still calls this entry
+/// would launch the app inside the daily gate -- the one thing the M1 boundary forbids. So the
+/// boundary is enforced here, at the single place a child can be started, rather than by trusting
+/// every declaration. An unreadable scope is refused under M1: the conservative answer to "unknown"
+/// is not to start an app.
+#[cfg(test)]
+pub(crate) fn cell_permits_child() -> Result<(), String> {
+    let scope = std::env::var(CELL_ENV).unwrap_or_default();
+    match scope.as_str() {
+        // A hand-run test names no scope; the complete gate and the default both allow a child.
+        // "ALL" is what the harness sets when it was not asked for a single cell (a plain
+        // `smoke-runners.sh --run`): every runner runs, so no child is out of scope.
+        "" | "M2" | "ALL" => Ok(()),
+        "M1" => Err(
+            "starts an app child, which the M1 (non-disturbing) boundary forbids; declare it SMOKE_CELL=M2 so it runs in the complete gate instead"
+                .to_string(),
+        ),
+        other => Err(format!(
+            "unknown run scope {other:?}; refusing to start an app child"
+        )),
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn run_smoke_child(name: &str, args: &[&str]) {
+    // Checked before the child is built or started, so an M1 run never creates the process.
+    if let Err(reason) = cell_permits_child() {
+        crate::smoke_verdict::report_failed(name, reason.clone());
+        panic!("{name}: the M1 boundary: {reason}");
+    }
     let before = file_verdict_len();
     let mut command = std::process::Command::new(crate::smoke_verdict::smoke_app_binary());
     command.args(args);
@@ -351,6 +386,52 @@ mod tests {
         assert_eq!(classify_child(Some("PASSED 00")), "NOT RUN");
         assert_eq!(classify_child(Some("PASSED invalid")), "NOT RUN");
         assert_eq!(classify_child(Some("PASSED 1")), "PASSED");
+    }
+
+    /// The M1 boundary is enforced where a child is started, not only where a runner is declared: a
+    /// runner declared M1 that calls the child launcher must be refused before any process exists.
+    #[test]
+    fn the_m1_scope_refuses_to_start_an_app_child() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let dir = std::env::temp_dir().join(format!(
+            "omt-smoke-scope-{}${}",
+            std::process::id(),
+            line!()
+        ));
+        let _ = std::fs::create_dir_all(&dir);
+        let parent = dir.join("verdict.txt");
+        std::fs::write(&parent, "").unwrap();
+        unsafe { std::env::set_var("OMT_SMOKE_VERDICT", &parent) };
+
+        // M1 refuses, and says why.
+        unsafe { std::env::set_var(super::CELL_ENV, "M1") };
+        let refused = super::cell_permits_child();
+        assert!(refused.is_err(), "M1 must not start an app child");
+        assert!(
+            refused.unwrap_err().contains("SMOKE_CELL=M2"),
+            "the refusal must say how to declare the runner correctly"
+        );
+
+        // M2, an unscoped harness run ("ALL"), a hand run, and the default all still start one.
+        unsafe { std::env::set_var(super::CELL_ENV, "M2") };
+        assert!(super::cell_permits_child().is_ok());
+        // "ALL" is what smoke-runners.sh sets for a plain --run with no --cell. Reading it as an
+        // unknown scope turned every child runner in that public entry into a pre-start failure.
+        unsafe { std::env::set_var(super::CELL_ENV, "ALL") };
+        assert!(
+            super::cell_permits_child().is_ok(),
+            "an unscoped --run must not refuse every child runner"
+        );
+        unsafe { std::env::remove_var(super::CELL_ENV) };
+        assert!(super::cell_permits_child().is_ok());
+
+        // An unrecognised scope is not read as permission.
+        unsafe { std::env::set_var(super::CELL_ENV, "M3") };
+        assert!(super::cell_permits_child().is_err());
+
+        unsafe { std::env::remove_var(super::CELL_ENV) };
+        unsafe { std::env::remove_var("OMT_SMOKE_VERDICT") };
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// The production classifier, exercised directly: malformed counts are not a pass.

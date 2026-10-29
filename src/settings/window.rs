@@ -1600,6 +1600,9 @@ unsafe fn clipboard_exclusion_rows_use_the_shared_row_height() -> bool {
 /// Run every settings page through the real AppKit layout path and debug validator, then exit.
 /// This is used by the ignored macOS smoke test; it deliberately exercises the same window
 /// builder as the interactive app instead of constructing a simplified test-only hierarchy.
+// SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+// without exactly one declaration. Opens the real settings window for every page.
+// SMOKE_DISTURBS=focus
 pub(crate) fn settings_layout_smoke_runner() -> bool {
     const UPDATE_CARD_EXPANSION_REQUEST: f64 = 640.0;
     // The page layout reserves part of the requested host height for the row and bottom padding;
@@ -2978,6 +2981,9 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
 }
 
 /// Exercise the scroll-mode popup and reverse switch through their real AppKit callbacks.
+// SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+// without exactly one declaration. Drives the real mouse-profile callback through the settings window.
+// SMOKE_DISTURBS=focus
 pub(crate) fn settings_mouse_profile_callback_smoke_runner() -> bool {
     unsafe {
         let original_cfg = CONFIG.read().unwrap().clone();
@@ -3414,6 +3420,9 @@ pub(super) fn show_alert(title: &str, msg: &str) {
 
 mod chrome;
 
+// SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+// without exactly one declaration. Zooms the real settings window.
+// SMOKE_DISTURBS=focus
 pub(crate) fn settings_vertical_zoom_smoke_runner() -> bool {
     unsafe {
         show_settings();

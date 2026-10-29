@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/r2-publisher-selftest.sh,tools/r2-publisher/
 # Offline selftest for the R2 publisher's workspace independence.
 #
 # Why it exists: both release scripts publish through

@@ -3443,6 +3443,9 @@ mod tests {
 
     /// Build every custom update prompt state in the real AppKit process. This is GUI-session
     /// dependent and is invoked explicitly through `--smoke-update-prompts`.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child to lay out the update prompt.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn update_prompt_button_layout_smoke() {

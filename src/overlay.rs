@@ -1655,6 +1655,9 @@ mod tests {
     }
 
     /// Run the real overlay summon path on the AppKit main thread in a child process.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Summons the real overlay panel.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn overlay_runtime_smoke() {

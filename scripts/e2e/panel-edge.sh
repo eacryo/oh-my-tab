@@ -26,6 +26,7 @@
 # content. It injects no global hotkey and changes no system preference, which is why it declares the
 # screen gate rather than one of the other two.
 # E2E_COVERS_SCREEN=1
+# E2E_REPLACES_INSTANCE=1
 set -euo pipefail
 
 # The repository is resolved to an absolute path ONCE, before anything changes directory: a trap that

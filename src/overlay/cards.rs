@@ -1508,6 +1508,9 @@ mod badge_smoke_tests {
     use crate::smoke_verdict::smoke_runner;
     /// Run the real card view tree on the AppKit main thread in a child process and assert that the
     /// preview-corner badges follow the card's state (including the icon-fallback branch).
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and renders real cards.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn card_badge_runtime_smoke() {
@@ -1526,6 +1529,9 @@ mod selection_ring_smoke_tests {
     /// Run the real card view tree on the AppKit main thread in a child process and assert that both
     /// card layouts build the documented selected-state ring. This is the regression guard for the
     /// icon-only layout, which used to build no ring at all.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and renders the selection ring on a real card.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn selection_ring_runtime_smoke() {

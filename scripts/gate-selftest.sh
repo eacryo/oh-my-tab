@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed
+# uses this mapping to select it; a selftest without one is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/gate.sh,scripts/gate-selftest.sh,scripts/m2.sh,scripts/e2e/run-all.sh
 # Offline selftest for scripts/gate.sh outcome vocabulary and exit-status propagation.
 #
 # Why it exists: the gate claims that a step which could not decide is never reported as a
@@ -44,7 +47,7 @@ make_step_stub() {
     # the file literally: %s substitution keeps it out of this shell's expansion.
     local var_name
     var_name="$(step_var "$rel")"
-    printf '#!/bin/bash\neval "code=\${%s:-0}"\nexit "$code"\n' "$var_name" > "$repo/scripts/$rel"
+    printf '#!/bin/bash\n# SELFTEST_INPUTS=scripts/gate.sh,scripts/gate-selftest.sh,scripts/m2.sh,scripts/e2e/run-all.sh\neval "code=\${%s:-0}"\nexit "$code"\n' "$var_name" > "$repo/scripts/$rel"
     chmod +x "$repo/scripts/$rel"
 }
 
@@ -74,11 +77,43 @@ expect_lines fmt PASSED
 expect_lines check PASSED
 
 # --- --offline leaves the GUI tiers NOT RUN, so the run is INCOMPLETE (75) -----------------
-PATH="$workdir:$PATH" "$repo/scripts/gate.sh" --offline --tier=fmt --tier=a1 --tier=a2 > "$workdir/out" 2>&1
+PATH="$workdir:$PATH" "$repo/scripts/gate.sh" --offline --tier=fmt --tier=m1 --tier=m2 > "$workdir/out" 2>&1
 status_out=$?
-if [ "$status_out" -eq 75 ]; then ok; else fail "--offline must exit 75 while a1/a2 are NOT RUN (got $status_out)"; fi
-expect_lines a1 "NOT RUN"
-expect_lines a2 "NOT RUN"
+if [ "$status_out" -eq 75 ]; then ok; else fail "--offline must exit 75 while m1/m2 are NOT RUN (got $status_out)"; fi
+expect_lines m1 "NOT RUN"
+expect_lines m2 "NOT RUN"
+
+# --- the old single-axis tier names are refused, never reinterpreted -----------------------
+# A1 and A2 named cells the classification replaced. An old command must not silently run a
+# different set, so the names are an error, and the error is not a tier outcome.
+PATH="$workdir:$PATH" "$repo/scripts/gate.sh" --tier=a1 > "$workdir/out" 2>&1
+status_out=$?
+if [ "$status_out" -eq 2 ]; then ok; else fail "--tier=a1 must be refused with exit 2 (got $status_out)"; fi
+if grep -q "is no longer a tier name" "$workdir/out"; then ok; else fail "--tier=a1 must say why it was refused"; fi
+if grep -qE "^gate: a1 (PASSED|FAILED|NOT RUN)" "$workdir/out"; then fail "--tier=a1 must not produce a tier outcome"; else ok; fi
+PATH="$workdir:$PATH" "$repo/scripts/gate.sh" --tier=a2 > "$workdir/out" 2>&1
+status_out=$?
+if [ "$status_out" -eq 2 ]; then ok; else fail "--tier=a2 must be refused with exit 2 (got $status_out)"; fi
+
+# --- no argument runs the daily gate (M1), says so, and does not select M2 -----------------
+PATH="$workdir:$PATH" "$repo/scripts/gate.sh" > "$workdir/out" 2>&1
+status_out=$?
+if grep -q "running M1 only" "$workdir/out"; then ok; else fail "a bare run must warn that it runs M1 only"; fi
+if grep -qE "^gate: m2 NOT SELECTED" "$workdir/out"; then ok; else fail "a bare run must print m2 as NOT SELECTED"; fi
+# M2 being unselected is not incompleteness, so a bare M1 run whose stubs pass exits 0.
+if [ "$status_out" -eq 0 ]; then ok; else fail "a bare M1 run must not be incomplete because m2 was not selected (got $status_out)"; fi
+if grep -qE "^gate: m1 PASSED" "$workdir/out"; then ok; else fail "a bare run must select and pass m1"; fi
+
+# --- --full selects M2, and an unauthorized M2 leaves the run incomplete -------------------
+printf '#!/bin/bash\nexit "${STUB_M2_STATUS:-0}"\n' > "$repo/scripts/m2.sh"
+chmod +x "$repo/scripts/m2.sh"
+PATH="$workdir:$PATH" "$repo/scripts/gate.sh" --full > "$workdir/out" 2>&1
+status_out=$?
+if grep -qE "^gate: m2 PASSED" "$workdir/out"; then ok; else fail "--full must run and record m2"; fi
+env STUB_M2_STATUS=75 PATH="$workdir:$PATH" "$repo/scripts/gate.sh" --full > "$workdir/out" 2>&1
+status_out=$?
+if [ "$status_out" -eq 75 ]; then ok; else fail "--full with an incomplete m2 must exit 75 (got $status_out)"; fi
+expect_lines m2 "NOT RUN"
 
 # --- a failing step exits 1 ----------------------------------------------------------------
 env "$cargo_var=1" PATH="$workdir:$PATH" "$repo/scripts/gate.sh" --tier=fmt > "$workdir/out" 2>&1

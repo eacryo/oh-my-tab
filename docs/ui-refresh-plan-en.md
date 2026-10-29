@@ -9,13 +9,30 @@ behaviour a user would call a feature — it changes how the app looks and how i
 
 ## 1. Ground rules
 
-- Before handing off any phase, run the full gate `scripts/gate.sh` (see `AGENTS.md`; without a graphical
-  session at least `scripts/gate.sh --offline`, with every unrun tier reported as unrun rather than passed),
-  then `scripts/dev-restart.sh --no-onboarding`.
+- A phase's daily gate is `scripts/gate.sh`, which runs M1 only (see `AGENTS.md`; without a graphical
+  session at least `scripts/gate.sh --offline`, with every unrun step reported as unrun rather than passed).
+  The complete run, `scripts/gate.sh --full`, includes M2 and is triggered by the user before a release or
+  whenever they ask; an agent never runs it on its own. Then `scripts/dev-restart.sh --no-onboarding`.
 - Layout-touching phases also run `--smoke-settings-layout`; overlay-touching phases also run
   `--smoke-overlay`; clipboard-touching phases also run `--smoke-clipboard`.
-- **Promotion rule**: every problem this review found is either fixed with an assertion in tier A, or
-  with a state field that makes it assertable. A fix without an assertion is not done.
+- **The classification**: tests are split along two independent dimensions — **who produces the final
+  verdict** (M: code decides; A: an agent decides, and A-class is never gate evidence) and **whether it
+  disturbs the user** (no disturbance, or disturbance: steals focus, covers or captures the screen live,
+  changes a system preference, or restarts/replaces the running instance). The four cells are M1
+  (code-decided, non-disturbing: the **daily gate** — the headless offline tier, every
+  `scripts/*-selftest.sh`, and the smoke runners that verifiably start no app, place no window on screen,
+  grab no screen, inject no input and restart no instance), M2 (code-decided but disturbing: the remaining
+  smoke runners and the 16 e2e scenarios, selected only by `--full`), A1 (agent-decided, non-disturbing:
+  reads state or an **existing** screenshot file, never a live screen grab) and A2 (agent-decided and
+  disturbing: must watch live, e.g. real-time UI review and triage that needs a scenario running now). The
+  daily loop runs M1; the complete run is triggered by the user before a release or whenever they ask, and
+  an agent never decides on its own to run M2. The four disturbances are independent and each needs its own
+  authorization. The M1 boundary is behavioural, not structural: `--smoke-overlay` summons a real panel and
+  `--smoke-settings-layout` opens the real settings window, so both are M2 however headless the command
+  line looks.
+- **Promotion rule**: every problem this review found is either fixed with an M-class assertion (M1 where
+  the claim is decidable without disturbance, M2 where it needs a real surface), or with a state field that
+  makes it assertable. A fix without an assertion is not done.
 - If a phase changes a value that the layout validator or a geometry test hardcodes, update the
   constant and the test together; never loosen the assertion to make it pass.
 - No phase may leave the tree in a state that renders a raw translation key, a raw identifier, or a
@@ -67,8 +84,9 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
 
 - **Now**: `frost` and `liquid-glass` draw their text with the dynamic system label colours on top of the
   material itself, so their contrast depends on how AppKit composites those colours against a translucent
-  surface. The tier-A smoke can only *log* the numbers (a colour-vs-constant comparison cannot see the
-  composite), and the style document states their tier as a target rather than an enforced floor. **Done, within its scope.** The A2 scenario measures the filter row and each footer caption on rendered pixels,
+  surface. A headless smoke (M1) can only *log* the numbers (a colour-vs-constant comparison cannot see the
+  composite), and the style document states their tier as a target rather than an enforced floor. **Done,
+  within its scope.** The M2 e2e scenario measures the filter row and each footer caption on rendered pixels,
   in same-launch differential frames (the app hides the panel's text in place between the two captures), and it
   fails below 3:1. What it actually measures is the **footer captions** on all twelve `{frost, liquid-glass,
   opaque} x {light, dark} x {black, white}` combinations, each of which clears the 3:1 caption tier. The **filter
@@ -76,8 +94,9 @@ Small, high-impact, low-risk. These are the defects the review found, not taste.
   unrun check is not coverage. Roles outside those two -- row titles, detail text, the keycap glyphs -- remain
   targets, and an ink contributing under 3 tone units is below what the diff can see. Earlier claim, now void: the
   two-launch form of this measurement, retracted below.
-- **Target**: an A2 scenario that reads the panel's frame from `--e2e-state` (`clipboard_picker`), captures
-  that region, and asserts the tier on rendered pixels -- `text_primary` >= 4.5:1, captions >= 3:1 -- for
+- **Target**: an M2 scenario -- it captures the screen, so it needs that disturbance's own authorization
+  (`--include-screen`) -- that reads the panel's frame from `--e2e-state` (`clipboard_picker`),
+  captures that region, and asserts the tier on rendered pixels -- `text_primary` >= 4.5:1, captions >= 3:1 -- for
   `{frost, liquid-glass} x {light, dark}`. The dark-mode glass case (`#6E6E6E` surface) is the first one to
   measure, because `NSGlassEffectView` provides no contrast-preserving composite and the three dynamic label
   colours are the only ink it gets.
@@ -246,16 +265,17 @@ Each P3 item is independent and can ship on its own.
 ## 7. Verification per phase
 
 ```sh
-scripts/gate.sh                                   # the whole gate: one PASSED/FAILED/NOT RUN line per tier
-scripts/gate.sh --offline                         # the headless subset; green here is not a green gate
+scripts/gate.sh                                   # the daily gate: M1 only, one PASSED/FAILED/NOT RUN line per step
+scripts/gate.sh --offline                         # the M1 subset without a graphical session
+scripts/gate.sh --full                            # the complete run, M2 included: the user triggers it before a release
 scripts/dev-restart.sh --no-onboarding            # functional handoff
 scripts/dev-restart.sh --no-onboarding --pseudo-locale   # long-text layout
 scripts/dev-restart.sh --opt --no-onboarding      # feel/perf check for Phase 2
-# GUI smoke entries (each exits non-zero on failure)
+# GUI smoke entries (M2: they open the real window; each exits non-zero on failure)
 ./dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab --smoke-settings-layout
 ./dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab --smoke-overlay
 ./dist/Oh-My-Tab-Dev.app/Contents/MacOS/oh-my-tab --smoke-clipboard
-# A2 end-to-end (asks before stealing focus)
+# M2 e2e scenarios (disturbing: focus, screen capture and the like; each kind asks separately)
 scripts/e2e/run-all.sh
 ```
 
@@ -277,5 +297,7 @@ about feel, so validate it with `--opt` and a real scroll/summon rather than by 
 
 - Every row of §2 is either resolved or recorded as an accepted deviation with a reason in the code.
 - `docs/design-style-en.md` §13's checklist passes for every surface.
-- Tier A contains an assertion for each P0 item and for the P1 palette and scale invariants.
+- M-class assertions exist for each P0 item and for the P1 palette and scale invariants; the ones
+  decidable without disturbance are M1 (the daily gate), the ones that need a real surface are M2 (selected
+  only by `--full`).
 - No user-visible string renders a raw key, and no control wraps to two lines.

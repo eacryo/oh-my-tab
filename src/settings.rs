@@ -2880,6 +2880,9 @@ mod tests {
     /// normal headless suite because NSWindow construction is GUI/session dependent.
     /// The same layout smoke with the Reduce Motion ask on: a switch state change must take the
     /// no-animation branch, which used to send `[CALayer layer]` and trap the process.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Opens the real settings layout under Reduce Motion.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn settings_layout_smoke_under_reduce_motion() {
@@ -2893,6 +2896,9 @@ mod tests {
 
     #[test]
     #[ignore]
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and drives the real settings window.
+    // SMOKE_DISTURBS=focus
     fn settings_vertical_zoom_smoke() {
         smoke_runner!("settings_vertical_zoom_smoke", 1, {
             // The child is the process that ran the assertions; it records the verdict
@@ -2907,6 +2913,9 @@ mod tests {
     /// The Finder Menu page's own A1 check. Separate from the all-pages layout smoke because that
     /// runner stops on an earlier, pre-existing clipboard assertion (docs/review-backlog.md entry
     /// 41) and would never reach any page's own assertions.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Builds the real Finder Menu settings page.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn finder_menu_page_smoke() {
@@ -2922,6 +2931,9 @@ mod tests {
 
     #[test]
     #[ignore]
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and drives the real settings window.
+    // SMOKE_DISTURBS=focus
     fn settings_layout_smoke() {
         smoke_runner!("settings_layout_smoke", 1, {
             // The child is the process that ran the assertions; it records the verdict
@@ -2934,6 +2946,9 @@ mod tests {
     }
 
     /// Call the registered NSApplication reopen delegate and verify custom handling opens Settings.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and opens the real settings window.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn application_reopen_delegate_opens_settings_smoke() {
@@ -2948,6 +2963,9 @@ mod tests {
     }
 
     /// Rebuilding settings content must not reset controls to their construction defaults.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and rebuilds the settings content.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn settings_state_sync_after_content_rebuild_smoke() {
@@ -2962,6 +2980,9 @@ mod tests {
     }
 
     /// Hiding a conditional clipboard row must preserve adjacent rows and close the layout gap.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and measures the real collapsible row.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn settings_collapsible_row_geometry_smoke() {
@@ -2977,6 +2998,9 @@ mod tests {
     /// Mouse profile edits must leave the RefCell borrow before runtime refresh re-enters settings.
     #[test]
     #[ignore]
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and drives the real settings window.
+    // SMOKE_DISTURBS=focus
     fn settings_mouse_profile_callback_smoke() {
         smoke_runner!("settings_mouse_profile_callback_smoke", 1, {
             // The child is the process that ran the assertions; it records the verdict
@@ -2989,6 +3013,9 @@ mod tests {
     }
 
     /// Create a pixel-based continuous CGEvent and round-trip every field used by smooth scroll.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and synthesises scroll events.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn smooth_scroll_synthetic_event_fields_smoke() {

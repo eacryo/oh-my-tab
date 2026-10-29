@@ -22,6 +22,7 @@
 # This scenario injects a real global hotkey and therefore steals focus; the marker below makes
 # scripts/e2e/run-all.sh skip it unless --include-focus is given.
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 #
 # Exit code: 0 = 全部断言通过;非 0 = 失败(逐条打印原因)。
 

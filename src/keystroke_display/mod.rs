@@ -637,6 +637,9 @@ mod tests {
         ));
     }
 
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Acquires the single-instance lock and spawns the app child for the panel assertions.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn panel_creation_and_badge_layout_smoke() {
@@ -648,9 +651,25 @@ mod tests {
                  against the previous implementation",
                 app.display()
             );
-            // The refusal probe needs exclusive ownership of the single-instance lock.
-            let instance_guard = crate::single_instance::acquire()
-                .expect("panel smoke requires no running app instance for its refusal probe");
+            // The refusal probe needs exclusive ownership of the single-instance lock. A running app is
+            // an environment the runner cannot change, not a defect: reporting it as a failed assertion
+            // turned "quit your app and rerun" into a red gate (observed 2026-10-29 with the dev
+            // instance up). Every other acquire error, and every assertion after this point, still
+            // fails for real; only this one short-circuit reports NOT RUN.
+            let instance_guard = match crate::single_instance::acquire() {
+                Ok(guard) => guard,
+                Err(crate::single_instance::AcquireError::AlreadyRunning) => {
+                    crate::smoke_verdict::report(
+                        "panel_creation_and_badge_layout_smoke",
+                        crate::smoke_verdict::Verdict::NotRun(
+                            "another Oh-My-Tab instance is running; quit it to run the refusal probe"
+                                .into(),
+                        ),
+                    );
+                    return;
+                }
+                Err(error) => panic!("panel smoke cannot acquire the instance lock: {error}"),
+            };
             let refusal = std::process::Command::new(&app)
                 // Keep this a smoke launch so a lock refusal has a failing exit status, but use
                 // an entry point that remains protected by the single-instance guard.

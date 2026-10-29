@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/lib/dev-lock.sh,scripts/dev-lock-selftest.sh
 # Offline self-test for scripts/lib/dev-lock.sh: no build, no app, no lock on the real repository.
 #
 # Each case below exists because a plausible implementation passed without it:

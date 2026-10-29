@@ -4582,6 +4582,8 @@ mod tests {
     /// Smoke (GUI/AppKit): the default-value ivar round-trips and a real NSEvent double-click
     /// restores it. Requires a GUI session, hence #[ignore]; run with
     /// `cargo test -- --ignored slider_double_click_smoke`.
+    // SMOKE_CELL=M1 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Builds a slider in-process and double-clicks it; no app, no window on screen, no capture.
     #[test]
     #[ignore]
     fn slider_double_click_smoke() {
@@ -4615,6 +4617,8 @@ mod tests {
     /// Smoke (GUI/AppKit): a stepped slider's own value only ever rests on a whole step. That is
     /// the property that makes the knob, the readout and the persisted field agree without any
     /// post-hoc correction: all three read this one control's value.
+    // SMOKE_CELL=M1 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Asserts the stepped slider's value arithmetic in-process; no app or window.
     #[test]
     #[ignore]
     fn stepped_slider_rests_on_whole_steps_smoke() {
@@ -4666,6 +4670,8 @@ mod tests {
         assert_eq!(derived_label_width(20.0, 16.0, 16.0), 1.0);
     }
 
+    // SMOKE_CELL=M1 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Asserts switch hit-test and focus-ring geometry in-process; no app or window.
     #[test]
     #[ignore]
     fn switch_hit_test_and_focus_ring_smoke() {

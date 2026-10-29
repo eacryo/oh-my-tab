@@ -6294,6 +6294,9 @@ mod tests {
     // is strictly main-thread-only, so the test harness's worker threads can't build the picker.
     // Two show_picker calls exercise rebuild_rows' row cleanup (a double-release UAF that once
     // segfaulted on the second summon).
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child (--smoke-clipboard) and drives the real picker panel.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn picker_rebuild_smoke() {

@@ -1,5 +1,6 @@
 #!/bin/bash
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 # LaunchServices reopen delivery opens Settings in the already-running accessory app.
 
 set -uo pipefail

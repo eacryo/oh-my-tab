@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/dev-unbundled-handover-selftest.sh,scripts/install-unbundled.sh,scripts/dev-restart.sh
 # Offline check of the unbundled-install handover in dev-restart.sh, running the real control
 # flow.
 #

@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/bundle.sh,src/version_consistency.rs,src/lib.rs,scripts/version-consistency-selftest.sh,Cargo.toml,crates/,finder-ext/
 # Offline selftest for the workspace release-version agreement.
 #
 # Why it exists: every packaging input (the app's Info.plist, the Finder extension's nested

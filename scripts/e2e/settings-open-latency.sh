@@ -1,5 +1,6 @@
 #!/bin/bash
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 # A2: opening the settings window from the clipboard picker is fast, and the measurement can tell
 # the warm path from the cold one.
 #

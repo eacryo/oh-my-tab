@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/cargo-test.sh,scripts/cargo-test-selftest.sh
 # Offline selftest for scripts/cargo-test.sh.
 #
 # Why it exists: the wrapper is the instrument the whole gate rests on, and its promise -- "a run

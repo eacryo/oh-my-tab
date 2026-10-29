@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/dev-launch-interrupt-selftest.sh,scripts/dev-restart.sh
 # Offline check of the launch-interruption cleanup, executing the real control flow.
 #
 # An earlier version copied the guard condition into the test and compared strings, which proves

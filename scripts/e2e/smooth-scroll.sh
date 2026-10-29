@@ -9,6 +9,10 @@
 #
 # The feature is enabled for this launch only through argv; no config file is edited.
 
+# E2E_REPLACES_INSTANCE=1
+# E2E_COVERS_SCREEN=1
+# E2E_STEALS_FOCUS=1
+
 set -uo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"

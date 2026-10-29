@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/doc-stats.py,scripts/doc-stats-selftest.sh,docs/
 # Offline self-test for scripts/doc-stats.py: no network, no build, no app.
 #
 # Why each case exists: the statistics are the instrument behind the quantitative claims in

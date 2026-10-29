@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/bundle.sh,scripts/generate-appcast.sh,scripts/release-dev.sh,scripts/release-dev-signing-selftest.sh,docs/releasing-en.md
 #
 # Self-test for the signing-identity resolution and the release gates in scripts/release-dev.sh.
 #

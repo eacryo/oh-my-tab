@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/lib/decode-launch-field.py,scripts/dev-launch-codec-selftest.sh,src/logger.rs
 # Round-trip check for the launch-record field codec, run against the code the script actually uses.
 #
 # Why this exists: the Rust test pins what the ENCODER produces, but the defect that survived an

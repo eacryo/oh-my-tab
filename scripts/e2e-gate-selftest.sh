@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed
+# uses this mapping to select it; a selftest without one is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/e2e/run-all.sh,scripts/e2e-gate-selftest.sh,scripts/lib/e2e-restore.sh
 # Offline selftest for scripts/lib/dev-stop.sh and for the A2 aggregator disturbance gates.
 #
 # Why it exists: the helper exists because a name-based kill can stop the user packaged app, and the
@@ -49,17 +52,21 @@ if [ -z "$extracted" ] || [ -z "$extracted_gate" ]; then
     exit 1
 fi
 
-# The worker runs in a subshell with the two functions and the three include flags the gate reads, so
-# a case can set any combination without leaking into the next one.
-gate() {  # <focus> <prefs> <screen> <include_focus> <include_prefs> <include_screen>
-    local focus="$1" prefs="$2" screen="$3" inc_focus="$4" inc_prefs="$5" inc_screen="$6"
+# The worker runs in a subshell with the two functions and the four include flags the gate reads, so
+# a case can set any combination without leaking into the next one. The instance flag is the fourth
+# disturbance: a scenario that restarts the app replaces the instance the person is using, which is
+# neither focus, screen nor preferences.
+gate() {  # <focus> <prefs> <screen> <instance> <inc_focus> <inc_prefs> <inc_screen> <inc_instance>
+    local focus="$1" prefs="$2" screen="$3" instance="$4"
+    local inc_focus="$5" inc_prefs="$6" inc_screen="$7" inc_instance="$8"
     (
         include_focus="$inc_focus"
         include_prefs="$inc_prefs"
         include_screen="$inc_screen"
+        include_instance="$inc_instance"
         eval "$extracted"
         eval "$extracted_gate"
-        gate_refusal "$focus" "$prefs" "$screen"
+        gate_refusal "$focus" "$prefs" "$screen" "$instance"
     )
 }
 
@@ -86,33 +93,43 @@ expect_refusal() {  # <label> <switch> <focus> <prefs> <screen> <inc_focus> <inc
 }
 
 # Nothing declared: always runs, whatever was authorised.
-expect_empty "no marks, no switches" 0 0 0 0 0 0
-expect_empty "no marks, all switches" 0 0 0 1 1 1
+expect_empty "no marks, no switches" 0 0 0 0 0 0 0 0
+expect_empty "no marks, all switches" 0 0 0 0 1 1 1 0
 
 # Each declaration alone is refused until its own switch is given -- and the other two switches must NOT
 # admit it. That is the counter-example the old single if-chain got wrong.
-expect_refusal "focus alone" --include-focus 1 0 0 0 0 0
-expect_refusal "focus alone, prefs+screen given" --include-focus 1 0 0 0 1 1
-expect_empty "focus alone, focus given" 1 0 0 1 0 0
+expect_refusal "focus alone" --include-focus 1 0 0 0 0 0 0 0
+expect_refusal "focus alone, prefs+screen given" --include-focus 1 0 0 0 0 1 1 0
+expect_empty "focus alone, focus given" 1 0 0 0 1 0 0 0
 
-expect_refusal "prefs alone" --include-prefs 0 1 0 0 0 0
-expect_refusal "prefs alone, focus+screen given" --include-prefs 0 1 0 1 0 1
-expect_empty "prefs alone, prefs given" 0 1 0 0 1 0
+expect_refusal "prefs alone" --include-prefs 0 1 0 0 0 0 0 0
+expect_refusal "prefs alone, focus+screen given" --include-prefs 0 1 0 0 1 0 1 0
+expect_empty "prefs alone, prefs given" 0 1 0 0 0 1 0 0
 
-expect_refusal "screen alone" --include-screen 0 0 1 0 0 0
-expect_refusal "screen alone, focus+prefs given" --include-screen 0 0 1 1 1 0
-expect_empty "screen alone, screen given" 0 0 1 0 0 1
+expect_refusal "screen alone" --include-screen 0 0 1 0 0 0 0 0
+expect_refusal "screen alone, focus+prefs given" --include-screen 0 0 1 0 1 1 0 0
+expect_empty "screen alone, screen given" 0 0 1 0 0 0 1 0
 
 # Stacked declarations need every switch: one of them is never enough. panel-contrast.sh is the real
 # case (prefs + screen).
-expect_refusal "prefs+screen, only prefs" --include-screen 0 1 1 0 1 0
-expect_refusal "prefs+screen, only screen" --include-prefs 0 1 1 0 0 1
-expect_empty "prefs+screen, both" 0 1 1 0 1 1
-expect_refusal "focus+screen, only focus" --include-screen 1 0 1 1 0 0
-expect_refusal "focus+screen, only screen" --include-focus 1 0 1 0 0 1
-expect_empty "focus+screen, both" 1 0 1 1 0 1
-expect_refusal "all three, only two" --include-screen 1 1 1 1 1 0
-expect_empty "all three, all given" 1 1 1 1 1 1
+expect_refusal "prefs+screen, only prefs" --include-screen 0 1 1 0 0 1 0 0
+expect_refusal "prefs+screen, only screen" --include-prefs 0 1 1 0 0 0 1 0
+expect_empty "prefs+screen, both" 0 1 1 0 0 1 1 0
+expect_refusal "focus+screen, only focus" --include-screen 1 0 1 0 1 0 0 0
+expect_refusal "focus+screen, only screen" --include-focus 1 0 1 0 0 0 1 0
+expect_empty "focus+screen, both" 1 0 1 0 1 0 1 0
+expect_refusal "all three, only two" --include-screen 1 1 1 0 1 1 0 0
+expect_empty "all three, all given" 1 1 1 0 1 1 1 0
+
+# The instance disturbance is independent of the other three: authorising a restart is not the same as
+# authorising focus, a screen grab or a preferences change, and none of them admits it.
+expect_refusal "instance alone" --include-instance 0 0 0 1 0 0 0 0
+expect_refusal "instance alone, focus+screen+prefs given" --include-instance 0 0 0 1 1 1 1 0
+expect_empty "instance alone, instance given" 0 0 0 1 0 0 0 1
+expect_refusal "focus+instance, only focus" --include-instance 1 0 0 1 1 0 0 0
+expect_empty "focus+instance, both" 1 0 0 1 1 0 0 1
+expect_refusal "prefs+instance, only prefs" --include-instance 0 1 0 1 0 1 0 0
+expect_empty "prefs+instance, both" 0 1 0 1 0 1 0 1
 
 # The marker reader itself: exact header lines only, so prose that mentions a marker cannot widen a gate
 # and a marker with a trailing comment cannot silently stop being one.
@@ -136,10 +153,12 @@ check_marks() {  # <label> <file> <want>
         ok
     fi
 }
-check_marks "exact markers" "$tmpdir/exact.sh" "1 0 1"
-check_marks "marker with a trailing comment is not a marker" "$tmpdir/trailing.sh" "0 0 0"
-check_marks "marker named in prose is not a marker" "$tmpdir/prose.sh" "0 0 0"
-check_marks "spaces around the assignment are not the marker" "$tmpdir/spaced.sh" "0 0 0"
+check_marks "exact markers" "$tmpdir/exact.sh" "1 0 1 0"
+check_marks "marker with a trailing comment is not a marker" "$tmpdir/trailing.sh" "0 0 0 0"
+check_marks "marker named in prose is not a marker" "$tmpdir/prose.sh" "0 0 0 0"
+check_marks "spaces around the assignment are not the marker" "$tmpdir/spaced.sh" "0 0 0 0"
+printf '# E2E_REPLACES_INSTANCE=1\n' >"$tmpdir/instance.sh"
+check_marks "instance marker alone" "$tmpdir/instance.sh" "0 0 0 1"
 
 # --- the conditional restore helper ------------------------------------------------------
 # Review finding: an unconditional "hand the front back" can yank a person who deliberately switched

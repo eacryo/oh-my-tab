@@ -233,11 +233,13 @@ semicolon inside a table row, a code span or a quoted command is data, not prose
 | launchd job (launchd 任务) | A job registered with launchd for the app or its Finder extension | daemon, service, agent |
 | worktree (worktree) | A git worktree of this repository; one build/test/launch transaction runs at a time across all of them | checkout, copy, clone |
 | gate (门禁) | `scripts/gate.sh` and its tiers, each printing one PASSED, FAILED or NOT RUN line | CI run, test suite, check |
-| tier A1 (A1 层) | The script-decided headless tests and the GUI smoke runners | smoke tier, unit tests |
-| tier A2 (A2 层) | The script-decided e2e scenarios under `scripts/e2e/` | integration tests, UI tests |
-| tier B (B 层) | Judgement a person or an agent decides: taste, first-pass UI review, failure triage, bug investigation. It decides, but it is never gate evidence, so a B-tier result must land an A-tier assertion | manual tests |
-| smoke runner (冒烟运行器) | One `#[ignore]` test that the A1 tier runs and classifies by its `smoke-result:` line | smoke test, GUI test |
-| e2e scenario (e2e 场景) | One `scripts/e2e/*.sh` script run through `scripts/e2e/run-all.sh` | e2e test, A2 test |
+| M1 (M1 格) | Code-decided and non-disturbing: the headless offline tier, every `scripts/*-selftest.sh`, and the smoke runners that start no app, place no window on screen, grab no screen, inject no input and restart no instance. This is the daily gate | smoke tier, unit tests, daily gate |
+| M2 (M2 格) | Code-decided and disturbing: the remaining smoke runners and the `scripts/e2e/` scenarios. Selected only by `gate.sh --full` | integration tests, UI tests, release gate |
+| A1 (A1 格) | Agent-decided and non-disturbing: an agent reads state or an **existing** screenshot file. Never gate evidence | manual review |
+| A2 (A2 格) | Agent-decided and disturbing: the agent must watch live (real-time UI review, live triage). Never gate evidence | manual review |
+| disturbance marker (干扰标记) | A declaration in a scenario's or runner's header: focus, screen, preferences, or replaces-instance. Each needs its own authorization; none implies another | `E2E_*` / `SMOKE_CELL` marker |
+| smoke runner (冒烟运行器) | One `#[ignore]` test carrying exactly one `SMOKE_CELL=M1\|M2` declaration, run and classified by its `smoke-result:` line | smoke test, GUI test |
+| e2e scenario (e2e 场景) | One `scripts/e2e/*.sh` script run through `scripts/e2e/run-all.sh`, always M2 | e2e test, M2 test |
 | disturbance switch (干扰闸门) | The `--include-focus`, `--include-screen` or `--include-prefs` consent for one declared disturbance | flag, opt-in |
 | reviewer session (审查会话) | The one `scripts/agent-review.sh` session that belongs to a task | review bot, ChatGPT session |
 | review round (审查轮次) | One complete round of the reviewer that ends in a verdict | review, iteration, pass |

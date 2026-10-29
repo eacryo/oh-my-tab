@@ -2024,6 +2024,9 @@ mod tests {
     }
 }
 
+// SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+// without exactly one declaration. Really captures a Finder window through CGS, with Screen Recording.
+// SMOKE_DISTURBS=focus,screen
 #[test]
 #[ignore]
 fn cgshwc_capture_smoke() {

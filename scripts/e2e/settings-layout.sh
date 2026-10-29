@@ -1,5 +1,6 @@
 #!/bin/bash
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 # A2 层 E2E 场景:设置窗口几何护栏(把"只有截图能看见"的事实变成断言)。
 #
 # 覆盖三类曾经只能靠目视发现、因而会静默回归的缺陷:

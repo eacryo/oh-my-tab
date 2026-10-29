@@ -39,6 +39,7 @@ e2e_dir="$repo_dir/scripts/e2e"
 include_focus=0
 include_prefs=0
 include_screen=0
+include_instance=0
 gate_mode=0
 list_only=0
 
@@ -47,6 +48,7 @@ for arg in "$@"; do
         --include-focus) include_focus=1 ;;
         --include-prefs) include_prefs=1 ;;
         --include-screen) include_screen=1 ;;
+        --include-instance) include_instance=1 ;;
         --list) list_only=1 ;;
         --gate) gate_mode=1 ;;
         # The range tracks the header above: it ends where the prose ends and the script begins.
@@ -59,24 +61,30 @@ done
 # two or three of them, and passing one switch must not admit a scenario that also needs another. The
 # declarations are read from the script's own header, one exact line each, so a marker that merely
 # mentions the name in prose cannot turn a gate on or off.
-scenario_marks() {  # <script> -> prints "focus prefs screen" as 0/1
-    local script="$1" focus=0 prefs=0 screen=0
+scenario_marks() {  # <script> -> prints "focus prefs screen instance" as 0/1
+    local script="$1" focus=0 prefs=0 screen=0 instance=0
     grep -q '^# E2E_STEALS_FOCUS=1$' "$script" && focus=1
     grep -q '^# E2E_CHANGES_PREFS=1$' "$script" && prefs=1
     grep -q '^# E2E_COVERS_SCREEN=1$' "$script" && screen=1
-    printf '%s %s %s\n' "$focus" "$prefs" "$screen"
+    grep -q '^# E2E_REPLACES_INSTANCE=1$' "$script" && instance=1
+    printf '%s %s %s %s\n' "$focus" "$prefs" "$screen" "$instance"
 }
 
 # The gates, in one place, so the aggregate and the offline selftest cannot disagree about them. The
 # order the refusal is named in is the order a person would want to be told: the most disruptive first.
-gate_refusal() {  # <focus> <prefs> <screen> -> prints the switch that would admit it, or nothing
-    local focus="$1" prefs="$2" screen="$3"
+gate_refusal() {  # <focus> <prefs> <screen> <instance> -> the switch that would admit it, or nothing
+    local focus="$1" prefs="$2" screen="$3" instance="$4"
     if [ "$focus" = "1" ] && [ "$include_focus" != "1" ]; then
         echo "--include-focus"
     elif [ "$screen" = "1" ] && [ "$include_screen" != "1" ]; then
         echo "--include-screen"
     elif [ "$prefs" = "1" ] && [ "$include_prefs" != "1" ]; then
         echo "--include-prefs"
+    elif [ "$instance" = "1" ] && [ "$include_instance" != "1" ]; then
+        # Last because it is the least visible consequence, not the least important: a scenario that
+        # restarts the app replaces whatever instance the person is using, and nothing on screen
+        # says it happened.
+        echo "--include-instance"
     fi
 }
 
@@ -85,6 +93,7 @@ nonexec_exec=0
 skipped=()
 skipped_prefs=()
 skipped_screen=()
+skipped_instance=()
 for script in "$e2e_dir"/*.sh; do
     name="$(basename "$script")"
     # 聚合器自己不是场景。
@@ -100,19 +109,37 @@ for script in "$e2e_dir"/*.sh; do
         fi
         continue
     }
-    read -r mark_focus mark_prefs mark_screen <<<"$(scenario_marks "$script")"
-    refusal="$(gate_refusal "$mark_focus" "$mark_prefs" "$mark_screen")"
+    read -r mark_focus mark_prefs mark_screen mark_instance <<<"$(scenario_marks "$script")"
+    refusal="$(gate_refusal "$mark_focus" "$mark_prefs" "$mark_screen" "$mark_instance")"
     case "$refusal" in
         --include-focus) skipped+=("$name") ;;
         --include-screen) skipped_screen+=("$name") ;;
         --include-prefs) skipped_prefs+=("$name") ;;
+        --include-instance) skipped_instance+=("$name") ;;
         "") scenarios+=("$script") ;;
     esac
 done
 
-if [ "${#scenarios[@]}" -eq 0 ]; then
-    echo "e2e run-all: no scenarios selected (nothing in $e2e_dir?)" >&2
+# Nothing selected is not the same as nothing existing. Every scenario in this directory declares
+# at least one disturbance, so a bare run legitimately selects none; that is a refusal, not a failure
+# of the tier, and it must say which switch would admit what.
+if [ "${#scenarios[@]}" -eq 0 ] && [ "${#skipped[@]}" -eq 0 ] && [ "${#skipped_screen[@]}" -eq 0 ] \
+    && [ "${#skipped_prefs[@]}" -eq 0 ] && [ "${#skipped_instance[@]}" -eq 0 ]; then
+    echo "e2e run-all: no scenario found in $e2e_dir" >&2
     exit 1
+fi
+
+if [ "${#scenarios[@]}" -eq 0 ]; then
+    echo "e2e run-all: no scenario selected: every scenario declares a disturbance (focus/screen/prefs/instance)" >&2
+    for name in "${skipped[@]:-}"; do [ -n "$name" ] && echo "  $name needs --include-focus"; done
+    for name in "${skipped_screen[@]:-}"; do [ -n "$name" ] && echo "  $name needs --include-screen"; done
+    for name in "${skipped_prefs[@]:-}"; do [ -n "$name" ] && echo "  $name needs --include-prefs"; done
+    for name in "${skipped_instance[@]:-}"; do [ -n "$name" ] && echo "  $name needs --include-instance"; done
+    if [ "$gate_mode" = "1" ]; then
+        echo "e2e run-all: GATE INCOMPLETE (no scenario was authorized)" >&2
+        exit 75
+    fi
+    exit 0
 fi
 
 if [ "$list_only" = "1" ]; then
@@ -120,6 +147,7 @@ if [ "$list_only" = "1" ]; then
     [ "${#skipped[@]}" -gt 0 ] && printf 'skip (steals focus): %s\n' "${skipped[@]}"
     [ "${#skipped_screen[@]}" -gt 0 ] && printf 'skip (covers the screen): %s\n' "${skipped_screen[@]}"
     [ "${#skipped_prefs[@]}" -gt 0 ] && printf 'skip (changes system prefs): %s\n' "${skipped_prefs[@]}"
+    [ "${#skipped_instance[@]}" -gt 0 ] && printf 'skip (restarts or replaces the running app): %s\n' "${skipped_instance[@]}"
     exit 0
 fi
 
@@ -131,6 +159,9 @@ for name in "${skipped_screen[@]:-}"; do
 done
 for name in "${skipped_prefs[@]:-}"; do
     [ -n "$name" ] && echo "e2e run-all: skipping $name (temporarily changes a system preference; use --include-prefs)"
+done
+for name in "${skipped_instance[@]:-}"; do
+    [ -n "$name" ] && echo "e2e run-all: skipping $name (restarts the app or replaces the instance you are running; use --include-instance)"
 done
 
 failures=0
@@ -182,8 +213,8 @@ if [ -n "$leftover" ]; then
     failures=$((failures + 1))
 fi
 
-skipped_total=$(( ${#skipped[@]} + ${#skipped_screen[@]} + ${#skipped_prefs[@]} ))
-echo "e2e run-all: $passed passed, $not_run not run, $failures failed, $skipped_total skipped (focus/screen/prefs)"
+skipped_total=$(( ${#skipped[@]} + ${#skipped_screen[@]} + ${#skipped_prefs[@]} + ${#skipped_instance[@]} ))
+echo "e2e run-all: $passed passed, $not_run not run, $failures failed, $skipped_total skipped (focus/screen/prefs/instance)"
 
 if [ "$failures" -ne 0 ] || [ "$nonexec_exec" -ne 0 ]; then
     exit 1

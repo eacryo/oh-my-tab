@@ -12,6 +12,7 @@
 #
 # 本场景会注入真实全局热键(抢焦点),故用标记声明;run-all.sh 默认跳过它。
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 #
 # 受控目标:注入真实热键后高亮项由 MRU 决定,不可控,因此本场景**只操作自己创建的窗口**:
 # 两个由本脚本打开的临时文档(TextEdit)。若 TextEdit 已在运行则拒绝运行——Cmd+H 会隐藏整个

@@ -52,7 +52,7 @@ hierarchy and leave a stale stroke behind. It overrides `hitTest:` to return nil
 whole panel and would otherwise swallow every click meant for the panel's content.
 
 **Development switches.** `--panel-outline=off|after:N` and `--panel-shadow=off|med|high|after:N` exist for
-the A2 measurements: each produces the counter-example frame the assertion diffs against, and `after:N`
+the M2 (e2e) measurements: each produces the counter-example frame the assertion diffs against, and `after:N`
 does it inside one launch (a translucent material does not re-render identically across launches, so the
 pair has to come from one). `--panel-shadow=off` removes the carrier entirely, which also makes it the
 pre-carrier baseline for the blur-retention gate. None of them may be left running: `scripts/e2e/run-all.sh`
@@ -154,7 +154,7 @@ model gets wrong:
 
 The end-to-end assertions for a cross-desktop card -- `minimized`/`fullscreen` and their evidence
 sources, `ordered_in`, `ax_pairing`, the raw row fields -- live in `scripts/e2e/space-desktops.sh`
-(run it with `--include-focus`); the scenario derives the injected chord from `keyboard.modifier`
+(an M2 scenario; run it with `--include-focus`); the scenario derives the injected chord from `keyboard.modifier`
 rather than assuming one.
 
 The minimized decode deliberately lets the ordered-in bit outrank a minimized claim. The reference
@@ -170,8 +170,8 @@ for a window accessibility does not publish at all.
 Thumbnails: such a card never *requests* a capture -- the private capture call this app uses
 (`SLSHWCaptureWindowList`) cannot capture a window off the active desktop, and no reference
 implementation asks it to -- but it does show a frame the cache already holds from when the window was
-on its own desktop -- the producers filter it out while the renderer keeps reading the cache, and the A2 snapshot
-publishes `thumbnail_ready` so that behaviour is assertable. Refusing to render that frame as well was
+on its own desktop -- the producers filter it out while the renderer keeps reading the cache, and the e2e
+(M2) snapshot publishes `thumbnail_ready` so that behaviour is assertable. Refusing to render that frame as well was
 wrong: a user who visits both desktops has one for most cards, and reference implementations keep the
 last thumbnail the same way.
 
@@ -324,7 +324,7 @@ Two operational notes.
 
 **The off-main load and its cost.** The load runs off the main thread because a keychain read can block (measured in a development build: the read itself took ~11s, the rest of the decision 0.2s — the app stayed fully responsive, which is the point of the split); `clipboard_storage.state` therefore reads `uninitialized` until that load lands, and a scenario asserting it must wait and trigger a fresh snapshot.
 
-**Keychain authorization** (measured, inferred and unverified must stay apart): **located and fixed on 2026-10-08**. The rule (three C probes plus the real app): **an item's ACL is judged against the signing identity of the app that CREATED it**. An item created by a self-signed or ad-hoc build stops being recognized as soon as that binary changes (probe: rebuild and re-sign the same path -> the next read prompts) -- the historical behaviour of this machine, no longer current: after the one-time reset on 2026-10-08 the item is Developer ID-created and a rebuild read it in 67 ms with no prompt. An item created by a Developer ID-signed build survives the same rebuild (probe: silent; real app: silent). **Do not read stability off the ACL's textual form**: macOS reports a path for every non-Apple-anchored app through the deprecated reading API, so `--e2e-state`'s `keychain_acl` (`requirement` / `foreign-requirement` / `path` / `none` / `unknown`) is a form report. **An app cannot adopt an item it did not create**: a Developer ID-signed app deleting one created by a different signature gets `errSecInvalidOwnerEdit` (-25244, measured), so a legacy item has to be deleted once by the user and re-created by the app (the old storage set is kept aside as `*.failed-<ts>`). **Unverified**: a release (Developer ID) install in a legacy environment that was never reset -- "prompts at most once" is an expectation, not a guarantee. Every `--smoke-*` launch is already isolated (test key, temporary directories), so an A1 smoke never reads the keychain and never prompts; `--clip-no-keychain` remains for other development or UI verification runs that do not need it.
+**Keychain authorization** (measured, inferred and unverified must stay apart): **located and fixed on 2026-10-08**. The rule (three C probes plus the real app): **an item's ACL is judged against the signing identity of the app that CREATED it**. An item created by a self-signed or ad-hoc build stops being recognized as soon as that binary changes (probe: rebuild and re-sign the same path -> the next read prompts) -- the historical behaviour of this machine, no longer current: after the one-time reset on 2026-10-08 the item is Developer ID-created and a rebuild read it in 67 ms with no prompt. An item created by a Developer ID-signed build survives the same rebuild (probe: silent; real app: silent). **Do not read stability off the ACL's textual form**: macOS reports a path for every non-Apple-anchored app through the deprecated reading API, so `--e2e-state`'s `keychain_acl` (`requirement` / `foreign-requirement` / `path` / `none` / `unknown`) is a form report. **An app cannot adopt an item it did not create**: a Developer ID-signed app deleting one created by a different signature gets `errSecInvalidOwnerEdit` (-25244, measured), so a legacy item has to be deleted once by the user and re-created by the app (the old storage set is kept aside as `*.failed-<ts>`). **Unverified**: a release (Developer ID) install in a legacy environment that was never reset -- "prompts at most once" is an expectation, not a guarantee. Every `--smoke-*` launch is already isolated (test key, temporary directories), so an M1 smoke never reads the keychain and never prompts; `--clip-no-keychain` remains for other development or UI verification runs that do not need it.
 
 
 
@@ -412,7 +412,7 @@ holds `action` / `trigger` / `enabled`.
   `resolve_edit_target` refuses the write with `errors.key_binding_edit_stale` unless that same binding
   is still at that index. Delete re-reads the config length for the same reason. An index thus never
   has to be invalidated the way the old selection did, and `key_bindings_selected` is published as
-  `null` -- kept only because the A2 schema requires the field to be present, with no promise about its
+  `null` -- kept only because the e2e (M2) snapshot schema requires the field to be present, with no promise about its
   type; an assertion on it must expect `null`.
 - **Edit and add share one panel.** The panel is the same surface in both modes: `BINDING_EDITING` holds
   the item being edited or `None` to append, and it decides only what confirm writes and what the
@@ -433,7 +433,7 @@ holds `action` / `trigger` / `enabled`.
 - **e2e state.** `--e2e-state` publishes `key_bindings_entries`, `key_bindings_live` and
   `key_bindings_enabled`, so a scenario can assert the migration and that nothing is live while the
   master switch is off. It also still publishes `key_bindings_selected`, always `null` now, because
-  the A2 schema requires the field to be present and makes no promise about its type.
+  the e2e (M2) snapshot schema requires the field to be present and makes no promise about its type.
 
 ## Switcher panel action keys (Cmd+W / M / H / Q)
 
@@ -616,7 +616,7 @@ that runner currently stops on an earlier clipboard-page assertion (see `docs/re
 
 The overlay runtime path also has an ignored child-process smoke test. Run `cargo build` first, then `cargo test overlay_runtime_smoke -- --ignored`; its `--smoke-overlay` switch bypasses the single-instance guard so an already-running development app cannot turn the test into a false pass.
 
-The **A2 scenarios** live in `scripts/e2e/*.sh` and run through `scripts/e2e/run-all.sh`, which discovers every executable script in that directory and runs the selected ones in order. Each scenario declares the disturbances it causes in its header, one exact line per kind, and each kind has its own switch: `# E2E_STEALS_FOCUS=1` (injects a real global hotkey through the system event stream, or activates the app) needs `--include-focus`; `# E2E_COVERS_SCREEN=1` (pins a full-screen backdrop over the desktop, or captures screen content) needs `--include-screen`; `# E2E_CHANGES_PREFS=1` (touches a system preference or the user's config) needs `--include-prefs`. The gates are independent and stack -- a scenario runs only when every declaration it makes has been authorised, because agreeing to switch the frontmost app is not agreeing to have the desktop covered or a system setting changed. A marker is an exact header line: one with a trailing comment is not a marker. `--list` prints what this run would execute. The app writes the facts a scenario cannot read back through Accessibility — `--e2e-state=<path>` JSON snapshots — and the scripts assert on those plus real WindowServer state; a scenario that asserts encryption must still read the stored file itself, because a self-report is not evidence.
+The **M2 e2e scenarios** live in `scripts/e2e/*.sh` and run through `scripts/e2e/run-all.sh`, which discovers every executable script in that directory and runs the selected ones in order. Each scenario declares the disturbances it causes in its header, one exact line per kind, and each kind has its own switch: `# E2E_STEALS_FOCUS=1` (injects a real global hotkey through the system event stream, or activates the app) needs `--include-focus`; `# E2E_COVERS_SCREEN=1` (pins a full-screen backdrop over the desktop, or captures screen content) needs `--include-screen`; `# E2E_CHANGES_PREFS=1` (touches a system preference or the user's config) needs `--include-prefs`. The gates are independent and stack -- a scenario runs only when every declaration it makes has been authorised, because agreeing to switch the frontmost app is not agreeing to have the desktop covered or a system setting changed. A marker is an exact header line: one with a trailing comment is not a marker. `--list` prints what this run would execute. The app writes the facts a scenario cannot read back through Accessibility — `--e2e-state=<path>` JSON snapshots — and the scripts assert on those plus real WindowServer state; a scenario that asserts encryption must still read the stored file itself, because a self-report is not evidence.
 
 ### Localization and layout QA
 

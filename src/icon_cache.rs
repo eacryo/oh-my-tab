@@ -455,6 +455,9 @@ mod tests {
         assert!(!extraction_known_missing(&with_fp("111"), ""));
     }
 
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Reads a real Finder process through Accessibility; needs a GUI session and a running Finder.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn icon_cache_roundtrip_smoke() {

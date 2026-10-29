@@ -1169,6 +1169,9 @@ mod tests {
     }
 
     /// The application menu on the real AppKit main thread; see `app_menu_smoke_runner`.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Drives the real main menu of an app child.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn app_menu_smoke() {

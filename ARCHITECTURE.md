@@ -26,9 +26,9 @@ src/
 │   └── clipboard/               # (see "Clipboard subsystem" below)
 ├── clipboard_highlight.rs       # clipboard text classification, code wrapping, display mapping
 ├── config.rs                    # Config: the TOML schema, per-field defaults, debounced persistence
-├── dev_backdrop.rs              # dev-only controlled backdrops for A2 pixel instruments
+├── dev_backdrop.rs              # dev-only controlled backdrops for M2 pixel instruments
 ├── dev_flags.rs                 # argv-only development switches (never the environment)
-├── e2e_state.rs                 # --e2e-state JSON snapshot of internal state for tier A2
+├── e2e_state.rs                 # --e2e-state JSON snapshot of internal state for tier M2
 ├── event_monitor.rs             # switcher shortcut matching (Cmd/Opt/Ctrl+Tab) over event_tap
 ├── event_tap.rs                 # shared CGEventTap leaf: types, FFI, semantic constants, start helper
 ├── ffi.rs                       # CF/CG declarations, pointer wrappers, NSString, color/layer helpers
@@ -63,7 +63,7 @@ src/
 │   ├── settings/                # pages, components, dispatch, sidebar, import/export (see below)
 ├── single_instance.rs           # instance lock (GUI launches share one; smoke processes do not)
 ├── skylight.rs                  # the one entry point for private-framework dlopen/dlsym
-├── smoke_verdict.rs             # the A1 smoke verdict channel: PASSED/NOT RUN plus the check count
+├── smoke_verdict.rs             # the M1 smoke verdict channel: PASSED/NOT RUN plus the check count
 ├── space_groups.rs              # which desktop owns a fullscreen Space
 ├── space_swipe.rs               # synthetic Dock swipe used to commit a Space switch
 ├── space_transition.rs          # Space-change settling state shared by collection/refresh/capture
@@ -215,7 +215,7 @@ clipboard/
   family; `widgets.rs` the concrete control classes; `select.rs` the custom select; `tooltip.rs` the
   disabled-setting hint; `dispatch.rs` the control-event dispatch and dependent enable/refresh;
   `mapping.rs` the mouse-mapping rows and side-button recorder; `bindings.rs` the key-bindings page;
-  `finder_menu_smoke.rs` the Finder Menu page's own A1 GUI smoke.
+  `finder_menu_smoke.rs` the Finder Menu page's own M1 GUI smoke.
 - `restore.rs` is restore/reset, `portability.rs` is config import/export, `i18n`/`theme` reloads invalidate the
   cached window through `settings.rs`.
 - Configuration is loaded **per field**: an invalid value falls back individually without discarding valid
@@ -346,7 +346,7 @@ and `system_action.rs` Dock/Exposé actions. Reconnects must reapply pointer set
 
 These exist for the gates, not for the product, and are linked into release unless a flag gates them:
 
-- `e2e_state.rs` writes the `--e2e-state` JSON that tier A2 asserts on, because AX cannot express CALayer
+- `e2e_state.rs` writes the `--e2e-state` JSON that tier M2 asserts on, because AX cannot express CALayer
   content or "which card is selected".
 - `dev_backdrop.rs` pins a controlled backdrop for pixel instruments.
 - `dev_flags.rs` is the **only** runtime switch channel, and it is argv-only: the app must never read the

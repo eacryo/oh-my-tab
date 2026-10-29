@@ -15,6 +15,7 @@
 # 本场景会**临时修改全局偏好** `AppleShowScrollBars`(模拟"插上鼠标/改成始终显示滚动条"),所以
 # 默认被 run-all.sh 跳过,必须显式 --include-prefs;退出时(含失败/中断)一定还原。
 # E2E_CHANGES_PREFS=1
+# E2E_REPLACES_INSTANCE=1
 # 本场景还会注入 Cmd+Tab 来触发快照,会改变前台 app,所以也必须显式 --include-focus。
 # This scenario also injects Cmd+Tab to trigger a snapshot and changes the frontmost app, so it
 # requires --include-focus as well.

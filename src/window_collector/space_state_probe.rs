@@ -536,6 +536,9 @@ mod tests {
 
     /// Run the state matrix on the AppKit main thread in a child process. It fails while MATRIX is
     /// unpinned, which is the honest outcome: the gate must not pass before the recording exists.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Creates a front window and probes real Space state.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn space_state_matrix_smoke() {

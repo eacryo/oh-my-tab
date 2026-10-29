@@ -25,6 +25,7 @@
 # scripts/e2e/run-all.sh 默认跳过它。
 # This scenario injects a real global hotkey and therefore steals focus.
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 #
 # 本场景会真实切换前台应用,只能在机器空闲时运行:任何并发输入都会让选中序列在断言途中改变。
 #

@@ -21,6 +21,7 @@
 # 本场景会注入真实全局热键并真实切换桌面(抢焦点),故用标记声明;run-all.sh 默认跳过。
 # This scenario injects a real global hotkey and switches desktops, so it steals focus.
 # E2E_STEALS_FOCUS=1
+# E2E_REPLACES_INSTANCE=1
 #
 # 本场景会临时改写用户配置里的 windows.show_other_desktops,并在 trap 里恢复原文件与重启 app。
 # Exit code: 0 = 断言全部通过,或环境不具备时的 NOT RUN;非 0 = 失败(逐条打印原因)。

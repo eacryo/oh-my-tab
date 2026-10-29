@@ -10,6 +10,9 @@
 # Why no hotkey: `--show-clipboard` opens the panel, and the clipboard panel is nonactivating, so
 # neither the launch nor the gesture steals focus. A scenario that pressed the global shortcut would
 # have to be authorised separately and could not run unattended.
+# E2E_REPLACES_INSTANCE=1
+# E2E_STEALS_FOCUS=1
+
 set -euo pipefail
 
 repo_dir="$(cd "$(dirname "$0")/../.." && pwd)"

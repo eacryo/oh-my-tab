@@ -1,4 +1,7 @@
 #!/bin/bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed uses this
+# mapping to select it; a selftest without a declaration is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/lib/workspace-versions.py,scripts/workspace-versions-selftest.sh,Cargo.toml,crates/,finder-ext/,tools/r2-publisher/Cargo.toml
 # Offline self-test for scripts/lib/workspace-versions.py -- the check dev-restart.sh runs before
 # it builds anything.
 #

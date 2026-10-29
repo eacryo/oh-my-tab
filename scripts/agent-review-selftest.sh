@@ -1,4 +1,7 @@
 #!/usr/bin/env bash
+# The inputs this selftest reads, one list, repo-relative. scripts/selftests.sh --changed
+# uses this mapping to select it; a selftest without one is refused rather than assumed irrelevant.
+# SELFTEST_INPUTS=scripts/agent-review.sh,scripts/agent-review-selftest.sh
 #
 # Self-test for scripts/agent-review.sh.
 #

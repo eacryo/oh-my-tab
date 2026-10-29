@@ -11,56 +11,67 @@ The app is Rust-only and calls AppKit, CoreGraphics, and ApplicationServices thr
 ## Build, run, and verification
 
 ```sh
-scripts/gate.sh                 # the whole gate, one command, one outcome per tier
-scripts/gate.sh --offline       # the tiers that need no graphical session
+scripts/gate.sh                 # the daily gate: M1 only (see "Testing classification")
+scripts/gate.sh --full          # the complete run, M2 included: the user triggers this before a release
+scripts/gate.sh --offline       # only the tiers that need no graphical session
 scripts/dev-restart.sh          # then launch the app (runtime changes only)
 ```
 
-The gate is `scripts/gate.sh`, and **it is the gate**: `selftests`, `fmt`, `check`, `clippy`,
-`release-check`, `cargo-test`, `a1` (the GUI smoke runners) and `a2` (the e2e scenarios), in that order —
-cheapest and most likely to fail first. Each tier prints exactly one `gate: <tier> PASSED|FAILED|NOT RUN`
-line and the run ends with a table of them, so a tier that could not decide is never read as one that passed.
-Its exit status follows the same rule: 0 = every selected tier passed, 1 = at least one failed,
-**75 = incomplete** (nothing failed, but a tier did not run, for example `--offline` or no graphical
-session). An aggregator child (`smoke-runners.sh`, `run-all.sh`) that exits 75 is recorded as NOT RUN,
-not FAILED (`run_step` in `scripts/gate.sh`), because it could not decide. A green `--offline` run is not
-a green gate.
+**The daily loop is M1, and M1 does not disturb the machine.** `scripts/gate.sh` with no arguments runs M1
+and prints a warning saying so; the complete run is `--full`, which the **user** triggers before a release
+or whenever they ask for it. An agent never decides on its own to run the disturbing tiers.
 
-**Match the gate to the change. A full run costs about 6.5 minutes, so it must not be the loop.**
+Every run prints exactly one `gate: <step> PASSED|FAILED|NOT RUN` line per selected step and ends with a
+table of them, so a step that could not decide is never read as one that passed. Exit status: 0 = every
+selected step passed, 1 = at least one failed, **75 = incomplete** (nothing failed, but something selected
+did not run). An aggregator child (`smoke-runners.sh`, `run-all.sh`, `selftests.sh`) that exits 75 is
+recorded as NOT RUN, not FAILED (`run_step` in `scripts/gate.sh`).
 
-Measured on 2026-10-24 with a warm `target/`. `fmt`, `check`, `clippy`, `release-check` and `cargo-test`
-together take about 5s. `a1` takes 44s. `selftests` takes 99s, and most of that is `agent-review-selftest.sh`
-at 84s. `a2` takes 226s, more than half the total. `a2` also needs a focus baseline, another desktop and a
-bound Space shortcut, so it is the tier most exposed to the machine. Paying for it on every edit buys noise,
-not signal. A cold build adds its own compile time on top and belongs to none of these.
+**M2's not-run items must not poison an M1 run.** Under the default M1 run, everything outside M1 is printed
+one line each as `NOT SELECTED (outside the daily gate)` — visible, but not counted as incomplete. Under
+`--full`, an M2 step that is skipped for want of an authorization switch **is** incomplete, so `--full`
+exits 75 unless every selected disturbance was authorized; failure still outranks incompleteness (exit 1).
+
+Measured on 2026-10-24 with a warm `target/`: `fmt`, `check`, `clippy`, `release-check` and `cargo-test`
+together take about 5s; the M1 smoke runners take about 50s; `selftests` takes 99s, most of it
+`agent-review-selftest.sh` at 84s; the M2 tier takes 226s, more than half a complete run, and it also needs a
+focus baseline, another desktop and a bound Space shortcut. A cold build adds its own compile time on top and
+belongs to none of these.
 
 | When | Run | Cost |
 | --- | --- | --- |
 | Iterating, nothing handed off | `cargo build` plus the tests for what changed | seconds |
-| Before a review round or a commit | `fmt`, `check`, `clippy`, `cargo-test`, `a1` | ~1.5 min |
-| Before handoff or release | the whole gate, `a2` included | ~6.5 min |
+| Before a review round or a commit | `scripts/gate.sh` (M1) | ~1 min |
+| Before a release, or whenever the user asks | `scripts/gate.sh --full` | ~6.5 min |
 
-The whole gate is also required for any change to FFI, concurrency, configuration, build or release code.
+A change to FFI, concurrency, configuration, build or release code, and any handoff, is the user's cue to
+run `--full`; an agent asks for it rather than running it.
 
-`scripts/gate.sh --tier=<name>` selects tiers and may be repeated. The middle row is one command:
-`scripts/gate.sh --tier=fmt --tier=check --tier=clippy --tier=cargo-test --tier=a1`.
+`--tier=<name>` still selects individual steps for iteration. **`--tier=a1` and `--tier=a2` are refused
+(exit 2)**: those names described the old single-axis tiers, and reinterpreting them silently would let an old
+command run a different set than it used to. Use `--tier=m1` or `--full` instead.
 
-Two rules bound that shortcut. Report every tier that did not run as NOT RUN in the handoff. Never report
-an unrun tier as green. The middle row suits a change whose blast radius is the code that was edited.
+Two rules bound any shortcut. Report every step that did not run as NOT RUN in the handoff. Never report
+an unrun step as green.
 
 - `scripts/cargo-test.sh` runs the suite and **fails when the run executed no test**. A plain `cargo test`
   exits 0 for a filter that matched nothing (measured: `running 0 tests ... ok`), so a typo in a filter reads
   as a pass; the wrapper makes that case a failure. Pass a filter as an argument and it keeps that guard;
   add `--require-match` when the filter must match the `oh-my-tab` lib tests specifically (other workspace
   targets legitimately run zero tests under a filter, so that is an opt-in rather than the default).
-- `scripts/smoke-runners.sh --list|--run` is the A1 tier: it derives the runner list from the compiled
-  `#[ignore]` tests instead of a transcribed list, refuses a `target/debug/oh-my-tab` older than `src/`,
-  and classifies each runner by the `smoke-result:` line it prints. Silence is NOT RUN, never a pass.
+- `scripts/smoke-runners.sh --list|--run` is the smoke-runner tier, split into M1 and M2 by each runner's
+  declared disturbance markers: it derives the runner list from the compiled `#[ignore]` tests instead of a
+  transcribed list, refuses a `target/debug/oh-my-tab` older than `src/`, and classifies each runner by the
+  `smoke-result:` line it prints. Silence is NOT RUN, never a pass. A runner with no `M1`/`M2` marker, or with
+  both, refuses admission (`--list` reports it and `--run` fails) rather than being guessed into a cell.
 - `scripts/selftests.sh` runs every `scripts/*-selftest.sh` offline, so the gate helpers are checked by
   something: the dev-instance lock and ownership probe, the Finder extension cleanup, the e2e disturbance
   gates, the reviewer script, the cargo-test wrapper, the launch codecs, the documentation statistics
   (`scripts/doc-stats.py`: rule parity between the guide's two languages) and the gate itself; `ls
-  scripts/*-selftest.sh` lists them, and the run prints the count it ran. The version agreement between the
+  scripts/*-selftest.sh` lists them, and the run prints the count it ran. Each selftest declares the
+  inputs it reads in a `# SELFTEST_INPUTS=<path>[,<path>...]` header; `scripts/selftests.sh --changed`
+  selects by that mapping and never by directory, and a selftest with no declaration is reported, not
+  skipped. The version agreement between the
   root `Cargo.toml` and every workspace member is asserted in three places. `src/version_consistency.rs`
   checks it in `cargo-test`; `scripts/bundle.sh`'s `workspace_version_mismatches` refuses to package a
   disagreeing workspace, so a release that skips the gate is still covered; and `scripts/dev-restart.sh`
@@ -74,11 +85,11 @@ an unrun tier as green. The middle row suits a change whose blast radius is the 
   version from the root manifest only, so a bump that touches it alone would ship an `.app` whose
   embedded crates claim another version.
 - The normal `cargo test` suite is headless-safe; GUI/permission-dependent smoke tests are marked `#[ignore]`.
-- Docs, comments, localization, and `AGENTS.md` changes need no Rust tests. Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
-- Pick the tier row from the table above rather than defaulting to the whole gate. A cross-module change, or one in unsafe/FFI, concurrency, configuration, build or release code, always takes the whole gate. So does any handoff.
+- Docs, comments, localization, and `AGENTS.md` changes need no Rust tests (they still select the selftests that declare them as inputs: `doc-stats-selftest.sh` reads the style guides). Rust changes require `cargo fmt` (plus `cargo check` when interfaces or compilation are affected) and targeted tests when behavior changes.
+- Pick the row from the table above rather than defaulting to the whole gate. A cross-module change, or one in unsafe/FFI, concurrency, configuration, build or release code, and any handoff, is the user's cue to run `--full`; an agent asks instead of running it.
 - Start the app with `scripts/dev-restart.sh`, never directly with `cargo run`.
 - `scripts/dev-restart.sh --check` verifies a launch and then **stops it**, leaving neither the process nor
-  its launchd job behind; that is the shape an automated check wants. Use it when an A2 or GUI check needs a
+  its launchd job behind; that is the shape an automated check wants. Use it when an M2 check needs a
   real instance and the run is done afterwards. It promises only what it can prove: `instance: stopped`, not
   "nothing changed" — the config file, clipboard history and caches are the app's and the run does not
   restore them. Interactive iteration keeps the default, which leaves the window open.
@@ -146,21 +157,58 @@ an unrun tier as green. The middle row suits a change whose blast radius is the 
   - `--show-clipboard[=after:N]` opens the clipboard picker and `--show-overlay` leaves the switcher standing; both exist because the real gesture steals focus, so a script cannot press it.
 - **The running app must not read or receive environment variables as configuration.** `crate::dev_flags` and the script's argv passthrough are the only runtime configuration channels. Build and release scripts may read explicitly named packaging inputs, but must not forward the caller's environment to the launched app, dump it, or print sensitive values — the caller's shell may hold cloud credentials.
 
-## Testing tiers
+## Testing classification
 
-Three layers, split by **who decides pass/fail** — not by which transport drives them.
+Every check sits on **two independent dimensions**. They are not a hierarchy: M2 is not "above" A1, and a
+label on one dimension says nothing about the other.
 
-| Tier | Decides | How | Repeatable | Gate |
-| --- | --- | --- | --- | --- |
-| A1 | script | Pure-headless tests plus `--smoke-*` runners over the real AppKit view tree; GUI-dependent runners require a macOS graphical session | yes | yes, every change (run the applicable tier; an unavailable GUI tier is unrun, not passed) |
-| A2 | script | `scripts/e2e/*.sh`, run through `scripts/e2e/run-all.sh` (the entry point; a scenario declares each disturbance in its header -- `E2E_STEALS_FOCUS`, `E2E_COVERS_SCREEN`, `E2E_CHANGES_PREFS` -- and each needs its own switch: `--include-focus`, `--include-screen`, `--include-prefs`), driven by the `cua-driver` CLI and asserting app-written JSON state (`--e2e-state=<path>`) plus real WindowServer state | yes | before handoff/release |
-| B | agent or person | MCP tools plus screenshots: taste, first-pass UI review, failure triage, bug investigation | no | never |
+**Dimension 1 — who produces the final verdict.**
 
-- Anything assertable belongs in A: severity is not the split, assertability is.
-- A1 has two execution environments: pure-headless tests can run without a graphical session; AppKit view-tree smoke runners must actually run in a macOS graphical session. A headless run does not pass or waive an unrun GUI smoke.
-- A2 covers what only real input reaches: the global hotkey → summon → raise path, permission branches, cross-app behavior. `--e2e-state` exists because AX cannot express CALayer content or internal state, so the app states those facts itself instead of the test guessing from pixels. A quick hotkey press-release legitimately skips the display path; display and layout assertions belong to A1 smoke runners.
-- **Promotion rule: every bug found in tier B must land an assertion in tier A** — or, when it cannot be asserted yet, a state field that makes it assertable. Otherwise the same regression returns unnoticed.
-- A2 hotkey scenarios press through the system event stream and therefore steal focus: run them only with the user's consent, never in a background loop.
+- **M** — code decides. A test or a script asserts, and that result is the verdict. An agent that merely
+  *runs* a script and reads its automatic assertions is still M: the agent is not deciding anything.
+- **A** — an agent decides. Taste, first-pass UI review, failure triage, bug investigation; the judgement is
+  the verdict. A is **never gate evidence**. The independent reviewer (see *Independent reviewer*) is a
+  separate concern and is neither: it reviews code, it does not run the product.
+
+**Dimension 2 — whether the run disturbs the user.** A run disturbs when it does any of these, and each is an
+independent authorization that no other implies:
+
+| Marker | What it does | Authorization |
+| --- | --- | --- |
+| `E2E_STEALS_FOCUS` | raises a window, injects real input, or changes the frontmost application | `--include-focus` |
+| `E2E_COVERS_SCREEN` | covers the screen, or captures it live | `--include-screen` |
+| `E2E_CHANGES_PREFS` | changes a system preference or the user's configuration | `--include-prefs` |
+| `E2E_REPLACES_INSTANCE` | restarts, or replaces the instance the user is running | `--include-instance` |
+
+**The four cells.**
+
+| | Code decides (M) | Agent decides (A) |
+| --- | --- | --- |
+| **Non-disturbing** | **M1 — the daily gate.** The headless offline tier (`fmt`, `check`, `clippy`, `release-check`, `cargo-test`), every `scripts/*-selftest.sh`, and the smoke runners that verifiably start no app instance, place no window on screen, inject no input, grab no screen and restart no instance. | **A1.** The agent reads state, or reads an **existing** screenshot file. It never takes a live screen grab and never drives the app. |
+| **Disturbing** | **M2.** The remaining smoke runners — they bring up the real AppKit tree or spawn a child — and the `scripts/e2e/*.sh` scenarios, driven by the `cua-driver` CLI and asserting app-written JSON state (`--e2e-state=<path>`) plus real WindowServer state. | **A2.** The agent must watch live: real-time UI review, and triage that needs a scenario running now. |
+
+- **M1 is the daily loop; M2 is the release loop.** `scripts/gate.sh` runs M1 by default and the user triggers
+  `--full` before a release. An agent never decides on its own to run M2, and never re-runs M2 "to be sure".
+- **Anything assertable belongs in M** — severity is not the split. An A-class finding must be promoted into
+  an M-class assertion, or into a state field that makes one possible; until then the A1/A2 registry in
+  `docs/developer-notes-en.md` records it, so the cell is not silently empty.
+- **The M1 boundary is behavioural, not structural.** A runner is M1 only when its own body can be shown not
+  to start an app, place a window on screen, capture the screen, inject input or replace an instance. `--smoke-overlay` summons a real panel and `--smoke-settings-layout` opens the real settings window: both are
+  **M2** no matter how headless the command line looks. Every runner and every scenario carries exactly one
+  M-cell label and its disturbance markers; a missing, conflicting or unknown label is refused by the
+  admission check, not skipped.
+- **A smoke runner's verdict is never inferred from its exit status.** libtest prints `ok` for a body that
+  returned early, so each runner records `smoke-result: PASSED <n checks>` or `smoke-result: NOT RUN <reason>`
+  through `src/smoke_verdict.rs`. Silence is NOT RUN. A pre-assertion short-circuit the runner recognises
+  (no Accessibility permission, another instance already running) is NOT RUN; a panic, a failed assertion or
+  a crashed child is FAILED, and FAILED outranks NOT RUN.
+- **A UI or layout claim still needs a real surface.** M1 can only assert what its own process can reach; a
+  claim about what the user sees in the overlay is M2 (the smoke runner or the e2e scenario), and a claim
+  that needs a person's eye is A-class. `--e2e-state` exists because Accessibility cannot express CALayer
+  content or internal state, so the app states those facts itself instead of the test guessing from pixels.
+- **Promotion rule (rewritten for the new names): every regression an agent review finds (A1/A2) must land an
+  M-class assertion** — or, when it cannot be asserted yet, a state field that makes it assertable. Otherwise
+  the same regression returns unnoticed.
 
 ## Mandatory development workflow
 
@@ -181,7 +229,8 @@ For every non-trivial implementation task:
    the approach is the only reasonable one, and put the choice to the user when there are genuinely different
    approaches with different costs, or when the reviewer's concerns change the direction.
 3. Implement the change.
-4. Run the applicable gate (see *Build, run, and verification* and *Testing tiers*).
+4. Run the applicable gate: `scripts/gate.sh` (M1) for the change. `--full` is the user's call, not the
+   agent's (see *Build, run, and verification* and *Testing classification*).
 5. Run an independent review — only once steps 3 and 4 are done: implemented, building, and the relevant
    tests passing. A half-finished change is never sent to the reviewer, and the reviewer is never used to find
    compile errors or to explore an unfinished design.
@@ -454,7 +503,7 @@ For detailed subsystem behavior, inspect the relevant module and `docs/developer
 - `docs/design-style-en.md` is the normative style for **every** surface the app draws; the Chinese version is `docs/design-style.md`. Any user-visible change must follow it. When code and that document disagree, the document wins and the code is the bug — fix the code, or change the document in the same change, with a reason.
 - It fixes the token set: semantic colors with measured contrast floors, the `12 / 14 / 20 / 26` type scale, a 4px spacing grid with named layout metrics, the `8 / 12 / 16` radius scale plus the concentric-derivation rule, the `med` and `high` elevation tokens (a surface with no shadow needs no token), and two animation durations with one easing curve. Never introduce a literal color, font size, radius, spacing or duration at a call site: add the token in `src/theme.rs` (or the owning module), document it, then use it.
 - Cards and rows are defined by border and surface, not by shadow; hover and selection never change layout; controls stay single-line and truncate long values with a tooltip; every animated surface honors Reduce Motion when the animation runs.
-- `docs/ui-refresh-plan-en.md` (Chinese: `docs/ui-refresh-plan.md`) tracks the migration from the current values to those tokens, phase by phase. Follow its order, and keep its rule: every fix lands with a tier-A assertion, or with a state field that makes the fix assertable.
+- `docs/ui-refresh-plan-en.md` (Chinese: `docs/ui-refresh-plan.md`) tracks the migration from the current values to those tokens, phase by phase. Follow its order, and keep its rule: every fix lands with an M-class assertion (M1 where the claim is non-disturbing), or with a state field that makes the fix assertable.
 
 ## Runtime requirements
 

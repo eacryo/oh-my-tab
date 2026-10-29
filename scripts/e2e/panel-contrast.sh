@@ -1,5 +1,6 @@
 #!/bin/bash
 # E2E_CHANGES_PREFS=1
+# E2E_REPLACES_INSTANCE=1
 # E2E_COVERS_SCREEN=1
 # A2: rendered-pixel contrast for the translucent panel materials.
 #
