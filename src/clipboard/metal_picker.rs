@@ -70,12 +70,18 @@ pub(super) unsafe fn show() {
     ensure_window();
     with_clipboard_ui(|ui| ui.search_query.clear());
     rebuild_model();
-    let mut slot = PICKER.lock().unwrap();
-    let Some(picker) = slot.as_mut() else {
-        return;
+    // Take the pointers and reset the transient state under the lock, then DROP
+    // it: `setFrame:` re-enters through `frame_changed` -> render -> with_picker,
+    // and a still-held RefCell borrow turns that into a contained panic.
+    let (window, view) = {
+        let mut slot = PICKER.lock().unwrap();
+        let Some(p) = slot.as_mut() else {
+            return;
+        };
+        p.scroll = 0.0;
+        p.hover = NO_SELECTION;
+        (p.window, p.view)
     };
-    picker.scroll = 0.0;
-    picker.hover = NO_SELECTION;
 
     // The same size derivation as show_picker: visible rows fit the height cap.
     let (cursor, screen_frame) = configured_picker_area();
@@ -84,13 +90,12 @@ pub(super) unsafe fn show() {
         screen_frame.size.height - 120.0 - pad.top - pad.bottom - PICKER_EDGE_MARGIN * 2.0,
     );
     let filtered_len = with_clipboard_ui(|ui| ui.filtered.len());
+    let pitches = with_picker(Vec::new(), |p| p.pitches.clone());
     let list_budget = max_h - header_strip_h() - FOOTER_H - PAD_Y;
     let list_h = if filtered_len == 0 {
         40.0
     } else {
-        list_fill_for_budget(&picker.pitches, list_budget)
-            .1
-            .max(ROW_H)
+        list_fill_for_budget(&pitches, list_budget).1.max(ROW_H)
     };
     let h = (header_strip_h() + list_h + FOOTER_H + PAD_Y)
         .max(picker_min_height())
@@ -104,14 +109,14 @@ pub(super) unsafe fn show() {
             h,
         ),
     );
-    crate::glass::set_panel_frame(picker.window, frame, true);
-    let _: () = msg_send![picker.view, setFrame: NSRect::new(
+    crate::glass::set_panel_frame(window, frame, true);
+    let _: () = msg_send![view, setFrame: NSRect::new(
         NSPoint::new(0.0, 0.0),
         NSSize::new(frame.size.width, frame.size.height)
     )];
-    let _: () = msg_send![picker.window, orderFrontRegardless];
-    let _: () = msg_send![picker.window, makeKeyWindow];
-    let _: bool = msg_send![picker.window, makeFirstResponder: picker.view];
+    let _: () = msg_send![window, orderFrontRegardless];
+    let _: () = msg_send![window, makeKeyWindow];
+    let _: bool = msg_send![window, makeFirstResponder: view];
     VISIBLE.store(true, Ordering::SeqCst);
     metal_view::redraw();
 }
