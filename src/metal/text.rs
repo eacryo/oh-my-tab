@@ -104,14 +104,14 @@ pub(crate) unsafe fn rasterize_attributed(
     let mut width = CTLineGetTypographicBounds(line, &mut ascent, &mut descent, &mut leading);
     let mut draw_line = line;
     if width > max_w && max_w.is_finite() && max_w > 0.0 {
-        // Ellipsis token in the same style as the text it ends.
-        let ell = make_nsstring("…");
-        let token = CTLineCreateWithAttributedString(ell as *const c_void);
-        CFRelease(ell as *const c_void);
-        let truncated = CTLineCreateTruncatedLine(line, max_w, CT_LINE_TRUNCATION_END, token);
-        if !token.is_null() {
-            CFRelease(token);
-        }
+        // NULL truncation token: CoreText substitutes its default "…" (passing a
+        // plain NSString here is an NSInvalidArgumentException at runtime).
+        let truncated = CTLineCreateTruncatedLine(
+            line,
+            max_w,
+            CT_LINE_TRUNCATION_END,
+            std::ptr::null_mut(),
+        );
         if !truncated.is_null() {
             draw_line = truncated;
             width = CTLineGetTypographicBounds(draw_line, &mut ascent, &mut descent, &mut leading);
