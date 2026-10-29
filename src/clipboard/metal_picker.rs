@@ -161,6 +161,7 @@ pub(super) unsafe fn show() {
     super::pin::begin_showing();
     super::apply_pin_window_properties();
     super::sync_outside_click_monitor();
+    metal_view::set_display_link_paused(false);
     metal_view::redraw();
 }
 
@@ -173,7 +174,10 @@ pub(crate) fn hide() {
     with_picker((), |p| unsafe {
         let _: () = msg_send![p.window, orderOut: std::ptr::null::<AnyObject>()];
     });
-    unsafe { super::sync_outside_click_monitor() };
+    unsafe {
+        metal_view::set_display_link_paused(true);
+        super::sync_outside_click_monitor();
+    }
 }
 
 /// The panel's window, for the shared outside-click monitor's "inside" tests.

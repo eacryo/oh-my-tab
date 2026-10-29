@@ -32,6 +32,11 @@ static VIEW: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::n
 /// The CAMetalLayer mounted inside `VIEW`'s layer (see `create_view`).
 static MLAYER: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::new(None) };
 static RENDERER: MainThreadSlot<Option<Renderer>> = unsafe { MainThreadSlot::new(None) };
+/// The vsync driver: one present a display frame, like mygo's render loop —
+/// a frame presented while the window was offscreen would otherwise leave the
+/// surface blank forever (on-demand renders never retry).
+static DISPLAY_LINK: MainThreadSlot<Option<*mut AnyObject>> =
+    unsafe { MainThreadSlot::new(None) };
 
 /// Register the surface callbacks and the shared renderer, once.
 pub(crate) unsafe fn install_handlers(handlers: MetalHandlers) {
@@ -97,7 +102,61 @@ pub(crate) unsafe fn create_view(parent: *mut AnyObject, frame: NSRect) -> *mut 
     }
     let _: () = msg_send![parent, addSubview: view];
     *VIEW.lock().unwrap() = Some(view);
+    install_display_link(view);
     view
+}
+
+/// Drive the surface from a CADisplayLink (mygo's model): every vsync re-runs
+/// the render handler, so a missed or dropped present is corrected one frame
+/// later and interactive feedback never stalls waiting for the next state
+/// change.
+fn ticker_class() -> StaticClass {
+    static CLS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLS, c"OhMyTabMetalTicker", || {
+        crate::ffi::build_class(c"OhMyTabMetalTicker", class!(NSObject), |builder| unsafe {
+            builder.add_method::<AnyObject, _>(
+                sel!(metalTick:),
+                tick_cb as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+            );
+        })
+    })
+}
+
+unsafe fn install_display_link(view: *mut AnyObject) {
+    static OBJ: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::new(None) };
+    let target: *mut AnyObject = msg_send![ticker_class().0 as *mut AnyObject, new];
+    *OBJ.lock().unwrap() = Some(target);
+    let _ = view;
+    let link: *mut AnyObject = msg_send![
+        class!(CADisplayLink),
+        displayLinkWithTarget: target,
+        selector: sel!(metalTick:)
+    ];
+    let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
+    let mode = crate::ffi::make_nsstring("NSRunLoopCommonModes");
+    let _: () = msg_send![link, addToRunLoop: run_loop, forMode: mode];
+    release_obj(mode);
+    *DISPLAY_LINK.lock().unwrap() = Some(link);
+}
+
+/// Pause/resume the vsync driver with the surface's visibility — hidden
+/// panels shouldn't burn a render every frame.
+pub(crate) unsafe fn set_display_link_paused(paused: bool) {
+    if let Some(link) = *DISPLAY_LINK.lock().unwrap() {
+        let _: () = msg_send![link, setPaused: paused];
+    }
+}
+
+extern "C" fn tick_cb(_self: *mut AnyObject, _cmd: Sel, _link: *mut AnyObject) {
+    callback_guard::void("metal_tick", || unsafe {
+        if let Some(view) = *VIEW.lock().unwrap() {
+            sync_drawable(view);
+            let bounds: NSRect = msg_send![view, bounds];
+            if let Some(render) = handlers(|h| h.render) {
+                render(view, bounds);
+            }
+        }
+    });
 }
 
 /// Redraw right now (scroll, hover, model change) instead of waiting for the
