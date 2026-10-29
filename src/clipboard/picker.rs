@@ -705,6 +705,10 @@ pub(crate) fn show_picker_for_development() {
     if !CONFIG.read().unwrap().clipboard.enabled {
         crate::log_info!("[clip] --show-clipboard: clipboard module is disabled in config");
     }
+    if super::metal_picker::metal_mode() {
+        unsafe { super::metal_picker::show() };
+        return;
+    }
     show_picker();
     // The detail panel is reached through a key or the header's toggle, neither of which a script
     // can press without taking focus from the panel, so the development switch can also open it
