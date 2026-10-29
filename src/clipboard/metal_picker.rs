@@ -128,6 +128,11 @@ pub(super) unsafe fn show() {
     let _: () = msg_send![window, makeKeyWindow];
     let _: bool = msg_send![window, makeFirstResponder: view];
     VISIBLE.store(true, Ordering::SeqCst);
+    // The dev flag the AppKit picker opens its detail with; here it just splits
+    // the panel (there is no gesture for a script to press → either).
+    if crate::dev_flags::present("show-clipboard-detail") {
+        set_detail_open(true);
+    }
     metal_view::redraw();
 }
 
