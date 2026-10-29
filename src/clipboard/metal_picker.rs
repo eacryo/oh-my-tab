@@ -553,19 +553,25 @@ unsafe fn orb_button(
         // white body, a cool-tinted lower half for the vertical falloff, a
         // small top specular, and a thin bright rim — stacked solids, not a
         // real gradient, but at ~30px the read is the same.
-        let body = if latched { 0.90 } else if hot { 0.86 } else { 0.80 };
+        // The mygo read: the button is glass — the panel's own frost shows
+        // through it, the body only lifts it white (0.58, not 0.80). A solid
+        // disc was the plastic look; texture inside the circle is the point.
+        let body = if latched { 0.68 } else if hot { 0.64 } else { 0.58 };
         ui.scene.fill([x - 0.5, y + 1.0, w + 1.0, h], r + 0.5, [0.0, 0.0, 0.0, 0.05]);
         ui.scene.fill([x, y, w, h], r, [1.0, 1.0, 1.0, body]);
         ui.scene.fill_radii(
             [x + 1.0, y + h * 0.45, w - 2.0, h * 0.53],
             [0.0, 0.0, r - 1.0, r - 1.0],
-            [245.0 / 255.0, 248.0 / 255.0, 1.0, 0.30],
+            [245.0 / 255.0, 248.0 / 255.0, 1.0, 0.22],
         );
         ui.scene.fill_radii(
             [x + 2.0, y + 1.5, w - 4.0, h * 0.34],
             [r - 2.0, r - 2.0, 0.0, 0.0],
-            [1.0, 1.0, 1.0, 0.15],
+            [1.0, 1.0, 1.0, 0.22],
         );
+        // Lens edge: a faint dark inner ring under the bright rim is what makes
+        // a glass disc read bent at its border.
+        ui.scene.border([x + 0.5, y + 0.5, w - 1.0, h - 1.0], r - 0.5, [0.0; 4], [0.0, 0.0, 0.0, 0.06], 1.0);
         ui.scene.border([x, y, w, h], r, [0.0; 4], [1.0, 1.0, 1.0, 0.55], 1.0);
     }
     ui.centered_label(glyph, font, color, tag, rect);
@@ -829,9 +835,9 @@ unsafe fn draw_header(
             render::f4(picker_field_ring(focused)),
         )
     } else if focused {
-        ([1.0, 1.0, 1.0, 0.80], [1.0, 1.0, 1.0, 0.50])
+        ([1.0, 1.0, 1.0, 0.62], [1.0, 1.0, 1.0, 0.50])
     } else {
-        ([1.0, 1.0, 1.0, 0.72], [1.0, 1.0, 1.0, 0.45])
+        ([1.0, 1.0, 1.0, 0.52], [1.0, 1.0, 1.0, 0.42])
     };
     // The capsule's own drop shadow under the milky body.
     if !palette.dark {
