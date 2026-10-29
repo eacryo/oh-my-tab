@@ -447,7 +447,13 @@ unsafe fn build_backdrop(
                 let container: *mut AnyObject = msg_send![container, initWithFrame: frame];
                 let _: () = msg_send![container, setAutoresizingMask: 18u64];
                 let _: () = msg_send![container, setWantsLayer: true];
-                apply_blur_underlay(container, tuning.blur_radius, tuning.saturation);
+                apply_blur_underlay(
+                    container,
+                    tuning.blur_radius,
+                    tuning.saturation,
+                    corner_radius,
+                    NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+                );
                 let _: () = msg_send![container, addSubview: glass];
                 container
             } else {
@@ -536,7 +542,13 @@ unsafe fn build_backdrop(
             let host: *mut AnyObject = msg_send![host, initWithFrame: frame];
             let _: () = msg_send![host, setAutoresizingMask: 18u64];
             let _: () = msg_send![host, setWantsLayer: true];
-            apply_blur_underlay(host, radius, tuning.saturation);
+            apply_blur_underlay(
+                host,
+                radius,
+                tuning.saturation,
+                corner_radius,
+                NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+            );
             let _: () = msg_send![root, addSubview: host];
             let content: *mut AnyObject = msg_send![class!(NSView), alloc];
             let content: *mut AnyObject = msg_send![content, initWithFrame: NSRect::new(
@@ -1597,7 +1609,19 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         // shadow carrier installed the content view is the carrier, and `apply_blur_underlay` inserts a
         // backdrop layer into whatever it is given.
         if let Some(material) = backdrop.material_root {
-            apply_blur_underlay(material.0, tuning.blur_radius, tuning.saturation);
+            // The material view's own layer already carries the panel's corner
+            // radius from build_backdrop — reuse it so the underlay's rounded
+            // clip matches the glass it sits under. The frame is the glass's
+            // own in that host: the host can be a shadow carrier larger than
+            // the panel, and host-bounds sizing was the band over the top edge.
+            let layer: *mut AnyObject = msg_send![material.0, layer];
+            let radius: f64 = if layer.is_null() {
+                0.0
+            } else {
+                msg_send![layer, cornerRadius]
+            };
+            let gframe: NSRect = msg_send![glass.0, frame];
+            apply_blur_underlay(material.0, tuning.blur_radius, tuning.saturation, radius, gframe);
         }
     }
     if let Some(effect) = backdrop.effect_view {
@@ -1730,6 +1754,8 @@ pub(crate) unsafe fn apply_blur_underlay(
     container: *mut AnyObject,
     blur_radius: f64,
     saturation: f64,
+    corner_radius: f64,
+    frame: NSRect,
 ) {
     if container.is_null() {
         return;
@@ -1751,10 +1777,14 @@ pub(crate) unsafe fn apply_blur_underlay(
     }
     set_layer_filter_value_bool(layer, "windowServerAware", true);
     set_layer_filter_value(layer, "scale", 1.0);
-    let bounds: NSRect = msg_send![container_layer, bounds];
-    let _: () = msg_send![layer, setFrame: bounds];
-    let radius: f64 = msg_send![container_layer, cornerRadius];
-    let _: () = msg_send![layer, setCornerRadius: radius];
+    // The underlay tracks the GLASS's rect inside its host — the host may be a
+    // shadow carrier larger than the panel, and container-bounds sizing was
+    // the band over the panel's top edge.
+    let _: () = msg_send![layer, setFrame: frame];
+    // `I`, not `Q`: CALayer's mask arg is a u32, same encoding rule the view's
+    // setAutoresizingMask uses.
+    let _: () = msg_send![layer, setAutoresizingMask: 18u32];
+    let _: () = msg_send![layer, setCornerRadius: corner_radius];
     let _: () = msg_send![layer, setMasksToBounds: true];
     let _: () = msg_send![container_layer, insertSublayer: layer, atIndex: 0u32];
 
