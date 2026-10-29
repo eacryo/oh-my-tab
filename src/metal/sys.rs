@@ -46,6 +46,10 @@ extern "C" {
     pub(crate) fn CGContextSetShouldAntialias(ctx: *mut c_void, antialias: bool);
     pub(crate) fn CGContextSetTextMatrix(ctx: *mut c_void, t: CGAffineTransform);
     pub(crate) fn CGContextScaleCTM(ctx: *mut c_void, sx: f64, sy: f64);
+    pub(crate) fn CGColorSpaceCreateWithName(name: *const c_void) -> *const c_void;
+    /// CoreGraphics exports the name constants as CFStringRef globals, not
+    /// string literals — read the pointer's pointee.
+    pub(crate) static kCGColorSpaceSRGB: *const c_void;
 }
 
 /// CoreGraphics affine transform (a,b,c,d,tx,ty).
@@ -106,5 +110,9 @@ pub(crate) const BITMAP_INFO_RGBA_PREMUL: u32 = 1;
 
 /// MTLPixelFormatRGBA8Unorm — the memory order CGBitmapContext writes.
 pub(crate) const MTL_PIXEL_FORMAT_RGBA8_UNORM: u64 = 70;
+
+/// kCALayerWidthSizable | kCALayerHeightSizable — the metal layer follows its
+/// superlayer's size (mygo's `layerWidthSizable|layerHeightSizable`).
+pub(crate) const LAYER_AUTORESIZE_WH: u64 = (1 << 1) | (1 << 4);
 
 

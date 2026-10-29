@@ -383,8 +383,7 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     });
     draw_scroll_indicator(&mut scene, &palette, w, list_rect, scroll);
     draw_footer(&mut scene, renderer, &palette, w, h, scale);
-    let layer: *mut AnyObject = msg_send![view, layer];
-    renderer.render(layer, &scene);
+    renderer.render(metal_view::metal_layer(), &scene);
 }
 
 unsafe fn draw_header(

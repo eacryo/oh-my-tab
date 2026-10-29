@@ -6,7 +6,7 @@
 use super::render::Renderer;
 use super::sys::*;
 use crate::callback_guard;
-use crate::ffi::{MainThreadSlot, StaticClass};
+use crate::ffi::{release_obj, CFRelease, MainThreadSlot, StaticClass};
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
@@ -29,6 +29,8 @@ pub(crate) struct MetalHandlers {
 static HANDLERS: MainThreadSlot<Option<MetalHandlers>> = unsafe { MainThreadSlot::new(None) };
 /// The live view pointer for the callbacks (one metal surface at a time).
 static VIEW: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::new(None) };
+/// The CAMetalLayer mounted inside `VIEW`'s layer (see `create_view`).
+static MLAYER: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::new(None) };
 static RENDERER: MainThreadSlot<Option<Renderer>> = unsafe { MainThreadSlot::new(None) };
 
 /// Register the surface callbacks and the shared renderer, once.
@@ -49,12 +51,50 @@ fn handlers<R>(f: impl FnOnce(&MetalHandlers) -> R) -> Option<R> {
     HANDLERS.lock().unwrap().as_ref().map(f)
 }
 
-/// Create the Metal view inside `parent` covering `frame`. Returns the view.
+/// The CAMetalLayer the scene renders into (null before `create_view`).
+pub(crate) fn metal_layer() -> *mut AnyObject {
+    MLAYER.lock().unwrap().unwrap_or(std::ptr::null_mut())
+}
+
+/// Create the Metal view inside `parent` covering `frame`. The view's own layer
+/// stays a plain CALayer; the CAMetalLayer mounts as a sublayer that tracks the
+/// view's size — mygo's `metal.New`, not the `makeBackingLayer` route.
 pub(crate) unsafe fn create_view(parent: *mut AnyObject, frame: NSRect) -> *mut AnyObject {
     let cls = view_class();
     let view: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, alloc];
     let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
     let _: () = msg_send![view, setWantsLayer: true];
+    let host: *mut AnyObject = msg_send![view, layer];
+    if !host.is_null() {
+        if let Some(renderer) = shared_renderer() {
+            let ml: *mut AnyObject = msg_send![class!(CAMetalLayer), new];
+            let _: () = msg_send![ml, setDevice: (*renderer).device()];
+            let _: () = msg_send![ml, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
+            let _: () = msg_send![ml, setOpaque: false];
+            // Present with the CA transaction, and keep three drawables in
+            // flight on ProMotion displays (mygo's layer setup verbatim).
+            let _: () = msg_send![ml, setPresentsWithTransaction: true];
+            let has_count: bool =
+                msg_send![ml, respondsToSelector: sel!(setMaximumDrawableCount:)];
+            if has_count {
+                let _: () = msg_send![ml, setMaximumDrawableCount: 3u64];
+            }
+            let srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
+            if !srgb.is_null() {
+                // ^{CGColorSpace=} — a raw send (no matching ffi:: type to encode).
+                type SetCS = unsafe extern "C" fn(*mut AnyObject, Sel, *const c_void);
+                let f: SetCS = std::mem::transmute(crate::ffi::objc_msgSend as *const ());
+                f(ml, sel!(setColorspace:), srgb);
+                CFRelease(srgb);
+            }
+            let _: () = msg_send![ml, setAutoresizingMask: LAYER_AUTORESIZE_WH as u32];
+            let bounds: NSRect = msg_send![view, bounds];
+            let _: () = msg_send![ml, setFrame: bounds];
+            let _: () = msg_send![host, addSublayer: ml];
+            release_obj(ml);
+            *MLAYER.lock().unwrap() = Some(ml);
+        }
+    }
     let _: () = msg_send![parent, addSubview: view];
     *VIEW.lock().unwrap() = Some(view);
     view
@@ -87,7 +127,7 @@ pub(crate) unsafe fn shared_renderer() -> Option<*const Renderer> {
 
 /// Update the CAMetalLayer's scale/drawableSize from the view's live geometry.
 unsafe fn sync_drawable(view: *mut AnyObject) {
-    let layer: *mut AnyObject = msg_send![view, layer];
+    let layer = metal_layer();
     if layer.is_null() {
         return;
     }
@@ -112,10 +152,6 @@ fn view_class() -> StaticClass {
     static CLS: OnceLock<StaticClass> = OnceLock::new();
     crate::ffi::StaticClass::register_once(&CLS, c"OhMyTabMetalView", || {
         crate::ffi::build_class(c"OhMyTabMetalView", class!(NSView), |builder| unsafe {
-            builder.add_method::<AnyObject, _>(
-                sel!(makeBackingLayer),
-                make_backing_layer as extern "C" fn(*mut AnyObject, Sel) -> *mut AnyObject,
-            );
             builder.add_method::<AnyObject, _>(
                 sel!(isFlipped),
                 is_flipped as extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
@@ -174,21 +210,6 @@ fn view_class() -> StaticClass {
             );
         })
     })
-}
-
-extern "C" fn make_backing_layer(_self: *mut AnyObject, _cmd: Sel) -> *mut AnyObject {
-    unsafe {
-        let layer: *mut AnyObject = msg_send![class!(CAMetalLayer), new];
-        if let Some(renderer) = shared_renderer() {
-            let _: () = msg_send![layer, setDevice: (*renderer).device()];
-        }
-        let _: () = msg_send![layer, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
-        // Non-opaque so the glass backdrop shows through; framebufferOnly is fine
-        // (nothing samples the drawable).
-        let _: () = msg_send![layer, setOpaque: false];
-        let _: () = msg_send![layer, setNeedsDisplayOnBoundsChange: true];
-        layer
-    }
 }
 
 extern "C" fn is_flipped(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
