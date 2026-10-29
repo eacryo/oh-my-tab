@@ -55,7 +55,8 @@ const HAIRLINE_LG: [f32; 4] = [52.0 / 255.0, 42.0 / 255.0, 30.0 / 255.0, 0.09];
 const ROW_HOVER_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.32];
 const ROW_SEL_LG: [f32; 4] = [92.0 / 255.0, 82.0 / 255.0, 72.0 / 255.0, 0.16];
 const SCROLL_LG: [f32; 4] = [60.0 / 255.0, 50.0 / 255.0, 36.0 / 255.0, 0.20];
-const WARM_TINT: [f32; 4] = [1.0, 0.98, 0.95, 0.14];
+const WARM_TINT: [f32; 4] = [1.0, 0.99, 0.97, 0.30];
+const ACCENT_GLOW: [f32; 4] = [47.0 / 255.0, 111.0 / 255.0, 237.0 / 255.0, 0.12];
 const ACCENT_LG: [f32; 4] = [47.0 / 255.0, 111.0 / 255.0, 237.0 / 255.0, 1.0];
 const ACCENT_DARK: [f32; 4] = [0.20, 0.35, 0.80, 1.0];
 
@@ -450,10 +451,26 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     let layout = picker_layout(w, detail);
     let list_w = if detail { layout.list_w } else { w };
     let mut scene = render::Scene::new(scale, w, h);
-    // The liquid-glass tint: a thin warm wash over the blur backdrop (the
-    // mock's cream gradient collapsed to its dominant tone).
+    // The liquid-glass panel (clipboard-v2): a bright warm wash over the blur,
+    // a whiter glow toward the top (the radial term's approximation), a faint
+    // inner glow at the bottom edge, the white glass rim, and the specular
+    // highlight hugging the top edge.
     if !palette.dark {
         scene.fill([0.0, 0.0, w, h], GLASS_RADIUS, WARM_TINT);
+        scene.fill([0.0, 0.0, w, h * 0.45], GLASS_RADIUS, [1.0, 1.0, 1.0, 0.12]);
+        scene.fill([0.0, h - 32.0, w, 32.0], 16.0, [1.0, 1.0, 1.0, 0.08]);
+        scene.border(
+            [0.5, 0.5, w - 1.0, h - 1.0],
+            GLASS_RADIUS - 0.5,
+            [0.0; 4],
+            [1.0, 1.0, 1.0, 0.5],
+            1.0,
+        );
+        scene.fill(
+            [GLASS_RADIUS * 0.8, 1.0, w - GLASS_RADIUS * 1.6, 1.0],
+            0.5,
+            [1.0, 1.0, 1.0, 0.88],
+        );
     }
     let mut action = Action::None;
 
@@ -496,6 +513,15 @@ fn metal_wash(palette: crate::theme::UiPalette, selected: bool, hovered: bool) -
         ROW_HOVER_LG
     } else {
         [0.0; 4]
+    }
+}
+
+/// The warm glass hairline (the mock's `rgba(52,42,30,0.09)`).
+fn hairline_f4(palette: crate::theme::UiPalette) -> [f32; 4] {
+    if palette.dark {
+        render::f4(picker_hairline())
+    } else {
+        HAIRLINE_LG
     }
 }
 
@@ -641,7 +667,7 @@ unsafe fn draw_detail(
     ui.scene.fill(
         [split_x, header_strip_h(), 1.0, h - header_strip_h() - FOOTER_H],
         0.0,
-        render::f4(picker_hairline()),
+        hairline_f4(*palette),
     );
     let pane_x = split_x + 1.0;
     let pane_w = (layout.detail_w - DETAIL_PAD * 2.0).max(0.0);
@@ -782,13 +808,13 @@ unsafe fn draw_header(
         small_font,
         icon_color,
         label_style_tag("hdr-close", palette, [0.0; 4]),
-        [0.85, 0.2, 0.2, 0.85],
+        if palette.dark { hover_wash } else { [1.0, 1.0, 1.0, 0.32] },
         r,
     ) {
         *action = Action::Hide;
     }
-    // The search capsule: warm field fill + the resting glass line; the focus
-    // ring stays accent (the field is always logically focused here).
+    // The search capsule: warm field fill, a white glass rim, and the mock's
+    // soft accent halo behind it while focused (always, here).
     let focused = true;
     let (fill, ring) = if palette.dark {
         (
@@ -796,10 +822,22 @@ unsafe fn draw_header(
             render::f4(picker_field_ring(focused)),
         )
     } else if focused {
-        (FIELD_BG_LG, ACCENT_LG)
+        (FIELD_BG_LG, [1.0, 1.0, 1.0, 0.86])
     } else {
         (FIELD_BG_LG_IDLE, [1.0, 1.0, 1.0, 0.58])
     };
+    if !palette.dark && focused {
+        ui.scene.fill(
+            [
+                search.origin.x - 3.0,
+                search.origin.y - 3.0,
+                search.size.width + 6.0,
+                search.size.height + 6.0,
+            ],
+            SEARCH_R.max(18.0) + 3.0,
+            ACCENT_GLOW,
+        );
+    }
     ui.scene.border(
         [
             search.origin.x,
@@ -873,6 +911,18 @@ unsafe fn draw_header(
             *action = Action::ClearSearch;
         }
     }
+    // The filter-active dot on the options orb (the mock's `.orb-dot`).
+    if *CLIP_FILTER.lock().unwrap() != ClipFilter::All {
+        let dot = [options.origin.x + options.size.width - 9.0, options.origin.y + 4.0, 5.0, 5.0];
+        ui.scene.fill([dot[0] - 1.0, dot[1] - 1.0, 7.0, 7.0], 3.5, [1.0, 1.0, 1.0, 0.58]);
+        ui.scene.fill(dot, 2.5, if palette.dark { ACCENT_DARK } else { ACCENT_LG });
+    }
+    // The header's bottom hairline separates it from the list.
+    ui.scene.fill(
+        [0.0, header_strip_h() - 1.0, w, 1.0],
+        0.0,
+        hairline_f4(*palette),
+    );
 }
 
 unsafe fn draw_rows(
@@ -977,10 +1027,14 @@ unsafe fn draw_rows(
             ROW_R_LG,
             wash,
         );
-        if selected {
-            ui.scene.fill([PAD_X + 4.0, y + 6.0, 2.0, row_h - 12.0], 1.0, render::f4(
-                picker_accent(*palette),
-            ));
+        // Selection carries no accent bar: the mock is a warm wash plus a
+        // specular inset line along the row's top edge.
+        if selected && !palette.dark {
+            ui.scene.fill(
+                [PAD_X + 10.0, y + 1.0, row_w - 20.0, 1.0],
+                0.5,
+                [1.0, 1.0, 1.0, 0.26],
+            );
         }
         draw_row_content(ui, palette, entry, i, hovered, y, row_h, row_w, w, style_tag, action);
         // The row's click pastes (any action button built above has already
@@ -1142,7 +1196,7 @@ fn draw_scroll_indicator(
     let color = if palette.dark {
         [1.0, 1.0, 1.0, 0.28]
     } else {
-        [0.0, 0.0, 0.0, 0.22]
+        SCROLL_LG
     };
     scene.fill(
         [
@@ -1166,7 +1220,7 @@ unsafe fn draw_footer(
     ui.scene.fill(
         [0.0, h - FOOTER_H, w, 1.0],
         0.0,
-        render::f4(picker_hairline()),
+        hairline_f4(*palette),
     );
     let total = CLIP_HISTORY.lock().unwrap().len();
     let count = t_count("clipboard.footer_count", total);
