@@ -20,6 +20,10 @@ struct MetalPicker {
     scroll: f64,
     hover: usize,
     pitches: Vec<f64>,
+    /// The history revision the current `pitches` were computed from; the render
+    /// path rebuilds the model when the history moved on or `ui.filtered` was
+    /// left non-empty by the AppKit picker's last showing.
+    revision: u64,
 }
 
 static PICKER: MainThreadSlot<Option<MetalPicker>> = unsafe { MainThreadSlot::new(None) };
@@ -127,6 +131,7 @@ pub(crate) fn hide() {
 /// change; selection is clamped like `rebuild_rows` does.
 fn rebuild_model() {
     let hist = CLIP_HISTORY.lock().unwrap();
+    let revision = history_revision();
     let query = with_clipboard_ui(|ui| ui.search_query.clone());
     let filter = *CLIP_FILTER.lock().unwrap();
     let filtered = filtered_indices(&hist, &query, filter);
@@ -135,7 +140,22 @@ fn rebuild_model() {
     let len = with_clipboard_ui(|ui| ui.filtered.len());
     let sel = picker_selection();
     set_picker_selection(clamp_selection(sel, len));
-    with_picker((), |p| p.pitches = pitches);
+    with_picker((), |p| {
+        p.pitches = pitches;
+        p.revision = revision;
+    });
+}
+
+/// Keep the model honest at the top of every frame: a copy arriving while the
+/// panel is open bumps the revision, and a `ui.filtered` left over from the
+/// AppKit picker's last showing must never be indexed with empty pitches.
+fn sync_model() {
+    let stale = with_picker(true, |p| {
+        p.revision != history_revision() || p.pitches.len() != with_clipboard_ui(|ui| ui.filtered.len())
+    });
+    if stale {
+        rebuild_model();
+    }
 }
 
 fn list_document_h() -> f64 {
@@ -211,6 +231,7 @@ unsafe fn ensure_window() {
         scroll: 0.0,
         hover: NO_SELECTION,
         pitches: Vec::new(),
+        revision: u64::MAX,
     });
 }
 
@@ -329,6 +350,7 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
         return;
     };
     let renderer = &*renderer;
+    sync_model();
     let scale = {
         let window: *mut AnyObject = msg_send![view, window];
         if window.is_null() {
@@ -539,7 +561,7 @@ unsafe fn draw_rows(
     });
     let style_tag = rows_style_tag(palette);
     let mut prev_group: Option<DayGroup> = None;
-    for (i, &h_idx) in filtered.iter().enumerate() {
+    for (i, &h_idx) in filtered.iter().enumerate().take(offsets.len()) {
         let y_doc = offsets[i] - scroll;
         if y_doc + pitches[i] < 0.0 || y_doc > list_h {
             prev_group = Some(day_group(hist[h_idx].copied_at));
