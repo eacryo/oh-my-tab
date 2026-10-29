@@ -44,13 +44,13 @@ static HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 // panel tint. Dark mode keeps the theme palette instead.
 const GLASS_RADIUS: f64 = 32.0;
 const ROW_R_LG: f64 = 14.0;
-const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.26];
-const ORB_BG_HOT: [f32; 4] = [1.0, 1.0, 1.0, 0.44];
-const ORB_BG_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.55];
-const ORB_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.52];
-const ORB_LINE_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.80];
-const FIELD_BG_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.38];
-const FIELD_BG_LG_IDLE: [f32; 4] = [1.0, 1.0, 1.0, 0.28];
+const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.34];
+const ORB_BG_HOT: [f32; 4] = [1.0, 1.0, 1.0, 0.50];
+const ORB_BG_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.60];
+const ORB_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.62];
+const ORB_LINE_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.85];
+const FIELD_BG_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.45];
+const FIELD_BG_LG_IDLE: [f32; 4] = [1.0, 1.0, 1.0, 0.32];
 const HAIRLINE_LG: [f32; 4] = [52.0 / 255.0, 42.0 / 255.0, 30.0 / 255.0, 0.09];
 const ROW_HOVER_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.28];
 // The reference's selected row is a warm tan wash, not a grey one.
@@ -828,9 +828,9 @@ unsafe fn draw_header(
             render::f4(picker_field_ring(focused)),
         )
     } else if focused {
-        (FIELD_BG_LG, [1.0, 1.0, 1.0, 0.86])
+        (FIELD_BG_LG, [1.0, 1.0, 1.0, 0.58])
     } else {
-        (FIELD_BG_LG_IDLE, [1.0, 1.0, 1.0, 0.58])
+        (FIELD_BG_LG_IDLE, [1.0, 1.0, 1.0, 0.45])
     };
     let _ = ACCENT_GLOW;
     ui.scene.border(
