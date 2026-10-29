@@ -42,7 +42,7 @@ static HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 // Liquid-glass palette (clipboard-v2.html): warm glass over the blur backdrop
 // — cream whites for fields/orbs, warm greys for washes, a barely-there warm
 // panel tint. Dark mode keeps the theme palette instead.
-const GLASS_RADIUS: f64 = 28.0;
+const GLASS_RADIUS: f64 = 32.0;
 const ROW_R_LG: f64 = 14.0;
 const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.20];
 const ORB_BG_HOT: [f32; 4] = [1.0, 1.0, 1.0, 0.44];
@@ -55,7 +55,7 @@ const HAIRLINE_LG: [f32; 4] = [52.0 / 255.0, 42.0 / 255.0, 30.0 / 255.0, 0.09];
 const ROW_HOVER_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.32];
 const ROW_SEL_LG: [f32; 4] = [92.0 / 255.0, 82.0 / 255.0, 72.0 / 255.0, 0.16];
 const SCROLL_LG: [f32; 4] = [60.0 / 255.0, 50.0 / 255.0, 36.0 / 255.0, 0.20];
-const WARM_TINT: [f32; 4] = [1.0, 0.99, 0.97, 0.30];
+const WARM_TINT: [f32; 4] = [1.0, 0.95, 0.88, 0.22];
 const ACCENT_GLOW: [f32; 4] = [47.0 / 255.0, 111.0 / 255.0, 237.0 / 255.0, 0.12];
 const ACCENT_LG: [f32; 4] = [47.0 / 255.0, 111.0 / 255.0, 237.0 / 255.0, 1.0];
 const ACCENT_DARK: [f32; 4] = [0.20, 0.35, 0.80, 1.0];
@@ -826,18 +826,7 @@ unsafe fn draw_header(
     } else {
         (FIELD_BG_LG_IDLE, [1.0, 1.0, 1.0, 0.58])
     };
-    if !palette.dark && focused {
-        ui.scene.fill(
-            [
-                search.origin.x - 3.0,
-                search.origin.y - 3.0,
-                search.size.width + 6.0,
-                search.size.height + 6.0,
-            ],
-            SEARCH_R.max(18.0) + 3.0,
-            ACCENT_GLOW,
-        );
-    }
+    let _ = ACCENT_GLOW;
     ui.scene.border(
         [
             search.origin.x,
@@ -1116,8 +1105,8 @@ fn row_action_rects(y: f64, row_h: f64, list_w: f64) -> [NSRect; 3] {
     ]
 }
 
-/// The hovered row's action buttons as widgets: the pin star always shows on a
-/// pinned row, all three on the hovered one; a click asks for its action.
+/// Row actions (clipboard-v2): pin + trash glyphs sit faintly on every row —
+/// hover tiles them and reveals the detail arrow between them.
 unsafe fn draw_row_actions(
     ui: &mut ui::Ui,
     palette: &crate::theme::UiPalette,
@@ -1129,15 +1118,37 @@ unsafe fn draw_row_actions(
     list_w: f64,
     action: &mut Action,
 ) {
-    if !entry.pinned && !hovered {
-        return;
-    }
     let [pin_r, det_r, del_r] = row_action_rects(y, row_h, list_w);
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: ACTION_GLYPH_SIZE];
     let ink = crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary);
-    let hover_wash = metal_wash(*palette, false, true);
     let r = crate::theme::RADIUS_LEGEND_CHIP;
+    if !hovered {
+        // Idle: the two glyphs only, dimmed — but still clickable.
+        let idle = crate::glass::panel_ink(palette.muted_text, crate::glass::PanelInk::Muted);
+        ui.centered_label(
+            if entry.pinned { "★" } else { "☆" },
+            font,
+            idle,
+            label_style_tag("row-pin-i", palette, [0.0; 4]),
+            pin_r,
+        );
+        if ui.clicked(pin_r) {
+            *action = Action::PinEntry(display_idx);
+        }
+        ui.centered_label(
+            "×",
+            font,
+            idle,
+            label_style_tag("row-del-i", palette, [0.0; 4]),
+            del_r,
+        );
+        if ui.clicked(del_r) {
+            *action = Action::DeleteEntry(display_idx);
+        }
+        return;
+    }
+    let hover_wash = metal_wash(*palette, false, true);
     if ui.icon_button(
         pin_r,
         if entry.pinned { "★" } else { "☆" },
@@ -1148,9 +1159,6 @@ unsafe fn draw_row_actions(
         r,
     ) {
         *action = Action::PinEntry(display_idx);
-    }
-    if !hovered {
-        return;
     }
     if ui.icon_button(
         det_r,
