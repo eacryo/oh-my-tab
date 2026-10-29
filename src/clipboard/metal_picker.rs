@@ -254,7 +254,7 @@ unsafe fn ensure_window() {
     let h = PICKER_MAX_HEIGHT;
     let frame = NSRect::new(NSPoint::new(200.0, 200.0), NSSize::new(w, h));
     let style: u64 = 1 << 7; // NSWindowStyleMaskNonactivatingPanel
-    let window: *mut AnyObject = msg_send![class!(NSPanel), alloc];
+    let window: *mut AnyObject = msg_send![panel_class().0 as *mut AnyObject, alloc];
     let window: *mut AnyObject = msg_send![
         window,
         initWithContentRect: frame,
@@ -298,6 +298,28 @@ unsafe fn ensure_window() {
         pitches: Vec::new(),
         revision: u64::MAX,
     });
+}
+
+/// The panel's class: a borderless NonactivatingPanel answers NO to
+/// `canBecomeKey` (no title/resize bar), which silently voids `makeKeyWindow`
+/// — arrows/Enter/Esc then never reach `keyDown:`. Both spellings return YES.
+fn panel_class() -> crate::ffi::StaticClass {
+    static CLS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLS, c"OhMyTabMetalPanel", || {
+        crate::ffi::build_class(c"OhMyTabMetalPanel", class!(NSPanel), |builder| unsafe {
+            extern "C" fn yes(_self: *mut AnyObject, _cmd: Sel) -> objc2::runtime::Bool {
+                objc2::runtime::Bool::YES
+            }
+            builder.add_method::<AnyObject, _>(
+                sel!(canBecomeKeyWindow),
+                yes as extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(canBecomeKey),
+                yes as extern "C" fn(*mut AnyObject, Sel) -> objc2::runtime::Bool,
+            );
+        })
+    })
 }
 
 unsafe fn install_resign_observer(window: *mut AnyObject) {
