@@ -164,9 +164,23 @@ unsafe fn install_display_link(view: *mut AnyObject) {
 /// panels shouldn't burn a render every frame. An atomic rather than a
 /// message: NSTimer has no `setPaused:` and invalidating it can't be undone.
 static TICK_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// A frame is wanted: any input/state change marks dirty and the next tick
+/// renders it — unconditional 60 Hz renders make `nextDrawable` (which
+/// blocks while the pool is empty) stall the main thread behind every
+/// mouse move, which is exactly "hover doesn't track".
+static FRAME_DIRTY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Frames rendered unconditionally after a show — a present dropped while
+/// the window is still ordering front self-heals within ~0.75 s.
+static WARMUP_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 pub(crate) fn set_display_link_paused(paused: bool) {
     TICK_PAUSED.store(paused, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Guaranteed frames for the next `n` ticks, used at show time.
+pub(crate) fn warmup_frames(n: u64) {
+    FRAME_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
+    WARMUP_TICKS.store(n, std::sync::atomic::Ordering::SeqCst);
 }
 
 extern "C" fn tick_cb(_self: *mut AnyObject, _cmd: Sel, _link: *mut AnyObject) {
@@ -174,13 +188,12 @@ extern "C" fn tick_cb(_self: *mut AnyObject, _cmd: Sel, _link: *mut AnyObject) {
         if TICK_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
             return;
         }
-        static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if n < 5 || n % 300 == 0 {
-            crate::log_info!("[metal] tick #{n} main={}", {
-                let m: bool = msg_send![class!(NSThread), isMainThread];
-                m
-            });
+        let warming = WARMUP_TICKS.load(std::sync::atomic::Ordering::SeqCst) > 0;
+        if !warming && !FRAME_DIRTY.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        if warming {
+            WARMUP_TICKS.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
         }
         if let Some(view) = *VIEW.lock().unwrap() {
             sync_drawable(view);
@@ -201,6 +214,7 @@ pub(crate) unsafe fn redraw() {
             render(view, bounds);
         }
         let _: () = msg_send![view, setNeedsDisplay: true];
+        FRAME_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -209,6 +223,7 @@ pub(crate) unsafe fn redraw() {
 /// a synchronous render per event floods `nextDrawable` (the pool blocks when
 /// the compositor is behind), which reads exactly as "hover doesn't track".
 pub(crate) unsafe fn queue_redraw() {
+    FRAME_DIRTY.store(true, std::sync::atomic::Ordering::SeqCst);
     if let Some(view) = *VIEW.lock().unwrap() {
         let _: () = msg_send![view, setNeedsDisplay: true];
     }

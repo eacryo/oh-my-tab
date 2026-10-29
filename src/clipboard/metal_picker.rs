@@ -162,6 +162,7 @@ pub(super) unsafe fn show() {
     super::apply_pin_window_properties();
     super::sync_outside_click_monitor();
     metal_view::set_display_link_paused(false);
+    metal_view::warmup_frames(45);
     metal_view::redraw();
 }
 
