@@ -112,6 +112,16 @@ pub(crate) unsafe fn redraw() {
     }
 }
 
+/// Mark dirty only: the next `updateLayer` pass renders once per display
+/// frame. High-frequency inputs (mouse-moved hover, wheel) take this path —
+/// a synchronous render per event floods `nextDrawable` (the pool blocks when
+/// the compositor is behind), which reads exactly as "hover doesn't track".
+pub(crate) unsafe fn queue_redraw() {
+    if let Some(view) = *VIEW.lock().unwrap() {
+        let _: () = msg_send![view, setNeedsDisplay: true];
+    }
+}
+
 /// The renderer the surface rasterizes with, lazily built.
 pub(crate) unsafe fn shared_renderer() -> Option<*const Renderer> {
     if RENDERER.lock().unwrap().is_none() {

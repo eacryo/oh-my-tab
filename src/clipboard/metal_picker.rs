@@ -1107,13 +1107,13 @@ unsafe fn scroll_cb(_event: *mut AnyObject, _dx: f64, dy: f64) {
         changed
     });
     if changed {
-        metal_view::redraw();
+        metal_view::queue_redraw();
     }
 }
 
 unsafe fn mouse_moved_cb(_event: *mut AnyObject, point: NSPoint) {
     with_picker((), |p| p.cursor = Some(point));
-    metal_view::redraw();
+    metal_view::queue_redraw();
 }
 
 unsafe fn mouse_exited_cb(_event: *mut AnyObject) {
@@ -1123,7 +1123,7 @@ unsafe fn mouse_exited_cb(_event: *mut AnyObject) {
         changed
     });
     if changed {
-        metal_view::redraw();
+        metal_view::queue_redraw();
     }
 }
 
