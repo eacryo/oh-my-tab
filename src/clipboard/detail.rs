@@ -3502,7 +3502,7 @@ pub(super) extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut 
 /// toggle_pin_on) -- the OLD index already refers to a different entry, so searching the
 /// fresh list with it would land on the old position, i.e. exactly "keep current" (the
 /// follow mode once failed this way).
-fn selection_after_pin(new_h_idx: usize) -> bool {
+pub(super) fn selection_after_pin(new_h_idx: usize) -> bool {
     if !CONFIG.read().unwrap().clipboard.pin_follow_selection {
         return false;
     }
@@ -3617,7 +3617,7 @@ fn paste_at(idx: usize) {
 /// The burn-after-paste variant of paste_at: on a successful paste the entry is removed
 /// from the history right away (Option+Enter/click, one-shot paste). Removal goes through
 /// delete_entry (the image cache file goes too); pinned entries burn all the same.
-fn paste_at_ex(idx: usize, delete_after: bool) {
+pub(super) fn paste_at_ex(idx: usize, delete_after: bool) {
     // These guards are unreachable in practice; they still follow the pinned rule rather than
     // hiding a panel the user is holding open (design decision R3).
     let Some(h_idx) = mapped_index(idx) else {

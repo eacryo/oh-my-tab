@@ -67,6 +67,7 @@ mod drag;
 mod image_cache;
 mod keyring;
 mod keyring_acl;
+pub(crate) mod metal_picker;
 mod model;
 mod monitor;
 mod notifications;

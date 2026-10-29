@@ -22,6 +22,7 @@ mod language_tolerance;
 mod logger;
 mod mem;
 mod menu;
+mod metal;
 mod mouse;
 mod onboarding;
 mod overlay;

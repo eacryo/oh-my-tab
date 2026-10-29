@@ -6,7 +6,7 @@ use crate::callback_guard;
 // Clipboard V2 typography is local to this surface; shared settings/control sizes stay unchanged.
 const ROW_TEXT_SIZE: f64 = 12.5;
 const ROW_CODE_SIZE: f64 = 11.5;
-const FOOTER_TEXT_SIZE: f64 = 10.5;
+pub(super) const FOOTER_TEXT_SIZE: f64 = 10.5;
 
 /// The material an attributed string's ink was resolved for. The ink comes from `glass::panel_ink`, which
 /// picks a *different colour object* per material (a dynamic system colour for frost, a palette colour

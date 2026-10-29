@@ -627,6 +627,12 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
             log_debug!("[clip] toggle ignored: clipboard history disabled");
             return;
         }
+        // `--metal-clipboard` diverts the summon to the Metal-drawn picker (the AppKit
+        // surface below stays the default).
+        if super::metal_picker::metal_mode() {
+            unsafe { super::metal_picker::toggle() };
+            return;
+        }
         // Decision B: while pinned the shortcut does nothing at all - it neither hides nor unpins the
         // panel. (An earlier design let it re-raise; the user chose a strict no-op.)
         if is_pinned() {
@@ -992,6 +998,9 @@ pub(super) fn show_picker() {
 }
 
 pub(super) fn hide_picker() {
+    // Paste paths reach here regardless of which surface is open; the Metal
+    // picker dismisses itself (a no-op unless it is the visible one).
+    super::metal_picker::hide();
     PICKER_VISIBLE.store(false, Ordering::SeqCst);
     *SCROLL_DRAG.lock().unwrap() = None;
     // Hiding does not reliably deliver mouseExited to every child button; clear the row hover
