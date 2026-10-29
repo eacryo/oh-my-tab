@@ -301,7 +301,7 @@ impl Renderer {
         }
         let desc: *mut AnyObject = msg_send![
             class!(MTLTextureDescriptor),
-            texture2DDescriptorWithPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM,
+            texture2DDescriptorWithPixelFormat: MTL_PIXEL_FORMAT_RGBA8_UNORM,
             width: width,
             height: height,
             mipmapped: false
@@ -443,6 +443,9 @@ impl Renderer {
             let _: () = msg_send![encoder, setVertexBuffer: buf, offset: 0usize, atIndex: 0usize];
             let _: () =
                 msg_send![encoder, setVertexBuffer: globals_buf, offset: 0usize, atIndex: 1usize];
+            // The fragment stage reads the same instance table (rect, colors,
+            // clip, misc) — it is not the vertex stage's bindings.
+            let _: () = msg_send![encoder, setFragmentBuffer: buf, offset: 0usize, atIndex: 0usize];
             for (slot, &texture) in local.iter().enumerate() {
                 let _: () =
                     msg_send![encoder, setFragmentTexture: texture, atIndex: slot];

@@ -96,9 +96,15 @@ pub(crate) const MTL_BLEND_FACTOR_ONE_MINUS_SOURCE_ALPHA: u64 = 5;
 // kCTLineTruncationEnd
 pub(crate) const CT_LINE_TRUNCATION_END: u32 = 2;
 
-/// CGBitmapInfo for an 8-bit premultiplied BGRA context: kCGImageAlphaPremultipliedFirst (2)
-/// | kCGBitmapByteOrder32Little (1 << 12). This is the byte order MTLPixelFormatBGRA8Unorm
-/// samples directly, so the context's memory can be uploaded untouched.
-pub(crate) const BITMAP_INFO_BGRA_PREMUL: u32 = (1 << 12) | 2;
+/// CGBitmapInfo for the context text/images rasterize into:
+/// kCGImageAlphaPremultipliedLast alone, the codebase's known-good combination
+/// (thumbnail/dev_backdrop). Byte-order-default packs a 32-bit RGBA pixel
+/// memory-order R,G,B,A — the texture uploads as MTLPixelFormatRGBA8Unorm.
+/// (kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little reads as the
+/// BGRA pair on paper but CGBitmapContextCreate rejects it with NULL here.)
+pub(crate) const BITMAP_INFO_RGBA_PREMUL: u32 = 1;
+
+/// MTLPixelFormatRGBA8Unorm — the memory order CGBitmapContext writes.
+pub(crate) const MTL_PIXEL_FORMAT_RGBA8_UNORM: u64 = 70;
 
 

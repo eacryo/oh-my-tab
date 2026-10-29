@@ -80,6 +80,7 @@ pub(crate) unsafe fn rasterize_attributed(
         nsstring_to_rust(ns)
     };
     if content.is_empty() {
+        crate::log_info!("[metal] rasterize: empty string");
         return None;
     }
     let key = fnv1a64(
@@ -98,6 +99,7 @@ pub(crate) unsafe fn rasterize_attributed(
 
     let line = CTLineCreateWithAttributedString(attr as *const c_void);
     if line.is_null() {
+        crate::log_info!("[metal] rasterize: CTLineCreate null");
         return None;
     }
     let (mut ascent, mut descent, mut leading) = (0.0f64, 0.0f64, 0.0f64);
@@ -157,12 +159,13 @@ unsafe fn draw_bitmap(
         8,
         w_px * 4,
         space as *mut c_void,
-        BITMAP_INFO_BGRA_PREMUL,
+        BITMAP_INFO_RGBA_PREMUL,
     );
     if !space.is_null() {
         CFRelease(space);
     }
     if ctx.is_null() {
+        crate::log_info!("[metal] rasterize: CGBitmapContext null {}x{}", w_px, h_px);
         return None;
     }
     CGContextSetShouldAntialias(ctx, true);
@@ -175,6 +178,7 @@ unsafe fn draw_bitmap(
     CTLineDraw(line, ctx);
     let data = CGBitmapContextGetData(ctx);
     if data.is_null() {
+        crate::log_info!("[metal] rasterize: GetData null");
         CFRelease(ctx);
         return None;
     }
@@ -182,6 +186,7 @@ unsafe fn draw_bitmap(
     CFRelease(ctx);
     let texture = renderer.make_texture(w_px, h_px, &pixels);
     if texture.is_null() {
+        crate::log_info!("[metal] rasterize: make_texture null");
         return None;
     }
     Some(TextBitmap {
@@ -216,7 +221,7 @@ pub(crate) unsafe fn rasterize_nsimage(
         8,
         w_px * 4,
         space as *mut c_void,
-        BITMAP_INFO_BGRA_PREMUL,
+        BITMAP_INFO_RGBA_PREMUL,
     );
     if !space.is_null() {
         CFRelease(space);

@@ -6,9 +6,9 @@
 //! "over" (one, one-minus-src-alpha). Coordinates are device pixels with a
 //! top-left origin — the CPU side multiplies points by the contents scale.
 //!
-//! Texture v runs in memory order: bitmaps arrive from CGBitmapContext, whose
-//! row 0 is the *bottom* of the drawing, so the vertex stage maps the quad's top
-//! edge to the instance's `uv.w` and its bottom edge to `uv.y`.
+//! Texture v runs in memory order: CGBitmapContext bitmaps store row 0 at the
+//! image's top (CGImage convention), so the quad's top edge maps to `uv.y` and
+//! its bottom edge to `uv.w` — no flip.
 
 pub(crate) const SHADER_SOURCE: &str = r#"
 #include <metal_stdlib>
@@ -54,8 +54,10 @@ vertex VSOut vs(uint vid [[vertex_id]], uint iid [[instance_id]],
     VSOut o;
     o.pos = float4(p / globals.xy * float2(2.0f, -2.0f) + float2(-1.0f, 1.0f), 0.0f, 1.0f);
     o.p = p;
+    // CGBitmapContext memory is top-down (CGImage convention: row 0 = image
+    // top), so v follows the quad's corner order directly, unflipped.
     o.tex = float2(i.uv.x + corner.x * (i.uv.z - i.uv.x),
-                   i.uv.y + (1.0f - corner.y) * (i.uv.w - i.uv.y));
+                   i.uv.y + corner.y * (i.uv.w - i.uv.y));
     o.inst = iid;
     return o;
 }
