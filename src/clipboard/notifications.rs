@@ -772,10 +772,12 @@ fn handle_outside_click_event(event: *mut AnyObject) {
         if super::is_pinned() || !super::picker_is_visible() {
             return;
         }
-        let Some(window) = *super::PICKER_WINDOW.lock().unwrap() else {
+        let Some(window) = super::metal_picker::window().or_else(|| {
+            super::PICKER_WINDOW.lock().unwrap().map(|w| w.0)
+        }) else {
             return;
         };
-        let is_key: bool = msg_send![window.0, isKeyWindow];
+        let is_key: bool = msg_send![window, isKeyWindow];
         if is_key {
             return;
         }
@@ -839,7 +841,8 @@ unsafe fn panel_group_contains(point: NSPoint) -> bool {
     } else {
         None
     };
-    for window in [*super::PICKER_WINDOW.lock().unwrap(), detail]
+    let metal = super::metal_picker::window().map(ObjPtr::new);
+    for window in [*super::PICKER_WINDOW.lock().unwrap(), detail, metal]
         .into_iter()
         .flatten()
     {

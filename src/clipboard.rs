@@ -2080,6 +2080,9 @@ pub(crate) fn picker_settings_row_rect_top_left() -> Option<(f64, f64, f64, f64)
 /// disagree, AppKit is the answer.
 pub(crate) fn picker_is_visible() -> bool {
     unsafe {
+        if let Some(w) = metal_picker::window() {
+            return msg_send![w, isVisible];
+        }
         let Some(window) = *PICKER_WINDOW.lock().unwrap() else {
             return false;
         };

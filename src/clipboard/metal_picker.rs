@@ -155,6 +155,12 @@ pub(super) unsafe fn show() {
     if crate::dev_flags::present("show-clipboard-detail") {
         set_detail_open(true);
     }
+    // The same showing bookkeeping the AppKit picker runs at this point: the
+    // generation invalidates stale dismissals, the pin's window props apply,
+    // and the outside-click monitor starts guarding the panel.
+    super::pin::begin_showing();
+    super::apply_pin_window_properties();
+    super::sync_outside_click_monitor();
     metal_view::redraw();
 }
 
@@ -167,6 +173,17 @@ pub(crate) fn hide() {
     with_picker((), |p| unsafe {
         let _: () = msg_send![p.window, orderOut: std::ptr::null::<AnyObject>()];
     });
+    unsafe { super::sync_outside_click_monitor() };
+}
+
+/// The panel's window, for the shared outside-click monitor's "inside" tests.
+pub(super) fn window() -> Option<*mut AnyObject> {
+    let w = with_picker(std::ptr::null_mut(), |p| p.window);
+    if w.is_null() {
+        None
+    } else {
+        Some(w)
+    }
 }
 
 /// The filtered list + pitches must be recomputed after every model or query
@@ -246,6 +263,10 @@ unsafe fn ensure_window() {
         defer: false
     ];
     apply_panel_appearance(window);
+    // A panel only becomes key for a text-field view while this is YES (the
+    // NSPanel default); the Metal surface draws its own field, so keyboard
+    // focus needs the flag off — arrows/Enter/Esc reach keyDown: only then.
+    let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: false];
     let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
     let _: () = msg_send![window, setLevel: 3u64];
     let _: () = msg_send![window, setOpaque: false];
@@ -311,7 +332,10 @@ unsafe fn install_resign_observer(window: *mut AnyObject) {
 
 extern "C" fn resigned_cb(_self: *mut AnyObject, _cmd: Sel, _note: *mut AnyObject) {
     callback_guard::void("metal_clip_resigned", || {
-        // Pinned panels stay; this surface has no pin affordance yet.
+        // A pinned panel stays open across focus loss, same as the AppKit one.
+        if super::pin::is_pinned() {
+            return;
+        }
         hide();
     });
 }
