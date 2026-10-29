@@ -1282,7 +1282,7 @@ unsafe fn mouse_moved_cb(event: *mut AnyObject, point: NSPoint) {
     // A grabbed blank region drags the panel: the gesture owns the cursor until
     // its release, so hover bookkeeping stays out of the way.
     if super::drag::drag_in_progress() {
-        super::drag::drag_mouse_dragged(std::ptr::null_mut(), std::mem::zeroed(), event);
+        super::drag::drag_mouse_dragged(std::ptr::null_mut(), sel!(noop:), event);
         return;
     }
     with_picker((), |p| p.cursor = Some(point));
@@ -1292,7 +1292,7 @@ unsafe fn mouse_moved_cb(event: *mut AnyObject, point: NSPoint) {
 /// The up-stroke of a panel drag (`handlers.mouse_up` is registered only for it).
 unsafe fn mouse_up_cb(event: *mut AnyObject, _point: NSPoint) {
     if super::drag::drag_in_progress() {
-        super::drag::drag_mouse_up(std::ptr::null_mut(), std::mem::zeroed(), event);
+        super::drag::drag_mouse_up(std::ptr::null_mut(), sel!(noop:), event);
     }
 }
 
@@ -1334,7 +1334,10 @@ unsafe fn mouse_down_cb(event: *mut AnyObject, point: NSPoint) {
         f.size.height
     });
     if in_drag_zone(point, w, h) {
-        super::drag::drag_mouse_down(std::ptr::null_mut(), std::mem::zeroed(), event);
+        // `Sel` is a NonNull-backed type — passing `mem::zeroed()` is UB and a
+        // debug-build precondition panic (the 22:07/22:22 crashes). The drag
+        // externs ignore `_cmd`, so any valid selector does.
+        super::drag::drag_mouse_down(std::ptr::null_mut(), sel!(noop:), event);
         return;
     }
     let mods: u64 = msg_send![event, modifierFlags];
