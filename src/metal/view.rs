@@ -127,30 +127,51 @@ unsafe fn install_display_link(view: *mut AnyObject) {
     let target: *mut AnyObject = msg_send![ticker_class().0 as *mut AnyObject, new];
     *OBJ.lock().unwrap() = Some(target);
     let _ = view;
+    // CADisplayLink proved dead here (registered, never fired); a 60 Hz NSTimer
+    // is the same one-render-per-vsync driver and fires on every runloop mode.
     let link: *mut AnyObject = msg_send![
-        class!(CADisplayLink),
-        displayLinkWithTarget: target,
-        selector: sel!(metalTick:)
+        class!(NSTimer),
+        timerWithTimeInterval: 1.0 / 60.0f64,
+        target: target,
+        selector: sel!(metalTick:),
+        userInfo: std::ptr::null::<AnyObject>(),
+        repeats: true
     ];
     let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
-    // The run-loop mode *value* for NSRunLoopCommonModes — passing the symbol
-    // name instead registers into a mode that never runs and ticks never fire.
     let mode = crate::ffi::make_nsstring("kCFRunLoopCommonModes");
-    let _: () = msg_send![link, addToRunLoop: run_loop, forMode: mode];
+    let _: () = msg_send![run_loop, addTimer: link, forMode: mode];
     release_obj(mode);
+    crate::log_info!(
+        "[metal] ticker: target_null={} timer_null={} runloop_null={}",
+        target.is_null(),
+        link.is_null(),
+        run_loop.is_null()
+    );
     *DISPLAY_LINK.lock().unwrap() = Some(link);
 }
 
 /// Pause/resume the vsync driver with the surface's visibility — hidden
-/// panels shouldn't burn a render every frame.
-pub(crate) unsafe fn set_display_link_paused(paused: bool) {
-    if let Some(link) = *DISPLAY_LINK.lock().unwrap() {
-        let _: () = msg_send![link, setPaused: paused];
-    }
+/// panels shouldn't burn a render every frame. An atomic rather than a
+/// message: NSTimer has no `setPaused:` and invalidating it can't be undone.
+static TICK_PAUSED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn set_display_link_paused(paused: bool) {
+    TICK_PAUSED.store(paused, std::sync::atomic::Ordering::SeqCst);
 }
 
 extern "C" fn tick_cb(_self: *mut AnyObject, _cmd: Sel, _link: *mut AnyObject) {
     callback_guard::void("metal_tick", || unsafe {
+        if TICK_PAUSED.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        static TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if n < 5 || n % 300 == 0 {
+            crate::log_info!("[metal] tick #{n} main={}", {
+                let m: bool = msg_send![class!(NSThread), isMainThread];
+                m
+            });
+        }
         if let Some(view) = *VIEW.lock().unwrap() {
             sync_drawable(view);
             let bounds: NSRect = msg_send![view, bounds];
