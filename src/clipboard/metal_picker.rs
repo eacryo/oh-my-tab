@@ -312,11 +312,15 @@ unsafe fn ensure_window() {
     let _: () = msg_send![window, setBackgroundColor: clear];
     let _: () = msg_send![window, setHasShadow: false];
 
+    // The panel's pinned glass: clear style + a 30px/1.6 blur underlay — the
+    // tuned look, owned by this panel's options instead of launch flags.
     let backdrop = crate::glass::install_backdrop(
         window,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
         GLASS_RADIUS,
-        picker_backdrop_options(),
+        picker_backdrop_options()
+            .with_glass_style(1)
+            .with_blur(30.0, 1.6),
     );
     let content_parent = backdrop.content_parent;
     let view = metal_view::create_view(
@@ -461,7 +465,6 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     if !palette.dark {
         scene.fill([0.0, 0.0, w, h], GLASS_RADIUS, WARM_TINT);
         scene.fill([0.0, 0.0, w, h * 0.45], GLASS_RADIUS, [1.0, 1.0, 1.0, 0.06]);
-        scene.fill([0.0, h - 32.0, w, 32.0], 16.0, [1.0, 1.0, 1.0, 0.05]);
         scene.border(
             [0.5, 0.5, w - 1.0, h - 1.0],
             GLASS_RADIUS - 0.5,
