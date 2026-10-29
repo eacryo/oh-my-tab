@@ -677,6 +677,11 @@ const DETAIL_ACTION_GAP: f64 = 6.0;
 /// footprint), with the switch inset from the chip's right edge.
 const DETAIL_SWITCH_CHIP_W: f64 = 48.0;
 const DETAIL_SWITCH_INSET: f64 = 8.0;
+/// The soft-wrap caption left of the switch. Wide enough for "Soft Wrap" / "自动换行" at the
+/// caption size and narrower than the meta column it sits above, so the row keeps its rhythm.
+const DETAIL_WRAP_LABEL_W: f64 = 72.0;
+/// The gap between the caption and the switch it names.
+const DETAIL_WRAP_LABEL_GAP: f64 = 8.0;
 
 /// The widest picker that still expands the detail INSIDE itself: the mock switches at
 /// `@media (max-width: 840px)`, where the picker plus the side pane no longer fit a desktop window.

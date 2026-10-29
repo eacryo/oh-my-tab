@@ -1456,6 +1456,10 @@ pub(super) extern "C" fn detail_preview_ready(
 /// was an invisible intermediate that every rebuild had to build and hide again.
 struct DetailActionSide {
     control: *mut AnyObject,
+    /// A visible caption drawn to the LEFT of the control, placed with it. The soft-wrap switch
+    /// reads as a bare pill without one: a switch whose only name is a tooltip is unnamed to
+    /// anyone who does not hover, and the caption is what ties it to the code pane below.
+    label: Option<*mut AnyObject>,
 }
 
 /// Build the detail actions for an entry: save-as always, the code soft-wrap switch only for
@@ -1504,6 +1508,24 @@ unsafe fn add_detail_actions(entry: &ClipEntry, width: f64, height: f64) {
             origin.y + (DETAIL_ACTION_H - control_frame.size.height) / 2.0,
         );
         let _: () = msg_send![action.control, setFrameOrigin: control_origin];
+        // A caption belongs to the control it names, so it is placed from that control's drawn
+        // frame rather than from a second entry in `frames`: one owner, no way for the two to drift.
+        if let Some(label) = action.label {
+            let label_frame: NSRect = msg_send![label, frame];
+            let label_origin = detail_wrap_label_frame(
+                control_origin,
+                control_frame.size.height,
+                label_frame.size.height,
+            );
+            let _: () = msg_send![label, setFrame: NSRect::new(
+                label_origin,
+                NSSize::new(DETAIL_WRAP_LABEL_W, label_frame.size.height)
+            )];
+            // Deliberately NOT released here: `labelWithString:` is a convenience constructor that
+            // returns an autoreleased object the superview retains, so releasing it would double
+            // free at pool drain.
+            let _ = label;
+        }
     }
 }
 
@@ -1523,6 +1545,19 @@ unsafe fn detail_document_view() -> Option<*mut AnyObject> {
 /// arithmetic the placement itself would do.
 ///
 /// Both share the "Size" meta row, trailing inside the pane's right inset, with save-as outermost.
+/// Where the soft-wrap caption sits: directly left of the switch, centred on it.
+///
+/// `switch_origin` and `switch_h` are the switch's frame as drawn rather than the taller action
+/// slot it is placed inside, and `label_h` is the caption's own line box, so the two centres are
+/// what meet. The caption box IS one text line (see `add_wrap_label`), which is what makes
+/// centring the boxes equivalent to centring the glyphs on this AppKit.
+fn detail_wrap_label_frame(switch_origin: NSPoint, switch_h: f64, label_h: f64) -> NSPoint {
+    NSPoint::new(
+        switch_origin.x - DETAIL_WRAP_LABEL_GAP - DETAIL_WRAP_LABEL_W,
+        switch_origin.y + (switch_h - label_h) / 2.0,
+    )
+}
+
 fn detail_action_frames(width: f64, height: f64, document_h: f64, in_pane: bool) -> [NSPoint; 2] {
     let pane = pane_for(width, height, in_pane);
     let y = save_action_row_y(&pane, document_h);
@@ -1593,7 +1628,45 @@ unsafe fn add_wrap_action(parent: *mut AnyObject) -> Option<DetailActionSide> {
     CFRelease(tooltip_ns as *const c_void);
     let _: () = msg_send![parent, addSubview: button];
     release_obj(button);
-    Some(DetailActionSide { control: button })
+    Some(DetailActionSide {
+        control: button,
+        label: Some(add_wrap_label(parent)),
+    })
+}
+
+/// The soft-wrap caption, right-aligned against the switch's left edge, so the row reads
+/// "caption [switch] [save]" from the trailing edge inward.
+///
+/// The frame is one text line tall, from the font's own ascent/descent/leading: this SDK's
+/// `NSTextField` draws a single line from the top of its box (there is no
+/// `setVerticallyCentered:`), so a taller box would leave the glyphs sitting high inside it and
+/// the caption would read as offset from the switch beside it.
+unsafe fn add_wrap_label(parent: *mut AnyObject) -> *mut AnyObject {
+    let text = make_nsstring(&t("clipboard.detail_soft_wrap"));
+    let label: *mut AnyObject = msg_send![class!(NSTextField), labelWithString: text];
+    CFRelease(text as *const c_void);
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
+    let _: () = msg_send![label, setFont: font];
+    let line_h: f64 = {
+        let ascender: f64 = msg_send![font, ascender];
+        let descender: f64 = msg_send![font, descender];
+        let leading: f64 = msg_send![font, leading];
+        (ascender - descender + leading).ceil()
+    };
+    let _: () = msg_send![label, setFrame: NSRect::new(
+        NSPoint::new(0.0, DETAIL_INSET_TOP),
+        NSSize::new(DETAIL_WRAP_LABEL_W, line_h)
+    )];
+    let color = crate::glass::panel_ink(
+        clipboard_palette().secondary_text,
+        crate::glass::PanelInk::Secondary,
+    );
+    let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setAlignment: 2isize]; // NSTextAlignmentRight
+    let _: () = msg_send![label, setLineBreakMode: 4isize]; // NSLineBreakByTruncatingTail
+    let _: () = msg_send![parent, addSubview: label];
+    label
 }
 
 /// The save-as button: the same glyph and hover behaviour as before, on the "Size" meta row.
@@ -1631,7 +1704,10 @@ unsafe fn add_save_as_action(content: *mut AnyObject, is_image: bool) -> DetailA
     add_hover_tracking(button);
     let _: () = msg_send![content, addSubview: button];
     release_obj(button);
-    DetailActionSide { control: button }
+    DetailActionSide {
+        control: button,
+        label: None,
+    }
 }
 
 /// Select the entry the detail follows, or `None` when nothing is selected (search-field focus)
@@ -2244,6 +2320,38 @@ mod tests {
         assert_eq!(ext_for_image_uti("public.png"), "png");
         assert_eq!(ext_for_image_uti("com.example.foo"), "png");
         assert_eq!(ext_for_image_uti(""), "png");
+    }
+
+    /// The soft-wrap switch carries a visible caption, left of it and inside the pane.
+    ///
+    /// Counter-example this fails on: the shipped state before this assertion had the caption key
+    /// in the locales but no view drawing it, so the switch was a bare pill whose only name was a
+    /// tooltip. A switch nobody can name without hovering is the regression this pins.
+    #[test]
+    fn the_soft_wrap_caption_sits_left_of_its_switch_inside_the_pane() {
+        for in_pane in [false, true] {
+            let visible_h = 600.0;
+            let document_h = 900.0;
+            let frames = detail_action_frames(DETAIL_MAX_W, visible_h, document_h, in_pane);
+            // 24pt is the switch's drawn height and 14pt a caption line box at FONT_CAPTION; the
+            // property under test is that the two are centred on one another, not these values.
+            let label = detail_wrap_label_frame(frames[0], 24.0, 14.0);
+            assert!(
+                (label.y + 7.0 - (frames[0].y + 12.0)).abs() < 0.01,
+                "the caption's centre must sit on the switch's centre"
+            );
+            assert!(
+                label.x >= 0.0,
+                "in_pane={in_pane}: the caption (x={}) must stay inside the document's left edge",
+                label.x
+            );
+            assert!(
+                label.x + DETAIL_WRAP_LABEL_W + DETAIL_WRAP_LABEL_GAP <= frames[0].x + 0.5,
+                "in_pane={in_pane}: the caption must end before the switch it names (caption ends at {}, switch at {})",
+                label.x + DETAIL_WRAP_LABEL_W,
+                frames[0].x
+            );
+        }
     }
 
     /// Both detail actions sit on the "Size" meta row, trailing, and neither covers that row's
