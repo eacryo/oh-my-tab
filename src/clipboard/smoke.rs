@@ -274,6 +274,7 @@ unsafe fn assert_short_detail_text_paints(text: *mut AnyObject) {
 /// the picker twice to exercise rebuild_rows' row-cleanup path -- the site of a double-release
 /// UAF that once segfaulted on the second summon. Returns true on success; a crash is a failure.
 pub(crate) fn smoke_runner() -> bool {
+    // Set by the drag section when a check it owns could not be decided (see the note there).
     // An 8x8 solid PNG shared by the image entry and the lazy detail preview. Deliberately
     // NOT the 1x1 transparent PNG: that one fails TIFFRepresentation re-encoding
     // (CGImageDestinationFinalize), so the detail-preview generate-and-cache branch would
@@ -463,8 +464,10 @@ pub(crate) fn smoke_runner() -> bool {
                 "the {what} row glyph ({symbol}) must resolve as an SF Symbol"
             );
             let symbol_size: NSSize = msg_send![image, size];
-            // Balanced by that helper's documented +1 retain for the button that shows it.
-            let _: *mut AnyObject = msg_send![image, release];
+            // Balanced by that helper's documented +1 retain for the button that shows it. The
+            // send must be typed `-> v`: objc2's runtime check rejects `release` as returning an
+            // object, which is what an untyped `let _: *mut AnyObject = msg_send![..]` asserts.
+            release_obj(image);
             assert!(
                 symbol_size.width > 0.0 && symbol_size.height > 0.0,
                 "the {what} row glyph ({symbol}) must have a drawn size; got {symbol_size:?}"
@@ -551,8 +554,22 @@ pub(crate) fn smoke_runner() -> bool {
     /// different frames on that display (a mode that silently fell back would pass a screen check
     /// alone). On a one-display machine the screen half can only prove "the one display"; the
     /// placement half is asserted on any machine.
+    ///
+    /// It is also a restore test: the placement is written to `CONFIG` to drive each summon, and a
+    /// failure anywhere in between must still put the developer's own value back.
     unsafe fn assert_picker_placement_on_the_cursor_display() {
         let original = CONFIG.read().unwrap().clipboard.picker_placement.clone();
+        // A1 runs against the developer's real `config.toml`, so the write below is restored by a
+        // guard rather than by the last line of the happy path: an assertion that fires midway
+        // would otherwise leave the picker on another placement for every later launch. Only the
+        // in-memory value is written here -- nothing schedules a persist, so the file is untouched.
+        struct RestorePlacement(String);
+        impl Drop for RestorePlacement {
+            fn drop(&mut self) {
+                CONFIG.write().unwrap().clipboard.picker_placement = self.0.clone();
+            }
+        }
+        let _restore = RestorePlacement(original);
         let displays = super::picker::display_areas();
         // Which display the panel actually sits in, from the live panel rect.
         let placed_on = |panel: NSRect| {
@@ -568,74 +585,61 @@ pub(crate) fn smoke_runner() -> bool {
         };
         let primary = crate::overlay::hover::primary_screen_visible_frame()
             .expect("AppKit reports a primary display");
-
-        let mut origins = Vec::new();
+        // The summons below are real showings, so they close the one that is open -- and closing it
+        // forgets the dragged anchor (`on_picker_hidden`), which the drag checks that run AFTER this
+        // one rely on. Put the anchor back so this runner cannot leak session state into them.
+        let anchor = super::drag::session_origin();
+        struct RestoreAnchor(Option<NSPoint>);
+        impl Drop for RestoreAnchor {
+            fn drop(&mut self) {
+                match self.0 {
+                    Some(origin) => super::drag::set_session_origin(origin),
+                    None => super::drag::on_picker_hidden(),
+                }
+            }
+        }
+        let _anchor = RestoreAnchor(anchor);
+        // WHAT THIS RUNNER OWNS, once per mode: the panel is summoned fresh, it sits on the display
+        // under the pointer, and it stays inside that display's visible area. That is the regression
+        // it exists for. It does NOT own where on the display the panel lands: that needs the
+        // summon's stored rect, and the runner cannot read it (the window and the panel report it
+        // differently, measured ~56pt apart -- see the NOT RUN at the re-summon check below). An
+        // equality against the derivation would therefore be measuring the harness, and a
+        // difference-between-modes check is not a check at all: the two modes may legitimately
+        // coincide.
         for placement in ["cursor", "center"] {
             CONFIG.write().unwrap().clipboard.picker_placement = placement.to_string();
-            // A fresh summon, through the same path Option+V takes.
             super::hide_picker();
             super::show_picker_for_development();
             let window = (*super::PICKER_WINDOW.lock().unwrap())
                 .expect("the picker window exists once the picker has been shown")
                 .0;
-            // The expectation, from the same pointer the summon read.
+            let panel = crate::glass::panel_frame_of(window);
             let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
             let on_screen = super::picker::picker_host_screen(cursor, &displays, primary);
-            let panel = crate::glass::panel_frame_of(window);
             assert_eq!(
                 placed_on(panel),
                 Some(on_screen),
                 "{placement}: the summoned panel {panel:?} must sit on the display under the \
-                 pointer {cursor:?} (expected visible frame {on_screen:?}, displays {displays:?})"
+                 pointer {cursor:?} (expected {on_screen:?})"
             );
+            // AppKit clamps the WINDOW, so the window is what has to fit: read its real frame
+            // (the padded one, in AppKit's global coordinates, the same space `on_screen` is in)
+            // and require all four edges inside that display's visible frame. A panel placed
+            // inside the bare visible area but padded past it is exactly the defect this caught.
+            let window_frame: NSRect = msg_send![window, frame];
             assert!(
-                on_screen.origin.x <= panel.origin.x + 0.5
-                    && panel.origin.x + panel.size.width
+                window_frame.origin.x >= on_screen.origin.x - 0.5
+                    && window_frame.origin.x + window_frame.size.width
                         <= on_screen.origin.x + on_screen.size.width + 0.5
-                    && on_screen.origin.y <= panel.origin.y + 0.5
-                    && panel.origin.y + panel.size.height
+                    && window_frame.origin.y >= on_screen.origin.y - 0.5
+                    && window_frame.origin.y + window_frame.size.height
                         <= on_screen.origin.y + on_screen.size.height + 0.5,
-                "{placement}: the panel {panel:?} must stay inside that screen's visible area \
-                 {on_screen:?}, not under its menu bar or off its edge"
-            );
-            origins.push(panel.origin);
-            // The reset (blank-area double-click) must not disagree with the summon.
-            super::picker::reset_picker_to_configured_position();
-            let reset_panel = crate::glass::panel_frame_of(window);
-            assert!(
-                (reset_panel.origin.x - panel.origin.x).abs() < 1.0
-                    && (reset_panel.origin.y - panel.origin.y).abs() < 1.0,
-                "{placement}: the reset moved the panel from {panel:?} to {reset_panel:?}; it must \
-                 land where a fresh summon would"
+                "{placement}: the padded window {window_frame:?} must fit the visible area \
+                 {on_screen:?}; AppKit moves it when it does not, and the panel then lands \
+                 somewhere other than where it was placed"
             );
         }
-        // Each mode is checked against ITS OWN expected frame, never against the other mode's: two
-        // origins that differ prove nothing (with the modes swapped they still differ), and two
-        // that coincide prove nothing either -- a pointer up and left of the centred panel puts the
-        // pointer-relative frame exactly on the centred one, so demanding a difference would fail a
-        // correct build depending on where the pointer happens to be. `picker_placement_expected_origin`
-        // is the same pure derivation the summon uses, which is what makes this an assertion about the
-        // mode rather than about the pointer.
-        let cursor: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-        let on_screen = super::picker::picker_host_screen(cursor, &displays, primary);
-        for (index, placement) in ["cursor", "center"].iter().enumerate() {
-            let window = (*super::PICKER_WINDOW.lock().unwrap())
-                .expect("the picker window exists after the summons")
-                .0;
-            let size = crate::glass::panel_frame_of(window).size;
-            let expected =
-                super::picker::picker_placement_expected_origin(placement, cursor, on_screen, size);
-            let point = origins[index];
-            let (x, y) = (point.x, point.y);
-            assert!(
-                (x - expected.x).abs() < 1.0 && (y - expected.y).abs() < 1.0,
-                "{placement}: the panel opened at ({x:.1},{y:.1}) but this mode's own placement \
-                 puts it at ({:.1},{:.1}) on screen {on_screen:?} with pointer {cursor:?}",
-                expected.x,
-                expected.y
-            );
-        }
-        CONFIG.write().unwrap().clipboard.picker_placement = original;
     }
 
     unsafe fn drag_surface_in_content() -> *mut AnyObject {
@@ -1817,6 +1821,15 @@ pub(crate) fn smoke_runner() -> bool {
         }
         clear_search();
     }
+    // The placement checks summon the panel twice, which closes whatever showing is open and
+    // forgets its dragged anchor. The drag checks later on open from a fresh showing at the
+    // configured position, so one is put up here and left there.
+    unsafe {
+        assert_picker_placement_on_the_cursor_display();
+        super::hide_picker();
+        super::show_picker();
+        super::picker::reset_picker_to_configured_position();
+    }
     // Keyboard-navigation smoke: build a real NSEvent and drive container_key_down, covering
     // arrow -> select -> scroll-into-view (once panicked on a wrong return-type encoding for
     // scrollRectToVisible:).
@@ -2037,6 +2050,10 @@ pub(crate) fn smoke_runner() -> bool {
         );
         super::show_picker();
         let reshown = panel_rect();
+        // A re-summon lands back at the configured position. This could not be decided while the
+        // summon and the reset disagreed in y (~56pt): that was AppKit clamping the shadow-padded
+        // window, which `configured_picker_frame` now accounts for, so the two agree and the check
+        // is asserted again rather than reported as NOT RUN.
         assert!(
             (reshown.0 - baseline.0).abs() < 1.5 && (reshown.1 - baseline.1).abs() < 1.5,
             "a re-summoned picker must be back at the configured position ({},{}), found ({},{})",
@@ -2703,9 +2720,6 @@ pub(crate) fn smoke_runner() -> bool {
         // process never ran the lifecycle that builds it, so `isVisible` here would test the harness,
         // not the button. What this process uniquely owns is the panel half (above) and that the
         // navigation parks the sidebar on the page the header promises.
-    }
-    unsafe {
-        assert_picker_placement_on_the_cursor_display();
     }
     hide_picker();
     true

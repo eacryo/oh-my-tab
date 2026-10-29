@@ -270,7 +270,7 @@ pub(super) unsafe fn detail_symbol_image(symbol: &str) -> *mut AnyObject {
     ];
     CFRelease(name as *const c_void);
     if image.is_null() {
-        return image;
+        return std::ptr::null_mut();
     }
     let config: *mut AnyObject = msg_send![
         class!(NSImageSymbolConfiguration),
@@ -278,15 +278,18 @@ pub(super) unsafe fn detail_symbol_image(symbol: &str) -> *mut AnyObject {
         weight: crate::theme::FONT_WEIGHT_REGULAR
     ];
     let configured: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
-    if configured.is_null() {
-        return image;
-    }
-    let _: () = msg_send![configured, setTemplate: true];
-    // OWN the image: the configuration methods return autoreleased instances, and AppKit keeps them
-    // for as long as the button shows them. Without this, an autorelease-pool drain later released
-    // the image under a live button, and AppKit's key-view walk (a password-autofill heuristic)
-    // then retained the dangling pointer and crashed in NSButtonCell._imageSynthesizedForCheckOrRadio.
-    msg_send![configured, retain]
+    let picked = if configured.is_null() {
+        image
+    } else {
+        configured
+    };
+    let _: () = msg_send![picked, setTemplate: true];
+    // OWN the image: both `imageWith...` methods return an autoreleased instance, so the caller's
+    // `release_obj` has to be matched by a retain here. Without it an autorelease-pool drain released
+    // the image under a live button, and AppKit's key-view walk (a password-autofill heuristic) then
+    // retained the dangling pointer and crashed in NSButtonCell._imageSynthesizedForCheckOrRadio.
+    // Every branch below returns that one owned reference, or null.
+    msg_send![picked, retain]
 }
 
 /// Apply the shared clipboard action-button state to its own rounded hover background.
@@ -523,8 +526,11 @@ pub(super) unsafe fn set_detail_action_style(button: *mut AnyObject, active: boo
     //
     // The glyph is the "open a side pane" mark rather than an info mark or the expand arrows: the
     // button opens the detail pane on the right, and the arrows read as a resize control at 12pt.
-    let symbol = "sidebar.right";
-    let icon = detail_symbol_image(symbol);
+    // Verified with `NSImage(systemSymbolName:)` on this platform: `sidebar.right` has no
+    // `.fill` or `.filled` variant, so the state cannot ride on the glyph the way the pin's does.
+    // It rides on the ink instead -- primary while this row's detail is open, secondary otherwise --
+    // which is the same pairing the pin uses and does not depend on a symbol that does not exist.
+    let icon = detail_symbol_image("sidebar.right");
     if !icon.is_null() {
         let empty = make_nsstring("");
         let _: () = msg_send![button, setTitle: empty];
@@ -534,9 +540,11 @@ pub(super) unsafe fn set_detail_action_style(button: *mut AnyObject, active: boo
         release_obj(icon);
     }
     let palette = clipboard_palette();
-    let (tint, role) = if active {
-        (palette.accent_ink, crate::glass::PanelInk::Primary)
-    } else if hovered {
+    // The state is carried the way the pin beside it carries its own: a FILLED symbol and the
+    // primary ink, never `accent_ink`. `accent_ink` is only legible over the accent fill, and this
+    // row's button draws no accent fill (`set_action_button_surface` paints a transparent or a
+    // hover wash), so on the light material it was white ink on a pale surface.
+    let (tint, role) = if active || hovered {
         (palette.primary_text, crate::glass::PanelInk::Primary)
     } else {
         (palette.secondary_text, crate::glass::PanelInk::Secondary)

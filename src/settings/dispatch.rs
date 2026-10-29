@@ -647,7 +647,7 @@ pub(super) fn picker_placement_index(value: &str) -> isize {
 
 /// Pure: the placement a popup index stores. Out of range falls back to the default, which is what
 /// the control shows then, so saving what is shown cannot invent a mode.
-fn picker_placement_for_popup_index(index: isize) -> &'static str {
+pub(super) fn picker_placement_for_popup_index(index: isize) -> &'static str {
     PICKER_PLACEMENT_VALUES
         .get(index as usize)
         .copied()
@@ -2916,6 +2916,39 @@ mod portability_ui_tests {
 
 #[cfg(test)]
 mod tests {
+    /// The popup's items and the stored strings are one mapping, and it must survive a round trip.
+    ///
+    /// Counter-example this is built to fail on: reordering `PICKER_PLACEMENT_VALUES` shows "Follow
+    /// the Cursor" while storing `center`. Every other layer (config, page builder, runtime flags)
+    /// passes through that array, so nothing else would notice the swap.
+    #[test]
+    fn the_placement_popup_round_trips_every_value() {
+        for value in super::PICKER_PLACEMENT_VALUES {
+            let index = super::picker_placement_index(value);
+            assert_eq!(
+                super::picker_placement_for_popup_index(index),
+                value,
+                "{value} must come back from the popup index it selects"
+            );
+        }
+        // The two values are distinct, so the array cannot collapse into one menu item.
+        assert_ne!(
+            super::picker_placement_index("cursor"),
+            super::picker_placement_index("center")
+        );
+        // An unknown stored value shows the default and saves the default, never a third mode.
+        let fallback = super::picker_placement_index("sideways");
+        assert_eq!(
+            super::picker_placement_for_popup_index(fallback),
+            crate::config::ClipboardSection::default().picker_placement
+        );
+        // An index past the end (a menu rebuilt while a stale value was selected) does the same.
+        assert_eq!(
+            super::picker_placement_for_popup_index(99),
+            super::PICKER_PLACEMENT_VALUES[0]
+        );
+    }
+
     use super::{
         checked_ids, clipboard_delete_dependent_visibility_from_config, smooth_slider_display,
         smooth_slider_value, take_edited_field, text_field_bit, Config, Ordering, TextField,

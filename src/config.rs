@@ -901,6 +901,14 @@ pub struct ClipboardSection {
     // clamping at the edges), "center" = the middle of that screen's visible area. The screen itself is
     // not a choice -- it is always the one the pointer is on. Defaults to following the pointer.
     pub picker_placement: String,
+    // Formerly `clipboard.picker_position` ("mouse" / "main"). Accepted only so a file written
+    // before the rename can be migrated; never written (serde skips it while it is None).
+    #[serde(
+        rename = "picker_position",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) picker_position_legacy: Option<String>,
     // Where the selection lands after pin/unpin: true = follow the toggled entry to its
     // new position; false = keep the current display position (pointing at the next
     // entry, convenient for batch pinning). Defaults to follow.
@@ -972,6 +980,7 @@ impl Default for ClipboardSection {
             auto_expire_days: 3,
             image_rows: 1,
             picker_placement: "cursor".to_string(),
+            picker_position_legacy: None,
             pin_follow_selection: true,
             paused: false,
             excluded_apps: default_excluded_apps(),
@@ -2161,6 +2170,19 @@ fn config_type_schema() -> toml::Value {
         profile.insert("enabled".into(), toml::Value::Boolean(false));
     }
 
+    // `clipboard.picker_position` is skipped during serialization for the same reason: it is read
+    // only so `migrate_picker_position` can fold it into `picker_placement`.
+    if let Some(clipboard) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("clipboard"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        clipboard.insert(
+            "picker_position".into(),
+            toml::Value::String("mouse".into()),
+        );
+    }
+
     // Legacy mouse fields are intentionally skipped during serialization, but they are still
     // accepted while reading old files and therefore need to be present in the type schema.
     if let Some(mouse) = value
@@ -2482,6 +2504,14 @@ pub(crate) fn parse_config_content(
     };
 
     let mut needs_persist = !errors.is_empty();
+    // Before validation: the fold writes a value the validator must see and accept, and the file
+    // has to be rewritten so the dead key does not outlive the rename. Presence is read off the raw
+    // document, the way the other migrations read it.
+    let placement_was_explicit = actual
+        .get("clipboard")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("picker_placement"));
+    needs_persist |= loaded.migrate_picker_position(placement_was_explicit);
     needs_persist |= loaded.mouse.migrate_legacy();
     needs_persist |= loaded.migrate_card_text_style();
     // Presence is read off the raw document: Serde cannot tell a missing table (or a missing
@@ -2641,6 +2671,36 @@ impl Config {
         // Unconditionally 0: this runs after fallback, so an invalid size has already become the
         // 15pt default -- and the hidden footer must still win.
         self.fonts.status_bar_size = 0.0;
+        true
+    }
+
+    /// Fold the retired `clipboard.picker_position` into `clipboard.picker_placement`, once.
+    ///
+    /// The rename changed more than a name: `main` meant "centred on the PRIMARY display", which
+    /// the picker no longer offers at all, while the old default `mouse` is the new `cursor`. A user
+    /// who chose `main` keeps what that choice was about -- the panel in the middle of screens --
+    /// as the new `center`, and a user who never touched the field keeps the pointer behaviour the
+    /// value was already asking for. Dropping the key silently would reset both to `cursor`.
+    ///
+    /// The value is taken out once it is folded in, so the file this app writes back carries only
+    /// `picker_placement` and a later hand-edit of the dead key does nothing.
+    ///
+    /// A file that names BOTH keys already answered the question in the new key, so that answer
+    /// wins and the old one is only removed. Folding it regardless would let a stale key the user
+    /// has already migrated away from silently overwrite the value they chose.
+    pub(crate) fn migrate_picker_position(&mut self, placement_was_explicit: bool) -> bool {
+        let Some(legacy) = self.clipboard.picker_position_legacy.take() else {
+            return false;
+        };
+        if placement_was_explicit {
+            return true;
+        }
+        self.clipboard.picker_placement = match legacy.as_str() {
+            "main" => "center",
+            // "mouse" is the new default, and anything else was never accepted.
+            _ => "cursor",
+        }
+        .to_string();
         true
     }
 
@@ -3621,33 +3681,67 @@ mod tests {
         assert_eq!(merged.clipboard.picker_placement, "center");
     }
 
-    /// A config written while `clipboard.picker_position` existed still loads.
+    /// A config written while `clipboard.picker_position` existed is MIGRATED, not reset.
     ///
-    /// The picker now always follows the cursor and the field is gone. Removing a field is only safe
-    /// because the sections tolerate unknown keys: a user whose file still carries the old key must
-    /// get a working config, not a parse error that silently drops every other setting in the file.
-    /// This is what lets the removal ship without a migration step.
+    /// The stored value was a preference, so dropping the key silently would hand every existing
+    /// user the new default: someone who had chosen `main` ("centred on the primary display") would
+    /// get a panel under the pointer, and someone who had never touched it would too. The fold keeps
+    /// what each value meant (`main` is the middle of the screen now) and the surviving settings
+    /// around it, and re-saving writes only the new key.
     #[test]
-    fn a_config_carrying_the_removed_picker_position_still_loads() {
-        let cfg: Config = toml::from_str(
-            "[clipboard]\nenabled = true\npicker_position = \"main\"\nmax_entries = 42\n",
+    fn a_config_carrying_the_removed_picker_position_is_migrated() {
+        for (stored, expected) in [("main", "center"), ("mouse", "cursor")] {
+            let content = format!(
+                "[clipboard]\nenabled = true\npicker_position = \"{stored}\"\nmax_entries = 42\n"
+            );
+            let (mut cfg, errs, _) = parse_config_content(&content)
+                .expect("a leftover clipboard.picker_position must not break the load");
+            assert!(
+                errs.is_empty(),
+                "the fold must not report an error: {errs:?}"
+            );
+            assert_eq!(
+                cfg.clipboard.picker_placement, expected,
+                "`{stored}` must keep its meaning, not fall back to the default"
+            );
+            assert_eq!(
+                cfg.clipboard.max_entries, 42,
+                "the settings around the removed key must survive"
+            );
+            // The fold is a one-shot: the value is taken out of the struct and never re-applied.
+            cfg.clipboard.picker_placement = "center".into();
+            assert!(!cfg.migrate_picker_position(true));
+            assert_eq!(cfg.clipboard.picker_placement, "center");
+            // ...and a save writes only the new key.
+            let resaved = toml::to_string_pretty(&cfg).unwrap();
+            assert!(
+                !resaved.contains("picker_position"),
+                "the removed key must not be written back out: {resaved}"
+            );
+            assert!(resaved.contains("picker_placement = \"center\""));
+        }
+        // A file that names BOTH keys has already been migrated by its owner: the new key wins and
+        // the stale one is simply removed, so a leftover cannot overwrite a chosen value.
+        let (mut both, errs, _) = parse_config_content(
+            "[clipboard]\nenabled = true\npicker_placement = \"center\"\npicker_position = \"mouse\"\n",
         )
-        .expect("a leftover clipboard.picker_position must not break the load");
-        assert!(cfg.clipboard.enabled);
-        assert_eq!(
-            cfg.clipboard.max_entries, 42,
-            "the settings around the removed key must survive, not fall back to defaults"
-        );
-        // The same file must still validate: the removed key takes no validation with it.
-        assert_err_count(&cfg, 0);
-        // ...and re-saving drops it, so the stale key does not outlive the feature.
-        let resaved = toml::to_string_pretty(&cfg).unwrap();
+        .unwrap();
         assert!(
-            !resaved.contains("picker_position"),
-            "the removed key must not be written back out"
+            errs.is_empty(),
+            "the conflict must not report an error: {errs:?}"
         );
+        assert_eq!(
+            both.clipboard.picker_placement, "center",
+            "an explicit picker_placement must beat the retired key"
+        );
+        let resaved = toml::to_string_pretty(&both).unwrap();
+        assert!(!resaved.contains("picker_position"), "{resaved}");
+        // ...and the fold is spent: re-running it cannot change the answer again.
+        assert!(!both.migrate_picker_position(true));
+        // A file with neither key keeps the default rather than inventing a placement.
+        let (cfg, _, _) = parse_config_content("[clipboard]\nenabled = true\n").unwrap();
+        assert_eq!(cfg.clipboard.picker_placement, "cursor");
     }
-
     #[test]
     fn validate_accepts_auto_expire_days_0_to_7() {
         // Auto-expire days: 0 (never) and 7 are valid, 8 is rejected.

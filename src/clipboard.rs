@@ -677,9 +677,7 @@ const DETAIL_ACTION_GAP: f64 = 6.0;
 /// footprint), with the switch inset from the chip's right edge.
 const DETAIL_SWITCH_CHIP_W: f64 = 48.0;
 const DETAIL_SWITCH_INSET: f64 = 8.0;
-/// A floating action's chip fill in light mode: a light glass wash (the mock's `.btn`
-/// background over the sheet).
-const DETAIL_ACTION_FILL_LIGHT: u32 = 0xFFFF_FF66;
+
 /// The widest picker that still expands the detail INSIDE itself: the mock switches at
 /// `@media (max-width: 840px)`, where the picker plus the side pane no longer fit a desktop window.
 /// The app's picker is 640pt, so it stands beside the detail today; a narrower panel (a small
@@ -1890,7 +1888,20 @@ pub(super) const POPOVER_TITLE_H: f64 = 23.0;
 /// `.pop-divider` 1px hairline with 6px vertical margins.
 pub(super) const POPOVER_DIVIDER_H: f64 = 13.0;
 /// Minimum clearance when centering the menu below its options button.
-pub(super) const POPOVER_RIGHT_INSET: f64 = 14.0;
+///
+/// It has to leave room for that centring, not just for the panel edge: the options orb sits
+/// `#header`'s second-from-right, so its centre is `(ORB + GAP) + ORB/2` from the right edge and
+/// the popover has to reach `centre + POPOVER_W/2`. At 14 it stopped 19pt short once the header
+/// lost its detail orb and every control moved right, and the clamp then hung the menu under the
+/// pin button instead -- measured by `the_popover_frame_anchors_under_the_options_orb`.
+pub(super) const POPOVER_RIGHT_INSET: f64 = SEARCH_PAD_X
+    + PICKER_CLOSE_BTN_SIZE
+    + PICKER_CLOSE_BTN_GAP
+    + PICKER_ORB_SIZE
+    + PICKER_CLOSE_BTN_GAP
+    + PICKER_ORB_SIZE / 2.0
+    - POPOVER_W / 2.0
+    - 2.0;
 pub(super) const POPOVER_TOP: f64 = 70.0;
 /// The gap the popover keeps from the panel's bottom edge when the panel is too short to hold the
 /// whole menu below `POPOVER_TOP` (it is pulled up rather than clipped).
@@ -4752,10 +4763,15 @@ mod tests {
         let parent_h = 600.0;
         let frame = filter_popover_frame(parent_h, false);
         let (_, _, options, _, _) = super::picker_header_frames();
+        // The mock's promise: the popover hangs under the options orb, centred on it. The header
+        // lost its detail orb, and the right inset the popover is clamped to stopped leaving room
+        // for that centre once the orb moved right -- the clamp then pulled it 22pt off, which a
+        // comparison of the EDGE (not the centre) could not see.
         assert_eq!(
             frame.origin.x + frame.size.width / 2.0,
             options.origin.x + options.size.width / 2.0
         );
+        assert!(frame.origin.x >= 0.0);
         assert_eq!(frame.size.width, POPOVER_W);
         assert_eq!(
             top_offset_of(frame.origin.y, parent_h, frame.size.height, false),
@@ -5804,6 +5820,7 @@ mod tests {
     fn picker_placement_centers_or_follows_the_cursor_within_one_screen() {
         use super::{picker_frame_centered, picker_frame_for};
         use objc2_foundation::{NSPoint, NSRect, NSSize};
+
         // A secondary display's visible area: its menu bar is carved out of the top.
         let screen = NSRect::new(NSPoint::new(-1920.0, 0.0), NSSize::new(1920.0, 1055.0));
         let size = NSSize::new(560.0, 400.0);
@@ -5852,14 +5869,24 @@ mod tests {
             coincident.origin, centered.origin,
             "the fixture must actually coincide, or it does not test the counter-example"
         );
-        // ...and each mode still reports its own origin correctly at that pointer.
-        assert_eq!(
-            super::picker_placement_expected_origin("cursor", coincident_cursor, screen, size),
-            centered.origin
+        // ...and the summon's own derivation is the bare one composed with the shadow padding, in
+        // both modes: the coincidence above is a property of the bare derivations, and the summon
+        // deliberately places inside a padded area (`the_summon_placement_composes_the_shadow_padding_per_mode`).
+        let pad = crate::glass::panel_elevation_padding();
+        let placeable = NSRect::new(
+            NSPoint::new(screen.origin.x + pad.left, screen.origin.y + pad.bottom),
+            NSSize::new(
+                screen.size.width - pad.left - pad.right,
+                screen.size.height - pad.bottom - pad.top,
+            ),
         );
         assert_eq!(
-            super::picker_placement_expected_origin("center", coincident_cursor, screen, size),
-            centered.origin
+            super::configured_picker_frame(false, coincident_cursor, screen, size).origin,
+            picker_frame_for(coincident_cursor, placeable, size.width, size.height).origin
+        );
+        assert_eq!(
+            super::configured_picker_frame(true, coincident_cursor, screen, size).origin,
+            picker_frame_centered(placeable, size).origin
         );
         // MODE -> IMPLEMENTATION, pinned explicitly. Every other assertion here reads the shared
         // `picker_placement_expected_origin`, which is only proved correct if something says which
@@ -5869,14 +5896,14 @@ mod tests {
         // two implementations directly, so a swap fails here.
         let elsewhere = NSPoint::new(screen.origin.x + 200.0, screen.origin.y + 800.0);
         assert_eq!(
-            super::picker_placement_expected_origin("cursor", elsewhere, screen, size),
-            picker_frame_for(elsewhere, screen, size.width, size.height).origin,
-            "'cursor' must be the pointer-relative placement (picker_frame_for)"
+            super::configured_picker_frame(false, elsewhere, screen, size).origin,
+            picker_frame_for(elsewhere, placeable, size.width, size.height).origin,
+            "'cursor' must be the pointer-relative placement, inside the padded area"
         );
         assert_eq!(
-            super::picker_placement_expected_origin("center", elsewhere, screen, size),
-            picker_frame_centered(screen, size).origin,
-            "'center' must be the centred placement (picker_frame_centered)"
+            super::configured_picker_frame(true, elsewhere, screen, size).origin,
+            picker_frame_centered(placeable, size).origin,
+            "'center' must be the centred placement, inside the padded area"
         );
         // ...and the two are actually different answers at this pointer, so the pair above is a
         // discriminating fixture rather than two names for one value.
@@ -5885,6 +5912,110 @@ mod tests {
             picker_frame_centered(screen, size).origin,
             "the fixture needs a pointer where the modes differ"
         );
+    }
+
+    /// The summon's placement is one derivation per mode, and the padding it composes is the shadow's.
+    ///
+    /// Both modes are exercised from fixed inputs, never from the user's configuration: reading
+    /// `picker_placement_centers()` here made a `center` configuration fail the cursor half. The
+    /// comparison is against the mode's own derivation run on the PLACEABLE area, which is what
+    /// keeps the padded window inside the display (`picker_placement_area`); dropping that
+    /// composition is what let AppKit move a placed panel.
+    #[test]
+    fn the_summon_placement_composes_the_shadow_padding_per_mode() {
+        use super::{configured_picker_frame, picker_frame_centered, picker_frame_for};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let screen = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1470.0, 923.0));
+        let size = NSSize::new(640.0, 544.0);
+        let cursor = NSPoint::new(717.0, 372.0);
+        let pad = crate::glass::panel_elevation_padding();
+        let placeable = NSRect::new(
+            NSPoint::new(screen.origin.x + pad.left, screen.origin.y + pad.bottom),
+            NSSize::new(
+                screen.size.width - pad.left - pad.right,
+                screen.size.height - pad.bottom - pad.top,
+            ),
+        );
+        // `false` = cursor placement, `true` = screen centre; the flags, not the config.
+        assert_eq!(
+            configured_picker_frame(false, cursor, screen, size),
+            picker_frame_for(cursor, placeable, size.width, size.height),
+            "the cursor placement is `picker_frame_for` on the padded area"
+        );
+        assert_eq!(
+            configured_picker_frame(true, cursor, screen, size),
+            picker_frame_centered(placeable, size),
+            "the centre placement ignores the pointer and centres in the padded area"
+        );
+        // The padding is not a no-op on this display, so the comparison above is not a tautology.
+        assert_ne!(
+            picker_frame_for(cursor, screen, size.width, size.height),
+            picker_frame_for(cursor, placeable, size.width, size.height),
+            "the fixture must discriminate, or the equality above proves nothing"
+        );
+        // A composed placement keeps the padded WINDOW inside the visible frame: that is the whole
+        // point, and the counter-example is the bare-area placement, which does not.
+        let window = crate::theme::window_frame_for_panel(
+            configured_picker_frame(false, cursor, screen, size),
+            pad,
+        );
+        assert!(window.origin.y >= screen.origin.y);
+        assert!(window.origin.y + window.size.height <= screen.origin.y + screen.size.height);
+        let overflows = crate::theme::window_frame_for_panel(
+            picker_frame_for(cursor, screen, size.width, size.height),
+            pad,
+        );
+        assert_ne!(
+            overflows.origin.y + overflows.size.height <= screen.size.height,
+            true,
+            "this cursor must overflow an unpadded placement, or the check proves nothing"
+        );
+    }
+    /// A panel that exactly fits its placeable area is placed at the edge, not past it.
+    ///
+    /// Counter-example this is built to fail on: the clamp used to apply its 8pt edge margin AFTER
+    /// the interval, so the reviewer's fixture (visible 768 wide, 64pt shadow each side, panel 640)
+    /// placed the panel at x=56 and the padded window at x=-8 -- the panel fit and the window did
+    /// not, and AppKit moved it back.
+    #[test]
+    fn a_panel_that_exactly_fits_is_placed_at_the_edge() {
+        use super::{picker_frame_for, PICKER_EDGE_MARGIN};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        let placeable = NSRect::new(NSPoint::new(64.0, 64.0), NSSize::new(640.0, 400.0));
+        let size = NSSize::new(640.0, 400.0);
+        for cursor in [
+            NSPoint::new(400.0, 300.0),
+            NSPoint::new(0.0, 0.0),
+            NSPoint::new(2000.0, 2000.0),
+        ] {
+            let frame = picker_frame_for(cursor, placeable, size.width, size.height);
+            assert!(
+                frame.origin.x >= placeable.origin.x - 0.001
+                    && frame.origin.x + frame.size.width
+                        <= placeable.origin.x + placeable.size.width + 0.001
+                    && frame.origin.y >= placeable.origin.y - 0.001
+                    && frame.origin.y + frame.size.height
+                        <= placeable.origin.y + placeable.size.height + 0.001,
+                "a fitting panel ({cursor:?}) must stay inside {placeable:?}, got {frame:?}"
+            );
+            assert_eq!(
+                frame.origin, placeable.origin,
+                "it can only sit at the edge"
+            );
+        }
+        // With room to spare the margin is still preferred: a panel that cannot sit beside the
+        // pointer lands 8pt inside the edge it had to use.
+        let roomy = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1470.0, 923.0));
+        // A pointer on the roomy area's far right with vertical room below it: the flip and the
+        // clamp both bite, and each keeps its own margin.
+        let at_edge = picker_frame_for(NSPoint::new(1050.0, 700.0), roomy, 400.0, 300.0);
+        assert_eq!(
+            at_edge.origin.x + 400.0,
+            roomy.size.width - PICKER_EDGE_MARGIN,
+            "the panel stops one margin inside the right edge"
+        );
+        // Vertically the pointer had room, so the panel sits under it at the cursor offset.
+        assert_eq!(at_edge.origin.y, 700.0 - 300.0 - super::PICKER_CURSOR_OFF);
     }
 
     #[test]

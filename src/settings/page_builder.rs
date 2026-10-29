@@ -2221,7 +2221,6 @@ pub(super) unsafe fn build_clipboard_page(
     ];
     let placement_label_refs: Vec<&str> = placement_labels.iter().map(|s| s.as_str()).collect();
     let placement_metrics = SettingsSelect::metrics();
-    ui.clipboard_picker_placement_row_height = placement_metrics.row_h;
     let cy = canvas.next_row(placement_metrics.row_h);
     SettingsRow::separator_above_row(clipboard_view, cy, placement_metrics.row_h, content_w);
     record_settings_search_row(

@@ -160,12 +160,7 @@ pub(super) fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) 
     if x + w > max_x {
         x = cursor.x - w - PICKER_CURSOR_OFF;
     }
-    if x < min_x {
-        x = min_x + PICKER_EDGE_MARGIN;
-    }
-    if x + w > max_x {
-        x = max_x - w - PICKER_EDGE_MARGIN;
-    }
+    x = clamp_inside(x, min_x, max_x, w);
 
     // y: prefer below the cursor (the panel's top edge sits 16pt under it); flip above when
     // tight; clamp to the edges.
@@ -173,14 +168,24 @@ pub(super) fn picker_frame_for(cursor: NSPoint, screen: NSRect, w: f64, h: f64) 
     if y < min_y {
         y = cursor.y + PICKER_CURSOR_OFF;
     }
-    if y + h > max_y {
-        y = max_y - h - PICKER_EDGE_MARGIN;
-    }
-    if y < min_y {
-        y = min_y + PICKER_EDGE_MARGIN;
-    }
+    y = clamp_inside(y, min_y, max_y, h);
 
     NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+}
+
+/// Clamp one axis' origin into `[min, max - extent]`, keeping `PICKER_EDGE_MARGIN` where the room
+/// allows it and giving the margin up where it does not.
+///
+/// The margin is a preference and the interval is a hard constraint. Applying the margin last (the
+/// previous form: `min + margin`, then `max - extent - margin`) pushed a panel that exactly fits
+/// past the edge it had just been clamped to, by exactly the overhang it could not afford.
+fn clamp_inside(value: f64, min: f64, max: f64, extent: f64) -> f64 {
+    let lowest = min;
+    let highest = (max - extent).max(lowest);
+    value
+        .min(highest - PICKER_EDGE_MARGIN)
+        .max(lowest + PICKER_EDGE_MARGIN)
+        .clamp(lowest, highest)
 }
 
 /// Pure: keep the detail panel on the picker's right and align it to the selected row within
@@ -364,22 +369,6 @@ pub(super) fn configured_picker_area() -> (NSPoint, NSRect) {
     }
 }
 
-/// Pure: the origin a placement produces for `cursor` on `screen`, given the panel's `size`.
-///
-/// The single answer to "where does this mode put the panel", shared by the summon (through
-/// `configured_picker_frame`) and by the A1 smoke, so the runner asserts each mode's own placement
-/// instead of comparing the two modes against each other -- those can legitimately coincide (a
-/// pointer up and left of the centred panel produces exactly the centred frame), and a comparison
-/// cannot tell a correct build from one that swapped them.
-pub(super) fn picker_placement_expected_origin(
-    placement: &str,
-    cursor: NSPoint,
-    screen: NSRect,
-    size: NSSize,
-) -> NSPoint {
-    configured_picker_frame(placement == "center", cursor, screen, size).origin
-}
-
 /// The frame the picker opens at, for a picker of `size`, on the screen the pointer is on.
 ///
 /// The screen never varies here (`configured_picker_area` supplies the pointer's display); only the
@@ -391,11 +380,41 @@ pub(super) fn configured_picker_frame(
     screen_frame: NSRect,
     size: NSSize,
 ) -> NSRect {
+    // The area the PANEL may occupy. `set_panel_frame` pads the panel by the elevation insets before
+    // handing it to AppKit, which clamps the WINDOW to the screen: a panel placed inside the bare
+    // visible frame therefore produces a padded window partly off the display, and AppKit moves it.
+    // That was a real disagreement -- a pointer near the bottom produced a panel 56pt from where the
+    // placement put it, with the summon and the reset disagreeing by the same amount.
+    let placeable = picker_placement_area(screen_frame, size);
     if center_on_screen {
-        picker_frame_centered(screen_frame, size)
+        picker_frame_centered(placeable, size)
     } else {
-        picker_frame_for(cursor, screen_frame, size.width, size.height)
+        picker_frame_for(cursor, placeable, size.width, size.height)
     }
+}
+
+/// The visible frame, shrunk by the shadow padding (and never below `size`), so that the WINDOW the
+/// padded panel becomes cannot overflow it.
+///
+/// Padding is taken off all four sides for the placement (the shadow reaches every edge; the top
+/// carries the largest inset because the shadow is offset upward), and the result is floored at the
+/// panel's own size: a panel taller than the placeable area is placed at its origin, where AppKit's
+/// clamp is the only thing left and no mathematical choice can be better.
+fn picker_placement_area(visible: NSRect, size: NSSize) -> NSRect {
+    let pad = crate::glass::panel_elevation_padding();
+    let width = (visible.size.width - pad.left - pad.right).max(size.width);
+    let height = (visible.size.height - pad.bottom - pad.top).max(size.height);
+    NSRect::new(
+        NSPoint::new(
+            visible.origin.x
+                + pad.left
+                + ((visible.size.width - pad.left - pad.right).max(0.0) - width) / 2.0,
+            visible.origin.y
+                + pad.bottom
+                + ((visible.size.height - pad.bottom - pad.top).max(0.0) - height) / 2.0,
+        ),
+        NSSize::new(width, height),
+    )
 }
 
 /// Pure: the picker's frame centred in `screen`'s visible area.
@@ -430,6 +449,10 @@ pub(super) fn reset_picker_to_configured_position() {
         let Some(picker_win) = PICKER_WINDOW.lock().unwrap().map(|w| w.0) else {
             return;
         };
+        // Both dimensions come from the live rect, so the reset only ever MOVES the panel it finds.
+        // The width must not be re-derived from the collapsed layout: an expanded split panel keeps
+        // its width while the detail is open, so narrowing it here would leave the detail, the
+        // divider and the header laid out for a width the window no longer has.
         let size = crate::glass::panel_frame_of(picker_win).size;
         let (cursor, screen_frame) = configured_picker_area();
         let target =
@@ -791,7 +814,12 @@ pub(super) fn show_picker() {
         // The window is the padded rect, so the panel's budget has to leave the elevation's padding room:
         // a window taller than the screen is constrained by AppKit, which moves the panel.
         let pad = crate::glass::panel_elevation_padding();
-        let max_h = PICKER_MAX_HEIGHT.min(screen_frame.size.height - 120.0 - pad.top - pad.bottom);
+        // The 8pt margin the placement itself keeps (PICKER_EDGE_MARGIN at both ends) and the whole
+        // shadow padding: with both reserved, `picker_frame_for`'s clamp and AppKit's window clamp
+        // act on the same real box and cannot disagree by the 56pt between them.
+        let max_h = PICKER_MAX_HEIGHT.min(
+            screen_frame.size.height - 120.0 - pad.top - pad.bottom - PICKER_EDGE_MARGIN * 2.0,
+        );
         // The visible row count derives from the height cap, floored to whole rows (no
         // half-cut row at the window's bottom). Pitches are accumulated per actual row
         // rather than estimated at ROW_H each: image entries can occupy several text rows
@@ -1416,26 +1444,26 @@ pub(super) extern "C" fn detail_preview_ready(
 }
 
 // ---------------------------------------------------------------------------------------------
-// Detail actions (floating, the mock's `.btn` treatment): the mock's detail pane has no
-// toolbar and no footer, but soft wrap and save-as are real features, so they float over the
-// top-right of the pane instead of reserving a strip. They sit in the mock's pane padding band,
-// so no body line is covered at rest; a long line scrolled under them keeps its text through a
-// translucent chip on the same glass material.
+// Detail actions: the mock's detail pane has no toolbar and no footer, but soft wrap and save-as
+// are real features. They trail the "Size" meta row instead of reserving a strip, inside the
+// scrolling document, so they travel with the table a long body pushes below the fold.
 // ---------------------------------------------------------------------------------------------
 
-/// A detail action's hit target and its chip for bubble layout.
+/// A detail action's control.
+///
+/// It used to own a chip view behind it, from the time both actions were bubbles floating over
+/// the pane. They now sit bare on the "Size" meta row inside the scrolling document, so the chip
+/// was an invisible intermediate that every rebuild had to build and hide again.
 struct DetailActionSide {
     control: *mut AnyObject,
-    chip: *mut AnyObject,
 }
 
 /// Build the detail actions for an entry: save-as always, the code soft-wrap switch only for
 /// code (it has nothing to switch for text or images).
 ///
-/// They are views over the scrolling column, not floats inside it. The mock's `.detail-scroll`
-/// (the pane's only scroller) scrolls its content under everything above it, so a chip floating
-/// over the column would sit on the panel material while a body scrolled past it; outside the
-/// scroll they stay put, which is the mock's behaviour with no chrome of its own in the column.
+/// They are views INSIDE the scrolling document's own coordinate space. The meta table is painted
+/// at that document's bottom, so a long body carries the actions below the fold with it instead of
+/// leaving them floating over the text at a fixed height.
 ///
 /// Both share the "Size" meta row, trailing in the pane's right inset. That row's own value ends
 /// far short of them: the right column starts at `DETAIL_META_RIGHT_SPLIT` and its value column is
@@ -1476,7 +1504,6 @@ unsafe fn add_detail_actions(entry: &ClipEntry, width: f64, height: f64) {
             origin.y + (DETAIL_ACTION_H - control_frame.size.height) / 2.0,
         );
         let _: () = msg_send![action.control, setFrameOrigin: control_origin];
-        let _: () = msg_send![action.chip, setFrameOrigin: *origin];
     }
 }
 
@@ -1540,38 +1567,7 @@ fn save_action_row_y(pane: &DetailPaneLayout, document_h: f64) -> f64 {
         + (pane.meta.row_h - DETAIL_ACTION_H) / 2.0
 }
 
-/// A translucent chip behind a floating action (the mock's `.btn` background), so a line
-/// scrolled underneath keeps its contrast. Rebuilt with the action, so a mode change is a
-/// rebuild and the chip follows the new palette.
-unsafe fn add_chip(content: *mut AnyObject, width: f64) -> *mut AnyObject {
-    let chip: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let chip: *mut AnyObject = msg_send![
-        chip,
-        initWithFrame: NSRect::new(
-            NSPoint::new(0.0, DETAIL_INSET_TOP),
-            NSSize::new(width, DETAIL_ACTION_H)
-        )
-    ];
-    let _: () = msg_send![chip, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![chip, layer];
-    crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(detail_action_fill()));
-    let _: () = msg_send![layer, setCornerRadius: crate::theme::RADIUS_CONTROL];
-    let _: () = msg_send![content, addSubview: chip];
-    chip
-}
-
-/// The floating actions' chip fill: a light glass wash over the panel material, or the palette's
-/// field fill in dark mode, so the chip never turns into a bright patch on the dark material.
-fn detail_action_fill() -> u32 {
-    if clipboard_palette().dark {
-        clipboard_palette().field_bg
-    } else {
-        DETAIL_ACTION_FILL_LIGHT
-    }
-}
-
-/// The soft-wrap switch, with its label as the tooltip: a 28pt pill inside the pane's padding
-/// band. Returns the switch and the chip behind it.
+/// The soft-wrap switch, with its label as the tooltip: a 28pt pill on the "Size" meta row.
 unsafe fn add_wrap_action(parent: *mut AnyObject) -> Option<DetailActionSide> {
     let enabled = DETAIL_SOFT_WRAP_ENABLED.load(Ordering::SeqCst);
     // Built fresh on every rebuild, like save-as. The switch used to be reused across rebuilds so
@@ -1579,9 +1575,6 @@ unsafe fn add_wrap_action(parent: *mut AnyObject) -> Option<DetailActionSide> {
     // other subview; then a chip added above it swallowed its clicks, and an off switch (the same
     // pale grey as that chip) looked dead. Its state lives in DETAIL_SOFT_WRAP_ENABLED instead, so
     // rebuilding it costs nothing but loses that whole class of ordering bug.
-    let chip = add_chip(parent, DETAIL_SWITCH_CHIP_W);
-    // The switch already draws its own pill; a rectangular chip behind it protrudes at the edges.
-    let _: () = msg_send![chip, setHidden: true];
     let button = crate::settings::make_shared_switch(
         DETAIL_SWITCH_CHIP_W - DETAIL_SWITCH_INSET,
         DETAIL_INSET_TOP,
@@ -1598,20 +1591,14 @@ unsafe fn add_wrap_action(parent: *mut AnyObject) -> Option<DetailActionSide> {
     let tooltip_ns = make_nsstring(&t(tooltip_key));
     let _: () = msg_send![button, setToolTip: tooltip_ns];
     CFRelease(tooltip_ns as *const c_void);
-    // Added AFTER its chip, so it is above it in `subviews` and receives the clicks.
     let _: () = msg_send![parent, addSubview: button];
     release_obj(button);
-    Some(DetailActionSide {
-        control: button,
-        chip,
-    })
+    Some(DetailActionSide { control: button })
 }
 
-/// The save-as button: the same glyph and hover behaviour as before, floated over the pane's
-/// top-right corner with a chip under it. Its tooltip says text or image file.
+/// The save-as button: the same glyph and hover behaviour as before, on the "Size" meta row.
+/// Its tooltip says text or image file.
 unsafe fn add_save_as_action(content: *mut AnyObject, is_image: bool) -> DetailActionSide {
-    let chip = add_chip(content, DETAIL_ACTION_H);
-    let _: () = msg_send![chip, setHidden: true];
     let button: *mut AnyObject = msg_send![hover_button_class(), alloc];
     let button: *mut AnyObject = msg_send![
         button,
@@ -1644,10 +1631,7 @@ unsafe fn add_save_as_action(content: *mut AnyObject, is_image: bool) -> DetailA
     add_hover_tracking(button);
     let _: () = msg_send![content, addSubview: button];
     release_obj(button);
-    DetailActionSide {
-        control: button,
-        chip,
-    }
+    DetailActionSide { control: button }
 }
 
 /// Select the entry the detail follows, or `None` when nothing is selected (search-field focus)

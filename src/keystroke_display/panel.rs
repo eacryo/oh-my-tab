@@ -1897,7 +1897,7 @@ pub(super) fn smoke_runner() -> bool {
         && (dev_only_material_forced || theme_refresh_retints_surface))
     {
         crate::log_info!(
-            "[smoke-keystroke-display-panel] which: structure={valid} isolated={smoke_process_isolated} rail={rail_geometry_valid} row={row_split_valid} column_pair={column_pair_margins_valid} stream={stream_alignment_valid} grip={grip_valid} config={config_restored} surface={every_material_paints_its_surface} theme={theme_refresh_retints_surface}"
+            "[smoke-keystroke-display-panel] which: structure={valid} isolated={smoke_process_isolated} rail={rail_geometry_valid} row={row_split_valid} column_pair={column_pair_margins_valid} stream={stream_alignment_valid} settings={settings_button_valid} grip={grip_valid} config={config_restored} preview={preview_valid} surface={every_material_paints_its_surface} theme={theme_refresh_retints_surface} dev_only_material={dev_only_material_forced}"
         );
     }
     valid

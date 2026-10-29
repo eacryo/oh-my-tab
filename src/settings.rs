@@ -521,7 +521,6 @@ pub(super) struct SettingsUi {
     // (follow the pinned entry / keep current position)
     clipboard_picker_placement: *mut AnyObject, // clipboard on the cursor screen
     // (follow the cursor / screen center)
-    clipboard_picker_placement_row_height: f64,
     clipboard_paused: *mut AnyObject, // pause recording (persisted, unlike the panel pin)
     /// Per-row "remove" buttons of the excluded-applications list. The SENDER POINTER identifies
     /// which entry to drop: a button's tag selects its hover/normal palette, so it must never carry

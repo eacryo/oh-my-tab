@@ -2197,10 +2197,11 @@ unsafe fn create_row_views(
     );
     if !detail_btn.is_null() {
         set_detail_action_style(detail_btn, detail_active, false);
-        let label = make_nsstring(&t("clipboard.expand_toggle"));
+        // It opens THIS row's detail, and the → still works: the shared "Show details (→)" names both.
+        let label = make_nsstring(&t("clipboard.detail_toggle"));
         let _: () = msg_send![detail_btn, setAccessibilityLabel: label];
         CFRelease(label as *const c_void);
-        let tip = make_nsstring(&t("clipboard.expand_toggle"));
+        let tip = make_nsstring(&t("clipboard.detail_toggle"));
         let _: () = msg_send![detail_btn, setToolTip: tip];
         CFRelease(tip as *const c_void);
         let _: () = msg_send![container, addSubview: detail_btn];
@@ -3468,15 +3469,22 @@ pub(super) extern "C" fn toggle_pin(_self: *mut c_void, _cmd: Sel, sender: *mut 
         if selection_after_pin(new_h_idx) {
             unsafe { rebuild_rows() };
         }
-        // Pinning changes the row position, and with "keep selection" the selection may stay on
-        // another entry; the row's own detail toggle is what the user pressed, so an open detail
-        // follows THAT entry to its new display position instead of the selection.
+        // An open detail panel follows THIS entry to its new display position -- but only when the
+        // user's "after pinning" setting lets the selection move at all. "Keep current position"
+        // means the highlight stays where it is, and moving the selection here anyway would both
+        // override that choice and leave the pane showing one entry while the highlight names
+        // another; the pane therefore follows the selection, wherever the setting put it.
         if detail_visible() {
-            let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-            if let Some(pos) = filtered.iter().position(|&h| h == new_h_idx) {
-                set_picker_selection(pos);
-                unsafe { show_detail_for_sel() };
+            if CONFIG.read().unwrap().clipboard.pin_follow_selection {
+                let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+                if let Some(pos) = filtered.iter().position(|&h| h == new_h_idx) {
+                    set_picker_selection(pos);
+                    // The highlight moved with the selection, so the row list has to be redrawn
+                    // before the pane is rebuilt from it.
+                    unsafe { rebuild_rows() };
+                }
             }
+            unsafe { show_detail_for_sel() };
         }
         let msg = if now_pinned {
             t("clipboard.toast_pinned")
