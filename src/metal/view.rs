@@ -84,9 +84,11 @@ pub(crate) unsafe fn create_view(parent: *mut AnyObject, frame: NSRect) -> *mut 
             let _: () = msg_send![ml, setDevice: (*renderer).device()];
             let _: () = msg_send![ml, setPixelFormat: MTL_PIXEL_FORMAT_BGRA8_UNORM];
             let _: () = msg_send![ml, setOpaque: false];
-            // Present with the CA transaction, and keep three drawables in
-            // flight on ProMotion displays (mygo's layer setup verbatim).
-            let _: () = msg_send![ml, setPresentsWithTransaction: true];
+            // Presents commit on `commit`, not on a CA transaction boundary:
+            // with-transaction presents were the frames that silently
+            // vanished whenever the panel re-showed. Three drawables stay in
+            // flight for ProMotion (mygo's layer setup otherwise verbatim).
+            let _: () = msg_send![ml, setPresentsWithTransaction: false];
             let has_count: bool =
                 msg_send![ml, respondsToSelector: sel!(setMaximumDrawableCount:)];
             if has_count {
