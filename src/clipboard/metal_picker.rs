@@ -19,6 +19,10 @@ struct MetalPicker {
     view: *mut AnyObject,
     scroll: f64,
     hover: usize,
+    /// The interactive element under the cursor (header buttons, the hovered
+    /// row's action buttons) — drives their hover tiles, the AppKit buttons'
+    /// highlight feedback.
+    hot: u8,
     /// The detail pane's open state: → splits the panel (list left, detail
     /// right) like the AppKit picker's expanded layout.
     detail: bool,
@@ -38,6 +42,15 @@ const DETAIL_PAD: f64 = 14.0;
 const DETAIL_META_H: f64 = 24.0;
 const DETAIL_LINE_GAP: f64 = 3.0;
 const DETAIL_EMPTY_LINE_H: f64 = 16.0;
+
+// `hot` values: which clickable region the cursor is over.
+const HOT_NONE: u8 = 0;
+const HOT_PAUSE: u8 = 1;
+const HOT_PIN: u8 = 2;
+const HOT_CLOSE: u8 = 3;
+const HOT_ROW_PIN: u8 = 4;
+const HOT_ROW_DET: u8 = 5;
+const HOT_ROW_DEL: u8 = 6;
 
 fn with_picker<R>(default: R, f: impl FnOnce(&mut MetalPicker) -> R) -> R {
     match PICKER.lock().unwrap().as_mut() {
@@ -89,6 +102,7 @@ pub(super) unsafe fn show() {
         };
         p.scroll = 0.0;
         p.hover = NO_SELECTION;
+        p.hot = HOT_NONE;
         p.detail = false;
         (p.window, p.view)
     };
@@ -250,6 +264,7 @@ unsafe fn ensure_window() {
         view,
         scroll: 0.0,
         hover: NO_SELECTION,
+        hot: HOT_NONE,
         detail: false,
         pitches: Vec::new(),
         revision: u64::MAX,
@@ -420,14 +435,14 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     let palette = clipboard_palette();
     let w = bounds.size.width;
     let h = bounds.size.height;
-    let (scroll, hover, detail) = with_picker((0.0, NO_SELECTION, false), |p| {
-        (p.scroll, p.hover, p.detail)
+    let (scroll, hover, detail, hot) = with_picker((0.0, NO_SELECTION, false, 0u8), |p| {
+        (p.scroll, p.hover, p.detail, p.hot)
     });
     let layout = picker_layout(w, detail);
     let list_w = if detail { layout.list_w } else { w };
     let mut scene = render::Scene::new(scale, w, h);
 
-    draw_header(&mut scene, renderer, &palette, w, scale);
+    draw_header(&mut scene, renderer, &palette, w, hot, scale);
 
     let list_rect = [
         0.0,
@@ -436,7 +451,7 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
         (h - header_strip_h() - FOOTER_H).max(0.0),
     ];
     scene.with_clip(list_rect, |s| unsafe {
-        draw_rows(s, renderer, &palette, list_w, scroll, hover, scale);
+        draw_rows(s, renderer, &palette, list_w, scroll, hover, hot, scale);
     });
     draw_scroll_indicator(&mut scene, &palette, list_w, list_rect, scroll);
     if detail {
@@ -547,11 +562,27 @@ unsafe fn draw_detail(
     });
 }
 
+/// A hover tile behind a header/row button's rect (the AppKit buttons'
+/// highlight). `red` for the close button's hover, which turns destructive.
+fn hot_tile(scene: &mut render::Scene, r: NSRect, palette: &crate::theme::UiPalette, red: bool) {
+    let color = if red {
+        [0.85, 0.2, 0.2, 0.85]
+    } else {
+        render::f4(row_backdrop_wash(*palette, false, true))
+    };
+    scene.fill(
+        [r.origin.x, r.origin.y, r.size.width, r.size.height],
+        crate::theme::RADIUS_LEGEND_CHIP,
+        color,
+    );
+}
+
 unsafe fn draw_header(
     scene: &mut render::Scene,
     renderer: &render::Renderer,
     palette: &crate::theme::UiPalette,
     w: f64,
+    hot: u8,
     scale: f64,
 ) {
     let (search, pause, _options, pin, close) = picker_header_frames_for(w);
@@ -562,6 +593,15 @@ unsafe fn draw_header(
         palette.secondary_text,
         crate::glass::PanelInk::Secondary,
     );
+    if hot == HOT_PAUSE {
+        hot_tile(scene, pause, palette, false);
+    }
+    if hot == HOT_PIN {
+        hot_tile(scene, pin, palette, false);
+    }
+    if hot == HOT_CLOSE {
+        hot_tile(scene, close, palette, true);
+    }
     draw_centered_label(
         scene,
         renderer,
@@ -694,6 +734,7 @@ unsafe fn draw_rows(
     w: f64,
     scroll: f64,
     hover: usize,
+    hot: u8,
     scale: f64,
 ) {
     let hist = CLIP_HISTORY.lock().unwrap();
@@ -796,7 +837,7 @@ unsafe fn draw_rows(
                 picker_accent(*palette),
             ));
         }
-        draw_row_content(scene, renderer, palette, entry, hovered, y, row_h, row_w, w, style_tag, scale);
+        draw_row_content(scene, renderer, palette, entry, hovered, hot, y, row_h, row_w, w, style_tag, scale);
     }
 }
 
@@ -806,6 +847,7 @@ unsafe fn draw_row_content(
     palette: &crate::theme::UiPalette,
     entry: &ClipEntry,
     hovered: bool,
+    hot: u8,
     y: f64,
     row_h: f64,
     row_w: f64,
@@ -852,7 +894,7 @@ unsafe fn draw_row_content(
             scale,
         );
     }
-    draw_row_actions(scene, renderer, palette, entry, hovered, y, row_h, panel_w, scale);
+    draw_row_actions(scene, renderer, palette, entry, hovered, hot, y, row_h, panel_w, scale);
 }
 
 unsafe fn draw_entry_text(
@@ -900,6 +942,7 @@ unsafe fn draw_row_actions(
     palette: &crate::theme::UiPalette,
     entry: &ClipEntry,
     hovered: bool,
+    hot: u8,
     y: f64,
     row_h: f64,
     list_w: f64,
@@ -912,6 +955,14 @@ unsafe fn draw_row_actions(
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: ACTION_GLYPH_SIZE];
     let ink = crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary);
+    if hovered {
+        match hot {
+            HOT_ROW_PIN => hot_tile(scene, pin_r, palette, false),
+            HOT_ROW_DET => hot_tile(scene, det_r, palette, false),
+            HOT_ROW_DEL => hot_tile(scene, del_r, palette, true),
+            _ => {}
+        }
+    }
     draw_centered_label(
         scene,
         renderer,
@@ -1089,6 +1140,64 @@ fn chip_f4(palette: &crate::theme::UiPalette) -> [f32; 4] {
 // Input
 // ---------------------------------------------------------------------------
 
+fn in_rect(point: NSPoint, r: NSRect) -> bool {
+    point.x >= r.origin.x
+        && point.x <= r.origin.x + r.size.width
+        && point.y >= r.origin.y
+        && point.y <= r.origin.y + r.size.height
+}
+
+/// The clickable zone under `point` (header buttons, the hovered row's action
+/// buttons). Shared by the hover tracker and the click dispatch.
+fn hit_zones(point: NSPoint, view_w: f64) -> u8 {
+    let (_search, pause, _options, pin, close) = picker_header_frames_for(view_w);
+    if in_rect(point, pause) {
+        return HOT_PAUSE;
+    }
+    if in_rect(point, pin) {
+        return HOT_PIN;
+    }
+    if in_rect(point, close) {
+        return HOT_CLOSE;
+    }
+    let Some(idx) = row_at(point) else {
+        return HOT_NONE;
+    };
+    let (pitches, scroll) = with_picker((Vec::new(), 0.0), |p| (p.pitches.clone(), p.scroll));
+    let offsets = row_offsets(&pitches);
+    if idx >= pitches.len() {
+        return HOT_NONE;
+    }
+    let y = header_strip_h() + offsets[idx] - scroll;
+    let has_header = {
+        let hist = CLIP_HISTORY.lock().unwrap();
+        let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+        let prev = idx
+            .checked_sub(1)
+            .and_then(|i| filtered.get(i))
+            .and_then(|&p| hist.get(p))
+            .map(|e| day_group(e.copied_at));
+        filtered
+            .get(idx)
+            .and_then(|&h| hist.get(h))
+            .map(|e| prev != Some(day_group(e.copied_at)))
+            .unwrap_or(false)
+    };
+    let row_y = y + if has_header { GROUP_H } else { 0.0 };
+    let row_h = pitches[idx] - if has_header { GROUP_H } else { 0.0 };
+    let [pin_r, det_r, del_r] = row_action_rects(row_y, row_h, list_w());
+    if in_rect(point, del_r) {
+        return HOT_ROW_DEL;
+    }
+    if in_rect(point, det_r) {
+        return HOT_ROW_DET;
+    }
+    if in_rect(point, pin_r) {
+        return HOT_ROW_PIN;
+    }
+    HOT_NONE
+}
+
 /// Rows' hit test: display index under the point (view coords), or None over
 /// chrome or the detail pane.
 fn row_at(point: NSPoint) -> Option<usize> {
@@ -1126,11 +1235,16 @@ unsafe fn scroll_cb(_event: *mut AnyObject, _dx: f64, dy: f64) {
 }
 
 unsafe fn mouse_moved_cb(_event: *mut AnyObject, point: NSPoint) {
-    let idx = row_at(point);
-    let idx = idx.unwrap_or(NO_SELECTION);
+    let view_w = with_picker(0.0, |p| {
+        let f: NSRect = msg_send![p.view, frame];
+        f.size.width
+    });
+    let hot = hit_zones(point, view_w);
+    let idx = row_at(point).unwrap_or(NO_SELECTION);
     let changed = with_picker(false, |p| {
-        let changed = p.hover != idx;
+        let changed = p.hover != idx || p.hot != hot;
         p.hover = idx;
+        p.hot = hot;
         changed
     });
     if changed {
@@ -1140,8 +1254,9 @@ unsafe fn mouse_moved_cb(_event: *mut AnyObject, point: NSPoint) {
 
 unsafe fn mouse_exited_cb(_event: *mut AnyObject) {
     let changed = with_picker(false, |p| {
-        let changed = p.hover != NO_SELECTION;
+        let changed = p.hover != NO_SELECTION || p.hot != HOT_NONE;
         p.hover = NO_SELECTION;
+        p.hot = HOT_NONE;
         changed
     });
     if changed {
@@ -1155,33 +1270,51 @@ unsafe fn mouse_down_cb(event: *mut AnyObject, point: NSPoint) {
         return;
     }
     let frame: NSRect = msg_send![view, frame];
-    let (search, pause, _options, pin, close) = picker_header_frames_for(frame.size.width);
-    let in_rect = |r: NSRect| {
-        point.x >= r.origin.x
-            && point.x <= r.origin.x + r.size.width
-            && point.y >= r.origin.y
-            && point.y <= r.origin.y + r.size.height
-    };
-    if in_rect(pause) {
-        let _ = set_collection_paused(!collection_paused());
-        refresh();
-        return;
-    }
-    if in_rect(pin) {
-        let p_frame: NSRect = msg_send![view, frame];
-        if super::pin::is_pinned() {
-            super::pin::unpin();
-        } else {
-            super::pin::pin(p_frame.size.height);
+    let (search, _pause, _options, _pin, _close) = picker_header_frames_for(frame.size.width);
+    match hit_zones(point, frame.size.width) {
+        HOT_PAUSE => {
+            let _ = set_collection_paused(!collection_paused());
+            refresh();
+            return;
         }
-        refresh();
-        return;
+        HOT_PIN => {
+            let p_frame: NSRect = msg_send![view, frame];
+            if super::pin::is_pinned() {
+                super::pin::unpin();
+            } else {
+                super::pin::pin(p_frame.size.height);
+            }
+            refresh();
+            return;
+        }
+        HOT_CLOSE => {
+            hide();
+            return;
+        }
+        HOT_ROW_DEL => {
+            if let Some(idx) = row_at(point) {
+                delete_entry_at(idx);
+            }
+            return;
+        }
+        HOT_ROW_DET => {
+            if let Some(idx) = row_at(point) {
+                set_picker_selection(idx);
+                set_detail_open(true);
+            }
+            return;
+        }
+        HOT_ROW_PIN => {
+            if let Some(idx) = row_at(point) {
+                set_picker_selection(idx);
+                pin_selected();
+            }
+            return;
+        }
+        _ => {}
     }
-    if in_rect(close) {
-        hide();
-        return;
-    }
-    if in_rect(search)
+    // The search field's clear ×.
+    if in_rect(point, search)
         && point.x >= search.origin.x + search.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
         && with_clipboard_ui(|ui| !ui.search_query.is_empty())
     {
@@ -1192,43 +1325,6 @@ unsafe fn mouse_down_cb(event: *mut AnyObject, point: NSPoint) {
     let Some(idx) = row_at(point) else {
         return;
     };
-    // The hovered row's action buttons (pin / detail / delete) win the click.
-    let (pitches, scroll) = with_picker((Vec::new(), 0.0), |p| (p.pitches.clone(), p.scroll));
-    let offsets = row_offsets(&pitches);
-    if idx < pitches.len() && with_picker(false, |p| p.hover == idx) {
-        let y = header_strip_h() + offsets[idx] - scroll;
-        let has_header = {
-            let hist = CLIP_HISTORY.lock().unwrap();
-            let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-            let prev = idx
-                .checked_sub(1)
-                .and_then(|i| filtered.get(i))
-                .and_then(|&p| hist.get(p))
-                .map(|e| day_group(e.copied_at));
-            filtered
-                .get(idx)
-                .and_then(|&h| hist.get(h))
-                .map(|e| prev != Some(day_group(e.copied_at)))
-                .unwrap_or(false)
-        };
-        let row_y = y + if has_header { GROUP_H } else { 0.0 };
-        let row_h = pitches[idx] - if has_header { GROUP_H } else { 0.0 };
-        let [pin_r, det_r, del_r] = row_action_rects(row_y, row_h, list_w());
-        if in_rect(del_r) {
-            delete_entry_at(idx);
-            return;
-        }
-        if in_rect(det_r) {
-            set_picker_selection(idx);
-            set_detail_open(true);
-            return;
-        }
-        if in_rect(pin_r) {
-            set_picker_selection(idx);
-            pin_selected();
-            return;
-        }
-    }
     let mods: u64 = msg_send![event, modifierFlags];
     set_picker_selection(idx);
     paste_at_ex(idx, (mods & 0x0008_0000) != 0);
