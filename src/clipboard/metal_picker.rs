@@ -44,18 +44,21 @@ static HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 // panel tint. Dark mode keeps the theme palette instead.
 const GLASS_RADIUS: f64 = 32.0;
 const ROW_R_LG: f64 = 14.0;
-const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.20];
+const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.26];
 const ORB_BG_HOT: [f32; 4] = [1.0, 1.0, 1.0, 0.44];
 const ORB_BG_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.55];
 const ORB_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.52];
 const ORB_LINE_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.80];
-const FIELD_BG_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.58];
-const FIELD_BG_LG_IDLE: [f32; 4] = [1.0, 1.0, 1.0, 0.38];
+const FIELD_BG_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.38];
+const FIELD_BG_LG_IDLE: [f32; 4] = [1.0, 1.0, 1.0, 0.28];
 const HAIRLINE_LG: [f32; 4] = [52.0 / 255.0, 42.0 / 255.0, 30.0 / 255.0, 0.09];
-const ROW_HOVER_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.32];
-const ROW_SEL_LG: [f32; 4] = [92.0 / 255.0, 82.0 / 255.0, 72.0 / 255.0, 0.16];
+const ROW_HOVER_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.28];
+// The reference's selected row is a warm tan wash, not a grey one.
+const ROW_SEL_LG: [f32; 4] = [156.0 / 255.0, 124.0 / 255.0, 84.0 / 255.0, 0.26];
 const SCROLL_LG: [f32; 4] = [60.0 / 255.0, 50.0 / 255.0, 36.0 / 255.0, 0.20];
-const WARM_TINT: [f32; 4] = [1.0, 0.95, 0.88, 0.22];
+// High-translucency glass (the reference photo): the wallpaper dominates and
+// the panel is only a thin frost — whites stay far lower than the v2 mock.
+const WARM_TINT: [f32; 4] = [1.0, 1.0, 1.0, 0.10];
 const ACCENT_GLOW: [f32; 4] = [47.0 / 255.0, 111.0 / 255.0, 237.0 / 255.0, 0.12];
 const ACCENT_LG: [f32; 4] = [47.0 / 255.0, 111.0 / 255.0, 237.0 / 255.0, 1.0];
 const ACCENT_DARK: [f32; 4] = [0.20, 0.35, 0.80, 1.0];
@@ -457,8 +460,8 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     // highlight hugging the top edge.
     if !palette.dark {
         scene.fill([0.0, 0.0, w, h], GLASS_RADIUS, WARM_TINT);
-        scene.fill([0.0, 0.0, w, h * 0.45], GLASS_RADIUS, [1.0, 1.0, 1.0, 0.12]);
-        scene.fill([0.0, h - 32.0, w, 32.0], 16.0, [1.0, 1.0, 1.0, 0.08]);
+        scene.fill([0.0, 0.0, w, h * 0.45], GLASS_RADIUS, [1.0, 1.0, 1.0, 0.06]);
+        scene.fill([0.0, h - 32.0, w, 32.0], 16.0, [1.0, 1.0, 1.0, 0.05]);
         scene.border(
             [0.5, 0.5, w - 1.0, h - 1.0],
             GLASS_RADIUS - 0.5,
@@ -1124,27 +1127,19 @@ unsafe fn draw_row_actions(
     let ink = crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary);
     let r = crate::theme::RADIUS_LEGEND_CHIP;
     if !hovered {
-        // Idle: the two glyphs only, dimmed — but still clickable.
-        let idle = crate::glass::panel_ink(palette.muted_text, crate::glass::PanelInk::Muted);
-        ui.centered_label(
-            if entry.pinned { "★" } else { "☆" },
-            font,
-            idle,
-            label_style_tag("row-pin-i", palette, [0.0; 4]),
-            pin_r,
-        );
-        if ui.clicked(pin_r) {
-            *action = Action::PinEntry(display_idx);
-        }
-        ui.centered_label(
-            "×",
-            font,
-            idle,
-            label_style_tag("row-del-i", palette, [0.0; 4]),
-            del_r,
-        );
-        if ui.clicked(del_r) {
-            *action = Action::DeleteEntry(display_idx);
+        // Idle rows carry no chrome in the reference — only the pinned mark.
+        if entry.pinned {
+            let idle = crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary);
+            ui.centered_label(
+                "★",
+                font,
+                idle,
+                label_style_tag("row-pin-i", palette, [0.0; 4]),
+                pin_r,
+            );
+            if ui.clicked(pin_r) {
+                *action = Action::PinEntry(display_idx);
+            }
         }
         return;
     }
