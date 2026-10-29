@@ -44,9 +44,9 @@ static HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 // panel tint. Dark mode keeps the theme palette instead.
 const GLASS_RADIUS: f64 = 32.0;
 const ROW_R_LG: f64 = 14.0;
-const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.46];
-const ORB_BG_HOT: [f32; 4] = [1.0, 1.0, 1.0, 0.58];
-const ORB_BG_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.66];
+const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.58];
+const ORB_BG_HOT: [f32; 4] = [1.0, 1.0, 1.0, 0.66];
+const ORB_BG_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.74];
 const ORB_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.70];
 const ORB_LINE_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.90];
 const FIELD_BG_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.45];
@@ -576,7 +576,7 @@ unsafe fn orb_button(
             rect.size.height * 0.52,
         ],
         [r, r, 0.0, 0.0],
-        [1.0, 1.0, 1.0, if dark { 0.14 } else { 0.30 }],
+        [1.0, 1.0, 1.0, if dark { 0.16 } else { 0.34 }],
     );
     ui.scene.fill_radii(
         [
@@ -586,7 +586,7 @@ unsafe fn orb_button(
             rect.size.height * 0.46,
         ],
         [0.0, 0.0, r, r],
-        [0.0, 0.0, 0.0, 0.09],
+        [0.0, 0.0, 0.0, 0.10],
     );
     ui.centered_label(glyph, font, color, tag, rect);
     ui.clicked(rect)
