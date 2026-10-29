@@ -9,7 +9,7 @@
 //! this picker instead of the AppKit one. Everything else stays untouched.
 
 use super::*;
-use crate::metal::{render, text, view as metal_view};
+use crate::metal::{render, text, ui, view as metal_view};
 
 /// Panel-local UI state. The list model itself lives in the shared
 /// `ClipboardUiState` (`ui.filtered`, `ui.search_query`, `picker_selection`), so
@@ -18,11 +18,13 @@ struct MetalPicker {
     window: *mut AnyObject,
     view: *mut AnyObject,
     scroll: f64,
-    hover: usize,
-    /// The interactive element under the cursor (header buttons, the hovered
-    /// row's action buttons) — drives their hover tiles, the AppKit buttons'
-    /// highlight feedback.
-    hot: u8,
+    /// The frame's pointer input the immediate-mode build answers: the cursor's
+    /// latest position (hover) and the pending mouse-down (click + whether
+    /// Option was held, for the burn-after-paste variant). A click is consumed
+    /// by the first widget whose rect contains it — drawing is the hit test,
+    /// the mygo `ui` pattern.
+    cursor: Option<NSPoint>,
+    click: Option<(NSPoint, bool)>,
     /// The detail pane's open state: → splits the panel (list left, detail
     /// right) like the AppKit picker's expanded layout.
     detail: bool,
@@ -43,14 +45,20 @@ const DETAIL_META_H: f64 = 24.0;
 const DETAIL_LINE_GAP: f64 = 3.0;
 const DETAIL_EMPTY_LINE_H: f64 = 16.0;
 
-// `hot` values: which clickable region the cursor is over.
-const HOT_NONE: u8 = 0;
-const HOT_PAUSE: u8 = 1;
-const HOT_PIN: u8 = 2;
-const HOT_CLOSE: u8 = 3;
-const HOT_ROW_PIN: u8 = 4;
-const HOT_ROW_DET: u8 = 5;
-const HOT_ROW_DEL: u8 = 6;
+/// What a clicked widget asks the frame to run after the build (the mygo
+/// "input read at construction, applied to the next frame" shape: the action
+/// executes once the frame encodes, never mid-draw).
+enum Action {
+    None,
+    Paste { idx: usize, burn: bool },
+    PinEntry(usize),
+    DeleteEntry(usize),
+    OpenDetail,
+    TogglePause,
+    TogglePanelPin,
+    ClearSearch,
+    Hide,
+}
 
 fn with_picker<R>(default: R, f: impl FnOnce(&mut MetalPicker) -> R) -> R {
     match PICKER.lock().unwrap().as_mut() {
@@ -101,8 +109,8 @@ pub(super) unsafe fn show() {
             return;
         };
         p.scroll = 0.0;
-        p.hover = NO_SELECTION;
-        p.hot = HOT_NONE;
+        p.cursor = None;
+        p.click = None;
         p.detail = false;
         (p.window, p.view)
     };
@@ -263,8 +271,8 @@ unsafe fn ensure_window() {
         window,
         view,
         scroll: 0.0,
-        hover: NO_SELECTION,
-        hot: HOT_NONE,
+        cursor: None,
+        click: None,
         detail: false,
         pitches: Vec::new(),
         revision: u64::MAX,
@@ -337,85 +345,6 @@ fn label_style_tag(tag: &str, palette: &crate::theme::UiPalette, color: [f32; 4]
     )
 }
 
-unsafe fn draw_text(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
-    attr: *mut AnyObject,
-    style_tag: u64,
-    x: f64,
-    y_top: f64,
-    max_w: f64,
-    scale: f64,
-) {
-    let Some(bmp) = text::rasterize_attributed(renderer, attr, style_tag, scale, max_w) else {
-        return;
-    };
-    scene.image(
-        bmp.texture,
-        [x - text::PAD_PT, y_top - text::PAD_PT, bmp.w, bmp.h],
-        1.0,
-        None,
-    );
-}
-
-/// A label centred inside `rect` (header buttons, row action glyphs).
-unsafe fn draw_centered_label(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
-    s: &str,
-    font: *mut AnyObject,
-    color: *mut AnyObject,
-    style_tag: u64,
-    rect: NSRect,
-    scale: f64,
-) {
-    let attr = text::make_text_attr(s, font, color);
-    if attr.is_null() {
-        return;
-    }
-    if let Some(bmp) = text::rasterize_attributed(
-        renderer,
-        attr,
-        style_tag,
-        scale,
-        rect.size.width,
-    ) {
-        scene.image(
-            bmp.texture,
-            [
-                rect.origin.x + (rect.size.width - bmp.w) / 2.0 - text::PAD_PT,
-                rect.origin.y + (rect.size.height - bmp.h) / 2.0 - text::PAD_PT,
-                bmp.w,
-                bmp.h,
-            ],
-            1.0,
-            None,
-        );
-    }
-    release_obj(attr);
-}
-
-/// Convenience: draw a one-off label string; the attr is built and released here.
-unsafe fn draw_label(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
-    s: &str,
-    font: *mut AnyObject,
-    color: *mut AnyObject,
-    style_tag: u64,
-    x: f64,
-    y_top: f64,
-    max_w: f64,
-    scale: f64,
-) {
-    let attr = text::make_text_attr(s, font, color);
-    if attr.is_null() {
-        return;
-    }
-    draw_text(scene, renderer, attr, style_tag, x, y_top, max_w, scale);
-    release_obj(attr);
-}
-
 /// `handlers.render`: rebuild the whole scene every frame — at these sizes
 /// (≤ ~60 visible ops) re-emitting costs nothing, and text bitmaps are cached.
 unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
@@ -435,50 +364,95 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     let palette = clipboard_palette();
     let w = bounds.size.width;
     let h = bounds.size.height;
-    let (scroll, hover, detail, hot) = with_picker((0.0, NO_SELECTION, false, 0u8), |p| {
-        (p.scroll, p.hover, p.detail, p.hot)
+    let (scroll, detail, cursor, click) = with_picker((0.0, false, None, None), |p| {
+        (p.scroll, p.detail, p.cursor, p.click)
     });
+    let burn = click.map(|(_, b)| b).unwrap_or(false);
     let layout = picker_layout(w, detail);
     let list_w = if detail { layout.list_w } else { w };
     let mut scene = render::Scene::new(scale, w, h);
+    let mut action = Action::None;
 
-    draw_header(&mut scene, renderer, &palette, w, hot, scale);
+    // The frame's build pass (mygo's `view(ctx)`): every widget answers its
+    // own input where it draws, and what it wants done lands in `action`.
+    {
+        let mut ui = ui::Ui::new(&mut scene, renderer, scale, cursor, click.map(|(p, _)| p));
+        draw_header(&mut ui, &palette, w, &mut action);
 
-    let list_rect = [
-        0.0,
-        header_strip_h(),
-        list_w,
-        (h - header_strip_h() - FOOTER_H).max(0.0),
-    ];
-    scene.with_clip(list_rect, |s| unsafe {
-        draw_rows(s, renderer, &palette, list_w, scroll, hover, hot, scale);
-    });
-    draw_scroll_indicator(&mut scene, &palette, list_w, list_rect, scroll);
-    if detail {
-        draw_detail(&mut scene, renderer, &palette, &layout, w, h, scale);
+        let list_rect = [
+            0.0,
+            header_strip_h(),
+            list_w,
+            (h - header_strip_h() - FOOTER_H).max(0.0),
+        ];
+        ui.scene.with_clip(list_rect, |s| {
+            let mut ui = ui::Ui::new(s, renderer, scale, cursor, click.map(|(p, _)| p));
+            draw_rows(&mut ui, &palette, list_w, scroll, burn, &mut action);
+        });
+        draw_scroll_indicator(ui.scene, &palette, list_w, list_rect, scroll);
+        if detail {
+            draw_detail(&mut ui, &palette, &layout, h);
+        }
+        draw_footer(&mut ui, &palette, w, h);
     }
-    draw_footer(&mut scene, renderer, &palette, w, h, scale);
     renderer.render(metal_view::metal_layer(), &scene);
+    with_picker((), |p| p.click = None);
+    run_action(action);
+}
+
+/// Run what the frame's clicked widget asked for — after encoding, so a click
+/// never mutates the model mid-draw.
+fn run_action(action: Action) {
+    match action {
+        Action::None => {}
+        Action::Paste { idx, burn } => {
+            set_picker_selection(idx);
+            paste_at_ex(idx, burn);
+        }
+        Action::PinEntry(idx) => {
+            set_picker_selection(idx);
+            pin_selected();
+        }
+        Action::DeleteEntry(idx) => delete_entry_at(idx),
+        Action::OpenDetail => unsafe { set_detail_open(true) },
+        Action::TogglePause => {
+            let _ = set_collection_paused(!collection_paused());
+            refresh();
+        }
+        Action::TogglePanelPin => {
+            let h = with_picker(0.0, |p| {
+                let f: NSRect = unsafe { msg_send![p.view, frame] };
+                f.size.height
+            });
+            if super::pin::is_pinned() {
+                super::pin::unpin();
+            } else {
+                super::pin::pin(h);
+            }
+            refresh();
+        }
+        Action::ClearSearch => {
+            with_clipboard_ui(|ui| ui.search_query.clear());
+            refresh();
+        }
+        Action::Hide => hide(),
+    }
 }
 
 /// The expanded layout's right pane: a hairline split, the source line, then
 /// the entry's content — full text for text entries, the image for image ones.
 unsafe fn draw_detail(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
+    ui: &mut ui::Ui,
     palette: &crate::theme::UiPalette,
     layout: &PickerLayout,
-    w: f64,
     h: f64,
-    scale: f64,
 ) {
     let split_x = layout.list_w;
-    scene.fill(
+    ui.scene.fill(
         [split_x, header_strip_h(), 1.0, h - header_strip_h() - FOOTER_H],
         0.0,
         render::f4(picker_hairline()),
     );
-    let _ = w;
     let pane_x = split_x + 1.0;
     let pane_w = (layout.detail_w - DETAIL_PAD * 2.0).max(0.0);
     let top = header_strip_h() + DETAIL_PAD;
@@ -499,9 +473,7 @@ unsafe fn draw_detail(
     } else {
         format!("{} · {}", entry.source_app, group_label(day_group(entry.copied_at)))
     };
-    draw_label(
-        scene,
-        renderer,
+    ui.label(
         &meta,
         meta_font,
         muted,
@@ -509,7 +481,6 @@ unsafe fn draw_detail(
         pane_x + DETAIL_PAD,
         y,
         pane_w,
-        scale,
     );
     y += DETAIL_META_H;
     if let Some(image) = &entry.image {
@@ -525,10 +496,10 @@ unsafe fn draw_detail(
             let size: NSSize = msg_send![im, size];
             if size.width > 0.0 && size.height > 0.0 {
                 let fit = (pane_w / size.width).min((bottom - y) / size.height).min(1.0);
-                if let Some(tex) = text::rasterize_nsimage(renderer, im, scale * fit.max(0.05)) {
+                if let Some(tex) = text::rasterize_nsimage(ui.renderer, im, ui.scale * fit.max(0.05)) {
                     let dw = size.width * fit;
                     let dh = size.height * fit;
-                    scene.image(
+                    ui.scene.image(
                         tex,
                         [pane_x + DETAIL_PAD, y, dw, dh],
                         1.0,
@@ -543,7 +514,9 @@ unsafe fn draw_detail(
     // Text: one CTLine per source line, drawn top-down and clipped at the pane.
     let kind = classify_text(&entry.text);
     let style_tag = label_style_tag("detail-lines", palette, [0.0; 4]);
-    scene.with_clip([pane_x, top - 4.0, layout.detail_w, bottom - top + 8.0], |s| unsafe {
+    let renderer = ui.renderer;
+    let scale = ui.scale;
+    ui.scene.with_clip([pane_x, top - 4.0, layout.detail_w, bottom - top + 8.0], |s| unsafe {
         for line in entry.text.split('\n') {
             if y > bottom {
                 break;
@@ -562,28 +535,11 @@ unsafe fn draw_detail(
     });
 }
 
-/// A hover tile behind a header/row button's rect (the AppKit buttons'
-/// highlight). `red` for the close button's hover, which turns destructive.
-fn hot_tile(scene: &mut render::Scene, r: NSRect, palette: &crate::theme::UiPalette, red: bool) {
-    let color = if red {
-        [0.85, 0.2, 0.2, 0.85]
-    } else {
-        render::f4(row_backdrop_wash(*palette, false, true))
-    };
-    scene.fill(
-        [r.origin.x, r.origin.y, r.size.width, r.size.height],
-        crate::theme::RADIUS_LEGEND_CHIP,
-        color,
-    );
-}
-
 unsafe fn draw_header(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
+    ui: &mut ui::Ui,
     palette: &crate::theme::UiPalette,
     w: f64,
-    hot: u8,
-    scale: f64,
+    action: &mut Action,
 ) {
     let (search, pause, _options, pin, close) = picker_header_frames_for(w);
     // The header's small buttons (pause / pin) — the options popover anchors to
@@ -593,40 +549,45 @@ unsafe fn draw_header(
         palette.secondary_text,
         crate::glass::PanelInk::Secondary,
     );
-    if hot == HOT_PAUSE {
-        hot_tile(scene, pause, palette, false);
-    }
-    if hot == HOT_PIN {
-        hot_tile(scene, pin, palette, false);
-    }
-    if hot == HOT_CLOSE {
-        hot_tile(scene, close, palette, true);
-    }
-    draw_centered_label(
-        scene,
-        renderer,
+    let hover_wash = render::f4(row_backdrop_wash(*palette, false, true));
+    let r = crate::theme::RADIUS_LEGEND_CHIP;
+    if ui.icon_button(
+        pause,
         if collection_paused() { "▶" } else { "⏸" },
         small_font,
         icon_color,
         label_style_tag("hdr-pause", palette, [0.0; 4]),
-        pause,
-        scale,
-    );
-    let pinned = super::pin::is_pinned();
-    draw_centered_label(
-        scene,
-        renderer,
-        if pinned { "★" } else { "☆" },
+        hover_wash,
+        r,
+    ) {
+        *action = Action::TogglePause;
+    }
+    if ui.icon_button(
+        pin,
+        if super::pin::is_pinned() { "★" } else { "☆" },
         small_font,
         icon_color,
         label_style_tag("hdr-pin", palette, [0.0; 4]),
-        pin,
-        scale,
-    );
+        hover_wash,
+        r,
+    ) {
+        *action = Action::TogglePanelPin;
+    }
+    if ui.icon_button(
+        close,
+        "×",
+        small_font,
+        icon_color,
+        label_style_tag("hdr-close", palette, [0.0; 4]),
+        [0.85, 0.2, 0.2, 0.85],
+        r,
+    ) {
+        *action = Action::Hide;
+    }
     // The search capsule: unfocused fill + the resting glass line (focus rings
     // come when editing lands; the field is always logically focused here).
     let focused = true;
-    scene.border(
+    ui.scene.border(
         [
             search.origin.x,
             search.origin.y,
@@ -638,16 +599,14 @@ unsafe fn draw_header(
         render::f4(picker_field_ring(focused)),
         1.0,
     );
-    let query = with_clipboard_ui(|ui| ui.search_query.clone());
+    let query = with_clipboard_ui(|u| u.search_query.clone());
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: SEARCH_FONT_SIZE];
     let line_y = search.origin.y + (search.size.height - SEARCH_FONT_SIZE * 1.4) / 2.0;
     if query.is_empty() {
         // "⌕" + placeholder, in one attributed run.
         let hint = t("clipboard.search_placeholder");
-        draw_label(
-            scene,
-            renderer,
+        ui.label(
             &format!("⌕  {hint}"),
             font,
             icon_color,
@@ -655,40 +614,25 @@ unsafe fn draw_header(
             search.origin.x + SEARCH_PAD_IN,
             line_y,
             search.size.width - SEARCH_PAD_IN * 2.0 - SEARCH_CLEAR_W,
-            scale,
         );
         // ⌘F keycap on the right.
-        let chip_w = 25.0;
-        let chip_h = 18.0;
-        let chip = [
-            search.origin.x + search.size.width - SEARCH_PAD_IN - chip_w,
-            search.origin.y + (search.size.height - chip_h) / 2.0,
-            chip_w,
-            chip_h,
-        ];
-        scene.fill(chip, 5.0, render::f4(palette.field_bg));
+        let chip = ui::rect(
+            search.origin.x + search.size.width - SEARCH_PAD_IN - 25.0,
+            search.origin.y + (search.size.height - 18.0) / 2.0,
+            25.0,
+            18.0,
+        );
+        ui.tile(chip, 5.0, render::f4(palette.field_bg));
         let cap_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 10.0];
-        let cap_attr = text::make_text_attr("⌘F", cap_font, icon_color);
-        if let Some(bmp) =
-            text::rasterize_attributed(renderer, cap_attr, label_style_tag("cap-cmdf", palette, [0.0;4]), scale, f64::INFINITY)
-        {
-            scene.image(
-                bmp.texture,
-                [
-                    chip[0] + (chip_w - bmp.w) / 2.0 - text::PAD_PT,
-                    chip[1] + (chip_h - bmp.h) / 2.0 - text::PAD_PT,
-                    bmp.w,
-                    bmp.h,
-                ],
-                1.0,
-                None,
-            );
-        }
-        release_obj(cap_attr);
+        ui.centered_label(
+            "⌘F",
+            cap_font,
+            icon_color,
+            label_style_tag("cap-cmdf", palette, [0.0; 4]),
+            chip,
+        );
     } else {
-        draw_label(
-            scene,
-            renderer,
+        ui.label(
             &format!("⌕  {query}"),
             font,
             crate::glass::panel_ink(palette.primary_text, crate::glass::PanelInk::Primary),
@@ -696,49 +640,38 @@ unsafe fn draw_header(
             search.origin.x + SEARCH_PAD_IN,
             line_y,
             search.size.width - SEARCH_PAD_IN * 2.0 - SEARCH_CLEAR_W,
-            scale,
         );
-        // The clear × on the right (click target wired in the hit test).
-        draw_label(
-            scene,
-            renderer,
+        // The clear × on the right — a widget, its click clears the query.
+        let clear_r = ui::rect(
+            search.origin.x + search.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W,
+            search.origin.y,
+            SEARCH_CLEAR_W,
+            search.size.height,
+        );
+        if ui.icon_button(
+            clear_r,
             "×",
             font,
             icon_color,
             label_style_tag("search-x", palette, [0.0; 4]),
-            search.origin.x + search.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W,
-            line_y,
-            SEARCH_CLEAR_W,
-            scale,
-        );
+            hover_wash,
+            r,
+        ) {
+            *action = Action::ClearSearch;
+        }
     }
-    // The corner close glyph (a plain ×, centred in its 30pt hit target).
-    draw_label(
-        scene,
-        renderer,
-        "×",
-        font,
-        icon_color,
-        label_style_tag("hdr-close", palette, [0.0; 4]),
-        close.origin.x + (close.size.width - 12.0) / 2.0,
-        close.origin.y + (close.size.height - 18.0) / 2.0,
-        12.0,
-        scale,
-    );
 }
 
 unsafe fn draw_rows(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
+    ui: &mut ui::Ui,
     palette: &crate::theme::UiPalette,
     w: f64,
     scroll: f64,
-    hover: usize,
-    hot: u8,
-    scale: f64,
+    burn: bool,
+    action: &mut Action,
 ) {
     let hist = CLIP_HISTORY.lock().unwrap();
-    let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
+    let filtered = with_clipboard_ui(|u| u.filtered.clone());
     let sel = picker_selection();
     let row_w = w - PAD_X * 2.0;
     let list_top = header_strip_h();
@@ -764,13 +697,13 @@ unsafe fn draw_rows(
                 crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary),
             );
             if let Some(bmp) = text::rasterize_attributed(
-                renderer,
+                ui.renderer,
                 attr,
                 label_style_tag("empty", palette, [0.0; 4]),
-                scale,
+                ui.scale,
                 w - 40.0,
             ) {
-                scene.image(
+                ui.scene.image(
                     bmp.texture,
                     [
                         (w - bmp.w) / 2.0 - text::PAD_PT,
@@ -808,9 +741,7 @@ unsafe fn draw_rows(
                 systemFontOfSize: crate::theme::FONT_CAPTION,
                 weight: crate::theme::FONT_WEIGHT_REGULAR
             ];
-            draw_label(
-                scene,
-                renderer,
+            ui.label(
                 &group_label(group),
                 font,
                 crate::glass::panel_ink(palette.muted_text, crate::glass::PanelInk::Muted),
@@ -818,42 +749,47 @@ unsafe fn draw_rows(
                 PAD_X + ROW_PAD_L,
                 y + GROUP_LABEL_PAD,
                 row_w,
-                scale,
             );
             y += GROUP_H;
         }
         let row_h = pitches[i] - if has_hdr { GROUP_H } else { 0.0 };
-        // Row wash: selection or hover.
+        // Row wash: selection or hover — the hover is the row's own rect test
+        // now, answered where the row is built (the mygo pattern).
+        let row_r = ui::rect(PAD_X, y, row_w, row_h);
         let selected = i == sel;
-        let hovered = i == hover;
+        let hovered = ui.hot(row_r);
         let wash = row_backdrop_wash(*palette, selected, hovered);
-        scene.fill(
+        ui.scene.fill(
             [PAD_X, y, row_w, row_h],
             SEL_TILE_R,
             render::f4(wash),
         );
         if selected {
-            scene.fill([PAD_X + 4.0, y + 6.0, 2.0, row_h - 12.0], 1.0, render::f4(
+            ui.scene.fill([PAD_X + 4.0, y + 6.0, 2.0, row_h - 12.0], 1.0, render::f4(
                 picker_accent(*palette),
             ));
         }
-        draw_row_content(scene, renderer, palette, entry, hovered, hot, y, row_h, row_w, w, style_tag, scale);
+        draw_row_content(ui, palette, entry, i, hovered, y, row_h, row_w, w, style_tag, action);
+        // The row's click pastes (any action button built above has already
+        // claimed a click on its own rect).
+        if ui.clicked(row_r) {
+            *action = Action::Paste { idx: i, burn };
+        }
     }
 }
 
 unsafe fn draw_row_content(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
+    ui: &mut ui::Ui,
     palette: &crate::theme::UiPalette,
     entry: &ClipEntry,
+    display_idx: usize,
     hovered: bool,
-    hot: u8,
     y: f64,
     row_h: f64,
     row_w: f64,
     panel_w: f64,
     style_tag: u64,
-    scale: f64,
+    action: &mut Action,
 ) {
     let content_x = PAD_X + ROW_PAD_L;
     let content_w = model::row_content_width(row_w);
@@ -864,89 +800,67 @@ unsafe fn draw_row_content(
         // texture (well + image + ring baked in).
         let im = make_row_image(entry, content_w);
         if !im.is_null() {
-            if let Some(tex) = text::rasterize_nsimage(renderer, im, scale) {
-                scene.image(tex, [content_x, content_y, content_w, content_h], 1.0, None);
+            if let Some(tex) = text::rasterize_nsimage(ui.renderer, im, ui.scale) {
+                ui.scene.image(tex, [content_x, content_y, content_w, content_h], 1.0, None);
             }
             release_obj(im);
         } else {
-            draw_entry_text(
-                scene,
-                renderer,
-                entry,
-                style_tag,
-                content_x,
-                content_y,
-                content_w,
-                content_h,
-                scale,
-            );
+            draw_entry_text(ui, entry, style_tag, content_x, content_y, content_w, content_h);
         }
     } else {
-        draw_entry_text(
-            scene,
-            renderer,
-            entry,
-            style_tag,
-            content_x,
-            content_y,
-            content_w,
-            content_h,
-            scale,
-        );
+        draw_entry_text(ui, entry, style_tag, content_x, content_y, content_w, content_h);
     }
-    draw_row_actions(scene, renderer, palette, entry, hovered, hot, y, row_h, panel_w, scale);
+    draw_row_actions(ui, palette, entry, display_idx, hovered, y, row_h, panel_w, action);
 }
 
 unsafe fn draw_entry_text(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
+    ui: &mut ui::Ui,
     entry: &ClipEntry,
     style_tag: u64,
     x: f64,
     y: f64,
     w: f64,
     h: f64,
-    scale: f64,
 ) {
     let kind = classify_text(&entry.text);
     let attr = make_content_attributed(&entry.text, kind);
     if attr.is_null() {
         return;
     }
-    if let Some(bmp) = text::rasterize_attributed(renderer, attr, style_tag, scale, w) {
+    if let Some(bmp) = text::rasterize_attributed(ui.renderer, attr, style_tag, ui.scale, w) {
         // Vertically centre the line's bitmap in the content band.
         let ty = y + (h - bmp.h) / 2.0 - text::PAD_PT;
-        scene.image(bmp.texture, [x - text::PAD_PT, ty, bmp.w, bmp.h], 1.0, None);
+        ui.scene.image(bmp.texture, [x - text::PAD_PT, ty, bmp.w, bmp.h], 1.0, None);
     }
     release_obj(attr);
 }
 
-/// The row's right-edge action buttons and their hit rects, right to left:
-/// delete, detail, pin (the AppKit row's hover actions). Always shown on a
-/// pinned row (its star); all three on the hovered row.
+/// The row's right-edge action buttons' rects, right to left: delete, detail,
+/// pin (the AppKit row's hover actions).
 fn row_action_rects(y: f64, row_h: f64, list_w: f64) -> [NSRect; 3] {
     let act_y = y + (row_h - ACTION_H) / 2.0;
     let x_del = list_w - PAD_X - ROW_PAD_R - ACTION_BTN;
     let x_det = x_del - ACTION_BTN - 2.0;
     let x_pin = x_det - ACTION_BTN - 2.0;
     [
-        NSRect::new(NSPoint::new(x_pin, act_y), NSSize::new(ACTION_BTN, ACTION_H)),
-        NSRect::new(NSPoint::new(x_det, act_y), NSSize::new(ACTION_BTN, ACTION_H)),
-        NSRect::new(NSPoint::new(x_del, act_y), NSSize::new(ACTION_BTN, ACTION_H)),
+        ui::rect(x_pin, act_y, ACTION_BTN, ACTION_H),
+        ui::rect(x_det, act_y, ACTION_BTN, ACTION_H),
+        ui::rect(x_del, act_y, ACTION_BTN, ACTION_H),
     ]
 }
 
+/// The hovered row's action buttons as widgets: the pin star always shows on a
+/// pinned row, all three on the hovered one; a click asks for its action.
 unsafe fn draw_row_actions(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
+    ui: &mut ui::Ui,
     palette: &crate::theme::UiPalette,
     entry: &ClipEntry,
+    display_idx: usize,
     hovered: bool,
-    hot: u8,
     y: f64,
     row_h: f64,
     list_w: f64,
-    scale: f64,
+    action: &mut Action,
 ) {
     if !entry.pinned && !hovered {
         return;
@@ -955,45 +869,43 @@ unsafe fn draw_row_actions(
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: ACTION_GLYPH_SIZE];
     let ink = crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary);
-    if hovered {
-        match hot {
-            HOT_ROW_PIN => hot_tile(scene, pin_r, palette, false),
-            HOT_ROW_DET => hot_tile(scene, det_r, palette, false),
-            HOT_ROW_DEL => hot_tile(scene, del_r, palette, true),
-            _ => {}
-        }
-    }
-    draw_centered_label(
-        scene,
-        renderer,
+    let hover_wash = render::f4(row_backdrop_wash(*palette, false, true));
+    let r = crate::theme::RADIUS_LEGEND_CHIP;
+    if ui.icon_button(
+        pin_r,
         if entry.pinned { "★" } else { "☆" },
         font,
         ink,
         label_style_tag("row-pin", palette, [0.0; 4]),
-        pin_r,
-        scale,
-    );
-    if hovered {
-        draw_centered_label(
-            scene,
-            renderer,
-            "→",
-            font,
-            ink,
-            label_style_tag("row-det", palette, [0.0; 4]),
-            det_r,
-            scale,
-        );
-        draw_centered_label(
-            scene,
-            renderer,
-            "×",
-            font,
-            ink,
-            label_style_tag("row-del", palette, [0.0; 4]),
-            del_r,
-            scale,
-        );
+        hover_wash,
+        r,
+    ) {
+        *action = Action::PinEntry(display_idx);
+    }
+    if !hovered {
+        return;
+    }
+    if ui.icon_button(
+        det_r,
+        "→",
+        font,
+        ink,
+        label_style_tag("row-det", palette, [0.0; 4]),
+        hover_wash,
+        r,
+    ) {
+        *action = Action::OpenDetail;
+    }
+    if ui.icon_button(
+        del_r,
+        "×",
+        font,
+        ink,
+        label_style_tag("row-del", palette, [0.0; 4]),
+        [0.85, 0.2, 0.2, 0.85],
+        r,
+    ) {
+        *action = Action::DeleteEntry(display_idx);
     }
 }
 
@@ -1032,15 +944,13 @@ fn draw_scroll_indicator(
 }
 
 unsafe fn draw_footer(
-    scene: &mut render::Scene,
-    renderer: &render::Renderer,
+    ui: &mut ui::Ui,
     palette: &crate::theme::UiPalette,
     w: f64,
     h: f64,
-    scale: f64,
 ) {
     // Top hairline.
-    scene.fill(
+    ui.scene.fill(
         [0.0, h - FOOTER_H, w, 1.0],
         0.0,
         render::f4(picker_hairline()),
@@ -1049,9 +959,7 @@ unsafe fn draw_footer(
     let count = t_count("clipboard.footer_count", total);
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: FOOTER_TEXT_SIZE];
     let muted = crate::glass::panel_ink(palette.muted_text, crate::glass::PanelInk::Muted);
-    draw_label(
-        scene,
-        renderer,
+    ui.label(
         &count,
         font,
         muted,
@@ -1059,7 +967,6 @@ unsafe fn draw_footer(
         FOOTER_PAD_X,
         h - FOOTER_H + (FOOTER_H - 14.0) / 2.0,
         FOOTER_COUNT_W,
-        scale,
     );
     // Shortcut legends right-to-left: ↵ paste · ⌫ delete · → detail · ← pin · Tab filter.
     let legends: [(&str, String); 5] = [
@@ -1079,17 +986,17 @@ unsafe fn draw_footer(
         let key_attr = text::make_text_attr(key, font, secondary);
         let label_attr = text::make_text_attr(label, font, muted);
         let key_bmp = text::rasterize_attributed(
-            renderer,
+            ui.renderer,
             key_attr,
             label_style_tag("kbd-key", palette, [0.0; 4]),
-            scale,
+            ui.scale,
             f64::INFINITY,
         );
         let label_bmp = text::rasterize_attributed(
-            renderer,
+            ui.renderer,
             label_attr,
             label_style_tag("kbd-label", palette, [0.0; 4]),
-            scale,
+            ui.scale,
             f64::INFINITY,
         );
         let key_w = key_bmp.map(|b| b.w - text::PAD_PT * 2.0 + KBD_CELL_PADDING).unwrap_or(21.0).max(21.0);
@@ -1098,9 +1005,9 @@ unsafe fn draw_footer(
         x -= group_w;
         let kbd_h = 19.0;
         let cap = [x, h - FOOTER_H + (FOOTER_H - kbd_h) / 2.0, key_w, kbd_h];
-        scene.fill(cap, crate::theme::RADIUS_LEGEND_CHIP, chip_f4(palette));
+        ui.scene.fill(cap, crate::theme::RADIUS_LEGEND_CHIP, chip_f4(palette));
         if let Some(bmp) = key_bmp {
-            scene.image(
+            ui.scene.image(
                 bmp.texture,
                 [
                     cap[0] + (key_w - bmp.w) / 2.0 - text::PAD_PT,
@@ -1113,7 +1020,7 @@ unsafe fn draw_footer(
             );
         }
         if let Some(bmp) = label_bmp {
-            scene.image(
+            ui.scene.image(
                 bmp.texture,
                 [
                     cap[0] + key_w + 5.0 - text::PAD_PT,
@@ -1137,86 +1044,10 @@ fn chip_f4(palette: &crate::theme::UiPalette) -> [f32; 4] {
 }
 
 // ---------------------------------------------------------------------------
-// Input
+// Input — pointer events only feed the frame's cursor/click; the widgets'
+// `hot`/`clicked` queries during the build are the hit test (mygo's `ui`
+// pattern: no second pass re-deriving the same geometry).
 // ---------------------------------------------------------------------------
-
-fn in_rect(point: NSPoint, r: NSRect) -> bool {
-    point.x >= r.origin.x
-        && point.x <= r.origin.x + r.size.width
-        && point.y >= r.origin.y
-        && point.y <= r.origin.y + r.size.height
-}
-
-/// The clickable zone under `point` (header buttons, the hovered row's action
-/// buttons). Shared by the hover tracker and the click dispatch.
-fn hit_zones(point: NSPoint, view_w: f64) -> u8 {
-    let (_search, pause, _options, pin, close) = picker_header_frames_for(view_w);
-    if in_rect(point, pause) {
-        return HOT_PAUSE;
-    }
-    if in_rect(point, pin) {
-        return HOT_PIN;
-    }
-    if in_rect(point, close) {
-        return HOT_CLOSE;
-    }
-    let Some(idx) = row_at(point) else {
-        return HOT_NONE;
-    };
-    let (pitches, scroll) = with_picker((Vec::new(), 0.0), |p| (p.pitches.clone(), p.scroll));
-    let offsets = row_offsets(&pitches);
-    if idx >= pitches.len() {
-        return HOT_NONE;
-    }
-    let y = header_strip_h() + offsets[idx] - scroll;
-    let has_header = {
-        let hist = CLIP_HISTORY.lock().unwrap();
-        let filtered = with_clipboard_ui(|ui| ui.filtered.clone());
-        let prev = idx
-            .checked_sub(1)
-            .and_then(|i| filtered.get(i))
-            .and_then(|&p| hist.get(p))
-            .map(|e| day_group(e.copied_at));
-        filtered
-            .get(idx)
-            .and_then(|&h| hist.get(h))
-            .map(|e| prev != Some(day_group(e.copied_at)))
-            .unwrap_or(false)
-    };
-    let row_y = y + if has_header { GROUP_H } else { 0.0 };
-    let row_h = pitches[idx] - if has_header { GROUP_H } else { 0.0 };
-    let [pin_r, det_r, del_r] = row_action_rects(row_y, row_h, list_w());
-    if in_rect(point, del_r) {
-        return HOT_ROW_DEL;
-    }
-    if in_rect(point, det_r) {
-        return HOT_ROW_DET;
-    }
-    if in_rect(point, pin_r) {
-        return HOT_ROW_PIN;
-    }
-    HOT_NONE
-}
-
-/// Rows' hit test: display index under the point (view coords), or None over
-/// chrome or the detail pane.
-fn row_at(point: NSPoint) -> Option<usize> {
-    let view_y = point.y;
-    let list_top = header_strip_h();
-    if view_y < list_top || point.x >= list_w() {
-        return None;
-    }
-    let (pitches, scroll) = with_picker((Vec::new(), 0.0), |p| (p.pitches.clone(), p.scroll));
-    let offsets = row_offsets(&pitches);
-    let doc_y = view_y - list_top + scroll;
-    let len = with_clipboard_ui(|ui| ui.filtered.len());
-    for i in 0..len.min(pitches.len()) {
-        if doc_y >= offsets[i] && doc_y < offsets[i] + pitches[i] {
-            return Some(i);
-        }
-    }
-    None
-}
 
 unsafe fn scroll_cb(_event: *mut AnyObject, _dx: f64, dy: f64) {
     let changed = with_picker(false, |p| {
@@ -1235,28 +1066,14 @@ unsafe fn scroll_cb(_event: *mut AnyObject, _dx: f64, dy: f64) {
 }
 
 unsafe fn mouse_moved_cb(_event: *mut AnyObject, point: NSPoint) {
-    let view_w = with_picker(0.0, |p| {
-        let f: NSRect = msg_send![p.view, frame];
-        f.size.width
-    });
-    let hot = hit_zones(point, view_w);
-    let idx = row_at(point).unwrap_or(NO_SELECTION);
-    let changed = with_picker(false, |p| {
-        let changed = p.hover != idx || p.hot != hot;
-        p.hover = idx;
-        p.hot = hot;
-        changed
-    });
-    if changed {
-        metal_view::redraw();
-    }
+    with_picker((), |p| p.cursor = Some(point));
+    metal_view::redraw();
 }
 
 unsafe fn mouse_exited_cb(_event: *mut AnyObject) {
     let changed = with_picker(false, |p| {
-        let changed = p.hover != NO_SELECTION || p.hot != HOT_NONE;
-        p.hover = NO_SELECTION;
-        p.hot = HOT_NONE;
+        let changed = p.cursor.is_some();
+        p.cursor = None;
         changed
     });
     if changed {
@@ -1264,70 +1081,14 @@ unsafe fn mouse_exited_cb(_event: *mut AnyObject) {
     }
 }
 
+/// A mouse-down is the frame's pending click: stored with the Option flag,
+/// dispatched by the next build pass's `clicked` queries (draw = hit test).
 unsafe fn mouse_down_cb(event: *mut AnyObject, point: NSPoint) {
-    let view = with_picker(std::ptr::null_mut(), |p| p.view);
-    if view.is_null() {
-        return;
-    }
-    let frame: NSRect = msg_send![view, frame];
-    let (search, _pause, _options, _pin, _close) = picker_header_frames_for(frame.size.width);
-    match hit_zones(point, frame.size.width) {
-        HOT_PAUSE => {
-            let _ = set_collection_paused(!collection_paused());
-            refresh();
-            return;
-        }
-        HOT_PIN => {
-            let p_frame: NSRect = msg_send![view, frame];
-            if super::pin::is_pinned() {
-                super::pin::unpin();
-            } else {
-                super::pin::pin(p_frame.size.height);
-            }
-            refresh();
-            return;
-        }
-        HOT_CLOSE => {
-            hide();
-            return;
-        }
-        HOT_ROW_DEL => {
-            if let Some(idx) = row_at(point) {
-                delete_entry_at(idx);
-            }
-            return;
-        }
-        HOT_ROW_DET => {
-            if let Some(idx) = row_at(point) {
-                set_picker_selection(idx);
-                set_detail_open(true);
-            }
-            return;
-        }
-        HOT_ROW_PIN => {
-            if let Some(idx) = row_at(point) {
-                set_picker_selection(idx);
-                pin_selected();
-            }
-            return;
-        }
-        _ => {}
-    }
-    // The search field's clear ×.
-    if in_rect(point, search)
-        && point.x >= search.origin.x + search.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
-        && with_clipboard_ui(|ui| !ui.search_query.is_empty())
-    {
-        with_clipboard_ui(|ui| ui.search_query.clear());
-        refresh();
-        return;
-    }
-    let Some(idx) = row_at(point) else {
-        return;
-    };
     let mods: u64 = msg_send![event, modifierFlags];
-    set_picker_selection(idx);
-    paste_at_ex(idx, (mods & 0x0008_0000) != 0);
+    with_picker((), |p| {
+        p.click = Some((point, (mods & 0x0008_0000) != 0));
+    });
+    metal_view::redraw();
 }
 
 fn ensure_selection_visible() {
@@ -1441,19 +1202,6 @@ unsafe fn set_detail_open(open: bool) {
         NSSize::new(target.size.width, target.size.height)
     )];
     refresh();
-}
-
-/// The list's usable width: the whole panel, or the list column when the
-/// detail pane splits it.
-fn list_w() -> f64 {
-    with_picker(0.0, |p| {
-        let f: NSRect = unsafe { msg_send![p.view, frame] };
-        if p.detail {
-            picker_layout(f.size.width, true).list_w
-        } else {
-            f.size.width
-        }
-    })
 }
 
 unsafe fn key_down_cb(event: *mut AnyObject) {

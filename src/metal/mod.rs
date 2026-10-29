@@ -13,4 +13,5 @@ pub(crate) mod render;
 pub(crate) mod shader;
 pub(crate) mod sys;
 pub(crate) mod text;
+pub(crate) mod ui;
 pub(crate) mod view;
