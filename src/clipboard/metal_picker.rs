@@ -458,13 +458,11 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     let layout = picker_layout(w, detail);
     let list_w = if detail { layout.list_w } else { w };
     let mut scene = render::Scene::new(scale, w, h);
-    // The liquid-glass panel (clipboard-v2): a bright warm wash over the blur,
-    // a whiter glow toward the top (the radial term's approximation), a faint
-    // inner glow at the bottom edge, the white glass rim, and the specular
-    // highlight hugging the top edge.
+    // The liquid-glass panel: a uniform thin wash over the blur, the white
+    // glass rim, and the specular highlight hugging the top edge. No top-glow
+    // rect — a solid fill can't feather, so its hard edge read as a seam.
     if !palette.dark {
         scene.fill([0.0, 0.0, w, h], GLASS_RADIUS, WARM_TINT);
-        scene.fill([0.0, 0.0, w, h * 0.45], GLASS_RADIUS, [1.0, 1.0, 1.0, 0.06]);
         scene.border(
             [0.5, 0.5, w - 1.0, h - 1.0],
             GLASS_RADIUS - 0.5,
