@@ -76,7 +76,8 @@ static DRAG_SURFACE: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::n
 /// Whether a grab is in flight (a press on a blank region, not yet released). The panel itself
 /// answers popover questions from `grab_travelled`; this is what the tests assert the recording
 /// against.
-#[cfg(test)]
+/// Whether a panel-drag session is live right now — the Metal surface routes
+/// moved/up events through here too, so this is no longer test-only.
 pub(super) fn drag_in_progress() -> bool {
     DRAG.lock().unwrap().is_some()
 }
@@ -748,7 +749,9 @@ fn apply_frames(picker: Option<NSRect>, detail: Option<NSRect>) {
 }
 
 unsafe fn picker_window() -> Option<*mut AnyObject> {
-    PICKER_WINDOW.lock().unwrap().map(|w| w.0)
+    // The Metal picker keeps its panel outside PICKER_WINDOW; the drag math is
+    // window-agnostic, so whichever surface is live answers here.
+    super::metal_picker::window().or_else(|| PICKER_WINDOW.lock().unwrap().map(|w| w.0))
 }
 
 unsafe fn detail_window() -> Option<*mut AnyObject> {

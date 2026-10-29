@@ -39,7 +39,27 @@ static PICKER: MainThreadSlot<Option<MetalPicker>> = unsafe { MainThreadSlot::ne
 static VISIBLE: AtomicBool = AtomicBool::new(false);
 static HANDLERS_INSTALLED: AtomicBool = AtomicBool::new(false);
 
-// The detail pane's own metrics (the AppKit pane's, kept simple for v1).
+// Liquid-glass palette (clipboard-v2.html): warm glass over the blur backdrop
+// — cream whites for fields/orbs, warm greys for washes, a barely-there warm
+// panel tint. Dark mode keeps the theme palette instead.
+const GLASS_RADIUS: f64 = 28.0;
+const ROW_R_LG: f64 = 14.0;
+const ORB_BG: [f32; 4] = [1.0, 1.0, 1.0, 0.20];
+const ORB_BG_HOT: [f32; 4] = [1.0, 1.0, 1.0, 0.44];
+const ORB_BG_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.55];
+const ORB_LINE: [f32; 4] = [1.0, 1.0, 1.0, 0.52];
+const ORB_LINE_ON: [f32; 4] = [1.0, 1.0, 1.0, 0.80];
+const FIELD_BG_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.58];
+const FIELD_BG_LG_IDLE: [f32; 4] = [1.0, 1.0, 1.0, 0.38];
+const HAIRLINE_LG: [f32; 4] = [52.0 / 255.0, 42.0 / 255.0, 30.0 / 255.0, 0.09];
+const ROW_HOVER_LG: [f32; 4] = [1.0, 1.0, 1.0, 0.32];
+const ROW_SEL_LG: [f32; 4] = [92.0 / 255.0, 82.0 / 255.0, 72.0 / 255.0, 0.16];
+const SCROLL_LG: [f32; 4] = [60.0 / 255.0, 50.0 / 255.0, 36.0 / 255.0, 0.20];
+const WARM_TINT: [f32; 4] = [1.0, 0.98, 0.95, 0.14];
+const ACCENT_LG: [f32; 4] = [47.0 / 255.0, 111.0 / 255.0, 237.0 / 255.0, 1.0];
+const ACCENT_DARK: [f32; 4] = [0.20, 0.35, 0.80, 1.0];
+
+/// The detail pane's own metrics (the AppKit pane's, kept simple for v1).
 const DETAIL_PAD: f64 = 14.0;
 const DETAIL_META_H: f64 = 24.0;
 const DETAIL_LINE_GAP: f64 = 3.0;
@@ -57,6 +77,7 @@ enum Action {
     TogglePause,
     TogglePanelPin,
     ClearSearch,
+    OptionsMenu,
     Hide,
 }
 
@@ -246,7 +267,7 @@ unsafe fn ensure_window() {
             key_down: Some(key_down_cb),
             mouse_moved: Some(mouse_moved_cb),
             mouse_down: Some(mouse_down_cb),
-            mouse_up: None,
+            mouse_up: Some(mouse_up_cb),
             mouse_exited: Some(mouse_exited_cb),
             scroll_wheel: Some(scroll_cb),
         });
@@ -283,7 +304,7 @@ unsafe fn ensure_window() {
     let backdrop = crate::glass::install_backdrop(
         window,
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)),
-        PICKER_PANEL_RADIUS,
+        GLASS_RADIUS,
         picker_backdrop_options(),
     );
     let content_parent = backdrop.content_parent;
@@ -422,6 +443,11 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     let layout = picker_layout(w, detail);
     let list_w = if detail { layout.list_w } else { w };
     let mut scene = render::Scene::new(scale, w, h);
+    // The liquid-glass tint: a thin warm wash over the blur backdrop (the
+    // mock's cream gradient collapsed to its dominant tone).
+    if !palette.dark {
+        scene.fill([0.0, 0.0, w, h], GLASS_RADIUS, WARM_TINT);
+    }
     let mut action = Action::None;
 
     // The frame's build pass (mygo's `view(ctx)`): every widget answers its
@@ -449,6 +475,61 @@ unsafe fn render_cb(view: *mut AnyObject, bounds: NSRect) {
     renderer.render(metal_view::metal_layer(), &scene);
     with_picker((), |p| p.click = None);
     run_action(action);
+}
+
+/// The row backdrop under the liquid-glass palette: hover is a white wash,
+/// selection a warm grey — dark mode keeps the theme's washes.
+fn metal_wash(palette: crate::theme::UiPalette, selected: bool, hovered: bool) -> [f32; 4] {
+    if palette.dark {
+        return render::f4(row_backdrop_wash(palette, selected, hovered));
+    }
+    if selected {
+        ROW_SEL_LG
+    } else if hovered {
+        ROW_HOVER_LG
+    } else {
+        [0.0; 4]
+    }
+}
+
+/// A header orb (clipboard-v2): a persistent translucent circle with a glass
+/// rim — fill and rim strengthen on hover and again when latched. Returns
+/// whether the orb was clicked this frame, like `icon_button`.
+unsafe fn orb_button(
+    ui: &mut ui::Ui,
+    rect: NSRect,
+    glyph: &str,
+    font: *mut AnyObject,
+    color: *mut AnyObject,
+    tag: u64,
+    latched: bool,
+    dark: bool,
+) -> bool {
+    let hot = ui.hot(rect);
+    let (fill, line) = if dark {
+        let base = if latched { 0.34 } else if hot { 0.24 } else { 0.10 };
+        ([1.0, 1.0, 1.0, base], [1.0, 1.0, 1.0, 0.28])
+    } else if latched {
+        (ORB_BG_ON, ORB_LINE_ON)
+    } else if hot {
+        (ORB_BG_HOT, ORB_LINE)
+    } else {
+        (ORB_BG, ORB_LINE)
+    };
+    ui.scene.border(
+        [
+            rect.origin.x,
+            rect.origin.y,
+            rect.size.width,
+            rect.size.height,
+        ],
+        rect.size.height / 2.0,
+        fill,
+        line,
+        1.0,
+    );
+    ui.centered_label(glyph, font, color, tag, rect);
+    ui.clicked(rect)
 }
 
 /// Run what the frame's clicked widget asked for — after encoding, so a click
@@ -486,8 +567,59 @@ fn run_action(action: Action) {
             with_clipboard_ui(|ui| ui.search_query.clear());
             refresh();
         }
+        Action::OptionsMenu => unsafe { show_filter_menu() },
         Action::Hide => hide(),
     }
+}
+
+/// The options orb's menu: the AppKit popover's filter rows as a native menu
+/// popped under the orb — the observer's `popoverFilterSelected:` applies the
+/// chosen filter the same way the popover does.
+unsafe fn show_filter_menu() {
+    let (view, options) = with_picker(
+        (std::ptr::null_mut(), NSRect::default()),
+        |p| {
+            let f: NSRect = msg_send![p.view, frame];
+            let (_, _, options, _, _) = picker_header_frames_for(f.size.width);
+            (p.view, options)
+        },
+    );
+    if view.is_null() {
+        return;
+    }
+    let menu: *mut AnyObject = msg_send![class!(NSMenu), alloc];
+    let blank = crate::ffi::make_nsstring("");
+    let menu: *mut AnyObject = msg_send![menu, initWithTitle: blank];
+    let labels = super::localized_filter_labels();
+    let rows = super::model::CLIP_FILTER_ROWS;
+    let current = *CLIP_FILTER.lock().unwrap();
+    let target = super::notifications::observer();
+    for (i, label) in labels.iter().enumerate() {
+        let title = crate::ffi::make_nsstring(label);
+        let item: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
+        let item: *mut AnyObject = msg_send![
+            item,
+            initWithTitle: title,
+            action: sel!(popoverFilterSelected:),
+            keyEquivalent: blank
+        ];
+        release_obj(title);
+        let _: () = msg_send![item, setTarget: target];
+        let _: () = msg_send![item, setTag: i as isize];
+        let state: isize = if rows[i] == current { 1 } else { 0 };
+        let _: () = msg_send![item, setState: state];
+        let _: () = msg_send![menu, addItem: item];
+        release_obj(item);
+    }
+    let at = NSPoint::new(options.origin.x, options.origin.y + options.size.height + 4.0);
+    let _: bool = msg_send![
+        menu,
+        popUpMenuPositioningItem: std::ptr::null::<AnyObject>(),
+        atLocation: at,
+        inView: view
+    ];
+    release_obj(menu);
+    release_obj(blank);
 }
 
 /// The expanded layout's right pane: a hairline split, the source line, then
@@ -592,35 +724,48 @@ unsafe fn draw_header(
     w: f64,
     action: &mut Action,
 ) {
-    let (search, pause, _options, pin, close) = picker_header_frames_for(w);
-    // The header's small buttons (pause / pin) — the options popover anchors to
-    // the AppKit picker's view tree and stays unported for now.
+    let (search, pause, options, pin, close) = picker_header_frames_for(w);
+    // The header orbs (pause / options / pin) and the plain close button.
     let small_font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 12.0];
     let icon_color = crate::glass::panel_ink(
         palette.secondary_text,
         crate::glass::PanelInk::Secondary,
     );
-    let hover_wash = render::f4(row_backdrop_wash(*palette, false, true));
+    let hover_wash = metal_wash(*palette, false, true);
     let r = crate::theme::RADIUS_LEGEND_CHIP;
-    if ui.icon_button(
+    if orb_button(
+        ui,
         pause,
         if collection_paused() { "▶" } else { "⏸" },
         small_font,
         icon_color,
         label_style_tag("hdr-pause", palette, [0.0; 4]),
-        hover_wash,
-        r,
+        collection_paused(),
+        palette.dark,
     ) {
         *action = Action::TogglePause;
     }
-    if ui.icon_button(
+    if orb_button(
+        ui,
+        options,
+        "⋯",
+        small_font,
+        icon_color,
+        label_style_tag("hdr-opt", palette, [0.0; 4]),
+        *CLIP_FILTER.lock().unwrap() != ClipFilter::All,
+        palette.dark,
+    ) {
+        *action = Action::OptionsMenu;
+    }
+    if orb_button(
+        ui,
         pin,
         if super::pin::is_pinned() { "★" } else { "☆" },
         small_font,
         icon_color,
         label_style_tag("hdr-pin", palette, [0.0; 4]),
-        hover_wash,
-        r,
+        super::pin::is_pinned(),
+        palette.dark,
     ) {
         *action = Action::TogglePanelPin;
     }
@@ -635,9 +780,19 @@ unsafe fn draw_header(
     ) {
         *action = Action::Hide;
     }
-    // The search capsule: unfocused fill + the resting glass line (focus rings
-    // come when editing lands; the field is always logically focused here).
+    // The search capsule: warm field fill + the resting glass line; the focus
+    // ring stays accent (the field is always logically focused here).
     let focused = true;
+    let (fill, ring) = if palette.dark {
+        (
+            render::f4(picker_field_fill(focused)),
+            render::f4(picker_field_ring(focused)),
+        )
+    } else if focused {
+        (FIELD_BG_LG, ACCENT_LG)
+    } else {
+        (FIELD_BG_LG_IDLE, [1.0, 1.0, 1.0, 0.58])
+    };
     ui.scene.border(
         [
             search.origin.x,
@@ -645,9 +800,9 @@ unsafe fn draw_header(
             search.size.width,
             search.size.height,
         ],
-        SEARCH_R,
-        render::f4(picker_field_fill(focused)),
-        render::f4(picker_field_ring(focused)),
+        SEARCH_R.max(18.0),
+        fill,
+        ring,
         1.0,
     );
     let query = with_clipboard_ui(|u| u.search_query.clone());
@@ -809,11 +964,11 @@ unsafe fn draw_rows(
         let row_r = ui::rect(PAD_X, y, row_w, row_h);
         let selected = i == sel;
         let hovered = ui.hot(row_r);
-        let wash = row_backdrop_wash(*palette, selected, hovered);
+        let wash = metal_wash(*palette, selected, hovered);
         ui.scene.fill(
             [PAD_X, y, row_w, row_h],
-            SEL_TILE_R,
-            render::f4(wash),
+            ROW_R_LG,
+            wash,
         );
         if selected {
             ui.scene.fill([PAD_X + 4.0, y + 6.0, 2.0, row_h - 12.0], 1.0, render::f4(
@@ -920,7 +1075,7 @@ unsafe fn draw_row_actions(
     let font: *mut AnyObject =
         msg_send![class!(NSFont), systemFontOfSize: ACTION_GLYPH_SIZE];
     let ink = crate::glass::panel_ink(palette.secondary_text, crate::glass::PanelInk::Secondary);
-    let hover_wash = render::f4(row_backdrop_wash(*palette, false, true));
+    let hover_wash = metal_wash(*palette, false, true);
     let r = crate::theme::RADIUS_LEGEND_CHIP;
     if ui.icon_button(
         pin_r,
@@ -1116,9 +1271,22 @@ unsafe fn scroll_cb(_event: *mut AnyObject, _dx: f64, dy: f64) {
     }
 }
 
-unsafe fn mouse_moved_cb(_event: *mut AnyObject, point: NSPoint) {
+unsafe fn mouse_moved_cb(event: *mut AnyObject, point: NSPoint) {
+    // A grabbed blank region drags the panel: the gesture owns the cursor until
+    // its release, so hover bookkeeping stays out of the way.
+    if super::drag::drag_in_progress() {
+        super::drag::drag_mouse_dragged(std::ptr::null_mut(), std::mem::zeroed(), event);
+        return;
+    }
     with_picker((), |p| p.cursor = Some(point));
     metal_view::queue_redraw();
+}
+
+/// The up-stroke of a panel drag (`handlers.mouse_up` is registered only for it).
+unsafe fn mouse_up_cb(event: *mut AnyObject, _point: NSPoint) {
+    if super::drag::drag_in_progress() {
+        super::drag::drag_mouse_up(std::ptr::null_mut(), std::mem::zeroed(), event);
+    }
 }
 
 unsafe fn mouse_exited_cb(_event: *mut AnyObject) {
@@ -1132,9 +1300,36 @@ unsafe fn mouse_exited_cb(_event: *mut AnyObject) {
     }
 }
 
+/// Blank regions of the panel (header outside its controls, the footer strip,
+/// the detail pane) are drag handles, the same rule the AppKit picker's blank
+/// views follow; interactive areas still queue a click for the build pass.
+fn in_drag_zone(p: NSPoint, w: f64, h: f64) -> bool {
+    let (search, pause, options, pin, close) = picker_header_frames_for(w);
+    if p.y < header_strip_h() {
+        return !(ui::in_rect(p, search)
+            || ui::in_rect(p, pause)
+            || ui::in_rect(p, options)
+            || ui::in_rect(p, pin)
+            || ui::in_rect(p, close));
+    }
+    p.y >= h - FOOTER_H
+}
+
 /// A mouse-down is the frame's pending click: stored with the Option flag,
 /// dispatched by the next build pass's `clicked` queries (draw = hit test).
 unsafe fn mouse_down_cb(event: *mut AnyObject, point: NSPoint) {
+    let w = with_picker(0.0, |p| {
+        let f: NSRect = msg_send![p.view, frame];
+        f.size.width
+    });
+    let h = with_picker(0.0, |p| {
+        let f: NSRect = msg_send![p.view, frame];
+        f.size.height
+    });
+    if in_drag_zone(point, w, h) {
+        super::drag::drag_mouse_down(std::ptr::null_mut(), std::mem::zeroed(), event);
+        return;
+    }
     let mods: u64 = msg_send![event, modifierFlags];
     with_picker((), |p| {
         p.click = Some((point, (mods & 0x0008_0000) != 0));
