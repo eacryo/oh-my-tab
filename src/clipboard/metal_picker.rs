@@ -82,7 +82,14 @@ enum Action {
 }
 
 fn with_picker<R>(default: R, f: impl FnOnce(&mut MetalPicker) -> R) -> R {
-    match PICKER.lock().unwrap().as_mut() {
+    // A reentrant borrow is a *skipped* call, not a panic: `with_picker` is
+    // re-entered whenever a msg_send inside a borrow loops back through AppKit
+    // (setFrame -> frame_changed -> render), and unwrap()ing a BorrowMutError
+    // inside an `extern "C"` frame aborts the whole app — the 22:07 crash.
+    let Ok(mut guard) = PICKER.lock() else {
+        return default;
+    };
+    match guard.as_mut() {
         Some(p) => f(p),
         None => default,
     }
