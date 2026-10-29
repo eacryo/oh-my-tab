@@ -69,7 +69,15 @@ pub(crate) unsafe fn create_view(parent: *mut AnyObject, frame: NSRect) -> *mut 
     let view: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, alloc];
     let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
     let _: () = msg_send![view, setWantsLayer: true];
+    // mygo's surface view: redraw policy on-setNeedsDisplay, the view tracks
+    // its superview's size, and the host layer resizes its contents — without
+    // the mask the view keeps its creation frame when the panel resizes.
+    let _: () = msg_send![view, setLayerContentsRedrawPolicy: 2u64];
+    let _: () = msg_send![view, setAutoresizingMask: LAYER_AUTORESIZE_WH];
     let host: *mut AnyObject = msg_send![view, layer];
+    let resize = crate::ffi::make_nsstring("resize");
+    let _: () = msg_send![host, setContentsGravity: resize];
+    release_obj(resize);
     if !host.is_null() {
         if let Some(renderer) = shared_renderer() {
             let ml: *mut AnyObject = msg_send![class!(CAMetalLayer), new];
@@ -126,9 +134,12 @@ unsafe fn install_display_link(view: *mut AnyObject) {
     static OBJ: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::new(None) };
     let target: *mut AnyObject = msg_send![ticker_class().0 as *mut AnyObject, new];
     *OBJ.lock().unwrap() = Some(target);
-    let _ = view;
-    // CADisplayLink proved dead here (registered, never fired); a 60 Hz NSTimer
-    // is the same one-render-per-vsync driver and fires on every runloop mode.
+    let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
+    let mode = crate::ffi::make_nsstring("kCFRunLoopCommonModes");
+    // CADisplayLink never fires in this app — neither the class method nor the
+    // view-bound NSView API produced a single tick — while this 60 Hz NSTimer
+    // ticks reliably. It is the same one-render-per-frame driver mygo's
+    // display link provides; vsync alignment is a nicety, not a requirement.
     let link: *mut AnyObject = msg_send![
         class!(NSTimer),
         timerWithTimeInterval: 1.0 / 60.0f64,
@@ -137,10 +148,9 @@ unsafe fn install_display_link(view: *mut AnyObject) {
         userInfo: std::ptr::null::<AnyObject>(),
         repeats: true
     ];
-    let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
-    let mode = crate::ffi::make_nsstring("kCFRunLoopCommonModes");
     let _: () = msg_send![run_loop, addTimer: link, forMode: mode];
     release_obj(mode);
+    let _ = view;
     crate::log_info!(
         "[metal] ticker: target_null={} timer_null={} runloop_null={}",
         target.is_null(),
