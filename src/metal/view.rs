@@ -133,7 +133,9 @@ unsafe fn install_display_link(view: *mut AnyObject) {
         selector: sel!(metalTick:)
     ];
     let run_loop: *mut AnyObject = msg_send![class!(NSRunLoop), mainRunLoop];
-    let mode = crate::ffi::make_nsstring("NSRunLoopCommonModes");
+    // The run-loop mode *value* for NSRunLoopCommonModes — passing the symbol
+    // name instead registers into a mode that never runs and ticks never fire.
+    let mode = crate::ffi::make_nsstring("kCFRunLoopCommonModes");
     let _: () = msg_send![link, addToRunLoop: run_loop, forMode: mode];
     release_obj(mode);
     *DISPLAY_LINK.lock().unwrap() = Some(link);
