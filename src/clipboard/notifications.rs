@@ -356,9 +356,12 @@ extern "C" fn picker_refresh_visible_rows(_self: *mut c_void, _cmd: Sel, _arg: *
     });
 }
 
-/// Coalesce consecutive scroll notifications, giving AppKit a short run-loop window to finish
-/// scrolling before the visible row set is rebuilt.
-unsafe fn schedule_picker_visible_rows_refresh() {
+/// Coalesce consecutive scroll notifications into one build per run-loop pass. The zero delay
+/// still defers the work past the current scroll event (the bounds notifications for a burst
+/// arrive in the same pass and share the pending flag), but it lands the build between scroll
+/// events instead of a fixed wait after them: a nonzero delay was what let freshly exposed rows
+/// sit blank while the list caught up.
+pub(super) unsafe fn schedule_picker_visible_rows_refresh() {
     if PICKER_VISIBLE_ROWS_REFRESH_PENDING.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -367,7 +370,7 @@ unsafe fn schedule_picker_visible_rows_refresh() {
         target,
         performSelector: sel!(refreshPickerVisibleRows:),
         withObject: std::ptr::null::<AnyObject>(),
-        afterDelay: 0.05f64
+        afterDelay: 0.0f64
     ];
 }
 
@@ -1462,9 +1465,26 @@ pub(super) fn picker_visible_range(
     }
 }
 
+/// How far past the viewport edges the materialized row set reaches. The first paint warms a
+/// small slice so the summon stays cheap; scrolling keeps a full viewport of built rows both
+/// ways, so a fling reveals rows that are already there instead of blank space while the
+/// deferred materialization catches up.
+#[derive(Clone, Copy)]
+pub(super) enum PickerRowOverscan {
+    /// Just past the edges so the boundary never flashes (the rebuild path's warm slice).
+    Warm,
+    /// One screenful beyond each edge; rows also stay materialized until a full viewport away,
+    /// which keeps scroll materialization incremental at the edges.
+    Scroll,
+}
+
 /// Read the current list viewport; before layout completes, warm only a small top slice so
 /// the first presentation never creates the entire list synchronously.
-pub(super) unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize) -> (usize, usize) {
+pub(super) unsafe fn picker_visible_row_range(
+    pitches: &[f64],
+    row_count: usize,
+    overscan: PickerRowOverscan,
+) -> (usize, usize) {
     if row_count == 0 {
         return (0, 0);
     }
@@ -1488,16 +1508,36 @@ pub(super) unsafe fn picker_visible_row_range(pitches: &[f64], row_count: usize)
     if visible_rect.size.width <= 0.0 || visible_rect.size.height <= 0.0 {
         return (0, fallback_end);
     }
-    picker_visible_range(pitches, visible_rect, ROW_H * 1.5)
+    let overscan = match overscan {
+        PickerRowOverscan::Warm => ROW_H * 1.5,
+        PickerRowOverscan::Scroll => visible_rect.size.height.max(ROW_H * 1.5),
+    };
+    picker_visible_range(pitches, visible_rect, overscan)
 }
 
-/// Check whether the current physical row slots cover the range needed by the viewport.
+/// Check whether the current physical row slots match the range the scroll path keeps
+/// materialized (viewport plus its overscan ring).
 pub(super) unsafe fn picker_materialized_range_changed() -> bool {
     let pitches = ROW_PITCHES.lock().unwrap().clone();
     let filtered_len = with_clipboard_ui(|ui| ui.filtered.len());
-    let (start, end) = picker_visible_row_range(&pitches, filtered_len);
+    let (start, end) = picker_visible_row_range(&pitches, filtered_len, PickerRowOverscan::Scroll);
     let indices = ROW_VIEW_INDICES.lock().unwrap();
     !indices.iter().copied().eq(start..end)
+}
+
+/// Whether the materialized rows cover the range needed under `overscan`. Unlike the scroll
+/// path's exact-match check, a wider ring around the needed range still counts: the summon only
+/// requires the on-screen rows to exist, and the deferred refresh tops the ring up afterwards.
+pub(super) unsafe fn picker_visible_rows_cover(overscan: PickerRowOverscan) -> bool {
+    let pitches = ROW_PITCHES.lock().unwrap().clone();
+    let filtered_len = with_clipboard_ui(|ui| ui.filtered.len());
+    let (start, end) = picker_visible_row_range(&pitches, filtered_len, overscan);
+    if start >= end {
+        return true;
+    }
+    // The materialized indices are one contiguous ascending range, so its first/last bound it.
+    let indices = ROW_VIEW_INDICES.lock().unwrap();
+    indices.first().copied() <= Some(start) && indices.last().is_some_and(|&last| last + 1 >= end)
 }
 
 pub(super) fn row_view_for_display_index(index: usize) -> Option<RowHoverViews> {

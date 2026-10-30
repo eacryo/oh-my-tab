@@ -963,6 +963,48 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut AnyObject, _cmd: Sel, event:
     }
 }
 
+/// The row action glyphs resolve the same three SF Symbols for every materialized row, and the
+/// `imageWithSystemSymbolName:` + configuration round trip was a measurable share of scroll-time
+/// row builds. They are template images tinted per button, so one configured instance serves
+/// every row and the cache never needs eviction (three entries at most).
+static ACTION_GLYPH_CACHE: LazyLock<MainThreadSlot<HashMap<&'static str, ObjPtr>>> =
+    LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
+
+/// The configured template image for an action glyph, cached per symbol name; null when the
+/// symbol is unavailable (the button then keeps its title).
+unsafe fn action_glyph_image(symbol: &'static str) -> *mut AnyObject {
+    if let Some(cached) = ACTION_GLYPH_CACHE.lock().unwrap().get(symbol) {
+        return cached.0;
+    }
+    let name = make_nsstring(symbol);
+    let source: *mut AnyObject = msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: name,
+        accessibilityDescription: std::ptr::null::<AnyObject>()
+    ];
+    CFRelease(name as *const c_void);
+    if source.is_null() {
+        return source;
+    }
+    let config: *mut AnyObject = msg_send![
+        class!(NSImageSymbolConfiguration),
+        configurationWithPointSize: ACTION_GLYPH_SIZE,
+        weight: crate::theme::FONT_WEIGHT_REGULAR
+    ];
+    let image: *mut AnyObject = msg_send![source, imageWithSymbolConfiguration: config];
+    if image.is_null() {
+        return image;
+    }
+    let _: () = msg_send![image, setTemplate: true];
+    // The cache owns this retain; entries are never evicted.
+    CFRetain(image as *const c_void);
+    ACTION_GLYPH_CACHE
+        .lock()
+        .unwrap()
+        .insert(symbol, ObjPtr::new(image));
+    image
+}
+
 pub(super) unsafe fn make_action_button(
     title: &str,
     action: Sel,
@@ -995,21 +1037,8 @@ pub(super) unsafe fn make_action_button(
         None
     };
     if let Some(symbol) = symbol {
-        let name = make_nsstring(symbol);
-        let image: *mut AnyObject = msg_send![
-            class!(NSImage),
-            imageWithSystemSymbolName: name,
-            accessibilityDescription: std::ptr::null::<AnyObject>()
-        ];
-        CFRelease(name as *const c_void);
+        let image = action_glyph_image(symbol);
         if !image.is_null() {
-            let config: *mut AnyObject = msg_send![
-                class!(NSImageSymbolConfiguration),
-                configurationWithPointSize: ACTION_GLYPH_SIZE,
-                weight: crate::theme::FONT_WEIGHT_REGULAR
-            ];
-            let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
-            let _: () = msg_send![image, setTemplate: true];
             let _: () = msg_send![b, setImage: image];
             let _: () = msg_send![b, setImagePosition: 1isize]; // NSImageOnly
         }

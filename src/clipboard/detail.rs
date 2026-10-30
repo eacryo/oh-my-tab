@@ -2876,7 +2876,8 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
     let doc_h = (rows_top_offset() + pitches.iter().take(filtered.len()).sum::<f64>() + PAD_Y)
         .max(picker_min_height() - header_strip_h() - FOOTER_H);
     let _: () = msg_send![container, setFrameSize: NSSize::new(picker_list_width(), doc_h)];
-    let (visible_start, visible_end) = picker_visible_row_range(&pitches, filtered.len());
+    let (visible_start, visible_end) =
+        picker_visible_row_range(&pitches, filtered.len(), PickerRowOverscan::Warm);
 
     let sel_idx = picker_selection();
     // The hovered row (independent of the selection: with keyboard navigation the mouse
@@ -2961,6 +2962,9 @@ pub(super) unsafe fn rebuild_rows() -> Option<PickerTimingSummary> {
         ui.last_rebuild_timing = Some(summary);
     });
     REBUILDING.store(false, Ordering::SeqCst);
+    // The rebuild materialized only the first-paint warm slice; the scroll overscan ring
+    // fills on the next run-loop pass so this path does not pay for still-offscreen rows.
+    schedule_picker_visible_rows_refresh();
     if summary.elapsed_ms >= CLIPBOARD_SLOW_PATH_MS {
         let slowest_row_index = summary
             .slowest_row_index
@@ -3000,7 +3004,8 @@ pub(super) unsafe fn sync_visible_rows() -> bool {
     if pitches.is_empty() || filtered.is_empty() {
         return false;
     }
-    let (start, end) = picker_visible_row_range(&pitches, filtered.len());
+    let (start, end) =
+        picker_visible_row_range(&pitches, filtered.len(), PickerRowOverscan::Scroll);
     {
         // The materialized range is unchanged (ascending contiguous) -> nothing to add/remove.
         let indices = ROW_VIEW_INDICES.lock().unwrap();

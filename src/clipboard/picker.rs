@@ -912,10 +912,16 @@ pub(super) fn show_picker() {
             let _: () = msg_send![container, scrollPoint: NSPoint::new(0.0, 0.0)];
         }
         // Hidden refreshes may leave physical slots for the old bottom viewport; materialize
-        // the top viewport after resetting the scroll position.
-        if picker_materialized_range_changed() {
-            rebuild_rows();
+        // the top viewport after resetting the scroll position. Coverage of the on-screen rows
+        // is enough here (a wider overscan ring is still a cover), and sync_visible_rows only
+        // touches the rows that actually need swapping -- much cheaper than a full rebuild.
+        if !picker_visible_rows_cover(PickerRowOverscan::Warm) {
+            sync_visible_rows();
         }
+        // Top the overscan ring up on the next run-loop pass: a reused warm-slice tree or a
+        // fresh rebuild both leave the scroll ring thin, and filling it lazily here keeps the
+        // summon cheap while the first scroll then finds rows already built.
+        schedule_picker_visible_rows_refresh();
         // An empty list has a fixed minimal height, while a reused row tree may have been laid out
         // at another height (the rows key carries no geometry) and the clear actions rebuild in
         // place without resizing the panel. Re-derive the hint's position for the frame this summon
