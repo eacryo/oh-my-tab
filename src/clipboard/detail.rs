@@ -4793,6 +4793,15 @@ unsafe fn add_popover_row_content(
     release_obj(content);
 }
 
+/// Whether the options menu draws a plain system glass body — the header chrome's look, where
+/// `NSGlassEffectView` renders the glass and its edge specular itself — instead of the panel's
+/// tinted shared material. The tinted embedded material stacked the menu's tint over the panel's
+/// and read as a solid card; the plain view is what the orbs and the capsule already use.
+fn popover_plain_glass() -> bool {
+    crate::glass::PanelMaterial::effective() == crate::glass::PanelMaterial::LiquidGlass
+        && objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some()
+}
+
 unsafe fn add_shared_popover_backdrop(
     popover: *mut AnyObject,
     size: NSSize,
@@ -4801,6 +4810,13 @@ unsafe fn add_shared_popover_backdrop(
     let decoration: *mut AnyObject = msg_send![popover_decoration_class(), alloc];
     let decoration: *mut AnyObject = msg_send![decoration, initWithFrame: bounds];
     let _: () = msg_send![decoration, setAutoresizingMask: 18u64];
+    if popover_plain_glass() {
+        let backdrop = crate::glass::install_plain_glass_backdrop(decoration, bounds, POPOVER_R)
+            .expect("checked by popover_plain_glass");
+        let _: () = msg_send![popover, addSubview: decoration];
+        release_obj(decoration);
+        return backdrop;
+    }
     let options = picker_backdrop_options().with_elevation(None);
     // `build_backdrop` already applied this material's live properties (tuning and glass tint) as it
     // built them, so a freshly built hierarchy has nothing to re-apply here.
@@ -5049,7 +5065,11 @@ pub(super) unsafe fn build_filter_popover(parent: *mut AnyObject) {
     }
 
     // The rim goes on last so it is the topmost thing the menu draws, above its own material.
-    add_popover_rim(popover, frame.size);
+    // The plain-glass path needs none: the glass view draws its own edge specular, which is the
+    // separator the rim exists to provide.
+    if !popover_plain_glass() {
+        add_popover_rim(popover, frame.size);
+    }
 
     // Top of the sibling list, not the bottom: the blank-area drag surface is a sibling that
     // covers the whole content parent, so a popover appended below it would be painted under the

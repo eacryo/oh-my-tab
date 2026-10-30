@@ -1514,6 +1514,39 @@ pub(crate) unsafe fn install_embedded_backdrop(
     )
 }
 
+/// Install a plain `NSGlassEffectView` (system style, no tint of ours) as an embedded backdrop —
+/// the same glass the header chrome draws, where the view renders the body and the edge specular
+/// itself. Surfaces that should read as that chrome rather than the panel's tinted material take
+/// this path; `finish_embedded_backdrop` still reasserts the layer clip once hosted. `None` when
+/// the class is unavailable, so the caller can fall back to the shared material.
+pub(crate) unsafe fn install_plain_glass_backdrop(
+    host: *mut AnyObject,
+    frame: NSRect,
+    corner_radius: f64,
+) -> Option<InstalledBackdrop> {
+    let cls = AnyClass::get(c"NSGlassEffectView")?;
+    let glass: *mut AnyObject = msg_send![cls, alloc];
+    let glass: *mut AnyObject = msg_send![glass, initWithFrame: frame];
+    let _: () = msg_send![glass, setCornerRadius: corner_radius];
+    let _: () = msg_send![glass, setAutoresizingMask: 18u64];
+    let _: () = msg_send![host, addSubview: glass];
+    release_obj(glass);
+    Some(InstalledBackdrop {
+        native_glass_edge: true,
+        material: PanelMaterial::LiquidGlass,
+        content_parent: glass,
+        root: Some(ObjPtr::new(glass)),
+        material_root: Some(ObjPtr::new(glass)),
+        glass: Some(ObjPtr::new(glass)),
+        effect_view: None,
+        opaque_view: None,
+        backdrop_view: None,
+        compensation_view: None,
+        compensation_layer: None,
+        outline_view: None,
+    })
+}
+
 /// Finish an embedded material after its outer host has entered the window. Realizing the
 /// layer earlier does not replace the post-hosting clip assertion required by Liquid Glass.
 pub(crate) unsafe fn finish_embedded_backdrop(backdrop: InstalledBackdrop, corner_radius: f64) {

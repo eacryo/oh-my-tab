@@ -1892,21 +1892,14 @@ pub(super) fn popover_hover_bg(palette: crate::theme::UiPalette, danger: bool) -
 pub(super) const POPOVER_TITLE_H: f64 = 23.0;
 /// `.pop-divider` 1px hairline with 6px vertical margins.
 pub(super) const POPOVER_DIVIDER_H: f64 = 13.0;
-/// Minimum clearance when centering the menu below its options button.
+/// Minimum clearance the menu keeps inside the panel's horizontal edges.
 ///
-/// It has to leave room for that centring, not just for the panel edge: the options orb sits
-/// `#header`'s second-from-right, so its centre is `(ORB + GAP) + ORB/2` from the right edge and
-/// the popover has to reach `centre + POPOVER_W/2`. At 14 it stopped 19pt short once the header
-/// lost its detail orb and every control moved right, and the clamp then hung the menu under the
-/// pin button instead -- measured by `the_popover_frame_anchors_under_the_options_orb`.
-pub(super) const POPOVER_RIGHT_INSET: f64 = SEARCH_PAD_X
-    + PICKER_CLOSE_BTN_SIZE
-    + PICKER_CLOSE_BTN_GAP
-    + PICKER_ORB_SIZE
-    + PICKER_CLOSE_BTN_GAP
-    + PICKER_ORB_SIZE / 2.0
-    - POPOVER_W / 2.0
-    - 2.0;
+/// It is deliberately a small positive margin, not the centred-reach figure it used to be
+/// (the computed inset that let the menu centre on the options orb was negative): centring it on
+/// the orb put its right edge ~5pt past the panel's, and the panel's own content clip then sliced
+/// the menu's corner, glass edge and shadow into a straight vertical cut. The clamp now trades
+/// exact centring for staying whole -- the orb's centre still falls inside the menu's span.
+pub(super) const POPOVER_RIGHT_INSET: f64 = 8.0;
 pub(super) const POPOVER_TOP: f64 = 70.0;
 /// The gap the popover keeps from the panel's bottom edge when the panel is too short to hold the
 /// whole menu below `POPOVER_TOP` (it is pulled up rather than clipped).
@@ -4768,16 +4761,16 @@ mod tests {
         let parent_h = 600.0;
         let frame = filter_popover_frame(parent_h, false);
         let (_, _, options, _, _) = super::picker_header_frames();
-        // The mock's promise: the popover hangs under the options orb, centred on it. The header
-        // lost its detail orb, and the right inset the popover is clamped to stopped leaving room
-        // for that centre once the orb moved right -- the clamp then pulled it 22pt off, which a
-        // comparison of the EDGE (not the centre) could not see.
-        assert_eq!(
-            frame.origin.x + frame.size.width / 2.0,
-            options.origin.x + options.size.width / 2.0
-        );
-        assert!(frame.origin.x >= 0.0);
+        // The mock's promise is "under the options orb", and exact centring is what that clamp
+        // now trades away: centring pushed the menu's right edge ~5pt past the panel's, where the
+        // panel's own content clip sliced the corner and the glass edge. The promises that survive
+        // are the orb's centre inside the menu's span and the whole menu inside the panel.
+        let orb_centre = options.origin.x + options.size.width / 2.0;
+        assert!(orb_centre >= frame.origin.x);
+        assert!(orb_centre <= frame.origin.x + frame.size.width);
         assert_eq!(frame.size.width, POPOVER_W);
+        assert!(frame.origin.x >= super::POPOVER_RIGHT_INSET);
+        assert!(frame.origin.x + frame.size.width <= super::PICKER_W - super::POPOVER_RIGHT_INSET);
         assert_eq!(
             top_offset_of(frame.origin.y, parent_h, frame.size.height, false),
             POPOVER_TOP
