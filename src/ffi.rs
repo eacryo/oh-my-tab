@@ -698,6 +698,38 @@ pub(crate) unsafe fn bundle_info_string(key: &str) -> String {
     nsstring_to_rust(value)
 }
 
+/// Allow this process's cursor changes to apply while the app is not frontmost.
+///
+/// Without it, every AppKit cursor mechanism -- `NSCursor set`/`push`, cursor rects and
+/// `cursorUpdate:` events -- is silently ignored over a non-activating panel once the app is
+/// inactive, which is exactly the keystroke HUD's situation. `SetsCursorInBackground` is a
+/// private CGS connection property (the standard trick floating overlay and menu-bar tools
+/// use); it has been stable across macOS releases and only affects this process.
+pub(crate) unsafe fn enable_cursor_in_background() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        extern "C" {
+            fn _CGSDefaultConnection() -> i32;
+            fn CGSSetConnectionProperty(
+                cid: i32,
+                target_cid: i32,
+                key: *const c_void,
+                value: *const c_void,
+            );
+        }
+        unsafe {
+            let key = make_nsstring("SetsCursorInBackground");
+            CGSSetConnectionProperty(
+                _CGSDefaultConnection(),
+                _CGSDefaultConnection(),
+                key as *const c_void,
+                kCFBooleanTrue,
+            );
+            CFRelease(key as *const c_void);
+        }
+    });
+}
+
 /// Build an NSString from a Rust &str (CFStringCreateWithCString returns +1; caller must release).
 pub(crate) fn make_nsstring(s: &str) -> *mut AnyObject {
     unsafe {

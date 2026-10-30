@@ -411,6 +411,33 @@ unsafe fn grip_view_class() -> *mut AnyObject {
                 grip_mouse_up as *mut c_void,
                 types.as_ptr(),
             );
+            class_addMethod(
+                cls,
+                sel!(mouseMoved:),
+                grip_mouse_moved as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(mouseExited:),
+                grip_mouse_exited as *mut c_void,
+                types.as_ptr(),
+            );
+            // NSCursor push/pop is a no-op on a non-activating panel while the app is inactive
+            // (the documented NSPanel caveat). Cursor rects + cursorUpdate go through the
+            // window server's own lookup, which is what updates the pointer over our surface.
+            class_addMethod(
+                cls,
+                sel!(resetCursorRects),
+                grip_reset_cursor_rects as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(cursorUpdate:),
+                grip_cursor_update as *mut c_void,
+                types.as_ptr(),
+            );
             objc_registerClassPair(cls);
             StaticClass(cls as *const objc2::runtime::AnyClass)
         })
@@ -423,6 +450,77 @@ extern "C" fn grip_mouse_down(_view: *mut c_void, _cmd: Sel, event: *mut c_void)
         if let Some(point) = current_cursor_appkit_point() {
             begin_grip_interaction(point, click_count, Instant::now());
         }
+    });
+}
+
+extern "C" fn grip_mouse_moved(_view: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    // The tick-driven update only samples the cursor when a key event lands, so hover feedback
+    // would never fire on a still panel. The whole panel is the drag surface, so every move over
+    // it re-decides the cursor here instead -- and the explicit set() re-asserts the hand, since
+    // the system cursor-rect lookup resolves back to the arrow between updates.
+    crate::callback_guard::void("keystroke_display_grip_mouse_moved", || unsafe {
+        if let Some(point) = current_cursor_appkit_point() {
+            PANEL.with(|panel| {
+                let mut state = panel.borrow_mut();
+                update_grip_tracking(&mut state, Some(point));
+                // The container's moved events still fire while the pointer is over the gear;
+                // pick the cursor by the control under it so the gear keeps its pointer.
+                let captured = state.drag.is_some() || state.settings_armed;
+                let cursor: *mut AnyObject =
+                    match panel_control_under_cursor(&state, Some(point), captured) {
+                        PanelControl::Settings => {
+                            msg_send![class!(NSCursor), pointingHandCursor]
+                        }
+                        PanelControl::Grip if state.drag.is_some() => {
+                            msg_send![class!(NSCursor), closedHandCursor]
+                        }
+                        PanelControl::Grip => {
+                            msg_send![class!(NSCursor), openHandCursor]
+                        }
+                        PanelControl::None => {
+                            msg_send![class!(NSCursor), arrowCursor]
+                        }
+                    };
+                let _: () = msg_send![cursor, set];
+            });
+        }
+    });
+}
+
+extern "C" fn grip_reset_cursor_rects(view: *mut c_void, _cmd: Sel) {
+    crate::callback_guard::void("keystroke_display_grip_reset_cursor_rects", || unsafe {
+        let view = view as *mut AnyObject;
+        let _: () = msg_send![view, discardCursorRects];
+        let bounds: NSRect = msg_send![view, bounds];
+        let cursor: *mut AnyObject = msg_send![class!(NSCursor), openHandCursor];
+        let _: () = msg_send![view, addCursorRect: bounds, cursor: cursor];
+    });
+}
+
+extern "C" fn grip_cursor_update(_view: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    crate::callback_guard::void("keystroke_display_grip_cursor_update", || unsafe {
+        let dragging = PANEL.with(|panel| panel.borrow().drag.is_some());
+        let cursor: *mut AnyObject = if dragging {
+            msg_send![class!(NSCursor), closedHandCursor]
+        } else {
+            msg_send![class!(NSCursor), openHandCursor]
+        };
+        let _: () = msg_send![cursor, set];
+    });
+}
+
+extern "C" fn grip_mouse_exited(_view: *mut c_void, _cmd: Sel, _event: *mut c_void) {
+    crate::callback_guard::void("keystroke_display_grip_mouse_exited", || {
+        // A resize of the view fires `mouseExited` even while the pointer is still inside the
+        // panel -- the panel grows and shrinks with every keycap. Re-decide from the live
+        // cursor position instead of trusting the event: a real exit lands on `None` and
+        // restores click-through; a resize-spurious one lands back on `Grip` and the hand stays.
+        PANEL.with(|panel| {
+            let mut state = panel.borrow_mut();
+            if state.drag.is_none() {
+                update_grip_tracking(&mut state, current_cursor_appkit_point());
+            }
+        });
     });
 }
 
@@ -446,15 +544,9 @@ fn begin_grip_interaction(point: NSPoint, click_count: isize, now: Instant) {
             return false;
         };
         let frame: NSRect = unsafe { crate::glass::panel_frame_of(window) };
-        let local_grip = grip_frame(state.orientation, frame.size);
-        let global_grip = NSRect::new(
-            NSPoint::new(
-                frame.origin.x + local_grip.origin.x,
-                frame.origin.y + local_grip.origin.y,
-            ),
-            local_grip.size,
-        );
-        if !contains(global_grip, point) {
+        // The whole panel is the drag handle now (the strip is only the visible affordance);
+        // the settings button's own mouseDown never reaches this path.
+        if !contains(frame, point) {
             return false;
         }
         state.fade_deadline = None;
@@ -2383,6 +2475,10 @@ extern "C" fn settings_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut 
 extern "C" fn settings_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     crate::callback_guard::void("settings_entered", || unsafe {
         set_settings_button_style(_self, true);
+        // The button's cursor rect does not apply over the non-activating panel either; the
+        // gear is a control, so it claims the pointing hand on entry.
+        let cursor: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
+        let _: () = msg_send![cursor, set];
     });
 }
 
@@ -2391,7 +2487,12 @@ extern "C" fn settings_exited(_self: *mut AnyObject, _cmd: Sel, _event: *mut Any
         // Leaving during the press cancels it; AppKit still delivers the action on mouseUp, so the
         // armed flag is what tells a real click from a drag-out.
         PANEL.with(|panel| panel.borrow_mut().settings_armed = false);
-        unsafe { set_settings_button_style(_self, false) };
+        unsafe {
+            set_settings_button_style(_self, false);
+            // Still over the panel: hand the surface's drag cursor back.
+            let cursor: *mut AnyObject = msg_send![class!(NSCursor), openHandCursor];
+            let _: () = msg_send![cursor, set];
+        }
     });
 }
 
@@ -2551,6 +2652,11 @@ unsafe fn make_settings_button(frame: NSRect) -> *mut AnyObject {
     ];
     let _: () = msg_send![button, addTrackingArea: tracking];
     release_obj(tracking);
+    // The gear is a control, not a drag handle: its own cursor rect wins the lookup where it
+    // overlaps the container's open-hand rect.
+    let pointing: *mut AnyObject = msg_send![class!(NSCursor), pointingHandCursor];
+    let button_bounds: NSRect = msg_send![button, bounds];
+    let _: () = msg_send![button, addCursorRect: button_bounds, cursor: pointing];
     let label = make_nsstring(&crate::i18n::t("keystroke_display.open_settings"));
     let _: () = msg_send![button, setAccessibilityLabel: label];
     CFRelease(label as *const c_void);
@@ -2568,6 +2674,9 @@ unsafe fn create_panel(
     *mut AnyObject,
     *mut AnyObject,
 ) {
+    // NSCursor calls over a non-activating panel are no-ops while the app is inactive unless
+    // this private connection property is set (see ffi::enable_cursor_in_background).
+    crate::ffi::enable_cursor_in_background();
     // A provisional non-empty frame: `render` assigns the real size immediately after creation.
     let provisional = if orientation.is_vertical() {
         NSSize::new(PANEL_H, 64.0)
@@ -2588,6 +2697,7 @@ unsafe fn create_panel(
     let _: () = msg_send![panel, setOpaque: false];
     let _: () = msg_send![panel, setHasShadow: false];
     let _: () = msg_send![panel, setIgnoresMouseEvents: true];
+    let _: () = msg_send![panel, setAcceptsMouseMovedEvents: true];
     let _: () = msg_send![panel, setHidesOnDeactivate: false];
     let _: () = msg_send![panel, setReleasedWhenClosed: false];
     let _: () = msg_send![panel, setCollectionBehavior: ((1u64 << 0) | (1u64 << 6) | (1u64 << 8))];
@@ -2600,11 +2710,28 @@ unsafe fn create_panel(
         crate::glass::PANEL_CORNER_RADIUS,
         hud_backdrop_options(),
     );
-    let badge_container: *mut AnyObject = msg_send![class!(NSView), alloc];
+    // The container IS the drag surface: it spans the panel and shares the grip class's
+    // mouse handlers, so a press anywhere off the settings button starts the drag. The small
+    // grip view on top stays purely visual (its own handlers keep working in its strip).
+    let badge_container: *mut AnyObject = msg_send![grip_view_class(), alloc];
     let badge_container: *mut AnyObject = msg_send![badge_container, initWithFrame: local_frame];
     let _: () = msg_send![badge_container, setWantsLayer: true];
     let _: () = msg_send![badge_container, setAutoresizingMask: 18u64];
     let _: () = msg_send![backdrop.content_parent, addSubview: badge_container];
+    // entered/exited/moved plus cursorUpdate, in the view's VISIBLE rect: a fixed rect built
+    // from the provisional size only covered a 64x54 corner, and crossing its edge fired a
+    // spurious mouseExited that re-armed ignoresMouseEvents -- the arrow-cursor regression.
+    let opts: u64 = 0x01 | 0x02 | 0x04 | 0x80 | 0x200;
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0)),
+        options: opts,
+        owner: badge_container,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![badge_container, addTrackingArea: tracking];
+    release_obj(tracking);
     let grip_view: *mut AnyObject = msg_send![grip_view_class(), alloc];
     let grip_view: *mut AnyObject =
         msg_send![grip_view, initWithFrame: grip_frame(orientation, provisional)];
@@ -2822,20 +2949,20 @@ fn panel_control_under_cursor(
         }
     }
     let local = panel_control_rects(state.orientation, frame.size);
-    for (control, rect) in [
-        (PanelControl::Settings, local.settings),
-        (PanelControl::Grip, local.grip),
-    ] {
-        let global = NSRect::new(
-            NSPoint::new(
-                frame.origin.x + rect.origin.x,
-                frame.origin.y + rect.origin.y,
-            ),
-            rect.size,
-        );
-        if contains(global, point) {
-            return control;
-        }
+    let settings = NSRect::new(
+        NSPoint::new(
+            frame.origin.x + local.settings.origin.x,
+            frame.origin.y + local.settings.origin.y,
+        ),
+        local.settings.size,
+    );
+    if contains(settings, point) {
+        return PanelControl::Settings;
+    }
+    // Everything else on the panel is the drag handle: the grip strip is only the visible
+    // affordance, the whole surface takes the open-hand cursor and starts a drag.
+    if contains(frame, point) {
+        return PanelControl::Grip;
     }
     PanelControl::None
 }
@@ -2843,7 +2970,6 @@ fn panel_control_under_cursor(
 /// The two controls' rects in panel coordinates, computed together so the input decision and the
 /// renderer can never disagree about where they are.
 struct PanelControlRects {
-    grip: NSRect,
     settings: NSRect,
 }
 
@@ -2854,7 +2980,6 @@ struct PanelControlRects {
 /// the stream centred while still clearing the trailing button.
 fn panel_control_rects(orientation: Orientation, panel_size: NSSize) -> PanelControlRects {
     PanelControlRects {
-        grip: grip_frame(orientation, panel_size),
         settings: settings_button_frame(orientation, panel_size),
     }
 }
@@ -4108,9 +4233,9 @@ mod tests {
         preview_badges, resize_frame_preserving_center, resolve_panel_frame, stream_axis_reserves,
         target_screen_index, trailing_edge_inset, uses_accent_fill, Badge, BadgeCell, Orientation,
         ScreenGeometry, BADGE_GAP, BADGE_H, HEAD_GRIP_RESERVE, HEAD_STREAM_RESERVE,
-        MIN_PANEL_STREAM_EXTENT, PANEL_SIDE_PADDING, PREVIEW_MAX_BADGES, PREVIEW_PHRASE,
-        SETTINGS_BTN_CROSS_INSET, SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE, STREAM_BUDGET_DEDUCTION,
-        TAIL_SETTINGS_RESERVE,
+        KEYCAP_BORDER_LIGHT, MIN_PANEL_STREAM_EXTENT, PANEL_SIDE_PADDING, PREVIEW_MAX_BADGES,
+        PREVIEW_PHRASE, SETTINGS_BTN_CROSS_INSET, SETTINGS_BTN_GAP, SETTINGS_BTN_SIZE,
+        STREAM_BUDGET_DEDUCTION, TAIL_SETTINGS_RESERVE,
     };
     use crate::config::KeystrokeDisplayPosition;
     use crate::keystroke_display::state::{
@@ -4124,7 +4249,10 @@ mod tests {
             (false, crate::theme::HUD_GLASS_COMPENSATION_LIGHT),
             (true, crate::theme::HUD_GLASS_COMPENSATION_DARK),
         ] {
-            assert_eq!(super::hud_compensation_tint("regular", dark), regular);
+            // Regular keeps the tint's RGB but thins the alpha to the glass-preserving lift.
+            let regular_tint = super::hud_compensation_tint("regular", dark);
+            assert_eq!(regular_tint & 0xFF, super::HUD_REGULAR_COMPENSATION_ALPHA);
+            assert_eq!(regular_tint >> 8, regular >> 8);
             assert_eq!(super::hud_compensation_tint("clear", dark) & 0xFF, 0);
             assert_eq!(
                 super::hud_compensation_tint("clear", dark) >> 8,
