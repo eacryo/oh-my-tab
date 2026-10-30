@@ -140,6 +140,12 @@ pub(crate) struct BackdropOptions {
     /// what makes `--panel-shadow=off` a true baseline for the blur-retention measurement rather than a
     /// second hierarchy that merely has its shadow turned down.
     pub(crate) elevation: Option<crate::theme::Elevation>,
+    /// The blur underlay's `(radius, saturation)` when this panel tunes its own, `None` to follow the
+    /// global `glass-blur`/`glass-saturation` tuning.
+    pub(crate) blur: Option<(f64, f64)>,
+    /// The glass view's `NSGlassEffectViewStyle` when this panel picks its own (`clear` is 1),
+    /// `None` to follow the configured `glass_style`.
+    pub(crate) glass_style: Option<i64>,
 }
 
 impl BackdropOptions {
@@ -148,12 +154,29 @@ impl BackdropOptions {
         Self {
             compensation_alpha,
             elevation: None,
+            blur: None,
+            glass_style: None,
         }
     }
 
     /// Declare the panel's elevation (see `docs/design-style-en.md` §7).
     pub(crate) const fn with_elevation(mut self, level: Option<crate::theme::Elevation>) -> Self {
         self.elevation = level;
+        self
+    }
+
+    /// Per-panel blur-underlay override `(radius, saturation)`: a panel that
+    /// wants a tuned blur keeps the value in its own options instead of the
+    /// global `--glass-blur`/`--glass-saturation` tuning, which every panel
+    /// would otherwise share.
+    pub(crate) const fn with_blur(mut self, radius: f64, saturation: f64) -> Self {
+        self.blur = Some((radius, saturation));
+        self
+    }
+
+    /// Per-panel glass style (`NSGlassEffectViewStyle`; `clear` is 1): the same scoping as `with_blur`.
+    pub(crate) const fn with_glass_style(mut self, style: i64) -> Self {
+        self.glass_style = Some(style);
         self
     }
 }
@@ -383,7 +406,9 @@ unsafe fn build_backdrop(
             let tint = hex_to_ns_color(tint_hex);
             let _: () = msg_send![
                 glass,
-                setStyle: glass_style_index(&crate::config::effective_glass_style())
+                setStyle: options.glass_style.unwrap_or_else(|| {
+                    glass_style_index(&crate::config::effective_glass_style())
+                })
             ];
             let _: () = msg_send![glass, setTintColor: tint];
             let _: () = msg_send![glass, setAlphaValue: tuning.opacity];
@@ -394,7 +419,19 @@ unsafe fn build_backdrop(
             //
             // The container survives only for the development-only blur underlay, which needs a layer of
             // its own to sit under the glass; the shipped path never creates it.
-            let underlay_active = tuning.blur_radius > 0.0;
+            // An explicit `--glass-*` flag still wins over the pinned option so a
+            // tuning A/B needs no rebuild; the option is the shipped default.
+            let blur_radius = if crate::dev_flags::value("glass-blur").is_some() {
+                tuning.blur_radius
+            } else {
+                options.blur.map_or(tuning.blur_radius, |(r, _)| r)
+            };
+            let blur_saturation = if crate::dev_flags::value("glass-saturation").is_some() {
+                tuning.saturation
+            } else {
+                options.blur.map_or(tuning.saturation, |(_, s)| s)
+            };
+            let underlay_active = blur_radius > 0.0;
             // `_variant` is private, and forcing 0 is not the same as leaving it alone: measured, a glass
             // view with `_variant` set to 0 renders as a transparent, unblurred overlay, while the system's
             // own Command+Tab look (and alt-tab-macos's `.regular` look, which never sets `_variant`) blurs.
@@ -447,7 +484,13 @@ unsafe fn build_backdrop(
                 let container: *mut AnyObject = msg_send![container, initWithFrame: frame];
                 let _: () = msg_send![container, setAutoresizingMask: 18u64];
                 let _: () = msg_send![container, setWantsLayer: true];
-                apply_blur_underlay(container, tuning.blur_radius, tuning.saturation);
+                apply_blur_underlay(
+                    container,
+                    blur_radius,
+                    blur_saturation,
+                    corner_radius,
+                    NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+                );
                 let _: () = msg_send![container, addSubview: glass];
                 container
             } else {
@@ -524,8 +567,10 @@ unsafe fn build_backdrop(
                 let _: () = msg_send![root_layer, setMasksToBounds: true];
             }
             let tuning = MaterialTuning::effective();
-            let radius = if tuning.blur_radius > 0.0 {
-                tuning.blur_radius
+            let blur_radius = options.blur.map_or(tuning.blur_radius, |(r, _)| r);
+            let blur_saturation = options.blur.map_or(tuning.saturation, |(_, s)| s);
+            let radius = if blur_radius > 0.0 {
+                blur_radius
             } else {
                 BACKDROP_BLUR_RADIUS
             };
@@ -536,7 +581,13 @@ unsafe fn build_backdrop(
             let host: *mut AnyObject = msg_send![host, initWithFrame: frame];
             let _: () = msg_send![host, setAutoresizingMask: 18u64];
             let _: () = msg_send![host, setWantsLayer: true];
-            apply_blur_underlay(host, radius, tuning.saturation);
+            apply_blur_underlay(
+                host,
+                radius,
+                blur_saturation,
+                corner_radius,
+                NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
+            );
             let _: () = msg_send![root, addSubview: host];
             let content: *mut AnyObject = msg_send![class!(NSView), alloc];
             let content: *mut AnyObject = msg_send![content, initWithFrame: NSRect::new(
@@ -1563,7 +1614,8 @@ unsafe fn reassert_glass_layer_clip(backdrop: &InstalledBackdrop, corner_radius:
 /// frost material (theme), and the opaque surface color (theme). Structural material
 /// changes go through `swap_backdrop` instead.
 pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options: BackdropOptions) {
-    let style: i64 = match crate::config::effective_glass_style().as_str() {
+    let style: i64 = options.glass_style.unwrap_or_else(|| {
+        match crate::config::effective_glass_style().as_str() {
         // Only `clear` takes the system's clear material (this app's historical clear look, and the
         // thinnest of the three). `system` takes the system's *regular* material and adds no tint of
         // ours, i.e. the glass exactly as the system draws it.
@@ -1579,7 +1631,8 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         // rendered in one screenshot over the same backdrop -- rather than screenshot forensics.
         "clear" => 1,
         _ => 0,
-    };
+    }
+    });
     let tuning = MaterialTuning::effective();
     let tint_hex = resolved_glass_tint_hex();
     let tint = hex_to_ns_color(tint_hex);
@@ -1587,7 +1640,9 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         let _: () = msg_send![glass.0, setStyle: style];
         let _: () = msg_send![glass.0, setTintColor: tint];
         let _: () = msg_send![glass.0, setAlphaValue: tuning.opacity];
-        let variant = if tuning.blur_radius > 0.0 {
+        let blur_radius = options.blur.map_or(tuning.blur_radius, |(r, _)| r);
+        let blur_saturation = options.blur.map_or(tuning.saturation, |(_, s)| s);
+        let variant = if blur_radius > 0.0 {
             19
         } else {
             tuning.variant
@@ -1597,7 +1652,17 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         // shadow carrier installed the content view is the carrier, and `apply_blur_underlay` inserts a
         // backdrop layer into whatever it is given.
         if let Some(material) = backdrop.material_root {
-            apply_blur_underlay(material.0, tuning.blur_radius, tuning.saturation);
+            // The radius comes from the GLASS's layer — it is the one build_backdrop
+            // actually rounded; the material root's layer never carries a radius, and a
+            // square underlay's corners poke past the glass's rounded corner cutouts.
+            let layer: *mut AnyObject = msg_send![glass.0, layer];
+            let radius: f64 = if layer.is_null() {
+                0.0
+            } else {
+                msg_send![layer, cornerRadius]
+            };
+            let gframe: NSRect = msg_send![glass.0, frame];
+            apply_blur_underlay(material.0, blur_radius, blur_saturation, radius, gframe);
         }
     }
     if let Some(effect) = backdrop.effect_view {
@@ -1730,6 +1795,8 @@ pub(crate) unsafe fn apply_blur_underlay(
     container: *mut AnyObject,
     blur_radius: f64,
     saturation: f64,
+    corner_radius: f64,
+    frame: NSRect,
 ) {
     if container.is_null() {
         return;
@@ -1751,10 +1818,14 @@ pub(crate) unsafe fn apply_blur_underlay(
     }
     set_layer_filter_value_bool(layer, "windowServerAware", true);
     set_layer_filter_value(layer, "scale", 1.0);
-    let bounds: NSRect = msg_send![container_layer, bounds];
-    let _: () = msg_send![layer, setFrame: bounds];
-    let radius: f64 = msg_send![container_layer, cornerRadius];
-    let _: () = msg_send![layer, setCornerRadius: radius];
+    // The underlay tracks the GLASS's rect inside its host — the host may be a
+    // shadow carrier larger than the panel, and container-bounds sizing was
+    // the band over the panel's top edge.
+    let _: () = msg_send![layer, setFrame: frame];
+    // `I`, not `Q`: CALayer's mask arg is a u32, same encoding rule the view's
+    // setAutoresizingMask uses.
+    let _: () = msg_send![layer, setAutoresizingMask: 18u32];
+    let _: () = msg_send![layer, setCornerRadius: corner_radius];
     let _: () = msg_send![layer, setMasksToBounds: true];
     let _: () = msg_send![container_layer, insertSublayer: layer, atIndex: 0u32];
 

@@ -529,8 +529,8 @@ const PICKER_ROW_HOVER_LIGHT: u32 = 0x5C52_481A;
 /// Hairline separators (footer top line and friends): `rgba(52, 42, 30, 0.09)`.
 const PICKER_HAIRLINE_LIGHT: u32 = 0x342A_1E17;
 /// Search field fill: `rgba(255, 255, 255, 0.38)`, focused `rgba(255, 255, 255, 0.58)`.
-const PICKER_FIELD_BG_LIGHT: u32 = 0xFFFF_FF61;
-const PICKER_FIELD_BG_FOCUS_LIGHT: u32 = 0xFFFF_FF94;
+const PICKER_FIELD_BG_LIGHT: u32 = 0xFFFF_FF26;
+const PICKER_FIELD_BG_FOCUS_LIGHT: u32 = 0xFFFF_FF38;
 /// The glass edge / field border: `rgba(255, 255, 255, 0.5)`, focused `rgba(255, 255, 255, 0.86)`.
 const PICKER_GLASS_LINE_LIGHT: u32 = 0xFFFF_FF80;
 /// The mock's emphasis colour `#2f6fed`.

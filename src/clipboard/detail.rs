@@ -1193,6 +1193,10 @@ pub(crate) fn picker_backdrop_options() -> crate::glass::BackdropOptions {
     // Liquid Glass treatment only while a pinned picker is non-key.
     crate::glass::BackdropOptions::new(Some(picker_inactive_compensation_alpha()))
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
+        // Regular style so the panel gets the same system-drawn edge the orbs
+        // get; the 30px/1.6 underlay keeps the backdrop rich under the frost.
+        .with_glass_style(0)
+        .with_blur(30.0, 1.6)
 }
 
 /// The detail panel is a passive companion of the picker, so its Liquid Glass takes the inactive
@@ -1391,6 +1395,56 @@ pub(super) unsafe fn ensure_picker_window() {
     *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(backdrop.content_parent));
     let content_parent = backdrop.content_parent;
 
+    // The thin white wash the Metal picker painted over its backdrop: without
+    // it the panel's colour is whatever the wallpaper happens to be.
+    if !clipboard_palette().dark {
+        let veil: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let veil: *mut AnyObject = msg_send![
+            veil,
+            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
+        ];
+        let _: () = msg_send![veil, setWantsLayer: true];
+        let _: () = msg_send![veil, setAutoresizingMask: 18u64];
+        let veil_layer: *mut AnyObject = msg_send![veil, layer];
+        if !veil_layer.is_null() {
+            crate::ffi::layer_set_background(
+                veil_layer,
+                crate::ffi::hex_to_cg_color(0xFFFF_FF1F),
+            );
+        }
+        // The veil is the first subview installed, so a plain addSubview already
+        // puts it under everything the panel builds afterwards.
+        let _: () = msg_send![content_parent, addSubview: veil];
+        release_obj(veil);
+
+        // A single bright hairline matching the search capsule's rim —
+        // nothing else: the earlier stacks (dark rings, fade bands, veil on
+        // top) are what read as a cream frame instead of an edge.
+        let rim: *mut AnyObject = msg_send![class!(NSView), alloc];
+        let rim: *mut AnyObject = msg_send![
+            rim,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.5, 0.5),
+                NSSize::new(w - 1.0, h - 1.0)
+            )
+        ];
+        let _: () = msg_send![rim, setWantsLayer: true];
+        let _: () = msg_send![rim, setAutoresizingMask: 18u64];
+        let rim_layer: *mut AnyObject = msg_send![rim, layer];
+        if !rim_layer.is_null() {
+            let _: () = msg_send![rim_layer, setCornerRadius: super::PICKER_PANEL_RADIUS - 0.5];
+            // A slightly soft bright line — the capsule rim's read is a ~2px
+            // glow, not a 1px wire and not a band; no fades behind it.
+            let _: () = msg_send![rim_layer, setBorderWidth: 1.5f64];
+            crate::ffi::layer_set_border(
+                rim_layer,
+                crate::ffi::hex_to_cg_color(0xFFFF_FFA6),
+            );
+        }
+        let _: () = msg_send![content_parent, addSubview: rim];
+        release_obj(rim);
+    }
+
     // Container (receives key events; flipped so rows stack top-down, newest on top).
     static CONTAINER_CLS: OnceLock<StaticClass> = OnceLock::new();
     let container_cls = raw_class(
@@ -1479,6 +1533,75 @@ pub(super) unsafe fn ensure_picker_window() {
     // with the scroll view.
     let _: () = msg_send![container, setAutoresizingMask: 0u64];
     add_picker_hover_tracking(content_parent, container);
+
+    // A real frosted disc behind a header orb — the AppKit version of what the
+    // Metal orbs could only fake with stacked solids: an NSVisualEffectView's
+    // own behind-window blur clipped to the circle, an opaque white carrier
+    // underneath it that both lifts the milk and casts a free soft shadow.
+    /// A real vertical fade inside a rounded layer — the specular top edge and
+    /// inner bottom shade the mock's glass controls carry. `colors` runs from
+    /// the frame's top to its bottom.
+    unsafe fn add_fade(
+        parent_layer: *mut AnyObject,
+        frame: NSRect,
+        top: u32,
+        bottom: u32,
+    ) {
+        let g: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
+        let _: () = msg_send![g, setFrame: frame];
+        let colors: *mut AnyObject = msg_send![class!(NSMutableArray), array];
+        let _: () = msg_send![
+            colors,
+            addObject: crate::ffi::hex_to_cg_color(top) as *mut AnyObject
+        ];
+        let _: () = msg_send![
+            colors,
+            addObject: crate::ffi::hex_to_cg_color(bottom) as *mut AnyObject
+        ];
+        let _: () = msg_send![g, setColors: colors];
+        let _: () = msg_send![g, setStartPoint: NSPoint::new(0.5, 1.0)];
+        let _: () = msg_send![g, setEndPoint: NSPoint::new(0.5, 0.0)];
+        let _: () = msg_send![parent_layer, addSublayer: g];
+    }
+
+    /// Wrap a header control in a real NSGlassEffectView — the system draws
+    /// the glass body AND the edge specular itself, which is the look the
+    /// stacked-quad approaches never reached. `radius` shapes it (orb circles
+    /// use h/2, the capsule SEARCH_R). Pre-macOS-26 falls back to a hud VEV.
+    unsafe fn install_glass_chrome(host: *mut AnyObject, frame: NSRect, radius: f64) -> *mut AnyObject {
+        if let Some(cls) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") {
+            let glass: *mut AnyObject = msg_send![cls, alloc];
+            let glass: *mut AnyObject = msg_send![glass, initWithFrame: frame];
+            let _: () = msg_send![glass, setCornerRadius: radius];
+            return glass;
+        }
+        let effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+        let effect: *mut AnyObject = msg_send![effect, initWithFrame: frame];
+        let _: () = msg_send![effect, setBlendingMode: 0u64];
+        let _: () = msg_send![effect, setMaterial: 13i64];
+        let _: () = msg_send![effect, setState: 1u64];
+        let _: () = msg_send![effect, setWantsLayer: true];
+        let effect_layer: *mut AnyObject = msg_send![effect, layer];
+        if !effect_layer.is_null() {
+            let _: () = msg_send![effect_layer, setCornerRadius: radius];
+            let _: () = msg_send![effect_layer, setMasksToBounds: true];
+        }
+        let _: () = msg_send![host, addSubview: effect];
+        release_obj(effect);
+        std::ptr::null_mut()
+    }
+
+    unsafe fn install_orb_glass(host: *mut AnyObject, frame: NSRect, button: *mut AnyObject) {
+        let glass = install_glass_chrome(host, frame, frame.size.height / 2.0);
+        if !glass.is_null() {
+            let _: () = msg_send![button, setAutoresizingMask: 18u64];
+            let _: () = msg_send![glass, setContentView: button];
+            let _: () = msg_send![host, addSubview: glass];
+            release_obj(glass);
+        } else {
+            let _: () = msg_send![host, addSubview: button];
+        }
+    }
 
     // A fixed header strip holding the search field + the clear button; it does NOT scroll
     // with the list (scrolling text used to bleed through the translucent tiles). Flipped so
@@ -1623,13 +1746,25 @@ pub(super) unsafe fn ensure_picker_window() {
     // row, so the shared geometry gives the field the remaining width.
     let (search_frame, pause_frame, options_frame, pin_frame, close_frame) = picker_header_frames();
     let search_w = search_frame.size.width;
+    // The capsule gets the same real-glass chrome as the orbs: the surface is
+    // the glass view's contentView, so the field chrome (edge specular, rim)
+    // comes from the system, not painted layers.
     let search_surface: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let search_surface: *mut AnyObject = msg_send![search_surface, initWithFrame: search_frame];
+    let search_surface: *mut AnyObject = msg_send![
+        search_surface,
+        initWithFrame: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(search_frame.size.width, search_frame.size.height)
+        )
+    ];
+    let _: () = msg_send![search_surface, setAutoresizingMask: 18u64];
     let _: () = msg_send![search_surface, setWantsLayer: true];
     let surface_layer: *mut AnyObject = msg_send![search_surface, layer];
     if !surface_layer.is_null() {
         let _: () = msg_send![surface_layer, setCornerRadius: SEARCH_R];
-        let _: () = msg_send![surface_layer, setMasksToBounds: true];
+        // Unmasked so the capsule's own soft shadow escapes — its background
+        // still respects cornerRadius on its own.
+        let _: () = msg_send![surface_layer, setMasksToBounds: false];
         crate::ffi::layer_set_background(
             surface_layer,
             crate::ffi::hex_to_cg_color(picker_field_fill(false)),
@@ -1639,13 +1774,25 @@ pub(super) unsafe fn ensure_picker_window() {
             surface_layer,
             crate::ffi::hex_to_cg_color(picker_field_ring(false)),
         );
+        // No drop shadow — the capsule reads as an inset well, not a raised pill.
     }
-    let _: () = msg_send![header_strip, addSubview: search_surface];
+    let search_glass = install_glass_chrome(header_strip, search_frame, SEARCH_R);
+    if !search_glass.is_null() {
+        let _: () = msg_send![search_glass, setContentView: search_surface];
+        let _: () = msg_send![header_strip, addSubview: search_glass];
+        release_obj(search_glass);
+    } else {
+        let _: () = msg_send![header_strip, addSubview: search_surface];
+    }
     release_obj(search_surface);
     *SEARCH_FIELD_SURFACE.lock().unwrap() = Some(ObjPtr::new(search_surface));
 
     let search: *mut AnyObject = msg_send![search_cls, alloc];
-    let search: *mut AnyObject = msg_send![search, initWithFrame: search_frame];
+    let search: *mut AnyObject = msg_send![search, initWithFrame: NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(search_frame.size.width, search_frame.size.height)
+    )];
+    let _: () = msg_send![search, setAutoresizingMask: 18u64];
     // A custom cell: the placeholder = "magnifier SF Symbol + search hint" drawn at the
     // field's left (see search_cell_class), with the ⌘F keycap at the far right.
     let cell: *mut AnyObject = msg_send![search_cell_class(), alloc];
@@ -1718,7 +1865,7 @@ pub(super) unsafe fn ensure_picker_window() {
     // editor forwards moveDown:).
     let _: () = msg_send![search, setDelegate: observer()];
     // The search field lives in the fixed header strip (it does not scroll with the list).
-    let _: () = msg_send![header_strip, addSubview: search];
+    let _: () = msg_send![search_surface, addSubview: search];
     // Track only the search field's × with a tracking area; InVisibleRect lets AppKit update
     // its range automatically if the field is resized.
     let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
@@ -1829,7 +1976,7 @@ pub(super) unsafe fn ensure_picker_window() {
         let _: () = msg_send![options_layer, addSublayer: dot];
         *OPTIONS_ORB_DOT.lock().unwrap() = Some(ObjPtr::new(dot));
     }
-    let _: () = msg_send![header_strip, addSubview: options_button];
+    install_orb_glass(header_strip, options_frame, options_button);
     release_obj(options_button);
     *PICKER_OPTIONS_ORB.lock().unwrap() = Some(ObjPtr::new(options_button));
     sync_options_orb_dot();
@@ -1853,7 +2000,7 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![pin_button, setAction: sel!(togglePanelPin:)];
     set_pin_button_style(pin_button, false, false);
     add_hover_tracking(pin_button);
-    let _: () = msg_send![header_strip, addSubview: pin_button];
+    install_orb_glass(header_strip, pin_frame, pin_button);
     release_obj(pin_button);
     *PICKER_PIN_BUTTON.lock().unwrap() = Some(ObjPtr::new(pin_button));
 
@@ -1877,7 +2024,7 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![pause_button, setAction: sel!(togglePauseRecording:)];
     set_settings_button_style(pause_button, false);
     add_hover_tracking(pause_button);
-    let _: () = msg_send![header_strip, addSubview: pause_button];
+    install_orb_glass(header_strip, pause_frame, pause_button);
     release_obj(pause_button);
     *PICKER_PAUSE_BUTTON.lock().unwrap() = Some(ObjPtr::new(pause_button));
     refresh_pause_button();

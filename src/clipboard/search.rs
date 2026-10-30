@@ -70,9 +70,11 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
     }
     let chip_w = 25.0;
     let chip_h = 18.0;
+    // The capsule now lives inside an NSGlassEffectView whose rounded corner
+    // clips content — pull right-edge glyphs past the corner arc.
     let chip_rect = NSRect::new(
         NSPoint::new(
-            cell_frame.origin.x + cell_frame.size.width - chip_w - SEARCH_PAD_IN,
+            cell_frame.origin.x + cell_frame.size.width - chip_w - SEARCH_PAD_IN - 14.0,
             cell_frame.origin.y + (cell_frame.size.height - chip_h) / 2.0,
         ),
         NSSize::new(chip_w, chip_h),
@@ -117,7 +119,7 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
         return;
     }
     let hovered = SEARCH_CLEAR_HOVERED.load(Ordering::SeqCst);
-    let clear_x = cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W;
+    let clear_x = cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W - 14.0;
     let clear_rect = NSRect::new(
         NSPoint::new(
             clear_x,
@@ -294,7 +296,7 @@ unsafe fn draw_search_query_layout(cell_frame: NSRect, value: *mut AnyObject, x:
     let _: () = msg_send![
         lm,
         drawGlyphsForGlyphRange: glyph_range,
-        atPoint: NSPoint::new(x, y_top)
+        atPoint: NSPoint::new(x, cell_frame.origin.y + y_top)
     ];
     release_obj(tc);
     release_obj(lm);
@@ -343,9 +345,6 @@ extern "C" fn search_cell_draw_interior(
                     return;
                 }
             }
-            // An empty editing string is fully drawn by outer drawWithFrame:, so do not draw it
-            // here again. With text (including a query retained after ↓ gives up focus), super draws
-            // the icon and field value.
             if str_len == 0 {
                 return;
             }

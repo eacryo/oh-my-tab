@@ -434,9 +434,9 @@ unsafe fn set_header_orb_surface(button: *mut AnyObject, active: bool, hovered: 
             palette.field_bg
         }
     } else if active {
-        0xFFFF_FF8C
+        0xFFFF_FF66
     } else if hovered {
-        0xFFFF_FF70
+        0xFFFF_FF4D
     } else {
         0xFFFF_FF33
     };
@@ -449,7 +449,7 @@ unsafe fn set_header_orb_surface(button: *mut AnyObject, active: bool, hovered: 
     } else if active {
         0xFFFF_FFCC
     } else {
-        0xFFFF_FF85
+        0xFFFF_FF59
     };
     let bounds: NSRect = msg_send![button, bounds];
     let _: () = msg_send![layer, setCornerRadius: bounds.size.width.min(bounds.size.height) / 2.0];

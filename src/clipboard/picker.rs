@@ -56,6 +56,7 @@ pub(super) fn picker_list_width() -> f64 {
 /// Reflow chrome from the live panel geometry; row layout uses its own list width.
 unsafe fn layout_picker_chrome(size: NSSize) {
     let (search, pause, options, pin, close) = picker_header_frames_for(size.width);
+    let strip_view = (*PICKER_HEADER_STRIP.lock().unwrap()).map_or(std::ptr::null_mut(), |s| s.0);
     for (view, frame) in [
         (*SEARCH_FIELD_SURFACE.lock().unwrap(), search),
         (*SEARCH_FIELD.lock().unwrap(), search),
@@ -65,7 +66,24 @@ unsafe fn layout_picker_chrome(size: NSSize) {
         (*PICKER_CLOSE_BUTTON.lock().unwrap(), close),
     ] {
         if let Some(view) = view {
-            let _: () = msg_send![view.0, setFrame: frame];
+            // Header controls are wrapped in NSGlassEffectView shells: the
+            // strip-level frame belongs to the shell directly under the strip,
+            // while the control keeps filling its container.
+            let mut shell = view.0;
+            loop {
+                let sup: *mut AnyObject = msg_send![shell, superview];
+                if sup.is_null() || sup == strip_view {
+                    break;
+                }
+                shell = sup;
+            }
+            if shell != view.0 {
+                let _: () = msg_send![
+                    view.0,
+                    setFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
+                ];
+            }
+            let _: () = msg_send![shell, setFrame: frame];
         }
     }
     if let Some(clear) = *SEARCH_CLEAR_BUTTON.lock().unwrap() {
