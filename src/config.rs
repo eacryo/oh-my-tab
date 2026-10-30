@@ -2874,14 +2874,30 @@ pub fn effective_glass_opacity() -> f64 {
     numeric_flag_or("glass-opacity", 1.0).clamp(0.0, 1.0)
 }
 
-/// Backdrop blur radius for the owned underlay (development-only, see `glass::apply_blur_underlay`).
+/// Clear glass's owned blur underlay; regular keeps native blur. A launch override tunes either look.
 pub fn effective_glass_blur_radius() -> f64 {
-    numeric_flag_or("glass-blur", 0.0).clamp(0.0, 64.0)
+    numeric_flag_or(
+        "glass-blur",
+        if effective_glass_style() == "clear" {
+            crate::glass::CLEAR_GLASS_BLUR_RADIUS
+        } else {
+            0.0
+        },
+    )
+    .clamp(0.0, 64.0)
 }
 
 /// Backdrop saturation for the owned underlay (development-only, same note).
 pub fn effective_glass_saturation() -> f64 {
-    numeric_flag_or("glass-saturation", 1.0).clamp(0.0, 4.0)
+    numeric_flag_or(
+        "glass-saturation",
+        if effective_glass_style() == "clear" {
+            crate::glass::CLEAR_GLASS_SATURATION
+        } else {
+            1.0
+        },
+    )
+    .clamp(0.0, 4.0)
 }
 
 /// The frosted material's light-mode brightness floor, resolved: the shipped

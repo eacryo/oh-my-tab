@@ -341,6 +341,46 @@ pub(crate) fn smoke_runner() -> bool {
     hide_picker();
     // Second show: rebuild_rows removes the old rows first (the former UAF path).
     show_picker();
+    unsafe {
+        let window = (*PICKER_WINDOW.lock().unwrap()).expect("picker window after show");
+        let original_frame = crate::glass::panel_frame_of(window.0);
+        let original_appearance = CONFIG.read().unwrap().appearance.clone();
+        crate::glass::set_panel_frame(
+            window.0,
+            NSRect::new(NSPoint::new(137.0, 113.0), original_frame.size),
+            false,
+        );
+        for style in ["regular", "clear"] {
+            CONFIG.write().unwrap().appearance.glass_style = style.into();
+            for material in ["frost", "opaque", "liquid-glass"] {
+                CONFIG.write().unwrap().appearance.panel_material = material.into();
+                detail::apply_backdrop_material();
+            }
+            let backdrop =
+                (*PICKER_BACKDROP.lock().unwrap()).expect("picker after material round trip");
+            if let Some(glass) = backdrop.glass {
+                let glass_frame: NSRect = msg_send![glass.0, frame];
+                let host = backdrop.material_root.expect("glass material host");
+                let host_bounds: NSRect = msg_send![host.0, bounds];
+                assert_eq!(
+                    glass_frame.origin,
+                    NSPoint::new(0.0, 0.0),
+                    "{style}: screen coordinates must not leak into the hosted glass"
+                );
+                assert_eq!(
+                    glass_frame.size, host_bounds.size,
+                    "{style}: hosted glass must fill the material after a round trip"
+                );
+            }
+        }
+        {
+            let mut config = CONFIG.write().unwrap();
+            config.appearance.glass_style = original_appearance.glass_style;
+            config.appearance.panel_material = original_appearance.panel_material;
+        }
+        detail::apply_backdrop_material();
+        crate::glass::set_panel_frame(window.0, original_frame, false);
+    }
     // The panel's outline is a decoration over the whole panel, so it has two ways to be wrong that no
     // token comparison would catch: absent (or present) against its own switch, and swallowing the
     // panel's input. Both are asserted here on the real view tree, including the `--panel-outline=off`
@@ -367,6 +407,21 @@ pub(crate) fn smoke_runner() -> bool {
                     expected(),
                     "live picker style must follow settings"
                 );
+                let veil_count = usize::from(
+                    crate::config::effective_glass_style() == "clear"
+                        && !crate::theme::resolved_is_dark(),
+                );
+                for _ in 0..2 {
+                    crate::glass::apply_live_properties(
+                        backdrop,
+                        detail::picker_backdrop_options(),
+                    );
+                    assert_eq!(
+                        crate::glass::floor_veil_count(backdrop.content_parent),
+                        veil_count,
+                        "reference lift must be unique in light clear and absent in regular/dark"
+                    );
+                }
             }
             CONFIG.write().unwrap().appearance.glass_style = original;
             crate::glass::apply_live_properties(backdrop, detail::picker_backdrop_options());

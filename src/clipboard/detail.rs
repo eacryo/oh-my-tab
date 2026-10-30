@@ -1195,8 +1195,6 @@ pub(crate) fn picker_backdrop_options() -> crate::glass::BackdropOptions {
     // Liquid Glass treatment only while a pinned picker is non-key.
     crate::glass::BackdropOptions::new(Some(picker_inactive_compensation_alpha()))
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
-        // Follow the configured glass style without installing a private blur underlay.
-        .with_blur(0.0, 1.0)
         .with_native_glass_edge()
 }
 

@@ -142,9 +142,6 @@ pub(crate) struct BackdropOptions {
     /// what makes `--panel-shadow=off` a true baseline for the blur-retention measurement rather than a
     /// second hierarchy that merely has its shadow turned down.
     pub(crate) elevation: Option<crate::theme::Elevation>,
-    /// The blur underlay's `(radius, saturation)` when this panel tunes its own, `None` to follow the
-    /// global `glass-blur`/`glass-saturation` tuning.
-    pub(crate) blur: Option<(f64, f64)>,
     /// Keep the native effect's edge outside the content clip.
     pub(crate) native_glass_edge: bool,
 }
@@ -156,7 +153,6 @@ impl BackdropOptions {
             compensation_alpha,
             compensation_tint: None,
             elevation: None,
-            blur: None,
             native_glass_edge: false,
         }
     }
@@ -164,15 +160,6 @@ impl BackdropOptions {
     /// Declare the panel's elevation (see `docs/design-style-en.md` §7).
     pub(crate) const fn with_elevation(mut self, level: Option<crate::theme::Elevation>) -> Self {
         self.elevation = level;
-        self
-    }
-
-    /// Per-panel blur-underlay override `(radius, saturation)`: a panel that
-    /// wants a tuned blur keeps the value in its own options instead of the
-    /// global `--glass-blur`/`--glass-saturation` tuning, which every panel
-    /// would otherwise share.
-    pub(crate) const fn with_blur(mut self, radius: f64, saturation: f64) -> Self {
-        self.blur = Some((radius, saturation));
         self
     }
 
@@ -404,7 +391,9 @@ unsafe fn build_backdrop(
         PanelMaterial::LiquidGlass if AnyClass::get(c"NSGlassEffectView").is_some() => {
             let glass_class = AnyClass::get(c"NSGlassEffectView").unwrap();
             let glass: *mut AnyObject = msg_send![glass_class, alloc];
-            let glass: *mut AnyObject = msg_send![glass, initWithFrame: frame];
+            let glass: *mut AnyObject = msg_send![glass, initWithFrame:
+                NSRect::new(NSPoint::new(0.0, 0.0), size)
+            ];
             let _: () = msg_send![glass, setCornerRadius: corner_radius];
             // The look chooses only `style`; the tint is the config's value, verbatim -- its alpha is the
             // whole strength.
@@ -417,25 +406,8 @@ unsafe fn build_backdrop(
             ];
             let _: () = msg_send![glass, setTintColor: tint];
             let _: () = msg_send![glass, setAlphaValue: tuning.opacity];
-            // Installation follows alt-tab-macos: the glass view becomes the window's `contentView`
-            // directly and the panel's content lives in `glass.contentView` -- nothing wraps it. That is
-            // the shape their working glass uses, and wrapping it in a plain container (which this code
-            // did) is the one structural difference that was never tested against the missing blur.
-            //
-            // The container survives only for the development-only blur underlay, which needs a layer of
-            // its own to sit under the glass; the shipped path never creates it.
-            // An explicit `--glass-*` flag still wins over the pinned option so a
-            // tuning A/B needs no rebuild; the option is the shipped default.
-            let blur_radius = if crate::dev_flags::value("glass-blur").is_some() {
-                tuning.blur_radius
-            } else {
-                options.blur.map_or(tuning.blur_radius, |(r, _)| r)
-            };
-            let blur_saturation = if crate::dev_flags::value("glass-saturation").is_some() {
-                tuning.saturation
-            } else {
-                options.blur.map_or(tuning.saturation, |(_, s)| s)
-            };
+            let blur_radius = tuning.blur_radius;
+            let blur_saturation = tuning.saturation;
             let underlay_active = blur_radius > 0.0;
             // `_variant` is private, and forcing 0 is not the same as leaving it alone: measured, a glass
             // view with `_variant` set to 0 renders as a transparent, unblurred overlay, while the system's
@@ -446,22 +418,8 @@ unsafe fn build_backdrop(
                 let variant = if underlay_active { 19 } else { tuning.variant };
                 apply_glass_variant(glass, variant);
             }
-            // Installation follows alt-tab-macos: the glass view is what the window hosts, with the
-            // panel's content in `glass.contentView` and nothing wrapping it. A `NSVisualEffectView` was
-            // briefly stacked under it to supply a sampled backdrop; that is exactly what their project
-            // warns against ("do NOT set vibrancy alongside liquid glass, it will override and look
-            // blurry") and on screen it turned all three looks into an opaque white surface, so it is gone.
-            //
-            // The container survives only for the development-only blur underlay, which needs a layer of
-            // its own to sit under the glass; the shipped path never creates it.
-            // `--glass-underlay`: stack the frost material under the glass for comparison. **Shipped path:
-            // off.** Measured on a stripe ladder the stack does blur more (contrast retention over 2-16pt
-            // detail 0.15-0.36 against the glass's own 0.24-0.57, a 48px stripe still arriving at 0.06), but
-            // it buys that with the frost material's milk: on screen every look -- `clear` included -- stops
-            // reading as transparent at all. Transparency is not something to spend on blur, and the
-            // community warning ("do NOT set vibrancy alongside liquid glass") is right about this
-            // direction. More blur *at the same transparency* needs a blur without a lightening layer -- a
-            // `CABackdropLayer` carrying `gaussianBlur` and nothing else -- which is a separate experiment.
+            // Keep a stable, non-clipping host in both looks. Live regular/clear changes can then
+            // add or remove the owned blur layer without rebuilding content or touching system layers.
             let frost_underlay = crate::dev_flags::value("glass-underlay").is_some();
             let root = if frost_underlay {
                 let under: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
@@ -484,7 +442,7 @@ unsafe fn build_backdrop(
                 }
                 let _: () = msg_send![under, addSubview: glass];
                 under
-            } else if underlay_active {
+            } else {
                 let container: *mut AnyObject = msg_send![class!(NSView), alloc];
                 let container: *mut AnyObject = msg_send![container, initWithFrame: frame];
                 let _: () = msg_send![container, setAutoresizingMask: 18u64];
@@ -498,8 +456,6 @@ unsafe fn build_backdrop(
                 );
                 let _: () = msg_send![container, addSubview: glass];
                 container
-            } else {
-                glass
             };
             let _: () = msg_send![glass, setAutoresizingMask: 18u64];
 
@@ -532,6 +488,7 @@ unsafe fn build_backdrop(
             };
 
             let _: () = msg_send![glass, setContentView: content];
+            sync_clear_veil(content);
             // Clip application content independently of the system's edge rendering.
             let _: () = msg_send![glass, setWantsLayer: true];
             let glass_layer: *mut AnyObject = msg_send![glass, layer];
@@ -547,11 +504,11 @@ unsafe fn build_backdrop(
             }
             if let Some(host) = embedded_host {
                 let _: () = msg_send![host, addSubview: root];
-                release_obj(content);
-                if root != glass {
-                    release_obj(root);
-                }
+                release_obj(root);
             }
+            // Glass owns content and the host owns glass. Window installations retain the host's
+            // alloc reference until the carrier/window adopts it; embedded installations did so above.
+            release_obj(content);
             release_obj(glass);
             InstalledBackdrop {
                 native_glass_edge: options.native_glass_edge,
@@ -581,8 +538,8 @@ unsafe fn build_backdrop(
                 let _: () = msg_send![root_layer, setMasksToBounds: true];
             }
             let tuning = MaterialTuning::effective();
-            let blur_radius = options.blur.map_or(tuning.blur_radius, |(r, _)| r);
-            let blur_saturation = options.blur.map_or(tuning.saturation, |(_, s)| s);
+            let blur_radius = tuning.blur_radius;
+            let blur_saturation = tuning.saturation;
             let radius = if blur_radius > 0.0 {
                 blur_radius
             } else {
@@ -841,6 +798,19 @@ const BACKDROP_BLUR_RADIUS: f64 = 12.0;
 /// purple), and multiplying the strength by 255 twice (the alpha collapsed to 20%).
 const GLASS_TINT_LIGHT: &str = "eeeeee66";
 const GLASS_TINT_DARK: &str = "1c1c1e99";
+const CLEAR_GLASS_TINT_LIGHT: &str = "eeeeee00";
+const CLEAR_GLASS_TINT_DARK: &str = "1c1c1e33";
+pub(crate) const CLEAR_GLASS_BLUR_RADIUS: f64 = 54.0;
+pub(crate) const CLEAR_GLASS_SATURATION: f64 = 1.78;
+
+fn glass_tint_for_style(style: &str, dark: bool) -> &'static str {
+    match (style == "clear", dark) {
+        (true, false) => CLEAR_GLASS_TINT_LIGHT,
+        (true, true) => CLEAR_GLASS_TINT_DARK,
+        (false, false) => GLASS_TINT_LIGHT,
+        (false, true) => GLASS_TINT_DARK,
+    }
+}
 
 /// The **frosted** material's light-mode brightness floor: the alpha of a flat white veil laid over the
 /// material and under the panel's content.
@@ -886,11 +856,10 @@ pub(crate) fn resolved_glass_tint_hex() -> u32 {
             return parsed;
         }
     }
-    let hex = if crate::theme::resolved_is_dark() {
-        GLASS_TINT_DARK
-    } else {
-        GLASS_TINT_LIGHT
-    };
+    let hex = glass_tint_for_style(
+        &crate::config::effective_glass_style(),
+        crate::theme::resolved_is_dark(),
+    );
     crate::config::parse_hex8(hex)
 }
 
@@ -1404,57 +1373,79 @@ fn install_shadow_carrier(
 /// so the window's reference is the only one left, which is the shape the other installed views use.
 pub(crate) unsafe fn adopt_window_root(window: *mut AnyObject, root: *mut AnyObject, owned: bool) {
     let _: () = msg_send![window, setContentView: root];
-    // `owned` is true only for the carrier: every material branch already released its own `alloc`
-    // reference inside `build_backdrop`, so releasing the material root here would over-release a view the
-    // window still holds (the no-carrier path, e.g. `--panel-shadow=off`).
+    // This balances only the carrier's alloc. The caller separately balances the Liquid Glass host
+    // after adoption; the older material branches already balanced theirs in the builder.
     if owned {
         release_obj(root);
     }
 }
 
+fn bevel_profile(hud: bool, style: &str) -> (f64, u32) {
+    if hud && style == "clear" {
+        (
+            crate::theme::HUD_CLEAR_EDGE_WIDTH,
+            crate::theme::HUD_CLEAR_EDGE_HIGHLIGHT,
+        )
+    } else {
+        (
+            crate::theme::CLIPBOARD_EDGE_INNER_WIDTH,
+            crate::theme::CLIPBOARD_EDGE_HIGHLIGHT,
+        )
+    }
+}
+
 extern "C" fn panel_bevel_draw(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect) {
     crate::callback_guard::void("panel_bevel_draw", || unsafe {
-        if crate::glass::PanelMaterial::effective() != crate::glass::PanelMaterial::LiquidGlass {
-            return;
-        }
-        use crate::theme::*;
-        let bounds: NSRect = msg_send![view, bounds];
-        let layer: *mut AnyObject = msg_send![view, layer];
-        let panel_radius: f64 = msg_send![layer, cornerRadius];
-        let ring = |inset: f64, width: f64| -> *mut AnyObject {
-            let rounded = |inset: f64| -> *mut AnyObject {
-                let rect = NSRect::new(
-                    NSPoint::new(bounds.origin.x + inset, bounds.origin.y + inset),
-                    NSSize::new(
-                        (bounds.size.width - inset * 2.0).max(0.0),
-                        (bounds.size.height - inset * 2.0).max(0.0),
-                    ),
-                );
-                let radius = (panel_radius + CLIPBOARD_EDGE_OUTSET - inset).max(0.0);
-                msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: rect, xRadius: radius, yRadius: radius]
-            };
-            let path = rounded(inset);
-            let _: () = msg_send![path, appendBezierPath: rounded(inset + width)];
-            let _: () = msg_send![path, setWindingRule: 1isize];
-            path
-        };
-        let outer = ring(0.0, CLIPBOARD_EDGE_OUTER_WIDTH);
-        let color = crate::ffi::hex_to_ns_color(if crate::theme::ui_palette().dark {
-            CLIPBOARD_EDGE_OUTER_DARK
-        } else {
-            CLIPBOARD_EDGE_OUTER_LIGHT
-        });
-        let _: () = msg_send![color, setFill];
-        let _: () = msg_send![outer, fill];
-        let inner = ring(CLIPBOARD_EDGE_OUTER_WIDTH, CLIPBOARD_EDGE_INNER_WIDTH);
-        let gradient: *mut AnyObject = msg_send![class!(NSGradient), alloc];
-        let gradient: *mut AnyObject = msg_send![gradient,
-            initWithStartingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_SHADE),
-            endingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_HIGHLIGHT)
-        ];
-        let _: () = msg_send![gradient, drawInBezierPath: inner, angle: 90.0f64];
-        release_obj(gradient);
+        draw_panel_bevel(view, false)
     });
+}
+
+extern "C" fn hud_bevel_draw(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect) {
+    crate::callback_guard::void("hud_bevel_draw", || unsafe { draw_panel_bevel(view, true) });
+}
+
+unsafe fn draw_panel_bevel(view: *mut AnyObject, hud: bool) {
+    if crate::glass::PanelMaterial::effective() != crate::glass::PanelMaterial::LiquidGlass {
+        return;
+    }
+    use crate::theme::*;
+    let (inner_width, highlight) = bevel_profile(hud, &crate::config::effective_glass_style());
+    let bounds: NSRect = msg_send![view, bounds];
+    let layer: *mut AnyObject = msg_send![view, layer];
+    let panel_radius: f64 = msg_send![layer, cornerRadius];
+    let ring = |inset: f64, width: f64| -> *mut AnyObject {
+        let rounded = |inset: f64| -> *mut AnyObject {
+            let rect = NSRect::new(
+                NSPoint::new(bounds.origin.x + inset, bounds.origin.y + inset),
+                NSSize::new(
+                    (bounds.size.width - inset * 2.0).max(0.0),
+                    (bounds.size.height - inset * 2.0).max(0.0),
+                ),
+            );
+            let radius = (panel_radius + CLIPBOARD_EDGE_OUTSET - inset).max(0.0);
+            msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: rect, xRadius: radius, yRadius: radius]
+        };
+        let path = rounded(inset);
+        let _: () = msg_send![path, appendBezierPath: rounded(inset + width)];
+        let _: () = msg_send![path, setWindingRule: 1isize];
+        path
+    };
+    let outer = ring(0.0, CLIPBOARD_EDGE_OUTER_WIDTH);
+    let color = crate::ffi::hex_to_ns_color(if crate::theme::ui_palette().dark {
+        CLIPBOARD_EDGE_OUTER_DARK
+    } else {
+        CLIPBOARD_EDGE_OUTER_LIGHT
+    });
+    let _: () = msg_send![color, setFill];
+    let _: () = msg_send![outer, fill];
+    let inner = ring(CLIPBOARD_EDGE_OUTER_WIDTH, inner_width);
+    let gradient: *mut AnyObject = msg_send![class!(NSGradient), alloc];
+    let gradient: *mut AnyObject = msg_send![gradient,
+        initWithStartingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_SHADE),
+        endingColor: crate::ffi::hex_to_ns_color(highlight)
+    ];
+    let _: () = msg_send![gradient, drawInBezierPath: inner, angle: 90.0f64];
+    release_obj(gradient);
 }
 
 extern "C" fn panel_bevel_hit_test(
@@ -1470,6 +1461,17 @@ pub(crate) unsafe fn install_panel_bevel(
     backdrop: &InstalledBackdrop,
     radius: f64,
 ) -> Option<ObjPtr> {
+    install_bevel(backdrop, radius, false)
+}
+
+pub(crate) unsafe fn install_hud_bevel(
+    backdrop: &InstalledBackdrop,
+    radius: f64,
+) -> Option<ObjPtr> {
+    install_bevel(backdrop, radius, true)
+}
+
+unsafe fn install_bevel(backdrop: &InstalledBackdrop, radius: f64, hud: bool) -> Option<ObjPtr> {
     // Keep the silhouette above the native effect, outside its content clip.
     let parent = backdrop.root?.0;
     let material = backdrop.material_root?.0;
@@ -1487,12 +1489,23 @@ pub(crate) unsafe fn install_panel_bevel(
         ),
     );
     static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
-    let cls = crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPanelBevel", || {
-        crate::ffi::build_class(c"OhMyTabPanelBevel", class!(NSView), |builder| {
-            builder.add_method::<AnyObject, _>(
-                sel!(drawRect:),
-                panel_bevel_draw as extern "C" fn(*mut AnyObject, Sel, NSRect),
-            );
+    static HUD_CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    let (slot, name, draw) = if hud {
+        (
+            &HUD_CLASS,
+            c"OhMyTabHudBevel",
+            hud_bevel_draw as extern "C" fn(*mut AnyObject, Sel, NSRect),
+        )
+    } else {
+        (
+            &CLASS,
+            c"OhMyTabPanelBevel",
+            panel_bevel_draw as extern "C" fn(*mut AnyObject, Sel, NSRect),
+        )
+    };
+    let cls = crate::ffi::StaticClass::register_once(slot, name, || {
+        crate::ffi::build_class(name, class!(NSView), |builder| {
+            builder.add_method::<AnyObject, _>(sel!(drawRect:), draw);
             builder.add_method::<AnyObject, _>(
                 sel!(hitTest:),
                 panel_bevel_hit_test
@@ -1678,6 +1691,9 @@ pub(crate) unsafe fn install_backdrop(
         backdrop.root.unwrap().0,
         carrier_installed(&backdrop),
     );
+    if backdrop.glass.is_some() {
+        release_obj(backdrop.material_root.unwrap().0);
+    }
     reassert_glass_layer_clip(&backdrop, corner_radius);
     backdrop.outline_view = install_panel_outline(&backdrop, corner_radius);
     backdrop
@@ -1754,6 +1770,9 @@ pub(crate) unsafe fn swap_backdrop(
     }
     let insets = install_shadow_carrier(&mut new, frame, corner_radius, options);
     adopt_window_root(window, new.root.unwrap().0, carrier_installed(&new));
+    if new.glass.is_some() {
+        release_obj(new.material_root.unwrap().0);
+    }
     remember_panel_insets(window, insets);
     if insets != panel_insets_of(window) {
         // Only reachable when the level itself changed (a dev switch); the window has to be re-padded to
@@ -1800,8 +1819,9 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         let _: () = msg_send![glass.0, setStyle: style];
         let _: () = msg_send![glass.0, setTintColor: tint];
         let _: () = msg_send![glass.0, setAlphaValue: tuning.opacity];
-        let blur_radius = options.blur.map_or(tuning.blur_radius, |(r, _)| r);
-        let blur_saturation = options.blur.map_or(tuning.saturation, |(_, s)| s);
+        sync_clear_veil(backdrop.content_parent);
+        let blur_radius = tuning.blur_radius;
+        let blur_saturation = tuning.saturation;
         // Match construction: live refreshes must preserve the system variant unless
         // the private development override was explicitly requested.
         if crate::dev_flags::value("glass-variant").is_some() {
@@ -1932,7 +1952,6 @@ pub(crate) unsafe fn apply_glass_variant(glass: *mut AnyObject, variant: i64) {
     imp(glass, sel, variant);
 }
 
-/// KVC write used by the (development-only) blur underlay.
 /// `[CAFilter filterWithType: "..."]`, or null where the private class or selector is absent.
 unsafe fn make_ca_filter(filter_type: &str) -> *mut AnyObject {
     let Some(class) = objc2::runtime::AnyClass::get(c"CAFilter") else {
@@ -1951,14 +1970,25 @@ unsafe fn make_ca_filter(filter_type: &str) -> *mut AnyObject {
     filter
 }
 
-/// Give the glass an owned backdrop layer carrying the blur/saturation filters.
-///
-/// **Development channel only** (`--glass-blur` / `--glass-saturation`), and the only place this app
-/// touches the system's private compositing: the layer is ours, inserted under the glass, with
-/// `CAFilter`s for `gaussianBlur` / `colorSaturate` attached. Nothing here runs on the shipped path --
-/// and the app must not poke the *system's* backdrop layers, which is what a previous version did on
-/// every build (a KVC write of `saturationFactor` into whatever backdrop layers the glass view owned),
-/// and which is exactly the kind of interference that can leave a system material unblurred.
+const OWNED_BLUR_LAYER_NAME: &str = "OhMyTabClearBlur";
+
+unsafe fn owned_blur_layers(parent: *mut AnyObject) -> Vec<*mut AnyObject> {
+    let layers: *mut AnyObject = msg_send![parent, sublayers];
+    if layers.is_null() {
+        return Vec::new();
+    }
+    let count: usize = msg_send![layers, count];
+    (0..count)
+        .filter_map(|index| {
+            let layer: *mut AnyObject = msg_send![layers, objectAtIndex: index];
+            let name: *mut AnyObject = msg_send![layer, name];
+            (!name.is_null() && crate::ffi::nsstring_to_rust(name) == OWNED_BLUR_LAYER_NAME)
+                .then_some(layer)
+        })
+        .collect()
+}
+
+/// Update only our named layer; native glass layers and their filters remain system-owned.
 pub(crate) unsafe fn apply_blur_underlay(
     container: *mut AnyObject,
     blur_radius: f64,
@@ -1973,17 +2003,45 @@ pub(crate) unsafe fn apply_blur_underlay(
     if container_layer.is_null() {
         return;
     }
+    sync_blur_layer(
+        container_layer,
+        blur_radius,
+        saturation,
+        corner_radius,
+        frame,
+    );
+}
+
+unsafe fn sync_blur_layer(
+    container_layer: *mut AnyObject,
+    blur_radius: f64,
+    saturation: f64,
+    corner_radius: f64,
+    frame: NSRect,
+) {
+    let existing = owned_blur_layers(container_layer);
     if blur_radius <= 0.0 {
+        for layer in existing {
+            let _: () = msg_send![layer, removeFromSuperlayer];
+        }
         return;
     }
-    let Some(class) = objc2::runtime::AnyClass::get(c"CABackdropLayer") else {
-        return;
+    let layer = if let Some(layer) = existing.first() {
+        *layer
+    } else {
+        let Some(class) = objc2::runtime::AnyClass::get(c"CABackdropLayer") else {
+            return;
+        };
+        let layer: *mut AnyObject = msg_send![class, layer];
+        if layer.is_null() {
+            return;
+        }
+        let name = crate::ffi::make_nsstring(OWNED_BLUR_LAYER_NAME);
+        let _: () = msg_send![layer, setName: name];
+        crate::ffi::CFRelease(name as *const c_void);
+        let _: () = msg_send![container_layer, insertSublayer: layer, atIndex: 0u32];
+        layer
     };
-    let layer: *mut AnyObject = msg_send![class, alloc];
-    let layer: *mut AnyObject = msg_send![layer, init];
-    if layer.is_null() {
-        return;
-    }
     set_layer_filter_value_bool(layer, "windowServerAware", true);
     set_layer_filter_value(layer, "scale", 1.0);
     // The underlay tracks the GLASS's rect inside its host — the host may be a
@@ -1995,8 +2053,6 @@ pub(crate) unsafe fn apply_blur_underlay(
     let _: () = msg_send![layer, setAutoresizingMask: 18u32];
     let _: () = msg_send![layer, setCornerRadius: corner_radius];
     let _: () = msg_send![layer, setMasksToBounds: true];
-    let _: () = msg_send![container_layer, insertSublayer: layer, atIndex: 0u32];
-
     let filters: *mut AnyObject = msg_send![class!(NSMutableArray), array];
     let blur = make_ca_filter("gaussianBlur");
     if !blur.is_null() {
@@ -2012,7 +2068,6 @@ pub(crate) unsafe fn apply_blur_underlay(
         }
     }
     let _: () = msg_send![layer, setFilters: filters];
-    crate::ffi::release_obj(layer);
 }
 
 unsafe fn set_layer_filter_value_bool(layer: *mut AnyObject, key: &str, value: bool) {
@@ -2249,6 +2304,38 @@ pub(crate) unsafe fn floor_veil_count(parent: *mut AnyObject) -> usize {
         .count()
 }
 
+fn clear_veil_enabled(style: &str, dark: bool) -> bool {
+    style == "clear" && !dark
+}
+
+unsafe fn sync_clear_veil(parent: *mut AnyObject) {
+    if parent.is_null() {
+        return;
+    }
+    let candidate: *mut AnyObject = msg_send![parent, viewWithTag: FLOOR_VEIL_TAG];
+    let existing = if !candidate.is_null() {
+        let owner: *mut AnyObject = msg_send![candidate, superview];
+        if owner == parent {
+            candidate
+        } else {
+            std::ptr::null_mut()
+        }
+    } else {
+        std::ptr::null_mut()
+    };
+    if clear_veil_enabled(
+        &crate::config::effective_glass_style(),
+        crate::theme::resolved_is_dark(),
+    ) {
+        if existing.is_null() {
+            let bounds: NSRect = msg_send![parent, bounds];
+            install_floor_veil(parent, bounds.size, FrostVeil::Gradient);
+        }
+    } else if !existing.is_null() {
+        let _: () = msg_send![existing, removeFromSuperview];
+    }
+}
+
 unsafe fn sync_floor_veil(parent: *mut AnyObject) {
     if parent.is_null() {
         return;
@@ -2431,12 +2518,72 @@ mod tests {
             0x1C1C_1E99
         );
         // The accessor follows the resolved mode, which is what the panel draws with.
-        let expected = if crate::theme::resolved_is_dark() {
-            0x1C1C_1E99
-        } else {
-            0xEEEE_EE66
-        };
+        let expected = crate::config::parse_hex8(super::glass_tint_for_style(
+            &crate::config::effective_glass_style(),
+            crate::theme::resolved_is_dark(),
+        ));
         assert_eq!(resolved_glass_tint_hex(), expected);
+    }
+
+    #[test]
+    fn blur_refresh_reuses_its_layer_and_regular_removes_only_that_layer() {
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+        use objc2_foundation::{NSPoint, NSRect, NSSize};
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let parent: *mut AnyObject = msg_send![class!(CALayer), layer];
+            let unrelated: *mut AnyObject = msg_send![class!(CALayer), layer];
+            let _: () = msg_send![parent, addSublayer: unrelated];
+            let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(640.0, 420.0));
+            super::sync_blur_layer(parent, super::CLEAR_GLASS_BLUR_RADIUS, 1.0, 32.0, frame);
+            let first = super::owned_blur_layers(parent);
+            assert_eq!(first.len(), 1);
+            for _ in 0..8 {
+                super::sync_blur_layer(parent, super::CLEAR_GLASS_BLUR_RADIUS, 1.0, 32.0, frame);
+                assert_eq!(super::owned_blur_layers(parent), first);
+            }
+            let layers: *mut AnyObject = msg_send![parent, sublayers];
+            let count: usize = msg_send![layers, count];
+            assert_eq!(count, 2);
+            let actual_frame: NSRect = msg_send![first[0], frame];
+            assert_eq!(actual_frame, frame);
+            super::sync_blur_layer(parent, 0.0, 1.0, 32.0, frame);
+            assert!(super::owned_blur_layers(parent).is_empty());
+            let layers: *mut AnyObject = msg_send![parent, sublayers];
+            let count: usize = msg_send![layers, count];
+            assert_eq!(count, 1);
+            let survivor: *mut AnyObject = msg_send![layers, objectAtIndex: 0usize];
+            assert_eq!(survivor, unrelated);
+        });
+    }
+
+    #[test]
+    fn clear_hud_has_a_visible_highlight_without_changing_other_panel_edges() {
+        let standard = (
+            crate::theme::CLIPBOARD_EDGE_INNER_WIDTH,
+            crate::theme::CLIPBOARD_EDGE_HIGHLIGHT,
+        );
+        assert_eq!(super::bevel_profile(false, "clear"), standard);
+        assert_eq!(super::bevel_profile(false, "regular"), standard);
+        assert_eq!(super::bevel_profile(true, "regular"), standard);
+        let (width, highlight) = super::bevel_profile(true, "clear");
+        assert!(width > standard.0);
+        assert!((highlight & 0xFF) > (standard.1 & 0xFF));
+    }
+
+    #[test]
+    fn clear_glass_keeps_more_background_color_in_both_themes() {
+        for dark in [false, true] {
+            let regular = crate::config::parse_hex8(super::glass_tint_for_style("regular", dark));
+            let clear = crate::config::parse_hex8(super::glass_tint_for_style("clear", dark));
+            assert_eq!(regular >> 8, clear >> 8);
+            assert!((clear & 0xFF) < (regular & 0xFF));
+        }
+        assert_eq!(super::CLEAR_GLASS_BLUR_RADIUS, 54.0);
+        assert_eq!(super::CLEAR_GLASS_SATURATION, 1.78);
+        assert!(super::clear_veil_enabled("clear", false));
+        assert!(!super::clear_veil_enabled("regular", false));
+        assert!(!super::clear_veil_enabled("clear", true));
     }
 
     /// Only `clear` selects the clear style. Everything else -- including the `system` value an earlier

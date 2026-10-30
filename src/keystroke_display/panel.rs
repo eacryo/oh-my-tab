@@ -166,7 +166,6 @@ pub(crate) fn hud_backdrop_options() -> crate::glass::BackdropOptions {
     crate::glass::BackdropOptions::new(Some(tint & 0xFF))
         .with_compensation_tint(tint)
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
-        .with_blur(0.0, 1.0)
         .with_native_glass_edge()
 }
 
@@ -2615,7 +2614,7 @@ unsafe fn create_panel(
     let _: () = msg_send![backdrop.content_parent, addSubview: settings_view];
     release_obj(settings_view);
     *PANEL_EDGE.lock().unwrap() =
-        crate::glass::install_panel_bevel(&backdrop, crate::glass::PANEL_CORNER_RADIUS);
+        crate::glass::install_hud_bevel(&backdrop, crate::glass::PANEL_CORNER_RADIUS);
     *PANEL_BACKDROP.lock().unwrap() = Some(backdrop);
     release_obj(badge_container);
     release_obj(grip_view);
@@ -2934,6 +2933,16 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
     let Some(backdrop) = installed_backdrop() else {
         return false;
     };
+    let Some(edge) = *PANEL_EDGE.lock().unwrap() else {
+        return false;
+    };
+    let Some(edge_class) = objc2::runtime::AnyClass::get(c"OhMyTabHudBevel") else {
+        return false;
+    };
+    let hud_edge: bool = msg_send![edge.0, isKindOfClass: edge_class];
+    if !hud_edge {
+        return false;
+    }
     let Some(material) = backdrop.material_root else {
         return false;
     };
@@ -2950,7 +2959,7 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
             return false;
         };
         // Content clips independently so the native glass edge can extend outside its bounds.
-        let glass_is_hosted: bool = view_contains_subview(root, glass.0);
+        let glass_is_hosted: bool = view_contains_subview(material.0, glass.0);
         let is_glass: bool = msg_send![root, isKindOfClass: glass_class];
         let radius: f64 = msg_send![glass.0, cornerRadius];
         let style: i64 = msg_send![glass.0, style];
@@ -3356,7 +3365,7 @@ pub(super) unsafe fn apply_backdrop_material() {
         hud_backdrop_options(),
     );
     *PANEL_EDGE.lock().unwrap() =
-        crate::glass::install_panel_bevel(&new, crate::glass::PANEL_CORNER_RADIUS);
+        crate::glass::install_hud_bevel(&new, crate::glass::PANEL_CORNER_RADIUS);
     *PANEL_BACKDROP.lock().unwrap() = Some(new);
     apply_glass_properties();
 }

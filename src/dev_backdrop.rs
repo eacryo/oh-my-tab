@@ -10,6 +10,7 @@
 //! structure and loses its high-frequency energy; a surface covered by a fill keeps neither. The A2
 //! instrument (`scripts/e2e/lib/png_stats.py --hf-retention`) reads exactly that difference, and
 //! `panel-contrast.sh` uses it as the gate that a hierarchy change must not break the blur.
+//! `--panel-backdrop=image:/absolute/path` supplies a reference image at a level below floating panels.
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
@@ -128,6 +129,36 @@ pub(crate) unsafe fn show_texture() {
         (frame.size.width * scale).round() as i64,
         (frame.size.height * scale).round() as i64
     );
+}
+
+/// Place a reference image below floating panels without activating another application.
+pub(crate) unsafe fn show_image(path: &str) {
+    let name = crate::ffi::make_nsstring(path);
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithContentsOfFile: name];
+    crate::ffi::CFRelease(name as *const c_void);
+    if image.is_null() {
+        crate::log_info!("[dev-backdrop] image could not be loaded");
+        return;
+    }
+    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+    let frame: NSRect = msg_send![screen, frame];
+    let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+    let window: *mut AnyObject = msg_send![window, initWithContentRect: frame,
+        styleMask: 0u64, backing: 2u64, defer: false];
+    let _: () = msg_send![window, setReleasedWhenClosed: false];
+    let _: () = msg_send![window, setLevel: 1isize];
+    let _: () = msg_send![window, setIgnoresMouseEvents: true];
+    let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let view: *mut AnyObject = msg_send![view, initWithFrame:
+        NSRect::new(objc2_foundation::NSPoint::new(0.0, 0.0), frame.size)];
+    let _: () = msg_send![view, setImage: image];
+    let _: () = msg_send![view, setImageScaling: 1isize];
+    let _: () = msg_send![window, setContentView: view];
+    crate::ffi::release_obj(image);
+    crate::ffi::release_obj(view);
+    let _: () = msg_send![window, orderFrontRegardless];
+    crate::log_info!("[dev-backdrop] image backdrop up");
 }
 
 #[cfg(test)]

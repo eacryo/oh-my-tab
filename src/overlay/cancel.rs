@@ -821,8 +821,6 @@ pub(crate) const fn switcher_backdrop_options() -> crate::glass::BackdropOptions
     // app's content is.
     crate::glass::BackdropOptions::new(None)
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
-        // Share the configured glass style and native edge with the clipboard picker.
-        .with_blur(0.0, 1.0)
         .with_native_glass_edge()
 }
 
@@ -941,21 +939,26 @@ pub(crate) unsafe fn apply_glass_properties() {
     let Some(backdrop) = *OVERLAY_BACKDROP.lock().unwrap() else {
         return;
     };
-    crate::glass::apply_live_properties(backdrop, switcher_backdrop_options());
-    let Some(root) = backdrop.root else {
+    let Some(root) = backdrop.glass.or(backdrop.material_root) else {
         return;
     };
     let radius = CONFIG.read().unwrap().appearance.corner_radius;
     if backdrop.glass.is_some() {
         let _: () = msg_send![root.0, setCornerRadius: radius];
     }
-    // Mirror the layer hard-clip: the glass cornerRadius rounds the tint but not the blur, so
-    // masksToBounds is needed to clip the blur into the rounded shape (see (6.5) notes).
+    // Clip content separately from the native glass edge; the shadow carrier must never clip.
     let root_layer: *mut AnyObject = msg_send![root.0, layer];
     if !root_layer.is_null() {
         let _: () = msg_send![root_layer, setCornerRadius: radius];
-        let _: () = msg_send![root_layer, setMasksToBounds: true];
+        let _: () = msg_send![root_layer, setMasksToBounds: backdrop.glass.is_none()];
     }
+    if backdrop.glass.is_some() {
+        let content_layer: *mut AnyObject = msg_send![backdrop.content_parent, layer];
+        if !content_layer.is_null() {
+            let _: () = msg_send![content_layer, setCornerRadius: radius];
+        }
+    }
+    crate::glass::apply_live_properties(backdrop, switcher_backdrop_options());
 }
 
 /// Bring the switcher's backdrop in line with the effective material. Called when the

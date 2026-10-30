@@ -4008,7 +4008,9 @@ pub fn run() {
         // (the A2 scenario `scripts/e2e/panel-contrast.sh` needs that to be repeatable). `texture` is the
         // patterned form: a flat tone cannot tell a live blur from an opaque fill that covers the texture.
         if let Some(shade) = crate::dev_flags::value("panel-backdrop") {
-            if shade.trim().eq_ignore_ascii_case("texture") {
+            if let Some(path) = shade.strip_prefix("image:") {
+                dev_backdrop::show_image(path);
+            } else if shade.trim().eq_ignore_ascii_case("texture") {
                 dev_backdrop::show_texture();
             } else {
                 show_dev_backdrop(&shade);

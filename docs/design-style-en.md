@@ -302,8 +302,10 @@ glass clips itself) and a border on any of them inherits that structure's behavi
 contract is shared; only the implementation is material-specific where a material forces it.
 
 The clipboard picker, switcher and keystroke HUD follow the configured regular/clear glass style,
-both when created and during live settings changes. They use no additional blur underlay, so the edge
-can be compared with the header's native glass shells. Live property refreshes preserve the system's
+both when created and during live settings changes. Clear uses a 54pt owned Gaussian blur underlay
+with saturation 1.78 to soften background detail while retaining large color regions. Regular keeps
+native blur only. A stable, non-clipping material host lets live changes reuse or remove that one named
+underlay without replacing content or changing system-owned filters. Live property refreshes preserve the system's
 variant; private variant overrides are development-only and explicitly requested.
 The picker's rounded clip applies to its content view, leaving the system glass layer unmasked
 so the native edge can extend beyond its bounds.
@@ -325,6 +327,11 @@ shadow. In regular mode its passive glass uses `HUD_GLASS_COMPENSATION_LIGHT` (w
 saved position and edge margin. Clear mode makes this compensation veil transparent in both themes
 so it cannot hide the material's transparency.
 
+The clear HUD's compact silhouette uses a stronger inner bevel (`HUD_CLEAR_EDGE_WIDTH`, 1.25pt,
+and `HUD_CLEAR_EDGE_HIGHLIGHT`, white at 88%) fading to the shared bottom shade. This keeps the lit
+top edge and rounded shoulders visible at its small size. Regular HUD and the larger panels retain
+the shared 0.5pt inner bevel; material color, shadow and hit testing are unchanged.
+
 **A panel's surface is its material, and the ink carries the contrast.** No panel paints a text surface
 over its material: a surface only ever covered part of the panel, so it banded against the material
 everywhere else (measured on the clipboard picker in light mode, an idle row at `#F3F4F6` against the bare
@@ -339,16 +346,21 @@ backdrop and the panel's high-frequency energy compared against an uncovered con
 material-free cell inside the panel 1.000, a plain translucent overlay 0.43,
 `NSVisualEffectView(.hudWindow)` 0.19): every `NSGlassEffectView` configuration collapses that energy to
 0.000-0.003 -- every variant, `regular`/`clear`, glass as the window's content view or as a subview, tinted
-or not, key or non-key panel, same-process and cross-process backdrops. **Blur is therefore neither a knob
-nor a differentiator.** The looks are:
+or not, key or non-key panel, same-process and cross-process backdrops. **That fine-texture result does not measure the readability of larger background text.**
+Clear now adds the owned 54pt blur described above. The looks are:
 
 | Look | `style` | Tint |
 | --- | --- | --- |
-| `regular` (default) | `.regular` (0) | `glass_tint`, applied verbatim |
-| `clear` | `.clear` (1) | the same tint; the clear style is what makes it read lighter |
+| `regular` (default) | `.regular` (0) | Light `#EEEEEE66`, dark `#1C1C1E99` |
+| `clear` | `.clear` (1) | Light transparent tint plus the reference gradient; dark `#1C1C1E33` |
 
-`glass_tint` is `RRGGBBAA` and its alpha *is* the strength knob (there is no separate opacity setting). It
-applies to **light mode**; dark mode takes a fixed dark tint (`#1C1C1E99`) instead. That split is measured,
+Tint is `RRGGBBAA`; alpha controls the neutral veil while text and controls remain fully opaque.
+Regular retains the measured per-mode tints. Clear uses lighter per-mode tints to follow the reference
+image's colored, softly blurred surface. In light clear, the shared 148-degree white-to-warm gradient
+(`FROST_VEIL_STOPS`) supplies the reference's highlight instead of a flat gray tint; it is unique,
+removed in regular/dark mode, and excluded when material swaps carry content forward. These are design
+inputs, not new contrast measurements. The
+regular mode's light/dark split is measured,
 not taste: with no text surface on the panel the ink sits on the glass itself, and the light tint in dark mode
 leaves the surface mid-grey, where the palette's caption ink cannot exceed 2.07:1. With the dark tint the same
 cell measures 9.93:1 on a black backdrop and 6.00:1 on a white one
@@ -836,3 +848,7 @@ no shadow, and a surface that needs `low` gets a new token rather than a literal
 The medium elevation is represented in `theme.rs` by one shared black shadow color, opacity, blur
 radius, and vertical offset. Use those constants for both dropdowns and tooltips. The high level is
 represented the same way (`ELEVATION_HIGH_*`), and the floating panels use it: the switcher, the
+
+The development-only `--panel-backdrop=image:/absolute/path` fixture displays a supplied reference image
+below floating panels without changing the desktop wallpaper or activating another app. It is removed
+when that development instance stops.
