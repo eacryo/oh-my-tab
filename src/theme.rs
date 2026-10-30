@@ -241,6 +241,19 @@ pub(crate) const RADIUS_CONTROL: f64 = 8.0;
 pub(crate) const RADIUS_CARD: f64 = 12.0;
 pub(crate) const RADIUS_PANEL: f64 = 18.0;
 pub(crate) const RADIUS_FULL: f64 = 9999.0;
+pub(crate) const CLIPBOARD_EDGE_OUTER_WIDTH: f64 = 0.5;
+pub(crate) const CLIPBOARD_EDGE_INNER_WIDTH: f64 = 0.5;
+pub(crate) const CLIPBOARD_EDGE_OUTSET: f64 = 0.5;
+pub(crate) const CLIPBOARD_EDGE_OUTER_LIGHT: u32 = 0x00000045;
+pub(crate) const CLIPBOARD_EDGE_OUTER_DARK: u32 = 0x00000045;
+pub(crate) const CLIPBOARD_EDGE_HIGHLIGHT: u32 = 0xFFFFFF70;
+pub(crate) const CLIPBOARD_EDGE_SHADE: u32 = 0xFFFFFF18;
+pub(crate) const CLIPBOARD_CONTACT_SHADOW: Elevation = Elevation {
+    color: 0x000000FF,
+    opacity: 0.18,
+    radius: 8.0,
+    offset_y: -2.0,
+};
 /// Corner radius of a shortcut legend's chip (the clipboard footer's key symbols). The chip is
 /// a grouping aid, not a control: `radius-control` is sized for 32pt controls and reads as a
 /// pill on a small chip, so the chip derives its radius from its own height.

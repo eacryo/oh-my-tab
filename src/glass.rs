@@ -146,6 +146,8 @@ pub(crate) struct BackdropOptions {
     /// The glass view's `NSGlassEffectViewStyle` when this panel picks its own (`clear` is 1),
     /// `None` to follow the configured `glass_style`.
     pub(crate) glass_style: Option<i64>,
+    /// Keep the native effect's edge outside the content clip.
+    pub(crate) native_glass_edge: bool,
 }
 
 impl BackdropOptions {
@@ -156,6 +158,7 @@ impl BackdropOptions {
             elevation: None,
             blur: None,
             glass_style: None,
+            native_glass_edge: false,
         }
     }
 
@@ -177,6 +180,11 @@ impl BackdropOptions {
     /// Per-panel glass style (`NSGlassEffectViewStyle`; `clear` is 1): the same scoping as `with_blur`.
     pub(crate) const fn with_glass_style(mut self, style: i64) -> Self {
         self.glass_style = Some(style);
+        self
+    }
+
+    pub(crate) const fn with_native_glass_edge(mut self) -> Self {
+        self.native_glass_edge = true;
         self
     }
 }
@@ -354,6 +362,7 @@ pub(crate) fn effective_material_id() -> &'static str {
 
 #[derive(Clone, Copy)]
 pub(crate) struct InstalledBackdrop {
+    native_glass_edge: bool,
     /// The material this backdrop was built for; show-time syncs compare it against
     /// `PanelMaterial::effective()` to pick up Reduce Transparency and config changes.
     pub(crate) material: PanelMaterial,
@@ -523,14 +532,18 @@ unsafe fn build_backdrop(
             };
 
             let _: () = msg_send![glass, setContentView: content];
-            // Layer-backed and self-clipped. Dropping this (an experiment to see whether the mask was what
-            // suppressed the backdrop blur) made the panel's top edge get cut off inside the window, so it
-            // is restored; the blur has to be chased without touching the glass's layer.
+            // Clip application content independently of the system's edge rendering.
             let _: () = msg_send![glass, setWantsLayer: true];
             let glass_layer: *mut AnyObject = msg_send![glass, layer];
             if !glass_layer.is_null() {
                 let _: () = msg_send![glass_layer, setCornerRadius: corner_radius];
-                let _: () = msg_send![glass_layer, setMasksToBounds: true];
+                let _: () = msg_send![glass_layer, setMasksToBounds: !options.native_glass_edge];
+            }
+            if options.native_glass_edge {
+                let _: () = msg_send![content, setWantsLayer: true];
+                let layer: *mut AnyObject = msg_send![content, layer];
+                let _: () = msg_send![layer, setCornerRadius: corner_radius];
+                let _: () = msg_send![layer, setMasksToBounds: true];
             }
             if let Some(host) = embedded_host {
                 let _: () = msg_send![host, addSubview: root];
@@ -541,6 +554,7 @@ unsafe fn build_backdrop(
             }
             release_obj(glass);
             InstalledBackdrop {
+                native_glass_edge: options.native_glass_edge,
                 material: PanelMaterial::LiquidGlass,
                 content_parent: content,
                 // The behind-window blur that gives the glass something sampled to sit on; the glass is
@@ -603,6 +617,7 @@ unsafe fn build_backdrop(
             }
             release_obj(root);
             InstalledBackdrop {
+                native_glass_edge: false,
                 material: PanelMaterial::Backdrop,
                 content_parent: content,
                 root: Some(ObjPtr::new(root)),
@@ -648,6 +663,7 @@ unsafe fn build_backdrop(
             }
             release_obj(effect);
             InstalledBackdrop {
+                native_glass_edge: false,
                 material: PanelMaterial::Frost,
                 content_parent: effect,
                 root: Some(ObjPtr::new(effect)),
@@ -675,6 +691,7 @@ unsafe fn build_backdrop(
             }
             release_obj(plain);
             InstalledBackdrop {
+                native_glass_edge: false,
                 material: PanelMaterial::Opaque,
                 content_parent: plain,
                 root: Some(ObjPtr::new(plain)),
@@ -1156,7 +1173,7 @@ struct CarrierGeometry {
     /// shadow-path API to state it through. A sublayer AppKit never created is never touched, and it can
     /// carry the explicit rounded path the translucent material needs. Held as an address because this map is
     /// shared across threads and a raw pointer is not `Send`; the carrier's layer owns the sublayer.
-    shadow_layer: usize,
+    shadow_layers: [usize; 2],
 }
 
 static CARRIER_GEOMETRY: std::sync::LazyLock<
@@ -1191,32 +1208,34 @@ fn carrier_class() -> *mut AnyObject {
 /// Give the carrier a rounded-rect shadow path covering the *panel* inside it, in the carrier's own
 /// coordinates. The padding is already outside that rect, so it is never expanded again here.
 unsafe fn sync_carrier_shadow_path(carrier: *mut AnyObject) {
-    let Some((shadow_layer, radius, insets)) = CARRIER_GEOMETRY
+    let Some((shadow_layers, radius, insets)) = CARRIER_GEOMETRY
         .lock()
         .unwrap()
         .get(&(carrier as usize))
-        .map(|geometry| (geometry.shadow_layer, geometry.radius, geometry.insets))
+        .map(|geometry| (geometry.shadow_layers, geometry.radius, geometry.insets))
     else {
         return;
     };
-    let shadow_layer = shadow_layer as *mut AnyObject;
     let bounds: NSRect = msg_send![carrier, bounds];
-    // The sublayer tracks the carrier itself; the path below is the panel inside it.
-    let _: () = msg_send![shadow_layer, setFrame: bounds];
-    let layer = shadow_layer;
-    let panel = crate::theme::panel_rect_in_window(bounds.size, insets);
-    // The layer copies the path, so each layout pass replaces it and leaks nothing (see
-    // `ffi::layer_set_rounded_shadow_path`).
-    crate::ffi::layer_set_rounded_shadow_path(
-        layer,
-        crate::ffi::CGRect {
-            x: panel.origin.x,
-            y: panel.origin.y,
-            w: panel.size.width,
-            h: panel.size.height,
-        },
-        radius,
-    );
+    for address in shadow_layers.into_iter().filter(|address| *address != 0) {
+        let shadow_layer = address as *mut AnyObject;
+        // The sublayer tracks the carrier itself; the path below is the panel inside it.
+        let _: () = msg_send![shadow_layer, setFrame: bounds];
+        let layer = shadow_layer;
+        let panel = crate::theme::panel_rect_in_window(bounds.size, insets);
+        // The layer copies the path, so each layout pass replaces it and leaks nothing (see
+        // `ffi::layer_set_rounded_shadow_path`).
+        crate::ffi::layer_set_rounded_shadow_path(
+            layer,
+            crate::ffi::CGRect {
+                x: panel.origin.x,
+                y: panel.origin.y,
+                w: panel.size.width,
+                h: panel.size.height,
+            },
+            radius,
+        );
+    }
 }
 
 /// Drop a retired carrier's geometry entry. Called when a material swap replaces the carrier: a swap builds
@@ -1234,15 +1253,17 @@ extern "C" fn carrier_layout(_self: *mut AnyObject, _cmd: Sel) {
 
 extern "C" fn carrier_drop_shadow(_self: *mut AnyObject, _cmd: Sel, _sender: *mut AnyObject) {
     crate::callback_guard::void("carrier_drop_shadow", || unsafe {
-        let Some(shadow_layer) = CARRIER_GEOMETRY
+        let Some(shadow_layers) = CARRIER_GEOMETRY
             .lock()
             .unwrap()
             .get(&(_self as usize))
-            .map(|geometry| geometry.shadow_layer)
+            .map(|geometry| geometry.shadow_layers)
         else {
             return;
         };
-        let _: () = msg_send![shadow_layer as *mut AnyObject, setShadowOpacity: 0.0f32];
+        for address in shadow_layers.into_iter().filter(|address| *address != 0) {
+            let _: () = msg_send![address as *mut AnyObject, setShadowOpacity: 0.0f32];
+        }
     });
 }
 
@@ -1253,6 +1274,7 @@ unsafe fn wrap_in_shadow_carrier(
     panel_frame: NSRect,
     level: crate::theme::Elevation,
     corner_radius: f64,
+    contact_shadow: bool,
 ) -> *mut AnyObject {
     let insets = crate::theme::elevation_insets(level);
     let padded = crate::theme::window_frame_for_panel(panel_frame, insets);
@@ -1277,7 +1299,7 @@ unsafe fn wrap_in_shadow_carrier(
         CarrierGeometry {
             radius: corner_radius,
             insets,
-            shadow_layer: shadow_layer as usize,
+            shadow_layers: [shadow_layer as usize, 0],
         },
     );
     layer_set_shadow_color(layer, hex_to_cg_color(level.color));
@@ -1291,6 +1313,21 @@ unsafe fn wrap_in_shadow_carrier(
     // hidden by the material inside the panel and visible only in the padding.
     let _: () = msg_send![carrier_layer, insertSublayer: shadow_layer, atIndex: 0u32];
     release_obj(shadow_layer);
+    if contact_shadow {
+        let contact = crate::theme::CLIPBOARD_CONTACT_SHADOW;
+        let layer: *mut AnyObject = msg_send![class!(CALayer), layer];
+        layer_set_shadow_color(layer, hex_to_cg_color(contact.color));
+        let _: () = msg_send![layer, setShadowOpacity: contact.opacity];
+        let _: () = msg_send![layer, setShadowRadius: contact.radius];
+        let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, contact.offset_y)];
+        let _: () = msg_send![carrier_layer, insertSublayer: layer, atIndex: 0u32];
+        CARRIER_GEOMETRY
+            .lock()
+            .unwrap()
+            .get_mut(&(carrier as usize))
+            .unwrap()
+            .shadow_layers[1] = layer as usize;
+    }
     // The material keeps the panel rect inside the padding, so every coordinate the panel's content uses
     // (relative to the material) is unchanged by the carrier's existence.
     let _: () = msg_send![
@@ -1340,8 +1377,15 @@ fn install_shadow_carrier(
     let Some(material_root) = backdrop.material_root else {
         return no_padding;
     };
-    let carrier =
-        unsafe { wrap_in_shadow_carrier(material_root.0, panel_frame, level, corner_radius) };
+    let carrier = unsafe {
+        wrap_in_shadow_carrier(
+            material_root.0,
+            panel_frame,
+            level,
+            corner_radius,
+            options.native_glass_edge && backdrop.material == PanelMaterial::LiquidGlass,
+        )
+    };
     if carrier.is_null() {
         crate::log_info!(
             "[panel-shadow] the carrier could not be created; the panel keeps its material without one"
@@ -1435,7 +1479,7 @@ pub(crate) unsafe fn carrier_shadow_path_rect(
         .lock()
         .unwrap()
         .get(&(carrier.0 as usize))
-        .map(|geometry| geometry.shadow_layer)?;
+        .map(|geometry| geometry.shadow_layers[0])?;
     let layer = shadow_layer as *mut AnyObject;
     let path = crate::ffi::layer_shadow_path(layer);
     if path.is_null() {
@@ -1595,8 +1639,8 @@ pub(crate) unsafe fn swap_backdrop(
 /// after the view sits in a window (see the build_backdrop note); re-assert it on the
 /// hosted view. No-op for the other materials.
 unsafe fn reassert_glass_layer_clip(backdrop: &InstalledBackdrop, corner_radius: f64) {
-    // The glass clips itself (its own layer); the container above it deliberately does not, because the
-    // variants draw their edge outside the glass bounds and a clipping container cut the panel's top off.
+    // Preserve the per-surface clip policy after hosting: native edges remain outside
+    // the content clip, while older surfaces retain their existing glass-layer clip.
     if let Some(root) = backdrop.root {
         let _: () = msg_send![root.0, setWantsLayer: true];
     }
@@ -1605,7 +1649,7 @@ unsafe fn reassert_glass_layer_clip(backdrop: &InstalledBackdrop, corner_radius:
         let glass_layer: *mut AnyObject = msg_send![glass.0, layer];
         if !glass_layer.is_null() {
             let _: () = msg_send![glass_layer, setCornerRadius: corner_radius];
-            let _: () = msg_send![glass_layer, setMasksToBounds: true];
+            let _: () = msg_send![glass_layer, setMasksToBounds: !backdrop.native_glass_edge];
         }
     }
 }
@@ -1616,22 +1660,22 @@ unsafe fn reassert_glass_layer_clip(backdrop: &InstalledBackdrop, corner_radius:
 pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options: BackdropOptions) {
     let style: i64 = options.glass_style.unwrap_or_else(|| {
         match crate::config::effective_glass_style().as_str() {
-        // Only `clear` takes the system's clear material (this app's historical clear look, and the
-        // thinnest of the three). `system` takes the system's *regular* material and adds no tint of
-        // ours, i.e. the glass exactly as the system draws it.
-        //
-        // It used to be `clear` + no tint, which made "System default" the *most* transparent option.
-        // That cannot be right for a setting whose reference is macOS's own Command+Tab panel: a
-        // screenshot comparison puts that panel at least as substantial as our regular look, and a
-        // pixel metric could not settle the difference (the same glass strip measured a text-contrast
-        // attenuation anywhere between alpha 0.28 and 0.65 depending on where it was sampled, because
-        // the two screenshots are separate captures at different scales). The ladder is therefore set by
-        // principle: system (regular, system tint only) < regular (regular + our floored tint) <
-        // clear (clear + our floored tint), and any further tuning needs a controlled A/B -- both looks
-        // rendered in one screenshot over the same backdrop -- rather than screenshot forensics.
-        "clear" => 1,
-        _ => 0,
-    }
+            // Only `clear` takes the system's clear material (this app's historical clear look, and the
+            // thinnest of the three). `system` takes the system's *regular* material and adds no tint of
+            // ours, i.e. the glass exactly as the system draws it.
+            //
+            // It used to be `clear` + no tint, which made "System default" the *most* transparent option.
+            // That cannot be right for a setting whose reference is macOS's own Command+Tab panel: a
+            // screenshot comparison puts that panel at least as substantial as our regular look, and a
+            // pixel metric could not settle the difference (the same glass strip measured a text-contrast
+            // attenuation anywhere between alpha 0.28 and 0.65 depending on where it was sampled, because
+            // the two screenshots are separate captures at different scales). The ladder is therefore set by
+            // principle: system (regular, system tint only) < regular (regular + our floored tint) <
+            // clear (clear + our floored tint), and any further tuning needs a controlled A/B -- both looks
+            // rendered in one screenshot over the same backdrop -- rather than screenshot forensics.
+            "clear" => 1,
+            _ => 0,
+        }
     });
     let tuning = MaterialTuning::effective();
     let tint_hex = resolved_glass_tint_hex();
@@ -1642,12 +1686,16 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         let _: () = msg_send![glass.0, setAlphaValue: tuning.opacity];
         let blur_radius = options.blur.map_or(tuning.blur_radius, |(r, _)| r);
         let blur_saturation = options.blur.map_or(tuning.saturation, |(_, s)| s);
-        let variant = if blur_radius > 0.0 {
-            19
-        } else {
-            tuning.variant
-        };
-        apply_glass_variant(glass.0, variant);
+        // Match construction: live refreshes must preserve the system variant unless
+        // the private development override was explicitly requested.
+        if crate::dev_flags::value("glass-variant").is_some() {
+            let variant = if blur_radius > 0.0 {
+                19
+            } else {
+                tuning.variant
+            };
+            apply_glass_variant(glass.0, variant);
+        }
         // The blur underlay belongs on the material hierarchy, not on the window's content view: with a
         // shadow carrier installed the content view is the carrier, and `apply_blur_underlay` inserts a
         // backdrop layer into whatever it is given.

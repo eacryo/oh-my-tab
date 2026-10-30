@@ -119,7 +119,8 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
         return;
     }
     let hovered = SEARCH_CLEAR_HOVERED.load(Ordering::SeqCst);
-    let clear_x = cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W - 14.0;
+    let clear_x =
+        cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W - 14.0;
     let clear_rect = NSRect::new(
         NSPoint::new(
             clear_x,

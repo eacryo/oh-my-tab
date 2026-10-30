@@ -3,6 +3,8 @@
 use super::*;
 use crate::callback_guard;
 
+static PICKER_EDGE: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+
 /// Whether the pinned picker has lost key status and needs to counter Liquid Glass's passive look.
 static PICKER_GLASS_INACTIVE: AtomicBool = AtomicBool::new(false);
 
@@ -1193,10 +1195,11 @@ pub(crate) fn picker_backdrop_options() -> crate::glass::BackdropOptions {
     // Liquid Glass treatment only while a pinned picker is non-key.
     crate::glass::BackdropOptions::new(Some(picker_inactive_compensation_alpha()))
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
-        // Regular style so the panel gets the same system-drawn edge the orbs
-        // get; the 30px/1.6 underlay keeps the backdrop rich under the frost.
+        // Match the header shells' native regular material. A nonzero blur override
+        // installs a private backdrop rather than leaving the system effect alone.
         .with_glass_style(0)
-        .with_blur(30.0, 1.6)
+        .with_blur(0.0, 1.0)
+        .with_native_glass_edge()
 }
 
 /// The detail panel is a passive companion of the picker, so its Liquid Glass takes the inactive
@@ -1213,6 +1216,9 @@ pub(crate) const fn detail_backdrop_options() -> crate::glass::BackdropOptions {
 /// During the settings live preview, update only the backdrop surfaces and detail
 /// compensation layer; do not rebuild clipboard content.
 pub(crate) unsafe fn apply_glass_properties() {
+    if let Some(edge) = *PICKER_EDGE.lock().unwrap() {
+        let _: () = msg_send![edge.0, setNeedsDisplay: true];
+    }
     if let Some(backdrop) = *PICKER_BACKDROP.lock().unwrap() {
         crate::glass::apply_live_properties(backdrop, picker_backdrop_options());
     }
@@ -1241,6 +1247,7 @@ pub(crate) unsafe fn apply_backdrop_material() {
         // The picker footer rebuild (locale/text-size changes) hangs content off this
         // pointer; a stale one would point into the retired hierarchy.
         *PICKER_CONTENT_PARENT.lock().unwrap() = Some(ObjPtr::new(new.content_parent));
+        install_picker_edge(new);
     }
     swap_backdrop_if_material_changed(&DETAIL_WINDOW, &DETAIL_BACKDROP, detail_backdrop_options());
     apply_glass_properties();
@@ -1325,6 +1332,88 @@ unsafe fn raw_class(
     })
 }
 
+extern "C" fn picker_edge_draw(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect) {
+    callback_guard::void("picker_edge_draw", || unsafe {
+        if crate::glass::PanelMaterial::effective() != crate::glass::PanelMaterial::LiquidGlass {
+            return;
+        }
+        use crate::theme::*;
+        let bounds: NSRect = msg_send![view, bounds];
+        let ring = |inset: f64, width: f64| -> *mut AnyObject {
+            let rounded = |inset: f64| -> *mut AnyObject {
+                let rect = NSRect::new(
+                    NSPoint::new(bounds.origin.x + inset, bounds.origin.y + inset),
+                    NSSize::new(
+                        (bounds.size.width - inset * 2.0).max(0.0),
+                        (bounds.size.height - inset * 2.0).max(0.0),
+                    ),
+                );
+                let radius = (super::PICKER_PANEL_RADIUS + CLIPBOARD_EDGE_OUTSET - inset).max(0.0);
+                msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: rect, xRadius: radius, yRadius: radius]
+            };
+            let path = rounded(inset);
+            let _: () = msg_send![path, appendBezierPath: rounded(inset + width)];
+            let _: () = msg_send![path, setWindingRule: 1isize];
+            path
+        };
+        let outer = ring(0.0, CLIPBOARD_EDGE_OUTER_WIDTH);
+        let color = crate::ffi::hex_to_ns_color(if clipboard_palette().dark {
+            CLIPBOARD_EDGE_OUTER_DARK
+        } else {
+            CLIPBOARD_EDGE_OUTER_LIGHT
+        });
+        let _: () = msg_send![color, setFill];
+        let _: () = msg_send![outer, fill];
+        let inner = ring(CLIPBOARD_EDGE_OUTER_WIDTH, CLIPBOARD_EDGE_INNER_WIDTH);
+        let gradient: *mut AnyObject = msg_send![class!(NSGradient), alloc];
+        let gradient: *mut AnyObject = msg_send![gradient,
+            initWithStartingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_SHADE),
+            endingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_HIGHLIGHT)
+        ];
+        let _: () = msg_send![gradient, drawInBezierPath: inner, angle: 90.0f64];
+        release_obj(gradient);
+    });
+}
+
+unsafe fn install_picker_edge(backdrop: crate::glass::InstalledBackdrop) {
+    // Keep the silhouette above the native effect, outside its content clip.
+    let parent = backdrop.root.unwrap().0;
+    let material = backdrop.material_root.unwrap().0;
+    let frame: NSRect = if parent == material {
+        msg_send![material, bounds]
+    } else {
+        msg_send![material, frame]
+    };
+    let outset = crate::theme::CLIPBOARD_EDGE_OUTSET;
+    let frame = NSRect::new(
+        NSPoint::new(frame.origin.x - outset, frame.origin.y - outset),
+        NSSize::new(
+            frame.size.width + outset * 2.0,
+            frame.size.height + outset * 2.0,
+        ),
+    );
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    let cls = StaticClass::register_once(&CLASS, c"OhMyTabClipboardEdge", || {
+        crate::ffi::build_class(c"OhMyTabClipboardEdge", class!(NSView), |builder| {
+            builder.add_method::<AnyObject, _>(
+                sel!(drawRect:),
+                picker_edge_draw as extern "C" fn(*mut AnyObject, Sel, NSRect),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(hitTest:),
+                popover_decoration_hit_test
+                    as extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+            );
+        })
+    });
+    let edge: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, alloc];
+    let edge: *mut AnyObject = msg_send![edge, initWithFrame: frame];
+    let _: () = msg_send![edge, setAutoresizingMask: 18u64];
+    let _: () = msg_send![parent, addSubview: edge];
+    *PICKER_EDGE.lock().unwrap() = Some(ObjPtr::new(edge));
+    release_obj(edge);
+}
+
 pub(super) unsafe fn ensure_picker_window() {
     if PICKER_WINDOW.lock().unwrap().is_some() {
         return;
@@ -1407,43 +1496,14 @@ pub(super) unsafe fn ensure_picker_window() {
         let _: () = msg_send![veil, setAutoresizingMask: 18u64];
         let veil_layer: *mut AnyObject = msg_send![veil, layer];
         if !veil_layer.is_null() {
-            crate::ffi::layer_set_background(
-                veil_layer,
-                crate::ffi::hex_to_cg_color(0xFFFF_FF1F),
-            );
+            crate::ffi::layer_set_background(veil_layer, crate::ffi::hex_to_cg_color(0xFFFF_FF1F));
         }
         // The veil is the first subview installed, so a plain addSubview already
         // puts it under everything the panel builds afterwards.
         let _: () = msg_send![content_parent, addSubview: veil];
         release_obj(veil);
-
-        // A single bright hairline matching the search capsule's rim —
-        // nothing else: the earlier stacks (dark rings, fade bands, veil on
-        // top) are what read as a cream frame instead of an edge.
-        let rim: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let rim: *mut AnyObject = msg_send![
-            rim,
-            initWithFrame: NSRect::new(
-                NSPoint::new(0.5, 0.5),
-                NSSize::new(w - 1.0, h - 1.0)
-            )
-        ];
-        let _: () = msg_send![rim, setWantsLayer: true];
-        let _: () = msg_send![rim, setAutoresizingMask: 18u64];
-        let rim_layer: *mut AnyObject = msg_send![rim, layer];
-        if !rim_layer.is_null() {
-            let _: () = msg_send![rim_layer, setCornerRadius: super::PICKER_PANEL_RADIUS - 0.5];
-            // A slightly soft bright line — the capsule rim's read is a ~2px
-            // glow, not a 1px wire and not a band; no fades behind it.
-            let _: () = msg_send![rim_layer, setBorderWidth: 1.5f64];
-            crate::ffi::layer_set_border(
-                rim_layer,
-                crate::ffi::hex_to_cg_color(0xFFFF_FFA6),
-            );
-        }
-        let _: () = msg_send![content_parent, addSubview: rim];
-        release_obj(rim);
     }
+    install_picker_edge(backdrop);
 
     // Container (receives key events; flipped so rows stack top-down, newest on top).
     static CONTAINER_CLS: OnceLock<StaticClass> = OnceLock::new();
@@ -1534,41 +1594,15 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![container, setAutoresizingMask: 0u64];
     add_picker_hover_tracking(content_parent, container);
 
-    // A real frosted disc behind a header orb — the AppKit version of what the
-    // Metal orbs could only fake with stacked solids: an NSVisualEffectView's
-    // own behind-window blur clipped to the circle, an opaque white carrier
-    // underneath it that both lifts the milk and casts a free soft shadow.
-    /// A real vertical fade inside a rounded layer — the specular top edge and
-    /// inner bottom shade the mock's glass controls carry. `colors` runs from
-    /// the frame's top to its bottom.
-    unsafe fn add_fade(
-        parent_layer: *mut AnyObject,
-        frame: NSRect,
-        top: u32,
-        bottom: u32,
-    ) {
-        let g: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
-        let _: () = msg_send![g, setFrame: frame];
-        let colors: *mut AnyObject = msg_send![class!(NSMutableArray), array];
-        let _: () = msg_send![
-            colors,
-            addObject: crate::ffi::hex_to_cg_color(top) as *mut AnyObject
-        ];
-        let _: () = msg_send![
-            colors,
-            addObject: crate::ffi::hex_to_cg_color(bottom) as *mut AnyObject
-        ];
-        let _: () = msg_send![g, setColors: colors];
-        let _: () = msg_send![g, setStartPoint: NSPoint::new(0.5, 1.0)];
-        let _: () = msg_send![g, setEndPoint: NSPoint::new(0.5, 0.0)];
-        let _: () = msg_send![parent_layer, addSublayer: g];
-    }
-
     /// Wrap a header control in a real NSGlassEffectView — the system draws
     /// the glass body AND the edge specular itself, which is the look the
     /// stacked-quad approaches never reached. `radius` shapes it (orb circles
     /// use h/2, the capsule SEARCH_R). Pre-macOS-26 falls back to a hud VEV.
-    unsafe fn install_glass_chrome(host: *mut AnyObject, frame: NSRect, radius: f64) -> *mut AnyObject {
+    unsafe fn install_glass_chrome(
+        host: *mut AnyObject,
+        frame: NSRect,
+        radius: f64,
+    ) -> *mut AnyObject {
         if let Some(cls) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") {
             let glass: *mut AnyObject = msg_send![cls, alloc];
             let glass: *mut AnyObject = msg_send![glass, initWithFrame: frame];

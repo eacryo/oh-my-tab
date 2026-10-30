@@ -301,6 +301,22 @@ on the material itself, because the three material views differ (frost carries a
 glass clips itself) and a border on any of them inherits that structure's behaviour. The *visual*
 contract is shared; only the implementation is material-specific where a material forces it.
 
+The clipboard picker uses native regular glass without an additional blur underlay, so its edge
+can be compared with the header's native glass shells. Live property refreshes preserve the system's
+variant; private variant overrides are development-only and explicitly requested.
+The picker's rounded clip applies to its content view, leaving the system glass layer unmasked
+so the native edge can extend beyond its bounds.
+For the clipboard picker, a narrow drawn bevel supplements that native edge: `CLIPBOARD_EDGE_*`
+tokens define a 0.5pt dark outer ring and a 0.5pt inner gradient from `#FFFFFF18` at the bottom to
+`#FFFFFF70` at the top. The outer ring is `#00000045` in both modes. The decoration sits on the
+outer carrier, extending 0.5pt beyond the material so the native highlight cannot cover the dark silhouette.
+These are design inputs, not measured contrast results (`rg 'CLIPBOARD_EDGE_' src/theme.rs`).
+The decoration ignores hit testing and draws only on Liquid Glass; frost and opaque keep the shared outline.
+The picker also supplements the broad high-elevation shadow with `CLIPBOARD_CONTACT_SHADOW`:
+black at 0.18 opacity, 8pt radius, offset 2pt down. It shares the carrier's rounded path and resize lifecycle,
+and is disabled together with the elevation shadow. This closer shadow defines the edge against the desktop
+without widening the bright rim (`rg -A5 'const CLIPBOARD_CONTACT_SHADOW' src/theme.rs`).
+
 **A panel's surface is its material, and the ink carries the contrast.** No panel paints a text surface
 over its material: a surface only ever covered part of the panel, so it banded against the material
 everywhere else (measured on the clipboard picker in light mode, an idle row at `#F3F4F6` against the bare
