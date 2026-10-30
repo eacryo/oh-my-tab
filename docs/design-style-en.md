@@ -301,7 +301,8 @@ on the material itself, because the three material views differ (frost carries a
 glass clips itself) and a border on any of them inherits that structure's behaviour. The *visual*
 contract is shared; only the implementation is material-specific where a material forces it.
 
-The clipboard picker uses native regular glass without an additional blur underlay, so its edge
+The clipboard picker, switcher and keystroke HUD follow the configured regular/clear glass style,
+both when created and during live settings changes. They use no additional blur underlay, so the edge
 can be compared with the header's native glass shells. Live property refreshes preserve the system's
 variant; private variant overrides are development-only and explicitly requested.
 The picker's rounded clip applies to its content view, leaving the system glass layer unmasked
@@ -317,11 +318,12 @@ black at 0.18 opacity, 8pt radius, offset 2pt down. It shares the carrier's roun
 and is disabled together with the elevation shadow. This closer shadow defines the edge against the desktop
 without widening the bright rim (`rg -A5 'const CLIPBOARD_CONTACT_SHADOW' src/theme.rs`).
 
-The keystroke HUD shares the picker's regular glass, bevel decoration, high elevation and contact
-shadow. Its passive glass uses `HUD_GLASS_COMPENSATION_LIGHT` (white at 0xE8 alpha) or
+The keystroke HUD shares the picker's glass style, bevel decoration, high elevation and contact
+shadow. In regular mode its passive glass uses `HUD_GLASS_COMPENSATION_LIGHT` (white at 0xE8 alpha) or
 `HUD_GLASS_COMPENSATION_DARK` (`#1C1C1E` at 0x99) to match the active picker's surface. It keeps its compact
 16pt corner radius; shadow padding may extend beyond the screen while the visible panel retains its
-saved position and edge margin.
+saved position and edge margin. Clear mode makes this compensation veil transparent in both themes
+so it cannot hide the material's transparency.
 
 **A panel's surface is its material, and the ink carries the contrast.** No panel paints a text surface
 over its material: a surface only ever covered part of the panel, so it banded against the material

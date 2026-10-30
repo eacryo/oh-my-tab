@@ -821,10 +821,7 @@ pub(crate) const fn switcher_backdrop_options() -> crate::glass::BackdropOptions
     // app's content is.
     crate::glass::BackdropOptions::new(None)
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
-        // Match the picker's regular glass: a style of our own would render the two panels
-        // differently for no product reason. A nonzero blur installs a private backdrop rather
-        // than leaving the system effect alone, and the native edge keeps the system's specular.
-        .with_glass_style(0)
+        // Share the configured glass style and native edge with the clipboard picker.
         .with_blur(0.0, 1.0)
         .with_native_glass_edge()
 }

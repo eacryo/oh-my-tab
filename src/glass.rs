@@ -145,9 +145,6 @@ pub(crate) struct BackdropOptions {
     /// The blur underlay's `(radius, saturation)` when this panel tunes its own, `None` to follow the
     /// global `glass-blur`/`glass-saturation` tuning.
     pub(crate) blur: Option<(f64, f64)>,
-    /// The glass view's `NSGlassEffectViewStyle` when this panel picks its own (`clear` is 1),
-    /// `None` to follow the configured `glass_style`.
-    pub(crate) glass_style: Option<i64>,
     /// Keep the native effect's edge outside the content clip.
     pub(crate) native_glass_edge: bool,
 }
@@ -160,7 +157,6 @@ impl BackdropOptions {
             compensation_tint: None,
             elevation: None,
             blur: None,
-            glass_style: None,
             native_glass_edge: false,
         }
     }
@@ -177,12 +173,6 @@ impl BackdropOptions {
     /// would otherwise share.
     pub(crate) const fn with_blur(mut self, radius: f64, saturation: f64) -> Self {
         self.blur = Some((radius, saturation));
-        self
-    }
-
-    /// Per-panel glass style (`NSGlassEffectViewStyle`; `clear` is 1): the same scoping as `with_blur`.
-    pub(crate) const fn with_glass_style(mut self, style: i64) -> Self {
-        self.glass_style = Some(style);
         self
     }
 
@@ -423,9 +413,7 @@ unsafe fn build_backdrop(
             let tint = hex_to_ns_color(tint_hex);
             let _: () = msg_send![
                 glass,
-                setStyle: options.glass_style.unwrap_or_else(|| {
-                    glass_style_index(&crate::config::effective_glass_style())
-                })
+                setStyle: glass_style_index(&crate::config::effective_glass_style())
             ];
             let _: () = msg_send![glass, setTintColor: tint];
             let _: () = msg_send![glass, setAlphaValue: tuning.opacity];
@@ -1804,25 +1792,7 @@ unsafe fn reassert_glass_layer_clip(backdrop: &InstalledBackdrop, corner_radius:
 /// frost material (theme), and the opaque surface color (theme). Structural material
 /// changes go through `swap_backdrop` instead.
 pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options: BackdropOptions) {
-    let style: i64 = options.glass_style.unwrap_or_else(|| {
-        match crate::config::effective_glass_style().as_str() {
-            // Only `clear` takes the system's clear material (this app's historical clear look, and the
-            // thinnest of the three). `system` takes the system's *regular* material and adds no tint of
-            // ours, i.e. the glass exactly as the system draws it.
-            //
-            // It used to be `clear` + no tint, which made "System default" the *most* transparent option.
-            // That cannot be right for a setting whose reference is macOS's own Command+Tab panel: a
-            // screenshot comparison puts that panel at least as substantial as our regular look, and a
-            // pixel metric could not settle the difference (the same glass strip measured a text-contrast
-            // attenuation anywhere between alpha 0.28 and 0.65 depending on where it was sampled, because
-            // the two screenshots are separate captures at different scales). The ladder is therefore set by
-            // principle: system (regular, system tint only) < regular (regular + our floored tint) <
-            // clear (clear + our floored tint), and any further tuning needs a controlled A/B -- both looks
-            // rendered in one screenshot over the same backdrop -- rather than screenshot forensics.
-            "clear" => 1,
-            _ => 0,
-        }
-    });
+    let style = glass_style_index(&crate::config::effective_glass_style());
     let tuning = MaterialTuning::effective();
     let tint_hex = resolved_glass_tint_hex();
     let tint = hex_to_ns_color(tint_hex);

@@ -159,17 +159,29 @@ static PANEL_EDGE: MainThreadSlot<Option<crate::ffi::ObjPtr>> =
 
 /// The HUD never becomes key; compensate its passive glass to match the active clipboard surface.
 pub(crate) fn hud_backdrop_options() -> crate::glass::BackdropOptions {
-    let tint = if crate::theme::resolved_is_dark() {
+    let tint = hud_compensation_tint(
+        &crate::config::effective_glass_style(),
+        crate::theme::resolved_is_dark(),
+    );
+    crate::glass::BackdropOptions::new(Some(tint & 0xFF))
+        .with_compensation_tint(tint)
+        .with_elevation(Some(crate::theme::ELEVATION_HIGH))
+        .with_blur(0.0, 1.0)
+        .with_native_glass_edge()
+}
+
+fn hud_compensation_tint(style: &str, dark: bool) -> u32 {
+    let tint = if dark {
         crate::theme::HUD_GLASS_COMPENSATION_DARK
     } else {
         crate::theme::HUD_GLASS_COMPENSATION_LIGHT
     };
-    crate::glass::BackdropOptions::new(Some(tint & 0xFF))
-        .with_compensation_tint(tint)
-        .with_elevation(Some(crate::theme::ELEVATION_HIGH))
-        .with_glass_style(0)
-        .with_blur(0.0, 1.0)
-        .with_native_glass_edge()
+    // Clear glass must remain translucent; the regular look alone needs the passive lift.
+    if crate::glass::glass_style_index(style) == 1 {
+        tint & 0xFFFF_FF00
+    } else {
+        tint
+    }
 }
 
 // Layout and dragging already clamp the visible panel to its screen. AppKit must not clamp the
@@ -2941,6 +2953,9 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         let glass_is_hosted: bool = view_contains_subview(root, glass.0);
         let is_glass: bool = msg_send![root, isKindOfClass: glass_class];
         let radius: f64 = msg_send![glass.0, cornerRadius];
+        let style: i64 = msg_send![glass.0, style];
+        let style_matches =
+            style == crate::glass::glass_style_index(&crate::config::effective_glass_style());
         let glass_layer: *mut AnyObject = msg_send![glass.0, layer];
         let glass_clips: bool = !glass_layer.is_null() && msg_send![glass_layer, masksToBounds];
         // Whatever hosts the glass must not **clip**. The panel's top edge was once cut off by a plain,
@@ -2975,6 +2990,7 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         let fill_is_child = view_contains_subview(inner, fill.0);
         let badges_are_child = view_contains_subview(inner, badge_container);
         (is_glass || glass_is_hosted)
+            && style_matches
             && !glass_clips
             && wrapper_ok
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
@@ -4065,6 +4081,21 @@ mod tests {
         estimated_badge_width, estimated_stream_width, BadgeKind, KEYCAP_RAIL_W,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn clear_glass_removes_the_passive_veil_in_both_themes() {
+        for (dark, regular) in [
+            (false, crate::theme::HUD_GLASS_COMPENSATION_LIGHT),
+            (true, crate::theme::HUD_GLASS_COMPENSATION_DARK),
+        ] {
+            assert_eq!(super::hud_compensation_tint("regular", dark), regular);
+            assert_eq!(super::hud_compensation_tint("clear", dark) & 0xFF, 0);
+            assert_eq!(
+                super::hud_compensation_tint("clear", dark) >> 8,
+                regular >> 8
+            );
+        }
+    }
 
     #[test]
     fn dragging_clamps_the_visible_panel_on_the_pointers_screen() {

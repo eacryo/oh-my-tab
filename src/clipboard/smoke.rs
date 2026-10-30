@@ -348,6 +348,29 @@ pub(crate) fn smoke_runner() -> bool {
     unsafe {
         let backdrop = (*PICKER_BACKDROP.lock().unwrap())
             .expect("the picker's backdrop exists once the picker has been shown");
+        if let Some(glass) = backdrop.glass {
+            let expected =
+                || crate::glass::glass_style_index(&crate::config::effective_glass_style());
+            let installed: i64 = msg_send![glass.0, style];
+            assert_eq!(
+                installed,
+                expected(),
+                "initial picker style must follow settings"
+            );
+            let original = CONFIG.read().unwrap().appearance.glass_style.clone();
+            for style in ["regular", "clear", "regular"] {
+                CONFIG.write().unwrap().appearance.glass_style = style.into();
+                crate::glass::apply_live_properties(backdrop, detail::picker_backdrop_options());
+                let installed: i64 = msg_send![glass.0, style];
+                assert_eq!(
+                    installed,
+                    expected(),
+                    "live picker style must follow settings"
+                );
+            }
+            CONFIG.write().unwrap().appearance.glass_style = original;
+            crate::glass::apply_live_properties(backdrop, detail::picker_backdrop_options());
+        }
         let expected = crate::glass::panel_outline_enabled()
             && backdrop.material != crate::glass::PanelMaterial::LiquidGlass
             && backdrop.material_root.is_some();
