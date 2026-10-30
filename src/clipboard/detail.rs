@@ -1216,6 +1216,10 @@ pub(crate) const fn detail_backdrop_options() -> crate::glass::BackdropOptions {
 /// During the settings live preview, update only the backdrop surfaces and detail
 /// compensation layer; do not rebuild clipboard content.
 pub(crate) unsafe fn apply_glass_properties() {
+    // The header chrome's shells are material-specific: a swap or a theme change that moved the
+    // effective material re-wraps them (a no-op when nothing changed, which keeps the frequent
+    // inactive-compensation calls cheap).
+    refresh_picker_header_chrome_if_material_changed();
     if let Some(edge) = *PICKER_EDGE.lock().unwrap() {
         let _: () = msg_send![edge.0, setNeedsDisplay: true];
     }
@@ -1414,6 +1418,151 @@ unsafe fn install_picker_edge(backdrop: crate::glass::InstalledBackdrop) {
     release_obj(edge);
 }
 
+/// Wrap a header control in a real NSGlassEffectView — the system draws the glass body AND the
+/// edge specular itself, which is the look the stacked-quad approaches never reached. Liquid
+/// Glass only: under any other material the chrome must not be a liquid-glass disc. `radius`
+/// shapes it (orb circles use h/2, the capsule SEARCH_R). Frost/backdrop and pre-macOS-26 fall
+/// back to a hud VEV; opaque needs no shell at all because the controls paint their own fills.
+/// A null return means "host the control directly" (on top of the VEV the fallback installed).
+unsafe fn install_glass_chrome(host: *mut AnyObject, frame: NSRect, radius: f64) -> *mut AnyObject {
+    let material = crate::glass::PanelMaterial::effective();
+    if material == crate::glass::PanelMaterial::Opaque {
+        return std::ptr::null_mut();
+    }
+    if material == crate::glass::PanelMaterial::LiquidGlass {
+        if let Some(cls) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") {
+            let glass: *mut AnyObject = msg_send![cls, alloc];
+            let glass: *mut AnyObject = msg_send![glass, initWithFrame: frame];
+            let _: () = msg_send![glass, setCornerRadius: radius];
+            return glass;
+        }
+    }
+    let effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
+    let effect: *mut AnyObject = msg_send![effect, initWithFrame: frame];
+    let _: () = msg_send![effect, setBlendingMode: 0u64];
+    let _: () = msg_send![effect, setMaterial: 13i64];
+    let _: () = msg_send![effect, setState: 1u64];
+    let _: () = msg_send![effect, setWantsLayer: true];
+    let effect_layer: *mut AnyObject = msg_send![effect, layer];
+    if !effect_layer.is_null() {
+        let _: () = msg_send![effect_layer, setCornerRadius: radius];
+        let _: () = msg_send![effect_layer, setMasksToBounds: true];
+    }
+    let _: () = msg_send![host, addSubview: effect];
+    release_obj(effect);
+    std::ptr::null_mut()
+}
+
+/// Put `button` inside the chrome shell `install_glass_chrome` picks for the effective material
+/// (its contentView under Liquid Glass, or directly on the host above the fallback surface).
+unsafe fn install_orb_glass(host: *mut AnyObject, frame: NSRect, button: *mut AnyObject) {
+    let glass = install_glass_chrome(host, frame, frame.size.height / 2.0);
+    if !glass.is_null() {
+        let _: () = msg_send![button, setAutoresizingMask: 18u64];
+        let _: () = msg_send![glass, setContentView: button];
+        let _: () = msg_send![host, addSubview: glass];
+        release_obj(glass);
+    } else {
+        // A direct strip child carries the frame itself; under glass the contentView fills it.
+        let _: () = msg_send![button, setFrame: frame];
+        let _: () = msg_send![host, addSubview: button];
+    }
+}
+
+/// The search capsule's equivalent of `install_orb_glass`: the surface fills the glass's
+/// contentView under Liquid Glass and sits at `frame` directly under every other material.
+unsafe fn install_search_glass(host: *mut AnyObject, frame: NSRect, surface: *mut AnyObject) {
+    let glass = install_glass_chrome(host, frame, SEARCH_R);
+    if !glass.is_null() {
+        let _: () = msg_send![surface, setAutoresizingMask: 18u64];
+        let _: () = msg_send![
+            surface,
+            setFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
+        ];
+        let _: () = msg_send![glass, setContentView: surface];
+        let _: () = msg_send![host, addSubview: glass];
+        release_obj(glass);
+    } else {
+        let _: () = msg_send![surface, setFrame: frame];
+        let _: () = msg_send![host, addSubview: surface];
+    }
+}
+
+/// The material the picker's header chrome was built for (255 = unset), so a material swap can
+/// re-wrap the shells instead of leaving liquid-glass discs on a frost or opaque panel.
+static PICKER_CHROME_MATERIAL: AtomicU8 = AtomicU8::new(255);
+
+/// Re-wrap the header chrome in the shell the effective material wants. `swap_backdrop`
+/// reparents panel content as-is, so shells built for the old material would otherwise survive
+/// a material switch. The guard makes the frequent `apply_glass_properties` calls cheap no-ops
+/// when nothing changed.
+unsafe fn refresh_picker_header_chrome_if_material_changed() {
+    let material = material_cache_key_for(crate::glass::PanelMaterial::effective());
+    if PICKER_CHROME_MATERIAL.swap(material, Ordering::SeqCst) == material {
+        return;
+    }
+    let Some(strip) = *PICKER_HEADER_STRIP.lock().unwrap() else {
+        return;
+    };
+    // The strip children worth keeping: the four wrapped controls and the two unwrapped buttons.
+    // Retained across the teardown because removeFromSuperview releases the view -- the shell's
+    // release alone could dealloc a wrapped control.
+    let keep = [
+        *SEARCH_FIELD_SURFACE.lock().unwrap(),
+        *PICKER_OPTIONS_ORB.lock().unwrap(),
+        *PICKER_PIN_BUTTON.lock().unwrap(),
+        *PICKER_PAUSE_BUTTON.lock().unwrap(),
+        *SEARCH_CLEAR_BUTTON.lock().unwrap(),
+        *PICKER_CLOSE_BUTTON.lock().unwrap(),
+    ];
+    for view in keep.iter().flatten() {
+        CFRetain(view.0 as *const c_void);
+    }
+    let subviews: *mut AnyObject = msg_send![strip.0, subviews];
+    let count: usize = msg_send![subviews, count];
+    for index in (0..count).rev() {
+        let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+        let _: () = msg_send![child, removeFromSuperview];
+    }
+    let strip_bounds: NSRect = msg_send![strip.0, bounds];
+    let (search_frame, pause_frame, options_frame, pin_frame, _) =
+        picker_header_frames_for(strip_bounds.size.width);
+    // The build order: search capsule, the unwrapped pair, then the three orbs.
+    if let Some(surface) = *SEARCH_FIELD_SURFACE.lock().unwrap() {
+        install_search_glass(strip.0, search_frame, surface.0);
+    }
+    for button in [
+        *SEARCH_CLEAR_BUTTON.lock().unwrap(),
+        *PICKER_CLOSE_BUTTON.lock().unwrap(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        let _: () = msg_send![strip.0, addSubview: button.0];
+    }
+    for (button, frame) in [
+        (*PICKER_OPTIONS_ORB.lock().unwrap(), options_frame),
+        (*PICKER_PIN_BUTTON.lock().unwrap(), pin_frame),
+        (*PICKER_PAUSE_BUTTON.lock().unwrap(), pause_frame),
+    ] {
+        if let Some(button) = button {
+            install_orb_glass(strip.0, frame, button.0);
+        }
+    }
+    for view in keep.iter().flatten() {
+        CFRelease(view.0 as *const c_void);
+    }
+}
+
+/// The material the picker's chrome was just built with; `ensure_picker_window` records it so
+/// the first property pass does not re-wrap correct shells.
+fn note_picker_chrome_material() {
+    PICKER_CHROME_MATERIAL.store(
+        material_cache_key_for(crate::glass::PanelMaterial::effective()),
+        Ordering::SeqCst,
+    );
+}
+
 pub(super) unsafe fn ensure_picker_window() {
     if PICKER_WINDOW.lock().unwrap().is_some() {
         return;
@@ -1594,49 +1743,6 @@ pub(super) unsafe fn ensure_picker_window() {
     let _: () = msg_send![container, setAutoresizingMask: 0u64];
     add_picker_hover_tracking(content_parent, container);
 
-    /// Wrap a header control in a real NSGlassEffectView — the system draws
-    /// the glass body AND the edge specular itself, which is the look the
-    /// stacked-quad approaches never reached. `radius` shapes it (orb circles
-    /// use h/2, the capsule SEARCH_R). Pre-macOS-26 falls back to a hud VEV.
-    unsafe fn install_glass_chrome(
-        host: *mut AnyObject,
-        frame: NSRect,
-        radius: f64,
-    ) -> *mut AnyObject {
-        if let Some(cls) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") {
-            let glass: *mut AnyObject = msg_send![cls, alloc];
-            let glass: *mut AnyObject = msg_send![glass, initWithFrame: frame];
-            let _: () = msg_send![glass, setCornerRadius: radius];
-            return glass;
-        }
-        let effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
-        let effect: *mut AnyObject = msg_send![effect, initWithFrame: frame];
-        let _: () = msg_send![effect, setBlendingMode: 0u64];
-        let _: () = msg_send![effect, setMaterial: 13i64];
-        let _: () = msg_send![effect, setState: 1u64];
-        let _: () = msg_send![effect, setWantsLayer: true];
-        let effect_layer: *mut AnyObject = msg_send![effect, layer];
-        if !effect_layer.is_null() {
-            let _: () = msg_send![effect_layer, setCornerRadius: radius];
-            let _: () = msg_send![effect_layer, setMasksToBounds: true];
-        }
-        let _: () = msg_send![host, addSubview: effect];
-        release_obj(effect);
-        std::ptr::null_mut()
-    }
-
-    unsafe fn install_orb_glass(host: *mut AnyObject, frame: NSRect, button: *mut AnyObject) {
-        let glass = install_glass_chrome(host, frame, frame.size.height / 2.0);
-        if !glass.is_null() {
-            let _: () = msg_send![button, setAutoresizingMask: 18u64];
-            let _: () = msg_send![glass, setContentView: button];
-            let _: () = msg_send![host, addSubview: glass];
-            release_obj(glass);
-        } else {
-            let _: () = msg_send![host, addSubview: button];
-        }
-    }
-
     // A fixed header strip holding the search field + the clear button; it does NOT scroll
     // with the list (scrolling text used to bleed through the translucent tiles). Flipped so
     // the search/clear frames work unchanged.
@@ -1810,14 +1916,7 @@ pub(super) unsafe fn ensure_picker_window() {
         );
         // No drop shadow — the capsule reads as an inset well, not a raised pill.
     }
-    let search_glass = install_glass_chrome(header_strip, search_frame, SEARCH_R);
-    if !search_glass.is_null() {
-        let _: () = msg_send![search_glass, setContentView: search_surface];
-        let _: () = msg_send![header_strip, addSubview: search_glass];
-        release_obj(search_glass);
-    } else {
-        let _: () = msg_send![header_strip, addSubview: search_surface];
-    }
+    install_search_glass(header_strip, search_frame, search_surface);
     release_obj(search_surface);
     *SEARCH_FIELD_SURFACE.lock().unwrap() = Some(ObjPtr::new(search_surface));
 
@@ -2162,6 +2261,7 @@ pub(super) unsafe fn ensure_picker_window() {
     CFRelease(become_key_name as *const c_void);
     *PICKER_CONTAINER.lock().unwrap() = Some(ObjPtr::new(container));
     *PICKER_WINDOW.lock().unwrap() = Some(ObjPtr::new(window));
+    note_picker_chrome_material();
 }
 
 /// Per-row build counters accumulated for the slow-path log (same accounting as before).
