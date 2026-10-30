@@ -317,6 +317,12 @@ black at 0.18 opacity, 8pt radius, offset 2pt down. It shares the carrier's roun
 and is disabled together with the elevation shadow. This closer shadow defines the edge against the desktop
 without widening the bright rim (`rg -A5 'const CLIPBOARD_CONTACT_SHADOW' src/theme.rs`).
 
+The keystroke HUD shares the picker's regular glass, bevel decoration, high elevation and contact
+shadow. Its passive glass uses `HUD_GLASS_COMPENSATION_LIGHT` (white at 0xE8 alpha) or
+`HUD_GLASS_COMPENSATION_DARK` (`#1C1C1E` at 0x99) to match the active picker's surface. It keeps its compact
+16pt corner radius; shadow padding may extend beyond the screen while the visible panel retains its
+saved position and edge margin.
+
 **A panel's surface is its material, and the ink carries the contrast.** No panel paints a text surface
 over its material: a surface only ever covered part of the panel, so it banded against the material
 everywhere else (measured on the clipboard picker in light mode, an idle row at `#F3F4F6` against the bare

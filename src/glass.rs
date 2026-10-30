@@ -135,6 +135,8 @@ const FROST_MATERIAL_LIGHT: i64 = 13; // hudWindow
 pub(crate) struct BackdropOptions {
     /// Liquid Glass darkens in passive panels; this alpha matches the clipboard detail panel.
     pub(crate) compensation_alpha: Option<u32>,
+    /// Optional RGB for passive compensation when the panel never becomes key.
+    pub(crate) compensation_tint: Option<u32>,
     /// The panel's declared elevation. `None` means the panel casts no shadow, and no shadow carrier is
     /// built at all -- so the material keeps the hierarchy it had before the carrier existed, which is
     /// what makes `--panel-shadow=off` a true baseline for the blur-retention measurement rather than a
@@ -155,6 +157,7 @@ impl BackdropOptions {
     pub(crate) const fn new(compensation_alpha: Option<u32>) -> Self {
         Self {
             compensation_alpha,
+            compensation_tint: None,
             elevation: None,
             blur: None,
             glass_style: None,
@@ -185,6 +188,11 @@ impl BackdropOptions {
 
     pub(crate) const fn with_native_glass_edge(mut self) -> Self {
         self.native_glass_edge = true;
+        self
+    }
+
+    pub(crate) const fn with_compensation_tint(mut self, tint: u32) -> Self {
+        self.compensation_tint = Some(tint);
         self
     }
 }
@@ -522,7 +530,11 @@ unsafe fn build_backdrop(
                 )];
                 let _: () = msg_send![fill, setWantsLayer: true];
                 let fill_layer: *mut AnyObject = msg_send![fill, layer];
-                set_compensation_tint(fill_layer, tint_hex, alpha);
+                set_compensation_tint(
+                    fill_layer,
+                    options.compensation_tint.unwrap_or(tint_hex),
+                    alpha,
+                );
                 let _: () = msg_send![fill, setAutoresizingMask: 18u64];
                 let _: () = msg_send![content, addSubview: fill];
                 release_obj(fill);
@@ -1406,10 +1418,109 @@ pub(crate) unsafe fn adopt_window_root(window: *mut AnyObject, root: *mut AnyObj
     let _: () = msg_send![window, setContentView: root];
     // `owned` is true only for the carrier: every material branch already released its own `alloc`
     // reference inside `build_backdrop`, so releasing the material root here would over-release a view the
-    // window still holds (the no-carrier path, i.e. the HUD and `--panel-shadow=off`).
+    // window still holds (the no-carrier path, e.g. `--panel-shadow=off`).
     if owned {
         release_obj(root);
     }
+}
+
+extern "C" fn panel_bevel_draw(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect) {
+    crate::callback_guard::void("panel_bevel_draw", || unsafe {
+        if crate::glass::PanelMaterial::effective() != crate::glass::PanelMaterial::LiquidGlass {
+            return;
+        }
+        use crate::theme::*;
+        let bounds: NSRect = msg_send![view, bounds];
+        let layer: *mut AnyObject = msg_send![view, layer];
+        let panel_radius: f64 = msg_send![layer, cornerRadius];
+        let ring = |inset: f64, width: f64| -> *mut AnyObject {
+            let rounded = |inset: f64| -> *mut AnyObject {
+                let rect = NSRect::new(
+                    NSPoint::new(bounds.origin.x + inset, bounds.origin.y + inset),
+                    NSSize::new(
+                        (bounds.size.width - inset * 2.0).max(0.0),
+                        (bounds.size.height - inset * 2.0).max(0.0),
+                    ),
+                );
+                let radius = (panel_radius + CLIPBOARD_EDGE_OUTSET - inset).max(0.0);
+                msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: rect, xRadius: radius, yRadius: radius]
+            };
+            let path = rounded(inset);
+            let _: () = msg_send![path, appendBezierPath: rounded(inset + width)];
+            let _: () = msg_send![path, setWindingRule: 1isize];
+            path
+        };
+        let outer = ring(0.0, CLIPBOARD_EDGE_OUTER_WIDTH);
+        let color = crate::ffi::hex_to_ns_color(if crate::theme::ui_palette().dark {
+            CLIPBOARD_EDGE_OUTER_DARK
+        } else {
+            CLIPBOARD_EDGE_OUTER_LIGHT
+        });
+        let _: () = msg_send![color, setFill];
+        let _: () = msg_send![outer, fill];
+        let inner = ring(CLIPBOARD_EDGE_OUTER_WIDTH, CLIPBOARD_EDGE_INNER_WIDTH);
+        let gradient: *mut AnyObject = msg_send![class!(NSGradient), alloc];
+        let gradient: *mut AnyObject = msg_send![gradient,
+            initWithStartingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_SHADE),
+            endingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_HIGHLIGHT)
+        ];
+        let _: () = msg_send![gradient, drawInBezierPath: inner, angle: 90.0f64];
+        release_obj(gradient);
+    });
+}
+
+extern "C" fn panel_bevel_hit_test(
+    _view: *mut AnyObject,
+    _cmd: Sel,
+    _point: NSPoint,
+) -> *mut AnyObject {
+    crate::callback_guard::nil("panel_bevel_hit_test", std::ptr::null_mut)
+}
+
+/// Install the shared clipboard bevel outside the native material clip.
+pub(crate) unsafe fn install_panel_bevel(
+    backdrop: &InstalledBackdrop,
+    radius: f64,
+) -> Option<ObjPtr> {
+    // Keep the silhouette above the native effect, outside its content clip.
+    let parent = backdrop.root?.0;
+    let material = backdrop.material_root?.0;
+    let frame: NSRect = if parent == material {
+        msg_send![material, bounds]
+    } else {
+        msg_send![material, frame]
+    };
+    let outset = crate::theme::CLIPBOARD_EDGE_OUTSET;
+    let frame = NSRect::new(
+        NSPoint::new(frame.origin.x - outset, frame.origin.y - outset),
+        NSSize::new(
+            frame.size.width + outset * 2.0,
+            frame.size.height + outset * 2.0,
+        ),
+    );
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    let cls = crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabPanelBevel", || {
+        crate::ffi::build_class(c"OhMyTabPanelBevel", class!(NSView), |builder| {
+            builder.add_method::<AnyObject, _>(
+                sel!(drawRect:),
+                panel_bevel_draw as extern "C" fn(*mut AnyObject, Sel, NSRect),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(hitTest:),
+                panel_bevel_hit_test
+                    as extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+            );
+        })
+    });
+    let edge: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, alloc];
+    let edge: *mut AnyObject = msg_send![edge, initWithFrame: frame];
+    let _: () = msg_send![edge, setAutoresizingMask: 18u64];
+    let _: () = msg_send![parent, addSubview: edge];
+    let _: () = msg_send![edge, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![edge, layer];
+    let _: () = msg_send![layer, setCornerRadius: radius];
+    release_obj(edge);
+    Some(ObjPtr::new(edge))
 }
 
 /// Recolour an installed outline, e.g. after the system or configured appearance changed.
@@ -1570,13 +1681,15 @@ pub(crate) unsafe fn install_backdrop(
 ) -> InstalledBackdrop {
     let mut backdrop = build_backdrop(frame, corner_radius, options, None);
     let insets = install_shadow_carrier(&mut backdrop, frame, corner_radius, options);
+    // NSWindow resizes an adopted content view immediately. Pad the window first: a compact HUD
+    // can otherwise shrink its material to zero during adoption and lose its autoresizing margins.
+    remember_panel_insets(window, insets);
+    grow_window_for_insets(window, insets);
     adopt_window_root(
         window,
         backdrop.root.unwrap().0,
         carrier_installed(&backdrop),
     );
-    remember_panel_insets(window, insets);
-    grow_window_for_insets(window, insets);
     reassert_glass_layer_clip(&backdrop, corner_radius);
     backdrop.outline_view = install_panel_outline(&backdrop, corner_radius);
     backdrop
@@ -1761,7 +1874,11 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
     }
     if let Some(layer) = backdrop.compensation_layer {
         if let Some(alpha) = options.compensation_alpha {
-            set_compensation_tint(layer.0, tint_hex, alpha);
+            set_compensation_tint(
+                layer.0,
+                options.compensation_tint.unwrap_or(tint_hex),
+                alpha,
+            );
         }
     }
     // The outline is a palette token, not a material one, so it is the one decoration a live appearance

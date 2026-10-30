@@ -154,6 +154,53 @@ thread_local! {
 static PANEL_BACKDROP: MainThreadSlot<Option<crate::glass::InstalledBackdrop>> =
     unsafe { MainThreadSlot::new(None) };
 
+static PANEL_EDGE: MainThreadSlot<Option<crate::ffi::ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
+
+/// The HUD never becomes key; compensate its passive glass to match the active clipboard surface.
+pub(crate) fn hud_backdrop_options() -> crate::glass::BackdropOptions {
+    let tint = if crate::theme::resolved_is_dark() {
+        crate::theme::HUD_GLASS_COMPENSATION_DARK
+    } else {
+        crate::theme::HUD_GLASS_COMPENSATION_LIGHT
+    };
+    crate::glass::BackdropOptions::new(Some(tint & 0xFF))
+        .with_compensation_tint(tint)
+        .with_elevation(Some(crate::theme::ELEVATION_HIGH))
+        .with_glass_style(0)
+        .with_blur(0.0, 1.0)
+        .with_native_glass_edge()
+}
+
+// Layout and dragging already clamp the visible panel to its screen. AppKit must not clamp the
+// larger, transparent shadow window again: doing so moves a saved panel away from the screen edge.
+extern "C" fn hud_constrain_frame(
+    _window: *mut AnyObject,
+    _cmd: Sel,
+    frame: NSRect,
+    _screen: *mut AnyObject,
+) -> NSRect {
+    crate::callback_guard::value("hud_constrain_frame", frame, || frame)
+}
+
+fn hud_panel_class() -> *mut AnyObject {
+    static CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabKeystrokePanel", || {
+        crate::ffi::build_class(
+            c"OhMyTabKeystrokePanel",
+            class!(NSPanel),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(constrainFrameRect:toScreen:),
+                    hud_constrain_frame
+                        as extern "C" fn(*mut AnyObject, Sel, NSRect, *mut AnyObject) -> NSRect,
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
+}
+
 unsafe extern "C" fn timer_callback(_timer: event_tap::CFRunLoopTimerRef, _info: *mut c_void) {
     crate::callback_guard::void("keystroke_display_timer", super::timer_fired);
 }
@@ -434,6 +481,8 @@ fn drag_grip_to(point: NSPoint, now: Instant) {
                 ),
                 drag.initial_frame.size,
             );
+            let screens = unsafe { screen_geometries() };
+            let frame = clamp_drag_frame(frame, point, &screens);
             unsafe {
                 // The drag is in panel coordinates (the handle the user grabs is on the panel), so the same
                 // rect both starts and lands the drag whatever padding the window carries.
@@ -2499,7 +2548,7 @@ unsafe fn create_panel(
     } else {
         NSSize::new(64.0, PANEL_H)
     };
-    let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
+    let panel: *mut AnyObject = msg_send![hud_panel_class(), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
         initWithContentRect: NSRect::new(NSPoint::new(0.0, 0.0), provisional),
@@ -2511,12 +2560,7 @@ unsafe fn create_panel(
     apply_panel_appearance(panel);
     let _: () = msg_send![panel, setLevel: 3isize];
     let _: () = msg_send![panel, setOpaque: false];
-    // The HUD keeps its native window shadow: it is placed `PANEL_EDGE_MARGIN` (18pt) from the visible
-    // edge, and a `high`-level shadow needs ~64-76pt of window padding around the panel, which AppKit then
-    // constrains back into the visible area -- measured, that moved the panel by 26pt and changed the
-    // meaning of a saved position. Giving the HUD a carrier shadow is therefore a placement decision of its
-    // own, not part of the switcher/clipboard change (see docs/review-backlog.md).
-    let _: () = msg_send![panel, setHasShadow: true];
+    let _: () = msg_send![panel, setHasShadow: false];
     let _: () = msg_send![panel, setIgnoresMouseEvents: true];
     let _: () = msg_send![panel, setHidesOnDeactivate: false];
     let _: () = msg_send![panel, setReleasedWhenClosed: false];
@@ -2528,7 +2572,7 @@ unsafe fn create_panel(
         panel,
         local_frame,
         crate::glass::PANEL_CORNER_RADIUS,
-        crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA)),
+        hud_backdrop_options(),
     );
     let badge_container: *mut AnyObject = msg_send![class!(NSView), alloc];
     let badge_container: *mut AnyObject = msg_send![badge_container, initWithFrame: local_frame];
@@ -2558,6 +2602,8 @@ unsafe fn create_panel(
         make_settings_button(settings_button_frame(orientation, provisional));
     let _: () = msg_send![backdrop.content_parent, addSubview: settings_view];
     release_obj(settings_view);
+    *PANEL_EDGE.lock().unwrap() =
+        crate::glass::install_panel_bevel(&backdrop, crate::glass::PANEL_CORNER_RADIUS);
     *PANEL_BACKDROP.lock().unwrap() = Some(backdrop);
     release_obj(badge_container);
     release_obj(grip_view);
@@ -2876,12 +2922,22 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
     let Some(backdrop) = installed_backdrop() else {
         return false;
     };
+    let Some(material) = backdrop.material_root else {
+        return false;
+    };
+    let material_frame: NSRect = msg_send![material.0, frame];
+    let panel_frame = crate::glass::panel_frame_of(panel);
+    if (material_frame.size.width - panel_frame.size.width).abs() > 0.5
+        || (material_frame.size.height - panel_frame.size.height).abs() > 0.5
+    {
+        return false;
+    }
     let root: *mut AnyObject = msg_send![panel, contentView];
     if let Some(glass) = backdrop.glass {
         let Some(glass_class) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") else {
             return false;
         };
-        // The glass carries the rounded clip itself.
+        // Content clips independently so the native glass edge can extend outside its bounds.
         let glass_is_hosted: bool = view_contains_subview(root, glass.0);
         let is_glass: bool = msg_send![root, isKindOfClass: glass_class];
         let radius: f64 = msg_send![glass.0, cornerRadius];
@@ -2919,7 +2975,7 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         let fill_is_child = view_contains_subview(inner, fill.0);
         let badges_are_child = view_contains_subview(inner, badge_container);
         (is_glass || glass_is_hosted)
-            && glass_clips
+            && !glass_clips
             && wrapper_ok
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
             && !inner.is_null()
@@ -2930,7 +2986,8 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         // The blur-only surface: the window hosts the rounding root, and the child view below the content
         // must really carry a `CABackdropLayer` with filters on it -- a surface that only *looks* like it
         // has a blur would otherwise pass.
-        let root_layer: *mut AnyObject = msg_send![root, layer];
+        let material = backdrop.material_root.unwrap().0;
+        let root_layer: *mut AnyObject = msg_send![material, layer];
         let radius: f64 = if root_layer.is_null() {
             -1.0
         } else {
@@ -2957,10 +3014,11 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
                 }
             }
         }
-        let host_is_child = view_contains_subview(root, host.0);
+        let material_is_hosted = material == root || view_contains_subview(root, material);
+        let host_is_child = view_contains_subview(material, host.0);
         // The app's own contract for every material: the panel puts its content in `content_parent`, and
         // that in turn sits inside the view the window hosts.
-        let content_in_root = view_contains_subview(root, backdrop.content_parent);
+        let content_in_root = view_contains_subview(material, backdrop.content_parent);
         let badges_ok = view_contains_subview(backdrop.content_parent, badge_container);
         let radius_ok = (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01;
         if !(host_is_child && content_in_root && badges_ok && radius_ok && carries_blur) {
@@ -2968,7 +3026,13 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
                 "[smoke-backdrop] host_is_child={host_is_child} content_in_root={content_in_root} badges={badges_ok} radius={radius} radius_ok={radius_ok} blur={carries_blur}"
             );
         }
-        host_is_child && content_in_root && badges_ok && host.0 != root && radius_ok && carries_blur
+        material_is_hosted
+            && host_is_child
+            && content_in_root
+            && badges_ok
+            && host.0 != root
+            && radius_ok
+            && carries_blur
     } else if let Some(effect) = backdrop.effect_view {
         let Some(effect_class) = objc2::runtime::AnyClass::get(c"NSVisualEffectView") else {
             return false;
@@ -2979,15 +3043,15 @@ unsafe fn backdrop_structure_valid(panel: *mut AnyObject, badge_container: *mut 
         // The panel keeps the system blur as its surface; the keycaps carry the text (see
         // `neutral_keycap_surface`), and nothing else is drawn on it.
         //
-        // Every material installs its root view as the window's content view directly.
+        // The shadow carrier hosts the material without clipping its native edge.
         is_effect
-            && effect.0 == root
+            && (effect.0 == root || view_contains_subview(root, effect.0))
             && view_contains_subview(effect.0, badge_container)
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
     } else if let Some(plain) = backdrop.opaque_view {
         let plain_layer: *mut AnyObject = msg_send![plain.0, layer];
         let radius: f64 = msg_send![plain_layer, cornerRadius];
-        plain.0 == root
+        (plain.0 == root || view_contains_subview(root, plain.0))
             && view_contains_subview(plain.0, badge_container)
             && (radius - crate::glass::PANEL_CORNER_RADIUS).abs() < 0.01
     } else {
@@ -3052,10 +3116,10 @@ pub(super) unsafe fn apply_glass_properties() {
     let Some(backdrop) = installed_backdrop() else {
         return;
     };
-    crate::glass::apply_live_properties(
-        backdrop,
-        crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA)),
-    );
+    crate::glass::apply_live_properties(backdrop, hud_backdrop_options());
+    if let Some(edge) = *PANEL_EDGE.lock().unwrap() {
+        let _: () = msg_send![edge.0, setNeedsDisplay: true];
+    }
 }
 
 /// The frost material's blur is composited by the window server and ignores layer
@@ -3273,8 +3337,10 @@ pub(super) unsafe fn apply_backdrop_material() {
         &old,
         panel_rect,
         crate::glass::PANEL_CORNER_RADIUS,
-        crate::glass::BackdropOptions::new(Some(crate::glass::INACTIVE_GLASS_COMPENSATION_ALPHA)),
+        hud_backdrop_options(),
     );
+    *PANEL_EDGE.lock().unwrap() =
+        crate::glass::install_panel_bevel(&new, crate::glass::PANEL_CORNER_RADIUS);
     *PANEL_BACKDROP.lock().unwrap() = Some(new);
     apply_glass_properties();
 }
@@ -3880,6 +3946,20 @@ fn clamp_origin_to_visible(origin: NSPoint, size: NSSize, visible: NSRect) -> NS
     )
 }
 
+fn clamp_drag_frame(mut frame: NSRect, pointer: NSPoint, screens: &[ScreenGeometry]) -> NSRect {
+    let distance = |screen: &ScreenGeometry| {
+        let nearest = clamp_origin_to_visible(pointer, NSSize::new(0.0, 0.0), screen.frame);
+        (pointer.x - nearest.x).hypot(pointer.y - nearest.y)
+    };
+    if let Some(screen) = screens
+        .iter()
+        .min_by(|a, b| distance(a).total_cmp(&distance(b)))
+    {
+        frame.origin = clamp_origin_to_visible(frame.origin, frame.size, screen.visible_frame);
+    }
+    frame
+}
+
 /// The frame the panel takes when nothing has been dragged: centered on the edge named by
 /// `initial_position`, keeping `PANEL_EDGE_MARGIN` from that edge. `top`/`bottom` center
 /// horizontally, `left`/`right` center vertically, so the panel is always parallel to its edge.
@@ -3985,6 +4065,52 @@ mod tests {
         estimated_badge_width, estimated_stream_width, BadgeKind, KEYCAP_RAIL_W,
     };
     use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    #[test]
+    fn dragging_clamps_the_visible_panel_on_the_pointers_screen() {
+        let screens = virtual_screens();
+        let size = NSSize::new(420.0, 54.0);
+        for screen in &screens {
+            let visible = screen.visible_frame;
+            let pointer = NSPoint::new(
+                visible.origin.x + visible.size.width / 2.0,
+                visible.origin.y + visible.size.height / 2.0,
+            );
+            for origin in [
+                NSPoint::new(
+                    visible.origin.x - size.width,
+                    visible.origin.y - size.height,
+                ),
+                NSPoint::new(
+                    visible.origin.x + visible.size.width,
+                    visible.origin.y + visible.size.height,
+                ),
+            ] {
+                let frame = super::clamp_drag_frame(NSRect::new(origin, size), pointer, &screens);
+                assert!(frame.origin.x >= visible.origin.x);
+                assert!(frame.origin.y >= visible.origin.y);
+                assert!(frame.origin.x + size.width <= visible.origin.x + visible.size.width);
+                assert!(frame.origin.y + size.height <= visible.origin.y + visible.size.height);
+            }
+        }
+    }
+
+    #[test]
+    fn shadow_padding_does_not_move_a_panel_at_the_screen_edge() {
+        let panel = NSRect::new(NSPoint::new(18.0, 18.0), NSSize::new(420.0, 54.0));
+        let insets = crate::theme::elevation_insets(crate::theme::ELEVATION_HIGH);
+        let window = crate::theme::window_frame_for_panel(panel, insets);
+        assert!(window.origin.x < 0.0 && window.origin.y < 0.0);
+        let constrained = super::hud_constrain_frame(
+            std::ptr::null_mut(),
+            objc2::sel!(constrainFrameRect:toScreen:),
+            window,
+            std::ptr::null_mut(),
+        );
+        assert_eq!(constrained, window);
+        assert_eq!(constrained.origin.x + insets.left, panel.origin.x);
+        assert_eq!(constrained.origin.y + insets.bottom, panel.origin.y);
+    }
 
     #[test]
     fn max_extent_for_percent_scales_the_screen_and_keeps_a_usable_floor() {

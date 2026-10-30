@@ -1336,86 +1336,9 @@ unsafe fn raw_class(
     })
 }
 
-extern "C" fn picker_edge_draw(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect) {
-    callback_guard::void("picker_edge_draw", || unsafe {
-        if crate::glass::PanelMaterial::effective() != crate::glass::PanelMaterial::LiquidGlass {
-            return;
-        }
-        use crate::theme::*;
-        let bounds: NSRect = msg_send![view, bounds];
-        let ring = |inset: f64, width: f64| -> *mut AnyObject {
-            let rounded = |inset: f64| -> *mut AnyObject {
-                let rect = NSRect::new(
-                    NSPoint::new(bounds.origin.x + inset, bounds.origin.y + inset),
-                    NSSize::new(
-                        (bounds.size.width - inset * 2.0).max(0.0),
-                        (bounds.size.height - inset * 2.0).max(0.0),
-                    ),
-                );
-                let radius = (super::PICKER_PANEL_RADIUS + CLIPBOARD_EDGE_OUTSET - inset).max(0.0);
-                msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: rect, xRadius: radius, yRadius: radius]
-            };
-            let path = rounded(inset);
-            let _: () = msg_send![path, appendBezierPath: rounded(inset + width)];
-            let _: () = msg_send![path, setWindingRule: 1isize];
-            path
-        };
-        let outer = ring(0.0, CLIPBOARD_EDGE_OUTER_WIDTH);
-        let color = crate::ffi::hex_to_ns_color(if clipboard_palette().dark {
-            CLIPBOARD_EDGE_OUTER_DARK
-        } else {
-            CLIPBOARD_EDGE_OUTER_LIGHT
-        });
-        let _: () = msg_send![color, setFill];
-        let _: () = msg_send![outer, fill];
-        let inner = ring(CLIPBOARD_EDGE_OUTER_WIDTH, CLIPBOARD_EDGE_INNER_WIDTH);
-        let gradient: *mut AnyObject = msg_send![class!(NSGradient), alloc];
-        let gradient: *mut AnyObject = msg_send![gradient,
-            initWithStartingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_SHADE),
-            endingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_HIGHLIGHT)
-        ];
-        let _: () = msg_send![gradient, drawInBezierPath: inner, angle: 90.0f64];
-        release_obj(gradient);
-    });
-}
-
 unsafe fn install_picker_edge(backdrop: crate::glass::InstalledBackdrop) {
-    // Keep the silhouette above the native effect, outside its content clip.
-    let parent = backdrop.root.unwrap().0;
-    let material = backdrop.material_root.unwrap().0;
-    let frame: NSRect = if parent == material {
-        msg_send![material, bounds]
-    } else {
-        msg_send![material, frame]
-    };
-    let outset = crate::theme::CLIPBOARD_EDGE_OUTSET;
-    let frame = NSRect::new(
-        NSPoint::new(frame.origin.x - outset, frame.origin.y - outset),
-        NSSize::new(
-            frame.size.width + outset * 2.0,
-            frame.size.height + outset * 2.0,
-        ),
-    );
-    static CLASS: OnceLock<StaticClass> = OnceLock::new();
-    let cls = StaticClass::register_once(&CLASS, c"OhMyTabClipboardEdge", || {
-        crate::ffi::build_class(c"OhMyTabClipboardEdge", class!(NSView), |builder| {
-            builder.add_method::<AnyObject, _>(
-                sel!(drawRect:),
-                picker_edge_draw as extern "C" fn(*mut AnyObject, Sel, NSRect),
-            );
-            builder.add_method::<AnyObject, _>(
-                sel!(hitTest:),
-                popover_decoration_hit_test
-                    as extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
-            );
-        })
-    });
-    let edge: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, alloc];
-    let edge: *mut AnyObject = msg_send![edge, initWithFrame: frame];
-    let _: () = msg_send![edge, setAutoresizingMask: 18u64];
-    let _: () = msg_send![parent, addSubview: edge];
-    *PICKER_EDGE.lock().unwrap() = Some(ObjPtr::new(edge));
-    release_obj(edge);
+    *PICKER_EDGE.lock().unwrap() =
+        crate::glass::install_panel_bevel(&backdrop, super::PICKER_PANEL_RADIUS);
 }
 
 /// Wrap a header control in a real NSGlassEffectView — the system draws the glass body AND the

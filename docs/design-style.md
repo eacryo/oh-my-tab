@@ -261,6 +261,11 @@ disabled `#7E7B83` 3.52:1；primary `#1D1C1A` 14.41:1；secondary `#4F4C48` 7.23
 向下偏移 2pt。它共享 carrier 的圆角路径和缩放生命周期，并随 elevation 阴影一起禁用。
 这层近距离阴影用于分隔桌面与面板，不加宽亮边（`rg -A5 'const CLIPBOARD_CONTACT_SHADOW' src/theme.rs`）。
 
+按键显示浮条复用剪贴板的 regular 玻璃、细描边、high 层级和近距离阴影。非活动玻璃使用
+`HUD_GLASS_COMPENSATION_LIGHT`（白色、0xE8 alpha）或 `HUD_GLASS_COMPENSATION_DARK`（`#1C1C1E`、
+0x99 alpha）补偿，以贴近活动剪贴板的底色。浮条保留紧凑的 16pt 圆角；阴影留白允许延伸到屏幕外，
+可见面板仍保持保存的位置与屏幕边距。
+
 **承载对比度表的是「文字面」，不是材质。** 面板用两种方式之一满足下限，而这个选择正是三种材质能否互相
 区分的分界：
 

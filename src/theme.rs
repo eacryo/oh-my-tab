@@ -248,6 +248,10 @@ pub(crate) const CLIPBOARD_EDGE_OUTER_LIGHT: u32 = 0x00000045;
 pub(crate) const CLIPBOARD_EDGE_OUTER_DARK: u32 = 0x00000045;
 pub(crate) const CLIPBOARD_EDGE_HIGHLIGHT: u32 = 0xFFFFFF70;
 pub(crate) const CLIPBOARD_EDGE_SHADE: u32 = 0xFFFFFF18;
+/// Passive HUD glass needs a brighter veil than key-window glass in light mode.
+pub(crate) const HUD_GLASS_COMPENSATION_LIGHT: u32 = 0xFFFFFFE8;
+pub(crate) const HUD_GLASS_COMPENSATION_DARK: u32 = 0x1C1C1E99;
+
 pub(crate) const CLIPBOARD_CONTACT_SHADOW: Elevation = Elevation {
     color: 0x000000FF,
     opacity: 0.18,
