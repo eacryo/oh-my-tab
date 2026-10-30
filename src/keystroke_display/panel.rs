@@ -27,6 +27,15 @@ use crate::ffi::{MainThreadSlot, StaticClass};
 
 /// Panel extent across the stream: one badge plus this padding on each side (34 + 2*10).
 const PANEL_H: f64 = 54.0;
+/// A keycap chip's lift shadow: the 1pt border alone cannot separate a near-white chip from the
+/// bright glass interior, which is what read as a smudged edge; a slightly bottom-weighted shadow
+/// is the thicker-bottom-border cue every keycap reference uses to sell the physical key.
+const KEYCAP_SHADOW_OPACITY: f32 = 0.22;
+const KEYCAP_SHADOW_RADIUS: f64 = 2.0;
+const KEYCAP_SHADOW_OFFSET_Y: f64 = -1.5;
+/// The neutral keycap's edge in light mode: `card_border` (10% black) disappears on the bright
+/// interior; ~25% is the 0.5px ring that defines the chip's silhouette.
+const KEYCAP_BORDER_LIGHT: u32 = 0x2D28_2440;
 /// Padding on the panel's cross axis, i.e. above and below a row / either side of a column.
 const PANEL_CROSS_PADDING: f64 = 10.0;
 /// Distance kept from the screen edge the panel is anchored to.
@@ -175,13 +184,19 @@ fn hud_compensation_tint(style: &str, dark: bool) -> u32 {
     } else {
         crate::theme::HUD_GLASS_COMPENSATION_LIGHT
     };
-    // Clear glass must remain translucent; the regular look alone needs the passive lift.
+    // Clear glass must remain translucent, and the regular look only needs a partial lift:
+    // the full-strength veil covered the panel in an opaque fill, which is what read as "no
+    // glass" -- half strength brightens the passive dim while the material still shows through.
     if crate::glass::glass_style_index(style) == 1 {
         tint & 0xFFFF_FF00
     } else {
-        tint
+        (tint & 0xFFFF_FF00) | HUD_REGULAR_COMPENSATION_ALPHA
     }
 }
+
+/// The regular look's veil strength: enough to keep the bare panel from the passive murk,
+/// translucent enough that the glass still reads.
+const HUD_REGULAR_COMPENSATION_ALPHA: u32 = 0x60;
 
 // Layout and dragging already clamp the visible panel to its screen. AppKit must not clamp the
 // larger, transparent shadow window again: doing so moves a saved panel away from the screen edge.
@@ -3601,6 +3616,13 @@ unsafe fn rebuild_badges(
         // floors cannot depend on what the panel happens to cover (see `opaque_over`).
         layer_set_background(layer, hex_to_cg_color(background));
         layer_set_border(layer, hex_to_cg_color(border));
+        let _: () = msg_send![layer, setShadowOpacity: KEYCAP_SHADOW_OPACITY];
+        let _: () = msg_send![layer, setShadowRadius: KEYCAP_SHADOW_RADIUS];
+        let _: () = msg_send![
+            layer,
+            setShadowOffset: NSSize::new(0.0, KEYCAP_SHADOW_OFFSET_Y)
+        ];
+        crate::ffi::layer_set_shadow_color(layer, hex_to_cg_color(0x000000FF));
         if orientation.is_vertical() && badge.repeats > 1 {
             // A merged keycap in a column keeps its glyph in the top cap-height zone and
             // puts the count on its own small row below (non-flipped coordinates: the top
@@ -3691,6 +3713,8 @@ unsafe fn rebuild_badges(
 /// - **Light**: the card surface at 80% alpha composited to white on the near-white panel (1.05:1),
 ///   so the cap had no visible surface at all. The inset field surface reads at 1.12:1 there, and its
 ///   text measures 11.6:1 primary / 4.6:1 muted (the values the design doc records for light keycaps).
+///   The token is flattened onto white rather than card: the card-flattened value read as a murky
+///   mid-grey over the bright glass interior.
 /// - **Dark**: the same lighter inset surface dropped the cap's text to 9.77:1 primary and 4.00:1
 ///   muted, under the palette's 12:1 and 4.5:1 floors, because light text needs a *dark* cap. Dark
 ///   therefore keeps the card surface at 80% (12.67:1 / 5.19:1).
@@ -3698,9 +3722,12 @@ fn neutral_keycap_surface(palette: &crate::theme::UiPalette) -> (u32, u32) {
     if palette.dark {
         (palette.card_bg, palette.card_border)
     } else {
+        // Flatten onto white, not card: over the bright glass interior the card-flattened value
+        // landed as a warm mid-grey, which is the murk the HUD's chips were read as. The same ink
+        // wash on white keeps the family but lifts the face back to a keycap's light tone.
         (
-            opaque_over(palette.field_bg, palette.card_bg),
-            palette.card_border,
+            opaque_over(palette.field_bg, 0xFFFF_FFFF),
+            KEYCAP_BORDER_LIGHT,
         )
     }
 }
@@ -4305,14 +4332,18 @@ mod tests {
                 }
             }
             // The fill identity per mode (the choice this test documents).
-            assert_eq!(border, palette.card_border, "dark={dark}");
             if dark {
+                assert_eq!(border, palette.card_border);
                 assert_eq!(fill, palette.card_bg, "dark keycaps are the card surface");
             } else {
                 assert_eq!(
+                    border, KEYCAP_BORDER_LIGHT,
+                    "light keycaps carry their own edge: card_border disappears on the bright panel"
+                );
+                assert_eq!(
                     fill,
-                    opaque_over(palette.field_bg, palette.card_bg),
-                    "light keycaps use the inset surface, flattened"
+                    opaque_over(palette.field_bg, 0xFFFF_FFFF),
+                    "light keycaps use the inset surface flattened onto white"
                 );
             }
             // Every chip is opaque, which is what makes the text floors independent of the panel
