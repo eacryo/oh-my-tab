@@ -70,11 +70,13 @@ unsafe fn draw_search_keycap(cell_frame: NSRect) {
     }
     let chip_w = 25.0;
     let chip_h = 18.0;
-    // The capsule now lives inside an NSGlassEffectView whose rounded corner
-    // clips content — pull right-edge glyphs past the corner arc.
+    // The capsule shell clips at its rounded corner — pull right-edge glyphs past the arc.
     let chip_rect = NSRect::new(
         NSPoint::new(
-            cell_frame.origin.x + cell_frame.size.width - chip_w - SEARCH_PAD_IN - 14.0,
+            cell_frame.origin.x + cell_frame.size.width
+                - chip_w
+                - SEARCH_PAD_IN
+                - SEARCH_TRAILING_INSET,
             cell_frame.origin.y + (cell_frame.size.height - chip_h) / 2.0,
         ),
         NSSize::new(chip_w, chip_h),
@@ -119,8 +121,10 @@ unsafe fn draw_search_clear(cell_frame: NSRect) {
         return;
     }
     let hovered = SEARCH_CLEAR_HOVERED.load(Ordering::SeqCst);
-    let clear_x =
-        cell_frame.origin.x + cell_frame.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W - 14.0;
+    let clear_x = cell_frame.origin.x + cell_frame.size.width
+        - SEARCH_PAD_IN
+        - SEARCH_CLEAR_W
+        - SEARCH_TRAILING_INSET;
     let clear_rect = NSRect::new(
         NSPoint::new(
             clear_x,

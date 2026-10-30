@@ -398,6 +398,10 @@ const SEARCH_PAD_IN: f64 = 12.0;
 const SEARCH_ICON_W: f64 = 22.0;
 /// The extra clear × size when a query exists.
 const SEARCH_CLEAR_W: f64 = 18.0;
+/// The capsule's glass corner clips content, so right-edge glyphs sit this far inside the
+/// geometric edge. The clear × and its click target must agree on it or the visible glyph is
+/// a dead zone beside a live invisible strip.
+const SEARCH_TRAILING_INSET: f64 = 14.0;
 /// Shared query font size for both editing and unfocused states.
 const SEARCH_FONT_SIZE: f64 = 13.0;
 /// Row action buttons meet the shared 28pt minimum hit target.

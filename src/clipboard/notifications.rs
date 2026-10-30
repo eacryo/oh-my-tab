@@ -2093,8 +2093,8 @@ unsafe fn search_clear_contains_event(field: *mut AnyObject, event: *mut c_void)
     let point: NSPoint =
         msg_send![field, convertPoint: location, fromView: std::ptr::null::<AnyObject>()];
     let bounds: NSRect = msg_send![field, bounds];
-    point.x >= bounds.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W
-        && point.x <= bounds.size.width - SEARCH_PAD_IN
+    point.x >= bounds.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W - SEARCH_TRAILING_INSET
+        && point.x <= bounds.size.width - SEARCH_PAD_IN - SEARCH_TRAILING_INSET
         && point.y >= 0.0
         && point.y <= bounds.size.height
 }

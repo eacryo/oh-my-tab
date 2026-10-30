@@ -4,6 +4,8 @@ use super::*;
 use crate::callback_guard;
 
 static PICKER_EDGE: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
+/// The light-mode wash under all panel content, kept so a live theme switch can hide/show it.
+static PICKER_PANEL_VEIL: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
 
 /// Whether the pinned picker has lost key status and needs to counter Liquid Glass's passive look.
 static PICKER_GLASS_INACTIVE: AtomicBool = AtomicBool::new(false);
@@ -1288,6 +1290,11 @@ pub(crate) unsafe fn apply_theme() {
         apply_panel_appearance(window.0);
     }
     apply_glass_properties();
+    // The panel wash is a light-mode-only surface; it is always installed, so a switch to or
+    // from dark only toggles visibility.
+    if let Some(veil) = *PICKER_PANEL_VEIL.lock().unwrap() {
+        let _: () = msg_send![veil.0, setHidden: clipboard_palette().dark];
+    }
     if let Some(buttons) = *CLEAR_HISTORY_ACTION_BUTTONS.lock().unwrap() {
         for button in buttons {
             set_clear_confirmation_button_style(button.0, false);
@@ -1337,23 +1344,34 @@ unsafe fn install_picker_edge(backdrop: crate::glass::InstalledBackdrop) {
         crate::glass::install_panel_bevel(&backdrop, super::PICKER_PANEL_RADIUS);
 }
 
-/// Wrap a header control in a real NSGlassEffectView — the system draws the glass body AND the
-/// edge specular itself, which is the look the stacked-quad approaches never reached. Liquid
-/// Glass only: under any other material the chrome must not be a liquid-glass disc. `radius`
-/// shapes it (orb circles use h/2, the capsule SEARCH_R). Frost/backdrop and pre-macOS-26 fall
-/// back to a hud VEV; opaque needs no shell at all because the controls paint their own fills.
-/// A null return means "host the control directly" (on top of the VEV the fallback installed).
-unsafe fn install_glass_chrome(host: *mut AnyObject, frame: NSRect, radius: f64) -> *mut AnyObject {
+/// Wrap `child` in the chrome shell the effective material wants and add the wrap to `host`.
+/// Liquid Glass wraps it in an `NSGlassEffectView` (the system draws the glass body and the
+/// edge specular). The frost/backdrop fallback wraps it in a hud `NSVisualEffectView` -- as
+/// the child's container, not a sibling, so `layout_picker_chrome`'s walk to the strip-level
+/// view moves the shell and the control together. Opaque hosts the control directly because
+/// the controls paint their own fills.
+unsafe fn install_glass_chrome(
+    host: *mut AnyObject,
+    frame: NSRect,
+    radius: f64,
+    child: *mut AnyObject,
+) {
     let material = crate::glass::PanelMaterial::effective();
     if material == crate::glass::PanelMaterial::Opaque {
-        return std::ptr::null_mut();
+        let _: () = msg_send![child, setFrame: frame];
+        let _: () = msg_send![host, addSubview: child];
+        return;
     }
     if material == crate::glass::PanelMaterial::LiquidGlass {
         if let Some(cls) = objc2::runtime::AnyClass::get(c"NSGlassEffectView") {
             let glass: *mut AnyObject = msg_send![cls, alloc];
             let glass: *mut AnyObject = msg_send![glass, initWithFrame: frame];
             let _: () = msg_send![glass, setCornerRadius: radius];
-            return glass;
+            let _: () = msg_send![child, setAutoresizingMask: 18u64];
+            let _: () = msg_send![glass, setContentView: child];
+            let _: () = msg_send![host, addSubview: glass];
+            release_obj(glass);
+            return;
         }
     }
     let effect: *mut AnyObject = msg_send![class!(NSVisualEffectView), alloc];
@@ -1367,44 +1385,24 @@ unsafe fn install_glass_chrome(host: *mut AnyObject, frame: NSRect, radius: f64)
         let _: () = msg_send![effect_layer, setCornerRadius: radius];
         let _: () = msg_send![effect_layer, setMasksToBounds: true];
     }
+    let _: () = msg_send![child, setAutoresizingMask: 18u64];
+    let _: () = msg_send![
+        child,
+        setFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
+    ];
+    let _: () = msg_send![effect, addSubview: child];
     let _: () = msg_send![host, addSubview: effect];
     release_obj(effect);
-    std::ptr::null_mut()
 }
 
-/// Put `button` inside the chrome shell `install_glass_chrome` picks for the effective material
-/// (its contentView under Liquid Glass, or directly on the host above the fallback surface).
+/// Put `button` inside the chrome shell `install_glass_chrome` picks for the effective material.
 unsafe fn install_orb_glass(host: *mut AnyObject, frame: NSRect, button: *mut AnyObject) {
-    let glass = install_glass_chrome(host, frame, frame.size.height / 2.0);
-    if !glass.is_null() {
-        let _: () = msg_send![button, setAutoresizingMask: 18u64];
-        let _: () = msg_send![glass, setContentView: button];
-        let _: () = msg_send![host, addSubview: glass];
-        release_obj(glass);
-    } else {
-        // A direct strip child carries the frame itself; under glass the contentView fills it.
-        let _: () = msg_send![button, setFrame: frame];
-        let _: () = msg_send![host, addSubview: button];
-    }
+    install_glass_chrome(host, frame, frame.size.height / 2.0, button);
 }
 
-/// The search capsule's equivalent of `install_orb_glass`: the surface fills the glass's
-/// contentView under Liquid Glass and sits at `frame` directly under every other material.
+/// The search capsule's equivalent of `install_orb_glass`.
 unsafe fn install_search_glass(host: *mut AnyObject, frame: NSRect, surface: *mut AnyObject) {
-    let glass = install_glass_chrome(host, frame, SEARCH_R);
-    if !glass.is_null() {
-        let _: () = msg_send![surface, setAutoresizingMask: 18u64];
-        let _: () = msg_send![
-            surface,
-            setFrame: NSRect::new(NSPoint::new(0.0, 0.0), frame.size)
-        ];
-        let _: () = msg_send![glass, setContentView: surface];
-        let _: () = msg_send![host, addSubview: glass];
-        release_obj(glass);
-    } else {
-        let _: () = msg_send![surface, setFrame: frame];
-        let _: () = msg_send![host, addSubview: surface];
-    }
+    install_glass_chrome(host, frame, SEARCH_R, surface);
 }
 
 /// The material the picker's header chrome was built for (255 = unset), so a material swap can
@@ -1553,24 +1551,26 @@ pub(super) unsafe fn ensure_picker_window() {
     let content_parent = backdrop.content_parent;
 
     // The thin white wash the Metal picker painted over its backdrop: without
-    // it the panel's colour is whatever the wallpaper happens to be.
-    if !clipboard_palette().dark {
-        let veil: *mut AnyObject = msg_send![class!(NSView), alloc];
-        let veil: *mut AnyObject = msg_send![
-            veil,
-            initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
-        ];
-        let _: () = msg_send![veil, setWantsLayer: true];
-        let _: () = msg_send![veil, setAutoresizingMask: 18u64];
-        let veil_layer: *mut AnyObject = msg_send![veil, layer];
-        if !veil_layer.is_null() {
-            crate::ffi::layer_set_background(veil_layer, crate::ffi::hex_to_cg_color(0xFFFF_FF1F));
-        }
-        // The veil is the first subview installed, so a plain addSubview already
-        // puts it under everything the panel builds afterwards.
-        let _: () = msg_send![content_parent, addSubview: veil];
-        release_obj(veil);
+    // it the panel's colour is whatever the wallpaper happens to be. Always installed --
+    // hidden in dark mode -- so a live theme switch only toggles visibility instead of
+    // leaving the veil stuck on or missing for the rest of the process.
+    let veil: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let veil: *mut AnyObject = msg_send![
+        veil,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h))
+    ];
+    let _: () = msg_send![veil, setWantsLayer: true];
+    let _: () = msg_send![veil, setAutoresizingMask: 18u64];
+    let veil_layer: *mut AnyObject = msg_send![veil, layer];
+    if !veil_layer.is_null() {
+        crate::ffi::layer_set_background(veil_layer, crate::ffi::hex_to_cg_color(0xFFFF_FF1F));
     }
+    let _: () = msg_send![veil, setHidden: clipboard_palette().dark];
+    // The veil is the first subview installed, so a plain addSubview already
+    // puts it under everything the panel builds afterwards.
+    let _: () = msg_send![content_parent, addSubview: veil];
+    *PICKER_PANEL_VEIL.lock().unwrap() = Some(ObjPtr::new(veil));
+    release_obj(veil);
     install_picker_edge(backdrop);
 
     // Container (receives key events; flipped so rows stack top-down, newest on top).
@@ -1939,7 +1939,7 @@ pub(super) unsafe fn ensure_picker_window() {
         clear_button,
         initWithFrame: NSRect::new(
             NSPoint::new(
-                SEARCH_PAD_X + search_w - SEARCH_PAD_IN - SEARCH_CLEAR_W,
+                SEARCH_PAD_X + search_w - SEARCH_PAD_IN - SEARCH_CLEAR_W - SEARCH_TRAILING_INSET,
                 TOP_PAD_Y + (SEARCH_H - ACTION_H) / 2.0
             ),
             NSSize::new(SEARCH_CLEAR_W, ACTION_H)

@@ -87,7 +87,7 @@ unsafe fn layout_picker_chrome(size: NSSize) {
         }
     }
     if let Some(clear) = *SEARCH_CLEAR_BUTTON.lock().unwrap() {
-        let _: () = msg_send![clear.0, setFrameOrigin: NSPoint::new(search.origin.x + search.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W, search.origin.y + (SEARCH_H - ACTION_H) / 2.0)];
+        let _: () = msg_send![clear.0, setFrameOrigin: NSPoint::new(search.origin.x + search.size.width - SEARCH_PAD_IN - SEARCH_CLEAR_W - SEARCH_TRAILING_INSET, search.origin.y + (SEARCH_H - ACTION_H) / 2.0)];
     }
     if let Some(strip) = *PICKER_HEADER_STRIP.lock().unwrap() {
         let _: () = msg_send![strip.0, setFrame: NSRect::new(NSPoint::new(0.0, size.height - header_strip_h()), NSSize::new(size.width, header_strip_h()))];
