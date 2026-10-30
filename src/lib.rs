@@ -1497,6 +1497,7 @@ fn create_overlay_window() -> *mut AnyObject {
             radius,
             crate::overlay::switcher_backdrop_options(),
         );
+        crate::overlay::install_overlay_edge(&backdrop);
         *crate::overlay::OVERLAY_BACKDROP.lock().unwrap() = Some(backdrop);
         let content_parent = backdrop.content_parent;
 

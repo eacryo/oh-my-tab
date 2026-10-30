@@ -813,16 +813,134 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
 /// The switcher's backdrop policy. Every card carries a text surface for its caption, and the status
 /// footer carries one too, so the material is left honest (design-style §3); the
 /// switcher is the active panel, so no inactive-glass compensation.
+/// The remaining knobs are the clipboard picker's (`picker_backdrop_options`): the two panels are the
+/// same kind of surface floating over another app's content and read as one product when their glass
+/// style, edge and blur posture agree.
 pub(crate) const fn switcher_backdrop_options() -> crate::glass::BackdropOptions {
     // `high`: §7's row for a surface above the whole UI, which is what a switcher summoned over another
     // app's content is.
-    crate::glass::BackdropOptions::new(None).with_elevation(Some(crate::theme::ELEVATION_HIGH))
+    crate::glass::BackdropOptions::new(None)
+        .with_elevation(Some(crate::theme::ELEVATION_HIGH))
+        // Match the picker's regular glass: a style of our own would render the two panels
+        // differently for no product reason. A nonzero blur installs a private backdrop rather
+        // than leaving the system effect alone, and the native edge keeps the system's specular.
+        .with_glass_style(0)
+        .with_blur(0.0, 1.0)
+        .with_native_glass_edge()
+}
+
+/// The bevel ring's view, kept so a live theme/material pass can ask for a repaint.
+pub(crate) static OVERLAY_EDGE: MainThreadSlot<Option<ObjPtr>> =
+    unsafe { MainThreadSlot::new(None) };
+
+/// The same bevel the clipboard picker draws (`picker_edge_draw`), re-keyed to the switcher's
+/// corner radius and palette so the two panels carry the identical rim.
+extern "C" fn overlay_edge_draw(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect) {
+    callback_guard::void("overlay_edge_draw", || unsafe {
+        if crate::glass::PanelMaterial::effective() != crate::glass::PanelMaterial::LiquidGlass {
+            return;
+        }
+        use crate::theme::*;
+        let bounds: NSRect = msg_send![view, bounds];
+        let panel_radius = CONFIG.read().unwrap().appearance.corner_radius;
+        let ring = |inset: f64, width: f64| -> *mut AnyObject {
+            let rounded = |inset: f64| -> *mut AnyObject {
+                let rect = NSRect::new(
+                    NSPoint::new(bounds.origin.x + inset, bounds.origin.y + inset),
+                    NSSize::new(
+                        (bounds.size.width - inset * 2.0).max(0.0),
+                        (bounds.size.height - inset * 2.0).max(0.0),
+                    ),
+                );
+                let radius = (panel_radius + CLIPBOARD_EDGE_OUTSET - inset).max(0.0);
+                msg_send![class!(NSBezierPath), bezierPathWithRoundedRect: rect, xRadius: radius, yRadius: radius]
+            };
+            let path = rounded(inset);
+            let _: () = msg_send![path, appendBezierPath: rounded(inset + width)];
+            let _: () = msg_send![path, setWindingRule: 1isize];
+            path
+        };
+        let outer = ring(0.0, CLIPBOARD_EDGE_OUTER_WIDTH);
+        let color = crate::ffi::hex_to_ns_color(if crate::theme::ui_palette().dark {
+            CLIPBOARD_EDGE_OUTER_DARK
+        } else {
+            CLIPBOARD_EDGE_OUTER_LIGHT
+        });
+        let _: () = msg_send![color, setFill];
+        let _: () = msg_send![outer, fill];
+        let inner = ring(CLIPBOARD_EDGE_OUTER_WIDTH, CLIPBOARD_EDGE_INNER_WIDTH);
+        let gradient: *mut AnyObject = msg_send![class!(NSGradient), alloc];
+        let gradient: *mut AnyObject = msg_send![gradient,
+            initWithStartingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_SHADE),
+            endingColor: crate::ffi::hex_to_ns_color(CLIPBOARD_EDGE_HIGHLIGHT)
+        ];
+        let _: () = msg_send![gradient, drawInBezierPath: inner, angle: 90.0f64];
+        release_obj(gradient);
+    });
+}
+
+/// The ring never answers hits: it hangs 0.5pt outside the material clip and would otherwise
+/// swallow the bottom-right pixel of a click that belongs to the card grid.
+extern "C" fn overlay_edge_hit_test(
+    _view: *mut AnyObject,
+    _cmd: Sel,
+    _point: NSPoint,
+) -> *mut AnyObject {
+    callback_guard::nil("overlay_edge_hit_test", std::ptr::null_mut)
+}
+
+/// Hang the bevel ring on the panel silhouette — same shape as `install_picker_edge`: the view
+/// rides the root (the shadow carrier when elevation installed one) and reaches 0.5pt past the
+/// material root so the gradient sits just outside the system specular.
+pub(crate) unsafe fn install_overlay_edge(backdrop: &crate::glass::InstalledBackdrop) {
+    let Some(parent) = backdrop.root else {
+        return;
+    };
+    let Some(material) = backdrop.material_root else {
+        return;
+    };
+    let frame: NSRect = if parent.0 == material.0 {
+        msg_send![material.0, bounds]
+    } else {
+        msg_send![material.0, frame]
+    };
+    let outset = crate::theme::CLIPBOARD_EDGE_OUTSET;
+    let frame = NSRect::new(
+        NSPoint::new(frame.origin.x - outset, frame.origin.y - outset),
+        NSSize::new(
+            frame.size.width + outset * 2.0,
+            frame.size.height + outset * 2.0,
+        ),
+    );
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    let cls = StaticClass::register_once(&CLASS, c"OhMyTabOverlayEdge", || {
+        crate::ffi::build_class(c"OhMyTabOverlayEdge", class!(NSView), |builder| {
+            builder.add_method::<AnyObject, _>(
+                sel!(drawRect:),
+                overlay_edge_draw as extern "C" fn(*mut AnyObject, Sel, NSRect),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(hitTest:),
+                overlay_edge_hit_test
+                    as extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+            );
+        })
+    });
+    let edge: *mut AnyObject = msg_send![cls.0 as *mut AnyObject, alloc];
+    let edge: *mut AnyObject = msg_send![edge, initWithFrame: frame];
+    let _: () = msg_send![edge, setAutoresizingMask: 18u64];
+    let _: () = msg_send![parent.0, addSubview: edge];
+    *OVERLAY_EDGE.lock().unwrap() = Some(ObjPtr::new(edge));
+    release_obj(edge);
 }
 
 /// Re-apply surface properties from CONFIG to the installed backdrop, for hot reload:
 /// glass style/tint, frost material, opaque surface color. Corner radius is re-asserted on
 /// whichever root view is installed (glass also carries it as its own rounding property).
 pub(crate) unsafe fn apply_glass_properties() {
+    if let Some(edge) = *OVERLAY_EDGE.lock().unwrap() {
+        let _: () = msg_send![edge.0, setNeedsDisplay: true];
+    }
     let Some(backdrop) = *OVERLAY_BACKDROP.lock().unwrap() else {
         return;
     };
@@ -867,6 +985,8 @@ pub(crate) unsafe fn apply_backdrop_material() {
         radius,
         switcher_backdrop_options(),
     );
+    // The swap retired the root the bevel ring was hanging on; rebuild it on the new one.
+    install_overlay_edge(&new);
     *OVERLAY_BACKDROP.lock().unwrap() = Some(new);
     apply_glass_properties();
 }

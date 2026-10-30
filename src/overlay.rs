@@ -403,8 +403,8 @@ pub(crate) use callbacks::{
 };
 pub(crate) use cancel::{
     apply_backdrop_material, apply_theme, close_window_at, extract_uncached_icons,
-    install_click_to_cancel, on_deferred_raise, on_delayed_order_out, refresh_highlight,
-    refresh_thumbnail_previews, switcher_backdrop_options, vanish_overlay,
+    install_click_to_cancel, install_overlay_edge, on_deferred_raise, on_delayed_order_out,
+    refresh_highlight, refresh_thumbnail_previews, switcher_backdrop_options, vanish_overlay,
 };
 pub(crate) use cards::{create_card_view, show_overlay};
 // Only the thumbnail unit tests use crate::overlay::nsimage_from_cgimage (cards.rs
