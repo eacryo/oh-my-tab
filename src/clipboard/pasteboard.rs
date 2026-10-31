@@ -1,6 +1,7 @@
 //! Clipboard subsystem · pasteboard: pasteboard reads and writes.
 
 use super::*;
+use objc2::rc::Retained;
 
 /// Read the pasteboard's plain text (None when no text).
 pub(super) unsafe fn read_pasteboard_text() -> Option<String> {
@@ -62,6 +63,13 @@ pub(super) const PREVIEW_MAX_DIM: f64 = 480.0;
 /// Image bytes -> a downsampled PNG (longest edge <= max_dim). Same scaling pipeline as the
 /// thumbnail drawing.
 pub(super) unsafe fn any_image_to_scaled_png(bytes: &[u8], max_dim: f64) -> Option<Vec<u8>> {
+    // The pool drains the autoreleased NSData/TIFF/rep/PNG temporaries per call: the detail
+    // worker thread has no run loop to drain them, and a history load converts many images
+    // in one main-thread turn. Each one holds a full-size copy of the image.
+    objc2::rc::autoreleasepool(|_| any_image_to_scaled_png_inner(bytes, max_dim))
+}
+
+unsafe fn any_image_to_scaled_png_inner(bytes: &[u8], max_dim: f64) -> Option<Vec<u8>> {
     // NSImage -> (lockFocus scale when needed) -> TIFFRepresentation -> NSBitmapImageRep ->
     // PNG (4). The same scaling pipeline as the thumbnail drawing.
     let data: *mut AnyObject = msg_send![
@@ -69,37 +77,38 @@ pub(super) unsafe fn any_image_to_scaled_png(bytes: &[u8], max_dim: f64) -> Opti
         dataWithBytes: bytes.as_ptr() as *const c_void,
         length: bytes.len()
     ];
+    // alloc/init return +1 objects the pool does not own. `Retained` releases them on every
+    // return path; leaking `img` kept the source bytes and the full-size decode alive per copy.
     let img: *mut AnyObject = msg_send![class!(NSImage), alloc];
     let img: *mut AnyObject = msg_send![img, initWithData: data];
-    if img.is_null() {
-        return None;
-    }
-    let src_size: NSSize = msg_send![img, size];
+    let img: Retained<AnyObject> = Retained::from_raw(img)?;
+    let src_size: NSSize = msg_send![&*img, size];
     let (w, h) = (src_size.width, src_size.height);
     // Only draw into a scaled target when downsampling is needed; small sources are used
     // as-is, skipping the extra pass.
-    let source: *mut AnyObject = if w > max_dim || h > max_dim {
+    let source: Retained<AnyObject> = if w > max_dim || h > max_dim {
         let scale = (max_dim / w).min(max_dim / h);
         let (tw, th) = (w * scale, h * scale);
         let target: *mut AnyObject = msg_send![class!(NSImage), alloc];
         let target: *mut AnyObject = msg_send![target, initWithSize: NSSize::new(tw, th)];
-        let _: () = msg_send![target, lockFocus];
+        let target: Retained<AnyObject> = Retained::from_raw(target)?;
+        let _: () = msg_send![&*target, lockFocus];
         let dst = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(tw, th));
         let src = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
         let op: usize = 1; // NSCompositingOperationCopy
         let _: () = msg_send![
-            img,
+            &*img,
             drawInRect: dst,
             fromRect: src,
             operation: op,
             fraction: 1.0f64
         ];
-        let _: () = msg_send![target, unlockFocus];
+        let _: () = msg_send![&*target, unlockFocus];
         target
     } else {
         img
     };
-    let tiff: *mut AnyObject = msg_send![source, TIFFRepresentation];
+    let tiff: *mut AnyObject = msg_send![&*source, TIFFRepresentation];
     if tiff.is_null() {
         return None;
     }
@@ -605,4 +614,54 @@ pub(super) unsafe fn write_pasteboard_file(path: &str) -> bool {
         urls_ok
     );
     ok
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An uncompressed 24-bit BMP whose pixels vary with `seed`, so no decoder cache can share
+    /// one decode between calls.
+    fn bmp(width: u32, height: u32, seed: u8) -> Vec<u8> {
+        let row = (width * 3).div_ceil(4) * 4;
+        let pixels = row * height;
+        let mut out = Vec::with_capacity(54 + pixels as usize);
+        out.extend_from_slice(b"BM");
+        out.extend_from_slice(&(54 + pixels).to_le_bytes());
+        out.extend_from_slice(&0u32.to_le_bytes());
+        out.extend_from_slice(&54u32.to_le_bytes());
+        out.extend_from_slice(&40u32.to_le_bytes());
+        out.extend_from_slice(&(width as i32).to_le_bytes());
+        out.extend_from_slice(&(height as i32).to_le_bytes());
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&24u16.to_le_bytes());
+        out.extend_from_slice(&[0u8; 24]);
+        out.extend((0..pixels).map(|i| (i as u8).wrapping_mul(31).wrapping_add(seed)));
+        out
+    }
+
+    /// Converting an image must not keep the source bytes or its full-size decode alive. Each
+    /// 2400x2400 call held ~40MB before the fix (8 calls: ~320MB); the bound leaves room for
+    /// allocator slack and the other tests running in this process.
+    #[test]
+    fn scaled_png_releases_the_source_image() {
+        let footprint = || {
+            crate::ffi::task_vm_info()
+                .expect("task_vm_info")
+                .phys_footprint
+        };
+        let images: Vec<Vec<u8>> = (0..9).map(|i| bmp(2400, 2400, i)).collect();
+        let warm = unsafe { any_image_to_preview_png(&images[0]) }.expect("bmp decodes");
+        assert!(!warm.is_empty());
+        let before = footprint();
+        for image in &images[1..] {
+            assert!(unsafe { any_image_to_preview_png(image) }.is_some());
+        }
+        let grown = footprint().saturating_sub(before);
+        assert!(
+            grown < 96 * 1024 * 1024,
+            "8 conversions grew the footprint by {} MB",
+            grown / (1024 * 1024)
+        );
+    }
 }
