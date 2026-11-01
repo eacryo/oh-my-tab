@@ -252,44 +252,13 @@ pub(super) fn detail_action_is_active(detail_visible: bool, selected: usize, row
     detail_visible && selected != NO_SELECTION && selected == row
 }
 
-/// Build the expand toggle's icon: an SF Symbol, so it is drawn by the same symbol engine as the pin
-/// and trash glyphs beside it and therefore shares their optical size, stroke weight and baseline.
-/// The state is carried by the symbol's fill (chevron outline, chevron filled) and by the ink
-/// (secondary, primary on hover, `accent_ink` over the accent chip while open), exactly as the
-/// pin's is.
-///
-/// It used to be a hand-drawn NSBezierPath circle on a 16pt canvas. Measured from a screen capture
-/// of one row, that drew 13 x 13pt of ink against the pin's 10.5 x 13.5 and the trash's 11 x 13, and
-/// its bottom edge sat 1px above theirs: three different icon scales in one row.
-pub(super) unsafe fn detail_symbol_image(symbol: &str) -> *mut AnyObject {
-    let name = make_nsstring(symbol);
-    let image: *mut AnyObject = msg_send![
-        class!(NSImage),
-        imageWithSystemSymbolName: name,
-        accessibilityDescription: std::ptr::null::<AnyObject>()
-    ];
-    CFRelease(name as *const c_void);
-    if image.is_null() {
-        return std::ptr::null_mut();
+/// Return an owned template image; the cache retains its own reference for later rows.
+pub(super) unsafe fn detail_symbol_image(symbol: &'static str) -> *mut AnyObject {
+    let image = action_glyph_image(symbol);
+    if !image.is_null() {
+        CFRetain(image as *const c_void);
     }
-    let config: *mut AnyObject = msg_send![
-        class!(NSImageSymbolConfiguration),
-        configurationWithPointSize: ACTION_GLYPH_SIZE,
-        weight: crate::theme::FONT_WEIGHT_REGULAR
-    ];
-    let configured: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
-    let picked = if configured.is_null() {
-        image
-    } else {
-        configured
-    };
-    let _: () = msg_send![picked, setTemplate: true];
-    // OWN the image: both `imageWith...` methods return an autoreleased instance, so the caller's
-    // `release_obj` has to be matched by a retain here. Without it an autorelease-pool drain released
-    // the image under a live button, and AppKit's key-view walk (a password-autofill heuristic) then
-    // retained the dangling pointer and crashed in NSButtonCell._imageSynthesizedForCheckOrRadio.
-    // Every branch below returns that one owned reference, or null.
-    msg_send![picked, retain]
+    image
 }
 
 /// Apply the shared clipboard action-button state to its own rounded hover background.
@@ -520,17 +489,7 @@ pub(super) unsafe fn set_detail_action_style(button: *mut AnyObject, active: boo
     if button.is_null() {
         return;
     }
-    // Follow the pin's recipe (set_pin_button_style): a template SF Symbol sized like the glyphs
-    // beside it, tinted through contentTintColor, with the selected row carrying the filled symbol
-    // over a tinted chip so the state is readable at a glance.
-    //
-    // The glyph is the "open a side pane" mark rather than an info mark or the expand arrows: the
-    // button opens the detail pane on the right, and the arrows read as a resize control at 12pt.
-    // Verified with `NSImage(systemSymbolName:)` on this platform: `sidebar.right` has no
-    // `.fill` or `.filled` variant, so the state cannot ride on the glyph the way the pin's does.
-    // It rides on the ink instead -- primary while this row's detail is open, secondary otherwise --
-    // which is the same pairing the pin uses and does not depend on a symbol that does not exist.
-    let icon = detail_symbol_image("sidebar.right");
+    let icon = detail_symbol_image("layout-sidebar-left-expand");
     if !icon.is_null() {
         let empty = make_nsstring("");
         let _: () = msg_send![button, setTitle: empty];
@@ -963,41 +922,35 @@ unsafe fn hover_button_mouse_down_inner(_self: *mut AnyObject, _cmd: Sel, event:
     }
 }
 
-/// The row action glyphs resolve the same three SF Symbols for every materialized row, and the
-/// `imageWithSystemSymbolName:` + configuration round trip was a measurable share of scroll-time
-/// row builds. They are template images tinted per button, so one configured instance serves
-/// every row and the cache never needs eviction (three entries at most).
+/// Cache one template per Tabler SVG; NSImage decodes the embedded vector data directly.
 static ACTION_GLYPH_CACHE: LazyLock<MainThreadSlot<HashMap<&'static str, ObjPtr>>> =
     LazyLock::new(|| unsafe { MainThreadSlot::new(HashMap::new()) });
 
-/// The configured template image for an action glyph, cached per symbol name; null when the
-/// symbol is unavailable (the button then keeps its title).
 unsafe fn action_glyph_image(symbol: &'static str) -> *mut AnyObject {
     if let Some(cached) = ACTION_GLYPH_CACHE.lock().unwrap().get(symbol) {
         return cached.0;
     }
-    let name = make_nsstring(symbol);
-    let source: *mut AnyObject = msg_send![
-        class!(NSImage),
-        imageWithSystemSymbolName: name,
-        accessibilityDescription: std::ptr::null::<AnyObject>()
+    let bytes: &[u8] = match symbol {
+        "layout-sidebar-left-expand" => {
+            include_bytes!("../../assets/clipboard-icons/layout-sidebar-left-expand.svg")
+        }
+        "map-pin-star" => include_bytes!("../../assets/clipboard-icons/map-pin-star.svg"),
+        "trash-x" => include_bytes!("../../assets/clipboard-icons/trash-x.svg"),
+        _ => return std::ptr::null_mut(),
+    };
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: bytes.as_ptr() as *const c_void,
+        length: bytes.len()
     ];
-    CFRelease(name as *const c_void);
-    if source.is_null() {
-        return source;
-    }
-    let config: *mut AnyObject = msg_send![
-        class!(NSImageSymbolConfiguration),
-        configurationWithPointSize: ACTION_GLYPH_SIZE,
-        weight: crate::theme::FONT_WEIGHT_REGULAR
-    ];
-    let image: *mut AnyObject = msg_send![source, imageWithSymbolConfiguration: config];
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithData: data];
     if image.is_null() {
         return image;
     }
+    let _: () = msg_send![image, setSize: NSSize::new(ACTION_GLYPH_SIZE, ACTION_GLYPH_SIZE)];
     let _: () = msg_send![image, setTemplate: true];
-    // The cache owns this retain; entries are never evicted.
-    CFRetain(image as *const c_void);
+    // initWithData returns the owned reference held by the process-lifetime cache.
     ACTION_GLYPH_CACHE
         .lock()
         .unwrap()
@@ -1030,9 +983,9 @@ pub(super) unsafe fn make_action_button(
     let _: () = msg_send![b, setTarget: row_target()];
     let _: () = msg_send![b, setAction: action];
     let symbol = if action == sel!(togglePin:) {
-        Some(if title == "★" { "pin.fill" } else { "pin" })
+        Some("map-pin-star")
     } else if action == sel!(deleteEntry:) {
-        Some("trash")
+        Some("trash-x")
     } else {
         None
     };

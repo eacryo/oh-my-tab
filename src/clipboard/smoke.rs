@@ -525,21 +525,17 @@ pub(crate) fn smoke_runner() -> bool {
         unsafe { detail::smoke_row_backdrop_paint_paths() },
         "selected+hovered row backdrops must match in the build and runtime repaint paths"
     );
-    // The row's three action glyphs (detail / pin / trash) are ONE icon family: all SF Symbols at
-    // the shared ACTION_GLYPH_SIZE, with the detail toggle carrying the same filled/outline state
-    // pair the pin uses. The detail toggle used to be a hand-drawn circle on its own 16pt canvas,
-    // which measured 13 x 13pt against the pin's 10.5 x 13.5 and sat 1px above their baseline.
+    // All row actions use the same Tabler canvas and template-image loader.
     unsafe {
         for (symbol, what) in [
-            ("sidebar.right", "detail pane"),
-            ("pin", "pin outline"),
-            ("pin.fill", "pin filled"),
-            ("trash", "trash"),
+            ("layout-sidebar-left-expand", "detail pane"),
+            ("map-pin-star", "pin"),
+            ("trash-x", "delete"),
         ] {
             let image = super::text_style::detail_symbol_image(symbol);
             assert!(
                 !image.is_null(),
-                "the {what} row glyph ({symbol}) must resolve as an SF Symbol"
+                "the {what} row glyph ({symbol}) must resolve as a vector image"
             );
             let symbol_size: NSSize = msg_send![image, size];
             // Balanced by that helper's documented +1 retain for the button that shows it. The
@@ -547,7 +543,7 @@ pub(crate) fn smoke_runner() -> bool {
             // object, which is what an untyped `let _: *mut AnyObject = msg_send![..]` asserts.
             release_obj(image);
             assert!(
-                symbol_size.width > 0.0 && symbol_size.height > 0.0,
+                symbol_size.width == ACTION_GLYPH_SIZE && symbol_size.height == ACTION_GLYPH_SIZE,
                 "the {what} row glyph ({symbol}) must have a drawn size; got {symbol_size:?}"
             );
         }

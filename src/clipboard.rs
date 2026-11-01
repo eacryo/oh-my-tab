@@ -408,10 +408,8 @@ const SEARCH_FONT_SIZE: f64 = 13.0;
 const ACTION_BTN: f64 = 22.0;
 const ACTION_H: f64 = 22.0;
 const ACTION_GAP: f64 = 1.0;
-/// The point size of the row action glyphs (detail/pin/trash). One constant for all three: the
-/// glyphs sit side by side in a row, so a different size for any one of them reads as a defect
-/// (the detail toggle used to be a hand-drawn circle on its own 16pt canvas and did exactly that).
-const ACTION_GLYPH_SIZE: f64 = 12.0;
+/// Shared canvas for the three Tabler row actions (24-unit source grid).
+const ACTION_GLYPH_SIZE: f64 = 16.0;
 /// The time-group header zone height.
 const GROUP_H: f64 = 28.0;
 /// The group label's top offset (vertically centered).
