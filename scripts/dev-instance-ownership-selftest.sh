@@ -267,6 +267,30 @@ done
 out="$(bash -c "source '$lib'; OMT_OWNERSHIP_PROCESS_NAME=omt-selftest-instance omt_ownership_probe '$fake_bin' '$real_log' '$fake_pid' '$fake_start'")"; st=$?
 expect_probe "re-checking the identity that is still running is MINE" MINE 0 "$out" "$st"
 
+# A caller may hand back the raw `ps -o lstart=` value it captured itself rather than the line this
+# probe printed. That value pads a single-digit day ("Sun Nov  1"), while the probe squeezes each
+# field to one space; comparing the two spellings directly reported NOT_MINE for a live instance.
+# The case above only exercises this on days 1-9, so it is pinned here with a literal padded value
+# that does not depend on today's date -- the defect was live for every run in the first nine days
+# of a month and the date-shaped case passed on the other three weeks of it.
+# Rebuilt unconditionally rather than taken from `ps`: real output only carries the double space
+# on days 1-9, so a case that copied it would exercise the padded path on those days and the
+# unpadded one on the rest, passing with the fix reverted for three weeks out of every month.
+fake_start_padded="$(printf '%s' "$fake_start" | awk '{printf "%s %s  %s %s %s", $1, $2, $3, $4, $5}')"
+case "$fake_start_padded" in
+    *"  "*) ;;
+    *)
+        fail "the synthetic padded start time carries no double space, so it cannot exercise the defect"
+        ;;
+esac
+out="$(bash -c "source '$lib'; OMT_OWNERSHIP_PROCESS_NAME=omt-selftest-instance omt_ownership_probe '$fake_bin' '$real_log' '$fake_pid' '$fake_start_padded'")"; st=$?
+expect_probe "a padded ps start time is normalized before the re-check compares it" MINE 0 "$out" "$st"
+
+# The normalization must not make every expectation match: a genuinely different start time is still
+# NOT_MINE, or the fix above would have traded a false negative for a false positive.
+out="$(bash -c "source '$lib'; OMT_OWNERSHIP_PROCESS_NAME=omt-selftest-instance omt_ownership_probe '$fake_bin' '$real_log' '$fake_pid' 'Thu Oct 22 14:50:43 2026'")"; st=$?
+expect_probe "a re-check against a different start time is still NOT_MINE" NOT_MINE 1 "$out" "$st"
+
 # Re-checking a snapshot after the process is gone -> NOT_MINE, which is the whole point: the
 # UI conclusion that belonged to that pid is void.
 kill "$fake_pid" 2>/dev/null

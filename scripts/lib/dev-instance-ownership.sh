@@ -287,6 +287,14 @@ omt_ownership_probe() {
     local log_path="$2"
     local expect_pid="${3:-}"
     local expect_start="${4:-}"
+    # A caller re-checking a snapshot passes back exactly what this probe printed, but a caller may
+    # also pass the raw `ps -o lstart=` value it captured itself, which pads a single-digit day
+    # ("Sun Nov  1"). The internal start time below is squeezed to one space per field, so the
+    # comparison against an unsqueezed expectation failed for every run in the first nine days of a
+    # month. Normalize the expectation the same way instead of trusting its spacing.
+    if [ -n "$expect_start" ]; then
+        expect_start="$(printf '%s' "$expect_start" | awk '{print $1" "$2" "$3" "$4" "$5}')"
+    fi
 
     local candidates status=0
     # Declared here, before anything assigns it: a later `local ... partial_listing=0` would reset
