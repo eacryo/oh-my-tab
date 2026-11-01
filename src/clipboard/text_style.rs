@@ -1455,41 +1455,6 @@ pub(super) unsafe fn build_footer(parent: *mut AnyObject, w: f64) {
         let key_ns = make_nsstring(key);
         let _: () = msg_send![key_label, setStringValue: key_ns];
         CFRelease(key_ns as *const c_void);
-        if i == 1 {
-            // The design uses a small trash glyph inside the delete keycap rather than a
-            // backspace character. Keep the existing key label as the measured layout anchor,
-            // but hide it and draw the SF Symbol at the same 10pt size as the HTML icon.
-            let _: () = msg_send![key_label, setHidden: true];
-            let symbol_name = make_nsstring("trash");
-            let image: *mut AnyObject = msg_send![
-                class!(NSImage),
-                imageWithSystemSymbolName: symbol_name,
-                accessibilityDescription: std::ptr::null::<AnyObject>()
-            ];
-            CFRelease(symbol_name as *const c_void);
-            if !image.is_null() {
-                let config: *mut AnyObject = msg_send![
-                    class!(NSImageSymbolConfiguration),
-                    configurationWithPointSize: 10.0f64,
-                    weight: crate::theme::FONT_WEIGHT_REGULAR
-                ];
-                let image: *mut AnyObject = msg_send![image, imageWithSymbolConfiguration: config];
-                let _: () = msg_send![image, setTemplate: true];
-                let icon: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-                let icon: *mut AnyObject = msg_send![
-                    icon,
-                    initWithFrame: NSRect::new(
-                        NSPoint::new((key_w - 10.0) / 2.0, (kbd_h - 10.0) / 2.0),
-                        NSSize::new(10.0, 10.0)
-                    )
-                ];
-                let _: () = msg_send![icon, setImage: image];
-                let _: () = msg_send![icon, setImageScaling: 3u64]; // proportional
-                let _: () = msg_send![icon, setContentTintColor: kc];
-                let _: () = msg_send![cap, addSubview: icon];
-                release_obj(icon);
-            }
-        }
         let _: () = msg_send![cap, addSubview: key_label];
         release_obj(key_label);
         let _: () = msg_send![parent, addSubview: cap];
