@@ -45,10 +45,9 @@
     <!-- The About-page switch is applied at runtime; this plist value is Sparkle's default. -->
     <key>SUEnableAutomaticChecks</key>
     <true/>
-    <!-- SMAppService 要求 macOS 13+;本应用不再兼容 13 以下,直接声明最低系统。 -->
-    <!-- SMAppService requires macOS 13+; the app no longer supports below 13, so declare the floor. -->
+    <!-- Direct SVG decoding through NSImage requires macOS 14+. -->
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>14.0</string>
     <!-- 辅助应用:无 Dock 图标、无主菜单栏,菜单栏常驻。等价于运行时 setActivationPolicy:1。 -->
     <!-- Accessory app: no Dock icon, no main menu bar, menu-bar resident. Equivalent to runtime setActivationPolicy:1. -->
     <key>LSUIElement</key>
