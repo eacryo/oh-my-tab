@@ -72,7 +72,6 @@
 | 33 | `sendEvent:` 不是可靠的滑块跟踪结束点：NSSliderCell 的跟踪循环可能在正常分发之前就消费掉 mouse-up，因此在窗口分发点结束尺寸预览是尽力而为，漏掉一次就回退到 3 秒 watchdog | keystroke 最大尺寸审查，R1–R2（finding 4） | MEDIUM | 一次短拖动最多能让预览（虚拟键帽、真实输入被丢弃）存活 3 秒；正确的结束点在原生跟踪边界内，意味着自己跑跟踪或钩住 cell——设置事件路径上的新仪器。修复期间实测：来自 action 处理器的事后修正、`mouseUp:` 覆写和一个延时定时器都会被 cell 撤销，这正是吸附改用 `allowsTickMarkValuesOnly` 的原因 | 下次改动滑块跟踪或预览生命周期时，或首次报告预览卡住时 |
 | 34 | 100% 时流向上限是按完整 `screen.frame` 计算的，而 `clamp_origin_to_visible` 只移动原点，因此一个高或宽超过可见区域的面板不会被缩小以适配 | keystroke 最大尺寸审查，R1–R2（finding 5） | MEDIUM | 50% 默认值留有很大余量，而上限只是*允许*用户要求的尺寸；把最终尺寸夹到可见 frame 是一个可见行为决定（它也会改变靠近边缘的已保存位置的含义），并且需要渲染器与状态机共用同一个有效预算 | 下次改动面板摆放或预算时，或在大上限下面板被报告出现在菜单栏或 Dock 之下时 |
 | 69 | `scripts/e2e/panel-edge.sh` 的描边检查失败：`check 1 outline (white backdrop)` 实测边缘对比 4.6 tone units，低于仪器 8-tone 的判定下限（其中 `panel-edge: check 1/top` 还报「outline off 时边缘与内部仍差 0.3，噪声下限 2」） | 设置页间距与剪贴板修复任务的完整门禁（`--full` 全授权），2026-11-02 | MEDIUM（既有失败，非本次改动引入） | 已对照确认与本任务无关：把 `src/clipboard/` 全部改动 stash 回 HEAD 后同一检查以相同数值失败。本任务改动的是标题间距与拖拽命中，不涉及面板描边。未在本任务内修，是因为描边对比度涉及材质合成与测量阈值，需要独立判断是仪器余量还是真实视觉退化 | 下次改动面板描边/阴影/材质合成或 `panel-edge.sh` 的测量阈值时；或首次报告「面板边缘看不见」时 |
-| 70 | `scripts/e2e/settings-open-latency.sh` 失败：`warm click 0ms, cold click 0ms`，且冷路径报「options popover never opened, the open-settings row is not on screen」 | 同上，2026-11-02 | MEDIUM（既有失败，非本次改动引入） | 已对照确认：撤掉本任务改动后同样失败且数值相同。该场景测的是设置面板打开延迟，与间距/拖拽无关。未在本任务内修，因为需要单独排查 popover 为何未打开（可能是冷启动路径），属于独立问题 | 下次改动配置面板（clipboard options popover）的打开路径或 `--settings-prewarm` 时 |
 | 71 | `scripts/e2e/scrollbar-style-flip.sh` 失败：`FAIL the system really switched the settings page to space-taking legacy scrollers: style=1 footprint=0`（13/14 checks） | 同上，2026-11-02 | LOW（环境相关，非本次改动引入） | 该场景要求系统在 legacy 与 overlay 滚动条之间真实切换；本机切换后 `footprint=0`，即系统未真正采用占据空间的旧式滚动条。这是系统偏好层面的事实，与代码改动无关，也无法在测试内伪造。其余 13 项检查通过 | 换一台会在切换后真正改变 footprint 的机器/系统版本再跑时；或该场景改为在切换后读一个不依赖 footprint 的信号时 |
 | 72 | `scripts/e2e/tab-repeat.sh` 失败：`AssertionError: timed out waiting for the first repeat to step and the rest to be throttled`（状态停在 `event=selection`，switcher 面板可见） | 同上，2026-11-02 | MEDIUM（既有失败，非本次改动引入） | 该场景测的是长按 Cmd+Tab 时首次重复步进、后续节流的时序，依赖系统按键重复速率与事件注入时机；本任务未触碰按键重复逻辑。未在本任务内修，因为需要单独判断是注入时序不稳还是节流实现问题 | 下次改动按键重复/节流逻辑或切换面板的重复处理时；或该场景在本机稳定可复现时 |
 | 73 | 完整门禁的 3 项环境性 NOT RUN：`panel-contrast.sh`、`space-desktops.sh`、`space-groups.sh` | 同上，2026-11-02 | LOW（未运行覆盖，环境限制） | 需要多显示器、另一个桌面、或绑定的 Space 快捷键等本机不具备的前置条件；场景自己报告 NOT RUN 而不是通过，这是设计如此 | 在有对应硬件/桌面环境的机器上跑 `--full` 时 |
@@ -82,6 +81,31 @@
 
 > **订正（2026-10-21，unbundled 安装交接审查）。** 审查轮 1 指出：杀掉 unbundled 实例（SIGTERM）不是成功退出，其 plist 设了 `KeepAlive.SuccessfulExit=false`，因此 launchd 会在大约 8 秒后拉起替代进程（实测 `state = spawn scheduled` → t+8s `state = running`，新 pid），而那时 dev 构建还没结束；替代进程随后占住实例锁，dev 版静默退出。当时我在 `--note` 里补了一句「已装的 `.app` 通过 SMAppService 登录项也有同样形态」，**这句是错的，在此撤回**。为判断这句而实测（与我们的代码无关，只关乎 launchd 语义）：一个临时 ad-hoc 签名的 `.app` 用真实 `SMAppService.mainApp` 注册成登录项（`status = 1`，`sfltool dumpbtm` 可见）后收到 SIGTERM，15 秒观察窗口内始终没有重启。普通 GUI app 的 job 是 `submitted by runningboardd`，出现在 `launchctl print` 但不在 `launchctl list`，随进程消失——它是瞬态的，且不带 `KeepAlive`。`SMAppService` 提供的是登录触发，不是运行期守护；只有 unbundled 的 plist 要求进程监督。因此 `dev-restart.sh` 对已装 `.app` 的既有处理本来就是对的，该 HIGH 只适用于 unbundled 路径，修复完整，`.app` 无需改动。测量用的临时 `.app` 已注销（`status` 回到 0）并删除：无进程、无 launchd job、无启用状态的登录项；`sfltool dumpbtm` 只留一条 `disabled` 的失效记录（bundle 已不在磁盘），无法启动任何东西。`/Applications/Oh-My-Tab.app` 的 BTM 记录未被触碰。
 
+
+## 2026-11-02 — #70 关闭：`settings-open-latency.sh` 的 0ms 来自发布坐标错误，已修
+
+`picker_settings_rect_top_left()`（`src/clipboard.rs`）直接返回 options orb 自己的 `frame`。玻璃材质下
+`install_glass_chrome` 把每个头部控件包进它自己的壳（`NSVisualEffectView` / `NSGlassEffectView`）并只把**壳**挂到
+strip 上，于是 orb 的 `frame` 是**壳内局部坐标**：实测 `panel_material = opaque` 报 `(510, 19, 34, 34)`（正确），
+`panel_material = frost` 报 `(0, 0, 34, 34)`（错误，控件实际画在右侧）。场景把这个矩形乘进一次桌面点击，于是点在
+面板左上角：popover 从没打开，设置点击时间也就从没发布，场景因此测出 0ms（warm 与 cold 都一样，不是偶发）。
+
+这一项起初按「既有失败、非本任务引入」记入 #70；追查后确认它是一个**产品缺陷**——任何按这个发布矩形做自动点击的
+调用者都会点到错误的位置，不只是这一个场景。
+
+修复：从 orb 向上走到 header 真正定位的那个视图（strip 的直接子视图，有壳时就是壳）并返回**它的** frame；遇到 strip
+或已脱离的视图即停止，不会爬出头部去报窗口的 frame。
+
+回归断言：`assert_header_controls_are_live`（`src/clipboard/smoke.rs`）断言**发布出来的**矩形等于
+`picker_header_frames()` 的 `options` 位置，而不是断言「读的是哪个视图」——只改读取方式而没改对数字的修法同样会红。
+反例已验证：撤掉向上遍历后 frost 与 liquid-glass 都失败，opaque 仍通过（无壳）；恢复后三种材质全过。
+
+A2 实跑：`scripts/e2e/settings-open-latency.sh` PASS——`warm click 112ms <= 400ms (delivery 1ms, window 100ms),
+cold click 509ms > warm`，测量恢复有效，且 warm 明显快于 cold。
+
+**顺带纠正一处我自己的误判**：我一度以为场景里的 `* scale` 是 bug（乘出来比屏宽还大）。不是——cua 的 desktop target
+收的是**桌面像素**并自行换算（返回里写着 `Sent screen-absolute click at desktop-pixel (1884,642) -> screen-point
+(942,321)`），场景是对的。
 ## 已在同一会话内关闭（不要重新打开）
 
 下列各轮都在预算政策存在之前就已在本会话内修完；记在这里只是为了后来的读者不必重新推导。修复都在树里，并带有各自的 A1 反例。

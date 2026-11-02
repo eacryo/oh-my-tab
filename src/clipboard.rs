@@ -2011,10 +2011,28 @@ pub(crate) fn picker_configured_screen_top_left() -> Option<(f64, f64, f64, f64)
 
 /// The settings button's frame in the picker's own points, top-left origin (None until the header
 /// has been built). Read from the live view so the reported rect is the one the user can click.
+///
+/// The orb itself is not always the view the header positions. Under the frosted and liquid-glass
+/// materials `install_glass_chrome` wraps every header control in its own shell and adds only that
+/// shell to the strip, so the orb's own `frame` is local to the shell -- it reads `(0, 0, 34, 34)`
+/// while the control is drawn near the right edge. Reporting that made a scenario click the panel's
+/// top-left corner and conclude the options popover never opened. The frame that answers "where is
+/// this control" is the one on the strip's direct child, so walk up to it.
 pub(crate) fn picker_settings_rect_top_left() -> Option<(f64, f64, f64, f64)> {
     let button = (*PICKER_OPTIONS_ORB.lock().unwrap())?;
+    let strip = (*PICKER_HEADER_STRIP.lock().unwrap()).map(|strip| strip.0);
     unsafe {
-        let frame: NSRect = msg_send![button.0, frame];
+        let mut positioned = button.0;
+        while let Some(strip) = strip {
+            let parent: *mut AnyObject = msg_send![positioned, superview];
+            // Stop at the strip (its child is the view it positions) or at a detached view: the
+            // walk must not climb out of the header and report the window's frame.
+            if parent.is_null() || parent == strip {
+                break;
+            }
+            positioned = parent;
+        }
+        let frame: NSRect = msg_send![positioned, frame];
         Some((
             frame.origin.x,
             frame.origin.y,

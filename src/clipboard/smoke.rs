@@ -1386,6 +1386,19 @@ pub(crate) fn smoke_runner() -> bool {
         assert!(pin.origin.x + pin.size.width <= close.origin.x);
         let options_hidden: bool = msg_send![found_settings, isHidden];
         assert!(!options_hidden, "the options orb must be visible");
+        // The rect `--e2e-state` publishes for this orb is what an A2 scenario clicks. It used to be
+        // read straight off the button, which under a glass material reports the position INSIDE the
+        // shell -- `(0, 0, 34, 34)` for a control drawn near the right edge -- so the scenario clicked
+        // the panel's top-left corner and reported that the options popover never opened. Assert the
+        // published rect against the geometry, not against the view it happens to be read from: a
+        // fix that only re-arranged the read would keep the wrong number.
+        let published = super::picker_settings_rect_top_left()
+            .expect("the settings orb rect must be published while the header is built");
+        assert_eq!(
+            published,
+            (options.origin.x, options.origin.y, options.size.width, options.size.height),
+            "the published settings-orb rect must be where the orb is drawn, not its shell-local frame"
+        );
         // The orb is a circle drawn with masksToBounds, and the "filter active" dot rides in its
         // corner. The clip is what the dot has to clear, so both are asserted on the live layer
         // tree: a corner radius without the mask leaves the dot painting over the square corner,
