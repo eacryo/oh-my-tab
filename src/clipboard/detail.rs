@@ -1358,6 +1358,17 @@ unsafe fn install_glass_chrome(
 ) {
     let material = crate::glass::PanelMaterial::effective();
     if material == crate::glass::PanelMaterial::Opaque {
+        // This branch lays the control out by FRAME, and a round trip through a glass material
+        // leaves two things behind that fight that. `NSGlassEffectView setContentView:` switches
+        // the control to Auto Layout, so a later layout pass sized it to its intrinsic content
+        // (a 34x34 orb became the 15x17 of its glyph); and the glass branch gave it a sizable
+        // autoresizing mask for a wrapper that is no longer there. Both are undone here so the
+        // frame below is the only thing that decides the geometry.
+        let _: () = msg_send![
+            child,
+            setTranslatesAutoresizingMaskIntoConstraints: true
+        ];
+        let _: () = msg_send![child, setAutoresizingMask: 0u64];
         let _: () = msg_send![child, setFrame: frame];
         let _: () = msg_send![host, addSubview: child];
         return;

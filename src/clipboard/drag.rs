@@ -329,11 +329,37 @@ fn point_in_list_region(point: NSPoint, scroll_frame: NSRect) -> bool {
 /// controls (buttons, fields, sliders -- `NSControl` covers every one of them), text views, and the
 /// scroll machinery itself. Everything else (the header strip, the footer, the document view, a
 /// label's plain container) is inert background.
+///
+/// A glass shell is not background. The frost and liquid-glass materials wrap each header control in
+/// an `NSVisualEffectView` or `NSGlassEffectView`, and AppKit reports the SHELL for a point over the
+/// control inside it. Treating the shell as inert made the drag surface swallow clicks on the search
+/// field under those materials -- a press in the search box started a panel drag instead of placing
+/// the caret. A shell therefore defers to whatever it wraps.
 unsafe fn drag_target_owns_the_click(target: *mut AnyObject) -> bool {
-    if target.is_null() {
+    if view_is_click_owner(target) {
+        return true;
+    }
+    // Only a decoration shell defers; any other unknown view stays background, so a stray container
+    // cannot make blank space undraggable.
+    if is_glass_shell(target) {
+        // A shell offers no single content accessor that both materials share -- liquid glass
+        // installs through `setContentView:` while the frosted shell uses `addSubview:`, and the
+        // search capsule puts a plain container under either of them before the field itself. So
+        // walk the whole subtree instead of naming one child.
+        return any_descendant_owns_the_click(target, 0);
+    }
+    false
+}
+
+/// Whether `view` itself claims the click: a control, a text view, or the scroll machinery.
+///
+/// Split out from `drag_target_owns_the_click` so the shell walk below can test each descendant
+/// without re-entering the shell handling (which would visit a nested shell twice).
+unsafe fn view_is_click_owner(view: *mut AnyObject) -> bool {
+    if view.is_null() {
         return false;
     }
-    if msg_send![target, isKindOfClass: scroll_indicator_class()] {
+    if msg_send![view, isKindOfClass: scroll_indicator_class()] {
         return true;
     }
     for class in [
@@ -343,12 +369,70 @@ unsafe fn drag_target_owns_the_click(target: *mut AnyObject) -> bool {
         class!(NSClipView),
         class!(NSScroller),
     ] {
-        let owns: bool = msg_send![target, isKindOfClass: class];
+        let owns: bool = msg_send![view, isKindOfClass: class];
         if owns {
             return true;
         }
     }
     false
+}
+
+/// Whether any view in `view`'s subtree claims the click, searched depth-first.
+///
+/// The depth bound keeps a pathological tree from hanging the hit test. This is a whole-shell answer,
+/// not a positional one: it takes no point, so a shell that CONTAINS an interactive descendant declines
+/// the drag in its entirety, padding included. That is the right trade for the header shells here,
+/// which exist to hold a control; a shell that was mostly blank would need a point to be useful.
+unsafe fn any_descendant_owns_the_click(view: *mut AnyObject, depth: usize) -> bool {
+    if depth > 8 {
+        return false;
+    }
+    let children: *mut AnyObject = msg_send![view, subviews];
+    if children.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![children, count];
+    for index in 0..count {
+        let child: *mut AnyObject = msg_send![children, objectAtIndex: index as isize];
+        if view_is_click_owner(child) || any_descendant_owns_the_click(child, depth + 1) {
+            return true;
+        }
+    }
+    false
+}
+
+/// The drag target classification, for the picker smoke.
+///
+/// `drag_surface_hit_test` does call this; the reason the smoke needs a direct hook is that its existing
+/// assertion feeds `hitTest:` a point where the hit resolves to something the old code already handled.
+/// That assertion kept passing with this function regressed to not defer to shells, so it never covered
+/// the shell case. Calling the classification directly on a known shell is what makes the shell branch
+/// observable.
+pub(super) unsafe fn the_target_owns_the_click_for_test(view: *mut AnyObject) -> bool {
+    drag_target_owns_the_click(view)
+}
+
+/// Whether `view` is a decoration shell, for the picker smoke. The assertion walks the field's
+/// ancestor chain with this instead of assuming a particular nesting depth.
+pub(super) unsafe fn the_shell_defers_for_test(view: *mut AnyObject) -> bool {
+    is_glass_shell(view)
+}
+
+/// Whether `view` is one of the decoration shells the glass materials wrap controls in.
+///
+/// Matched by class rather than by pointer identity so the check keeps working after a material swap
+/// rebuilds every shell.
+unsafe fn is_glass_shell(view: *mut AnyObject) -> bool {
+    if view.is_null() {
+        return false;
+    }
+    if msg_send![view, isKindOfClass: class!(NSVisualEffectView)] {
+        return true;
+    }
+    objc2::runtime::AnyClass::get(c"NSGlassEffectView").is_some_and(|cls| {
+        let is: bool = msg_send![view, isKindOfClass: cls];
+        is
+    })
 }
 
 /// The view AppKit would hit for `point` if the drag surface were not in the tree: the sibling

@@ -272,10 +272,11 @@ if labels:
     # src/settings/ 的常量。每个步长量的是**相邻两个标签的原点**:
     # 0    = 同一行的行标签与它的取值子视图(原点相同),
     # 20   = 页头:应用名 → 版本副标题,
-    # 36.5 = 分区标题 → 该区的第一行(56 − 行标签在本行内的原点偏移 19.5),
+    # 40.5 = 分区标题 → 该区的第一行:56 − 19.5,再加 4(SETTINGS_SECTION_CARD_GAP 8→4 后标题
+    #        相对卡片下移 4pt),
     # 56   = 行 → 行(SINGLE_LINE_ROW_H 56,row_gap 0,行在卡片内连续),
-    # 62.5 = 上一区的末行 → 下一区的分区标题(section_step 43 + 行标签原点偏移 19.5),
-    # 70   = 版本副标题 → 第一个分区标题(section_step 43 + 27,其中 27 = 页头副标题块高 80 − 该标签原点偏移 53)。
+    # 58.5 = 上一区的末行 → 下一区的分区标题:62.5 − 4(section_step 仍为 43,标题整体下移 4),
+    # 66   = 版本副标题 → 第一个分区标题:70 − 4(同上)。
     # 任何别的步长都是排版漂移。
     # Layout step conventions. Every value is measured from an --e2e-state snapshot (2026-10-24, the
     # About page's 18 row labels) and traced back to the constants in src/settings/. Each step is the
@@ -296,10 +297,10 @@ if labels:
     allowed = {
         0.0: ("a row label and its value subview, same origin", 4),
         20.0: ("the app name to the version subtitle", 1),
-        36.5: ("a section header to its first row", 3),
+        40.5: ("a section header to its first row", 3),
         56.0: ("row to row (SINGLE_LINE_ROW_H 56, contiguous rows)", 6),
-        62.5: ("the last row of a section to the next section header", 2),
-        70.0: ("the version subtitle to the first section header", 1),
+        58.5: ("the last row of a section to the next section header", 2),
+        66.0: ("the version subtitle to the first section header", 1),
     }
     unexpected = [d for d in deltas if not any(abs(d - v) <= 1.5 for v in allowed)]
     check(

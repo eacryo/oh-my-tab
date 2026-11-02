@@ -1126,28 +1126,22 @@ pub(crate) fn smoke_runner() -> bool {
 
         let subviews: *mut AnyObject = msg_send![header, subviews];
         let count: usize = msg_send![subviews, count];
-        let mut found_settings: *mut AnyObject = std::ptr::null_mut();
-        let mut found_close = false;
         // Every header orb, keyed by its action, so the family's shared surface can be asserted.
+        // Found through the whole subtree: a frosted or liquid-glass material wraps each control in
+        // its own shell, so the buttons are grandchildren of the strip, not its direct subviews.
         let mut orbs: Vec<(&str, *mut AnyObject)> = Vec::new();
-        for index in 0..count {
-            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-            let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-            if !is_button {
-                continue;
-            }
-            let action: Sel = msg_send![view, action];
-            if action == sel!(toggleFilterPopover:) {
-                found_settings = view;
-                orbs.push(("options", view));
-            } else if action == sel!(togglePanelPin:) {
-                orbs.push(("pin", view));
-            } else if action == sel!(togglePauseRecording:) {
-                orbs.push(("pause", view));
-            } else if action == sel!(pickerClose:) {
-                found_close = true;
+        for (name, action) in [
+            ("options", sel!(toggleFilterPopover:)),
+            ("pin", sel!(togglePanelPin:)),
+            ("pause", sel!(togglePauseRecording:)),
+        ] {
+            let button = find_button_answering(header, action);
+            if !button.is_null() {
+                orbs.push((name, button));
             }
         }
+        let found_settings = find_button_answering(header, sel!(toggleFilterPopover:));
+        let found_close = !find_button_answering(header, sel!(pickerClose:)).is_null();
         // The recording control is one of the corner orbs, not a bare glyph: it must carry the same
         // 1pt orb border they do. A missing border is exactly the defect this family check exists
         // for -- the pause orb shipped without one and read as a different kind of control. The
@@ -1303,66 +1297,83 @@ pub(crate) fn smoke_runner() -> bool {
             hit_search.is_null(),
             "the search field must keep its own click; the drag surface must decline it"
         );
+        // The fix that makes the capsule clickable lives in the drag target classification. The
+        // `hitTest:` above still passes with that classification reverted, because the point it feeds
+        // resolves to something the older code already handled -- so it never covered the case where
+        // AppKit reports the glass SHELL for a press over the control inside it. Assert the
+        // classification directly on the real ancestor chain instead. Only glass shells are
+        // asserted: the plain container between the shell and the field is background by design, and
+        // the shell walk is what reaches through it, so requiring it to own the click would be wrong.
+        {
+            let search_view = (*super::SEARCH_FIELD.lock().unwrap())
+                .expect("the search field must be built")
+                .0;
+            let mut ancestor: *mut AnyObject = search_view;
+            let mut shells = 0usize;
+            while !ancestor.is_null() && ancestor != header {
+                if super::drag::the_shell_defers_for_test(ancestor) {
+                    assert!(
+                        super::drag::the_target_owns_the_click_for_test(ancestor),
+                        "a glass shell above the search field must own the click, or a press there starts a panel drag"
+                    );
+                    shells += 1;
+                }
+                ancestor = msg_send![ancestor, superview];
+            }
+            // Under the opaque material there is no shell at all: the field hangs directly off the
+            // strip, which the hitTest above already covers. The shells assertion applies only when
+            // the material actually wrapped the control.
+            let wrapped =
+                crate::glass::PanelMaterial::effective() != crate::glass::PanelMaterial::Opaque;
+            assert!(
+                shells > 0 || !wrapped,
+                "a non-opaque material must wrap the search field in a shell, or this check covers nothing"
+            );
+        }
+
         // The pin is the corner row's third glyph. It is found by ACTION, so a rename that left the
         // header without a working pin fails here, and its frame is checked against the geometry
         // that no-overlap proof is written against.
-        let found_pin = (0..count).any(|index| {
-            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-            // Only buttons answer action; the header strip is a plain NSView, and asking it would
-            // be a "method not found" crash.
-            let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-            if !is_button {
-                return false;
-            }
-            let action: Sel = msg_send![view, action];
-            if action != sel!(togglePanelPin:) {
-                return false;
-            }
-            let frame: NSRect = msg_send![view, frame];
+        // Searched through the subtree: glass materials wrap the control in their own shell.
+        let pin_view = find_button_answering(header, sel!(togglePanelPin:));
+        let found_pin = !pin_view.is_null();
+        if found_pin {
+            let frame = frame_in_header(pin_view, header);
             assert_eq!(
                 frame, pin,
                 "the pin button must sit in the frame the geometry reserves for it"
             );
-            let label: *mut AnyObject = msg_send![view, accessibilityLabel];
+            let label: *mut AnyObject = msg_send![pin_view, accessibilityLabel];
             assert!(
                 !label.is_null(),
                 "the pin must state its state to assistive clients, not just show a glyph"
             );
-            true
-        });
+        }
         assert!(
             found_pin,
             "the header must carry a pin button targeting togglePanelPin:"
         );
         // The recording control is found by ACTION too: a rename that left the panel without a
         // working pause entry fails here, and its frame is checked against the geometry above.
-        let found_pause = (0..count).any(|index| {
-            let view: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-            let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
-            if !is_button {
-                return false;
-            }
-            let action: Sel = msg_send![view, action];
-            if action != sel!(togglePauseRecording:) {
-                return false;
-            }
-            let frame: NSRect = msg_send![view, frame];
+        let pause_view = find_button_answering(header, sel!(togglePauseRecording:));
+        let found_pause = !pause_view.is_null();
+        if found_pause {
+            let frame = frame_in_header(pause_view, header);
             assert_eq!(
                 frame, pause,
                 "the pause orb must sit in the frame the geometry reserves for it"
             );
-            let label: *mut AnyObject = msg_send![view, accessibilityLabel];
+            let label: *mut AnyObject = msg_send![pause_view, accessibilityLabel];
             assert!(
                 !label.is_null(),
                 "the pause orb must state whether it pauses or resumes recording"
             );
-            true
-        });
+        }
         assert!(
             found_pause,
             "the header must carry a pause-recording orb targeting togglePauseRecording:"
         );
-        let options_frame: NSRect = msg_send![found_settings, frame];
+        let options_frame = frame_in_header(found_settings, header);
         assert_eq!(
             options_frame, options,
             "the options orb must sit in the frame the geometry reserves for it"
@@ -1404,6 +1415,64 @@ pub(crate) fn smoke_runner() -> bool {
             super::orb_dot_is_drawn_in_full(super::PICKER_ORB_SIZE, dot_frame),
             "the option orb's dot must be drawn whole inside the orb (frame {dot_frame:?})"
         );
+    }
+
+    /// Every button in `view`'s subtree that answers `action`, depth-first, in view order.
+    ///
+    /// The header orbs are NOT always direct subviews: `install_glass_chrome` wraps each control in
+    /// an `NSGlassEffectView` or `NSVisualEffectView` for the frosted and liquid-glass materials and
+    /// adds only that shell to the strip. A lookup that reads one level therefore finds zero orbs on
+    /// every material except opaque, which is why this walks the whole subtree.
+    unsafe fn buttons_answering(view: *mut AnyObject, action: Sel, out: &mut Vec<*mut AnyObject>) {
+        if view.is_null() {
+            return;
+        }
+        let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+        if is_button {
+            let own: Sel = msg_send![view, action];
+            if own == action {
+                out.push(view);
+            }
+        }
+        let children: *mut AnyObject = msg_send![view, subviews];
+        if children.is_null() {
+            return;
+        }
+        let count: usize = msg_send![children, count];
+        for index in 0..count {
+            let child: *mut AnyObject = msg_send![children, objectAtIndex: index as isize];
+            buttons_answering(child, action, out);
+        }
+    }
+
+    /// The first button in `view`'s subtree answering `action`, or null.
+    unsafe fn find_button_answering(view: *mut AnyObject, action: Sel) -> *mut AnyObject {
+        let mut found = Vec::new();
+        buttons_answering(view, action, &mut found);
+        found.first().copied().unwrap_or(std::ptr::null_mut())
+    }
+
+    /// The frame a header control OCCUPIES, in the header strip's coordinate space.
+    ///
+    /// A glass-wrapped control is not positioned by its own frame: `install_glass_chrome` builds a
+    /// shell at the reserved frame, hands the control to `setContentView:`, and never recentres it,
+    /// so the control's own frame is in the shell's space and describes the shell's content box
+    /// rather than where the control appears. When the control sits inside such a shell, the shell
+    /// is the view whose frame answers "where is this control on screen".
+    unsafe fn frame_in_header(view: *mut AnyObject, header: *mut AnyObject) -> NSRect {
+        // Walk up until the ancestor that the header actually positions. The liquid-glass branch
+        // nests the control inside NSGlassEffectView > ContentHolderView, so one level is not enough
+        // and an intermediate holder answers with its own local frame.
+        let mut current = view;
+        for _ in 0..8 {
+            let parent: *mut AnyObject = msg_send![current, superview];
+            if parent.is_null() || parent == header {
+                break;
+            }
+            current = parent;
+        }
+        let f: NSRect = msg_send![current, frame];
+        f
     }
 
     // Footer shortcut legends must survive the fonts they are drawn with, in every shipped
