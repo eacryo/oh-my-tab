@@ -562,8 +562,8 @@ Markdown 更新说明的一级标题使用 `sidebar-title` 粗体，二级标题
 | 品牌行 | 34pt 图标距左 12，名称在其后 8，14pt/600；下一行导航条目距该行 16 | `brand_row_frames`、`sidebar_first_nav_row_top` |
 | 页面顶部留白 | 24 | `SettingsPageHeader::TOP_PADDING` |
 | 页面底部留白 | 20 | `SettingsPageHeader::BOTTOM_PADDING` |
-| 区块标题上方间距 | 20 | `SETTINGS_SECTION_HEADER_GAP` |
-| 标题 → 卡片间距 | 8 | `SETTINGS_SECTION_CARD_GAP` |
+| 区块节奏 | 上一卡片底边到下一条卡片顶边 43；其中上一卡片底距下一标题框顶 24（43 − 15 − 4） | `SETTINGS_SECTION_RHYTHM_GAP` + `SETTINGS_SECTION_HEADER_GAP`；固定此项，调整标题自身间距不会移动页面内容 |
+| 标题 → 卡片间距 | 目标 6，实际渲染 5.75（框间距 4） | `SETTINGS_SECTION_HEADING_INK_GAP` 是唯一输入：读者看到的「标题字形 → 卡片顶边」净空。`SETTINGS_SECTION_CARD_GAP` 由它推导并向下取整到 4pt 网格，故实际为 5.75 |
 | 行间距 | 0 | `SettingsLayout::row_gap` |
 | 行高 56，控件高 32，垂直居中 | | `SettingsLayout` |
 | 控件列 | 宽 180，右对齐，距卡片右边 16 | `SettingsLayout` |

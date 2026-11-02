@@ -648,9 +648,37 @@ const MAPPING_ACTION_TOP: f64 = 12.0; // gap above the add-mapping button
 const MAPPING_ACTION_H: f64 = 32.0; // add-mapping button height
 const MAPPING_CARD_PAD_BOT: f64 = 8.0; // card bottom padding
 
-/// Gap from a section header to the top edge of its grouped card (the mock's
-/// `.section-title` margin-bottom; measured 7.99pt).
-const SETTINGS_SECTION_CARD_GAP: f64 = 8.0;
+/// THE spacing control for a section heading and the card below it: the clearance a reader sees
+/// between the heading's GLYPHS and the card's top edge. This is the one design input; every other
+/// number below is derived from it, so adjusting the look means adjusting this value and nothing else.
+pub(super) const SETTINGS_SECTION_HEADING_INK_GAP: f64 = 6.0;
+
+/// How far a section heading's ink sits above its label box bottom edge.
+///
+/// Measured on the rendered settings window: a 12pt heading in the 15pt box leaves about 1.75pt of
+/// box below the glyphs. It is a property of AppKit's text layout, so it is measured rather than
+/// chosen, and it is deliberately NOT a design token.
+pub(super) const SECTION_HEADING_INK_BELOW_BOX: f64 = 1.75;
+
+/// Gap from a section heading's box bottom to the top edge of its card, DERIVED from the visible
+/// clearance above by removing the box that sits below the glyphs.
+///
+/// The settings grid requires every spacing token to be a multiple of 4, so this is rounded DOWN to
+/// the nearest grid step rather than chosen freely; the visible clearance a page actually renders is
+/// therefore `SETTINGS_SECTION_RENDERED_INK_GAP`, which `--smoke-settings-layout` asserts.
+const SETTINGS_SECTION_CARD_GAP: f64 =
+    ((SETTINGS_SECTION_HEADING_INK_GAP - SECTION_HEADING_INK_BELOW_BOX) / 4.0).floor() * 4.0;
+
+/// What the page actually renders, given the grid rounding above. The M2 smoke asserts this exact
+/// value, so a reader comparing the screen with the token can see where the difference comes from.
+pub(super) const SETTINGS_SECTION_RENDERED_INK_GAP: f64 =
+    SETTINGS_SECTION_CARD_GAP + SECTION_HEADING_INK_BELOW_BOX;
+
+/// The gap term the page rhythm spends between a heading box and the card below it. Pinned at the
+/// historical 8 so tightening `SETTINGS_SECTION_CARD_GAP` moves only the heading, not every section
+/// below it: the rhythm measures the distance between consecutive CARDS, which is a different
+/// promise from the heading's clearance from its own card.
+const SETTINGS_SECTION_RHYTHM_GAP: f64 = 8.0;
 /// Horizontal padding of the settings detail content inside the pane (`.settings-content
 /// { padding: 0 var(--sp-7) }`). The page layout and the search results' page-style chunks both
 /// use it, so their cards share the same columns.

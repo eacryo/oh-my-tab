@@ -710,8 +710,8 @@ against.
 | Brand row | 34pt icon 12pt in, name 8pt after it, 14pt/600; next nav row 16pt below the row | `brand_row_frames`, `sidebar_first_nav_row_top` |
 | Page top padding | 24 | `SettingsPageHeader::TOP_PADDING` |
 | Page bottom padding | 20 | `SettingsPageHeader::BOTTOM_PADDING` |
-| Section header gap | 20 | `SETTINGS_SECTION_HEADER_GAP` |
-| Header → card gap | 8 | `SETTINGS_SECTION_CARD_GAP` |
+| Section rhythm | 43 from the previous card's bottom edge to the next card's top edge; within that, the previous card's bottom sits 24 above the next heading box top (43 − 15 − 4) | `SETTINGS_SECTION_RHYTHM_GAP` + `SETTINGS_SECTION_HEADER_GAP`; pinned so adjusting the heading's own gap never moves page content |
+| Header → card gap | 6 wanted, 5.75 rendered (box gap 4) | `SETTINGS_SECTION_HEADING_INK_GAP` is the single input: the clearance a reader sees between the heading's glyphs and its card. `SETTINGS_SECTION_CARD_GAP` is derived from it and floored to the 4pt grid, which is why the rendered value is 5.75 |
 | Row gap | 0 | `SettingsLayout::row_gap` |
 | Rows | 56 tall, control 32 tall, vertically centred | `SettingsLayout` |
 | Control column | 180 wide, right-aligned, 16 from the card's right edge | `SettingsLayout` |

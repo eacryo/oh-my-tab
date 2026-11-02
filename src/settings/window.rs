@@ -1410,6 +1410,112 @@ unsafe fn general_page_leads_with_startup_and_icon_cards() -> bool {
         && order[2] == t("settings.header_appearance")
         && order[3] == t("settings.header_language")
 }
+/// The gap between a section heading and the card it labels, measured on the rendered view tree.
+///
+/// Two assertions, and they answer different questions:
+/// - the FRAME contract, exactly. `SettingsSection::attach` and every reflow place the heading box
+///   bottom `SETTINGS_SECTION_CARD_GAP` above the card top, so this is pure arithmetic and a
+///   tolerance of one backing pixel is generous. This is the check the original defect fails: the
+///   reflow used to put both edges on the same coordinate, a delta of 0 against an expected 8.
+/// - the INK floor, as a minimum. The heading glyphs sit inside their box, above the box bottom
+///   edge, so the visible gap is LARGER than the frame gap by that box's own bottom leading. A
+///   floor rather than an exact value keeps a taller-rendering locale passing while still failing
+///   a return to the bare 3pt of leading the defect left.
+///
+/// A pair that cannot be measured is reported and fails: "cannot decide" must never read as pass.
+unsafe fn section_headings_hang_above_their_cards() -> bool {
+    let pairs = match super::components::SECTION_PAIRS.lock() {
+        Ok(pairs) => pairs.clone(),
+        Err(_) => {
+            log_info!("[smoke-settings-layout] the section pair registry is already borrowed");
+            return false;
+        }
+    };
+    if pairs.is_empty() {
+        log_info!("[smoke-settings-layout] no section heading/card pair was registered to measure");
+        return false;
+    }
+    // The tolerance is one backing pixel, so it has to come from the window these views actually
+    // live in: that is 1pt at 1x and 0.5pt at 2x.
+    let scale: f64 = pairs
+        .first()
+        .map(|(header, _)| {
+            let header = *header as *mut AnyObject;
+            let window: *mut AnyObject = msg_send![header, window];
+            if window.is_null() {
+                0.0
+            } else {
+                msg_send![window, backingScaleFactor]
+            }
+        })
+        .filter(|scale: &f64| *scale > 0.0)
+        .unwrap_or(1.0);
+    let frame_tolerance = 1.0 / scale;
+    // The visible clearance is asserted as a RANGE around the token that states it, not as a bare
+    // floor: `SETTINGS_SECTION_HEADING_INK_GAP` is the quantity the design controls, so a page that
+    // renders it wider or narrower than the token says is a regression in either direction. The
+    // tolerance covers the one-or-two-pixel ambiguity of an anti-aliased glyph edge, which is wider
+    // than the frame tolerance because ink edges are softer than a view edge.
+    let ink_tolerance = 1.0 / scale + 0.5;
+    let mut checked = 0usize;
+    for (header, card) in pairs {
+        let header = header as *mut AnyObject;
+        let card = card as *mut AnyObject;
+        if header.is_null() || card.is_null() {
+            continue;
+        }
+        let header_hidden: bool = msg_send![header, isHidden];
+        let card_hidden: bool = msg_send![card, isHidden];
+        if header_hidden || card_hidden {
+            continue;
+        }
+        let header_frame: NSRect = msg_send![header, frame];
+        let card_frame: NSRect = msg_send![card, frame];
+        let frame_gap = header_frame.origin.y - (card_frame.origin.y + card_frame.size.height);
+        if (frame_gap - super::SETTINGS_SECTION_CARD_GAP).abs() > frame_tolerance {
+            log_info!(
+                "[smoke-settings-layout] a section heading sits {frame_gap:.2}pt above its card, not {}pt",
+                super::SETTINGS_SECTION_CARD_GAP
+            );
+            return false;
+        }
+        // Bounded to the heading own box: the page midpoint background would be a card surface and
+        // the card edge below the heading would otherwise read as ink.
+        let Some((ink_lo, _ink_hi)) = super::widgets::view_ink_span_in_own_box(header) else {
+            log_info!(
+                "[smoke-settings-layout] a section heading ink is not measurable, so its clearance is undecidable"
+            );
+            return false;
+        };
+        // `ink_lo` is the lower edge in AppKit's upward-y space, which is the edge nearest the
+        // card below, so this is the clearance a reader actually sees.
+        let ink_gap = ink_lo - (card_frame.origin.y + card_frame.size.height);
+        // What the page should render, given the grid rounding of the derived box gap.
+        let ink_expect = super::SETTINGS_SECTION_RENDERED_INK_GAP;
+        if (ink_gap - ink_expect).abs() > ink_tolerance {
+            log_info!(
+                "[smoke-settings-layout] a section heading ink clears its card by {ink_gap:.2}pt, not the {ink_expect:.2}pt the token states"
+            );
+            return false;
+        }
+        checked += 1;
+    }
+    if checked == 0 {
+        log_info!(
+            "[smoke-settings-layout] every section heading/card pair was hidden or unmeasurable"
+        );
+        return false;
+    }
+    // Both numbers are named so a reader can tell the design input from what was asserted: the
+    // assertion above uses RENDERED_INK_GAP, which is the input rounded down to the 4pt grid.
+    log_info!(
+        "[smoke-settings-layout] section headings render {:.2}pt of ink clearance above their cards ({checked} pairs; design input {:.2}pt, box gap {}pt)",
+        super::SETTINGS_SECTION_RENDERED_INK_GAP,
+        super::SETTINGS_SECTION_HEADING_INK_GAP,
+        super::SETTINGS_SECTION_CARD_GAP
+    );
+    true
+}
 /// Whether the expanded update card and its host sit inside the page document with the page's bottom
 /// padding, and the document covers the card's top edge (i.e. the whole card can be scrolled to).
 unsafe fn update_card_inside_document() -> bool {
@@ -1923,6 +2029,13 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             return false;
         }
         log_info!("[smoke-settings-layout] General page leads with the startup and icon cards");
+        // The heading-to-card gap is a rendered relation: the frame contract is arithmetic, but
+        // whether a reflow preserved it only shows on the built page.
+        if !section_headings_hang_above_their_cards() {
+            log_info!("[smoke-settings-layout] a section heading does not hang above its card");
+            hide_settings();
+            return false;
+        }
         let sidebar_layout_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let buttons = sidebar_buttons(ui);
@@ -4215,6 +4328,9 @@ fn clear_settings_content_registries() {
     widgets::clear_settings_select_registry(select::SelectOwner::SettingsPage);
     tooltip::SettingsTooltip::clear_runtime_registries();
     widgets::clear_sidebar_view_registries();
+    // Same rule as the registries above: these name views by address, and a rebuild releases the
+    // views a previous build registered. A stale pair would be messaged after it was freed.
+    components::clear_section_pairs();
 }
 
 /// Detach global references owned by a settings window before it is released or replaced.

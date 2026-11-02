@@ -2613,7 +2613,7 @@ pub(super) fn pixel_rows_to_parent_span(
     (parent_origin_y + a / scale_y, parent_origin_y + b / scale_y)
 }
 
-unsafe fn child_ink_span_in_parent(child: *mut AnyObject) -> Option<(f64, f64)> {
+pub(super) unsafe fn child_ink_span_in_parent(child: *mut AnyObject) -> Option<(f64, f64)> {
     if child.is_null() {
         return None;
     }
@@ -2697,6 +2697,97 @@ unsafe fn child_ink_span_in_parent(child: *mut AnyObject) -> Option<(f64, f64)> 
         ph,
         sy,
         pb.origin.y,
+        flipped,
+    ))
+}
+
+/// Ink span of one view, measured inside its OWN box.
+///
+/// `child_ink_span_in_parent` renders the whole parent and takes its background from the parent
+/// vertical midpoint. That is fine for a sidebar button, whose parent is a uniform row, but a
+/// section heading lives on the page document, whose midpoint lands on a card: the sampled
+/// background would be the card surface rather than the page, and the card edge below the heading
+/// would read as ink. This scan is limited to the heading box own frame and takes its background
+/// from that frame own top edge, so nothing outside the box can enter the result.
+///
+/// Returns the span in the parent coordinate space, as `child_ink_span_in_parent` does.
+pub(super) unsafe fn view_ink_span_in_own_box(child: *mut AnyObject) -> Option<(f64, f64)> {
+    if child.is_null() {
+        return None;
+    }
+    let parent: *mut AnyObject = msg_send![child, superview];
+    if parent.is_null() {
+        return None;
+    }
+    let pb: NSRect = msg_send![parent, bounds];
+    if pb.size.width <= 1.0 || pb.size.height <= 1.0 {
+        return None;
+    }
+    let cf: NSRect = msg_send![child, frame];
+    if cf.size.width <= 1.0 || cf.size.height <= 1.0 {
+        return None;
+    }
+    // Only the child box is rendered and scanned; nothing below it in the parent (a card, a rule,
+    // another heading) is part of the bitmap at all.
+    let mut scan = cf;
+    scan.origin.x = (scan.origin.x - pb.origin.x).max(0.0);
+    scan.origin.y = (scan.origin.y - pb.origin.y).max(0.0);
+    let rep: *mut AnyObject = msg_send![parent, bitmapImageRepForCachingDisplayInRect: scan];
+    if rep.is_null() {
+        return None;
+    }
+    let _: () = msg_send![parent, cacheDisplayInRect: scan, toBitmapImageRep: rep];
+    let pw: isize = msg_send![rep, pixelsWide];
+    let ph: isize = msg_send![rep, pixelsHigh];
+    if pw <= 2 || ph <= 2 {
+        return None;
+    }
+    let data: *mut u8 = msg_send![rep, bitmapData];
+    let bytes_per_row: isize = msg_send![rep, bytesPerRow];
+    let samples: isize = msg_send![rep, samplesPerPixel];
+    let bits_per_sample: isize = msg_send![rep, bitsPerSample];
+    let bits_per_pixel: isize = msg_send![rep, bitsPerPixel];
+    let planar: bool = msg_send![rep, isPlanar];
+    let usable = bits_per_sample == 8
+        && bits_per_pixel == samples * 8
+        && !planar
+        && bytes_per_row >= pw * samples;
+    if data.is_null() || samples < 3 || !usable {
+        return None;
+    }
+    let n = samples as usize;
+    // Background from the top-left pixel of the box: a heading box opens above its cap height, so it
+    // is page surface there. Read as raw bytes, which is equivalent to comparing colours because the
+    // scan compares the same positions against the same reference.
+    let top_row = std::slice::from_raw_parts(data, pw as usize * n);
+    let mut bg = [0u8; 4];
+    bg[..n].copy_from_slice(&top_row[..n]);
+    let mut ink_top = isize::MAX;
+    let mut ink_bottom = isize::MIN;
+    for py in 0..ph {
+        let row = std::slice::from_raw_parts(
+            data.add(py as usize * bytes_per_row as usize),
+            pw as usize * n,
+        );
+        for px in 0..pw {
+            let off = px as usize * n;
+            if (0..n).any(|ch| (row[off + ch] as i32 - bg[ch] as i32).abs() > 5) {
+                ink_top = ink_top.min(py);
+                ink_bottom = ink_bottom.max(py);
+            }
+        }
+    }
+    if ink_top > ink_bottom {
+        return None;
+    }
+    let flipped: bool = msg_send![parent, isFlipped];
+    let scale_y = ph as f64 / scan.size.height;
+    Some(pixel_rows_to_parent_span(
+        ink_top,
+        ink_bottom,
+        ph,
+        scale_y,
+        scan.origin.y + pb.origin.y,
         flipped,
     ))
 }
@@ -3144,7 +3235,13 @@ const SECTION_HEADER_KERN: f64 = 0.44;
 
 /// Section header label in the mock's `.section-title` style (11pt semibold, tracked, muted);
 /// released after being added to the parent.
-pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f64, w: f64) {
+pub(super) unsafe fn add_header(
+    parent: *mut AnyObject,
+    text: &str,
+    x: f64,
+    y: f64,
+    w: f64,
+) -> *mut AnyObject {
     let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let label: *mut AnyObject = msg_send![
         label,
@@ -3173,7 +3270,11 @@ pub(super) unsafe fn add_header(parent: *mut AnyObject, text: &str, x: f64, y: f
     // Vertical placement belongs to the page layout owner (no MinYMargin).
     let _: () = msg_send![label, setAutoresizingMask: 2u64];
     let _: () = msg_send![parent, addSubview: label];
+    // Returned before the release: the caller may register the pair for the layout smoke, and the
+    // parent holds the only owning reference from here on.
+    let handle = label;
     release_obj(label);
+    handle
 }
 
 /// Add a page title matching the HTML redesign's large, tight heading and return its height.

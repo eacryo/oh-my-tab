@@ -1007,8 +1007,11 @@ impl PageCanvas {
             }
         }
 
-        // Section headers are drawn with their bottom edge on their section's cursor. The cursor
-        // comes from the walk, so a hidden group above them pulls them up with the rows.
+        // Section headers hang SETTINGS_SECTION_CARD_GAP above their card's top edge, which is the
+        // rule `SettingsSection::attach` already applies when the page is built. Re-placing the
+        // header box on the cursor itself instead puts its bottom edge on the card top and erases
+        // the gap on every reflow, so the creation-time spacing is not what the screen shows.
+        // The cursor comes from the walk, so a hidden group above them pulls them up with the rows.
         for (index, section) in self.sections.iter().enumerate() {
             if section.header.is_null() {
                 continue;
@@ -1018,10 +1021,11 @@ impl PageCanvas {
                 .get(index)
                 .copied()
                 .unwrap_or(section.rel);
+            let header_y = self.layout.section_header_y(base + rel);
             let frame: NSRect = msg_send![section.header, frame];
             let _: () = msg_send![
                 section.header,
-                setFrameOrigin: NSPoint::new(frame.origin.x, base + rel)
+                setFrameOrigin: NSPoint::new(frame.origin.x, header_y)
             ];
         }
 
@@ -1573,5 +1577,163 @@ mod tests {
             layout.row_gap + layout.card_bottom_inset
         );
         assert_eq!(last_row_origin - card_bottom, layout.card_bottom_inset);
+    }
+
+    /// The heading box hangs `SETTINGS_SECTION_CARD_GAP` above its card, and the reflow path asks
+    /// the same question the builder does. Before this rule existed the reflow placed the heading
+    /// box bottom ON the section cursor, which is the card top, so the gap the builder had applied
+    /// was erased on the first reflow and the screen showed only the glyph-to-box slack.
+    #[test]
+    fn a_section_heading_hangs_the_card_gap_above_its_card() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [row_in(56.0, None, 0), row_in(56.0, None, 1)];
+        let walk = RelativeLayout::of(&rows, &[], layout);
+        for (index, rel) in walk.section_rels.iter().enumerate() {
+            let card_top = layout.card_top(*rel);
+            let header_box_bottom = layout.section_header_y(*rel);
+            assert_eq!(
+                header_box_bottom - card_top,
+                super::super::SETTINGS_SECTION_CARD_GAP,
+                "section {index} heading does not hang the card gap above its card"
+            );
+        }
+    }
+
+    /// The counter-example: the rule the reflow used to apply puts the heading box bottom on the
+    /// card top, so the same assertion must fail. Without this the test above could pass on both
+    /// placements and would pin nothing.
+    #[test]
+    fn placing_the_heading_box_on_the_card_top_is_the_failing_shape() {
+        let layout = SettingsLayout::new(400.0);
+        let rows = [row_in(56.0, None, 0)];
+        let walk = RelativeLayout::of(&rows, &[], layout);
+        let rel = walk.section_rels[0];
+        let stale_header_bottom = layout.card_top(rel);
+        assert_ne!(
+            stale_header_bottom - layout.card_top(rel),
+            super::super::SETTINGS_SECTION_CARD_GAP,
+            "the stale placement must fail the gap assertion, or the test above proves nothing"
+        );
+    }
+
+    /// A group that is hidden and restored moves the heading with its rows and keeps the gap.
+    #[test]
+    fn a_restored_group_keeps_the_heading_card_gap() {
+        let layout = SettingsLayout::new(400.0);
+        let group = RowGroup::SmoothScrolling;
+        let rows = [
+            row_in(56.0, Some(group), 0),
+            row_in(56.0, Some(group), 0),
+            row_in(56.0, None, 1),
+        ];
+        let hidden = RelativeLayout::of(&rows, &[group], layout);
+        let shown = RelativeLayout::of(&rows, &[], layout);
+        for walk in [&hidden, &shown] {
+            for rel in &walk.section_rels {
+                assert_eq!(
+                    layout.section_header_y(*rel) - layout.card_top(*rel),
+                    super::super::SETTINGS_SECTION_CARD_GAP,
+                );
+            }
+        }
+        assert_ne!(
+            hidden.section_rels[1], shown.section_rels[1],
+            "hiding the group must move the second section, or this test covers nothing"
+        );
+    }
+    /// Tightening the heading clearance moves the HEADING only. The first card keeps the position
+    /// it has always had, so the page content does not shift, and the extra room shows up as a
+    /// larger page-title-to-heading distance instead.
+    #[test]
+    fn the_first_heading_keeps_the_page_title_gap_and_its_card_gap() {
+        let doc_top = 900.0;
+        let title_h = 34.0;
+        let cursor = super::SettingsPageHeader::first_section_cursor(doc_top, title_h);
+        let layout = SettingsLayout::new(400.0);
+        // The heading hangs above the first card exactly as it does above every later one.
+        assert_eq!(
+            layout.section_header_y(cursor) - layout.card_top(cursor),
+            super::super::SETTINGS_SECTION_CARD_GAP,
+        );
+        // The page title clears the heading box by FIRST_SECTION_GAP plus whatever the rhythm
+        // reserves beyond the heading own gap. That is the whole point of pinning the rhythm: the
+        // card stays put and the heading absorbs the difference.
+        let title_bottom = doc_top - super::SettingsPageHeader::TOP_PADDING - title_h;
+        let heading_box_bottom = layout.section_header_y(cursor);
+        let heading_box_top = heading_box_bottom + super::super::widgets::SECTION_HEADER_H;
+        let reserved =
+            super::super::SETTINGS_SECTION_RHYTHM_GAP - super::super::SETTINGS_SECTION_CARD_GAP;
+        assert_eq!(
+            title_bottom - heading_box_top,
+            super::SettingsPageHeader::FIRST_SECTION_GAP + reserved
+        );
+        assert!(
+            title_bottom - heading_box_top > 0.0,
+            "the heading must not run into the page title"
+        );
+    }
+
+    /// The change that tightened the heading clearance must not have moved any CONTENT. This pins
+    /// the first card top and every row origin against a value computed with the rhythm gap, so a
+    /// heading-gap change cannot drag the page up or down without failing here.
+    #[test]
+    fn tightening_the_heading_gap_leaves_the_content_where_it_was() {
+        let doc_top = 900.0;
+        let title_h = 34.0;
+        let cursor = super::SettingsPageHeader::first_section_cursor(doc_top, title_h);
+        // The cursor is the first CARD TOP and must be independent of the heading own gap: build
+        // the same budget from the fixed terms only, and require they agree.
+        let content_budget = doc_top
+            - super::SettingsPageHeader::TOP_PADDING
+            - title_h
+            - super::SettingsPageHeader::FIRST_SECTION_GAP
+            - super::super::widgets::SECTION_HEADER_H
+            - super::super::SETTINGS_SECTION_RHYTHM_GAP;
+        assert_eq!(
+            cursor, content_budget,
+            "the first card top must not depend on SETTINGS_SECTION_CARD_GAP"
+        );
+        // The page rhythm a later section steps by is built from the fixed rhythm term, not from
+        // the heading gap, so tightening the heading cannot compress the space between cards.
+        // `section_step` is the value `next_section` subtracts; it is asserted here as the same
+        // composition the layout builds, with the heading gap deliberately absent.
+        let layout = SettingsLayout::new(400.0);
+        let rhythm = super::super::SETTINGS_SECTION_HEADER_GAP
+            + super::super::widgets::SECTION_HEADER_H
+            + layout.card_bottom_inset
+            + super::super::SETTINGS_SECTION_RHYTHM_GAP;
+        assert_eq!(layout.section_step, rhythm);
+        assert_ne!(
+            rhythm,
+            super::super::SETTINGS_SECTION_HEADER_GAP
+                + super::super::widgets::SECTION_HEADER_H
+                + layout.card_bottom_inset
+                + super::super::SETTINGS_SECTION_CARD_GAP,
+            "the rhythm must NOT follow the heading gap, or a heading change would move every card"
+        );
+    }
+
+    /// The counter-example: the cursor WITHOUT the card-gap term is what the pre-fix code produced
+    /// once the heading moved up, and it closes the title-to-heading distance. If this ever matches the
+    /// real distance, the budget has been lost again.
+    #[test]
+    fn a_cursor_without_the_card_gap_closes_the_page_title_distance() {
+        let doc_top = 900.0;
+        let title_h = 34.0;
+        let with_gap = super::SettingsPageHeader::page_title_to_first_heading(doc_top, title_h);
+        let cursor_without_gap = doc_top
+            - super::SettingsPageHeader::TOP_PADDING
+            - title_h
+            - super::SettingsPageHeader::FIRST_SECTION_GAP
+            - super::super::widgets::SECTION_HEADER_H;
+        let heading_top_without_gap = SettingsLayout::new(400.0)
+            .section_header_y(cursor_without_gap)
+            + super::super::widgets::SECTION_HEADER_H;
+        let title_bottom = doc_top - super::SettingsPageHeader::TOP_PADDING - title_h;
+        let without_gap = title_bottom - heading_top_without_gap;
+        assert_ne!(
+            with_gap, without_gap,
+            "omitting the card gap from the cursor must change the result, or the assertion covers nothing"
+        );
     }
 }

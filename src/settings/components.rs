@@ -124,10 +124,20 @@ impl SettingsLayout {
             // under the row top), so the step grows by that delta to keep the same visible gap
             // between a card's bottom and the next section's heading. The heading term is its box
             // height, so the step follows `add_header` instead of a second number.
+            //
+            // SECTION_RHYTHM_GAP is written out rather than derived from
+            // `SETTINGS_SECTION_CARD_GAP`, so tightening the heading-to-its-own-card spacing leaves
+            // `section_step` alone. What `section_step` measures is the PREVIOUS card's BOTTOM edge
+            // to the NEXT card's TOP edge -- not one card top to the next, which would also carry
+            // the previous card's height.
+            //
+            // With the rhythm pinned at 8 and the heading gap at 4, the previous card's bottom
+            // sits 24pt above the next heading box top (43 - 15 - 4) and the heading box hangs
+            // 4pt above its own card. The heading absorbs the change; no card moves.
             section_step: super::SETTINGS_SECTION_HEADER_GAP
                 + widgets::SECTION_HEADER_H
                 + Self::CARD_BOTTOM_INSET
-                + super::SETTINGS_SECTION_CARD_GAP,
+                + super::SETTINGS_SECTION_RHYTHM_GAP,
             // The mockup's rows are contiguous inside a group; a `border-top` divides them rather
             // than a gap (`.setting-row + .setting-row`).
             row_gap: 0.0,
@@ -140,6 +150,16 @@ impl SettingsLayout {
     /// `-card_header_gap`, i.e. the first row poked 4pt out of the card).
     pub(super) fn card_top(self, header_y: f64) -> f64 {
         header_y + Self::CARD_BOTTOM_INSET
+    }
+
+    /// The bottom edge of a section heading's box, given its section cursor (the card top).
+    ///
+    /// One rule, used by the page builder and by every reflow, so the creation-time spacing is
+    /// also the spacing the screen shows. `widgets::add_header` grows the label box upwards from
+    /// this edge, so the box hangs `SETTINGS_SECTION_CARD_GAP` above the card rather than sitting
+    /// on it.
+    pub(super) fn section_header_y(self, section_cursor: f64) -> f64 {
+        self.card_top(section_cursor) + super::SETTINGS_SECTION_CARD_GAP
     }
 }
 
@@ -202,15 +222,52 @@ impl SettingsPageHeader {
     ///
     /// Paired with `TOP_PADDING` so their sum stays constant: the title's frame is taller than its
     /// ink, so this value is really "what is left of the title-to-card rhythm after the frame".
-    const FIRST_SECTION_GAP: f64 = 8.0;
+    pub(super) const FIRST_SECTION_GAP: f64 = 8.0;
+
+    /// The first section's cursor, from the document top and the measured page-title height.
+    ///
+    /// The cursor is the first CARD TOP, and it is deliberately INDEPENDENT of the heading's card
+    /// gap: the first card keeps the position it has always had, so tightening the heading's
+    /// clearance moves only the heading and never shifts the page's content. The heading is placed
+    /// from the same cursor by `SettingsLayout::section_header_y`, so a smaller gap simply drops it
+    /// closer to its own card.
+    ///
+    /// The fixed `SETTINGS_SECTION_RHYTHM_GAP` term is what buys that independence: it reserves the
+    /// historical box gap so the budget does not move when `SETTINGS_SECTION_CARD_GAP` does.
+    pub(super) fn first_section_cursor(doc_top: f64, title_h: f64) -> f64 {
+        doc_top
+            - Self::TOP_PADDING
+            - title_h
+            - Self::FIRST_SECTION_GAP
+            - widgets::SECTION_HEADER_H
+            - super::SETTINGS_SECTION_RHYTHM_GAP
+    }
+
+    /// Distance from the page title frame bottom to the first heading box top edge.
+    ///
+    /// Test-only: the layout itself builds the cursor, and the assertions need the distance as a
+    /// value to compare against `FIRST_SECTION_GAP`.
+    #[cfg(test)]
+    pub(super) fn page_title_to_first_heading(doc_top: f64, title_h: f64) -> f64 {
+        let title_bottom = doc_top - Self::TOP_PADDING - title_h;
+        // The cursor is the first CARD TOP; the heading box bottom hangs SETTINGS_SECTION_CARD_GAP
+        // above it, so the box top edge is that gap plus the box height above the cursor.
+        let heading_top = Self::first_section_cursor(doc_top, title_h)
+            + super::SETTINGS_SECTION_CARD_GAP
+            + widgets::SECTION_HEADER_H;
+        title_bottom - heading_top
+    }
 
     /// Build the page title and return its document top plus the first section cursor below it.
     ///
-    /// The cursor is that heading's frame BOTTOM: `widgets::add_header` grows its label upwards
-    /// from there, and `SettingsSection::attach` puts the card top `SETTINGS_SECTION_CARD_GAP`
-    /// below it. Callers hand it to their first `SettingsSection::attach` and advance from it with
-    /// `SettingsLayout::next_row_cursor`, exactly like every later section -- which is what keeps
-    /// the first card's row on the same 4pt inset as all the others.
+    /// The cursor is the first heading's CARD TOP, which is also where its rows begin.
+    /// `SettingsSection::attach` and `PageCanvas::reflow` both put the heading's box bottom
+    /// `SETTINGS_SECTION_CARD_GAP` above that edge, so the cursor itself is not the box bottom.
+    /// On top of `FIRST_SECTION_GAP` this cursor therefore reserves the heading height AND that
+    /// gap, which is what keeps the page title clear of the first heading instead of letting the
+    /// heading eat the space above it. Callers hand it to their first `SettingsSection::attach` and
+    /// advance from it with `SettingsLayout::next_row_cursor`, exactly like every later section --
+    /// which is what keeps the first card's row on the same 4pt inset as all the others.
     pub(super) unsafe fn attach(
         parent: *mut AnyObject,
         title: &str,
@@ -237,14 +294,12 @@ impl SettingsPageHeader {
             w,
         );
         // Title frame bottom, one FIRST_SECTION_GAP further down, then the heading label's own
-        // height up to its bottom edge -- the cursor callers lay the page out from.
+        // height up to its box bottom, then the gap that box hangs above the first card -- the
+        // cursor callers lay the page out from. Omitting the last term would make the raised
+        // heading consume FIRST_SECTION_GAP and close the title-to-heading distance to zero.
         (
             actual_doc_top,
-            actual_doc_top
-                - Self::TOP_PADDING
-                - title_h
-                - Self::FIRST_SECTION_GAP
-                - widgets::SECTION_HEADER_H,
+            Self::first_section_cursor(actual_doc_top, title_h),
         )
     }
 }
@@ -266,6 +321,20 @@ impl SettingsCard {
     }
 }
 
+/// Every built section heading paired with the card it labels, for the settings smoke to measure the
+/// heading-to-card gap on the rendered view tree. Rebuilt as the page is built, so a stale pair from a
+/// previous page build cannot be measured. Main-thread only, like every other settings registry.
+pub(super) static SECTION_PAIRS: LazyLock<crate::ffi::MainThreadSlot<Vec<(usize, usize)>>> =
+    LazyLock::new(|| unsafe { crate::ffi::MainThreadSlot::new(Vec::new()) });
+
+/// Drop every registered pair. Called wherever the settings content is rebuilt, because the
+/// addresses in the registry name views that rebuild releases.
+pub(super) fn clear_section_pairs() {
+    if let Ok(mut pairs) = SECTION_PAIRS.lock() {
+        pairs.clear();
+    }
+}
+
 /// A titled settings section: the small explanatory heading and its rounded card are one unit.
 pub(super) struct SettingsSection;
 
@@ -275,9 +344,17 @@ impl SettingsSection {
         frame: NSRect,
         title: &str,
     ) -> SettingsCard {
+        // The same relation `SettingsLayout::section_header_y` states for every later reflow: the
+        // heading box hangs SETTINGS_SECTION_CARD_GAP above the card, never on top of it.
         let header_y = frame.origin.y + frame.size.height + super::SETTINGS_SECTION_CARD_GAP;
-        widgets::add_header(parent, title, 0.0, header_y, frame.size.width);
-        SettingsCard::attach(parent, widgets::settings_card_rect(frame))
+        let header = widgets::add_header(parent, title, 0.0, header_y, frame.size.width);
+        let card = SettingsCard::attach(parent, widgets::settings_card_rect(frame));
+        // Register the pair so the settings smoke can measure the gap on the rendered tree. Both
+        // pointers stay alive because the page document owns them; the registry only names them.
+        if let Ok(mut pairs) = SECTION_PAIRS.lock() {
+            pairs.push((header as usize, card.card as usize));
+        }
+        card
     }
 }
 
@@ -2434,6 +2511,42 @@ mod tests {
 
     /// The section rhythm is the mock's, end to end: 20pt card bottom to title top, a 15pt title
     /// box, 8pt title bottom to card top, and no card padding.
+    ///
+    /// The last term is `SETTINGS_SECTION_RHYTHM_GAP`, not the heading's own card gap: tightening
+    /// how close a heading sits to ITS card must not move the distance between consecutive cards,
+    /// so the rhythm keeps its historical 8 and this assertion pins the total at 43.
+
+    /// The heading clearance is governed by ONE token that states what a reader sees, and the box
+    /// gap that implements it is derived from that token. This pins both directions: the visible
+    /// value the design document quotes, and the box arithmetic that produces it.
+    /// The visible clearance is the ONE design input: the box gap is derived from it and rounded to
+    /// the 4pt grid, and the value a page actually renders follows from that rounding. Changing the
+    /// input changes the layout; changing the box gap follows from it rather than the reverse.
+    #[test]
+    fn the_visible_clearance_is_the_input_the_box_gap_is_derived_from() {
+        // The box gap is the input minus the box below the glyphs, floored to the design grid.
+        let expected: f64 = ((super::super::SETTINGS_SECTION_HEADING_INK_GAP
+            - super::super::SECTION_HEADING_INK_BELOW_BOX)
+            / 4.0)
+            .floor()
+            * 4.0;
+        assert_eq!(super::super::SETTINGS_SECTION_CARD_GAP, expected.max(0.0));
+        // The grid constraint the design system imposes on every settings spacing.
+        assert_eq!(super::super::SETTINGS_SECTION_CARD_GAP % 4.0, 0.0);
+        // What the page renders, and what the M2 smoke asserts, is the rounded box gap plus the
+        // box below the glyphs -- so the token and the screen differ by at most one grid step.
+        assert_eq!(
+            super::super::SETTINGS_SECTION_RENDERED_INK_GAP,
+            super::super::SETTINGS_SECTION_CARD_GAP + super::super::SECTION_HEADING_INK_BELOW_BOX,
+        );
+        let rounding = super::super::SETTINGS_SECTION_HEADING_INK_GAP
+            - super::super::SETTINGS_SECTION_RENDERED_INK_GAP;
+        assert!(
+            (0.0..4.0).contains(&rounding),
+            "the grid rounding must cost less than one grid step, got {rounding}"
+        );
+    }
+
     #[test]
     fn section_step_is_the_mock_rhythm() {
         let layout = SettingsLayout::new(600.0);
@@ -2442,7 +2555,7 @@ mod tests {
             layout.section_step,
             super::super::SETTINGS_SECTION_HEADER_GAP
                 + super::super::widgets::SECTION_HEADER_H
-                + super::super::SETTINGS_SECTION_CARD_GAP
+                + super::super::SETTINGS_SECTION_RHYTHM_GAP
                 + layout.card_bottom_inset
         );
     }
