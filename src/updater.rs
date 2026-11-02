@@ -515,6 +515,161 @@ fn release_notes_measured_width(layout_scale: f64) -> ReleaseNotesMeasuredWidth 
     ReleaseNotesMeasuredWidth(RELEASE_NOTES_LAYOUT_WIDTH * layout_scale)
 }
 
+/// The prompt's text column, and everything the title and message layouts are derived from.
+///
+/// It was two independent pairs of numbers: the label views were built 576pt wide by 32pt from
+/// each side, while the release-notes document above them was built at
+/// `RELEASE_NOTES_LAYOUT_WIDTH` (576pt) by itself. Naming the column once keeps the three from
+/// drifting apart when the window width changes.
+/// The standalone update prompt's window width; inline it is the width every authored frame is
+/// scaled from.
+const PROMPT_WINDOW_W: f64 = 640.0;
+const PROMPT_COLUMN_X: f64 = 32.0;
+/// Its width repeats `RELEASE_NOTES_LAYOUT_WIDTH`; the test below asserts the two agree, and the
+/// library build itself never reads it.
+#[cfg_attr(not(test), allow(dead_code))]
+const PROMPT_COLUMN_W: f64 = 576.0;
+/// The title's line box at `FONT_PAGE_TITLE` (26pt) with the title line-height ratio.
+const PROMPT_TITLE_LINE_H: f64 = 32.0;
+/// The title's box as laid out in the standalone window, top-left based on the x axis only (y is
+/// resolved by the caller). Pure, so a test can assert where the label actually lands.
+fn prompt_title_layout_frame(window_w: f64, title_y: f64) -> NSRect {
+    NSRect::new(
+        NSPoint::new(PROMPT_COLUMN_X, title_y),
+        NSSize::new(window_w - PROMPT_COLUMN_X * 2.0, PROMPT_TITLE_LINE_H),
+    )
+}
+
+/// The box the prompt's title needs, measured before the standalone window is sized.
+///
+/// `layout_width` is the width the label is AUTHORED at; `layout_scale` is the factor `add_control`
+/// installs its frame with. An inline prompt is scaled down to the host width and keeps its height,
+/// so the width the text actually wraps at is the product — measuring at the authored width would
+/// keep a title that wraps in the host one line tall. At scale 1.0 both are the window width.
+///
+/// A one-line result keeps the title's line box (`PROMPT_TITLE_LINE_H`). Extra lines add their own
+/// line height, because the label has no paragraph style: its lines take the font's natural height,
+/// not the title ratio the one-line box was drawn for. A measurement that fails falls back to the
+/// one-line box, which is the geometry this prompt had before it could wrap.
+unsafe fn prompt_title_box(text: &str, layout_width: f64, layout_scale: f64) -> (NSRect, f64, f64) {
+    let width = (layout_width * layout_scale).max(1.0);
+    let height = prompt_title_height_at(text, width);
+    let authored = NSRect::new(
+        NSPoint::new(PROMPT_COLUMN_X, 0.0),
+        NSSize::new(layout_width, height),
+    );
+    (authored, width, height)
+}
+
+/// The wrapped height of `text` at `wrap_width`, which is the width `prompt_title_box` derives
+/// from the authored width and the install scale.
+unsafe fn prompt_title_height_at(text: &str, wrap_width: f64) -> f64 {
+    debug_assert!(wrap_width > 0.0);
+    // The paragraph style carries the title font, the word-wrapping mode and the height, and the
+    // attributed string is built by hand. The height then never needs a view at all, so it can be
+    // measured by a plain unit test; only the prompt's own AppKit object graph is main-thread.
+    let text_ns = make_nsstring(text);
+    let attributed: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let attributed: *mut AnyObject = msg_send![attributed, initWithString: text_ns];
+    crate::ffi::CFRelease(text_ns as *const c_void);
+    if attributed.is_null() {
+        return PROMPT_TITLE_LINE_H;
+    }
+    let line_h = title_natural_line_height();
+    apply_title_attributes(attributed, line_h);
+    let extra_lines = match crate::settings::widgets::textkit_line_fragments(attributed, wrap_width)
+    {
+        Some((_, fragments)) if fragments.len() > 1 => fragments.len() - 1,
+        _ => 0,
+    };
+    release_obj(attributed);
+    // No view is created on any branch: the one-line box plus one natural line height per extra
+    // line. This is an upper bound on what the label draws, never a shortage -- the two-line CJK
+    // title that prompted this needed 56pt at 460.8pt and is given 63pt.
+    (PROMPT_TITLE_LINE_H + line_h * extra_lines as f64).ceil()
+}
+
+/// The title's text attributes: the page-title font, word wrapping and the natural line height.
+/// Split out of `prompt_title_height_at` so the height is measurable without a view.
+unsafe fn apply_title_attributes(attributed: *mut AnyObject, line_h: f64) {
+    let length: usize = msg_send![attributed, length];
+    if length == 0 {
+        return;
+    }
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
+    let paragraph: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
+    let paragraph: *mut AnyObject = msg_send![paragraph, init];
+    let _: () = msg_send![paragraph, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    let _: () = msg_send![paragraph, setMinimumLineHeight: line_h];
+    let _: () = msg_send![paragraph, setMaximumLineHeight: line_h];
+    let font_key = make_nsstring("NSFont");
+    let paragraph_key = make_nsstring("NSParagraphStyle");
+    let range = NSRange::new(0, length);
+    let _: () = msg_send![
+        attributed,
+        addAttribute: font_key,
+        value: font,
+        range: range
+    ];
+    let _: () = msg_send![
+        attributed,
+        addAttribute: paragraph_key,
+        value: paragraph,
+        range: range
+    ];
+    crate::ffi::CFRelease(font_key as *const c_void);
+    crate::ffi::CFRelease(paragraph_key as *const c_void);
+    release_obj(paragraph);
+}
+
+/// One natural line of the title font: ascent plus descent plus leading, the height an unstyled
+/// wrapped line actually occupies. Falls back to `PROMPT_TITLE_LINE_H` when the font cannot be
+/// created, so the caller always gets a usable number.
+unsafe fn title_natural_line_height() -> f64 {
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
+    if font.is_null() {
+        return PROMPT_TITLE_LINE_H;
+    }
+    let ascender: f64 = msg_send![font, ascender];
+    let descender: f64 = msg_send![font, descender];
+    let leading: f64 = msg_send![font, leading];
+    let height = (ascender - descender + leading).ceil();
+    if height.is_finite() && height > 0.0 {
+        height
+    } else {
+        PROMPT_TITLE_LINE_H
+    }
+}
+
+/// The factor `add_control` installs an authored frame with: 1.0 standalone, the host/window ratio
+/// inline.
+fn prompt_install_scale() -> f64 {
+    let inline = e2e_update_target_is_inline();
+    let host_w = if inline {
+        let ui = UPDATE_UI_STATE.lock().unwrap();
+        if ui.host_view == 0 {
+            0.0
+        } else {
+            let frame: NSRect = unsafe { msg_send![ui.host_view as *mut AnyObject, frame] };
+            frame.size.width
+        }
+    } else {
+        0.0
+    };
+    prompt_layout_scale_for(inline, host_w, PROMPT_WINDOW_W)
+}
+
+/// The authored width behind an installed one: the inverse of `scale_frame`'s width scaling.
+fn unscale_installed_width(installed_w: f64, scale: f64) -> f64 {
+    if scale > 0.0 && scale.is_finite() {
+        installed_w / scale
+    } else {
+        installed_w
+    }
+}
+
 /// Map a standalone-window frame onto the host width, scaling x and width proportionally.
 fn scale_frame(target: RenderTarget, window_w: f64, frame: NSRect) -> NSRect {
     if target.host.is_null() || window_w <= 0.0 {
@@ -1626,11 +1781,10 @@ unsafe fn make_custom_update_found_window(
         String::new()
     };
 
-    let window_w = 640.0;
+    let window_w = PROMPT_WINDOW_W;
     let button_y = 14.0;
     let button_gap = 4.0;
     let message_h = 44.0;
-    let title_h = 32.0;
     let layout_scale = prompt_layout_scale(window_w);
     let skip_w = if prompt_kind == UpdatePromptKind::InformationOnly {
         180.0 * layout_scale
@@ -1720,6 +1874,18 @@ unsafe fn make_custom_update_found_window(
         release_notes_y
     };
     let title_y = message_y + message_h + 10.0;
+    // The title wraps to as many lines as `FONT_PAGE_TITLE` needs, so its height is what the font
+    // measures at the width the label is installed at rather than one line box. Measured before
+    // the window exists: the standalone window's height depends on it.
+    let (title_box, _, title_h) = prompt_title_box(
+        &title_text,
+        prompt_title_layout_frame(window_w, 0.0).size.width,
+        layout_scale,
+    );
+    let title_frame = NSRect::new(
+        NSPoint::new(title_box.origin.x, title_y),
+        NSSize::new(title_box.size.width, title_h),
+    );
     let window_h = title_y + title_h + 8.0;
     let target = render_target(window_h);
     let (content, window) = if target.host.is_null() {
@@ -1745,10 +1911,7 @@ unsafe fn make_custom_update_found_window(
         (target.parent, std::ptr::null_mut())
     };
     let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let title: *mut AnyObject = msg_send![
-        title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(576.0, title_h))
-    ];
+    let title: *mut AnyObject = msg_send![title, initWithFrame: title_frame];
     let title_ns = make_nsstring(&title_text);
     let _: () = msg_send![title, setStringValue: title_ns];
     crate::ffi::CFRelease(title_ns as *const c_void);
@@ -1760,13 +1923,14 @@ unsafe fn make_custom_update_found_window(
     let title_font: *mut AnyObject =
         msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
     let _: () = msg_send![title, setFont: title_font];
-    add_control(
-        target,
-        window_w,
-        title,
-        NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(576.0, title_h)),
-        content,
-    );
+    // Word wrapping, not truncation: a title that does not fit on one line grows to a second
+    // line inside the height measured above.
+    let _: () = msg_send![title, setUsesSingleLineMode: false];
+    let _: () = msg_send![title, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![title, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![title, setMaximumNumberOfLines: 0isize];
+    }
+    add_control(target, window_w, title, title_frame, content);
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -1845,6 +2009,98 @@ unsafe fn make_custom_update_found_window(
     ui.window = window as usize;
     ui.update_reply = copied_reply;
     ui.information_url = information_url;
+}
+
+/// Whether `label` shows its whole text inside `frame` at the width `wrap_width`.
+///
+/// The frame alone is not enough to ask this: an inline prompt installs the title at the host's
+/// narrower width while keeping its height, so a check that reads the installed frame measures the
+/// already-shrunk box as if it were the authored one. The wrap width is passed in so the caller
+/// states the width it is testing. A field that is set to truncate fails outright, because the
+/// truncation is the defect this check exists for.
+unsafe fn text_field_fits(
+    label: *mut AnyObject,
+    frame: NSRect,
+    wrap_width: f64,
+    check_wrap_mode: bool,
+) -> bool {
+    let text = nsstring_to_string(msg_send![label, stringValue]);
+    if text.is_empty() || wrap_width <= 0.0 {
+        return true;
+    }
+    if check_wrap_mode {
+        let single_line: bool = msg_send![label, usesSingleLineMode];
+        let break_mode: isize = msg_send![label, lineBreakMode];
+        // NSLineBreakByWordWrapping is 0; every other mode truncates or clips.
+        if single_line || break_mode != 0 {
+            log_info!(
+                "[smoke-update-prompts] field truncates instead of wrapping: text={:?}, single_line={single_line}, line_break_mode={break_mode}",
+                text
+            );
+            return false;
+        }
+    }
+    let attributed: *mut AnyObject = msg_send![label, attributedStringValue];
+    let required = crate::settings::widgets::textkit_line_fragments(attributed, wrap_width)
+        .map(|(used, _)| used.size.height)
+        .unwrap_or(0.0);
+    if !required.is_finite() || required > frame.size.height + 1.0 {
+        log_info!(
+            "[smoke-update-prompts] text does not fit: text={:?}, required_h={:.1}, wrap_width={wrap_width:.1}, frame={:?}",
+            text,
+            required,
+            frame
+        );
+        return false;
+    }
+    true
+}
+
+/// Whether the prompt's title and message show their whole text inside the frames they were given.
+///
+/// The title used to be a single-line field in a 32pt box with a default truncation mode, so a
+/// localized title longer than its column was cut off mid-character and nothing reported it. Both
+/// fields wrap now; this is what notices when one of them no longer fits.
+///
+/// `at_layout_width` names the width the prompt was authored at. For a standalone prompt that is
+/// the frame itself; for an inline one it is the frame divided by the host/window scale, so the
+/// title is judged against the width its text was measured at, not the narrower installed box.
+unsafe fn update_prompt_text_labels_fit(
+    view: *mut AnyObject,
+    at_layout_width: bool,
+) -> (bool, usize) {
+    if view.is_null() {
+        return (true, 0);
+    }
+    let is_field: bool = msg_send![view, isKindOfClass: class!(NSTextField)];
+    let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
+    let mut ok = true;
+    let mut checked = 0;
+    if is_field && !is_button {
+        let frame: NSRect = msg_send![view, frame];
+        if frame.size.width > 0.0 && !nsstring_to_string(msg_send![view, stringValue]).is_empty() {
+            checked += 1;
+            let wrap_width = if at_layout_width {
+                unscale_installed_width(frame.size.width, prompt_install_scale())
+            } else {
+                frame.size.width
+            };
+            if !text_field_fits(view, frame, wrap_width, at_layout_width) {
+                ok = false;
+            }
+        }
+    }
+    let subviews: *mut AnyObject = msg_send![view, subviews];
+    if !subviews.is_null() {
+        let count: usize = msg_send![subviews, count];
+        for index in 0..count {
+            let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
+            let (child_ok, child_checked) = update_prompt_text_labels_fit(child, at_layout_width);
+            ok = ok && child_ok;
+            checked += child_checked;
+        }
+    }
+    (ok, checked)
 }
 
 unsafe fn update_prompt_button_labels_fit(view: *mut AnyObject) -> (bool, usize) {
@@ -1926,10 +2182,13 @@ pub(crate) fn smoke_update_prompt_layouts() -> bool {
                 let window = UPDATE_UI_STATE.lock().unwrap().window as *mut AnyObject;
                 let content: *mut AnyObject = msg_send![window, contentView];
                 let (fits, labels) = update_prompt_button_labels_fit(content);
+                // Title plus message: the text this prompt shows is never truncated, whatever the
+                // locale or the app name length.
+                let (text_fits, text_labels) = update_prompt_text_labels_fit(content, true);
                 let expected_min = if information_only { 2 } else { 3 };
-                if !fits || labels < expected_min {
+                if !fits || labels < expected_min || !text_fits || text_labels < 2 {
                     log_info!(
-                        "[smoke-update-prompts] failed locale={locale}, stage={stage}, information_only={information_only}, labels={labels}"
+                        "[smoke-update-prompts] failed locale={locale}, stage={stage}, information_only={information_only}, labels={labels}, text_fits={text_fits}, text_labels={text_labels}"
                     );
                     ok = false;
                 }
@@ -3263,10 +3522,12 @@ pub(crate) fn check_for_updates() -> bool {
 mod tests {
     use super::{
         focus_window_for_prompt, inline_layout_scale, is_safe_update_info_url, prefers_inline,
-        prompt_layout_scale_for, release_notes_heading_style, release_notes_measured_width,
+        prompt_layout_scale_for, prompt_title_box, prompt_title_height_at,
+        prompt_title_layout_frame, release_notes_heading_style, release_notes_measured_width,
         render_release_notes_markdown, scale_frame, select_release_notes_locale,
-        teardown_closes_standalone, update_prompt_kind, updater_delegate_class, RenderTarget,
-        UpdatePromptKind, RELEASE_NOTES_LAYOUT_WIDTH,
+        teardown_closes_standalone, unscale_installed_width, update_prompt_kind,
+        updater_delegate_class, RenderTarget, UpdatePromptKind, PROMPT_COLUMN_W, PROMPT_COLUMN_X,
+        PROMPT_TITLE_LINE_H, PROMPT_WINDOW_W, RELEASE_NOTES_LAYOUT_WIDTH,
     };
     use crate::smoke_verdict::smoke_runner;
     use objc2::runtime::AnyObject;
@@ -3350,6 +3611,71 @@ mod tests {
         assert_ne!(
             prompt_layout_scale_for(false, 512.0, 640.0),
             prompt_layout_scale_for(true, 512.0, 640.0)
+        );
+    }
+
+    /// The measured title box for a locale's title at one install scale: the authored column
+    /// rectangle, the width the text wraps at once installed, and the height the product computes.
+    ///
+    /// This is the product's own `prompt_title_box`, and the measurement behind it creates no
+    /// view: the height comes from an attributed string laid out by TextKit, so the test is safe
+    /// on a libtest worker thread. Creating an `NSTextField` here would be the off-main AppKit
+    /// access this crate forbids.
+    unsafe fn title_box_for(title: &str, layout_scale: f64) -> (NSRect, f64, f64) {
+        let layout_w = prompt_title_layout_frame(PROMPT_WINDOW_W, 0.0).size.width;
+        prompt_title_box(title, layout_w, layout_scale)
+    }
+
+    /// The title is measured at the width it is installed at, not the width it is authored at.
+    ///
+    /// An inline prompt keeps its height and shrinks its width to the host's ratio. Measuring at
+    /// the authored 576pt kept a title that needs two lines at 460.8pt one line tall, and the host
+    /// then clipped the second line -- the same truncation this change is for, one layout over.
+    #[test]
+    fn the_title_is_measured_at_the_width_it_is_installed_at() {
+        // A title that fits on one line at full width and needs a second line at 0.8x. Both
+        // halves are asserted, so the fixture cannot silently stop exercising the scale.
+        let title = "有新的 Oh-My-Tab Development 版本可用！";
+        unsafe {
+            let (_, wrap_full, h_full) = title_box_for(title, 1.0);
+            let (_, wrap_inline, h_inline) = title_box_for(title, 0.8);
+            assert!((wrap_full - PROMPT_COLUMN_W).abs() < 0.01);
+            assert!(
+                (wrap_inline - PROMPT_COLUMN_W * 0.8).abs() < 0.01,
+                "an inline title must be measured at the host width"
+            );
+            assert_eq!(h_full, PROMPT_TITLE_LINE_H, "one line at full width");
+            assert!(
+                h_inline > PROMPT_TITLE_LINE_H,
+                "the same title needs a second line at the host width, and the box must grow for it"
+            );
+        }
+    }
+
+    /// The inverse of the install scale recovers the authored width the fit check tests against.
+    #[test]
+    fn the_authored_width_is_recovered_from_an_installed_frame() {
+        assert!((unscale_installed_width(460.8, 0.8) - 576.0).abs() < 0.01);
+        assert_eq!(unscale_installed_width(576.0, 1.0), 576.0);
+        // Degenerate scales pass the frame through rather than dividing by zero or going negative.
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(unscale_installed_width(576.0, scale), 576.0);
+        }
+    }
+
+    #[test]
+    fn the_prompt_title_spans_the_prompt_column() {
+        for window_w in [640.0, 512.0] {
+            let frame = prompt_title_layout_frame(window_w, 100.0);
+            assert_eq!(frame.origin.x, PROMPT_COLUMN_X);
+            assert_eq!(frame.size.width, window_w - PROMPT_COLUMN_X * 2.0);
+            assert_eq!(frame.size.height, PROMPT_TITLE_LINE_H);
+        }
+        // The column is the release notes' document width, so the three labels share one edge.
+        assert_eq!(PROMPT_COLUMN_W, RELEASE_NOTES_LAYOUT_WIDTH);
+        assert_eq!(
+            prompt_title_layout_frame(640.0, 0.0).size.width,
+            PROMPT_COLUMN_W
         );
     }
 

@@ -945,7 +945,7 @@ pub(crate) unsafe fn full_wrapped_text_size(label: *mut AnyObject, width: f64) -
     (used.size.width.is_finite() && used.size.height.is_finite()).then_some(used.size)
 }
 
-unsafe fn textkit_line_fragments(
+pub(crate) unsafe fn textkit_line_fragments(
     attributed: *mut AnyObject,
     width: f64,
 ) -> Option<(NSRect, Vec<NSRect>)> {
