@@ -355,39 +355,99 @@ def drive() -> None:
 
     # Repeats closer together than the app's cadence (140ms). The first repeat of a hold steps
     # (macOS applied its own initial delay already); the ones inside the cadence are swallowed.
+    #
+    # These four are their own HOLD, ended by a release, and the counts are read from the commit frame
+    # that release produces. Reading them from a selection frame instead was a race with no stable
+    # answer: the counter pair is bumped on the tap thread as each event arrives, while the snapshot is
+    # written on the main thread when it processes a STEP. If the main thread kept up, the only frame it
+    # wrote held (1, 0) -- the throttles had not happened yet -- and no later frame ever carried
+    # (1, 3), because a throttled repeat neither steps nor publishes. If the main thread lagged, the
+    # same run published (1, 3) and passed. The stage-final commit frame is the one point both threads
+    # have finished at, so it is the only honest place to read the pair.
+    #
+    # Note what this does and does not prove: it proves one step and three swallows across the hold,
+    # and that the release committed what the single step selected. It does NOT prove the first repeat
+    # stepped without waiting -- nothing here measures latency. That rule lives in the pure tests for
+    # repeat_step_due.
+    phase_before = current_seq()
     fast_repeats = 4
     for _ in range(fast_repeats):
         post(VK_TAB, True, forward_flags, 1)
         time.sleep(0.035)
-    before_fast = current_seq()
-    fast = wait_state(
-        lambda s: repeat_meters(s) == (base_steps + 1, base_throttled + fast_repeats - 1),
-        3,
-        "the first repeat to step and the rest to be throttled",
-        after_seq=before_fast,
-    )
-    fast_steps, fast_throttled = repeat_meters(fast)
+    fast_commit = commit_after_release(forward_flags, "the fast-hold release to commit")
+    fast_steps, fast_throttled = repeat_meters(fast_commit)
     check(
-        fast_steps == base_steps + 1,
-        "the first repeat of a hold steps immediately",
+        fast_steps - base_steps == 1,
+        "the fast hold advances the selection exactly once",
         f"stepped={fast_steps - base_steps} sent={fast_repeats}",
     )
     check(
-        fast_throttled == base_throttled + fast_repeats - 1,
+        fast_throttled - base_throttled == fast_repeats - 1,
         "repeats inside the cadence are swallowed without stepping",
         f"throttled={fast_throttled - base_throttled} sent={fast_repeats}",
     )
+    # The counters say the tap classified the input correctly; they say nothing about whether the main
+    # thread actually moved the selection. If it dropped the step, the release would still produce a
+    # commit -- of the card that was selected BEFORE the hold -- and every counter check above would
+    # still pass. So assert the identity too: the committed card must be the summon card's successor in
+    # the list the commit frame itself reports.
+    fast_cards = card_keys(fast_commit)
+    summon_key = selected_key(summon)
+    expected_index = None
+    if fast_cards and summon_key is not None and summon_key in fast_cards:
+        expected_index = (fast_cards.index(summon_key) + 1) % len(fast_cards)
+    check(
+        expected_index is not None,
+        "the summon card is still in the committed list, so the advance is verifiable",
+        f"summon_key={summon_key} cards={len(fast_cards)}",
+    )
+    committed_fast = fast_commit.get("committed") or {}
+    committed_fast_key = (committed_fast.get("pid"), committed_fast.get("window_id"))
+    check(
+        expected_index is not None
+        and committed_fast.get("index") == expected_index
+        and fast_cards
+        and expected_index < len(fast_cards)
+        and committed_fast_key == fast_cards[expected_index],
+        "the fast hold really advanced one card and committed that card",
+        f"expected_index={expected_index} committed={committed_fast} summon_key={summon_key}",
+    )
+    check(
+        fast_commit.get("seq", 0) > phase_before,
+        "the fast-stage counts come from a frame written after the hold started",
+        f"seq={fast_commit.get('seq')} phase_before={phase_before}",
+    )
 
+    # The spaced phase runs as its own hold, from a FRESH summon and a fresh baseline. The fast
+    # hold's release committed a window, which reorders the MRU and can change the card set, so
+    # carrying its `cards` or its meter into this phase would measure across two holds: a missed
+    # fast step could be cancelled by an extra spaced one and neither phase would be attributable.
+    # "Unchanged" for this phase means its checks mean what they always meant, not that it reuses
+    # the previous phase's state.
+    spaced_summon = open_switcher(forward_flags)
+    spaced_cards = spaced_summon["cards_count"]
+    spaced_first = spaced_summon["selected_index"]
+    spaced_base_steps, spaced_base_throttled = settled_meters()
+    check(
+        spaced_cards >= 3,
+        "the spaced phase re-summoned with enough cards to wrap the list",
+        f"cards={spaced_cards} selected={spaced_first}",
+    )
     # Spaced wider than the cadence, for more than one full lap so the wrap is exercised. The pause
     # also clears the cadence so the first spaced repeat is due.
     time.sleep(0.25)
-    spaced_repeats = cards + 3
+    spaced_repeats = spaced_cards + 3
     hold_repeats(spaced_repeats, forward_flags, 0.2)
     committed = commit_after_release(forward_flags, "the forward release to commit a window")
 
     steps_after, throttled_after = repeat_meters(committed)
-    total_steps = steps_after - base_steps
-    spaced_steps = steps_after - fast_steps
+    # Measured from the SPACED phase's baseline, matching the frames `steps` collects. Using the
+    # first hold's baseline here counted the fast phase's step too, so a sampling shortfall was
+    # reported as one step more than the frames could ever account for.
+    total_steps = steps_after - spaced_base_steps
+    spaced_steps = steps_after - spaced_base_steps
+    fast_steps = spaced_base_steps
+    fast_throttled = spaced_base_throttled
     check(
         spaced_steps >= spaced_repeats,
         "every spaced repeat steps",
@@ -421,9 +481,12 @@ def drive() -> None:
     # card further along in the list that frame itself reports. That is what "keeps switching and
     # loops" means, and it is asserted on identities rather than on a global index because a window
     # appearing or closing mid-hold legitimately reorders the cards.
+    # Bounded by the SPACED summon, not the first one: the fast hold sits between them, and a range
+    # that spans both would compare the fast hold's last selection with the spaced hold's first and
+    # read a legitimate stage boundary as a stall.
     steps = [
         snapshot
-        for snapshot in frames_between(summon["seq"], committed["seq"])
+        for snapshot in frames_between(spaced_summon["seq"], committed["seq"])
         if snapshot.get("event") == "selection"
     ]
     check(
