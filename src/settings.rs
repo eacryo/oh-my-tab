@@ -1313,6 +1313,38 @@ const UPDATE_CARD_BOTTOM_PADDING: f64 = 32.0;
 /// the host's height (its row consumption), the collapse of the action band it replaces, and the
 /// tighter bottom padding the expanded card keeps. The card follows the host's bottom edge on its
 /// own, exactly like every other card follows its last row, so no card geometry is computed here.
+/// Development switch: scroll the About page to its end, so the expanded update card is on screen
+/// in a window shorter than the page. Used with --check-update-on-launch when the prompt is
+/// photographed rather than asserted.
+pub(crate) fn scroll_about_page_to_bottom() {
+    with_settings_ui(|ui_guard| {
+        let Some(ui) = ui_guard.as_ref() else {
+            return;
+        };
+        unsafe {
+            let scroll = window::page_scroll_views(ui)[SETTINGS_ABOUT_PAGE_INDEX];
+            if scroll.is_null() {
+                crate::log_info!("[scroll-about] no About scroll view");
+                return;
+            }
+            let clip: *mut AnyObject = msg_send![scroll, contentView];
+            if clip.is_null() {
+                return;
+            }
+            let doc: *mut AnyObject = msg_send![scroll, documentView];
+            if doc.is_null() {
+                return;
+            }
+            let doc_bounds: NSRect = msg_send![doc, bounds];
+            let clip_bounds: NSRect = msg_send![clip, bounds];
+            let max_y = (doc_bounds.size.height - clip_bounds.size.height).max(0.0);
+            let _: () = msg_send![clip, scrollToPoint: NSPoint::new(0.0, max_y)];
+            let _: () = msg_send![scroll, reflectScrolledClipView: clip];
+            crate::log_info!("[scroll-about] scrolled to y={max_y:.1}");
+        }
+    });
+}
+
 pub(crate) fn expand_update_section(window_h: f64) {
     with_settings_ui(|ui_guard| {
         let Some(ui) = ui_guard.as_mut() else {
@@ -1322,6 +1354,12 @@ pub(crate) fn expand_update_section(window_h: f64) {
             || ui.update_host.is_null()
             || !ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX].is_bound()
         {
+            crate::log_info!(
+                "[update-inline] expand refused: card_null={} host_null={} canvas_bound={}",
+                ui.update_card.is_null(),
+                ui.update_host.is_null(),
+                ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX].is_bound()
+            );
             return;
         }
         unsafe {

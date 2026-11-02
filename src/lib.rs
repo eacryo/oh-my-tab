@@ -4003,6 +4003,18 @@ pub fn run() {
         if let Some(page) = open_settings_page_request() {
             settings::show_settings_page(page);
         }
+        // Development switch: run the real update check once the settings window is up, so the
+        // prompt renders INLINE on the About page. Queued after the page is shown because inline
+        // rendering needs that page visible; a check made earlier falls back to the standalone
+        // window, which is the surface this switch exists to avoid.
+        if crate::dev_flags::present("check-update-on-launch") {
+            updater::schedule_launch_update_check();
+        }
+        // Development switch: scroll the About page to the expanded update card, which sits below
+        // the fold in a window shorter than the page. Delayed past the check so the card has grown.
+        if crate::dev_flags::present("scroll-about-to-updates") {
+            updater::schedule_about_scroll();
+        }
         // Development switch: paint a controlled backdrop behind the panels, so a translucent material's
         // contrast can be measured against a known surface instead of whatever the desktop happens to show
         // (the A2 scenario `scripts/e2e/panel-contrast.sh` needs that to be repeatable). `texture` is the

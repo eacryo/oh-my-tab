@@ -432,6 +432,37 @@ cargo test settings_layout_smoke -- --ignored
 
 **M2 的 e2e 场景**放在 `scripts/e2e/*.sh`，统一通过 `scripts/e2e/run-all.sh` 运行：它会自动发现该目录下所有可执行脚本，按顺序跑选中的那些。场景在头部声明自己会造成哪种打扰，每种打扰有独立开关，**互不代替、可叠加（全部满足才跑）**：`# E2E_STEALS_FOCUS=1`（经系统事件流注入真实全局热键，或把 app 激活到前台）需要 `--include-focus`；`# E2E_COVERS_SCREEN=1`（在屏幕上钉覆盖全屏的背景板或抓取屏幕内容）需要 `--include-screen`；`# E2E_CHANGES_PREFS=1`（改系统偏好或用户配置）需要 `--include-prefs`。标记必须独占一行，行尾带注释就不再是标记。`--list` 只打印本次会跑哪些场景。应用通过 `--e2e-state=<path>` 写出 JSON 快照，把脚本无法从辅助功能读到的内部事实自己讲出来；脚本对这些快照加真实 WindowServer 状态做断言；断言「已加密」的场景仍必须自己读磁盘文件，因为应用自述不算证据。
 
+### 更新提示的布局验证
+
+四个开发开关可以在不发布版本的情况下走到更新界面。它们都经由 `scripts/dev-restart.sh` 的 argv 透传（脚本不认识的参数原样传给应用），只对当次启动生效。
+
+**提示有两套布局，标题缺陷只存在于其中一套。** 设置窗口关闭时，更新流程渲染进 640pt 的独立窗口；设置窗口停在「关于」页时，它内联渲染进一个宿主视图，日志报出的宽度是 415pt（`[update-inline] host frame w=415.0`）。内联布局把每个稿件 frame 按 `415/640 = 0.648` 缩放安装，于是标题 576pt 的栏位变成 373.5pt，窄于 zh-Hans 标题 `有新的 Oh-My-Tab Dev 版本可用！` 在 26pt 粗体下的 387pt。只看独立窗口的检查因此看不到这个缺陷：测量和验证都必须走内联路径。
+
+所有提示标题现在都由 `prompt_heading_frame` 与 `prompt_heading_field` 生成：按窗口宽度算栏位、换行而不截断、并按**安装宽度**（稿件宽度乘安装比例）测量高度。被替换的五个构造函数各自硬编码了 456、496 或 576pt 乘 28 或 32pt。
+
+`--check-update-on-launch` 在启动后一秒发起一次真实更新检查，与「关于」页按钮是同一次调用。它只在「关于」页可见时才执行，避免提示落到独立窗口。延迟是必需的：`run()` 在 `NSApplication run` 之前到达该点，而 `check_for_updates` 交给 Sparkle 的是延迟的 `performSelectorOnMainThread:`，在没有 run loop 旋转时会被丢弃。一次性 `NSTimer` 只在循环跑起来后触发。
+
+只有构建号低于 feed 提供的最新版本时才会弹出提示。开发包只在输入变化时用新的 UTC 时间戳重新打包，而 `SPARKLE_BUILD_VERSION` 不在那份指纹里。复用的包保留打包时的号，通常正是 feed 已有的号，于是检查结果为「已是最新」、不弹提示。先改一个源文件，或核对脚本打印的 `build-version:` 是否早于 feed 最新项。`~/Library/Logs/oh-my-tab/oh-my-tab.log` 记录整个过程，没有弹出提示时从该文件诊断。
+
+`--dump-update-prompts=<dir>` 由 `--smoke-update-prompts` 运行器读取，把可用、已下载、安装中以及仅信息这四种提示状态在每种语言下各写成一张 <dir> 下的 PNG：
+
+```sh
+cargo build
+./target/debug/oh-my-tab --smoke-update-prompts --dump-update-prompts=/tmp/prompts
+```
+
+运行器会显示真实视图层级并在一次启动内销毁它，屏幕截图抓不到；改用 `cacheDisplayInRect:` 记录视图，布局缺陷因此变成审查者可以打开的文件。裸 `target/debug` 二进制没有 bundle，标题里显示的是回退应用名，而不是 `Oh-My-Tab Dev`。
+
+另外两个开关负责给**内联**布局留证：`--dump-inline-prompt=<dir>` 在提示构建完成后把「关于」页宿主视图写成 `<dir>/inline-<locale>.png`；`--scroll-about-to-updates` 在启动两秒后把该页滚动到展开的更新卡片，用于比页面矮的窗口。两者都不作用于普通启动。
+
+**+0 返回值不是被拥有的对象。** `bitmapImageRepForCachingDisplayInRect:` 与 `representationUsingType:properties:` 都返回 autoreleased 对象；导出辅助函数曾释放了那个位图，导致下一次 run loop 的 autorelease pool 弹出时在 `objc_release` 里以 `EXC_BAD_ACCESS` 崩溃。`alloc`/`init` 得到的是 +1，必须在 `addSubview:` 持有它之后再释放，`prompt_heading_field` 在每个调用处都做了这一步平衡。
+
+```sh
+SPARKLE_BUILD_VERSION=20261101000000 scripts/dev-restart.sh \
+  --no-onboarding --open-settings=about \
+  --check-update-on-launch --dump-inline-prompt=/tmp/out
+```
+
 ### 本地化与布局 QA
 
 `scripts/dev-restart.sh` 构建的 Debug 版会在语言下拉框中加入 `[TEST] English x3` 选项。选中后会把每一条英文 UI 文案重复三遍，便于在真实设置窗口中检查超长下拉项及其所在行、卡片。`scripts/release-dev.sh` 构建的优化开发包通过 `dev-long-text` Cargo feature 包含同一夹具；正式发布脚本不启用它。旧的 `--pseudo-locale` 开关仍可用于仅限 debug 的符号膨胀。

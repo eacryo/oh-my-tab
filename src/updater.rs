@@ -433,11 +433,24 @@ unsafe fn render_target(window_h: f64) -> RenderTarget {
     }
     let ui = UPDATE_UI_STATE.lock().unwrap();
     if ui.host_view != 0 {
+        unsafe {
+            let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
+            log_info!(
+                "[update-inline] host frame w={:.1} h={:.1}",
+                frame.size.width,
+                frame.size.height
+            );
+        }
         // Host coordinates start at (0,0); width is the host frame width, so inline layout fits.
         // When hosted inline, expand the card to this screen's height and size the host to match,
         // keeping the host top fixed so the top-down flip is exact.
         crate::settings::expand_update_section(window_h);
         let frame: NSRect = msg_send![ui.host_view as *mut AnyObject, frame];
+        log_info!(
+            "[update-inline] after expand: requested_h={:.1} host_h={:.1}",
+            window_h,
+            frame.size.height
+        );
         RenderTarget {
             host: ui.host_view as *mut AnyObject,
             parent: ui.host_view as *mut AnyObject,
@@ -645,20 +658,31 @@ unsafe fn title_natural_line_height() -> f64 {
 
 /// The factor `add_control` installs an authored frame with: 1.0 standalone, the host/window ratio
 /// inline.
-fn prompt_install_scale() -> f64 {
+fn prompt_install_scale(window_w: f64) -> f64 {
     let inline = e2e_update_target_is_inline();
-    let host_w = if inline {
-        let ui = UPDATE_UI_STATE.lock().unwrap();
-        if ui.host_view == 0 {
-            0.0
-        } else {
-            let frame: NSRect = unsafe { msg_send![ui.host_view as *mut AnyObject, frame] };
-            frame.size.width
-        }
-    } else {
-        0.0
-    };
-    prompt_layout_scale_for(inline, host_w, PROMPT_WINDOW_W)
+    prompt_install_scale_from(inline, prompt_host_width(inline), window_w)
+}
+
+/// The host view's width, or 0 when the prompt is not inline (or no host is registered yet).
+fn prompt_host_width(inline: bool) -> f64 {
+    if !inline {
+        return 0.0;
+    }
+    let ui = UPDATE_UI_STATE.lock().unwrap();
+    if ui.host_view == 0 {
+        return 0.0;
+    }
+    let frame: NSRect = unsafe { msg_send![ui.host_view as *mut AnyObject, frame] };
+    frame.size.width
+}
+
+/// The scale \`add_control\` installs an authored frame with, from the readings that decide it.
+///
+/// Pure, and the only place the denominator is chosen: it is THIS prompt's authored width, not one
+/// shared constant. The update flow builds 520, 560 and 640pt windows, so dividing all of them by
+/// 640 measured a 560pt window's heading at a width it never installs at.
+fn prompt_install_scale_from(inline: bool, host_w: f64, window_w: f64) -> f64 {
+    prompt_layout_scale_for(inline, host_w, window_w)
 }
 
 /// The authored width behind an installed one: the inverse of `scale_frame`'s width scaling.
@@ -668,6 +692,96 @@ fn unscale_installed_width(installed_w: f64, scale: f64) -> f64 {
     } else {
         installed_w
     }
+}
+
+/// The heading box for a prompt of `window_w`: the prompt's text column, as many lines tall as
+/// `text` needs at the width the heading is installed at.
+/// The width a prompt heading wraps at: its authored column times the install scale of
+/// THAT prompt.
+///
+/// Pure, so the test can assert the product uses the prompt's own width rather than one
+/// shared denominator. `prompt_heading_frame` is its only production caller.
+fn prompt_heading_wrap_width(window_w: f64, install_scale: f64) -> f64 {
+    let column_w = window_w - PROMPT_COLUMN_X * 2.0;
+    (column_w * install_scale).max(1.0)
+}
+unsafe fn prompt_heading_frame(window_w: f64, y: f64, text: &str, font_size: f64) -> NSRect {
+    let column_w = window_w - PROMPT_COLUMN_X * 2.0;
+    let wrap_w = prompt_heading_wrap_width(window_w, prompt_install_scale(window_w));
+    let height = heading_height_at(text, wrap_w, font_size);
+    NSRect::new(
+        NSPoint::new(PROMPT_COLUMN_X, y),
+        NSSize::new(column_w, height),
+    )
+}
+
+/// Height `text` needs at `wrap_w`: one line box, plus one line height per line it wraps to.
+///
+/// This is an upper bound on what the label draws rather than a pixel-exact match: the label has
+/// no paragraph style, so a second line takes the field's own line height, which is slightly
+/// shorter than the title ratio. A taller box than needed shows the text; the truncated box this
+/// replaces did not.
+unsafe fn heading_height_at(text: &str, wrap_w: f64, font_size: f64) -> f64 {
+    let line_h = crate::theme::line_height(font_size, crate::theme::LINE_HEIGHT_TITLE_RATIO);
+    let text_ns = make_nsstring(text);
+    let attributed: *mut AnyObject = msg_send![class!(NSMutableAttributedString), alloc];
+    let attributed: *mut AnyObject = msg_send![attributed, initWithString: text_ns];
+    crate::ffi::CFRelease(text_ns as *const c_void);
+    if attributed.is_null() {
+        return line_h;
+    }
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: font_size, weight: crate::theme::FONT_WEIGHT_BOLD];
+    let length: usize = msg_send![attributed, length];
+    if length > 0 {
+        let font_key = make_nsstring("NSFont");
+        let _: () = msg_send![
+            attributed,
+            addAttribute: font_key,
+            value: font,
+            range: NSRange::new(0, length)
+        ];
+        crate::ffi::CFRelease(font_key as *const c_void);
+    }
+    let extra_lines = match crate::settings::widgets::textkit_line_fragments(attributed, wrap_w) {
+        Some((_, fragments)) if fragments.len() > 1 => fragments.len() - 1,
+        _ => 0,
+    };
+    release_obj(attributed);
+    (line_h * (extra_lines + 1) as f64).ceil()
+}
+
+/// Build a prompt's heading field that fills the column and wraps instead of truncating.
+///
+/// Every prompt used to lay its heading out by hand with a width and height of its own (456, 496
+/// or 576pt by 28 or 32pt, five values in four constructors). A width below the text's natural
+/// length then cut the heading off mid-character, and the default line-break mode made the cut
+/// silent. The override is left to the caller only where a prompt deliberately draws a different
+/// type role (the checking and ready-to-install windows use the sidebar-title font).
+unsafe fn prompt_heading_field(
+    text: &str,
+    frame: NSRect,
+    font_size: f64,
+    weight: f64,
+) -> *mut AnyObject {
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![field, initWithFrame: frame];
+    let text_ns = make_nsstring(text);
+    let _: () = msg_send![field, setStringValue: text_ns];
+    crate::ffi::CFRelease(text_ns as *const c_void);
+    let _: () = msg_send![field, setBezeled: false];
+    let _: () = msg_send![field, setDrawsBackground: false];
+    let _: () = msg_send![field, setEditable: false];
+    let _: () = msg_send![field, setSelectable: false];
+    let _: () = msg_send![field, setAlignment: 1isize]; // centered
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: font_size, weight: weight];
+    let _: () = msg_send![field, setFont: font];
+    let _: () = msg_send![field, setUsesSingleLineMode: false];
+    let _: () = msg_send![field, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    if msg_send![field, respondsToSelector: sel!(setMaximumNumberOfLines:)] {
+        let _: () = msg_send![field, setMaximumNumberOfLines: 0isize];
+    }
+    field
 }
 
 /// Map a standalone-window frame onto the host width, scaling x and width proportionally.
@@ -1077,28 +1191,22 @@ unsafe fn make_custom_update_window(driver: *mut c_void, cancellation: *mut c_vo
     } else {
         (target.parent, std::ptr::null_mut())
     };
-    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject = msg_send![
-        label,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 118.0), NSSize::new(456.0, 28.0))
-    ];
-    let text = make_nsstring(&t("settings.update_checking"));
-    let _: () = msg_send![label, setStringValue: text];
-    crate::ffi::CFRelease(text as *const c_void);
-    let _: () = msg_send![label, setBezeled: false];
-    let _: () = msg_send![label, setDrawsBackground: false];
-    let _: () = msg_send![label, setEditable: false];
-    let _: () = msg_send![label, setSelectable: false];
-    let font: *mut AnyObject =
-        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
-    let _: () = msg_send![label, setFont: font];
-    add_control(
-        target,
+    let checking_text = t("settings.update_checking");
+    let label_frame = prompt_heading_frame(
         window_w,
-        label,
-        NSRect::new(NSPoint::new(32.0, 118.0), NSSize::new(456.0, 28.0)),
-        content,
+        118.0,
+        &checking_text,
+        crate::theme::FONT_SIDEBAR_TITLE,
     );
+    let label = prompt_heading_field(
+        &checking_text,
+        label_frame,
+        crate::theme::FONT_SIDEBAR_TITLE,
+        crate::theme::FONT_WEIGHT_BOLD,
+    );
+    add_control(target, window_w, label, label_frame, content);
+    // prompt_heading_field returns alloc/init +1; the superview retains it, so balance here.
+    release_obj(label);
 
     let progress: *mut AnyObject = msg_send![class!(NSProgressIndicator), alloc];
     let progress: *mut AnyObject = msg_send![
@@ -1179,28 +1287,17 @@ unsafe fn make_custom_result_window(
     } else {
         (target.parent, std::ptr::null_mut())
     };
-    let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let title: *mut AnyObject = msg_send![
-        title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 164.0), NSSize::new(456.0, 32.0))
-    ];
-    let title_ns = make_nsstring(title_text);
-    let _: () = msg_send![title, setStringValue: title_ns];
-    crate::ffi::CFRelease(title_ns as *const c_void);
-    let _: () = msg_send![title, setBezeled: false];
-    let _: () = msg_send![title, setDrawsBackground: false];
-    let _: () = msg_send![title, setEditable: false];
-    let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject =
-        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
-    let _: () = msg_send![title, setFont: title_font];
-    add_control(
-        target,
-        window_w,
-        title,
-        NSRect::new(NSPoint::new(32.0, 164.0), NSSize::new(456.0, 32.0)),
-        content,
+    let title_frame =
+        prompt_heading_frame(window_w, 164.0, title_text, crate::theme::FONT_PAGE_TITLE);
+    let title = prompt_heading_field(
+        title_text,
+        title_frame,
+        crate::theme::FONT_PAGE_TITLE,
+        crate::theme::FONT_WEIGHT_BOLD,
     );
+    add_control(target, window_w, title, title_frame, content);
+    // prompt_heading_field returns alloc/init +1; the superview retains it, so balance here.
+    release_obj(title);
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -1282,26 +1379,22 @@ unsafe fn make_custom_permission_window(driver: *mut c_void, reply: *mut c_void)
     };
     let app = app_display_name();
 
-    let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let title: *mut AnyObject = msg_send![
-        title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 172.0), NSSize::new(496.0, 32.0))
-    ];
-    set_string_value(title, &t("settings.update_permission_title"));
-    let _: () = msg_send![title, setBezeled: false];
-    let _: () = msg_send![title, setDrawsBackground: false];
-    let _: () = msg_send![title, setEditable: false];
-    let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject =
-        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
-    let _: () = msg_send![title, setFont: title_font];
-    add_control(
-        target,
+    let permission_text = t("settings.update_permission_title");
+    let title_frame = prompt_heading_frame(
         window_w,
-        title,
-        NSRect::new(NSPoint::new(32.0, 172.0), NSSize::new(496.0, 32.0)),
-        content,
+        172.0,
+        &permission_text,
+        crate::theme::FONT_SIDEBAR_TITLE,
     );
+    let title = prompt_heading_field(
+        &permission_text,
+        title_frame,
+        crate::theme::FONT_SIDEBAR_TITLE,
+        crate::theme::FONT_WEIGHT_BOLD,
+    );
+    add_control(target, window_w, title, title_frame, content);
+    // prompt_heading_field returns alloc/init +1; the superview retains it, so balance here.
+    release_obj(title);
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -1931,6 +2024,8 @@ unsafe fn make_custom_update_found_window(
         let _: () = msg_send![title, setMaximumNumberOfLines: 0isize];
     }
     add_control(target, window_w, title, title_frame, content);
+    // prompt_heading_field returns alloc/init +1; the superview retains it, so balance here.
+    release_obj(title);
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -2008,6 +2103,15 @@ unsafe fn make_custom_update_found_window(
     let mut ui = UPDATE_UI_STATE.lock().unwrap();
     ui.window = window as usize;
     ui.update_reply = copied_reply;
+    if let Some(dir) = crate::dev_flags::value("dump-inline-prompt") {
+        let host = ui.host_view as *mut AnyObject;
+        if !host.is_null() {
+            let path = format!("{dir}/inline-{}.png", crate::i18n::current_locale());
+            if dump_prompt_view(host, &path) {
+                log_info!("[dump-inline-prompt] wrote {path}");
+            }
+        }
+    }
     ui.information_url = information_url;
 }
 
@@ -2068,6 +2172,7 @@ unsafe fn text_field_fits(
 unsafe fn update_prompt_text_labels_fit(
     view: *mut AnyObject,
     at_layout_width: bool,
+    window_w: f64,
 ) -> (bool, usize) {
     if view.is_null() {
         return (true, 0);
@@ -2078,10 +2183,13 @@ unsafe fn update_prompt_text_labels_fit(
     let mut checked = 0;
     if is_field && !is_button {
         let frame: NSRect = msg_send![view, frame];
-        if frame.size.width > 0.0 && !nsstring_to_string(msg_send![view, stringValue]).is_empty() {
+        // A field narrower than 2pt belongs to a control the prompt collapsed to hide it (the
+        // information-only prompt's "Remind Me Later" sits in a 1pt frame). It is not drawn, and
+        // judging it as clipped text reports a defect the user never sees.
+        if frame.size.width > 2.0 && !nsstring_to_string(msg_send![view, stringValue]).is_empty() {
             checked += 1;
             let wrap_width = if at_layout_width {
-                unscale_installed_width(frame.size.width, prompt_install_scale())
+                unscale_installed_width(frame.size.width, prompt_install_scale(window_w))
             } else {
                 frame.size.width
             };
@@ -2095,7 +2203,8 @@ unsafe fn update_prompt_text_labels_fit(
         let count: usize = msg_send![subviews, count];
         for index in 0..count {
             let child: *mut AnyObject = msg_send![subviews, objectAtIndex: index as isize];
-            let (child_ok, child_checked) = update_prompt_text_labels_fit(child, at_layout_width);
+            let (child_ok, child_checked) =
+                update_prompt_text_labels_fit(child, at_layout_width, window_w);
             ok = ok && child_ok;
             checked += child_checked;
         }
@@ -2110,7 +2219,16 @@ unsafe fn update_prompt_button_labels_fit(view: *mut AnyObject) -> (bool, usize)
     let is_button: bool = msg_send![view, isKindOfClass: class!(NSButton)];
     let mut ok = true;
     let mut visible_labels = 0;
-    if is_button {
+    // The information-only prompt collapses "Remind Me Later" to a 1pt-wide frame (it hides the
+    // button by geometry, not by `isHidden`). Its label is narrower than one glyph and cannot
+    // wrap, so a fit check would report a failure the user never sees.
+    let button_visible: bool = if is_button {
+        let frame: NSRect = msg_send![view, frame];
+        frame.size.width > 2.0
+    } else {
+        false
+    };
+    if is_button && button_visible {
         let subviews: *mut AnyObject = msg_send![view, subviews];
         if !subviews.is_null() {
             let count: usize = msg_send![subviews, count];
@@ -2123,8 +2241,14 @@ unsafe fn update_prompt_button_labels_fit(view: *mut AnyObject) -> (bool, usize)
                 if nsstring_to_string(text).is_empty() {
                     continue;
                 }
-                visible_labels += 1;
                 let frame: NSRect = msg_send![label, frame];
+                // The information-only prompt collapses "Remind Me Later" to a 1pt-wide frame,
+                // so its label is narrower than one glyph and cannot wrap. It is not shown, and
+                // reading that as a failure reports a defect the user never sees.
+                if frame.size.width <= 2.0 {
+                    continue;
+                }
+                visible_labels += 1;
                 // Single-line button titles do not acquire the multiline role's line-height floor.
                 let required =
                     crate::settings::widgets::full_wrapped_text_size(label, frame.size.width)
@@ -2184,7 +2308,15 @@ pub(crate) fn smoke_update_prompt_layouts() -> bool {
                 let (fits, labels) = update_prompt_button_labels_fit(content);
                 // Title plus message: the text this prompt shows is never truncated, whatever the
                 // locale or the app name length.
-                let (text_fits, text_labels) = update_prompt_text_labels_fit(content, true);
+                let (text_fits, text_labels) =
+                    update_prompt_text_labels_fit(content, true, PROMPT_WINDOW_W);
+                if let Some(dir) = crate::dev_flags::value("dump-update-prompts") {
+                    let path =
+                        format!("{dir}/prompt-{locale}-stage{stage}-info{information_only}.png");
+                    if dump_prompt_view(content, &path) {
+                        log_info!("[dump-update-prompts] wrote {path}");
+                    }
+                }
                 let expected_min = if information_only { 2 } else { 3 };
                 if !fits || labels < expected_min || !text_fits || text_labels < 2 {
                     log_info!(
@@ -2198,6 +2330,47 @@ pub(crate) fn smoke_update_prompt_layouts() -> bool {
         crate::i18n::apply_config_locale(&original_locale);
     }
     ok
+}
+
+/// Render `view` to a PNG at `path`, for the development switch `--dump-update-prompts`.
+///
+/// The prompt windows are shown and torn down within one run, so a screenshot cannot catch them;
+/// this captures the same view hierarchy the user would see, without depending on the screen.
+/// Returns whether the file was actually written, so a caller never reports success for an
+/// unwritable directory and leaves an older image to be read as this run's evidence.
+unsafe fn dump_prompt_view(view: *mut AnyObject, path: &str) -> bool {
+    let bounds: NSRect = msg_send![view, bounds];
+    if bounds.size.width <= 0.0 || bounds.size.height <= 0.0 {
+        log_info!("[dump-prompt] empty view; nothing written to {path}");
+        return false;
+    }
+    // Both the bitmap and the encoded data are +0 autoreleased objects. A raw-pointer
+    // `msg_send!` adds no ownership, so the pool releases them; releasing the bitmap here
+    // consumed ownership the pool still holds, and the next run-loop pool pop released an
+    // already-deallocated object (`EXC_BAD_ACCESS` in `objc_release`).
+    let rep: *mut AnyObject = msg_send![view, bitmapImageRepForCachingDisplayInRect: bounds];
+    if rep.is_null() {
+        log_info!("[dump-prompt] no bitmap for {path}");
+        return false;
+    }
+    let _: () = msg_send![view, cacheDisplayInRect: bounds, toBitmapImageRep: rep];
+    let empty: *mut AnyObject = msg_send![class!(NSDictionary), dictionary];
+    let data: *mut AnyObject = msg_send![
+        rep,
+        representationUsingType: 4isize, // NSBitmapImageFileTypePNG
+        properties: empty
+    ];
+    if data.is_null() {
+        log_info!("[dump-prompt] PNG encoding failed for {path}");
+        return false;
+    }
+    let path_ns = make_nsstring(path);
+    let written: bool = msg_send![data, writeToFile: path_ns, atomically: true];
+    crate::ffi::CFRelease(path_ns as *const c_void);
+    if !written {
+        log_info!("[dump-prompt] could not write {path}");
+    }
+    written
 }
 
 fn format_download_bytes(bytes: u64) -> String {
@@ -2275,26 +2448,22 @@ unsafe fn make_custom_download_window(driver: *mut c_void, cancellation: *mut c_
     } else {
         (target.parent, std::ptr::null_mut())
     };
-    let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let title: *mut AnyObject = msg_send![
-        title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0))
-    ];
-    set_string_value(title, &t("settings.update_downloading"));
-    let _: () = msg_send![title, setBezeled: false];
-    let _: () = msg_send![title, setDrawsBackground: false];
-    let _: () = msg_send![title, setEditable: false];
-    let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject =
-        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_PAGE_TITLE];
-    let _: () = msg_send![title, setFont: title_font];
-    add_control(
-        target,
+    let downloading_text = t("settings.update_downloading");
+    let title_frame = prompt_heading_frame(
         window_w,
-        title,
-        NSRect::new(NSPoint::new(32.0, 100.0), NSSize::new(496.0, 32.0)),
-        content,
+        100.0,
+        &downloading_text,
+        crate::theme::FONT_PAGE_TITLE,
     );
+    let title = prompt_heading_field(
+        &downloading_text,
+        title_frame,
+        crate::theme::FONT_PAGE_TITLE,
+        crate::theme::FONT_WEIGHT_BOLD,
+    );
+    add_control(target, window_w, title, title_frame, content);
+    // prompt_heading_field returns alloc/init +1; the superview retains it, so balance here.
+    release_obj(title);
 
     let progress: *mut AnyObject = msg_send![class!(NSProgressIndicator), alloc];
     let progress: *mut AnyObject = msg_send![
@@ -2439,7 +2608,9 @@ unsafe fn make_custom_choice_window(
     let button_h =
         crate::settings::widgets::configure_settings_button_wrapping(button, button_w, 3).max(36.0);
     let message_h = 44.0;
-    let title_h = 32.0;
+    let title_frame =
+        prompt_heading_frame(window_w, 0.0, title_text, crate::theme::FONT_SIDEBAR_TITLE);
+    let title_h = title_frame.size.height;
     let message_y = button_y + button_h + 4.0;
     let title_y = message_y + message_h + 10.0;
     // Keep a small top inset after the title instead of reserving the old empty check-button
@@ -2467,26 +2638,19 @@ unsafe fn make_custom_choice_window(
     } else {
         (target.parent, std::ptr::null_mut())
     };
-    let title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let title: *mut AnyObject = msg_send![
-        title,
-        initWithFrame: NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(496.0, title_h))
-    ];
-    set_string_value(title, title_text);
-    let _: () = msg_send![title, setBezeled: false];
-    let _: () = msg_send![title, setDrawsBackground: false];
-    let _: () = msg_send![title, setEditable: false];
-    let _: () = msg_send![title, setSelectable: false];
-    let title_font: *mut AnyObject =
-        msg_send![class!(NSFont), boldSystemFontOfSize: crate::theme::FONT_SIDEBAR_TITLE];
-    let _: () = msg_send![title, setFont: title_font];
-    add_control(
-        target,
-        window_w,
-        title,
-        NSRect::new(NSPoint::new(32.0, title_y), NSSize::new(496.0, title_h)),
-        content,
+    let title_frame = NSRect::new(
+        NSPoint::new(title_frame.origin.x, title_y),
+        title_frame.size,
     );
+    let title = prompt_heading_field(
+        title_text,
+        title_frame,
+        crate::theme::FONT_SIDEBAR_TITLE,
+        crate::theme::FONT_WEIGHT_BOLD,
+    );
+    add_control(target, window_w, title, title_frame, content);
+    // prompt_heading_field returns alloc/init +1; the superview retains it, so balance here.
+    release_obj(title);
 
     let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
     let message: *mut AnyObject = msg_send![
@@ -3483,6 +3647,117 @@ pub(crate) fn set_automatic_downloads(enabled: bool) {
     log_debug!("Sparkle automatic update downloads set to {}", enabled);
 }
 
+/// Development switch: run one real update check shortly after launch.
+///
+/// The call is queued on the main run loop rather than made inline: `run()` reaches this point
+/// before `NSApplication run`, and `check_for_updates` hands Sparkle a deferred
+/// `performSelectorOnMainThread` that is dropped when no run loop is spinning yet (observed: the
+/// log stopped at "checkForUpdates selector scheduled" and the check never started). A one-shot
+/// timer fires only once the loop is running.
+pub(crate) fn schedule_launch_update_check() {
+    unsafe {
+        let _: *mut AnyObject = msg_send![
+            class!(NSTimer),
+            scheduledTimerWithTimeInterval: 1.0f64,
+            target: launch_update_check_target(),
+            selector: sel!(fireLaunchUpdateCheck:),
+            userInfo: std::ptr::null::<AnyObject>(),
+            repeats: false
+        ];
+    }
+}
+
+/// Development switch: scroll the About page to its end shortly after launch.
+///
+/// The update card grows below the fold once a prompt renders, so a screenshot of a short
+/// settings window shows it only after the page scrolls. Two seconds covers the launch check and
+/// the expansion that follows it.
+pub(crate) fn schedule_about_scroll() {
+    unsafe {
+        let _: *mut AnyObject = msg_send![
+            class!(NSTimer),
+            scheduledTimerWithTimeInterval: 2.0f64,
+            target: launch_update_check_target(),
+            selector: sel!(fireAboutScroll:),
+            userInfo: std::ptr::null::<AnyObject>(),
+            repeats: false
+        ];
+    }
+}
+
+extern "C" fn fire_about_scroll(_this: *mut c_void, _cmd: Sel, _timer: *mut AnyObject) {
+    crate::callback_guard::void("fire_about_scroll", || {
+        crate::settings::scroll_about_page_to_bottom();
+    });
+}
+
+/// The one-shot timer's target; it holds no state, it only gives the timer a selector to call.
+///
+/// `msg_send![class, new]` returns a +1 object. The pointer is kept in a process-lifetime
+/// `Retained` so it is owned once: storing it as a bare `usize` lost that ownership, and the
+/// autorelease pool later released a pointer nothing retained (EXC_BAD_ACCESS in `objc_release`).
+unsafe fn launch_update_check_target() -> *mut AnyObject {
+    static TARGET: std::sync::OnceLock<crate::ffi::CallbackTarget> = std::sync::OnceLock::new();
+    TARGET
+        .get_or_init(|| {
+            let name = c"OhMyTabLaunchUpdateCheckTarget";
+            let superclass = class!(NSObject) as *const _ as *mut AnyObject;
+            let cls = objc_allocateClassPair(superclass, name.as_ptr(), 0);
+            assert!(
+                !cls.is_null(),
+                "dynamic class {} could not be allocated; is it registered twice?",
+                name.to_string_lossy()
+            );
+            let types = CString::new("v@:@").unwrap();
+            class_addMethod(
+                cls,
+                sel!(fireLaunchUpdateCheck:),
+                fire_launch_update_check as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(fireAboutScroll:),
+                fire_about_scroll as *mut c_void,
+                types.as_ptr(),
+            );
+            objc_registerClassPair(cls);
+            // +1 from `new`, held by `CallbackTarget` for the process lifetime and never
+            // released -- the same ownership `CHECK_LOADING_TIMER_TARGET` uses. Storing the
+            // pointer as a bare integer lost that ownership, and the autorelease pool then
+            // released an object nothing retained (EXC_BAD_ACCESS in `objc_release`).
+            let instance: *mut AnyObject = msg_send![cls, new];
+            crate::ffi::CallbackTarget::new(instance)
+        })
+        .0
+}
+
+extern "C" fn fire_launch_update_check(_this: *mut c_void, _cmd: Sel, _timer: *mut AnyObject) {
+    crate::callback_guard::void("fire_launch_update_check", || unsafe {
+        if !e2e_update_target_is_inline() {
+            log_info!(
+                "[check-update-on-launch] the About page is not the visible page;                  not checking, so the prompt cannot land in a standalone window"
+            );
+            return;
+        }
+        log_info!("[check-update-on-launch] requesting an update check (inline)");
+        let updater = state().lock().unwrap().as_ref().map(|c| c.updater);
+        match updater {
+            Some(u) if !u.is_null() => {
+                let can: bool = msg_send![u, canCheckForUpdates];
+                let busy: bool = msg_send![u, sessionInProgress];
+                log_info!(
+                    "[check-update-on-launch] canCheckForUpdates={can} sessionInProgress={busy}"
+                );
+            }
+            _ => log_info!("[check-update-on-launch] no updater instance"),
+        }
+        if !check_for_updates() {
+            log_info!("[check-update-on-launch] the updater refused the check");
+        }
+    });
+}
+
 /// Ask Sparkle to check for updates; the custom user driver presents the update UI.
 pub(crate) fn check_for_updates() -> bool {
     // Be defensive for smoke tests or an unusual launch path that invokes the About action
@@ -3522,12 +3797,13 @@ pub(crate) fn check_for_updates() -> bool {
 mod tests {
     use super::{
         focus_window_for_prompt, inline_layout_scale, is_safe_update_info_url, prefers_inline,
-        prompt_layout_scale_for, prompt_title_box, prompt_title_height_at,
-        prompt_title_layout_frame, release_notes_heading_style, release_notes_measured_width,
-        render_release_notes_markdown, scale_frame, select_release_notes_locale,
-        teardown_closes_standalone, unscale_installed_width, update_prompt_kind,
-        updater_delegate_class, RenderTarget, UpdatePromptKind, PROMPT_COLUMN_W, PROMPT_COLUMN_X,
-        PROMPT_TITLE_LINE_H, PROMPT_WINDOW_W, RELEASE_NOTES_LAYOUT_WIDTH,
+        prompt_heading_wrap_width, prompt_install_scale_from, prompt_layout_scale_for,
+        prompt_title_box, prompt_title_height_at, prompt_title_layout_frame,
+        release_notes_heading_style, release_notes_measured_width, render_release_notes_markdown,
+        scale_frame, select_release_notes_locale, teardown_closes_standalone,
+        unscale_installed_width, update_prompt_kind, updater_delegate_class, RenderTarget,
+        UpdatePromptKind, PROMPT_COLUMN_W, PROMPT_COLUMN_X, PROMPT_TITLE_LINE_H, PROMPT_WINDOW_W,
+        RELEASE_NOTES_LAYOUT_WIDTH,
     };
     use crate::smoke_verdict::smoke_runner;
     use objc2::runtime::AnyObject;
@@ -3626,6 +3902,52 @@ mod tests {
         prompt_title_box(title, layout_w, layout_scale)
     }
 
+    /// The heading measures at the width that prompt installs it at, for every prompt width.
+    ///
+    /// The update flow builds 520, 560 and 640pt windows and `add_control` scales each by its own
+    /// width. Deriving the scale from one shared constant (640) measured a 560pt window's heading at
+    /// 321.6pt while it installs at 367.6pt, so the heading wrapped early and reserved height it
+    /// never needed.
+    ///
+    /// The assertions go through `prompt_heading_wrap_width`, the function the product itself calls,
+    /// and compare its answer with the width `add_control` installs. Reverting
+    /// `prompt_install_scale` to a shared denominator fails them.
+    #[test]
+    fn every_prompt_width_measures_its_heading_at_its_installed_width() {
+        let host_w = 415.0;
+        for window_w in [520.0, 560.0, PROMPT_WINDOW_W] {
+            let column_w = window_w - PROMPT_COLUMN_X * 2.0;
+            // Standalone: scale is 1.0, so the wrap width is the column itself.
+            assert_eq!(
+                prompt_heading_wrap_width(
+                    window_w,
+                    prompt_install_scale_from(false, 0.0, window_w)
+                ),
+                column_w
+            );
+            // Inline: the scale the PRODUCT computes must equal the scale add_control installs
+            // with, so the heading measures at exactly the width it is drawn at.
+            let installed_scale = inline_layout_scale(host_w, window_w);
+            let product_scale = prompt_install_scale_from(true, host_w, window_w);
+            assert!(
+                (product_scale - installed_scale).abs() < 1e-9,
+                "window {window_w}: the product scales by {product_scale:.6} but add_control installs at {installed_scale:.6}"
+            );
+            let installed_width = column_w * installed_scale;
+            assert!(
+                (prompt_heading_wrap_width(window_w, product_scale) - installed_width).abs() < 0.01,
+                "window {window_w}: the heading measures at a width it does not install at"
+            );
+        }
+        // The defect this holds shut: a shared denominator makes the product scale a 560pt
+        // window differently from what add_control installs for that same window.
+        let wrong = prompt_layout_scale_for(true, host_w, PROMPT_WINDOW_W);
+        let right = prompt_install_scale_from(true, host_w, 560.0);
+        assert!(
+            wrong < right,
+            "a shared denominator must under-measure the narrower window: {wrong:.6} vs {right:.6}"
+        );
+    }
     /// The title is measured at the width it is installed at, not the width it is authored at.
     ///
     /// An inline prompt keeps its height and shrinks its width to the host's ratio. Measuring at

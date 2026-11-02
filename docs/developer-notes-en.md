@@ -618,6 +618,88 @@ The overlay runtime path also has an ignored child-process smoke test. Run `carg
 
 The **M2 e2e scenarios** live in `scripts/e2e/*.sh` and run through `scripts/e2e/run-all.sh`, which discovers every executable script in that directory and runs the selected ones in order. Each scenario declares the disturbances it causes in its header, one exact line per kind, and each kind has its own switch: `# E2E_STEALS_FOCUS=1` (injects a real global hotkey through the system event stream, or activates the app) needs `--include-focus`; `# E2E_COVERS_SCREEN=1` (pins a full-screen backdrop over the desktop, or captures screen content) needs `--include-screen`; `# E2E_CHANGES_PREFS=1` (touches a system preference or the user's config) needs `--include-prefs`. The gates are independent and stack -- a scenario runs only when every declaration it makes has been authorised, because agreeing to switch the frontmost app is not agreeing to have the desktop covered or a system setting changed. A marker is an exact header line: one with a trailing comment is not a marker. `--list` prints what this run would execute. The app writes the facts a scenario cannot read back through Accessibility — `--e2e-state=<path>` JSON snapshots — and the scripts assert on those plus real WindowServer state; a scenario that asserts encryption must still read the stored file itself, because a self-report is not evidence.
 
+### Update prompt layout QA
+
+Four development switches reach the update UI without a published release. All go through the
+`scripts/dev-restart.sh` argv passthrough (it forwards any flag it does not own to the app) and
+apply to that launch only.
+
+**The prompt has two layouts, and a heading defect exists in only one of them.** With the settings
+window closed the update flow renders into a standalone 640pt window; with the window open on the
+About page it renders inline, in a host view the log reports as 415pt wide
+(`[update-inline] host frame w=415.0`). The inline layout installs every authored frame scaled by
+`415/640 = 0.648`, so the title's 576pt column becomes 373.5pt — narrower than the zh-Hans title
+`有新的 Oh-My-Tab Dev 版本可用！`, which measures 387pt at 26pt bold. A check that only looks at the
+standalone window therefore cannot see the defect: measure and verify the inline path.
+
+Every prompt heading now comes from `prompt_heading_frame` and `prompt_heading_field`, which size the
+field from the window width, wrap instead of truncating, and measure their height at the width the
+heading is installed at (authored width times the install scale). The five constructors this replaced
+each hardcoded their own width and height (456, 496 or 576pt by 28 or 32pt).
+
+`--dump-update-prompts=<dir>` renders each update prompt state -- available, downloaded, installing,
+and the information-only variant, in every locale -- to a PNG under `<dir>`. It is read by the
+`--smoke-update-prompts` runner, which builds the states:
+
+```sh
+cargo build
+./target/debug/oh-my-tab --smoke-update-prompts --dump-update-prompts=/tmp/prompts
+```
+
+The runner shows the real view hierarchy and tears it down inside one launch, so a screen capture
+cannot catch it; `cacheDisplayInRect:` records the view instead, which makes a layout defect a file a
+reviewer can open. The bare `target/debug` binary has no bundle, so its heading shows the fallback
+app name instead of `Oh-My-Tab Dev`.
+
+`--check-update-on-launch` runs one real update check one second after launch, the same call the
+About page's button makes. It refuses to run unless the About page is the visible page, so the
+prompt renders inline instead of in a standalone window:
+
+```sh
+SPARKLE_BUILD_VERSION=20261101000000 scripts/dev-restart.sh \
+  --no-onboarding --open-settings=about --check-update-on-launch
+```
+
+The delay is required, not cosmetic. `run()` reaches that point before `NSApplication run`, and
+`check_for_updates` hands Sparkle a deferred `performSelectorOnMainThread:`, which is dropped while
+no run loop spins. The inline call this switch first used logged `Sparkle checkForUpdates selector
+scheduled` and then nothing; the one-shot `NSTimer` fires only once the loop is running, and the log
+then shows `canCheckForUpdates=true`, `Sparkle update check started` and the request context.
+
+A check presents a prompt only when the build number is older than what the feed serves. The dev
+bundle is repackaged with a fresh UTC timestamp build number only when its inputs change, and
+`SPARKLE_BUILD_VERSION` is NOT part of that fingerprint (see "Building and testing"). A reused
+bundle therefore keeps the number it was packaged with -- normally the one the feed already carries
+-- and the check reports "up to date" with no prompt. Passing an older `SPARKLE_BUILD_VERSION`
+changes the number only when the same run also repackages, which happens when the binary or a
+bundled resource changed. Touch a source file first, or read the `build-version:` line the script
+prints and confirm it is older than the feed's newest item before expecting a prompt.
+`~/Library/Logs/oh-my-tab/oh-my-tab.log` records the whole sequence, so a check that produced no
+prompt is diagnosed from that file rather than from the screen.
+
+Two switches photograph the inline layout, which no screen capture can reach while it renders:
+
+`--dump-inline-prompt=<dir>` writes the About page's host view to `<dir>/inline-<locale>.png` right
+after the prompt is built, and `--scroll-about-to-updates` scrolls that page to the expanded update
+card two seconds after launch, for a window shorter than the page. Together they show the real
+inline prompt:
+
+```sh
+SPARKLE_BUILD_VERSION=20261101000000 scripts/dev-restart.sh \
+  --no-onboarding --open-settings=about \
+  --check-update-on-launch --dump-inline-prompt=/tmp/out
+```
+
+The launch check refuses to run when the About page is not the visible page, so the prompt cannot
+land in a standalone window by accident; `--open-settings=about` is what makes the inline path
+reachable. Neither switch applies to a normal launch.
+
+**A +0 return is not an owned object.** `bitmapImageRepForCachingDisplayInRect:` and
+`representationUsingType:properties:` both return autoreleased objects; the dump helper released the
+bitmap once and the next run-loop autorelease-pool pop crashed in `objc_release` with
+`EXC_BAD_ACCESS`. An `alloc`/`init` object is +1 and must be released after `addSubview:` retains it —
+`prompt_heading_field` balances that in each caller.
+
 ### Localization and layout QA
 
 The Debug app built by `scripts/dev-restart.sh` adds a `[TEST] English x3` option to the language selector. Selecting it repeats every English UI string three times, so long dropdown values and their surrounding rows and cards can be checked in the real settings window. The optimized development package built by `scripts/release-dev.sh` includes the same fixture through the `dev-long-text` Cargo feature; the production release scripts do not enable it. The older `--pseudo-locale` switch is still available for debug-only punctuation-based expansion.
