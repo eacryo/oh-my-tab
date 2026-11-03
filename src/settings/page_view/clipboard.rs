@@ -300,6 +300,7 @@ unsafe fn draw_shortcut_row(
         kind: ControlKind::Button,
         control: button,
         readout: error,
+        action: std::ptr::null_mut(),
         extra: RenderedExtra::Shortcut { row_height: row_h },
     }
 }
@@ -346,6 +347,7 @@ unsafe fn draw_max_entries_row(
         kind: ControlKind::Button,
         control: field,
         readout: std::ptr::null_mut(),
+        action: std::ptr::null_mut(),
         extra: RenderedExtra::MaxEntries,
     }
 }

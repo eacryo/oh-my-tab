@@ -704,14 +704,27 @@ mod tests {
                 )
             })
             .collect();
-        // Every field this page declares is one the hook knows; the shared slot table is the
-        // wrong place to look for them, and asserting that keeps the two lists from drifting.
+        // Every field this page declares is one the page knows. The scalar fields are now bound by
+        // the shared slot table (the legacy consumers read `SettingsUi` directly); the POSITIONAL
+        // ones — one control per file type and per terminal — are bound into their Vec fields by
+        // the hook, because a one-slot-per-field table cannot hold a list.
         assert_eq!(bound.len(), fields(&view).len());
         for field in &bound {
-            assert!(
-                crate::settings::page_view::settings_ui_slot_field(*field).is_none(),
-                "{field:?} moved into the shared slot table; the hook no longer needs it"
+            let positional = matches!(
+                field,
+                ControlField::FinderMenuNewFileType(_) | ControlField::FinderMenuTerminal(_)
             );
+            if positional {
+                assert!(
+                    crate::settings::page_view::settings_ui_slot_field(*field).is_none(),
+                    "{field:?} is positional and must not be in the one-slot-per-field table"
+                );
+            } else {
+                assert!(
+                    crate::settings::page_view::settings_ui_slot_field(*field).is_some(),
+                    "{field:?} is described but no SettingsUi slot is bound for it"
+                );
+            }
         }
         // The status row is an action, and the activation refresh writes it by pointer.
         assert_eq!(

@@ -147,6 +147,13 @@ pub(super) struct PageCanvas {
     rows: Vec<Row>,
     sections: Vec<Section>,
     cards: Vec<Card>,
+    /// Views the page creates inside a row but does not want that row (or any row) to own. The
+    /// canvas leaves them alone; the page maintains them itself.
+    detached: Vec<*mut AnyObject>,
+    /// Views a page anchored to another row's LIVE origin: (view, row, offset from that row). A
+    /// page-owned line that must not travel with the row it is drawn in (the About update divider)
+    /// is detached from capture and anchored here instead.
+    anchored: Vec<(*mut AnyObject, usize, f64)>,
     pending: Option<PendingRow>,
     /// Views the page pins to the document's top edge, with their distance from it: the About page
     /// draws its own About title and version subtitle instead of the shared page title.
@@ -245,6 +252,20 @@ unsafe fn subview_at(view: *mut AnyObject, index: usize) -> *mut AnyObject {
 /// Only views added with the plain `addSubview:` belong to a row. The card is inserted at the
 /// bottom of the z-order (`addSubview:positioned:relativeTo:`) and shifts array indices, so cards
 /// are created right after a row has been captured (see `card`).
+/// The views a row captures: everything appended since it opened, minus the views the page
+/// detached. A page-owned line that must not travel with its row (the About update divider) is
+/// excluded HERE, which is why this is a named function: the rule is what the M1 test asserts, not
+/// just the presence of a list entry.
+fn captured_row_views(
+    added: Vec<*mut AnyObject>,
+    detached: &[*mut AnyObject],
+) -> Vec<*mut AnyObject> {
+    added
+        .into_iter()
+        .filter(|view| !detached.contains(view))
+        .collect()
+}
+
 unsafe fn views_added_since(view: *mut AnyObject, mark: usize) -> Vec<*mut AnyObject> {
     let count = subview_count(view);
     if count <= mark {
@@ -345,6 +366,8 @@ impl PageCanvas {
             rows: Vec::new(),
             sections: Vec::new(),
             cards: Vec::new(),
+            detached: Vec::new(),
+            anchored: Vec::new(),
             pending: None,
             pinned: Vec::new(),
             group: None,
@@ -389,6 +412,8 @@ impl PageCanvas {
                 extra: 0.0,
             }],
             cards: Vec::new(),
+            detached: Vec::new(),
+            anchored: Vec::new(),
             pending: None,
             pinned: Vec::new(),
             group: None,
@@ -475,6 +500,8 @@ impl PageCanvas {
                 extra: 0.0,
             }],
             cards: Vec::new(),
+            detached: Vec::new(),
+            anchored: Vec::new(),
             pending: None,
             pinned: Vec::new(),
             group: None,
@@ -624,7 +651,10 @@ impl PageCanvas {
         let Some(mut pending) = self.pending.take() else {
             return;
         };
-        let views = views_added_since(self.document, pending.mark);
+        let views = captured_row_views(
+            views_added_since(self.document, pending.mark),
+            &self.detached,
+        );
         self.rows.push(Row {
             views,
             consume: pending.consume,
@@ -640,6 +670,37 @@ impl PageCanvas {
             state.row_consumes.push(pending.consume);
             state.group_hidden_views.push(None);
         }
+    }
+
+    /// Anchor a view the page owns to a CANVAS ROW: on every re-flow it is placed at that row's
+    /// current origin plus `offset`.
+    ///
+    /// A view created inside a row is captured by that row (`flush_pending`), which is wrong for a
+    /// line that must stay put while the row below collapses: this excludes it from capture AND
+    /// gives it a live anchor, so it follows the rows around it without belonging to any of them.
+    pub(super) fn anchor_to_row(&mut self, view: *mut AnyObject, row: usize, offset: f64) {
+        if view.is_null() {
+            return;
+        }
+        self.detached.push(view);
+        self.anchored.push((view, row, offset));
+    }
+    /// Where an anchored view goes, given the origins THIS re-flow computed: `None` when the row is
+    ///
+    /// This is the rule the re-flow applies, named so the M1 tests can prove it directly -- in
+    /// particular that it consumes the CURRENT computation rather than the previous re-flow's.
+    #[allow(dead_code)]
+    pub(super) fn anchored_view_y(origin: Option<f64>, offset: f64) -> Option<f64> {
+        origin.map(|origin| origin + offset)
+    }
+
+    /// The row and offset an anchored view is registered against, if it is anchored at all.
+    #[cfg(test)]
+    pub(super) fn anchored_for_test(&self, view: *mut AnyObject) -> Option<(usize, f64)> {
+        self.anchored
+            .iter()
+            .find(|(anchored, _, _)| *anchored == view)
+            .map(|(_, row, offset)| (*row, *offset))
     }
 
     /// Close the current section by drawing its card around the rows since the section opened.
@@ -682,6 +743,12 @@ impl PageCanvas {
         card
     }
 
+    /// How many rows the canvas has SETTLED: a row a page is currently drawing into is still
+    /// pending, so this is one less than `last_row()` while that row is open.
+    #[allow(dead_code)]
+    pub(super) fn settled_rows(&self) -> usize {
+        self.rows.len()
+    }
     /// The row's placed views with their offsets from its origin (the re-flow's own record).
     #[allow(dead_code)]
     pub(super) fn row_placements(&self, row: usize) -> Option<&[(*mut AnyObject, NSPoint)]> {
@@ -1273,6 +1340,30 @@ impl PageCanvas {
                     frame.origin.x,
                     doc_height - SettingsPageHeader::TOP_PADDING - self.title_height
                 )
+            ];
+        }
+        // Anchored page views follow the origin THIS re-flow computed: `state.origins` is only
+        // written back at the end of this function, so reading it here would place them one
+        // re-flow behind whenever the document grew or the viewport changed.
+        for (view, row, offset) in &self.anchored {
+            if view.is_null() {
+                continue;
+            }
+            let Some(y) = Self::anchored_view_y(
+                relative
+                    .origins
+                    .get(*row)
+                    .copied()
+                    .flatten()
+                    .map(|rel| base + rel),
+                *offset,
+            ) else {
+                continue;
+            };
+            let frame: NSRect = msg_send![*view, frame];
+            let _: () = msg_send![
+                *view,
+                setFrameOrigin: NSPoint::new(frame.origin.x, y)
             ];
         }
         for (view, offset) in &self.pinned {
@@ -1904,5 +1995,58 @@ mod tests {
             with_gap, without_gap,
             "omitting the card gap from the cursor must change the result, or the assertion covers nothing"
         );
+    }
+
+    /// A view created inside a row is captured by that row unless the page detaches it, and the
+    /// About page's update divider must NOT travel with the band the flow collapses: it marks the
+    /// band's top edge, which is the host's bottom edge, so it has to stay put when the band's
+    /// consume drops to zero.
+    #[test]
+    fn the_canvas_does_not_capture_a_view_the_page_detached_from_its_row() {
+        // The canvas's own rule, tested without AppKit: a detached view is excluded from the row's
+        // captured views, so a later re-flow never moves it.
+        // The capture rule itself: a detached view never enters a row's view list. Removing the
+        // filter from `captured_row_views` fails HERE, which is the failure this asserts.
+        let kept = 1usize as *mut AnyObject;
+        let detached = 2usize as *mut AnyObject;
+        let captured = captured_row_views(vec![kept, detached], &[detached]);
+        assert_eq!(
+            captured,
+            vec![kept],
+            "a detached view is not captured by its row"
+        );
+        // ...and the canvas really registers the view as detached when the page asks.
+        let mut canvas = PageCanvas::empty();
+        canvas.anchor_to_row(detached, 0, 0.0);
+        assert!(canvas.anchored_for_test(detached).is_some());
+        assert!(canvas.anchored_for_test(std::ptr::null_mut()).is_none());
+    }
+
+    /// An anchored page view follows its row's LIVE origin. This is the line the About update flow
+    /// needs: the divider marks the band's top edge, must not travel with the band when the flow
+    /// collapses it, and must still move with the rows above it when the document grows. A test
+    /// that only checks list membership would pass even if the re-flow stopped applying it.
+    #[test]
+    fn an_anchored_view_is_replaced_at_its_rows_current_origin() {
+        let mut canvas = PageCanvas::empty();
+        // The rule the re-flow applies: anchored views are placed at `origin + offset`, and the
+        // origin comes from the row's CURRENT position, not the build-time one.
+        let origin_after_reflow = Some(120.0);
+        let offset = 56.0;
+        assert_eq!(
+            PageCanvas::anchored_view_y(origin_after_reflow, offset),
+            Some(origin_after_reflow.unwrap() + offset),
+            "an anchored view is placed from the row's CURRENT origin"
+        );
+        // A hidden row yields nothing to place: the view stays with that row's visibility.
+        assert_eq!(PageCanvas::anchored_view_y(None, offset), None);
+        // The rule is the same one a pinned view uses (document height - offset), applied to a row.
+        let view = 1usize as *mut AnyObject;
+        canvas.anchor_to_row(view, 3, offset);
+        assert!(
+            canvas.anchored_for_test(view).is_some(),
+            "an anchored view is registered and not row-captured"
+        );
+        assert_eq!(canvas.anchored_for_test(view), Some((3, offset)));
     }
 }

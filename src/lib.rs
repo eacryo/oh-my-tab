@@ -3214,6 +3214,7 @@ pub fn run() {
             || arg == "--smoke-smooth-scroll-event"
             || arg == "--smoke-card-badges"
             || arg == "--smoke-selection-ring"
+            || arg == "--smoke-migrated-pages"
             || arg == "--smoke-space-state-matrix"
             || arg == "--smoke-panel-keys"
             || arg == "--smoke-main-thread-slot"

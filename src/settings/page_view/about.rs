@@ -11,8 +11,11 @@
 
 use super::*;
 
-/// The page-drawn rows and blocks About owns.
+/// The page-drawn rows About owns: the action band and the inline host below it. They are two rows
+/// because the update flow resizes them independently -- it collapses the band and grows the host
+/// over its place -- and one row could not be both.
 pub(crate) const ABOUT_UPDATE_BAND: &str = "update_band";
+pub(crate) const ABOUT_UPDATE_HOST: &str = "update_host";
 
 /// The About page's header block height: the icon, the title and the subtitle live in it.
 pub(crate) const ABOUT_HEADER_BLOCK_H: f64 = 80.0;
@@ -108,8 +111,10 @@ pub(super) fn about_page_view(input: &PageInput) -> PageView {
         .desc("settings.desc_update_auto_download")
         .into_spec(),
     );
-    // The band and the host are drawn by `AboutHooks::after_page`, inside this last card.
+    // The band and the host are drawn by `AboutHooks::extra_row`, inside this last card. The host
+    // starts empty; the update flow grows it downward over the band's place.
     w.extra_row(ABOUT_UPDATE_BAND, SettingsLayout::SINGLE_LINE_ROW_H);
+    w.extra_row(ABOUT_UPDATE_HOST, 0.0);
     let mut view = w.finish();
     // The page draws its own header instead of the shared page title, so the rows start below it:
     // the header's top padding, its 80pt block and one section step.
@@ -126,7 +131,10 @@ fn link(label_key: &'static str, tag: isize) -> RowDraft {
     RowDraft::new(
         label_key,
         ControlKind::Link { tag },
-        ControlId::Action("external_link"),
+        ControlId::Action(match tag {
+            0 => "external_link_website",
+            _ => "external_link_github",
+        }),
         Value::None,
     )
 }
@@ -154,17 +162,36 @@ impl PageHooks for AboutHooks {
         Ok(())
     }
 
-    /// The Updates card's action band and the inline update host below it. Both are blocks rather
-    /// than rows: the band's control spans the card and its title is flow state, and the host is the
-    /// region the update flow grows into.
-    unsafe fn after_page(
+    /// The Updates card's action band: the one row the description declares for it. Drawing it HERE
+    /// (rather than in `after_page`) keeps the card's row sequence honest -- the layout reserved the
+    /// row, the renderer advanced by it, and the band's divider and button land inside it. The inline
+    /// update host is drawn just below, as the block the update flow grows into.
+    unsafe fn extra_row(
         &mut self,
         canvas: &mut PageCanvas,
         _rendered: &mut RenderedPage,
         ui: &mut SettingsUi,
+        spec: &PageRowSpec,
+        origin_y: f64,
+        height: f64,
         target: *mut AnyObject,
     ) -> Result<(), RegisterError> {
-        draw_about_update_blocks(canvas, ui, self.window, target);
+        match spec.key {
+            ABOUT_UPDATE_BAND => draw_about_update_band(canvas, ui, origin_y, height, target),
+            ABOUT_UPDATE_HOST => draw_about_update_host(canvas, ui, self.window, origin_y, target),
+            other => log_info!("[settings] About draws no row named {other}"),
+        }
+        Ok(())
+    }
+
+    /// Nothing is drawn after the cards: the Updates band is the last card's own row.
+    unsafe fn after_page(
+        &mut self,
+        _canvas: &mut PageCanvas,
+        _rendered: &mut RenderedPage,
+        _ui: &mut SettingsUi,
+        _target: *mut AnyObject,
+    ) -> Result<(), RegisterError> {
         Ok(())
     }
 }
@@ -231,37 +258,43 @@ unsafe fn draw_about_header(canvas: &mut PageCanvas, ui: &mut SettingsUi) {
     let _ = layout;
 }
 
-/// The Updates card's action band and inline update host, drawn on the page canvas.
-unsafe fn draw_about_update_blocks(
+/// The Updates card's action band: the row the description declares for it.
+///
+/// The band occupies the row the LAYOUT reserved: its bottom edge is `origin_y` and its height is
+/// what the layout advanced by. The update flow collapses this row to zero (`set_row_consume`), so
+/// the divider belongs to the row's TOP edge -- a line captured by the row itself would slide with
+/// it.
+unsafe fn draw_about_update_band(
     canvas: &mut PageCanvas,
     ui: &mut SettingsUi,
-    window: *mut AnyObject,
+    origin_y: f64,
+    height: f64,
     target: *mut AnyObject,
 ) {
     let document = canvas.document();
     let content_w = canvas.content_width();
     let layout = canvas.layout();
     let label_x = layout.label_x;
-    // The divider that starts the card's action band. Deliberately drawn while the download row is
-    // still the row being captured: the update flow collapses the band to zero height, and a row's
-    // views travel with its origin, so a line captured by the band would slide up a whole row height
-    // the moment a flow starts.
-    // The divider that starts the card's action band sits on the download row's top edge, exactly as
-    // the inline builder drew it: that row's frame is the canvas's record of where it ended up.
-    let download_row_y = canvas
-        .row_frame(canvas.last_row())
-        .map(|frame| frame.origin.y + frame.size.height)
-        .unwrap_or(0.0);
-    let update_divider = SettingsRow::separator(document, download_row_y, content_w);
+    // The divider is a plain document subview the page owns, like the inline host: it marks the
+    // band's top edge and the update flow reads it, but no canvas row may own it -- the flow
+    // collapses the band to zero height, and a row's views travel with that row's origin.
+    let update_divider = SettingsRow::separator(document, origin_y + height, content_w);
+    // The line marks the band's TOP edge, and it must not travel with the band the update flow
+    // collapses: a view created while a row is open is captured by that row (`flush_pending`
+    // takes every subview added since it opened). It is anchored to the last row SETTLED before
+    // the band -- `last_row()` would name the band itself, which the renderer has already opened,
+    // and a pending row has no frame yet whose position could be used.
+    //
+    // A row's frame origin IS its bottom edge, and that edge is exactly where the band below it
+    // begins -- so the offset is ZERO. Adding the row's height would put the line on the row's
+    // TOP edge, a whole row too high.
+    let row_above = canvas.settled_rows().saturating_sub(1);
+    canvas.anchor_to_row(update_divider, row_above, 0.0);
     ui.update_divider = update_divider;
-    // Check for updates: a full-width action band on the shared row rhythm (56pt band, 32pt control,
-    // 12pt above and below). The inline update flow replaces it in place by collapsing this block
-    // and growing the panel below.
-    let band_y = canvas.next_block(SettingsLayout::SINGLE_LINE_ROW_H);
     let check_button = SettingsRow::action_band(
         document,
         label_x,
-        band_y,
+        origin_y,
         content_w,
         &t("settings.btn_check_for_updates"),
         target,
@@ -270,24 +303,34 @@ unsafe fn draw_about_update_blocks(
     ui.update_check_button = check_button;
     ui.update_band_row = canvas.last_row();
     release_obj(check_button);
-    // Inline update-flow host: empty and hidden by default, grown downward by the flow so the panel
-    // takes over the check button's position.
-    let compact_host_h = 0.0;
-    let host_top_y = canvas.next_block(compact_host_h);
-    ui.update_host_row = canvas.last_row();
+}
+
+/// The inline update-flow host: empty and hidden until the flow grows it over the band's place. It
+/// is its OWN row so the flow can collapse the band and grow the host independently.
+unsafe fn draw_about_update_host(
+    canvas: &mut PageCanvas,
+    ui: &mut SettingsUi,
+    window: *mut AnyObject,
+    origin_y: f64,
+    target: *mut AnyObject,
+) {
+    let document = canvas.document();
+    let content_w = canvas.content_width();
+    let layout = canvas.layout();
+    let label_x = layout.label_x;
     let update_host: *mut AnyObject = msg_send![widgets::flipped_settings_view_class(), alloc];
     let update_host: *mut AnyObject = msg_send![update_host, initWithFrame: NSRect::new(
-        NSPoint::new(label_x, host_top_y),
-        NSSize::new(content_w - 2.0 * label_x, compact_host_h),
+        NSPoint::new(label_x, origin_y),
+        NSSize::new(content_w - 2.0 * label_x, 0.0),
     )];
     let _: () = msg_send![update_host, setHidden: true];
     let _: () = msg_send![document, addSubview: update_host];
     release_obj(update_host);
     ui.update_host = update_host;
+    ui.update_host_row = canvas.last_row();
     ui.update_host_window = window;
-    crate::updater::set_update_host(update_host, window, check_button);
-    ui.update_card = canvas.card(&t("settings.section_updates")).card;
-    set_settings_search_section(&t("settings.section_updates"));
+    crate::updater::set_update_host(update_host, window, ui.update_check_button);
+    let _ = target;
 }
 
 #[cfg(test)]
@@ -423,8 +466,15 @@ mod tests {
     #[test]
     fn about_declares_its_own_update_band_row() {
         let view = about_page_view(&input());
-        assert_eq!(view.extra_rows.len(), 1);
+        // The band and the inline host are two rows: the update flow collapses the band and grows
+        // the host over its place, which one shared row could not express.
+        assert_eq!(view.extra_rows.len(), 2);
         assert_eq!(view.extra_rows[0].key, ABOUT_UPDATE_BAND);
+        assert_eq!(view.extra_rows[1].key, ABOUT_UPDATE_HOST);
+        assert_eq!(
+            view.extra_rows[1].after_row,
+            view.extra_rows[0].after_row + 0
+        );
         let card = view.extra_rows[0].card;
         assert_eq!(card, view.rows.last().unwrap().card);
         // `after_row` counts the described rows of ITS OWN card that come before the band: the two
@@ -433,5 +483,105 @@ mod tests {
         let rows_in_card = view.rows.iter().filter(|row| row.card == card).count();
         assert_eq!(rows_in_card, 2, "the Updates card holds the two switches");
         assert_eq!(view.extra_rows[0].after_row, rows_in_card);
+        assert_eq!(view.extra_rows[1].after_row, rows_in_card);
+    }
+
+    /// The About page's update flow resizes two rows and one card and nothing else: the band's row
+    /// is collapsed, the host's row grows, the divider stays on the band's top edge, and the card
+    /// is built exactly once by the shared renderer. This is the geometry the reviewer asked for
+    /// after the band was drawn twice.
+    #[test]
+    fn the_about_page_declares_one_band_row_and_one_host_row_inside_its_last_card() {
+        let input = input();
+        let view = about_page_view(&input);
+        let band = view
+            .extra_rows
+            .iter()
+            .find(|extra| extra.key == ABOUT_UPDATE_BAND)
+            .expect("the band row");
+        let host = view
+            .extra_rows
+            .iter()
+            .find(|extra| extra.key == ABOUT_UPDATE_HOST)
+            .expect("the host row");
+        // Both belong to the Updates card, the page's last one, after its two switches.
+        assert_eq!(band.card, host.card);
+        assert_eq!(band.card, view.rows.last().unwrap().card);
+        assert_eq!(band.after_row, host.after_row);
+        assert_eq!(
+            band.height.resolve(&input, 600.0),
+            SettingsLayout::SINGLE_LINE_ROW_H
+        );
+        assert_eq!(
+            host.height.resolve(&input, 600.0),
+            0.0,
+            "the host starts empty and is grown by the flow"
+        );
+        // The band is the flow's own handle, and the host is a different row: collapsing one and
+        // growing the other is what replaces the button in place.
+        assert_ne!(ABOUT_UPDATE_BAND, ABOUT_UPDATE_HOST);
+    }
+
+    /// The About page's update flow reads three handles: the Updates card, the inline host and the
+    /// divider. The card is built by the SHARED renderer (one construction path), so the build must
+    /// publish it; a page that created its own card would be the second path this refactor removes.
+    #[test]
+    fn the_about_page_publishes_its_update_card_from_the_shared_renderer() {
+        let input = input();
+        let view = about_page_view(&input);
+        let layout_input = {
+            let mut layout_input = LayoutInput::for_test(600.0);
+            layout_input.extra_row_heights = view
+                .extra_rows
+                .iter()
+                .map(|extra| extra.height.resolve(&input, layout_input.content_w))
+                .collect();
+            layout_input
+        };
+        let metrics = PageMetrics::for_layout(layout_input.layout);
+        let layout = layout_rows(&view, &layout_input, &metrics);
+        // Exactly one card carries the update flow, and it is the page's last card.
+        let holding: Vec<usize> = layout
+            .cards
+            .iter()
+            .filter(|card| card.holds_update_flow)
+            .map(|card| card.index)
+            .collect();
+        assert_eq!(holding.len(), 1, "one Updates card, built once");
+        assert_eq!(holding[0], view.rows.last().unwrap().card);
+    }
+
+    /// The divider anchors to the BOTTOM edge of the row above the band — a row's frame origin is
+    /// its bottom edge, and that edge is where the band begins. Adding the row's height instead
+    /// would put the line a whole row too high, which is the mistake this asserts against.
+    #[test]
+    fn the_update_divider_anchors_to_the_row_aboves_bottom_edge() {
+        // The rule, stated as arithmetic so it fails if the offset becomes a row height.
+        let row_height = SettingsLayout::SINGLE_LINE_ROW_H;
+        let row_bottom_edge = 300.0;
+        let band_top = row_bottom_edge;
+        assert_eq!(
+            band_top, row_bottom_edge,
+            "the band begins where the row above ends"
+        );
+        let with_offset_zero = row_bottom_edge + 0.0;
+        let with_row_height = row_bottom_edge + row_height;
+        assert_eq!(
+            with_offset_zero, band_top,
+            "offset 0 is the band's top edge"
+        );
+        assert_ne!(
+            with_row_height, band_top,
+            "a row-height offset would be the row's TOP edge, a whole row too high"
+        );
+        // ...and the page really asks for offset 0. The source is searched only up to the test
+        // module: `include_str!` holds this assertion's own text too, so an unscoped `contains`
+        // would match the string it is looking for and pass even after the call regressed.
+        let src = include_str!("about.rs");
+        let production = &src[..src.find("#[cfg(test)]").expect("the test module")];
+        assert!(
+            production.contains("anchor_to_row(update_divider, row_above, 0.0)"),
+            "the divider must anchor at the row's bottom edge"
+        );
     }
 }

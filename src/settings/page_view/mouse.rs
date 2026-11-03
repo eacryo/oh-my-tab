@@ -69,7 +69,11 @@ pub(super) fn mouse_page_view(input: &PageInput) -> PageView {
     w.card("settings.header_mouse_device");
     w.extra_row_measured(MOUSE_DEVICE_ROW, device_row_height);
     w.extra_row(MOUSE_SCROLL_MODE_ROW, SettingsSelect::metrics().row_h);
-    w.extra_row(MOUSE_LINE_COUNT_ROW, SettingsLayout::SINGLE_LINE_ROW_H);
+    w.extra_row_in_group(
+        MOUSE_LINE_COUNT_ROW,
+        SettingsLayout::SINGLE_LINE_ROW_H,
+        Some(RowGroup::LineCount),
+    );
 
     // ---- Scrolling: the inverted-scroll switch ----
     w.card("settings.header_mouse_scrolling");
@@ -85,10 +89,15 @@ pub(super) fn mouse_page_view(input: &PageInput) -> PageView {
 
     // ---- Smooth scrolling: the preset and its four fractional sliders are page-drawn ----
     w.card("settings.header_mouse_smooth_scrolling");
-    w.extra_row(MOUSE_SMOOTH_PRESET_ROW, SettingsSelect::metrics().row_h);
-    w.extra_row(
+    w.extra_row_in_group(
+        MOUSE_SMOOTH_PRESET_ROW,
+        SettingsSelect::metrics().row_h,
+        Some(RowGroup::SmoothScrolling),
+    );
+    w.extra_row_in_group(
         MOUSE_SMOOTH_SLIDERS_ROW,
         4.0 * SettingsLayout::SINGLE_LINE_ROW_H,
+        Some(RowGroup::SmoothScrolling),
     );
 
     // ---- Pointer: the acceleration switch, then the tracking speed it reveals ----
@@ -102,7 +111,11 @@ pub(super) fn mouse_page_view(input: &PageInput) -> PageView {
         .caption("settings.desc_disable_pointer_accel")
         .into_spec(),
     );
-    w.extra_row(MOUSE_TRACKING_SPEED_ROW, SettingsLayout::SINGLE_LINE_ROW_H);
+    w.extra_row_in_group(
+        MOUSE_TRACKING_SPEED_ROW,
+        SettingsLayout::SINGLE_LINE_ROW_H,
+        Some(RowGroup::PointerAccel),
+    );
 
     // ---- Button mappings: the master switch, then the page's own table block ----
     w.card("settings.header_mouse_mappings");
@@ -350,8 +363,11 @@ unsafe fn draw_mouse_row(
             ];
             let mut controls: Vec<(*mut AnyObject, *mut AnyObject)> = Vec::new();
             for (index, (key, minimum, maximum, default_value)) in specs.into_iter().enumerate() {
-                // The sub-rows step DOWN from the block's bottom origin.
-                let y = origin_y + index as f64 * SettingsLayout::SINGLE_LINE_ROW_H;
+                // The block's origin is its BOTTOM edge, so its top is `origin_y + height` and the
+                // sub-rows are stacked downward from there: index 0 (response) is the topmost, in
+                // the order the inline builder drew them.
+                let y =
+                    origin_y + height - (index as f64 + 1.0) * SettingsLayout::SINGLE_LINE_ROW_H;
                 let slider = SettingsControl::double_slider(
                     ctrl_x,
                     y + 10.0,
@@ -670,6 +686,33 @@ mod tests {
         assert!(
             measured >= SettingsSelect::metrics().row_h,
             "it never shrinks below the select's own row height"
+        );
+    }
+
+    /// The Mouse page's mode-dependent rows must carry the SAME conditional groups the refresh
+    /// functions drive (`update_mode_dependent_visibility` / `update_pointer_accel_visibility`):
+    /// a page-drawn row outside its group stays visible when the switch says it should be hidden.
+    #[test]
+    fn the_mouse_pages_drawn_rows_declare_their_conditional_groups() {
+        let view = mouse_page_view(&input());
+        let group_of = |key: &str| {
+            view.extra_rows
+                .iter()
+                .find(|extra| extra.key == key)
+                .and_then(|extra| extra.group)
+        };
+        assert_eq!(group_of(MOUSE_LINE_COUNT_ROW), Some(RowGroup::LineCount));
+        assert_eq!(
+            group_of(MOUSE_SMOOTH_PRESET_ROW),
+            Some(RowGroup::SmoothScrolling)
+        );
+        assert_eq!(
+            group_of(MOUSE_SMOOTH_SLIDERS_ROW),
+            Some(RowGroup::SmoothScrolling)
+        );
+        assert_eq!(
+            group_of(MOUSE_TRACKING_SPEED_ROW),
+            Some(RowGroup::PointerAccel)
         );
     }
 }

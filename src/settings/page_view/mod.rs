@@ -435,6 +435,9 @@ pub(super) struct PageView {
 pub(super) struct PageRowSpec {
     /// The card the row belongs to, like [`RowSpec::card`].
     pub(super) card: usize,
+    /// The card's heading copy key, like [`RowSpec::section`]: a card that holds ONLY page-drawn
+    /// rows has no described row to take it from, so the page-drawn row carries it too.
+    pub(super) section: &'static str,
     /// The page's own name for this row; passed back to [`PageHooks::extra_row`].
     pub(super) key: &'static str,
     /// The row's height. A described row's height comes from its copy; a page-drawn row states its
@@ -443,6 +446,10 @@ pub(super) struct PageRowSpec {
     pub(super) height: RowHeight,
     /// How many described rows of that card come before it.
     pub(super) after_row: usize,
+    /// The page's conditional group this row belongs to, exactly like [`RowSpec::group`]: a
+    /// page-drawn row that a mode switch hides must be hidden by the SAME canvas group list, or
+    /// the page stops following the switch.
+    pub(super) group: Option<RowGroup>,
 }
 
 /// A page-drawn row's height: a constant, or a measurement of the page input.
@@ -892,6 +899,14 @@ impl BoxRect {
 /// A card the page draws: the heading and the rounded surface around one run of rows.
 #[derive(Clone, Debug, PartialEq)]
 pub(super) struct CardRect {
+    /// Whether this card is the page's update-flow card: the About Updates card, whose handle the
+    /// inline update flow reads. A card is not a control, so this is the one property the renderer
+    /// has to know about it.
+    pub(super) holds_update_flow: bool,
+    /// The card's own index in the page (`RowSpec::card` / `PageRowSpec::card`). The walk uses
+    /// THIS, not the card's position in the vector: a page may have a card that holds only rows the
+    /// page draws itself, and a positional index would then address the wrong card.
+    pub(super) index: usize,
     pub(super) section: &'static str,
     /// The card surface's frame in the document.
     pub(super) frame: BoxRect,
@@ -907,6 +922,17 @@ pub(super) struct BannerRect {
     pub(super) button: BoxRect,
 }
 
+/// One position in a page's document: a described row, or a row the page draws itself. The layout
+/// and the renderer both walk a page as a sequence of these, so a page that interleaves the two
+/// cannot have one of them laid out at a different offset than it is drawn at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum PlacedRow {
+    /// Index into `PageView::rows`.
+    Described(usize),
+    /// Index into `PageView::extra_rows`.
+    Drawn(usize),
+}
+
 /// Everything `layout_rows` computes for one page: where every row, card and panel sits.
 ///
 /// Coordinates are the page document's (unflipped), and they come from the same walk the canvas
@@ -914,6 +940,14 @@ pub(super) struct BannerRect {
 /// boxes to the canvas, which is what keeps a page's build and its later re-flow in step.
 #[derive(Clone, Debug, PartialEq, Default)]
 pub(super) struct PageLayout {
+    /// The page's rows in document order, top to bottom: the ONE sequence the renderer walks.
+    pub(super) sequence: Vec<PlacedRow>,
+    /// Every page-drawn row's origin and the height the layout reserved for it, in `extra_rows`
+    /// order, so drawing one uses the number the layout above it assumed (index, origin, height).
+    pub(super) drawn_rows: Vec<(usize, f64, f64)>,
+    /// The height each page-drawn row took, in `PageView::extra_rows` order: the number the layout
+    /// reserved, so the renderer advances by exactly that instead of measuring a second time.
+    pub(super) extra_row_heights: Vec<f64>,
     pub(super) banner: Option<BannerRect>,
     /// The first card's top edge (the first section cursor).
     pub(super) first_card_top: f64,
@@ -1003,203 +1037,258 @@ pub(super) fn layout_rows(
     let banner_h = banner.as_ref().map_or(0.0, |b| b.strip.h);
     // The first card hangs from the first section cursor, one banner further down when there is
     // one (the banner is a sibling of the page, not part of the header block).
+    // ONE walk drives the whole page: each card's described rows and the rows the page draws
+    // itself, in document order. The card surfaces, the described rows' frames and the heights the
+    // renderer advances by therefore all come from one sequence, so a page that mixes the two (the
+    // Mouse page: cards 1 and 3 hold only page-drawn rows) cannot have a row laid out at a
+    // different offset than it is drawn at.
+    let highest_card = view
+        .rows
+        .iter()
+        .map(|row| row.card)
+        .chain(view.extra_rows.iter().map(|extra| extra.card))
+        .max()
+        .unwrap_or(0);
+    let sequence = page_sequence(view);
     let mut cursor = doc_top - input.header_offset - banner_h;
     let first_card_top = cursor;
     let mut card_tops = vec![first_card_top];
-    let mut rows: Vec<RowLayout> = Vec::with_capacity(view.rows.len());
-    let mut card = 0usize;
-    for (index, row) in view.rows.iter().enumerate() {
+    // Each card's lowest edge, described or page-drawn: the surface must cover both kinds of row.
+    let mut card_bottoms = vec![first_card_top; highest_card + 1];
+    // Every page-drawn row's origin and the height reserved for it, in extra_rows order: the
+    // renderer draws it at exactly that origin with exactly that height.
+    let mut drawn_rows: Vec<(usize, f64, f64)> =
+        vec![(0, first_card_top, 0.0); view.extra_rows.len()];
+    let mut placed_rows: Vec<Option<RowLayout>> = vec![None; view.rows.len()];
+    for placed in sequence.iter().copied() {
+        let card = match placed {
+            PlacedRow::Described(index) => view.rows[index].card,
+            PlacedRow::Drawn(index) => view.extra_rows[index].card,
+        };
         // A card boundary at the page's start has no step: the first card IS the first cursor.
-        while card < row.card {
+        while card_tops.len() <= card {
             cursor -= metrics.section_step;
-            card += 1;
             card_tops.push(cursor);
         }
-        // A page-drawn row opens here: it costs its own height plus the row gap, exactly what
-        // `render_page` advances by, so the described rows below it land where the layout says.
-        let drawn_in_card = view.rows[..index]
-            .iter()
-            .filter(|earlier| earlier.card == row.card)
-            .count();
-        let extra_heights: f64 = view
-            .extra_rows
-            .iter()
-            .enumerate()
-            .filter(|(_, extra)| extra.card == row.card && extra.after_row == drawn_in_card)
-            .map(|(index, _)| {
-                metrics.row_gap + input.extra_row_heights.get(index).copied().unwrap_or(0.0)
-            })
-            .sum();
-        cursor -= extra_heights;
-        let subtitle_h = text.subtitle_heights.get(index).copied().unwrap_or(0.0);
-        let height = row_height(row, subtitle_h, metrics, input);
-        cursor -= metrics.row_gap + height;
-        let top = cursor + height;
-        let copy_x = metrics.card_inset + metrics.label_x;
-        // The copy column ends at the design system's fixed label width; the control column starts
-        // at the measured control edge, which stays clear of it on every page width.
-        let copy_w = layout.label_w.max(1.0);
-        let (label, caption, stacked) = match row.copy {
-            RowCopy::Plain => (
-                BoxRect::new(
-                    copy_x,
-                    cursor + (height - text.title_h) / 2.0,
-                    copy_w,
-                    text.title_h,
-                ),
-                None,
-                false,
-            ),
-            RowCopy::Captioned => {
-                let stack_h = text.title_h + text.title_caption_gap + subtitle_h;
-                let caption_y = cursor + (height - stack_h.max(0.0)) / 2.0;
-                (
-                    BoxRect::new(
-                        copy_x,
-                        caption_y + subtitle_h + text.title_caption_gap,
-                        copy_w,
-                        text.title_h,
-                    ),
-                    Some(BoxRect::new(copy_x, caption_y, copy_w, subtitle_h)),
-                    true,
-                )
+        cursor -= metrics.row_gap;
+        match placed {
+            PlacedRow::Drawn(index) => {
+                let height = input.extra_row_heights.get(index).copied().unwrap_or(0.0);
+                cursor -= height;
+                drawn_rows[index] = (index, cursor, height);
+                card_bottoms[card] = card_bottoms[card].min(cursor);
             }
-        };
-        let (control, readout) = match &row.control {
-            ControlKind::Switch => {
-                let right_x = layout.control_x + layout.control_w;
-                let y = if stacked {
-                    top - metrics.control_h
-                } else {
-                    cursor + (height - metrics.control_h) / 2.0
-                };
-                (
-                    BoxRect::new(
-                        right_x - metrics.switch_w,
-                        y + (metrics.control_h - metrics.switch_h) / 2.0,
-                        metrics.switch_w,
-                        metrics.switch_h,
-                    ),
-                    None,
-                )
-            }
-            ControlKind::Popup { .. } => (
-                BoxRect::new(
-                    layout.control_x,
-                    cursor + (height - metrics.control_h) / 2.0,
-                    layout.control_w,
-                    metrics.control_h,
-                ),
-                None,
-            ),
-            // A hyperlink sits at the control column's leading edge, like a value: it is text, not a
-            // right-aligned control.
-            ControlKind::Link { .. } => (
-                BoxRect::new(
-                    layout.control_x,
-                    cursor + (height - metrics.control_h) / 2.0,
-                    layout.control_w,
-                    metrics.control_h,
-                ),
-                None,
-            ),
-            ControlKind::Slider { .. } => {
-                let h = layout.row_h;
-                let w = (layout.control_w - metrics.readout_w - metrics.readout_gap).max(1.0);
-                let y = cursor + (height - h) / 2.0;
-                (
-                    BoxRect::new(layout.control_x, y, w, h),
-                    Some(BoxRect::new(
-                        layout.control_x + w + metrics.readout_gap,
-                        y + (h - metrics.readout_h) / 2.0,
-                        metrics.readout_w,
-                        metrics.readout_h,
-                    )),
-                )
-            }
-            ControlKind::Button => {
-                let right_x = layout.control_x + layout.control_w;
-                (
-                    BoxRect::new(
-                        right_x - metrics.action_btn_w,
-                        top - metrics.action_btn_h,
-                        metrics.action_btn_w,
-                        metrics.action_btn_h,
-                    ),
-                    None,
-                )
-            }
-            // A read-only value is drawn where the control column puts a control, left-aligned so a
-            // status line reads as text rather than as a disabled button. With an action beside it,
-            // the value takes the room the button leaves.
-            ControlKind::Value { action, .. } => {
-                let y = cursor + (height - metrics.control_h) / 2.0;
-                match action {
-                    None => (
-                        BoxRect::new(layout.control_x, y, layout.control_w, metrics.control_h),
+            PlacedRow::Described(index) => {
+                let row = &view.rows[index];
+                let subtitle_h = text.subtitle_heights.get(index).copied().unwrap_or(0.0);
+                let height = row_height(row, subtitle_h, metrics, input);
+                cursor -= height;
+                let top = cursor + height;
+                card_bottoms[card] = card_bottoms[card].min(cursor);
+
+                let copy_x = metrics.card_inset + metrics.label_x;
+                // The copy column ends at the design system's fixed label width; the control column starts
+                // at the measured control edge, which stays clear of it on every page width.
+                let copy_w = layout.label_w.max(1.0);
+                let (label, caption, stacked) = match row.copy {
+                    RowCopy::Plain => (
+                        BoxRect::new(
+                            copy_x,
+                            cursor + (height - text.title_h) / 2.0,
+                            copy_w,
+                            text.title_h,
+                        ),
                         None,
+                        false,
                     ),
-                    Some(_) => (
+                    RowCopy::Captioned => {
+                        let stack_h = text.title_h + text.title_caption_gap + subtitle_h;
+                        let caption_y = cursor + (height - stack_h.max(0.0)) / 2.0;
+                        (
+                            BoxRect::new(
+                                copy_x,
+                                caption_y + subtitle_h + text.title_caption_gap,
+                                copy_w,
+                                text.title_h,
+                            ),
+                            Some(BoxRect::new(copy_x, caption_y, copy_w, subtitle_h)),
+                            true,
+                        )
+                    }
+                };
+                let (control, readout) = match &row.control {
+                    ControlKind::Switch => {
+                        let right_x = layout.control_x + layout.control_w;
+                        let y = if stacked {
+                            top - metrics.control_h
+                        } else {
+                            cursor + (height - metrics.control_h) / 2.0
+                        };
+                        (
+                            BoxRect::new(
+                                right_x - metrics.switch_w,
+                                y + (metrics.control_h - metrics.switch_h) / 2.0,
+                                metrics.switch_w,
+                                metrics.switch_h,
+                            ),
+                            None,
+                        )
+                    }
+                    ControlKind::Popup { .. } => (
                         BoxRect::new(
                             layout.control_x,
-                            y,
-                            (layout.control_w
-                                - super::components::ROW_ACTION_BTN_W
-                                - VALUE_ACTION_GAP)
-                                .max(1.0),
+                            cursor + (height - metrics.control_h) / 2.0,
+                            layout.control_w,
                             metrics.control_h,
                         ),
                         None,
                     ),
-                }
+                    // A hyperlink sits at the control column's leading edge, like a value: it is text, not a
+                    // right-aligned control.
+                    ControlKind::Link { .. } => (
+                        BoxRect::new(
+                            layout.control_x,
+                            cursor + (height - metrics.control_h) / 2.0,
+                            layout.control_w,
+                            metrics.control_h,
+                        ),
+                        None,
+                    ),
+                    ControlKind::Slider { .. } => {
+                        let h = layout.row_h;
+                        let w =
+                            (layout.control_w - metrics.readout_w - metrics.readout_gap).max(1.0);
+                        let y = cursor + (height - h) / 2.0;
+                        (
+                            BoxRect::new(layout.control_x, y, w, h),
+                            Some(BoxRect::new(
+                                layout.control_x + w + metrics.readout_gap,
+                                y + (h - metrics.readout_h) / 2.0,
+                                metrics.readout_w,
+                                metrics.readout_h,
+                            )),
+                        )
+                    }
+                    ControlKind::Button => {
+                        let right_x = layout.control_x + layout.control_w;
+                        (
+                            BoxRect::new(
+                                right_x - metrics.action_btn_w,
+                                top - metrics.action_btn_h,
+                                metrics.action_btn_w,
+                                metrics.action_btn_h,
+                            ),
+                            None,
+                        )
+                    }
+                    // A read-only value is drawn where the control column puts a control, left-aligned so a
+                    // status line reads as text rather than as a disabled button. With an action beside it,
+                    // the value takes the room the button leaves.
+                    ControlKind::Value { action, .. } => {
+                        let y = cursor + (height - metrics.control_h) / 2.0;
+                        match action {
+                            None => (
+                                BoxRect::new(
+                                    layout.control_x,
+                                    y,
+                                    layout.control_w,
+                                    metrics.control_h,
+                                ),
+                                None,
+                            ),
+                            Some(_) => (
+                                BoxRect::new(
+                                    layout.control_x,
+                                    y,
+                                    (layout.control_w
+                                        - super::components::ROW_ACTION_BTN_W
+                                        - VALUE_ACTION_GAP)
+                                        .max(1.0),
+                                    metrics.control_h,
+                                ),
+                                None,
+                            ),
+                        }
+                    }
+                };
+                let action_frame = match &row.control {
+                    ControlKind::Value {
+                        action: Some(_), ..
+                    } => Some(BoxRect::new(
+                        layout.control_x + layout.control_w - super::components::ROW_ACTION_BTN_W,
+                        cursor + (height - super::components::ROW_ACTION_BTN_H) / 2.0,
+                        super::components::ROW_ACTION_BTN_W,
+                        super::components::ROW_ACTION_BTN_H,
+                    )),
+                    _ => None,
+                };
+                let _ = &action_frame;
+                placed_rows[index] = Some(RowLayout {
+                    frame: BoxRect::new(0.0, cursor, content_w, height),
+                    action_frame,
+                    height,
+                    label_frame: label,
+                    stack_frame: label,
+                    caption_frame: caption,
+                    control_frame: control,
+                    readout_frame: readout,
+                    control_h: control.h,
+                    stacked,
+                });
             }
-        };
-        let action_frame = match &row.control {
-            ControlKind::Value {
-                action: Some(_), ..
-            } => Some(BoxRect::new(
-                layout.control_x + layout.control_w - super::components::ROW_ACTION_BTN_W,
-                cursor + (height - super::components::ROW_ACTION_BTN_H) / 2.0,
-                super::components::ROW_ACTION_BTN_W,
-                super::components::ROW_ACTION_BTN_H,
-            )),
-            _ => None,
-        };
-        let _ = &action_frame;
-        rows.push(RowLayout {
-            frame: BoxRect::new(0.0, cursor, content_w, height),
-            action_frame,
-            height,
-            label_frame: label,
-            stack_frame: label,
-            caption_frame: caption,
-            control_frame: control,
-            readout_frame: readout,
-            control_h: control.h,
-            stacked,
-        });
+        }
     }
     // A card's surface spans from its section cursor down past its last row's bottom edge.
-    let groups = card_row_ranges(view);
-    // Every card index gets a section cursor, including a card that drew no row: the canvas
-    // walks sections, not drawn cards, so the cursors must line up with those indices.
-    let highest_card = view.rows.iter().map(|row| row.card).max().unwrap_or(0);
+    // Every card index gets a section cursor, including a card that drew no DESCRIBED row: the
+    // canvas walks sections, and a page may put rows it draws itself into a card of their own.
+    let highest_card = view
+        .rows
+        .iter()
+        .map(|row| row.card)
+        .chain(view.extra_rows.iter().map(|extra| extra.card))
+        .max()
+        .unwrap_or(0);
     while card_tops.len() <= highest_card {
         let next = card_tops[card_tops.len() - 1] - metrics.section_step;
         card_tops.push(next);
     }
     let mut cards = Vec::new();
-    for (card_index, end) in groups.iter().copied() {
-        // A card's slot in the walk is its own index, which is also where its section cursor
-        // stands (the walk steps a section for every card index it passes).
-        let start = view.rows[..end]
+    for (card_index, card_top) in card_tops.iter().enumerate().take(highest_card + 1) {
+        // The rows of this card, described or page-drawn, are what the surface spans.
+        let described: Vec<usize> = view
+            .rows
             .iter()
-            .rposition(|row| row.card < card_index)
-            .map_or(0, |position| position + 1);
-        let top = card_tops[card_index];
-        let bottom = rows.get(end - 1).map(|row| row.frame.y).unwrap_or(top);
+            .enumerate()
+            .filter(|(_, row)| row.card == card_index)
+            .map(|(index, _)| index)
+            .collect();
+        let section = described
+            .first()
+            .map(|index| view.rows[*index].section)
+            // A card with no described row names itself through the first page-drawn row's key:
+            // the hook that draws it knows the heading copy it opens under.
+            .or_else(|| {
+                view.extra_rows
+                    .iter()
+                    .find(|extra| extra.card == card_index)
+                    .map(|extra| extra.key)
+            })
+            .unwrap_or("");
+        let top = *card_top;
+        // The card's lowest row, described or page-drawn: a card may hold only rows the page draws
+        // itself, and its surface has to cover them.
+        let bottom = card_bottoms
+            .get(card_index)
+            .copied()
+            .unwrap_or(top)
+            .min(top);
         cards.push(CardRect {
-            section: view.rows[start].section,
+            holds_update_flow: view.extra_rows.iter().any(|extra| {
+                extra.card == card_index
+                    && extra.key == crate::settings::page_view::about::ABOUT_UPDATE_BAND
+            }),
+            index: card_index,
+            section,
             frame: BoxRect::new(0.0, bottom, content_w, (top - bottom).max(0.0)),
             header: BoxRect::new(
                 metrics.card_inset,
@@ -1209,9 +1298,23 @@ pub(super) fn layout_rows(
             ),
         });
     }
+    // The described rows, back in `PageView::rows` order: that is the order the renderer indexes,
+    // the search index reads and a canvas lookup names.
+    let rows: Vec<RowLayout> = placed_rows
+        .into_iter()
+        .map(|row| row.expect("every described row was laid out"))
+        .collect();
     let content_top = first_card_top;
-    let content_bottom = rows.last().map_or(content_top, |row| row.frame.y);
+    let content_bottom = rows
+        .last()
+        .map(|row| row.frame.y)
+        .into_iter()
+        .chain(drawn_rows.iter().map(|(_, origin, _)| *origin))
+        .fold(content_top, f64::min);
     PageLayout {
+        sequence,
+        drawn_rows,
+        extra_row_heights: input.extra_row_heights.clone(),
         banner,
         first_card_top,
         rows,
@@ -1227,43 +1330,65 @@ pub(super) fn layout_rows(
 /// A described row takes one canvas row; a page-drawn row (`extra_row`) takes another. Every
 /// described row after one of those is shifted by the count of page-drawn rows opened before it, so
 /// this is the index the search index and any canvas lookup must use.
+/// The canvas row a described row lands in.
+///
+/// The canvas opens one row per POSITION in the page's `PlacedRow` sequence, so the canvas row is
+/// the row's position there -- not its index among described rows. A page whose earlier cards hold
+/// rows it draws itself (Mouse: three device-card rows before its second described row) would
+/// otherwise map every later described row to the wrong canvas row, and the search would scroll to
+/// a page-drawn row instead of the match.
 pub(super) fn canvas_row_of_described_row(view: &PageView, row: usize) -> usize {
-    let mut extras = 0usize;
-    let mut drawn_in_card = 0usize;
-    let mut card = None;
-    for (index, spec) in view.rows.iter().enumerate() {
-        if card != Some(spec.card) {
-            card = Some(spec.card);
-            drawn_in_card = 0;
-        }
-        extras += view
-            .extra_rows
-            .iter()
-            .filter(|extra| extra.card == spec.card && extra.after_row == drawn_in_card)
-            .count();
-        if index == row {
-            return index + extras;
-        }
-        drawn_in_card += 1;
-    }
-    row
+    canvas_rows(view).get(row).copied().unwrap_or(row)
 }
 
-pub(super) fn card_row_ranges(view: &PageView) -> Vec<(usize, usize)> {
-    let mut ranges: Vec<(usize, usize)> = Vec::new();
-    for (index, row) in view.rows.iter().enumerate() {
-        match ranges.last().map(|(card, _)| *card) {
-            Some(card) if card == row.card => {
-                if let Some(last) = ranges.last_mut() {
-                    last.1 = index + 1;
+/// The canvas row of every described row, in `PageView::rows` order, derived from the ONE sequence
+/// the layout and the renderer walk.
+pub(super) fn canvas_rows(view: &PageView) -> Vec<usize> {
+    let mut rows: Vec<Option<usize>> = vec![None; view.rows.len()];
+    for (position, placed) in page_sequence(view).iter().enumerate() {
+        if let PlacedRow::Described(index) = placed {
+            rows[*index] = Some(position);
+        }
+    }
+    rows.into_iter()
+        .map(|row| row.expect("every described row is in the sequence"))
+        .collect()
+}
+
+/// The page's rows in document order: every card's described rows and the rows the page draws
+/// itself, exactly as `layout_rows` and `render_page` walk them.
+pub(super) fn page_sequence(view: &PageView) -> Vec<PlacedRow> {
+    let highest_card = view
+        .rows
+        .iter()
+        .map(|row| row.card)
+        .chain(view.extra_rows.iter().map(|extra| extra.card))
+        .max()
+        .unwrap_or(0);
+    let mut sequence: Vec<PlacedRow> = Vec::with_capacity(view.rows.len() + view.extra_rows.len());
+    for card_index in 0..=highest_card {
+        let mut drawn_in_card = 0usize;
+        for (index, row) in view.rows.iter().enumerate() {
+            if row.card != card_index {
+                continue;
+            }
+            for (extra_index, extra) in view.extra_rows.iter().enumerate() {
+                if extra.card == card_index && extra.after_row == drawn_in_card {
+                    sequence.push(PlacedRow::Drawn(extra_index));
                 }
             }
-            _ => ranges.push((row.card, index + 1)),
+            sequence.push(PlacedRow::Described(index));
+            drawn_in_card += 1;
+        }
+        // A page-drawn row declared after the card's last described row still belongs to it.
+        for (extra_index, extra) in view.extra_rows.iter().enumerate() {
+            if extra.card == card_index && extra.after_row >= drawn_in_card {
+                sequence.push(PlacedRow::Drawn(extra_index));
+            }
         }
     }
-    ranges
+    sequence
 }
-
 // MARK: - Row constructors
 
 /// Build rows card by card: `card` opens a card (its heading copy key), and the rows that follow
@@ -1319,12 +1444,20 @@ impl RowWriter {
     /// The row stays inside the current card, so the described rows that follow still land in the
     /// same card and the card closes where it would have closed anyway.
     fn extra_row(&mut self, key: &'static str, height: f64) {
+        self.extra_row_in_group(key, height, None);
+    }
+
+    /// Declare a page-drawn row that belongs to a conditional group: the canvas hides it with the
+    /// same `set_group_visible` the described rows of that group use.
+    fn extra_row_in_group(&mut self, key: &'static str, height: f64, group: Option<RowGroup>) {
         let after = self.rows.iter().filter(|row| row.card == self.card).count();
         self.extra.push(PageRowSpec {
             card: self.card,
+            section: self.section,
             key,
             height: RowHeight::Fixed(height),
             after_row: after,
+            group,
         });
     }
 
@@ -1334,9 +1467,11 @@ impl RowWriter {
         let after = self.rows.iter().filter(|row| row.card == self.card).count();
         self.extra.push(PageRowSpec {
             card: self.card,
+            section: self.section,
             key,
             height: RowHeight::Measured(measure),
             after_row: after,
+            group: None,
         });
     }
 
@@ -1525,6 +1660,9 @@ pub(super) struct RenderedControl {
     pub(super) control: *mut AnyObject,
     /// The slider's readout, or null.
     pub(super) readout: *mut AnyObject,
+    /// The action button beside a value row, or null. A status row binds its label and its button
+    /// separately: the refresh function writes the text and enables the button by its own pointer.
+    pub(super) action: *mut AnyObject,
     /// What a page-drawn control needs beyond its identity. A described row is always `None`: its
     /// fields are bound from its `ControlId`.
     pub(super) extra: RenderedExtra,
@@ -1562,6 +1700,11 @@ pub(super) struct RenderedPage {
     pub(super) banner_strip: *mut AnyObject,
     pub(super) banner_label: *mut AnyObject,
     pub(super) banner_button: *mut AnyObject,
+    /// The About page's Updates card, which the inline update flow reads (`ui.update_card`).
+    /// The shared renderer builds every card, so it is the only place that can publish it; a page
+    /// that built its own card would be a second construction path, which is the defect the
+    /// description exists to remove.
+    pub(super) update_card: *mut AnyObject,
 }
 
 impl RenderedPage {
@@ -1577,12 +1720,17 @@ impl RenderedPage {
 /// The Windows master switch is the one case: turning the switcher off has to freeze the options
 /// below it in the same action. Every other static control goes through the unified handler.
 fn dedicated_selector(field: Option<ControlField>) -> Sel {
+    // A field whose control had its own handler in the inline builder keeps it: each of these
+    // does more than write the config (it retitles a button, freezes dependent rows, re-reads a
+    // device, restarts a tap). Losing one is silent — the value still changes, the page just stops
+    // following it.
     match field {
         Some(ControlField::WindowsEnabled) => sel!(handleWindowsEnabledToggle:),
-        // The Mouse page's two switches have their own handlers: the master switch retitles the
-        // OK button, and the mappings switch freezes the mapping rows below it.
         Some(ControlField::MouseEnabled) => sel!(handleEnableMouseToggle:),
         Some(ControlField::MappingEnabled) => sel!(handleMappingEnabledChanged:),
+        Some(ControlField::ClipboardEnabled) => sel!(handleClipboardEnabledToggle:),
+        Some(ControlField::ClipboardPaused) => sel!(handlePauseRecordingToggle:),
+        Some(ControlField::KeyBindingsEnabled) => sel!(handleKeyBindingsToggle:),
         _ => sel!(handleControlChanged:),
     }
 }
@@ -1754,8 +1902,8 @@ unsafe fn render_row(
                 Value::Dynamic(text) => text.clone(),
                 other => other.describe(),
             };
-            // A value row's action button is a second view in the row; it is built after the label
-            // below, once the label has taken the room the button leaves.
+            // A value row's action button is a second view in the row, drawn in the box the layout
+            // reserved for it beside the label.
             let _ = action;
             let label = SettingsControl::value_label(
                 placed.control_frame.x,
@@ -1791,39 +1939,6 @@ unsafe fn render_row(
     if control.is_null() {
         return Ok(());
     }
-    // A value row's action button is a SECOND view in the row: it is built here, after the label,
-    // and registered like any other action control so its selector is reached the same way.
-    if let ControlKind::Value {
-        action: Some(action),
-        ..
-    } = &row.control
-    {
-        if let Some(frame) = placed.action_frame {
-            let button = SettingsControl::button(
-                frame.x,
-                frame.y,
-                frame.w,
-                frame.h,
-                &t(action.button_key),
-                target,
-                action_selector(action.action),
-                SettingsButtonRole::Action,
-            );
-            if !button.is_null() {
-                let _: () = msg_send![button, setFrame: frame.rect()];
-                let _: () = msg_send![parent, addSubview: button];
-                release_obj(button);
-                canvas.place_pending_view(button, frame.rect());
-                rendered.controls.push(RenderedControl {
-                    id: ControlId::Action(action.action),
-                    kind: ControlKind::Button,
-                    control: button,
-                    readout: std::ptr::null_mut(),
-                    extra: RenderedExtra::None,
-                });
-            }
-        }
-    }
     // The control enters the view tree and the page gives up its +1: every widget above is
     // allocated +1 and every inline builder released its view after adding it.
     let _: () = msg_send![control, setFrame: placed.control_frame.rect()];
@@ -1843,6 +1958,35 @@ unsafe fn render_row(
         let _: () = msg_send![control, setTarget: target];
         let _: () = msg_send![control, setAction: selector];
     }
+    // A value row's action button: it is the row's second control, so it enters the view tree and
+    // the page's binding list beside the label rather than instead of it.
+    let mut action_button = std::ptr::null_mut();
+    if let (
+        ControlKind::Value {
+            action: Some(action),
+            ..
+        },
+        Some(frame),
+    ) = (&row.control, placed.action_frame)
+    {
+        let button = SettingsControl::button(
+            frame.x,
+            frame.y,
+            frame.w,
+            frame.h,
+            &t(action.button_key),
+            target,
+            action_selector(action.action),
+            SettingsButtonRole::Action,
+        );
+        if !button.is_null() {
+            let _: () = msg_send![button, setFrame: frame.rect()];
+            let _: () = msg_send![parent, addSubview: button];
+            release_obj(button);
+            canvas.place_pending_view(button, frame.rect());
+            action_button = button;
+        }
+    }
     let readout = match (&row.control, placed.readout_frame) {
         (ControlKind::Slider { readout, .. }, Some(frame)) => {
             let view = SettingsRow::attach_slider_readout(parent, control, readout);
@@ -1858,6 +2002,7 @@ unsafe fn render_row(
         kind: row.control.clone(),
         control,
         readout,
+        action: action_button,
         // A described row binds every field its ControlId names; only a page-drawn row needs more.
         extra: RenderedExtra::None,
     });
@@ -1904,7 +2049,6 @@ pub(super) unsafe fn render_page(
     view: &PageView,
     layout: &PageLayout,
     _metrics: &PageMetrics,
-    input: &PageInput,
     ui: &mut SettingsUi,
     hooks: &mut dyn PageHooks,
 ) -> Result<RenderedPage, RegisterError> {
@@ -1953,77 +2097,71 @@ pub(super) unsafe fn render_page(
         rendered.banner_label = label;
         rendered.banner_button = button;
     }
-    for (card_index, card) in layout.cards.iter().enumerate() {
+    for card in layout.cards.iter() {
+        // The card's OWN index addresses its rows and its page-drawn slots; a page may have a card
+        // that holds no described row, so a positional index would address the wrong card.
+        let card_index = card.index;
         // Every card after the first opens its own section: the canvas steps one section per
         // card, which is what the layout's card tops were computed from.
         if card_index > 0 {
             canvas.next_section();
         }
-        // The described rows of this card, in document order, with the page's own rows opened at
-        // the point the description says they follow.
-        let mut drawn_in_card = 0usize;
-        let card_extra: Vec<&PageRowSpec> = view
-            .extra_rows
-            .iter()
-            .filter(|extra| extra.card == card_index)
-            .collect();
-        let mut next_extra = 0usize;
-        for (index, row) in view.rows.iter().enumerate() {
-            if row.card != card_index {
-                continue;
+        // The card's rows in document order, described or page-drawn, exactly as the layout walked
+        // them. A page-drawn row is drawn at the origin and height the LAYOUT reserved for it, so
+        // the controls inside it cannot disagree with the space above them.
+        for placed in layout.sequence.iter().copied() {
+            match placed {
+                PlacedRow::Described(index) => {
+                    if view.rows[index].card != card_index {
+                        continue;
+                    }
+                    render_row(
+                        canvas,
+                        target,
+                        &view.rows[index],
+                        &layout.rows[index],
+                        &mut rendered,
+                    )?;
+                }
+                PlacedRow::Drawn(index) => {
+                    let extra = &view.extra_rows[index];
+                    if extra.card != card_index {
+                        continue;
+                    }
+                    let (_, origin_y, height) = layout.drawn_rows[index];
+                    // The row is OPENED on the canvas before the hook draws into it: the hook's
+                    // views belong to this row, and a row the canvas never opened is a row the
+                    // page cannot re-flow, resize or scroll to.
+                    let drawn_origin = canvas.next_row(height);
+                    // The row joins its conditional group BEFORE the hook adds views, so those
+                    // views are captured by the row and hidden with the group -- the same
+                    // `set_group_visible` a mode switch already drives.
+                    canvas.set_pending_group(extra.group);
+                    debug_assert!(
+                        (drawn_origin - origin_y).abs() < 0.5,
+                        "the canvas origin must be the one the layout reserved"
+                    );
+                    hooks.extra_row(
+                        canvas,
+                        &mut rendered,
+                        ui,
+                        extra,
+                        drawn_origin,
+                        height,
+                        target,
+                    )?;
+                }
             }
-            while next_extra < card_extra.len() && card_extra[next_extra].after_row == drawn_in_card
-            {
-                let extra = card_extra[next_extra];
-                draw_extra_row(
-                    canvas,
-                    target,
-                    extra,
-                    extra.height.resolve(input, canvas.content_width()),
-                    hooks,
-                    &mut rendered,
-                    ui,
-                )?;
-                next_extra += 1;
-            }
-            render_row(canvas, target, row, &layout.rows[index], &mut rendered)?;
-            drawn_in_card += 1;
         }
-        // A row declared after the card's last described row still belongs to it.
-        while next_extra < card_extra.len() {
-            let extra = card_extra[next_extra];
-            draw_extra_row(
-                canvas,
-                target,
-                extra,
-                extra.height.resolve(input, canvas.content_width()),
-                hooks,
-                &mut rendered,
-                ui,
-            )?;
-            next_extra += 1;
+        let built = canvas.card(&t(card.section));
+        if card.holds_update_flow {
+            rendered.update_card = built.card;
         }
-        canvas.card(&t(card.section));
     }
     for group in description_groups(view) {
         canvas.set_group_visible(group, false);
     }
     Ok(rendered)
-}
-
-/// Open one row the page draws itself: the canvas advances by the row's height and hands the origin
-/// to the page, so its views land inside the card exactly like a described row's would.
-unsafe fn draw_extra_row(
-    canvas: &mut PageCanvas,
-    target: *mut AnyObject,
-    spec: &PageRowSpec,
-    height: f64,
-    hooks: &mut dyn PageHooks,
-    rendered: &mut RenderedPage,
-    ui: &mut SettingsUi,
-) -> Result<(), RegisterError> {
-    let origin = canvas.next_row(height);
-    hooks.extra_row(canvas, rendered, ui, spec, origin, height, target)
 }
 
 /// Write one control's value from the update description's entry.
@@ -2266,7 +2404,6 @@ pub(super) unsafe fn build_page(
         &view,
         &page_layout,
         &metrics,
-        input,
         ui,
         hooks,
     ) {
@@ -2280,6 +2417,11 @@ pub(super) unsafe fn build_page(
             return Err(error);
         }
     };
+    // The page's own handles the inline update flow reads. They are bound HERE because `ui` is
+    // the build's, and the page hook that draws the band cannot reach it after the card is built.
+    if !rendered.update_card.is_null() {
+        ui.update_card = rendered.update_card;
+    }
     if let Err(error) = rendered.registrations.publish(&mut ui.control_table) {
         // Nothing may look alive without being wired: take the half-built page out again.
         log_info!("[settings] page build aborted ({error:?}); the previous state is kept");
@@ -2309,14 +2451,160 @@ pub(super) struct BuiltPage {
     pub(super) content_bottom: f64,
 }
 
-// MARK: - Smoke
+/// A `SettingsUi` with no views behind it: the smoke runner builds pages on a detached
+/// document to check what the renderer places, and the bindings it writes there are
+/// discarded with it. Every field is empty, so a page hook writing one is harmless.
+pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
+    SettingsUi {
+        permission_warning_label: std::ptr::null_mut(),
+        permission_warning_button: std::ptr::null_mut(),
+        page_viewport_h: 0.0,
+        window: std::ptr::null_mut(),
+        settings_search: sidebar::SettingsSearch::EMPTY,
+        sidebar_highlight: std::ptr::null_mut(),
+        sidebar_buttons: [std::ptr::null_mut(); SETTINGS_PAGE_COUNT],
+        page_views: [std::ptr::null_mut(); SETTINGS_PAGE_COUNT],
+        about_subtitle: std::ptr::null_mut(),
+        accessibility_permission_status: std::ptr::null_mut(),
+        accessibility_permission_button: std::ptr::null_mut(),
+        screen_recording_permission_status: std::ptr::null_mut(),
+        keychain_access_status: std::ptr::null_mut(),
+        keychain_access_button: std::ptr::null_mut(),
+        theme: std::ptr::null_mut(),
+        glass_style: std::ptr::null_mut(),
+        panel_material: std::ptr::null_mut(),
+        corner_radius: std::ptr::null_mut(),
+        thumbnails_enabled: std::ptr::null_mut(),
+        focused_thumbnail_prewarm: std::ptr::null_mut(),
+        show_app_name_in_cards: std::ptr::null_mut(),
+        thumbnail_size: std::ptr::null_mut(),
+        card_text_size: std::ptr::null_mut(),
+        card_text_size_value_label: std::ptr::null_mut(),
+        clipboard_image_rows: std::ptr::null_mut(),
+        clipboard_image_rows_value_label: std::ptr::null_mut(),
+        status_bar_text_size: std::ptr::null_mut(),
+        status_bar_text_size_value_label: std::ptr::null_mut(),
+        show_footer_title: std::ptr::null_mut(),
+        modifier: std::ptr::null_mut(),
+        locale: std::ptr::null_mut(),
+        panel_close_enabled: std::ptr::null_mut(),
+        panel_minimize_enabled: std::ptr::null_mut(),
+        panel_hide_enabled: std::ptr::null_mut(),
+        panel_quit_enabled: std::ptr::null_mut(),
+        show_minimized: std::ptr::null_mut(),
+        show_hidden_app_windows: std::ptr::null_mut(),
+        show_other_desktops: std::ptr::null_mut(),
+        windows_enabled: std::ptr::null_mut(),
+        overlay_position: std::ptr::null_mut(),
+        activation_mode: std::ptr::null_mut(),
+        keystroke_display_enabled: std::ptr::null_mut(),
+        keystroke_display_mode: std::ptr::null_mut(),
+        keystroke_display_tap_level: std::ptr::null_mut(),
+        keystroke_display_position: std::ptr::null_mut(),
+        keystroke_display_initial_position: std::ptr::null_mut(),
+        keystroke_display_max_extent: std::ptr::null_mut(),
+        keystroke_display_max_extent_value: std::ptr::null_mut(),
+        log_level: std::ptr::null_mut(),
+        launch_at_login: std::ptr::null_mut(),
+        hide_menu_bar_icon: std::ptr::null_mut(),
+        reverse_scroll: std::ptr::null_mut(),
+        enable_mouse: std::ptr::null_mut(),
+        scroll_mode: std::ptr::null_mut(),
+        line_count: std::ptr::null_mut(),
+        line_count_label: std::ptr::null_mut(),
+        line_count_value_label: std::ptr::null_mut(),
+        disable_pointer_accel: std::ptr::null_mut(),
+        pointer_accel_slider: std::ptr::null_mut(),
+        pointer_accel_label: std::ptr::null_mut(),
+        pointer_accel_value_label: std::ptr::null_mut(),
+        smooth_scrolling_preset: std::ptr::null_mut(),
+        smooth_scrolling_response: std::ptr::null_mut(),
+        smooth_scrolling_response_value: std::ptr::null_mut(),
+        smooth_scrolling_speed: std::ptr::null_mut(),
+        smooth_scrolling_speed_value: std::ptr::null_mut(),
+        smooth_scrolling_acceleration: std::ptr::null_mut(),
+        smooth_scrolling_acceleration_value: std::ptr::null_mut(),
+        smooth_scrolling_inertia: std::ptr::null_mut(),
+        smooth_scrolling_inertia_value: std::ptr::null_mut(),
+        mapping_layout_row: 0,
+        update_host_row: 0,
+        update_band_row: 0,
+        mapping_scroll: std::ptr::null_mut(),
+        mapping_doc: std::ptr::null_mut(),
+        mapping_card: std::ptr::null_mut(),
+        mapping_panel: std::ptr::null_mut(),
+        mapping_rows: Vec::new(),
+        clipboard_enabled: std::ptr::null_mut(),
+        clipboard_shortcut: std::ptr::null_mut(),
+        clipboard_shortcut_error: std::ptr::null_mut(),
+        clipboard_shortcut_row_height: 0.0,
+        clipboard_pin_follow_row_height: 0.0,
+        clipboard_row_gap: 0.0,
+        key_bindings_enabled: std::ptr::null_mut(),
+        key_bindings_doc: std::ptr::null_mut(),
+        key_bindings_empty: std::ptr::null_mut(),
+        key_bindings_footer: std::ptr::null_mut(),
+        key_bindings_footer_button: std::ptr::null_mut(),
+        key_bindings_row: 0,
+        key_binding_rows: Vec::new(),
+        key_binding_items_rendered: Vec::new(),
+        clipboard_clear_on_quit: std::ptr::null_mut(),
+        clipboard_separate_clear_all: std::ptr::null_mut(),
+        clipboard_move_used_to_top: std::ptr::null_mut(),
+        clipboard_delete_after_paste: std::ptr::null_mut(),
+        clipboard_clear_system_pasteboard_after_paste: std::ptr::null_mut(),
+        clipboard_max_entries: std::ptr::null_mut(),
+        clipboard_auto_expire_days: std::ptr::null_mut(),
+        clipboard_auto_expire_days_value_label: std::ptr::null_mut(),
+        clipboard_show_source_app: std::ptr::null_mut(),
+        clipboard_pin_follow: std::ptr::null_mut(),
+        clipboard_picker_placement: std::ptr::null_mut(),
+        clipboard_paused: std::ptr::null_mut(),
+        clipboard_excluded_remove: Vec::new(),
+        clipboard_excluded_add: std::ptr::null_mut(),
+        clipboard_excluded_candidates: Vec::new(),
+        clipboard_excluded_restore: std::ptr::null_mut(),
+        add_mapping_button: std::ptr::null_mut(),
+        mapping_enabled: std::ptr::null_mut(),
+        mapping_empty: std::ptr::null_mut(),
+        device_indicator: std::ptr::null_mut(),
+        device_info_caption: std::ptr::null_mut(),
+        restore_defaults: RestoreDefaultsControl::empty(),
+        page_restores: std::array::from_fn(|_| RestoreDefaultsControl::empty()),
+        page_canvases: std::array::from_fn(|_| PageCanvas::empty()),
+        permission_warning_view: std::ptr::null_mut(),
+        update_auto_check: std::ptr::null_mut(),
+        update_auto_download: std::ptr::null_mut(),
+        update_check_button: std::ptr::null_mut(),
+        update_host: std::ptr::null_mut(),
+        update_host_window: std::ptr::null_mut(),
+        update_card: std::ptr::null_mut(),
+        update_divider: std::ptr::null_mut(),
+        update_card_expanded: false,
+        finder_menu_status: std::ptr::null_mut(),
+        finder_menu_enabled: std::ptr::null_mut(),
+        finder_menu_layout: std::ptr::null_mut(),
+        finder_menu_new_file_switches: Vec::new(),
+        finder_menu_terminal_switches: Vec::new(),
+        finder_menu_copy_path: std::ptr::null_mut(),
+        finder_menu_copy_sha256: std::ptr::null_mut(),
+        control_table: ControlTable::new(),
+        migrated_pages: std::array::from_fn(|_| None),
+    }
+}
 
-/// The app-side entry the M2 runner spawns (`--smoke-migrated-pages`): build both migrated pages
-/// on the main thread, then DRIVE the production re-flow -- hide a conditional group, re-flow, and
-/// re-assert -- so a correct re-position is checked, not just the build-time frames.
 pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
     let mut ok = true;
-    for page in [SettingsPageId::Switcher, SettingsPageId::General] {
+    for page in [
+        SettingsPageId::Switcher,
+        SettingsPageId::General,
+        SettingsPageId::Clipboard,
+        SettingsPageId::About,
+        SettingsPageId::KeystrokeDisplay,
+        SettingsPageId::FinderMenu,
+        SettingsPageId::KeyBindings,
+        SettingsPageId::Mouse,
+    ] {
         let document: *mut AnyObject = msg_send![class!(NSView), alloc];
         let document: *mut AnyObject = msg_send![
             document,
@@ -2329,7 +2617,7 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
         );
         let view = view_for(page, &input);
         let metrics = PageMetrics::for_layout(SettingsLayout::new(600.0));
-        let canvas = PageCanvas::new(
+        let mut canvas = PageCanvas::new(
             document,
             600.0,
             SettingsLayout::new(600.0),
@@ -2352,12 +2640,9 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
                 .collect(),
         };
         let layout = layout_rows(&view, &layout_input, &metrics);
-        // What this runner can prove without a Settings window: every described row got a
-        // frame, every page-drawn row is accounted for, the rows are ordered top to bottom, and
-        // each card has a surface. The RENDERED half (views placed at those frames, and the
-        // re-flow after a group collapses) needs a real settings window, which the settings GUI
-        // smoke runner builds.
-        let rows_laid_out = layout.rows.len() == view.rows.len();
+        // The description half: one laid-out row per described row, one surface per card
+        // (page-drawn-only cards included), and a sequence that places every row exactly once.
+        let described_laid_out = layout.rows.len() == view.rows.len();
         let highest_card = view
             .rows
             .iter()
@@ -2367,19 +2652,100 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             .map_or(0, |card| card + 1);
         let cards_laid_out =
             layout.cards.len() == highest_card && layout.card_tops.len() >= highest_card;
-        let frames_are_ordered = layout
-            .rows
-            .windows(2)
-            .all(|pair| pair[0].frame.y > pair[1].frame.y);
-        let frames_are_real = layout
-            .rows
-            .iter()
-            .all(|row| row.frame.h > 0.0 && row.frame.w > 0.0);
-        if !(rows_laid_out && cards_laid_out && frames_are_ordered && frames_are_real) {
+        let sequence_complete = layout.sequence.len() == view.rows.len() + view.extra_rows.len();
+        // The rendered half: build the page's REAL views, with the page's own hooks, on the
+        // detached document. This is what catches a control that never entered the view tree and a
+        // placement that ignored the row's origin.
+        let mut ui = headless_settings_ui();
+        let mut hooks = page_hooks(page);
+        let rendered = match render_page(
+            &mut canvas,
+            std::ptr::null_mut(),
+            &view,
+            &layout,
+            &metrics,
+            &mut ui,
+            hooks.as_mut(),
+        ) {
+            Ok(rendered) => rendered,
+            Err(error) => {
+                log_info!("[smoke-migrated-pages] {page:?}: render refused ({error:?})");
+                ok = false;
+                continue;
+            }
+        };
+        // The canvas settles its row bookkeeping when the page is finished: every view is placed and
+        // every row flushed by then, which is what the placement checks read.
+        let _: f64 = canvas.finish();
+        // Every DESCRIBED row placed its control (by identity): the count is larger than the row
+        // count whenever a page also draws rows of its own or a value row carries an action button,
+        // and smaller when a row failed to build — which is the failure this catches.
+        let described_ok = !view.rows.is_empty()
+            && view
+                .rows
+                .iter()
+                .all(|row| rendered.controls.iter().any(|control| control.id == row.id));
+        if !described_ok {
             log_info!(
-                "[smoke-migrated-pages] {page:?}: rows={} cards={} ordered={frames_are_ordered} real={frames_are_real}",
-                rows_laid_out,
-                cards_laid_out
+                "[smoke-migrated-pages] {page:?}: a described row placed no control ({} controls)",
+                rendered.controls.len()
+            );
+        }
+        let mut placed_ok = scene_holds_placements(&canvas, &view, &layout);
+        // Every page-drawn row placed at least one view, inside the row the layout reserved.
+        for (index, spec) in view.extra_rows.iter().enumerate() {
+            let Some(row) = canvas_row_of_drawn_row(&layout, index) else {
+                log_info!(
+                    "[smoke-migrated-pages] {page:?}: {} is not in the layout",
+                    spec.key
+                );
+                placed_ok = false;
+                continue;
+            };
+            let (_, origin, height) = layout.drawn_rows[index];
+            let Some(views) = canvas.row_views(row) else {
+                log_info!(
+                    "[smoke-migrated-pages] {page:?}: page-drawn row {} ({}) placed nothing",
+                    index,
+                    spec.key
+                );
+                placed_ok = false;
+                continue;
+            };
+            // A row the flow grows later (the About page's inline update host) starts at zero
+            // height by design: what matters is that it placed its views inside the page.
+            if views.is_empty() || height < 0.0 || origin > layout.first_card_top {
+                log_info!(
+                    "[smoke-migrated-pages] {page:?}: page-drawn row {} ({}) is empty or outside the page",
+                    index,
+                    spec.key
+                );
+                placed_ok = false;
+            }
+        }
+        // DRIVE the production re-flow: collapse a conditional group, re-flow, re-assert; then move
+        // the viewport, which shifts every row's origin, and re-assert again. A renderer that placed
+        // its views once and never followed the canvas fails HERE.
+        let groups = description_groups(&view);
+        if let Some(group) = groups.first().copied() {
+            canvas.set_group_visible(group, true);
+            placed_ok &= scene_holds_placements(&canvas, &view, &layout);
+            canvas.set_group_visible(group, false);
+            placed_ok &= scene_holds_placements(&canvas, &view, &layout);
+        }
+        canvas.set_viewport(520.0);
+        placed_ok &= scene_holds_placements(&canvas, &view, &layout);
+        canvas.set_viewport(700.0);
+        let cards_ok = view_cards_contain_their_rows(&view, &layout);
+        if !(described_laid_out && cards_laid_out && sequence_complete && cards_ok) {
+            log_info!(
+                "[smoke-migrated-pages] {page:?}: described={described_laid_out} cards={cards_laid_out} sequence={sequence_complete} cards_cover={cards_ok}"
+            );
+            ok = false;
+        }
+        if !(described_ok && placed_ok) {
+            log_info!(
+                "[smoke-migrated-pages] {page:?}: controls={described_ok} placements={placed_ok}"
             );
             ok = false;
         }
@@ -2387,6 +2753,121 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
     ok
 }
 
+/// The page's REAL hooks, built against the headless UI: a page whose hook draws rows cannot be
+/// checked by skipping it.
+unsafe fn page_hooks(page: SettingsPageId) -> Box<dyn PageHooks> {
+    match page {
+        SettingsPageId::About => Box::new(AboutHooks {
+            window: std::ptr::null_mut(),
+        }),
+        SettingsPageId::Clipboard => Box::new(ClipboardHooks {
+            shortcut_title: String::new(),
+        }),
+        SettingsPageId::KeyBindings => Box::new(KeyBindingsHooks::default()),
+        SettingsPageId::FinderMenu => Box::new(FinderMenuHooks {}),
+        SettingsPageId::Mouse => Box::new(MouseHooks {
+            target: std::ptr::null_mut(),
+        }),
+        _ => Box::new(NoHooks),
+    }
+}
+
+/// The canvas row a page-drawn row occupies: its position in the layout's sequence, which is also
+/// the canvas row the renderer opened for it.
+pub(super) fn canvas_row_of_drawn_row(layout: &PageLayout, index: usize) -> Option<usize> {
+    layout
+        .sequence
+        .iter()
+        .position(|placed| matches!(placed, PlacedRow::Drawn(drawn) if *drawn == index))
+}
+
+/// Each card's surface must cover every row inside it, described or page-drawn.
+fn view_cards_contain_their_rows(view: &PageView, layout: &PageLayout) -> bool {
+    for card in &layout.cards {
+        for (index, row) in view.rows.iter().enumerate() {
+            if row.card != card.index {
+                continue;
+            }
+            let frame = &layout.rows[index].frame;
+            if frame.y < card.frame.y - 1.0e-6
+                || frame.y + frame.h > card.frame.y + card.frame.h + 1.0e-6
+            {
+                return false;
+            }
+        }
+        for (position, extra) in view.extra_rows.iter().enumerate() {
+            if extra.card != card.index {
+                continue;
+            }
+            let (_, origin, height) = layout.drawn_rows[position];
+            if origin < card.frame.y - 1.0e-6
+                || origin + height > card.frame.y + card.frame.h + 1.0e-6
+            {
+                return false;
+            }
+        }
+    }
+    true
+}
+
+/// Every row the description declares has views in the detached document, with a real size: the
+/// check the smoke runner drives after building a page's real views.
+/// Every view a row placed is in the detached document, has a real size, and sits at its row's
+/// CURRENT origin plus the offset the layout gave it — read from the CANVAS, which is what a
+/// re-flow moves. A renderer that placed its views once and never followed a re-flow fails here.
+/// Every view a row placed is a subview of the document with a real size, and its frame matches the
+/// row's CURRENT canvas origin plus the offset the layout gave it. Reading the origin from the
+/// CANVAS is the point: it is what a re-flow moves, so a renderer that placed its views once and
+/// never followed a re-flow fails here.
+/// Every row the description placed is still where the canvas's current re-flow says it is: the
+/// canvas records each view's offset from its row's origin, applies the row's CURRENT origin, and
+/// `placements_are_stale` reports a view that did not follow. Reading the ORIGIN from the canvas is
+/// the point — a group collapse or a viewport change moves it, and a renderer that placed its views
+/// once and never followed fails HERE.
+unsafe fn scene_holds_placements(
+    canvas: &PageCanvas,
+    view: &PageView,
+    layout: &PageLayout,
+) -> bool {
+    let document = canvas.document();
+    if document.is_null() {
+        return false;
+    }
+    // The canvas row is the row's position in the ONE sequence, never its index among described
+    // rows: a page whose earlier cards hold page-drawn rows puts its later rows further down.
+    let canvas_rows = canvas_rows(view);
+    for (row, _spec) in view.rows.iter().enumerate() {
+        let canvas_row = canvas_rows[row];
+        let (Some(_origin), Some(placements)) = (
+            canvas.current_row_origin(canvas_row),
+            canvas.row_placements(canvas_row),
+        ) else {
+            return false;
+        };
+        // A described row always draws at least its copy and its control.
+        if placements.len() < 2 {
+            return false;
+        }
+        if canvas.placements_are_stale(canvas_row) {
+            return false;
+        }
+        for (placed_view, _offset) in placements {
+            if placed_view.is_null() {
+                return false;
+            }
+            let frame: NSRect = msg_send![*placed_view, frame];
+            if frame.size.width <= 0.0 || frame.size.height <= 0.0 {
+                return false;
+            }
+            let parent: *mut AnyObject = msg_send![*placed_view, superview];
+            if parent != document {
+                return false;
+            }
+        }
+    }
+    // The layout must still describe the same page it was computed for.
+    layout.rows.len() == view.rows.len()
+}
 /// The height the detached smoke document is provisioned with.
 fn document_fixture_height() -> f64 {
     900.0
@@ -2435,6 +2916,36 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::KeystrokeDisplayPosition => &mut ui.keystroke_display_position,
         ControlField::KeystrokeDisplayInitialPosition => &mut ui.keystroke_display_initial_position,
         ControlField::KeystrokeDisplayMaxExtent => &mut ui.keystroke_display_max_extent,
+        ControlField::ClipboardEnabled => &mut ui.clipboard_enabled,
+        ControlField::ClipboardPaused => &mut ui.clipboard_paused,
+        ControlField::ClipboardClearOnQuit => &mut ui.clipboard_clear_on_quit,
+        ControlField::ClipboardSeparateClearAll => &mut ui.clipboard_separate_clear_all,
+        ControlField::ClipboardShowSourceApp => &mut ui.clipboard_show_source_app,
+        ControlField::ClipboardMoveUsedToTop => &mut ui.clipboard_move_used_to_top,
+        ControlField::ClipboardDeleteAfterPaste => &mut ui.clipboard_delete_after_paste,
+        ControlField::ClipboardClearSystemPasteboardAfterPaste => {
+            &mut ui.clipboard_clear_system_pasteboard_after_paste
+        }
+        ControlField::ClipboardAutoExpireDays => &mut ui.clipboard_auto_expire_days,
+        ControlField::ClipboardImageRows => &mut ui.clipboard_image_rows,
+        ControlField::ClipboardPinFollow => &mut ui.clipboard_pin_follow,
+        ControlField::ClipboardPickerPlacement => &mut ui.clipboard_picker_placement,
+        ControlField::ClipboardMaxEntries => &mut ui.clipboard_max_entries,
+        ControlField::MouseEnabled => &mut ui.enable_mouse,
+        ControlField::ReverseScroll => &mut ui.reverse_scroll,
+        ControlField::ScrollMode => &mut ui.scroll_mode,
+        ControlField::LineCount => &mut ui.line_count,
+        ControlField::DisablePointerAccel => &mut ui.disable_pointer_accel,
+        ControlField::PointerAcceleration => &mut ui.pointer_accel_slider,
+        ControlField::MappingEnabled => &mut ui.mapping_enabled,
+        ControlField::KeyBindingsEnabled => &mut ui.key_bindings_enabled,
+        ControlField::UpdateAutoCheck => &mut ui.update_auto_check,
+        ControlField::UpdateAutoDownload => &mut ui.update_auto_download,
+        ControlField::FinderMenuEnabled => &mut ui.finder_menu_enabled,
+        ControlField::FinderMenuLayout => &mut ui.finder_menu_layout,
+        ControlField::FinderMenuCopyPath => &mut ui.finder_menu_copy_path,
+        ControlField::FinderMenuCopySha256 => &mut ui.finder_menu_copy_sha256,
+        ControlField::ShowFooterTitle => &mut ui.show_footer_title,
         // `settings_ui_slot_present` listed every field above; a new one without a slot is a
         // compile error here, which is what keeps the two in step.
         _ => {
@@ -2475,6 +2986,34 @@ pub(super) unsafe fn bind_page_controls(ui: &mut SettingsUi, rendered: &Rendered
             }
             RenderedExtra::MaxEntries => ui.clipboard_max_entries = control.control,
         }
+        // About's status rows are VALUES with their own action: the refresh function writes the
+        // status text and the button that opens the matching pane, both by pointer. A row player
+        // of `ControlField` has no room for them (they are not config fields), so they are bound
+        // by the action identity that names them.
+        if let ControlId::Action(action) = control.id {
+            // The status label and the action button are bound SEPARATELY: the refresh function
+            // writes the text by pointer and enables/disables the button by its own pointer.
+            match action {
+                "open_accessibility_permission" => {
+                    ui.accessibility_permission_status = control.control;
+                }
+                "open_screen_recording_permission" => {
+                    ui.screen_recording_permission_status = control.control;
+                }
+                "retry_keychain_access" => ui.keychain_access_status = control.control,
+                _ => {}
+            }
+            if !control.action.is_null() {
+                match action {
+                    "open_accessibility_permission" => {
+                        ui.accessibility_permission_button = control.action
+                    }
+                    "retry_keychain_access" => ui.keychain_access_button = control.action,
+                    _ => {}
+                }
+            }
+            continue;
+        }
         let ControlId::Field(field) = control.id else {
             continue;
         };
@@ -2490,6 +3029,14 @@ pub(super) unsafe fn bind_page_controls(ui: &mut SettingsUi, rendered: &Rendered
                 }
                 ControlField::KeystrokeDisplayMaxExtent => {
                     ui.keystroke_display_max_extent_value = control.readout
+                }
+                // The clipboard page's two numeric rows draw a readout beside the slider; the
+                // refill writes it, so it needs the pointer like every other readout.
+                ControlField::ClipboardAutoExpireDays => {
+                    ui.clipboard_auto_expire_days_value_label = control.readout
+                }
+                ControlField::ClipboardImageRows => {
+                    ui.clipboard_image_rows_value_label = control.readout
                 }
                 _ => {}
             }
@@ -2541,6 +3088,37 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::KeystrokeDisplayPosition
             | ControlField::KeystrokeDisplayInitialPosition
             | ControlField::KeystrokeDisplayMaxExtent
+            // The pages migrated after the first two: their controls exist only as described rows,
+            // so the shared binder is the only place their legacy consumers (which read
+            // `SettingsUi` fields directly) can be handed the control the table identified.
+            | ControlField::ClipboardEnabled
+            | ControlField::ClipboardPaused
+            | ControlField::ClipboardClearOnQuit
+            | ControlField::ClipboardSeparateClearAll
+            | ControlField::ClipboardShowSourceApp
+            | ControlField::ClipboardMoveUsedToTop
+            | ControlField::ClipboardDeleteAfterPaste
+            | ControlField::ClipboardClearSystemPasteboardAfterPaste
+            | ControlField::ClipboardAutoExpireDays
+            | ControlField::ClipboardImageRows
+            | ControlField::ClipboardPinFollow
+            | ControlField::ClipboardPickerPlacement
+            | ControlField::ClipboardMaxEntries
+            | ControlField::MouseEnabled
+            | ControlField::ReverseScroll
+            | ControlField::ScrollMode
+            | ControlField::LineCount
+            | ControlField::DisablePointerAccel
+            | ControlField::PointerAcceleration
+            | ControlField::MappingEnabled
+            | ControlField::KeyBindingsEnabled
+            | ControlField::UpdateAutoCheck
+            | ControlField::UpdateAutoDownload
+            | ControlField::FinderMenuEnabled
+            | ControlField::FinderMenuLayout
+            | ControlField::FinderMenuCopyPath
+            | ControlField::FinderMenuCopySha256
+            | ControlField::ShowFooterTitle
     )
 }
 
@@ -3581,5 +4159,393 @@ mod tests {
             .find(|update| update.field == ControlField::ShowAppNameInCards)
             .expect("the changed field is in the description");
         assert_eq!(update.value, "on");
+    }
+
+    /// Every page's real description must pass the identity check the build runs before creating a
+    /// view: a duplicate there refuses the whole page and it renders empty. This is the guard the
+    /// About page's two links needed and did not have.
+    #[test]
+    fn every_pages_description_passes_the_identity_check_the_build_runs() {
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            assert!(
+                description_identity_conflict(&view).is_ok(),
+                "{page:?} declares a duplicate control identity, so its build would be refused"
+            );
+        }
+    }
+
+    /// Every row — described or page-drawn — must belong to a card the layout produced, and the
+    /// layout must preserve the card's OWN index. A page whose cards mix described and page-drawn
+    /// rows (Mouse: 0,1,2,3,4,5 with 1 and 3 page-only) once lost every card after the gap because
+    /// the layout and the renderer both used a positional index.
+    #[test]
+    fn every_card_and_row_survives_the_layout_for_every_page() {
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            let mut layout_input = LayoutInput::for_test(700.0);
+            layout_input.extra_row_heights = view
+                .extra_rows
+                .iter()
+                .map(|extra| extra.height.resolve(&input, layout_input.content_w))
+                .collect();
+            let metrics = PageMetrics::for_layout(layout_input.layout);
+            let layout = layout_rows(&view, &layout_input, &metrics);
+            let highest = view
+                .rows
+                .iter()
+                .map(|row| row.card)
+                .chain(view.extra_rows.iter().map(|extra| extra.card))
+                .max()
+                .unwrap_or(0);
+            assert_eq!(
+                layout.cards.len(),
+                highest + 1,
+                "{page:?} must produce one card per card index, page-drawn-only cards included"
+            );
+            for card in &layout.cards {
+                assert!(
+                    (0..=highest).contains(&card.index),
+                    "{page:?} produced a card with an out-of-range index"
+                );
+            }
+            let mut indices: Vec<usize> = layout.cards.iter().map(|card| card.index).collect();
+            indices.sort_unstable();
+            assert_eq!(
+                indices,
+                (0..=highest).collect::<Vec<_>>(),
+                "{page:?} must keep every card index, in order"
+            );
+            // A card that holds only page-drawn rows still names itself.
+            for card in &layout.cards {
+                let has_described = view.rows.iter().any(|row| row.card == card.index);
+                if !has_described {
+                    assert!(
+                        !card.section.is_empty(),
+                        "{page:?}: a page-drawn-only card must still name its heading"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every field a migrated page describes must have a `SettingsUi` slot, because the legacy
+    /// consumers (`apply_control_field`, the refill, the enable lists) read those fields directly:
+    /// a field the table identifies but nothing binds is a control that looks alive and does
+    /// nothing. This is the assertion the Clipboard/Mouse/About pages needed and did not have.
+    #[test]
+    fn every_described_field_of_every_page_has_a_settings_ui_slot() {
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            for row in &view.rows {
+                let Some(field) = row.field() else {
+                    continue; // an action row stores nothing
+                };
+                // The Finder Menu page's catalog rows are POSITIONAL (one entry per file type /
+                // terminal); they are bound into their Vec fields by the page's own hook, not by
+                // the one-slot-per-field table. Every other described field must have a slot.
+                if matches!(
+                    field,
+                    ControlField::FinderMenuNewFileType(_) | ControlField::FinderMenuTerminal(_)
+                ) {
+                    continue;
+                }
+                assert!(
+                    settings_ui_slot_present(field),
+                    "{page:?}: {field:?} is described but no SettingsUi slot is bound for it"
+                );
+            }
+        }
+    }
+
+    /// The fields whose controls had a DEDICATED handler in the inline builder must still have one:
+    /// each does more than write the config (retitles a button, freezes dependent rows, restarts a
+    /// tap, re-reads a device), and losing it is silent — the value changes and the page stops
+    /// following it. The list is the old builders' `sel!(handle…:)` assignments.
+    #[test]
+    fn every_field_with_a_dedicated_handler_still_has_one() {
+        let dedicated = [
+            (ControlField::WindowsEnabled, "handleWindowsEnabledToggle:"),
+            (ControlField::MouseEnabled, "handleEnableMouseToggle:"),
+            (ControlField::MappingEnabled, "handleMappingEnabledChanged:"),
+            (
+                ControlField::ClipboardEnabled,
+                "handleClipboardEnabledToggle:",
+            ),
+            (ControlField::ClipboardPaused, "handlePauseRecordingToggle:"),
+            (ControlField::KeyBindingsEnabled, "handleKeyBindingsToggle:"),
+        ];
+        for (field, selector) in dedicated {
+            let resolved = dedicated_selector(Some(field));
+            assert_eq!(
+                resolved.name().to_str().expect("a selector name is UTF-8"),
+                selector,
+                "{field:?} lost its dedicated handler and now runs the generic one"
+            );
+        }
+        assert_eq!(
+            dedicated_selector(Some(ControlField::Theme))
+                .name()
+                .to_str()
+                .expect("a selector name is UTF-8"),
+            "handleControlChanged:",
+            "an ordinary field still uses the unified handler"
+        );
+    }
+
+    /// A page-drawn row must consume the height the LAYOUT reserved for it, at the origin the
+    /// layout put it, and a card must cover the rows the page draws inside it. Mouse is the page
+    /// this went wrong on: its smooth-slider row was handed the device row's height, and its
+    /// page-drawn-only cards had no surface.
+    #[test]
+    fn page_drawn_rows_are_laid_out_at_their_own_height_and_cards_cover_them() {
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            let mut layout_input = LayoutInput::for_test(700.0);
+            layout_input.extra_row_heights = view
+                .extra_rows
+                .iter()
+                .map(|extra| extra.height.resolve(&input, layout_input.content_w))
+                .collect();
+            let metrics = PageMetrics::for_layout(layout_input.layout);
+            let layout = layout_rows(&view, &layout_input, &metrics);
+            assert_eq!(layout.drawn_rows.len(), view.extra_rows.len());
+            assert_eq!(
+                layout.sequence.len(),
+                view.rows.len() + view.extra_rows.len()
+            );
+            // The declared height reaches the layout unchanged, and the row's origin is the
+            // position in the sequence, not a per-card index into a page-wide array.
+            for (index, extra) in view.extra_rows.iter().enumerate() {
+                let (row_index, origin, height) = layout.drawn_rows[index];
+                assert_eq!(row_index, index);
+                let declared = extra.height.resolve(&input, layout_input.content_w);
+                assert_eq!(
+                    height, declared,
+                    "{page:?}: row {index} ({}) was laid out at a different height than declared",
+                    extra.key
+                );
+                assert!(origin <= layout.first_card_top);
+                // The row sits inside the card's surface.
+                let card = layout
+                    .cards
+                    .iter()
+                    .find(|card| card.index == extra.card)
+                    .expect("every card has a surface");
+                assert!(
+                    origin >= card.frame.y
+                        && origin + height <= card.frame.y + card.frame.h + 1.0e-6,
+                    "{page:?}: row {} ({}) is outside its card's surface",
+                    index,
+                    extra.key
+                );
+            }
+        }
+    }
+
+    /// The sequence must place every described row exactly once and every page-drawn row exactly
+    /// once, in card order: the renderer draws from it, so a missing entry is a row that never
+    /// appears.
+    #[test]
+    fn the_sequence_places_every_row_exactly_once() {
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            let mut layout_input = LayoutInput::for_test(700.0);
+            layout_input.extra_row_heights = view
+                .extra_rows
+                .iter()
+                .map(|extra| extra.height.resolve(&input, layout_input.content_w))
+                .collect();
+            let metrics = PageMetrics::for_layout(layout_input.layout);
+            let layout = layout_rows(&view, &layout_input, &metrics);
+            let mut described: Vec<usize> = Vec::new();
+            let mut drawn: Vec<usize> = Vec::new();
+            for placed in &layout.sequence {
+                match placed {
+                    PlacedRow::Described(index) => described.push(*index),
+                    PlacedRow::Drawn(index) => drawn.push(*index),
+                }
+            }
+            assert_eq!(
+                described,
+                (0..view.rows.len()).collect::<Vec<_>>(),
+                "{page:?}: every described row appears once, in document order"
+            );
+            assert_eq!(
+                drawn,
+                (0..view.extra_rows.len()).collect::<Vec<_>>(),
+                "{page:?}: every page-drawn row appears once, in document order"
+            );
+
+            // Rows are ordered top to bottom: the sequence's origins descend, and two rows may
+            // share an origin only when the lower one takes no space (the About page's inline
+            // update host starts empty and grows over the band's place).
+            let mut last = layout.first_card_top;
+            let mut previous_zero_height = false;
+            for placed in &layout.sequence {
+                let (origin, height) = match placed {
+                    PlacedRow::Described(index) => {
+                        (layout.rows[*index].frame.y, layout.rows[*index].frame.h)
+                    }
+                    PlacedRow::Drawn(index) => {
+                        let (_, origin, height) = layout.drawn_rows[*index];
+                        (origin, height)
+                    }
+                };
+                assert!(
+                    origin <= last,
+                    "{page:?}: the sequence must descend (origin={origin}, previous={last}, placed={placed:?})"
+                );
+                let _ = (height, previous_zero_height);
+                previous_zero_height = height <= 0.0;
+                last = origin;
+            }
+        }
+    }
+
+    /// Every control a page describes must be REACHABLE after the build: a config field through
+    /// its `SettingsUi` slot, a value row's action button through the action identity that names
+    /// it, and a slider's readout through the field its value belongs to. A control that is
+    /// identified but never bound looks alive and does nothing — exactly the About status rows and
+    /// the Clipboard readouts before this guard existed.
+    #[test]
+    fn every_described_control_has_a_binding() {
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            for row in &view.rows {
+                match &row.control {
+                    ControlKind::Slider { .. } => assert!(
+                        row.field().is_some(),
+                        "{page:?}: a slider reads a field, so its readout can be bound"
+                    ),
+                    ControlKind::Value { action, .. } => {
+                        // A value with an action needs BOTH bindings named; a plain value has
+                        // one (the label itself, bound by the refresh that writes it).
+                        let expected = match (&row.id, action) {
+                            (ControlId::Action(name), Some(_)) => Some(*name),
+                            (ControlId::Action(name), None) => Some(*name),
+                            _ => None,
+                        };
+                        assert!(
+                            expected.is_some(),
+                            "{page:?}: a value row is bound by an action identity"
+                        );
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    /// The canvas row a described row lands in is its position in the page's ONE sequence, not its
+    /// index among described rows: Mouse's `reverse_scroll` is described row 1 but canvas row 4,
+    /// because three rows of the device card are drawn by the page. The search scrolls to, and the
+    /// M2 checker inspects, the canvas row — so a mapping that ignores the pure-hook cards sends
+    /// both to a page-drawn row.
+    #[test]
+    fn the_canvas_row_mapping_counts_the_page_drawn_rows_of_every_card() {
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            let sequence = page_sequence(&view);
+            let rows = canvas_rows(&view);
+            // Every described row's canvas row is where the sequence puts it.
+            for (index, row) in view.rows.iter().enumerate() {
+                let position = sequence
+                    .iter()
+                    .position(
+                        |placed| matches!(placed, PlacedRow::Described(drawn) if *drawn == index),
+                    )
+                    .expect("every described row is in the sequence");
+                assert_eq!(
+                    rows[index], position,
+                    "{page:?}: described row {index} maps wrong"
+                );
+                assert_eq!(canvas_row_of_described_row(&view, index), position);
+                let _ = row;
+            }
+            // The mapping is strictly increasing: the canvas rows follow the document order.
+            assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
+        }
+        // The counterexample, named: Mouse's second described row sits after three page-drawn rows.
+        let mouse = view_for(SettingsPageId::Mouse, &input);
+        assert_eq!(canvas_rows(&mouse), vec![0, 4, 7, 9]);
+        assert_eq!(mouse.rows[1].label_key, "settings.row_reverse_scroll");
     }
 }
