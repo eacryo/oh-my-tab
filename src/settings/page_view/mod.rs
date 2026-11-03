@@ -26,6 +26,12 @@ use super::*;
 
 use std::collections::HashMap;
 
+// The search index is written while a page is BUILT, not while it is described: a page-owned card
+// that is not described at all records its rows through these, exactly as the inline builder did.
+pub(super) use super::page_builder::{
+    begin_settings_search_page, record_settings_search_row, set_settings_search_section,
+};
+
 // One module per page description, so pages can be written independently: each is pure and returns
 // a `PageView`, and the shared machinery here (layout, rendering, identities, the update
 // description) is the only thing they share.
@@ -38,6 +44,7 @@ mod switcher;
 
 use about::about_page_view;
 use clipboard::clipboard_page_view;
+pub(super) use clipboard::ClipboardHooks;
 use finder_menu::finder_menu_page_view;
 use general::general_page_view;
 use keystroke_display::keystroke_display_page_view;
@@ -56,6 +63,10 @@ pub(super) struct PageInput {
     /// the pages that follow.
     #[allow(dead_code)]
     pub(super) device: Option<crate::mouse::device::DeviceKey>,
+    /// The Finder Menu page's extension status. It comes from the system (is the extension
+    /// elected?) and from the recovery transaction's last result, so it is captured here rather
+    /// than computed by a description.
+    pub(super) finder_menu_status: String,
 }
 
 impl PageInput {
@@ -64,11 +75,16 @@ impl PageInput {
     /// The single call site is a page's build; the concurrency source test in `settings.rs` counts
     /// these, so a description that reaches for a global instead is visible.
     pub(super) fn capture() -> Self {
-        Self::from_config(
+        let mut input = Self::from_config(
             CONFIG.read().unwrap().clone(),
             super::current_selected_device(),
             crate::theme::ThemeInput::current(),
-        )
+        );
+        // The one system read the descriptions cannot make: the extension's election and the
+        // recovery transaction's outcome are process state, captured at build time.
+        input.finder_menu_status =
+            super::finder_menu_status_text_now(crate::finder_menu::extension_enabled());
+        input
     }
 
     pub(super) fn from_config(
@@ -80,6 +96,7 @@ impl PageInput {
             config,
             theme,
             device,
+            finder_menu_status: String::new(),
         }
     }
 }
@@ -229,7 +246,10 @@ pub(super) enum ControlKind {
     Button,
     /// A read-only value drawn in the control column (a permission status, a device name): the row
     /// carries text, not an editable control, and a callback refreshes it.
-    Value,
+    ///
+    /// `action` adds the row's own action button beside the value (the Finder Menu page's status
+    /// line opens the extension settings; the About page's permission rows open System Settings).
+    Value { action: Option<ValueAction> },
 }
 
 /// What a control is, for the dispatcher. A field identity is what the config stores; an action
@@ -419,6 +439,24 @@ pub(super) trait PageHooks {
     ) -> Result<(), RegisterError> {
         Ok(())
     }
+
+    /// Draw what the page owns BELOW its described cards -- its own trailing card, an action band,
+    /// a host view -- on the page's own canvas, before the page is finished and published.
+    ///
+    /// The canvas sequence stays the page's: what is drawn here belongs to the page document, so a
+    /// later reflow moves it together with the cards above it.
+    /// `SettingsUi` is passed so the page can write the fields its own callbacks read (a card of
+    /// its own that is not described at all, such as the clipboard exclusion list) with exactly the
+    /// same writes the inline builder made.
+    unsafe fn after_page(
+        &mut self,
+        _canvas: &mut PageCanvas,
+        _rendered: &mut RenderedPage,
+        _ui: &mut SettingsUi,
+        _target: *mut AnyObject,
+    ) -> Result<(), RegisterError> {
+        Ok(())
+    }
 }
 
 /// The hooks a page with no self-drawn rows uses.
@@ -434,6 +472,21 @@ pub(super) struct BannerSpec {
     pub(super) gap: f64,
 }
 
+/// The action button a [`ControlKind::Value`] row carries beside its text.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct ValueAction {
+    /// The action identity the dispatcher resolves to a selector.
+    pub(super) action: &'static str,
+    /// The button's copy key.
+    pub(super) button_key: &'static str,
+}
+
+impl ValueAction {
+    pub(super) fn new(action: &'static str, button_key: &'static str) -> Self {
+        Self { action, button_key }
+    }
+}
+
 /// A row placed in the page: its frame and the frames of the views it draws.
 ///
 /// These are the numbers the page is built with; the canvas then re-places the views from its own
@@ -442,6 +495,8 @@ pub(super) struct BannerSpec {
 pub(super) struct RowLayout {
     /// The row's frame in the page document (unflipped: the origin is the row's bottom edge).
     pub(super) frame: BoxRect,
+    /// The action button beside a value row, when the row carries one.
+    pub(super) action_frame: Option<BoxRect>,
     pub(super) label_frame: BoxRect,
     /// The copy box the label is centered in or aligned to.
     #[allow(dead_code)]
@@ -784,7 +839,15 @@ fn row_height(
         ControlKind::Switch | ControlKind::Button | ControlKind::Slider { .. } => {
             input.layout.described_row_h
         }
-        ControlKind::Value => SettingsLayout::SINGLE_LINE_ROW_H,
+        ControlKind::Value { action } => {
+            // A value row with a button is a described row (the button makes it two lines tall,
+            // like every other row carrying a control).
+            if action.is_some() {
+                input.layout.described_row_h
+            } else {
+                SettingsLayout::SINGLE_LINE_ROW_H
+            }
+        }
     };
     match row.copy {
         RowCopy::Plain => base,
@@ -951,19 +1014,45 @@ pub(super) fn layout_rows(
                 )
             }
             // A read-only value is drawn where the control column puts a control, left-aligned so a
-            // status line reads as text rather than as a disabled button.
-            ControlKind::Value => (
-                BoxRect::new(
-                    layout.control_x,
-                    cursor + (height - metrics.control_h) / 2.0,
-                    layout.control_w,
-                    metrics.control_h,
-                ),
-                None,
-            ),
+            // status line reads as text rather than as a disabled button. With an action beside it,
+            // the value takes the room the button leaves.
+            ControlKind::Value { action } => {
+                let y = cursor + (height - metrics.control_h) / 2.0;
+                match action {
+                    None => (
+                        BoxRect::new(layout.control_x, y, layout.control_w, metrics.control_h),
+                        None,
+                    ),
+                    Some(_) => (
+                        BoxRect::new(
+                            layout.control_x,
+                            y,
+                            (layout.control_w
+                                - super::components::ROW_ACTION_BTN_W
+                                - VALUE_ACTION_GAP)
+                                .max(1.0),
+                            metrics.control_h,
+                        ),
+                        None,
+                    ),
+                }
+            }
         };
+        let action_frame = match &row.control {
+            ControlKind::Value {
+                action: Some(action),
+            } => Some(BoxRect::new(
+                layout.control_x + layout.control_w - super::components::ROW_ACTION_BTN_W,
+                cursor + (height - super::components::ROW_ACTION_BTN_H) / 2.0,
+                super::components::ROW_ACTION_BTN_W,
+                super::components::ROW_ACTION_BTN_H,
+            )),
+            _ => None,
+        };
+        let _ = &action_frame;
         rows.push(RowLayout {
             frame: BoxRect::new(0.0, cursor, content_w, height),
+            action_frame,
             height,
             label_frame: label,
             stack_frame: label,
@@ -1017,6 +1106,33 @@ pub(super) fn layout_rows(
 }
 /// Each card's row range (start, end-exclusive), in card order: one range per run of rows that
 /// share a card index. A page that opens a card and draws no row in it draws no card.
+/// The canvas row a described row lands in.
+///
+/// A described row takes one canvas row; a page-drawn row (`extra_row`) takes another. Every
+/// described row after one of those is shifted by the count of page-drawn rows opened before it, so
+/// this is the index the search index and any canvas lookup must use.
+pub(super) fn canvas_row_of_described_row(view: &PageView, row: usize) -> usize {
+    let mut extras = 0usize;
+    let mut drawn_in_card = 0usize;
+    let mut card = None;
+    for (index, spec) in view.rows.iter().enumerate() {
+        if card != Some(spec.card) {
+            card = Some(spec.card);
+            drawn_in_card = 0;
+        }
+        extras += view
+            .extra_rows
+            .iter()
+            .filter(|extra| extra.card == spec.card && extra.after_row == drawn_in_card)
+            .count();
+        if index == row {
+            return index + extras;
+        }
+        drawn_in_card += 1;
+    }
+    row
+}
+
 pub(super) fn card_row_ranges(view: &PageView) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (index, row) in view.rows.iter().enumerate() {
@@ -1281,6 +1397,27 @@ pub(super) struct RenderedControl {
     pub(super) control: *mut AnyObject,
     /// The slider's readout, or null.
     pub(super) readout: *mut AnyObject,
+    /// What a page-drawn control needs beyond its identity. A described row is always `None`: its
+    /// fields are bound from its `ControlId`.
+    pub(super) extra: RenderedExtra,
+}
+
+/// What a page-drawn control needs beyond its identity: the few `SettingsUi` fields its own
+/// callback reads, which no described row has.
+///
+/// A page-drawn row is outside the described control set, so its consumer is the page's own code.
+/// This is the narrow channel between the two: the hook says what it drew, and
+/// `bind_page_controls` puts it on the fields that code reads.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(super) enum RenderedExtra {
+    /// Nothing beyond the identity (every described row).
+    #[default]
+    None,
+    /// The clipboard shortcut recorder: its row height follows the recorded chord, and the capture
+    /// state machine reads it back.
+    Shortcut { row_height: f64 },
+    /// The clipboard history limit: a numeric field whose callback looks it up by pointer.
+    MaxEntries,
 }
 
 unsafe impl Send for RenderedControl {}
@@ -1323,6 +1460,15 @@ fn action_selector(action: &str) -> Sel {
     match action {
         "export_settings" => sel!(handleExportSettings:),
         "import_settings" => sel!(handleImportSettings:),
+        // The Finder Menu page's status row opens the extension's System Settings pane.
+        "open_finder_extension_settings" => sel!(handleOpenFinderExtensionManagement:),
+        // The About page's permission rows open their own System Settings panes, and its keychain
+        // row retries the read.
+        "open_accessibility_permission" => sel!(handleOpenPrivacy:),
+        "open_screen_recording_permission" => sel!(handleOpenScreenRecordingPrivacy:),
+        "retry_keychain_access" => sel!(retryKeychainAccess:),
+        // The About page's guide row opens the onboarding window.
+        "open_onboarding" => sel!(handleOpenOnboarding:),
         _ => sel!(handleExportLogs:),
     }
 }
@@ -1462,11 +1608,14 @@ unsafe fn render_row(
         // A read-only value: text in the control column, refreshed by its callback (permission
         // status, keychain status). Its identity still comes from the row, so a later update can
         // find it.
-        ControlKind::Value => {
+        ControlKind::Value { action } => {
             let text = match &row.value {
                 Value::Dynamic(text) => text.clone(),
                 other => other.describe(),
             };
+            // A value row's action button is a second view in the row; it is built after the label
+            // below, once the label has taken the room the button leaves.
+            let _ = action;
             SettingsControl::value_label(
                 placed.control_frame.x,
                 placed.control_frame.y,
@@ -1494,6 +1643,38 @@ unsafe fn render_row(
     };
     if control.is_null() {
         return Ok(());
+    }
+    // A value row's action button is a SECOND view in the row: it is built here, after the label,
+    // and registered like any other action control so its selector is reached the same way.
+    if let ControlKind::Value {
+        action: Some(action),
+    } = &row.control
+    {
+        if let Some(frame) = placed.action_frame {
+            let button = SettingsControl::button(
+                frame.x,
+                frame.y,
+                frame.w,
+                frame.h,
+                &t(action.button_key),
+                target,
+                action_selector(action.action),
+                SettingsButtonRole::Action,
+            );
+            if !button.is_null() {
+                let _: () = msg_send![button, setFrame: frame.rect()];
+                let _: () = msg_send![parent, addSubview: button];
+                release_obj(button);
+                canvas.place_pending_view(button, frame.rect());
+                rendered.controls.push(RenderedControl {
+                    id: ControlId::Action(action.action),
+                    kind: ControlKind::Button,
+                    control: button,
+                    readout: std::ptr::null_mut(),
+                    extra: RenderedExtra::None,
+                });
+            }
+        }
     }
     // The control enters the view tree and the page gives up its +1: every widget above is
     // allocated +1 and every inline builder released its view after adding it.
@@ -1529,6 +1710,8 @@ unsafe fn render_row(
         kind: row.control.clone(),
         control,
         readout,
+        // A described row binds every field its ControlId names; only a page-drawn row needs more.
+        extra: RenderedExtra::None,
     });
     Ok(())
 }
@@ -1696,7 +1879,7 @@ pub(super) unsafe fn apply_control_update(control: &RenderedControl, value: &str
         }
         // A read-only value shows the update's display text, which is what a status callback
         // computed (never a second formatter here).
-        ControlKind::Value => set_field(control.control, display),
+        ControlKind::Value { .. } => set_field(control.control, display),
         ControlKind::Button => {}
     }
 }
@@ -1804,6 +1987,9 @@ pub(super) const BANNER_GAP: f64 = 12.0;
 
 /// The banner strip's height for the current state: the permission-migration copy is taller than
 /// the ordinary warning.
+/// Clearance between a value row's text and the action button beside it.
+pub(super) const VALUE_ACTION_GAP: f64 = 8.0;
+
 pub(super) fn banner_height() -> f64 {
     let content_h = if crate::update_notice::needs_permission_migration_copy() {
         60.0
@@ -1911,6 +2097,9 @@ pub(super) unsafe fn build_page(
     // The rows are built; hand the page's layout owner its final geometry. Every page's document
     // is settled by `finalize_settings_pages` once all pages exist, so this must not run the
     // restore-control pass here.
+    // Whatever the page owns below its described cards: its own trailing card, an action band, a
+    // host view. It runs before `finish` so the content height accounts for it.
+    hooks.after_page(&mut canvas, &mut rendered, ui, target)?;
     let content_bottom = canvas.finish();
     Ok(BuiltPage {
         view,
@@ -2103,6 +2292,12 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::PanelQuitEnabled => &mut ui.panel_quit_enabled,
         ControlField::CornerRadius => &mut ui.corner_radius,
         ControlField::Modifier => &mut ui.modifier,
+        ControlField::KeystrokeDisplayEnabled => &mut ui.keystroke_display_enabled,
+        ControlField::KeystrokeDisplayMode => &mut ui.keystroke_display_mode,
+        ControlField::KeystrokeDisplayTapLevel => &mut ui.keystroke_display_tap_level,
+        ControlField::KeystrokeDisplayPosition => &mut ui.keystroke_display_position,
+        ControlField::KeystrokeDisplayInitialPosition => &mut ui.keystroke_display_initial_position,
+        ControlField::KeystrokeDisplayMaxExtent => &mut ui.keystroke_display_max_extent,
         // `settings_ui_slot_present` listed every field above; a new one without a slot is a
         // compile error here, which is what keeps the two in step.
         _ => {
@@ -2131,6 +2326,18 @@ pub(super) fn bind_page_banner(ui: &mut SettingsUi, rendered: &RenderedPage) {
 /// alone until the new page is known good.
 pub(super) unsafe fn bind_page_controls(ui: &mut SettingsUi, rendered: &RenderedPage) {
     for control in &rendered.controls {
+        // A page-drawn control has no ControlField; it says which of the fields its own callback
+        // reads the value belongs in. Without this a page could draw a control the dispatcher can
+        // never reach.
+        match &control.extra {
+            RenderedExtra::None => {}
+            RenderedExtra::Shortcut { row_height } => {
+                ui.clipboard_shortcut = control.control;
+                ui.clipboard_shortcut_error = control.readout;
+                ui.clipboard_shortcut_row_height = *row_height;
+            }
+            RenderedExtra::MaxEntries => ui.clipboard_max_entries = control.control,
+        }
         let ControlId::Field(field) = control.id else {
             continue;
         };
@@ -2143,6 +2350,9 @@ pub(super) unsafe fn bind_page_controls(ui: &mut SettingsUi, rendered: &Rendered
                 ControlField::CardTextSize => ui.card_text_size_value_label = control.readout,
                 ControlField::StatusBarTextSize => {
                     ui.status_bar_text_size_value_label = control.readout
+                }
+                ControlField::KeystrokeDisplayMaxExtent => {
+                    ui.keystroke_display_max_extent_value = control.readout
                 }
                 _ => {}
             }
@@ -2188,6 +2398,12 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::PanelQuitEnabled
             | ControlField::CornerRadius
             | ControlField::Modifier
+            | ControlField::KeystrokeDisplayEnabled
+            | ControlField::KeystrokeDisplayMode
+            | ControlField::KeystrokeDisplayTapLevel
+            | ControlField::KeystrokeDisplayPosition
+            | ControlField::KeystrokeDisplayInitialPosition
+            | ControlField::KeystrokeDisplayMaxExtent
     )
 }
 
@@ -2196,7 +2412,9 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
 pub(super) fn settings_ui_readout_field(field: ControlField) -> bool {
     matches!(
         field,
-        ControlField::CardTextSize | ControlField::StatusBarTextSize
+        ControlField::CardTextSize
+            | ControlField::StatusBarTextSize
+            | ControlField::KeystrokeDisplayMaxExtent
     )
 }
 

@@ -562,6 +562,18 @@ impl PageCanvas {
         self.document
     }
 
+    /// The page's layout metrics (label and control columns, row heights). A row the page draws
+    /// itself places its views in the same columns as a described row, so it reads them from here
+    /// instead of re-deriving them from the content width.
+    pub(super) fn layout(&self) -> SettingsLayout {
+        self.layout
+    }
+
+    /// The page's content width: the width a card or a row the page draws itself must span.
+    pub(super) fn content_width(&self) -> f64 {
+        self.content_w
+    }
+
     /// The distance from the document's top edge down to the first section cursor: the
     /// measurement a pure layout needs to place rows without duplicating the header's metrics.
     pub(super) fn header_offset(&self) -> f64 {

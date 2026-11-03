@@ -2009,7 +2009,11 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 page_view::refresh_migrated_pages(
                     u,
                     &input,
-                    &[SettingsPageId::Switcher, SettingsPageId::General],
+                    &[
+                        SettingsPageId::Switcher,
+                        SettingsPageId::General,
+                        SettingsPageId::KeystrokeDisplay,
+                    ],
                 );
             }
 
@@ -2028,49 +2032,6 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             ] {
                 let _: () = msg_send![control, setState: if on { 1isize } else { 0isize }];
             }
-
-            let _: () = msg_send![
-                u.keystroke_display_enabled,
-                setState: if cfg.keystroke_display.enabled { 1isize } else { 0isize }
-            ];
-            let mode_idx: isize = match cfg.keystroke_display.mode.as_str() {
-                "shortcuts" => 1,
-                "commands" => 2,
-                _ => 0,
-            };
-            let _: () = msg_send![u.keystroke_display_mode, selectItemAtIndex: mode_idx];
-            let tap_idx: isize = if cfg.keystroke_display.tap_level == "hid" {
-                1
-            } else {
-                0
-            };
-            let _: () = msg_send![u.keystroke_display_tap_level, selectItemAtIndex: tap_idx];
-            let display_position_idx = super::KEYSTROKE_DISPLAY_POSITION_VALUES
-                .iter()
-                .position(|mode| *mode == cfg.keystroke_display.display_position)
-                .unwrap_or(1) as isize;
-            let _: () = msg_send![
-                u.keystroke_display_position,
-                selectItemAtIndex: display_position_idx
-            ];
-            let initial_position_idx = super::KEYSTROKE_DISPLAY_INITIAL_POSITION_VALUES
-                .iter()
-                .position(|edge| *edge == cfg.keystroke_display.initial_position)
-                .unwrap_or(1) as isize;
-            let _: () = msg_send![
-                u.keystroke_display_initial_position,
-                selectItemAtIndex: initial_position_idx
-            ];
-            // The cap slider follows a reload or a defaults restore like every other control.
-            let max_extent = crate::config::keystroke_display_max_extent_percent_snap(
-                cfg.keystroke_display.max_extent_percent,
-            );
-            let _: () =
-                msg_send![u.keystroke_display_max_extent, setIntegerValue: max_extent as isize];
-            super::page_builder::set_max_extent_readout(
-                u.keystroke_display_max_extent_value,
-                max_extent,
-            );
 
             let thumbnail_idx: isize = if cfg.layout.thumbnails_enabled { 1 } else { 0 };
             let _: () = msg_send![u.thumbnails_enabled, selectItemAtIndex: thumbnail_idx];
@@ -2097,22 +2058,16 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 make_nsstring(&format!("{}", super::status_bar_size_for_index(size_value)));
             let _: () = msg_send![u.status_bar_text_size_value_label, setStringValue: readout];
             CFRelease(readout as *const c_void);
-            // Same for the clipboard image-rows slider: the picker rebuilds its rows from the
-            // reloaded config, so the settings control must show the same stop.
-            let image_rows = (cfg.clipboard.image_rows as i64).clamp(1, 3);
-            let _: () = msg_send![u.clipboard_image_rows, setIntegerValue: image_rows];
-            set_field(u.clipboard_image_rows_value_label, image_rows);
-            // The pushback: selection after pinning, and where the picker opens on its screen, both
-            // follow an external edit or a defaults restore like every other control -- the next
-            // summon already uses the new value, and the open page must not claim otherwise.
-            let pin_follow_idx: isize = if cfg.clipboard.pin_follow_selection {
-                0
-            } else {
-                1
-            };
-            let _: () = msg_send![u.clipboard_pin_follow, selectItemAtIndex: pin_follow_idx];
-            let placement_idx = picker_placement_index(&cfg.clipboard.picker_placement);
-            let _: () = msg_send![u.clipboard_picker_placement, selectItemAtIndex: placement_idx];
+            // The Clipboard page's described rows were written above by the shared update
+            // description (image rows, pin selection, picker placement and the rest); the page's own
+            // rows keep their writes: the recorded chord and the numeric entry limit.
+            let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
+                && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
+            set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording, None);
+            set_field(
+                u.clipboard_max_entries,
+                cfg.clipboard.max_entries.to_string(),
+            );
             // The finder menu page follows a reload or a defaults restore like every other page:
             // switches, layout popup, status line and the master-switch freeze.
             fill_finder_menu_controls(u, &cfg);

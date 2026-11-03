@@ -64,270 +64,47 @@ pub(super) unsafe fn build_switcher_page(
         }
     }
 }
-/// Build the Keystroke Display page and return its card bottom.
+/// Build the Keystroke Display page from its description.
+///
+/// The page is data now: `keystroke_display_page_view` says what it is (rows, copy keys, identities,
+/// values, search entries), `layout_rows` says where everything sits, `render_page` applies that,
+/// and `page_update_description` is what the refill and the in-place refresh write. There is no
+/// second, inline construction path for this page.
 pub(super) unsafe fn build_keystroke_display_page(
     context: &SettingsPageBuildContext,
     keystroke_display_view: *mut AnyObject,
     keystroke_display_doc_h: f64,
     ui: &mut SettingsUi,
 ) -> f64 {
-    let content_w = context.content_w;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let label_w = layout.label_w;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
-    // The page's rows fall back to this page's title as their section until a card sets one.
     begin_settings_search_page();
-    let mut canvas = PageCanvas::new(
+    let input = PageInput::capture();
+    match build_page(
+        ui,
+        SettingsPageId::KeystrokeDisplay,
         keystroke_display_view,
-        content_w,
-        layout,
-        &t("settings.sidebar_keystroke_display"),
+        context.content_w,
+        context.layout,
         keystroke_display_doc_h,
         context.page_frame.size.height,
-    );
-
-    let y = canvas.next_row(described_row_h);
-    record_settings_search_row(
-        SettingsPageId::KeystrokeDisplay,
-        canvas.last_row(),
-        &t("settings.row_keystroke_display_enabled"),
-        Some(&t("settings.desc_keystroke_display_enabled")),
-    );
-    ui.keystroke_display_enabled = SettingsRow::described(
-        keystroke_display_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_keystroke_display_enabled"),
-        &t("settings.desc_keystroke_display_enabled"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    );
-    bind_control(target, ui.keystroke_display_enabled);
-    // The master switch keeps a card of its own, like the mouse, clipboard, and key-binding pages:
-    // the card boundary is what makes it read as the feature's on/off row instead of the first row
-    // of the options list. The options below open a second card with their own header.
-    canvas.card(&t("settings.header_keystroke_display"));
-    set_settings_search_section(&t("settings.header_keystroke_display"));
-    canvas.next_section();
-
-    let mode_labels = [
-        t("settings.keystroke_display_mode_all"),
-        t("settings.keystroke_display_mode_shortcuts"),
-        t("settings.keystroke_display_mode_commands"),
-    ];
-    let mode_refs: Vec<&str> = mode_labels.iter().map(|s| s.as_str()).collect();
-    let mode_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(mode_metrics.row_h);
-    record_settings_search_row(
-        SettingsPageId::KeystrokeDisplay,
-        canvas.last_row(),
-        &t("settings.row_keystroke_display_mode"),
-        None,
-    );
-    record_settings_search_options(&mode_refs);
-    ui.keystroke_display_mode = SettingsRow::tall_with_height(
-        keystroke_display_view,
-        label_x,
-        y,
-        label_w,
-        mode_metrics.row_h,
-        &t("settings.row_keystroke_display_mode"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (mode_metrics.row_h - mode_metrics.control_h) / 2.0,
-            ctrl_w,
-            mode_metrics.control_h,
-            &mode_refs,
-            0,
-        ),
-    )
-    .1;
-    bind_control(target, ui.keystroke_display_mode);
-
-    let tap_labels = [
-        t("settings.keystroke_display_tap_session"),
-        t("settings.keystroke_display_tap_hid"),
-    ];
-    let tap_refs: Vec<&str> = tap_labels.iter().map(|s| s.as_str()).collect();
-    let tap_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(tap_metrics.row_h);
-    SettingsRow::separator_above_row(keystroke_display_view, y, tap_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::KeystrokeDisplay,
-        canvas.last_row(),
-        &t("settings.row_keystroke_display_tap_level"),
-        None,
-    );
-    record_settings_search_options(&tap_refs);
-    ui.keystroke_display_tap_level = SettingsRow::tall_with_height(
-        keystroke_display_view,
-        label_x,
-        y,
-        label_w,
-        tap_metrics.row_h,
-        &t("settings.row_keystroke_display_tap_level"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (tap_metrics.row_h - tap_metrics.control_h) / 2.0,
-            ctrl_w,
-            tap_metrics.control_h,
-            &tap_refs,
-            0,
-        ),
-    )
-    .1;
-    bind_control(target, ui.keystroke_display_tap_level);
-
-    let display_position_labels = [
-        t("settings.keystroke_display_position_main"),
-        t("settings.keystroke_display_position_caret"),
-    ];
-    let display_position_refs: Vec<&str> =
-        display_position_labels.iter().map(|s| s.as_str()).collect();
-    let display_position_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(display_position_metrics.row_h);
-    SettingsRow::separator_above_row(
-        keystroke_display_view,
-        y,
-        display_position_metrics.row_h,
-        content_w,
-    );
-    record_settings_search_row(
-        SettingsPageId::KeystrokeDisplay,
-        canvas.last_row(),
-        &t("settings.row_keystroke_display_position"),
-        None,
-    );
-    record_settings_search_options(&display_position_refs);
-    ui.keystroke_display_position = SettingsRow::tall_with_height(
-        keystroke_display_view,
-        label_x,
-        y,
-        label_w,
-        display_position_metrics.row_h,
-        &t("settings.row_keystroke_display_position"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (display_position_metrics.row_h - display_position_metrics.control_h) / 2.0,
-            ctrl_w,
-            display_position_metrics.control_h,
-            &display_position_refs,
-            1,
-        ),
-    )
-    .1;
-    bind_control(target, ui.keystroke_display_position);
-
-    let initial_position_labels = [
-        t("settings.keystroke_display_initial_position_top"),
-        t("settings.keystroke_display_initial_position_bottom"),
-        t("settings.keystroke_display_initial_position_left"),
-        t("settings.keystroke_display_initial_position_right"),
-    ];
-    let initial_position_refs: Vec<&str> =
-        initial_position_labels.iter().map(|s| s.as_str()).collect();
-    let initial_position_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(initial_position_metrics.row_h);
-    SettingsRow::separator_above_row(
-        keystroke_display_view,
-        y,
-        initial_position_metrics.row_h,
-        content_w,
-    );
-    record_settings_search_row(
-        SettingsPageId::KeystrokeDisplay,
-        canvas.last_row(),
-        &t("settings.row_keystroke_display_initial_position"),
-        None,
-    );
-    record_settings_search_options(&initial_position_refs);
-    ui.keystroke_display_initial_position = SettingsRow::tall_with_height(
-        keystroke_display_view,
-        label_x,
-        y,
-        label_w,
-        initial_position_metrics.row_h,
-        &t("settings.row_keystroke_display_initial_position"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (initial_position_metrics.row_h - initial_position_metrics.control_h) / 2.0,
-            ctrl_w,
-            initial_position_metrics.control_h,
-            &initial_position_refs,
-            // Index 1 is "bottom", the documented default.
-            1,
-        ),
-    )
-    .1;
-    bind_control(target, ui.keystroke_display_initial_position);
-
-    // The panel's stream-axis cap. One value covers both orientations: it is the width of a
-    // horizontal stream and the height of a vertical one. Whole tens only, so the readout, the
-    // saved value and the config validation all speak the same steps. No marker is drawn at the
-    // default stop: a full-height rule there pokes out above and below the knob and reads as a
-    // stray line, and the stop is already legible while the user drags. The reset gesture itself is
-    // announced by the slider's tooltip.
-    // A standard single-line row: the slider control keeps its CONTROL_H height, while the row
-    // itself uses the shared SINGLE_LINE_ROW_H like every other row on the page.
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(keystroke_display_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::KeystrokeDisplay,
-        canvas.last_row(),
-        &t("settings.row_keystroke_display_max_extent"),
-        None,
-    );
-    ui.keystroke_display_max_extent = SettingsRow::tall(
-        keystroke_display_view,
-        label_x,
-        y,
-        label_w,
-        &t("settings.row_keystroke_display_max_extent"),
-        SettingsControl::stepped_slider(
-            ctrl_x,
-            y + 10.0,
-            SettingsRow::slider_width(ctrl_w),
-            row_h,
-            max_extent_slider_min(),
-            max_extent_slider_max(),
-            crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_STEP as i64,
-            max_extent_slider_value(
-                crate::config::CONFIG
-                    .read()
-                    .unwrap()
-                    .keystroke_display
-                    .max_extent_percent,
-            ),
-            // Double-click restores the 50% default, which is the panel's pre-setting behaviour.
-            Some(crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT as f64),
-        ),
-    )
-    .1;
-    ui.keystroke_display_max_extent_value = SettingsRow::attach_slider_readout(
-        keystroke_display_view,
-        ui.keystroke_display_max_extent,
-        max_extent_readout(
-            crate::config::CONFIG
-                .read()
-                .unwrap()
-                .keystroke_display
-                .max_extent_percent,
-        ),
-    );
-    bind_control(target, ui.keystroke_display_max_extent);
-    canvas.card(&t("settings.header_keystroke_display_options"));
-    set_settings_search_section(&t("settings.header_keystroke_display_options"));
-
-    sweep_unindexed_rows(&canvas, SettingsPageId::KeystrokeDisplay);
-    let content_bottom = canvas.finish();
-    ui.page_canvases[SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX] = canvas;
-    content_bottom
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+        &mut page_view::NoHooks,
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::KeystrokeDisplay, built),
+        Err(_) => {
+            // A first build has no previous state: the page stays empty and nothing is
+            // published, which is better than a page that looks alive but is not wired.
+            empty_page(
+                ui,
+                SettingsPageId::KeystrokeDisplay,
+                keystroke_display_view,
+                context,
+                keystroke_display_doc_h,
+            )
+        }
+    }
 }
 
 /// Build the Finder Menu page and return its final card bottom.
@@ -1247,612 +1024,47 @@ pub(super) unsafe fn build_mouse_page(
     content_bottom
 }
 
-/// Build the Clipboard page and return its final options-card bottom.
+/// Build the Clipboard page: the described static rows, then the excluded-applications card the
+/// page draws itself (its list is not a row set the description can express).
 pub(super) unsafe fn build_clipboard_page(
     context: &SettingsPageBuildContext,
     clipboard_view: *mut AnyObject,
     clipboard_doc_h: f64,
     ui: &mut SettingsUi,
 ) -> f64 {
-    let content_w = context.content_w;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let label_w = layout.label_w;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
-    // The page's layout owner: rows, cards, the title and the document height all follow from it.
-    // The page's rows fall back to this page's title as their section until a card sets one.
     begin_settings_search_page();
-    let mut canvas = PageCanvas::new(
+    let input = PageInput::capture();
+    let mut hooks = ClipboardHooks {
+        shortcut_title: crate::mouse::shortcut::display_shortcut(&input.config.clipboard.shortcut),
+    };
+    match build_page(
+        ui,
+        SettingsPageId::Clipboard,
         clipboard_view,
-        content_w,
-        layout,
-        &t("settings.sidebar_clipboard"),
+        context.content_w,
+        context.layout,
         clipboard_doc_h,
         context.page_frame.size.height,
-    );
-    let caption = t("settings.desc_clipboard_enabled");
-    let caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
-    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
-    let cy = canvas.next_row(caption_row_h);
-    // English "Enable clipboard history" (measured 146pt) plus cell padding sits on
-    // the label_w=150 edge; widen to 225 along with the clear_on_quit/move_used_to_top rows.
-    // `captioned`, not `described`: the latter's subtitle is not rendered at all, and this row has to
-    // state that turning the feature off deletes the saved records -- that line is the only warning
-    // the user gets, so it must actually be drawn (asserted by the settings layout smoke).
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_enabled"),
-        Some(&caption),
-    );
-    let (_, _, ui_clipboard_enabled) = SettingsRow::captioned(
-        clipboard_view,
-        label_x,
-        cy,
-        caption_w,
-        caption_row_h,
-        &t("settings.row_clipboard_enabled"),
-        &caption,
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    ui.clipboard_enabled = ui_clipboard_enabled;
-    let _: () = msg_send![ui.clipboard_enabled, setTarget: target];
-    let _: () = msg_send![
-        ui.clipboard_enabled,
-        setAction: sel!(handleClipboardEnabledToggle:)
-    ];
-    // Pause recording. A persisted switch, unlike the panel pin: a pause is a standing intent, so
-    // a restart must not silently resume collecting. While it is on, the poll timer keeps running
-    // and advances the changeCount baseline, so nothing copied during the pause is recorded later.
-    let pause_caption = t("settings.desc_clipboard_paused");
-    let pause_row_h = widgets::captioned_row_height(&pause_caption, caption_w);
-    let cy = canvas.next_row(pause_row_h);
-    // Second row of its card: it needs the same hairline the rest of the page's rows carry, or the
-    // two switches read as one block.
-    SettingsRow::separator_above_row(clipboard_view, cy, pause_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_paused"),
-        Some(&pause_caption),
-    );
-    let (_, _, ui_clipboard_paused) = SettingsRow::captioned(
-        clipboard_view,
-        label_x,
-        cy,
-        caption_w,
-        pause_row_h,
-        &t("settings.row_clipboard_paused"),
-        &pause_caption,
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    ui.clipboard_paused = ui_clipboard_paused;
-    let _: () = msg_send![ui.clipboard_paused, setTarget: target];
-    let _: () = msg_send![ui.clipboard_paused, setAction: sel!(handlePauseRecordingToggle:)];
-    canvas.card(&t("settings.header_clipboard"));
-    set_settings_search_section(&t("settings.header_clipboard"));
-    // Keep the history controls in a second titled card, matching the switcher layout.
-    canvas.next_section();
-    let active_shortcut = crate::config::CONFIG
-        .read()
-        .unwrap()
-        .clipboard
-        .shortcut
-        .clone();
-    let shortcut_row_h = (row_h + 22.0).max(60.0);
-    let cy = canvas.next_row(shortcut_row_h);
-    ui.clipboard_shortcut_row_height = shortcut_row_h;
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_shortcut"),
-        None,
-    );
-    ui.clipboard_shortcut = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        220.0,
-        shortcut_row_h,
-        &t("settings.row_clipboard_shortcut"),
-        SettingsControl::button(
-            ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
-            cy + (shortcut_row_h - ROW_ACTION_BTN_H) / 2.0,
-            ROW_ACTION_BTN_W,
-            ROW_ACTION_BTN_H,
-            &crate::mouse::shortcut::display_shortcut(&active_shortcut),
-            target,
-            sel!(handleClipboardShortcutRecord:),
-            SettingsButtonRole::ControlField,
-        ),
-    );
-    ui.clipboard_shortcut_error =
-        make_value_label(label_x, cy + 2.0, content_w - label_x - 12.0, 18.0, "");
-    apply_settings_text_role(ui.clipboard_shortcut_error, SettingsTextRole::Destructive);
-    let _: () = msg_send![ui.clipboard_shortcut_error, setHidden: true];
-    let _: () = msg_send![clipboard_view, addSubview: ui.clipboard_shortcut_error];
-    release_obj(ui.clipboard_shortcut_error);
-    let shortcut_tooltip = make_nsstring(&t("settings.desc_clipboard_shortcut"));
-    let _: () = msg_send![ui.clipboard_shortcut, setToolTip: shortcut_tooltip];
-    release_obj(shortcut_tooltip);
-    // Pin-selection popup: items = [Follow the Pinned Entry, Keep Current Position];
-    // default index 0 (follow); the real value is set by load_settings_from.
-    let pin_labels = [
-        t("settings.pin_follow_entry"),
-        t("settings.pin_keep_position"),
-    ];
-    let pin_label_refs: Vec<&str> = pin_labels.iter().map(|s| s.as_str()).collect();
-    let pin_metrics = SettingsSelect::metrics();
-    ui.clipboard_pin_follow_row_height = pin_metrics.row_h;
-    ui.clipboard_row_gap = layout.row_gap;
-    let cy = canvas.next_row(pin_metrics.row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, pin_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_pin_follow"),
-        None,
-    );
-    record_settings_search_options(&pin_label_refs);
-    ui.clipboard_pin_follow = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        220.0,
-        pin_metrics.row_h,
-        &t("settings.row_clipboard_pin_follow"),
-        SettingsControl::popup(
-            ctrl_x,
-            cy + (pin_metrics.row_h - pin_metrics.control_h) / 2.0,
-            ctrl_w,
-            pin_metrics.control_h,
-            &pin_label_refs,
-            0,
-        ),
-    );
-    bind_control(target, ui.clipboard_pin_follow);
-    // Where the picker opens ON the screen it opens on. The screen itself is not a choice -- it is the
-    // one the pointer is on -- so both items describe placement within that screen; the row sits next
-    // to the pin-selection popup because both answer "where does something appear".
-    let placement_labels = [
-        t("settings.picker_placement_cursor"),
-        t("settings.picker_placement_center"),
-    ];
-    let placement_label_refs: Vec<&str> = placement_labels.iter().map(|s| s.as_str()).collect();
-    let placement_metrics = SettingsSelect::metrics();
-    let cy = canvas.next_row(placement_metrics.row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, placement_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_picker_placement"),
-        None,
-    );
-    record_settings_search_options(&placement_label_refs);
-    ui.clipboard_picker_placement = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        220.0,
-        placement_metrics.row_h,
-        &t("settings.row_clipboard_picker_placement"),
-        SettingsControl::popup(
-            ctrl_x,
-            cy + (placement_metrics.row_h - placement_metrics.control_h) / 2.0,
-            ctrl_w,
-            placement_metrics.control_h,
-            &placement_label_refs,
-            0,
-        ),
-    );
-    bind_control(target, ui.clipboard_picker_placement);
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // Persist switch (saved to disk, survives restarts; plaintext on disk -- the
-    // privacy implications are documented in the README).
-    // Clear-on-quit switch (history is written to disk while the app runs; this is the way to leave
-    // nothing behind after a session). Measured at the row's 14pt label font: en "Clear history on
-    // quit or shutdown" 214.2pt, zh-Hans 194.5pt, zh-Hant 222.3pt -- all past the default
-    // label_w=150, and the Traditional label also past the 220 this row used before, so it reserves
-    // 236 (the control column starts ~150pt further right, so nothing is squeezed).
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_clear_on_quit"),
-        None,
-    );
-    ui.clipboard_clear_on_quit = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        236.0,
-        described_row_h,
-        &t("settings.row_clipboard_clear_on_quit"),
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    bind_control(target, ui.clipboard_clear_on_quit);
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // Opt-in second header button in the history picker ("clear all"): it also takes the pinned
-    // entries of the visible scope, so it stays off by default. The plain clear button never
-    // touches pinned entries either way.
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_separate_clear_all"),
-        None,
-    );
-    ui.clipboard_separate_clear_all = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        236.0,
-        described_row_h,
-        &t("settings.row_clipboard_separate_clear_all"),
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    bind_control(target, ui.clipboard_separate_clear_all);
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // show the source app.
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_show_source_app"),
-        None,
-    );
-    ui.clipboard_show_source_app = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        label_w,
-        described_row_h,
-        &t("settings.row_clipboard_show_source_app"),
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    bind_control(target, ui.clipboard_show_source_app);
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // Move used entries to the top (whether pasting reorders the history; on by
-    // default = current behavior).
-    // English "Move used entries to top" (measured 150.3pt) exceeds label_w=150 and
-    // rendered truncated ("move used entries to" after switching to English), widened
-    // to 225.
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_move_used_to_top"),
-        None,
-    );
-    ui.clipboard_move_used_to_top = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        220.0,
-        described_row_h,
-        &t("settings.row_clipboard_move_used_to_top"),
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    bind_control(target, ui.clipboard_move_used_to_top);
-    let caption = t("settings.desc_clipboard_delete_after_paste");
-    let caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
-    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
-    let cy = canvas.next_row(caption_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, caption_row_h, content_w);
-    // The destructive shortcut remains opt-in; its gesture hint lives in the muted caption.
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_delete_after_paste"),
-        None,
-    );
-    let (_, _, ui_control) = SettingsRow::captioned(
-        clipboard_view,
-        label_x,
-        cy,
-        caption_w,
-        caption_row_h,
-        &t("settings.row_clipboard_delete_after_paste"),
-        &caption,
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    ui.clipboard_delete_after_paste = ui_control;
-    bind_control(target, ui.clipboard_delete_after_paste);
-    // This row is a child of the switch above (indented label): it only appears while "delete
-    // entry after paste" is on, so it belongs to a row group the page layout owner skips (the row
-    // disappears and the rows below close its gap) rather than being greyed out. The group opens
-    // before the row is placed: `next_row` records the group its row belongs to.
-    canvas.group_begin(RowGroup::ClipboardDeleteChild);
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_clear_system_pasteboard_after_paste"),
-        None,
-    );
-    let (_, clear_pasteboard_switch) = SettingsRow::tall_with_height(
-        clipboard_view,
-        label_x + 18.0,
-        cy,
-        ctrl_x - label_x - 36.0,
-        described_row_h,
-        &t("settings.row_clipboard_clear_system_pasteboard_after_paste"),
-        SettingsControl::switch(ctrl_x + ctrl_w, cy, row_h, false),
-    );
-    ui.clipboard_clear_system_pasteboard_after_paste = clear_pasteboard_switch;
-    bind_control(target, ui.clipboard_clear_system_pasteboard_after_paste);
-    canvas.group_end();
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // max entries (number input).
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_max_entries"),
-        None,
-    );
-    ui.clipboard_max_entries = SettingsRow::plain(
-        clipboard_view,
-        label_x,
-        cy,
-        label_w,
-        described_row_h,
-        &t("settings.row_clipboard_max_entries"),
-        SettingsControl::text_input(ctrl_x, cy, ctrl_w, row_h, "50"),
-    );
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // Auto-expire days slider: 0..=7, where 0 means never; the current value is shown on
-    // the right.
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_auto_expire_days"),
-        None,
-    );
-    let (_, auto_expire_slider) = SettingsRow::tall(
-        clipboard_view,
-        label_x,
-        cy,
-        label_w,
-        &t("settings.row_clipboard_auto_expire_days"),
-        SettingsControl::stepped_slider(
-            ctrl_x,
-            cy + 10.0,
-            SettingsRow::slider_width(ctrl_w),
-            row_h,
-            CLIPBOARD_AUTO_EXPIRE_MIN,
-            CLIPBOARD_AUTO_EXPIRE_MAX,
-            1,
-            CLIPBOARD_AUTO_EXPIRE_DEFAULT,
-            // Double-click restores the default (3 days).
-            Some(CLIPBOARD_AUTO_EXPIRE_DEFAULT as f64),
-        ),
-    );
-    ui.clipboard_auto_expire_days = auto_expire_slider;
-    ui.clipboard_auto_expire_days_value_label = SettingsRow::attach_slider_readout(
-        clipboard_view,
-        auto_expire_slider,
-        CLIPBOARD_AUTO_EXPIRE_DEFAULT,
-    );
-    bind_control(target, ui.clipboard_auto_expire_days);
-    let cy = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, described_row_h, content_w);
-    // Image row height: how many text-row heights an image entry occupies in the picker
-    // (1 = thumbnail row like today, 2/3 = a taller preview row).
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_image_rows"),
-        None,
-    );
-    let (_, image_rows_slider) = SettingsRow::tall(
-        clipboard_view,
-        label_x,
-        cy,
-        label_w,
-        &t("settings.row_clipboard_image_rows"),
-        SettingsControl::stepped_slider(
-            ctrl_x,
-            cy + 10.0,
-            SettingsRow::slider_width(ctrl_w),
-            row_h,
-            1,
-            3,
-            1,
-            1,
-            // Double-click restores the default (1 row).
-            Some(1.0),
-        ),
-    );
-    ui.clipboard_image_rows = image_rows_slider;
-    ui.clipboard_image_rows_value_label =
-        SettingsRow::attach_slider_readout(clipboard_view, image_rows_slider, 1);
-    bind_control(target, ui.clipboard_image_rows);
-    canvas.card(&t("settings.header_clipboard_options"));
-    set_settings_search_section(&t("settings.header_clipboard_options"));
-
-    // ---- Excluded applications ----
-    // Copies made by these apps are never recorded (matched inside the poll, before the payload is
-    // read). The list is a card of its own: it grows and shrinks, so it must not share a card with
-    // the fixed rows above. next_section opens the group and card closes it over the rows, which is
-    // the order every other page uses -- calling card first would re-title the rows above.
-    canvas.next_section();
-    let excluded = crate::config::CONFIG
-        .read()
-        .unwrap()
-        .clipboard
-        .excluded_apps
-        .clone();
-    // One row height for the whole card: it follows the binding list's single-line row (tall enough
-    // for a 28pt row action with breathing room), not the 32pt control height the page's own rows
-    // use. The list rows AND the controls under them share it, so the card reads as one rhythm.
-    let excluded_row_h = described_row_h;
-    if excluded.is_empty() {
-        let cy = canvas.next_row(excluded_row_h);
-        record_settings_search_row(
-            SettingsPageId::Clipboard,
-            canvas.last_row(),
-            &t("settings.clipboard_excluded_empty"),
-            None,
-        );
-        let label = make_value_label(
-            label_x,
-            cy + 10.0,
-            content_w - label_x - 12.0,
-            18.0,
-            &t("settings.clipboard_excluded_empty"),
-        );
-        apply_settings_text_role(label, SettingsTextRole::Secondary);
-        let _: () = msg_send![clipboard_view, addSubview: label];
-        release_obj(label);
-    } else {
-        let last = excluded.len().saturating_sub(1);
-        for (index, entry) in excluded.iter().enumerate() {
-            let cy = canvas.next_row(excluded_row_h);
-            // The row style follows the Key Bindings list: a name and one trailing row action, with a
-            // divider between rows instead of a bordered control per row. The LAST row hands that
-            // boundary to the row below it (the add control draws its own), so the card never carries
-            // two overlapping lines at one edge.
-            if index < last {
-                SettingsRow::separator(clipboard_view, cy, content_w);
-            }
-            // The display name is a snapshot taken when the entry was added; the identifier is the
-            // only matching key and is shown when the snapshot is missing.
-            let display = if entry.name.is_empty() {
-                entry.bundle_id.clone()
-            } else {
-                entry.name.clone()
-            };
-            record_settings_search_row(
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+        &mut hooks,
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::Clipboard, built),
+        Err(_) => {
+            // A first build has no previous state: the page stays empty and nothing is
+            // published, which is better than a page that looks alive but is not wired.
+            empty_page(
+                ui,
                 SettingsPageId::Clipboard,
-                canvas.last_row(),
-                &display,
-                None,
-            );
-            let btn_y = cy + (excluded_row_h - bindings::BINDING_BTN_H) / 2.0;
-            let delete = SettingsButton::action(
-                NSRect::new(
-                    NSPoint::new(ctrl_x + ctrl_w - bindings::BINDING_BTN_W, btn_y),
-                    NSSize::new(bindings::BINDING_BTN_W, bindings::BINDING_BTN_H),
-                ),
-                &t("settings.clipboard_excluded_remove"),
-                target,
-                sel!(handleClipboardExcludedRemove:),
-                SettingsButtonRole::ROW_ACTION,
-            );
-            // The returned control is the remove button: the handler finds the entry by comparing
-            // the sender pointer against this list.
-            // `tall_before_control`, not `plain`: the tall row measures its label for a single-line
-            // row, which is what keeps the name and the 28pt row action on one centre line. `plain`
-            // lays the label out for the page's 32pt control rows and sits low in a 56pt row.
-            let (_, remove) = SettingsRow::tall_before_control(
                 clipboard_view,
-                label_x,
-                cy,
-                ctrl_x + ctrl_w - bindings::BINDING_BTN_W,
-                super::SETTINGS_CONTROL_LABEL_GAP,
-                &display,
-                delete,
-            );
-            ui.clipboard_excluded_remove.push(remove);
+                context,
+                clipboard_doc_h,
+            )
         }
     }
-    // Add a running app. The candidates are captured here so the handler can map the popup's
-    // selection index back to an identifier without re-enumerating (and re-sorting) running apps
-    // between the click and the callback.
-    let running = crate::app_identity::running_apps_with_bundle_ids();
-    let listed: Vec<String> = excluded
-        .iter()
-        .map(|e| e.bundle_id.to_ascii_lowercase())
-        .collect();
-    let candidates: Vec<(String, String)> = running
-        .into_iter()
-        .filter(|(bundle_id, _)| !listed.contains(&bundle_id.to_ascii_lowercase()))
-        .collect();
-    // ONE add control. The popup lists the running candidates and carries a trailing "choose from
-    // disk" entry, the macOS "Other…" pattern: the same intent, reached from one place, instead of
-    // two rows that both mean "exclude an application".
-    let mut add_labels: Vec<String> = vec![t("settings.clipboard_excluded_add_placeholder")];
-    add_labels.extend(candidates.iter().map(|(_, name)| name.clone()));
-    add_labels.push(t("settings.clipboard_excluded_choose_from_disk"));
-    let add_label_refs: Vec<&str> = add_labels.iter().map(String::as_str).collect();
-    let add_metrics = SettingsSelect::metrics();
-    let cy = canvas.next_row(excluded_row_h);
-    // The list's last row handed this boundary over, so this is the one and only line here.
-    SettingsRow::separator_above_row(clipboard_view, cy, excluded_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_excluded_add"),
-        None,
-    );
-    let add_popup = SettingsControl::popup(
-        ctrl_x,
-        cy + (excluded_row_h - add_metrics.control_h) / 2.0,
-        ctrl_w,
-        add_metrics.control_h,
-        &add_label_refs,
-        0,
-    );
-    style_flat_popup(add_popup);
-    let _: () = msg_send![add_popup, setTarget: target];
-    let _: () = msg_send![add_popup, setAction: sel!(handleClipboardExcludedAdd:)];
-    ui.clipboard_excluded_add = SettingsRow::tall_before_control(
-        clipboard_view,
-        label_x,
-        cy,
-        ctrl_x,
-        super::SETTINGS_CONTROL_LABEL_GAP,
-        &t("settings.row_clipboard_excluded_add"),
-        add_popup,
-    )
-    .1;
-    ui.clipboard_excluded_candidates = candidates;
-    // (The disk picker lives inside the add popup above, as its trailing entry.)
-    // Restore the built-in list.
-    let cy = canvas.next_row(excluded_row_h);
-    SettingsRow::separator_above_row(clipboard_view, cy, excluded_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Clipboard,
-        canvas.last_row(),
-        &t("settings.row_clipboard_excluded_restore"),
-        None,
-    );
-    ui.clipboard_excluded_restore = SettingsRow::tall_before_control(
-        clipboard_view,
-        label_x,
-        cy,
-        ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
-        super::SETTINGS_CONTROL_LABEL_GAP,
-        &t("settings.row_clipboard_excluded_restore"),
-        SettingsControl::button(
-            ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
-            cy + (excluded_row_h - ROW_ACTION_BTN_H) / 2.0,
-            ROW_ACTION_BTN_W,
-            ROW_ACTION_BTN_H,
-            &t("settings.clipboard_excluded_restore_action"),
-            target,
-            sel!(handleClipboardExcludedRestore:),
-            SettingsButtonRole::ControlField,
-        ),
-    )
-    .1;
-
-    canvas.card(&t("settings.header_clipboard_excluded"));
-    set_settings_search_section(&t("settings.header_clipboard_excluded"));
-
-    sweep_unindexed_rows(&canvas, SettingsPageId::Clipboard);
-    let content_bottom = canvas.finish();
-    ui.page_canvases[SETTINGS_CLIPBOARD_PAGE_INDEX] = canvas;
-    content_bottom
 }
-
 /// Build the Key Bindings page: one card holding the master switch, the editable binding list and
 /// the add row. Returns the add card's bottom.
 ///
@@ -2517,9 +1729,13 @@ unsafe fn record_page_search_entries(page: SettingsPageId, view: &PageView, canv
     sidebar::begin_settings_search_section();
     let page_index = settings_page_index(page);
     for (row, spec) in view.rows.iter().enumerate() {
+        // A row the page draws itself also takes a canvas row, so the described index is not the
+        // canvas row once one has been opened before it. Without this correction every entry after
+        // such a row is attached to its neighbour and a search hit scrolls to the wrong control.
+        let canvas_row = page_view::canvas_row_of_described_row(view, row);
         let entry = sidebar::SearchEntry::row(
             page_index,
-            row,
+            canvas_row,
             &spec.search.label,
             spec.search.desc.as_deref(),
             &spec.search.section,
@@ -2529,12 +1745,12 @@ unsafe fn record_page_search_entries(page: SettingsPageId, view: &PageView, canv
         // The same backfill the pages built inline get: whatever the row's views actually show
         // (a button's title, a dropdown's choices) is searchable too.
         let mut text = Vec::new();
-        if let Some(views) = canvas.row_views(row) {
+        if let Some(views) = canvas.row_views(canvas_row) {
             for &view in views {
                 collect_settings_search_text(view, &mut text);
             }
         }
-        sidebar::extend_settings_search_row(page_index, row, &text);
+        sidebar::extend_settings_search_row(page_index, canvas_row, &text);
     }
 }
 

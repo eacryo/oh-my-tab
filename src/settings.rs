@@ -2055,7 +2055,11 @@ pub(super) fn refresh_migrated_pages_from(ui: &SettingsUi, cfg: &Config) {
         page_view::refresh_migrated_pages(
             ui,
             &input,
-            &[SettingsPageId::Switcher, SettingsPageId::General],
+            &[
+                SettingsPageId::Switcher,
+                SettingsPageId::General,
+                SettingsPageId::KeystrokeDisplay,
+            ],
         );
     }
 }
@@ -2118,46 +2122,6 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             let mod_idx =
                 crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier) as isize;
             let _: () = msg_send![ui.modifier, selectItemAtIndex: mod_idx];
-            let _: () = msg_send![
-                ui.keystroke_display_enabled,
-                setState: if cfg.keystroke_display.enabled { 1isize } else { 0isize }
-            ];
-            let mode_idx: isize = match cfg.keystroke_display.mode.as_str() {
-                "shortcuts" => 1,
-                "commands" => 2,
-                _ => 0,
-            };
-            let _: () = msg_send![ui.keystroke_display_mode, selectItemAtIndex: mode_idx];
-            let tap_idx: isize = if cfg.keystroke_display.tap_level == "hid" {
-                1
-            } else {
-                0
-            };
-            let _: () = msg_send![ui.keystroke_display_tap_level, selectItemAtIndex: tap_idx];
-            let display_position_idx = KEYSTROKE_DISPLAY_POSITION_VALUES
-                .iter()
-                .position(|mode| *mode == cfg.keystroke_display.display_position)
-                .unwrap_or(1) as isize;
-            let _: () = msg_send![
-                ui.keystroke_display_position,
-                selectItemAtIndex: display_position_idx
-            ];
-            let initial_position_idx = KEYSTROKE_DISPLAY_INITIAL_POSITION_VALUES
-                .iter()
-                .position(|edge| *edge == cfg.keystroke_display.initial_position)
-                .unwrap_or(1) as isize;
-            let _: () = msg_send![
-                ui.keystroke_display_initial_position,
-                selectItemAtIndex: initial_position_idx
-            ];
-            let max_extent = crate::config::keystroke_display_max_extent_percent_snap(
-                cfg.keystroke_display.max_extent_percent,
-            );
-            let _: () = msg_send![
-                ui.keystroke_display_max_extent,
-                setIntegerValue: max_extent as isize
-            ];
-            page_builder::set_max_extent_readout(ui.keystroke_display_max_extent_value, max_extent);
             // locale: select the item matching CONFIG.i18n.locale; fall back to index 0 (auto).
             let loc_idx: isize = LOCALE_VALUES
                 .iter()
@@ -2273,93 +2237,31 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             // and the clipboard-delete rows (Clipboard), so every open needs it whatever page it is for.
             update_conditional_rows(ui);
 
-            // Clipboard page: populate the recorded chord from the global config.
+            // Clipboard page: the described rows were refilled from the shared update description
+            // above. The rows the page builds itself keep their own writes here -- the recorded
+            // chord (with any capture in progress), the numeric entry limit, and the dependent
+            // row visibility the master switch list needs.
             let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
                 && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
+            // Key-bindings page: the master switch is static; its rows are rendered by the bindings
+            // module, which also owns their enable state.
+            let _: () = msg_send![
+                ui.key_bindings_enabled,
+                setState: if cfg.key_bindings.enabled { 1isize } else { 0isize }
+            ];
             dispatch::set_clipboard_shortcut_capture_state(
                 ui,
                 &cfg.clipboard.shortcut,
                 recording,
                 None,
             );
-            let _: () = msg_send![
-                ui.clipboard_enabled,
-                setState: if cfg.clipboard.enabled { 1isize } else { 0isize }
-            ];
-            // Key-bindings page: the master switch is static, the rows are rendered from the config
-            // by the bindings module (which also owns their enable state).
-            let _: () = msg_send![
-                ui.key_bindings_enabled,
-                setState: if cfg.key_bindings.enabled { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.clipboard_clear_on_quit,
-                setState: if cfg.clipboard.clear_on_quit { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.clipboard_separate_clear_all,
-                setState: if cfg.clipboard.separate_clear_all {
-                    1isize
-                } else {
-                    0isize
-                }
-            ];
-            let _: () = msg_send![
-                ui.clipboard_show_source_app,
-                setState: if cfg.clipboard.show_source_app { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.clipboard_move_used_to_top,
-                setState: if cfg.clipboard.move_used_to_top { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.clipboard_delete_after_paste,
-                setState: if cfg.clipboard.delete_after_paste { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.clipboard_clear_system_pasteboard_after_paste,
-                setState: if cfg.clipboard.clear_system_pasteboard_after_paste {
-                    1isize
-                } else {
-                    0isize
-                }
-            ];
-            // The clipboard controls are populated after the initial conditional-row pass, so
-            // apply visibility once more from the saved config here.
-            update_clipboard_delete_dependent_visibility_from_config(ui, cfg);
-            let _: () = msg_send![
-                ui.clipboard_paused,
-                setState: if cfg.clipboard.paused { 1isize } else { 0isize }
-            ];
             set_field(
                 ui.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),
             );
-            let auto_expire_days = (cfg.clipboard.auto_expire_days as i64)
-                .clamp(CLIPBOARD_AUTO_EXPIRE_MIN, CLIPBOARD_AUTO_EXPIRE_MAX);
-            let _: () = msg_send![
-                ui.clipboard_auto_expire_days,
-                setIntegerValue: auto_expire_days as isize
-            ];
-            set_field(ui.clipboard_auto_expire_days_value_label, auto_expire_days);
-            let image_rows = (cfg.clipboard.image_rows as i64).clamp(1, 3);
-            let _: () = msg_send![
-                ui.clipboard_image_rows,
-                setIntegerValue: image_rows as isize
-            ];
-            set_field(ui.clipboard_image_rows_value_label, image_rows);
-            // pin_follow_selection: popup index 0 = follow, 1 = keep.
-            let pin_idx: isize = if cfg.clipboard.pin_follow_selection {
-                0
-            } else {
-                1
-            };
-            let _: () = msg_send![ui.clipboard_pin_follow, selectItemAtIndex: pin_idx];
-            // picker_placement: popup index 0 = follow the cursor, 1 = screen center. The same mapping
-            // `apply_control_field` writes back, so an untouched page cannot show one placement while
-            // the picker uses the other.
-            let placement_idx = dispatch::picker_placement_index(&cfg.clipboard.picker_placement);
-            let _: () = msg_send![ui.clipboard_picker_placement, selectItemAtIndex: placement_idx];
+            // The clipboard controls are populated after the initial conditional-row pass, so
+            // apply visibility once more from the saved config here.
+            update_clipboard_delete_dependent_visibility_from_config(ui, cfg);
             update_clipboard_controls_enabled(ui);
             // Finder Menu page: the status line is read-only state from System Settings, and every
             // switch mirrors the config's vec-backed fields (membership, not order).
