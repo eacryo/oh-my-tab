@@ -48,6 +48,7 @@ pub(super) unsafe fn build_switcher_page(
         context.page_viewport_h,
         &input,
         context.target,
+        &mut page_view::NoHooks,
     ) {
         Ok(built) => publish_built_page(ui, SettingsPageId::Switcher, built),
         Err(_) => {
@@ -664,6 +665,7 @@ pub(super) unsafe fn build_general_page(
         context.page_viewport_h,
         &input,
         context.target,
+        &mut page_view::NoHooks,
     ) {
         Ok(built) => publish_built_page(ui, SettingsPageId::General, built),
         Err(_) => empty_page(

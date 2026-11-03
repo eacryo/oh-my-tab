@@ -227,6 +227,9 @@ pub(super) enum ControlKind {
     },
     /// An action band's button: pressing it runs the row's action.
     Button,
+    /// A read-only value drawn in the control column (a permission status, a device name): the row
+    /// carries text, not an editable control, and a callback refreshes it.
+    Value,
 }
 
 /// What a control is, for the dispatcher. A field identity is what the config stores; an action
@@ -323,11 +326,14 @@ pub(super) struct SearchRow {
 }
 
 /// The value a control starts with, and the value the refill writes later.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum Value {
     Switch(bool),
     Index(usize),
     Slider(i64),
+    /// A control whose content is data rather than a locale key: the clipboard shortcut recorder's
+    /// title is the recorded chord, and a permission status row shows text a callback maintains.
+    Dynamic(String),
     /// An action row has no value.
     None,
 }
@@ -339,6 +345,7 @@ impl Value {
             Value::Switch(false) => "off".to_string(),
             Value::Index(index) => index.to_string(),
             Value::Slider(value) => value.to_string(),
+            Value::Dynamic(text) => text.clone(),
             Value::None => String::new(),
         }
     }
@@ -370,7 +377,53 @@ pub(super) struct PageView {
     pub(super) initial_section: String,
     /// A page-level block above the rows (the General page's permission banner).
     pub(super) banner: Option<BannerSpec>,
+    /// How far below the document's top edge the rows start, when the page draws its OWN header
+    /// instead of the shared page title. `None` = the shared title (the canvas measures it); the
+    /// About page pins an icon, a title and a subtitle of its own, so it states the offset the
+    /// canvas must start from.
+    pub(super) header_offset: Option<f64>,
+    /// Rows the page draws ITSELF, in place inside a described card.
+    ///
+    /// The description covers controls; a few rows are widgets it has no kind for (a shortcut
+    /// recorder with a capture state machine, a numeric text field). Those are ordered here, so the
+    /// card still runs in one sequence, and [`PageHooks::extra_row`] draws them where they belong.
+    pub(super) extra_rows: Vec<PageRowSpec>,
 }
+
+/// One row a page draws itself: where it sits, what the page calls it, and how tall it is on top of
+/// the described rows it follows.
+#[derive(Clone, Debug, PartialEq)]
+pub(super) struct PageRowSpec {
+    /// The card the row belongs to, like [`RowSpec::card`].
+    pub(super) card: usize,
+    /// The page's own name for this row; passed back to [`PageHooks::extra_row`].
+    pub(super) key: &'static str,
+    /// The row's height. A described row's height comes from its copy; a page-drawn row states its
+    /// own, because only the page knows what it puts there.
+    pub(super) height: f64,
+    /// How many described rows of that card come before it.
+    pub(super) after_row: usize,
+}
+
+/// What a page supplies to draw the rows it owns. The default draws none, which is every page whose
+/// rows are all described.
+pub(super) trait PageHooks {
+    /// Draw the extra row `spec`, whose origin the canvas has already advanced to.
+    unsafe fn extra_row(
+        &mut self,
+        _canvas: &mut PageCanvas,
+        _rendered: &mut RenderedPage,
+        _spec: &PageRowSpec,
+        _origin_y: f64,
+        _target: *mut AnyObject,
+    ) -> Result<(), RegisterError> {
+        Ok(())
+    }
+}
+
+/// The hooks a page with no self-drawn rows uses.
+pub(super) struct NoHooks;
+impl PageHooks for NoHooks {}
 
 /// The permission banner a page carries above its rows.
 #[derive(Clone, Debug, PartialEq)]
@@ -731,6 +784,7 @@ fn row_height(
         ControlKind::Switch | ControlKind::Button | ControlKind::Slider { .. } => {
             input.layout.described_row_h
         }
+        ControlKind::Value => SettingsLayout::SINGLE_LINE_ROW_H,
     };
     match row.copy {
         RowCopy::Plain => base,
@@ -796,6 +850,19 @@ pub(super) fn layout_rows(
             card += 1;
             card_tops.push(cursor);
         }
+        // A page-drawn row opens here: it costs its own height plus the row gap, exactly what
+        // `render_page` advances by, so the described rows below it land where the layout says.
+        let drawn_in_card = view.rows[..index]
+            .iter()
+            .filter(|earlier| earlier.card == row.card)
+            .count();
+        let extra_heights: f64 = view
+            .extra_rows
+            .iter()
+            .filter(|extra| extra.card == row.card && extra.after_row == drawn_in_card)
+            .map(|extra| metrics.row_gap + extra.height)
+            .sum();
+        cursor -= extra_heights;
         let subtitle_h = text.subtitle_heights.get(index).copied().unwrap_or(0.0);
         let height = row_height(row, subtitle_h, metrics, input);
         cursor -= metrics.row_gap + height;
@@ -883,6 +950,17 @@ pub(super) fn layout_rows(
                     None,
                 )
             }
+            // A read-only value is drawn where the control column puts a control, left-aligned so a
+            // status line reads as text rather than as a disabled button.
+            ControlKind::Value => (
+                BoxRect::new(
+                    layout.control_x,
+                    cursor + (height - metrics.control_h) / 2.0,
+                    layout.control_w,
+                    metrics.control_h,
+                ),
+                None,
+            ),
         };
         rows.push(RowLayout {
             frame: BoxRect::new(0.0, cursor, content_w, height),
@@ -965,6 +1043,7 @@ struct RowWriter {
     card: usize,
     section: &'static str,
     rows: Vec<RowSpec>,
+    extra: Vec<PageRowSpec>,
 }
 
 impl RowWriter {
@@ -975,6 +1054,7 @@ impl RowWriter {
             card: 0,
             section: "",
             rows: Vec::new(),
+            extra: Vec::new(),
         }
     }
 
@@ -1002,6 +1082,20 @@ impl RowWriter {
         self.rows.push(row);
     }
 
+    /// Declare a row the PAGE draws itself, after the card's described rows so far.
+    ///
+    /// The row stays inside the current card, so the described rows that follow still land in the
+    /// same card and the card closes where it would have closed anyway.
+    fn extra_row(&mut self, key: &'static str, height: f64) {
+        let after = self.rows.iter().filter(|row| row.card == self.card).count();
+        self.extra.push(PageRowSpec {
+            card: self.card,
+            key,
+            height,
+            after_row: after,
+        });
+    }
+
     fn finish(self) -> PageView {
         PageView {
             page: self.page,
@@ -1009,6 +1103,8 @@ impl RowWriter {
             rows: self.rows,
             initial_section: self.initial_section,
             banner: None,
+            header_offset: None,
+            extra_rows: self.extra,
         }
     }
 }
@@ -1055,6 +1151,12 @@ impl RowDraft {
     #[allow(dead_code)]
     fn depends_on(mut self, field: ControlField) -> Self {
         self.depends_on = Some(field);
+        self
+    }
+
+    /// A `Value::Dynamic` control: its content is data the caller computed, not a locale key.
+    fn dynamic(mut self, text: impl Into<String>) -> Self {
+        self.value = Value::Dynamic(text.into());
         self
     }
 
@@ -1161,7 +1263,7 @@ pub(super) fn page_update_description(
         let values: HashMap<ControlField, Value> = view
             .rows
             .iter()
-            .filter_map(|row| row.field().map(|field| (field, row.value)))
+            .filter_map(|row| row.field().map(|field| (field, row.value.clone())))
             .collect();
         updates.extend(update_description(&view, &values));
     }
@@ -1357,6 +1459,22 @@ unsafe fn render_row(
                 *reset,
             )
         }
+        // A read-only value: text in the control column, refreshed by its callback (permission
+        // status, keychain status). Its identity still comes from the row, so a later update can
+        // find it.
+        ControlKind::Value => {
+            let text = match &row.value {
+                Value::Dynamic(text) => text.clone(),
+                other => other.describe(),
+            };
+            SettingsControl::value_label(
+                placed.control_frame.x,
+                placed.control_frame.y,
+                placed.control_frame.w,
+                placed.control_frame.h,
+                &text,
+            )
+        }
         ControlKind::Button => {
             let action = match &row.id {
                 ControlId::Action(action) => *action,
@@ -1454,6 +1572,7 @@ pub(super) unsafe fn render_page(
     view: &PageView,
     layout: &PageLayout,
     _metrics: &PageMetrics,
+    hooks: &mut dyn PageHooks,
 ) -> Result<RenderedPage, RegisterError> {
     let mut rendered = RenderedPage::default();
     // A conditional row is hidden through the canvas's own group list: the page has no other
@@ -1506,11 +1625,31 @@ pub(super) unsafe fn render_page(
         if card_index > 0 {
             canvas.next_section();
         }
+        // The described rows of this card, in document order, with the page's own rows opened at
+        // the point the description says they follow.
+        let mut drawn_in_card = 0usize;
+        let card_extra: Vec<&PageRowSpec> = view
+            .extra_rows
+            .iter()
+            .filter(|extra| extra.card == card_index)
+            .collect();
+        let mut next_extra = 0usize;
         for (index, row) in view.rows.iter().enumerate() {
             if row.card != card_index {
                 continue;
             }
+            while next_extra < card_extra.len() && card_extra[next_extra].after_row == drawn_in_card
+            {
+                draw_extra_row(canvas, target, card_extra[next_extra], hooks, &mut rendered)?;
+                next_extra += 1;
+            }
             render_row(canvas, target, row, &layout.rows[index], &mut rendered)?;
+            drawn_in_card += 1;
+        }
+        // A row declared after the card's last described row still belongs to it.
+        while next_extra < card_extra.len() {
+            draw_extra_row(canvas, target, card_extra[next_extra], hooks, &mut rendered)?;
+            next_extra += 1;
         }
         canvas.card(&t(card.section));
     }
@@ -1518,6 +1657,19 @@ pub(super) unsafe fn render_page(
         canvas.set_group_visible(group, false);
     }
     Ok(rendered)
+}
+
+/// Open one row the page draws itself: the canvas advances by the row's height and hands the origin
+/// to the page, so its views land inside the card exactly like a described row's would.
+unsafe fn draw_extra_row(
+    canvas: &mut PageCanvas,
+    target: *mut AnyObject,
+    spec: &PageRowSpec,
+    hooks: &mut dyn PageHooks,
+    rendered: &mut RenderedPage,
+) -> Result<(), RegisterError> {
+    let origin = canvas.next_row(spec.height);
+    hooks.extra_row(canvas, rendered, spec, origin, target)
 }
 
 /// Write one control's value from the update description's entry.
@@ -1542,6 +1694,9 @@ pub(super) unsafe fn apply_control_update(control: &RenderedControl, value: &str
                 set_field(control.readout, display);
             }
         }
+        // A read-only value shows the update's display text, which is what a status callback
+        // computed (never a second formatter here).
+        ControlKind::Value => set_field(control.control, display),
         ControlKind::Button => {}
     }
 }
@@ -1699,6 +1854,7 @@ pub(super) unsafe fn build_page(
     page_viewport_h: f64,
     input: &PageInput,
     target: *mut AnyObject,
+    hooks: &mut dyn PageHooks,
 ) -> Result<BuiltPage, RegisterError> {
     let view = view_for(page, input);
     // Identity is a property of the DESCRIPTION, so a duplicate is found before a single view is
@@ -1708,14 +1864,19 @@ pub(super) unsafe fn build_page(
         log_info!("[settings] page description declares a duplicate identity: {error:?}");
         return Err(error);
     }
-    let mut canvas = PageCanvas::new(
-        document,
-        content_w,
-        layout,
-        &t(view.title_key),
-        doc_h,
-        clip_height,
-    );
+    // A page that draws its own header states where its rows start; every other page gets the
+    // shared page title from the canvas, which measures it.
+    let mut canvas = match view.header_offset {
+        Some(offset) => PageCanvas::new_at(document, content_w, layout, offset, doc_h, clip_height),
+        None => PageCanvas::new(
+            document,
+            content_w,
+            layout,
+            &t(view.title_key),
+            doc_h,
+            clip_height,
+        ),
+    };
     // The banner's box comes from the page context (the detail pane's inset and the VISIBLE
     // viewport), not from the page document -- its parent is the settings content view.
     let layout_input = page_layout_input(
@@ -1729,7 +1890,8 @@ pub(super) unsafe fn build_page(
     );
     let metrics = PageMetrics::for_layout(layout);
     let page_layout = layout_rows(&view, &layout_input, &metrics);
-    let mut rendered = match render_page(&mut canvas, target, &view, &page_layout, &metrics) {
+    let mut rendered = match render_page(&mut canvas, target, &view, &page_layout, &metrics, hooks)
+    {
         Ok(rendered) => rendered,
         Err(error) => {
             // A duplicate was refused while building: nothing has been published, and the page's
@@ -1804,7 +1966,14 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             text: measured,
         };
         let layout = layout_rows(&view, &layout_input, &metrics);
-        match render_page(&mut canvas, std::ptr::null_mut(), &view, &layout, &metrics) {
+        match render_page(
+            &mut canvas,
+            std::ptr::null_mut(),
+            &view,
+            &layout,
+            &metrics,
+            &mut NoHooks,
+        ) {
             Ok(rendered) => {
                 // Build state, then the production re-flow with a conditional group collapsed and
                 // expanded again: the checker reads the canvas's CURRENT row origin each time.
@@ -2996,7 +3165,7 @@ mod tests {
                 .collect();
             for (row, update) in rows.iter().zip(updates.iter()) {
                 assert_eq!(update.value, row.value.describe(), "{page:?}: {update:?}");
-                match (&row.control, row.value) {
+                match (&row.control, row.value.clone()) {
                     (ControlKind::Switch, Value::Switch(_)) => {
                         assert!(update.value == "on" || update.value == "off");
                     }
