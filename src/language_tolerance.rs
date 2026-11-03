@@ -33,7 +33,9 @@ const SITES: &[Site] = &[
     Site {
         id: "LT1-A04",
         content_state: "settings-caption-row-title",
-        source: "settings/widgets.rs:add_described_row",
+        // The described-row title: the migrated pages draw it through this helper (the inline
+        // builder add_described_row is gone with the last inline page).
+        source: "settings/page_widgets.rs:plain_row_label",
         runner: "--smoke-settings-layout",
     },
     Site {
@@ -219,6 +221,8 @@ mod tests {
                 "settings/widgets.rs" => include_str!("settings/widgets.rs"),
                 "settings/tooltip.rs" => include_str!("settings/tooltip.rs"),
                 "settings/select.rs" => include_str!("settings/select.rs"),
+                "settings/page_widgets.rs" => include_str!("settings/page_widgets.rs"),
+                "settings/page_view/mod.rs" => include_str!("settings/page_view/mod.rs"),
                 "clipboard/text_style.rs" => include_str!("clipboard/text_style.rs"),
                 "clipboard/detail.rs" => include_str!("clipboard/detail.rs"),
                 "keystroke_display/panel.rs" => include_str!("keystroke_display/panel.rs"),

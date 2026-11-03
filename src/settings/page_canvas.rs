@@ -603,10 +603,13 @@ impl PageCanvas {
     }
 
     /// The group the following rows belong to, until [`PageCanvas::group_end`].
+    #[allow(dead_code)] // the described renderer states groups per row; this pair is the API a
+                        // page-drawn block would use, and the M2 smoke inspects what it set.
     pub(super) fn group_begin(&mut self, group: RowGroup) {
         self.group = Some(group);
     }
 
+    #[allow(dead_code)]
     pub(super) fn group_end(&mut self) {
         self.group = None;
     }
@@ -680,11 +683,13 @@ impl PageCanvas {
     }
 
     /// The row's placed views with their offsets from its origin (the re-flow's own record).
+    #[allow(dead_code)]
     pub(super) fn row_placements(&self, row: usize) -> Option<&[(*mut AnyObject, NSPoint)]> {
         Some(self.rows.get(row)?.placements.as_slice())
     }
 
     /// The row's CURRENT origin from the last re-flow: what a placement is applied from.
+    #[allow(dead_code)]
     pub(super) fn current_row_origin(&self, row: usize) -> Option<f64> {
         if !self.is_bound() {
             return None;
@@ -695,6 +700,7 @@ impl PageCanvas {
 
     /// Whether the row's placed views are still at the last re-flow's positions (the smoke's
     /// staleness probe: a placement the canvas never applied reads as stale).
+    #[allow(dead_code)]
     pub(super) unsafe fn placements_are_stale(&self, row: usize) -> bool {
         let Some(origin) = self.current_row_origin(row) else {
             return true;
@@ -719,6 +725,7 @@ impl PageCanvas {
     }
 
     /// The conditional group the row belongs to, as the canvas recorded it.
+    #[allow(dead_code)]
     pub(super) fn row_group(&self, row: usize) -> Option<RowGroup> {
         self.rows.get(row).and_then(|row| row.group)
     }

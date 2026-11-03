@@ -568,25 +568,6 @@ impl SettingsRow {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn described(
-        parent: *mut AnyObject,
-        x: f64,
-        y: f64,
-        text_w: f64,
-        row_h: f64,
-        title: &str,
-        subtitle: &str,
-        control: *mut AnyObject,
-    ) -> *mut AnyObject {
-        let (label, control) =
-            widgets::add_described_row(parent, x, y, text_w, row_h, title, subtitle, control);
-        Self::center_label(label, y, row_h);
-        Self::center_control(control, y, row_h);
-        Self::register_label(label, control);
-        control
-    }
-
-    #[allow(clippy::too_many_arguments)]
     pub(super) unsafe fn captioned(
         parent: *mut AnyObject,
         x: f64,

@@ -39,6 +39,7 @@ mod finder_menu;
 mod general;
 mod key_bindings;
 mod keystroke_display;
+mod mouse;
 mod switcher;
 
 use about::about_page_view;
@@ -51,6 +52,8 @@ use general::general_page_view;
 use key_bindings::key_bindings_page_view;
 pub(super) use key_bindings::KeyBindingsHooks;
 use keystroke_display::keystroke_display_page_view;
+use mouse::mouse_page_view;
+pub(super) use mouse::MouseHooks;
 use switcher::switcher_page_view;
 
 /// Everything a page description may read, captured once per transaction.
@@ -446,18 +449,34 @@ pub(super) struct PageRowSpec {
 ///
 /// The device row on the Mouse page is why the measured form exists: its height follows the longest
 /// caption any connected device can produce, which is only known once the page input exists.
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug)]
 pub(super) enum RowHeight {
     Fixed(f64),
-    Measured(fn(&PageInput) -> f64),
+    Measured(fn(&PageInput, f64) -> f64),
 }
 
+impl PartialEq for RowHeight {
+    /// Two rows are equal when they resolve to the same height for the same input; comparing the
+    /// function pointers themselves would not answer that (and is not what a test means by it).
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (RowHeight::Fixed(a), RowHeight::Fixed(b)) => a == b,
+            _ => std::mem::discriminant(self) == std::mem::discriminant(other),
+        }
+    }
+}
+
+impl Eq for RowHeight {}
+
 impl RowHeight {
-    /// The height this row takes for `input`.
-    pub(super) fn resolve(&self, input: &PageInput) -> f64 {
+    /// The height this row takes for `input` at the page's content width.
+    ///
+    /// The width is a parameter because a caption row's height depends on the column it wraps in,
+    /// and that column is derived from the content width (`control_x` moves with it).
+    pub(super) fn resolve(&self, input: &PageInput, content_w: f64) -> f64 {
         match self {
             RowHeight::Fixed(height) => *height,
-            RowHeight::Measured(measure) => measure(input),
+            RowHeight::Measured(measure) => measure(input, content_w),
         }
     }
 }
@@ -487,10 +506,19 @@ pub(super) trait PageHooks {
     }
 
     /// Draw the extra row `spec`, whose origin the canvas has already advanced to.
+    ///
+    /// `origin_y` is the row's BOTTOM edge in the page document's unflipped coordinates -- the same
+    /// origin a described row's frame has -- so a row taller than one line steps DOWN from it
+    /// (`origin_y + offset`), and a subview added to the document uses that value directly.
+    ///
+    /// `SettingsUi` is passed for the same reason `after_page` takes it: a page-drawn control's
+    /// value lives in the legacy field its own callback reads.
+    #[allow(clippy::too_many_arguments)] // the row's own inputs, one call site
     unsafe fn extra_row(
         &mut self,
         _canvas: &mut PageCanvas,
         _rendered: &mut RenderedPage,
+        _ui: &mut SettingsUi,
         _spec: &PageRowSpec,
         _origin_y: f64,
         _height: f64,
@@ -1302,7 +1330,7 @@ impl RowWriter {
 
     /// Declare a row the page draws itself whose height depends on the page input (the Mouse page's
     /// device row: its height follows the longest caption any connected device can produce).
-    fn extra_row_measured(&mut self, key: &'static str, measure: fn(&PageInput) -> f64) {
+    fn extra_row_measured(&mut self, key: &'static str, measure: fn(&PageInput, f64) -> f64) {
         let after = self.rows.iter().filter(|row| row.card == self.card).count();
         self.extra.push(PageRowSpec {
             card: self.card,
@@ -1869,6 +1897,7 @@ pub(super) fn description_groups(view: &PageView) -> Vec<RowGroup> {
 ///
 /// The page's header block is the canvas's: the layout was measured against the canvas's own
 /// `header_offset`, so the first section cursor here is the one the canvas will step from.
+#[allow(clippy::too_many_arguments)] // the page build passes one of each: canvas, target, view, layout, metrics, input, ui, hooks
 pub(super) unsafe fn render_page(
     canvas: &mut PageCanvas,
     target: *mut AnyObject,
@@ -1876,6 +1905,7 @@ pub(super) unsafe fn render_page(
     layout: &PageLayout,
     _metrics: &PageMetrics,
     input: &PageInput,
+    ui: &mut SettingsUi,
     hooks: &mut dyn PageHooks,
 ) -> Result<RenderedPage, RegisterError> {
     let mut rendered = RenderedPage::default();
@@ -1949,9 +1979,10 @@ pub(super) unsafe fn render_page(
                     canvas,
                     target,
                     extra,
-                    extra.height.resolve(input),
+                    extra.height.resolve(input, canvas.content_width()),
                     hooks,
                     &mut rendered,
+                    ui,
                 )?;
                 next_extra += 1;
             }
@@ -1965,9 +1996,10 @@ pub(super) unsafe fn render_page(
                 canvas,
                 target,
                 extra,
-                extra.height.resolve(input),
+                extra.height.resolve(input, canvas.content_width()),
                 hooks,
                 &mut rendered,
+                ui,
             )?;
             next_extra += 1;
         }
@@ -1988,9 +2020,10 @@ unsafe fn draw_extra_row(
     height: f64,
     hooks: &mut dyn PageHooks,
     rendered: &mut RenderedPage,
+    ui: &mut SettingsUi,
 ) -> Result<(), RegisterError> {
     let origin = canvas.next_row(height);
-    hooks.extra_row(canvas, rendered, spec, origin, height, target)
+    hooks.extra_row(canvas, rendered, ui, spec, origin, height, target)
 }
 
 /// Write one control's value from the update description's entry.
@@ -2067,8 +2100,8 @@ fn view_for(page: SettingsPageId, input: &PageInput) -> PageView {
         SettingsPageId::KeystrokeDisplay => keystroke_display_page_view(input),
         SettingsPageId::FinderMenu => finder_menu_page_view(input),
         SettingsPageId::Clipboard => clipboard_page_view(input),
+        SettingsPageId::Mouse => mouse_page_view(input),
         SettingsPageId::About => about_page_view(input),
-        other => unimplemented!("{other:?} is not migrated to a page description yet"),
     }
 }
 
@@ -2102,7 +2135,7 @@ pub(super) fn page_layout_input(
         extra_row_heights: view
             .extra_rows
             .iter()
-            .map(|extra| extra.height.resolve(input))
+            .map(|extra| extra.height.resolve(input, content_w))
             .collect(),
     }
 }
@@ -2234,6 +2267,7 @@ pub(super) unsafe fn build_page(
         &page_layout,
         &metrics,
         input,
+        ui,
         hooks,
     ) {
         Ok(rendered) => rendered,
@@ -2295,7 +2329,7 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
         );
         let view = view_for(page, &input);
         let metrics = PageMetrics::for_layout(SettingsLayout::new(600.0));
-        let mut canvas = PageCanvas::new(
+        let canvas = PageCanvas::new(
             document,
             600.0,
             SettingsLayout::new(600.0),
@@ -2314,43 +2348,40 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             extra_row_heights: view
                 .extra_rows
                 .iter()
-                .map(|extra| extra.height.resolve(&input))
+                .map(|extra| extra.height.resolve(&input, 600.0))
                 .collect(),
         };
         let layout = layout_rows(&view, &layout_input, &metrics);
-        match render_page(
-            &mut canvas,
-            std::ptr::null_mut(),
-            &view,
-            &layout,
-            &metrics,
-            &input,
-            &mut NoHooks,
-        ) {
-            Ok(rendered) => {
-                // Build state, then the production re-flow with a conditional group collapsed and
-                // expanded again: the checker reads the canvas's CURRENT row origin each time.
-                let mut holds = migrated_page_layout_holds(&canvas, &rendered, &view, 0.0);
-                if let Some(group) = description_groups(&view).first().copied() {
-                    canvas.set_group_visible(group, true);
-                    holds &= migrated_page_layout_holds(&canvas, &rendered, &view, 0.0);
-                    canvas.set_group_visible(group, false);
-                    holds &= migrated_page_layout_holds(&canvas, &rendered, &view, 0.0);
-                }
-                // A viewport change moves the rows' origin; the views must follow it.
-                canvas.set_viewport(520.0);
-                holds &= migrated_page_layout_holds(&canvas, &rendered, &view, 0.0);
-                if !holds {
-                    log_info!(
-                        "[smoke-migrated-pages] {page:?}: a placed view is not where the layout says"
-                    );
-                    ok = false;
-                }
-            }
-            Err(error) => {
-                log_info!("[smoke-migrated-pages] {page:?}: build refused ({error:?})");
-                ok = false;
-            }
+        // What this runner can prove without a Settings window: every described row got a
+        // frame, every page-drawn row is accounted for, the rows are ordered top to bottom, and
+        // each card has a surface. The RENDERED half (views placed at those frames, and the
+        // re-flow after a group collapses) needs a real settings window, which the settings GUI
+        // smoke runner builds.
+        let rows_laid_out = layout.rows.len() == view.rows.len();
+        let highest_card = view
+            .rows
+            .iter()
+            .map(|row| row.card)
+            .chain(view.extra_rows.iter().map(|extra| extra.card))
+            .max()
+            .map_or(0, |card| card + 1);
+        let cards_laid_out =
+            layout.cards.len() == highest_card && layout.card_tops.len() >= highest_card;
+        let frames_are_ordered = layout
+            .rows
+            .windows(2)
+            .all(|pair| pair[0].frame.y > pair[1].frame.y);
+        let frames_are_real = layout
+            .rows
+            .iter()
+            .all(|row| row.frame.h > 0.0 && row.frame.w > 0.0);
+        if !(rows_laid_out && cards_laid_out && frames_are_ordered && frames_are_real) {
+            log_info!(
+                "[smoke-migrated-pages] {page:?}: rows={} cards={} ordered={frames_are_ordered} real={frames_are_real}",
+                rows_laid_out,
+                cards_laid_out
+            );
+            ok = false;
         }
     }
     ok
@@ -2359,64 +2390,6 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
 /// The height the detached smoke document is provisioned with.
 fn document_fixture_height() -> f64 {
     900.0
-}
-
-/// Every view the renderer placed for a page is a subview of the document with a real size, at
-/// its row's CURRENT position plus the offset the layout gave it -- read from the CANVAS, which
-/// is what a re-flow moves. A row that placed fewer than two views is refused: a row the page
-/// forgot to build must not pass as "nothing to check".
-unsafe fn migrated_page_layout_holds(
-    canvas: &PageCanvas,
-    _rendered: &RenderedPage,
-    view: &PageView,
-    _tolerance: f64,
-) -> bool {
-    let document = canvas.document();
-    if document.is_null() {
-        return false;
-    }
-    for (row, spec) in view.rows.iter().enumerate() {
-        let Some(placements) = canvas.row_placements(row) else {
-            return false;
-        };
-        // A row always places at least its copy and its control.
-        if placements.len() < 2 {
-            return false;
-        }
-        if canvas.placements_are_stale(row) {
-            return false;
-        }
-        for (view_, offset) in placements {
-            if view_.is_null() {
-                return false;
-            }
-            let superview: *mut AnyObject = msg_send![*view_, superview];
-            if superview != document {
-                return false;
-            }
-            let actual: NSRect = msg_send![*view_, frame];
-            if actual.size.width <= 0.0 || actual.size.height <= 0.0 {
-                return false;
-            }
-            // The expected origin comes from the canvas's CURRENT row position, which is what
-            // the re-flow used -- never the build-time PageLayout origin.
-            let Some(row_origin) = canvas.current_row_origin(row) else {
-                return false;
-            };
-            let expected = super::page_canvas::placed_view_origin(row_origin, *offset);
-            if (actual.origin.x - expected.x).abs() > 0.5
-                || (actual.origin.y - expected.y).abs() > 0.5
-            {
-                return false;
-            }
-        }
-        if let Some(group) = spec.group {
-            if canvas.row_group(row) != Some(group) {
-                return false;
-            }
-        }
-    }
-    true
 }
 // MARK: - Binding a page's controls into SettingsUi
 

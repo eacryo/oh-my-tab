@@ -202,6 +202,7 @@ impl PageHooks for ClipboardHooks {
         &mut self,
         canvas: &mut PageCanvas,
         rendered: &mut RenderedPage,
+        _ui: &mut SettingsUi,
         spec: &PageRowSpec,
         origin_y: f64,
         height: f64,
