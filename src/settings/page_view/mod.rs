@@ -29,10 +29,18 @@ use std::collections::HashMap;
 // One module per page description, so pages can be written independently: each is pure and returns
 // a `PageView`, and the shared machinery here (layout, rendering, identities, the update
 // description) is the only thing they share.
+mod about;
+mod clipboard;
+mod finder_menu;
 mod general;
+mod keystroke_display;
 mod switcher;
 
+use about::about_page_view;
+use clipboard::clipboard_page_view;
+use finder_menu::finder_menu_page_view;
 use general::general_page_view;
+use keystroke_display::keystroke_display_page_view;
 use switcher::switcher_page_view;
 
 /// Everything a page description may read, captured once per transaction.
@@ -1577,6 +1585,10 @@ fn view_for(page: SettingsPageId, input: &PageInput) -> PageView {
     match page {
         SettingsPageId::Switcher => switcher_page_view(input),
         SettingsPageId::General => general_page_view(input),
+        SettingsPageId::KeystrokeDisplay => keystroke_display_page_view(input),
+        SettingsPageId::FinderMenu => finder_menu_page_view(input),
+        SettingsPageId::Clipboard => clipboard_page_view(input),
+        SettingsPageId::About => about_page_view(input),
         other => unimplemented!("{other:?} is not migrated to a page description yet"),
     }
 }
