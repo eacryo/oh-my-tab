@@ -2385,6 +2385,12 @@ pub(super) unsafe fn build_page(
             clip_height,
         ),
     };
+    // A page that reserves a band above its cards (the permission banner) hands it to the canvas
+    // first: its rows are laid out below that band, and a canvas that started at the document edge
+    // would place every card surface one band higher than the rows inside it.
+    if view.banner.is_some() {
+        canvas.reserve_top_band(banner_height());
+    }
     // A page that draws its own header draws it now: the canvas exists (so `view_mark`/`pin_from_mark`
     // work) and no row has been placed yet, which is what the header block is pinned above.
     hooks.before_page(&mut canvas, ui, target)?;
@@ -4711,11 +4717,8 @@ mod tests {
     /// settings-layout smoke reports as "views overlap" -- reproduced here without a window.
     #[test]
     fn every_card_heading_hangs_above_its_first_row_for_every_page() {
-        let input = PageInput::from_config(
-            Config::default(),
-            None,
-            crate::theme::ThemeInput::current(),
-        );
+        let input =
+            PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current());
         for page in [
             SettingsPageId::Switcher,
             SettingsPageId::General,

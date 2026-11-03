@@ -524,6 +524,19 @@ impl PageCanvas {
         !self.document.is_null()
     }
 
+    /// Lower the page cursor and its base by a band the page reserves ABOVE its cards.
+    ///
+    /// The permission banner is a child of the page document (the window re-parents it later), so
+    /// while the page is built it occupies the document's top band. The layout reserves it, and a
+    /// canvas that started at the document edge would place every card surface one band higher
+    /// than the rows inside it -- which the layout validator reports as a control overlapping the
+    /// section heading above it.
+    pub(super) fn reserve_top_band(&mut self, height: f64) {
+        let height = height.max(0.0);
+        self.cursor -= height;
+        self.base -= height;
+    }
+
     /// Open a section and return its cursor: the next card hangs from it and its header label is
     /// drawn on it.
     pub(super) unsafe fn next_section(&mut self) -> f64 {
