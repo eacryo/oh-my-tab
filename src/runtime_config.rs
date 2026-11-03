@@ -71,6 +71,14 @@ struct ChangeFlags {
     finder_menu: bool,
 }
 
+/// Test entry: does this config change make an already-open settings window re-read its
+/// controls in place? Both halves are the runtime path's own functions, so a field that drives
+/// the trigger and the descriptions that write the controls can be asserted together.
+#[cfg(test)]
+pub(crate) fn change_needs_in_place_control_sync(old: &Config, new: &Config) -> bool {
+    needs_in_place_control_sync(&change_flags(old, new, ConfigChangeSource::Settings))
+}
+
 /// Whether an already-open settings window has to re-read the config in place after this change.
 ///
 /// Pure so the trigger can be asserted without a window: adding a field to `ChangeFlags` without

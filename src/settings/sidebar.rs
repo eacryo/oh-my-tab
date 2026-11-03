@@ -265,6 +265,13 @@ impl SearchEntry {
         }
     }
 
+    /// This row with the choices its dropdown offers, already resolved to text.
+    pub(super) fn with_options(mut self, options: &[String]) -> Self {
+        let refs: Vec<&str> = options.iter().map(String::as_str).collect();
+        self.set_options(&refs);
+        self
+    }
+
     /// The choices this row's dropdown offers (empty for a row without one).
     fn set_options(&mut self, options: &[&str]) {
         self.options = options
@@ -377,6 +384,27 @@ pub(super) fn begin_settings_search_index() {
 /// (or will never get one), so nothing is left waiting for a header.
 pub(super) fn begin_settings_search_section() {
     PENDING_SECTION.lock().unwrap().clear();
+}
+
+/// Hold the search index still for a test: the index is a process-global table the page
+/// builders write, so a test that reads it must not interleave with a writing test.
+#[cfg(test)]
+pub(super) fn lock_search_index_for_test() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The rows of `page` whose entry a query matches. Test-only: it answers "is this row still
+/// findable?" through the very comparison the search field uses.
+#[cfg(test)]
+pub(super) fn match_settings_search_for_page(page: usize, query: &str) -> Vec<usize> {
+    let index = SETTINGS_SEARCH_INDEX.lock().unwrap().clone();
+    match_settings_search(&index, query)
+        .into_iter()
+        .filter_map(|position| index.get(position))
+        .filter(|entry| entry.page == page)
+        .map(|entry| entry.row)
+        .collect()
 }
 
 /// The rows the current build has recorded for `page`, so a page can fill the gaps it left.

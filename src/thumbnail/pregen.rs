@@ -432,7 +432,8 @@ pub(crate) fn backfill_after_permission_grant() {
 /// "startup" from the observer thread's first pass, "permission-grant" from the denied -> granted
 /// backfill.
 unsafe fn pregen_startup_windows(startup_jobs: Vec<(i32, u32, u64)>, source: &str) {
-    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) || !capture_allowed()
+    {
         log_debug!("[thumb] prewarm skipped (source={source}: disabled or unauthorized)");
         return;
     }
@@ -462,7 +463,8 @@ unsafe fn pregen_startup_windows(startup_jobs: Vec<(i32, u32, u64)>, source: &st
 /// Pre-generate existing standard windows for a newly launched app; the initial
 /// startup batch uses pregen_startup_windows instead.
 unsafe fn pregen_windows_for_pid(pid: i32) {
-    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) || !capture_allowed()
+    {
         return;
     }
     let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
@@ -514,7 +516,8 @@ unsafe extern "C" fn thumb_ax_observer(
             }) {
                 let mut pid: i32 = 0;
                 AXUIElementGetPid(element, &mut pid);
-                if pid > 0 && crate::theme::thumbnails_enabled() {
+                if pid > 0 && crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current())
+                {
                     let pid_generation = CAPTURE_STATE.lock().unwrap().pid_generation(pid);
                     // The debounce task below can bail out (thumbnails off, no permission) without
                     // enqueueing, so publish the reclaim notice here.
@@ -522,7 +525,9 @@ unsafe extern "C" fn thumb_ax_observer(
                     // Debounce 300ms: brand-new windows may still be laying out / blank.
                     std::thread::spawn(move || {
                         std::thread::sleep(Duration::from_millis(300));
-                        if crate::theme::thumbnails_enabled() && capture_allowed() {
+                        if crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current())
+                            && capture_allowed()
+                        {
                             enqueue_job_for_generation(
                                 pid,
                                 wid,

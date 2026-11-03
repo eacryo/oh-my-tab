@@ -31,6 +31,7 @@ use crate::window_server;
 use crate::window_refresh::request_window_refresh;
 use crate::with_tab_state;
 use crate::AppState;
+use crate::LayoutProjectionGuard;
 use crate::{log_debug, log_info, WINDOW_COUNT};
 
 pub(crate) const KEY_TAB: u16 = keyboard::VK_TAB;
@@ -86,8 +87,8 @@ const CARD_AREA_TOP_INSET: f64 = 32.0;
 /// visibly lopsided. The panel height, the document height and every card's document y grow by this
 /// room together, which keeps the card viewport, the scrollbar, the floating settings gear and every
 /// frame-based hit test in one coordinate system instead of only moving what is drawn.
-fn no_footer_bottom_slack() -> f64 {
-    if crate::theme::footer_band_h() > 0.0 {
+fn no_footer_bottom_slack(input: &crate::theme::ThemeInput) -> f64 {
+    if crate::theme::footer_band_h_test_pinned(input) > 0.0 {
         return 0.0;
     }
     (CARD_AREA_TOP_INSET - crate::theme::THUMB_BOTTOM_INSET).max(0.0)
@@ -177,62 +178,19 @@ static CARD_KEY_MAP: LazyLock<Mutex<HashMap<usize, WindowKey>>> =
 /// only that card.
 static CARD_SIGNATURES: LazyLock<Mutex<HashMap<usize, CardSignature>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
-/// Global window-index range currently rendered in thumbnail mode; the authoritative
-/// window list is never truncated.
-static THUMB_VISIBLE_RANGE: Mutex<Option<Range<usize>>> = Mutex::new(None);
-/// Stable row ranges for the complete flow layout, used for row scrolling and keeping selection visible.
-static THUMB_ROW_RANGES: Mutex<Option<Vec<Range<usize>>>> = Mutex::new(None);
-/// Maximum number of rows visible in the current panel.
-static THUMB_MAX_ROWS: Mutex<usize> = Mutex::new(1);
-/// post-close reflow must reuse it or the cards jump.
-static THUMB_CONTENT_INSET: Mutex<f64> = Mutex::new(0.0);
-/// The current layout's height budget; the post-close reflow reuses it so both paths follow the same
-/// "decided by the cards, capped by the budget" rule. The infinite default means "no layout yet", so
-/// the reflow cannot clamp the panel down to zero.
-static THUMB_PANEL_MAX_H: Mutex<f64> = Mutex::new(f64::INFINITY);
-/// Whether the teaser fits the budget without costing a whole row in the current layout; the
-/// post-close reflow reuses the same verdict.
-static THUMB_TEASER_FITS: Mutex<bool> = Mutex::new(false);
-/// First row of the scrolling viewport; zero starts at the top of the MRU list.
-static THUMB_SCROLL_ROW: Mutex<usize> = Mutex::new(0);
-/// Point offset from the top of the scrolling content, allowing cards to cross viewport edges smoothly.
-static THUMB_SCROLL_OFFSET: Mutex<f64> = Mutex::new(0.0);
-/// Maximum point offset allowed by the current complete layout.
-static THUMB_SCROLL_MAX_OFFSET: Mutex<f64> = Mutex::new(0.0);
-/// Current thumbnail document height excluding the status bar, used for the clip-view range.
-static THUMB_DOCUMENT_HEIGHT: Mutex<f64> = Mutex::new(0.0);
-/// Current preview pixel demand, reused when scrolling into a new row.
-static THUMB_CAPTURE_TARGET_PX_H: Mutex<u32> = Mutex::new(512);
+/// The plan each card view was built from, keyed by view pointer like the other card maps.
+///
+/// The selection refresh reads its geometry from here instead of measuring the live subviews:
+/// measuring them would be a second derivation of the same numbers, and the two would drift.
+static CARD_PLANS: LazyLock<Mutex<HashMap<usize, CardPlan>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 /// Last resolved palette used by `apply_theme`; prevents unrelated config changes from forcing
 /// a full thumbnail recapture when the effective light/dark appearance is unchanged.
 static LAST_APPLIED_THEME_DARK: Mutex<Option<bool>> = Mutex::new(None);
-/// Current full-layout row pitch (card height + row gap), reused by whole-row keyboard navigation.
-static THUMB_SCROLL_ROW_PITCH: Mutex<f64> = Mutex::new(1.0);
-/// Explicit drag state for the custom scrollbar.
-#[derive(Clone, Copy)]
-struct ThumbnailScrollDrag {
-    start_y: f64,
-    start_offset: f64,
-    max_offset: f64,
-    thumb_travel: f64,
-}
-
-static THUMB_SCROLL_DRAG: Mutex<Option<ThumbnailScrollDrag>> = Mutex::new(None);
-
-/// Scrollbar hover state: increase thumb visibility over the viewport, then one more level over the thumb.
-#[derive(Clone, Copy, Default, PartialEq)]
-struct ThumbnailScrollerHover {
-    viewport: bool,
-    knob: bool,
-}
-
-static THUMB_SCROLLER_HOVER: Mutex<ThumbnailScrollerHover> = Mutex::new(ThumbnailScrollerHover {
-    viewport: false,
-    knob: false,
-});
 
 /// Window currently playing its exit animation; uses stable identity instead of a transient index.
-struct PendingCardClose {
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PendingCardClose {
     pid: i32,
     cgwid: u32,
     animation_finished: bool,
@@ -256,7 +214,6 @@ struct PendingCardClose {
 }
 
 type WindowKey = (i32, u32);
-static PENDING_CARD_CLOSE: Mutex<Option<PendingCardClose>> = Mutex::new(None);
 /// Single-slot value result from the background AX close; the worker never mutates the
 /// main-thread animation state directly.
 static CARD_CLOSE_AX_RESULT: Mutex<Option<(WindowKey, bool)>> = Mutex::new(None);
@@ -310,6 +267,7 @@ fn card_reconcile_action(
 fn card_signature(
     window: &WindowInfo,
     frame: NSRect,
+    input: &crate::theme::ThemeInput,
     thumbnail_layout: bool,
     thumbnail_capture_allowed: bool,
 ) -> CardSignature {
@@ -320,14 +278,14 @@ fn card_signature(
         minimized: window.minimized,
         fullscreen: window.fullscreen,
         on_other_desktop: window.on_other_desktop,
-        theme_dark: crate::theme::resolved_is_dark(),
+        theme_dark: input.dark,
         card_width_bits: frame.size.width.to_bits(),
         card_height_bits: frame.size.height.to_bits(),
-        card_radius_bits: crate::theme::overlay_card_radius().to_bits(),
-        title_font_bits: crate::theme::card_title_font_size().to_bits(),
-        app_name_font_bits: crate::theme::card_app_name_font_size().to_bits(),
+        card_radius_bits: crate::theme::overlay_card_radius(input).to_bits(),
+        title_font_bits: crate::theme::card_title_font_size(input).to_bits(),
+        app_name_font_bits: crate::theme::card_app_name_font_size(input).to_bits(),
         thumbnail_layout,
-        show_app_name_in_cards: crate::theme::show_app_name_in_cards(),
+        show_app_name_in_cards: crate::theme::show_app_name_in_cards(input),
         thumbnail_capture_allowed,
         // The frame version joins the signature: any frame replacement (seed ->
         // real, activation refresh, appearance recapture) mismatches the next
@@ -337,16 +295,124 @@ fn card_signature(
     }
 }
 
-fn clear_thumbnail_scroll_drag() {
-    *THUMB_SCROLL_DRAG.lock().unwrap() = None;
-}
-/// Preferred horizontal center retained across consecutive vertical moves; reset
-/// by horizontal navigation, mouse selection, and a fresh summon.
-static THUMB_NAV_ANCHOR_X: Mutex<Option<f64>> = Mutex::new(None);
 type CardPlacementFrame = (usize, f64, f64, f64);
-/// Prevents hover-selection on the card under the cursor when the window first
-/// opens. Reset on a fresh summon and flipped to true on the first mouse move.
-pub(crate) static MOUSE_MOVED: AtomicBool = AtomicBool::new(false);
+
+/// Explicit drag state for the custom scrollbar.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ThumbnailScrollDrag {
+    start_y: f64,
+    start_offset: f64,
+    max_offset: f64,
+    thumb_travel: f64,
+}
+
+/// Scrollbar hover state: increase thumb visibility over the viewport, then one more level over the
+/// thumb.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ThumbnailScrollerHover {
+    viewport: bool,
+    knob: bool,
+}
+
+/// The current flow layout's results.
+///
+/// Every field is derived on the summon path (`show_overlay`) and then read by the code that has to
+/// agree with that decision later: the scroller, the wheel and drag offset clamping, the navigation
+/// that keeps the selection visible, and the post-close reflow.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct FlowLayoutState {
+    /// Global window-index range currently rendered; the authoritative window list is never
+    /// truncated.
+    pub(crate) visible_range: Option<Range<usize>>,
+    /// Stable row ranges for the complete flow layout, used for row scrolling and keeping the
+    /// selection visible.
+    pub(crate) row_ranges: Option<Vec<Range<usize>>>,
+    /// Maximum number of rows visible in the current panel.
+    pub(crate) max_rows: usize,
+    /// Content inset; the post-close reflow must reuse it or the cards jump.
+    pub(crate) content_inset: f64,
+    /// The current layout's height budget; the post-close reflow reuses it so both paths follow the
+    /// same "decided by the cards, capped by the budget" rule. Infinite means "no layout yet", so
+    /// the reflow cannot clamp the panel down to zero.
+    pub(crate) panel_max_h: f64,
+    /// Whether the teaser fits the budget without costing a whole row in the current layout; the
+    /// post-close reflow reuses the same verdict.
+    pub(crate) teaser_fits: bool,
+    /// Current full-layout row pitch (card height + row gap), reused by whole-row keyboard
+    /// navigation.
+    pub(crate) row_pitch: f64,
+    /// Current preview pixel demand, reused when scrolling into a new row.
+    pub(crate) capture_target_px_h: u32,
+}
+
+impl Default for FlowLayoutState {
+    fn default() -> Self {
+        FlowLayoutState {
+            visible_range: None,
+            row_ranges: None,
+            max_rows: 1,
+            content_inset: 0.0,
+            panel_max_h: f64::INFINITY,
+            teaser_fits: false,
+            row_pitch: 1.0,
+            capture_target_px_h: 512,
+        }
+    }
+}
+
+/// The viewport's scroll position.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct ScrollState {
+    /// First row of the scrolling viewport; zero starts at the top of the MRU list.
+    pub(crate) row: usize,
+    /// Point offset from the top of the scrolling content, allowing cards to cross viewport edges
+    /// smoothly.
+    pub(crate) offset: f64,
+    /// Maximum point offset allowed by the current complete layout.
+    pub(crate) max_offset: f64,
+    /// Current thumbnail document height excluding the status bar, used for the clip-view range.
+    pub(crate) document_height: f64,
+    /// The custom scrollbar's explicit drag, while one is in progress.
+    pub(crate) drag: Option<ThumbnailScrollDrag>,
+}
+
+/// Pointer-driven view state: scrollbar hover, the vertical-navigation anchor and the
+/// "the pointer has moved" gate.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub(crate) struct HoverState {
+    pub(crate) scroller: ThumbnailScrollerHover,
+    /// Preferred horizontal center retained across consecutive vertical moves; reset by horizontal
+    /// navigation, mouse selection, and a fresh summon.
+    pub(crate) nav_anchor_x: Option<f64>,
+    /// Prevents hover-selection on the card under the cursor when the window first opens. Reset on
+    /// a fresh summon and flipped to true on the first mouse move.
+    pub(crate) mouse_moved: bool,
+}
+
+/// The overlay's layout and rendered-view state, carried on `AppState` so that a decision, once
+/// made, is read back as a value rather than recomputed at each reader.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct SwitcherLayout {
+    pub(crate) flow: FlowLayoutState,
+    pub(crate) scroll: ScrollState,
+    pub(crate) hover: HoverState,
+    /// The exit animation in progress, if any. Only the animation state lives here; the AX
+    /// worker's result travels through `CARD_CLOSE_AX_RESULT`, across the thread boundary.
+    pub(crate) close: Option<PendingCardClose>,
+}
+
+impl SwitcherLayout {
+    /// The state an overlay that has never laid anything out starts from.
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    /// One value to hand out: the projection guard already refuses a worker thread, so a copy is
+    /// the right shape for a reader and keeps it out of the borrow.
+    pub(crate) fn snapshot(&self) -> SwitcherLayout {
+        self.clone()
+    }
+}
 
 /// Whether the overlay currently activates windows on hover.
 pub(crate) fn activates_on_hover() -> bool {
@@ -407,6 +473,7 @@ pub(crate) use cancel::{
     refresh_highlight, refresh_thumbnail_previews, switcher_backdrop_options, vanish_overlay,
 };
 pub(crate) use cards::{create_card_view, show_overlay};
+pub(crate) use cards::{CardLayout, CardPlan};
 // Only the thumbnail unit tests use crate::overlay::nsimage_from_cgimage (cards.rs
 // also calls it internally).
 #[cfg(test)]
@@ -610,7 +677,7 @@ pub(crate) unsafe fn smoke_footer_settings_button_fits() -> Result<(), String> {
         .ok_or_else(|| "the status label was never created".to_string())?;
     let window =
         overlay_window_ptr().ok_or_else(|| "the overlay window was never created".to_string())?;
-    let band = footer_band_h();
+    let band = footer_band_h(&crate::theme::ThemeInput::current());
     let button_frame: NSRect = msg_send![button, frame];
     let label_frame: NSRect = msg_send![label, frame];
     if button_frame.size.width < crate::theme::FOOTER_CONTROL_SIZE - 0.5
@@ -791,6 +858,14 @@ fn set_card_signature(view: *mut AnyObject, signature: CardSignature) {
         .insert(view as usize, signature);
 }
 
+fn set_card_plan(view: *mut AnyObject, plan: CardPlan) {
+    CARD_PLANS.lock().unwrap().insert(view as usize, plan);
+}
+
+fn card_plan_for(view: *mut AnyObject) -> Option<CardPlan> {
+    CARD_PLANS.lock().unwrap().get(&(view as usize)).cloned()
+}
+
 fn card_signature_for(view: *mut AnyObject) -> Option<CardSignature> {
     CARD_SIGNATURES
         .lock()
@@ -815,6 +890,7 @@ pub(crate) fn remove_card_index(view: *mut AnyObject) {
     map.remove(&(view as usize));
     CARD_KEY_MAP.lock().unwrap().remove(&(view as usize));
     CARD_SIGNATURES.lock().unwrap().remove(&(view as usize));
+    CARD_PLANS.lock().unwrap().remove(&(view as usize));
 }
 
 pub(crate) fn clear_card_indices() {
@@ -822,24 +898,59 @@ pub(crate) fn clear_card_indices() {
     map.clear();
     CARD_KEY_MAP.lock().unwrap().clear();
     CARD_SIGNATURES.lock().unwrap().clear();
+    CARD_PLANS.lock().unwrap().clear();
+}
+
+/// The current layout and view state, as one value.
+///
+/// Read through this rather than through several accessors: each accessor would be its own short
+/// borrow, and a caller that needs two facts at once must see one consistent layout.
+pub(crate) fn layout_snapshot() -> SwitcherLayout {
+    with_tab_state(|state_opt| {
+        let _guard = LayoutProjectionGuard::enter();
+        state_opt
+            .as_ref()
+            .map(|state| state.layout.snapshot())
+            .unwrap_or_default()
+    })
+}
+
+/// Open or close the "the pointer has moved" gate that lets hover select a card.
+fn set_mouse_moved(moved: bool) {
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.layout.hover.mouse_moved = moved;
+        }
+    });
 }
 
 /// Visible-range snapshot for thumbnail scheduling.
 pub(crate) fn thumbnail_visible_range() -> Option<Range<usize>> {
-    THUMB_VISIBLE_RANGE.lock().unwrap().clone()
+    with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .and_then(|state| state.layout.flow.visible_range.clone())
+    })
 }
 
 pub(crate) fn reset_thumbnail_visible_range() {
-    *THUMB_VISIBLE_RANGE.lock().unwrap() = None;
-    *THUMB_ROW_RANGES.lock().unwrap() = None;
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.layout.flow.visible_range = None;
+            state.layout.flow.row_ranges = None;
+        }
+    });
 }
 
 pub(crate) fn reset_thumbnail_scroll() {
-    *THUMB_SCROLL_ROW.lock().unwrap() = 0;
-    *THUMB_SCROLL_OFFSET.lock().unwrap() = 0.0;
-    *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = 0.0;
-    *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = 0.0;
-    *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = 1.0;
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.layout.scroll = ScrollState::default();
+            state.layout.flow.row_pitch = 1.0;
+            state.layout.flow.capture_target_px_h = 0;
+            state.layout.hover.scroller = ThumbnailScrollerHover::default();
+        }
+    });
     clear_thumbnail_scroll_drag();
     set_thumbnail_scroller_hover(false, false);
 }
@@ -876,14 +987,20 @@ fn invalidate_thumbnail_scroller() {
 }
 
 fn set_thumbnail_scroller_hover(viewport: bool, knob: bool) {
-    let mut state = THUMB_SCROLLER_HOVER.lock().unwrap();
     let next = ThumbnailScrollerHover { viewport, knob };
-    if *state == next {
-        return;
+    let changed = with_tab_state(|state_opt| {
+        let Some(state) = state_opt.as_mut() else {
+            return false;
+        };
+        if state.layout.hover.scroller == next {
+            return false;
+        }
+        state.layout.hover.scroller = next;
+        true
+    });
+    if changed {
+        invalidate_thumbnail_scroller();
     }
-    *state = next;
-    drop(state);
-    invalidate_thumbnail_scroller();
 }
 
 fn visible_range_for_scroll(
@@ -908,16 +1025,19 @@ fn visible_range_for_scroll(
 }
 
 fn update_thumbnail_scroll_state(offset: f64) -> bool {
-    let rows = THUMB_ROW_RANGES.lock().unwrap().clone().unwrap_or_default();
-    let max_rows = *THUMB_MAX_ROWS.lock().unwrap();
-    let row_pitch = *THUMB_SCROLL_ROW_PITCH.lock().unwrap();
-    let (visible, row_start) = visible_range_for_scroll(&rows, max_rows, row_pitch, offset);
-    let mut current = THUMB_VISIBLE_RANGE.lock().unwrap();
-    let changed = current.as_ref() != Some(&visible);
-    *current = Some(visible);
-    drop(current);
-    *THUMB_SCROLL_ROW.lock().unwrap() = row_start;
-    changed
+    with_tab_state(|state_opt| {
+        let Some(state) = state_opt.as_mut() else {
+            return false;
+        };
+        let rows = state.layout.flow.row_ranges.clone().unwrap_or_default();
+        let max_rows = state.layout.flow.max_rows;
+        let row_pitch = state.layout.flow.row_pitch;
+        let (visible, row_start) = visible_range_for_scroll(&rows, max_rows, row_pitch, offset);
+        let changed = state.layout.flow.visible_range.as_ref() != Some(&visible);
+        state.layout.flow.visible_range = Some(visible);
+        state.layout.scroll.row = row_start;
+        changed
+    })
 }
 
 unsafe fn apply_thumbnail_clip_offset() {
@@ -925,15 +1045,21 @@ unsafe fn apply_thumbnail_clip_offset() {
         return;
     };
     let bounds: NSRect = msg_send![container, bounds];
-    let requested_max = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
-    let document_h = *THUMB_DOCUMENT_HEIGHT.lock().unwrap();
+    let (requested_max, document_h, offset) =
+        with_tab_state(|state_opt| match state_opt.as_ref() {
+            Some(state) => (
+                state.layout.scroll.max_offset,
+                state.layout.scroll.document_height,
+                state.layout.scroll.offset,
+            ),
+            None => (0.0, 0.0, 0.0),
+        });
     let legal_max = (document_h - bounds.size.height).max(0.0);
     let max_offset = if document_h > 0.0 {
         requested_max.min(legal_max)
     } else {
         requested_max
     };
-    let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
     // AppKit's y axis grows upward: logical offset=0 is the document top, so bounds starts at max.
     let origin_y = (max_offset - offset).clamp(0.0, max_offset.max(0.0));
     let _: () = msg_send![
@@ -944,7 +1070,11 @@ unsafe fn apply_thumbnail_clip_offset() {
 }
 
 fn apply_thumbnail_scroll_offset() {
-    let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+    let offset = with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .map_or(0.0, |state| state.layout.scroll.offset)
+    });
     update_thumbnail_scroll_state(offset);
     unsafe {
         apply_thumbnail_clip_offset();
@@ -956,24 +1086,27 @@ fn apply_thumbnail_scroll_offset() {
 
 /// Bring the selected item into view; leave a user-scrolled viewport alone when it already contains it.
 fn ensure_thumbnail_selection_visible(selected: usize) -> bool {
-    let rows = THUMB_ROW_RANGES.lock().unwrap().clone();
-    let Some(rows) = rows else {
-        return false;
-    };
-    let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
-    let Some(selected_row) = rows.iter().position(|range| range.contains(&selected)) else {
-        return false;
-    };
-    let mut scroll_row = THUMB_SCROLL_ROW.lock().unwrap();
-    let current = *scroll_row;
-    let next = scroll_start_for_selection(current, selected_row, max_rows);
-    let changed = next != current;
-    *scroll_row = next;
-    if changed {
-        let row_pitch = *THUMB_SCROLL_ROW_PITCH.lock().unwrap();
-        *THUMB_SCROLL_OFFSET.lock().unwrap() = next as f64 * row_pitch;
-    }
-    changed
+    with_tab_state(|state_opt| {
+        let Some(state) = state_opt.as_mut() else {
+            return false;
+        };
+        let layout = &mut state.layout;
+        let Some(rows) = layout.flow.row_ranges.clone() else {
+            return false;
+        };
+        let max_rows = layout.flow.max_rows.max(1);
+        let Some(selected_row) = rows.iter().position(|range| range.contains(&selected)) else {
+            return false;
+        };
+        let current = layout.scroll.row;
+        let next = scroll_start_for_selection(current, selected_row, max_rows);
+        let changed = next != current;
+        layout.scroll.row = next;
+        if changed {
+            layout.scroll.offset = next as f64 * layout.flow.row_pitch;
+        }
+        changed
+    })
 }
 
 /// Move only one row when selection crosses a viewport edge, preserving one overlapping row.
@@ -994,8 +1127,10 @@ fn scroll_thumbnail_by_offset(delta: f64) {
     if !delta.is_finite() || delta.abs() < f64::EPSILON {
         return;
     }
-    let current = *THUMB_SCROLL_OFFSET.lock().unwrap();
-    let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+    let (current, max_offset) = with_tab_state(|state_opt| match state_opt.as_ref() {
+        Some(state) => (state.layout.scroll.offset, state.layout.scroll.max_offset),
+        None => (0.0, 0.0),
+    });
     set_thumbnail_scroll_offset(current + delta, max_offset);
 }
 
@@ -1003,18 +1138,24 @@ pub(crate) fn set_thumbnail_scroll_offset(next: f64, max_offset: f64) {
     if !next.is_finite() || !max_offset.is_finite() {
         return;
     }
-    let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
-    let next = next.clamp(0.0, max_offset.max(0.0));
-    if (next - *offset).abs() < f64::EPSILON {
+    let Some(capture_target_px_h) = with_tab_state(|state_opt| {
+        let state = state_opt.as_mut()?;
+        let next = next.clamp(0.0, max_offset.max(0.0));
+        if (next - state.layout.scroll.offset).abs() < f64::EPSILON {
+            return None;
+        }
+        state.layout.scroll.offset = next;
+        Some(state.layout.flow.capture_target_px_h)
+    }) else {
         return;
-    }
-    *offset = next;
-    drop(offset);
+    };
     let visible_changed = update_thumbnail_scroll_state(next);
     apply_thumbnail_scroll_offset();
-    if visible_changed && crate::theme::thumbnails_enabled() {
-        let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
-        crate::thumbnail::refresh_for_summon(target_px_h);
+    if visible_changed {
+        let input = crate::theme::ThemeInput::current();
+        if crate::theme::thumbnails_enabled(&input) {
+            crate::thumbnail::refresh_for_summon(&input, capture_target_px_h);
+        }
     }
     // Re-hit-test the stationary pointer about 50ms after scrolling stops, avoiding highlight
     // churn while cards pass under the cursor during a gesture.
@@ -1022,24 +1163,45 @@ pub(crate) fn set_thumbnail_scroll_offset(next: f64, max_offset: f64) {
 }
 
 pub(crate) fn thumbnail_scroller_set_fraction_for_smoke(fraction: f64) {
-    let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
+    let max_offset = thumbnail_scroller_max_offset();
     set_thumbnail_scroll_offset(fraction.clamp(0.0, 1.0) * max_offset, max_offset);
 }
 
 pub(crate) fn thumbnail_scroller_max_offset() -> f64 {
-    *THUMB_SCROLL_MAX_OFFSET.lock().unwrap()
+    with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .map_or(0.0, |state| state.layout.scroll.max_offset)
+    })
 }
 
 pub(crate) fn reset_thumbnail_nav_anchor() {
-    *THUMB_NAV_ANCHOR_X.lock().unwrap() = None;
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.layout.hover.nav_anchor_x = None;
+        }
+    });
 }
 
-fn thumbnail_card_lift_y(is_selected: bool) -> f64 {
-    if is_selected {
-        SELECTED_CARD_LIFT
-    } else {
-        0.0
-    }
+/// Reset the pointer-driven view state of one summon: the scrollbar hover, the drag, the "the
+/// pointer has moved" gate and the vertical-navigation anchor, with no AppKit call in between.
+fn reset_pointer_view_state() {
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.layout.hover.scroller = ThumbnailScrollerHover::default();
+            state.layout.scroll.drag = None;
+            state.layout.hover.mouse_moved = false;
+            state.layout.hover.nav_anchor_x = None;
+        }
+    });
+}
+
+fn clear_thumbnail_scroll_drag() {
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.layout.scroll.drag = None;
+        }
+    });
 }
 
 fn horizontal_nav_index(selected: usize, len: usize, backward: bool) -> usize {
@@ -1156,6 +1318,8 @@ mod tests {
     use super::thumbnail_scroller_geometry;
     use super::thumbnail_scroller_knob_contains;
     use super::vertical_nav_index;
+    use super::CardLayout;
+    use super::CardPlan;
     use super::CardReconcileAction;
     use super::CardSignature;
     use super::CARD_AREA_TOP_INSET;
@@ -1175,13 +1339,15 @@ mod tests {
 
     /// With the footer band absent the card area keeps the same room below its last row that it
     /// keeps above its first one, or the panel's whitespace reads lopsided. The band is pinned in
-    /// both states: the suite otherwise assumes a band exists (see `theme::footer_band_h`).
+    /// both states through `theme::set_test_footer_band`, the band's own test hook: the fixture's
+    /// footer size would otherwise make this depend on the on-disk config.
     #[test]
     fn the_no_footer_bottom_room_matches_the_card_areas_top_inset() {
+        let input = crate::theme::ThemeInput::current();
         crate::theme::set_test_footer_band(Some(crate::theme::FOOTER_CONTROL_MIN_H));
-        let with_band = no_footer_bottom_slack();
+        let with_band = no_footer_bottom_slack(&input);
         crate::theme::set_test_footer_band(Some(0.0));
-        let without_band = no_footer_bottom_slack();
+        let without_band = no_footer_bottom_slack(&input);
         crate::theme::set_test_footer_band(None);
 
         assert_eq!(
@@ -1265,10 +1431,17 @@ mod tests {
         );
     }
 
+    /// The thumbnail card lifts as one unit while selected, and the lift lives on the plan the
+    /// card was built with -- the same value `refresh_highlight` moves the card root by.
     #[test]
     fn thumbnail_selection_lifts_the_whole_card_by_one_point() {
-        assert_eq!(super::thumbnail_card_lift_y(true), 1.0);
-        assert_eq!(super::thumbnail_card_lift_y(false), 0.0);
+        let input = crate::theme::ThemeInput::current();
+        let plan = CardPlan::new(300.0, 240.0, CardLayout::Thumbnail, &input);
+        assert_eq!(plan.selected_lift_of(true), 1.0);
+        assert_eq!(plan.selected_lift_of(false), 0.0);
+        // The icon-only card marks its icon instead and keeps the card still.
+        let icon_only = CardPlan::new(300.0, 240.0, CardLayout::IconOnly, &input);
+        assert_eq!(icon_only.selected_lift_of(true), 0.0);
     }
 
     #[test]
@@ -1846,7 +2019,10 @@ pub(crate) fn activate_and_raise(pid: i32, cgwid: u32, minimized: bool, on_other
     );
 }
 
-pub(crate) fn update_status_label() {
+/// `input` is the caller's transaction snapshot. An independent entry (a timer, a notification)
+/// samples once and calls this; a render step hands over the snapshot it is already building from,
+/// so the footer cannot describe a different configuration from the panel around it.
+pub(crate) fn update_status_label(input: &crate::theme::ThemeInput) {
     unsafe {
         let status_label = match *STATUS_LABEL.lock().unwrap() {
             Some(l) => l.0,
@@ -1863,7 +2039,7 @@ pub(crate) fn update_status_label() {
                 // an empty panel would otherwise carry no explanation at all.
                 return Some(Some(t("overlay.no_windows")));
             }
-            if !crate::theme::show_footer_title() {
+            if !crate::theme::show_footer_title(input) {
                 return Some(None);
             }
             let selected = state.selected;
@@ -1884,8 +2060,8 @@ pub(crate) fn update_status_label() {
         let title_visible = status_text.is_some();
         let status_text = status_text.unwrap_or_default();
 
-        let colors = current_colors();
-        let footer_h = footer_band_h();
+        let colors = crate::theme::colors_from(input, input.dark);
+        let footer_h = footer_band_h(input);
         // The panel's own rect: the window is the padded (elevation) rect, so its frame is NOT the
         // panel size the corner geometry must be computed against. The clip view sits directly above
         // the footer band and carries the panel's width, so panel height = viewport height + band.
@@ -1893,18 +2069,18 @@ pub(crate) fn update_status_label() {
             let container = CONTAINER.lock().unwrap();
             let c = container.unwrap().0;
             let f: NSRect = msg_send![c, frame];
-            (f.size.width, f.size.height + footer_band_h())
+            (f.size.width, f.size.height + footer_band_h(input))
         };
         if !title_visible {
             // No title: the band is gone too, so there is no text frame to place. The gear still has
             // to be laid out -- it now sits in the panel's bottom-right corner.
             let _: () = msg_send![status_label, setHidden: true];
-            footer_settings::layout_and_repaint(NSSize::new(container_w, panel_h));
+            footer_settings::layout_and_repaint(input, NSSize::new(container_w, panel_h));
             return;
         }
         let status_font: *mut AnyObject = {
             let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
-            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
+            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(input), weight: status_bar_weight]
         };
         let status_color = hex_to_ns_color(colors.status_bar_text);
         let ns_stat = make_nsstring(&status_text);
@@ -1929,7 +2105,7 @@ pub(crate) fn update_status_label() {
         // With the title off the only thing this label can still say is the empty-state hint, and
         // there is no band left to hold it: centre it in the card viewport instead.
         let (stat_x, stat_y, stat_w) = if footer_h > 0.0 {
-            footer_text_frame(container_w, panel_h, line_h)
+            footer_text_frame(input, container_w, panel_h, line_h)
         } else {
             (0.0, ((panel_h - line_h) / 2.0).max(0.0), container_w)
         };
@@ -1941,7 +2117,7 @@ pub(crate) fn update_status_label() {
         // footer (summon, card-close reflow, theme apply, corner-radius change) already calls this,
         // so the button can never be left at a stale frame while the text moves -- which is how a
         // shrunk panel would otherwise clip it.
-        footer_settings::layout_and_repaint(NSSize::new(container_w, panel_h));
+        footer_settings::layout_and_repaint(input, NSSize::new(container_w, panel_h));
     }
 }
 
@@ -2072,7 +2248,7 @@ pub(crate) fn handle_display_reconfiguration() {
         // post-snapshot second pass corrects card aspects.
         show_overlay();
     }
-    let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
+    let target_px_h = layout_snapshot().flow.capture_target_px_h;
     crate::thumbnail::refresh_for_display_change(target_px_h);
 }
 
@@ -2080,4 +2256,134 @@ pub(crate) fn handle_display_reconfiguration() {
 /// must re-layout once even when the window set is unchanged.
 pub(crate) fn take_display_relayout_pending() -> bool {
     DISPLAY_RECONFIG_RELAYOUT_PENDING.swap(false, Ordering::SeqCst)
+}
+#[cfg(test)]
+mod card_plan_tests {
+    use super::{CardLayout, CardPlan};
+    use crate::theme::{self, ThemeInput};
+
+    /// The plan is a definite value for a given card size: every frame is finite, non-empty and
+    /// inside the card it describes. A geometry function whose result depends on something the
+    /// caller did not pass in would show up here as a frame that moves between two calls.
+    #[test]
+    fn plan_card_produces_definite_frames_in_both_layouts() {
+        let input = ThemeInput::current();
+        for layout in [CardLayout::Thumbnail, CardLayout::IconOnly] {
+            for (card_w, card_h) in [(300.0, 240.0), (420.0, 300.0), (180.0, 120.0)] {
+                let plan = CardPlan::new(card_w, card_h, layout, &input);
+                let again = CardPlan::new(card_w, card_h, layout, &input);
+                assert_eq!(
+                    plan, again,
+                    "{layout:?} {card_w}x{card_h}: the plan is not a value"
+                );
+
+                let frames: Vec<(&str, crate::NSRect)> = match plan.thumbnail {
+                    Some(thumb) => vec![
+                        ("ring", plan.ring_frame),
+                        ("close", plan.close_frame),
+                        ("mini", thumb.mini_frame),
+                        ("title", thumb.title_frame),
+                        ("preview", thumb.preview_frame),
+                    ],
+                    None => vec![("ring", plan.ring_frame), ("close", plan.close_frame)],
+                };
+                for (name, frame) in frames {
+                    assert!(
+                        frame.origin.x.is_finite()
+                            && frame.origin.y.is_finite()
+                            && frame.size.width.is_finite()
+                            && frame.size.height.is_finite(),
+                        "{layout:?} {card_w}x{card_h}: the {name} frame is not finite: {frame:?}"
+                    );
+                    assert!(
+                        frame.size.width > 0.0 && frame.size.height > 0.0,
+                        "{layout:?} {card_w}x{card_h}: the {name} frame is empty: {frame:?}"
+                    );
+                }
+                assert_eq!(plan.layout, layout);
+            }
+        }
+    }
+
+    /// The icon-only plan's vertical geometry is the theme's own: the card builder now lays the icon
+    /// and the caption lines out from `theme::icon_card_layout`, so a plan that disagreed with it
+    /// would draw the plate around one shape and the artwork around another.
+    #[test]
+    fn plan_card_agrees_with_the_themed_icon_layout() {
+        let input = ThemeInput::current();
+        let card_w = theme::card_w();
+        let card_h = theme::card_h(&input);
+        let plan = CardPlan::new(card_w, card_h, CardLayout::IconOnly, &input);
+        let layout = theme::icon_card_layout(&input, card_w, card_h);
+
+        assert_eq!(plan.icon_bottom, Some(layout.icon_bottom));
+        // The plate is the theme's icon selection plate, un-nudged.
+        let (px, py, pw, ph) = theme::icon_selection_plate(card_w, card_h);
+        assert_eq!(plan.ring_frame.origin.x, px);
+        assert_eq!(plan.ring_frame.origin.y, py);
+        assert_eq!(plan.ring_frame.size.width, pw);
+        assert_eq!(plan.ring_frame.size.height, ph);
+        assert_eq!(plan.ring_radius, theme::icon_selection_plate_radius());
+        // The icon-only card never lifts: its selection unit is the icon.
+        assert_eq!(plan.selected_lift_of(true), 0.0);
+        // The plate takes the same nudge the icon does, keeping the two concentric.
+        let nudged = plan.ring_origin(true);
+        assert_eq!(nudged.x, px);
+        assert!(nudged.y > py);
+        assert_eq!(plan.ring_origin(false), crate::NSPoint::new(px, py));
+    }
+
+    /// The thumbnail plan's caption row and preview are the theme's, and the caption text sits
+    /// inside the row it belongs to. The two numbers the old refresh path re-derived
+    /// (`caption_y + 2.0` and `close_sz = 24.0`) are now the plan's own and are asserted in terms
+    /// of the row, not of a literal.
+    #[test]
+    fn plan_card_agrees_with_the_themed_thumbnail_metrics() {
+        let input = ThemeInput::current();
+        let card_w = 300.0;
+        for card_h in [180.0, 220.0, 300.0, 420.0] {
+            let plan = CardPlan::new(card_w, card_h, CardLayout::Thumbnail, &input);
+            let thumb = plan.thumbnail.expect("a thumbnail card has a caption row");
+
+            assert_eq!(
+                thumb.caption_h,
+                theme::thumb_caption_h_for_card(&input, card_h),
+                "{card_h}: the caption row height must be the theme's"
+            );
+            assert_eq!(
+                thumb.preview_h,
+                theme::thumb_preview_h(&input, card_h),
+                "{card_h}: the preview height must be the theme's"
+            );
+            assert!(
+                (thumb.caption_y + thumb.caption_h + theme::THUMB_PAD - card_h).abs() < 1e-9,
+                "{card_h}: the caption row must sit against the card's top padding"
+            );
+            assert!(
+                (thumb.preview_frame.origin.y - theme::THUMB_PAD).abs() < 1e-9,
+                "{card_h}: the preview must sit against the card's bottom padding"
+            );
+            // The title stays inside the caption row, and the close button does too: a title frame
+            // that escaped its row is exactly what made the caption look misplaced.
+            assert!(
+                thumb.title_frame.origin.y >= thumb.caption_y - 1e-9
+                    && thumb.title_frame.origin.y + thumb.title_frame.size.height
+                        <= thumb.caption_y + thumb.caption_h + 1e-9,
+                "{card_h}: the title frame {thumb:?} leaves its caption row"
+            );
+            assert!(
+                thumb.title_frame.origin.x + thumb.title_frame.size.width
+                    <= plan.close_frame.origin.x + 1e-9,
+                "{card_h}: the title must truncate before the close button, or it draws under it"
+            );
+            assert!(
+                plan.close_frame.origin.x + plan.close_frame.size.width
+                    <= card_w - theme::THUMB_PAD + 1e-9,
+                "{card_h}: the close button must stay inside the card's padding"
+            );
+            // The thumbnail card lifts as one unit while selected.
+            assert!(plan.selected_lift_of(true) > 0.0);
+            assert_eq!(plan.selected_lift_of(false), 0.0);
+        }
+    }
 }

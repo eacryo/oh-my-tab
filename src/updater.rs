@@ -3798,11 +3798,11 @@ mod tests {
     use super::{
         focus_window_for_prompt, inline_layout_scale, is_safe_update_info_url, prefers_inline,
         prompt_heading_wrap_width, prompt_install_scale_from, prompt_layout_scale_for,
-        prompt_title_box, prompt_title_height_at, prompt_title_layout_frame,
-        release_notes_heading_style, release_notes_measured_width, render_release_notes_markdown,
-        scale_frame, select_release_notes_locale, teardown_closes_standalone,
-        unscale_installed_width, update_prompt_kind, updater_delegate_class, RenderTarget,
-        UpdatePromptKind, PROMPT_COLUMN_W, PROMPT_COLUMN_X, PROMPT_TITLE_LINE_H, PROMPT_WINDOW_W,
+        prompt_title_box, prompt_title_layout_frame, release_notes_heading_style,
+        release_notes_measured_width, render_release_notes_markdown, scale_frame,
+        select_release_notes_locale, teardown_closes_standalone, unscale_installed_width,
+        update_prompt_kind, updater_delegate_class, RenderTarget, UpdatePromptKind,
+        PROMPT_COLUMN_W, PROMPT_COLUMN_X, PROMPT_TITLE_LINE_H, PROMPT_WINDOW_W,
         RELEASE_NOTES_LAYOUT_WIDTH,
     };
     use crate::smoke_verdict::smoke_runner;

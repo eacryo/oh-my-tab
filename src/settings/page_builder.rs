@@ -6,9 +6,11 @@ use super::*;
 pub(super) struct SettingsPageBuildContext {
     pub(super) content: *mut AnyObject,
     pub(super) content_w: f64,
+    /// The detail pane's left edge in the content view: the banner's final parent there.
     pub(super) page_x: f64,
-    pub(super) page_frame: NSRect,
+    /// The VISIBLE page viewport height (the clip), which the banner hangs from.
     pub(super) page_viewport_h: f64,
+    pub(super) page_frame: NSRect,
     pub(super) palette: UiPalette,
     pub(super) layout: SettingsLayout,
     pub(super) target: *mut AnyObject,
@@ -20,471 +22,47 @@ pub(super) struct SettingsPageFinalization {
     pub(super) bottoms: [f64; SETTINGS_PAGE_COUNT],
 }
 
-/// Build the Switcher page and return its final keyboard-card bottom.
+/// Build the Switcher page from its description.
+///
+/// The page is data now: `switcher_page_view` says what it is (rows, copy keys, identities,
+/// values, search entries), `layout_rows` says where everything sits, `render_page` applies that,
+/// and `page_update_description` is what the refill and the in-place refresh write. There is no
+/// second, inline construction path for this page.
 pub(super) unsafe fn build_switcher_page(
     context: &SettingsPageBuildContext,
     switcher_view: *mut AnyObject,
     switcher_doc_h: f64,
     ui: &mut SettingsUi,
 ) -> f64 {
-    let content_w = context.content_w;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let label_w = layout.label_w;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
-    // The page's layout owner: rows, cards, the title and the document height all follow from it.
-    // The page's rows fall back to this page's title as their section until a card sets one.
     begin_settings_search_page();
-    let mut canvas = PageCanvas::new(
+    let input = PageInput::capture();
+    match build_page(
+        ui,
+        SettingsPageId::Switcher,
         switcher_view,
-        content_w,
-        layout,
-        &t("settings.sidebar_switcher"),
+        context.content_w,
+        context.layout,
         switcher_doc_h,
         context.page_frame.size.height,
-    );
-    let y = canvas.next_row(described_row_h);
-    // App-switcher master switch: off = Cmd+Tab passes through to the system.
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_windows_enabled"),
-        Some(&t("settings.desc_windows_enabled")),
-    );
-    ui.windows_enabled = SettingsRow::described(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_windows_enabled"),
-        &t("settings.desc_windows_enabled"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    );
-    let _: () = msg_send![ui.windows_enabled, setTarget: target];
-    let _: () = msg_send![
-        ui.windows_enabled,
-        setAction: sel!(handleWindowsEnabledToggle:)
-    ];
-    canvas.card(&t("settings.header_windows"));
-    set_settings_search_section(&t("settings.header_windows"));
-    // The remaining window settings form a second card with its own section title.
-    canvas.next_section();
-    let y = canvas.next_row(described_row_h);
-    // Let the label fill the space before the control column, adapting to the available page width.
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_show_minimized"),
-        None,
-    );
-    ui.show_minimized = SettingsRow::tall_before_control(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x,
-        super::SETTINGS_CONTROL_LABEL_GAP,
-        &t("settings.row_show_minimized"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    )
-    .1;
-    bind_control(target, ui.show_minimized);
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_show_hidden_app_windows"),
-        None,
-    );
-    ui.show_hidden_app_windows = SettingsRow::tall_before_control(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x,
-        super::SETTINGS_CONTROL_LABEL_GAP,
-        &t("settings.row_show_hidden_app_windows"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    )
-    .1;
-    bind_control(target, ui.show_hidden_app_windows);
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    // Described row: the switch carries real caveats (icon-only cards, the Screen Recording
-    // dependency for titles, and the unreadable minimized state on another desktop).
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_show_other_desktops"),
-        Some(&t("settings.desc_show_other_desktops")),
-    );
-    ui.show_other_desktops = SettingsRow::described(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_show_other_desktops"),
-        &t("settings.desc_show_other_desktops"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    );
-    bind_control(target, ui.show_other_desktops);
-    // Window display mode: icons only or icons and thumbnails; the config remains stored as
-    // the thumbnails_enabled boolean.
-    let window_display_mode_labels = [
-        t("settings.window_display_mode_icons"),
-        t("settings.window_display_mode_icons_thumbnails"),
-    ];
-    let window_display_mode_refs: Vec<&str> = window_display_mode_labels
-        .iter()
-        .map(|s| s.as_str())
-        .collect();
-    let display_mode_metrics = SettingsSelect::metrics();
-    // Keep the trigger on the fixed 32pt control grid inside the standard 52pt settings row.
-    let y = canvas.next_row(display_mode_metrics.row_h);
-    SettingsRow::separator_above_row(switcher_view, y, display_mode_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_window_display_mode"),
-        None,
-    );
-    record_settings_search_options(&window_display_mode_refs);
-    ui.thumbnails_enabled = SettingsRow::tall_with_height(
-        switcher_view,
-        label_x,
-        y,
-        220.0,
-        display_mode_metrics.row_h,
-        &t("settings.row_window_display_mode"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            display_mode_metrics.control_h,
-            &window_display_mode_refs,
-            0,
-        ),
-    )
-    .1;
-    bind_control(target, ui.thumbnails_enabled);
-    // These two rows only mean something in icons-and-thumbnails mode: there is no thumbnail to
-    // prewarm in icon-only mode, and the app name already gets its own line there (see below), so
-    // they are one row group the page layout owner skips (both rows and their dividers go away and
-    // the sections below close the gap).
-    canvas.group_begin(RowGroup::ThumbnailOnly);
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_focused_thumbnail_prewarm"),
-        None,
-    );
-    let (_, prewarm_switch) = SettingsRow::tall_with_height(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_focused_thumbnail_prewarm"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    );
-    ui.focused_thumbnail_prewarm = prewarm_switch;
-    bind_control(target, ui.focused_thumbnail_prewarm);
-    // App name in card titles: the switch controls whether the thumbnail card's caption
-    // shows the app name before the window title, separated by " · "; icon-only mode
-    // already shows the app name on its own line below the title, so it is unaffected.
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_show_app_name_in_cards"),
-        None,
-    );
-    let (_, app_name_switch) = SettingsRow::tall(
-        switcher_view,
-        label_x,
-        y,
-        220.0,
-        &t("settings.row_show_app_name_in_cards"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    );
-    ui.show_app_name_in_cards = app_name_switch;
-    bind_control(target, ui.show_app_name_in_cards);
-    // Thumbnail card size: "auto" picks the step from the window count, a percent pins it so adding
-    // or removing a window only reflows rows and columns. Thumbnail mode only, like the two rows
-    // above (the group is hidden in icon-only mode).
-    let thumbnail_size_labels: Vec<String> = crate::config::THUMBNAIL_SIZE_VALUES
-        .iter()
-        .map(|value| match *value {
-            "auto" => t("settings.thumbnail_size_auto"),
-            percent => tf("settings.thumbnail_size_percent", &[("percent", percent)]),
-        })
-        .collect();
-    let thumbnail_size_refs: Vec<&str> = thumbnail_size_labels.iter().map(|s| s.as_str()).collect();
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_thumbnail_size"),
-        Some(&t("settings.desc_thumbnail_size")),
-    );
-    record_settings_search_options(&thumbnail_size_refs);
-    ui.thumbnail_size = SettingsRow::described(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_thumbnail_size"),
-        &t("settings.desc_thumbnail_size"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            SettingsSelect::metrics().control_h,
-            &thumbnail_size_refs,
-            0,
-        ),
-    );
-    bind_control(target, ui.thumbnail_size);
-    canvas.group_end();
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_card_text_size"),
-        Some(&t("settings.desc_card_text_size")),
-    );
-    ui.card_text_size = SettingsRow::described(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_card_text_size"),
-        &t("settings.desc_card_text_size"),
-        SettingsControl::stepped_slider(
-            ctrl_x,
-            y + 10.0,
-            SettingsRow::slider_width(ctrl_w),
-            row_h,
-            TEXT_SIZE_MIN,
-            TEXT_SIZE_MAX,
-            1,
-            TEXT_SIZE_DEFAULT,
-            // Double-click restores the default size (15pt).
-            Some(TEXT_SIZE_DEFAULT as f64),
-        ),
-    );
-    ui.card_text_size_value_label =
-        SettingsRow::attach_slider_readout(switcher_view, ui.card_text_size, TEXT_SIZE_DEFAULT);
-    bind_control(target, ui.card_text_size);
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_status_bar_text_size"),
-        Some(&t("settings.desc_status_bar_text_size")),
-    );
-    ui.status_bar_text_size = SettingsRow::described(
-        switcher_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_status_bar_text_size"),
-        &t("settings.desc_status_bar_text_size"),
-        SettingsControl::stepped_slider(
-            ctrl_x,
-            y + 10.0,
-            SettingsRow::slider_width(ctrl_w),
-            row_h,
-            STATUS_BAR_SIZE_MIN,
-            STATUS_BAR_SIZE_STOPS - 1,
-            1,
-            // The domain is stop indices (0 = hidden, 1..=8 = 13..=20pt); the loaded value is
-            // synced by load_settings_values like every other control.
-            STATUS_BAR_SIZE_DEFAULT_INDEX,
-            // Double-click restores the default size (15pt, stop 3).
-            Some(STATUS_BAR_SIZE_DEFAULT_INDEX as f64),
-        ),
-    );
-    ui.status_bar_text_size_value_label = SettingsRow::attach_slider_readout(
-        switcher_view,
-        ui.status_bar_text_size,
-        TEXT_SIZE_DEFAULT,
-    );
-    bind_control(target, ui.status_bar_text_size);
-    // overlay_position popup: [Follow Active Window, Always on Main Screen]; default index 0.
-    let op_labels = [
-        t("settings.overlay_position_follow_active"),
-        t("settings.overlay_position_main_screen"),
-    ];
-    let op_label_refs: Vec<&str> = op_labels.iter().map(|s| s.as_str()).collect();
-    let op_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(op_metrics.row_h);
-    SettingsRow::separator_above_row(switcher_view, y, op_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_overlay_position"),
-        None,
-    );
-    record_settings_search_options(&op_label_refs);
-    ui.overlay_position = SettingsRow::tall_with_height(
-        switcher_view,
-        label_x,
-        y,
-        label_w,
-        op_metrics.row_h,
-        &t("settings.row_overlay_position"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (op_metrics.row_h - op_metrics.control_h) / 2.0,
-            ctrl_w,
-            op_metrics.control_h,
-            &op_label_refs,
-            0,
-        ),
-    )
-    .1;
-    bind_control(target, ui.overlay_position);
-    // Window activation mode popup: index 0 = activate on hover, 1 = activate on click;
-    // default index 0.
-    let activation_labels = [
-        t("settings.activation_mode_hover"),
-        t("settings.activation_mode_click"),
-    ];
-    let activation_label_refs: Vec<&str> = activation_labels.iter().map(|s| s.as_str()).collect();
-    let activation_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(activation_metrics.row_h);
-    SettingsRow::separator_above_row(switcher_view, y, activation_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_activation_mode"),
-        None,
-    );
-    record_settings_search_options(&activation_label_refs);
-    ui.activation_mode = SettingsRow::tall_with_height(
-        switcher_view,
-        label_x,
-        y,
-        label_w,
-        activation_metrics.row_h,
-        &t("settings.row_activation_mode"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (activation_metrics.row_h - activation_metrics.control_h) / 2.0,
-            ctrl_w,
-            activation_metrics.control_h,
-            &activation_label_refs,
-            0,
-        ),
-    )
-    .1;
-    bind_control(target, ui.activation_mode);
-    // In-overlay action keys: one switch per key, all default-off. They only apply while the
-    // overlay is the key window (Command is held throughout the summon) and each acts on the
-    // HIGHLIGHTED card. Every one of them is a described row: the chord is real information the
-    // user cannot guess from the label alone.
-    let panel_rows: [(&str, &str); 4] = [
-        ("settings.row_panel_close", "settings.desc_panel_close"),
-        (
-            "settings.row_panel_minimize",
-            "settings.desc_panel_minimize",
-        ),
-        ("settings.row_panel_hide", "settings.desc_panel_hide"),
-        ("settings.row_panel_quit", "settings.desc_panel_quit"),
-    ];
-    for (title_key, desc_key) in panel_rows {
-        let y = canvas.next_row(described_row_h);
-        SettingsRow::separator_above_row(switcher_view, y, described_row_h, content_w);
-        record_settings_search_row(
-            SettingsPageId::Switcher,
-            canvas.last_row(),
-            &t(title_key),
-            Some(&t(desc_key)),
-        );
-        let control = SettingsRow::described(
-            switcher_view,
-            label_x,
-            y,
-            ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-            described_row_h,
-            &t(title_key),
-            &t(desc_key),
-            SettingsControl::switch(
-                ctrl_x + ctrl_w,
-                y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
-                row_h,
-                false,
-            ),
-        );
-        bind_control(target, control);
-        match title_key {
-            "settings.row_panel_close" => ui.panel_close_enabled = control,
-            "settings.row_panel_minimize" => ui.panel_minimize_enabled = control,
-            "settings.row_panel_hide" => ui.panel_hide_enabled = control,
-            _ => ui.panel_quit_enabled = control,
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::Switcher, built),
+        Err(_) => {
+            // A first build has no previous state: the page stays empty and nothing is
+            // published, which is better than a page that looks alive but is not wired.
+            empty_page(
+                ui,
+                SettingsPageId::Switcher,
+                switcher_view,
+                context,
+                switcher_doc_h,
+            )
         }
     }
-    canvas.card(&t("settings.header_window_options"));
-    set_settings_search_section(&t("settings.header_window_options"));
-    canvas.next_section();
-    // Modifier popup items follow config::SWITCHER_MODIFIER_VALUES (option / command / control).
-    let mod_labels = [
-        t("settings.modifier_option"),
-        t("settings.modifier_command"),
-        t("settings.modifier_control"),
-    ];
-    let mod_label_refs: Vec<&str> = mod_labels.iter().map(|s| s.as_str()).collect();
-    let mod_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(mod_metrics.row_h);
-    record_settings_search_row(
-        SettingsPageId::Switcher,
-        canvas.last_row(),
-        &t("settings.row_modifier"),
-        None,
-    );
-    record_settings_search_options(&mod_label_refs);
-    ui.modifier = SettingsRow::tall_with_height(
-        switcher_view,
-        label_x,
-        y,
-        label_w,
-        mod_metrics.row_h,
-        &t("settings.row_modifier"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (mod_metrics.row_h - mod_metrics.control_h) / 2.0,
-            ctrl_w,
-            mod_metrics.control_h,
-            &mod_label_refs,
-            0,
-        ),
-    )
-    .1;
-    bind_control(target, ui.modifier);
-    canvas.card(&t("settings.header_keyboard"));
-    set_settings_search_section(&t("settings.header_keyboard"));
-
-    sweep_unindexed_rows(&canvas, SettingsPageId::Switcher);
-    let content_bottom = canvas.finish();
-    ui.page_canvases[SETTINGS_SWITCHER_PAGE_INDEX] = canvas;
-    content_bottom
 }
-
 /// Build the Keystroke Display page and return its card bottom.
 pub(super) unsafe fn build_keystroke_display_page(
     context: &SettingsPageBuildContext,
@@ -1034,446 +612,43 @@ pub(super) unsafe fn set_max_extent_readout(label: *mut AnyObject, percent: u32)
 unsafe impl Send for SettingsPageBuildContext {}
 unsafe impl Sync for SettingsPageBuildContext {}
 
-/// Build the General page and return its final content bottom.
+/// Build the General page from its description.
+///
+/// Same shape as the Switcher page: the description says what the page is (rows, copy keys,
+/// identities, the permission banner), `layout_rows` says where it sits, `render_page` applies
+/// that, and `page_update_description` is what the refill and the in-place refresh write. The
+/// inline construction is deleted, so the page has one path.
 pub(super) unsafe fn build_general_page(
     context: &SettingsPageBuildContext,
     general_view: *mut AnyObject,
     general_doc_h: f64,
     ui: &mut SettingsUi,
 ) -> f64 {
-    let content_w = context.content_w;
-    let page_x = context.page_x;
-    let page_viewport_h = context.page_viewport_h;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let label_w = layout.label_w;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
-    // The whole page-top block (title + first section heading) comes from the component; the
-    // returned cursor is that heading's own cursor.
-    // The page's layout owner: rows, cards, the title and the document height all follow from it.
-    // The page's rows fall back to this page's title as their section until a card sets one.
     begin_settings_search_page();
-    let mut canvas = PageCanvas::new(
+    let input = PageInput::capture();
+    match build_page(
+        ui,
+        SettingsPageId::General,
         general_view,
-        content_w,
-        layout,
-        &t("settings.sidebar_general"),
+        context.content_w,
+        context.layout,
         general_doc_h,
         context.page_frame.size.height,
-    );
-
-    // The banner is a sibling of the scroll views; its strip and bottom gap are reserved so
-    // it cannot cover the title or cards.
-    let is_permission_migration = crate::update_notice::needs_permission_migration_copy();
-    let banner_content_h = if is_permission_migration { 60.0 } else { 48.0 };
-    let banner_gap = 12.0;
-    let banner_h = banner_content_h + banner_gap;
-    let banner: *mut AnyObject = msg_send![class!(NSView), alloc];
-    let banner: *mut AnyObject = msg_send![
-        banner,
-        initWithFrame: NSRect::new(
-            NSPoint::new(
-                page_x,
-                page_viewport_h - SettingsPageHeader::TOP_PADDING - banner_h,
-            ),
-            NSSize::new(content_w, banner_h)
-        )
-    ];
-    // Stretch horizontally and stay pinned to the content top (WidthSizable|MinYMargin = 10).
-    let _: () = msg_send![banner, setAutoresizingMask: 10u64];
-    ui.permission_warning_view = banner;
-
-    // warning text: word-wrapped, system red
-    let warning_label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let warning_label: *mut AnyObject = msg_send![
-        warning_label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(12.0, banner_gap + 6.0),
-            NSSize::new(content_w - 160.0, banner_content_h - 12.0)
-        )
-    ];
-    let warning_key = if is_permission_migration {
-        "settings.permission_migration_warning"
-    } else {
-        "settings.accessibility_warning"
-    };
-    let wl = make_nsstring(&t(warning_key));
-    let _: () = msg_send![warning_label, setStringValue: wl];
-    CFRelease(wl as *const c_void);
-    // The refresh path re-texts this label: the warning shown depends on live state (permissions,
-    // and whether the clipboard storage key could be obtained), not only on the build-time one.
-    ui.permission_warning_label = warning_label;
-    let _: () = msg_send![warning_label, setEditable: false];
-    let _: () = msg_send![warning_label, setBezeled: false];
-    let _: () = msg_send![warning_label, setDrawsBackground: false];
-    let _: () = msg_send![warning_label, setUsesSingleLineMode: false];
-    let _: () = msg_send![warning_label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
-    let red: *mut AnyObject = msg_send![class!(NSColor), systemRedColor];
-    let _: () = msg_send![warning_label, setTextColor: red];
-    // Stretches with the banner and stays left-anchored (WidthSizable = 2).
-    let _: () = msg_send![warning_label, setAutoresizingMask: 2u64];
-    let _: () = msg_send![banner, addSubview: warning_label];
-    release_obj(warning_label);
-
-    // "Open Privacy & Security" button
-    let open_btn = SettingsButton::action(
-        NSRect::new(
-            NSPoint::new(
-                content_w - 150.0,
-                banner_gap + (banner_content_h - 28.0) / 2.0,
-            ),
-            NSSize::new(140.0, 28.0),
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::General, built),
+        Err(_) => empty_page(
+            ui,
+            SettingsPageId::General,
+            general_view,
+            context,
+            general_doc_h,
         ),
-        &t("settings.btn_open_privacy"),
-        target,
-        sel!(handleOpenPrivacy:),
-        SettingsButtonRole::Action,
-    );
-    let _: () = msg_send![banner, addSubview: open_btn];
-    release_obj(open_btn);
-    // The storage warning reuses this strip but has no privacy pane to offer, so the refresh hides
-    // the button with the variant.
-    ui.permission_warning_button = open_btn;
-
-    // Start hidden; page selection applies the permission state and resizes General's viewport.
-    let _: () = msg_send![banner, setHidden: true];
-
-    // Startup card, first on the page: the two settings a new install most often needs.
-    let y = canvas.next_row(described_row_h);
-    // Launch-at-login switch: no title (the row label on the left already describes it).
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_launch_at_login"),
-        Some(&t("settings.desc_launch_at_login")),
-    );
-    ui.launch_at_login = SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        content_w - label_x * 2.0 - 58.0,
-        described_row_h,
-        &t("settings.row_launch_at_login"),
-        &t("settings.desc_launch_at_login"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    );
-    bind_control(target, ui.launch_at_login);
-    canvas.card(&t("settings.header_startup"));
-    set_settings_search_section(&t("settings.header_startup"));
-
-    // Menu-bar icon: its own card, because hiding the icon is a distinct decision from what the app
-    // does at login — and the row has to say where Settings can still be reached without it.
-    canvas.next_section();
-    let caption = t("settings.desc_hide_menu_bar_icon");
-    let caption_w = content_w - label_x * 2.0 - 58.0;
-    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
-    let y = canvas.next_row(caption_row_h);
-    // `captioned`, not `described`: the latter never renders its subtitle, and this row has to carry
-    // the "Settings can still be reached" promise that keeps a hidden icon from stranding the user
-    // (asserted by --smoke-settings-layout).
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_hide_menu_bar_icon"),
-        Some(&caption),
-    );
-    ui.hide_menu_bar_icon = SettingsRow::captioned(
-        general_view,
-        label_x,
-        y,
-        caption_w,
-        caption_row_h,
-        &t("settings.row_hide_menu_bar_icon"),
-        &caption,
-        SettingsControl::switch(ctrl_x + ctrl_w, y + 10.0, row_h, false),
-    )
-    .2;
-    bind_control(target, ui.hide_menu_bar_icon);
-    canvas.card(&t("settings.header_menu_bar_icon"));
-    set_settings_search_section(&t("settings.header_menu_bar_icon"));
-
-    canvas.next_section();
-    let theme_items = [
-        t("settings.theme_dark"),
-        t("settings.theme_light"),
-        t("settings.theme_auto"),
-    ];
-    let theme_item_refs: Vec<&str> = theme_items.iter().map(String::as_str).collect();
-    let theme_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(theme_metrics.row_h);
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_theme"),
-        Some(&t("settings.desc_theme")),
-    );
-    record_settings_search_options(&theme_item_refs);
-    ui.theme = SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        theme_metrics.row_h,
-        &t("settings.row_theme"),
-        &t("settings.desc_theme"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            theme_metrics.control_h,
-            &theme_item_refs,
-            0,
-        ),
-    );
-    bind_control(target, ui.theme);
-    let material_items = [
-        t("settings.panel_material_liquid_glass"),
-        t("settings.panel_material_frost"),
-        t("settings.panel_material_opaque"),
-    ];
-    let material_item_refs: Vec<&str> = material_items.iter().map(String::as_str).collect();
-    let material_metrics = SettingsSelect::metrics();
-    let y = canvas.next_block(material_metrics.row_h);
-    SettingsRow::separator(general_view, y + material_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_panel_material"),
-        Some(&t("settings.desc_panel_material")),
-    );
-    record_settings_search_options(&material_item_refs);
-    ui.panel_material = SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        material_metrics.row_h,
-        &t("settings.row_panel_material"),
-        &t("settings.desc_panel_material"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            material_metrics.control_h,
-            &material_item_refs,
-            0,
-        ),
-    );
-    bind_control(target, ui.panel_material);
-    // The glass style is a Liquid-Glass sub-option. It is always built and shown or hidden as a
-    // `RowGroup` (see `update_conditional_rows`), so switching the panel material reflows this one
-    // row in place instead of rebuilding the whole settings content. The private `_variant` is
-    // deliberately NOT a user choice: two attempts at labelling it from a brightness sample were
-    // wrong (variant 19 measures the *most* transparent and renders broken rainbow edges), so it
-    // stays a config/dev knob until a backdrop-differential measurement exists.
-    canvas.group_begin(RowGroup::GlassStyle);
-    // The two looks this app has always had: `regular` (index 0) and `clear` (index 1). The index is
-    // the config value (see `ControlField::GlassStyle`).
-    let glass_style_labels = [
-        t("settings.glass_style_regular"),
-        t("settings.glass_style_clear"),
-    ];
-    let glass_style_label_refs: Vec<&str> = glass_style_labels.iter().map(String::as_str).collect();
-    let glass_style_metrics = SettingsSelect::metrics();
-    let y = canvas.next_block(glass_style_metrics.row_h);
-    SettingsRow::separator(general_view, y + glass_style_metrics.row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_glass_style"),
-        Some(&t("settings.desc_glass_style")),
-    );
-    record_settings_search_options(&glass_style_label_refs);
-    ui.glass_style = SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        glass_style_metrics.row_h,
-        &t("settings.row_glass_style"),
-        &t("settings.desc_glass_style"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            glass_style_metrics.control_h,
-            &glass_style_label_refs,
-            0,
-        ),
-    );
-    bind_control(target, ui.glass_style);
-    canvas.group_end();
-    canvas.card(&t("settings.header_appearance"));
-    set_settings_search_section(&t("settings.header_appearance"));
-
-    canvas.next_section();
-    let locale_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(locale_metrics.row_h);
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_locale"),
-        None,
-    );
-    record_settings_search_options(&LOCALE_LABELS);
-    ui.locale = SettingsRow::plain(
-        general_view,
-        label_x,
-        y,
-        label_w,
-        locale_metrics.row_h,
-        &t("settings.row_locale"),
-        SettingsControl::popup(
-            ctrl_x,
-            y,
-            ctrl_w,
-            locale_metrics.control_h,
-            &LOCALE_LABELS,
-            0,
-        ),
-    );
-    bind_control(target, ui.locale);
-    canvas.card(&t("settings.header_language"));
-    set_settings_search_section(&t("settings.header_language"));
-
-    canvas.next_section();
-    // Log level popup: items = [debug, info]; default index 1 (info).
-    let log_levels = [t("settings.log_level_debug"), t("settings.log_level_info")];
-    let log_level_refs: Vec<&str> = log_levels.iter().map(String::as_str).collect();
-    let log_level_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(log_level_metrics.row_h);
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_log_level"),
-        Some(&t("settings.desc_log_level")),
-    );
-    record_settings_search_options(&log_level_refs);
-    ui.log_level = SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        log_level_metrics.row_h,
-        &t("settings.row_log_level"),
-        &t("settings.desc_log_level"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + 10.0,
-            ctrl_w,
-            log_level_metrics.control_h,
-            &log_level_refs,
-            1,
-        ),
-    );
-    bind_control(target, ui.log_level);
-    // Export logs: title+description on the left, action button on the right (same card
-    // as the log level; the button opts out of ControlField live-apply and goes straight
-    // through target/action).
-    let y = canvas.next_row(described_row_h);
-    // In-card divider: the export row sits right below it (separator_above_row owns the
-    // row-relative math).
-    SettingsRow::separator_above_row(general_view, y, described_row_h, content_w);
-    let export_btn = row_action_button(
-        ctrl_x,
-        ctrl_w,
-        y,
-        &t("settings.btn_export_logs"),
-        target,
-        sel!(handleExportLogs:),
-    );
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_export_logs"),
-        Some(&t("settings.desc_export_logs")),
-    );
-    SettingsRow::described(
-        general_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_export_logs"),
-        &t("settings.desc_export_logs"),
-        export_btn,
-    );
-    canvas.card(&t("settings.header_logging"));
-    set_settings_search_section(&t("settings.header_logging"));
-
-    // Backup: export the whole configuration to a file, or restore it on this or another Mac.
-    // `captioned`, not `described`: the latter's subtitle is never rendered, and the import row has
-    // to carry the "this replaces your settings" warning in place of a confirmation dialog.
-    canvas.next_section();
-    let caption = t("settings.desc_export_settings");
-    let caption_w = ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP;
-    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
-    let y = canvas.next_row(caption_row_h);
-    let export_settings_btn = row_action_button(
-        ctrl_x,
-        ctrl_w,
-        y,
-        &t("settings.btn_export_settings"),
-        target,
-        sel!(handleExportSettings:),
-    );
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_export_settings"),
-        Some(&caption),
-    );
-    SettingsRow::captioned(
-        general_view,
-        label_x,
-        y,
-        caption_w,
-        caption_row_h,
-        &t("settings.row_export_settings"),
-        &caption,
-        export_settings_btn,
-    );
-    let caption = t("settings.desc_import_settings");
-    let caption_row_h = widgets::captioned_row_height(&caption, caption_w);
-    let y = canvas.next_row(caption_row_h);
-    SettingsRow::separator_above_row(general_view, y, caption_row_h, content_w);
-    let import_settings_btn = row_action_button(
-        ctrl_x,
-        ctrl_w,
-        y,
-        &t("settings.btn_import_settings"),
-        target,
-        sel!(handleImportSettings:),
-    );
-    record_settings_search_row(
-        SettingsPageId::General,
-        canvas.last_row(),
-        &t("settings.row_import_settings"),
-        Some(&caption),
-    );
-    SettingsRow::captioned(
-        general_view,
-        label_x,
-        y,
-        caption_w,
-        caption_row_h,
-        &t("settings.row_import_settings"),
-        &caption,
-        import_settings_btn,
-    );
-    canvas.card(&t("settings.header_backup"));
-    set_settings_search_section(&t("settings.header_backup"));
-
-    sweep_unindexed_rows(&canvas, SettingsPageId::General);
-    let content_bottom = canvas.finish();
-    ui.page_canvases[SETTINGS_GENERAL_PAGE_INDEX] = canvas;
-    content_bottom
+    }
 }
-
 /// Build the Mouse page and return its final content bottom.
 pub(super) unsafe fn build_mouse_page(
     context: &SettingsPageBuildContext,
@@ -3264,6 +2439,74 @@ pub(super) unsafe fn finalize_settings_pages(
             document: *document,
         }
         .validate(settings_page_name(index));
+    }
+}
+
+/// Store a migrated page: its layout owner and its rendered controls, and record its search
+/// index from the description's own values (the pure description never writes to the index).
+pub(super) unsafe fn publish_built_page(
+    ui: &mut SettingsUi,
+    page: SettingsPageId,
+    built: BuiltPage,
+) -> f64 {
+    let index = settings_page_index(page);
+    record_page_search_entries(page, &built.view, &built.canvas);
+    // The page is good: give its controls to the pointer fields the dispatcher, the refill's own
+    // consumers and the freeze lists read, before the page becomes the one on screen.
+    bind_page_controls(ui, &built.rendered);
+    ui.page_canvases[index] = built.canvas;
+    // The banner's three pointers are bound from the page's own record before it is stored.
+    bind_page_banner(ui, &built.rendered);
+    ui.migrated_pages[index] = Some(built.rendered);
+    built.content_bottom
+}
+
+/// Build an empty layout owner for a page whose description could not be built.
+pub(super) unsafe fn empty_page(
+    ui: &mut SettingsUi,
+    page: SettingsPageId,
+    document: *mut AnyObject,
+    context: &SettingsPageBuildContext,
+    doc_h: f64,
+) -> f64 {
+    let mut canvas = PageCanvas::new(
+        document,
+        context.content_w,
+        context.layout,
+        &t(page.title_key()),
+        doc_h,
+        context.page_frame.size.height,
+    );
+    let bottom = canvas.finish();
+    ui.page_canvases[settings_page_index(page)] = canvas;
+    ui.migrated_pages[settings_page_index(page)] = None;
+    bottom
+}
+/// Record a migrated page's search index from its description: every row's entry is a value the
+/// description produced. The sweep that follows fills in the rest, exactly as it does for the
+/// pages still built inline.
+unsafe fn record_page_search_entries(page: SettingsPageId, view: &PageView, canvas: &PageCanvas) {
+    sidebar::begin_settings_search_section();
+    let page_index = settings_page_index(page);
+    for (row, spec) in view.rows.iter().enumerate() {
+        let entry = sidebar::SearchEntry::row(
+            page_index,
+            row,
+            &spec.search.label,
+            spec.search.desc.as_deref(),
+            &spec.search.section,
+        )
+        .with_options(&spec.search.options);
+        sidebar::record_settings_search_entry(entry);
+        // The same backfill the pages built inline get: whatever the row's views actually show
+        // (a button's title, a dropdown's choices) is searchable too.
+        let mut text = Vec::new();
+        if let Some(views) = canvas.row_views(row) {
+            for &view in views {
+                collect_settings_search_text(view, &mut text);
+            }
+        }
+        sidebar::extend_settings_search_row(page_index, row, &text);
     }
 }
 

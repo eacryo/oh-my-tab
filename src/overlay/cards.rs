@@ -362,7 +362,224 @@ pub(super) unsafe fn populate_thumbnail_preview(
     add_status_badges_if_needed(container, pw, ph, w);
 }
 
+// The card's own geometry tokens. They live with the card because the card owns them: every one is
+// a ratio or an inset of the card's own caption row, not a page- or panel-level metric, and a call
+// site must never state one of these numbers itself.
+
+/// The app-icon chip beside the caption: a base size the text scale multiplies, then clamps.
+const MINI_ICON_BASE_SIZE: f64 = 22.0;
+const MINI_ICON_MIN_SIZE: f64 = 16.0;
+const MINI_ICON_MAX_SIZE: f64 = 30.0;
+/// How much shorter than the caption row the chip may get (the row is `chip + INSET` at most).
+const MINI_ICON_CAPTION_INSET: f64 = 2.0;
+/// The card title label inside its caption row: it starts this far above the row's bottom and keeps
+/// the same room at its top, so the row is the label plus `2 * INSET`.
+const CARD_TITLE_CAPTION_INSET: f64 = 2.0;
+/// Room the trailing close affordance needs; the title truncates before reaching it. The reserve is
+/// deliberately wider than `CARD_CLOSE_SIZE`: a caption that ran flush against the button read as
+/// one clipped word, and this is the gap the caption already kept.
+const CARD_CAPTION_CLOSE_RESERVE: f64 = 24.0;
+/// A caption too narrow to read the rounded ellipsis is not a caption; the title keeps this floor.
+const CARD_CAPTION_MIN_W: f64 = 20.0;
+/// The close button's square side, shared by both card layouts.
+const CARD_CLOSE_SIZE: f64 = 20.0;
+/// The icon-only card's close button sits this far in from the card's trailing corner.
+const CARD_CLOSE_CORNER_INSET: f64 = 27.0;
+/// The geometry of one card, computed once and applied by both the creation path and the refresh
+/// path.
+///
+/// Card creation builds a view tree from these frames, and the selection refresh moves and hides
+/// parts of that same tree. Two independent derivations of the same numbers drift apart with no
+/// test able to see it, so there is exactly one: `plan_card`, whose result the refresh re-reads
+/// instead of re-deriving from the live view frames.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct CardPlan {
+    pub(crate) layout: CardLayout,
+    /// The selection plate: the whole card with the ring outset for the thumbnail layout, the icon
+    /// selection plate around the artwork for the icon-only layout.
+    pub(crate) ring_frame: NSRect,
+    pub(crate) ring_radius: f64,
+    /// The card root's upward translation while selected (0.0 in the icon-only layout, whose
+    /// selection unit is the icon rather than the whole card).
+    pub(crate) selected_lift: f64,
+    /// The close button's frame.
+    pub(crate) close_frame: NSRect,
+    pub(crate) close_radius: f64,
+    pub(crate) close_font_size: f64,
+    /// The thumbnail caption row, when the card is in the thumbnail layout.
+    pub(crate) thumbnail: Option<ThumbnailCardPlan>,
+    /// The icon-only vertical layout's bottom edge, when the card is in the icon-only layout:
+    /// the one number the selection refresh needs from it (the plate and the captions are laid
+    /// out once, at creation).
+    pub(crate) icon_bottom: Option<f64>,
+}
+
+/// The thumbnail card's caption row and preview frames.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct ThumbnailCardPlan {
+    pub(crate) caption_h: f64,
+    pub(crate) caption_y: f64,
+    /// The app-icon chip at the caption row's leading edge.
+    pub(crate) mini_frame: NSRect,
+    /// The caption label: its height is the row minus its own insets, and `+INSET` is what made the
+    /// creation path and the refresh path disagree about where the text sat.
+    pub(crate) title_frame: NSRect,
+    pub(crate) preview_frame: NSRect,
+    pub(crate) preview_h: f64,
+}
+
+/// The selection unit a card marks, which is also what decides whether the whole card lifts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CardLayout {
+    /// Caption row plus preview; the plate wraps the card.
+    Thumbnail,
+    /// Centered icon plus two caption lines; the plate wraps the artwork.
+    IconOnly,
+}
+
+impl CardPlan {
+    /// The plan for a card of `card_w` x `card_h`. `layout` selects the card design and `input`
+    /// supplies every themed quantity (paddings, radii, caption height, close-button metrics), so
+    /// the result is a pure function of its arguments.
+    pub(crate) fn new(
+        card_w: f64,
+        card_h: f64,
+        layout: CardLayout,
+        input: &crate::theme::ThemeInput,
+    ) -> CardPlan {
+        let radii =
+            crate::theme::overlay_radii(crate::theme::overlay_card_radius(input), THUMB_PAD);
+        let close_font_size = crate::theme::FONT_CAPTION;
+        let close_radius = radii.close_button;
+        match layout {
+            CardLayout::Thumbnail => {
+                let caption_h = crate::theme::thumb_caption_h_for_card(input, card_h);
+                let preview_h = crate::theme::thumb_preview_h(input, card_h);
+                let caption_y = card_h - THUMB_PAD - caption_h;
+                let mini_sz = (MINI_ICON_BASE_SIZE * crate::theme::text_scale(input))
+                    .clamp(MINI_ICON_MIN_SIZE, MINI_ICON_MAX_SIZE)
+                    .min((caption_h - MINI_ICON_CAPTION_INSET).max(1.0));
+                let mini_frame = NSRect::new(
+                    NSPoint::new(THUMB_PAD, caption_y + (caption_h - mini_sz) / 2.0),
+                    NSSize::new(mini_sz, mini_sz),
+                );
+                let title_x = THUMB_PAD + mini_sz + THUMB_CAPTION_ICON_GAP;
+                let title_frame = NSRect::new(
+                    NSPoint::new(title_x, caption_y + CARD_TITLE_CAPTION_INSET),
+                    NSSize::new(
+                        (card_w - title_x - CARD_CAPTION_CLOSE_RESERVE - THUMB_PAD)
+                            .max(CARD_CAPTION_MIN_W),
+                        (caption_h - CARD_TITLE_CAPTION_INSET * 2.0).max(1.0),
+                    ),
+                );
+                let close_sz = CARD_CLOSE_SIZE;
+                let close_frame = NSRect::new(
+                    NSPoint::new(
+                        card_w - THUMB_PAD - close_sz,
+                        caption_y + (caption_h - close_sz) / 2.0,
+                    ),
+                    NSSize::new(close_sz, close_sz),
+                );
+                let preview_frame = NSRect::new(
+                    NSPoint::new(THUMB_PAD, THUMB_PAD),
+                    NSSize::new(card_w - THUMB_PAD * 2.0, preview_h),
+                );
+                let inset = crate::theme::OVERLAY_RING_INSET;
+                CardPlan {
+                    layout,
+                    ring_frame: NSRect::new(
+                        NSPoint::new(-inset, -inset),
+                        NSSize::new(card_w + inset * 2.0, card_h + inset * 2.0),
+                    ),
+                    ring_radius: radii.selection_ring,
+                    selected_lift: SELECTED_CARD_LIFT,
+                    close_frame,
+                    close_radius,
+                    close_font_size,
+                    thumbnail: Some(ThumbnailCardPlan {
+                        caption_h,
+                        caption_y,
+                        mini_frame,
+                        title_frame,
+                        preview_frame,
+                        preview_h,
+                    }),
+                    icon_bottom: None,
+                }
+            }
+            CardLayout::IconOnly => {
+                let icon = crate::theme::icon_card_layout(input, card_w, card_h);
+                let (px, py, pw, ph) = crate::theme::icon_selection_plate(card_w, card_h);
+                let close_sz = CARD_CLOSE_SIZE;
+                CardPlan {
+                    layout,
+                    ring_frame: NSRect::new(NSPoint::new(px, py), NSSize::new(pw, ph)),
+                    ring_radius: crate::theme::icon_selection_plate_radius(),
+                    selected_lift: 0.0,
+                    close_frame: NSRect::new(
+                        NSPoint::new(
+                            card_w - CARD_CLOSE_CORNER_INSET,
+                            card_h - CARD_CLOSE_CORNER_INSET,
+                        ),
+                        NSSize::new(close_sz, close_sz),
+                    ),
+                    close_radius,
+                    close_font_size,
+                    thumbnail: None,
+                    icon_bottom: Some(icon.icon_bottom),
+                }
+            }
+        }
+    }
+
+    /// The plate's origin while the card is selected: the icon-only plate takes the same nudge the
+    /// icon does, so the two stay concentric; the thumbnail plate rides the lifted card instead.
+    pub(crate) fn ring_origin(&self, is_selected: bool) -> NSPoint {
+        let lift = if is_selected {
+            SELECTED_CONTENT_NUDGE
+        } else {
+            0.0
+        };
+        match self.layout {
+            CardLayout::IconOnly => {
+                NSPoint::new(self.ring_frame.origin.x, self.ring_frame.origin.y + lift)
+            }
+            CardLayout::Thumbnail => self.ring_frame.origin,
+        }
+    }
+
+    /// The card root's upward translation while selected. The icon-only layout keeps the card
+    /// still and moves the icon and its plate instead.
+    pub(crate) fn selected_lift_of(&self, is_selected: bool) -> f64 {
+        if is_selected {
+            self.selected_lift
+        } else {
+            0.0
+        }
+    }
+
+    /// The icon's bottom edge while selected. Recomputed from the baseline on every refresh so
+    /// repeated selection changes never accumulate the offset.
+    pub(crate) fn icon_origin_y(&self, current_icon_h: f64, is_selected: bool) -> f64 {
+        let Some(icon_bottom) = self.icon_bottom else {
+            return 0.0;
+        };
+        let icon_px = crate::theme::icon_px();
+        let base_y = if (current_icon_h - icon_px).abs() < 0.5 {
+            icon_bottom
+        } else {
+            icon_bottom + (icon_px - current_icon_h) / 2.0
+        };
+        base_y
+            + if is_selected {
+                SELECTED_CONTENT_NUDGE
+            } else {
+                0.0
+            }
+    }
+}
 pub(crate) fn create_card_view(
+    theme: &crate::theme::ThemeInput,
     w: &WindowInfo,
     index: usize,
     card_width: f64,
@@ -379,9 +596,24 @@ pub(crate) fn create_card_view(
         // caller: after the flow layout's shrink step each card's actual height is
         // smaller than the base, and the internal geometry MUST be laid out from
         // that actual height or masksToBounds clips the caption away (verified).
-        let use_new = crate::theme::thumbnails_enabled();
-        let card_radius = crate::theme::overlay_card_radius();
+        // `theme` is the caller's transaction snapshot, never re-read here: a summon builds every
+        // card from one ThemeInput, so a config reload cannot land halfway through a card tree.
+        let use_new = crate::theme::thumbnails_enabled(theme);
+        let card_radius = crate::theme::overlay_card_radius(theme);
         let radii = crate::theme::overlay_radii(card_radius, THUMB_PAD);
+        // One plan for the whole card: the creation path below lays every subview out from it, and
+        // `refresh_highlight` re-reads the same plan when it moves the selection instead of
+        // re-deriving frames from the live views.
+        let plan = CardPlan::new(
+            card_width,
+            card_h,
+            if use_new {
+                CardLayout::Thumbnail
+            } else {
+                CardLayout::IconOnly
+            },
+            theme,
+        );
         let frame = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card_width, card_h));
         let view: *mut AnyObject = msg_send![card_cls_ptr, alloc];
         let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
@@ -402,10 +634,13 @@ pub(crate) fn create_card_view(
         set_card_key(view, (w.pid, w.window_id));
         set_card_signature(
             view,
-            card_signature(w, frame, use_new, thumbnail_capture_allowed),
+            card_signature(w, frame, theme, use_new, thumbnail_capture_allowed),
         );
+        // The plan the card was built from. `refresh_highlight` re-reads it rather than deriving
+        // the same frames from the live views a second time.
+        set_card_plan(view, plan.clone());
 
-        let colors = current_colors();
+        let colors = crate::theme::colors_from(theme, theme.dark);
 
         // The selection plate, built by both layouts and owned (visibility, colour) by
         // refresh_highlight. What each one marks is the layout's own unit of selection:
@@ -417,22 +652,8 @@ pub(crate) fn create_card_view(
         //   (theme::icon_selection_plate) and the captions stay outside it.
         // masksToBounds=false on the plate's layer: its fill and border are drawn inside its own
         // frame, but the card clip must not eat them while the card is translated.
-        let (ring_frame, ring_radius) = if use_new {
-            let inset = crate::theme::OVERLAY_RING_INSET;
-            (
-                NSRect::new(
-                    NSPoint::new(-inset, -inset),
-                    NSSize::new(card_width + inset * 2.0, card_h + inset * 2.0),
-                ),
-                radii.selection_ring,
-            )
-        } else {
-            let (px, py, pw, ph) = crate::theme::icon_selection_plate(card_width, card_h);
-            (
-                NSRect::new(NSPoint::new(px, py), NSSize::new(pw, ph)),
-                crate::theme::icon_selection_plate_radius(),
-            )
-        };
+        let ring_frame = plan.ring_frame;
+        let ring_radius = plan.ring_radius;
         let ring: *mut AnyObject = msg_send![class!(NSImageView), alloc];
         let ring: *mut AnyObject = msg_send![ring, initWithFrame: ring_frame];
         let _: () = msg_send![ring, setTag: THUMB_SELECTION_RING_TAG];
@@ -454,17 +675,11 @@ pub(crate) fn create_card_view(
         release_obj(ring);
 
         if use_new {
-            let caption_h = thumb_caption_h_for_card(card_h);
-            let preview_h = thumb_preview_h(card_h);
-            let caption_y = card_h - THUMB_PAD - caption_h;
-
-            let mini_sz = (22.0 * text_scale())
-                .clamp(16.0, 30.0)
-                .min((caption_h - 2.0).max(1.0));
-            let mini_frame = NSRect::new(
-                NSPoint::new(THUMB_PAD, caption_y + (caption_h - mini_sz) / 2.0),
-                NSSize::new(mini_sz, mini_sz),
-            );
+            let thumbnail = plan
+                .thumbnail
+                .expect("a thumbnail card is planned with its caption row");
+            let mini_frame = thumbnail.mini_frame;
+            let mini_sz = mini_frame.size.width;
             let mut mini_img: Option<*mut AnyObject> = None;
             if let Some(ref icon_path) = w.icon_path {
                 let ns_path = make_nsstring(icon_path);
@@ -516,10 +731,7 @@ pub(crate) fn create_card_view(
 
             // --- Title (left-aligned, tail-truncated; the app name sinks into the
             // status footer) ---
-            let title_x = THUMB_PAD + mini_sz + THUMB_CAPTION_ICON_GAP;
-            let close_sz = 24.0;
-            let title_w = (card_width - title_x - close_sz - THUMB_PAD).max(20.0);
-            let title_size = card_title_font_size();
+            let title_size = card_title_font_size(theme);
             let title_font: *mut AnyObject = {
                 let cfg = CONFIG.read().unwrap();
                 msg_send![class!(NSFont), systemFontOfSize: title_size, weight: cfg.fonts.title_weight]
@@ -529,23 +741,20 @@ pub(crate) fn create_card_view(
                 &card_caption(
                     &w.window_title,
                     &w.app_name,
-                    crate::theme::show_app_name_in_cards(),
+                    crate::theme::show_app_name_in_cards(theme),
                 ),
                 title_font,
                 crate::glass::PanelInk::Primary.color(),
-                title_x,
-                caption_y + 2.0,
-                title_w,
-                (caption_h - 4.0).max(1.0),
+                thumbnail.title_frame.origin.x,
+                thumbnail.title_frame.origin.y,
+                thumbnail.title_frame.size.width,
+                thumbnail.title_frame.size.height,
                 crate::glass::vibrant_label_class(),
             );
             let _: () = msg_send![view, addSubview: title_label];
             release_obj(title_label);
 
-            let preview_frame = NSRect::new(
-                NSPoint::new(THUMB_PAD, THUMB_PAD),
-                NSSize::new(card_width - THUMB_PAD * 2.0, preview_h),
-            );
+            let preview_frame = thumbnail.preview_frame;
             // The preview container is an NSImageView: refresh_highlight's
             // selected-state nudge locates it via viewWithTag, and setTag: only
             // exists on NSControl-derived classes -- a bare NSView's tag property is
@@ -572,9 +781,9 @@ pub(crate) fn create_card_view(
         } else {
             // One shared derivation of the icon-only card's vertical layout, so the icon, the two
             // caption lines and the plate that wraps them cannot drift apart.
-            let layout = crate::theme::icon_card_layout(card_width, card_h);
-            let icon_x = layout.icon_x; // 15.0
-            let icon_bottom = layout.icon_bottom; // 70.5
+            let layout = crate::theme::icon_card_layout(theme, card_width, card_h);
+            let icon_x = layout.icon_x;
+            let icon_bottom = layout.icon_bottom;
 
             if let Some(ref icon_path) = w.icon_path {
                 let ns_path = make_nsstring(icon_path);
@@ -669,7 +878,7 @@ pub(crate) fn create_card_view(
             let secondary_bottom = layout.secondary_bottom;
 
             // --- Primary line: window title (12px medium, dark).
-            let primary_font_size = card_title_font_size();
+            let primary_font_size = card_title_font_size(theme);
             let primary_font: *mut AnyObject = {
                 let cfg = CONFIG.read().unwrap();
                 msg_send![class!(NSFont), systemFontOfSize: primary_font_size, weight: cfg.fonts.title_weight]
@@ -688,7 +897,7 @@ pub(crate) fn create_card_view(
             release_obj(title_label); // view owns the label; drop our alloc +1
 
             // --- Secondary line: app name (10px regular, light).
-            let secondary_font_size = card_app_name_font_size();
+            let secondary_font_size = card_app_name_font_size(theme);
             let secondary_font: *mut AnyObject = {
                 let cfg = CONFIG.read().unwrap();
                 msg_send![class!(NSFont), systemFontOfSize: secondary_font_size, weight: cfg.fonts.app_name_weight]
@@ -723,30 +932,9 @@ pub(crate) fn create_card_view(
         // only a 5.5pt ring now, so the glyph has no room inside its corner and
         // sits in the icon canvas' transparent margin instead, over the scrim
         // added below. ---
-        let (btn_frame, btn_radius, btn_font_sz) = if use_new {
-            let caption_h = thumb_caption_h_for_card(card_h);
-            let caption_y = card_h - THUMB_PAD - caption_h;
-            (
-                NSRect::new(
-                    NSPoint::new(
-                        card_width - THUMB_PAD - 20.0,
-                        caption_y + (caption_h - 20.0) / 2.0,
-                    ),
-                    NSSize::new(20.0, 20.0),
-                ),
-                radii.close_button,
-                crate::theme::FONT_CAPTION,
-            )
-        } else {
-            (
-                NSRect::new(
-                    NSPoint::new(card_width - 27.0, card_h - 27.0),
-                    NSSize::new(20.0, 20.0),
-                ),
-                radii.close_button,
-                crate::theme::FONT_CAPTION,
-            )
-        };
+        let btn_frame = plan.close_frame;
+        let btn_radius = plan.close_radius;
+        let btn_font_sz = plan.close_font_size;
         if !use_new {
             // The icon-only button sits over the icon itself, so it carries its own chip:
             // the same `badge_scrim` + white glyph the preview badges use (design-style §11),
@@ -881,13 +1069,14 @@ fn overlay_target_screen(windows: &[WindowInfo]) -> (NSRect, NSRect, f64) {
 /// Find the widest card represented by a currently maximized window, and use it as
 /// the cap for unusually wide window thumbnails.
 fn thumbnail_max_card_width(
+    input: &crate::theme::ThemeInput,
     windows: &[WindowInfo],
     card_h: f64,
     max_inner: f64,
     screen_frame: NSRect,
     screen_visible: NSRect,
 ) -> f64 {
-    let fallback = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO).min(max_inner);
+    let fallback = thumb_card_w_for_aspect(input, card_h, THUMB_PREVIEW_RATIO).min(max_inner);
     let screen_w = screen_frame.size.width.max(1.0);
     let visible_h = screen_visible.size.height.max(1.0);
 
@@ -899,7 +1088,7 @@ fn thumbnail_max_card_width(
             // This deliberately avoids treating half-screen and ordinary resized windows as
             // the reference, even when their aspect ratio is unusually wide.
             let maximized = width >= screen_w * 0.90 && height >= visible_h * 0.80;
-            maximized.then(|| thumb_card_w_for_aspect(card_h, width / height).min(max_inner))
+            maximized.then(|| thumb_card_w_for_aspect(input, card_h, width / height).min(max_inner))
         })
         .max_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
         .unwrap_or(fallback)
@@ -922,8 +1111,9 @@ unsafe fn reconcile_card_views(
     placements: &[CardPlacementFrame],
     card_height: f64,
     thumbnail_capture_allowed: bool,
+    input: &crate::theme::ThemeInput,
 ) -> CardReconcileStats {
-    let use_new = crate::theme::thumbnails_enabled();
+    let use_new = crate::theme::thumbnails_enabled(input);
     let mut existing: HashMap<WindowKey, *mut AnyObject> = card_views(document)
         .into_iter()
         .filter_map(|card| card_key(card).map(|key| (key, card)))
@@ -936,11 +1126,16 @@ unsafe fn reconcile_card_views(
         };
         let key = (window.pid, window.window_id);
         let desired_frame = NSRect::new(
-            NSPoint::new(card_x, card_y - footer_band_h()),
+            NSPoint::new(card_x, card_y - footer_band_h(input)),
             NSSize::new(card_w, card_height),
         );
-        let desired_signature =
-            card_signature(window, desired_frame, use_new, thumbnail_capture_allowed);
+        let desired_signature = card_signature(
+            window,
+            desired_frame,
+            input,
+            use_new,
+            thumbnail_capture_allowed,
+        );
 
         let card = existing.remove(&key);
         let action = match card {
@@ -953,6 +1148,7 @@ unsafe fn reconcile_card_views(
         match action {
             CardReconcileAction::Create => {
                 let card = create_card_view(
+                    input,
                     window,
                     idx,
                     desired_frame.size.width,
@@ -977,6 +1173,7 @@ unsafe fn reconcile_card_views(
                 let card = card.unwrap();
                 remove_card_index(card);
                 let new_card = create_card_view(
+                    input,
                     window,
                     idx,
                     desired_frame.size.width,
@@ -1025,7 +1222,10 @@ pub(crate) fn show_overlay() {
         // The target screen comes first: the flow layout needs its width as the
         // packing budget; centering reuses it.
         let (screen_frame, screen_visible, screen_scale) = overlay_target_screen(&windows);
-        let use_flow = crate::theme::thumbnails_enabled();
+        // One theme snapshot for this whole render: the layout plan, every card and the footer all
+        // read the same values, and no leaf re-reads the global behind a caller's back.
+        let input = crate::theme::ThemeInput::current();
+        let use_flow = crate::theme::thumbnails_enabled(&input);
         // One TCC preflight covers every card in this render instead of querying once
         // per create_card_view call.
         let thumbnail_capture_allowed = use_flow && crate::thumbnail::capture_allowed();
@@ -1047,7 +1247,7 @@ pub(crate) fn show_overlay() {
         let bottom_slack = if windows.is_empty() {
             0.0
         } else {
-            no_footer_bottom_slack()
+            no_footer_bottom_slack(&input)
         };
         let max_panel_h = (screen_visible.size.height * PANEL_MAX_HEIGHT_RATIO
             - 2.0 * PANEL_MARGIN
@@ -1055,7 +1255,15 @@ pub(crate) fn show_overlay() {
             - elevation_pad.bottom
             - bottom_slack)
             .max(240.0);
-        let scroll_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+        // The scroll offset the summon started from. Read before the layout plan, because the plan
+        // clamps it into the new range.
+        let previous_scroll = with_tab_state(|state_opt| {
+            state_opt
+                .as_ref()
+                .map(|state| state.layout.scroll)
+                .unwrap_or_default()
+        });
+        let scroll_offset = previous_scroll.offset;
         let layout = if use_flow {
             // Thumbnails balance rows by window aspect; icon-only mode uses fixed cards and auto columns.
             // The width budget also comes from visibleFrame: a side Dock reserves part of the frame,
@@ -1089,6 +1297,7 @@ pub(crate) fn show_overlay() {
                 })
                 .collect();
             plan_thumb_scroll_layout_with_max_card_w(
+                &input,
                 &aspects,
                 max_inner,
                 max_panel_w,
@@ -1098,6 +1307,7 @@ pub(crate) fn show_overlay() {
                 scroll_offset,
                 |card_h| {
                     thumbnail_max_card_width(
+                        &input,
                         &windows,
                         card_h,
                         max_inner,
@@ -1108,6 +1318,7 @@ pub(crate) fn show_overlay() {
             )
         } else {
             plan_icon_scroll_layout(
+                &input,
                 windows.len(),
                 screen_visible.size.width,
                 max_panel_h,
@@ -1115,31 +1326,34 @@ pub(crate) fn show_overlay() {
                 scroll_offset,
             )
         };
-        *THUMB_VISIBLE_RANGE.lock().unwrap() = Some(layout.visible.clone());
-        *THUMB_ROW_RANGES.lock().unwrap() = Some(layout.row_ranges.clone());
-        *THUMB_MAX_ROWS.lock().unwrap() = layout.max_rows.max(1);
-        // The post-close reflow reuses the same inset/budget/teaser verdict, or closing a card makes
-        // the panel taller (measured).
-        *THUMB_CONTENT_INSET.lock().unwrap() = layout.content_inset;
-        *THUMB_PANEL_MAX_H.lock().unwrap() = max_panel_h;
-        *THUMB_TEASER_FITS.lock().unwrap() = crate::theme::thumb_teaser_fits(
-            layout.card_h,
-            max_panel_h,
-            if use_flow {
-                THUMB_ROW_GAP
-            } else {
-                ICON_CARD_GAP
-            },
-        );
-        *THUMB_SCROLL_ROW.lock().unwrap() = layout.row_start;
-        *THUMB_SCROLL_OFFSET.lock().unwrap() = scroll_offset.clamp(0.0, layout.max_scroll_offset);
-        *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = layout.max_scroll_offset;
-        *THUMB_SCROLL_ROW_PITCH.lock().unwrap() = layout.card_h
-            + if use_flow {
-                THUMB_ROW_GAP
-            } else {
-                ICON_CARD_GAP
+        // Publish the plan as one value: every later reader (the scroller, the wheel and drag
+        // clamping, navigation, the post-close reflow) takes its numbers from here instead of
+        // recomputing them, and the post-close reflow reuses the same inset/budget/teaser verdict or
+        // closing a card makes the panel taller (measured).
+        let row_gap = if use_flow {
+            THUMB_ROW_GAP
+        } else {
+            ICON_CARD_GAP
+        };
+        let teaser_fits =
+            crate::theme::thumb_teaser_fits(&input, layout.card_h, max_panel_h, row_gap);
+        let row_pitch = layout.card_h + row_gap;
+        with_tab_state(|state_opt| {
+            let Some(state) = state_opt.as_mut() else {
+                return;
             };
+            let published = &mut state.layout;
+            published.flow.visible_range = Some(layout.visible.clone());
+            published.flow.row_ranges = Some(layout.row_ranges.clone());
+            published.flow.max_rows = layout.max_rows.max(1);
+            published.flow.content_inset = layout.content_inset;
+            published.flow.panel_max_h = max_panel_h;
+            published.flow.teaser_fits = teaser_fits;
+            published.flow.row_pitch = row_pitch;
+            published.scroll.row = layout.row_start;
+            published.scroll.offset = scroll_offset.clamp(0.0, layout.max_scroll_offset);
+            published.scroll.max_offset = layout.max_scroll_offset;
+        });
         let thumb_scroll_metrics =
             Some((layout.overflowed, layout.row_ranges.len(), layout.max_rows));
         debug_assert!(
@@ -1216,14 +1430,18 @@ pub(crate) fn show_overlay() {
         // to 640px. Live screen scale naturally handles hot-plug; a higher cached frame remains
         // valid after returning to a lower-demand display.
         let capture_target_px_h = use_flow.then(|| {
-            crate::thumbnail::target_px_height(thumb_preview_h(card_h_outer), screen_scale)
+            crate::thumbnail::target_px_height(thumb_preview_h(&input, card_h_outer), screen_scale)
         });
         if let Some(target_px_h) = capture_target_px_h {
-            *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap() = target_px_h;
+            with_tab_state(|state_opt| {
+                if let Some(state) = state_opt.as_mut() {
+                    state.layout.flow.capture_target_px_h = target_px_h;
+                }
+            });
             log_debug!(
                 "[overlay] thumbnail target_h={} preview_h={:.1}pt backing_scale={:.2}",
                 target_px_h,
-                thumb_preview_h(card_h_outer),
+                thumb_preview_h(&input, card_h_outer),
                 screen_scale
             );
         }
@@ -1232,7 +1450,7 @@ pub(crate) fn show_overlay() {
         // before card reconciliation does any per-card AppKit work. Capture remains asynchronous;
         // this only gives the worker the earliest safe head start for the first visible frame.
         if let Some(target_px_h) = capture_target_px_h {
-            crate::thumbnail::refresh_selected_for_summon(target_px_h);
+            crate::thumbnail::refresh_selected_for_summon(&input, target_px_h);
         }
 
         let t_reconcile = Instant::now(); // TIMING-DEBUG
@@ -1242,6 +1460,7 @@ pub(crate) fn show_overlay() {
             &placements,
             card_h_outer,
             thumbnail_capture_allowed,
+            &input,
         );
         let reconcile_ms = t_reconcile.elapsed().as_millis(); // TIMING-DEBUG
         let t_cards_ms = t0.elapsed().as_millis(); // TIMING-DEBUG
@@ -1256,8 +1475,8 @@ pub(crate) fn show_overlay() {
         let _: () = msg_send![
             container,
             setFrame: NSRect::new(
-                NSPoint::new(0.0, footer_band_h()),
-                NSSize::new(w, (h - footer_band_h()).max(1.0))
+                NSPoint::new(0.0, footer_band_h(&input)),
+                NSSize::new(w, (h - footer_band_h(&input)).max(1.0))
             )
         ];
         let _: () = msg_send![
@@ -1267,10 +1486,14 @@ pub(crate) fn show_overlay() {
                 NSSize::new(w, document_h.max(1.0))
             )
         ];
-        *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = document_h.max(1.0);
+        with_tab_state(|state_opt| {
+            if let Some(state) = state_opt.as_mut() {
+                state.layout.scroll.document_height = document_h.max(1.0);
+            }
+        });
         apply_thumbnail_clip_offset();
         if let Some((overflowed, row_count, max_rows)) = thumb_scroll_metrics {
-            update_thumbnail_scroller(w, h, overflowed, row_count, max_rows);
+            update_thumbnail_scroller(&input, w, h, overflowed, row_count, max_rows);
         } else if let Some(scroller) = thumbnail_scroller() {
             let _: () = msg_send![scroller.0, setHidden: true];
         }
@@ -1280,8 +1503,9 @@ pub(crate) fn show_overlay() {
         // the resize it uses the stale width (the initial max width at launch, or the previous
         // summon's width), leaving the text off-center once the container shrinks.
         // Re-centres the footer text AND re-lays the gear against the panel's new size (one place,
-        // so the two can never disagree about the band).
-        update_status_label();
+        // so the two can never disagree about the band). Same snapshot as the layout above: a
+        // footer read from a second config snapshot could describe a panel that is not on screen.
+        update_status_label(&input);
 
         let _: () = msg_send![window, setAcceptsMouseMovedEvents: true];
         // Refresh the highlight/selection once after summoning: fresh cards start with the
@@ -1350,7 +1574,7 @@ pub(crate) fn show_overlay() {
         // (icon fallback when absent); stale/missing ones are re-captured async and
         // swapped in place via thumbnailReady -> rebuild_cards.
         if let Some(target_px_h) = capture_target_px_h {
-            crate::thumbnail::refresh_for_summon(target_px_h);
+            crate::thumbnail::refresh_for_summon(&input, target_px_h);
         }
         // TIMING-DEBUG summary: per-stage timings (for chasing summon stalls).
         let total_ms = t0.elapsed().as_millis();
@@ -1612,7 +1836,9 @@ pub(crate) fn smoke_selection_ring() -> bool {
         let card_h = 170.0;
         let (plate_x, plate_y, plate_w, plate_h) =
             crate::theme::icon_selection_plate(card_width, card_h);
-        let radii = crate::theme::overlay_radii(crate::theme::overlay_card_radius(), THUMB_PAD);
+        let input = crate::theme::ThemeInput::current();
+        let radii =
+            crate::theme::overlay_radii(crate::theme::overlay_card_radius(&input), THUMB_PAD);
         let mut ok = true;
         for thumbnails in [true, false] {
             let previous = {
@@ -1621,7 +1847,7 @@ pub(crate) fn smoke_selection_ring() -> bool {
                 config.layout.thumbnails_enabled = thumbnails;
                 previous
             };
-            let card = create_card_view(&window, 0, card_width, card_h, true);
+            let card = create_card_view(&input, &window, 0, card_width, card_h, true);
             let rings = count_views_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
             let ring = view_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
             let (want_frame, want_radius) = if thumbnails {
@@ -1746,6 +1972,8 @@ pub(crate) fn smoke_card_badges() -> bool {
 
 /// The badge assertions themselves, under the thumbnail layout the caller switched on.
 unsafe fn smoke_card_badges_in_thumbnail_layout() -> bool {
+    // An independent entry point, so it takes its own snapshot (the config was just switched on).
+    let input = crate::theme::ThemeInput::current();
     let base = WindowInfo {
         pid: std::process::id() as i32,
         window_id: 1,
@@ -1760,7 +1988,7 @@ unsafe fn smoke_card_badges_in_thumbnail_layout() -> bool {
         bounds: (0.0, 0.0, 640.0, 400.0),
         state: Default::default(),
     };
-    let with_state = create_card_view(&base, 0, 220.0, 170.0, true);
+    let with_state = create_card_view(&input, &base, 0, 220.0, 170.0, true);
     let fullscreen_badges =
         count_views_with_tag(with_state, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
     let visibility_badges =
@@ -1770,7 +1998,7 @@ unsafe fn smoke_card_badges_in_thumbnail_layout() -> bool {
     let mut plain = base;
     plain.minimized = false;
     plain.fullscreen = false;
-    let plain_card = create_card_view(&plain, 1, 220.0, 170.0, true);
+    let plain_card = create_card_view(&input, &plain, 1, 220.0, 170.0, true);
     let plain_fullscreen =
         count_views_with_tag(plain_card, crate::overlay::THUMB_FULLSCREEN_BADGE_TAG);
     let plain_visibility =
@@ -1779,7 +2007,7 @@ unsafe fn smoke_card_badges_in_thumbnail_layout() -> bool {
 
     log_info!(
         "[smoke-card-badges] thumbnails={} fullscreen={} visibility={} plain_fullscreen={} plain_visibility={}",
-        crate::theme::thumbnails_enabled(),
+        crate::theme::thumbnails_enabled(&input),
         fullscreen_badges,
         visibility_badges,
         plain_fullscreen,

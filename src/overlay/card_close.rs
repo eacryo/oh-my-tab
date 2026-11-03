@@ -159,9 +159,60 @@ pub(crate) extern "C" fn on_close_card(_self: *mut c_void, _cmd: Sel, sender: *m
     });
 }
 
+/// The panel and scroll geometry the post-close reflow commits, decided in one place.
+///
+/// It is a value, not a sequence of statements inside the close path, so the decision "the panel
+/// after the close is the layout before it, re-derived for the items that remain" can be asserted
+/// without a window: [`ReflowGeometry::decide`] takes the pre-close budget and the post-close item
+/// count and nothing else.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) struct ReflowGeometry {
+    pub(super) panel_h: f64,
+    pub(super) viewport_h: f64,
+    pub(super) document_h: f64,
+    pub(super) max_scroll_offset: f64,
+    pub(super) scroll_offset: f64,
+}
+
+impl ReflowGeometry {
+    /// `theme_panel_h` is the panel the cards themselves need after the close (see
+    /// `theme::thumb_close_panel_metrics`); `content_h` is the document they need; `bottom_slack` is
+    /// the summon's no-footer room, which the panel and the document both carry.
+    pub(super) fn decide(
+        theme_panel_h: f64,
+        content_h: f64,
+        bottom_slack: f64,
+        footer_h: f64,
+        old_document_h: f64,
+        old_offset: f64,
+    ) -> ReflowGeometry {
+        let panel_h = theme_panel_h + bottom_slack;
+        let viewport_h = (panel_h - footer_h).max(1.0);
+        let document_h = (content_h + bottom_slack).max(viewport_h).max(1.0);
+        let (document_h, max_scroll_offset, scroll_offset, _) =
+            rebase_thumb_scroll_after_document_resize(
+                old_document_h,
+                document_h,
+                viewport_h,
+                old_offset,
+            );
+        ReflowGeometry {
+            panel_h,
+            viewport_h,
+            document_h,
+            max_scroll_offset,
+            scroll_offset,
+        }
+    }
+}
+
 /// Whether a close transition is active; structural refreshes must wait until it commits.
 pub(crate) fn card_close_in_progress() -> bool {
-    PENDING_CARD_CLOSE.lock().unwrap().is_some()
+    with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .is_some_and(|state| state.layout.close.is_some())
+    })
 }
 
 /// Start the slot-collapse/reflow animation; the actual AX close runs on a worker thread.
@@ -169,8 +220,10 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
     if card_close_in_progress() {
         return;
     }
+    // One theme snapshot for the whole close transaction, taken before the state borrow.
+    let input = crate::theme::ThemeInput::current();
     let Some((pending, views)) = with_tab_state(|state_opt| {
-        let state = state_opt.as_ref()?;
+        let state = state_opt.as_mut()?;
         if !state.visible {
             return None;
         }
@@ -220,11 +273,12 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             (container_frame, document_frame, bounds_origin)
         };
         let panel_w = panel_frame.size.width;
-        let overflowed = THUMB_ROW_RANGES
-            .lock()
-            .unwrap()
+        let overflowed = state
+            .layout
+            .flow
+            .row_ranges
             .as_ref()
-            .is_some_and(|rows| rows.len() > *THUMB_MAX_ROWS.lock().unwrap());
+            .is_some_and(|rows| rows.len() > state.layout.flow.max_rows);
         let scrollbar_w = if overflowed { THUMB_SCROLLBAR_W } else { 0.0 };
         let card_area_w = (panel_w - scrollbar_w).max(1.0);
         let max_inner = (card_area_w - H_PADDING * 2.0).max(1.0);
@@ -232,7 +286,7 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             .get(&key)
             .map(|frame| frame.size.height)
             .unwrap_or(1.0);
-        let gap = if crate::theme::thumbnails_enabled() {
+        let gap = if crate::theme::thumbnails_enabled(&input) {
             THUMB_ROW_GAP
         } else {
             ICON_CARD_GAP
@@ -248,15 +302,18 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             survivor_keys.push(candidate_key);
             widths.push(frame.size.width);
         }
-        let document_h = (*THUMB_DOCUMENT_HEIGHT.lock().unwrap()).max(1.0);
-        let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
-        let content_inset = *THUMB_CONTENT_INSET.lock().unwrap();
-        let max_panel_h = *THUMB_PANEL_MAX_H.lock().unwrap();
-        let teaser_fits = *THUMB_TEASER_FITS.lock().unwrap();
+        let document_h = state.layout.scroll.document_height.max(1.0);
+        let max_rows = state.layout.flow.max_rows.max(1);
+        let content_inset = state.layout.flow.content_inset;
+        let max_panel_h = state.layout.flow.panel_max_h;
+        let teaser_fits = state.layout.flow.teaser_fits;
         // The floating settings control's trailing room has to survive a close reflow, or closing
         // one card would narrow the panel back under the control.
-        let trailing_reserve =
-            crate::theme::footer_control_right_reserve(card_area_w + H_PADDING * 2.0, max_panel_h);
+        let trailing_reserve = crate::theme::footer_control_right_reserve(
+            &input,
+            card_area_w + H_PADDING * 2.0,
+            max_panel_h,
+        );
         // The reflow repacks the survivors, so it needs the same packing budget the summon used: the
         // control's reserve is part of the panel, not of the room left for cards.
         let max_inner = (max_inner - trailing_reserve).max(1.0);
@@ -278,13 +335,16 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         // layout's `thumb_panel_metrics`; building the formula here again is what re-introduced the
         // "panel grows while closing" bug (measured 901 > 875).
         let (theme_panel_h, final_content_inset) = thumb_close_panel_metrics(
+            &input,
             final_row_ranges.len(),
             final_overflowed,
-            card_h,
-            gap,
-            teaser_fits,
+            ThumbPanelMetrics {
+                card_h,
+                gap,
+                teaser_fits,
+                max_panel_h,
+            },
             max_rows,
-            max_panel_h,
         );
         let content_h = thumb_document_height_for_rows(
             final_row_ranges.len(),
@@ -299,19 +359,21 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
         let bottom_slack = if widths.is_empty() {
             0.0
         } else {
-            no_footer_bottom_slack()
+            no_footer_bottom_slack(&input)
         };
-        let final_panel_h = theme_panel_h + bottom_slack;
-        let final_viewport_h = (final_panel_h - footer_band_h()).max(1.0);
-        let final_document_h = (content_h + bottom_slack).max(final_viewport_h).max(1.0);
-        let old_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
-        let (final_document_h, final_scroll_max_offset, final_scroll_offset, _) =
-            rebase_thumb_scroll_after_document_resize(
-                document_h,
-                final_document_h,
-                final_viewport_h,
-                old_offset,
-            );
+        let geometry = ReflowGeometry::decide(
+            theme_panel_h,
+            content_h,
+            bottom_slack,
+            footer_band_h(&input),
+            document_h,
+            state.layout.scroll.offset,
+        );
+        let final_panel_h = geometry.panel_h;
+        let final_viewport_h = geometry.viewport_h;
+        let final_document_h = geometry.document_h;
+        let final_scroll_max_offset = geometry.max_scroll_offset;
+        let final_scroll_offset = geometry.scroll_offset;
         let final_bounds_origin = NSPoint::new(
             original_bounds_origin.x,
             (final_scroll_max_offset - final_scroll_offset)
@@ -338,58 +400,48 @@ pub(crate) fn begin_close_window_at(idx: usize, card: *mut AnyObject) {
             NSSize::new(final_panel_w, final_panel_h),
         );
         let final_container_frame = NSRect::new(
-            NSPoint::new(original_container_frame.origin.x, footer_band_h()),
+            NSPoint::new(original_container_frame.origin.x, footer_band_h(&input)),
             NSSize::new(final_panel_w, final_viewport_h),
         );
         let final_document_frame = NSRect::new(
             original_document_frame.origin,
             NSSize::new(final_panel_w, final_document_h),
         );
-        Some((
-            PendingCardClose {
-                pid: window.pid,
-                cgwid: window.window_id,
-                animation_finished: false,
-                ax_result: None,
-                original_panel_frame: panel_frame,
-                original_container_frame,
-                original_document_frame,
-                original_bounds_origin,
-                original_frames,
-                final_frames,
-                final_row_ranges,
-                final_panel_frame,
-                final_container_frame,
-                final_document_frame,
-                final_bounds_origin,
-                final_overflowed,
-                original_document_h: document_h,
-                final_document_h,
-                final_scroll_max_offset,
-                final_scroll_offset,
-            },
-            views,
-        ))
+        let pending = PendingCardClose {
+            pid: window.pid,
+            cgwid: window.window_id,
+            animation_finished: false,
+            ax_result: None,
+            original_panel_frame: panel_frame,
+            original_container_frame,
+            original_document_frame,
+            original_bounds_origin,
+            original_frames,
+            final_frames,
+            final_row_ranges,
+            final_panel_frame,
+            final_container_frame,
+            final_document_frame,
+            final_bounds_origin,
+            final_overflowed,
+            original_document_h: document_h,
+            final_document_h,
+            final_scroll_max_offset,
+            final_scroll_offset,
+        };
+        // Publish the exit animation as one transition: every AppKit call that follows reads the
+        // published copy, so none of them runs while a state borrow is held.
+        state.layout.close = Some(pending.clone());
+        Some((pending, views))
     }) else {
         return;
     };
     let close_key = (pending.pid, pending.cgwid);
-    {
-        let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
-        if closing.is_some() {
-            return;
-        }
-        *closing = Some(pending);
-    }
 
     unsafe {
-        let pending_ref = PENDING_CARD_CLOSE.lock().unwrap();
-        if let Some(pending) = pending_ref.as_ref() {
-            animate_card_close_reflow(pending, &views);
-        }
-        drop(pending_ref);
-        start_async_ax_close(close_key);
+        animate_card_close_reflow(&pending, &views);
     }
+    start_async_ax_close(close_key);
 }
 
 /// Run the AX close off the main thread so visible animation frames never wait on AX queries.
@@ -399,13 +451,15 @@ pub(super) fn start_async_ax_close(key: WindowKey) {
     // thread. The pending card-close animation will consume this successful result normally.
     if key.0 == std::process::id() as i32 {
         crate::settings::close_settings_from_switcher();
-        let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
-        if let Some(current) = closing
-            .as_mut()
-            .filter(|current| (current.pid, current.cgwid) == key)
-        {
-            current.ax_result = Some(true);
-        }
+        with_tab_state(|state_opt| {
+            if let Some(current) = state_opt
+                .as_mut()
+                .and_then(|state| state.layout.close.as_mut())
+                .filter(|current| (current.pid, current.cgwid) == key)
+            {
+                current.ax_result = Some(true);
+            }
+        });
         return;
     }
     std::thread::spawn(move || {
@@ -430,14 +484,23 @@ pub(super) fn start_async_ax_close(key: WindowKey) {
 /// Commit the list update and reflow only after both the animation and AX result are ready.
 pub(super) fn finish_pending_card_close() {
     let pending = {
-        let mut closing = PENDING_CARD_CLOSE.lock().unwrap();
-        let Some(current) = closing.as_ref() else {
+        let mut finished = None;
+        with_tab_state(|state_opt| {
+            let Some(state) = state_opt.as_mut() else {
+                return;
+            };
+            let Some(current) = state.layout.close.as_ref() else {
+                return;
+            };
+            if !current.animation_finished || current.ax_result.is_none() {
+                return;
+            }
+            finished = state.layout.close.take();
+        });
+        let Some(pending) = finished else {
             return;
         };
-        if !current.animation_finished || current.ax_result.is_none() {
-            return;
-        }
-        closing.take().unwrap()
+        pending
     };
     if !pending.ax_result.unwrap_or(false) {
         unsafe {
@@ -451,9 +514,14 @@ pub(super) fn finish_pending_card_close() {
 /// Exit-animation completion callback; AX may already be done or still be running in the worker.
 pub(crate) extern "C" fn on_card_close_finished(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
     callback_guard::void("on_card_close_finished", || {
-        if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
-            pending.animation_finished = true;
-        }
+        with_tab_state(|state_opt| {
+            if let Some(pending) = state_opt
+                .as_mut()
+                .and_then(|state| state.layout.close.as_mut())
+            {
+                pending.animation_finished = true;
+            }
+        });
         finish_pending_card_close();
     });
 }
@@ -464,11 +532,16 @@ pub(crate) extern "C" fn on_card_close_ax_result(_self: *mut c_void, _cmd: Sel, 
         let Some((key, result)) = CARD_CLOSE_AX_RESULT.lock().unwrap().take() else {
             return;
         };
-        if let Some(pending) = PENDING_CARD_CLOSE.lock().unwrap().as_mut() {
-            if (pending.pid, pending.cgwid) == key {
-                pending.ax_result = Some(result);
+        with_tab_state(|state_opt| {
+            if let Some(pending) = state_opt
+                .as_mut()
+                .and_then(|state| state.layout.close.as_mut())
+            {
+                if (pending.pid, pending.cgwid) == key {
+                    pending.ax_result = Some(result);
+                }
             }
-        }
+        });
         finish_pending_card_close();
     });
 }
@@ -555,8 +628,12 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
         if let Some(document) = card_document() {
             let _: () = msg_send![document, setFrame: pending.final_document_frame];
         }
-        *THUMB_DOCUMENT_HEIGHT.lock().unwrap() = document_h;
     }
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.layout.scroll.document_height = document_h;
+        }
+    });
 
     if became_empty {
         if was_visible {
@@ -573,16 +650,21 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
 
     // Animate the panel resize together with the close transition; atomically sync the document
     // and scroll metadata at commit so the content cannot jump independently of the scrollbar.
-    let max_rows = (*THUMB_MAX_ROWS.lock().unwrap()).max(1);
+    let (max_rows, offset) = with_tab_state(|state_opt| {
+        let Some(state) = state_opt.as_mut() else {
+            return (1, rebased_offset);
+        };
+        let max_rows = state.layout.flow.max_rows.max(1);
+        state.layout.flow.row_ranges = Some(pending.final_row_ranges.clone());
+        state.layout.scroll.max_offset = max_offset;
+        state.layout.scroll.offset = rebased_offset;
+        (max_rows, rebased_offset)
+    });
     let row_count = pending.final_row_ranges.len();
-    *THUMB_ROW_RANGES.lock().unwrap() = Some(pending.final_row_ranges);
-    *THUMB_SCROLL_MAX_OFFSET.lock().unwrap() = max_offset;
-    let offset = {
-        let mut offset = THUMB_SCROLL_OFFSET.lock().unwrap();
-        *offset = rebased_offset;
-        *offset
-    };
     update_thumbnail_scroll_state(offset);
+    // The commit is one render transaction: one snapshot for the scroller and the footer that are
+    // about to describe the reflowed panel.
+    let input = crate::theme::ThemeInput::current();
     unsafe {
         apply_thumbnail_clip_offset();
         if let Some(window) = *OVERLAY_WINDOW.lock().unwrap() {
@@ -590,6 +672,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
             // larger by the elevation padding.
             let frame = crate::glass::panel_frame_of(window.0);
             update_thumbnail_scroller(
+                &input,
                 frame.size.width,
                 frame.size.height,
                 pending.final_overflowed,
@@ -599,7 +682,7 @@ pub(super) fn commit_pending_card_close(pending: PendingCardClose) {
         }
     }
     refresh_highlight();
-    update_status_label();
+    update_status_label(&input);
     log_debug!(
         "[overlay] close reflow committed: pid={} cgwid={} remaining={} selected={}",
         pending.pid,
@@ -964,7 +1047,12 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
         if !activates_on_hover() {
             return;
         }
-        if !MOUSE_MOVED.load(Ordering::Relaxed) {
+        let mouse_moved = with_tab_state(|state_opt| {
+            state_opt
+                .as_ref()
+                .is_some_and(|state| state.layout.hover.mouse_moved)
+        });
+        if !mouse_moved {
             log_debug!(
                 "[overlay] card {} mouseEntered (gated, mouse not moved yet)",
                 idx
@@ -984,7 +1072,166 @@ pub(crate) extern "C" fn card_mouse_entered(_self: *mut c_void, _cmd: Sel, _even
         if changed {
             reset_thumbnail_nav_anchor();
             refresh_highlight();
-            update_status_label();
+            // An event callback is an independent entry: one snapshot for this reaction.
+            update_status_label(&crate::theme::ThemeInput::current());
         }
     });
+}
+#[cfg(test)]
+mod tests {
+    use super::ReflowGeometry;
+    use crate::theme::{self, ThemeInput};
+
+    const PANEL_W: f64 = 1470.0 * 0.92;
+    const SCREEN_BUDGET: f64 = 923.0 - 2.0 * theme::PANEL_MARGIN;
+
+    /// The M1 budget assertion for the card-close reflow: the geometry after the close is the
+    /// layout before it, re-derived for the items that remain.
+    ///
+    /// It drives the production decision (`ReflowGeometry::decide`, which
+    /// `begin_close_window_at` commits) with the production height functions, so a close cannot
+    /// grow the panel, cannot exceed the budget the summon had, and leaves the document, the
+    /// viewport and the scroll range consistent with one another -- three facts a wrong formula
+    /// fails and a faithful refactor preserves.
+    #[test]
+    fn the_close_reflow_budget_is_the_pre_close_layout_minus_one_item() {
+        // Pin the band so the budget is comparable whatever the machine's footer title setting is;
+        // the snapshot still supplies every other geometry input.
+        theme::set_test_footer_band(Some(theme::FOOTER_CONTROL_MIN_H));
+        let input = ThemeInput::current();
+        let card_h = theme::thumb_card_h_for_scale(&input, theme::THUMB_MIN_SCALE);
+        let gap = theme::THUMB_ROW_GAP;
+        let max_inner = PANEL_W - theme::H_PADDING * 2.0 - theme::THUMB_SCROLLBAR_W;
+        let teaser_fits = theme::thumb_teaser_fits(&input, card_h, SCREEN_BUDGET, gap);
+        let cap = theme::thumb_card_w_for_aspect(&input, card_h, theme::THUMB_PREVIEW_RATIO)
+            .min(max_inner);
+        let start = 25usize;
+        let aspects = vec![theme::THUMB_PREVIEW_RATIO; start];
+        let initial = theme::plan_thumb_scroll_layout_with_max_card_w(
+            &input,
+            &aspects,
+            max_inner,
+            PANEL_W,
+            SCREEN_BUDGET,
+            gap,
+            theme::THUMB_SCROLLBAR_W,
+            0.0,
+            |_| cap,
+        );
+        assert!(initial.overflowed, "25 cards must take the scrolling path");
+        let footer_h = theme::footer_band_h_test_pinned(&input);
+        // The row budget and the teaser verdict the summon decided stay in force for every close.
+        let max_rows = initial.max_rows;
+
+        let mut widths = vec![cap; start];
+        let mut row_count;
+        let mut overflowed = initial.overflowed;
+        // The baseline the close must not exceed is the panel the summon itself drew, which is on
+        // the same footing as the reflow's: `thumb_panel_metrics` includes the footer band.
+        let mut panel_before = initial.panel_h;
+        let mut document_before = initial.document_h;
+
+        for remaining in (1..=start).rev() {
+            let (_, row_ranges, _, next_overflowed) = theme::plan_thumb_close_reflow(
+                &widths,
+                card_h,
+                max_inner,
+                gap,
+                document_before,
+                initial.content_inset,
+                overflowed,
+                max_rows,
+                0.0,
+            );
+            row_count = row_ranges.len();
+            overflowed = next_overflowed;
+            // The post-close panel height comes from the same function the summon uses, which is
+            // what stops the "panel grows while closing" defect (measured 901 > 875).
+            let (panel_h, content_inset) = theme::thumb_close_panel_metrics(
+                &input,
+                row_count,
+                overflowed,
+                theme::ThumbPanelMetrics {
+                    card_h,
+                    gap,
+                    teaser_fits,
+                    max_panel_h: SCREEN_BUDGET,
+                },
+                max_rows,
+            );
+            assert!(
+                (content_inset - initial.content_inset).abs() < 1e-9,
+                "{remaining} left: the content inset {content_inset} must stay the summon's \
+                 {}, or the cards jump",
+                initial.content_inset
+            );
+            let content_h =
+                theme::thumb_document_height_for_rows(row_count, card_h, gap, content_inset);
+            let geometry =
+                ReflowGeometry::decide(panel_h, content_h, 0.0, footer_h, document_before, 0.0);
+
+            assert!(
+                geometry.panel_h <= panel_before + 1e-9,
+                "{remaining} left: the panel {:.1} is taller than the {:.1} it had before the \
+                 close",
+                geometry.panel_h,
+                panel_before
+            );
+            assert!(
+                geometry.panel_h <= SCREEN_BUDGET + 1e-9,
+                "{remaining} left: the panel {:.1} exceeds the {:.1} budget",
+                geometry.panel_h,
+                SCREEN_BUDGET
+            );
+            assert!(
+                (geometry.viewport_h - (geometry.panel_h - footer_h)).abs() < 1e-9,
+                "{remaining} left: the viewport must be the panel above the footer band"
+            );
+            assert!(
+                geometry.document_h + 1e-9 >= geometry.viewport_h,
+                "{remaining} left: the document {:.1} must cover the viewport {:.1}",
+                geometry.document_h,
+                geometry.viewport_h
+            );
+            assert!(
+                (geometry.max_scroll_offset - (geometry.document_h - geometry.viewport_h).max(0.0))
+                    .abs()
+                    < 1e-9,
+                "{remaining} left: the scroll range must be the document overflow"
+            );
+            assert!(
+                geometry.scroll_offset >= 0.0
+                    && geometry.scroll_offset <= geometry.max_scroll_offset + 1e-9,
+                "{remaining} left: the scroll offset {:.1} is outside 0..={:.1}",
+                geometry.scroll_offset,
+                geometry.max_scroll_offset
+            );
+            panel_before = geometry.panel_h;
+            document_before = geometry.document_h;
+            widths.pop();
+        }
+    }
+
+    /// A document that shrinks below its viewport still yields a definite geometry rather than a
+    /// zeroed panel or a negative scroll range.
+    #[test]
+    fn the_close_reflow_geometry_is_definite_when_the_document_shrinks_below_the_viewport() {
+        let geometry = ReflowGeometry::decide(120.0, 100.0, 0.0, 22.0, 400.0, 50.0);
+        assert_eq!(geometry.panel_h, 120.0);
+        assert_eq!(geometry.viewport_h, 98.0);
+        assert_eq!(geometry.document_h, 100.0);
+        assert_eq!(geometry.max_scroll_offset, 2.0);
+        assert_eq!(geometry.scroll_offset, 2.0);
+    }
+
+    /// The no-footer room is part of both the panel and the document, so the reflow has to carry it
+    /// the same way the summon does; dropping it on the close shrinks the panel by that room.
+    #[test]
+    fn the_close_reflow_carries_the_no_footer_room_in_the_panel_and_the_document() {
+        let slack = 24.0;
+        let without = ReflowGeometry::decide(300.0, 250.0, 0.0, 0.0, 250.0, 0.0);
+        let with = ReflowGeometry::decide(300.0, 250.0, slack, 0.0, 250.0, 0.0);
+        assert_eq!(with.panel_h, without.panel_h + slack);
+        assert_eq!(with.document_h, without.document_h + slack);
+    }
 }

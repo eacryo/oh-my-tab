@@ -523,11 +523,15 @@ pub(crate) fn refresh_highlight() {
             // Read the card's title-label text to verify content matches the index (investigating
             // "shows Picview but opens Ghostty").
             let is_selected = tag == selected;
-            // A thumbnail card carries the preview view; the icon-only layout does not. That is a
-            // per-card fact, so a layout swap mid-session cannot leave a card decorated the old
-            // way, and it is the same signal the thumbnail lift below already relies on.
-            let preview: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_PREVIEW_TAG];
-            let icon_only = preview.is_null();
+            // Every frame below comes from the plan this card was built with. Measuring the live
+            // views instead was a second, independent derivation of the same numbers, and the two
+            // had already drifted; one plan cannot.
+            let Some(plan) = card_plan_for(sv) else {
+                continue;
+            };
+            // The card's own layout, not a probe of its subviews: a layout swap mid-session must
+            // not leave a card decorated the old way, and the plan is what the card was built as.
+            let icon_only = plan.layout == CardLayout::IconOnly;
             // The plate below is the whole selection decoration in both layouts: the card itself
             // never paints, so the panel's material stays behind the icons, the previews and the
             // caption rows. Stated unconditionally rather than only on selection, so a reused card
@@ -536,12 +540,11 @@ pub(crate) fn refresh_highlight() {
             layer_set_border(layer, std::ptr::null_mut());
             layer_set_background(layer, std::ptr::null_mut());
             let _: () = msg_send![layer, setShadowOpacity: 0.0f32];
-            if !icon_only {
-                // The HTML applies translateY(-1px) to the `.item.selected` root rather
-                // than `.preview`; +1pt in AppKit coordinates lifts the caption row and
-                // preview together as one card. The plate is a subview, so it lifts with them.
-                layer_set_translation_y(layer, thumbnail_card_lift_y(is_selected));
-            }
+            // The HTML applies translateY(-1px) to the `.item.selected` root rather than
+            // `.preview`; the plan is what lifts the caption row and preview together as one card,
+            // and the plate is a subview, so it lifts with them. The icon-only layout marks the
+            // icon instead and keeps the card still.
+            layer_set_translation_y(layer, plan.selected_lift_of(is_selected));
 
             let ring: *mut AnyObject = msg_send![sv, viewWithTag: THUMB_SELECTION_RING_TAG];
             if !ring.is_null() {
@@ -553,19 +556,11 @@ pub(crate) fn refresh_highlight() {
                 layer_set_background(ring_layer, plate_bg_color);
                 let _: () = msg_send![ring_layer, setShadowOpacity: 0.0f32];
                 if icon_only {
-                    // The icon-only plate takes the same SELECTED_CONTENT_NUDGE the icon below
-                    // takes, so the two stay concentric instead of the icon drifting toward the
-                    // plate's top edge. The thumbnail plate is a subview of the lifted card and
-                    // follows it without help.
-                    let frame: NSRect = msg_send![sv, frame];
-                    let (px, py, _, _) =
-                        crate::theme::icon_selection_plate(frame.size.width, frame.size.height);
-                    let lift = if is_selected {
-                        SELECTED_CONTENT_NUDGE
-                    } else {
-                        0.0
-                    };
-                    let _: () = msg_send![ring, setFrameOrigin: NSPoint::new(px, py + lift)];
+                    // The icon-only plate takes the same content nudge the icon below takes, so
+                    // the two stay concentric instead of the icon drifting toward the plate's top
+                    // edge. The thumbnail plate is a subview of the lifted card and follows it
+                    // without help, so only this layout needs the nudge.
+                    let _: () = msg_send![ring, setFrameOrigin: plan.ring_origin(is_selected)];
                 }
                 let _: () = msg_send![ring, setHidden: !is_selected];
             }
@@ -577,19 +572,7 @@ pub(crate) fn refresh_highlight() {
             let icon: *mut AnyObject = msg_send![sv, viewWithTag: ICON_VIEW_TAG];
             if !icon.is_null() {
                 let icon_frame: NSRect = msg_send![icon, frame];
-                let icon_px_now = icon_frame.size.height;
-                let icon_bottom = card_h() - crate::theme::ICON_TOP_INSET - icon_px();
-                let base_y = if (icon_px_now - icon_px()).abs() < 0.5 {
-                    icon_bottom
-                } else {
-                    icon_bottom + (icon_px() - icon_px_now) / 2.0
-                };
-                let icon_y = base_y
-                    + if is_selected {
-                        SELECTED_CONTENT_NUDGE
-                    } else {
-                        0.0
-                    };
+                let icon_y = plan.icon_origin_y(icon_frame.size.height, is_selected);
                 let _: () = msg_send![
                     icon,
                     setFrameOrigin: NSPoint::new(icon_frame.origin.x, icon_y)
@@ -700,8 +683,10 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
     }
 
     unsafe {
+        // One snapshot for this whole rebuild pass: every card it replaces is built from it.
+        let input = crate::theme::ThemeInput::current();
         let thumbnail_capture_allowed =
-            crate::theme::thumbnails_enabled() && crate::thumbnail::capture_allowed();
+            crate::theme::thumbnails_enabled(&input) && crate::thumbnail::capture_allowed();
         let document = match card_document() {
             Some(document) => document,
             None => return,
@@ -726,6 +711,7 @@ pub(crate) fn rebuild_cards(indices: &[usize]) {
                 // Reuse the old card frame's width AND height (in-place replacement:
                 // after flow shrink both are per-card values).
                 let new_card = create_card_view(
+                    &input,
                     w,
                     idx,
                     frame.size.width,
@@ -774,8 +760,8 @@ pub(crate) fn refresh_thumbnail_previews(keys: &[(i32, u32)]) {
 
     unsafe {
         let started = Instant::now();
-        let capture_allowed =
-            crate::theme::thumbnails_enabled() && crate::thumbnail::capture_allowed();
+        let capture_allowed = crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current())
+            && crate::thumbnail::capture_allowed();
         let colors = current_colors();
         let document = match card_document() {
             Some(document) => document,
@@ -1031,6 +1017,9 @@ pub(crate) fn apply_theme() {
         apply_glass_properties();
     }
 
+    // apply_theme is an independent entry (a config change or a system appearance notification),
+    // so it takes the snapshot for the pass it is about to run.
+    let input = crate::theme::ThemeInput::current();
     if visible_indices.is_empty() {
         refresh_highlight();
     } else {
@@ -1040,8 +1029,8 @@ pub(crate) fn apply_theme() {
     // tree immediately and force a fresh capture for every known window so the next preview does
     // not keep a frame from the previous light/dark appearance.
     if theme_changed {
-        let target_px_h = *THUMB_CAPTURE_TARGET_PX_H.lock().unwrap();
+        let target_px_h = layout_snapshot().flow.capture_target_px_h;
         crate::thumbnail::refresh_for_theme(target_px_h);
     }
-    update_status_label();
+    update_status_label(&input);
 }

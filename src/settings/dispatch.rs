@@ -10,7 +10,7 @@ use crate::callback_guard;
 // persist with a debounce.
 
 /// Editable control ids. The pointer → field mapping lives in control_field_of.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(super) enum ControlField {
     Theme,
     PanelMaterial,
@@ -86,9 +86,16 @@ pub(super) enum ControlField {
 }
 
 /// Identify a field by its control pointer (the window is reused, pointers are stable).
+///
+/// A control a migrated page built is answered by the page's own registrations in
+/// `ControlTable`; an unknown sender — every page that is still built inline, and anything the
+/// table never saw — falls through to the pointer comparison below, unchanged.
 unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;
+        if let Some(ControlId::Field(field)) = u.control_table.lookup(sender) {
+            return Some(field);
+        }
         let ptr = sender as usize;
         let m = |ctrl: *mut AnyObject, field: ControlField| (ptr == ctrl as usize).then_some(field);
         m(u.theme, ControlField::Theme)
@@ -1966,6 +1973,22 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             // Not mouse-specific: the display-mode pair and the clipboard-delete rows need this on every
             // config change, whatever page is on screen.
             update_conditional_rows(u);
+
+            // The pages migrated to a row description take their values from the SAME pure update
+            // description the refill uses (computed from this config), so the two write paths
+            // cannot disagree. The pages still built inline keep their own writes below, untouched.
+            {
+                let input = PageInput::from_config(
+                    cfg.clone(),
+                    current_selected_device(),
+                    crate::theme::ThemeInput::current(),
+                );
+                page_view::refresh_migrated_pages(
+                    u,
+                    &input,
+                    &[SettingsPageId::Switcher, SettingsPageId::General],
+                );
+            }
 
             let modifier_idx =
                 crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier) as isize;

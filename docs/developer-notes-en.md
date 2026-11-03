@@ -459,249 +459,36 @@ default: quitting an app is destructive and hiding one changes what the user is 
   on the main thread (`keycode_for_character`), with that action's ANSI position as a per-action
   fallback, so one unresolvable key never disables the other three.
 
+## Settings pages: description, layout and rendering are three stages
+
+`settings/page_view.rs` is pure over `PageInput` (`Config` + `ThemeInput` + the selected mouse
+device). Three stages, in this order and never merged:
+
+1. `page_view(&PageInput) -> PageView` produces one `RowSpec` per row — copy keys, control kind, an
+   explicit `ControlId::{Field, Action}`, initial `Value`, options, dependency, group, and the row's
+   search entry as a value. It creates no view, reads no config and writes nothing to the search
+   index.
+2. `layout_rows(&PageView, &LayoutInput, &PageMetrics) -> PageLayout` is the only layout
+   computation. `LayoutInput` carries the content width, the document height (`doc_top`, what the
+   rows are placed against), the visible page viewport, the page rectangle for the banner's final
+   parent, `SettingsLayout` and the measured text.
+3. `render_page` applies those boxes and nothing else.
+
+A migrated page's controls are identified by the `ControlTable` the build produces, not by a
+hand-written pointer comparison: `PageRegistrations` validates the whole page before it replaces
+the old entries, so a duplicate aborts the build with the old views **and** the old mapping still
+in place. `bind_page_controls` fills the `SettingsUi` fields the dispatcher, the refill and the
+freeze lists still read, only after that validation succeeds. Placements are stored **relative to
+their row's origin**, so a conditional row collapsing or the viewport changing moves the controls
+with their row instead of leaving them at their build-time frame.
+
+One pure update description (`page_update_description`) feeds both `load_settings_from` and the
+in-place refresh; a `ControlUpdate` carries the control's value and its display text separately,
+because a slider's stop is not its reading (the footer text size).
+
+Command that reproduces the page description: `scripts/cargo-test.sh settings::page_view`.
 ## Settings backup (export and import)
 
 "Export settings" writes the live config as ordinary TOML under a small comment header
 (`# oh-my-tab settings export`, `# format = N`); the body is therefore also a valid `config.toml`.
 "Import settings" parses it with the app's own loader rather than deserializing it directly, which is
-what makes both directions survive a version difference: a field this build does not know is ignored,
-one it knows but rejects falls back on its own, and an older file's legacy `[quick_actions]` /
-`[window_control]` sections still seed the binding list. The header's format version guards the *file
-protocol* only -- it rises when the meaning of the file changes, not when the app gains settings.
-
-Two rules keep an import from doing damage. A file without the marker is refused, so a file that merely
-happens to be valid TOML cannot import as "everything at its default" and wipe the user's settings; and
-`restore_local_fields` keeps this machine's own values for the login item, the absolute log path, the
-keystroke panel's saved position, and the clipboard storage decisions (`enabled`, `max_entries`,
-`auto_expire_days`, `clear_on_quit`) -- importing `clipboard.enabled = false` over a machine that has it
-on would otherwise run the feature's disable path and delete the stored history. A re-export is
-lossless for what this build understands, not for the bytes: unknown fields have nowhere to live in the
-live `Config`.
-
-## Menu-bar icon and reopening
-
-"Hide menu bar icon" (`startup.hide_menu_bar_icon`) calls `NSStatusItem.isVisible = NO` on the live
-item instead of destroying it, so menu-title refreshes, the clipboard pin's check state and the main
-menu's key equivalents keep working while the icon is hidden. The switch travels with export/import
-(it is a display preference, not a per-machine registration, unlike launch-at-login).
-
-With the icon hidden the app must not become unreachable: the switcher's footer gear and the clipboard
-panel's gear open the relevant settings page, and activating the app again (Finder, Spotlight,
-`open -a`) is handled by `applicationShouldHandleReopen:hasVisibleWindows:`, which opens Settings
-with that callback returning NO so AppKit does not also perform its generic reopen. Launching the
-binary path directly is not that path: a second process is refused by the single-instance lock and
-exits, so the running instance never sees it.
-
-## Finder context menu (Finder Sync extension)
-
-The right-click menu is the only feature with a **second process in its own bundle**. Finder Sync
-extensions must run sandboxed and Finder only draws them from a plug-in it discovered, so the
-extension can neither write a file nor launch an application. The split is therefore not a style
-choice: the app builds the menu, the extension draws it, and every click comes back to the app.
-
-**Message path.** The app pushes a `MenuModel` (titles already localized, icons as SF Symbol names,
-each leaf carrying its action) over `<host bundle id>.finder.app2ext`. The extension caches the last
-model, re-renders it per right-click, and reports a click over `<host bundle id>.finder.ext2app`.
-Both directions carry the host bundle id and the app's launch instance; anything from another channel
-or an earlier app process is dropped. A message larger than 64 KiB is refused before parsing.
-
-**Why a click is not trusted.** A distributed notification can be posted by any local process, and
-a menu can stay open across a settings change. The extension sends the action the user *clicked*
-(from the item's `representedObject`), and the app checks it against the live config (feature on,
-file type still offered, terminal still enabled) before doing anything. That is the security story
-of this feature: the action set is deliberately non-destructive (create an empty file in a folder
-the user right-clicked, open a configured terminal, write the clipboard), and the app re-validates
-rather than trusting the message.
-
-**Staleness / offline.** The extension syncs every 10 s. If no app message has arrived for 45 s the
-model is treated as stale and no items are offered — an idle app is not mistaken for a dead one
-because the sync itself keeps the timestamp fresh, and a crash expires the menu instead of leaving
-clickable items behind. On an orderly quit the app sends `quit` and the extension clears at once.
-
-**Localization.** All menu titles are localized in the app and shipped as strings, so the extension
-has no `.strings`/`.xcstrings` of its own and the three locales cannot drift between the two
-processes.
-
-**Signing.** The extension needs `com.apple.security.app-sandbox`; the app does not. Sign
-**inside-out**: the extension first, the app last, and the app **without** `--deep`. `codesign --deep`
-on the app re-signs nested code and drops that entitlement (measured: the appex comes out with no
-entitlements, and Finder then refuses to load it), and it seals the nested bundle by cdhash, so
-re-signing the extension afterwards makes the parent invalid ("nested code is modified or invalid").
-Inside-out leaves the parent recording the extension by requirement, so `--verify --deep --strict`
-passes. `scripts/release.sh` additionally proves the staged appex still carries the entitlement and
-shares the app's team.
-
-**Election after an update.** Replacing the app makes macOS disable the extension (the system keeps
-the user's election for the plugin instance it discovered, not for the new bundle). The main app
-restores it once, through `pluginkit -e use`, but only when it can prove the election belonged to the
-user before *our own* update: the SPUUpdaterDelegate install hooks (`willInstallUpdate:`,
-`willInstallUpdateOnQuit:`) record a transaction with the appcast item's CFBundleVersion as the
-expected target build, the election observed then, and the feature switch; the first launch whose
-build equals that target restores it and records the attempt. A cancelled installation (the
-install-phase Skip button, `SUInstallationCanceledError`) revokes the transaction; Later/Dismiss keeps
-it (the update may still install at quit). Manual replacement, a different build and a missing
-transaction are deliberately not restored: the user's post-quit changes are indistinguishable from an
-update's, so the app only restores what it can attribute to its own update. The dev channel writes
-the same record from `scripts/dev-restart.sh` before it deletes the bundle, sharing the bytes with the
-Rust parser through `testdata/finder-ext-transaction.toml`. `!` (the debug election) and unknown
-states are left alone. The settings row says "Disabled after the update" when the attempt failed, so
-the user still knows to act.
-
-**Rebuilds.** Finder caches the extension process. `scripts/dev-restart.sh` registers the new appex
-with `pluginkit`, stops only the process whose executable is *this* worktree's appex, and prints the
-election state; restarting Finder (which makes a rebuilt menu appear reliably, but closes every
-window) is opt-in as `--reload-finder-extension`. A dev and a release extension enabled at the same
-time put two copies of the menu in Finder; the script reports that rather than changing the user's
-choice.
-
-**A registered extension is not a working one (measured 2026-10-23).** Finder does not run the
-appex itself: it asks launchd for a per-request service instance named
-`gui/<uid>/<appex bundle id>.<request uuid>`, and launchd caches that instance's executable path.
-A worktree that ran the extension once leaves such an instance pointing at *its* appex; delete the
-worktree and every later request re-bootstraps the same bundle id, gets "will use existing" with the
-dead path, then `Missing executable detected`, and the spawn fails. PlugInKit still reports the
-extension as elected (`+`), System Settings still shows the switch on, and the menu is silently
-empty — nothing but the unified log says otherwise. `pluginkit -a` cannot repair that: it adds a
-record, it does not replace a pinned instance.
-
-`scripts/lib/finder-extension.sh` (sourced by `dev-restart.sh`, self-tested by
-`scripts/finder-extension-selftest.sh`) removes a per-request instance ***only* when the program path
-launchd has pinned for it no longer exists on disk, launchd does not report a live process for it, and
-its state is not `running`** (the self-test narrows removal to the labels it created through an optional
-allowlist, so the production rule can be exercised without touching another app's services) — the one state Finder cannot recover from, and
-the shape the incident had. An instance whose program still exists is left running, whoever owns it.
-What the script does do, after registering the freshly signed appex, is stop the extension process
-of *its own* appex (Finder may have started the previous build while cargo ran). Finder is restarted
-only when that appex then has no extension process at all — a restart closes every Finder window —
-or when `--reload-finder-extension` asks for one. Two things are never touched: the host app's own
-launchd instance (`application.<host bundle id>.<pid>.<pid>`; booting it out leaves the app running
-with unlinked log fds, and `--whose-instance` then reports UNVERIFIED) and an extension process of a
-different appex (the packaged install, another worktree). The script reports whether the extension
-process is up instead of letting "elected" stand for "works".
-
-**Terminal adapters.** Terminals differ in how they accept a directory: a running Terminal.app or
-iTerm2 opens a folder URL, while Ghostty/WezTerm/kitty/Alacritty need a fresh instance with their own
-argument. `finder_menu/terminals.rs` owns one adapter per known bundle id; `open_arguments` is pure and
-unit-tested, and the settings page only offers terminals LaunchServices reports as installed.
-
-## Building and testing
-
-`scripts/dev-restart.sh` is the normal way to run the app during development. It builds the development `.app` and re-assembles and re-signs it only when its inputs change (the built binary, the bundled resources, the signing identity), using the Apple-issued identity when one is installed (`CODESIGN_IDENTITY` overrides the discovery; signing is done without a secure timestamp so a local build never depends on Apple's timestamp service), then launches it through the per-user `launchd` domain. **Only two identities are accepted -- the Apple-issued one and the self-signed one; ad-hoc is refused**, and a failure to sign with the Apple identity fails the build unless `--allow-signing-fallback` asks for the self-signed identity on purpose. A stable signing identity is what keeps the Accessibility, Screen Recording and keychain grants alive across rebuilds; when nothing changed the existing bundle is reused, so a restart does not reset them.
-
-**A launch is verified from the running process, never from the plist on disk.** The script waits for the app's own `[launch] pid=… executable=… version=… bundle=…` record -- written by the process itself, so it can only describe the process that wrote it -- and fails when the pid, the executable path or the version disagree, or when the process exited right after writing it. When the log window is unusable (rotated, truncated, unreadable) the run reports `build timestamp: unverified` instead of passing; that is a report, not a pass. Report the `build-version` the script prints, which is the one the process reported. `--check` verifies such a launch and then stops it, leaving neither the process nor its launchd job behind.
-
-**One build/test/launch transaction at a time, across worktrees.** Every worktree shares one bundle id, one launchd label and one app log -- that is what keeps the TCC grants and the keychain ACL valid across rebuilds -- so two concurrent runs fight over one instance. The script takes a `lockf` claim in the git common directory before it stops anything and waits up to `--lock-wait=<sec>` (default 900) before failing with exit 75. The claim covers the transaction only: the app the script leaves running is not protected, and the next run may replace it. `scripts/dev-lock-selftest.sh` checks the claim offline, including the cross-worktree case.
-
-The unit-test suite is headless-safe by default; clipboard image and history fixtures use isolated temporary directories per process and thread. Run it through `scripts/cargo-test.sh`: a `cargo test` filter that matches nothing exits 0 while printing `running 0 tests ... ok`, so a typo in a filter reads as a pass — the wrapper counts the executed tests and fails the run when the count is zero. It forwards every argument to `cargo test`, so a filter keeps the guard.
-
-The CG/AX **smoke tests** are marked `#[ignore]` and need a GUI session plus an Accessibility grant:
-
-```sh
-cargo test -- --ignored
-```
-
-On a macOS GUI session, the real AppKit settings smoke test can traverse every settings page and run the post-layout checks without manual clicking:
-
-```sh
-cargo build
-cargo test settings_layout_smoke -- --ignored
-```
-
-It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits all eight pages, validates their descendant view frames, and exits.
-
-The Finder Menu settings page has its own smoke (`cargo test finder_menu_page_smoke -- --ignored`, or
-`./target/debug/oh-my-tab --smoke-finder-menu`): it opens the real window on that page and asserts the
-page's own contract against the live view tree. It is separate from the all-pages layout smoke because
-that runner currently stops on an earlier clipboard-page assertion (see `docs/review-backlog.md`).
-
-The overlay runtime path also has an ignored child-process smoke test. Run `cargo build` first, then `cargo test overlay_runtime_smoke -- --ignored`; its `--smoke-overlay` switch bypasses the single-instance guard so an already-running development app cannot turn the test into a false pass.
-
-The **M2 e2e scenarios** live in `scripts/e2e/*.sh` and run through `scripts/e2e/run-all.sh`, which discovers every executable script in that directory and runs the selected ones in order. Each scenario declares the disturbances it causes in its header, one exact line per kind, and each kind has its own switch: `# E2E_STEALS_FOCUS=1` (injects a real global hotkey through the system event stream, or activates the app) needs `--include-focus`; `# E2E_COVERS_SCREEN=1` (pins a full-screen backdrop over the desktop, or captures screen content) needs `--include-screen`; `# E2E_CHANGES_PREFS=1` (touches a system preference or the user's config) needs `--include-prefs`. The gates are independent and stack -- a scenario runs only when every declaration it makes has been authorised, because agreeing to switch the frontmost app is not agreeing to have the desktop covered or a system setting changed. A marker is an exact header line: one with a trailing comment is not a marker. `--list` prints what this run would execute. The app writes the facts a scenario cannot read back through Accessibility — `--e2e-state=<path>` JSON snapshots — and the scripts assert on those plus real WindowServer state; a scenario that asserts encryption must still read the stored file itself, because a self-report is not evidence.
-
-### Update prompt layout QA
-
-Four development switches reach the update UI without a published release. All go through the
-`scripts/dev-restart.sh` argv passthrough (it forwards any flag it does not own to the app) and
-apply to that launch only.
-
-**The prompt has two layouts, and a heading defect exists in only one of them.** With the settings
-window closed the update flow renders into a standalone 640pt window; with the window open on the
-About page it renders inline, in a host view the log reports as 415pt wide
-(`[update-inline] host frame w=415.0`). The inline layout installs every authored frame scaled by
-`415/640 = 0.648`, so the title's 576pt column becomes 373.5pt — narrower than the zh-Hans title
-`有新的 Oh-My-Tab Dev 版本可用！`, which measures 387pt at 26pt bold. A check that only looks at the
-standalone window therefore cannot see the defect: measure and verify the inline path.
-
-Every prompt heading now comes from `prompt_heading_frame` and `prompt_heading_field`, which size the
-field from the window width, wrap instead of truncating, and measure their height at the width the
-heading is installed at (authored width times the install scale). The five constructors this replaced
-each hardcoded their own width and height (456, 496 or 576pt by 28 or 32pt).
-
-`--dump-update-prompts=<dir>` renders each update prompt state -- available, downloaded, installing,
-and the information-only variant, in every locale -- to a PNG under `<dir>`. It is read by the
-`--smoke-update-prompts` runner, which builds the states:
-
-```sh
-cargo build
-./target/debug/oh-my-tab --smoke-update-prompts --dump-update-prompts=/tmp/prompts
-```
-
-The runner shows the real view hierarchy and tears it down inside one launch, so a screen capture
-cannot catch it; `cacheDisplayInRect:` records the view instead, which makes a layout defect a file a
-reviewer can open. The bare `target/debug` binary has no bundle, so its heading shows the fallback
-app name instead of `Oh-My-Tab Dev`.
-
-`--check-update-on-launch` runs one real update check one second after launch, the same call the
-About page's button makes. It refuses to run unless the About page is the visible page, so the
-prompt renders inline instead of in a standalone window:
-
-```sh
-SPARKLE_BUILD_VERSION=20261101000000 scripts/dev-restart.sh \
-  --no-onboarding --open-settings=about --check-update-on-launch
-```
-
-The delay is required, not cosmetic. `run()` reaches that point before `NSApplication run`, and
-`check_for_updates` hands Sparkle a deferred `performSelectorOnMainThread:`, which is dropped while
-no run loop spins. The inline call this switch first used logged `Sparkle checkForUpdates selector
-scheduled` and then nothing; the one-shot `NSTimer` fires only once the loop is running, and the log
-then shows `canCheckForUpdates=true`, `Sparkle update check started` and the request context.
-
-A check presents a prompt only when the build number is older than what the feed serves. The dev
-bundle is repackaged with a fresh UTC timestamp build number only when its inputs change, and
-`SPARKLE_BUILD_VERSION` is NOT part of that fingerprint (see "Building and testing"). A reused
-bundle therefore keeps the number it was packaged with -- normally the one the feed already carries
--- and the check reports "up to date" with no prompt. Passing an older `SPARKLE_BUILD_VERSION`
-changes the number only when the same run also repackages, which happens when the binary or a
-bundled resource changed. Touch a source file first, or read the `build-version:` line the script
-prints and confirm it is older than the feed's newest item before expecting a prompt.
-`~/Library/Logs/oh-my-tab/oh-my-tab.log` records the whole sequence, so a check that produced no
-prompt is diagnosed from that file rather than from the screen.
-
-Two switches photograph the inline layout, which no screen capture can reach while it renders:
-
-`--dump-inline-prompt=<dir>` writes the About page's host view to `<dir>/inline-<locale>.png` right
-after the prompt is built, and `--scroll-about-to-updates` scrolls that page to the expanded update
-card two seconds after launch, for a window shorter than the page. Together they show the real
-inline prompt:
-
-```sh
-SPARKLE_BUILD_VERSION=20261101000000 scripts/dev-restart.sh \
-  --no-onboarding --open-settings=about \
-  --check-update-on-launch --dump-inline-prompt=/tmp/out
-```
-
-The launch check refuses to run when the About page is not the visible page, so the prompt cannot
-land in a standalone window by accident; `--open-settings=about` is what makes the inline path
-reachable. Neither switch applies to a normal launch.
-
-**A +0 return is not an owned object.** `bitmapImageRepForCachingDisplayInRect:` and
-`representationUsingType:properties:` both return autoreleased objects; the dump helper released the
-bitmap once and the next run-loop autorelease-pool pop crashed in `objc_release` with
-`EXC_BAD_ACCESS`. An `alloc`/`init` object is +1 and must be released after `addSubview:` retains it —
-`prompt_heading_field` balances that in each caller.
-
-### Localization and layout QA
-
-The Debug app built by `scripts/dev-restart.sh` adds a `[TEST] English x3` option to the language selector. Selecting it repeats every English UI string three times, so long dropdown values and their surrounding rows and cards can be checked in the real settings window. The optimized development package built by `scripts/release-dev.sh` includes the same fixture through the `dev-long-text` Cargo feature; the production release scripts do not enable it. The older `--pseudo-locale` switch is still available for debug-only punctuation-based expansion.
-
-Launch a debug build with `--layout-debug` to enable runtime settings-page assertions; peer controls crossing labels or controls, and frames escaping the document, fail fast with the page name and offending frames. Internal views inside native controls are excluded from peer comparisons.

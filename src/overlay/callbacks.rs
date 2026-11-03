@@ -51,10 +51,10 @@ fn prepare_first_summon_state(backward: bool) {
             state.windows.len()
         );
     });
-    reset_thumbnail_visible_range();
-    reset_thumbnail_scroll();
-    reset_thumbnail_nav_anchor();
-    MOUSE_MOVED.store(false, Ordering::Relaxed);
+    reset_thumbnail_state();
+    // One borrow for the whole pointer reset (hover levels, drag, the "pointer has moved" gate,
+    // navigation anchor); no AppKit call happens between these fields.
+    reset_pointer_view_state();
     *HOVER_TICK_POS.lock().unwrap() = None;
 }
 
@@ -224,7 +224,8 @@ fn refresh_after_selection_change(backfill_icons: bool) {
         }
     }
     refresh_highlight();
-    update_status_label();
+    // A navigation callback is an independent entry: one snapshot for this reaction.
+    update_status_label(&crate::theme::ThemeInput::current());
     if backfill_icons {
         extract_uncached_icons();
     }
@@ -331,10 +332,11 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
             return None;
         }
         let current_center = card_center_x(rects, state.selected)?;
-        let anchor_x = {
-            let mut anchor = THUMB_NAV_ANCHOR_X.lock().unwrap();
-            *anchor.get_or_insert(current_center)
-        };
+        let anchor_x = *state
+            .layout
+            .hover
+            .nav_anchor_x
+            .get_or_insert(current_center);
         let index = vertical_nav_index(rects, state.selected, up, anchor_x)?;
         state.selected = index;
         mark_user_picked(state);
@@ -345,7 +347,8 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
             apply_thumbnail_scroll_offset();
         }
         refresh_highlight();
-        update_status_label();
+        // A key callback is an independent entry: one snapshot for this reaction.
+        update_status_label(&crate::theme::ThemeInput::current());
     }
 }
 
@@ -621,8 +624,10 @@ pub(super) unsafe fn update_thumbnail_pointer_state(window_point: NSPoint) {
         && scroller_point.x <= scroller_bounds.origin.x + scroller_bounds.size.width
         && scroller_point.y >= scroller_bounds.origin.y
         && scroller_point.y <= scroller_bounds.origin.y + scroller_bounds.size.height;
-    let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
-    let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+    let (max_offset, offset) = with_tab_state(|state_opt| match state_opt.as_ref() {
+        Some(state) => (state.layout.scroll.max_offset, state.layout.scroll.offset),
+        None => (0.0, 0.0),
+    });
     let knob = thumbnail_scroller_geometry(scroller_bounds.size.height, max_offset, offset)
         .is_some_and(|geometry| {
             in_scroller && thumbnail_scroller_knob_contains(scroller_point.y, geometry)
@@ -656,9 +661,12 @@ pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
     callback_guard::void("thumbnail_scroller_draw_rect", || unsafe {
         let scroller = scroller as *mut AnyObject;
         let bounds: NSRect = msg_send![scroller, bounds];
-        let offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
-        let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
-        let Some(geometry) = thumbnail_scroller_geometry(bounds.size.height, max_offset, offset)
+        let (scroll, hover) = with_tab_state(|state_opt| match state_opt.as_ref() {
+            Some(state) => (state.layout.scroll, state.layout.hover),
+            None => Default::default(),
+        });
+        let Some(geometry) =
+            thumbnail_scroller_geometry(bounds.size.height, scroll.max_offset, scroll.offset)
         else {
             return;
         };
@@ -675,9 +683,9 @@ pub(crate) extern "C" fn thumbnail_scroller_draw_rect(
             "dark" => true,
             _ => system_dark_mode(),
         };
-        let hover = *THUMB_SCROLLER_HOVER.lock().unwrap();
-        let dragging = THUMB_SCROLL_DRAG.lock().unwrap().is_some();
-        let alpha = thumbnail_scroller_alpha(hover.viewport, hover.knob, dragging);
+        let dragging = scroll.drag.is_some();
+        let alpha =
+            thumbnail_scroller_alpha(hover.scroller.viewport, hover.scroller.knob, dragging);
         let color: *mut AnyObject = if dark {
             msg_send![class!(NSColor), colorWithWhite: 1.0f64, alpha: alpha]
         } else {
@@ -721,8 +729,10 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
             fromView: std::ptr::null::<AnyObject>()
         ];
         let bounds: NSRect = msg_send![scroller, bounds];
-        let max_offset = *THUMB_SCROLL_MAX_OFFSET.lock().unwrap();
-        let current_offset = *THUMB_SCROLL_OFFSET.lock().unwrap();
+        let (max_offset, current_offset) = with_tab_state(|state_opt| match state_opt.as_ref() {
+            Some(state) => (state.layout.scroll.max_offset, state.layout.scroll.offset),
+            None => (0.0, 0.0),
+        });
         let Some(geometry) =
             thumbnail_scroller_geometry(bounds.size.height, max_offset, current_offset)
         else {
@@ -741,11 +751,15 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_down(
         if !inside_knob {
             set_thumbnail_scroll_offset(start_offset, max_offset);
         }
-        *THUMB_SCROLL_DRAG.lock().unwrap() = Some(ThumbnailScrollDrag {
-            start_y: point.y,
-            start_offset,
-            max_offset,
-            thumb_travel: geometry.thumb_travel,
+        with_tab_state(|state_opt| {
+            if let Some(state) = state_opt.as_mut() {
+                state.layout.scroll.drag = Some(ThumbnailScrollDrag {
+                    start_y: point.y,
+                    start_offset,
+                    max_offset,
+                    thumb_travel: geometry.thumb_travel,
+                });
+            }
         });
         invalidate_thumbnail_scroller();
     });
@@ -757,7 +771,11 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_dragged(
     event: *mut c_void,
 ) {
     callback_guard::void("thumbnail_scroller_mouse_dragged", || unsafe {
-        let Some(drag) = *THUMB_SCROLL_DRAG.lock().unwrap() else {
+        let Some(drag) = with_tab_state(|state_opt| {
+            state_opt
+                .as_ref()
+                .and_then(|state| state.layout.scroll.drag)
+        }) else {
             return;
         };
         let scroller = _self as *mut AnyObject;
@@ -784,7 +802,7 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
     event: *mut c_void,
 ) {
     callback_guard::void("thumbnail_scroller_mouse_up", || {
-        *THUMB_SCROLL_DRAG.lock().unwrap() = None;
+        clear_thumbnail_scroll_drag();
         unsafe {
             let point: NSPoint = msg_send![event as *mut AnyObject, locationInWindow];
             update_thumbnail_pointer_state(point);
@@ -794,7 +812,11 @@ pub(crate) extern "C" fn thumbnail_scroller_mouse_up(
 }
 
 /// Update the scroller track, knob proportion, and position; hide it when there is no overflow.
+///
+/// `input` is the caller's transaction snapshot: the track's height depends on the footer band, so
+/// this must be the same theme the panel was laid out with, not a second reading of the config.
 pub(super) unsafe fn update_thumbnail_scroller(
+    input: &crate::theme::ThemeInput,
     panel_w: f64,
     panel_h: f64,
     overflowed: bool,
@@ -808,10 +830,10 @@ pub(super) unsafe fn update_thumbnail_scroller(
         let _: () = msg_send![scroller.0, setHidden: true];
         return;
     }
-    let footer_h = footer_band_h();
+    let footer_h = footer_band_h(input);
     // With the title off the gear floats in this same trailing column and is added to the view
     // hierarchy first, so the track has to start above it or the two hit areas overlap.
-    let bottom = footer_h + crate::theme::footer_control_bottom_reserve();
+    let bottom = footer_h + crate::theme::footer_control_bottom_reserve(input);
     let frame = NSRect::new(
         NSPoint::new(
             panel_w - H_PADDING - THUMB_SCROLLBAR_W + THUMB_SCROLLBAR_W / 2.0,
@@ -820,7 +842,12 @@ pub(super) unsafe fn update_thumbnail_scroller(
         NSSize::new(THUMB_SCROLLBAR_W, (panel_h - bottom).max(1.0)),
     );
     // Keep the hit view's frame stable during dragging; card rebuilds only refresh the capsule.
-    if THUMB_SCROLL_DRAG.lock().unwrap().is_none() {
+    let dragging = with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .is_some_and(|state| state.layout.scroll.drag.is_some())
+    });
+    if !dragging {
         let _: () = msg_send![scroller.0, setFrame: frame];
     }
     let _: () = msg_send![scroller.0, setHidden: false];

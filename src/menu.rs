@@ -1041,7 +1041,8 @@ pub(crate) extern "C" fn handle_toggle_thumbnail(
     _sender: *mut c_void,
 ) {
     crate::callback_guard::void("handle_toggle_thumbnail", || {
-        let thumbnails_enabled = !crate::theme::thumbnails_enabled();
+        let thumbnails_enabled =
+            !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current());
         let old_cfg = CONFIG.read().unwrap().clone();
         let new_cfg = {
             let mut cfg = old_cfg.clone();

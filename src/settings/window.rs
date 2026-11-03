@@ -4038,6 +4038,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             finder_menu_new_file_switches: Vec::new(),
             finder_menu_terminal_switches: Vec::new(),
             finder_menu_copy_path: std::ptr::null_mut(),
+            control_table: ControlTable::new(),
+            migrated_pages: std::array::from_fn(|_| None),
         };
 
         // The sidebar and detail pane meet directly at the original sidebar boundary; their
@@ -4080,8 +4082,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             content,
             content_w,
             page_x,
-            page_frame,
             page_viewport_h,
+            page_frame,
             palette,
             layout,
             target,
@@ -4335,6 +4337,14 @@ fn clear_settings_content_registries() {
 
 /// Detach global references owned by a settings window before it is released or replaced.
 unsafe fn detach_settings_window_runtime() {
+    // The identity table names controls by address; it is emptied BEFORE the views are released,
+    // so no later hit test can reach a freed object through a stale entry.
+    with_settings_ui(|slot| {
+        if let Some(ui) = slot.as_mut() {
+            ui.control_table.clear();
+            ui.migrated_pages = std::array::from_fn(|_| None);
+        }
+    });
     // Detach the updater's host references before releasing the window so it never touches
     // a deallocated view.
     crate::updater::clear_update_host();

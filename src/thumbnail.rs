@@ -342,7 +342,7 @@ fn activation_capture_is_valid(
 /// background. Recheck the activation token and system frontmost PID after a delay before
 /// replacing the last-known-good cache entry.
 pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant) {
-    if !crate::theme::thumbnails_enabled() {
+    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) {
         return;
     }
     schedule_focused_prewarm(pid, wid);
@@ -383,7 +383,7 @@ pub(crate) fn refresh_after_activation(pid: i32, wid: u32, activated_at: Instant
 /// +350ms and by the blank retry). Cross-app switches fail the frontmost
 /// precondition inside and keep using the notification-driven chain.
 pub(crate) fn refresh_after_same_app_switch(pid: i32, wid: u32) {
-    if !crate::theme::thumbnails_enabled() {
+    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) {
         return;
     }
     if !pid_is_frontmost(pid) {
@@ -1774,7 +1774,7 @@ mod tests {
 
     /// The ledger's bound, stated as a set inclusion so it can FAIL: the ledger's own size is not on
     /// the right-hand side. A build that never reclaims must violate it.
-
+    ///
     /// Every growth entry point reports growth, including the first generation query -- otherwise a
     /// pid whose row was created by a query (before its launch notification) would never trigger a
     /// reclaim for its whole lifecycle.

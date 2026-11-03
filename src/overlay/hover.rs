@@ -18,7 +18,7 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
     // Why: the overlay may open with the cursor already over a card -- that mouseEntered
     // gets swallowed by the gate and never re-fires (already inside), so side-button
     // summons would never hover-select if we only relied on mouseEntered (verified).
-    MOUSE_MOVED.store(true, Ordering::Relaxed);
+    set_mouse_moved(true);
     unsafe {
         let document = match card_document() {
             Some(document) => document,
@@ -57,7 +57,8 @@ pub(crate) fn handle_hover_at(loc: NSPoint) {
             if changed {
                 reset_thumbnail_nav_anchor();
                 refresh_highlight();
-                update_status_label();
+                // A pointer event is an independent entry: one snapshot for this reaction.
+                update_status_label(&crate::theme::ThemeInput::current());
             }
             break;
         }

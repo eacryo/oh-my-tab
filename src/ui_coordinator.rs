@@ -15,7 +15,8 @@ pub(crate) fn apply_theme_and_locale_refresh() {
     }
     crate::overlay::apply_theme();
     crate::overlay::refresh_highlight();
-    crate::overlay::update_status_label();
+    // A locale/theme switch is an independent entry: it samples once for the footer pass it owns.
+    crate::overlay::update_status_label(&crate::theme::ThemeInput::current());
     // The footer gear's window is cached across a locale switch: its tooltip and accessibility
     // label would otherwise keep the previous language (same reason the picker's gear is refreshed).
     crate::overlay::refresh_footer_settings_strings();

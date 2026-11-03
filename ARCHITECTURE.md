@@ -104,6 +104,14 @@ lib.rs (run)                                                      wiring + run l
 - **Subsystems** own their state and their windows. They may read leaves and `config`, never each other's
   internals; the few legitimate cross-surface actions go through `runtime_config.rs` (config deltas) or
   `ui_coordinator.rs` (theme/locale refresh), both of which call public refresh APIs rather than reaching in.
+- **`theme.rs` does not read the configuration.** A snapshot (`ThemeInput`) is taken once per transaction —
+  at the entry point, before any AppKit work — and passed down, so one render never observes two
+  configurations and no leaf helper takes the lock. `ThemeInput::current()` is the transitional entry that
+  still reads the global; the pure theme, layout and description layers must not call it.
+- **The overlay's layout and view state is `AppState.layout`** (`overlay::SwitcherLayout`), not a set of
+  statics. `with_tab_state` borrows the state mutably, so the rule is: take a short borrow to read the plan
+  or update the state, **release it**, and only then run AppKit work and the callbacks it can trigger. A
+  nested entry fails loudly rather than corrupting the state.
 - `app_identity.rs` exists because `window_collector` and `icon_cache` otherwise formed a cycle; both depend
   on it one-way.
 
@@ -209,13 +217,28 @@ clipboard/
 
 - `settings.rs` is the root: `SettingsUi`, control builders, window build/show, the live-apply dispatcher
   (every change writes the in-memory `CONFIG` and persists debounced), and restore-defaults.
+- A page is **described before it is built**. `settings/page_view.rs` is pure: `page_view(&PageInput) ->
+  PageView` produces one `RowSpec` per row (copy keys, control kind, an explicit `ControlId`, initial value,
+  options, dependency, group, and its search entry as a value), `layout_rows` is the only layout computation
+  (`RowLayout` frames from the page plus a `LayoutInput`), and `page_update_description` is the one
+  field-to-value description both the refill and the in-place refresh consume. `page_widgets.rs` holds the
+  copy widgets the renderer uses; it and `page_view.rs` are the page's two halves, description and drawing.
+- `ControlTable` (on `SettingsUi`) is the control-to-identity mapping, produced while the page is built by a
+  `PageRegistrations` buffer that validates the whole page before it replaces the old entries: a duplicate
+  identity aborts the build and leaves the old views and the old mapping together. `dispatch.rs` asks the
+  table first and falls back to the pointer comparison for pages that are not described yet.
 - `settings/window.rs` + `settings/window/chrome.rs` own the window and its native classes; `sidebar.rs` the
-  two-pane background; `page_builder.rs`/`page_canvas.rs` the page context and its vertical layout;
+  two-pane background; `page_builder.rs`/`page_canvas.rs` the page context, `build_page`/`publish_built_page`,
+  and the vertical layout owner;
   `components.rs` the semantic `SettingsSection`/`SettingsCard`/`SettingsRow`/`SettingsControl`/`SettingsButton`
   family; `widgets.rs` the concrete control classes; `select.rs` the custom select; `tooltip.rs` the
   disabled-setting hint; `dispatch.rs` the control-event dispatch and dependent enable/refresh;
   `mapping.rs` the mouse-mapping rows and side-button recorder; `bindings.rs` the key-bindings page;
   `finder_menu_smoke.rs` the Finder Menu page's own M1 GUI smoke.
+- Migrating a page to the description is one change: the `*_page_view` function, its `view_for` arm, the
+  `build_<page>_page` body replaced by `build_page`/(`publish_built_page` | `empty_page`), and the page added
+  to `refresh_migrated_pages_from` and `refresh_migrated_pages`. The old inline body is deleted in the same
+  change — two construction paths for one page is the defect this split exists to remove.
 - `restore.rs` is restore/reset, `portability.rs` is config import/export, `i18n`/`theme` reloads invalidate the
   cached window through `settings.rs`.
 - Configuration is loaded **per field**: an invalid value falls back individually without discarding valid

@@ -54,7 +54,8 @@ static FOCUSED_PREWARM_WAKE: LazyLock<(Mutex<()>, Condvar)> =
     LazyLock::new(|| (Mutex::new(()), Condvar::new()));
 
 fn focused_prewarm_enabled() -> bool {
-    crate::config::focused_thumbnail_prewarm_enabled() && crate::theme::thumbnails_enabled()
+    crate::config::focused_thumbnail_prewarm_enabled()
+        && crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current())
 }
 
 pub(super) fn next_focused_prewarm_target_revision() -> u64 {
@@ -1913,7 +1914,7 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
     // Re-preflight per job: silently skip while unauthorized (auto-resumes once
     // granted mid-run).
     let allowed = capture_allowed();
-    let enabled = crate::theme::thumbnails_enabled();
+    let enabled = crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current());
     if !allowed || !enabled {
         log_debug!(
             "[thumb] job skipped (allowed={}, enabled={})",
@@ -2195,7 +2196,7 @@ pub(super) fn pid_is_frontmost(pid: i32) -> bool {
 /// The user may have arrowed away or closed the overlay mid-generation, so every
 /// key is re-verified.
 pub(crate) fn handle_ready_main() {
-    if !crate::theme::thumbnails_enabled() {
+    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) {
         READY_QUEUE.lock().unwrap().clear();
         READY_DELIVERY_SCHEDULED.store(false, Ordering::Release);
         return;

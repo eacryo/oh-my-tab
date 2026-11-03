@@ -35,6 +35,21 @@ pub(super) enum RowGroup {
     GlassStyle,
 }
 
+/// How a row re-places the views the canvas captured for it.
+///
+/// The default keeps every captured view at its build-time offset from the row's origin. A row
+/// whose content the page wrote itself — the page renderer builds a title, a caption and a
+/// control in boxes the layout computed — re-places them absolutely on every walk, from frames
+/// that do not depend on the row's own origin.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub(super) enum AdvanceState {
+    /// Move each captured view with the row's origin (the inline builders' shape).
+    #[default]
+    Relative,
+    /// Re-place the captured views absolutely, from their own frames.
+    Absolute,
+}
+
 /// One laid-out row.
 struct Row {
     /// The row's own views: its labels, controls, readouts and the separator above it. They move
@@ -49,6 +64,13 @@ struct Row {
     group: Option<RowGroup>,
     /// The section this row belongs to: a new section consumes its heading step before the row.
     section: usize,
+    /// How the row's views follow it.
+    advance: AdvanceState,
+    /// The row's own views with their box STATED RELATIVE TO THE ROW'S ORIGIN. A re-flow places
+    /// each one at `row_origin + offset`, so a row that moves -- a hidden group above it, a
+    /// viewport change, a banner appearing -- takes its copy, its control and its readout with it,
+    /// at the same relative position the layout gave them.
+    placements: Vec<(*mut AnyObject, NSPoint)>,
 }
 
 /// One section: the cursor its card hangs from, plus the header label drawn at that cursor.
@@ -81,6 +103,9 @@ struct PendingRow {
     section: usize,
     /// Origin relative to the first section cursor.
     rel: f64,
+    advance: AdvanceState,
+    /// The row's own views with their offsets from the row's origin.
+    placements: Vec<(*mut AnyObject, NSPoint)>,
 }
 
 /// Layout state the runtime mutates through `&self`.
@@ -226,6 +251,29 @@ unsafe fn views_added_since(view: *mut AnyObject, mark: usize) -> Vec<*mut AnyOb
         return Vec::new();
     }
     (mark..count).map(|index| subview_at(view, index)).collect()
+}
+
+/// Move a view to the box the layout computed, unless it is being hosted elsewhere (the search
+/// temporarily re-parents page controls into its own result rows; their frames belong to that
+/// layout until they return).
+/// Where a placed view goes on the current walk: its row's CURRENT origin plus the offset the
+/// layout gave it. Pure, and the only expression of the rule -- the canvas calls it for every
+/// placement it applies.
+pub(super) fn placed_view_origin(row_origin: f64, offset: NSPoint) -> NSPoint {
+    NSPoint::new(offset.x, row_origin + offset.y)
+}
+
+fn place_row_view(view: *mut AnyObject, document: *mut AnyObject, origin: NSPoint) {
+    if view.is_null() {
+        return;
+    }
+    let parent: *mut AnyObject = unsafe { msg_send![view, superview] };
+    if parent != document {
+        return;
+    }
+    // The size belongs to the view; only the row's movement moves it.
+    let frame: NSRect = unsafe { msg_send![view, frame] };
+    let _: () = unsafe { msg_send![view, setFrame: NSRect::new(origin, frame.size)] };
 }
 
 /// Whether a row is hidden because the conditional group it belongs to is off. Pure, so the
@@ -502,8 +550,55 @@ impl PageCanvas {
             group: self.group,
             section: self.sections.len().saturating_sub(1),
             rel: origin - self.base,
+            advance: AdvanceState::Relative,
+            placements: Vec::new(),
         });
         origin
+    }
+
+    /// The document every row, card and heading is added to. The page header owns the top block;
+    /// rows appended to this view belong to the row opened last (see `next_row`).
+    pub(super) fn document(&self) -> *mut AnyObject {
+        self.document
+    }
+
+    /// The distance from the document's top edge down to the first section cursor: the
+    /// measurement a pure layout needs to place rows without duplicating the header's metrics.
+    pub(super) fn header_offset(&self) -> f64 {
+        self.header_offset
+    }
+
+    /// Make the next captured row re-place its views absolutely (see `AdvanceState`).
+    pub(super) fn set_pending_advance(&mut self, advance: AdvanceState) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.advance = advance;
+        }
+    }
+
+    /// Give the row being captured its conditional group. A row's membership is set when its
+    /// views are placed, so `set_group_visible` has something to hide.
+    pub(super) fn set_pending_group(&mut self, group: Option<RowGroup>) {
+        if let Some(pending) = self.pending.as_mut() {
+            pending.group = group;
+        }
+    }
+
+    /// Give the row being captured its own views with their boxes: the copy, the control, a
+    /// slider's readout, and the views it captured when `next_row` returned. The reflow re-places
+    /// every one of them from these boxes on every walk, which is what makes the recorded layout
+    /// the page's only layout owner.
+    pub(super) fn place_pending_view(&mut self, view: *mut AnyObject, frame: NSRect) {
+        if view.is_null() {
+            return;
+        }
+        if let Some(pending) = self.pending.as_mut() {
+            // Stored relative to the row the view belongs to: the re-flow adds the row's current
+            // origin, so the view follows whatever the canvas does to the row.
+            let origin = self.base + pending.rel;
+            pending
+                .placements
+                .push((view, NSPoint::new(frame.origin.x, frame.origin.y - origin)));
+        }
     }
 
     /// The group the following rows belong to, until [`PageCanvas::group_end`].
@@ -522,7 +617,7 @@ impl PageCanvas {
     /// of being appended, so they never land in a row (and every caller flushes before creating
     /// one).
     unsafe fn flush_pending(&mut self) {
-        let Some(pending) = self.pending.take() else {
+        let Some(mut pending) = self.pending.take() else {
             return;
         };
         let views = views_added_since(self.document, pending.mark);
@@ -532,6 +627,8 @@ impl PageCanvas {
             height: pending.height,
             group: pending.group,
             section: pending.section,
+            advance: pending.advance,
+            placements: std::mem::take(&mut pending.placements),
         });
         {
             let mut state = self.state.borrow_mut();
@@ -579,6 +676,50 @@ impl PageCanvas {
             bottom_offset: offset,
         });
         card
+    }
+
+    /// The row's placed views with their offsets from its origin (the re-flow's own record).
+    pub(super) fn row_placements(&self, row: usize) -> Option<&[(*mut AnyObject, NSPoint)]> {
+        Some(self.rows.get(row)?.placements.as_slice())
+    }
+
+    /// The row's CURRENT origin from the last re-flow: what a placement is applied from.
+    pub(super) fn current_row_origin(&self, row: usize) -> Option<f64> {
+        if !self.is_bound() {
+            return None;
+        }
+        let state = self.state.borrow();
+        state.origins.get(row).copied()
+    }
+
+    /// Whether the row's placed views are still at the last re-flow's positions (the smoke's
+    /// staleness probe: a placement the canvas never applied reads as stale).
+    pub(super) unsafe fn placements_are_stale(&self, row: usize) -> bool {
+        let Some(origin) = self.current_row_origin(row) else {
+            return true;
+        };
+        let Some(placements) = self.row_placements(row) else {
+            return true;
+        };
+        let mut stale = false;
+        for (view, offset) in placements {
+            if view.is_null() {
+                return true;
+            }
+            let actual: NSRect = msg_send![*view, frame];
+            let expected = placed_view_origin(origin, *offset);
+            if (actual.origin.x - expected.x).abs() > 0.5
+                || (actual.origin.y - expected.y).abs() > 0.5
+            {
+                stale = true;
+            }
+        }
+        stale
+    }
+
+    /// The conditional group the row belongs to, as the canvas recorded it.
+    pub(super) fn row_group(&self, row: usize) -> Option<RowGroup> {
+        self.rows.get(row).and_then(|row| row.group)
     }
 
     /// The index of the row opened last, counting the row still being captured: the handle a block
@@ -956,7 +1097,19 @@ impl PageCanvas {
                         }
                     }
                     let delta = target - previous.get(index).copied().unwrap_or(target);
-                    if delta != 0.0 {
+                    if row.advance == AdvanceState::Absolute {
+                        // The page renderer's rows were built in frames the pure layout computed,
+                        // so every view is placed at the row's CURRENT origin plus the offset the
+                        // layout gave it -- not at the build-time frame, which a hidden group above
+                        // or a viewport change has since moved.
+                        for (view, offset) in &row.placements {
+                            place_row_view(
+                                *view,
+                                self.document,
+                                placed_view_origin(target, *offset),
+                            );
+                        }
+                    } else if delta != 0.0 {
                         for &view in &row.views {
                             if view.is_null() {
                                 continue;
@@ -1249,6 +1402,8 @@ mod tests {
             height: 40.0,
             group,
             section: 0,
+            advance: AdvanceState::Relative,
+            placements: Vec::new(),
         };
         let conditional = row(Some(RowGroup::LineCount));
         let plain = row(None);
@@ -1267,6 +1422,8 @@ mod tests {
             height,
             group,
             section: 0,
+            advance: AdvanceState::Relative,
+            placements: Vec::new(),
         }
     }
 
@@ -1277,6 +1434,8 @@ mod tests {
             height,
             group,
             section,
+            advance: AdvanceState::Relative,
+            placements: Vec::new(),
         }
     }
 
@@ -1417,6 +1576,8 @@ mod tests {
             height,
             group: None,
             section: 0,
+            advance: AdvanceState::Relative,
+            placements: Vec::new(),
         }
     }
 

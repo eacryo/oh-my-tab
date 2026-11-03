@@ -134,9 +134,15 @@ pub(crate) unsafe fn set_footer_settings_style(button: *mut AnyObject, hovered: 
 /// same arc model, with `FOOTER_FLOAT_MARGIN` as its distance from the bottom edge and no
 /// `H_PADDING` floor -- at the shipped radius that floor would push the control into the card area,
 /// while the arc-derived inset keeps it inside the panel's own right padding.
-pub(crate) fn footer_settings_frame(panel_size: NSSize) -> NSRect {
-    let band = crate::theme::footer_band_h();
-    let radius = crate::theme::layout_corner_radius();
+pub(crate) fn footer_settings_frame(
+    input: &crate::theme::ThemeInput,
+    panel_size: NSSize,
+) -> NSRect {
+    // The pinned accessor, not `footer_band_h`: it is identical in every non-test build, and in a
+    // test it lets the suite pin "band gone" for geometry it does not otherwise describe (the same
+    // seam `no_footer_bottom_slack` uses).
+    let band = crate::theme::footer_band_h_test_pinned(input);
+    let radius = crate::theme::layout_corner_radius(input);
     let size = crate::theme::FOOTER_CONTROL_SIZE;
     if band <= 0.0 {
         let margin = crate::theme::FOOTER_FLOAT_MARGIN;
@@ -233,12 +239,12 @@ pub(crate) fn refresh_localized_strings() {
 }
 
 /// Reposition the gear after the panel resizes and repaint it from the current palette.
-pub(crate) fn layout_and_repaint(panel_size: NSSize) {
+pub(crate) fn layout_and_repaint(input: &crate::theme::ThemeInput, panel_size: NSSize) {
     let Some(button) = *FOOTER_SETTINGS_BUTTON.lock().unwrap() else {
         return;
     };
     unsafe {
-        let _: () = msg_send![button.0, setFrame: footer_settings_frame(panel_size)];
+        let _: () = msg_send![button.0, setFrame: footer_settings_frame(input, panel_size)];
         set_footer_settings_style(button.0, false);
     }
 }
@@ -247,19 +253,14 @@ pub(crate) fn layout_and_repaint(panel_size: NSSize) {
 mod tests {
     use super::*;
 
-    /// Recompute the same corner-safe inset the frame uses, from the live config radius.
-    fn expected_inset(panel_size: NSSize) -> f64 {
-        let radius = crate::config::CONFIG
-            .read()
-            .unwrap()
-            .appearance
-            .corner_radius;
+    /// Recompute the same corner-safe inset the frame uses, from the snapshot's own radius.
+    fn expected_inset(input: &crate::theme::ThemeInput, panel_size: NSSize) -> f64 {
         crate::theme::footer_control_inset(
-            radius,
+            crate::theme::layout_corner_radius(input),
             panel_size.width,
             panel_size.height,
             crate::theme::FOOTER_CONTROL_SIZE,
-            crate::theme::footer_band_h(),
+            crate::theme::footer_band_h(input),
         )
         .max(crate::theme::H_PADDING)
     }
@@ -269,11 +270,12 @@ mod tests {
         // Pin the band: it is otherwise read from the on-disk config, and this asserts the
         // band-present geometry specifically.
         crate::theme::set_test_footer_band(Some(crate::theme::FOOTER_CONTROL_MIN_H));
+        let input = crate::theme::ThemeInput::current();
         let panel = NSSize::new(600.0, 400.0);
-        let rect = footer_settings_frame(panel);
+        let rect = footer_settings_frame(&input, panel);
         let size = crate::theme::FOOTER_CONTROL_SIZE;
-        let band = crate::theme::footer_band_h();
-        let inset = expected_inset(panel);
+        let band = crate::theme::footer_band_h(&input);
+        let inset = expected_inset(&input, panel);
 
         assert_eq!(rect.size.width, size);
         assert_eq!(rect.size.height, size);
@@ -299,8 +301,9 @@ mod tests {
         // Pin the radius: at the shipped one the reserve is a sub-point, which makes the trailing
         // assertion below pass no matter what.
         crate::theme::set_test_corner_radius(Some(64.0));
+        let input = crate::theme::ThemeInput::current();
         let panel = NSSize::new(600.0, 400.0);
-        let rect = footer_settings_frame(panel);
+        let rect = footer_settings_frame(&input, panel);
         let size = crate::theme::FOOTER_CONTROL_SIZE;
         assert_eq!(rect.origin.y, crate::theme::FOOTER_FLOAT_MARGIN);
         assert_eq!(rect.size.width, size);
@@ -311,7 +314,7 @@ mod tests {
         // packing for them would change the layout for no visible gain), hence the one-point slack.
         // A regression that re-applied the `H_PADDING` floor would land ~28pt further left and fail.
         let grid_right = panel.width - crate::theme::H_PADDING;
-        let reserve = crate::theme::footer_control_right_reserve(panel.width, panel.height);
+        let reserve = crate::theme::footer_control_right_reserve(&input, panel.width, panel.height);
         assert!(
             rect.origin.x >= grid_right - reserve - 1.0,
             "the floating control at x={:.1} reaches past what the grid gives up \
@@ -328,7 +331,7 @@ mod tests {
     fn footer_settings_frame_clamps_x_for_a_tiny_panel() {
         // Narrower than the inset plus the control, so the trailing layout would go negative.
         let panel = NSSize::new(10.0, 400.0);
-        let rect = footer_settings_frame(panel);
+        let rect = footer_settings_frame(&crate::theme::ThemeInput::current(), panel);
         assert_eq!(rect.origin.x, 0.0);
         assert_eq!(rect.size.width, crate::theme::FOOTER_CONTROL_SIZE);
     }

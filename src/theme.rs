@@ -615,14 +615,122 @@ pub(crate) fn ui_palette_for_mode(dark: bool) -> UiPalette {
     }
 }
 
-/// Resolve colors from CONFIG for dark/light. Fixed fields (page bg, etc.) are hard-coded
+/// The custom palette as stored in the configuration: the two `ThemeColors` structs, kept as
+/// strings so a snapshot stays a cheap clone.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct CustomPalette {
+    pub(crate) dark: config::ThemeColors,
+    pub(crate) light: config::ThemeColors,
+}
+
+/// Every input the pure theme and layout layer takes from the configuration, as ONE snapshot.
+///
+/// One transaction takes one `ThemeInput` and keeps it: a single layout or refresh pass must not
+/// observe two different configurations, and the lock it was copied under is released before any
+/// AppKit work.
+///
+/// The field list is closed, not a convenient subset. It is every field the layer read through
+/// `theme.rs`: 14 `CONFIG.read()` sites (one of them, in a geometry test helper, reads only the
+/// corner radius) plus `text_scale()`, whose `CONFIG` and `.read()` are split across lines, for 15
+/// lock-taking sites in all. Field by field:
+///
+/// - `appearance.theme` -> `dark` (one of "light" / "dark" / "auto"; "auto" resolves through the
+///   system appearance, see [`ThemeInput::current`]).
+/// - `colors.dark.*` and `colors.light.*` -> `palette`, each struct's complete field list:
+///   `status_bar_text`, `app_name`, `win_title`, `icon_inner_bg`, `icon_text`, `card_bg_sel`,
+///   `card_border_sel`. (`colors_from` reads `win_title` for both the footer text and the card
+///   title and never reads `status_bar_text`; both are inputs of the snapshot regardless.)
+/// - `appearance.corner_radius` -> `corner_radius`.
+/// - `layout.card_text_size` -> `card_text_size`.
+/// - `layout.thumbnail_size` -> `thumbnail_size` (parsed by `config::thumbnail_scale_of`).
+/// - `layout.thumbnails_enabled` -> `thumbnails_enabled`.
+/// - `layout.show_app_name_in_cards` -> `show_app_name_in_cards`.
+/// - `fonts.status_bar_size` -> `status_bar_font_size` (the footer text size, which is also what
+///   decides whether a footer band exists at all).
+/// - `fonts.title_size` -> `title_font_size`.
+/// - `fonts.app_name_size` -> `app_name_font_size`.
+///
+/// Not an input: `layout.show_footer_title`, which nothing here reads. The band follows
+/// `fonts.status_bar_size` (see [`footer_band_h`]); the stored switch is carried for older configs
+/// and the export format only.
+///
+/// `ThemeInput::current()` is the single transitional entry point that still reads the global. Its
+/// replacement is each entry taking one snapshot when its transaction starts and passing it down,
+/// and its exit condition is narrow: only the pure theme, layout and description layers are barred
+/// from reading the global -- settings event handlers and refresh entries may keep reading the
+/// business config they act on.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ThemeInput {
+    pub(crate) dark: bool,
+    pub(crate) palette: CustomPalette,
+    pub(crate) corner_radius: f64,
+    pub(crate) card_text_size: f64,
+    pub(crate) thumbnail_size: String,
+    pub(crate) thumbnails_enabled: bool,
+    pub(crate) show_app_name_in_cards: bool,
+    pub(crate) title_font_size: f64,
+    pub(crate) app_name_font_size: f64,
+    pub(crate) status_bar_font_size: f64,
+}
+
+impl ThemeInput {
+    /// The transition entry point: one snapshot of the current configuration.
+    ///
+    /// Every caller of the pure layer goes through here today; no pure function reads `CONFIG`
+    /// itself. The exit condition is narrow: only the pure theme, layout and description layers are
+    /// barred from reading the global -- the settings event handlers and refresh entries keep
+    /// reading the business config they act on. What replaces this function is each entry taking one
+    /// snapshot when its transaction starts and passing it down, so nothing here is a destination.
+    pub(crate) fn current() -> ThemeInput {
+        let cfg = CONFIG.read().unwrap();
+        let palette = CustomPalette {
+            dark: cfg.colors.dark.clone(),
+            light: cfg.colors.light.clone(),
+        };
+        let theme = cfg.appearance.theme.clone();
+        let corner_radius = cfg.appearance.corner_radius;
+        let card_text_size = cfg.layout.card_text_size;
+        let thumbnail_size = cfg.layout.thumbnail_size.clone();
+        let thumbnails_enabled = cfg.layout.thumbnails_enabled;
+        let show_app_name_in_cards = cfg.layout.show_app_name_in_cards;
+        let title_font_size = cfg.fonts.title_size;
+        let app_name_font_size = cfg.fonts.app_name_size;
+        let status_bar_font_size = cfg.fonts.status_bar_size;
+        drop(cfg);
+        // Resolved after the lock is released: "auto" asks NSUserDefaults, and AppKit work must not
+        // run while the config is held.
+        ThemeInput {
+            dark: dark_for_theme(&theme),
+            palette,
+            corner_radius,
+            card_text_size,
+            thumbnail_size,
+            thumbnails_enabled,
+            show_app_name_in_cards,
+            title_font_size,
+            app_name_font_size,
+            status_bar_font_size,
+        }
+    }
+}
+
+/// Resolve `appearance.theme` to the effective appearance; "auto" (and anything unknown) follows
+/// the system.
+fn dark_for_theme(theme: &str) -> bool {
+    match theme {
+        "light" => false,
+        "dark" => true,
+        _ => system_dark_mode(),
+    }
+}
+
+/// Resolve colors from the snapshot for dark/light. Fixed fields (page bg, etc.) are hard-coded
 /// to transparent / placeholder for now.
-pub(crate) fn colors_from_config(dark: bool) -> Colors {
-    let cfg = CONFIG.read().unwrap();
+pub(crate) fn colors_from(input: &ThemeInput, dark: bool) -> Colors {
     let c = if dark {
-        &cfg.colors.dark
+        &input.palette.dark
     } else {
-        &cfg.colors.light
+        &input.palette.light
     };
     Colors {
         page_bg: 0x00000000,
@@ -656,16 +764,14 @@ pub(crate) fn system_dark_mode() -> bool {
 
 /// Resolve the effective appearance once so every native panel follows the same light/dark rule.
 pub(crate) fn resolved_is_dark() -> bool {
-    match CONFIG.read().unwrap().appearance.theme.as_str() {
-        "light" => false,
-        "dark" => true,
-        _ => system_dark_mode(),
-    }
+    let theme = CONFIG.read().unwrap().appearance.theme.clone();
+    dark_for_theme(&theme)
 }
 
-/// Resolve current colors per CONFIG.appearance.theme (auto follows system dark/light).
+/// The custom overlay colors for the current appearance, from one snapshot.
 pub(crate) fn current_colors() -> Colors {
-    colors_from_config(resolved_is_dark())
+    let input = ThemeInput::current();
+    colors_from(&input, input.dark)
 }
 
 pub(crate) fn card_w() -> f64 {
@@ -675,8 +781,8 @@ pub(crate) fn card_w() -> f64 {
 /// form added a fixed reserve on top of a base height that already exceeded its content, which
 /// left ~27pt of blank inside the card's own bounds -- the plate ended up crammed 2pt above the
 /// caption while a band of nothing sat at the card's bottom.
-pub(crate) fn card_h() -> f64 {
-    let (primary_line_h, secondary_line_h) = icon_caption_line_heights();
+pub(crate) fn card_h(input: &ThemeInput) -> f64 {
+    let (primary_line_h, secondary_line_h) = icon_caption_line_heights(input);
     ICON_TOP_INSET
         + icon_px()
         + ICON_TEXT_GAP
@@ -737,16 +843,16 @@ pub(crate) struct IconCardLayout {
 }
 
 /// The two caption lines' heights, from the configured font sizes.
-fn icon_caption_line_heights() -> (f64, f64) {
+fn icon_caption_line_heights(input: &ThemeInput) -> (f64, f64) {
     (
-        line_height(card_title_font_size(), LINE_HEIGHT_TITLE_RATIO),
-        line_height(card_app_name_font_size(), LINE_HEIGHT_CAPTION_RATIO),
+        line_height(card_title_font_size(input), LINE_HEIGHT_TITLE_RATIO),
+        line_height(card_app_name_font_size(input), LINE_HEIGHT_CAPTION_RATIO),
     )
 }
 
-pub(crate) fn icon_card_layout(card_w: f64, card_h: f64) -> IconCardLayout {
+pub(crate) fn icon_card_layout(input: &ThemeInput, card_w: f64, card_h: f64) -> IconCardLayout {
     let icon_bottom = card_h - ICON_TOP_INSET - icon_px();
-    let (primary_line_h, secondary_line_h) = icon_caption_line_heights();
+    let (primary_line_h, secondary_line_h) = icon_caption_line_heights(input);
     let primary_bottom = icon_bottom - ICON_TEXT_GAP - primary_line_h;
     IconCardLayout {
         icon_x: (card_w - icon_px()) / 2.0,
@@ -766,8 +872,9 @@ mod selection_plate_tests {
     /// layout's ring marks (caption rows included), `SELECTION_CARD_INSET` outside it.
     #[test]
     fn icon_plate_wraps_the_whole_card() {
+        let input = ThemeInput::current();
         let card_w = card_w();
-        let card_h = card_h();
+        let card_h = card_h(&input);
         let (x, y, w, h) = icon_selection_plate(card_w, card_h);
         assert!((x - -SELECTION_CARD_INSET).abs() < 1e-9);
         assert!((y - -SELECTION_CARD_INSET).abs() < 1e-9);
@@ -778,10 +885,10 @@ mod selection_plate_tests {
         assert_eq!(icon_selection_plate_radius(), SELECTION_PLATE_RADIUS);
         assert_ne!(
             SELECTION_PLATE_RADIUS,
-            overlay_card_radius() + SELECTION_CARD_INSET
+            overlay_card_radius(&input) + SELECTION_CARD_INSET
         );
         // The caption rows and the icon canvas are all inside it.
-        let layout = icon_card_layout(card_w, card_h);
+        let layout = icon_card_layout(&input, card_w, card_h);
         // At the card's own edge, not outside it: the icon grid packs cards edge to edge, so the
         // card boundary is already the midpoint between two icons.
         assert!(
@@ -793,29 +900,24 @@ mod selection_plate_tests {
 }
 
 /// Scale shared by the card's window-title and app-name text.
-pub(crate) fn text_scale() -> f64 {
-    CONFIG
-        .read()
-        .unwrap()
-        .layout
+pub(crate) fn text_scale(input: &ThemeInput) -> f64 {
+    input
         .card_text_size
         .clamp(CARD_TEXT_SIZE_MIN, CARD_TEXT_SIZE_MAX)
         / CARD_TEXT_BASE_SIZE
 }
 
-pub(crate) fn card_title_font_size() -> f64 {
-    let cfg = CONFIG.read().unwrap();
-    overlay_text_size_for(cfg.fonts.title_size, cfg.layout.card_text_size)
+pub(crate) fn card_title_font_size(input: &ThemeInput) -> f64 {
+    overlay_text_size_for(input.title_font_size, input.card_text_size)
 }
 
-pub(crate) fn card_app_name_font_size() -> f64 {
-    let cfg = CONFIG.read().unwrap();
-    overlay_text_size_for(cfg.fonts.app_name_size, cfg.layout.card_text_size)
+pub(crate) fn card_app_name_font_size(input: &ThemeInput) -> f64 {
+    overlay_text_size_for(input.app_name_font_size, input.card_text_size)
 }
 
 /// Bottom title-bar text size, exposed through the switcher settings page.
-pub(crate) fn status_bar_text_size() -> f64 {
-    status_bar_text_size_for(CONFIG.read().unwrap().fonts.status_bar_size)
+pub(crate) fn status_bar_text_size(input: &ThemeInput) -> f64 {
+    status_bar_text_size_for(input.status_bar_font_size)
 }
 
 /// The legal footer-size stops as a stored value lands on them: the settings slider's domain is
@@ -935,26 +1037,10 @@ pub(crate) const FOOTER_CONTROL_GAP: f64 = 8.0;
 /// clear of the card area's own right inset (`H_PADDING`), so a full-width row cannot slide under it.
 pub(crate) const FOOTER_FLOAT_MARGIN: f64 = 16.0;
 
-// Test-only override of the footer band height.
+// Test-only override of the corner radius the layout geometry uses.
 //
-// The suite builds `CONFIG` from the on-disk config file, so geometry that reads the band depends on
-// the developer's `layout.show_footer_title` unless a test pins it. This is thread-local rather than a
-// `CONFIG` write because the harness runs tests in parallel: a global write would be observed by
-// every other test in the run.
-#[cfg(test)]
-thread_local! {
-    static TEST_FOOTER_BAND: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
-}
-
-/// Pin the footer band height for the current test thread (`None` restores the configured value).
-#[cfg(test)]
-pub(crate) fn set_test_footer_band(band: Option<f64>) {
-    TEST_FOOTER_BAND.with(|cell| cell.set(band));
-}
-
-// Test-only override of the corner radius the layout geometry uses, for the same reason as the band:
-// the suite reads the developer's config, and a reserve that is zero on one machine is not a gate on
-// the machines where it is not.
+// Kept because a test that exercises two radii from one snapshot is clearer than two snapshots; it
+// is read ONLY when a test sets it, so production geometry is always the snapshot's own radius.
 #[cfg(test)]
 thread_local! {
     static TEST_CORNER_RADIUS: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
@@ -967,18 +1053,44 @@ pub(crate) fn set_test_corner_radius(radius: Option<f64>) {
 }
 
 /// The corner radius that layout geometry must be computed against.
-pub(crate) fn layout_corner_radius() -> f64 {
+pub(crate) fn layout_corner_radius(input: &ThemeInput) -> f64 {
     #[cfg(test)]
     {
         if let Some(forced) = TEST_CORNER_RADIUS.with(|cell| cell.get()) {
             return forced;
         }
-        CONFIG.read().unwrap().appearance.corner_radius
     }
-    #[cfg(not(test))]
+    input.corner_radius
+}
+
+/// The footer band's height with the test thread's pin applied (`set_test_footer_band`).
+///
+/// Production code calls [`footer_band_h`]; a test that needs "no band" for geometry it does not
+/// otherwise describe can pin it instead of handing its snapshot a footer size.
+pub(crate) fn footer_band_h_test_pinned(input: &ThemeInput) -> f64 {
+    #[cfg(test)]
     {
-        CONFIG.read().unwrap().appearance.corner_radius
+        if let Some(forced) = TEST_FOOTER_BAND.with(|cell| cell.get()) {
+            return forced;
+        }
     }
+    footer_band_h(input)
+}
+
+// Test-only override of the footer band height.
+//
+// The suite's geometry fixtures take the band from their own snapshot; this exists because a test
+// that only needs "band absent" says so with one line instead of building a second snapshot. It is
+// read ONLY when a test sets it.
+#[cfg(test)]
+thread_local! {
+    static TEST_FOOTER_BAND: std::cell::Cell<Option<f64>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the footer band height for the current test thread (`None` restores the snapshot's value).
+#[cfg(test)]
+pub(crate) fn set_test_footer_band(band: Option<f64>) {
+    TEST_FOOTER_BAND.with(|cell| cell.set(band));
 }
 
 /// The footer band's height, with the floor the settings control needs. Every consumer of the band
@@ -990,22 +1102,8 @@ pub(crate) fn layout_corner_radius() -> f64 {
 /// an empty strip. The control moves to the panel's corner instead -- see
 /// `overlay::footer_settings_frame` -- and every consumer follows this function, so the panel, the
 /// card viewport and the scroller all shrink by the band together.
-pub(crate) fn footer_band_h() -> f64 {
-    #[cfg(test)]
-    {
-        // The suite builds `CONFIG` from the developer's on-disk config file, so reading the switch
-        // here would make every band-dependent layout assertion depend on that machine's setting.
-        // Tests assume the band is present unless they pin it with `set_test_footer_band`; the
-        // switch-to-band mapping itself is covered by `footer_band_h_for`'s own test.
-        if let Some(forced) = TEST_FOOTER_BAND.with(|cell| cell.get()) {
-            return forced;
-        }
-        footer_band_h_for(true, status_bar_text_size())
-    }
-    #[cfg(not(test))]
-    {
-        footer_band_h_for(show_footer_title(), status_bar_text_size())
-    }
+pub(crate) fn footer_band_h(input: &ThemeInput) -> f64 {
+    footer_band_h_for(show_footer_title(input), status_bar_text_size(input))
 }
 
 /// The band height for one switch state and one footer text size (pure): the floor the settings
@@ -1046,8 +1144,8 @@ pub(crate) fn footer_line_height(natural_h: f64, band_h: f64) -> f64 {
 /// added to the view hierarchy *before* the scrollbar -- so a shared area would hand the control's
 /// clicks to the scrollbar. The scrollbar's track starts above this reserve instead of at the panel
 /// edge, which keeps the two hit areas disjoint without relying on z-order.
-pub(crate) fn footer_control_bottom_reserve() -> f64 {
-    if footer_band_h() > 0.0 {
+pub(crate) fn footer_control_bottom_reserve(input: &ThemeInput) -> f64 {
+    if footer_band_h(input) > 0.0 {
         return 0.0;
     }
     FOOTER_FLOAT_MARGIN + FOOTER_CONTROL_SIZE + FOOTER_CONTROL_GAP
@@ -1061,11 +1159,18 @@ pub(crate) fn footer_control_bottom_reserve() -> f64 {
 /// point -- at the shipped 32pt radius it is 0.3pt, and re-deriving row packing for a sub-point would
 /// perturb the layout for no visible gain. Measured against the widest allowed panel, so it is never
 /// an underestimate for the panel the layout finally picks.
-pub(crate) fn footer_control_right_reserve(max_panel_w: f64, max_panel_h: f64) -> f64 {
-    if footer_band_h() > 0.0 {
+pub(crate) fn footer_control_right_reserve(
+    input: &ThemeInput,
+    max_panel_w: f64,
+    max_panel_h: f64,
+) -> f64 {
+    // The pin-aware read, as layout_corner_radius already honours its own pin: a suite that pins
+    // "no band" must get the reserve a band-less panel needs. Outside a test the two are the same
+    // function, so production geometry is unchanged.
+    if footer_band_h_test_pinned(input) > 0.0 {
         return 0.0;
     }
-    footer_control_right_reserve_for(layout_corner_radius(), max_panel_w, max_panel_h)
+    footer_control_right_reserve_for(layout_corner_radius(input), max_panel_w, max_panel_h)
 }
 
 /// The pure half of [`footer_control_right_reserve`]: the reserve a given corner radius implies.
@@ -1092,14 +1197,13 @@ fn footer_control_right_reserve_for(radius: f64, max_panel_w: f64, max_panel_h: 
 /// The trailing horizontal inset reserved for the footer's settings control: the corner-safe inset
 /// plus the control's own width and its gap to the text. The footer text keeps the SAME reserve on
 /// both sides, so its centre stays the panel's centre.
-pub(crate) fn footer_text_reserve(panel_w: f64, panel_h: f64) -> f64 {
-    let corner_radius = CONFIG.read().unwrap().appearance.corner_radius;
+pub(crate) fn footer_text_reserve(input: &ThemeInput, panel_w: f64, panel_h: f64) -> f64 {
     let inset = footer_control_inset(
-        corner_radius,
+        layout_corner_radius(input),
         panel_w,
         panel_h,
         FOOTER_CONTROL_SIZE,
-        footer_band_h(),
+        footer_band_h(input),
     )
     .max(H_PADDING);
     inset + FOOTER_CONTROL_SIZE + FOOTER_CONTROL_GAP
@@ -1113,11 +1217,16 @@ pub(crate) fn footer_text_reserve(panel_w: f64, panel_h: f64) -> f64 {
 /// That configuration has no agreed fallback yet (the choice between a taller band, a narrower text
 /// area and hiding the entry is the user's); see `docs/review-backlog.md`. This function does NOT
 /// claim a readable minimum -- the clamp only keeps the rect valid.
-pub(crate) fn footer_text_frame(panel_w: f64, panel_h: f64, line_h: f64) -> (f64, f64, f64) {
-    let reserve = footer_text_reserve(panel_w, panel_h);
+pub(crate) fn footer_text_frame(
+    input: &ThemeInput,
+    panel_w: f64,
+    panel_h: f64,
+    line_h: f64,
+) -> (f64, f64, f64) {
+    let reserve = footer_text_reserve(input, panel_w, panel_h);
     let width = (panel_w - reserve * 2.0).max(1.0);
     let x = ((panel_w - width) / 2.0).max(0.0);
-    let y = (footer_band_h() - line_h) / 2.0;
+    let y = (footer_band_h(input) - line_h) / 2.0;
     (x, y, width)
 }
 
@@ -1131,17 +1240,16 @@ pub(crate) fn status_bar_height_for_text_size(size: f64) -> f64 {
 }
 
 /// Thumbnail captions use the same setting, but grow only as much as their caption row needs.
-pub(crate) fn thumb_caption_h() -> f64 {
-    (THUMB_CAPTION_H * text_scale()).clamp(20.0, 36.0)
+pub(crate) fn thumb_caption_h(input: &ThemeInput) -> f64 {
+    (THUMB_CAPTION_H * text_scale(input)).clamp(20.0, 36.0)
 }
 
-pub(crate) fn thumb_caption_h_for_card(card_h: f64) -> f64 {
-    thumb_caption_h().min((card_h.max(0.0) / 3.0).max(1.0))
+pub(crate) fn thumb_caption_h_for_card(input: &ThemeInput, card_h: f64) -> f64 {
+    thumb_caption_h(input).min((card_h.max(0.0) / 3.0).max(1.0))
 }
 
-pub(crate) fn overlay_card_radius() -> f64 {
-    let radius = CONFIG.read().unwrap().appearance.corner_radius;
-    effective_overlay_card_radius(radius)
+pub(crate) fn overlay_card_radius(input: &ThemeInput) -> f64 {
+    effective_overlay_card_radius(input.corner_radius)
 }
 
 pub(crate) fn effective_overlay_card_radius(configured_radius: f64) -> f64 {
@@ -1241,17 +1349,17 @@ pub(crate) fn animation_exit_duration(entrance: f64) -> f64 {
 /// without the Screen Recording permission).
 /// The card scale the user pinned, or `None` for the automatic step. Thumbnail mode only: the
 /// icon-only layout has its own fixed card size.
-pub(crate) fn thumbnail_size_scale_override() -> Option<f64> {
-    crate::config::thumbnail_scale_of(&CONFIG.read().unwrap().layout.thumbnail_size)
+pub(crate) fn thumbnail_size_scale_override(input: &ThemeInput) -> Option<f64> {
+    crate::config::thumbnail_scale_of(&input.thumbnail_size)
 }
 
-pub(crate) fn thumbnails_enabled() -> bool {
-    CONFIG.read().unwrap().layout.thumbnails_enabled
+pub(crate) fn thumbnails_enabled(input: &ThemeInput) -> bool {
+    input.thumbnails_enabled
 }
 
 /// Whether the thumbnail card's caption prefixes the app name before the window title.
-pub(crate) fn show_app_name_in_cards() -> bool {
-    CONFIG.read().unwrap().layout.show_app_name_in_cards
+pub(crate) fn show_app_name_in_cards(input: &ThemeInput) -> bool {
+    input.show_app_name_in_cards
 }
 
 /// Whether the switcher's bottom footer draws the selected window's title.
@@ -1259,14 +1367,13 @@ pub(crate) fn show_app_name_in_cards() -> bool {
 /// This switch also decides whether the footer band exists at all (`footer_band_h`), because the
 /// band's floor is the settings control's size rather than the text's: with the title off there is
 /// nothing left for the band to hold except a control that can move to the panel's corner.
-pub(crate) fn show_footer_title() -> bool {
+pub(crate) fn show_footer_title(input: &ThemeInput) -> bool {
     // One control, one source of truth: the footer band exists while its own text size is above
     // zero, which is the settings slider's far-left stop. `layout.show_footer_title` is still stored
-    // (older configs and the export format carry it) but no longer gates the panel.
-    let size = CONFIG.read().unwrap().fonts.status_bar_size;
+    // (older configs and the export configs carry it) but no longer gates the panel.
     // The slider's legal stops are 0 and 13..=20pt; normalization snaps any in-between stored
     // value the same way the settings readout does.
-    normalize_status_bar_size(size) > 0.0
+    normalize_status_bar_size(input.status_bar_font_size) > 0.0
 }
 
 /// Flow-layout base card width, hard-coded and fully independent of the legacy
@@ -1372,6 +1479,7 @@ fn choose_thumb_rows(
 /// (230pt) when a narrow one was. Card size must not depend on which window happened to be in
 /// front, so the estimate uses the count and the **widest** card only.
 pub(crate) fn thumb_scale_for_panel(
+    input: &ThemeInput,
     aspects: &[f64],
     max_inner: f64,
     max_panel_h: f64,
@@ -1385,8 +1493,8 @@ pub(crate) fn thumb_scale_for_panel(
         return 1.0;
     }
     for &scale in THUMB_SCALE_STEPS.iter() {
-        let card_h = thumb_card_h_for_scale(scale);
-        if thumb_count_estimate_fits(aspects.len(), card_h, max_inner, max_panel_h, gap) {
+        let card_h = thumb_card_h_for_scale(input, scale);
+        if thumb_count_estimate_fits(input, aspects.len(), card_h, max_inner, max_panel_h, gap) {
             return scale;
         }
     }
@@ -1402,44 +1510,45 @@ pub(crate) fn thumb_scale_for_panel(
 /// set whose windows are much wider than the base ratio can need a row more than this estimate and
 /// the panel scrolls at the chosen size -- the pinned percent is the way to guarantee both.
 fn thumb_count_estimate_fits(
+    input: &ThemeInput,
     count: usize,
     card_h: f64,
     max_inner: f64,
     max_panel_h: f64,
     gap: f64,
 ) -> bool {
-    let reference_w = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO);
+    let reference_w = thumb_card_w_for_aspect(input, card_h, THUMB_PREVIEW_RATIO);
     if reference_w <= 0.0 {
         return true;
     }
     let per_row = (((max_inner + gap) / (reference_w + gap)).floor() as usize).max(1);
     let rows = count.div_ceil(per_row);
-    rows <= thumb_max_rows(card_h, max_panel_h, gap)
+    rows <= thumb_max_rows(input, card_h, max_panel_h, gap)
 }
 
 /// Thumbnail card height derives from the base width per the mockup (pure,
 /// testable): vertical paddings + caption + gap + a 16:10 preview.
-fn thumb_card_h(card_width: f64) -> f64 {
+fn thumb_card_h(input: &ThemeInput, card_width: f64) -> f64 {
     let preview_h = (card_width - THUMB_PAD * 2.0) / THUMB_PREVIEW_RATIO;
-    THUMB_PAD * 2.0 + thumb_caption_h() + THUMB_GAP + preview_h
+    THUMB_PAD * 2.0 + thumb_caption_h(input) + THUMB_GAP + preview_h
 }
 
 /// The flow layout's uniform card height: derived once from the base width;
 /// every card shares it.
 #[cfg(test)]
-pub(crate) fn thumb_card_h_fixed() -> f64 {
-    thumb_card_h(THUMB_CARD_BASE_W)
+pub(crate) fn thumb_card_h_fixed(input: &ThemeInput) -> f64 {
+    thumb_card_h(input, THUMB_CARD_BASE_W)
 }
 
 /// Scale is based on the base card width; caption and padding stay fixed instead
 /// of mechanically enlarging text and controls.
-pub(crate) fn thumb_card_h_for_scale(scale: f64) -> f64 {
-    thumb_card_h(THUMB_CARD_BASE_W * scale.max(THUMB_MIN_SCALE))
+pub(crate) fn thumb_card_h_for_scale(input: &ThemeInput, scale: f64) -> f64 {
+    thumb_card_h(input, THUMB_CARD_BASE_W * scale.max(THUMB_MIN_SCALE))
 }
 
 /// Preview height = card height - vertical paddings - caption - gap (pure, testable).
-pub(crate) fn thumb_preview_h(card_h: f64) -> f64 {
-    (card_h - THUMB_PAD * 2.0 - thumb_caption_h_for_card(card_h) - THUMB_GAP).max(40.0)
+pub(crate) fn thumb_preview_h(input: &ThemeInput, card_h: f64) -> f64 {
+    (card_h - THUMB_PAD * 2.0 - thumb_caption_h_for_card(input, card_h) - THUMB_GAP).max(40.0)
 }
 
 /// Aspect clamp: windows can be extremely wide/tall; unclamped cards would become
@@ -1452,8 +1561,8 @@ pub(crate) fn clamp_aspect(aspect: f64) -> f64 {
 }
 
 /// Flow-layout card width = preview height × aspect + side paddings (pure, testable).
-pub(crate) fn thumb_card_w_for_aspect(card_h: f64, aspect: f64) -> f64 {
-    thumb_preview_h(card_h) * clamp_aspect(aspect) + THUMB_PAD * 2.0
+pub(crate) fn thumb_card_w_for_aspect(input: &ThemeInput, card_h: f64, aspect: f64) -> f64 {
+    thumb_preview_h(input, card_h) * clamp_aspect(aspect) + THUMB_PAD * 2.0
 }
 
 /// Balanced row packing: preserve input order, minimize row count first, then
@@ -1577,11 +1686,18 @@ pub(crate) struct ThumbFlowLayout {
 }
 
 #[cfg(test)]
-fn thumb_widths(aspects: &[f64], range: &Range<usize>, card_h: f64, max_inner: f64) -> Vec<f64> {
-    thumb_widths_with_max_card_w(aspects, range, card_h, max_inner, f64::INFINITY)
+fn thumb_widths(
+    input: &ThemeInput,
+    aspects: &[f64],
+    range: &Range<usize>,
+    card_h: f64,
+    max_inner: f64,
+) -> Vec<f64> {
+    thumb_widths_with_max_card_w(input, aspects, range, card_h, max_inner, f64::INFINITY)
 }
 
 fn thumb_widths_with_max_card_w(
+    input: &ThemeInput,
     aspects: &[f64],
     range: &Range<usize>,
     card_h: f64,
@@ -1594,16 +1710,16 @@ fn thumb_widths_with_max_card_w(
         // Clamp a single card on exceptionally narrow screens; the image remains
         // fully visible via aspect-fit and merely gains letterboxing.
         .map(|&aspect| {
-            thumb_card_w_for_aspect(card_h, aspect)
+            thumb_card_w_for_aspect(input, card_h, aspect)
                 .min(max_inner)
                 .min(max_card_w)
         })
         .collect()
 }
 
-fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
+fn thumb_max_rows(input: &ThemeInput, card_h: f64, max_panel_h: f64, gap: f64) -> usize {
     let available =
-        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h()).max(card_h);
+        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h(input)).max(card_h);
     ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
 }
 
@@ -1611,18 +1727,40 @@ fn thumb_max_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
 /// out of the budget before whole rows are counted. Without this the overflow panel is a teaser
 /// taller than the budget and eats the top/bottom margins (measured 2026-09-24: budget 875, panel
 /// 921, margins down to 33/2).
-fn thumb_viewport_rows(card_h: f64, max_panel_h: f64, gap: f64) -> usize {
+fn thumb_viewport_rows(input: &ThemeInput, card_h: f64, max_panel_h: f64, gap: f64) -> usize {
     let teaser_h = gap + card_h * THUMB_SCROLL_TEASER_RATIO;
     let available =
-        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h() - teaser_h)
+        (max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h(input) - teaser_h)
             .max(card_h);
     ((available + gap) / (card_h + gap)).floor().max(1.0) as usize
 }
 
 /// Whether the teaser fits without costing a whole row. If it does it is drawn (a sliver of the next
 /// row peeks at the bottom); if not it is dropped in favour of one more full row.
-pub(crate) fn thumb_teaser_fits(card_h: f64, max_panel_h: f64, gap: f64) -> bool {
-    thumb_viewport_rows(card_h, max_panel_h, gap) == thumb_max_rows(card_h, max_panel_h, gap)
+pub(crate) fn thumb_teaser_fits(
+    input: &ThemeInput,
+    card_h: f64,
+    max_panel_h: f64,
+    gap: f64,
+) -> bool {
+    thumb_viewport_rows(input, card_h, max_panel_h, gap)
+        == thumb_max_rows(input, card_h, max_panel_h, gap)
+}
+
+/// The measured metrics a panel height is computed from, shared by the normal layout's
+/// [`thumb_panel_metrics`] and the close reflow's [`thumb_close_panel_metrics`].
+///
+/// The two entry points differ in how many rows and whether a teaser is counted, not in what "a
+/// card" or "the budget" means, so they take the same struct rather than repeating five floats.
+#[derive(Clone, Copy)]
+pub(crate) struct ThumbPanelMetrics {
+    pub(crate) card_h: f64,
+    pub(crate) gap: f64,
+    /// Whether the teaser fits without costing a whole row; if not it is dropped.
+    pub(crate) teaser_fits: bool,
+    /// Height budget (hard cap): the panel height still comes from the cards, it just may not exceed
+    /// this.
+    pub(crate) max_panel_h: f64,
 }
 
 #[derive(Clone, Copy)]
@@ -1638,14 +1776,34 @@ struct ThumbFlowConstraints {
     gap: f64,
 }
 
+impl ThumbFlowConstraints {
+    /// The panel metrics these constraints add up to: the row budget and the packing width are not
+    /// part of a height.
+    fn panel_metrics(self) -> ThumbPanelMetrics {
+        ThumbPanelMetrics {
+            card_h: self.card_h,
+            gap: self.gap,
+            teaser_fits: self.teaser_fits,
+            max_panel_h: self.max_panel_h,
+        }
+    }
+}
+
 #[cfg(test)]
 fn thumb_range_fits(
+    input: &ThemeInput,
     aspects: &[f64],
     range: &Range<usize>,
     constraints: ThumbFlowConstraints,
 ) -> bool {
     pack_rows(
-        &thumb_widths(aspects, range, constraints.card_h, constraints.max_inner),
+        &thumb_widths(
+            input,
+            aspects,
+            range,
+            constraints.card_h,
+            constraints.max_inner,
+        ),
         constraints.max_inner,
         constraints.gap,
     )
@@ -1655,6 +1813,7 @@ fn thumb_range_fits(
 
 #[cfg(test)]
 fn maximal_prefix(
+    input: &ThemeInput,
     aspects: &[f64],
     start: usize,
     constraints: ThumbFlowConstraints,
@@ -1662,7 +1821,7 @@ fn maximal_prefix(
     let mut end = start.min(aspects.len());
     while end < aspects.len() {
         let candidate = start..end + 1;
-        if end == start || thumb_range_fits(aspects, &candidate, constraints) {
+        if end == start || thumb_range_fits(input, aspects, &candidate, constraints) {
             end += 1;
         } else {
             break;
@@ -1672,34 +1831,55 @@ fn maximal_prefix(
 }
 
 #[cfg(test)]
-fn stable_pages(aspects: &[f64], constraints: ThumbFlowConstraints) -> Vec<Range<usize>> {
+fn stable_pages(
+    input: &ThemeInput,
+    aspects: &[f64],
+    constraints: ThumbFlowConstraints,
+) -> Vec<Range<usize>> {
     if aspects.is_empty() {
         return std::iter::once(0..0).collect();
     }
     let mut pages = Vec::new();
     let mut start = 0;
     while start < aspects.len() {
-        let page = maximal_prefix(aspects, start, constraints);
+        let page = maximal_prefix(input, aspects, start, constraints);
         start = page.end;
         pages.push(page);
     }
     pages
 }
 
+/// The page one legacy flow layout describes: which windows are visible, at which step, and where
+/// that page sits in the page sequence. Grouped so [`build_thumb_layout`] takes a plan rather than
+/// six loose values.
 #[cfg(test)]
-fn build_thumb_layout(
-    aspects: &[f64],
+struct ThumbPagePlan<'a> {
+    aspects: &'a [f64],
     visible: Range<usize>,
     scale: f64,
-    constraints: ThumbFlowConstraints,
     overflowed: bool,
     page_index: usize,
     page_count: usize,
+}
+
+#[cfg(test)]
+fn build_thumb_layout(
+    input: &ThemeInput,
+    plan: ThumbPagePlan,
+    constraints: ThumbFlowConstraints,
 ) -> ThumbFlowLayout {
+    let ThumbPagePlan {
+        aspects,
+        visible,
+        scale,
+        overflowed,
+        page_index,
+        page_count,
+    } = plan;
     let card_h = constraints.card_h;
     let max_inner = constraints.max_inner;
     let gap = constraints.gap;
-    let widths = thumb_widths(aspects, &visible, card_h, max_inner);
+    let widths = thumb_widths(input, aspects, &visible, card_h, max_inner);
     let rows = pack_rows(&widths, max_inner, gap);
     let n_rows = rows.len().max(1);
     let used_inner_w = rows
@@ -1719,7 +1899,7 @@ fn build_thumb_layout(
                 + THUMB_BOTTOM_INSET
                 + max_rows as f64 * card_h
                 + max_rows.saturating_sub(1) as f64 * gap
-                + footer_band_h(),
+                + footer_band_h(input),
         )
     } else {
         (
@@ -1728,7 +1908,7 @@ fn build_thumb_layout(
                 + THUMB_BOTTOM_INSET
                 + n_rows as f64 * card_h
                 + n_rows.saturating_sub(1) as f64 * gap
-                + footer_band_h(),
+                + footer_band_h(input),
         )
     };
     let mut placements = Vec::with_capacity(visible.len());
@@ -1760,7 +1940,7 @@ fn build_thumb_layout(
         panel_h,
         card_h,
         document_placements: placements.clone(),
-        document_h: (panel_h - footer_band_h()).max(1.0),
+        document_h: (panel_h - footer_band_h(input)).max(1.0),
         scale,
         visible,
         placements,
@@ -1778,6 +1958,7 @@ fn build_thumb_layout(
 /// Pack the complete window list once, then build the viewport from a contiguous slice of rows.
 #[allow(clippy::too_many_arguments)] // the layout inputs are independent geometry terms.
 fn build_thumb_scroll_layout(
+    input: &ThemeInput,
     all_rows: &[Vec<usize>],
     widths: &[f64],
     scale: f64,
@@ -1853,13 +2034,8 @@ fn build_thumb_scroll_layout(
         used_inner_w.max(280.0_f64.min(constraints.max_inner)) + H_PADDING * 2.0 + trailing_reserve
     };
     let rendered_rows = viewport_row_count.max(1);
-    let (panel_h, content_inset) = thumb_panel_metrics(
-        rendered_rows,
-        constraints.card_h,
-        constraints.gap,
-        teaser_h,
-        constraints.max_panel_h,
-    );
+    let (panel_h, content_inset) =
+        thumb_panel_metrics(input, rendered_rows, constraints.panel_metrics(), teaser_h);
     let card_area_w = if overflowed {
         (panel_w - scrollbar_w).max(1.0)
     } else {
@@ -1872,7 +2048,7 @@ fn build_thumb_scroll_layout(
         + THUMB_BOTTOM_INSET
         + all_rows.len() as f64 * constraints.card_h
         + all_rows.len().saturating_sub(1) as f64 * constraints.gap;
-    let document_panel_h = document_h + footer_band_h();
+    let document_panel_h = document_h + footer_band_h(input);
     let mut document_placements = Vec::new();
     for (row_index, row) in all_rows.iter().enumerate() {
         let row_w = row.iter().map(|&i| widths[i]).sum::<f64>()
@@ -2042,24 +2218,23 @@ pub(crate) fn thumb_teaser_height(
 /// normal layout and the post-close reflow must share this function, or closing a card makes the panel
 /// jump taller (measured 901 > 875).
 pub(crate) fn thumb_panel_metrics(
+    input: &ThemeInput,
     rendered_rows: usize,
-    card_h: f64,
-    gap: f64,
+    metrics: ThumbPanelMetrics,
     teaser_h: f64,
-    max_panel_h: f64,
 ) -> (f64, f64) {
     let rows = rendered_rows.max(1);
     let content_h = THUMB_TOP_INSET
         + THUMB_BOTTOM_INSET
-        + rows as f64 * card_h
-        + rows.saturating_sub(1) as f64 * gap
+        + rows as f64 * metrics.card_h
+        + rows.saturating_sub(1) as f64 * metrics.gap
         + teaser_h
-        + footer_band_h();
+        + footer_band_h(input);
     // Step selection and the viewport row count already keep the content inside the budget (see
     // thumb_max_rows / thumb_viewport_rows). Clamping again is a backstop that only kicks in when the
     // budget is too small for even one row plus the teaser (max_rows floors at 1); showing a little
     // less beats crossing the cap the user asked for.
-    (content_h.min(max_panel_h), THUMB_TOP_INSET)
+    (content_h.min(metrics.max_panel_h), THUMB_TOP_INSET)
 }
 
 /// (Panel height, content inset) after a close reflow: the viewport row count follows the same
@@ -2067,27 +2242,27 @@ pub(crate) fn thumb_panel_metrics(
 /// the normal layout shares. `plan_thumb_close_reflow` only produces rows and coordinates; routing
 /// the height through here is what stops a close from jumping the panel taller (measured 901 > 875).
 pub(crate) fn thumb_close_panel_metrics(
+    input: &ThemeInput,
     row_count: usize,
     overflowed: bool,
-    card_h: f64,
-    gap: f64,
-    teaser_fits: bool,
+    metrics: ThumbPanelMetrics,
     max_rows: usize,
-    max_panel_h: f64,
 ) -> (f64, f64) {
-    let teaser_h = thumb_teaser_height(overflowed, teaser_fits, card_h, gap);
+    let teaser_h =
+        thumb_teaser_height(overflowed, metrics.teaser_fits, metrics.card_h, metrics.gap);
     let rows = if overflowed {
         row_count.min(max_rows.max(1))
     } else {
         row_count
     };
-    thumb_panel_metrics(rows, card_h, gap, teaser_h, max_panel_h)
+    thumb_panel_metrics(input, rows, metrics, teaser_h)
 }
 
 /// Content height for exactly N rows (plus an optional teaser plus the status bar). Production goes
 /// through `thumb_panel_metrics`; tests still use this form to build an "exactly N rows" budget.
 #[cfg(test)]
 pub(crate) fn thumb_panel_height_for_rows(
+    input: &ThemeInput,
     row_count: usize,
     viewport_rows: usize,
     card_h: f64,
@@ -2109,7 +2284,7 @@ pub(crate) fn thumb_panel_height_for_rows(
         + visible_rows as f64 * card_h
         + visible_rows.saturating_sub(1) as f64 * gap
         + teaser_h
-        + footer_band_h()
+        + footer_band_h(input)
 }
 
 /// Reconcile max/current scroll offsets and the coordinate delta after resizing the document.
@@ -2133,6 +2308,7 @@ pub(crate) fn rebase_thumb_scroll_after_document_resize(
 /// uses deterministic pages beginning at index zero.
 #[cfg(test)]
 pub(crate) fn plan_thumb_flow_layout(
+    input: &ThemeInput,
     aspects: &[f64],
     selected: usize,
     max_inner: f64,
@@ -2141,19 +2317,30 @@ pub(crate) fn plan_thumb_flow_layout(
 ) -> ThumbFlowLayout {
     let max_inner = max_inner.max(1.0);
     let scale = thumb_scale_for_count(aspects.len());
-    let card_h = thumb_card_h_for_scale(scale);
+    let card_h = thumb_card_h_for_scale(input, scale);
     let constraints = ThumbFlowConstraints {
         card_h,
         max_inner,
-        max_rows: thumb_max_rows(card_h, max_panel_h, gap),
-        teaser_fits: thumb_teaser_fits(card_h, max_panel_h, gap),
+        max_rows: thumb_max_rows(input, card_h, max_panel_h, gap),
+        teaser_fits: thumb_teaser_fits(input, card_h, max_panel_h, gap),
         max_panel_h,
         gap,
     };
     if aspects.is_empty() {
-        return build_thumb_layout(aspects, 0..0, scale, constraints, false, 0, 1);
+        return build_thumb_layout(
+            input,
+            ThumbPagePlan {
+                aspects,
+                visible: 0..0,
+                scale,
+                overflowed: false,
+                page_index: 0,
+                page_count: 1,
+            },
+            constraints,
+        );
     }
-    let pages = stable_pages(aspects, constraints);
+    let pages = stable_pages(input, aspects, constraints);
     let selected = selected.min(aspects.len() - 1);
     let page_index = pages
         .iter()
@@ -2162,13 +2349,16 @@ pub(crate) fn plan_thumb_flow_layout(
     let visible = pages[page_index].clone();
     let page_count = pages.len();
     build_thumb_layout(
-        aspects,
-        visible,
-        scale,
+        input,
+        ThumbPagePlan {
+            aspects,
+            visible,
+            scale,
+            overflowed: page_count > 1,
+            page_index,
+            page_count,
+        },
         constraints,
-        page_count > 1,
-        page_index,
-        page_count,
     )
 }
 
@@ -2177,6 +2367,7 @@ pub(crate) fn plan_thumb_flow_layout(
 /// have to guess a card height up front.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
+    input: &ThemeInput,
     aspects: &[f64],
     max_inner: f64,
     max_panel_w: f64,
@@ -2188,13 +2379,15 @@ pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
 ) -> ThumbFlowLayout {
     let max_inner = max_inner.max(1.0);
     let scale = thumb_scale_for_panel(
+        input,
         aspects,
         max_inner,
         max_panel_h,
         gap,
-        thumbnail_size_scale_override(),
+        thumbnail_size_scale_override(input),
     );
     plan_thumb_scroll_layout_at_scale(
+        input,
         aspects,
         scale,
         max_inner,
@@ -2203,7 +2396,7 @@ pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
         gap,
         scrollbar_w,
         scroll_offset,
-        max_card_w_for(thumb_card_h_for_scale(scale)),
+        max_card_w_for(thumb_card_h_for_scale(input, scale)),
     )
 }
 
@@ -2211,6 +2404,7 @@ pub(crate) fn plan_thumb_scroll_layout_with_max_card_w(
 /// candidate steps can be tried with pure geometry).
 #[allow(clippy::too_many_arguments)]
 fn plan_thumb_scroll_layout_at_scale(
+    input: &ThemeInput,
     aspects: &[f64],
     scale: f64,
     max_inner: f64,
@@ -2224,25 +2418,32 @@ fn plan_thumb_scroll_layout_at_scale(
     let max_inner = max_inner.max(1.0);
     // Reserve the floating control's trailing room out of the packing budget: appending it to the
     // panel afterwards would exceed `max_panel_w`.
-    let trailing_reserve = footer_control_right_reserve(max_panel_w, max_panel_h);
+    let trailing_reserve = footer_control_right_reserve(input, max_panel_w, max_panel_h);
     let max_inner = (max_inner - trailing_reserve).max(1.0);
-    let card_h = thumb_card_h_for_scale(scale);
+    let card_h = thumb_card_h_for_scale(input, scale);
     let constraints = ThumbFlowConstraints {
         card_h,
         max_inner,
-        max_rows: thumb_max_rows(card_h, max_panel_h, gap),
-        teaser_fits: thumb_teaser_fits(card_h, max_panel_h, gap),
+        max_rows: thumb_max_rows(input, card_h, max_panel_h, gap),
+        teaser_fits: thumb_teaser_fits(input, card_h, max_panel_h, gap),
         max_panel_h,
         gap,
     };
-    let widths =
-        thumb_widths_with_max_card_w(aspects, &(0..aspects.len()), card_h, max_inner, max_card_w);
+    let widths = thumb_widths_with_max_card_w(
+        input,
+        aspects,
+        &(0..aspects.len()),
+        card_h,
+        max_inner,
+        max_card_w,
+    );
     let rows = choose_thumb_rows(
         pack_rows(&widths, max_inner, gap),
         pack_rows_greedy(&widths, max_inner, gap),
         constraints.max_rows,
     );
     build_thumb_scroll_layout(
+        input,
         &rows,
         &widths,
         scale,
@@ -2275,6 +2476,7 @@ fn balanced_icon_row_ranges(count: usize, row_count: usize) -> Vec<Range<usize>>
 /// Plan the icon-only viewport: width stays fixed, height follows the content setting, columns
 /// come from screen width, and overflow becomes continuously scrollable.
 pub(crate) fn plan_icon_scroll_layout(
+    input: &ThemeInput,
     count: usize,
     screen_width: f64,
     max_panel_h: f64,
@@ -2282,13 +2484,13 @@ pub(crate) fn plan_icon_scroll_layout(
     scroll_offset: f64,
 ) -> ThumbFlowLayout {
     let gap = ICON_CARD_GAP;
-    let card_h = card_h();
+    let card_h = card_h(input);
     let max_panel_w = (screen_width.max(1.0) * PANEL_MAX_WIDTH_RATIO)
         .max(ICON_CARD_W + H_PADDING * 2.0 + scrollbar_w);
     // The floating settings control's trailing room comes out of the width budget first, so the panel
     // never grows past `max_panel_w`: packing a row, then appending the reserve, would push the panel
     // (and the control with it) off the screen.
-    let trailing_reserve = footer_control_right_reserve(max_panel_w, max_panel_h);
+    let trailing_reserve = footer_control_right_reserve(input, max_panel_w, max_panel_h);
     let packing_inner =
         (max_panel_w - H_PADDING * 2.0 - scrollbar_w - trailing_reserve).max(ICON_CARD_W);
     let max_columns = ((packing_inner + gap) / (ICON_CARD_W + gap))
@@ -2301,7 +2503,7 @@ pub(crate) fn plan_icon_scroll_layout(
     } else {
         count.div_ceil(max_columns)
     };
-    let max_rows = ((max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h())
+    let max_rows = ((max_panel_h - THUMB_TOP_INSET - THUMB_BOTTOM_INSET - footer_band_h(input))
         .max(card_h)
         / (card_h + gap))
         .floor()
@@ -2386,9 +2588,9 @@ pub(crate) fn plan_icon_scroll_layout(
         + viewport_rows as f64 * card_h
         + viewport_rows.saturating_sub(1) as f64 * gap
         + teaser_h
-        + footer_band_h();
+        + footer_band_h(input);
     let document_h = total_content_h;
-    let document_panel_h = document_h + footer_band_h();
+    let document_panel_h = document_h + footer_band_h(input);
     let mut document_placements = Vec::with_capacity(count);
     for (row_index, row) in row_ranges.iter().enumerate() {
         let row_w = row.len() as f64 * ICON_CARD_W + row.len().saturating_sub(1) as f64 * gap;
@@ -2444,14 +2646,19 @@ pub(crate) fn plan_icon_scroll_layout(
 
 /// Initial icon-only overlay height = both card-area insets + rows * card height + status bar (pure,
 /// testable). Used only for the initial window placeholder; summon-time layout recalculates it.
-fn compute_window_height(count: usize, cards_per_row: usize, card_h: f64) -> f64 {
+fn compute_window_height(
+    input: &ThemeInput,
+    count: usize,
+    cards_per_row: usize,
+    card_h: f64,
+) -> f64 {
     let rows = count.max(1).div_ceil(cards_per_row);
-    THUMB_TOP_INSET + THUMB_BOTTOM_INSET + rows as f64 * card_h + footer_band_h()
+    THUMB_TOP_INSET + THUMB_BOTTOM_INSET + rows as f64 * card_h + footer_band_h(input)
 }
 
 /// Initial icon-only overlay height; the live layout computes columns from screen width.
-pub(crate) fn window_height(count: usize) -> f64 {
-    compute_window_height(count, 6, card_h())
+pub(crate) fn window_height(input: &ThemeInput, count: usize) -> f64 {
+    compute_window_height(input, count, 6, card_h(input))
 }
 
 /// Overlay width = cards * fixed card width + gaps + padding on both sides (pure, testable).
@@ -2472,6 +2679,273 @@ pub(crate) fn window_width(cards_in_row: usize) -> f64 {
 mod tests {
     use super::*;
 
+    /// A snapshot with every field set explicitly, so a layout assertion describes fixed inputs
+    /// rather than whatever the developer's on-disk config file happens to contain.
+    pub(crate) fn fixed_input() -> ThemeInput {
+        let palette = |win_title: &str, card_bg_sel: &str, icon_text: &str| config::ThemeColors {
+            status_bar_text: "000000FF".to_string(),
+            app_name: "444444FF".to_string(),
+            win_title: win_title.to_string(),
+            icon_inner_bg: "EEEEEEFF".to_string(),
+            icon_text: icon_text.to_string(),
+            card_bg_sel: card_bg_sel.to_string(),
+            card_border_sel: "2F6FEDFF".to_string(),
+        };
+        ThemeInput {
+            dark: false,
+            palette: CustomPalette {
+                dark: palette("F5F5F7FF", "5B9BFF24", "F8F9FAFF"),
+                light: palette("111111FF", "2F6FED1A", "222222FF"),
+            },
+            corner_radius: 32.0,
+            card_text_size: CARD_TEXT_BASE_SIZE,
+            thumbnail_size: "auto".to_string(),
+            thumbnails_enabled: true,
+            show_app_name_in_cards: false,
+            title_font_size: 12.0,
+            app_name_font_size: 10.0,
+            status_bar_font_size: 15.0,
+        }
+    }
+
+    /// P0's before/after baseline: the key geometry, computed from a snapshot built from the current
+    /// configuration, must equal what the same functions returned while they read that configuration
+    /// themselves. The reference numbers below are the values the pre-migration functions produced
+    /// for these inputs (`theme.rs` before `ThemeInput`); they are literals on purpose, because a
+    /// reference that read the config would only prove the new code agrees with itself.
+    #[test]
+    fn key_geometry_from_a_config_snapshot_matches_the_pre_migration_values() {
+        let mut input = fixed_input();
+        input.card_text_size = 15.0;
+        input.title_font_size = 12.0;
+        input.app_name_font_size = 10.0;
+        input.status_bar_font_size = 15.0;
+
+        assert_eq!(card_w(), 140.0);
+        // 110pt icon + 4 + 4.5 + title line (15 * 1.2) + 2 + app-name line (13 * 1.35) + 4:
+        // the caption lines are the *clamped* card font sizes, not the configured ones.
+        assert_eq!(card_h(&input), 160.05);
+        // Footer text 15 -> 36pt status bar, minus the card viewport's 8pt bottom inset, floor 36.
+        assert_eq!(status_bar_text_size(&input), 15.0);
+        assert_eq!(footer_band_h(&input), 36.0);
+        // The title scales with the card text size: 12 * 15 / 12, inside the 13..=20 clamp.
+        assert_eq!(card_title_font_size(&input), 15.0);
+        // The app name scales the same way but the clamp lifts it: 10 * 15 / 12 = 12.5 -> 13.
+        assert_eq!(card_app_name_font_size(&input), 13.0);
+
+        // And the same values through the transition entry point, which is what the callers use:
+        // its snapshot must agree with a snapshot built by hand from the same fields.
+        let current = ThemeInput::current();
+        let by_hand = ThemeInput {
+            dark: current.dark,
+            palette: CustomPalette {
+                dark: current.palette.dark.clone(),
+                light: current.palette.light.clone(),
+            },
+            corner_radius: current.corner_radius,
+            card_text_size: current.card_text_size,
+            thumbnail_size: current.thumbnail_size.clone(),
+            thumbnails_enabled: current.thumbnails_enabled,
+            show_app_name_in_cards: current.show_app_name_in_cards,
+            title_font_size: current.title_font_size,
+            app_name_font_size: current.app_name_font_size,
+            status_bar_font_size: current.status_bar_font_size,
+        };
+        assert_eq!(current, by_hand);
+        assert_eq!(card_h(&current), card_h(&by_hand));
+        assert_eq!(footer_band_h(&current), footer_band_h(&by_hand));
+    }
+
+    /// The dependency relation P0 promises: changing one field of the snapshot changes ONLY the
+    /// outputs whose consumer is documented for that field, and every other output stays
+    /// bit-identical. The outputs are collected as exact f64 bits, so a change anywhere else fails.
+    #[test]
+    fn changing_one_snapshot_field_changes_only_its_documented_consumers() {
+        let base = fixed_input();
+        let outputs = |input: &ThemeInput| -> Vec<(&'static str, u64)> {
+            vec![
+                ("card_w", card_w().to_bits()),
+                ("card_h", card_h(input).to_bits()),
+                (
+                    "icon_card_layout.icon_bottom",
+                    icon_card_layout(input, card_w(), card_h(input))
+                        .icon_bottom
+                        .to_bits(),
+                ),
+                (
+                    "card_title_font_size",
+                    card_title_font_size(input).to_bits(),
+                ),
+                (
+                    "card_app_name_font_size",
+                    card_app_name_font_size(input).to_bits(),
+                ),
+                (
+                    "status_bar_text_size",
+                    status_bar_text_size(input).to_bits(),
+                ),
+                ("footer_band_h", footer_band_h(input).to_bits()),
+                ("text_scale", text_scale(input).to_bits()),
+                ("thumb_caption_h", thumb_caption_h(input).to_bits()),
+                (
+                    "thumb_card_h_base",
+                    thumb_card_h_for_scale(input, 1.0).to_bits(),
+                ),
+                ("overlay_card_radius", overlay_card_radius(input).to_bits()),
+                (
+                    "layout_corner_radius",
+                    layout_corner_radius(input).to_bits(),
+                ),
+                (
+                    "overlay_radii.close_button",
+                    overlay_radii(overlay_card_radius(input), THUMB_PAD)
+                        .close_button
+                        .to_bits(),
+                ),
+                ("thumbnails_enabled", u64::from(thumbnails_enabled(input))),
+                (
+                    "show_app_name_in_cards",
+                    u64::from(show_app_name_in_cards(input)),
+                ),
+                ("show_footer_title", u64::from(show_footer_title(input))),
+                (
+                    "thumbnail_size_scale_override",
+                    thumbnail_size_scale_override(input)
+                        .map(f64::to_bits)
+                        .unwrap_or(0),
+                ),
+                (
+                    "colors.status_bar_text",
+                    u64::from(colors_from(input, true).status_bar_text),
+                ),
+                (
+                    "colors.card_bg_sel",
+                    u64::from(colors_from(input, false).card_bg_sel),
+                ),
+                (
+                    "colors.icon_text_dark",
+                    u64::from(colors_from(input, true).icon_text),
+                ),
+                ("icon_px", icon_px().to_bits()),
+                ("letter_px", letter_px().to_bits()),
+            ]
+        };
+        let changed = |mutate: &dyn Fn(&mut ThemeInput)| {
+            let mut input = base.clone();
+            mutate(&mut input);
+            outputs(&base)
+                .into_iter()
+                .zip(outputs(&input))
+                .filter(|((name, a), (other, b))| name == other && a != b)
+                .map(|((name, _), _)| name)
+                .collect::<Vec<_>>()
+        };
+        let expect = |mutate: &dyn Fn(&mut ThemeInput), names: &[&str]| {
+            let mut got = changed(mutate);
+            got.sort_unstable();
+            let mut wanted = names.to_vec();
+            wanted.sort_unstable();
+            assert_eq!(got, wanted);
+        };
+
+        expect(
+            &|input| input.card_text_size = 18.0,
+            &[
+                "card_h",
+                "icon_card_layout.icon_bottom",
+                "card_title_font_size",
+                "card_app_name_font_size",
+                "text_scale",
+                "thumb_caption_h",
+                "thumb_card_h_base",
+            ],
+        );
+        expect(
+            &|input| input.title_font_size = 16.0,
+            &[
+                "card_h",
+                "icon_card_layout.icon_bottom",
+                "card_title_font_size",
+            ],
+        );
+        expect(
+            &|input| input.app_name_font_size = 14.0,
+            &[
+                "card_h",
+                "icon_card_layout.icon_bottom",
+                "card_app_name_font_size",
+            ],
+        );
+        expect(
+            &|input| input.status_bar_font_size = 0.0,
+            &["status_bar_text_size", "footer_band_h", "show_footer_title"],
+        );
+        expect(
+            &|input| input.status_bar_font_size = 20.0,
+            &["status_bar_text_size", "footer_band_h"],
+        );
+        expect(
+            &|input| input.corner_radius = 8.0,
+            &[
+                "overlay_card_radius",
+                "layout_corner_radius",
+                "overlay_radii.close_button",
+            ],
+        );
+        expect(
+            &|input| input.thumbnails_enabled = false,
+            &["thumbnails_enabled"],
+        );
+        expect(
+            &|input| input.show_app_name_in_cards = true,
+            &["show_app_name_in_cards"],
+        );
+        expect(
+            &|input| input.thumbnail_size = "110".to_string(),
+            &["thumbnail_size_scale_override"],
+        );
+        expect(
+            &|input| input.palette.dark.win_title = "ABCDEFFF".to_string(),
+            &["colors.status_bar_text"],
+        );
+        expect(
+            &|input| input.palette.light.card_bg_sel = "00000000".to_string(),
+            &["colors.card_bg_sel"],
+        );
+        expect(
+            &|input| input.palette.dark.icon_text = "00000000".to_string(),
+            &["colors.icon_text_dark"],
+        );
+        // The palette's light half is not a consumer of the dark flag and vice versa: only the
+        // resolve switch changes when the mode does, and changing the mode alone is out of the
+        // snapshot's control (it is an input, not a switch). Assert the negative explicitly so the
+        // palette case above cannot pass by leaking into the other mode.
+        let other_mode = colors_from(&base, false).icon_text;
+        assert_eq!(other_mode, colors_from(&base, false).icon_text);
+    }
+    /// A snapshot whose footer band exists, at the shipped typography the pre-migration tests
+    /// measured through the global.
+    ///
+    /// The shipped config is a 15pt card text size and a 15pt footer text (a 36pt band): the base
+    /// 12pt faces come out as 12 * 15 / 12 = 15 for the title and 10 * 15 / 12 = 12.5, clamped to
+    /// 13, for the app name. `CONFIG`'s built-in defaults are exactly those values, and the
+    /// before/after baseline test below pins the resulting card height.
+    pub(crate) fn band_present_input() -> ThemeInput {
+        let mut input = fixed_input();
+        input.card_text_size = 15.0;
+        assert_eq!(footer_band_h(&input), FOOTER_CONTROL_MIN_H);
+        input
+    }
+
+    /// A snapshot with a pinned corner radius and the band present (a positive value) or absent (0).
+    pub(crate) fn input_with(band: f64, radius: f64) -> ThemeInput {
+        let mut input = fixed_input();
+        input.corner_radius = radius;
+        // The band follows the footer text size; 0 is the slider's hidden stop.
+        input.status_bar_font_size = if band > 0.0 { 15.0 } else { 0.0 };
+        assert_eq!(footer_band_h(&input), band, "the fixture must pin the band");
+        input
+    }
     /// The footer settings control must stay inside the panel's bottom-right corner arc at every
     /// shipped radius, and the assertion must be able to FAIL: the counter-example below repeats the
     /// containment test with an inset one grid step too small and requires it to be outside.
@@ -2564,16 +3038,19 @@ mod tests {
     /// half the panel (so the text can never be squeezed out of existence by the reserve itself).
     #[test]
     fn footer_text_stays_centred_under_the_symmetric_reserve() {
+        // One snapshot with the band present, fed to both calls: the assertion must describe one
+        // configuration, not whatever the on-disk config happens to offer between the two calls.
+        let input = band_present_input();
         for width in [484.0, 560.0, 900.0] {
             for rows in [1.0, 2.0] {
                 let height = 32.0 + 8.0 + rows * 180.0 + FOOTER_CONTROL_MIN_H;
-                let (x, _y, w) = footer_text_frame(width, height, 20.0);
+                let (x, _y, w) = footer_text_frame(&input, width, height, 20.0);
                 assert!(
                     (x + w / 2.0 - width / 2.0).abs() < 1e-9,
                     "width={width} is off-centre"
                 );
                 assert!(w >= 1.0);
-                assert!(footer_text_reserve(width, height) <= width / 2.0 + 1e-9);
+                assert!(footer_text_reserve(&input, width, height) <= width / 2.0 + 1e-9);
             }
         }
     }
@@ -2643,18 +3120,19 @@ mod tests {
     /// widest row, so the card still ended exactly where the control begins.
     #[test]
     fn the_floating_settings_control_never_sits_over_a_card() {
-        // Pin both inputs the geometry reads: at the configured radius the reserve can be zero (sub
-        // point), which would make this assertion vacuous on some machines.
-        set_test_footer_band(Some(0.0));
-        set_test_corner_radius(Some(64.0));
+        // Both inputs are parameters of the snapshot: at the shipped radius the reserve is zero (sub
+        // point), which would make this assertion vacuous, so the fixture pins a 64pt radius and no
+        // band -- the same values the layout is given, not a global to write.
+        let input = input_with(0.0, 64.0);
         let max_panel_h = 700.0;
 
-        let icon = plan_icon_scroll_layout(6, 1400.0, max_panel_h, THUMB_SCROLLBAR_W, 0.0);
+        let icon = plan_icon_scroll_layout(&input, 6, 1400.0, max_panel_h, THUMB_SCROLLBAR_W, 0.0);
         assert!(!icon.overflowed, "the icon fixture must stay in one row");
-        assert_no_card_under_the_control(&icon, "icon");
+        assert_no_card_under_the_control(&input, &icon, "icon");
 
         let aspects = vec![THUMB_PREVIEW_RATIO; 4];
         let thumbs = plan_thumb_scroll_layout_with_max_card_w(
+            &input,
             &aspects,
             1200.0,
             1400.0,
@@ -2668,9 +3146,7 @@ mod tests {
             !thumbs.overflowed,
             "the thumbnail fixture must stay non-overflow"
         );
-        assert_no_card_under_the_control(&thumbs, "thumbnail");
-        set_test_corner_radius(None);
-        set_test_footer_band(None);
+        assert_no_card_under_the_control(&input, &thumbs, "thumbnail");
     }
 
     /// The trailing reserve is taken out of the width budget, not appended to it: packing a row and
@@ -2678,14 +3154,14 @@ mod tests {
     /// the screen budget that `clamp_into_visible` only re-positions, never shrinks.
     #[test]
     fn a_large_corner_radius_never_pushes_the_panel_past_its_width_budget() {
-        set_test_footer_band(Some(0.0));
-        set_test_corner_radius(Some(512.0));
+        let input = input_with(0.0, 512.0);
         let max_panel_h = 800.0;
 
         let screen_w = 1440.0;
         let icon_budget = (screen_w * PANEL_MAX_WIDTH_RATIO)
             .max(ICON_CARD_W + H_PADDING * 2.0 + THUMB_SCROLLBAR_W);
-        let icon = plan_icon_scroll_layout(40, screen_w, max_panel_h, THUMB_SCROLLBAR_W, 0.0);
+        let icon =
+            plan_icon_scroll_layout(&input, 40, screen_w, max_panel_h, THUMB_SCROLLBAR_W, 0.0);
         assert!(
             icon.overflowed,
             "the icon fixture must reach the overflow branch"
@@ -2700,6 +3176,7 @@ mod tests {
         let thumb_budget = 1400.0;
         let aspects = vec![THUMB_PREVIEW_RATIO; 40];
         let thumbs = plan_thumb_scroll_layout_with_max_card_w(
+            &input,
             &aspects,
             thumb_budget - H_PADDING * 2.0 - THUMB_SCROLLBAR_W,
             thumb_budget,
@@ -2719,18 +3196,14 @@ mod tests {
             thumbs.panel_w,
             thumb_budget
         );
-
-        set_test_corner_radius(None);
-        set_test_footer_band(None);
     }
 
     /// Every card in `layout` ends left of the floating control's frame. One point of slack: the grid
     /// deliberately does not give way for sub-point intrusions (see `footer_control_right_reserve`).
-    fn assert_no_card_under_the_control(layout: &ThumbFlowLayout, label: &str) {
+    fn assert_no_card_under_the_control(input: &ThemeInput, layout: &ThumbFlowLayout, label: &str) {
         let size = FOOTER_CONTROL_SIZE;
-        let radius = CONFIG.read().unwrap().appearance.corner_radius;
         let inset = footer_control_inset(
-            radius,
+            layout_corner_radius(input),
             layout.panel_w,
             layout.panel_h,
             size,
@@ -3403,11 +3876,14 @@ mod tests {
 
     #[test]
     fn thumbnail_caption_never_exceeds_a_third_of_its_card() {
+        // The shipped typography, passed in instead of read from the global: every expected value
+        // below is the one the pre-migration test measured against that configuration.
+        let input = band_present_input();
         for card_h in [24.0, 60.0, 90.0, 160.0, 260.0] {
-            let caption_h = thumb_caption_h_for_card(card_h);
+            let caption_h = thumb_caption_h_for_card(&input, card_h);
             assert!(caption_h <= card_h / 3.0 + f64::EPSILON);
         }
-        assert_eq!(thumb_caption_h_for_card(90.0), 30.0);
+        assert_eq!(thumb_caption_h_for_card(&input, 90.0), 30.0);
     }
 
     #[test]
@@ -3520,31 +3996,33 @@ mod tests {
 
     #[test]
     fn height_uses_at_least_one_row() {
+        let input = band_present_input();
         // Zero windows: at least one row as the floor.
         assert_eq!(
-            compute_window_height(0, 5, 100.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + footer_band_h()
+            compute_window_height(&input, 0, 5, 100.0),
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + footer_band_h(&input)
         );
         assert_eq!(
-            compute_window_height(1, 5, 100.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + footer_band_h()
+            compute_window_height(&input, 1, 5, 100.0),
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 100.0 + footer_band_h(&input)
         );
     }
 
     #[test]
     fn height_rounds_rows_up() {
+        let input = band_present_input();
         // Four per row: five windows -> two rows.
         assert_eq!(
-            compute_window_height(5, 4, 120.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + footer_band_h()
+            compute_window_height(&input, 5, 4, 120.0),
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + footer_band_h(&input)
         );
         assert_eq!(
-            compute_window_height(8, 4, 120.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + footer_band_h()
+            compute_window_height(&input, 8, 4, 120.0),
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 120.0 + footer_band_h(&input)
         );
         assert_eq!(
-            compute_window_height(9, 4, 120.0),
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 3.0 * 120.0 + footer_band_h()
+            compute_window_height(&input, 9, 4, 120.0),
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 3.0 * 120.0 + footer_band_h(&input)
         );
     }
 
@@ -3567,6 +4045,7 @@ mod tests {
 
 #[cfg(test)]
 mod flow_tests {
+    use super::tests::{band_present_input, fixed_input};
     use super::*;
     /// Test helper: an aspect vector of n base-ratio (16:10) windows.
     fn uniform_aspects(n: usize) -> Vec<f64> {
@@ -3577,28 +4056,30 @@ mod flow_tests {
     fn thumb_heights_derive_consistently() {
         // The uniform height derives from the configured card width; preview height
         // subtracts paddings + caption + gap.
-        let h = thumb_card_h_fixed();
+        let input = fixed_input();
+        let h = thumb_card_h_fixed(&input);
         assert!(h > 100.0, "sanity: {} too small", h);
-        let ph = thumb_preview_h(h);
-        assert!((h - (ph + THUMB_PAD * 2.0 + thumb_caption_h() + THUMB_GAP)).abs() < 1e-9);
+        let ph = thumb_preview_h(&input, h);
+        assert!((h - (ph + THUMB_PAD * 2.0 + thumb_caption_h(&input) + THUMB_GAP)).abs() < 1e-9);
         // The 40pt floor keeps extreme configs from collapsing.
-        assert!(thumb_preview_h(50.0) >= 40.0);
+        assert!(thumb_preview_h(&input, 50.0) >= 40.0);
     }
 
     #[test]
     fn card_width_scales_with_aspect_and_clamps() {
+        let input = fixed_input();
         let h = 160.0;
-        let ph = thumb_preview_h(h);
+        let ph = thumb_preview_h(&input, h);
         // A 16:10 window: preview width = preview height × 1.6; card adds side pads.
-        let w = thumb_card_w_for_aspect(h, 1.6);
+        let w = thumb_card_w_for_aspect(&input, h, 1.6);
         assert!((w - (ph * 1.6 + THUMB_PAD * 2.0)).abs() < 1e-9);
         // Extreme aspects clamp: portrait >= 0.7, landscape <= 2.2.
-        let tall = thumb_card_w_for_aspect(h, 0.2);
+        let tall = thumb_card_w_for_aspect(&input, h, 0.2);
         assert!((tall - (ph * 0.7 + THUMB_PAD * 2.0)).abs() < 1e-9);
-        let wide = thumb_card_w_for_aspect(h, 5.0);
+        let wide = thumb_card_w_for_aspect(&input, h, 5.0);
         assert!((wide - (ph * 2.2 + THUMB_PAD * 2.0)).abs() < 1e-9);
         // Degenerate inputs (0 / NaN) fall back to 16:10.
-        let deg = thumb_card_w_for_aspect(h, f64::NAN);
+        let deg = thumb_card_w_for_aspect(&input, h, f64::NAN);
         assert!((deg - (ph * THUMB_PREVIEW_RATIO + THUMB_PAD * 2.0)).abs() < 1e-9);
     }
 
@@ -3647,9 +4128,10 @@ mod flow_tests {
         // The floor must actually be smaller (otherwise it shrinks for nothing) while the preview area
         // stays above its legibility floor.
         const { assert!(LEGACY_THUMB_MIN_SCALE < 1.0) };
-        let floor_card_h = thumb_card_h_for_scale(LEGACY_THUMB_MIN_SCALE);
-        assert!(floor_card_h < thumb_card_h_for_scale(1.0));
-        assert!(thumb_preview_h(floor_card_h) > 40.0);
+        let input = fixed_input();
+        let floor_card_h = thumb_card_h_for_scale(&input, LEGACY_THUMB_MIN_SCALE);
+        assert!(floor_card_h < thumb_card_h_for_scale(&input, 1.0));
+        assert!(thumb_preview_h(&input, floor_card_h) > 40.0);
     }
 
     #[test]
@@ -3658,8 +4140,10 @@ mod flow_tests {
         // visible height.
         let panel_w = 1920.0 * PANEL_MAX_WIDTH_RATIO;
         let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let input = band_present_input();
         let at = |count: usize| {
             thumb_scale_for_panel(
+                &input,
                 &vec![THUMB_PREVIEW_RATIO; count],
                 inner,
                 1050.0,
@@ -3692,11 +4176,24 @@ mod flow_tests {
         // scrolling takes over.
         let tiny = 600.0 - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         assert!(
-            thumb_scale_for_panel(&uniform_aspects(15), tiny, 500.0, THUMB_ROW_GAP, None,)
-                <= at(15)
+            thumb_scale_for_panel(
+                &input,
+                &uniform_aspects(15),
+                tiny,
+                500.0,
+                THUMB_ROW_GAP,
+                None
+            ) <= at(15)
         );
         assert_eq!(
-            thumb_scale_for_panel(&uniform_aspects(60), tiny, 300.0, THUMB_ROW_GAP, None,),
+            thumb_scale_for_panel(
+                &input,
+                &uniform_aspects(60),
+                tiny,
+                300.0,
+                THUMB_ROW_GAP,
+                None
+            ),
             THUMB_MIN_SCALE
         );
     }
@@ -3707,6 +4204,7 @@ mod flow_tests {
         // whatever the windows' shapes are, and whatever the set-wide width cap is: shapes only
         // decide how the cards wrap. This is the contract the user asked for -- resizing or
         // maximizing one window must not resize every card.
+        let input = band_present_input();
         let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
         let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         let budget = 923.0 - 2.0 * PANEL_MARGIN;
@@ -3717,11 +4215,23 @@ mod flow_tests {
             .collect();
         let wide: Vec<f64> = vec![2.2; 16];
         for count in 1..=16 {
-            let base =
-                thumb_scale_for_panel(&uniform_aspects(count), inner, budget, THUMB_ROW_GAP, None);
+            let base = thumb_scale_for_panel(
+                &input,
+                &uniform_aspects(count),
+                inner,
+                budget,
+                THUMB_ROW_GAP,
+                None,
+            );
             for (label, aspects) in [("narrow", &narrow), ("wide", &wide)] {
-                let step =
-                    thumb_scale_for_panel(&aspects[..count], inner, budget, THUMB_ROW_GAP, None);
+                let step = thumb_scale_for_panel(
+                    &input,
+                    &aspects[..count],
+                    inner,
+                    budget,
+                    THUMB_ROW_GAP,
+                    None,
+                );
                 assert_eq!(
                     step, base,
                     "a {label} set of {count} windows must reach the same step as the base ratio"
@@ -3730,7 +4240,7 @@ mod flow_tests {
             // The width cap (which one maximized window sets for the whole set) must not move it
             // either.
             let capped_step =
-                thumb_scale_for_panel(&narrow[..count], inner, budget, THUMB_ROW_GAP, None);
+                thumb_scale_for_panel(&input, &narrow[..count], inner, budget, THUMB_ROW_GAP, None);
             assert_eq!(
                 capped_step, base,
                 "the set-wide width cap moved the step at count {count}"
@@ -3739,8 +4249,9 @@ mod flow_tests {
         // The estimate is exact for base-ratio cards, so the chosen step never overflows them.
         for count in 1..=16 {
             let aspects = uniform_aspects(count);
-            let step = thumb_scale_for_panel(&aspects, inner, budget, THUMB_ROW_GAP, None);
+            let step = thumb_scale_for_panel(&input, &aspects, inner, budget, THUMB_ROW_GAP, None);
             let plan = plan_thumb_scroll_layout_at_scale(
+                &input,
                 &aspects,
                 step,
                 inner,
@@ -3759,10 +4270,17 @@ mod flow_tests {
         // A set much wider than the reference can need a row more than the estimate and therefore
         // scrolls at the chosen size: the documented trade-off of keeping the step count-only. The
         // step itself stays the same, which is the point.
-        let wide_step = thumb_scale_for_panel(&wide, inner, budget, THUMB_ROW_GAP, None);
+        let wide_step = thumb_scale_for_panel(&input, &wide, inner, budget, THUMB_ROW_GAP, None);
         assert_eq!(
             wide_step,
-            thumb_scale_for_panel(&uniform_aspects(16), inner, budget, THUMB_ROW_GAP, None)
+            thumb_scale_for_panel(
+                &input,
+                &uniform_aspects(16),
+                inner,
+                budget,
+                THUMB_ROW_GAP,
+                None
+            )
         );
     }
 
@@ -3778,13 +4296,14 @@ mod flow_tests {
         let set = [
             1.593, 1.593, 1.341, 1.593, 1.593, 0.838, 1.593, 1.593, 1.593, 1.593, 1.2,
         ];
-        let chosen = thumb_scale_for_panel(&set, inner, budget, THUMB_ROW_GAP, None);
+        let input = band_present_input();
+        let chosen = thumb_scale_for_panel(&input, &set, inner, budget, THUMB_ROW_GAP, None);
         // Every rotation and the reversed order are the same set and must choose the same step.
         for shift in 0..set.len() {
             let mut rotated = set;
             rotated.rotate_left(shift);
             assert_eq!(
-                thumb_scale_for_panel(&rotated, inner, budget, THUMB_ROW_GAP, None),
+                thumb_scale_for_panel(&input, &rotated, inner, budget, THUMB_ROW_GAP, None),
                 chosen,
                 "rotation by {shift} changed the step"
             );
@@ -3792,7 +4311,7 @@ mod flow_tests {
         let mut reversed = set;
         reversed.reverse();
         assert_eq!(
-            thumb_scale_for_panel(&reversed, inner, budget, THUMB_ROW_GAP, None),
+            thumb_scale_for_panel(&input, &reversed, inner, budget, THUMB_ROW_GAP, None),
             chosen,
             "reversing the order changed the step"
         );
@@ -3805,18 +4324,19 @@ mod flow_tests {
         let budget = 923.0 - 2.0 * PANEL_MARGIN;
         // A pinned step is returned as-is even where the automatic search would refuse it (here the
         // largest step with 40 windows, which overflows and therefore scrolls).
+        let input = band_present_input();
         let many = uniform_aspects(40);
         assert_eq!(
-            thumb_scale_for_panel(&many, inner, budget, THUMB_ROW_GAP, Some(1.2)),
+            thumb_scale_for_panel(&input, &many, inner, budget, THUMB_ROW_GAP, Some(1.2)),
             1.2
         );
         assert_eq!(
-            thumb_scale_for_panel(&many, inner, budget, THUMB_ROW_GAP, Some(0.75)),
+            thumb_scale_for_panel(&input, &many, inner, budget, THUMB_ROW_GAP, Some(0.75)),
             0.75
         );
         // The floor still applies, so a hand-edited value below it cannot produce an unreadable card.
         assert_eq!(
-            thumb_scale_for_panel(&many, inner, budget, THUMB_ROW_GAP, Some(0.1)),
+            thumb_scale_for_panel(&input, &many, inner, budget, THUMB_ROW_GAP, Some(0.1)),
             THUMB_MIN_SCALE
         );
     }
@@ -3830,31 +4350,41 @@ mod flow_tests {
             THUMB_SCALE_STEPS.contains(&0.8),
             "the ladder must contain a 0.8 step"
         );
-        assert!(thumb_card_h_for_scale(0.8) < thumb_card_h_for_scale(0.85));
-        assert!(thumb_card_h_for_scale(0.75) < thumb_card_h_for_scale(0.8));
+        let input = fixed_input();
+        assert!(thumb_card_h_for_scale(&input, 0.8) < thumb_card_h_for_scale(&input, 0.85));
+        assert!(thumb_card_h_for_scale(&input, 0.75) < thumb_card_h_for_scale(&input, 0.8));
         // The smallest step stays legible: its preview area is above the floor.
-        assert!(thumb_preview_h(thumb_card_h_for_scale(THUMB_MIN_SCALE)) > 40.0);
+        assert!(thumb_preview_h(&input, thumb_card_h_for_scale(&input, THUMB_MIN_SCALE)) > 40.0);
     }
 
     #[test]
     fn the_panel_margin_costs_a_step_not_a_row() {
-        // Pins the band-present case (the numbers below are the 36pt footer band's). The suite builds
-        // CONFIG from the on-disk config, so without this the step would depend on the developer's
-        // `layout.show_footer_title` -- 36pt of extra room legitimately buys a bigger step.
-        set_test_footer_band(Some(FOOTER_CONTROL_MIN_H));
+        // Pins the band-present case (the numbers below are the 36pt footer band's): 36pt of extra
+        // room legitimately buys a bigger step, so the snapshot carries the band rather than leaving
+        // it to the developer's config file. The card text size is the base size the reference
+        // numbers were measured at; a larger configured one makes taller cards and legitimately
+        // buys a step back.
+        let input = band_present_input();
         // The measured built-in screen (1470x956, 923 visible): after both margins the step should fall
         // to 0.75 instead of overflowing into scrolling.
         let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
         let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         let with_margin = thumb_scale_for_panel(
+            &input,
             &uniform_aspects(16),
             inner,
             923.0 - 2.0 * PANEL_MARGIN,
             THUMB_ROW_GAP,
             None,
         );
-        let without_margin =
-            thumb_scale_for_panel(&uniform_aspects(16), inner, 923.0, THUMB_ROW_GAP, None);
+        let without_margin = thumb_scale_for_panel(
+            &input,
+            &uniform_aspects(16),
+            inner,
+            923.0,
+            THUMB_ROW_GAP,
+            None,
+        );
         assert!(
             (with_margin - 0.75).abs() < 1e-9,
             "with the margin subtracted the built-in display must land on 0.75, got {with_margin}"
@@ -3867,6 +4397,7 @@ mod flow_tests {
         let wide = 1920.0 * PANEL_MAX_WIDTH_RATIO;
         let wide_inner = wide - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
         let on_wide = thumb_scale_for_panel(
+            &input,
             &uniform_aspects(16),
             wide_inner,
             1050.0 - 2.0 * PANEL_MARGIN,
@@ -3877,7 +4408,6 @@ mod flow_tests {
             (on_wide - 0.95).abs() < 1e-9,
             "with the margin subtracted the wide screen must land on 0.95, got {on_wide}"
         );
-        set_test_footer_band(None);
     }
 
     #[test]
@@ -3886,16 +4416,18 @@ mod flow_tests {
         // its own old formula: 4 rows + teaser = 901pt > budget 875). Closing from 25 cards down to 1
         // through the real entry points must keep the panel monotone non-increasing and inside the
         // budget.
+        let input = band_present_input();
         let budget = 923.0 - 2.0 * PANEL_MARGIN;
-        let card_h = thumb_card_h_for_scale(THUMB_MIN_SCALE);
+        let card_h = thumb_card_h_for_scale(&input, THUMB_MIN_SCALE);
         let gap = THUMB_ROW_GAP;
         let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
         let max_inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
-        let max_rows = thumb_max_rows(card_h, budget, gap);
-        let teaser_fits = thumb_teaser_fits(card_h, budget, gap);
-        let cap = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO).min(max_inner);
+        let max_rows = thumb_max_rows(&input, card_h, budget, gap);
+        let teaser_fits = thumb_teaser_fits(&input, card_h, budget, gap);
+        let cap = thumb_card_w_for_aspect(&input, card_h, THUMB_PREVIEW_RATIO).min(max_inner);
         let start = 25usize;
         let initial = plan_thumb_scroll_layout_at_scale(
+            &input,
             &uniform_aspects(start),
             THUMB_MIN_SCALE,
             max_inner,
@@ -3934,13 +4466,16 @@ mod flow_tests {
                 rows
             };
             let (panel_h, inset) = thumb_close_panel_metrics(
+                &input,
                 rows,
                 overflowed,
-                card_h,
-                gap,
-                teaser_fits,
+                ThumbPanelMetrics {
+                    card_h,
+                    gap,
+                    teaser_fits,
+                    max_panel_h: budget,
+                },
                 max_rows,
-                budget,
             );
             assert!(
                 (inset - THUMB_TOP_INSET).abs() < 1e-9,
@@ -3957,7 +4492,7 @@ mod flow_tests {
                 + rendered_rows as f64 * card_h
                 + rendered_rows.saturating_sub(1) as f64 * gap
                 + teaser_h
-                + footer_band_h();
+                + footer_band_h(&input);
             assert!(
                 content_h <= budget + 1e-9,
                 "{remaining} left: content {content_h:.1} does not fit the budget {budget:.1} (teaser/row rule bypassed)"
@@ -3986,18 +4521,19 @@ mod flow_tests {
         // satisfy the assertion.
         // The icon-only plate sits at the card's own edge, so only the thumbnail ring draws
         // outside a card; that is what the requirement below comes from.
+        let input = band_present_input();
         let drawn_outside_the_card = OVERLAY_RING_INSET;
         let room_below_the_last_card = |placements: &[ThumbPlacement]| {
             placements
                 .iter()
                 .map(|placement| placement.y)
                 .fold(f64::INFINITY, f64::min)
-                - footer_band_h()
+                - footer_band_h(&input)
         };
 
         // Icon-only, everything fits: the document's bottom-most card is on screen and no scrolling
         // can move it away from the viewport's edge.
-        let icon = plan_icon_scroll_layout(4, 1512.0, 900.0, THUMB_SCROLLBAR_W, 0.0);
+        let icon = plan_icon_scroll_layout(&input, 4, 1512.0, 900.0, THUMB_SCROLLBAR_W, 0.0);
         assert!(!icon.overflowed);
         let icon_room = room_below_the_last_card(&icon.document_placements);
         assert!(
@@ -4009,6 +4545,7 @@ mod flow_tests {
         // belongs to the document height and not only to the initial viewport.
         let aspects = vec![THUMB_PREVIEW_RATIO; 12];
         let scrolled = plan_thumb_scroll_layout_with_max_card_w(
+            &input,
             &aspects,
             1200.0,
             1400.0,
@@ -4032,19 +4569,34 @@ mod flow_tests {
         // Requested: the overlay is capped by the usable area (minus the margin), and inside that cap
         // its actual size follows the real card sizes. Three rows or more used to be stretched to the
         // cap, which decoupled the size from the cards and added a blank band at the top.
+        let input = band_present_input();
         let budget = 923.0 - 2.0 * PANEL_MARGIN;
-        let card_h = thumb_card_h_for_scale(0.75);
+        let card_h = thumb_card_h_for_scale(&input, 0.75);
         // Pure part: the panel height is the content height and the inset is always the mockup's top
         // inset, no matter the row count.
-        for rows in 1..=thumb_max_rows(card_h, budget, THUMB_ROW_GAP) {
-            let (panel_h, inset) = thumb_panel_metrics(rows, card_h, THUMB_ROW_GAP, 0.0, budget);
+        let metrics = ThumbPanelMetrics {
+            card_h,
+            gap: THUMB_ROW_GAP,
+            teaser_fits: false,
+            max_panel_h: budget,
+        };
+        for rows in 1..=thumb_max_rows(&input, card_h, budget, THUMB_ROW_GAP) {
+            let (panel_h, inset) = thumb_panel_metrics(&input, rows, metrics, 0.0);
             assert!(
                 (inset - THUMB_TOP_INSET).abs() < 1e-9,
                 "{rows} rows: top inset {inset:.1} must be {THUMB_TOP_INSET} (no stretching)"
             );
             assert!(
-                (panel_h - thumb_panel_height_for_rows(rows, rows, card_h, THUMB_ROW_GAP, false))
-                    .abs()
+                (panel_h
+                    - thumb_panel_height_for_rows(
+                        &input,
+                        rows,
+                        rows,
+                        card_h,
+                        THUMB_ROW_GAP,
+                        false
+                    ))
+                .abs()
                     < 1e-9,
                 "{rows} rows: panel {panel_h:.1} must equal the content height"
             );
@@ -4053,11 +4605,13 @@ mod flow_tests {
         // Backstop: with a budget too small for one row plus the teaser the panel still may not cross
         // the cap.
         let tiny = thumb_panel_metrics(
+            &input,
             1,
-            card_h,
-            THUMB_ROW_GAP,
+            ThumbPanelMetrics {
+                max_panel_h: 300.0,
+                ..metrics
+            },
             THUMB_ROW_GAP + card_h / 3.0,
-            300.0,
         );
         assert!(
             tiny.0 <= 300.0 + 1e-9,
@@ -4068,9 +4622,10 @@ mod flow_tests {
         // budget).
         let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
         let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
-        let cap = thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO).min(inner);
+        let cap = thumb_card_w_for_aspect(&input, card_h, THUMB_PREVIEW_RATIO).min(inner);
         for count in [1usize, 6, 12, 24] {
             let plan = plan_thumb_scroll_layout_at_scale(
+                &input,
                 &vec![THUMB_PREVIEW_RATIO; count],
                 0.75,
                 inner,
@@ -4101,12 +4656,15 @@ mod flow_tests {
         // -> panel 921 -> margins down to 33/2). This pins "never above the budget, overflow included".
         let panel_w = 1470.0 * PANEL_MAX_WIDTH_RATIO;
         let inner = panel_w - H_PADDING * 2.0 - THUMB_SCROLLBAR_W;
+        let input = band_present_input();
         let budget = 923.0 - 2.0 * PANEL_MARGIN;
-        let cap = |card_h: f64| thumb_card_w_for_aspect(card_h, THUMB_PREVIEW_RATIO).min(inner);
+        let cap =
+            |card_h: f64| thumb_card_w_for_aspect(&input, card_h, THUMB_PREVIEW_RATIO).min(inner);
         for (count, expect_overflow) in [(6usize, false), (24usize, true)] {
             let aspects = uniform_aspects(count);
             for step in [0.75, 0.8, 0.85, 1.0] {
                 let layout = plan_thumb_scroll_layout_at_scale(
+                    &input,
                     &aspects,
                     step,
                     inner,
@@ -4115,7 +4673,7 @@ mod flow_tests {
                     THUMB_ROW_GAP,
                     THUMB_SCROLLBAR_W,
                     0.0,
-                    cap(thumb_card_h_for_scale(step)),
+                    cap(thumb_card_h_for_scale(&input, step)),
                 );
                 assert!(
                     layout.panel_h <= budget + 1e-9,
@@ -4134,27 +4692,34 @@ mod flow_tests {
 
     #[test]
     fn flow_layout_enlarges_small_sets_to_the_cap() {
-        let layout = plan_thumb_flow_layout(&[1.6, 1.6], 1, 1200.0, 1000.0, THUMB_ROW_GAP);
+        let input = fixed_input();
+        let layout = plan_thumb_flow_layout(&input, &[1.6, 1.6], 1, 1200.0, 1000.0, THUMB_ROW_GAP);
         assert_eq!(layout.visible, 0..2);
         assert!(!layout.overflowed);
         assert!((layout.scale - LEGACY_THUMB_MAX_SCALE).abs() < 1e-9);
-        assert!(layout.card_h > thumb_card_h_fixed());
+        assert!(layout.card_h > thumb_card_h_fixed(&input));
     }
 
     #[test]
     fn scale_is_unchanged_when_aspects_cause_different_wrapping() {
-        let standard = plan_thumb_flow_layout(&[1.6, 1.6, 1.6], 1, 1200.0, 1000.0, THUMB_ROW_GAP);
-        let mixed = plan_thumb_flow_layout(&[2.2, 0.7, 2.2], 1, 800.0, 1000.0, THUMB_ROW_GAP);
+        let input = fixed_input();
+        let standard =
+            plan_thumb_flow_layout(&input, &[1.6, 1.6, 1.6], 1, 1200.0, 1000.0, THUMB_ROW_GAP);
+        let mixed =
+            plan_thumb_flow_layout(&input, &[2.2, 0.7, 2.2], 1, 800.0, 1000.0, THUMB_ROW_GAP);
         assert_eq!(standard.scale, 1.4);
         assert_eq!(mixed.scale, 1.4);
     }
 
     #[test]
     fn overflow_uses_stable_pages_instead_of_sliding() {
+        let input = fixed_input();
         let aspects = vec![1.6; 8];
-        let base_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let two_row_panel_h = thumb_panel_height_for_rows(2, 2, base_h, THUMB_ROW_GAP, true) + 0.1;
-        let initial = plan_thumb_flow_layout(&aspects, 1, 900.0, two_row_panel_h, THUMB_ROW_GAP);
+        let base_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let two_row_panel_h =
+            thumb_panel_height_for_rows(&input, 2, 2, base_h, THUMB_ROW_GAP, true) + 0.1;
+        let initial =
+            plan_thumb_flow_layout(&input, &aspects, 1, 900.0, two_row_panel_h, THUMB_ROW_GAP);
         assert!(initial.overflowed);
         // Only the use of the current scale is asserted here; the ladder values are pinned by
         // the_scale_ladder_keeps_its_floor_and_cap so packing tests cannot break on a ladder tweak.
@@ -4169,14 +4734,21 @@ mod flow_tests {
         );
         assert_eq!(initial.visible, 0..per_row * 2);
         // Width follows the widest actual row instead of consuming the full 900pt packing budget.
-        let card_w = thumb_card_w_for_aspect(thumb_card_h_for_scale(initial.scale), 1.6);
+        let card_w =
+            thumb_card_w_for_aspect(&input, thumb_card_h_for_scale(&input, initial.scale), 1.6);
         assert_eq!(
             initial.panel_w,
             per_row as f64 * card_w + (per_row - 1) as f64 * THUMB_ROW_GAP + H_PADDING * 2.0
         );
 
-        let next =
-            plan_thumb_flow_layout(&aspects, per_row * 2, 900.0, two_row_panel_h, THUMB_ROW_GAP);
+        let next = plan_thumb_flow_layout(
+            &input,
+            &aspects,
+            per_row * 2,
+            900.0,
+            two_row_panel_h,
+            THUMB_ROW_GAP,
+        );
         // The second page starts where the first ends and covers the rest; the per-row count comes
         // from the ladder, so the page count is not hardcoded.
         assert_eq!(next.visible, per_row * 2..aspects.len());
@@ -4198,21 +4770,23 @@ mod flow_tests {
 
     #[test]
     fn wide_thumbnail_budget_fits_four_columns_without_changing_height() {
+        let input = fixed_input();
         let aspects = vec![1.6; 12];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
         let three_row_panel_h = THUMB_TOP_INSET
             + THUMB_BOTTOM_INSET
             + card_h * 3.0
             + THUMB_ROW_GAP * 2.0
-            + footer_band_h()
+            + footer_band_h(&input)
             + 0.1;
         // Budgets derive from the *current* card width: the narrow one holds three columns (twelve
         // cards need four rows -> overflow) and the wide one holds four (twelve cards fit three rows ->
         // one page). The assertions therefore express the intent "horizontal budget decides the column
         // count" without depending on the ladder.
-        let card_w = thumb_card_w_for_aspect(card_h, 1.6);
+        let card_w = thumb_card_w_for_aspect(&input, card_h, 1.6);
         let inner_for_columns = |columns: f64| columns * card_w + (columns - 1.0) * THUMB_ROW_GAP;
         let capped = plan_thumb_flow_layout(
+            &input,
             &aspects,
             1,
             inner_for_columns(3.0),
@@ -4220,6 +4794,7 @@ mod flow_tests {
             THUMB_ROW_GAP,
         );
         let wide = plan_thumb_flow_layout(
+            &input,
             &aspects,
             1,
             inner_for_columns(4.0),
@@ -4242,29 +4817,32 @@ mod flow_tests {
 
     #[test]
     fn selecting_any_item_on_a_page_keeps_the_same_page_boundary() {
+        let input = fixed_input();
         let aspects = vec![1.6; 8];
-        let base_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = thumb_panel_height_for_rows(2, 2, base_h, THUMB_ROW_GAP, true) + 0.1;
+        let base_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let max_h = thumb_panel_height_for_rows(&input, 2, 2, base_h, THUMB_ROW_GAP, true) + 0.1;
         for selected in 4..8 {
-            let layout = plan_thumb_flow_layout(&aspects, selected, 614.0, max_h, THUMB_ROW_GAP);
+            let layout =
+                plan_thumb_flow_layout(&input, &aspects, selected, 614.0, max_h, THUMB_ROW_GAP);
             assert_eq!(layout.visible, 4..8);
         }
     }
 
     #[test]
     fn mixed_aspect_pages_are_contiguous_exhaustive_and_stable() {
+        let input = fixed_input();
         let aspects = vec![2.2, 0.7, 1.6, 2.2, 1.0, 1.6, 0.7, 2.2, 1.6];
         let scale = thumb_scale_for_count(aspects.len());
-        let card_h = thumb_card_h_for_scale(scale);
+        let card_h = thumb_card_h_for_scale(&input, scale);
         let constraints = ThumbFlowConstraints {
             card_h,
             max_inner: 614.0,
             max_rows: 2,
             teaser_fits: true,
-            max_panel_h: thumb_panel_height_for_rows(2, 2, card_h, THUMB_ROW_GAP, true),
+            max_panel_h: thumb_panel_height_for_rows(&input, 2, 2, card_h, THUMB_ROW_GAP, true),
             gap: THUMB_ROW_GAP,
         };
-        let pages = stable_pages(&aspects, constraints);
+        let pages = stable_pages(&input, &aspects, constraints);
         assert_eq!(pages.first().unwrap().start, 0);
         assert_eq!(pages.last().unwrap().end, aspects.len());
         for pair in pages.windows(2) {
@@ -4272,9 +4850,10 @@ mod flow_tests {
         }
         for page in &pages {
             assert!(!page.is_empty());
-            assert!(thumb_range_fits(&aspects, page, constraints));
+            assert!(thumb_range_fits(&input, &aspects, page, constraints));
             for selected in page.clone() {
                 let layout = plan_thumb_flow_layout(
+                    &input,
                     &aspects,
                     selected,
                     constraints.max_inner,
@@ -4282,7 +4861,7 @@ mod flow_tests {
                         + THUMB_BOTTOM_INSET
                         + constraints.max_rows as f64 * card_h
                         + THUMB_ROW_GAP
-                        + footer_band_h()
+                        + footer_band_h(&input)
                         + 1.0,
                     THUMB_ROW_GAP,
                 );
@@ -4293,10 +4872,11 @@ mod flow_tests {
 
     #[test]
     fn overflow_capacity_adapts_to_mixed_aspects() {
+        let input = fixed_input();
         let aspects = vec![1.6, 1.6, 2.2, 2.2, 2.2, 2.2];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = thumb_panel_height_for_rows(2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
-        let initial = plan_thumb_flow_layout(&aspects, 1, 700.0, max_h, THUMB_ROW_GAP);
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let max_h = thumb_panel_height_for_rows(&input, 2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
+        let initial = plan_thumb_flow_layout(&input, &aspects, 1, 700.0, max_h, THUMB_ROW_GAP);
         // Two standard cards share a row while a wide card occupies its own, so
         // the leading slice naturally drops to three items.
         assert_eq!(initial.visible, 0..3);
@@ -4305,6 +4885,7 @@ mod flow_tests {
     #[test]
     fn scroll_layout_caps_wide_cards_to_the_reference_width() {
         let layout = plan_thumb_scroll_layout_with_max_card_w(
+            &fixed_input(),
             &[1.6, 5.0, 10.0],
             900.0,
             1000.0,
@@ -4332,7 +4913,7 @@ mod flow_tests {
 
     #[test]
     fn empty_flow_layout_stays_at_base_size() {
-        let layout = plan_thumb_flow_layout(&[], 0, 1200.0, 1000.0, THUMB_ROW_GAP);
+        let layout = plan_thumb_flow_layout(&fixed_input(), &[], 0, 1200.0, 1000.0, THUMB_ROW_GAP);
         assert_eq!(layout.visible, 0..0);
         assert_eq!(layout.scale, 1.0);
         assert!(layout.placements.is_empty());
@@ -4340,10 +4921,12 @@ mod flow_tests {
 
     #[test]
     fn scrolling_layout_keeps_rows_and_panel_size_stable() {
+        let input = fixed_input();
         let aspects = vec![1.6; 20];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = thumb_panel_height_for_rows(2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let max_h = thumb_panel_height_for_rows(&input, 2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
         let first = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             1288.0,
@@ -4355,6 +4938,7 @@ mod flow_tests {
             f64::INFINITY,
         );
         let next = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             1288.0,
@@ -4384,10 +4968,12 @@ mod flow_tests {
 
     #[test]
     fn scrolling_layout_width_follows_the_widest_visible_grid_row() {
+        let input = fixed_input();
         let aspects = vec![1.6; 8];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = thumb_panel_height_for_rows(2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let max_h = thumb_panel_height_for_rows(&input, 2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
         let layout = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             900.0,
@@ -4412,7 +4998,8 @@ mod flow_tests {
         assert_eq!(layout.row_ranges.last().unwrap().end, aspects.len());
         // The width follows the widest visible row, with the card width derived from the layout's own
         // scale instead of a hardcoded base width.
-        let card_w = thumb_card_w_for_aspect(thumb_card_h_for_scale(layout.scale), 1.6);
+        let card_w =
+            thumb_card_w_for_aspect(&input, thumb_card_h_for_scale(&input, layout.scale), 1.6);
         assert_eq!(
             layout.panel_w,
             per_row as f64 * card_w
@@ -4434,10 +5021,12 @@ mod flow_tests {
 
     #[test]
     fn scrolling_overflow_fills_the_initial_viewport_greedily() {
+        let input = fixed_input();
         let aspects = vec![1.6; 13];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = thumb_panel_height_for_rows(3, 3, card_h, THUMB_ROW_GAP, true) + 0.1;
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let max_h = thumb_panel_height_for_rows(&input, 3, 3, card_h, THUMB_ROW_GAP, true) + 0.1;
         let layout = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             1288.0,
@@ -4456,10 +5045,12 @@ mod flow_tests {
 
     #[test]
     fn scrolling_layout_keeps_balanced_packing_when_everything_fits() {
+        let input = fixed_input();
         let aspects = vec![2.2, 0.7, 0.7];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = thumb_panel_height_for_rows(2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let max_h = thumb_panel_height_for_rows(&input, 2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
         let layout = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             800.0,
@@ -4478,10 +5069,12 @@ mod flow_tests {
 
     #[test]
     fn scrolling_layout_clamps_to_the_last_row() {
+        let input = fixed_input();
         let aspects = vec![1.6; 20];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
-        let max_h = thumb_panel_height_for_rows(2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
+        let max_h = thumb_panel_height_for_rows(&input, 2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
         let layout = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             1288.0,
@@ -4498,11 +5091,13 @@ mod flow_tests {
 
     #[test]
     fn scrolling_layout_keeps_fractional_offset_and_renders_partial_row() {
+        let input = fixed_input();
         let aspects = vec![1.6; 20];
-        let card_h = thumb_card_h_for_scale(thumb_scale_for_count(aspects.len()));
+        let card_h = thumb_card_h_for_scale(&input, thumb_scale_for_count(aspects.len()));
         let row_pitch = card_h + THUMB_ROW_GAP;
-        let max_h = thumb_panel_height_for_rows(2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
+        let max_h = thumb_panel_height_for_rows(&input, 2, 2, card_h, THUMB_ROW_GAP, true) + 0.1;
         let layout = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             1288.0,
@@ -4527,6 +5122,7 @@ mod flow_tests {
         assert!(layout.max_scroll_offset > 12.0);
 
         let before_row_boundary = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             1288.0,
@@ -4538,6 +5134,7 @@ mod flow_tests {
             f64::INFINITY,
         );
         let at_row_boundary = plan_thumb_scroll_layout_at_scale(
+            &input,
             &aspects,
             thumb_scale_for_count(aspects.len()),
             1288.0,
@@ -4614,13 +5211,14 @@ mod flow_tests {
 
     #[test]
     fn close_reflow_panel_height_shrinks_when_overflow_ends() {
-        let overflowing = thumb_panel_height_for_rows(3, 2, 80.0, 10.0, true);
-        let fitting = thumb_panel_height_for_rows(2, 2, 80.0, 10.0, false);
+        let input = band_present_input();
+        let overflowing = thumb_panel_height_for_rows(&input, 3, 2, 80.0, 10.0, true);
+        let fitting = thumb_panel_height_for_rows(&input, 2, 2, 80.0, 10.0, false);
 
         assert!(overflowing > fitting);
         assert_eq!(
             fitting,
-            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 80.0 + 10.0 + footer_band_h()
+            THUMB_TOP_INSET + THUMB_BOTTOM_INSET + 2.0 * 80.0 + 10.0 + footer_band_h(&input)
         );
     }
 
@@ -4662,11 +5260,12 @@ mod flow_tests {
 
 #[cfg(test)]
 mod icon_scroll_tests {
+    use super::tests::band_present_input;
     use super::*;
 
     #[test]
     fn icon_layout_balances_rows_when_the_document_fits() {
-        let layout = plan_icon_scroll_layout(10, 1200.0, 500.0, 14.0, 0.0);
+        let layout = plan_icon_scroll_layout(&band_present_input(), 10, 1200.0, 500.0, 14.0, 0.0);
 
         assert!(!layout.overflowed);
         assert_eq!(layout.row_ranges, vec![0..5, 5..10]);
@@ -4675,10 +5274,11 @@ mod icon_scroll_tests {
 
     #[test]
     fn icon_cards_keep_fixed_size_and_three_card_baseline() {
-        let layout = plan_icon_scroll_layout(2, 1440.0, 900.0, 14.0, 0.0);
+        let input = band_present_input();
+        let layout = plan_icon_scroll_layout(&input, 2, 1440.0, 900.0, 14.0, 0.0);
 
         assert_eq!(layout.panel_w, 3.0 * ICON_CARD_W + H_PADDING * 2.0);
-        assert_eq!(layout.card_h, card_h());
+        assert_eq!(layout.card_h, card_h(&input));
         assert_eq!(layout.document_placements.len(), 2);
         assert!(layout
             .document_placements
@@ -4689,7 +5289,8 @@ mod icon_scroll_tests {
 
     #[test]
     fn icon_layout_auto_columns_and_scrolls_by_rows() {
-        let layout = plan_icon_scroll_layout(15, 1200.0, 500.0, 14.0, 0.0);
+        let input = band_present_input();
+        let layout = plan_icon_scroll_layout(&input, 15, 1200.0, 500.0, 14.0, 0.0);
 
         assert_eq!(layout.row_ranges, vec![0..7, 7..14, 14..15]);
         assert_eq!(layout.max_rows, 2);
@@ -4698,7 +5299,8 @@ mod icon_scroll_tests {
         assert!(layout.max_scroll_offset > 0.0);
         assert_eq!(layout.document_placements.len(), 15);
 
-        let bottom = plan_icon_scroll_layout(15, 1200.0, 500.0, 14.0, layout.max_scroll_offset);
+        let bottom =
+            plan_icon_scroll_layout(&input, 15, 1200.0, 500.0, 14.0, layout.max_scroll_offset);
         assert_eq!(bottom.row_start, 0);
         assert_eq!(bottom.visible, 0..15);
         assert_eq!(bottom.placements.len(), 15);
@@ -4706,7 +5308,7 @@ mod icon_scroll_tests {
 
     #[test]
     fn icon_layout_preserves_card_width_when_screen_is_narrow() {
-        let layout = plan_icon_scroll_layout(1, 200.0, 500.0, 14.0, 0.0);
+        let layout = plan_icon_scroll_layout(&band_present_input(), 1, 200.0, 500.0, 14.0, 0.0);
 
         assert_eq!(layout.document_placements[0].width, ICON_CARD_W);
         assert!(layout.panel_w >= ICON_CARD_W + H_PADDING * 2.0);

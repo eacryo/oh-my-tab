@@ -54,9 +54,9 @@ pub(crate) unsafe fn onboarding_switch(
 /// Right-hand read-only readout of a slider row: its width, the gap before it, and its own
 /// height. The readout hugs the slider's right end and is vertically centred on it, so a slider
 /// in such a row takes the control column's width minus the first two.
-const SLIDER_READOUT_W: f64 = 44.0;
-const SLIDER_READOUT_GAP: f64 = 8.0;
-const SLIDER_READOUT_H: f64 = 20.0;
+pub(super) const SLIDER_READOUT_W: f64 = 44.0;
+pub(super) const SLIDER_READOUT_GAP: f64 = 8.0;
+pub(super) const SLIDER_READOUT_H: f64 = 20.0;
 // The macOS SDK uses iOS alignment enum values on arm64 and legacy AppKit values on x86_64.
 const TEXT_ALIGNMENT_RIGHT: isize = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
 const RESTORE_SHELL_INSET: f64 = 8.0;
@@ -79,7 +79,7 @@ const SEPARATOR_ABOVE_ROW_GAP: f64 = 0.0;
 static ROW_LABELS: LazyLock<Mutex<Vec<(usize, usize)>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 
 /// Shared horizontal and vertical metrics for all settings pages.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Default)]
 pub(super) struct SettingsLayout {
     pub label_x: f64,
     pub label_w: f64,
@@ -363,7 +363,12 @@ impl SettingsSection {
 pub(super) struct SettingsRow;
 
 impl SettingsRow {
-    unsafe fn register_label(label: *mut AnyObject, control: *mut AnyObject) {
+    /// Associate a row's label with its control: the row's accessibility label (design-style §11)
+    /// and the `ROW_LABELS` pairing the freeze lists read when a row is disabled (dim + tooltip).
+    ///
+    /// Every row builder in this file goes through it, and so does the page renderer that builds a
+    /// row from its description -- one association contract, one cleanup path.
+    pub(super) unsafe fn register_label(label: *mut AnyObject, control: *mut AnyObject) {
         if label.is_null() || control.is_null() {
             return;
         }
@@ -2515,7 +2520,6 @@ mod tests {
     /// The last term is `SETTINGS_SECTION_RHYTHM_GAP`, not the heading's own card gap: tightening
     /// how close a heading sits to ITS card must not move the distance between consecutive cards,
     /// so the rhythm keeps its historical 8 and this assertion pins the total at 43.
-
     /// The heading clearance is governed by ONE token that states what a reader sees, and the box
     /// gap that implements it is derived from that token. This pins both directions: the visible
     /// value the design document quotes, and the box arithmetic that produces it.

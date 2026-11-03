@@ -561,6 +561,13 @@ pub(super) struct SettingsUi {
     /// One layout owner per page (index order matches `page_restores`): rows, cards, the page
     /// title, the restore control and the document height all follow from its row list.
     page_canvases: [PageCanvas; SETTINGS_PAGE_COUNT],
+    /// Which control edits which field, filled while each migrated page is built. The dispatcher
+    /// reads it instead of comparing every control pointer by hand; the pages that are still
+    /// built inline keep their pointer comparison as the fallback for an unknown sender.
+    control_table: ControlTable,
+    /// The controls each migrated page built, so the refill and the in-place refresh write them
+    /// from the page's own description.
+    migrated_pages: [Option<RenderedPage>; SETTINGS_PAGE_COUNT],
     permission_warning_view: *mut AnyObject, // permission-warning banner container
     update_auto_check: *mut AnyObject,       // Sparkle auto-check switch
     update_auto_download: *mut AnyObject,    // Sparkle auto-download switch
@@ -911,6 +918,8 @@ mod finder_menu_smoke;
 pub(crate) mod mapping;
 mod page_builder;
 pub(crate) mod page_canvas;
+mod page_view;
+mod page_widgets;
 pub(crate) mod portability;
 pub(crate) mod restore;
 pub(crate) mod select;
@@ -923,7 +932,7 @@ use components::{
     row_action_button, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard,
     SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
     SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H,
-    ROW_ACTION_BTN_W,
+    ROW_ACTION_BTN_W, SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
 };
 use dispatch::*;
 use mapping::*;
@@ -934,6 +943,8 @@ pub(crate) use mapping::{
     handle_panel_record_trigger, handle_recording_cancelled, handle_recording_finished,
 };
 use page_canvas::*;
+pub(crate) use page_view::migrated_pages_smoke_runner;
+use page_view::*;
 pub(super) use restore::{
     collapse_restore_confirmations, collapse_restore_confirmations_on_external_click,
 };
@@ -1979,6 +1990,24 @@ pub(crate) fn e2e_mouse_line_count_text() -> String {
 
 /// Load the settings controls from the live config for a page that is being opened (`Some(page)`) or for an
 /// in-place refresh (`None`).
+/// Re-read the pages that were migrated to a row description. The value of every one of their
+/// controls comes from `page_update_description`, the same pure description the in-place refresh
+/// consumes, so the two write paths cannot disagree.
+pub(super) fn refresh_migrated_pages_from(ui: &SettingsUi, cfg: &Config) {
+    let input = PageInput::from_config(
+        cfg.clone(),
+        current_selected_device(),
+        crate::theme::ThemeInput::current(),
+    );
+    unsafe {
+        page_view::refresh_migrated_pages(
+            ui,
+            &input,
+            &[SettingsPageId::Switcher, SettingsPageId::General],
+        );
+    }
+}
+
 fn load_settings_values_for(requested_page: Option<usize>) {
     if requested_page.is_none() {
         // An in-place refresh means the values may have changed: whatever the mouse page shows is stale.
@@ -2184,6 +2213,10 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             ) {
                 materialize_mouse_page(ui, cfg);
             }
+            // The migrated pages take their values from the same update description the in-place
+            // refresh writes, so a field cannot show its build value in one path and its refilled
+            // value in the other.
+            super::refresh_migrated_pages_from(ui, cfg);
             // Not part of the mouse fill: this one helper also recomputes the display-mode pair (General)
             // and the clipboard-delete rows (Clipboard), so every open needs it whatever page it is for.
             update_conditional_rows(ui);
@@ -2956,6 +2989,27 @@ mod tests {
             crate::smoke_verdict::run_smoke_child(
                 "settings_layout_smoke_under_reduce_motion",
                 &["--smoke-settings-layout", "--reduce-motion"],
+            );
+        });
+    }
+
+    /// The pages migrated to a row description, built with the REAL renderer on the AppKit main
+    /// thread: every placed view must be a subview of its page, at its row's origin plus the offset
+    /// the layout gave it, in the row's group, and no row may have placed nothing.
+    /// libtest's worker threads cannot drive the renderer (it registers section headings in a
+    /// main-thread-only slot), so the runner spawns the app and reports the child's own verdict.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child and builds the real pages.
+    // SMOKE_DISTURBS=focus
+    #[test]
+    #[ignore]
+    fn migrated_pages_render_smoke() {
+        smoke_runner!("migrated_pages_render_smoke", 1, {
+            // The child is the process that ran the assertions; it records the verdict through
+            // the shared channel and this parent reports what it recorded.
+            crate::smoke_verdict::run_smoke_child(
+                "migrated_pages_render_smoke",
+                &["--smoke-migrated-pages"],
             );
         });
     }

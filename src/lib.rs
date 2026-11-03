@@ -119,6 +119,9 @@ pub(crate) struct AppState {
     // Cmd release received while the first snapshot is pending; committed when that snapshot
     // arrives instead of being discarded because the overlay is not visible yet.
     pub(crate) pending_first_release: bool,
+    // The overlay's layout and view state — the plan the renderer follows and the values every
+    // later reader (scroller, scroll clamping, navigation, close reflow) must agree with.
+    pub(crate) layout: crate::overlay::SwitcherLayout,
 }
 
 impl AppState {
@@ -161,6 +164,7 @@ impl AppState {
             pending_first_show: false,
             pending_first_backward: false,
             pending_first_release: false,
+            layout: crate::overlay::SwitcherLayout::new(),
         }
     }
 }
@@ -179,10 +183,78 @@ thread_local! {
 }
 
 /// Borrow the main-thread runtime for one short, synchronous state transition.
+///
+/// The borrow is exclusive and is not reentrant: a closure that calls `with_tab_state` again -- which
+/// any AppKit call it makes can do, through a callback or a notification -- would otherwise panic
+/// inside `RefCell` with nothing saying why. The guard fails with a message instead, and it fails in
+/// release builds too, where a nested borrow is a bug of exactly the same shape.
 pub(crate) fn with_tab_state<R>(f: impl FnOnce(&mut Option<AppState>) -> R) -> R {
     debug_assert_main_thread();
+    let _guard = StateProjectionGuard::enter();
     APP_RUNTIME.with(|runtime| f(&mut runtime.borrow_mut().switcher))
 }
+
+/// Refuses a nested entry into [`with_tab_state`].
+///
+/// The UI state is a `RefCell<Option<AppState>>` borrowed for the whole closure, and the rule that
+/// keeps it usable is "take a short borrow, release it, then do AppKit work". The rule has no
+/// type-system guarantee -- the outermost closure's borrow stays alive while an inner function
+/// calls `with_tab_state` again -- so the violation is made to fail at the point it happens:
+/// loudly, with a message, instead of as a bare `BorrowMutError` from deep inside `std`.
+#[derive(Debug)]
+struct StateProjectionGuard;
+
+thread_local! {
+    static STATE_PROJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl StateProjectionGuard {
+    fn enter() -> Self {
+        STATE_PROJECTED
+            .with(|projected| assert!(!projected.replace(true), "{}", NESTED_PROJECTION_MESSAGE));
+        StateProjectionGuard
+    }
+}
+
+impl Drop for StateProjectionGuard {
+    fn drop(&mut self) {
+        STATE_PROJECTED.with(|projected| projected.set(false));
+    }
+}
+
+const NESTED_PROJECTION_MESSAGE: &str = "the switcher state was borrowed re-entrantly: a \
+     with_tab_state closure called with_tab_state again (directly, or through an AppKit callback it \
+     triggered) instead of releasing the borrow first";
+
+/// The same refusal, for a borrow of one field of the runtime that AppKit work re-enters.
+///
+/// The overlay's layout state has the same shape as [`with_tab_state`]: a reader takes a short borrow,
+/// copies what it needs, releases the borrow, and only then calls AppKit. This guard makes a reader
+/// that keeps its borrow across such a call fail where it happens rather than as a bare `RefCell`
+/// error; it is a separate flag from [`StateProjectionGuard`] so that a nested entry into either one
+/// is caught on its own terms.
+#[derive(Debug)]
+pub(crate) struct LayoutProjectionGuard;
+
+thread_local! {
+    static LAYOUT_PROJECTED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+impl LayoutProjectionGuard {
+    pub(crate) fn enter() -> Self {
+        LAYOUT_PROJECTED
+            .with(|projected| assert!(!projected.replace(true), "{}", NESTED_LAYOUT_MESSAGE));
+        LayoutProjectionGuard
+    }
+}
+
+impl Drop for LayoutProjectionGuard {
+    fn drop(&mut self) {
+        LAYOUT_PROJECTED.with(|projected| projected.set(false));
+    }
+}
+
+const NESTED_LAYOUT_MESSAGE: &str = "the switcher layout was borrowed re-entrantly: a reader kept      its AppState.layout borrow across a call that re-entered the layout instead of copying what it      needed and releasing the borrow first";
 
 /// Refuse an access to the main-thread runtime from any other thread, in every build.
 ///
@@ -1390,8 +1462,11 @@ fn create_overlay_window() -> *mut AnyObject {
     unsafe {
         let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
         let screen_frame: NSRect = msg_send![screen, frame];
-        let h = window_height(6); // initial reasonable default
-        let footer_h = footer_band_h();
+        // One snapshot for the whole window construction: the height, the band and the scroller
+        // below all describe the same configuration.
+        let input = crate::theme::ThemeInput::current();
+        let h = window_height(&input, 6); // initial reasonable default
+        let footer_h = footer_band_h(&input);
         let w = window_width(3); // initial three-card baseline; summon recalculates the live width
         let x = (screen_frame.size.width - w) / 2.0 + screen_frame.origin.x;
         let y = (screen_frame.size.height - h) / 2.0 + screen_frame.origin.y;
@@ -1667,7 +1742,7 @@ fn create_overlay_window() -> *mut AnyObject {
 
         let status_font: *mut AnyObject = {
             let status_bar_weight = CONFIG.read().unwrap().fonts.status_bar_weight;
-            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(), weight: status_bar_weight]
+            msg_send![class!(NSFont), systemFontOfSize: status_bar_text_size(&input), weight: status_bar_weight]
         };
         // The status line (and the "no windows to switch" hint it carries) rides on the user's material
         // with vibrant ink, so it needs no band (design-style §3).
@@ -1688,6 +1763,7 @@ fn create_overlay_window() -> *mut AnyObject {
         // resizes) and on a corner-radius change, so it is never left on a stale geometry.
         let settings_button =
             crate::overlay::make_footer_settings_button(crate::overlay::footer_settings_frame(
+                &input,
                 NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h)).size,
             ));
         let _: () = msg_send![content_parent, addSubview: settings_button];
@@ -1699,7 +1775,7 @@ fn create_overlay_window() -> *mut AnyObject {
         // or interrupt explicit dragging. Its track starts above the floating settings control when
         // the footer title is off: the control is added to the hierarchy first, so an overlap would
         // give the scrollbar the control's clicks.
-        let scroller_bottom = footer_h + crate::theme::footer_control_bottom_reserve();
+        let scroller_bottom = footer_h + crate::theme::footer_control_bottom_reserve(&input);
         let scroller: *mut AnyObject = msg_send![scroller_cls, alloc];
         let scroller: *mut AnyObject = msg_send![
             scroller,
@@ -3821,6 +3897,16 @@ pub fn run() {
             std::process::exit(if passed { 0 } else { 1 });
         }
     }
+    if std::env::args().any(|a| a == "--smoke-migrated-pages") {
+        unsafe {
+            // The migrated pages' renderer builds real AppKit views; this is the process that can.
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let passed = settings::migrated_pages_smoke_runner();
+            crate::smoke_verdict::record_for_child(if passed { "PASSED 1" } else { "FAILED" });
+            std::process::exit(if passed { 0 } else { 1 });
+        }
+    }
     if std::env::args().any(|a| a == "--smoke-settings-layout") {
         unsafe {
             // The layout validator recognizes `--smoke-settings-layout` on its own; nothing is
@@ -4118,6 +4204,52 @@ mod tests {
         orderly_exit_count, settings_prewarm_step, SettingsPrewarmStep,
         SETTINGS_PREWARM_MAX_ATTEMPTS,
     };
+
+    /// A nested entry into the state projection fails loudly, and it fails where it happens.
+    ///
+    /// The UI state is one `RefCell` borrow for the whole closure; the rule that keeps it usable is
+    /// "take a short borrow, release it, then do AppKit work". A closure that calls back in -- which
+    /// any AppKit call it makes can do -- violates it, and this is the assertion that says so
+    /// instead of a bare `BorrowMutError`.
+    #[test]
+    fn a_nested_state_projection_is_refused_loudly() {
+        let _ = super::is_main_thread;
+        let outer = super::StateProjectionGuard::enter();
+        let nested = std::panic::catch_unwind(super::StateProjectionGuard::enter);
+        let message = nested.expect_err("a nested projection must panic");
+        let text = message
+            .downcast_ref::<String>()
+            .cloned()
+            .or_else(|| message.downcast_ref::<&str>().map(|s| s.to_string()))
+            .unwrap_or_default();
+        assert!(
+            text.contains("re-entrantly"),
+            "the panic must say what was violated, not just that a RefCell was busy: {text}"
+        );
+        drop(outer);
+    }
+
+    /// The guard clears itself on the way out, including on the unwind path: a thread-local left set
+    /// after a panic would refuse every later projection on this thread and turn one caught panic
+    /// into a permanently broken main thread.
+    #[test]
+    fn the_state_projection_guard_clears_itself_after_a_panic() {
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = super::StateProjectionGuard::enter();
+            panic!("simulated failure inside a state projection");
+        });
+        assert!(panicked.is_err(), "the simulated failure must unwind");
+        let guard = super::StateProjectionGuard::enter();
+        drop(guard);
+
+        let panicked = std::panic::catch_unwind(|| {
+            let _guard = super::LayoutProjectionGuard::enter();
+            panic!("simulated failure inside a layout projection");
+        });
+        assert!(panicked.is_err(), "the simulated failure must unwind");
+        let guard = super::LayoutProjectionGuard::enter();
+        drop(guard);
+    }
 
     #[test]
     fn the_settings_warm_up_builds_only_at_a_quiet_moment_and_gives_up_after_the_cap() {

@@ -18,8 +18,8 @@ pub(super) fn capture_range_for_visible(visible: Option<Range<usize>>, len: usiz
 /// Submit the selected window at the highest priority before the panel orders in, giving
 /// the capture a chance to finish before the first visible frame; show_overlay still
 /// performs the complete visible-range refresh after showing.
-pub(crate) fn refresh_selected_for_summon(required_px_h: u32) {
-    if !crate::theme::thumbnails_enabled() || !capture_allowed() {
+pub(crate) fn refresh_selected_for_summon(input: &crate::theme::ThemeInput, required_px_h: u32) {
+    if !crate::theme::thumbnails_enabled(input) || !capture_allowed() {
         return;
     }
     let Some((pid, wid)) = crate::with_tab_state(|state_opt| {
@@ -54,8 +54,8 @@ pub(crate) fn refresh_selected_for_summon(required_px_h: u32) {
 /// is requested first.
 /// The selection is read from TAB_STATE internally; callers just invoke once at
 /// the end of show_overlay.
-pub(crate) fn refresh_for_summon(required_px_h: u32) {
-    if !crate::theme::thumbnails_enabled() {
+pub(crate) fn refresh_for_summon(input: &crate::theme::ThemeInput, required_px_h: u32) {
+    if !crate::theme::thumbnails_enabled(input) {
         return;
     }
     if !capture_allowed() {
@@ -218,7 +218,7 @@ pub(crate) fn refresh_for_summon(required_px_h: u32) {
 /// suspended WebView still replaces the old frame -- one stale-appearance card
 /// amid the new theme looks worse than a temporary placeholder.
 pub(crate) fn refresh_for_theme(required_px_h: u32) {
-    if !crate::theme::thumbnails_enabled() {
+    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) {
         return;
     }
     if !capture_allowed() {
@@ -330,7 +330,7 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
 /// image (a real frame with the old aspect beats a correctly-shaped blank), and the
 /// geometry guard still drops frames captured mid-animation.
 pub(crate) fn refresh_for_display_change(required_px_h: u32) {
-    if !crate::theme::thumbnails_enabled() {
+    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) {
         return;
     }
     if !capture_allowed() {
