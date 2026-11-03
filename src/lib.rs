@@ -3449,7 +3449,14 @@ pub fn run() {
     // judged without waiting for a Finder click. `--toast-preview` keeps it up with no deadline.
     if crate::dev_flags::present("toast-preview") {
         let text = crate::i18n::t("finder_menu.sha256_copied");
-        crate::ui::toast::schedule_preview(vec![text]);
+        // Late enough that the launch is over: a preview that fires while the window server is still putting the
+        // session together animates an entrance nobody is looking at yet. The value is the delay in seconds, and a
+        // bare switch keeps the old one second for a preview of a still surface.
+        let delay = crate::dev_flags::value("toast-preview")
+            .and_then(|value| value.parse::<f64>().ok())
+            .filter(|seconds| seconds.is_finite() && *seconds >= 0.0)
+            .unwrap_or(1.0);
+        crate::ui::toast::schedule_preview_at(vec![text], delay);
     }
 
     // Start bounded workers for post-activation AX focus queries so notification bursts do not

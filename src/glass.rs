@@ -1765,8 +1765,6 @@ pub(crate) unsafe fn install_backdrop(
 ) -> InstalledBackdrop {
     let mut backdrop = build_backdrop(frame, corner_radius, options, None);
     let insets = install_shadow_carrier(&mut backdrop, frame, corner_radius, options);
-    // NSWindow resizes an adopted content view immediately. Pad the window first: a compact HUD
-    // can otherwise shrink its material to zero during adoption and lose its autoresizing margins.
     remember_panel_insets(window, insets);
     grow_window_for_insets(window, insets);
     adopt_window_root(
@@ -1780,6 +1778,74 @@ pub(crate) unsafe fn install_backdrop(
     reassert_glass_layer_clip(&backdrop, corner_radius);
     backdrop.outline_view = install_panel_outline(&backdrop, corner_radius);
     backdrop
+}
+
+/// Install a backdrop with its elevation into a host view, without touching any window.
+///
+/// `install_backdrop` makes the backdrop the window's content and grows the window by the elevation, because its
+/// callers do not animate. A surface that has to MOVE its whole self -- material, outline, shadow and all -- needs the
+/// opposite: a window that stays exactly where it is and a backdrop that is one child view inside it, so the motion is
+/// a view move rather than a window move. This builds the same hierarchy and carrier, then adds the carrier to
+/// `host` at `origin` (the chip's screen-independent position inside the host) and returns it. The window is never
+/// consulted: its size and content view belong to the caller.
+///
+/// The returned backdrop's root and material root are the carrier and the material, exactly as `install_backdrop`
+/// leaves them, so every decoration (outline, bevel, live property refresh) works the same way.
+pub(crate) unsafe fn install_hosted_backdrop(
+    host: *mut AnyObject,
+    origin: NSPoint,
+    panel: NSRect,
+    corner_radius: f64,
+    options: BackdropOptions,
+) -> InstalledBackdrop {
+    let mut backdrop = build_backdrop(panel, corner_radius, options, None);
+    let insets = install_shadow_carrier(&mut backdrop, panel, corner_radius, options);
+    let Some(carrier) = backdrop.root.map(|root| root.0) else {
+        return backdrop;
+    };
+    // The carrier is the panel plus the elevation's padding; its origin is the panel's, minus that padding.
+    let holder = holder_frame(panel, origin, insets);
+    let _: () = msg_send![carrier, setFrame: holder];
+    let _: () = msg_send![host, addSubview: carrier];
+    release_obj(carrier);
+    if backdrop.glass.is_some() {
+        release_obj(backdrop.material_root.unwrap().0);
+    }
+    reassert_glass_layer_clip(&backdrop, corner_radius);
+    backdrop.outline_view = install_panel_outline(&backdrop, corner_radius);
+    backdrop
+}
+
+/// The carrier's frame inside the host for a panel whose own origin inside the host is `origin`: the carrier is
+/// the panel grown by the elevation's padding, so its origin moves out by the lower padding and its size by both.
+pub(crate) fn holder_frame(
+    panel: NSRect,
+    origin: NSPoint,
+    insets: crate::theme::PanelInsets,
+) -> NSRect {
+    NSRect::new(
+        NSPoint::new(
+            origin.x - insets.left,
+            origin.y - insets.bottom,
+        ),
+        NSSize::new(
+            panel.size.width + insets.left + insets.right,
+            panel.size.height + insets.top + insets.bottom,
+        ),
+    )
+}
+
+/// The chip's size the surface behind it needs, for a caller that has to size a host window around it.
+pub(crate) fn panel_insets_for(options: BackdropOptions) -> crate::theme::PanelInsets {
+    match effective_elevation(options.elevation) {
+        Some(level) => crate::theme::elevation_insets(level),
+        None => crate::theme::PanelInsets {
+            top: 0.0,
+            right: 0.0,
+            bottom: 0.0,
+            left: 0.0,
+        },
+    }
 }
 
 /// Enlarge a freshly created panel window by its shadow padding. The window was created at the panel

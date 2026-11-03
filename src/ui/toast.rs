@@ -79,17 +79,27 @@ const TOAST_ROW_CHROME: f64 =
 const TOAST_MAX_WIDTH: f64 = 560.0;
 /// Distance kept from the screen's visible bottom edge.
 const TOAST_BOTTOM_MARGIN: f64 = 48.0;
+/// The slide's distance and timing, from the reference this surface follows (appica.dev's toast): the element
+/// enters from `translateY(150%)` and leaves the same way, over `transform 0.5s cubic-bezier(0.22, 1, 0.36, 1)`
+/// with `opacity 0.5s`. 150% of a 44pt chip is 66pt, so it rises from about a chip's height below its resting place.
+const TOAST_SLIDE_RATIO: f64 = 1.5;
+const TOAST_SLIDE_SECONDS: f64 = 0.5;
+/// The reference's easing control points, as (x1, y1, x2, y2) for `CAMediaTimingFunction`.
+const TOAST_SLIDE_EASING: (f64, f64, f64, f64) = (0.22, 1.0, 0.36, 1.0);
+
 /// How long a FINISHED message stays. A message still working has no deadline, and the ✕ answers before it.
 ///
-/// Five seconds rather than the 2.5s this surface shipped with: it now carries a sentence the user may want to
-/// read ("已拷贝路径") and a dismiss button, and a chip that leaves while a hand reaches for that button reads as
-/// broken. The reference's own preview keeps its toast up until it is dismissed.
-const TOAST_VISIBLE: Duration = Duration::from_millis(5000);
+/// Two seconds: long enough to read the sentence and reach the ✕, short enough not to linger. The reference's own
+/// preview keeps its toast up until it is dismissed; this surface resolves on a timer because a copied path or digest
+/// has nothing to click.
+const TOAST_VISIBLE: Duration = Duration::from_millis(2000);
 
 struct State {
     /// Which bubble this is (see `SLOTS`); the close button carries it in its tag.
     slot: usize,
     panel: *mut AnyObject,
+    /// The fixed host view the carrier moves inside; kept so the window's content is never rebound.
+    host: *mut AnyObject,
     label: *mut AnyObject,
     /// The emerald status badge (a circle and its tick), kept so a redraw can recolour it.
     badge: *mut AnyObject,
@@ -100,6 +110,9 @@ struct State {
     backdrop: Option<crate::glass::InstalledBackdrop>,
     /// The lit inner bevel; kept so the view is not dropped while its parent still shows it.
     bevel: Option<crate::ffi::ObjPtr>,
+    /// Which message this bubble is showing. Bumped by every presentation, so a completion handler from an older
+    /// dismissal can tell it is stale.
+    generation: u64,
     /// The pending auto-dismiss, cleared whenever the text changes or the panel is hidden.
     timer: *mut AnyObject,
 }
@@ -109,12 +122,14 @@ impl Default for State {
         Self {
             slot: 0,
             panel: std::ptr::null_mut(),
+            host: std::ptr::null_mut(),
             label: std::ptr::null_mut(),
             badge: std::ptr::null_mut(),
             close: std::ptr::null_mut(),
             close_tracked: false,
             backdrop: None,
             bevel: None,
+            generation: 0,
             timer: std::ptr::null_mut(),
         }
     }
@@ -176,6 +191,13 @@ unsafe fn show_in(
         // is restored right after it, so a theme change cannot turn the white chip into a dark one.
         crate::glass::paint_opaque_surface(&backdrop, toast_fill_hex());
     }
+    // A message that arrives while the chip is already up REPLACES the one on screen in the same chip: the computing
+    // chip becomes the result without an exit and a second entrance, and the deadline restarts here, so the time the
+    // user reads is measured from the state they are looking at.
+    let already_up = {
+        let visible: bool = unsafe { msg_send![state.panel, isVisible] };
+        visible
+    };
     let text_ns = make_nsstring(text);
     let _: () = msg_send![state.label, setStringValue: text_ns];
     release_obj(text_ns);
@@ -183,14 +205,49 @@ unsafe fn show_in(
     // a field lays the line out with its cell's metrics, which run a few points wider. Sizing from the font alone
     // cut the last glyph of a message that was, by that measure, exactly the right width.
     let width = unsafe { toast_width_for_field(state.label, text) };
-    place(state.panel, width, row_offset, state.bevel);
-    layout_row(state, width);
+    // A new message. Any dismissal still animating belongs to the previous one and must not act on this one.
+    state.generation = state.generation.wrapping_add(1);
     ensure_close_tracking(state);
     // The close view paints itself; a fresh presentation starts it at rest and marks it dirty.
     let _: () = msg_send![state.close, setNeedsDisplay: true];
-    let _: () = msg_send![state.panel, setAlphaValue: 0.0f64];
+    place(state.panel, width, row_offset, state.bevel);
+    layout_row(state, width);
+    // A message replacing one that is already up has already arrived: it is re-laid out and re-timed, and nothing
+    // animates. Only the first message of a showing enters from below.
+    if already_up {
+        cancel_timer(state);
+        // A replacement that lands while the entrance is still running settles the chip at its resting frame first (the
+        // new width moved it); `animate` would be ignored mid-flight, so this is a plain set and the entrance's own
+        // animation is left to finish or to be replaced by the next presentation.
+        // A replacement that lands while the entrance is still running settles the chip at its resting frame first (the
+        // new width moved it); an animated set would be ignored mid-flight, so this is a plain one and the entrance's
+        // own animation is left to finish or to be replaced by the next presentation.
+        let resting = carrier_resting(state);
+        if let Some(carrier) = state.backdrop.and_then(|backdrop| backdrop.root) {
+            let current: NSRect = msg_send![carrier.0, frame];
+            let _: () = msg_send![carrier.0, setFrame: NSRect::new(resting.origin, current.size)];
+            let _: () = msg_send![carrier.0, setAlphaValue: 1.0f64];
+        }
+        if let Some(delay) = dismiss_after {
+            schedule_dismiss(state, delay);
+        }
+        return true;
+    }
+    // The carrier is the chip -- material, outline, shadow and row. It starts one slide below its resting place, set
+    // with no animation in this same turn so no frame of a stationary chip is ever shown, and one animation carries it
+    // up while the window (and its opacity) never move.
+    let resting = carrier_resting(state);
+    // Both restored with plain setters before the window is shown: a previous exit may have left the window at 0.
+    let _: () = msg_send![state.panel, setAlphaValue: 1.0f64];
+    if let Some(root) = state.backdrop.and_then(|backdrop| backdrop.root) {
+        let _: () = msg_send![root.0, setAlphaValue: 1.0f64];
+    }
+    set_carrier_slide(state, 1.0);
+    if let Some(root) = state.backdrop.and_then(|backdrop| backdrop.root) {
+        let _: () = msg_send![root.0, setAlphaValue: 0.0f64];
+    }
     let _: () = msg_send![state.panel, orderFrontRegardless];
-    fade(state.panel, 1.0);
+    slide_carrier(state, resting, 0.0, 1.0);
     cancel_timer(state);
     if let Some(delay) = dismiss_after {
         schedule_dismiss(state, delay);
@@ -200,6 +257,9 @@ unsafe fn show_in(
 
 unsafe fn hide_in(state: &mut State) {
     cancel_timer(state);
+    // A dismissal -- by the ✕ or by the timer -- ends the presentation that was animating in: bumping the generation
+    // makes that entrance's completion a no-op, so it cannot restore the chip after the exit has started.
+    state.generation = state.generation.wrapping_add(1);
     // A panel that is ordered out never delivers `mouseExited:`, so the resting style is restated here; otherwise the
     // next showing would open with a red wash under a pointer that is nowhere near it.
     if !state.close.is_null() {
@@ -208,42 +268,55 @@ unsafe fn hide_in(state: &mut State) {
     if state.panel.is_null() {
         return;
     }
-    // Fading out and then ordering out, unless the system asks for less motion, in which case the
-    // panel goes at once -- a message nobody asked to see must not animate on its way out.
+    let panel = state.panel;
+    // The reference's exit: the chip leaves exactly the way it arrived -- from its resting place down one slide
+    // (translateY(150%)) while its opacity goes to 0 -- and is ordered out only when that motion has finished.
+    //
+    // ONE animated property carries the whole chip: the carrier's position. Its opacity and the window's move together
+    // in the same grouping, so the white surface, its outline, its shadow and the row fade as one thing; the first
+    // version faded the window while the material kept reasserting its own fill, which is why the surface and the
+    // text vanished in two separate steps. Reduce Motion still orders out at once, with no travel.
     if crate::theme::reduce_motion_enabled() {
-        let _: () = msg_send![state.panel, orderOut: std::ptr::null_mut::<AnyObject>()];
+        let _: () = msg_send![panel, orderOut: std::ptr::null_mut::<AnyObject>()];
         return;
     }
-    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    if context.is_null() {
-        let _: () = msg_send![state.panel, orderOut: std::ptr::null_mut::<AnyObject>()];
-        return;
-    }
+    let generation = state.generation;
+    let resting = carrier_resting(state);
     let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
     let group: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![group, setDuration: theme::ANIMATION_DURATION_FAST];
-    let animator: *mut AnyObject = msg_send![state.panel, animator];
-    let _: () = msg_send![animator, setAlphaValue: 0.0f64];
-    let panel = state.panel;
+    let _: () = msg_send![group, setDuration: TOAST_SLIDE_SECONDS];
+    if let Some(easing) = timing_function(TOAST_SLIDE_EASING) {
+        let _: () = msg_send![group, setTimingFunction: easing];
+    }
+    // Registered BEFORE the animated setters: a completion handler is grouped with the animations that follow it, and
+    // one registered after them can fire first. That ordering is the whole point of setting it here.
     let completion: block2::RcBlock<dyn Fn()> = block2::RcBlock::new(move || {
-        crate::callback_guard::void("toast_hide", || unsafe {
-            let _: () = msg_send![panel, orderOut: std::ptr::null_mut::<AnyObject>()];
+        crate::callback_guard::void("toast_hide", || {
+            if current_generation() != Some(generation) {
+                return;
+            }
+            unsafe {
+                // Both the window's and the carrier's opacity are restored by `show_in` on the next presentation, which
+                // is where they are needed and where a stale value cannot matter.
+                let _: () = msg_send![panel, orderOut: std::ptr::null_mut::<AnyObject>()];
+            }
         });
     });
     let _: () = msg_send![group, setCompletionHandler: &*completion];
-    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
-}
-
-unsafe fn fade(panel: *mut AnyObject, alpha: f64) {
-    if crate::theme::reduce_motion_enabled() {
-        let _: () = msg_send![panel, setAlphaValue: alpha];
-        return;
+    if let Some(root) = state.backdrop.and_then(|backdrop| backdrop.root) {
+        // From the resting frame, not from wherever an interrupted entrance had left it: the presentation that frame
+        // belonged to is over, and an exit measured from a partial frame is an exit of the wrong length.
+        let target = NSPoint::new(
+            resting.origin.x,
+            resting.origin.y - TOAST_HEIGHT * TOAST_SLIDE_RATIO,
+        );
+        // The carrier is the one view that contains everything the chip is: moving it and fading it are one layer
+        // subtree's two properties, animated together, so the surface, its edge, its shadow and the row cannot come
+        // apart. The WINDOW's opacity is left alone -- it was the outer fade that made the chip look two-stage.
+        let carrier_animator: *mut AnyObject = msg_send![root.0, animator];
+        let _: () = msg_send![carrier_animator, setFrameOrigin: target];
+        let _: () = msg_send![carrier_animator, setAlphaValue: 0.0f64];
     }
-    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-    let group: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![group, setDuration: theme::ANIMATION_DURATION_FAST];
-    let animator: *mut AnyObject = msg_send![panel, animator];
-    let _: () = msg_send![animator, setAlphaValue: alpha];
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 }
 
@@ -283,7 +356,18 @@ extern "C" {
 }
 
 unsafe fn build(state: &mut State) -> bool {
-    let local = toast_rect(TOAST_MIN_WIDTH);
+    // The design: a fixed, transparent HOST window, and the backdrop's carrier as one child view inside it. The chip is
+    // the carrier's material; the room the slide needs is the host's, so moving the chip moves material, outline and
+    // shadow together and never moves a window.
+    let insets = crate::glass::panel_insets_for(toast_backdrop_options());
+    let chip = toast_rect(TOAST_MIN_WIDTH);
+    let carrier = crate::glass::holder_frame(chip, NSPoint::new(0.0, 0.0), insets);
+    let host_size = NSSize::new(
+        carrier.size.width,
+        // The resting chip plus the room it travels down through, and the elevation's padding beyond that.
+        carrier.size.height + TOAST_HEIGHT * TOAST_SLIDE_RATIO,
+    );
+    let local = NSRect::new(NSPoint::new(0.0, 0.0), host_size);
     let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
@@ -296,8 +380,6 @@ unsafe fn build(state: &mut State) -> bool {
         return false;
     }
     let _: () = msg_send![panel, setReleasedWhenClosed: false];
-    // The vibrant appearance decides what a dynamic ink resolves to, and the material's rim is drawn
-    // from it. The keystroke display sets it before any content exists for the same reason.
     let appearance_name = make_nsstring(crate::glass::vibrant_appearance_name(
         theme::resolved_is_dark(),
     ));
@@ -307,38 +389,40 @@ unsafe fn build(state: &mut State) -> bool {
     if !appearance.is_null() {
         let _: () = msg_send![panel, setAppearance: appearance];
     }
-    // Floating level, so the message sits above ordinary windows like the other panels do.
     let _: () = msg_send![panel, setLevel: 3isize];
-    // The ✕ has to be clickable, so the window takes the mouse. It is still a NON-activating panel: a click
-    // dismisses the message and never raises this app over the one the user is working in.
     let _: () = msg_send![panel, setIgnoresMouseEvents: false];
     let _: () = msg_send![panel, setHidesOnDeactivate: false];
     let _: () = msg_send![panel, setCollectionBehavior: ((1u64 << 0) | (1u64 << 6) | (1u64 << 8))];
-    // The window itself is transparent: the material, its rounded corner and its shadow all come
-    // from the shared backdrop, exactly as they do for the switcher and the keystroke display.
     let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
     let _: () = msg_send![panel, setBackgroundColor: clear];
     let _: () = msg_send![panel, setOpaque: false];
-    // The panel draws its own shadow: install_backdrop wraps the material in a shadow carrier with
-    // a rounded path. Leaving AppKit's window shadow on as well stacks a second silhouette derived
-    // from the opaque region, which on a transparent window extends well past the rounded corner and
-    // showed as a speckled halo around the whole panel. The keystroke display disables it the same way.
     let _: () = msg_send![panel, setHasShadow: false];
 
-    let backdrop =
-        crate::glass::install_backdrop(panel, local, TOAST_RADIUS, toast_backdrop_options());
+    // The host: a plain view the window shows, holding nothing but the carrier. Everything the chip is, the carrier
+    // is; the host is only the frame the motion happens in.
+    let host: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let host: *mut AnyObject = msg_send![host, initWithFrame: local];
+    let _: () = msg_send![host, setWantsLayer: true];
+    let _: () = msg_send![panel, setContentView: host];
+    release_obj(host);
 
-    // A row centred in the panel, built in the order the reference lays it out: the status badge, the message,
-    // and the close glyph on the trailing edge. The text's field is exactly one line tall because NSTextField
-    // draws from the TOP of its frame; giving it the full panel height put the glyphs at the top.
-    // The edge is the app's own, not a stroke of this surface's: the shared 1pt palette outline that
-    // `install_backdrop` puts on every opaque surface, and the clipboard bevel inside it -- a 0.5pt dark outer
-    // ring with a lit inner one, the same pair the clear-glass panel wears.
+    // The carrier sits on the host's BOTTOM edge: at rest the chip's bottom is the window's bottom, and the reserved
+    // slide room is above it, which keeps the resting chip where the bottom margin of the screen says it is.
+    let carrier_origin = NSPoint::new(insets.left, insets.bottom);
+    let backdrop = crate::glass::install_hosted_backdrop(
+        host,
+        carrier_origin,
+        chip,
+        TOAST_RADIUS,
+        toast_backdrop_options(),
+    );
+    // One surface: the material is the white chip, its outline and the clipboard bevel its edge. The row draws no
+    // background of its own -- a second fill is what showed as a box inside a box.
     let bevel = crate::glass::install_panel_bevel(&backdrop, TOAST_RADIUS);
 
     let content: *mut AnyObject = backdrop.content_parent;
+    // The row is laid out in the MATERIAL's coordinates, whose origin is the chip's.
     let row_mid = TOAST_HEIGHT / 2.0;
-
     let badge = build_badge(
         content,
         NSRect::new(
@@ -346,10 +430,7 @@ unsafe fn build(state: &mut State) -> bool {
             NSSize::new(TOAST_BADGE_SIZE, TOAST_BADGE_SIZE),
         ),
     );
-
     let text_x = TOAST_PADDING_X + TOAST_BADGE_SIZE + TOAST_GAP;
-    // The message takes everything between the badge and the close glyph; \`layout_row\` sets that width on every
-    // presentation, because the panel is resized to the message.
     let label = build_message(
         content,
         NSRect::new(
@@ -360,16 +441,14 @@ unsafe fn build(state: &mut State) -> bool {
             ),
         ),
     );
-
     let close = build_close_glyph(content, state.slot);
 
-    // A surface that could not be made opaque is not this surface: say so instead of showing it, because a
-    // translucent bubble over a dark desktop is exactly the state this look exists to rule out.
     if backdrop.material != crate::glass::PanelMaterial::Opaque {
         release_obj(panel);
         return false;
     }
     state.panel = panel;
+    state.host = host;
     state.label = label;
     state.badge = badge;
     state.close = close;
@@ -709,12 +788,15 @@ unsafe fn build_close_glyph(content: *mut AnyObject, _slot: usize) -> *mut AnyOb
     close
 }
 
-/// A bubble that is `width` wide, at the bottom-left of its window.
+/// The gap between two bubbles standing side by side.
+const TOAST_ROW_GAP: f64 = 16.0;
+
+/// The chip's own rect for a `width`-wide bubble: the panel the user sees, without the window's slide room.
 fn toast_rect(width: f64) -> NSRect {
     NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, TOAST_HEIGHT))
 }
 
-/// The width a bubble takes for a text line `measured` wide: the icon, the gap, the text, and the
+/// The width a bubble takes for a text line `measured` wide/// The width a bubble takes for a text line `measured` wide: the icon, the gap, the text, and the
 /// padding on both sides -- floored at TOAST_MIN_WIDTH and capped at TOAST_MAX_WIDTH.
 ///
 /// Pure so the rule is asserted without AppKit. A measurement of zero or less (an empty string, or a
@@ -756,30 +838,40 @@ fn toast_row_offset(position: usize, left_width: f64) -> f64 {
     }
 }
 
-/// The gap between two bubbles standing side by side.
-const TOAST_ROW_GAP: f64 = 16.0;
-
 unsafe fn place(
     panel: *mut AnyObject,
     width: f64,
     row_offset: f64,
     bevel: Option<crate::ffi::ObjPtr>,
-) {
+) -> NSRect {
     // `visibleFrame`, not `frame`: the visible area already excludes the menu bar and the Dock.
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     if screen.is_null() {
-        return;
+        return NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
     }
     // `place` carries the width rather than reading it back from `TOAST`: it is called from `show_in`,
     // which already holds the thread-local mutably, and a second `borrow()` there panics.
     let visible: NSRect = msg_send![screen, visibleFrame];
     let origin = toast_origin(visible, width, row_offset);
-    // The window is larger than the panel by its shadow padding, so the requested panel rect is
-    // converted through the insets rather than assigned to the window frame directly.
-    let panel_rect = toast_rect(width);
-    let panel_rect = NSRect::new(origin, panel_rect.size);
-    let insets = crate::glass::panel_insets_of(panel);
-    let frame = theme::window_frame_for_panel(panel_rect, insets);
+    // The host window is the carrier, whose width follows the message, plus the room the chip travels down through.
+    // The chip's resting rect is `origin`; the carrier extends beyond it by the elevation's padding, and the host
+    // beyond the carrier by the slide room.
+    let insets = crate::glass::panel_insets_for(toast_backdrop_options());
+    let carrier = crate::glass::holder_frame(
+        NSRect::new(origin, NSSize::new(width, TOAST_HEIGHT)),
+        NSPoint::new(0.0, 0.0),
+        insets,
+    );
+    // The chip's resting bottom IS the screen's bottom margin (`toast_origin`), so the window cannot hang below it:
+    // AppKit clamps a window into the screen on order-in. The reserved room therefore goes ABOVE the carrier -- the
+    // chip starts one slide BELOW its resting place and travels UP, and the window needs that room at the top.
+    let frame = NSRect::new(
+        NSPoint::new(origin.x - insets.left, origin.y - insets.bottom),
+        NSSize::new(
+            carrier.size.width,
+            carrier.size.height + TOAST_HEIGHT * TOAST_SLIDE_RATIO,
+        ),
+    );
     let _: () = msg_send![panel, setFrame: frame, display: false];
     // setFrame does not synchronously re-lay-out the content. The shadow carrier derives its rounded
     // path from its own laid-out bounds, so without this pass the shadow is drawn for the unpadded
@@ -793,9 +885,104 @@ unsafe fn place(
     if let Some(bevel) = bevel {
         let _: () = msg_send![bevel.0, setNeedsDisplay: true];
     }
+    frame
 }
 
-/// Lay the row out for a panel `width` wide: the badge on the leading edge, the close glyph on the trailing
+/// `+[CAMediaTimingFunction functionWithControlPoints::::]`, through a typed call so the four-part selector is
+/// written once, as text. Returns null where the class or method is missing, in which case the slide keeps AppKit's
+/// default easing rather than not animating at all.
+unsafe fn timing_function(points: (f64, f64, f64, f64)) -> Option<*mut AnyObject> {
+    let class = objc2::runtime::AnyClass::get(c"CAMediaTimingFunction")?;
+    let sel = sel!(functionWithControlPoints::::);
+    let method = class.class_method(sel)?;
+    let function: unsafe extern "C-unwind" fn(
+        *mut AnyObject,
+        Sel,
+        f32,
+        f32,
+        f32,
+        f32,
+    ) -> *mut AnyObject = std::mem::transmute(method.implementation());
+    let object = function(
+        class as *const objc2::runtime::AnyClass as *mut AnyObject,
+        sel,
+        points.0 as f32,
+        points.1 as f32,
+        points.2 as f32,
+        points.3 as f32,
+    );
+    (!object.is_null()).then_some(object)
+}
+
+/// The generation of the bubble in slot 0, or `None` when it has not been built. A completion handler compares
+/// against this rather than capturing the panel: the panel is reused, the generation is not.
+fn current_generation() -> Option<u64> {
+    SLOTS.with(|slots| slots.borrow().first().map(|state| state.generation))
+}
+
+/// The carrier's resting frame inside the host: where `build` put it, and where every presentation returns it.
+unsafe fn carrier_resting(state: &State) -> NSRect {
+    let Some(root) = state.backdrop.and_then(|backdrop| backdrop.root) else {
+        return NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(0.0, 0.0));
+    };
+    let current: NSRect = msg_send![root.0, frame];
+    let resting_y = resting_carrier_y(state);
+    NSRect::new(NSPoint::new(current.origin.x, resting_y), current.size)
+}
+
+/// The carrier's y at rest: the host's bottom padding plus the room the slide travels through.
+unsafe fn resting_carrier_y(_state: &State) -> f64 {
+    // The carrier sits on the host's bottom edge -- the chip's padding at rest -- and the slide room is above it.
+    let insets = crate::glass::panel_insets_for(toast_backdrop_options());
+    insets.bottom
+}
+
+/// Put the carrier at `fraction` of a slide below its resting place, with no animation: the entrance's start.
+unsafe fn set_carrier_slide(state: &State, fraction: f64) {
+    let Some(root) = state.backdrop.and_then(|backdrop| backdrop.root) else {
+        return;
+    };
+    let resting = carrier_resting(state);
+    let _: () = msg_send![root.0, setFrameOrigin: NSPoint::new(
+        resting.origin.x,
+        resting.origin.y - TOAST_HEIGHT * TOAST_SLIDE_RATIO * fraction
+    )];
+}
+
+/// The reference's motion, applied to the carrier inside a window that never moves: the chip (material, outline, row
+/// and shadow together) travels from `fraction` of a slide below its resting place to its resting place, while the
+/// panel's opacity goes to `alpha`, over `TOAST_SLIDE_SECONDS` on the reference's curve.
+unsafe fn slide_carrier(state: &State, resting: NSRect, fraction: f64, alpha: f64) {
+    let Some(root) = state.backdrop.and_then(|backdrop| backdrop.root) else {
+        return;
+    };
+    let target_origin = NSPoint::new(
+        resting.origin.x,
+        resting.origin.y - TOAST_HEIGHT * TOAST_SLIDE_RATIO * fraction,
+    );
+    if crate::theme::reduce_motion_enabled() {
+        let _: () = msg_send![root.0, setFrameOrigin: target_origin];
+        let _: () = msg_send![root.0, setAlphaValue: alpha];
+        return;
+    }
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let group: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![group, setDuration: TOAST_SLIDE_SECONDS];
+    if let Some(easing) = timing_function(TOAST_SLIDE_EASING) {
+        let _: () = msg_send![group, setTimingFunction: easing];
+    }
+    // Both properties on the SAME view, in one grouping: the carrier moves and fades as one layer subtree, so the
+    // material, its outline, its shadow and the row share exactly one alpha and one position.
+    let animator: *mut AnyObject = msg_send![root.0, animator];
+    let _: () = msg_send![animator, setFrameOrigin: target_origin];
+    let _: () = msg_send![animator, setAlphaValue: alpha];
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+    let now: NSRect = msg_send![root.0, frame];
+    let alpha_now: f64 = msg_send![state.panel, alphaValue];
+    crate::log_info!("[toast-anim] target={target_origin:?} model_now={now:?} alpha={alpha_now}");
+}
+
+/// Lay the row out for a panel `width` wide/// Lay the row out for a panel `width` wide: the badge on the leading edge, the close glyph on the trailing
 /// edge, and the message taking everything between them. Called on every presentation, because the width
 /// follows the message.
 ///
@@ -803,6 +990,7 @@ unsafe fn place(
 /// field's frame -- so the frame is set, the cell is told the text fits its frame, and the same frame is set
 /// again. Without the second step the label truncated a 98.5pt message inside a 98.5pt frame.
 unsafe fn layout_row(state: &State, width: f64) {
+    // The row is laid out in the container's coordinates, whose origin is the chip's own origin.
     let row_mid = TOAST_HEIGHT / 2.0;
     let _: () = msg_send![state.badge, setFrame: NSRect::new(
         NSPoint::new(TOAST_PADDING_X, row_mid - TOAST_BADGE_SIZE / 2.0),
@@ -890,12 +1078,14 @@ unsafe extern "C" fn dismiss_toast(_this: *mut AnyObject, _cmd: Sel, _timer: *mu
 ///
 /// A timer rather than a direct call: `run()` reaches its launch switches before `NSApplication run`,
 /// and a panel ordered front with no run loop never draws.
-pub(crate) fn schedule_preview(bubbles: Vec<String>) {
+/// The preview `delay` seconds from now. `--toast-preview=<delay>` reaches this, so an entrance can be watched
+/// after the launch has settled instead of during it.
+pub(crate) fn schedule_preview_at(bubbles: Vec<String>, delay: f64) {
     PREVIEW_TEXT.lock().unwrap().replace(bubbles);
     unsafe {
         let _: *mut AnyObject = msg_send![
             class!(NSTimer),
-            scheduledTimerWithTimeInterval: 1.0f64,
+            scheduledTimerWithTimeInterval: delay,
             target: preview_target(),
             selector: sel!(fireToastPreview:),
             userInfo: std::ptr::null::<AnyObject>(),
