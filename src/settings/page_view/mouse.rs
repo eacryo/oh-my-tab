@@ -574,3 +574,102 @@ unsafe fn draw_mapping_block(canvas: &mut PageCanvas, ui: &mut SettingsUi, targe
     ui.mapping_scroll = std::ptr::null_mut();
     ui.mapping_doc = card_bg;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input() -> PageInput {
+        PageInput::from_config(Config::default(), None, crate::theme::ThemeInput::current())
+    }
+
+    /// The Mouse page is five described rows plus six page-drawn ones: the description carries the
+    /// rows whose value is an exact resolved boolean, and the hooks carry the rows whose value is
+    /// device-resolved or fractional (a described slider's update is written with setIntegerValue).
+    #[test]
+    fn the_page_describes_the_boolean_rows_and_declares_the_device_rows_in_place() {
+        let view = mouse_page_view(&input());
+        assert_eq!(view.page, SettingsPageId::Mouse);
+        let described: Vec<&str> = view.rows.iter().map(|row| row.label_key).collect();
+        assert_eq!(
+            described,
+            vec![
+                "settings.row_enable_mouse",
+                "settings.row_reverse_scroll",
+                "settings.row_disable_pointer_accel",
+                "settings.row_mapping_enable",
+            ],
+            "the described rows are the ones whose value is a plain resolved boolean"
+        );
+        let drawn: Vec<&str> = view.extra_rows.iter().map(|row| row.key).collect();
+        assert_eq!(
+            drawn,
+            vec![
+                MOUSE_DEVICE_ROW,
+                MOUSE_SCROLL_MODE_ROW,
+                MOUSE_LINE_COUNT_ROW,
+                MOUSE_SMOOTH_PRESET_ROW,
+                MOUSE_SMOOTH_SLIDERS_ROW,
+                MOUSE_TRACKING_SPEED_ROW,
+            ],
+            "the page-drawn rows keep their document order"
+        );
+        // Every described row carries a field identity, and the identities are unique.
+        let mut seen = Vec::new();
+        for row in &view.rows {
+            let field = row.field().expect("a described Mouse row edits a field");
+            assert!(!seen.contains(&field), "{field:?} appears twice");
+            seen.push(field);
+        }
+        assert!(description_identity_conflict(&view).is_ok());
+    }
+
+    /// The described rows read the resolved per-device view, not raw config: the values are the
+    /// device's effective ones, which is what the page has always shown.
+    #[test]
+    fn the_described_rows_read_the_resolved_device_view() {
+        let mut config = Config::default();
+        config.mouse.enabled = !config.mouse.enabled;
+        let view = mouse_page_view(&PageInput::from_config(
+            config.clone(),
+            None,
+            crate::theme::ThemeInput::current(),
+        ));
+        let enabled = match view.rows[0].value.clone() {
+            Value::Switch(on) => on,
+            other => panic!("the master switch is a switch, not {other:?}"),
+        };
+        assert_eq!(enabled, config.mouse.enabled);
+    }
+
+    /// A field change must reach the described rows through the same update description the refill
+    /// uses, or an open page keeps showing the old state after a reload.
+    #[test]
+    fn a_field_change_reaches_the_described_rows() {
+        let mut config = Config::default();
+        config.mouse.enabled = !config.mouse.enabled;
+        let input =
+            PageInput::from_config(config.clone(), None, crate::theme::ThemeInput::current());
+        let updates = page_update_description(&input, &[SettingsPageId::Mouse]);
+        let enabled = updates
+            .iter()
+            .find(|update| update.field == ControlField::MouseEnabled)
+            .expect("the master switch is refilled");
+        assert_eq!(
+            enabled.value,
+            if config.mouse.enabled { "on" } else { "off" }
+        );
+    }
+
+    /// The measured device row states its height through the layout input, so the renderer advances
+    /// by the same number the layout reserved.
+    #[test]
+    fn the_device_row_measures_its_own_height() {
+        let measured = device_row_height(&input(), 600.0);
+        assert!(measured > 0.0, "the device row is at least one row tall");
+        assert!(
+            measured >= SettingsSelect::metrics().row_h,
+            "it never shrinks below the select's own row height"
+        );
+    }
+}
