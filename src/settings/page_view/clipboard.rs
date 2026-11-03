@@ -185,123 +185,6 @@ pub(super) fn clipboard_page_view(input: &PageInput) -> PageView {
     );
     w.finish()
 }
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn input() -> PageInput {
-        PageInput::from_config(
-            crate::config::Config::default(),
-            None,
-            crate::theme::ThemeInput::current(),
-        )
-    }
-
-    #[test]
-    fn clipboard_page_view_describes_every_static_row_with_its_identity() {
-        let view = clipboard_page_view(&input());
-        assert_eq!(view.page, SettingsPageId::Clipboard);
-        let fields: Vec<ControlField> = view.rows.iter().filter_map(|row| row.field()).collect();
-        assert_eq!(
-            fields,
-            vec![
-                ControlField::ClipboardEnabled,
-                ControlField::ClipboardPaused,
-                ControlField::ClipboardPinFollow,
-                ControlField::ClipboardPickerPlacement,
-                ControlField::ClipboardClearOnQuit,
-                ControlField::ClipboardSeparateClearAll,
-                ControlField::ClipboardShowSourceApp,
-                ControlField::ClipboardMoveUsedToTop,
-                ControlField::ClipboardDeleteAfterPaste,
-                ControlField::ClipboardClearSystemPasteboardAfterPaste,
-                ControlField::ClipboardAutoExpireDays,
-                ControlField::ClipboardImageRows,
-            ]
-        );
-        // The switches that carry a drawn caption (the feature warning and the destructive gesture
-        // hint), and the one that is a plain switch.
-        assert_eq!(view.rows[0].copy, RowCopy::Captioned);
-        assert_eq!(view.rows[1].copy, RowCopy::Captioned);
-        assert_eq!(view.rows[8].copy, RowCopy::Captioned);
-        assert_eq!(view.rows[2].copy, RowCopy::Plain);
-        // The numeric entry limit is page-built: it is not a described row at all.
-        let ids: Vec<&str> = view.rows.iter().map(|row| row.label_key).collect();
-        assert!(!ids.contains(&"settings.row_clipboard_max_entries"));
-        // The clear-system-pasteboard row is the child of "delete after paste".
-        assert_eq!(
-            view.rows[9].group,
-            Some(RowGroup::ClipboardDeleteChild),
-            "the clear-pasteboard row is the child of delete-after-paste"
-        );
-        // The action rows carry action identities, never a field.
-        let actions: Vec<&str> = view
-            .rows
-            .iter()
-            .filter_map(|row| match row.id {
-                ControlId::Action(action) => Some(action),
-                ControlId::Field(_) => None,
-            })
-            .collect();
-        assert_eq!(actions, vec!["restore_excluded"]);
-        // The cards are the page's own, in order.
-        assert_eq!(view.rows[0].section, "settings.header_clipboard");
-        assert_eq!(view.rows[2].section, "settings.header_clipboard_options");
-        assert_eq!(
-            view.rows.last().unwrap().section,
-            "settings.header_clipboard_excluded"
-        );
-    }
-
-    #[test]
-    fn clipboard_values_come_from_the_config() {
-        let mut config = crate::config::Config::default();
-        config.clipboard.paused = true;
-        config.clipboard.max_entries = 37;
-        config.clipboard.auto_expire_days = 5;
-        config.clipboard.pin_follow_selection = false;
-        let input = PageInput::from_config(config, None, crate::theme::ThemeInput::current());
-        let view = clipboard_page_view(&input);
-        let value = |field: ControlField| {
-            view.rows
-                .iter()
-                .find(|row| row.field() == Some(field))
-                .map(|row| row.value.clone())
-                .expect("the field's row")
-        };
-        assert_eq!(value(ControlField::ClipboardPaused), Value::Switch(true));
-        // The numeric entry limit is not in the description: the page builds it.
-        assert!(view
-            .rows
-            .iter()
-            .all(|row| row.field() != Some(ControlField::ClipboardMaxEntries)));
-        // The auto-expire readout is the value itself (days, not a stop index).
-        assert_eq!(
-            value(ControlField::ClipboardAutoExpireDays),
-            Value::Slider(5)
-        );
-        // "Keep current position" is the second item, i.e. index 1.
-        assert_eq!(value(ControlField::ClipboardPinFollow), Value::Index(1));
-    }
-
-    #[test]
-    fn every_clipboard_row_has_a_search_entry() {
-        let _guard = crate::settings::sidebar::lock_search_index_for_test();
-        let view = clipboard_page_view(&input());
-        for row in &view.rows {
-            assert!(
-                !row.search.label.is_empty(),
-                "{} has no search label",
-                row.label_key
-            );
-            assert!(
-                !row.search.section.is_empty(),
-                "{} has no section",
-                row.label_key
-            );
-        }
-    }
-}
 
 /// The page hooks that draw Clipboard's own rows: the shortcut recorder (a button with a capture
 /// state machine and an inline error label) and the numeric entry limit (a text field).
@@ -645,4 +528,122 @@ unsafe fn draw_excluded_card(canvas: &mut PageCanvas, ui: &mut SettingsUi, targe
 
     canvas.card(&t("settings.header_clipboard_excluded"));
     set_settings_search_section(&t("settings.header_clipboard_excluded"));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn input() -> PageInput {
+        PageInput::from_config(
+            crate::config::Config::default(),
+            None,
+            crate::theme::ThemeInput::current(),
+        )
+    }
+
+    #[test]
+    fn clipboard_page_view_describes_every_static_row_with_its_identity() {
+        let view = clipboard_page_view(&input());
+        assert_eq!(view.page, SettingsPageId::Clipboard);
+        let fields: Vec<ControlField> = view.rows.iter().filter_map(|row| row.field()).collect();
+        assert_eq!(
+            fields,
+            vec![
+                ControlField::ClipboardEnabled,
+                ControlField::ClipboardPaused,
+                ControlField::ClipboardPinFollow,
+                ControlField::ClipboardPickerPlacement,
+                ControlField::ClipboardClearOnQuit,
+                ControlField::ClipboardSeparateClearAll,
+                ControlField::ClipboardShowSourceApp,
+                ControlField::ClipboardMoveUsedToTop,
+                ControlField::ClipboardDeleteAfterPaste,
+                ControlField::ClipboardClearSystemPasteboardAfterPaste,
+                ControlField::ClipboardAutoExpireDays,
+                ControlField::ClipboardImageRows,
+            ]
+        );
+        // The switches that carry a drawn caption (the feature warning and the destructive gesture
+        // hint), and the one that is a plain switch.
+        assert_eq!(view.rows[0].copy, RowCopy::Captioned);
+        assert_eq!(view.rows[1].copy, RowCopy::Captioned);
+        assert_eq!(view.rows[8].copy, RowCopy::Captioned);
+        assert_eq!(view.rows[2].copy, RowCopy::Plain);
+        // The numeric entry limit is page-built: it is not a described row at all.
+        let ids: Vec<&str> = view.rows.iter().map(|row| row.label_key).collect();
+        assert!(!ids.contains(&"settings.row_clipboard_max_entries"));
+        // The clear-system-pasteboard row is the child of "delete after paste".
+        assert_eq!(
+            view.rows[9].group,
+            Some(RowGroup::ClipboardDeleteChild),
+            "the clear-pasteboard row is the child of delete-after-paste"
+        );
+        // The action rows carry action identities, never a field.
+        let actions: Vec<&str> = view
+            .rows
+            .iter()
+            .filter_map(|row| match row.id {
+                ControlId::Action(action) => Some(action),
+                ControlId::Field(_) => None,
+            })
+            .collect();
+        assert_eq!(actions, vec!["restore_excluded"]);
+        // The cards are the page's own, in order.
+        assert_eq!(view.rows[0].section, "settings.header_clipboard");
+        assert_eq!(view.rows[2].section, "settings.header_clipboard_options");
+        assert_eq!(
+            view.rows.last().unwrap().section,
+            "settings.header_clipboard_excluded"
+        );
+    }
+
+    #[test]
+    fn clipboard_values_come_from_the_config() {
+        let mut config = crate::config::Config::default();
+        config.clipboard.paused = true;
+        config.clipboard.max_entries = 37;
+        config.clipboard.auto_expire_days = 5;
+        config.clipboard.pin_follow_selection = false;
+        let input = PageInput::from_config(config, None, crate::theme::ThemeInput::current());
+        let view = clipboard_page_view(&input);
+        let value = |field: ControlField| {
+            view.rows
+                .iter()
+                .find(|row| row.field() == Some(field))
+                .map(|row| row.value.clone())
+                .expect("the field's row")
+        };
+        assert_eq!(value(ControlField::ClipboardPaused), Value::Switch(true));
+        // The numeric entry limit is not in the description: the page builds it.
+        assert!(view
+            .rows
+            .iter()
+            .all(|row| row.field() != Some(ControlField::ClipboardMaxEntries)));
+        // The auto-expire readout is the value itself (days, not a stop index).
+        assert_eq!(
+            value(ControlField::ClipboardAutoExpireDays),
+            Value::Slider(5)
+        );
+        // "Keep current position" is the second item, i.e. index 1.
+        assert_eq!(value(ControlField::ClipboardPinFollow), Value::Index(1));
+    }
+
+    #[test]
+    fn every_clipboard_row_has_a_search_entry() {
+        let _guard = crate::settings::sidebar::lock_search_index_for_test();
+        let view = clipboard_page_view(&input());
+        for row in &view.rows {
+            assert!(
+                !row.search.label.is_empty(),
+                "{} has no search label",
+                row.label_key
+            );
+            assert!(
+                !row.search.section.is_empty(),
+                "{} has no section",
+                row.label_key
+            );
+        }
+    }
 }

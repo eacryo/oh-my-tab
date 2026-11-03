@@ -28,9 +28,7 @@ use std::collections::HashMap;
 
 // The search index is written while a page is BUILT, not while it is described: a page-owned card
 // that is not described at all records its rows through these, exactly as the inline builder did.
-pub(super) use super::page_builder::{
-    begin_settings_search_page, record_settings_search_row, set_settings_search_section,
-};
+pub(super) use super::page_builder::{record_settings_search_row, set_settings_search_section};
 
 // One module per page description, so pages can be written independently: each is pure and returns
 // a `PageView`, and the shared machinery here (layout, rendering, identities, the update
@@ -46,6 +44,9 @@ use about::about_page_view;
 use clipboard::clipboard_page_view;
 pub(super) use clipboard::ClipboardHooks;
 use finder_menu::finder_menu_page_view;
+#[allow(unused_imports)]
+// the Finder Menu page's builder passes it; the page itself is in flight
+pub(super) use finder_menu::FinderMenuHooks;
 use general::general_page_view;
 use keystroke_display::keystroke_display_page_view;
 use switcher::switcher_page_view;
@@ -1039,9 +1040,7 @@ pub(super) fn layout_rows(
             }
         };
         let action_frame = match &row.control {
-            ControlKind::Value {
-                action: Some(action),
-            } => Some(BoxRect::new(
+            ControlKind::Value { action: Some(_) } => Some(BoxRect::new(
                 layout.control_x + layout.control_w - super::components::ROW_ACTION_BTN_W,
                 cursor + (height - super::components::ROW_ACTION_BTN_H) / 2.0,
                 super::components::ROW_ACTION_BTN_W,
