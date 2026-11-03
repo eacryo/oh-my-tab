@@ -4038,6 +4038,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             finder_menu_new_file_switches: Vec::new(),
             finder_menu_terminal_switches: Vec::new(),
             finder_menu_copy_path: std::ptr::null_mut(),
+            finder_menu_copy_sha256: std::ptr::null_mut(),
         };
 
         // The sidebar and detail pane meet directly at the original sidebar boundary; their

@@ -819,6 +819,9 @@ pub struct FinderMenuSection {
     pub layout: String,
     /// Show "Copy Path" for the selected item or the current folder.
     pub copy_path: bool,
+    /// Show "Copy SHA-256". Only reachable for a single regular file: the menu hides the item
+    /// for a folder, a special file, or any other selection.
+    pub copy_sha256: bool,
     /// File extensions offered under "New File", in menu order.
     pub new_file_types: Vec<String>,
     /// Bundle ids of the terminal applications offered under "Open in Terminal", in menu order.
@@ -831,6 +834,7 @@ impl Default for FinderMenuSection {
             enabled: false,
             layout: FINDER_MENU_DEFAULT_LAYOUT.to_string(),
             copy_path: true,
+            copy_sha256: true,
             new_file_types: FINDER_MENU_FILE_TYPES
                 .iter()
                 .map(|extension| extension.to_string())

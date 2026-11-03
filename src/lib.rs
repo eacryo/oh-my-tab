@@ -3425,6 +3425,13 @@ pub fn run() {
         exit_smoke_passed();
     }
 
+    // Development switch: show the toast once at launch so its material, corner and shadow can be
+    // judged without waiting for a Finder click. `--toast-preview` keeps it up with no deadline.
+    if crate::dev_flags::present("toast-preview") {
+        let text = crate::i18n::t("finder_menu.sha256_copied");
+        crate::ui::toast::schedule_preview(text);
+    }
+
     // Start bounded workers for post-activation AX focus queries so notification bursts do not
     // create large numbers of threads.
     start_activation_focus_scheduler();

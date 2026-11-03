@@ -6,7 +6,7 @@
 use crate::config::{Config, FINDER_MENU_FILE_TYPES};
 use crate::finder_menu::terminals::{self, TerminalSpec};
 use crate::i18n::{t, tf};
-use finder_protocol::{Context, MenuAction, MenuModel, MenuNode};
+use finder_protocol::{Context, MenuAction, MenuModel, MenuNode, MenuTarget};
 
 /// Build the model for the current config. An empty list means "show nothing".
 pub(crate) fn build(
@@ -65,6 +65,9 @@ pub(crate) fn build(
             if section.copy_path {
                 items.push(copy_path_item());
             }
+            if section.copy_sha256 {
+                items.push(copy_sha256_item());
+            }
         }
         "submenu" => {
             let mut children = Vec::new();
@@ -86,6 +89,9 @@ pub(crate) fn build(
             }
             if section.copy_path {
                 children.push(copy_path_item());
+            }
+            if section.copy_sha256 {
+                children.push(copy_sha256_item());
             }
             if !children.is_empty() {
                 items.push(MenuNode::submenu(
@@ -117,6 +123,9 @@ pub(crate) fn build(
             if section.copy_path {
                 items.push(copy_path_item());
             }
+            if section.copy_sha256 {
+                items.push(copy_sha256_item());
+            }
         }
     }
 
@@ -140,6 +149,16 @@ fn new_file_label(extension: &str) -> String {
     }
 }
 
+fn copy_sha256_item() -> MenuNode {
+    MenuNode::item_targeting(
+        t("finder_menu.copy_sha256"),
+        Some("number"),
+        MenuAction::CopySha256,
+        &[Context::Items],
+        MenuTarget::SingleRegularFile,
+    )
+}
+
 fn copy_path_item() -> MenuNode {
     MenuNode::item(
         t("finder_menu.copy_path"),
@@ -160,6 +179,7 @@ mod tests {
                 enabled: true,
                 layout: layout.to_string(),
                 copy_path: true,
+                copy_sha256: true,
                 new_file_types: vec!["md".into(), "txt".into()],
                 terminals: vec!["com.apple.Terminal".into()],
             },
@@ -178,10 +198,12 @@ mod tests {
     #[test]
     fn grouped_puts_new_files_and_terminals_in_submenus() {
         let model = build(&config("grouped"), "com.example.app", "instance", 1);
-        assert_eq!(model.items.len(), 3);
+        // New File and Open in Terminal as submenus, then Copy Path and Copy SHA-256.
+        assert_eq!(model.items.len(), 4);
         assert!(matches!(model.items[0], MenuNode::Submenu { .. }));
         assert!(matches!(model.items[1], MenuNode::Submenu { .. }));
         assert!(matches!(model.items[2], MenuNode::Item { .. }));
+        assert!(matches!(model.items[3], MenuNode::Item { .. }));
     }
 
     #[test]
@@ -191,7 +213,8 @@ mod tests {
             .items
             .iter()
             .all(|item| matches!(item, MenuNode::Item { .. })));
-        assert_eq!(model.items.len(), 2 + 1 + 1);
+        // Two file types, one terminal, Copy Path and Copy SHA-256.
+        assert_eq!(model.items.len(), 2 + 1 + 2);
     }
 
     #[test]
@@ -203,7 +226,7 @@ mod tests {
                 title, children, ..
             } => {
                 assert_eq!(title, "Oh-My-Tab");
-                assert_eq!(children.len(), 3);
+                assert_eq!(children.len(), 4);
             }
             other => panic!("expected outer submenu, got {other:?}"),
         }
@@ -212,7 +235,7 @@ mod tests {
     #[test]
     fn unknown_layout_falls_back_to_grouped() {
         let model = build(&config("garbage"), "com.example.app", "instance", 1);
-        assert_eq!(model.items.len(), 3);
+        assert_eq!(model.items.len(), 4);
     }
 
     #[test]

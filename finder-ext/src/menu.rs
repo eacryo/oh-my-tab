@@ -89,7 +89,7 @@ pub(crate) fn resolve_click(
 /// Build the context menu for `trigger`. None means "no items apply"; Finder then shows nothing.
 pub(crate) fn build(trigger: Trigger, target: *mut AnyObject) -> Option<*mut AnyObject> {
     // No model (feature off, app gone, or nothing applies): offer no items at all.
-    let model = crate::state::model(trigger.context())?;
+    let model = crate::state::model(trigger)?;
     unsafe {
         let menu = new_menu("Oh-My-Tab");
         if menu.is_null() {

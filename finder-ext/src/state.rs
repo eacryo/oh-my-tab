@@ -9,8 +9,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use finder_protocol::{
-    decode, encode, AppToExt, ClickTemplate, Context, ExtToApp, MenuModel, Trigger,
-    PROTOCOL_VERSION,
+    decode, encode, AppToExt, ClickTemplate, ExtToApp, MenuModel, Trigger, PROTOCOL_VERSION,
 };
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -107,7 +106,11 @@ fn send_sync() {
 }
 
 /// The model to render, or None when the app is gone.
-pub(crate) fn model(trigger: Context) -> Option<MenuModel> {
+///
+/// Takes the whole `Trigger`, not just its `Context`: a toolbar click also reports `Items`, but its
+/// selection comes from a different place, and the `SingleRegularFile` items must not appear there
+/// on the strength of a stale item selection.
+pub(crate) fn model(trigger: Trigger) -> Option<MenuModel> {
     let shared = shared()?;
     let fresh = *shared
         .last_state
@@ -121,7 +124,8 @@ pub(crate) fn model(trigger: Context) -> Option<MenuModel> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()?;
-    let filtered = finder_protocol::filter_model(&model, trigger);
+    let selection = unsafe { self::selection(trigger == Trigger::Toolbar) };
+    let filtered = finder_protocol::filter_model(&model, trigger.context(), selection);
     (!filtered.items.is_empty()).then_some(filtered)
 }
 
@@ -150,6 +154,93 @@ pub(crate) fn send_click(template: ClickTemplate) {
         trigger: template.trigger,
     };
     post(&shared.host_bundle_id, &message);
+}
+
+/// What the extension can tell about the selection for menu filtering.
+///
+/// Stats AT MOST ONE item: every `SingleRegularFile` item is hidden for any other count, so
+/// paying a filesystem query per selected item on each menu open would cost without deciding
+/// anything. A query that fails (an unreadable volume, a sandbox refusal) reports `regular_file:
+/// false`, which hides the item rather than guessing.
+///
+/// Uses `NSURLIsRegularFileKey`, not the negation of `isDirectory`: a FIFO or a device is also
+/// "not a directory", and reading one would block the hashing thread forever.
+pub(crate) unsafe fn selection(toolbar: bool) -> finder_protocol::Selection {
+    let none = finder_protocol::Selection::NONE;
+    let Some(urls) = selected_urls(toolbar) else {
+        return none;
+    };
+    if urls.is_empty() {
+        return none;
+    }
+    if urls.len() != 1 {
+        return none;
+    }
+    let url = urls[0];
+    let key = nsstring("NSURLIsRegularFileKey");
+    let keys: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: key];
+    let values: *mut AnyObject = msg_send![
+        url,
+        resourceValuesForKeys: keys,
+        error: std::ptr::null_mut::<*mut AnyObject>()
+    ];
+    let regular = if values.is_null() {
+        false
+    } else {
+        let number: *mut AnyObject = msg_send![
+            values,
+            objectForKey: nsstring("NSURLIsRegularFileKey")
+        ];
+        !number.is_null() && msg_send![number, boolValue]
+    };
+    finder_protocol::Selection {
+        single: true,
+        regular_file: regular,
+    }
+}
+
+/// The selected URLs as objects, without converting them to paths.
+///
+/// `selection_paths` drops a URL it cannot turn into a path, so its length is not the selection's.
+/// This keeps the count honest: two selected items stay two even if one has no usable path.
+unsafe fn selected_urls(toolbar: bool) -> Option<Vec<*mut AnyObject>> {
+    let controller: *mut AnyObject = msg_send![class!(FIFinderSyncController), defaultController];
+    if controller.is_null() {
+        return None;
+    }
+    let urls: *mut AnyObject = if toolbar {
+        std::ptr::null_mut()
+    } else {
+        msg_send![controller, selectedItemURLs]
+    };
+    let urls = if urls.is_null() {
+        let targeted: *mut AnyObject = msg_send![controller, targetedURL];
+        if targeted.is_null() {
+            return Some(Vec::new());
+        }
+        let is_array: bool = msg_send![targeted, isKindOfClass: class!(NSArray)];
+        if is_array {
+            targeted
+        } else {
+            let one: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: targeted];
+            one
+        }
+    } else {
+        urls
+    };
+    let is_array: bool = msg_send![urls, isKindOfClass: class!(NSArray)];
+    if !is_array {
+        return Some(vec![urls]);
+    }
+    let count: usize = msg_send![urls, count];
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let url: *mut AnyObject = msg_send![urls, objectAtIndex: index];
+        if !url.is_null() {
+            out.push(url);
+        }
+    }
+    Some(out)
 }
 
 unsafe fn selection_paths(trigger: Trigger) -> Vec<String> {

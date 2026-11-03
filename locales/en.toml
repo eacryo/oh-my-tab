@@ -98,6 +98,12 @@ new_file = "New File"
 open_in_terminal_menu = "Open in Terminal"
 open_in_terminal = "Open in {app}"
 copy_path = "Copy Path"
+copy_sha256 = "Copy SHA-256"
+sha256_working = "Computing SHA-256…"
+sha256_copied = "SHA-256 copied"
+sha256_failed = "Could not read the file"
+sha256_unavailable = "Could not use the clipboard"
+sha256_busy = "Still computing the previous file"
 untitled = "Untitled"
 
 [finder_menu.new_file_item]
@@ -553,6 +559,8 @@ terminal_not_installed = "Not installed"
 header_menu_items = "Menu Items"
 row_copy_path = "Copy path"
 desc_copy_path = "Add \"Copy Path\" for the selected item or the current folder."
+row_copy_sha256 = "Copy SHA-256"
+desc_copy_sha256 = 'Add "Copy SHA-256" for a selected file. It is hidden when the selection is a folder, more than one item, or not a regular file.'
 
 [alert]
 config_error_title = "Configuration Error"

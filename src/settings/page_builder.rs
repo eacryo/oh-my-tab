@@ -989,6 +989,29 @@ pub(super) unsafe fn build_finder_menu_page(
     )
     .1;
     bind_control(target, ui.finder_menu_copy_path);
+    let y = canvas.next_row(described_row_h);
+    record_settings_search_row(
+        SettingsPageId::FinderMenu,
+        canvas.last_row(),
+        &t("settings.finder_menu.row_copy_sha256"),
+        Some(&t("settings.finder_menu.desc_copy_sha256")),
+    );
+    ui.finder_menu_copy_sha256 = SettingsRow::tall_before_control(
+        finder_menu_view,
+        label_x,
+        y,
+        ctrl_x,
+        super::SETTINGS_CONTROL_LABEL_GAP,
+        &t("settings.finder_menu.row_copy_sha256"),
+        SettingsControl::switch(
+            ctrl_x + ctrl_w,
+            y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
+            row_h,
+            false,
+        ),
+    )
+    .1;
+    bind_control(target, ui.finder_menu_copy_sha256);
     canvas.card(&t("settings.finder_menu.header_menu_items"));
     set_settings_search_section(&t("settings.finder_menu.header_menu_items"));
 

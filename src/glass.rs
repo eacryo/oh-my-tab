@@ -144,6 +144,10 @@ pub(crate) struct BackdropOptions {
     pub(crate) elevation: Option<crate::theme::Elevation>,
     /// Keep the native effect's edge outside the content clip.
     pub(crate) native_glass_edge: bool,
+    /// A frost surface's `NSVisualEffectView` material for this panel only, overriding the shared
+    /// `frost_material()`. Used by a surface that should read like a menu rather than like the HUD:
+    /// the materials are different stock looks, and the menu one is the only way to borrow that.
+    pub(crate) frost_material: Option<i64>,
 }
 
 impl BackdropOptions {
@@ -154,7 +158,14 @@ impl BackdropOptions {
             compensation_tint: None,
             elevation: None,
             native_glass_edge: false,
+            frost_material: None,
         }
+    }
+
+    /// Use `material` for this panel's frost surface instead of the shared one.
+    pub(crate) const fn with_frost_material(mut self, material: i64) -> Self {
+        self.frost_material = Some(material);
+        self
     }
 
     /// Declare the panel's elevation (see `docs/design-style-en.md` §7).
@@ -596,7 +607,7 @@ unsafe fn build_backdrop(
             let effect: *mut AnyObject = msg_send![effect, initWithFrame: frame];
             // BehindWindow: blur whatever is actually under the panel, not window content.
             let _: () = msg_send![effect, setBlendingMode: 0u64];
-            let _: () = msg_send![effect, setMaterial: frost_material()];
+            let _: () = msg_send![effect, setMaterial: options.frost_material.unwrap_or_else(frost_material)];
             let _: () = msg_send![effect, setState: 1u64]; // Active
             let _: () = msg_send![effect, setAutoresizingMask: 18u64];
             let _: () = msg_send![effect, setWantsLayer: true];
@@ -613,6 +624,18 @@ unsafe fn build_backdrop(
             if !mask.is_null() {
                 let _: () = msg_send![effect, setMaskImage: mask];
                 release_obj(mask);
+            }
+            // Diagnostic: the frost surface's real parameters, so two panels built from the same
+            // options can be compared as facts instead of inferred from their pixels.
+            {
+                let state: i64 = msg_send![effect, state];
+                let material: i64 = msg_send![effect, material];
+                let blending: i64 = msg_send![effect, blendingMode];
+                crate::log_info!(
+                    "[frost] frame={:.0}x{:.0} material={} state={} blending={} dark={} veil={:?} radius={:.1}",
+                    size.width, size.height, material, state, blending,
+                    crate::theme::resolved_is_dark(), veil, corner_radius
+                );
             }
             install_floor_veil(effect, size, veil);
             if let Some(host) = embedded_host {
@@ -1850,7 +1873,8 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         }
     }
     if let Some(effect) = backdrop.effect_view {
-        let _: () = msg_send![effect.0, setMaterial: frost_material()];
+        let _: () =
+            msg_send![effect.0, setMaterial: options.frost_material.unwrap_or_else(frost_material)];
         // The floor veil follows the resolved theme, and this is the only path a live appearance change
         // takes, so it is where the veil is added or dropped.
         sync_floor_veil(effect.0);

@@ -584,6 +584,7 @@ pub(super) struct SettingsUi {
     finder_menu_new_file_switches: Vec<*mut AnyObject>,
     finder_menu_terminal_switches: Vec<*mut AnyObject>,
     finder_menu_copy_path: *mut AnyObject,
+    finder_menu_copy_sha256: *mut AnyObject,
 }
 
 impl SettingsUi {
