@@ -2970,6 +2970,32 @@ pub(crate) unsafe fn about_update_flow_smoke_runner() -> bool {
     let host: NSRect = msg_send![ui.update_host, frame];
     let host_top = host.origin.y + host.size.height;
     let host_ok = (host_top - divider_after).abs() <= 1.0;
+    // A PHASE CHANGE inside the flow: Sparkle resizes the host as its state advances, calling the
+    // flow's expand again with a different height. The divider must stay on the row above's bottom
+    // edge and the host's top edge must still meet it, at every height -- not only the first.
+    let mut phase_ok = true;
+    for phase_h in [180.0_f64, 300.0, 120.0] {
+        canvas.set_row_consume(host_row, phase_h);
+        let host: NSRect = msg_send![ui.update_host, frame];
+        let _: () = msg_send![
+            ui.update_host,
+            setFrameSize: NSSize::new(host.size.width, phase_h)
+        ];
+        let _: f64 = canvas.finish();
+        let divider_y = divider_y(&canvas);
+        let anchored = canvas
+            .current_row_origin(row_above)
+            .map(|origin| (divider_y - origin).abs() <= 0.5)
+            .unwrap_or(false);
+        let host: NSRect = msg_send![ui.update_host, frame];
+        let meets = ((host.origin.y + host.size.height) - divider_y).abs() <= 1.0;
+        if !(anchored && meets) {
+            log_info!(
+                "[smoke-update-flow] phase height {phase_h}: anchored={anchored} meets={meets}"
+            );
+            phase_ok = false;
+        }
+    }
     // Collapsing restores the compact relation.
     let _: () = msg_send![ui.update_host, setFrameSize: NSSize::new(host.size.width, 0.0)];
     canvas.set_row_consume(host_row, 0.0);
@@ -2979,14 +3005,14 @@ pub(crate) unsafe fn about_update_flow_smoke_runner() -> bool {
         .current_row_origin(row_above)
         .map(|origin| (divider_y(&canvas) - origin).abs() <= 0.5)
         .unwrap_or(false);
-    let ok = compact_ok && anchored_ok && host_ok && collapsed_ok;
+    let ok = compact_ok && anchored_ok && host_ok && phase_ok && collapsed_ok;
     if !ok {
         log_info!(
             "[smoke-update-flow] compact={compact_ok} anchored={anchored_ok} host={host_ok} (gap={:.1}) collapsed={collapsed_ok}",
             host_top - divider_after
         );
     } else {
-        log_info!("[smoke-update-flow] 4 relations checked");
+        log_info!("[smoke-update-flow] 4 relations plus 3 phase heights checked");
     }
     ok
 }
