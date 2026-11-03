@@ -964,7 +964,9 @@ pub(super) unsafe fn build_finder_menu_page(
     canvas.card(&t("settings.finder_menu.header_open_in_terminal"));
     set_settings_search_section(&t("settings.finder_menu.header_open_in_terminal"));
 
-    // "Copy path" is the one non-creation item this page owns.
+    // "Copy path" and "Copy SHA-256" share the "菜单项" card, so the second row carries the card's internal divider --
+    // the shared `SettingsRow::separator_above_row`, which is what every other multi-row card in Settings uses. Both
+    // rows used to be built without it, which is the line that was missing between them.
     canvas.next_section();
     let y = canvas.next_row(described_row_h);
     record_settings_search_row(
@@ -990,6 +992,7 @@ pub(super) unsafe fn build_finder_menu_page(
     .1;
     bind_control(target, ui.finder_menu_copy_path);
     let y = canvas.next_row(described_row_h);
+    SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
     record_settings_search_row(
         SettingsPageId::FinderMenu,
         canvas.last_row(),
