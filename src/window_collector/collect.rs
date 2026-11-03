@@ -1663,6 +1663,29 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         pid_names.insert(owner_pid, owner_name);
         pids.insert(owner_pid);
     }
+    // Drop app extensions before any AX work: their windows are ordinary layer-0 surfaces, so no
+    // window rule can reject them, but the process is not activatable and the card never opens
+    // (see `app_identity::is_extension_process`). System Settings panes ("锁屏", "显示器", "VPN")
+    // are the ones users see; skipping them here also saves their AX round trip.
+    // The filter runs on the collection thread, which is not a Cocoa main thread and owns no
+    // pool, so the NSRunningApplication / NSURL / NSString temporaries each lookup creates need a
+    // boundary of their own: the AX phase has one per chunk, and this pass runs before those.
+    objc2::rc::autoreleasepool(|_pool| {
+        pids.retain(|&pid| {
+            let executable = unsafe { crate::app_identity::executable_path_of(pid) };
+            let is_extension = executable
+                .as_deref()
+                .is_some_and(crate::app_identity::is_extension_process);
+            if is_extension {
+                log_debug!(
+                    "[collect] extension process skipped: pid={} app=\"{}\"",
+                    pid,
+                    pid_names.get(&pid).map(String::as_str).unwrap_or("?")
+                );
+            }
+            !is_extension
+        });
+    });
 
     // Use AX window list as primary source (same as macOS App Switcher)
     // pid -> cache identity (bundle id + mtime). Resolved once per pid in the AX phase so the
@@ -2276,6 +2299,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 );
                 continue;
             }
+
             // Same filters as the CG path: minimized gated by the switch; empty titles
             // (not titleless) are meaningless.
             if ax_info.title.is_empty() && !titleless_pids.contains(&pid) {

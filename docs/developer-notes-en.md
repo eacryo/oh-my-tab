@@ -211,6 +211,85 @@ for a cross-Space target. Which attempt moved the Space is published per raise, 
 `scripts/e2e/space-desktops.sh` runs one pass with activation suppressed so the rescue is verified on
 its own rather than inferred.
 
+## Which processes become switch targets
+
+An **app extension** publishes ordinary windows but cannot be activated, so its card never opens.
+The collector drops extension processes before any Accessibility work
+(`app_identity::is_extension_process`), because nothing about the window gives them away.
+
+The evidence, measured on macOS 26 with the System Settings panes open. The command lists every
+window the WindowServer reports, then prints the extension-owned ones with their layer, alpha and
+bounds; the pids in the sample below belong to that session, not to this document:
+
+```sh
+swift - <<'EOF'
+import AppKit
+import CoreGraphics
+let all = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as! [[String: Any]]
+for w in all {
+  let pid = w[kCGWindowOwnerPID as String] as? Int ?? -1
+  guard let app = NSRunningApplication(processIdentifier: pid_t(pid)),
+        (app.executableURL?.path ?? "").contains(".appex") else { continue }
+  print("pid=\(pid) layer=\(w[kCGWindowLayer as String] ?? "?") alpha=\(w[kCGWindowAlpha as String] ?? "?") bounds=\(w[kCGWindowBounds as String] ?? "?")")
+}
+EOF
+```
+
+```
+pid=6622 layer=0 alpha=1 bounds={740x923 at 577,93}   DisplaysExt.appex, 6 windows
+pid=6629 layer=0 alpha=1 bounds={740x923 at 577,93}   LockScreen.appex, 1 window
+pid=12862 layer=0 alpha=1                             VPN.appex, 2 windows
+```
+
+Every window rule admits them: the layer is the normal one, the surface is opaque and
+ordinary-sized. The failure is one level up, in the process:
+
+```
+[raise] SLPS failed: _SLPSSetFrontProcessWithOptions pid=6629 status=-606   (procNotFound)
+[raise] activate fallback failed: pid=6629 activateWithOptions=false
+[raise] fast recovery exhausted: activate=false slps=false click=true attempts=2
+```
+
+`AXRaise` answers `first_err=0` on the same card, which is the trap: accessibility accepts the
+request and the window still does not come forward, so a raise that reports success is not evidence
+that the user can switch to it.
+
+The rule therefore keys on where the executable lives, `.appex/Contents/MacOS/`, not on the window
+and not on `activationPolicy`. `prohibited` looks like the natural test and is the wrong one: on the
+same machine 12 processes owning windows reported it, and one of them is the 豆包输入法 input method
+under `/Library/Input Methods/DoubaoIme.app`, a legitimate switch target. A path test separates the
+extensions without a list to maintain. Count them yourself with the command below; `prohibited` is
+`NSApplicationActivationPolicyProhibited`, and the sample count is from one session, not a constant:
+
+```sh
+swift - <<'EOF'
+import AppKit
+import CoreGraphics
+let all = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as! [[String: Any]]
+var owners = Set<pid_t>()
+for w in all { owners.insert(pid_t(w[kCGWindowOwnerPID as String] as? Int ?? -1)) }
+var byPolicy: [String: Int] = [:]
+for pid in owners {
+  guard let app = NSRunningApplication(processIdentifier: pid) else { continue }
+  let policy: String
+  switch app.activationPolicy {
+  case .regular: policy = "regular"
+  case .accessory: policy = "accessory"
+  case .prohibited: policy = "prohibited"
+  @unknown default: policy = "unknown"
+  }
+  byPolicy[policy, default: 0] += 1
+  if policy == "prohibited" { print("prohibited", pid, app.executableURL?.path ?? "?") }
+}
+print(byPolicy)
+EOF
+```
+
+The three reference implementations each miss this class, and each for an instructive reason:
+BetterCmdTab drops `layer >= 20 || layer < 0`, alt-tab-macos drops *phantom* windows (ordered out or
+`alpha == 0`), and DockDoor takes `layer == 0` plus one bundle-identifier denylist. All three keep
+the extension's window, because all three rules describe the window and the window is normal.
+
 ## Thumbnail card sizing
 
 The overlay's thumbnail grid gives every card **one** height. The user pins it with the App Switcher
