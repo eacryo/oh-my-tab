@@ -105,6 +105,9 @@ sha256_copied = "已拷贝 SHA-256"
 sha256_failed = "无法读取该文件"
 sha256_unavailable = "无法使用剪贴板"
 sha256_busy = "正在计算上一个文件"
+path_copied = "已拷贝路径"
+path_unavailable = "无法使用剪贴板"
+toast_dismiss = "关闭"
 untitled = "未命名"
 
 [finder_menu.new_file_item]

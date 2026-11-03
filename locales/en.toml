@@ -104,6 +104,9 @@ sha256_copied = "SHA-256 copied"
 sha256_failed = "Could not read the file"
 sha256_unavailable = "Could not use the clipboard"
 sha256_busy = "Still computing the previous file"
+path_copied = "Path copied"
+path_unavailable = "Could not use the clipboard"
+toast_dismiss = "Dismiss"
 untitled = "Untitled"
 
 [finder_menu.new_file_item]

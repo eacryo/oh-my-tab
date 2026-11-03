@@ -76,7 +76,10 @@ pub(crate) fn execute(action: MenuAction, paths: Vec<String>, context: Context) 
             let Some(path) = paths.first() else {
                 return;
             };
-            copy_path(path);
+            // The bubble says what happened, for the same reason SHA-256 has one: a menu item that
+            // silently did nothing and one that copied are otherwise indistinguishable, and the
+            // pasteboard can refuse the write.
+            copy_path_and_report(path);
         }
         MenuAction::CopySha256 => {
             if !config.finder_menu.copy_sha256 {
@@ -245,21 +248,36 @@ fn target_directory(paths: &[String], context: Context) -> Option<PathBuf> {
     })
 }
 
-fn copy_path(path: &str) {
+/// Copy `path` and say so: the successful bubble, or the same refusal SHA-256 reports when the
+/// pasteboard will not take the text.
+fn copy_path_and_report(path: &str) {
+    if copy_path(path) {
+        log_info!("[finder-menu] path copied");
+        crate::ui::toast::show_done(&t("finder_menu.path_copied"));
+    } else {
+        log_info!("[finder-menu] path could not reach the pasteboard");
+        crate::ui::toast::show_done(&t("finder_menu.path_unavailable"));
+    }
+}
+
+/// Put `path` on the general pasteboard as plain text. Returns whether the write succeeded: the
+/// bubble reports the answer, so a refused write cannot read as a copy.
+fn copy_path(path: &str) -> bool {
     unsafe {
         use crate::ffi::{make_nsstring, release_obj};
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
         let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         if pasteboard.is_null() {
-            return;
+            return false;
         }
         let _: isize = msg_send![pasteboard, clearContents];
         let value = make_nsstring(path);
         let kind = make_nsstring("public.utf8-plain-text");
-        let _: bool = msg_send![pasteboard, setString: value, forType: kind];
+        let written: bool = msg_send![pasteboard, setString: value, forType: kind];
         release_obj(value);
         release_obj(kind);
+        written
     }
 }
 

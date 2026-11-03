@@ -148,6 +148,13 @@ pub(crate) struct BackdropOptions {
     /// `frost_material()`. Used by a surface that should read like a menu rather than like the HUD:
     /// the materials are different stock looks, and the menu one is the only way to borrow that.
     pub(crate) frost_material: Option<i64>,
+    /// The material this surface needs, when it cannot accept the configured one.
+    ///
+    /// Almost every surface takes PanelMaterial::effective -- the user's choice, with Reduce Transparency and
+    /// the system's capabilities applied. A surface whose whole promise is that the desktop behind it cannot
+    /// change its tone (the Finder menu's message bubble) asks for Opaque here instead, so a configured glass
+    /// material cannot turn it translucent.
+    pub(crate) material: Option<PanelMaterial>,
 }
 
 impl BackdropOptions {
@@ -159,18 +166,20 @@ impl BackdropOptions {
             elevation: None,
             native_glass_edge: false,
             frost_material: None,
+            material: None,
         }
-    }
-
-    /// Use `material` for this panel's frost surface instead of the shared one.
-    pub(crate) const fn with_frost_material(mut self, material: i64) -> Self {
-        self.frost_material = Some(material);
-        self
     }
 
     /// Declare the panel's elevation (see `docs/design-style-en.md` §7).
     pub(crate) const fn with_elevation(mut self, level: Option<crate::theme::Elevation>) -> Self {
         self.elevation = level;
+        self
+    }
+
+    /// Pin the material this surface is built with (see the `material` field).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) const fn with_material(mut self, material: PanelMaterial) -> Self {
+        self.material = Some(material);
         self
     }
 
@@ -345,6 +354,20 @@ impl PanelMaterial {
     }
 }
 
+impl PanelMaterial {
+    /// The config value this material is written as -- the inverse of `from_config_value`, so a caller
+    /// that temporarily swaps the material under a live surface can put the configuration back.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn config_value(self) -> &'static str {
+        match self {
+            Self::LiquidGlass => "liquid-glass",
+            Self::Frost => "frost",
+            Self::Opaque => "opaque",
+            Self::Backdrop => "backdrop",
+        }
+    }
+}
+
 /// The effective material's config id, for the e2e state document (assertions key on the
 /// id, never on view classes).
 pub(crate) fn effective_material_id() -> &'static str {
@@ -395,7 +418,7 @@ unsafe fn build_backdrop(
     embedded_host: Option<*mut AnyObject>,
 ) -> InstalledBackdrop {
     let size = frame.size;
-    let material = PanelMaterial::effective();
+    let material = options.material.unwrap_or_else(PanelMaterial::effective);
     let compensation_alpha = options.compensation_alpha;
     let veil = effective_frost_veil();
     match material {
@@ -1230,9 +1253,10 @@ unsafe fn sync_carrier_shadow_path(carrier: *mut AnyObject) {
     }
 }
 
-/// Drop a retired carrier's geometry entry. Called when a material swap replaces the carrier: a swap builds
-/// a new carrier every time, and leaving the retired one's entry behind would grow this map for the life of
-/// the process.
+/// Drop a root's geometry entry because the view is being retired. Called from `swap_backdrop` for whatever
+/// the replaced backdrop had as its window root: a swap builds a new hierarchy every time, and leaving the
+/// retired one's entry behind would both grow this map for the life of the process and leave the address --
+/// which a later allocation can reuse -- pointing at another panel's shadow path.
 pub(crate) fn forget_carrier_shadow_path(carrier: *mut AnyObject) {
     CARRIER_GEOMETRY.lock().unwrap().remove(&(carrier as usize));
 }
@@ -1342,7 +1366,10 @@ unsafe fn wrap_in_shadow_carrier(
 }
 
 /// Whether this backdrop's window root is a carrier rather than the material root itself.
-fn carrier_installed(backdrop: &InstalledBackdrop) -> bool {
+///
+/// The only evidence that a shadow is actually cast: `install_shadow_carrier` leaves the material without one when
+/// the carrier cannot be created, so a declared elevation is not the same fact as a shadow being present.
+pub(crate) fn carrier_installed(backdrop: &InstalledBackdrop) -> bool {
     match (backdrop.root, backdrop.material_root) {
         (Some(root), Some(material)) => root.0 != material.0,
         _ => false,
@@ -1565,6 +1592,39 @@ pub(crate) unsafe fn refresh_panel_outline(backdrop: &InstalledBackdrop) {
     );
 }
 
+/// The size of one line of text at `font_size`, for a surface that is only as wide as its message.
+///
+/// `NSAttributedString.size` lays the line out without a window, so a caller can size a panel before it is
+/// placed. An empty string measures nothing; callers treat a zero/non-finite answer as "no measurement"
+/// rather than drawing a zero-width message.
+///
+/// The same measurement the settings surface takes for a label it sizes to its text (`NSFontAttributeName`,
+/// the system font, `sizeWithAttributes:`), so the bubble and the settings label agree on what a string
+/// is wide. A width of zero or less means the string could not be measured here; the caller decides what
+/// to fall back to rather than drawing a zero-width line.
+pub(crate) fn measure_single_line_text(text: &str, font_size: f64) -> NSSize {
+    #[link(name = "AppKit", kind = "framework")]
+    extern "C" {
+        static NSFontAttributeName: *mut AnyObject;
+    }
+    unsafe {
+        let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: font_size];
+        let string = crate::ffi::make_nsstring(text);
+        let attributes: *mut AnyObject = msg_send![
+            class!(NSDictionary),
+            dictionaryWithObject: font,
+            forKey: NSFontAttributeName
+        ];
+        let size: NSSize = if attributes.is_null() {
+            NSSize::new(0.0, 0.0)
+        } else {
+            msg_send![string, sizeWithAttributes: attributes]
+        };
+        crate::ffi::release_obj(string);
+        size
+    }
+}
+
 /// A1: the installed outline view, for a smoke runner that wants to read its layer directly.
 pub(crate) fn outline_view_for_smoke(backdrop: &InstalledBackdrop) -> Option<*mut AnyObject> {
     backdrop.outline_view.map(|outline| outline.0)
@@ -1784,13 +1844,14 @@ pub(crate) unsafe fn swap_backdrop(
     // shadow path or its stale geometry. The panel rect is read *before* the new insets are recorded: the
     // window is currently padded by the old ones, and the padding is not part of the panel.
     let panel = panel_frame_of(window);
-    // The retired carrier is about to be dropped with the old content view; the path its layer points at is
-    // ours to free (see `CARRIER_SHADOW_PATHS`).
-    if carrier_installed(old) {
-        if let Some(retired) = old.root {
-            forget_carrier_shadow_path(retired.0);
-        }
+    // The retired root is about to be dropped with the old content view, so its geometry entry -- and the
+    // path its shadow layer points at -- are ours to release. That is true whenever the old hierarchy had a
+    // root, not only when it carried a shadow: the entry is keyed by the root's address, a later allocation
+    // can reuse it, and a stale entry would hand that new view another panel's shadow path.
+    if let Some(retired) = old.root {
+        forget_carrier_shadow_path(retired.0);
     }
+    forget_opaque_fill(old);
     let insets = install_shadow_carrier(&mut new, frame, corner_radius, options);
     adopt_window_root(window, new.root.unwrap().0, carrier_installed(&new));
     if new.glass.is_some() {
@@ -1827,6 +1888,62 @@ unsafe fn reassert_glass_layer_clip(backdrop: &InstalledBackdrop, corner_radius:
             let _: () = msg_send![glass_layer, setCornerRadius: corner_radius];
             let _: () = msg_send![glass_layer, setMasksToBounds: !backdrop.native_glass_edge];
         }
+    }
+}
+
+/// Paint an opaque backdrop's surface with `hex` instead of the palette's own window colour.
+///
+/// The opaque material's fill is installed by `build_backdrop`, and `apply_live_properties` keeps re-painting it
+/// from `ui_palette().window_bg`, which follows the theme. A surface that has to keep one tone in both modes
+/// (the Finder menu's message bubble) owns its colour here, and has to repaint through this same call after
+/// every live refresh rather than only once at construction.
+pub(crate) unsafe fn paint_opaque_surface(backdrop: &InstalledBackdrop, hex: u32) {
+    let Some(plain) = backdrop.opaque_view else {
+        return;
+    };
+    let _: () = msg_send![plain.0, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![plain.0, layer];
+    if !layer.is_null() {
+        layer_set_background(layer, hex_to_cg_color(hex));
+        OPAQUE_FILLS.lock().unwrap().insert(plain.0 as usize, hex);
+    }
+}
+
+/// The opaque surfaces whose fill a caller has **overridden**, keyed by the view. Only overrides are recorded:
+/// every other opaque surface keeps the theme's window colour and must follow a theme change, so a live refresh
+/// reads the palette for it rather than this map. A view's address is reused after it is freed, so an entry is
+/// dropped when its hierarchy is replaced (`swap_backdrop`) and never outlives the surface that asked for it.
+static OPAQUE_FILLS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<usize, u32>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// The colour a surface's opaque fill is meant to be: its own override when a caller painted one, and the
+/// palette's current window colour otherwise -- so a themed panel follows a theme change while an overridden chip
+/// keeps the tone it asked for.
+fn painted_opaque_fill(plain: *mut AnyObject) -> u32 {
+    let override_fill = OPAQUE_FILLS.lock().unwrap().get(&(plain as usize)).copied();
+    opaque_fill(override_fill, crate::theme::ui_palette().window_bg)
+}
+
+/// Which colour an opaque surface takes: its own override when a caller recorded one, the palette's window colour
+/// otherwise.
+///
+/// Pure, so both halves are asserted without AppKit -- a themed panel follows the theme, an overridden chip keeps
+/// the tone it asked for. The earlier version cached the palette's own colour at creation, which froze every themed
+/// opaque panel (the clipboard picker, the keystroke display) on the theme it was built with.
+pub(crate) fn opaque_fill(override_fill: Option<u32>, palette_window_bg: u32) -> u32 {
+    override_fill.unwrap_or(palette_window_bg)
+}
+
+/// Forget a retired hierarchy's fill override, for every view it could have been recorded against: the opaque
+/// surface itself, and the material root that carries the fill when it is the same view. Called from
+/// `swap_backdrop`, where the retired hierarchy is about to be dropped.
+fn forget_opaque_fill(backdrop: &InstalledBackdrop) {
+    let mut fills = OPAQUE_FILLS.lock().unwrap();
+    if let Some(plain) = backdrop.opaque_view {
+        fills.remove(&(plain.0 as usize));
+    }
+    if let Some(material) = backdrop.material_root {
+        fills.remove(&(material.0 as usize));
     }
 }
 
@@ -1883,7 +2000,7 @@ pub(crate) unsafe fn apply_live_properties(backdrop: InstalledBackdrop, options:
         let _: () = msg_send![plain.0, setWantsLayer: true];
         let layer: *mut AnyObject = msg_send![plain.0, layer];
         if !layer.is_null() {
-            layer_set_background(layer, hex_to_cg_color(crate::theme::ui_palette().window_bg));
+            layer_set_background(layer, hex_to_cg_color(painted_opaque_fill(plain.0)));
         }
     }
     if let Some(layer) = backdrop.compensation_layer {
@@ -2383,6 +2500,20 @@ unsafe fn sync_floor_veil(parent: *mut AnyObject) {
 
 #[cfg(test)]
 mod tests {
+    /// The opaque fill rule, both halves. A themed panel follows the palette on every live refresh -- the earlier
+    /// version cached the palette's colour at creation and froze the clipboard picker and the keystroke display on
+    /// the theme they were built with -- while a surface that asked for its own colour (the message bubble's white
+    /// chip) keeps it whatever the theme does.
+    #[test]
+    fn an_opaque_fill_follows_the_theme_unless_it_was_overridden() {
+        let light = 0xF5F5F7FF;
+        let dark = 0x1C1C1EFF;
+        assert_eq!(super::opaque_fill(None, light), light);
+        assert_eq!(super::opaque_fill(None, dark), dark);
+        assert_eq!(super::opaque_fill(Some(0xFFFFFFFF), light), 0xFFFFFFFF);
+        assert_eq!(super::opaque_fill(Some(0xFFFFFFFF), dark), 0xFFFFFFFF);
+    }
+
     use super::{
         carries_over, floor_veil_hex, frost_veil_gradient_points, glass_style_index,
         panel_outline_color, parse_dev_outline, resolved_glass_tint_hex, DevOutline, PanelMaterial,

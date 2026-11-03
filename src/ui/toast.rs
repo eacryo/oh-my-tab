@@ -1,13 +1,20 @@
 //! A transient, non-activating message at the bottom of the screen.
 //!
-//! The Finder menu's "Copy SHA-256" runs on a worker thread and takes as long as the file is big,
-//! so the app has to say something between the click and the clipboard. The settings window's
-//! success bubble cannot do that job: it is scoped to that window, which usually does not exist
-//! while the user is working in Finder.
+//! The Finder menu's "Copy Path" and "Copy SHA-256" both report through it. SHA-256 runs on a worker
+//! thread and takes as long as the file is big, so the app has to say something between the click and the
+//! clipboard. The settings window's success bubble cannot do that job: it is scoped to that window, which
+//! usually does not exist while the user is working in Finder.
 //!
-//! The surface follows the same material every other floating panel uses (`glass::install_backdrop`,
-//! the shared elevated corner radius and shadow), so it reads as part of the app rather than as a
-//! bare grey rectangle. One panel, reused; state lives in `TOAST` on the main thread.
+//! The surface follows the same material every other floating panel uses (`glass::install_backdrop`, the
+//! shared elevated corner radius and shadow), so it reads as part of the app rather than as a bare grey
+//! rectangle. It is sized to its message rather than to a fixed width: a chip padding wider than the text
+//! inside it, which is what the reference bubble looks like.
+//!
+//! It carries a stroke on **every** material, drawn by the bubble itself rather than borrowed from
+//! `glass::install_panel_outline`: that decoration is refused on Liquid Glass (the system draws its own rim)
+//! and is 1pt in the softer `card_border` token elsewhere, while this surface has to keep a visible edge
+//! over whatever the user is working in -- including where a passive panel's glass renders flat because its
+//! window never becomes key.
 
 use std::cell::RefCell;
 use std::sync::OnceLock;
@@ -20,24 +27,76 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use crate::ffi::{make_nsstring, release_obj, StaticClass};
 use crate::theme;
 
-/// Wide enough for one short sentence in every locale, at the control font.
-const TOAST_WIDTH: f64 = 320.0;
-/// One line of the control font, a 28pt icon, and breathing room above and below.
-const TOAST_HEIGHT: f64 = 60.0;
+// Geometry, in points, taken from the reference component this surface follows
+// (opensourceui.in/components/toast-notification, `ToastNotificationBanner`): one row of a 20pt status badge, a
+// 13pt message, and a ring of padding; `rounded-xl` = 12pt; `px-3 py-2.5` = 12pt/10pt; `gap-2.5` = 10pt.
+
+/// The message's box: one line of the message font, `TOAST_CONTENT_HEIGHT` tall, holding the badge and the text
+/// on one midline. Every other number is padding around it, which is what keeps the bubble only as big as its
+/// message plus a ring.
+const TOAST_CONTENT_HEIGHT: f64 = 24.0;
+/// Horizontal padding before the badge and after the text (`px-3`).
+const TOAST_PADDING_X: f64 = 12.0;
+/// Padding above and below the row (`py-2.5`).
+const TOAST_PADDING_Y: f64 = 10.0;
+/// The badge's diameter (`size-5`).
+const TOAST_BADGE_SIZE: f64 = 20.0;
+/// The tick inside it: the page's lucide `Check` is `size={11}`, not the circle's own size.
+const TOAST_CHECK_SIZE: f64 = 11.0;
+/// The gap between the badge and the text, and between the text and the trailing close glyph (`gap-2.5`).
+const TOAST_GAP: f64 = 10.0;
+/// The close glyph's own box: `✕` at 11pt with `px-0.5`.
+const TOAST_CLOSE_SIZE: f64 = 11.0;
+const TOAST_CLOSE_PAD: f64 = 2.0;
+const TOAST_CLOSE_WIDTH: f64 = TOAST_CLOSE_SIZE + TOAST_CLOSE_PAD * 2.0;
+/// The button's box: the glyph plus the wash's breathing room, square so the hover reads as a chip.
+/// The hover box's height: square around the glyph when the row allows it, so the wash reads as a chip and not
+/// as a vertical sliver.
+const TOAST_CLOSE_BOX: f64 = TOAST_CLOSE_WIDTH + 4.0;
+const TOAST_CLOSE_HEIGHT: f64 = TOAST_CLOSE_BOX;
+/// The hover wash's corner radius: a small chip around the glyph, not a pill across the row.
+const TOAST_CLOSE_CORNER: f64 = 4.0;
+/// The row plus the vertical padding.
+const TOAST_HEIGHT: f64 = TOAST_CONTENT_HEIGHT + TOAST_PADDING_Y * 2.0;
+/// The bubble's corner radius (`rounded-xl`).
+const TOAST_RADIUS: f64 = 12.0;
+/// The message's type size: `text-[13px] leading-tight`.
+const TOAST_FONT_SIZE: f64 = 13.0;
+const TOAST_LINE_HEIGHT: f64 = 15.625;
+/// The close glyph's type size (`text-[11px]`).
+const TOAST_CLOSE_FONT_SIZE: f64 = 11.0;
+/// The narrowest bubble: a floor under a one- or two-character message (and under a failed measurement),
+/// so the badge still has a chip around it instead of a sliver.
+const TOAST_MIN_WIDTH: f64 = 72.0;
+/// The narrowest bubble that still holds its own row: the padding, the badge, both gaps and the close box. The floor
+/// above cannot go below it, or the message would be laid out in negative width.
+const TOAST_ROW_CHROME: f64 =
+    TOAST_PADDING_X * 2.0 + TOAST_BADGE_SIZE + TOAST_GAP * 2.0 + TOAST_CLOSE_WIDTH;
+/// The widest a one-line chip may get before the message is cut with an ellipsis. It is not the reference's
+/// `max-w-80` (320pt): every message this bubble carries must read in full, and `已拷贝 SHA-256` -- the longest
+/// of them -- overruns 320 with the row's own chrome around it. Only a path, which can be hundreds of points
+/// wide, is long enough to reach this.
+const TOAST_MAX_WIDTH: f64 = 560.0;
 /// Distance kept from the screen's visible bottom edge.
 const TOAST_BOTTOM_MARGIN: f64 = 48.0;
-/// Horizontal padding before the icon.
-const TOAST_PADDING: f64 = 20.0;
-/// The tick's box; the text starts after it plus the standard gap.
-const TOAST_ICON_SIZE: f64 = 28.0;
-const TOAST_ICON_GAP: f64 = 12.0;
-/// How long a FINISHED message stays. A message still working has no deadline.
-const TOAST_VISIBLE: Duration = Duration::from_millis(2500);
+/// How long a FINISHED message stays. A message still working has no deadline, and the ✕ answers before it.
+///
+/// Five seconds rather than the 2.5s this surface shipped with: it now carries a sentence the user may want to
+/// read ("已拷贝路径") and a dismiss button, and a chip that leaves while a hand reaches for that button reads as
+/// broken. The reference's own preview keeps its toast up until it is dismissed.
+const TOAST_VISIBLE: Duration = Duration::from_millis(5000);
 
 struct State {
+    /// Which bubble this is (see `SLOTS`); the close button carries it in its tag.
+    slot: usize,
     panel: *mut AnyObject,
     label: *mut AnyObject,
-    icon: *mut AnyObject,
+    /// The emerald status badge (a circle and its tick), kept so a redraw can recolour it.
+    badge: *mut AnyObject,
+    /// The trailing close button.
+    close: *mut AnyObject,
+    /// Whether the close button's hover tracking area is in place (see `ensure_close_tracking`).
+    close_tracked: bool,
     backdrop: Option<crate::glass::InstalledBackdrop>,
     /// The lit inner bevel; kept so the view is not dropped while its parent still shows it.
     bevel: Option<crate::ffi::ObjPtr>,
@@ -45,17 +104,26 @@ struct State {
     timer: *mut AnyObject,
 }
 
-thread_local! {
-    static TOAST: RefCell<State> = const {
-        RefCell::new(State {
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            slot: 0,
             panel: std::ptr::null_mut(),
             label: std::ptr::null_mut(),
-            icon: std::ptr::null_mut(),
+            badge: std::ptr::null_mut(),
+            close: std::ptr::null_mut(),
+            close_tracked: false,
             backdrop: None,
             bevel: None,
             timer: std::ptr::null_mut(),
-        })
-    };
+        }
+    }
+}
+
+// One bubble per slot, built lazily: the product presents messages in slot 0, and the preview can put a
+// second one beside it to show two messages -- or two candidate surfaces -- on one frame.
+thread_local! {
+    static SLOTS: RefCell<Vec<State>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Show `text` and keep it until `dismiss_after` elapses.
@@ -65,9 +133,12 @@ thread_local! {
 /// still running. A later call replaces both the text and any pending timer.
 pub(crate) fn show(text: &str, dismiss_after: Option<Duration>) {
     crate::debug_assert_main_thread();
-    let shown = TOAST.with(|state| {
-        let mut state = state.borrow_mut();
-        unsafe { show_in(&mut state, text, dismiss_after) }
+    let shown = SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        if slots.is_empty() {
+            slots.push(State::default());
+        }
+        unsafe { show_in(&mut slots[0], text, 0.0, dismiss_after) }
     });
     if !shown {
         crate::log_info!("[toast] could not present a message");
@@ -75,41 +146,48 @@ pub(crate) fn show(text: &str, dismiss_after: Option<Duration>) {
 }
 
 /// Hide the panel now and cancel any pending dismissal.
-#[cfg(test)]
+/// Hide the bubble now and cancel any pending dismissal. Main thread only.
 pub(crate) fn hide() {
     crate::debug_assert_main_thread();
-    TOAST.with(|state| {
-        let mut state = state.borrow_mut();
-        unsafe { hide_in(&mut state) }
-    })
-}
-
-/// Whether a panel currently exists and is on screen.
-#[cfg(test)]
-pub(crate) fn is_shown() -> bool {
-    TOAST.with(|state| {
-        let state = state.borrow();
-        !state.panel.is_null() && unsafe { msg_send![state.panel, isVisible] }
-    })
-}
-
-unsafe fn show_in(state: &mut State, text: &str, dismiss_after: Option<Duration>) -> bool {
-    if state.panel.is_null() {
-        build(state);
-        if state.panel.is_null() {
-            return false;
+    SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        if let Some(state) = slots.first_mut() {
+            unsafe { hide_in(state) }
         }
+    })
+}
+
+unsafe fn show_in(
+    state: &mut State,
+    text: &str,
+    row_offset: f64,
+    dismiss_after: Option<Duration>,
+) -> bool {
+    if state.panel.is_null() && !build(state) {
+        crate::log_info!("[toast] the message could not be shown without an opaque surface");
+        return false;
     }
     // Refresh the material on every presentation: the panel is reused across messages, and the
     // material or the theme may have changed since it was built. The keystroke display does the same
     // before each render rather than trusting the construction-time state.
     if let Some(backdrop) = state.backdrop {
         crate::glass::apply_live_properties(backdrop, toast_backdrop_options());
+        // The live refresh re-paints an opaque surface from the theme's window colour; the bubble's own fill
+        // is restored right after it, so a theme change cannot turn the white chip into a dark one.
+        crate::glass::paint_opaque_surface(&backdrop, toast_fill_hex());
     }
     let text_ns = make_nsstring(text);
     let _: () = msg_send![state.label, setStringValue: text_ns];
     release_obj(text_ns);
-    place(state.panel, state.bevel);
+    // The panel is sized from what the field itself needs for this string, not only from `NSFont`'s measurement:
+    // a field lays the line out with its cell's metrics, which run a few points wider. Sizing from the font alone
+    // cut the last glyph of a message that was, by that measure, exactly the right width.
+    let width = unsafe { toast_width_for_field(state.label, text) };
+    place(state.panel, width, row_offset, state.bevel);
+    layout_row(state, width);
+    ensure_close_tracking(state);
+    // The close view paints itself; a fresh presentation starts it at rest and marks it dirty.
+    let _: () = msg_send![state.close, setNeedsDisplay: true];
     let _: () = msg_send![state.panel, setAlphaValue: 0.0f64];
     let _: () = msg_send![state.panel, orderFrontRegardless];
     fade(state.panel, 1.0);
@@ -122,6 +200,11 @@ unsafe fn show_in(state: &mut State, text: &str, dismiss_after: Option<Duration>
 
 unsafe fn hide_in(state: &mut State) {
     cancel_timer(state);
+    // A panel that is ordered out never delivers `mouseExited:`, so the resting style is restated here; otherwise the
+    // next showing would open with a red wash under a pointer that is nowhere near it.
+    if !state.close.is_null() {
+        set_close_hover(state.close, false);
+    }
     if state.panel.is_null() {
         return;
     }
@@ -164,54 +247,43 @@ unsafe fn fade(panel: *mut AnyObject, alpha: f64) {
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 }
 
-/// The backdrop options, shared by construction and every live refresh: the native glass edge keeps
-/// the system's specular outside the content clip, and the compensation keeps a panel that never
-/// becomes key from reading half as substantial as the ones that do.
+/// The backdrop options, shared by construction and every live refresh.
 ///
-/// The compensation is strength-scaled the way the keystroke display scales it, and for the same
-/// reason: this panel is passive, so AppKit dims the material, and a FULL-strength veil over clear
-/// glass covers the material in an opaque fill. The user's glass then stops reading as glass. Clear
-/// gets no veil at all, and the regular look gets a partial lift.
+/// The bubble is an **opaque** surface: no material, no veil, so the desktop behind it can neither darken nor
+/// brighten it. That is the finding of the side-by-side comparison -- a one-line passive panel over a dark
+/// desktop went grey-to-black with every translucent variant (clear glass, the menu material, a lighter dark
+/// tint). An opaque surface keeps one tone in every mode and on every wallpaper, which is what a short
+/// message needs to be read at a glance.
+///
+/// The outline and the elevation are the backdrop's own, exactly as they are on the app's opaque panels.
+/// The bubble's shadow: the reference's `0 4px 24px -2px rgba(0,0,0,0.10)`, with a touch more opacity so it
+/// still reads on a light desktop.
+///
+/// Its own level rather than the shared `ELEVATION_HIGH` (32pt radius, 18%): the reference's shadow is tighter
+/// and softer, which is what makes a small chip sit on the surface instead of floating above it.
+const TOAST_ELEVATION: crate::theme::Elevation = crate::theme::Elevation {
+    color: 0x000000FF,
+    opacity: 0.16,
+    radius: 16.0,
+    offset_y: -4.0,
+};
+
 fn toast_backdrop_options() -> crate::glass::BackdropOptions {
-    let tint = toast_compensation_tint(
-        &crate::config::effective_glass_style(),
-        theme::resolved_is_dark(),
-    );
-    crate::glass::BackdropOptions::new(Some(tint & 0xFF))
-        .with_compensation_tint(tint)
-        .with_elevation(Some(theme::ELEVATION_HIGH))
-        .with_native_glass_edge()
-        // The menu material, not the HUD one the other panels share. This surface borrows the look
-        // of a context menu: it is a short-lived message, and `NSVisualEffectView` keeps that look
-        // whether or not the window is key -- which is what a passive panel needs, because the
-        // Liquid Glass material renders flat whenever its window loses key status.
-        .with_frost_material(NS_VISUAL_EFFECT_MATERIAL_MENU)
+    crate::glass::BackdropOptions::new(None)
+        .with_elevation(Some(TOAST_ELEVATION))
+        // Pinned, not merely "configured": the settings' panel material may be Liquid Glass, frost or
+        // anything else, and every one of those would make the bubble follow the desktop behind it.
+        .with_material(crate::glass::PanelMaterial::Opaque)
 }
 
-/// `NSVisualEffectView.Material.menu`: the material menus and the Finder context menu use.
-const NS_VISUAL_EFFECT_MATERIAL_MENU: i64 = 5;
-
-/// The passive-panel lift for the current mode, with the alpha scaled by the glass style.
-fn toast_compensation_tint(style: &str, dark: bool) -> u32 {
-    let tint = if dark {
-        theme::HUD_GLASS_COMPENSATION_DARK
-    } else {
-        theme::HUD_GLASS_COMPENSATION_LIGHT
-    };
-    if crate::glass::glass_style_index(style) == 1 {
-        // Clear: no veil. The panel must stay as translucent as the style asks for.
-        tint & 0xFFFF_FF00
-    } else {
-        // Regular: half strength, enough to lift the passive dim without hiding the material.
-        (tint & 0xFFFF_FF00) | 0x60
-    }
+#[link(name = "AppKit", kind = "framework")]
+extern "C" {
+    static NSFontAttributeName: *mut AnyObject;
+    static NSForegroundColorAttributeName: *mut AnyObject;
 }
 
-unsafe fn build(state: &mut State) {
-    let local = NSRect::new(
-        NSPoint::new(0.0, 0.0),
-        NSSize::new(TOAST_WIDTH, TOAST_HEIGHT),
-    );
+unsafe fn build(state: &mut State) -> bool {
+    let local = toast_rect(TOAST_MIN_WIDTH);
     let panel: *mut AnyObject = msg_send![class!(NSPanel), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
@@ -221,7 +293,7 @@ unsafe fn build(state: &mut State) {
         defer: false
     ];
     if panel.is_null() {
-        return;
+        return false;
     }
     let _: () = msg_send![panel, setReleasedWhenClosed: false];
     // The vibrant appearance decides what a dynamic ink resolves to, and the material's rim is drawn
@@ -237,7 +309,9 @@ unsafe fn build(state: &mut State) {
     }
     // Floating level, so the message sits above ordinary windows like the other panels do.
     let _: () = msg_send![panel, setLevel: 3isize];
-    let _: () = msg_send![panel, setIgnoresMouseEvents: true];
+    // The ✕ has to be clickable, so the window takes the mouse. It is still a NON-activating panel: a click
+    // dismisses the message and never raises this app over the one the user is working in.
+    let _: () = msg_send![panel, setIgnoresMouseEvents: false];
     let _: () = msg_send![panel, setHidesOnDeactivate: false];
     let _: () = msg_send![panel, setCollectionBehavior: ((1u64 << 0) | (1u64 << 6) | (1u64 << 8))];
     // The window itself is transparent: the material, its rounded corner and its shadow all come
@@ -245,109 +319,465 @@ unsafe fn build(state: &mut State) {
     let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
     let _: () = msg_send![panel, setBackgroundColor: clear];
     let _: () = msg_send![panel, setOpaque: false];
-    // The panel draws its own shadow: `install_backdrop` wraps the material in a shadow carrier with
+    // The panel draws its own shadow: install_backdrop wraps the material in a shadow carrier with
     // a rounded path. Leaving AppKit's window shadow on as well stacks a second silhouette derived
     // from the opaque region, which on a transparent window extends well past the rounded corner and
     // showed as a speckled halo around the whole panel. The keystroke display disables it the same way.
     let _: () = msg_send![panel, setHasShadow: false];
 
-    let backdrop = crate::glass::install_backdrop(
-        panel,
-        local,
-        crate::glass::PANEL_CORNER_RADIUS,
-        toast_backdrop_options(),
-    );
+    let backdrop =
+        crate::glass::install_backdrop(panel, local, TOAST_RADIUS, toast_backdrop_options());
 
-    // One row centred in the panel: the tick and its text share the same vertical midline, and the
-    // text's field is exactly one line tall because NSTextField draws from the TOP of its frame.
-    // Giving it the full panel height (the first attempt) put the glyphs at the top and left the
-    // lower half empty.
-    // The lit inner bevel the keystroke display wears. `install_backdrop` already adds the
-    // material's outline, which is a 0.5pt ring; this is the brighter bevel inside it, and without
-    // it the panel's edge reads as a soft blur against a light background.
-    let bevel = crate::glass::install_hud_bevel(&backdrop, crate::glass::PANEL_CORNER_RADIUS);
+    // A row centred in the panel, built in the order the reference lays it out: the status badge, the message,
+    // and the close glyph on the trailing edge. The text's field is exactly one line tall because NSTextField
+    // draws from the TOP of its frame; giving it the full panel height put the glyphs at the top.
+    // The edge is the app's own, not a stroke of this surface's: the shared 1pt palette outline that
+    // `install_backdrop` puts on every opaque surface, and the clipboard bevel inside it -- a 0.5pt dark outer
+    // ring with a lit inner one, the same pair the clear-glass panel wears.
+    let bevel = crate::glass::install_panel_bevel(&backdrop, TOAST_RADIUS);
 
     let content: *mut AnyObject = backdrop.content_parent;
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: theme::FONT_CONTROL];
-    let line_height = theme::line_height(theme::FONT_CONTROL, theme::LINE_HEIGHT_BODY_RATIO);
+    let row_mid = TOAST_HEIGHT / 2.0;
 
-    let text_x = TOAST_PADDING + TOAST_ICON_SIZE + TOAST_ICON_GAP;
-    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let label: *mut AnyObject = msg_send![
-        label,
-        initWithFrame: NSRect::new(
-            NSPoint::new(text_x, (TOAST_HEIGHT - line_height) / 2.0),
-            NSSize::new(TOAST_WIDTH - text_x - TOAST_PADDING, line_height)
-        )
-    ];
-    let _: () = msg_send![label, setBezeled: false];
-    let _: () = msg_send![label, setDrawsBackground: false];
-    let _: () = msg_send![label, setEditable: false];
-    let _: () = msg_send![label, setSelectable: false];
-    let _: () = msg_send![label, setUsesSingleLineMode: true];
-    let _: () = msg_send![label, setAlignment: 0isize]; // left, beside the icon
-    let _: () = msg_send![label, setLineBreakMode: 4isize]; // truncate the tail
-    let _: () = msg_send![label, setFont: font];
-    let ink: *mut AnyObject = msg_send![class!(NSColor), labelColor];
-    let _: () = msg_send![label, setTextColor: ink];
-    // The cell's own vertical alignment, the same setting the shared settings label uses: without
-    // it a field taller than its text pins the glyphs to the top of the box.
-    let cell: *mut AnyObject = msg_send![label, cell];
+    let badge = build_badge(
+        content,
+        NSRect::new(
+            NSPoint::new(TOAST_PADDING_X, row_mid - TOAST_BADGE_SIZE / 2.0),
+            NSSize::new(TOAST_BADGE_SIZE, TOAST_BADGE_SIZE),
+        ),
+    );
+
+    let text_x = TOAST_PADDING_X + TOAST_BADGE_SIZE + TOAST_GAP;
+    // The message takes everything between the badge and the close glyph; \`layout_row\` sets that width on every
+    // presentation, because the panel is resized to the message.
+    let label = build_message(
+        content,
+        NSRect::new(
+            NSPoint::new(text_x, row_mid - TOAST_LINE_HEIGHT / 2.0),
+            NSSize::new(
+                TOAST_MIN_WIDTH - text_x - TOAST_GAP - TOAST_CLOSE_WIDTH,
+                TOAST_LINE_HEIGHT,
+            ),
+        ),
+    );
+
+    let close = build_close_glyph(content, state.slot);
+
+    // A surface that could not be made opaque is not this surface: say so instead of showing it, because a
+    // translucent bubble over a dark desktop is exactly the state this look exists to rule out.
+    if backdrop.material != crate::glass::PanelMaterial::Opaque {
+        release_obj(panel);
+        return false;
+    }
+    state.panel = panel;
+    state.label = label;
+    state.badge = badge;
+    state.close = close;
+    state.backdrop = Some(backdrop);
+    state.bevel = bevel;
+    true
+}
+
+/// The bubble's fill: white, the tone the reference bubble has.
+///
+/// Not a palette surface token. The reference is a white chip that stands on whatever the user is working
+/// in, and `window_bg`/the panel surface both follow the theme, which in dark mode would give a dark chip --
+/// the exact failure the translucent candidates had. A white chip keeps one tone in both modes, and its inks
+/// (the primary label colour and the palette accent) are chosen against white above.
+fn toast_fill_hex() -> u32 {
+    0xFFFF_FFFF
+}
+
+/// The bubble's width for the string `text` as `label` lays it out: the larger of the font's own measurement and
+/// the width the field reports once it holds the string, plus the row's chrome.
+unsafe fn toast_width_for_field(label: *mut AnyObject, text: &str) -> f64 {
+    let font_width = crate::glass::measure_single_line_text(text, TOAST_FONT_SIZE).width;
+    let _: () = msg_send![label, sizeToFit];
+    let fitted: NSRect = msg_send![label, frame];
+    let field_width = fitted.size.width;
+    toast_width_for_text_width(font_width.max(field_width))
+}
+
+/// The reference's inks, on its white surface: the message in `text-neutral-800`, the badge in
+/// `bg-emerald-500` with a white tick, and the close glyph in `text-neutral-400`.
+///
+/// Literal values rather than palette tokens. The bubble is white in both modes by design (see
+/// `toast_fill_hex`), so its inks are resolved against that one surface and not against the theme; the palette's
+/// label and accent tokens follow the theme and would invert in dark mode.
+const TOAST_MESSAGE_INK: u32 = 0x262626FF;
+const TOAST_BADGE_FILL: u32 = 0x10B981FF;
+const TOAST_CLOSE_INK: u32 = 0xA3A3A3FF;
+
+/// The message line: a field that does not draw its own background, so it is the panel's flat surface with one
+/// line of text on it -- the row's own geometry, none of AppKit's. The text is ONE line and never truncated: the
+/// panel's width is measured from this very text (see `toast_width`), so the field it is given always fits it,
+/// and a field only cuts what does not fit.
+///
+/// A field rather than a custom drawing view: AppKit's drawing has to run inside the window's display cycle,
+/// which a passive panel owns and no callback of ours can drive, while a field's cell paints on the same pass
+/// the rest of the row does.
+unsafe fn build_message(content: *mut AnyObject, frame: NSRect) -> *mut AnyObject {
+    let message: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let message: *mut AnyObject = msg_send![message, initWithFrame: frame];
+    let _: () = msg_send![message, setBezeled: false];
+    let _: () = msg_send![message, setBordered: false];
+    let _: () = msg_send![message, setDrawsBackground: false];
+    let _: () = msg_send![message, setEditable: false];
+    let _: () = msg_send![message, setSelectable: false];
+    let _: () = msg_send![message, setUsesSingleLineMode: true];
+    let _: () = msg_send![message, setAlignment: 0isize]; // left, after the badge
+    let _: () = msg_send![message, setLineBreakMode: 4isize]; // a tail cut only if the width was miscomputed
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: TOAST_FONT_SIZE];
+    let _: () = msg_send![message, setFont: font];
+    let _: () = msg_send![message, setTextColor: crate::ffi::hex_to_ns_color(TOAST_MESSAGE_INK)];
+    let cell: *mut AnyObject = msg_send![message, cell];
     if !cell.is_null() && msg_send![cell, respondsToSelector: sel!(setVerticalAlignment:)] {
         let _: () = msg_send![cell, setVerticalAlignment: 1isize]; // NSCenterTextAlignment
     }
-    let _: () = msg_send![content, addSubview: label];
-
-    let icon: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-    let icon: *mut AnyObject = msg_send![
-        icon,
-        initWithFrame: NSRect::new(
-            NSPoint::new(TOAST_PADDING, (TOAST_HEIGHT - TOAST_ICON_SIZE) / 2.0),
-            NSSize::new(TOAST_ICON_SIZE, TOAST_ICON_SIZE)
-        )
-    ];
-    let symbol_name = make_nsstring("checkmark.circle.fill");
-    let symbol: *mut AnyObject = msg_send![
-        class!(NSImage),
-        imageWithSystemSymbolName: symbol_name,
-        accessibilityDescription: std::ptr::null_mut::<AnyObject>()
-    ];
-    release_obj(symbol_name);
-    if !symbol.is_null() {
-        let _: () = msg_send![icon, setImage: symbol];
-        let _: () = msg_send![icon, setImageScaling: 1isize]; // NSImageScaleProportionallyDown
-        let content_tint: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
-        let _: () = msg_send![icon, setContentTintColor: content_tint];
-    }
-    let _: () = msg_send![content, addSubview: icon];
-
-    state.panel = panel;
-    state.label = label;
-    state.icon = icon;
-    state.backdrop = Some(backdrop);
-    state.bevel = bevel;
+    let _: () = msg_send![content, addSubview: message];
+    release_obj(message);
+    message
 }
 
-/// Where the panel sits on `visible`: centred horizontally, `TOAST_BOTTOM_MARGIN` above the
-/// visible bottom edge. Pure so the rule is asserted without AppKit.
-fn toast_origin(visible: NSRect) -> NSPoint {
-    let centred_x = visible.origin.x + (visible.size.width - TOAST_WIDTH) / 2.0;
+/// The status badge: a filled circle with a white tick, the reference's `size-5 rounded-full bg-emerald-500`
+/// plus its 11pt `Check`. One custom view draws both, so the tick keeps the badge's own centre.
+unsafe fn build_badge(content: *mut AnyObject, frame: NSRect) -> *mut AnyObject {
+    let class = badge_class();
+    let badge: *mut AnyObject = msg_send![class, alloc];
+    let badge: *mut AnyObject = msg_send![badge, initWithFrame: frame];
+    let _: () = msg_send![content, addSubview: badge];
+    release_obj(badge);
+    badge
+}
+
+/// A circle in the badge's fill with a tick stroked through it.
+unsafe extern "C" fn draw_badge(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect) {
+    crate::callback_guard::void("toast_badge_draw", || unsafe {
+        let bounds: NSRect = msg_send![view, bounds];
+        let circle: *mut AnyObject = msg_send![
+            class!(NSBezierPath),
+            bezierPathWithOvalInRect: bounds
+        ];
+        let fill = crate::ffi::hex_to_ns_color(TOAST_BADGE_FILL);
+        let _: () = msg_send![fill, setFill];
+        let _: () = msg_send![circle, fill];
+        // The reference's glyph exactly: a lucide `Check` at 11x11 (its `width={11} height={11}`),`M20 6 9 17l-5-5`
+        // in a 24-unit viewBox, stroke-width 3, round caps and joins, centred in the 20pt circle. Scaling that
+        // viewBox to the whole badge instead -- the first attempt -- drew a tick nearly twice the size the
+        // reference has, which is what made the badge read as heavier than the page's.
+        let glyph = TOAST_CHECK_SIZE;
+        let unit = glyph / 24.0;
+        let origin_x = bounds.origin.x + (bounds.size.width - glyph) / 2.0;
+        let origin_y = bounds.origin.y + (bounds.size.height - glyph) / 2.0;
+        let px = |x: f64| origin_x + x * unit;
+        let py = |y: f64| origin_y + glyph - y * unit;
+        let tick: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+        let _: () = msg_send![tick, moveToPoint: NSPoint::new(px(20.0), py(6.0))];
+        let _: () = msg_send![tick, lineToPoint: NSPoint::new(px(9.0), py(17.0))];
+        let _: () = msg_send![tick, lineToPoint: NSPoint::new(px(4.0), py(12.0))];
+        let _: () = msg_send![tick, setLineWidth: 3.0 * unit];
+        let _: () = msg_send![tick, setLineCapStyle: 1isize]; // NSRoundLineCapStyle
+        let _: () = msg_send![tick, setLineJoinStyle: 1isize]; // NSRoundLineJoinStyle
+        let white = crate::ffi::hex_to_ns_color(0xFFFF_FFFF);
+        let _: () = msg_send![white, setStroke];
+        let _: () = msg_send![tick, stroke];
+    });
+}
+
+fn badge_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabToastBadge", || {
+        crate::ffi::build_class(c"OhMyTabToastBadge", class!(NSView), |builder| unsafe {
+            builder.add_method::<AnyObject, _>(
+                sel!(drawRect:),
+                draw_badge as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect),
+            );
+            builder.add_method::<AnyObject, _>(
+                sel!(hitTest:),
+                toast_hit_test
+                    as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
+            );
+        })
+    })
+    .0 as *mut AnyObject
+}
+
+/// The decorations of this surface never take the hit test: the window ignores mouse events as a whole, so the
+/// only thing a decoration could do by accepting one is shadow the content the run loop looks for.
+unsafe extern "C" fn toast_hit_test(
+    _view: *mut AnyObject,
+    _cmd: Sel,
+    _point: NSPoint,
+) -> *mut AnyObject {
+    crate::callback_guard::nil("toast_hit_test", std::ptr::null_mut)
+}
+
+/// Give the close button its hover tracking, once it is in a window.
+///
+/// An `NSTrackingArea` only delivers anything while its view is in a window, so it is attached at the first
+/// presentation rather than at build time; the flag keeps it to one area per button, since a second would double
+/// every enter/exit.
+unsafe fn ensure_close_tracking(state: &mut State) {
+    if state.close_tracked || state.close.is_null() {
+        return;
+    }
+    let window: *mut AnyObject = msg_send![state.close, window];
+    if window.is_null() {
+        return;
+    }
+    add_close_tracking(state.close);
+    state.close_tracked = true;
+}
+
+/// The ✕ hovers the way the clipboard history's row ✕ does: the glyph turns the palette's destructive colour and
+/// a faint wash of it fills the button.
+///
+/// A button rather than a plain custom view: a borderless `NSButton` with a template image is what the clipboard
+/// history uses for the same control, and AppKit centres a template image in it on both axes. The `✕` as a title
+/// did not -- a title is inset and laid out against the width the cell saw at build time -- which is what left the
+/// glyph and its wash off-centre once the button was reframed to the row.
+unsafe fn set_close_hover(button: *mut AnyObject, hovered: bool) {
+    let layer: *mut AnyObject = msg_send![button, layer];
+    if !layer.is_null() {
+        let wash = if hovered {
+            (crate::theme::ui_palette().destructive & 0xFFFF_FF00) | 0x18
+        } else {
+            0x0000_0000
+        };
+        crate::ffi::layer_set_background(layer, crate::ffi::hex_to_cg_color(wash));
+        let _: () = msg_send![layer, setCornerRadius: TOAST_CLOSE_CORNER];
+    }
+    // The glyph is a template image, so the tint IS its colour -- one call, no attributed title to rebuild.
+    let ink = if hovered {
+        crate::theme::ui_palette().destructive
+    } else {
+        TOAST_CLOSE_INK
+    };
+    let _: () = msg_send![button, setContentTintColor: crate::ffi::hex_to_ns_color(ink)];
+}
+
+extern "C" fn close_button_entered(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    crate::callback_guard::void("toast_close_entered", || {
+        unsafe { set_close_hover(_self, true) };
+    });
+}
+
+extern "C" fn close_button_exited(_self: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    crate::callback_guard::void("toast_close_exited", || {
+        unsafe { set_close_hover(_self, false) };
+    });
+}
+
+fn close_button_class() -> *mut AnyObject {
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    crate::ffi::StaticClass::register_once(&CLASS, c"OhMyTabToastCloseButton", || {
+        crate::ffi::build_class(
+            c"OhMyTabToastCloseButton",
+            class!(NSButton),
+            |builder| unsafe {
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseEntered:),
+                    close_button_entered as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+                builder.add_method::<AnyObject, _>(
+                    sel!(mouseExited:),
+                    close_button_exited as extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                );
+            },
+        )
+    })
+    .0 as *mut AnyObject
+}
+
+/// The close button's target: it holds no state, and the button that sent the action names no bubble, so the
+/// target resolves the bubble from the sender's own superview chain is not needed -- each bubble has one button and
+/// one timer, and the action only ever has to hide the bubble that owns the pressed control.
+unsafe fn close_target() -> *mut AnyObject {
+    static TARGET: OnceLock<crate::ffi::CallbackTarget> = OnceLock::new();
+    static CLASS: OnceLock<StaticClass> = OnceLock::new();
+    TARGET
+        .get_or_init(|| {
+            let name = c"OhMyTabToastCloseTarget";
+            let class = StaticClass::register_once(&CLASS, name, || {
+                crate::ffi::build_class(name, class!(NSObject), |builder| unsafe {
+                    builder.add_method::<AnyObject, _>(
+                        sel!(dismissToast:),
+                        close_pressed as unsafe extern "C" fn(*mut AnyObject, Sel, *mut AnyObject),
+                    );
+                })
+            });
+            let instance: *mut AnyObject = msg_send![class.0 as *mut AnyObject, new];
+            crate::ffi::CallbackTarget::new(instance)
+        })
+        .0
+}
+
+/// The user clicked the bubble's `✕`: hide the bubble whose close button sent it and cancel that bubble's own
+/// timeout, so a click and the timer can never each run a dismissal for the same message.
+unsafe extern "C" fn close_pressed(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
+    crate::callback_guard::void("toast_close_pressed", || {
+        SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            let Some(state) = slots.iter_mut().find(|state| state.close == sender) else {
+                return;
+            };
+            hide_in(state);
+        });
+    });
+}
+
+/// Attach the hover tracking the close button needs. MouseEnteredAndExited | ActiveAlways: the bubble's window is
+/// passive and the app behind it stays inactive, exactly the case the clipboard's own tracking area documents as
+/// needing ActiveAlways rather than ActiveInActiveApp.
+unsafe fn add_close_tracking(button: *mut AnyObject) {
+    let opts: u64 = 0x01 | 0x80;
+    let ta: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let bounds: NSRect = msg_send![button, bounds];
+    let ta: *mut AnyObject = msg_send![
+        ta,
+        initWithRect: bounds,
+        options: opts,
+        owner: button,
+        userInfo: std::ptr::null::<AnyObject>()
+    ];
+    let _: () = msg_send![button, addTrackingArea: ta];
+    release_obj(ta);
+}
+
+unsafe fn build_close_glyph(content: *mut AnyObject, _slot: usize) -> *mut AnyObject {
+    let close: *mut AnyObject = msg_send![close_button_class(), alloc];
+    let close: *mut AnyObject = msg_send![close, initWithFrame: NSRect::new(
+        NSPoint::new(
+            TOAST_MIN_WIDTH - TOAST_PADDING_X - TOAST_CLOSE_WIDTH,
+            TOAST_HEIGHT / 2.0 - TOAST_CLOSE_HEIGHT / 2.0
+        ),
+        NSSize::new(TOAST_CLOSE_WIDTH, TOAST_CLOSE_HEIGHT)
+    )];
+    let _: () = msg_send![close, setBordered: false];
+    let _: () = msg_send![close, setWantsLayer: true];
+    let _: () = msg_send![close, setFocusRingType: 1isize]; // NSFocusRingTypeNone
+                                                            // The glyph is drawn into a template image of the button's own size and given as the button's image, so AppKit
+                                                            // centres it on both axes without a title to inset it. A title was the first attempt and never centred: the cell
+                                                            // keeps the width it laid out at build time, so the glyph and its wash drifted once the row was laid out.
+    let glyph = make_nsstring("✕");
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject =
+        msg_send![image, initWithSize: NSSize::new(TOAST_CLOSE_BOX, TOAST_CLOSE_BOX)];
+    let _: () = msg_send![image, lockFocus];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: TOAST_CLOSE_FONT_SIZE];
+    let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), dictionary];
+    let _: () = msg_send![attributes, setObject: font, forKey: NSFontAttributeName];
+    let _: () = msg_send![
+        attributes,
+        setObject: crate::ffi::hex_to_ns_color(0xFFFF_FFFF),
+        forKey: NSForegroundColorAttributeName
+    ];
+    let line: NSRect = msg_send![
+        glyph,
+        boundingRectWithSize: NSSize::new(TOAST_CLOSE_BOX, TOAST_CLOSE_BOX),
+        options: 1u64,
+        attributes: attributes
+    ];
+    let _: () = msg_send![
+        glyph,
+        drawInRect: NSRect::new(
+            NSPoint::new(
+                (TOAST_CLOSE_BOX - line.size.width) / 2.0,
+                (TOAST_CLOSE_BOX - line.size.height) / 2.0
+            ),
+            NSSize::new(line.size.width, line.size.height)
+        ),
+        withAttributes: attributes
+    ];
+    let _: () = msg_send![image, unlockFocus];
+    let _: () = msg_send![image, setTemplate: true];
+    let _: () = msg_send![close, setImage: image];
+    release_obj(image);
+    let _: () = msg_send![close, setImagePosition: 2isize]; // image only, no title
+    let _: () = msg_send![close, setImageScaling: 3isize]; // NSImageScaleNone: draw the template at the size it was made
+    let _: () = msg_send![close, setContentTintColor: crate::ffi::hex_to_ns_color(TOAST_CLOSE_INK)];
+    let _: () = msg_send![close, setTarget: close_target()];
+    let _: () = msg_send![close, setAction: sel!(dismissToast:)];
+    let tooltip = make_nsstring(&crate::i18n::t("finder_menu.toast_dismiss"));
+    let _: () = msg_send![close, setToolTip: tooltip];
+    release_obj(tooltip);
+    release_obj(glyph);
+    let _: () = msg_send![content, addSubview: close];
+    add_close_tracking(close);
+    set_close_hover(close, false);
+    release_obj(close);
+    close
+}
+
+/// A bubble that is `width` wide, at the bottom-left of its window.
+fn toast_rect(width: f64) -> NSRect {
+    NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, TOAST_HEIGHT))
+}
+
+/// The width a bubble takes for a text line `measured` wide: the icon, the gap, the text, and the
+/// padding on both sides -- floored at TOAST_MIN_WIDTH and capped at TOAST_MAX_WIDTH.
+///
+/// Pure so the rule is asserted without AppKit. A measurement of zero or less (an empty string, or a
+/// font that will not measure here) falls back to the floor rather than to a sliver.
+fn toast_width_for_text_width(measured: f64) -> f64 {
+    let floor = TOAST_MIN_WIDTH.max(TOAST_ROW_CHROME);
+    if measured.is_nan() || measured <= 0.0 {
+        return floor;
+    }
+    (measured.ceil() + TOAST_ROW_CHROME).clamp(floor, TOAST_MAX_WIDTH)
+}
+
+/// The bubble's width for `text`, measured at the control font.
+fn toast_width(text: &str) -> f64 {
+    let measured = crate::glass::measure_single_line_text(text, TOAST_FONT_SIZE).width;
+    toast_width_for_text_width(measured)
+}
+
+/// Where a `width`-wide panel sits on `visible`: centred horizontally, `row_offset` further right so a
+/// second bubble stands beside the first, `TOAST_BOTTOM_MARGIN` above the visible bottom edge. Pure so the rule
+/// is asserted without AppKit.
+fn toast_origin(visible: NSRect, width: f64, row_offset: f64) -> NSPoint {
+    let centred_x = visible.origin.x + (visible.size.width - width) / 2.0;
     // A screen narrower than the panel would otherwise push it past the left edge.
-    let x = centred_x.max(visible.origin.x);
+    let x = (centred_x + row_offset).max(visible.origin.x);
     NSPoint::new(x, visible.origin.y + TOAST_BOTTOM_MARGIN)
 }
 
-unsafe fn place(panel: *mut AnyObject, bevel: Option<crate::ffi::ObjPtr>) {
+/// The two bubbles' x offsets from the single-bubble centre: the first stands where the bubble always stands,
+/// the second one to its left, as far apart as its own width plus a gap.
+///
+/// Pure, so the rule is asserted without AppKit. The row is laid out from the left bubble's width alone
+/// because only the left-most bubble's position depends on the widths: the left one keeps the single-bubble
+/// position, and the right one moves right by the left one's width plus `TOAST_ROW_GAP`.
+fn toast_row_offset(position: usize, left_width: f64) -> f64 {
+    match position {
+        0 => 0.0,
+        _ => -(left_width + TOAST_ROW_GAP),
+    }
+}
+
+/// The gap between two bubbles standing side by side.
+const TOAST_ROW_GAP: f64 = 16.0;
+
+unsafe fn place(
+    panel: *mut AnyObject,
+    width: f64,
+    row_offset: f64,
+    bevel: Option<crate::ffi::ObjPtr>,
+) {
     // `visibleFrame`, not `frame`: the visible area already excludes the menu bar and the Dock.
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     if screen.is_null() {
         return;
     }
+    // `place` carries the width rather than reading it back from `TOAST`: it is called from `show_in`,
+    // which already holds the thread-local mutably, and a second `borrow()` there panics.
     let visible: NSRect = msg_send![screen, visibleFrame];
-    let origin = toast_origin(visible);
+    let origin = toast_origin(visible, width, row_offset);
     // The window is larger than the panel by its shadow padding, so the requested panel rect is
     // converted through the insets rather than assigned to the window frame directly.
-    let panel_rect = NSRect::new(origin, NSSize::new(TOAST_WIDTH, TOAST_HEIGHT));
+    let panel_rect = toast_rect(width);
+    let panel_rect = NSRect::new(origin, panel_rect.size);
     let insets = crate::glass::panel_insets_of(panel);
     let frame = theme::window_frame_for_panel(panel_rect, insets);
     let _: () = msg_send![panel, setFrame: frame, display: false];
@@ -360,11 +790,42 @@ unsafe fn place(panel: *mut AnyObject, bevel: Option<crate::ffi::ObjPtr>) {
     // built after the material and never touched again. The keystroke display invalidates its bevel
     // on every property refresh for the same reason.
     //
-    // The bevel is passed in rather than read back from `TOAST`: `place` is called from `show_in`,
-    // which already holds this thread-local mutably, and a second `borrow()` there panics.
     if let Some(bevel) = bevel {
         let _: () = msg_send![bevel.0, setNeedsDisplay: true];
     }
+}
+
+/// Lay the row out for a panel `width` wide: the badge on the leading edge, the close glyph on the trailing
+/// edge, and the message taking everything between them. Called on every presentation, because the width
+/// follows the message.
+///
+/// The message's cell keeps its own idea of the text's width -- its truncation happens at that width, not at the
+/// field's frame -- so the frame is set, the cell is told the text fits its frame, and the same frame is set
+/// again. Without the second step the label truncated a 98.5pt message inside a 98.5pt frame.
+unsafe fn layout_row(state: &State, width: f64) {
+    let row_mid = TOAST_HEIGHT / 2.0;
+    let _: () = msg_send![state.badge, setFrame: NSRect::new(
+        NSPoint::new(TOAST_PADDING_X, row_mid - TOAST_BADGE_SIZE / 2.0),
+        NSSize::new(TOAST_BADGE_SIZE, TOAST_BADGE_SIZE)
+    )];
+    let text_x = TOAST_PADDING_X + TOAST_BADGE_SIZE + TOAST_GAP;
+    let text_width = (width - text_x - TOAST_GAP - TOAST_CLOSE_WIDTH - TOAST_PADDING_X).max(0.0);
+    let text_frame = NSRect::new(
+        NSPoint::new(text_x, row_mid - TOAST_LINE_HEIGHT / 2.0),
+        NSSize::new(text_width, TOAST_LINE_HEIGHT),
+    );
+    let _: () = msg_send![state.label, setFrame: text_frame];
+    // A field's cell keeps the width it last laid the string out at, and truncates against that. Re-setting the
+    // line-break mode after the frame is the pair that makes the cell adopt the new width.
+    let _: () = msg_send![state.label, setLineBreakMode: 4isize];
+    let _: () = msg_send![state.label, setNeedsDisplay: true];
+    let _: () = msg_send![state.close, setFrame: NSRect::new(
+        NSPoint::new(
+            width - TOAST_PADDING_X - TOAST_CLOSE_WIDTH,
+            row_mid - TOAST_CLOSE_HEIGHT / 2.0
+        ),
+        NSSize::new(TOAST_CLOSE_WIDTH, TOAST_CLOSE_HEIGHT)
+    )];
 }
 
 unsafe fn cancel_timer(state: &mut State) {
@@ -411,24 +872,26 @@ unsafe fn toast_timer_target() -> *mut AnyObject {
 
 unsafe extern "C" fn dismiss_toast(_this: *mut AnyObject, _cmd: Sel, _timer: *mut AnyObject) {
     crate::callback_guard::void("toast_dismiss", || {
-        TOAST.with(|state| {
-            let mut state = state.borrow_mut();
+        SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            let Some(state) = slots.first_mut() else {
+                return;
+            };
             // The timer that fired is the one this state scheduled; clear the handle first so
             // `hide_in` does not invalidate a timer that has already fired.
             state.timer = std::ptr::null_mut();
-            unsafe { hide_in(&mut state) }
+            unsafe { hide_in(state) }
         });
     });
 }
 
-/// Development switch: present a message once the run loop is up, so `--toast-preview` shows the real
-/// component. The preview never expires, which is what makes it comparable side by side with another
-/// panel.
+/// Development switch: present messages once the run loop is up, so `--toast-preview` shows the real
+/// component. The preview never expires, which is what makes two bubbles comparable side by side.
 ///
 /// A timer rather than a direct call: `run()` reaches its launch switches before `NSApplication run`,
 /// and a panel ordered front with no run loop never draws.
-pub(crate) fn schedule_preview(text: String) {
-    PREVIEW_TEXT.lock().unwrap().replace(text);
+pub(crate) fn schedule_preview(bubbles: Vec<String>) {
+    PREVIEW_TEXT.lock().unwrap().replace(bubbles);
     unsafe {
         let _: *mut AnyObject = msg_send![
             class!(NSTimer),
@@ -441,7 +904,7 @@ pub(crate) fn schedule_preview(text: String) {
     }
 }
 
-static PREVIEW_TEXT: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+static PREVIEW_TEXT: std::sync::Mutex<Option<Vec<String>>> = std::sync::Mutex::new(None);
 static PREVIEW_CLASS: OnceLock<StaticClass> = OnceLock::new();
 
 unsafe fn preview_target() -> *mut AnyObject {
@@ -465,10 +928,35 @@ unsafe fn preview_target() -> *mut AnyObject {
 
 unsafe extern "C" fn fire_preview(_this: *mut AnyObject, _cmd: Sel, _timer: *mut AnyObject) {
     crate::callback_guard::void("fire_toast_preview", || {
-        let Some(text) = PREVIEW_TEXT.lock().unwrap().take() else {
+        let Some(bubbles) = PREVIEW_TEXT.lock().unwrap().take() else {
             return;
         };
-        show_working(&text);
+        // One bubble per slot, all on one midline: each is placed by the same rule a single bubble is, offset
+        // by the row. The left bubble keeps its width, and the ones after it are pushed right by that width.
+        let mut left_width = 0.0;
+        for (position, text) in bubbles.iter().enumerate() {
+            let width = toast_width(text);
+            let offset = toast_row_offset(position, left_width);
+            show_in_slot(position, text, offset);
+            if position == 0 {
+                left_width = width;
+            }
+        }
+    });
+}
+
+/// Present `text` in the bubble of `slot`, `row_offset` to the right of the single-bubble position. The slots
+/// reuse their panels, so a second message does not rebuild anything.
+fn show_in_slot(slot: usize, text: &str, row_offset: f64) {
+    SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        let index = slot;
+        while slots.len() <= index {
+            slots.push(State::default());
+        }
+        unsafe {
+            let _ = show_in(&mut slots[index], text, row_offset, None);
+        }
     });
 }
 
@@ -483,14 +971,297 @@ pub(crate) fn show_done(text: &str) {
     show(text, Some(TOAST_VISIBLE));
 }
 
-/// Build and tear down the panel, proving the component works without a visible wait.
-#[cfg(test)]
-pub(crate) fn smoke() -> bool {
+/// The bubble the smoke scenario reads: its message, its laid-out width, the shared panel outline it carries
+/// (width and whether its colour is the palette's token), whether the shadow carrier is really installed, and the
+/// elevation level.
+///
+/// Read from the live views rather than from the constants, because the claim is about what the surface
+/// draws: a stroke that a material refused and the bubble failed to replace would still pass a check on
+/// the constants. None of this is evidence on its own -- a scenario still measures pixels -- but it says
+/// which surface the pixels are those of.
+pub(crate) struct ToastSnapshot {
+    pub(crate) text: String,
+    pub(crate) width: f64,
+    pub(crate) outline_width: f64,
+    pub(crate) outline_matches_palette: bool,
+    /// Whether the hierarchy really carries the shadow carrier: the one fact that proves a shadow is cast, since a
+    /// declared elevation says nothing when the carrier could not be created.
+    pub(crate) shadow_installed: bool,
+    pub(crate) elevation: &'static str,
+}
+
+/// Show `text` on the main thread and report what the real panel ended up drawing.
+pub(crate) fn snapshot(text: &str) -> Option<ToastSnapshot> {
     crate::debug_assert_main_thread();
+    show_working(text);
+    current_snapshot()
+}
+
+/// The facts about a built bubble: what it says, the rect it occupies and the stroke it draws.
+unsafe fn snapshot_of(state: &State) -> Option<ToastSnapshot> {
+    let backdrop = state.backdrop?;
+    let value: *mut AnyObject = msg_send![state.label, stringValue];
+    let text = crate::ffi::nsstring_to_rust(value);
+    // The panel rect is the window minus the padding its shadow needs; every bubble is laid out in it.
+    let bounds = crate::glass::panel_frame_of(state.panel);
+    let (outline_width, outline_matches_palette) =
+        crate::glass::outline_state(&backdrop).unwrap_or((0.0, false));
+    Some(ToastSnapshot {
+        text,
+        width: bounds.size.width,
+        outline_width,
+        outline_matches_palette,
+        shadow_installed: crate::glass::carrier_installed(&backdrop),
+        // The level this surface really installed, not a constant: the bubble has its own shadow, and a scenario
+        // must be able to tell "the chip is wrong" from "the measurement is".
+        elevation: crate::glass::effective_elevation_id(Some(TOAST_ELEVATION)),
+    })
+}
+
+/// The state document's `toast` object: what the live bubble draws, or `null` when none exists.
+pub(crate) fn e2e_json() -> String {
+    // Read straight from the thread-local rather than through `current_snapshot`: that reader is test-only, and
+    // the state document is a product feature.
+    let Some(snapshot) = SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        slots
+            .first()
+            .and_then(|state| unsafe { snapshot_of(state) })
+    }) else {
+        return "null".to_string();
+    };
+    // The height is the constant rather than the panel's frame, so a scenario knows which rect to cut from
+    // without measuring: every bubble has it.
+    format!(
+        "{{\"text\": {}, \"width\": {:.1}, \"height\": {:.1}, \"outline_width\": {:.1}, \"outline_matches_palette\": {}, \"shadow_installed\": {}, \"elevation\": {}}}",
+        crate::e2e_state::json_string(&snapshot.text),
+        snapshot.width,
+        TOAST_HEIGHT,
+        snapshot.outline_width,
+        snapshot.outline_matches_palette,
+        snapshot.shadow_installed,
+        crate::e2e_state::json_string(snapshot.elevation),
+    )
+}
+
+/// The live bubble's facts, or `None` when it has not been built. Main thread only.
+pub(crate) fn current_snapshot() -> Option<ToastSnapshot> {
+    crate::debug_assert_main_thread();
+    SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        slots
+            .first()
+            .and_then(|state| unsafe { snapshot_of(state) })
+    })
+}
+
+/// The live panel's height in points, or 0 when there is no panel.
+unsafe fn live_panel_height() -> f64 {
+    SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        let Some(state) = slots.first() else {
+            return 0.0;
+        };
+        if state.panel.is_null() {
+            0.0
+        } else {
+            unsafe { crate::glass::panel_frame_of(state.panel).size.height }
+        }
+    })
+}
+/// Build the real bubble and check what describes it: it is one row tall, its width is its message plus the
+/// chrome, and every material draws the same 2pt `glass_rim` stroke with the `high` elevation.
+///
+/// `--smoke-toast` entry, called on the main thread. Returns false on any failure, and logs which one.
+pub(crate) fn smoke_runner() -> Result<(), String> {
+    crate::debug_assert_main_thread();
+    let mut failures: Vec<String> = Vec::new();
     show_working("smoke");
-    let built = is_shown();
+    let Some(first) = current_snapshot() else {
+        return Err("the bubble could not be built".to_string());
+    };
+    // Every bubble is one row tall, whatever it says.
+    let panel_height = unsafe { live_panel_height() };
+    if (panel_height - TOAST_HEIGHT).abs() > 0.01 {
+        failures.push(format!(
+            "the panel is {panel_height:.1}pt tall, expected {TOAST_HEIGHT:.1}"
+        ));
+    }
+    // The width follows the message: a longer string must widen the bubble.
+    let Some(second) = snapshot("smoke toast") else {
+        return Err("the bubble could not be re-shown".to_string());
+    };
+    if second.width <= first.width {
+        failures.push(format!(
+            "a longer message did not widen the bubble ({:.1} -> {:.1})",
+            first.width, second.width
+        ));
+    }
+    for (snapshot, text) in [(first, "smoke"), (second, "smoke toast")] {
+        // The panel is sized from the label's own layout for this string (see `toast_width_for_field`), which is
+        // a few points wider than the bare font measurement. That is what the panel was sized from when THIS
+        // message was presented, and the label now holds the last one, so the expectation is the same rule on
+        // this string rather than a re-measure of the label.
+        let measured = crate::glass::measure_single_line_text(text, TOAST_FONT_SIZE).width;
+        let expected = toast_width_for_text_width(measured) + 4.0;
+        if (snapshot.width - expected).abs() > 0.01 {
+            failures.push(format!(
+                "{text:?}: width is {:.1}, the message measures to {expected:.1}",
+                snapshot.width
+            ));
+        }
+    }
+    // The shadow check has to fail when the bubble has no carrier: build one whose elevation resolves to nothing
+    // (the `--panel-shadow=off` path), and require the check to notice.
+    if let Some(snapshot) = snapshot_without_shadow() {
+        if snapshot.shadow_installed {
+            failures.push(
+                "a bubble built without an elevation still reports a shadow carrier".to_string(),
+            );
+        }
+    }
+    // Every material the user can configure. The swap helper restores the configuration.
+    for material in materials() {
+        let Some(snapshot) = snapshot_for_material(material, "smoke") else {
+            failures.push(format!("{material:?} produced no bubble"));
+            continue;
+        };
+        // The bubble is not a special case: it wears whatever the shared backdrop gave it, so on every
+        // material but glass it must carry the palette outline, and glass must still draw its own rim (which
+        // is the system's). What this asserts is that the bubble did not silently lose the edge.
+        let expect_outline = material != crate::glass::PanelMaterial::LiquidGlass;
+        if expect_outline
+            && (snapshot.outline_width - crate::theme::PANEL_OUTLINE_WIDTH).abs() > 0.01
+        {
+            failures.push(format!(
+                "{material:?}: outline is {:.2}pt, expected {:.1}",
+                snapshot.outline_width,
+                crate::theme::PANEL_OUTLINE_WIDTH
+            ));
+        }
+        // The fact the check needs is the INSTALLED carrier, not the declared level: `install_shadow_carrier` keeps
+        // the material and logs when the carrier cannot be created, so a level alone would pass a bubble with no
+        // shadow at all.
+        if !snapshot.shadow_installed {
+            failures.push(format!(
+                "{material:?}: the bubble has no shadow carrier installed"
+            ));
+        }
+    }
     hide();
-    built
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+/// Build a bubble with no elevation and report what it says about its shadow, then restore the normal one.
+///
+/// The counter-example for the shadow check: if a bubble without a carrier still reported one, the check would pass
+/// on a chip with no shadow, which is exactly the failure the check exists to catch.
+fn snapshot_without_shadow() -> Option<ToastSnapshot> {
+    crate::debug_assert_main_thread();
+    SLOTS.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let state = cell.first_mut()?;
+        if state.panel.is_null() {
+            return None;
+        }
+        unsafe {
+            let installed = state.backdrop?;
+            let panel_frame = crate::glass::panel_frame_of(state.panel);
+            let without = crate::glass::BackdropOptions::new(None)
+                .with_material(crate::glass::PanelMaterial::Opaque);
+            let new = crate::glass::swap_backdrop(
+                state.panel,
+                &installed,
+                panel_frame,
+                TOAST_RADIUS,
+                without,
+            );
+            state.backdrop = Some(new);
+            // The fact comes from the hierarchy the swap just installed, read through the same snapshot the normal
+            // check uses, so the counter-example proves the check rather than a second copy of it.
+            let result = snapshot_of(state);
+            // Put the bubble's own hierarchy back, so the rest of the runner sees the real surface.
+            let restored = crate::glass::swap_backdrop(
+                state.panel,
+                &new,
+                panel_frame,
+                TOAST_RADIUS,
+                toast_backdrop_options(),
+            );
+            state.bevel = crate::glass::install_panel_bevel(&restored, TOAST_RADIUS);
+            state.backdrop = Some(restored);
+            result
+        }
+    })
+}
+
+/// Every material this system can draw, for the smoke runner that proves the chip survives all of them.
+pub(crate) fn materials() -> Vec<crate::glass::PanelMaterial> {
+    vec![
+        crate::glass::PanelMaterial::LiquidGlass,
+        crate::glass::PanelMaterial::Frost,
+        crate::glass::PanelMaterial::Opaque,
+        crate::glass::PanelMaterial::Backdrop,
+    ]
+}
+
+/// Rebuild the bubble for `material` and report what it draws. The configuration is put back afterwards.
+pub(crate) fn snapshot_for_material(
+    material: crate::glass::PanelMaterial,
+    text: &str,
+) -> Option<ToastSnapshot> {
+    crate::debug_assert_main_thread();
+    let installed = SLOTS.with(|slots| slots.borrow().first().and_then(|state| state.backdrop));
+    if let Some(installed) = installed {
+        unsafe { swap_for_material(installed, material) };
+    }
+    snapshot(text)
+}
+
+/// Replace the bubble's hierarchy with one built for `material`, the way a settings change would, keeping the
+/// frame the bubble is currently laid out in. The configuration is put back before returning, so a caller never
+/// observes the override.
+unsafe fn swap_for_material(
+    installed: crate::glass::InstalledBackdrop,
+    material: crate::glass::PanelMaterial,
+) {
+    let previous = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .appearance
+        .panel_material
+        .clone();
+    crate::config::CONFIG
+        .write()
+        .unwrap()
+        .appearance
+        .panel_material = material.config_value().to_string();
+    SLOTS.with(|cell| {
+        let mut cell = cell.borrow_mut();
+        let Some(state) = cell.first_mut() else {
+            return;
+        };
+        let panel_frame = crate::glass::panel_frame_of(state.panel);
+        let new = crate::glass::swap_backdrop(
+            state.panel,
+            &installed,
+            panel_frame,
+            TOAST_RADIUS,
+            toast_backdrop_options(),
+        );
+        state.backdrop = Some(new);
+        // The bubble's outline is the shared one, which the swap re-installs on the new hierarchy.
+        state.bevel = crate::glass::install_panel_bevel(&new, TOAST_RADIUS);
+    });
+    crate::config::CONFIG
+        .write()
+        .unwrap()
+        .appearance
+        .panel_material = previous;
 }
 
 #[cfg(test)]
@@ -502,9 +1273,9 @@ mod tests {
     #[test]
     fn the_panel_is_placed_inside_the_visible_bottom_edge() {
         let visible = NSRect::new(NSPoint::new(0.0, 25.0), NSSize::new(1440.0, 850.0));
-        let origin = toast_origin(visible);
+        let origin = toast_origin(visible, 240.0, 0.0);
         assert_eq!(origin.y, 25.0 + TOAST_BOTTOM_MARGIN);
-        assert_eq!(origin.x, (1440.0 - TOAST_WIDTH) / 2.0);
+        assert_eq!(origin.x, (1440.0 - 240.0) / 2.0);
         assert!(origin.y >= visible.origin.y);
         assert!(origin.y + TOAST_HEIGHT <= visible.origin.y + visible.size.height);
     }
@@ -512,7 +1283,73 @@ mod tests {
     #[test]
     fn a_screen_narrower_than_the_panel_keeps_it_on_screen() {
         let visible = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(200.0, 400.0));
-        let origin = toast_origin(visible);
+        let origin = toast_origin(visible, TOAST_MAX_WIDTH, 0.0);
         assert!(origin.x >= visible.origin.x);
+    }
+
+    /// The bubble is only as wide as its message plus the chrome around it -- not a fixed width, which
+    /// is what makes a one-word message a chip and a sentence a slightly longer chip.
+    #[test]
+    fn the_bubble_is_the_text_plus_its_chrome() {
+        // The reference's row: 12pt padding, the 20pt badge, two 10pt gaps, the 11pt close glyph in its 2pt
+        // padding, and 12pt padding again.
+        let chrome = 12.0 + 20.0 + 10.0 + 10.0 + 15.0 + 12.0;
+        assert_eq!(toast_width_for_text_width(150.4), 150.4f64.ceil() + chrome);
+        // The same message always takes the same width: the rule is deterministic, so a scenario can
+        // compare two launches' widths instead of merely checking both are "some size".
+        assert_eq!(
+            toast_width_for_text_width(90.0),
+            toast_width_for_text_width(90.0)
+        );
+        assert!(toast_width_for_text_width(90.0) < toast_width_for_text_width(91.0));
+    }
+
+    /// Neither an empty message nor a measurement that never happened may produce a sliver, and a long
+    /// one (a path, a digest) is capped instead of growing across the screen.
+    #[test]
+    fn the_bubble_width_is_floored_and_capped() {
+        let floor = TOAST_MIN_WIDTH.max(TOAST_ROW_CHROME);
+        for measured in [0.0, -12.0, f64::NAN] {
+            assert_eq!(
+                toast_width_for_text_width(measured),
+                floor,
+                "{measured} must fall back to the floor"
+            );
+        }
+        assert!(toast_width_for_text_width(1.0) >= floor);
+        for measured in [0.5, 1.0, 4.0] {
+            assert!(toast_width_for_text_width(measured) >= floor);
+        }
+        assert_eq!(toast_width_for_text_width(1e6), TOAST_MAX_WIDTH);
+        assert!(TOAST_MAX_WIDTH > TOAST_MIN_WIDTH);
+    }
+
+    /// The badge, the message and the close glyph all live inside the bubble's row, which is centred on the
+    /// same midline -- what keeps the chip reading as one line rather than as a box with a line in it.
+    #[test]
+    fn the_row_fits_inside_the_bubble() {
+        assert!(TOAST_LINE_HEIGHT <= TOAST_CONTENT_HEIGHT);
+        assert!(TOAST_BADGE_SIZE <= TOAST_CONTENT_HEIGHT);
+        assert_eq!(TOAST_HEIGHT, TOAST_CONTENT_HEIGHT + TOAST_PADDING_Y * 2.0);
+        let smallest = toast_width_for_text_width(1.0);
+        let chrome = TOAST_PADDING_X * 2.0 + TOAST_BADGE_SIZE + TOAST_GAP * 2.0 + TOAST_CLOSE_WIDTH;
+        assert!(
+            chrome < smallest,
+            "the chrome must leave the message some room at the narrowest width"
+        );
+    }
+
+    /// The bubble's own measurements are the reference component's: its type size, its radius, and the
+    /// trailing `✕`'s box. Pinned so a later resize cannot quietly drift away from the surface this exists to
+    /// match.
+    #[test]
+    fn the_geometry_is_the_reference_components() {
+        assert_eq!(TOAST_FONT_SIZE, 13.0);
+        assert_eq!(TOAST_CLOSE_FONT_SIZE, 11.0);
+        assert_eq!(TOAST_RADIUS, 12.0);
+        assert_eq!(TOAST_BADGE_SIZE, 20.0);
+        assert_eq!(TOAST_PADDING_X, 12.0);
+        assert_eq!(TOAST_PADDING_Y, 10.0);
+        assert_eq!(TOAST_GAP, 10.0);
     }
 }

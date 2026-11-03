@@ -623,3 +623,5 @@ to prove a second launch is refused. After stopping it (`dev-restart.sh --check`
 watch: run A1 with the app down, or the refusal probe reports AlreadyRunning.
 
 Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
+
+- **气泡 smoke 里「面板宽度 = 该消息排版宽度」的期望带了一个未解释的 +4pt 余量**（2026-11-03，右键菜单通知气泡审查 R3，MEDIUM——覆盖缺口，延后）。`src/ui/toast.rs` 的 `toast_bubble_smoke` 用 `toast_width_for_text_width(字体测量) + 4.0` 作为期望值；实际差异来源是标签（`NSTextField`）自己的排版比 `NSFont` 的 `sizeWithAttributes:` 宽几个点，但差值没有被逐项核实，4.0 是观察值而不是推导值。同一规则的纯函数（`toast_width_for_text_width` 的边界与钳制）已由 M1 单测覆盖，这里缺的只是端到端那一跳的解释。**重新审视的触发条件：** 下一次改动气泡的排版或宽度规则时，把测量改成「对同一字符串取 `toast_width_for_field` 的结果作为期望」，并在同一次改动里删掉这个常数。

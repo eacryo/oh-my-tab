@@ -3141,6 +3141,7 @@ pub fn run() {
             || arg == "--smoke-space-state-matrix"
             || arg == "--smoke-panel-keys"
             || arg == "--smoke-main-thread-slot"
+            || arg == "--smoke-toast"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -3425,11 +3426,30 @@ pub fn run() {
         exit_smoke_passed();
     }
 
+    // Smoke-test entry (--smoke-toast): build the real bubble and assert what it draws -- its outline on every
+    // material, its width and its elevation. The child that reports the verdict is the child that ran the checks:
+    // the assertions are NOT under #[cfg(test)], because a runner whose checks were compiled out reported PASSED
+    // without looking at anything (that is precisely what this branch used to do).
+    if crate::dev_flags::present("smoke-toast") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        if let Err(reason) = crate::ui::toast::smoke_runner() {
+            eprintln!("[smoke-toast] the bubble did not draw what it promises: {reason}");
+            crate::smoke_verdict::report("toast", crate::smoke_verdict::Verdict::NotRun(reason));
+            std::process::exit(1);
+        }
+        log_info!("[smoke-toast] the bubble keeps its outline and shadow on every material and sizes to its message");
+        crate::smoke_verdict::report("smoke", crate::smoke_verdict::Verdict::Passed { checks: 1 });
+        exit_smoke_passed();
+    }
+
     // Development switch: show the toast once at launch so its material, corner and shadow can be
     // judged without waiting for a Finder click. `--toast-preview` keeps it up with no deadline.
     if crate::dev_flags::present("toast-preview") {
         let text = crate::i18n::t("finder_menu.sha256_copied");
-        crate::ui::toast::schedule_preview(text);
+        crate::ui::toast::schedule_preview(vec![text]);
     }
 
     // Start bounded workers for post-activation AX focus queries so notification bursts do not

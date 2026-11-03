@@ -872,7 +872,7 @@ fn json_opt_u128(value: Option<u128>) -> String {
     value.map_or_else(|| "null".to_string(), |value| value.to_string())
 }
 
-fn json_string(value: &str) -> String {
+pub(crate) fn json_string(value: &str) -> String {
     let mut out = String::with_capacity(value.len() + 2);
     out.push('"');
     for ch in value.chars() {
@@ -1124,6 +1124,12 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         crate::theme::PANEL_OUTLINE_WIDTH,
         crate::glass::effective_panel_elevation_id()
     ));
+    // The message bubble the Finder menu reports through, as the surface itself was left after the last
+    // presentation: its message, its laid-out width and height, the stroke that is actually installed (width,
+    // and whether it is the palette's edge token) and the elevation its shadow carries. `null` until a
+    // bubble is shown. A scenario that measures the bubble's pixels reads this first, because "the stroke is
+    // missing" and "the stroke is there but the cut is in the wrong place" are otherwise the same frame.
+    json.push_str(&format!("  \"toast\": {},\n", crate::ui::toast::e2e_json()));
     // The effective glass look and the tint it resolved to, verbatim from the config. AX cannot express a
     // tint and `NSGlassEffectView.tintColor` reports a system default, so the app states the value itself:
     // this is what makes "the panel shipped with the wrong tint (or an opaque white sheet)" assertable.
