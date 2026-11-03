@@ -1836,9 +1836,6 @@ pub(crate) fn smoke_selection_ring() -> bool {
         let card_h = 170.0;
         let (plate_x, plate_y, plate_w, plate_h) =
             crate::theme::icon_selection_plate(card_width, card_h);
-        let input = crate::theme::ThemeInput::current();
-        let radii =
-            crate::theme::overlay_radii(crate::theme::overlay_card_radius(&input), THUMB_PAD);
         let mut ok = true;
         for thumbnails in [true, false] {
             let previous = {
@@ -1847,6 +1844,12 @@ pub(crate) fn smoke_selection_ring() -> bool {
                 config.layout.thumbnails_enabled = thumbnails;
                 previous
             };
+            // The snapshot is taken AFTER the config change and per iteration: one `ThemeInput` is one
+            // transaction, so a value captured before the loop would describe the other layout (the
+            // card would build thumbnail geometry while the smoke asserts the icon one).
+            let input = crate::theme::ThemeInput::current();
+            let radii =
+                crate::theme::overlay_radii(crate::theme::overlay_card_radius(&input), THUMB_PAD);
             let card = create_card_view(&input, &window, 0, card_width, card_h, true);
             let rings = count_views_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
             let ring = view_with_tag(card, crate::overlay::THUMB_SELECTION_RING_TAG);
