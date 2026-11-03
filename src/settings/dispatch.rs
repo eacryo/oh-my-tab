@@ -461,65 +461,6 @@ fn checked_ids<'a>(ids: impl IntoIterator<Item = &'a str>, states: &[bool]) -> V
         .collect()
 }
 
-/// Fill every Finder Menu control from the config and settle the dependent enable states.
-///
-/// Shared by the ordinary open fill and the in-place config reload so the two cannot disagree
-/// about what the page shows: a switch is membership of its id in the config vec, in catalog order.
-pub(super) unsafe fn fill_finder_menu_controls(ui: &SettingsUi, cfg: &Config) {
-    set_field(
-        ui.finder_menu_status,
-        super::finder_menu_status_text_now(crate::finder_menu::extension_enabled()),
-    );
-    let layout_idx = crate::config::FINDER_MENU_LAYOUTS
-        .iter()
-        .position(|layout| *layout == cfg.finder_menu.layout.as_str())
-        .unwrap_or(0) as isize;
-    let _: () = msg_send![ui.finder_menu_layout, selectItemAtIndex: layout_idx];
-    let _: () = msg_send![
-        ui.finder_menu_enabled,
-        setState: if cfg.finder_menu.enabled { 1isize } else { 0isize }
-    ];
-    for (index, control) in ui.finder_menu_new_file_switches.iter().enumerate() {
-        let checked = crate::config::FINDER_MENU_FILE_TYPES
-            .get(index)
-            .is_some_and(|extension| {
-                cfg.finder_menu
-                    .new_file_types
-                    .iter()
-                    .any(|value| value == extension)
-            });
-        let _: () = msg_send![*control, setState: if checked { 1isize } else { 0isize }];
-    }
-    for (index, control) in ui.finder_menu_terminal_switches.iter().enumerate() {
-        let checked = crate::finder_menu::terminals()
-            .get(index)
-            .is_some_and(|spec| {
-                cfg.finder_menu
-                    .terminals
-                    .iter()
-                    .any(|bundle_id| bundle_id == spec.bundle_id)
-            });
-        let _: () = msg_send![*control, setState: if checked { 1isize } else { 0isize }];
-    }
-    let _: () = msg_send![
-        ui.finder_menu_copy_path,
-        setState: if cfg.finder_menu.copy_path {
-            1isize
-        } else {
-            0isize
-        }
-    ];
-    let _: () = msg_send![
-        ui.finder_menu_copy_sha256,
-        setState: if cfg.finder_menu.copy_sha256 {
-            1isize
-        } else {
-            0isize
-        }
-    ];
-    update_finder_menu_controls_enabled(ui);
-}
-
 /// Freeze the Finder Menu options below the master switch, and keep each terminal row gated by
 /// whether that app is installed. The page build also calls this after creating the rows.
 pub(super) unsafe fn update_finder_menu_controls_enabled(ui: &SettingsUi) {
@@ -2012,7 +1953,11 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                     &[
                         SettingsPageId::Switcher,
                         SettingsPageId::General,
+                        SettingsPageId::Clipboard,
+                        SettingsPageId::About,
                         SettingsPageId::KeystrokeDisplay,
+                        SettingsPageId::FinderMenu,
+                        SettingsPageId::KeyBindings,
                     ],
                 );
             }
@@ -2068,9 +2013,10 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                 u.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),
             );
-            // The finder menu page follows a reload or a defaults restore like every other page:
-            // switches, layout popup, status line and the master-switch freeze.
-            fill_finder_menu_controls(u, &cfg);
+            // The Finder Menu page's rows come from the shared update description above; only its
+            // master-switch freeze has no described value, so it is settled here. The extension's
+            // status line is process state, not config, and has no field to refill.
+            update_finder_menu_controls_enabled(u);
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
             // Key bindings: an external change (a menu toggle, a reloaded file) has to reach the

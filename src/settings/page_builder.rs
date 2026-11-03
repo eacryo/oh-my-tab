@@ -107,277 +107,48 @@ pub(super) unsafe fn build_keystroke_display_page(
     }
 }
 
-/// Build the Finder Menu page and return its final card bottom.
+/// Build the Finder Menu page from its description.
+///
+/// Same shape as the Switcher page: `finder_menu_page_view` says what the page is (rows, copy keys,
+/// identities, values, search entries), `layout_rows` says where it sits, `render_page` applies it,
+/// and `page_update_description` is what the refill and the in-place refresh write. The page's legacy
+/// `SettingsUi` pointers are bound by `FinderMenuHooks` after the build, so there is one
+/// construction path for this page and no inline builder left.
 pub(super) unsafe fn build_finder_menu_page(
     context: &SettingsPageBuildContext,
     finder_menu_view: *mut AnyObject,
     finder_menu_doc_h: f64,
     ui: &mut SettingsUi,
 ) -> f64 {
-    let content_w = context.content_w;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let label_w = layout.label_w;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
     begin_settings_search_page();
-    let mut canvas = PageCanvas::new(
+    let input = PageInput::capture();
+    match build_page(
+        ui,
+        SettingsPageId::FinderMenu,
         finder_menu_view,
-        content_w,
-        layout,
-        &t("settings.sidebar_finder_menu"),
+        context.content_w,
+        context.layout,
         finder_menu_doc_h,
         context.page_frame.size.height,
-    );
-
-    // The status row reports the extension's System Settings state. A Finder Sync extension cannot
-    // switch itself on: the app only restores an election the user had enabled *before our own
-    // update* replaced the bundle (finder_menu::recovery). First-time enabling and re-enabling after
-    // a deliberate disable stay the user's decision, so the row keeps the value read-only and pairs
-    // it with the button that opens the pane where the user can.
-    let status_action_gap = 8.0;
-    let status_w = ctrl_w - ROW_ACTION_BTN_W - status_action_gap;
-    let status_y = canvas.next_row(described_row_h);
-    let status_value = SettingsControl::value_label(
-        ctrl_x,
-        status_y,
-        status_w,
-        row_h,
-        &super::finder_menu_status_text_now(crate::finder_menu::extension_enabled()),
-    );
-    let _: () = msg_send![status_value, setAlignment: 1isize];
-    record_settings_search_row(
-        SettingsPageId::FinderMenu,
-        canvas.last_row(),
-        &t("settings.finder_menu.row_status"),
-        Some(&t("settings.finder_menu.desc_status")),
-    );
-    ui.finder_menu_status = SettingsRow::plain(
-        finder_menu_view,
-        label_x,
-        status_y,
-        label_w,
-        described_row_h,
-        &t("settings.finder_menu.row_status"),
-        status_value,
-    );
-    let status_button = row_action_button(
-        ctrl_x,
-        ctrl_w,
-        status_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
-        &t("settings.finder_menu.open_extension_settings"),
-        target,
-        sel!(handleOpenFinderExtensionManagement:),
-    );
-    let _: () = msg_send![finder_menu_view, addSubview: status_button];
-    release_obj(status_button);
-
-    // Master switch: it owns whether any of the items below reach Finder's context menu. It shares
-    // the "访达集成" card with the status row above, so it carries the card's internal divider —
-    // the same separator every other multi-row card draws above its second and later rows.
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::FinderMenu,
-        canvas.last_row(),
-        &t("settings.finder_menu.row_enabled"),
-        Some(&t("settings.finder_menu.desc_enabled")),
-    );
-    ui.finder_menu_enabled = SettingsRow::described(
-        finder_menu_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.finder_menu.row_enabled"),
-        &t("settings.finder_menu.desc_enabled"),
-        SettingsControl::switch(
-            ctrl_x + ctrl_w,
-            y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
-            row_h,
-            false,
-        ),
-    );
-    bind_control(target, ui.finder_menu_enabled);
-    canvas.card(&t("settings.finder_menu.header_integration"));
-    set_settings_search_section(&t("settings.finder_menu.header_integration"));
-
-    // Arrangement popup: index order is FINDER_MENU_LAYOUTS.
-    canvas.next_section();
-    let layout_labels = [
-        t("settings.finder_menu.layout_flat"),
-        t("settings.finder_menu.layout_grouped"),
-        t("settings.finder_menu.layout_submenu"),
-    ];
-    let layout_refs: Vec<&str> = layout_labels.iter().map(|s| s.as_str()).collect();
-    let layout_metrics = SettingsSelect::metrics();
-    let y = canvas.next_row(layout_metrics.row_h);
-    record_settings_search_row(
-        SettingsPageId::FinderMenu,
-        canvas.last_row(),
-        &t("settings.finder_menu.row_layout"),
-        Some(&t("settings.finder_menu.desc_layout")),
-    );
-    record_settings_search_options(&layout_refs);
-    ui.finder_menu_layout = SettingsRow::tall_with_height(
-        finder_menu_view,
-        label_x,
-        y,
-        label_w,
-        layout_metrics.row_h,
-        &t("settings.finder_menu.row_layout"),
-        SettingsControl::popup(
-            ctrl_x,
-            y + (layout_metrics.row_h - layout_metrics.control_h) / 2.0,
-            ctrl_w,
-            layout_metrics.control_h,
-            &layout_refs,
-            0,
-        ),
-    )
-    .1;
-    bind_control(target, ui.finder_menu_layout);
-    canvas.card(&t("settings.finder_menu.header_layout"));
-    set_settings_search_section(&t("settings.finder_menu.header_layout"));
-
-    // "New File": one switch per extension the menu can create, in FINDER_MENU_FILE_TYPES order.
-    canvas.next_section();
-    let new_file_keys = [
-        "settings.finder_menu.new_file_md",
-        "settings.finder_menu.new_file_txt",
-        "settings.finder_menu.new_file_json",
-    ];
-    let mut new_file_switches = Vec::with_capacity(crate::config::FINDER_MENU_FILE_TYPES.len());
-    for (index, key) in new_file_keys.iter().enumerate() {
-        let y = canvas.next_row(described_row_h);
-        if index > 0 {
-            SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+        &mut page_view::FinderMenuHooks::default(),
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::FinderMenu, built),
+        Err(_) => {
+            // A first build has no previous state: the page stays empty and nothing is published,
+            // which is better than a page that looks alive but is not wired.
+            empty_page(
+                ui,
+                SettingsPageId::FinderMenu,
+                finder_menu_view,
+                context,
+                finder_menu_doc_h,
+            )
         }
-        record_settings_search_row(SettingsPageId::FinderMenu, canvas.last_row(), &t(key), None);
-        let switch = SettingsRow::tall_before_control(
-            finder_menu_view,
-            label_x,
-            y,
-            ctrl_x,
-            super::SETTINGS_CONTROL_LABEL_GAP,
-            &t(key),
-            SettingsControl::switch(
-                ctrl_x + ctrl_w,
-                y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
-                row_h,
-                false,
-            ),
-        )
-        .1;
-        bind_control(target, switch);
-        new_file_switches.push(switch);
     }
-    ui.finder_menu_new_file_switches = new_file_switches;
-    canvas.card(&t("settings.finder_menu.header_new_file"));
-    set_settings_search_section(&t("settings.finder_menu.header_new_file"));
-
-    // "Open in Terminal": one switch per known terminal, in finder_menu::terminals() order. A row
-    // whose app is not installed is frozen with the shared "not installed" tooltip.
-    canvas.next_section();
-    let mut terminal_switches = Vec::with_capacity(crate::finder_menu::terminals().len());
-    for (index, spec) in crate::finder_menu::terminals().iter().enumerate() {
-        let y = canvas.next_row(described_row_h);
-        if index > 0 {
-            SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
-        }
-        // The terminal product name is data, not UI chrome, so it is not translated.
-        record_settings_search_row(
-            SettingsPageId::FinderMenu,
-            canvas.last_row(),
-            spec.name,
-            Some(&t("settings.finder_menu.header_open_in_terminal")),
-        );
-        let switch = SettingsRow::tall_before_control(
-            finder_menu_view,
-            label_x,
-            y,
-            ctrl_x,
-            super::SETTINGS_CONTROL_LABEL_GAP,
-            spec.name,
-            SettingsControl::switch(
-                ctrl_x + ctrl_w,
-                y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
-                row_h,
-                false,
-            ),
-        )
-        .1;
-        bind_control(target, switch);
-        terminal_switches.push(switch);
-    }
-    ui.finder_menu_terminal_switches = terminal_switches;
-    // Settle the master-switch freeze and the per-terminal installed gate now, so the page is
-    // already honest before the open-path fill runs.
-    update_finder_menu_controls_enabled(ui);
-    canvas.card(&t("settings.finder_menu.header_open_in_terminal"));
-    set_settings_search_section(&t("settings.finder_menu.header_open_in_terminal"));
-
-    // "Copy path" and "Copy SHA-256" share the "菜单项" card, so the second row carries the card's internal divider --
-    // the shared `SettingsRow::separator_above_row`, which is what every other multi-row card in Settings uses. Both
-    // rows used to be built without it, which is the line that was missing between them.
-    canvas.next_section();
-    let y = canvas.next_row(described_row_h);
-    record_settings_search_row(
-        SettingsPageId::FinderMenu,
-        canvas.last_row(),
-        &t("settings.finder_menu.row_copy_path"),
-        Some(&t("settings.finder_menu.desc_copy_path")),
-    );
-    ui.finder_menu_copy_path = SettingsRow::tall_before_control(
-        finder_menu_view,
-        label_x,
-        y,
-        ctrl_x,
-        super::SETTINGS_CONTROL_LABEL_GAP,
-        &t("settings.finder_menu.row_copy_path"),
-        SettingsControl::switch(
-            ctrl_x + ctrl_w,
-            y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
-            row_h,
-            false,
-        ),
-    )
-    .1;
-    bind_control(target, ui.finder_menu_copy_path);
-    let y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(finder_menu_view, y, described_row_h, content_w);
-    record_settings_search_row(
-        SettingsPageId::FinderMenu,
-        canvas.last_row(),
-        &t("settings.finder_menu.row_copy_sha256"),
-        Some(&t("settings.finder_menu.desc_copy_sha256")),
-    );
-    ui.finder_menu_copy_sha256 = SettingsRow::tall_before_control(
-        finder_menu_view,
-        label_x,
-        y,
-        ctrl_x,
-        super::SETTINGS_CONTROL_LABEL_GAP,
-        &t("settings.finder_menu.row_copy_sha256"),
-        SettingsControl::switch(
-            ctrl_x + ctrl_w,
-            y + super::SETTINGS_DESCRIBED_CONTROL_OFFSET,
-            row_h,
-            false,
-        ),
-    )
-    .1;
-    bind_control(target, ui.finder_menu_copy_sha256);
-    canvas.card(&t("settings.finder_menu.header_menu_items"));
-    set_settings_search_section(&t("settings.finder_menu.header_menu_items"));
-
-    sweep_unindexed_rows(&canvas, SettingsPageId::FinderMenu);
-    let content_bottom = canvas.finish();
-    ui.page_canvases[settings_page_index(SettingsPageId::FinderMenu)] = canvas;
-    content_bottom
 }
 
 /// The keystroke panel cap slider range, in whole percent. Shared with dispatch.rs so the
@@ -1077,73 +848,34 @@ pub(super) unsafe fn build_key_bindings_page(
     key_bindings_doc_h: f64,
     ui: &mut SettingsUi,
 ) -> f64 {
-    let content_w = context.content_w;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
-    // The page's rows fall back to this page's title as their section until a card sets one.
     begin_settings_search_page();
-    let mut canvas = PageCanvas::new(
+    let input = PageInput::capture();
+    match build_page(
+        ui,
+        SettingsPageId::KeyBindings,
         key_bindings_view,
-        content_w,
-        layout,
-        &t("settings.sidebar_key_bindings"),
+        context.content_w,
+        context.layout,
         key_bindings_doc_h,
         context.page_frame.size.height,
-    );
-
-    // ---- Master switch: its own card, like the mouse page's "Enable button mappings" ----
-    let y = canvas.next_row(described_row_h);
-    record_settings_search_row(
-        SettingsPageId::KeyBindings,
-        canvas.last_row(),
-        &t("settings.row_key_bindings_enabled"),
-        Some(&t("settings.desc_key_bindings_enabled")),
-    );
-    ui.key_bindings_enabled = SettingsRow::described(
-        key_bindings_view,
-        label_x,
-        y,
-        ctrl_x - label_x - super::SETTINGS_CONTROL_LABEL_GAP,
-        described_row_h,
-        &t("settings.row_key_bindings_enabled"),
-        &t("settings.desc_key_bindings_enabled"),
-        SettingsControl::switch(ctrl_x + ctrl_w, y, row_h, false),
-    );
-    let _: () = msg_send![ui.key_bindings_enabled, setTarget: target];
-    let _: () = msg_send![
-        ui.key_bindings_enabled,
-        setAction: sel!(handleKeyBindingsToggle:)
-    ];
-    // The card closes over the rows registered *before* it, so the switch's card is closed here and
-    // the list gets a card of its own below — the same split the mouse page's mappings use.
-    canvas.card(&t("settings.header_key_bindings"));
-    set_settings_search_section(&t("settings.header_key_bindings"));
-
-    // ---- The binding list: its own section, with its own header like every other card ----
-    canvas.next_section();
-    // The list is a block the canvas owns: its height is provisional here and replaced by the
-    // renderer through `set_row_consume`. The canvas then wraps it in a card, which is what draws
-    // the section header above it and the surface behind it.
-    let origin_y = canvas.next_block(BINDINGS_BLOCK_H);
-    ui.key_bindings_row = canvas.last_row();
-    let (doc, empty) = build_bindings_block(key_bindings_view, content_w, origin_y);
-    ui.key_bindings_doc = doc;
-    ui.key_bindings_empty = empty;
-    canvas.card(&t("settings.header_key_binding_list"));
-    set_settings_search_section(&t("settings.header_key_binding_list"));
-
-    // Adding happens in the floating panel the card's footer ＋ opens, so the page is one list and
-    // nothing else: choosing the action, recording the chord and agreeing to it all live in the
-    // panel, where the user is already looking.
-    sweep_unindexed_rows(&canvas, SettingsPageId::KeyBindings);
-    let content_bottom = canvas.finish();
-    ui.page_canvases[super::SETTINGS_KEY_BINDINGS_PAGE_INDEX] = canvas;
-    content_bottom
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+        &mut page_view::KeyBindingsHooks::default(),
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::KeyBindings, built),
+        Err(error) => {
+            log_info!("[settings] the Key Bindings page description was refused: {error:?}");
+            empty_page(
+                ui,
+                SettingsPageId::KeyBindings,
+                key_bindings_view,
+                context,
+                key_bindings_doc_h,
+            )
+        }
+    }
 }
 
 /// The card the binding rows are rendered into, plus its empty-state hint.
@@ -1151,7 +883,7 @@ pub(super) unsafe fn build_key_bindings_page(
 /// It is a flipped settings card (surface, border and radius from the shared palette) so it reads
 /// like the other cards; the renderer grows it from the top edge and hands the height to the page
 /// canvas.
-unsafe fn build_bindings_block(
+pub(super) unsafe fn build_bindings_block(
     parent: *mut AnyObject,
     content_w: f64,
     origin_y: f64,
@@ -1192,7 +924,8 @@ unsafe fn build_bindings_block(
 /// height as soon as the rows are rendered.
 const BINDINGS_BLOCK_H: f64 = 200.0;
 
-/// Build the About page and return its compact update-card bottom.
+/// Build the About page: the described rows, with the page's own header block above them and its
+/// update band plus inline host inside the last card.
 pub(super) unsafe fn build_about_page(
     context: &SettingsPageBuildContext,
     about_view: *mut AnyObject,
@@ -1200,443 +933,31 @@ pub(super) unsafe fn build_about_page(
     window: *mut AnyObject,
     ui: &mut SettingsUi,
 ) -> f64 {
-    let content_w = context.content_w;
-    let layout = context.layout;
-    let target = context.target;
-    let label_x = layout.label_x;
-    let label_w = layout.label_w;
-    let ctrl_w = layout.control_w;
-    let ctrl_x = layout.control_x;
-    let row_h = layout.row_h;
-    let described_row_h = layout.described_row_h;
-    // The About page's header keeps the same rhythm as the shared page header: its block starts
-    // `PageHeader`-style below the top edge and the first section steps from the block's bottom.
-    // `ABOUT_HEADER_TOP` is the header block's own top offset; the block height below is what keeps
-    // the first section cursor at `ABOUT_HEADER_TOP + ABOUT_HEADER_BLOCK_H + section_step`.
-    const ABOUT_HEADER_TOP: f64 = SettingsPageHeader::TOP_PADDING;
-    const ABOUT_HEADER_BLOCK_H: f64 = 80.0;
-    let header_top = about_doc_h - ABOUT_HEADER_TOP;
-    // The About page draws its own header, so it hands the canvas the distance from the document's
-    // top edge down to the first section cursor and pins the header views it creates below.
-    let header_offset = ABOUT_HEADER_TOP + ABOUT_HEADER_BLOCK_H + layout.section_step;
-    // The page's rows fall back to this page's title as their section until a card sets one.
     begin_settings_search_page();
-    let mut canvas = PageCanvas::new_at(
+    let input = PageInput::capture();
+    let mut hooks = AboutHooks { window };
+    match build_page(
+        ui,
+        SettingsPageId::About,
         about_view,
-        content_w,
-        layout,
-        header_offset,
+        context.content_w,
+        context.layout,
         about_doc_h,
         context.page_frame.size.height,
-    );
-    let header_mark = canvas.view_mark();
-    const ABOUT_APP_ICON_TEXT_INSET: f64 = 73.0;
-    // Offset the icon slot by its render overflow so the visible image aligns with the cards below.
-    let about_header_slot_x = ABOUT_HEADER_CONTENT_LEADING_X + ABOUT_APP_ICON_RENDER_OVERFLOW;
-    let about_header_text_x = about_header_slot_x + ABOUT_APP_ICON_TEXT_INSET;
-    add_about_app_icon(about_view, about_header_slot_x, header_top - 58.0);
-    let about_title: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let about_title: *mut AnyObject = msg_send![
-        about_title,
-        initWithFrame: NSRect::new(
-            NSPoint::new(about_header_text_x, header_top - 33.0),
-            NSSize::new(content_w - about_header_text_x, 32.0),
-        )
-    ];
-    let _: () = msg_send![about_title, setBezeled: false];
-    let _: () = msg_send![about_title, setDrawsBackground: false];
-    let _: () = msg_send![about_title, setEditable: false];
-    widgets::set_page_title_text(about_title, "Oh My Tab");
-    let _: () = msg_send![about_view, addSubview: about_title];
-    release_obj(about_title);
-
-    let about_subtitle: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-    let about_subtitle: *mut AnyObject = msg_send![
-        about_subtitle,
-        initWithFrame: NSRect::new(
-            NSPoint::new(about_header_text_x, header_top - 53.0),
-            NSSize::new(content_w - about_header_text_x, 18.0),
-        )
-    ];
-    set_field(
-        about_subtitle,
-        tf(
-            "settings.version_label",
-            &[("version", env!("CARGO_PKG_VERSION"))],
-        ),
-    );
-    let _: () = msg_send![about_subtitle, setBezeled: false];
-    let _: () = msg_send![about_subtitle, setDrawsBackground: false];
-    let _: () = msg_send![about_subtitle, setEditable: false];
-    let about_subtitle_font: *mut AnyObject =
-        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_CAPTION];
-    let _: () = msg_send![about_subtitle, setFont: about_subtitle_font];
-    let about_subtitle_color = settings_text_color(SettingsTextRole::Muted);
-    let _: () = msg_send![about_subtitle, setTextColor: about_subtitle_color];
-    let _: () = msg_send![about_view, addSubview: about_subtitle];
-    release_obj(about_subtitle);
-    ui.about_subtitle = about_subtitle;
-
-    // Transparent hit area for the five-click build-version easter egg. It is added after
-    // the labels so it receives clicks across the whole header without changing its visuals.
-    let about_header_hit: *mut AnyObject = msg_send![about_header_click_view_class(), alloc];
-    let about_header_hit: *mut AnyObject = msg_send![
-        about_header_hit,
-        initWithFrame: NSRect::new(
-            NSPoint::new(0.0, header_top - 64.0),
-            NSSize::new(content_w, 64.0),
-        )
-    ];
-    let _: () = msg_send![about_view, addSubview: about_header_hit];
-    release_obj(about_header_hit);
-    canvas.pin_from_mark(header_mark);
-
-    // Rows inside a card are derived from the layout, like every other page: the first row is
-    // card top minus the bottom inset minus the row height, then next_row_cursor steps down.
-    // The old header_top - 88 - 35 - 27 was legacy magic arithmetic.
-    // Keep the App section title close to its card, matching the spacing used by the
-    // other settings pages. The About card holds several rows, so its content cursor is lower
-    // than a normal section header; placing the title at the old cursor left a large void.
-    // The page title and version subtitle occupy the header block; the App section begins below
-    // that block to keep its heading clear of the page subtitle.
-    // Keep every About row on the same two-column grid: label on the left, value on the right.
-    let about_value_x = label_x + 145.0;
-    let about_value_w = (content_w - 2.0 * label_x - 145.0).max(1.0);
-    // "View guide" leads the App card: the guide covers precisely the permissions and usage the
-    // rows below describe, and it can be reopened at any time (the button dispatches by
-    // selector and leaves the SettingsButton tag alone).
-    // The first row uses the same layout row-step convention as the rest of the card (and every
-    // other page); it used card_top - card_bottom_inset - described_row_h before, 6pt more than
-    // the convention, which made this row look taller.
-    let guide_y = canvas.next_row(described_row_h);
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.row_view_guide"),
-        None,
-    );
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.website_label"),
-        None,
-    );
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.github_label"),
-        None,
-    );
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.version_label_short"),
-        None,
-    );
-    SettingsRow::plain(
-        about_view,
-        label_x,
-        guide_y,
-        label_w,
-        described_row_h,
-        &t("settings.row_view_guide"),
-        // Same component and convention as "Export Logs" and "Open Settings": flush to the
-        // control column's right edge instead of the App card's value column (about_value_x).
-        // The row is a single 52pt line, so the button centers vertically inside it.
-        row_action_button(
-            ctrl_x,
-            ctrl_w,
-            guide_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
-            &t("settings.btn_open"),
-            target,
-            sel!(handleOpenOnboarding:),
-        ),
-    );
-    let website_y = canvas.next_row(described_row_h);
-    // With "View guide" leading the card, the website row needs its own separator (it used to
-    // be the first row, so it had none).
-    SettingsRow::separator_above_row(about_view, website_y, described_row_h, content_w);
-    SettingsRow::plain(
-        about_view,
-        label_x,
-        website_y,
-        label_w,
-        described_row_h,
-        &t("settings.website_label"),
-        SettingsControl::external_link(
-            about_value_x,
-            website_y,
-            about_value_w,
-            row_h,
-            &t("settings.website_url"),
-            0,
-        ),
-    );
-    let github_y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(about_view, github_y, described_row_h, content_w);
-    SettingsRow::plain(
-        about_view,
-        label_x,
-        github_y,
-        label_w,
-        described_row_h,
-        &t("settings.github_label"),
-        SettingsControl::external_link(
-            about_value_x,
-            github_y,
-            about_value_w,
-            row_h,
-            &t("settings.github_url"),
-            1,
-        ),
-    );
-    let version_y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(about_view, version_y, described_row_h, content_w);
-    SettingsRow::plain(
-        about_view,
-        label_x,
-        version_y,
-        label_w,
-        described_row_h,
-        &t("settings.version_label_short"),
-        SettingsControl::value_label(
-            about_value_x,
-            version_y,
-            120.0,
-            row_h,
-            env!("CARGO_PKG_VERSION"),
-        ),
-    );
-    canvas.card(&t("settings.section_app"));
-    set_settings_search_section(&t("settings.section_app"));
-
-    canvas.next_section_with_offset(layout.card_bottom_inset);
-    // The first row derives from the card top so it matches card_bottom_inset (10); the old
-    // 27+44 assumed the retired 44pt row height and left ~11pt of extra space above it.
-    let permissions_row_top_y = canvas.next_row(described_row_h);
-    let permission_action_gap = 8.0;
-    // The status column width is derived from the shared action-button convention so the
-    // button's right edge lines up with every other in-row action button.
-    let permission_status_w = ctrl_w - ROW_ACTION_BTN_W - permission_action_gap;
-    let accessibility_status = SettingsControl::value_label(
-        ctrl_x,
-        permissions_row_top_y,
-        permission_status_w,
-        row_h,
-        &t("settings.permission_status_missing"),
-    );
-    let _: () = msg_send![accessibility_status, setAlignment: 1isize];
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.permission_accessibility_label"),
-        None,
-    );
-    ui.accessibility_permission_status = SettingsRow::plain(
-        about_view,
-        label_x,
-        permissions_row_top_y,
-        label_w,
-        described_row_h,
-        &t("settings.permission_accessibility_label"),
-        accessibility_status,
-    );
-    let accessibility_button = row_action_button(
-        ctrl_x,
-        ctrl_w,
-        permissions_row_top_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
-        &t("settings.btn_open_permission_settings"),
-        target,
-        sel!(handleOpenPrivacy:),
-    );
-    let _: () = msg_send![about_view, addSubview: accessibility_button];
-    ui.accessibility_permission_button = accessibility_button;
-    release_obj(accessibility_button);
-
-    let screen_recording_row_y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(
-        about_view,
-        screen_recording_row_y,
-        described_row_h,
-        content_w,
-    );
-    let screen_recording_status = SettingsControl::value_label(
-        ctrl_x,
-        screen_recording_row_y,
-        permission_status_w,
-        row_h,
-        &t("settings.permission_status_missing"),
-    );
-    let _: () = msg_send![screen_recording_status, setAlignment: 1isize];
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.permission_screen_recording_label"),
-        None,
-    );
-    ui.screen_recording_permission_status = SettingsRow::plain(
-        about_view,
-        label_x,
-        screen_recording_row_y,
-        label_w,
-        described_row_h,
-        &t("settings.permission_screen_recording_label"),
-        screen_recording_status,
-    );
-    let screen_recording_button = row_action_button(
-        ctrl_x,
-        ctrl_w,
-        screen_recording_row_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
-        &t("settings.btn_open_permission_settings"),
-        target,
-        sel!(handleOpenScreenRecordingPrivacy:),
-    );
-    let _: () = msg_send![about_view, addSubview: screen_recording_button];
-    release_obj(screen_recording_button);
-
-    // Keychain access is not a TCC permission -- there is no System Settings pane for it -- so this
-    // row carries the app's own action instead of an "open settings" button: it re-reads the
-    // clipboard key, which raises the system's authorization prompt once.
-    let keychain_row_y = canvas.next_row(described_row_h);
-    SettingsRow::separator_above_row(about_view, keychain_row_y, described_row_h, content_w);
-    let keychain_status = SettingsControl::value_label(
-        ctrl_x,
-        keychain_row_y,
-        permission_status_w,
-        row_h,
-        &t("settings.keychain_status_missing"),
-    );
-    let _: () = msg_send![keychain_status, setAlignment: 1isize];
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.permission_keychain_label"),
-        None,
-    );
-    ui.keychain_access_status = SettingsRow::plain(
-        about_view,
-        label_x,
-        keychain_row_y,
-        label_w,
-        described_row_h,
-        &t("settings.permission_keychain_label"),
-        keychain_status,
-    );
-    // A short label: this button shares the in-row action width with the permission buttons, and the
-    // longer wording ("Grant Keychain Access") wraps and overflows the row's height (the settings
-    // layout smoke measures exactly that).
-    let keychain_button = row_action_button(
-        ctrl_x,
-        ctrl_w,
-        keychain_row_y + (described_row_h - ROW_ACTION_BTN_H) / 2.0,
-        &t("settings.btn_grant_keychain_access"),
-        target,
-        sel!(retryKeychainAccess:),
-    );
-    let _: () = msg_send![about_view, addSubview: keychain_button];
-    ui.keychain_access_button = keychain_button;
-    release_obj(keychain_button);
-    canvas.card(&t("settings.section_permissions"));
-    set_settings_search_section(&t("settings.section_permissions"));
-
-    canvas.next_section_with_offset(layout.card_bottom_inset);
-    let update_row_y = canvas.next_row(described_row_h);
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.row_update_auto_check"),
-        None,
-    );
-    ui.update_auto_check = SettingsRow::described(
-        about_view,
-        label_x,
-        update_row_y,
-        (ctrl_x + ctrl_w) - label_x - 70.0,
-        described_row_h,
-        &t("settings.row_update_auto_check"),
-        &t("settings.desc_update_auto_check"),
-        SettingsControl::switch(ctrl_x + ctrl_w, update_row_y + 10.0, row_h, false),
-    );
-    bind_control(target, ui.update_auto_check);
-    // Automatically-download-and-install switch, between auto-check and the check button.
-    let download_row_y = canvas.next_row(described_row_h);
-    record_settings_search_row(
-        SettingsPageId::About,
-        canvas.last_row(),
-        &t("settings.row_update_auto_download"),
-        None,
-    );
-    ui.update_auto_download = SettingsRow::described(
-        about_view,
-        label_x,
-        download_row_y,
-        (ctrl_x + ctrl_w) - label_x - 70.0,
-        described_row_h,
-        &t("settings.row_update_auto_download"),
-        &t("settings.desc_update_auto_download"),
-        SettingsControl::switch(ctrl_x + ctrl_w, download_row_y + 10.0, row_h, false),
-    );
-    bind_control(target, ui.update_auto_download);
-    // Keep the two update toggles visually grouped with the same inset divider used by other
-    // multi-row cards. The rows are contiguous here, so the divider sits at their shared edge.
-    SettingsRow::separator(about_view, update_row_y, content_w);
-    // The divider that starts the card's action band. It is created while the download row is still
-    // the row being captured -- deliberately, so the line belongs to that row and not to the band:
-    // the update flow collapses the band to zero height, and a row's views travel with its origin, so
-    // a line captured by the band would slide up by a whole row height the moment a flow starts. It
-    // stays visible in every state; it is the boundary between the toggle rows and whatever occupies
-    // the action position (the check button, or the inline update panel).
-    let update_divider = SettingsRow::separator(about_view, download_row_y, content_w);
-    ui.update_divider = update_divider;
-    // Check for updates: a full-width action band on the shared row rhythm (56pt band, 32pt control,
-    // 12pt above and below) whose title switches between "Check for Updates…", "Checking…" and
-    // "You're up to date". It is a block rather than a row -- the control spans the card and its
-    // title is flow state, so there is no label to pair it with -- and the update flow replaces it
-    // in place by collapsing this block and growing the inline panel below.
-    let band_y = canvas.next_block(SettingsLayout::SINGLE_LINE_ROW_H);
-    let check_button = SettingsRow::action_band(
-        about_view,
-        label_x,
-        band_y,
-        content_w,
-        &t("settings.btn_check_for_updates"),
-        target,
-        sel!(handleCheckForUpdates:),
-    );
-    ui.update_check_button = check_button;
-    ui.update_band_row = canvas.last_row();
-    release_obj(check_button);
-    // Inline update-flow host container: update status/progress/buttons render here instead of
-    // a separate NSWindow. Empty and hidden by default, so the About page stays compact; when a flow
-    // runs, the layout owner collapses the action band and grows this host downward from the
-    // divider, so the panel takes over the check button's position.
-    let compact_host_h = 0.0;
-    let host_top_y = canvas.next_block(compact_host_h);
-    ui.update_host_row = canvas.last_row();
-    let update_host: *mut AnyObject = msg_send![widgets::flipped_settings_view_class(), alloc];
-    let update_host: *mut AnyObject = msg_send![
-        update_host,
-        initWithFrame: NSRect::new(
-            NSPoint::new(label_x, host_top_y),
-            NSSize::new(content_w - 2.0 * label_x, compact_host_h),
-        )
-    ];
-    let _: () = msg_send![update_host, setHidden: true];
-    let _: () = msg_send![about_view, addSubview: update_host];
-    release_obj(update_host);
-    ui.update_host = update_host;
-    ui.update_host_window = window;
-    crate::updater::set_update_host(update_host, window, check_button);
-    // The collapsed card bottom hugs the check button with an 8pt inset; the inline area is
-    // not reserved by default, avoiding a large blank.
-    ui.update_card = canvas.card(&t("settings.section_updates")).card;
-    set_settings_search_section(&t("settings.section_updates"));
-    sweep_unindexed_rows(&canvas, SettingsPageId::About);
-    let content_bottom = canvas.finish();
-    ui.page_canvases[SETTINGS_ABOUT_PAGE_INDEX] = canvas;
-    content_bottom
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+        &mut hooks,
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::About, built),
+        Err(_) => {
+            // A first build has no previous state: the page stays empty and nothing is
+            // published, which is better than a page that looks alive but is not wired.
+            empty_page(ui, SettingsPageId::About, about_view, context, about_doc_h)
+        }
+    }
 }
-
 /// Finish page registration, restore-default controls, and document validation.
 pub(super) unsafe fn finalize_settings_pages(
     content: *mut AnyObject,

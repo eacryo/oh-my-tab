@@ -432,17 +432,6 @@ impl PageCanvas {
         }
     }
 
-    /// Open a section whose cursor the page computed itself: the About page steps its sections from
-    /// the previous card's bottom edge, `extra` points below its last row.
-    pub(super) unsafe fn next_section_with_offset(&mut self, extra: f64) -> f64 {
-        self.cursor -= extra;
-        self.next_section();
-        if let Some(section) = self.sections.last_mut() {
-            section.extra = extra;
-        }
-        self.cursor
-    }
-
     /// Start a page: draw its title and take over the layout from `doc_h`, the provisional document
     /// height the page builder was given (the first re-flow settles the real one).
     pub(super) unsafe fn new(

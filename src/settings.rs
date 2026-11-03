@@ -751,11 +751,6 @@ const SETTINGS_SECTION_HEADER_GAP: f64 = 20.0;
 const SETTINGS_CONTROL_TRAILING_INSET: f64 = 16.0;
 /// Clear space between a localized row label and its control column.
 pub(crate) const SETTINGS_CONTROL_LABEL_GAP: f64 = 16.0;
-/// Vertical offset that centers a 32pt control inside a described (two-line) row. Every described
-/// row in the settings pages positions its control this way; the value is a token so a call site
-/// does not carry its own copy of the layout number.
-pub(crate) const SETTINGS_DESCRIBED_CONTROL_OFFSET: f64 = 10.0;
-
 /// The action-type popup items; index maps 1:1 to semantics (shared by render and the
 /// change handler).
 const MAPPING_ACTION_KEYS: [&str; 8] = [
@@ -981,10 +976,10 @@ pub(crate) mod widgets;
 mod window;
 
 use components::{
-    row_action_button, RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard,
-    SettingsControl, SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader,
-    SettingsRow, SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H,
-    ROW_ACTION_BTN_W, SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
+    RestoreDefaultsControl, SettingsButton, SettingsButtonRole, SettingsCard, SettingsControl,
+    SettingsLayout, SettingsMappingActionIcon, SettingsPage, SettingsPageHeader, SettingsRow,
+    SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H, ROW_ACTION_BTN_W,
+    SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
 };
 use dispatch::*;
 use mapping::*;
@@ -2058,7 +2053,11 @@ pub(super) fn refresh_migrated_pages_from(ui: &SettingsUi, cfg: &Config) {
             &[
                 SettingsPageId::Switcher,
                 SettingsPageId::General,
+                SettingsPageId::Clipboard,
+                SettingsPageId::About,
                 SettingsPageId::KeystrokeDisplay,
+                SettingsPageId::FinderMenu,
+                SettingsPageId::KeyBindings,
             ],
         );
     }
@@ -2208,14 +2207,8 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             // hide_menu_bar_icon: the switch reflects the saved value; the status item itself is
             // toggled by runtime_config, so the launch path and a live edit agree.
             let _: () = msg_send![ui.hide_menu_bar_icon, setState: if cfg.startup.hide_menu_bar_icon { 1isize } else { 0isize }];
-            let _: () = msg_send![
-                ui.update_auto_check,
-                setState: if cfg.updates.automatically_check { 1isize } else { 0isize }
-            ];
-            let _: () = msg_send![
-                ui.update_auto_download,
-                setState: if cfg.updates.automatically_download { 1isize } else { 0isize }
-            ];
+            // The About page's two update switches are described rows: the shared update
+            // description above already wrote them.
             update_windows_controls_enabled(ui);
 
             // Mouse page: filled only when it is the page being opened, or when it is the page on screen
@@ -2263,9 +2256,9 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             // apply visibility once more from the saved config here.
             update_clipboard_delete_dependent_visibility_from_config(ui, cfg);
             update_clipboard_controls_enabled(ui);
-            // Finder Menu page: the status line is read-only state from System Settings, and every
-            // switch mirrors the config's vec-backed fields (membership, not order).
-            fill_finder_menu_controls(ui, cfg);
+            // The Finder Menu page is described too: its rows (the extension-status row included)
+            // were refilled from the same update description, and the page's own enable state is
+            // settled by the master-switch freeze the in-place path owns.
             bindings::render_binding_rows(ui, cfg);
             bindings::update_binding_controls_enabled(ui);
         });

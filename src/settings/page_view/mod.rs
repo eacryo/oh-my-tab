@@ -37,17 +37,19 @@ mod about;
 mod clipboard;
 mod finder_menu;
 mod general;
+mod key_bindings;
 mod keystroke_display;
 mod switcher;
 
 use about::about_page_view;
+pub(super) use about::AboutHooks;
 use clipboard::clipboard_page_view;
 pub(super) use clipboard::ClipboardHooks;
 use finder_menu::finder_menu_page_view;
-#[allow(unused_imports)]
-// the Finder Menu page's builder passes it; the page itself is in flight
 pub(super) use finder_menu::FinderMenuHooks;
 use general::general_page_view;
+use key_bindings::key_bindings_page_view;
+pub(super) use key_bindings::KeyBindingsHooks;
 use keystroke_display::keystroke_display_page_view;
 use switcher::switcher_page_view;
 
@@ -250,7 +252,12 @@ pub(super) enum ControlKind {
     ///
     /// `action` adds the row's own action button beside the value (the Finder Menu page's status
     /// line opens the extension settings; the About page's permission rows open System Settings).
-    Value { action: Option<ValueAction> },
+    Value {
+        action: Option<ValueAction>,
+        /// How the value's text is aligned. Defaults to the platform's natural alignment; a value
+        /// that sits against its action button is right-aligned, as the shipped pages draw it.
+        align: ValueAlign,
+    },
     /// A hyperlink drawn as the row's control (the About page's website and GitHub rows). Its
     /// target is chosen by the `tag` the click handler reads.
     Link { tag: isize },
@@ -504,6 +511,20 @@ impl ValueAction {
     pub(super) fn new(action: &'static str, button_key: &'static str) -> Self {
         Self { action, button_key }
     }
+}
+
+/// How a value row's text is aligned in its box.
+///
+/// The shipped pages are not uniform: the Finder Menu status line and the About permission rows
+/// right-align their value so it sits against the action button, while a lone value (the version
+/// line) is aligned naturally. Making this a row field is what keeps the migrated pages looking
+/// exactly as they did.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) enum ValueAlign {
+    /// The platform's natural alignment (left in every shipped locale).
+    #[default]
+    Natural,
+    Right,
 }
 
 /// A row placed in the page: its frame and the frames of the views it draws.
@@ -859,7 +880,7 @@ fn row_height(
         | ControlKind::Button
         | ControlKind::Slider { .. }
         | ControlKind::Link { .. } => input.layout.described_row_h,
-        ControlKind::Value { action } => {
+        ControlKind::Value { action, .. } => {
             // A value row with a button is a described row (the button makes it two lines tall,
             // like every other row carrying a control).
             if action.is_some() {
@@ -1047,7 +1068,7 @@ pub(super) fn layout_rows(
             // A read-only value is drawn where the control column puts a control, left-aligned so a
             // status line reads as text rather than as a disabled button. With an action beside it,
             // the value takes the room the button leaves.
-            ControlKind::Value { action } => {
+            ControlKind::Value { action, .. } => {
                 let y = cursor + (height - metrics.control_h) / 2.0;
                 match action {
                     None => (
@@ -1070,7 +1091,9 @@ pub(super) fn layout_rows(
             }
         };
         let action_frame = match &row.control {
-            ControlKind::Value { action: Some(_) } => Some(BoxRect::new(
+            ControlKind::Value {
+                action: Some(_), ..
+            } => Some(BoxRect::new(
                 layout.control_x + layout.control_w - super::components::ROW_ACTION_BTN_W,
                 cursor + (height - super::components::ROW_ACTION_BTN_H) / 2.0,
                 super::components::ROW_ACTION_BTN_W,
@@ -1646,7 +1669,7 @@ unsafe fn render_row(
         // A read-only value: text in the control column, refreshed by its callback (permission
         // status, keychain status). Its identity still comes from the row, so a later update can
         // find it.
-        ControlKind::Value { action } => {
+        ControlKind::Value { action, align } => {
             let text = match &row.value {
                 Value::Dynamic(text) => text.clone(),
                 other => other.describe(),
@@ -1654,13 +1677,19 @@ unsafe fn render_row(
             // A value row's action button is a second view in the row; it is built after the label
             // below, once the label has taken the room the button leaves.
             let _ = action;
-            SettingsControl::value_label(
+            let label = SettingsControl::value_label(
                 placed.control_frame.x,
                 placed.control_frame.y,
                 placed.control_frame.w,
                 placed.control_frame.h,
                 &text,
-            )
+            );
+            // The shipped pages are not uniform about this (see [`ValueAlign`]), so the row states
+            // it rather than leaving every value on the platform default.
+            if matches!(align, ValueAlign::Right) && !label.is_null() {
+                let _: () = msg_send![label, setAlignment: super::components::TEXT_ALIGNMENT_RIGHT];
+            }
+            label
         }
         ControlKind::Button => {
             let action = match &row.id {
@@ -1686,6 +1715,7 @@ unsafe fn render_row(
     // and registered like any other action control so its selector is reached the same way.
     if let ControlKind::Value {
         action: Some(action),
+        ..
     } = &row.control
     {
         if let Some(frame) = placed.action_frame {
@@ -1963,6 +1993,7 @@ fn view_for(page: SettingsPageId, input: &PageInput) -> PageView {
     match page {
         SettingsPageId::Switcher => switcher_page_view(input),
         SettingsPageId::General => general_page_view(input),
+        SettingsPageId::KeyBindings => key_bindings_page_view(input),
         SettingsPageId::KeystrokeDisplay => keystroke_display_page_view(input),
         SettingsPageId::FinderMenu => finder_menu_page_view(input),
         SettingsPageId::Clipboard => clipboard_page_view(input),

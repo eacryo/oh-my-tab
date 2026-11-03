@@ -20,27 +20,6 @@ use super::{
 pub(crate) const ROW_ACTION_BTN_W: f64 = 110.0;
 pub(crate) const ROW_ACTION_BTN_H: f64 = 32.0;
 
-/// Build an in-row action button aligned to the control column's right edge.
-pub(crate) unsafe fn row_action_button(
-    ctrl_x: f64,
-    ctrl_w: f64,
-    row_y: f64,
-    title: &str,
-    target: *mut AnyObject,
-    action: Sel,
-) -> *mut AnyObject {
-    SettingsControl::button(
-        ctrl_x + ctrl_w - ROW_ACTION_BTN_W,
-        row_y,
-        ROW_ACTION_BTN_W,
-        ROW_ACTION_BTN_H,
-        title,
-        target,
-        action,
-        SettingsButtonRole::Action,
-    )
-}
-
 /// Build the shared custom switch for the onboarding flow.
 pub(crate) unsafe fn onboarding_switch(
     right_x: f64,
@@ -58,7 +37,7 @@ pub(super) const SLIDER_READOUT_W: f64 = 44.0;
 pub(super) const SLIDER_READOUT_GAP: f64 = 8.0;
 pub(super) const SLIDER_READOUT_H: f64 = 20.0;
 // The macOS SDK uses iOS alignment enum values on arm64 and legacy AppKit values on x86_64.
-const TEXT_ALIGNMENT_RIGHT: isize = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
+pub(super) const TEXT_ALIGNMENT_RIGHT: isize = if cfg!(target_arch = "aarch64") { 2 } else { 1 };
 const RESTORE_SHELL_INSET: f64 = 8.0;
 const RESTORE_TRIGGER_INSET: f64 = 8.0;
 const RESTORE_CONTAINER_ORIGIN: f64 = 16.0;
@@ -689,25 +668,6 @@ impl SettingsRow {
         Self::center_control(control, y, row_h);
         Self::register_label(label, control);
         (label, control)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub(super) unsafe fn plain(
-        parent: *mut AnyObject,
-        label_x: f64,
-        y: f64,
-        label_w: f64,
-        h: f64,
-        label_text: &str,
-        control: *mut AnyObject,
-    ) -> *mut AnyObject {
-        let (label, control) =
-            widgets::add_row_with_label(parent, label_x, y, label_w, h, label_text, control);
-        Self::center_label(label, y, h);
-        Self::center_readonly_text_control(control, y, h);
-        Self::center_control(control, y, h);
-        Self::register_label(label, control);
-        control
     }
 
     /// Vertical padding above and below a card's action-band control.
