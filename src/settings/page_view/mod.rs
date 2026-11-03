@@ -2269,7 +2269,11 @@ pub(super) fn page_layout_input(
             banner_height(),
         )),
         layout,
-        text: MeasuredText::measure(view, content_w - 2.0 * SETTINGS_DETAIL_INSET),
+        // A caption is drawn inside the LABEL column, not across the page: measuring it at the page
+        // width under-reports its wrapped height -- a two-line caption gets one line's box, and the
+        // control on the row below overlaps it. The inline builder measured at exactly the width it
+        // drew at; this is the same number, taken from the layout that draws it.
+        text: MeasuredText::measure(view, layout.label_w.max(1.0)),
         extra_row_heights: view
             .extra_rows
             .iter()
@@ -2391,6 +2395,10 @@ pub(super) unsafe fn build_page(
         input,
         content_w,
         layout,
+        // The row origins hang from the document's TOP EDGE, and the canvas anchors to the
+        // document's ACTUAL height (`SettingsPageHeader::attach` reads the frame): when the window
+        // grew the document to the viewport, the provisional `doc_h` is shorter and every row would
+        // land lower than the canvas puts it. The canvas reports the top it used.
         doc_h,
         canvas.header_offset(),
         page_x,
@@ -2625,13 +2633,14 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             document_fixture_height(),
             700.0,
         );
-        let measured = MeasuredText::measure(&view, 600.0 - 2.0 * SETTINGS_DETAIL_INSET);
+        let fixture_layout = SettingsLayout::new(600.0);
+        let measured = MeasuredText::measure(&view, fixture_layout.label_w.max(1.0));
         let layout_input = LayoutInput {
             content_w: 600.0,
             doc_top: document_fixture_height(),
             header_offset: canvas.header_offset(),
             banner_frame: BannerFrame::of(banner_parent_frame(28.0, 700.0, 600.0, banner_height())),
-            layout: SettingsLayout::new(600.0),
+            layout: fixture_layout,
             text: measured,
             extra_row_heights: view
                 .extra_rows
@@ -2908,7 +2917,7 @@ pub(crate) unsafe fn about_update_flow_smoke_runner() -> bool {
         header_offset: canvas.header_offset(),
         banner_frame: BannerFrame::of(banner_parent_frame(28.0, 900.0, 600.0, banner_height())),
         layout,
-        text: MeasuredText::measure(&view, 600.0 - 2.0 * SETTINGS_DETAIL_INSET),
+        text: MeasuredText::measure(&view, layout.label_w.max(1.0)),
         extra_row_heights: view
             .extra_rows
             .iter()
@@ -4695,5 +4704,56 @@ mod tests {
         let mouse = view_for(SettingsPageId::Mouse, &input);
         assert_eq!(canvas_rows(&mouse), vec![0, 4, 7, 9]);
         assert_eq!(mouse.rows[1].label_key, "settings.row_reverse_scroll");
+    }
+
+    /// A card's section heading sits ABOVE its card, and the card's first row starts below the
+    /// card's top edge. A heading that overlaps its own first row's control is the failure the
+    /// settings-layout smoke reports as "views overlap" -- reproduced here without a window.
+    #[test]
+    fn every_card_heading_hangs_above_its_first_row_for_every_page() {
+        let input = PageInput::from_config(
+            Config::default(),
+            None,
+            crate::theme::ThemeInput::current(),
+        );
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Clipboard,
+            SettingsPageId::About,
+            SettingsPageId::KeystrokeDisplay,
+            SettingsPageId::FinderMenu,
+            SettingsPageId::KeyBindings,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            let mut layout_input = LayoutInput::for_test(700.0);
+            layout_input.extra_row_heights = view
+                .extra_rows
+                .iter()
+                .map(|extra| extra.height.resolve(&input, layout_input.content_w))
+                .collect();
+            let metrics = PageMetrics::for_layout(layout_input.layout);
+            let layout = layout_rows(&view, &layout_input, &metrics);
+            for card in &layout.cards {
+                let header = card.header;
+                // In the document's unflipped coordinates a larger y is HIGHER on screen: the
+                // heading's bottom edge must sit above the card's top edge, and it must not
+                // overlap the card's own surface.
+                let card_top = card.frame.y + card.frame.h;
+                assert!(
+                    header.y >= card_top - 1.0e-6,
+                    "{page:?}: card {} heading (y={}) is below its card top ({card_top}) with h={}",
+                    card.index,
+                    header.y,
+                    header.h
+                );
+                assert!(
+                    header.y >= card_top + header.h - 1.0e-6 || header.y > card_top,
+                    "{page:?}: card {} heading ({header:?}) overlaps the card surface",
+                    card.index
+                );
+            }
+        }
     }
 }

@@ -2985,6 +2985,7 @@ mod tests {
     /// main-thread-only slot), so the runner spawns the app and reports the child's own verdict.
     // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
     // without exactly one declaration. Spawns the app child and builds the real pages.
+    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn migrated_pages_render_smoke() {
