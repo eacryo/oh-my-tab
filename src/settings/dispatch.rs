@@ -2309,7 +2309,14 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
         sidebar::clear_settings_search();
         let btn = sender as *mut AnyObject;
         let tag: isize = unsafe { msg_send![btn, tag] };
+        if tag < 0 || (tag as usize) >= SETTINGS_PAGE_COUNT {
+            return;
+        }
         select_sidebar(tag as usize);
+        // A click in the sidebar is the user choosing where they work: this is the page the next launch reopens on.
+        // The programmatic entries do not record, so opening Settings from the clipboard picker or the updater does not
+        // steal the choice.
+        super::remember_settings_page(tag as usize);
     });
 }
 

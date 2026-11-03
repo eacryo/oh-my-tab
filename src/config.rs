@@ -30,6 +30,21 @@ pub struct Config {
     pub keystroke_display: KeystrokeDisplaySection,
     /// Finder context-menu items, rendered by the Finder Sync app extension.
     pub finder_menu: FinderMenuSection,
+    /// What the windows remembered between launches. Not a preference the user sets: this section is written by
+    /// the app when the user moves a window's own state (today: which settings page is on screen).
+    pub window_state: WindowStateSection,
+}
+
+/// Window state carried across launches.
+///
+/// The page is stored by NAME (`settings_page_name`, the same spelling `--open-settings` accepts) rather than as a
+/// sidebar index: the table's order is a presentation detail, and a page inserted or moved would otherwise reopen
+/// the window on a different page than the user last saw. An empty or unknown name means "nothing remembered yet".
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct WindowStateSection {
+    /// The settings page the user last selected, as `settings_page_name`.
+    pub settings_page: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
