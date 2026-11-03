@@ -19,6 +19,45 @@ pub(crate) struct AppIdentity {
     pub(crate) process_start_time_us: Option<u64>,
 }
 
+/// Whether a process is an ExtensionKit / appex extension rather than a switchable application.
+///
+/// An app extension runs out of `....appex/Contents/MacOS/<name>` (system ones under
+/// `/System/Library/ExtensionKit/Extensions/`). It can publish ordinary layer-0 windows — the
+/// "Screen Saver"/"Displays"/"VPN" panes in System Settings each own one — but its process is not
+/// activatable: `_SLPSSetFrontProcessWithOptions` answers `-606` (procNotFound) and
+/// `activateWithOptions:` returns false, so the card cannot be opened even though AX raises the
+/// window without error.
+///
+/// The window itself carries no evidence for this: the extension's window is layer 0, alpha 1.0
+/// and ordinary-sized, so every layer/shape rule admits it. Only the executable's location tells
+/// them apart, which is why this keys on the path rather than on anything about the window.
+///
+/// Input methods are deliberately not matched: an IME is a `prohibited` process too, and it lives
+/// under `/Library/Input Methods/` in an ordinary `.app` bundle.
+pub(crate) fn is_extension_process(executable_path: &str) -> bool {
+    // EVERY slash-delimited component is tested, not just the first one containing ".appex". In
+    // "/Applications/Foo.appexhelper.app/Contents/PlugIns/Widget.appex/Contents/MacOS/Widget" the
+    // first hit is ".appexhelper"; stopping there classified a real extension as an application.
+    executable_path
+        .split('/')
+        .any(|component| component.ends_with(".appex"))
+}
+
+/// The executable path of a running process, or None when the process cannot be resolved.
+pub(crate) unsafe fn executable_path_of(pid: i32) -> Option<String> {
+    let app: *mut AnyObject =
+        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    if app.is_null() {
+        return None;
+    }
+    let exec_url: *mut AnyObject = msg_send![app, executableURL];
+    if exec_url.is_null() {
+        return None;
+    }
+    let path_obj: *mut AnyObject = msg_send![exec_url, path];
+    read_nsstring(path_obj)
+}
+
 /// Read an NSString into a Rust String (nil -> None). The object is autoreleased; caller must be in a pool.
 unsafe fn read_nsstring(obj: *mut AnyObject) -> Option<String> {
     if obj.is_null() {
@@ -191,5 +230,61 @@ pub(crate) unsafe fn identity_of_app(app: *mut AnyObject, pid: i32) -> AppIdenti
         key,
         fingerprint,
         process_start_time_us,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_extension_process;
+
+    /// App extensions publish ordinary layer-0 windows and cannot be activated (-606), so the card
+    /// never opens. The executable's location is the only evidence, and these are the three the
+    /// collector actually met on this machine plus the two shapes a path can take.
+    #[test]
+    fn a_bundle_under_an_appex_is_an_extension() {
+        for path in [
+            "/System/Library/ExtensionKit/Extensions/LockScreen.appex/Contents/MacOS/LockScreen",
+            "/System/Library/ExtensionKit/Extensions/DisplaysExt.appex/Contents/MacOS/DisplaysExt",
+            "/System/Library/ExtensionKit/Extensions/VPN.appex/Contents/MacOS/VPN",
+            "/System/Applications/System Settings.app/Contents/PlugIns/Some.appex/Contents/MacOS/Some",
+        ] {
+            assert!(is_extension_process(path), "{path} is an app extension");
+        }
+    }
+
+    /// Ordinary applications, and the input method that is `prohibited` for the same reason but
+    /// must stay switchable, are not extensions.
+    #[test]
+    fn an_ordinary_application_is_not_an_extension() {
+        for path in [
+            "/Applications/Oh My Tab.app/Contents/MacOS/oh-my-tab",
+            "/Library/Input Methods/DoubaoIme.app/Contents/MacOS/DoubaoIme",
+            "/System/Library/Frameworks/AppKit.framework/Versions/C/XPCServices/com.apple.appkit.xpc.openAndSavePanelService.xpc/Contents/MacOS/com.apple.appkit.xpc.openAndSavePanelService",
+            "",
+        ] {
+            assert!(!is_extension_process(path), "{path} is not an app extension");
+        }
+    }
+
+    /// A name that merely starts with `.appex` is a different file, not an extension bundle.
+    #[test]
+    fn an_appex_prefix_without_a_path_boundary_does_not_match() {
+        assert!(!is_extension_process(
+            "/tmp/Foo.appexhelper/Contents/MacOS/Foo"
+        ));
+        assert!(!is_extension_process("/tmp/my.appexfile"));
+        assert!(is_extension_process("/tmp/Foo.appex"));
+    }
+
+    /// A false `.appex` prefix earlier in the path must not mask a real extension later in it.
+    /// Testing only the first match read this path as an application.
+    #[test]
+    fn a_false_appex_prefix_does_not_mask_a_real_extension() {
+        assert!(is_extension_process(
+            "/Applications/Foo.appexhelper.app/Contents/PlugIns/Widget.appex/Contents/MacOS/Widget"
+        ));
+        assert!(is_extension_process(
+            "/tmp/my.appexfile/Contents/PlugIns/Real.appex/Contents/MacOS/Real"
+        ));
     }
 }

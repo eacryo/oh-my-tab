@@ -225,6 +225,57 @@ pub(super) fn view_root_names() -> ([String; SETTINGS_PAGE_COUNT], [String; SETT
     (sidebar, page)
 }
 
+/// The settings page the user last chose, by sidebar index, or \`None\` when nothing is remembered yet.
+///
+/// Read from the configuration, which stores the page's NAME (see [\`crate::config::WindowStateSection::settings_page\`]):
+/// a page that no longer exists resolves to nothing rather than to whatever position it used to occupy, so a release
+/// that retires a page falls back to the default instead of opening a neighbour.
+pub(crate) fn remembered_settings_page() -> Option<usize> {
+    let stored = crate::config::CONFIG
+        .read()
+        .unwrap()
+        .window_state
+        .settings_page
+        .clone();
+    settings_page_from_name(&stored)
+}
+
+/// The index \`name\` occupies, or \`None\` when it names no page (empty, unknown, or a page this release retired).
+///
+/// Pure, so the rule is asserted without AppKit. A remembered page is looked up by NAME only -- never by index -- which is
+/// what keeps an insertion or a reorder of the sidebar from reopening the window somewhere the user never chose.
+pub(crate) fn settings_page_from_name(name: &str) -> Option<usize> {
+    let name = name.trim().to_ascii_lowercase();
+    if name.is_empty() {
+        return None;
+    }
+    SETTINGS_PAGES.iter().position(|page| page.name == name)
+}
+
+/// Remember \`page\` as the page to reopen on, and persist it.
+///
+/// Only a page the USER chose is recorded: the programmatic entries (the clipboard picker's settings button, the
+/// updater's About, \`--open-settings\`) present their own page without claiming the next launch, so a user who opens
+/// Settings from the clipboard panel still comes back to the page they were working on.
+pub(crate) fn remember_settings_page(page: usize) {
+    let page = page.min(SETTINGS_PAGE_COUNT - 1);
+    let name = settings_page_name(page).to_string();
+    let changed = {
+        let mut config = crate::config::CONFIG.write().unwrap();
+        if config.window_state.settings_page == name {
+            false
+        } else {
+            config.window_state.settings_page = name;
+            true
+        }
+    };
+    if changed {
+        // The page is state, not a preference: it is written on the debounced channel the other settings use, so a
+        // burst of tab clicks costs one write.
+        crate::config::schedule_config_persist();
+    }
+}
+
 /// Which page --open-settings=<spec> selects, or None when the value names no page.
 ///
 /// A bare switch and the boolean truthy spelling (plus the pre-existing 1/true) select About, which is
@@ -591,6 +642,7 @@ pub(super) struct SettingsUi {
     finder_menu_new_file_switches: Vec<*mut AnyObject>,
     finder_menu_terminal_switches: Vec<*mut AnyObject>,
     finder_menu_copy_path: *mut AnyObject,
+    finder_menu_copy_sha256: *mut AnyObject,
 }
 
 impl SettingsUi {
@@ -2777,11 +2829,11 @@ mod tests {
     }
 
     use super::{
-        parse_settings_page_spec, settings_page_identity, settings_page_index, settings_page_name,
-        SettingsPageId, SETTINGS_ABOUT_PAGE_INDEX, SETTINGS_CLIPBOARD_PAGE_INDEX,
-        SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX, SETTINGS_KEY_BINDINGS_PAGE_INDEX,
-        SETTINGS_MOUSE_PAGE_INDEX, SETTINGS_PAGES, SETTINGS_PAGE_COUNT,
-        SETTINGS_SWITCHER_PAGE_INDEX,
+        parse_settings_page_spec, settings_page_from_name, settings_page_identity,
+        settings_page_index, settings_page_name, SettingsPageId, SETTINGS_ABOUT_PAGE_INDEX,
+        SETTINGS_CLIPBOARD_PAGE_INDEX, SETTINGS_KEYSTROKE_DISPLAY_PAGE_INDEX,
+        SETTINGS_KEY_BINDINGS_PAGE_INDEX, SETTINGS_MOUSE_PAGE_INDEX, SETTINGS_PAGES,
+        SETTINGS_PAGE_COUNT, SETTINGS_SWITCHER_PAGE_INDEX,
     };
 
     /// The table is the single source of truth for the sidebar order: each entry claims the index it
@@ -2837,6 +2889,27 @@ mod tests {
             settings_page_index(SettingsPageId::Clipboard)
         );
         assert_ne!(SettingsPageId::General, SettingsPageId::About);
+    }
+
+    /// The remembered page is a NAME, and only a name that still exists resolves. An index would reopen the window on
+    /// whatever page later occupies that slot, and a retired page would silently land on a neighbour -- both are the
+    /// failures this pins: nothing remembered opens on General, and an unknown name resolves to nothing.
+    #[test]
+    fn a_remembered_page_resolves_by_name_and_never_by_position() {
+        for (index, page) in SETTINGS_PAGES.iter().enumerate() {
+            assert_eq!(settings_page_from_name(page.name), Some(index));
+            assert_eq!(
+                settings_page_from_name(&format!("  {}  ", page.name.to_uppercase())),
+                Some(index)
+            );
+        }
+        for stored in ["", "   ", "general-settings", "99", "0", "bindings"] {
+            assert_eq!(
+                settings_page_from_name(stored),
+                None,
+                "{stored:?} names no page and must not reopen the window somewhere arbitrary"
+            );
+        }
     }
 
     /// Every page must be reachable by its name, and nothing that names no page may resolve. The

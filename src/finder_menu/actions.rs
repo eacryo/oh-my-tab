@@ -8,8 +8,14 @@ use std::path::{Path, PathBuf};
 
 use finder_protocol::{Context, MenuAction};
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+use objc2::msg_send;
+use objc2::runtime::AnyObject;
+
 use crate::config::CONFIG;
-use crate::finder_menu::{new_file, terminals};
+use crate::finder_menu::{hash, new_file, terminals};
+use crate::i18n::t;
 use crate::log_info;
 
 /// Run one action. Called on the main thread.
@@ -70,8 +76,155 @@ pub(crate) fn execute(action: MenuAction, paths: Vec<String>, context: Context) 
             let Some(path) = paths.first() else {
                 return;
             };
-            copy_path(path);
+            // The bubble says what happened, for the same reason SHA-256 has one: a menu item that
+            // silently did nothing and one that copied are otherwise indistinguishable, and the
+            // pasteboard can refuse the write.
+            copy_path_and_report(path);
         }
+        MenuAction::CopySha256 => {
+            if !config.finder_menu.copy_sha256 {
+                log_info!("[finder-menu] ignored copy sha256 while it is disabled");
+                return;
+            }
+            // Re-validate everything the menu decided, because the notification can name any
+            // action and the selection may have changed since the menu was built.
+            if paths.len() != 1 {
+                log_info!("[finder-menu] sha256 needs exactly one selection");
+                return;
+            }
+            let path = std::path::PathBuf::from(&paths[0]);
+            start_sha256(path);
+        }
+    }
+}
+
+/// One SHA-256 run at a time across the whole app.
+///
+/// Two concurrent runs would read two large files at once and could finish out of order, letting
+/// the earlier click overwrite the later digest on the clipboard. A second click while one is
+/// running is refused with a message rather than queued: the user can see it is busy.
+static SHA256_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+fn start_sha256(path: PathBuf) {
+    if SHA256_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        crate::ui::toast::show_done(&t("finder_menu.sha256_busy"));
+        return;
+    }
+    // The computing message has no deadline: a large file outlives any fixed timeout, and a
+    // bubble that vanished early would leave the user unable to tell it is still working.
+    crate::ui::toast::show_working(&t("finder_menu.sha256_working"));
+    std::thread::spawn(move || {
+        let digest = hash::sha256_file(&path);
+        SHA256_IN_FLIGHT.store(false, Ordering::SeqCst);
+        deliver_sha256(digest);
+    });
+}
+
+/// Hand the worker's result back to the main thread. AppKit and the pasteboard are main-thread
+/// only, so the work is re-dispatched rather than done here.
+fn deliver_sha256(result: std::io::Result<String>) {
+    enum Outcome {
+        Copied,
+        Failed,
+        Unwritable,
+    }
+    let outcome = match result {
+        Ok(digest) => {
+            if copy_text(&digest) {
+                log_info!("[finder-menu] sha256 copied");
+                Outcome::Copied
+            } else {
+                log_info!("[finder-menu] sha256 could not reach the pasteboard");
+                Outcome::Unwritable
+            }
+        }
+        Err(error) => {
+            log_info!("[finder-menu] sha256 failed: {error}");
+            Outcome::Failed
+        }
+    };
+    let message = match outcome {
+        Outcome::Copied => t("finder_menu.sha256_copied"),
+        Outcome::Failed => t("finder_menu.sha256_failed"),
+        Outcome::Unwritable => t("finder_menu.sha256_unavailable"),
+    };
+    // AppKit and the pasteboard are main-thread only, so the message is staged for the main
+    // thread and a selector wakes it. The staged text is the only thing shared, and it is taken
+    // out once, so a delayed dispatch can never show a stale result twice.
+    PENDING_TOAST.lock().unwrap().replace(message);
+    deliver_toast_on_main();
+}
+
+/// The message a worker finished with, waiting for the main thread to take it.
+static PENDING_TOAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
+/// Wake the main thread to show whatever is staged. Safe to call from any thread: it only posts.
+fn deliver_toast_on_main() {
+    unsafe {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        let target = toast_target();
+        let _: () = msg_send![
+            target,
+            performSelectorOnMainThread: objc2::sel!(showPendingToast),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+static TOAST_TARGET: std::sync::OnceLock<crate::ffi::CallbackTarget> = std::sync::OnceLock::new();
+
+unsafe fn toast_target() -> *mut AnyObject {
+    TOAST_TARGET
+        .get_or_init(|| {
+            let name = c"OhMyTabFinderToastTarget";
+            let class = crate::ffi::StaticClass::register_once(&TOAST_CLASS, name, || {
+                crate::ffi::build_class(name, objc2::class!(NSObject), |builder| {
+                    builder.add_method::<AnyObject, _>(
+                        objc2::sel!(showPendingToast),
+                        show_pending_toast
+                            as unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel),
+                    );
+                })
+            });
+            let instance: *mut AnyObject = msg_send![class.0 as *mut AnyObject, new];
+            crate::ffi::CallbackTarget::new(instance)
+        })
+        .0
+}
+
+static TOAST_CLASS: std::sync::OnceLock<crate::ffi::StaticClass> = std::sync::OnceLock::new();
+
+unsafe extern "C" fn show_pending_toast(_this: *mut AnyObject, _cmd: objc2::runtime::Sel) {
+    crate::callback_guard::void("finder_show_pending_toast", || {
+        // Taken, not peeked: a second dispatch for the same message would otherwise show it
+        // again after the user had already seen it.
+        let Some(message) = PENDING_TOAST.lock().unwrap().take() else {
+            return;
+        };
+        crate::ui::toast::show_done(&message);
+    });
+}
+
+/// Put `text` on the general pasteboard. Returns whether the write succeeded: `copy_path` ignored
+/// this answer, and reporting "copied" for a failed write is worse than saying nothing.
+fn copy_text(text: &str) -> bool {
+    unsafe {
+        use crate::ffi::{make_nsstring, release_obj};
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+        let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        if pasteboard.is_null() {
+            return false;
+        }
+        let _: isize = msg_send![pasteboard, clearContents];
+        let value = make_nsstring(text);
+        let kind = make_nsstring("public.utf8-plain-text");
+        let written: bool = msg_send![pasteboard, setString: value, forType: kind];
+        release_obj(value);
+        release_obj(kind);
+        written
     }
 }
 
@@ -95,21 +248,36 @@ fn target_directory(paths: &[String], context: Context) -> Option<PathBuf> {
     })
 }
 
-fn copy_path(path: &str) {
+/// Copy `path` and say so: the successful bubble, or the same refusal SHA-256 reports when the
+/// pasteboard will not take the text.
+fn copy_path_and_report(path: &str) {
+    if copy_path(path) {
+        log_info!("[finder-menu] path copied");
+        crate::ui::toast::show_done(&t("finder_menu.path_copied"));
+    } else {
+        log_info!("[finder-menu] path could not reach the pasteboard");
+        crate::ui::toast::show_done(&t("finder_menu.path_unavailable"));
+    }
+}
+
+/// Put `path` on the general pasteboard as plain text. Returns whether the write succeeded: the
+/// bubble reports the answer, so a refused write cannot read as a copy.
+fn copy_path(path: &str) -> bool {
     unsafe {
         use crate::ffi::{make_nsstring, release_obj};
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
         let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         if pasteboard.is_null() {
-            return;
+            return false;
         }
         let _: isize = msg_send![pasteboard, clearContents];
         let value = make_nsstring(path);
         let kind = make_nsstring("public.utf8-plain-text");
-        let _: bool = msg_send![pasteboard, setString: value, forType: kind];
+        let written: bool = msg_send![pasteboard, setString: value, forType: kind];
         release_obj(value);
         release_obj(kind);
+        written
     }
 }
 

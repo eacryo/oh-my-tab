@@ -83,6 +83,7 @@ pub(super) enum ControlField {
     FinderMenuNewFileType(usize),
     FinderMenuTerminal(usize),
     FinderMenuCopyPath,
+    FinderMenuCopySha256,
 }
 
 /// Identify a field by its control pointer (the window is reused, pointers are stable).
@@ -268,6 +269,12 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                     .map(ControlField::FinderMenuTerminal)
             })
             .or_else(|| m(u.finder_menu_copy_path, ControlField::FinderMenuCopyPath))
+            .or_else(|| {
+                m(
+                    u.finder_menu_copy_sha256,
+                    ControlField::FinderMenuCopySha256,
+                )
+            })
     })
 }
 
@@ -502,6 +509,14 @@ pub(super) unsafe fn fill_finder_menu_controls(ui: &SettingsUi, cfg: &Config) {
             0isize
         }
     ];
+    let _: () = msg_send![
+        ui.finder_menu_copy_sha256,
+        setState: if cfg.finder_menu.copy_sha256 {
+            1isize
+        } else {
+            0isize
+        }
+    ];
     update_finder_menu_controls_enabled(ui);
 }
 
@@ -511,7 +526,11 @@ pub(super) unsafe fn update_finder_menu_controls_enabled(ui: &SettingsUi) {
     let state: isize = msg_send![ui.finder_menu_enabled, state];
     let on = state == 1;
     let master_tooltip = t("settings.finder_menu.tooltip_disabled");
-    let mut controls = vec![ui.finder_menu_layout, ui.finder_menu_copy_path];
+    let mut controls = vec![
+        ui.finder_menu_layout,
+        ui.finder_menu_copy_path,
+        ui.finder_menu_copy_sha256,
+    ];
     controls.extend(ui.finder_menu_new_file_switches.iter().copied());
     for ctrl in controls {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &master_tooltip);
@@ -1012,6 +1031,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::FinderMenuCopyPath => {
                     let state: isize = msg_send![u.finder_menu_copy_path, state];
                     cfg.finder_menu.copy_path = state == 1;
+                }
+                ControlField::FinderMenuCopySha256 => {
+                    let state: isize = msg_send![u.finder_menu_copy_sha256, state];
+                    cfg.finder_menu.copy_sha256 = state == 1;
                 }
             }
         }
@@ -2309,7 +2332,14 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
         sidebar::clear_settings_search();
         let btn = sender as *mut AnyObject;
         let tag: isize = unsafe { msg_send![btn, tag] };
+        if tag < 0 || (tag as usize) >= SETTINGS_PAGE_COUNT {
+            return;
+        }
         select_sidebar(tag as usize);
+        // A click in the sidebar is the user choosing where they work: this is the page the next launch reopens on.
+        // The programmatic entries do not record, so opening Settings from the clipboard picker or the updater does not
+        // steal the choice.
+        super::remember_settings_page(tag as usize);
     });
 }
 

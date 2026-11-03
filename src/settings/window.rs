@@ -515,7 +515,10 @@ unsafe fn center_settings_window(window: *mut AnyObject) {
 }
 
 pub(super) fn show_settings() {
-    show_settings_inner(None, 0, None, true);
+    // The page the user last chose, when there is one: reopening Settings lands where they left it. With nothing
+    // remembered -- first launch, or a page a release has retired -- the window opens on General.
+    let page = super::remembered_settings_page().unwrap_or(0);
+    show_settings_inner(None, page, None, true);
 }
 
 /// Present the settings window on `page`. The page is selected (and its pill committed) while the window
@@ -4038,6 +4041,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             finder_menu_new_file_switches: Vec::new(),
             finder_menu_terminal_switches: Vec::new(),
             finder_menu_copy_path: std::ptr::null_mut(),
+            finder_menu_copy_sha256: std::ptr::null_mut(),
             control_table: ControlTable::new(),
             migrated_pages: std::array::from_fn(|_| None),
         };

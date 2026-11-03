@@ -6324,6 +6324,21 @@ mod tests {
             crate::smoke_verdict::run_smoke_child("picker_rebuild_smoke", &["--smoke-clipboard"]);
         });
     }
+
+    // Runs the real app binary as a subprocess (--smoke-toast): the Finder menu's Copy Path and
+    // Copy SHA-256 both report through the message bubble, and its stroke and its sizing are what the
+    // two clicks promise. AppKit view construction is main-thread-only, so the child builds the bubble.
+    // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+    // without exactly one declaration. Spawns the app child (--smoke-toast), which places the real bubble
+    // on screen, and builds the material variants in the same child.
+    // SMOKE_DISTURBS=focus
+    #[test]
+    #[ignore]
+    fn toast_bubble_smoke() {
+        smoke_runner!("toast_bubble_smoke", 1, {
+            crate::smoke_verdict::run_smoke_child("toast_bubble_smoke", &["--smoke-toast"]);
+        });
+    }
     /// The promise in AGENTS.md, through the decision the reload path uses: a paused session that
     /// is disabled and re-enabled still records nothing.
     ///

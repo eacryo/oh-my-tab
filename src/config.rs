@@ -30,6 +30,21 @@ pub struct Config {
     pub keystroke_display: KeystrokeDisplaySection,
     /// Finder context-menu items, rendered by the Finder Sync app extension.
     pub finder_menu: FinderMenuSection,
+    /// What the windows remembered between launches. Not a preference the user sets: this section is written by
+    /// the app when the user moves a window's own state (today: which settings page is on screen).
+    pub window_state: WindowStateSection,
+}
+
+/// Window state carried across launches.
+///
+/// The page is stored by NAME (`settings_page_name`, the same spelling `--open-settings` accepts) rather than as a
+/// sidebar index: the table's order is a presentation detail, and a page inserted or moved would otherwise reopen
+/// the window on a different page than the user last saw. An empty or unknown name means "nothing remembered yet".
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct WindowStateSection {
+    /// The settings page the user last selected, as `settings_page_name`.
+    pub settings_page: String,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -819,6 +834,9 @@ pub struct FinderMenuSection {
     pub layout: String,
     /// Show "Copy Path" for the selected item or the current folder.
     pub copy_path: bool,
+    /// Show "Copy SHA-256". Only reachable for a single regular file: the menu hides the item
+    /// for a folder, a special file, or any other selection.
+    pub copy_sha256: bool,
     /// File extensions offered under "New File", in menu order.
     pub new_file_types: Vec<String>,
     /// Bundle ids of the terminal applications offered under "Open in Terminal", in menu order.
@@ -831,6 +849,7 @@ impl Default for FinderMenuSection {
             enabled: false,
             layout: FINDER_MENU_DEFAULT_LAYOUT.to_string(),
             copy_path: true,
+            copy_sha256: true,
             new_file_types: FINDER_MENU_FILE_TYPES
                 .iter()
                 .map(|extension| extension.to_string())

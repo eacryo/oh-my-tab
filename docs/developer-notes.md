@@ -148,6 +148,80 @@ CG 已经报告 `onscreen=true` **之后**紧接着做的成员查询，仍显�
 探针程序，是错的：该调用确实会切换，两个参考实现都依赖它。每次抬窗都会发布是哪条路径移动了 Space，
 `scripts/e2e/space-desktops.sh` 还会用「抑制应用激活」的一趟单独验证兜底，而不是靠推断。
 
+## 哪些进程会成为切换目标
+
+**app 扩展**会发布普通窗口，但进程无法被激活，于是卡片永远打不开。收集器在任何辅助功能调用之前
+就丢弃扩展进程（`app_identity::is_extension_process`），因为窗口本身没有任何线索。
+
+在 macOS 26 上、系统设置对应面板打开时实测。下面的命令列出 WindowServer 报告的全部窗口，再打印其中
+属于扩展的那些及其 layer、alpha 与 bounds；样例里的 pid 是那一次会话的，不属于本文档：
+
+```sh
+swift - <<'EOF'
+import AppKit
+import CoreGraphics
+let all = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as! [[String: Any]]
+for w in all {
+  let pid = w[kCGWindowOwnerPID as String] as? Int ?? -1
+  guard let app = NSRunningApplication(processIdentifier: pid_t(pid)),
+        (app.executableURL?.path ?? "").contains(".appex") else { continue }
+  print("pid=\(pid) layer=\(w[kCGWindowLayer as String] ?? "?") alpha=\(w[kCGWindowAlpha as String] ?? "?") bounds=\(w[kCGWindowBounds as String] ?? "?")")
+}
+EOF
+```
+
+```
+pid=6622 layer=0 alpha=1 bounds={740x923 at 577,93}   DisplaysExt.appex，6 个窗口
+pid=6629 layer=0 alpha=1 bounds={740x923 at 577,93}   LockScreen.appex，1 个窗口
+pid=12862 layer=0 alpha=1                             VPN.appex，2 个窗口
+```
+
+所有窗口规则都会放行它们：层级是普通层，表面不透明、尺寸正常。失败发生在上一层，也就是进程：
+
+```
+[raise] SLPS failed: _SLPSSetFrontProcessWithOptions pid=6629 status=-606   (procNotFound)
+[raise] activate fallback failed: pid=6629 activateWithOptions=false
+[raise] fast recovery exhausted: activate=false slps=false click=true attempts=2
+```
+
+同一张卡片上 `AXRaise` 却返回 `first_err=0`，这正是陷阱所在：辅助功能接受了请求，窗口依然没有
+上前，所以「raise 报告成功」不能当作「用户可以切过去」的证据。
+
+因此判据落在可执行文件的位置 `.appex/Contents/MacOS/`，既不依据窗口，也不依据
+`activationPolicy`。`prohibited` 看起来是自然的选择，但它是错的：同一台机器上有 12 个拥有窗口的
+进程报这个值，其中包括 `/Library/Input Methods/DoubaoIme.app` 下的豆包输入法，而输入法是合法的
+切换目标。路径判据不需要维护名单，就能把扩展区分开。用下面的命令可自行复核这个数量；
+`prohibited` 即 `NSApplicationActivationPolicyProhibited`，它是某一次会话的样本，不是常量：
+
+```sh
+swift - <<'EOF'
+import AppKit
+import CoreGraphics
+let all = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as! [[String: Any]]
+var owners = Set<pid_t>()
+for w in all { owners.insert(pid_t(w[kCGWindowOwnerPID as String] as? Int ?? -1)) }
+var byPolicy: [String: Int] = [:]
+for pid in owners {
+  guard let app = NSRunningApplication(processIdentifier: pid) else { continue }
+  let policy: String
+  switch app.activationPolicy {
+  case .regular: policy = "regular"
+  case .accessory: policy = "accessory"
+  case .prohibited: policy = "prohibited"
+  @unknown default: policy = "unknown"
+  }
+  byPolicy[policy, default: 0] += 1
+  if policy == "prohibited" { print("prohibited", pid, app.executableURL?.path ?? "?") }
+}
+print(byPolicy)
+EOF
+```
+
+三个参考实现都漏掉了这一类，理由各自值得记下：BetterCmdTab 丢弃
+`layer >= 20 || layer < 0`，alt-tab-macos 丢弃 *phantom* 窗口（已 ordered out 或 `alpha == 0`），
+DockDoor 用 `layer == 0` 加一条 bundle id 黑名单。三者都保留了扩展的窗口，因为三条规则描述的都是
+窗口，而窗口本身是正常的。
+
 ## 缩略图卡片尺寸
 
 浮窗的缩略图网格给**所有**卡片一个高度。用户可以用 App Switcher 页的「**缩略图大小**」下拉钉住它
