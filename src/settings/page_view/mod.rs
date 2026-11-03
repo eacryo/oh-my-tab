@@ -26,6 +26,15 @@ use super::*;
 
 use std::collections::HashMap;
 
+// One module per page description, so pages can be written independently: each is pure and returns
+// a `PageView`, and the shared machinery here (layout, rendering, identities, the update
+// description) is the only thing they share.
+mod general;
+mod switcher;
+
+use general::general_page_view;
+use switcher::switcher_page_view;
+
 /// Everything a page description may read, captured once per transaction.
 pub(super) struct PageInput {
     pub(super) config: Config,
@@ -1129,332 +1138,6 @@ fn button(label_key: &'static str, action: &'static str) -> RowDraft {
         ControlId::Action(action),
         Value::None,
     )
-}
-
-// MARK: - The Switcher page
-
-/// The Switcher page's description: its rows, their values and their identities.
-pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
-    let cfg = &input.config;
-    let mut w = RowWriter::new(SettingsPageId::Switcher, t("settings.sidebar_switcher"));
-    w.in_first_card("settings.header_windows");
-    w.push(
-        switch(
-            "settings.row_windows_enabled",
-            ControlField::WindowsEnabled,
-            cfg.windows.enabled,
-        )
-        .desc("settings.desc_windows_enabled")
-        .into_spec(),
-    );
-    w.push(
-        switch(
-            "settings.row_show_minimized",
-            ControlField::ShowMinimized,
-            cfg.windows.show_minimized,
-        )
-        .into_spec(),
-    );
-    w.push(
-        switch(
-            "settings.row_show_hidden_app_windows",
-            ControlField::ShowHiddenAppWindows,
-            cfg.windows.show_hidden_app_windows,
-        )
-        .into_spec(),
-    );
-    w.push(
-        switch(
-            "settings.row_show_other_desktops",
-            ControlField::ShowOtherDesktops,
-            cfg.windows.show_other_desktops,
-        )
-        .desc("settings.desc_show_other_desktops")
-        .into_spec(),
-    );
-    let display_modes = vec![
-        t("settings.window_display_mode_icons"),
-        t("settings.window_display_mode_icons_thumbnails"),
-    ];
-    w.push(
-        popup(
-            "settings.row_window_display_mode",
-            &display_modes,
-            ControlField::ThumbnailsEnabled,
-            usize::from(cfg.layout.thumbnails_enabled),
-        )
-        .into_spec(),
-    );
-    w.push(
-        switch(
-            "settings.row_focused_thumbnail_prewarm",
-            ControlField::FocusedThumbnailPrewarm,
-            cfg.layout.focused_thumbnail_prewarm,
-        )
-        .group(RowGroup::ThumbnailOnly)
-        .into_spec(),
-    );
-    w.push(
-        switch(
-            "settings.row_show_app_name_in_cards",
-            ControlField::ShowAppNameInCards,
-            cfg.layout.show_app_name_in_cards,
-        )
-        .group(RowGroup::ThumbnailOnly)
-        .into_spec(),
-    );
-    let thumbnail_sizes: Vec<String> = crate::config::THUMBNAIL_SIZE_VALUES
-        .iter()
-        .map(|value| match *value {
-            "auto" => t("settings.thumbnail_size_auto"),
-            percent => tf("settings.thumbnail_size_percent", &[("percent", percent)]),
-        })
-        .collect();
-    w.push(
-        popup(
-            "settings.row_thumbnail_size",
-            &thumbnail_sizes,
-            ControlField::ThumbnailSize,
-            crate::config::thumbnail_size_index_of(&cfg.layout.thumbnail_size).unwrap_or(0),
-        )
-        .desc("settings.desc_thumbnail_size")
-        .group(RowGroup::ThumbnailOnly)
-        .into_spec(),
-    );
-    let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
-    w.push(
-        slider(
-            "settings.row_card_text_size",
-            ControlField::CardTextSize,
-            (TEXT_SIZE_MIN, TEXT_SIZE_MAX, 1),
-            card_text_size,
-            Some(TEXT_SIZE_DEFAULT as f64),
-            card_text_size.to_string(),
-        )
-        .desc("settings.desc_card_text_size")
-        .into_spec(),
-    );
-    let status_bar_stop = status_bar_size_slider_value(cfg.fonts.status_bar_size);
-    w.push(
-        slider(
-            "settings.row_status_bar_text_size",
-            ControlField::StatusBarTextSize,
-            (STATUS_BAR_SIZE_MIN, STATUS_BAR_SIZE_STOPS - 1, 1),
-            status_bar_stop,
-            Some(STATUS_BAR_SIZE_DEFAULT_INDEX as f64),
-            status_bar_size_for_index(status_bar_stop).to_string(),
-        )
-        .desc("settings.desc_status_bar_text_size")
-        .into_spec(),
-    );
-    let overlay_positions = vec![
-        t("settings.overlay_position_follow_active"),
-        t("settings.overlay_position_main_screen"),
-    ];
-    w.push(
-        popup(
-            "settings.row_overlay_position",
-            &overlay_positions,
-            ControlField::OverlayPosition,
-            usize::from(cfg.windows.overlay_position.as_str() == "main"),
-        )
-        .into_spec(),
-    );
-    let activation_modes = vec![
-        t("settings.activation_mode_hover"),
-        t("settings.activation_mode_click"),
-    ];
-    w.push(
-        popup(
-            "settings.row_activation_mode",
-            &activation_modes,
-            ControlField::ActivationMode,
-            usize::from(cfg.windows.activation_mode.as_str() == "click"),
-        )
-        .into_spec(),
-    );
-    for (label_key, desc_key, field, on) in [
-        (
-            "settings.row_panel_close",
-            "settings.desc_panel_close",
-            ControlField::PanelCloseEnabled,
-            cfg.windows.panel_close_enabled,
-        ),
-        (
-            "settings.row_panel_minimize",
-            "settings.desc_panel_minimize",
-            ControlField::PanelMinimizeEnabled,
-            cfg.windows.panel_minimize_enabled,
-        ),
-        (
-            "settings.row_panel_hide",
-            "settings.desc_panel_hide",
-            ControlField::PanelHideEnabled,
-            cfg.windows.panel_hide_enabled,
-        ),
-        (
-            "settings.row_panel_quit",
-            "settings.desc_panel_quit",
-            ControlField::PanelQuitEnabled,
-            cfg.windows.panel_quit_enabled,
-        ),
-    ] {
-        w.push(switch(label_key, field, on).desc(desc_key).into_spec());
-    }
-    w.card("settings.header_window_options");
-    let modifiers = vec![
-        t("settings.modifier_option"),
-        t("settings.modifier_command"),
-        t("settings.modifier_control"),
-    ];
-    w.push(
-        popup(
-            "settings.row_modifier",
-            &modifiers,
-            ControlField::Modifier,
-            crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier),
-        )
-        .into_spec(),
-    );
-    w.finish()
-}
-
-// MARK: - The General page
-
-/// The General page's description: its rows, their values and their identities.
-pub(super) fn general_page_view(input: &PageInput) -> PageView {
-    let cfg = &input.config;
-    let mut w = RowWriter::new(SettingsPageId::General, t("settings.sidebar_general"));
-    w.in_first_card("settings.header_startup");
-    w.push(
-        switch(
-            "settings.row_launch_at_login",
-            ControlField::LaunchAtLogin,
-            cfg.startup.launch_at_login,
-        )
-        .desc("settings.desc_launch_at_login")
-        .into_spec(),
-    );
-    w.card("settings.header_menu_bar_icon");
-    w.push(
-        switch(
-            "settings.row_hide_menu_bar_icon",
-            ControlField::HideMenuBarIcon,
-            cfg.startup.hide_menu_bar_icon,
-        )
-        .caption("settings.desc_hide_menu_bar_icon")
-        .into_spec(),
-    );
-    w.card("settings.header_appearance");
-    let themes = vec![
-        t("settings.theme_dark"),
-        t("settings.theme_light"),
-        t("settings.theme_auto"),
-    ];
-    let theme_index = match cfg.appearance.theme.as_str() {
-        "dark" => 0,
-        "light" => 1,
-        _ => 2,
-    };
-    w.push(
-        popup(
-            "settings.row_theme",
-            &themes,
-            ControlField::Theme,
-            theme_index,
-        )
-        .desc("settings.desc_theme")
-        .into_spec(),
-    );
-    let materials = vec![
-        t("settings.panel_material_liquid_glass"),
-        t("settings.panel_material_frost"),
-        t("settings.panel_material_opaque"),
-    ];
-    w.push(
-        popup(
-            "settings.row_panel_material",
-            &materials,
-            ControlField::PanelMaterial,
-            crate::config::panel_material_index_of(&cfg.appearance.panel_material).unwrap_or(0),
-        )
-        .desc("settings.desc_panel_material")
-        .into_spec(),
-    );
-    let glass_styles = vec![
-        t("settings.glass_style_regular"),
-        t("settings.glass_style_clear"),
-    ];
-    w.push(
-        popup(
-            "settings.row_glass_style",
-            &glass_styles,
-            ControlField::GlassStyle,
-            crate::glass::glass_style_index(&cfg.appearance.glass_style) as usize,
-        )
-        .desc("settings.desc_glass_style")
-        .group(RowGroup::GlassStyle)
-        .into_spec(),
-    );
-    w.card("settings.header_language");
-    let locales: Vec<String> = LOCALE_LABELS
-        .iter()
-        .map(|label| label.to_string())
-        .collect();
-    w.push(
-        popup(
-            "settings.row_locale",
-            &locales,
-            ControlField::Locale,
-            LOCALE_VALUES
-                .iter()
-                .position(|value| *value == cfg.i18n.locale.as_str())
-                .unwrap_or(0),
-        )
-        .into_spec(),
-    );
-    w.card("settings.header_logging");
-    let log_levels = vec![t("settings.log_level_debug"), t("settings.log_level_info")];
-    w.push(
-        popup(
-            "settings.row_log_level",
-            &log_levels,
-            ControlField::LogLevel,
-            usize::from(cfg.logging.level.as_str() != "debug"),
-        )
-        .desc("settings.desc_log_level")
-        .into_spec(),
-    );
-    w.push(
-        button("settings.row_export_logs", "export_logs")
-            .desc("settings.desc_export_logs")
-            .into_spec(),
-    );
-    w.card("settings.header_backup");
-    w.push(
-        button("settings.row_export_settings", "export_settings")
-            .caption("settings.desc_export_settings")
-            .into_spec(),
-    );
-    w.push(
-        button("settings.row_import_settings", "import_settings")
-            .caption("settings.desc_import_settings")
-            .into_spec(),
-    );
-    let mut view = w.finish();
-    // The storage/permission banner: the page reserves its strip, the refresh re-texts it.
-    let is_permission_migration = crate::update_notice::needs_permission_migration_copy();
-    view.banner = Some(BannerSpec {
-        copy_key: if is_permission_migration {
-            "settings.permission_migration_warning"
-        } else {
-            "settings.accessibility_warning"
-        },
-        action_id: "open_privacy",
-        content_h: if is_permission_migration { 60.0 } else { 48.0 },
-        gap: 12.0,
-    });
-    view
 }
 
 // MARK: - The update description
@@ -2781,7 +2464,7 @@ mod tests {
         // it too: a second release would steal the parent's own reference.
         let view_src = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/settings/page_view.rs"
+            "/src/settings/page_view/mod.rs"
         ))
         .expect("the page renderer's own source");
         let page_start = view_src.find("pub(super) unsafe fn render_page(").unwrap();
@@ -2862,7 +2545,7 @@ mod tests {
         // M2 runner drives.
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/settings/page_view.rs"
+            "/src/settings/page_view/mod.rs"
         ))
         .expect("the page renderer's own source");
         let start = source.find("unsafe fn render_row(").expect("render_row");
@@ -3003,7 +2686,7 @@ mod tests {
         // The renderer places it on the row's own capture, not before the row opens.
         let source = std::fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/src/settings/page_view.rs"
+            "/src/settings/page_view/mod.rs"
         ))
         .expect("the page renderer's own source");
         let start = source.find("unsafe fn render_row(").expect("render_row");

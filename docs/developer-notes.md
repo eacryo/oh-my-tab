@@ -419,7 +419,7 @@ DockDoor 用 `layer == 0` 加一条 bundle id 黑名单。三者都保留了扩�
 
 ## 设置页：描述、布局、渲染是三段
 
-`settings/page_view.rs` 对 `PageInput`（`Config` + `ThemeInput` + 当前选中的鼠标设备）是纯的。三段按
+`settings/page_view/` 对 `PageInput`（`Config` + `ThemeInput` + 当前选中的鼠标设备）是纯的。三段按
 顺序执行，永不合并：
 
 1. `page_view(&PageInput) -> PageView` 为每一行产出一个 `RowSpec`——文案键、控件种类、显式的

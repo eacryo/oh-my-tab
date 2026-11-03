@@ -540,7 +540,7 @@ default: quitting an app is destructive and hiding one changes what the user is 
 
 ## Settings pages: description, layout and rendering are three stages
 
-`settings/page_view.rs` is pure over `PageInput` (`Config` + `ThemeInput` + the selected mouse
+`settings/page_view/` is pure over `PageInput` (`Config` + `ThemeInput` + the selected mouse
 device). Three stages, in this order and never merged:
 
 1. `page_view(&PageInput) -> PageView` produces one `RowSpec` per row — copy keys, control kind, an

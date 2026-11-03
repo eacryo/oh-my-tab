@@ -217,12 +217,14 @@ clipboard/
 
 - `settings.rs` is the root: `SettingsUi`, control builders, window build/show, the live-apply dispatcher
   (every change writes the in-memory `CONFIG` and persists debounced), and restore-defaults.
-- A page is **described before it is built**. `settings/page_view.rs` is pure: `page_view(&PageInput) ->
+- A page is **described before it is built**. `settings/page_view/` is pure: `page_view(&PageInput) ->
   PageView` produces one `RowSpec` per row (copy keys, control kind, an explicit `ControlId`, initial value,
   options, dependency, group, and its search entry as a value), `layout_rows` is the only layout computation
   (`RowLayout` frames from the page plus a `LayoutInput`), and `page_update_description` is the one
   field-to-value description both the refill and the in-place refresh consume. `page_widgets.rs` holds the
-  copy widgets the renderer uses; it and `page_view.rs` are the page's two halves, description and drawing.
+  copy widgets the renderer uses; it and `page_view/` are the page's two halves, description and drawing.
+  `page_view/mod.rs` holds the shared machinery (the row writer, layout, rendering, identities); one
+  file per page sits beside it (`switcher.rs`, `general.rs`), so a page can be written on its own.
 - `ControlTable` (on `SettingsUi`) is the control-to-identity mapping, produced while the page is built by a
   `PageRegistrations` buffer that validates the whole page before it replaces the old entries: a duplicate
   identity aborts the build and leaves the old views and the old mapping together. `dispatch.rs` asks the
