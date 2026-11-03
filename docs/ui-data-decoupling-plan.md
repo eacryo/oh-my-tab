@@ -1,6 +1,6 @@
 # 数据与渲染解耦方案
 
-- 状态：实施完成并通过独立代码审查（第 6 轮 REVIEW-STATUS: PASS）。已实现：P0（theme 快照）、P1a + P2（Switcher 与 General 两页的描述/布局/渲染三段式、ControlTable、共享更新描述）、P3（SwitcherLayout 入 AppState）、P4（CardPlan）。未实施：P1b–P1d（其余六页，记入 docs/review-backlog.md 第 76 条）、P5。验证：M1 门禁除一条被环境阻塞的 smoke runner 外全绿（见 review-backlog 第 77 条）；新增 M2 runner `migrated_pages_render_smoke` 已接入门禁发现机制但**未运行**（NOT RUN）。
+- 状态：P0–P4 全部实施完成，八个设置页全部由描述生成（含 Mouse 与 Key Bindings）；页面级钩子（before_page/extra_row/after_page）覆盖描述无法承载的控件。M1 门禁通过；M2 未运行。
 - 日期：2026-11-03
 - 任务键：`ui-data-decoupling`
 

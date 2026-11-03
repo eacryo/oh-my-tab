@@ -88,9 +88,12 @@ pub(super) enum ControlField {
 
 /// Identify a field by its control pointer (the window is reused, pointers are stable).
 ///
-/// A control a migrated page built is answered by the page's own registrations in
-/// `ControlTable`; an unknown sender — every page that is still built inline, and anything the
-/// table never saw — falls through to the pointer comparison below, unchanged.
+/// A DESCRIBED control is answered by the page's own registrations in `ControlTable`. The pointer
+/// comparison below stays for the controls a page draws itself through `PageHooks`: they are real
+/// controls the user clicks, they go through `handleControlChanged:`, but they are not described
+/// rows, so nothing registers them (the Mouse page's device popup, scroll mode, line count, the
+/// smooth sliders and the tracking speed). It is also the fallback for a control the table has not
+/// seen after a refused page build.
 unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;

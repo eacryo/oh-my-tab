@@ -1,6 +1,6 @@
 # Separating the data from the rendering
 
-- Status: implemented and through independent code review (round 6, REVIEW-STATUS: PASS). Implemented: P0 (theme snapshot), P1a + P2 (Switcher and General pages as description/layout/render, ControlTable, the shared update description), P3 (SwitcherLayout on AppState), P4 (CardPlan). Not implemented: P1b–P1d (the other six pages, `docs/review-backlog.md` entry 76) and P5. Verification: the M1 gate is green except one smoke runner blocked by the environment (entry 77); the new M2 runner `migrated_pages_render_smoke` is wired into the runner discovery but **NOT RUN**.
+- Status: P0-P4 implemented; all eight settings pages are described (Mouse and Key Bindings included), with page hooks (before_page/extra_row/after_page) covering the controls a description cannot carry. The M1 gate passes; M2 is NOT RUN.
 - Date: 2026-11-03
 - Task key: `ui-data-decoupling`
 

@@ -223,12 +223,21 @@ clipboard/
   (`RowLayout` frames from the page plus a `LayoutInput`), and `page_update_description` is the one
   field-to-value description both the refill and the in-place refresh consume. `page_widgets.rs` holds the
   copy widgets the renderer uses; it and `page_view/` are the page's two halves, description and drawing.
-  `page_view/mod.rs` holds the shared machinery (the row writer, layout, rendering, identities); one
-  file per page sits beside it (`switcher.rs`, `general.rs`), so a page can be written on its own.
+  `page_view/mod.rs` holds the shared machinery (the row writer, layout, rendering, identities); **one
+  file per page** sits beside it (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `about.rs`,
+  `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
+- **Every settings page is described.** `page_builder.rs` is now one ~20-line entry point per page: it
+  captures a `PageInput`, calls `build_page` and publishes (or falls back to `empty_page`). A page that
+  needs something the description cannot carry states it in `PageHooks`: `before_page` for a page-drawn
+  header, `extra_row` for a control whose value or identity is not a `ControlField` (a device list, a
+  fractional slider, a shortcut recorder), `after_page` for a block of its own (the mapping table, the
+  update band). Those hooks are the only place a page touches AppKit, and they hand the legacy
+  `SettingsUi` fields their controls.
 - `ControlTable` (on `SettingsUi`) is the control-to-identity mapping, produced while the page is built by a
   `PageRegistrations` buffer that validates the whole page before it replaces the old entries: a duplicate
   identity aborts the build and leaves the old views and the old mapping together. `dispatch.rs` asks the
-  table first and falls back to the pointer comparison for pages that are not described yet.
+  table first and keeps the pointer comparison for the controls a page draws itself (they are clickable
+  controls but not described rows, so nothing registers them) and for a control no table has seen.
 - `settings/window.rs` + `settings/window/chrome.rs` own the window and its native classes; `sidebar.rs` the
   two-pane background; `page_builder.rs`/`page_canvas.rs` the page context, `build_page`/`publish_built_page`,
   and the vertical layout owner;
