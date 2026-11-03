@@ -103,9 +103,8 @@ pub(super) fn keystroke_display_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
     // The panel's stream-axis cap: one value covers both orientations, whole tens only, so the
-    // readout, the saved value and the config validation all speak the same steps.
-    let max_extent =
-        crate::config::keystroke_display_max_extent_percent_snap(display.max_extent_percent);
+    // readout, the saved value and the config validation all speak the same steps. The two helpers
+    // both snap, so an out-of-step saved value shows the stop the control will actually rest on.
     w.push(
         slider(
             "settings.row_keystroke_display_max_extent",
@@ -115,10 +114,10 @@ pub(super) fn keystroke_display_page_view(input: &PageInput) -> PageView {
                 crate::settings::page_builder::max_extent_slider_max(),
                 crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_STEP as i64,
             ),
-            crate::settings::page_builder::max_extent_slider_value(max_extent),
+            crate::settings::page_builder::max_extent_slider_value(display.max_extent_percent),
             // Double-click restores the 50% default, the panel's pre-setting behaviour.
             Some(crate::config::KEYSTROKE_DISPLAY_MAX_EXTENT_PERCENT_DEFAULT as f64),
-            crate::settings::page_builder::max_extent_readout(max_extent),
+            crate::settings::page_builder::max_extent_readout(display.max_extent_percent),
         )
         .into_spec(),
     );

@@ -251,6 +251,9 @@ pub(super) enum ControlKind {
     /// `action` adds the row's own action button beside the value (the Finder Menu page's status
     /// line opens the extension settings; the About page's permission rows open System Settings).
     Value { action: Option<ValueAction> },
+    /// A hyperlink drawn as the row's control (the About page's website and GitHub rows). Its
+    /// target is chosen by the `tag` the click handler reads.
+    Link { tag: isize },
 }
 
 /// What a control is, for the dispatcher. A field identity is what the config stores; an action
@@ -429,6 +432,21 @@ pub(super) struct PageRowSpec {
 /// What a page supplies to draw the rows it owns. The default draws none, which is every page whose
 /// rows are all described.
 pub(super) trait PageHooks {
+    /// Draw the page's OWN header, before any row.
+    ///
+    /// A page that draws its header itself (the About page's icon, title, subtitle and hit view)
+    /// states its `PageView::header_offset` and draws the block here, then pins it with the
+    /// canvas's `view_mark`/`pin_from_mark`. Every other page leaves this empty and gets the shared
+    /// page title from the canvas.
+    unsafe fn before_page(
+        &mut self,
+        _canvas: &mut PageCanvas,
+        _ui: &mut SettingsUi,
+        _target: *mut AnyObject,
+    ) -> Result<(), RegisterError> {
+        Ok(())
+    }
+
     /// Draw the extra row `spec`, whose origin the canvas has already advanced to.
     unsafe fn extra_row(
         &mut self,
@@ -837,9 +855,10 @@ fn row_height(
 ) -> f64 {
     let base = match row.control {
         ControlKind::Popup { .. } => SettingsLayout::SINGLE_LINE_ROW_H,
-        ControlKind::Switch | ControlKind::Button | ControlKind::Slider { .. } => {
-            input.layout.described_row_h
-        }
+        ControlKind::Switch
+        | ControlKind::Button
+        | ControlKind::Slider { .. }
+        | ControlKind::Link { .. } => input.layout.described_row_h,
         ControlKind::Value { action } => {
             // A value row with a button is a described row (the button makes it two lines tall,
             // like every other row carrying a control).
@@ -980,6 +999,17 @@ pub(super) fn layout_rows(
                 )
             }
             ControlKind::Popup { .. } => (
+                BoxRect::new(
+                    layout.control_x,
+                    cursor + (height - metrics.control_h) / 2.0,
+                    layout.control_w,
+                    metrics.control_h,
+                ),
+                None,
+            ),
+            // A hyperlink sits at the control column's leading edge, like a value: it is text, not a
+            // right-aligned control.
+            ControlKind::Link { .. } => (
                 BoxRect::new(
                     layout.control_x,
                     cursor + (height - metrics.control_h) / 2.0,
@@ -1581,6 +1611,15 @@ unsafe fn render_row(
                 selected,
             )
         }
+        // A hyperlink: the widget opens the URL its tag names on a click.
+        ControlKind::Link { tag } => SettingsControl::external_link(
+            placed.control_frame.x,
+            placed.control_frame.y,
+            placed.control_frame.w,
+            placed.control_frame.h,
+            &title,
+            *tag,
+        ),
         ControlKind::Slider {
             min,
             max,
@@ -1869,6 +1908,8 @@ pub(super) unsafe fn apply_control_update(control: &RenderedControl, value: &str
             let index = value.parse::<isize>().unwrap_or(0);
             let _: () = msg_send![control.control, selectItemAtIndex: index];
         }
+        // A hyperlink has no value to write: its text is its own copy.
+        ControlKind::Link { .. } => {}
         ControlKind::Slider { .. } => {
             let number = value.parse::<isize>().unwrap_or(0);
             let _: () = msg_send![control.control, setIntegerValue: number];
@@ -2062,6 +2103,9 @@ pub(super) unsafe fn build_page(
             clip_height,
         ),
     };
+    // A page that draws its own header draws it now: the canvas exists (so `view_mark`/`pin_from_mark`
+    // work) and no row has been placed yet, which is what the header block is pinned above.
+    hooks.before_page(&mut canvas, ui, target)?;
     // The banner's box comes from the page context (the detail pane's inset and the VISIBLE
     // viewport), not from the page document -- its parent is the settings content view.
     let layout_input = page_layout_input(
