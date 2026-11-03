@@ -461,11 +461,49 @@ unsafe fn settings_select_close(button: *mut AnyObject) {
         state.panel as *mut AnyObject
     };
     if !panel.is_null() {
-        settings_select_finish_close(
-            button as *mut c_void,
-            sel!(finishClose:),
-            panel as *mut c_void,
-        );
+        // The exit mirrors the entrance: the panel eases out over the same duration and curve it eased in, and the
+        // popup is ordered away when that finishes. Closing used to order the window out in the same turn, so an open
+        // that took 380ms was answered by an instantaneous disappearance -- the abrupt transition.
+        let layer: *mut AnyObject = msg_send![panel, layer];
+        let fading = !layer.is_null() && !crate::theme::reduce_motion_enabled();
+        if fading {
+            // A CALayer is not animatable through `animator` (only views and windows are); the fade is the same
+            // implicit-animation-free recipe the entrance uses -- set the model value, then add one explicit animation
+            // for the property that changed. The cleanup runs on the animation's own copy, so the popup is ordered away
+            // exactly when the fade ends rather than in the same turn the close started.
+            let fade = crate::theme::ANIMATION_DURATION_MEDIUM;
+            let _: () = msg_send![layer, setOpacity: 0.0f32];
+            let key_path = make_nsstring("opacity");
+            let animation: *mut AnyObject = msg_send![
+                class!(CABasicAnimation),
+                animationWithKeyPath: key_path
+            ];
+            CFRelease(key_path as *const c_void);
+            let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
+            let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
+            let _: () = msg_send![animation, setFromValue: from_value];
+            let _: () = msg_send![animation, setToValue: to_value];
+            let _: () = msg_send![animation, setDuration: fade];
+            let timings = crate::theme::ease_standard_timing_function();
+            if !timings.is_null() {
+                let _: () = msg_send![animation, setTimingFunction: timings];
+            }
+            let animation_key = make_nsstring("settings-select-close-opacity");
+            let _: () = msg_send![layer, addAnimation: animation, forKey: animation_key];
+            CFRelease(animation_key as *const c_void);
+            let _: () = msg_send![
+                button,
+                performSelector: sel!(finishClose:),
+                withObject: panel as *mut AnyObject,
+                afterDelay: fade
+            ];
+        } else {
+            settings_select_finish_close(
+                button as *mut c_void,
+                sel!(finishClose:),
+                panel as *mut c_void,
+            );
+        }
     }
     if ACTIVE_SETTINGS_SELECT
         .lock()
@@ -997,9 +1035,13 @@ struct SettingsSelectPanel {
     scrolls: bool,
 }
 
-/// Blank space the floating window leaves around the panel, so the panel's rounded shadow has room
-/// (a window clips whatever exceeds its own frame).
-const SELECT_POPUP_SHADOW_PAD: f64 = 12.0;
+/// The popup window's room for the panel's shadow, on every edge.
+///
+/// The shadow is the Finder message bubble's own elevation (a soft, downward-offset blur), and the window has to be
+/// large enough for the blur's tail: the window clips whatever exceeds its frame, so a pad smaller than the radius
+/// shows a shadow with its edge cut off -- the faint ring around the panel's bottom corner.
+const SELECT_POPUP_SHADOW_PAD: f64 =
+    crate::theme::ELEVATION_HIGH_SHADOW_RADIUS + crate::theme::ELEVATION_SHADOW_TAIL_ALLOWANCE;
 
 /// Resolve the geometry of an opening option panel. Pure, so it can be unit-tested (see this
 /// module's tests).
@@ -1149,19 +1191,25 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
             crate::ffi::hex_to_cg_color(palette.card_border),
         );
         let _: () = msg_send![panel_layer, setBorderWidth: 1.0f64];
-        let _: () = msg_send![panel_layer, setCornerRadius: crate::theme::RADIUS_PANEL];
+        // The panel's own corner is a CARD radius, not the panel radius: the accent-highlighted option row inside it is
+        // drawn with \`RADIUS_CONTROL\`, and a surface whose corner is larger than the chip it frames reads as a second,
+        // mismatched shape poking out past it. A card corner sits inside that chip and matches the cards the dropdown
+        // hangs from.
+        let _: () = msg_send![panel_layer, setCornerRadius: crate::theme::RADIUS_CARD];
         // Keep the panel's shadow outside its bounds; option rows already clip themselves to
         let _: () = msg_send![panel_layer, setMasksToBounds: false];
         if !crate::theme::reduce_motion_enabled() {
             let _: () = msg_send![panel_layer, setOpacity: 0.0f32];
         }
-        let shadow_color = crate::ffi::hex_to_cg_color(crate::theme::ELEVATION_MED_SHADOW_COLOR);
+        // The floating panels' `high` elevation, which is also the message bubble's: a wide, soft, downward-offset
+        // blur. The dropdown used the tighter `med` level, whose short radius reads as a hard ring hugging the panel's
+        // corner rather than as the panel floating above the page.
+        let shadow = crate::theme::ELEVATION_HIGH;
+        let shadow_color = crate::ffi::hex_to_cg_color(shadow.color);
         crate::ffi::layer_set_shadow_color(panel_layer, shadow_color);
-        let _: () =
-            msg_send![panel_layer, setShadowOpacity: crate::theme::ELEVATION_MED_SHADOW_OPACITY];
-        let _: () =
-            msg_send![panel_layer, setShadowRadius: crate::theme::ELEVATION_MED_SHADOW_RADIUS];
-        let _: () = msg_send![panel_layer, setShadowOffset: NSSize::new(0.0, crate::theme::ELEVATION_MED_SHADOW_OFFSET_Y)];
+        let _: () = msg_send![panel_layer, setShadowOpacity: shadow.opacity];
+        let _: () = msg_send![panel_layer, setShadowRadius: shadow.radius];
+        let _: () = msg_send![panel_layer, setShadowOffset: NSSize::new(0.0, shadow.offset_y)];
     }
 
     // Where the rows hang: directly on the panel when they fit, otherwise inside a scroll view
