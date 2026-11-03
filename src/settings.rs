@@ -990,8 +990,8 @@ pub(crate) use mapping::{
     handle_panel_record_trigger, handle_recording_cancelled, handle_recording_finished,
 };
 use page_canvas::*;
-pub(crate) use page_view::migrated_pages_smoke_runner;
 use page_view::*;
+pub(crate) use page_view::{about_update_flow_smoke_runner, migrated_pages_smoke_runner};
 pub(super) use restore::{
     collapse_restore_confirmations, collapse_restore_confirmations_on_external_click,
 };
@@ -2961,6 +2961,23 @@ mod tests {
         });
     }
 
+    /// The About page's inline update flow, driven through the SAME canvas calls the production
+    /// path uses: collapse the action band's row, grow the host's row, and assert the relations a
+    /// single-row or row-height-anchored layout got wrong -- the divider stays on the row above's
+    /// bottom edge, and the expanded host's top edge is that same line.
+    // SMOKE_CELL=M2 -- the child brings up AppKit; declared exactly once for scripts/smoke-runners.sh.
+    // SMOKE_DISTURBS=focus
+    #[test]
+    #[ignore]
+    fn about_update_flow_smoke() {
+        smoke_runner!("about_update_flow_smoke", 4, {
+            crate::smoke_verdict::run_smoke_child(
+                "about_update_flow_smoke",
+                &["--smoke-about-update-flow"],
+            );
+        });
+    }
+
     /// The pages migrated to a row description, built with the REAL renderer on the AppKit main
     /// thread: every placed view must be a subview of its page, at its row's origin plus the offset
     /// the layout gave it, in the row's group, and no row may have placed nothing.
@@ -2968,7 +2985,6 @@ mod tests {
     /// main-thread-only slot), so the runner spawns the app and reports the child's own verdict.
     // SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
     // without exactly one declaration. Spawns the app child and builds the real pages.
-    // SMOKE_DISTURBS=focus
     #[test]
     #[ignore]
     fn migrated_pages_render_smoke() {

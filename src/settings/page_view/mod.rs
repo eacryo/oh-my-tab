@@ -2868,6 +2868,128 @@ unsafe fn scene_holds_placements(
     // The layout must still describe the same page it was computed for.
     layout.rows.len() == view.rows.len()
 }
+
+/// Drive the About page's inline update flow on a detached document, through the SAME canvas calls
+/// the production path uses, and assert its geometry.
+///
+/// The relations, not the absolute coordinates: the document is laid out from its TOP edge, so
+/// growing it moves every row. What must hold is (a) the divider sits on the last row above the
+/// band -- before, during and after the flow -- and (b) the expanded host's top edge is that same
+/// line, so the panel takes the check button's place instead of starting a row lower.
+pub(crate) unsafe fn about_update_flow_smoke_runner() -> bool {
+    let document: *mut AnyObject = msg_send![class!(NSView), alloc];
+    let document: *mut AnyObject = msg_send![
+        document,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 900.0))
+    ];
+    let input = PageInput::from_config(
+        crate::config::Config::default(),
+        None,
+        crate::theme::ThemeInput::current(),
+    );
+    let view = view_for(SettingsPageId::About, &input);
+    let layout = SettingsLayout::new(600.0);
+    let metrics = PageMetrics::for_layout(layout);
+    let mut canvas = PageCanvas::new_at(
+        document,
+        600.0,
+        layout,
+        view.header_offset.unwrap_or(0.0),
+        1200.0,
+        900.0,
+    );
+    let mut ui = headless_settings_ui();
+    let mut hooks = AboutHooks {
+        window: std::ptr::null_mut(),
+    };
+    let layout_input = LayoutInput {
+        content_w: 600.0,
+        doc_top: 1200.0,
+        header_offset: canvas.header_offset(),
+        banner_frame: BannerFrame::of(banner_parent_frame(28.0, 900.0, 600.0, banner_height())),
+        layout,
+        text: MeasuredText::measure(&view, 600.0 - 2.0 * SETTINGS_DETAIL_INSET),
+        extra_row_heights: view
+            .extra_rows
+            .iter()
+            .map(|extra| extra.height.resolve(&input, 600.0))
+            .collect(),
+    };
+    let page_layout = layout_rows(&view, &layout_input, &metrics);
+    if render_page(
+        &mut canvas,
+        std::ptr::null_mut(),
+        &view,
+        &page_layout,
+        &metrics,
+        &mut ui,
+        &mut hooks,
+    )
+    .is_err()
+    {
+        log_info!("[smoke-update-flow] the About page refused to build");
+        return false;
+    }
+    let _: f64 = canvas.finish();
+    let (band_row, host_row) = (ui.update_band_row, ui.update_host_row);
+    let divider = ui.update_divider;
+    if divider.is_null() || band_row == host_row || ui.update_host.is_null() {
+        log_info!("[smoke-update-flow] the flow has no distinct rows, host and divider");
+        return false;
+    }
+    // The row the divider marks the bottom edge of: the last row settled before the band.
+    let row_above = band_row.saturating_sub(1);
+    let divider_y = |_canvas: &PageCanvas| -> f64 {
+        let frame: NSRect = msg_send![divider, frame];
+        frame.origin.y
+    };
+    // The compact state: the divider is the row above's bottom edge.
+    let _: f64 = canvas.finish();
+    let row_above_origin = canvas.current_row_origin(row_above);
+    let compact_ok = row_above_origin
+        .map(|origin| (divider_y(&canvas) - origin).abs() <= 0.5)
+        .unwrap_or(false);
+    // The flow's own calls, in production's order.
+    let host_h = 240.0;
+    canvas.set_bottom_padding(SettingsPageHeader::BOTTOM_PADDING.min(24.0));
+    canvas.set_row_consume(band_row, 0.0);
+    canvas.set_row_consume(host_row, host_h);
+    let host: NSRect = msg_send![ui.update_host, frame];
+    let _: () = msg_send![
+        ui.update_host,
+        setFrameSize: NSSize::new(host.size.width, host_h)
+    ];
+    let _: f64 = canvas.finish();
+    // (a) the divider still marks the row above's bottom edge.
+    let divider_after = divider_y(&canvas);
+    let anchored_ok = canvas
+        .current_row_origin(row_above)
+        .map(|origin| (divider_after - origin).abs() <= 0.5)
+        .unwrap_or(false);
+    // (b) the expanded host hangs from that same line.
+    let host: NSRect = msg_send![ui.update_host, frame];
+    let host_top = host.origin.y + host.size.height;
+    let host_ok = (host_top - divider_after).abs() <= 1.0;
+    // Collapsing restores the compact relation.
+    let _: () = msg_send![ui.update_host, setFrameSize: NSSize::new(host.size.width, 0.0)];
+    canvas.set_row_consume(host_row, 0.0);
+    canvas.set_row_consume(band_row, SettingsLayout::SINGLE_LINE_ROW_H);
+    let _: f64 = canvas.finish();
+    let collapsed_ok = canvas
+        .current_row_origin(row_above)
+        .map(|origin| (divider_y(&canvas) - origin).abs() <= 0.5)
+        .unwrap_or(false);
+    let ok = compact_ok && anchored_ok && host_ok && collapsed_ok;
+    if !ok {
+        log_info!(
+            "[smoke-update-flow] compact={compact_ok} anchored={anchored_ok} host={host_ok} (gap={:.1}) collapsed={collapsed_ok}",
+            host_top - divider_after
+        );
+    } else {
+        log_info!("[smoke-update-flow] 4 relations checked");
+    }
+    ok
+}
 /// The height the detached smoke document is provisioned with.
 fn document_fixture_height() -> f64 {
     900.0

@@ -3215,6 +3215,7 @@ pub fn run() {
             || arg == "--smoke-card-badges"
             || arg == "--smoke-selection-ring"
             || arg == "--smoke-migrated-pages"
+            || arg == "--smoke-about-update-flow"
             || arg == "--smoke-space-state-matrix"
             || arg == "--smoke-panel-keys"
             || arg == "--smoke-main-thread-slot"
@@ -3928,6 +3929,16 @@ pub fn run() {
         }
         {
             let passed = settings::settings_vertical_zoom_smoke_runner();
+            crate::smoke_verdict::record_for_child(if passed { "PASSED 1" } else { "FAILED" });
+            std::process::exit(if passed { 0 } else { 1 });
+        }
+    }
+    if std::env::args().any(|a| a == "--smoke-about-update-flow") {
+        unsafe {
+            // The About page's inline update flow: canvas calls only, on a detached document.
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+            let passed = settings::about_update_flow_smoke_runner();
             crate::smoke_verdict::record_for_child(if passed { "PASSED 1" } else { "FAILED" });
             std::process::exit(if passed { 0 } else { 1 });
         }
