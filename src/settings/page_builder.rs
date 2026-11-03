@@ -421,10 +421,32 @@ pub(super) unsafe fn build_about_page(
         Err(_) => {
             // A first build has no previous state: the page stays empty and nothing is
             // published, which is better than a page that looks alive but is not wired.
+            // The inline update flow reads four pointers into this page (the card, the host, the
+            // divider and the check button); the page's views are dropped with the refused build,
+            // so they must be cleared here or the flow's own null guards would let it dereference
+            // views that no longer exist.
+            drop_about_update_flow_pointers(ui);
             empty_page(ui, SettingsPageId::About, about_view, context, about_doc_h)
         }
     }
 }
+/// Forget the four pointers the inline update flow reads into the About page, and its two row
+/// indices.
+///
+/// Defensive, not a reproduced defect: a normal rebuild builds a fresh `SettingsUi` (with these
+/// already null), and `empty_page` leaves the refused page's document in place rather than freeing
+/// it. Clearing them here keeps the failure path from leaving the flow pointing at a page whose
+/// build was just abandoned, which is the state a future partial rebuild would make unsafe.
+pub(super) fn drop_about_update_flow_pointers(ui: &mut super::SettingsUi) {
+    ui.update_card = std::ptr::null_mut();
+    ui.update_host = std::ptr::null_mut();
+    ui.update_divider = std::ptr::null_mut();
+    ui.update_check_button = std::ptr::null_mut();
+    ui.update_band_row = 0;
+    ui.update_host_row = 0;
+    ui.update_card_expanded = false;
+}
+
 /// Finish page registration, restore-default controls, and document validation.
 pub(super) unsafe fn finalize_settings_pages(
     content: *mut AnyObject,
@@ -705,5 +727,32 @@ mod tests {
         let readout = max_extent_readout(54);
         assert!(!readout.contains("settings."));
         assert!(!readout.contains("keystroke_display"));
+    }
+}
+
+#[cfg(test)]
+mod update_flow_pointer_tests {
+    use super::*;
+    /// A refused About build drops the page's views, so the four pointers the inline update flow
+    /// reads into that page must be cleared with it: a dangling `update_card` would pass the flow's
+    /// own null guard and be dereferenced.
+    #[test]
+    fn a_refused_about_build_clears_the_update_flow_pointers() {
+        let mut ui = unsafe { crate::settings::page_view::headless_settings_ui() };
+        ui.update_card = 1usize as *mut AnyObject;
+        ui.update_host = 2usize as *mut AnyObject;
+        ui.update_divider = 3usize as *mut AnyObject;
+        ui.update_check_button = 4usize as *mut AnyObject;
+        ui.update_band_row = 7;
+        ui.update_host_row = 8;
+        ui.update_card_expanded = true;
+        super::page_builder::drop_about_update_flow_pointers(&mut ui);
+        assert!(ui.update_card.is_null());
+        assert!(ui.update_host.is_null());
+        assert!(ui.update_divider.is_null());
+        assert!(ui.update_check_button.is_null());
+        assert_eq!(ui.update_band_row, 0);
+        assert_eq!(ui.update_host_row, 0);
+        assert!(!ui.update_card_expanded);
     }
 }
