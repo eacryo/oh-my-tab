@@ -204,21 +204,20 @@ impl PageHooks for ClipboardHooks {
         rendered: &mut RenderedPage,
         spec: &PageRowSpec,
         origin_y: f64,
+        height: f64,
         target: *mut AnyObject,
     ) -> Result<(), RegisterError> {
         match spec.key {
             CLIPBOARD_SHORTCUT_ROW => rendered.controls.push(draw_shortcut_row(
                 canvas,
                 origin_y,
-                spec.height,
+                height,
                 &self.shortcut_title,
                 target,
             )),
-            CLIPBOARD_MAX_ENTRIES_ROW => {
-                rendered
-                    .controls
-                    .push(draw_max_entries_row(canvas, origin_y, spec.height))
-            }
+            CLIPBOARD_MAX_ENTRIES_ROW => rendered
+                .controls
+                .push(draw_max_entries_row(canvas, origin_y, height)),
             other => log_info!("[settings] Clipboard draws no row named {other}"),
         }
         Ok(())

@@ -147,6 +147,10 @@ pub(super) struct LayoutInput {
     pub(super) banner_frame: BannerFrame,
     pub(super) layout: SettingsLayout,
     pub(super) text: MeasuredText,
+    /// The heights of the page's own rows, resolved from the page input by the caller. A
+    /// measured row cannot be resolved here: this type has no `PageInput`, so the page build
+    /// resolves them once and the layout reads them.
+    pub(super) extra_row_heights: Vec<f64>,
 }
 
 /// Text metrics a page's rows are placed with, measured once by the caller.
@@ -221,6 +225,7 @@ impl LayoutInput {
             },
             layout: SettingsLayout::new(content_w),
             text: MeasuredText::base(),
+            extra_row_heights: Vec::new(),
         }
     }
 }
@@ -430,10 +435,37 @@ pub(super) struct PageRowSpec {
     /// The page's own name for this row; passed back to [`PageHooks::extra_row`].
     pub(super) key: &'static str,
     /// The row's height. A described row's height comes from its copy; a page-drawn row states its
-    /// own, because only the page knows what it puts there.
-    pub(super) height: f64,
+    /// own, because only the page knows what it puts there — either a constant, or a measurement
+    /// over the page input (a row whose height follows the connected devices, for example).
+    pub(super) height: RowHeight,
     /// How many described rows of that card come before it.
     pub(super) after_row: usize,
+}
+
+/// A page-drawn row's height: a constant, or a measurement of the page input.
+///
+/// The device row on the Mouse page is why the measured form exists: its height follows the longest
+/// caption any connected device can produce, which is only known once the page input exists.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(super) enum RowHeight {
+    Fixed(f64),
+    Measured(fn(&PageInput) -> f64),
+}
+
+impl RowHeight {
+    /// The height this row takes for `input`.
+    pub(super) fn resolve(&self, input: &PageInput) -> f64 {
+        match self {
+            RowHeight::Fixed(height) => *height,
+            RowHeight::Measured(measure) => measure(input),
+        }
+    }
+}
+
+impl From<f64> for RowHeight {
+    fn from(height: f64) -> Self {
+        RowHeight::Fixed(height)
+    }
 }
 
 /// What a page supplies to draw the rows it owns. The default draws none, which is every page whose
@@ -461,6 +493,7 @@ pub(super) trait PageHooks {
         _rendered: &mut RenderedPage,
         _spec: &PageRowSpec,
         _origin_y: f64,
+        _height: f64,
         _target: *mut AnyObject,
     ) -> Result<(), RegisterError> {
         Ok(())
@@ -963,8 +996,11 @@ pub(super) fn layout_rows(
         let extra_heights: f64 = view
             .extra_rows
             .iter()
-            .filter(|extra| extra.card == row.card && extra.after_row == drawn_in_card)
-            .map(|extra| metrics.row_gap + extra.height)
+            .enumerate()
+            .filter(|(_, extra)| extra.card == row.card && extra.after_row == drawn_in_card)
+            .map(|(index, _)| {
+                metrics.row_gap + input.extra_row_heights.get(index).copied().unwrap_or(0.0)
+            })
             .sum();
         cursor -= extra_heights;
         let subtitle_h = text.subtitle_heights.get(index).copied().unwrap_or(0.0);
@@ -1259,7 +1295,19 @@ impl RowWriter {
         self.extra.push(PageRowSpec {
             card: self.card,
             key,
-            height,
+            height: RowHeight::Fixed(height),
+            after_row: after,
+        });
+    }
+
+    /// Declare a row the page draws itself whose height depends on the page input (the Mouse page's
+    /// device row: its height follows the longest caption any connected device can produce).
+    fn extra_row_measured(&mut self, key: &'static str, measure: fn(&PageInput) -> f64) {
+        let after = self.rows.iter().filter(|row| row.card == self.card).count();
+        self.extra.push(PageRowSpec {
+            card: self.card,
+            key,
+            height: RowHeight::Measured(measure),
             after_row: after,
         });
     }
@@ -1503,6 +1551,10 @@ impl RenderedPage {
 fn dedicated_selector(field: Option<ControlField>) -> Sel {
     match field {
         Some(ControlField::WindowsEnabled) => sel!(handleWindowsEnabledToggle:),
+        // The Mouse page's two switches have their own handlers: the master switch retitles the
+        // OK button, and the mappings switch freezes the mapping rows below it.
+        Some(ControlField::MouseEnabled) => sel!(handleEnableMouseToggle:),
+        Some(ControlField::MappingEnabled) => sel!(handleMappingEnabledChanged:),
         _ => sel!(handleControlChanged:),
     }
 }
@@ -1823,6 +1875,7 @@ pub(super) unsafe fn render_page(
     view: &PageView,
     layout: &PageLayout,
     _metrics: &PageMetrics,
+    input: &PageInput,
     hooks: &mut dyn PageHooks,
 ) -> Result<RenderedPage, RegisterError> {
     let mut rendered = RenderedPage::default();
@@ -1891,7 +1944,15 @@ pub(super) unsafe fn render_page(
             }
             while next_extra < card_extra.len() && card_extra[next_extra].after_row == drawn_in_card
             {
-                draw_extra_row(canvas, target, card_extra[next_extra], hooks, &mut rendered)?;
+                let extra = card_extra[next_extra];
+                draw_extra_row(
+                    canvas,
+                    target,
+                    extra,
+                    extra.height.resolve(input),
+                    hooks,
+                    &mut rendered,
+                )?;
                 next_extra += 1;
             }
             render_row(canvas, target, row, &layout.rows[index], &mut rendered)?;
@@ -1899,7 +1960,15 @@ pub(super) unsafe fn render_page(
         }
         // A row declared after the card's last described row still belongs to it.
         while next_extra < card_extra.len() {
-            draw_extra_row(canvas, target, card_extra[next_extra], hooks, &mut rendered)?;
+            let extra = card_extra[next_extra];
+            draw_extra_row(
+                canvas,
+                target,
+                extra,
+                extra.height.resolve(input),
+                hooks,
+                &mut rendered,
+            )?;
             next_extra += 1;
         }
         canvas.card(&t(card.section));
@@ -1916,11 +1985,12 @@ unsafe fn draw_extra_row(
     canvas: &mut PageCanvas,
     target: *mut AnyObject,
     spec: &PageRowSpec,
+    height: f64,
     hooks: &mut dyn PageHooks,
     rendered: &mut RenderedPage,
 ) -> Result<(), RegisterError> {
-    let origin = canvas.next_row(spec.height);
-    hooks.extra_row(canvas, rendered, spec, origin, target)
+    let origin = canvas.next_row(height);
+    hooks.extra_row(canvas, rendered, spec, origin, height, target)
 }
 
 /// Write one control's value from the update description's entry.
@@ -2009,6 +2079,7 @@ fn view_for(page: SettingsPageId, input: &PageInput) -> PageView {
 #[allow(clippy::too_many_arguments)] // one call site, one meaning per argument
 pub(super) fn page_layout_input(
     view: &PageView,
+    input: &PageInput,
     content_w: f64,
     layout: SettingsLayout,
     doc_h: f64,
@@ -2028,6 +2099,11 @@ pub(super) fn page_layout_input(
         )),
         layout,
         text: MeasuredText::measure(view, content_w - 2.0 * SETTINGS_DETAIL_INSET),
+        extra_row_heights: view
+            .extra_rows
+            .iter()
+            .map(|extra| extra.height.resolve(input))
+            .collect(),
     }
 }
 /// The banner strip's rectangle for its FINAL parent, the settings content view.
@@ -2141,6 +2217,7 @@ pub(super) unsafe fn build_page(
     // viewport), not from the page document -- its parent is the settings content view.
     let layout_input = page_layout_input(
         &view,
+        input,
         content_w,
         layout,
         doc_h,
@@ -2150,8 +2227,15 @@ pub(super) unsafe fn build_page(
     );
     let metrics = PageMetrics::for_layout(layout);
     let page_layout = layout_rows(&view, &layout_input, &metrics);
-    let mut rendered = match render_page(&mut canvas, target, &view, &page_layout, &metrics, hooks)
-    {
+    let mut rendered = match render_page(
+        &mut canvas,
+        target,
+        &view,
+        &page_layout,
+        &metrics,
+        input,
+        hooks,
+    ) {
         Ok(rendered) => rendered,
         Err(error) => {
             // A duplicate was refused while building: nothing has been published, and the page's
@@ -2227,6 +2311,11 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             banner_frame: BannerFrame::of(banner_parent_frame(28.0, 700.0, 600.0, banner_height())),
             layout: SettingsLayout::new(600.0),
             text: measured,
+            extra_row_heights: view
+                .extra_rows
+                .iter()
+                .map(|extra| extra.height.resolve(&input))
+                .collect(),
         };
         let layout = layout_rows(&view, &layout_input, &metrics);
         match render_page(
@@ -2235,6 +2324,7 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             &view,
             &layout,
             &metrics,
+            &input,
             &mut NoHooks,
         ) {
             Ok(rendered) => {
@@ -3103,6 +3193,7 @@ mod tests {
         let content_w = 600.0;
         let layout_input = page_layout_input(
             &view,
+            &input,
             content_w,
             SettingsLayout::new(content_w),
             doc_h,

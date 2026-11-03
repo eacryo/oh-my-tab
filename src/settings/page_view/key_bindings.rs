@@ -67,6 +67,7 @@ impl PageHooks for KeyBindingsHooks {
         rendered: &mut RenderedPage,
         spec: &PageRowSpec,
         origin_y: f64,
+        _height: f64,
         _target: *mut AnyObject,
     ) -> Result<(), RegisterError> {
         let _ = rendered;
@@ -154,7 +155,11 @@ mod tests {
             ref other => panic!("the master switch is a switch, not {other:?}"),
         };
         assert_eq!(on, config.key_bindings.enabled);
-        assert_eq!(view.extra_rows[0].height, BINDINGS_BLOCK_H);
+        assert_eq!(
+            view.extra_rows[0].height,
+            RowHeight::Fixed(BINDINGS_BLOCK_H),
+            "the list block states its provisional height"
+        );
         assert_eq!(BINDINGS_BLOCK_H, 200.0);
     }
 
