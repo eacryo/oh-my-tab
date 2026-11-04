@@ -180,17 +180,27 @@ pub(super) struct MeasuredText {
 
 /// The width a CAPTIONED row's text block occupies.
 ///
-/// The inline builder measured and drew captions at `content_w - label_x * 2 - 58`: the page's
-/// content width, inset by the label column on both sides, less the room a control needs. Stating
-/// it against the CONTROL column instead would stop the block at the control's leading edge, which
-/// is ~166pt narrower on a 464pt page and wraps the design's two-line descriptions to three.
-pub(super) fn captioned_text_width(layout: SettingsLayout, content_w: f64) -> f64 {
-    (content_w - layout.label_x * 2.0 - CAPTION_CONTROL_RESERVE)
-        .max(layout.label_w)
-        .max(1.0)
+/// The inline builder stated it per row from two expressions:
+///
+/// - the default, `control_x - label_x - CONTROL_LABEL_GAP`: the text stops where the control
+///   column begins. Every captioned row used this, including the ones whose control is a switch;
+/// - the wide one, `content_w - label_x * 2 - 58`, used by exactly one row -- the General page's
+///   menu-bar switch -- where the copy has to fit the design's two lines.
+///
+/// A row therefore states which block it takes (\`PageRowSpec::wide_caption\`) instead of the layout
+/// guessing from the control: guessing gave every switch the wide block and wrapped the clipboard
+/// page's three-line warnings onto two.
+pub(super) fn captioned_text_width(layout: SettingsLayout, content_w: f64, row: &RowSpec) -> f64 {
+    let narrow = (layout.control_x - layout.label_x - super::SETTINGS_CONTROL_LABEL_GAP).max(1.0);
+    let width = if row.wide_caption {
+        (content_w - layout.label_x * 2.0 - CAPTION_CONTROL_RESERVE).max(narrow)
+    } else {
+        narrow
+    };
+    width.max(layout.label_w).max(1.0)
 }
 
-/// Room a control keeps clear of a captioned row's text block.
+/// Room a row that takes the wide text block keeps clear of a control at the card's far edge.
 const CAPTION_CONTROL_RESERVE: f64 = 58.0;
 
 impl MeasuredText {
@@ -211,12 +221,12 @@ impl MeasuredText {
     /// block. The page supplies the strings; this is the only place a height is measured.
     pub(super) fn measure(page: &PageView, layout: SettingsLayout, content_w: f64) -> Self {
         let mut measured = Self::base();
-        let caption_w = captioned_text_width(layout, content_w);
         measured.subtitle_heights = page
             .rows
             .iter()
             .map(|row| match row.copy {
                 RowCopy::Captioned => unsafe {
+                    let caption_w = captioned_text_width(layout, content_w, row);
                     super::widgets::wrapped_caption_height(&row.subtitle_text(), caption_w)
                         .max(measured.caption_one_line_h)
                 },
@@ -329,6 +339,10 @@ pub(super) struct RowSpec {
     /// measured by [`MeasuredText::measure`].
     pub(super) caption_key: Option<&'static str>,
     pub(super) control: ControlKind,
+    /// Whether a captioned row's text block takes the WIDE width (up to the card's far inset)
+    /// instead of the default one that stops at the control column. One row in the design needs
+    /// it: the General page's menu-bar switch.
+    pub(super) wide_caption: bool,
     /// The row's control identity. Every declared row carries one.
     pub(super) id: ControlId,
     pub(super) copy: RowCopy,
@@ -1113,7 +1127,7 @@ pub(super) fn layout_rows(
                 // copy to three lines and grew the row, so the page stopped matching the design.
                 let copy_w = match row.copy {
                     RowCopy::Plain => layout.label_w.max(1.0),
-                    RowCopy::Captioned => captioned_text_width(layout, content_w),
+                    RowCopy::Captioned => captioned_text_width(layout, content_w, row),
                 };
                 let (label, caption, stacked) = match row.copy {
                     RowCopy::Plain => (
@@ -1525,6 +1539,7 @@ struct RowDraft {
     control: ControlKind,
     id: ControlId,
     copy: RowCopy,
+    wide_caption: bool,
     depends_on: Option<ControlField>,
     group: Option<RowGroup>,
     value: Value,
@@ -1539,10 +1554,18 @@ impl RowDraft {
             control,
             id,
             copy: RowCopy::Plain,
+            wide_caption: false,
             depends_on: None,
             group: None,
             value,
         }
+    }
+
+    /// Give this captioned row the WIDE text block (up to the card's far inset). The design uses
+    /// it on the one row whose copy must fit two lines beside a right-aligned switch.
+    fn wide_caption(mut self) -> Self {
+        self.wide_caption = true;
+        self
     }
 
     fn desc(mut self, key: &'static str) -> Self {
@@ -1585,6 +1608,7 @@ impl RowDraft {
             desc_key: self.desc_key,
             caption_key: self.caption_key,
             control: self.control,
+            wide_caption: self.wide_caption,
             id: self.id,
             copy: self.copy,
             depends_on: self.depends_on,
@@ -4926,5 +4950,50 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A captioned row's text block is the width the inline builder gave it.
+    ///
+    /// The inline builder used two expressions: the default one that stops at the control column,
+    /// and one wide block for the General page's menu-bar switch. Drawing every captioned row at one
+    /// width wrapped the clipboard page's three-line warnings onto two lines and pushed the
+    /// menu-bar promise to three.
+    #[test]
+    fn a_captioned_row_states_which_text_block_it_takes() {
+        let input = input();
+        let narrow = 600.0 - 180.0 - 16.0 - 16.0 - 16.0;
+        for page in [SettingsPageId::General, SettingsPageId::Clipboard] {
+            let view = view_for(page, &input);
+            let layout = SettingsLayout::new(600.0);
+            for row in view
+                .rows
+                .iter()
+                .filter(|row| row.copy == RowCopy::Captioned)
+            {
+                let width = captioned_text_width(layout, 600.0, row);
+                if row.wide_caption {
+                    assert!(
+                        width > narrow,
+                        "{page:?} {}: a wide block must be wider than the default",
+                        row.label_key
+                    );
+                } else {
+                    assert!(!row.wide_caption);
+                }
+            }
+        }
+        // Exactly one row in the whole app takes the wide block.
+        let wide: Vec<&str> = [SettingsPageId::General, SettingsPageId::Clipboard]
+            .into_iter()
+            .flat_map(|page| {
+                let view = view_for(page, &input);
+                view.rows
+                    .iter()
+                    .filter(|row| row.wide_caption)
+                    .map(|row| row.label_key)
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(wide, vec!["settings.row_hide_menu_bar_icon"]);
     }
 }

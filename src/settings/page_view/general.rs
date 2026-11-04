@@ -27,6 +27,9 @@ pub(super) fn general_page_view(input: &PageInput) -> PageView {
             cfg.startup.hide_menu_bar_icon,
         )
         .caption("settings.desc_hide_menu_bar_icon")
+        // The one row in the design whose copy takes the wide text block: the promise that
+        // Settings stays reachable must fit beside the right-aligned switch, on two lines.
+        .wide_caption()
         .into_spec(),
     );
     w.card("settings.header_appearance");
