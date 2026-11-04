@@ -200,8 +200,18 @@ page whose M2 was not run because authorization was not given must be reported a
 Mechanism: control identity **comes from the description**, not from the control kind — several switches map
 to different fields and a button maps to its own action, so a `RowSpec` carries an explicit `ControlId`
 (a field identity or an action identity), not "this is a switch". `render_page` registers each control with
-its `ControlId` in a `ControlTable` held by `SettingsUi` as it creates it, and the 44-arm linear comparison in
-`control_field_of` becomes a lookup.
+its `ControlId` in a `ControlTable` held by `SettingsUi` as it creates it, and `control_field_of` **asks
+that table first**: a described row's control is answered by the table instead of the linear comparison.
+
+**What was actually delivered (verified against the code at hand-off, not against the plan's wording):**
+the linear comparison was **not deleted**. 43 arms remain, and they answer for the controls a page draws
+itself through `PageHooks` -- the Mouse page's device popup, scroll mode, lines per tick, the four smooth
+sliders and the tracking speed are not described rows (`extra_row` draws them), so nothing registers them.
+It is also the fallback after a refused page build. So: **on all eight migrated pages, every control the
+description produces is identified by the `ControlTable`; a hook-drawn control is still identified by its
+pointer.** The plan's wording read as though the whole chain had been replaced, and it had not. Removing
+the pointer chain needs those hook controls described (or the hooks registering their own `ControlId`),
+which is separate work -- see `docs/review-backlog.md`.
 
 Lifecycle rules (missing from the first draft and required):
 
