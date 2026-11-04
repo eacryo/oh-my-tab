@@ -310,7 +310,9 @@ unsafe fn draw_shortcut_row(
     release_obj(error);
     RenderedControl {
         id: ControlId::Action("record_shortcut"),
-        kind: ControlKind::Button,
+        kind: ControlKind::Button {
+            title_key: "settings.btn_open",
+        },
         control: button,
         readout: error,
         action: std::ptr::null_mut(),
@@ -357,7 +359,9 @@ unsafe fn draw_max_entries_row(
     SettingsRow::register_label(label, field);
     RenderedControl {
         id: ControlId::Action("max_entries"),
-        kind: ControlKind::Button,
+        kind: ControlKind::Button {
+            title_key: "settings.btn_open",
+        },
         control: field,
         readout: std::ptr::null_mut(),
         action: std::ptr::null_mut(),

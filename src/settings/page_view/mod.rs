@@ -279,8 +279,10 @@ pub(super) enum ControlKind {
         reset: Option<f64>,
         readout: String,
     },
-    /// An action band's button: pressing it runs the row's action.
-    Button,
+    /// A row's action button: pressing it runs the row's action. Its `title_key` is the copy the
+    /// button DRAWS, which is not the row's label (the About page's guide row reads "View guide"
+    /// on the left and "Open" on the button).
+    Button { title_key: &'static str },
     /// A read-only value drawn in the control column (a permission status, a device name): the row
     /// carries text, not an editable control, and a callback refreshes it.
     ///
@@ -293,8 +295,9 @@ pub(super) enum ControlKind {
         align: ValueAlign,
     },
     /// A hyperlink drawn as the row's control (the About page's website and GitHub rows). Its
-    /// target is chosen by the `tag` the click handler reads.
-    Link { tag: isize },
+    /// target is chosen by the `tag` the click handler reads; `text_key` is the copy it draws,
+    /// which is the URL, not the row's label.
+    Link { tag: isize, text_key: &'static str },
 }
 
 /// What a control is, for the dispatcher. A field identity is what the config stores; an action
@@ -339,6 +342,10 @@ pub(super) struct RowSpec {
     /// measured by [`MeasuredText::measure`].
     pub(super) caption_key: Option<&'static str>,
     pub(super) control: ControlKind,
+    /// Whether this row's LINK or VALUE control is drawn in the page's own value column (the About
+    /// page's website, GitHub and version rows) instead of the shared control column: that column
+    /// starts further right and runs to the card's far inset, which is where the URL text fits.
+    pub(super) value_column: bool,
     /// Whether a captioned row's text block takes the WIDE width (up to the card's far inset)
     /// instead of the default one that stops at the control column. One row in the design needs
     /// it: the General page's menu-bar switch.
@@ -883,6 +890,22 @@ pub(super) struct PageMetrics {
     pub(super) action_btn_h: f64,
 }
 
+/// The page's own value column: where a row's LINK or VALUE control is drawn when the design gives
+/// that page one (the About page's website, GitHub and version rows).
+///
+/// The inline builder stated it as `label_x + 145` wide open to the card's far inset, which is what
+/// lets a full URL fit; the shared control column is 180pt wide and truncates it.
+fn value_column_box(layout: SettingsLayout, content_w: f64) -> (f64, f64) {
+    let x = layout.label_x + VALUE_COLUMN_OFFSET;
+    // The column ends at the card's LABEL inset, not its outer inset: the inline builder stated it
+    // as `content_w - 2 * label_x - 145`, whose right edge is `content_w - label_x`.
+    let w = (content_w - layout.label_x - x).max(1.0);
+    (x, w)
+}
+
+/// Distance from a row's copy column to the page's own value column.
+const VALUE_COLUMN_OFFSET: f64 = 145.0;
+
 impl PageMetrics {
     /// The metrics every settings page is laid out with today, read from the design system.
     pub(super) fn for_layout(layout: SettingsLayout) -> Self {
@@ -1002,7 +1025,7 @@ fn row_height(
     let base = match row.control {
         ControlKind::Popup { .. } => SettingsLayout::SINGLE_LINE_ROW_H,
         ControlKind::Switch
-        | ControlKind::Button
+        | ControlKind::Button { .. }
         | ControlKind::Slider { .. }
         | ControlKind::Link { .. } => input.layout.described_row_h,
         ControlKind::Value { action, .. } => {
@@ -1184,15 +1207,22 @@ pub(super) fn layout_rows(
                     ),
                     // A hyperlink sits at the control column's leading edge, like a value: it is text, not a
                     // right-aligned control.
-                    ControlKind::Link { .. } => (
-                        BoxRect::new(
-                            layout.control_x,
-                            cursor + (height - metrics.control_h) / 2.0,
-                            layout.control_w,
-                            metrics.control_h,
-                        ),
-                        None,
-                    ),
+                    ControlKind::Link { .. } => {
+                        let (x, w) = if row.value_column {
+                            value_column_box(layout, content_w)
+                        } else {
+                            (layout.control_x, layout.control_w)
+                        };
+                        (
+                            BoxRect::new(
+                                x,
+                                cursor + (height - metrics.control_h) / 2.0,
+                                w,
+                                metrics.control_h,
+                            ),
+                            None,
+                        )
+                    }
                     ControlKind::Slider { .. } => {
                         let h = layout.row_h;
                         let w =
@@ -1208,7 +1238,7 @@ pub(super) fn layout_rows(
                             )),
                         )
                     }
-                    ControlKind::Button => {
+                    ControlKind::Button { .. } => {
                         let right_x = layout.control_x + layout.control_w;
                         // A row's action button is centred in the band, like every other control:
                         // the inline builder centred it, and pinning it to the band's top edge put
@@ -1228,16 +1258,16 @@ pub(super) fn layout_rows(
                     // the value takes the room the button leaves.
                     ControlKind::Value { action, .. } => {
                         let y = cursor + (height - metrics.control_h) / 2.0;
+                        // A page with its own value column (About) draws its read-only values
+                        // there: that column is wider than the shared control column, which is
+                        // what lets a version string or a URL read in full.
+                        let (column_x, column_w) = if row.value_column && action.is_none() {
+                            value_column_box(layout, content_w)
+                        } else {
+                            (layout.control_x, layout.control_w)
+                        };
                         match action {
-                            None => (
-                                BoxRect::new(
-                                    layout.control_x,
-                                    y,
-                                    layout.control_w,
-                                    metrics.control_h,
-                                ),
-                                None,
-                            ),
+                            None => (BoxRect::new(column_x, y, column_w, metrics.control_h), None),
                             Some(_) => (
                                 BoxRect::new(
                                     layout.control_x,
@@ -1539,6 +1569,7 @@ struct RowDraft {
     control: ControlKind,
     id: ControlId,
     copy: RowCopy,
+    value_column: bool,
     wide_caption: bool,
     depends_on: Option<ControlField>,
     group: Option<RowGroup>,
@@ -1554,11 +1585,18 @@ impl RowDraft {
             control,
             id,
             copy: RowCopy::Plain,
+            value_column: false,
             wide_caption: false,
             depends_on: None,
             group: None,
             value,
         }
+    }
+
+    /// Draw this row's LINK or VALUE control in the page's own value column.
+    fn value_column(mut self) -> Self {
+        self.value_column = true;
+        self
     }
 
     /// Give this captioned row the WIDE text block (up to the card's far inset). The design uses
@@ -1608,6 +1646,7 @@ impl RowDraft {
             desc_key: self.desc_key,
             caption_key: self.caption_key,
             control: self.control,
+            value_column: self.value_column,
             wide_caption: self.wide_caption,
             id: self.id,
             copy: self.copy,
@@ -1676,7 +1715,9 @@ fn slider(
 fn button(label_key: &'static str, action: &'static str) -> RowDraft {
     RowDraft::new(
         label_key,
-        ControlKind::Button,
+        ControlKind::Button {
+            title_key: "settings.btn_open",
+        },
         ControlId::Action(action),
         Value::None,
     )
@@ -1936,12 +1977,12 @@ unsafe fn render_row(
             )
         }
         // A hyperlink: the widget opens the URL its tag names on a click.
-        ControlKind::Link { tag } => SettingsControl::external_link(
+        ControlKind::Link { tag, text_key } => SettingsControl::external_link(
             placed.control_frame.x,
             placed.control_frame.y,
             placed.control_frame.w,
             placed.control_frame.h,
-            &title,
+            &t(text_key),
             *tag,
         ),
         ControlKind::Slider {
@@ -1992,17 +2033,19 @@ unsafe fn render_row(
             }
             label
         }
-        ControlKind::Button => {
+        ControlKind::Button { title_key } => {
             let action = match &row.id {
                 ControlId::Action(action) => *action,
                 ControlId::Field(_) => "export_logs",
             };
+            // The BUTTON's copy, which is not the row's label: the About page's guide row reads
+            // "View guide" on the left and "Open" on the button.
             SettingsControl::button(
                 placed.control_frame.x,
                 placed.control_frame.y,
                 placed.control_frame.w,
                 placed.control_frame.h,
-                &title,
+                &t(title_key),
                 target,
                 action_selector(action),
                 SettingsButtonRole::Action,
@@ -2025,7 +2068,7 @@ unsafe fn render_row(
     // The shared association contract: VoiceOver label + the ROW_LABELS pairing the freeze lists
     // use to dim the row's label and give it the disabled tooltip.
     SettingsRow::register_label(title_label, control);
-    if !matches!(row.control, ControlKind::Button) {
+    if !matches!(row.control, ControlKind::Button { .. }) {
         // `bind_control` is the unified handler; a field with a dedicated callback keeps it.
         let selector = dedicated_selector(row.field());
         let _: () = msg_send![control, setTarget: target];
@@ -2264,7 +2307,7 @@ pub(super) unsafe fn apply_control_update(control: &RenderedControl, value: &str
         // A read-only value shows the update's display text, which is what a status callback
         // computed (never a second formatter here).
         ControlKind::Value { .. } => set_field(control.control, display),
-        ControlKind::Button => {}
+        ControlKind::Button { .. } => {}
     }
 }
 
@@ -4361,7 +4404,9 @@ mod tests {
                     (ControlKind::Slider { .. }, Value::Slider(value)) => {
                         assert_eq!(update.value, value.to_string());
                     }
-                    (ControlKind::Button, Value::None) => panic!("an action row has no field"),
+                    (ControlKind::Button { .. }, Value::None) => {
+                        panic!("an action row has no field")
+                    }
                     _ => panic!("the kind and the value agree"),
                 }
             }
@@ -4377,7 +4422,7 @@ mod tests {
                 .collect();
         for page in [SettingsPageId::Switcher, SettingsPageId::General] {
             for row in view_for(page, &input).rows {
-                if matches!(row.control, ControlKind::Button) {
+                if matches!(row.control, ControlKind::Button { .. }) {
                     continue;
                 }
                 if let Some(field) = row.field() {
@@ -4995,5 +5040,78 @@ mod tests {
             })
             .collect();
         assert_eq!(wide, vec!["settings.row_hide_menu_bar_icon"]);
+    }
+
+    /// A row's control draws its OWN copy, not the row's label.
+    ///
+    /// The inline builder passed the URL as the link's text and "Open" as the guide button's
+    /// title. Drawing the row's label instead put "Website" where the URL belongs and made the
+    /// guide button repeat its own row label.
+    #[test]
+    fn a_rows_control_draws_its_own_copy() {
+        let input = input();
+        let view = about_page_view(&input);
+        let links: Vec<&'static str> = view
+            .rows
+            .iter()
+            .filter_map(|row| match row.control {
+                ControlKind::Link { text_key, .. } => Some(text_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            links,
+            vec!["settings.website_url", "settings.github_url"],
+            "a link draws the URL, not the row label"
+        );
+        for key in links {
+            assert_ne!(t(key), key, "{key} has no translation");
+        }
+        let buttons: Vec<&'static str> = view
+            .rows
+            .iter()
+            .filter_map(|row| match row.control {
+                ControlKind::Button { title_key } => Some(title_key),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(buttons, vec!["settings.btn_open"]);
+    }
+
+    /// The About page's links and version sit in the page's own VALUE column.
+    ///
+    /// The inline builder put them at `label_x + 145` and let them run to the card's label inset,
+    /// which is what fits a full URL; the shared control column is 180pt wide and truncated it.
+    #[test]
+    fn about_draws_its_value_column() {
+        let input = input();
+        let view = about_page_view(&input);
+        let layout = SettingsLayout::new(620.0);
+        let metrics = PageMetrics::for_layout(layout);
+        let layout_input = LayoutInput::for_test(620.0);
+        let rows = layout_rows(&view, &layout_input, &metrics);
+        let value_x = layout.label_x + 145.0;
+        let mut checked = 0;
+        for (index, row) in view.rows.iter().enumerate() {
+            if !row.value_column {
+                continue;
+            }
+            checked += 1;
+            assert!(
+                (rows.rows[index].control_frame.x - value_x).abs() < 0.01,
+                "About row {index} draws at x={}, not the value column's {value_x}",
+                rows.rows[index].control_frame.x
+            );
+            let want_w = 620.0 - layout.label_x - value_x;
+            assert!(
+                (rows.rows[index].control_frame.w - want_w).abs() < 0.01,
+                "About row {index} is {} wide, not {want_w}",
+                rows.rows[index].control_frame.w
+            );
+        }
+        assert!(
+            checked >= 3,
+            "the links and the version row take the value column"
+        );
     }
 }

@@ -28,8 +28,8 @@ pub(super) fn about_page_view(input: &PageInput) -> PageView {
     // ---- App card: the guide, the website and the source repository ----
     w.in_first_card("settings.section_app");
     w.push(button("settings.row_view_guide", "open_onboarding").into_spec());
-    w.push(link("settings.website_label", 0).into_spec());
-    w.push(link("settings.github_label", 1).into_spec());
+    w.push(link("settings.website_label", 0).value_column().into_spec());
+    w.push(link("settings.github_label", 1).value_column().into_spec());
     w.push(
         RowDraft::new(
             "settings.version_label_short",
@@ -40,6 +40,7 @@ pub(super) fn about_page_view(input: &PageInput) -> PageView {
             ControlId::Action("about_version"),
             Value::Dynamic(env!("CARGO_PKG_VERSION").to_string()),
         )
+        .value_column()
         .into_spec(),
     );
 
@@ -130,7 +131,13 @@ pub(super) fn about_page_view(input: &PageInput) -> PageView {
 fn link(label_key: &'static str, tag: isize) -> RowDraft {
     RowDraft::new(
         label_key,
-        ControlKind::Link { tag },
+        ControlKind::Link {
+            tag,
+            text_key: match tag {
+                0 => "settings.website_url",
+                _ => "settings.github_url",
+            },
+        },
         ControlId::Action(match tag {
             0 => "external_link_website",
             _ => "external_link_github",
@@ -420,8 +427,14 @@ mod tests {
     #[test]
     fn about_links_keep_their_old_tags() {
         let view = about_page_view(&input());
-        assert_eq!(view.rows[1].control, ControlKind::Link { tag: 0 });
-        assert_eq!(view.rows[2].control, ControlKind::Link { tag: 1 });
+        assert!(matches!(
+            view.rows[1].control,
+            ControlKind::Link { tag: 0, .. }
+        ));
+        assert!(matches!(
+            view.rows[2].control,
+            ControlKind::Link { tag: 1, .. }
+        ));
     }
 
     #[test]
