@@ -453,6 +453,11 @@ impl Value {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct ControlUpdate {
     pub(super) field: ControlField,
+    /// The value the control is SET to, still typed the way the description stated it. The string
+    /// form is [`Value::describe`], kept for the display contract and for the tests that read the
+    /// description; a control that needs a NUMBER takes it from here instead of parsing the text
+    /// back, which is how a popup index and a slider stop used to be recovered.
+    pub(super) typed: Value,
     pub(super) value: String,
     pub(super) display: String,
 }
@@ -698,6 +703,7 @@ pub(super) fn update_description(
         };
         updates.push(ControlUpdate {
             field,
+            typed: value.clone(),
             value: value.describe(),
             display,
         });
@@ -2319,22 +2325,33 @@ pub(super) unsafe fn render_page(
 /// Write one control's value from the update description's entry.
 ///
 /// The value comes from the description, never from a second expression here.
-pub(super) unsafe fn apply_control_update(control: &RenderedControl, value: &str, display: &str) {
+pub(super) unsafe fn apply_control_update(control: &RenderedControl, value: &Value, display: &str) {
     if control.control.is_null() {
         return;
     }
     match &control.kind {
         ControlKind::Switch => {
-            widgets::set_switch_state_immediate(control.control, value == "on");
+            widgets::set_switch_state_immediate(
+                control.control,
+                matches!(value, Value::Switch(true)),
+            );
         }
         ControlKind::Popup { .. } => {
-            let index = value.parse::<isize>().unwrap_or(0);
+            // The INDEX the description stated, not a number parsed back out of its text.
+            let index = match value {
+                Value::Index(index) => *index as isize,
+                _ => 0,
+            };
             let _: () = msg_send![control.control, selectItemAtIndex: index];
         }
         // A hyperlink has no value to write: its text is its own copy.
         ControlKind::Link { .. } => {}
         ControlKind::Slider { .. } => {
-            let number = value.parse::<isize>().unwrap_or(0);
+            // The STOP the description stated, not a number parsed back out of its text.
+            let number = match value {
+                Value::Slider(stop) => *stop,
+                _ => 0,
+            };
             let _: () = msg_send![control.control, setIntegerValue: number];
             if !control.readout.is_null() {
                 set_field(control.readout, display);
@@ -2352,7 +2369,7 @@ pub(super) unsafe fn apply_control_update(control: &RenderedControl, value: &str
 pub(super) unsafe fn apply_page_updates(rendered: &RenderedPage, updates: &[ControlUpdate]) {
     for update in updates {
         if let Some(control) = rendered.control(&ControlId::Field(update.field)) {
-            apply_control_update(control, &update.value, &update.display);
+            apply_control_update(control, &update.typed, &update.display);
         }
     }
 }
@@ -5388,5 +5405,25 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// A control that needs a NUMBER takes it from the description's typed value.
+    ///
+    /// `ControlUpdate` used to carry only text, so the applier parsed a popup's index and a
+    /// slider's stop back out of the string they had just been formatted into. The typed value is
+    /// what the description asserted; the string stays for display and for the tests that read the
+    /// description. This pins that no branch of the applier parses.
+    #[test]
+    fn the_applier_never_parses_a_controls_value_out_of_its_text() {
+        let source = include_str!("mod.rs");
+        let start = source
+            .find("pub(super) unsafe fn apply_control_update")
+            .expect("the applier exists");
+        let applier = &source[start..];
+        let applier = &applier[..applier.find("\n}\n").expect("the applier ends")];
+        assert!(
+            !applier.contains(".parse::<"),
+            "the applier parses a value out of text instead of using the typed one: {applier}"
+        );
     }
 }
