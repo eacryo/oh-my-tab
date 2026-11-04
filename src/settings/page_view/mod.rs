@@ -4726,9 +4726,10 @@ mod tests {
             // The mapping is strictly increasing: the canvas rows follow the document order.
             assert!(rows.windows(2).all(|pair| pair[0] < pair[1]));
         }
-        // The counterexample, named: Mouse's second described row sits after three page-drawn rows.
+        // The counterexample, named: Mouse's second described row sits after three page-drawn rows
+        // (device, scroll mode, line count) and before the fourth card's own page-drawn rows.
         let mouse = view_for(SettingsPageId::Mouse, &input);
-        assert_eq!(canvas_rows(&mouse), vec![0, 4, 7, 9]);
+        assert_eq!(canvas_rows(&mouse), vec![0, 4, 10, 12]);
         assert_eq!(mouse.rows[1].label_key, "settings.row_reverse_scroll");
     }
 
