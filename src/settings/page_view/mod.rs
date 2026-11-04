@@ -3259,7 +3259,6 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::PanelMinimizeEnabled => &mut ui.panel_minimize_enabled,
         ControlField::PanelHideEnabled => &mut ui.panel_hide_enabled,
         ControlField::PanelQuitEnabled => &mut ui.panel_quit_enabled,
-        ControlField::CornerRadius => &mut ui.corner_radius,
         ControlField::Modifier => &mut ui.modifier,
         ControlField::KeystrokeDisplayEnabled => &mut ui.keystroke_display_enabled,
         ControlField::KeystrokeDisplayMode => &mut ui.keystroke_display_mode,
@@ -3281,7 +3280,6 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::ClipboardImageRows => &mut ui.clipboard_image_rows,
         ControlField::ClipboardPinFollow => &mut ui.clipboard_pin_follow,
         ControlField::ClipboardPickerPlacement => &mut ui.clipboard_picker_placement,
-        ControlField::ClipboardMaxEntries => &mut ui.clipboard_max_entries,
         ControlField::MouseEnabled => &mut ui.enable_mouse,
         ControlField::ReverseScroll => &mut ui.reverse_scroll,
         ControlField::ScrollMode => &mut ui.scroll_mode,
@@ -3296,7 +3294,6 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::FinderMenuLayout => &mut ui.finder_menu_layout,
         ControlField::FinderMenuCopyPath => &mut ui.finder_menu_copy_path,
         ControlField::FinderMenuCopySha256 => &mut ui.finder_menu_copy_sha256,
-        ControlField::ShowFooterTitle => &mut ui.show_footer_title,
         // `settings_ui_slot_present` listed every field above; a new one without a slot is a
         // compile error here, which is what keeps the two in step.
         _ => {
@@ -3431,7 +3428,6 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::PanelMinimizeEnabled
             | ControlField::PanelHideEnabled
             | ControlField::PanelQuitEnabled
-            | ControlField::CornerRadius
             | ControlField::Modifier
             | ControlField::KeystrokeDisplayEnabled
             | ControlField::KeystrokeDisplayMode
@@ -3454,7 +3450,6 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::ClipboardImageRows
             | ControlField::ClipboardPinFollow
             | ControlField::ClipboardPickerPlacement
-            | ControlField::ClipboardMaxEntries
             | ControlField::MouseEnabled
             | ControlField::ReverseScroll
             | ControlField::ScrollMode
@@ -3469,7 +3464,6 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::FinderMenuLayout
             | ControlField::FinderMenuCopyPath
             | ControlField::FinderMenuCopySha256
-            | ControlField::ShowFooterTitle
     )
 }
 

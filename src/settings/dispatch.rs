@@ -26,7 +26,6 @@ pub(super) enum ControlField {
     ThumbnailsEnabled,
     FocusedThumbnailPrewarm,
     ShowAppNameInCards,
-    ShowFooterTitle,
     CardTextSize,
     ThumbnailSize,
     StatusBarTextSize,
@@ -36,7 +35,6 @@ pub(super) enum ControlField {
     PanelMinimizeEnabled,
     PanelHideEnabled,
     PanelQuitEnabled,
-    CornerRadius,
     Modifier,
     KeystrokeDisplayEnabled,
     KeystrokeDisplayMode,
@@ -64,11 +62,6 @@ pub(super) enum ControlField {
     ClipboardMoveUsedToTop,
     ClipboardDeleteAfterPaste,
     ClipboardClearSystemPasteboardAfterPaste,
-    // No row carries this as a `ControlId::Field`: the entry limit is a TEXT FIELD that reaches its
-    // control through `text_field_of`. The variant stays because `settings_ui_slot` names the slot the
-    // field binds to; deleting it is its own change (see `docs/review-backlog.md`).
-    #[allow(dead_code)]
-    ClipboardMaxEntries,
     ClipboardAutoExpireDays,
     ClipboardImageRows,
     ClipboardPinFollow,
@@ -90,43 +83,30 @@ pub(super) enum ControlField {
     FinderMenuCopySha256,
 }
 
-/// Identify a field by the control that sent the event.
+/// Identify a field by the control that sent the event: a lookup in the page's `ControlTable`.
 ///
-/// Every control a page builds now carries an identity: a described row registers its own, and a
-/// control a page draws through `PageHooks` registers itself as it is drawn (`draw_mouse_row` does
-/// this for the Mouse page). The `ControlTable` is therefore the answer in every normal case, and
-/// this function asks it first.
+/// Every control a page builds carries an identity. A described row registers its own while it is
+/// rendered, and a control a page draws through `PageHooks` registers itself as it is drawn
+/// (`draw_mouse_row` does this for the Mouse page). The table is therefore the answer for every
+/// control the user can click, and this function is only a lookup.
 ///
-/// What follows the lookup is not a migration leftover: it holds the two fields no page builds at
-/// all (`ShowFooterTitle`, `CornerRadius`). Their `SettingsUi` slots are never assigned, so those
-/// arms can never match — they stay only because deleting the fields themselves is a separate
-/// change. A hook-drawn control that stopped registering would show up here as a control that does
-/// nothing, not as a compile error, so the registration is asserted where the hook is tested.
+/// Nothing here compares pointers any more. The chain that used to do so was removed in two steps:
+/// the arms for described rows were unreachable once the table existed, and the arms for the Mouse
+/// page's own controls went once those registered. A control that stops registering shows up as one
+/// that does nothing, not as a compile error, so each registration is asserted where its page is
+/// tested (`a_hook_drawn_control_registers_its_identity`, and the wiring test below).
+///
+/// Two controls do not come through here at all: the clipboard entry limit and the corner radius are
+/// numeric text fields, dispatched by `text_field_of`.
 unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;
-        if let Some(ControlId::Field(field)) = u.control_table.lookup(sender) {
-            return Some(field);
+        match u.control_table.lookup(sender) {
+            Some(ControlId::Field(field)) => Some(field),
+            _ => None,
         }
-        let ptr = sender as usize;
-        let m = |ctrl: *mut AnyObject, field: ControlField| (ptr == ctrl as usize).then_some(field);
-        // Two controls no page builds any more: their `SettingsUi` slots are never assigned, so these
-        // arms can never match. They stay rather than being deleted with their variants, which is its
-        // own change (see `docs/review-backlog.md`).
-        m(u.show_footer_title, ControlField::ShowFooterTitle)
-            .or_else(|| m(u.corner_radius, ControlField::CornerRadius))
-        // The Mouse page's own controls (scroll mode, line count, tracking speed and the five
-        // smooth-scrolling controls) are registered with their `ControlId` by the page hook, so
-        // the table above answers them; they need no pointer arm here.
-        // The clipboard entry limit is a TEXT FIELD: it reaches its field through
-        // `text_field_of`, which compares the pointer itself, so it is not a target/action row
-        // and never comes through this function.
-        //
-        // The Finder Menu rows are DESCRIBED rows, so the control table answers them first;
-        // their pointers are read from `rendered.controls`, not from this chain.
     })
 }
-
 pub(super) unsafe fn set_clipboard_shortcut_capture_state(
     ui: &SettingsUi,
     current: &str,
@@ -577,10 +557,6 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.show_app_name_in_cards, state];
                     cfg.layout.show_app_name_in_cards = state == 1;
                 }
-                ControlField::ShowFooterTitle => {
-                    let state: isize = msg_send![u.show_footer_title, state];
-                    cfg.layout.show_footer_title = state == 1;
-                }
                 ControlField::CardTextSize => {
                     let val: isize = msg_send![u.card_text_size, integerValue];
                     cfg.layout.card_text_size = val as f64;
@@ -622,11 +598,6 @@ fn apply_control_field(field: ControlField) {
                 ControlField::PanelQuitEnabled => {
                     let state: isize = msg_send![u.panel_quit_enabled, state];
                     cfg.windows.panel_quit_enabled = state == 1;
-                }
-                ControlField::CornerRadius => {
-                    // Corner radius is a numeric text field on the notification path; it
-                    // should never arrive via target/action.
-                    log_debug!("[settings] corner radius via unexpected action path ignored");
                 }
                 ControlField::Modifier => {
                     let idx: isize = msg_send![u.modifier, indexOfSelectedItem];
@@ -756,10 +727,6 @@ fn apply_control_field(field: ControlField) {
                 ControlField::ClipboardImageRows => {
                     let value: isize = msg_send![u.clipboard_image_rows, integerValue];
                     cfg.clipboard.image_rows = (value as u32).clamp(1, 3);
-                }
-                ControlField::ClipboardMaxEntries => {
-                    // Numeric text fields ride the NSControlText notification path.
-                    log_debug!("[settings] numeric field via unexpected action path ignored");
                 }
                 ControlField::ClipboardPinFollow => {
                     let idx: isize = msg_send![u.clipboard_pin_follow, indexOfSelectedItem];
@@ -2928,21 +2895,15 @@ mod tests {
             !apply.contains("fn control_field_of("),
             "the apply range swallowed the lookup function; the scan cannot decide"
         );
-        // A field with no control at all is legitimate for two historical entries
-        // (`ShowFooterTitle`, `CornerRadius`): no page builds them, their `SettingsUi` slots are never
-        // assigned, and their arms can never match. Naming them here keeps the assertion honest --
-        // the alternative is a test that passes because it stopped looking.
-        const ORPHANED: [&str; 2] = ["ShowFooterTitle", "CornerRadius"];
-        //
         // Where a field's CONTROL comes from has two answers, and both are wiring:
         //
-        // - a described row registers it in the `ControlTable`, which `control_field_of` asks first;
-        // - a control a page draws itself through `PageHooks` is not described, so the pointer chain
-        //   is the only thing that can name it.
+        // - a described row registers it in the `ControlTable`, which `control_field_of` looks up;
+        // - a control a page draws itself through `PageHooks` registers itself as it is drawn, so the
+        //   hook's own source names the field (the Mouse page's rows).
         //
-        // Requiring a pointer branch for EVERY variant would demand dead arms for the described ones
-        // (51 of them were exactly that), and deleting those arms without widening this assertion
-        // would report a working field as unwired.
+        // `control_field_of` compares no pointers any more, so it names no fields: requiring a branch
+        // there for every variant would demand dead arms (there were 63 of them) and would report a
+        // working field as unwired once they were deleted.
         let described = {
             let mut text = String::new();
             for page in [
@@ -2970,12 +2931,7 @@ mod tests {
         let mut missing = Vec::new();
         for variant in &variants {
             let token = format!("ControlField::{variant}");
-            // An orphaned field has no control to find, so neither source is required of it; what is
-            // required is that the list stays short and explicit.
-            if !ORPHANED.contains(&variant.as_str())
-                && !lookup.contains(&token)
-                && !described.contains(&token)
-            {
+            if !lookup.contains(&token) && !described.contains(&token) {
                 missing.push(format!(
                     "{variant}: no description row and no control_field_of branch"
                 ));

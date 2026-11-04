@@ -634,11 +634,13 @@ mod tests {
                 .expect("the field's row")
         };
         assert_eq!(value(ControlField::ClipboardPaused), Value::Switch(true));
-        // The numeric entry limit is not in the description: the page builds it.
+        // The numeric entry limit is not in the description: the page builds it as a text field,
+        // which dispatches through `text_field_of`. It therefore has no `ControlField` at all, and
+        // this asserts the absence by the label key rather than by a variant that no longer exists.
         assert!(view
             .rows
             .iter()
-            .all(|row| row.field() != Some(ControlField::ClipboardMaxEntries)));
+            .all(|row| row.label_key != "settings.row_clipboard_max_entries"));
         // The auto-expire readout is the value itself (days, not a stop index).
         assert_eq!(
             value(ControlField::ClipboardAutoExpireDays),
