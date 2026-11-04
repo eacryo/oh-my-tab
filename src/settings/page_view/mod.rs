@@ -3406,17 +3406,25 @@ mod tests {
         assert!(matches!(view.rows[0].control, ControlKind::Switch));
         assert!(matches!(view.rows[4].control, ControlKind::Popup { .. }));
         assert!(matches!(view.rows[8].control, ControlKind::Slider { .. }));
-        // The cards are the page's own: four sections, in order.
+        // The cards are the inline builder's three, in its order: the overlay switch alone, then
+        // every other window setting, then the keyboard row.
         let sections: Vec<&str> = view.rows.iter().map(|row| row.section).collect();
         assert_eq!(sections[0], "settings.header_windows");
-        assert_eq!(sections[12], "settings.header_windows");
-        assert_eq!(sections[16], "settings.header_window_options");
-        // The section a trailing empty "Keyboard" card would have opened is not drawn: a card
-        // needs a row to exist, and the page's last card already carries the modifier row.
+        assert_eq!(sections[1], "settings.header_window_options");
+        assert_eq!(sections[12], "settings.header_window_options");
+        assert_eq!(sections[16], "settings.header_keyboard");
+        assert_eq!(view.rows[0].card, 0);
+        assert_eq!(view.rows[1].card, 1);
+        assert_eq!(view.rows[16].card, 2);
         // The first row of every card has no divider above it; every later row in the card does.
-        assert!(!view.rows[0].separator_above);
-        assert!(view.rows[1].separator_above);
-        assert!(!view.rows[16].separator_above);
+        for (index, row) in view.rows.iter().enumerate() {
+            let first_of_card = index == 0 || view.rows[index - 1].card != row.card;
+            assert_eq!(
+                row.separator_above, !first_of_card,
+                "row {index} of card {} states the wrong divider",
+                row.card
+            );
+        }
         // The thumbnail-only block is a conditional group, so its rows can be skipped together.
         let grouped: Vec<usize> = view
             .rows
@@ -3701,14 +3709,18 @@ mod tests {
         let layout_input = LayoutInput::for_test(600.0);
         let metrics = PageMetrics::for_layout(layout_input.layout);
         let layout = layout_rows(&view, &layout_input, &metrics);
-        // The ThumbnailOnly rows are 5..=7; a row below them is the card-text-size row (index 8).
+        // The ThumbnailOnly rows are 5..=7 in the window-options card; a row below them in the
+        // SAME card is the card-text-size row (index 8).
         let hidden_rows = 5..=7;
+        let thumbnail_card = view.rows[5].card;
         let below = layout
             .rows
             .iter()
             .enumerate()
             .find(|(index, _)| {
-                !hidden_rows.contains(index) && *index > 7 && view.rows[*index].card == 0
+                !hidden_rows.contains(index)
+                    && *index > 7
+                    && view.rows[*index].card == thumbnail_card
             })
             .map(|(_, row)| row)
             .expect("a row below the thumbnail group");

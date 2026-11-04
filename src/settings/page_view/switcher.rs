@@ -19,6 +19,10 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
         .desc("settings.desc_windows_enabled")
         .into_spec(),
     );
+    // The overlay switch is its own card; every remaining window setting is the next one. The
+    // inline builder split here (\`canvas.card(header_windows)\` then \`next_section()\`), and a
+    // description that opens the second card at the end puts every row under the first heading.
+    w.card("settings.header_window_options");
     w.push(
         switch(
             "settings.row_show_minimized",
@@ -173,7 +177,10 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
     ] {
         w.push(switch(label_key, field, on).desc(desc_key).into_spec());
     }
-    w.card("settings.header_window_options");
+    // The modifier popup lives in a THIRD card with its own heading ("Keyboard"), not at the tail
+    // of Window Options: the inline builder opened a section for it after closing the options card,
+    // and merging the two put a keyboard setting under a window-options heading.
+    w.card("settings.header_keyboard");
     let modifiers = vec![
         t("settings.modifier_option"),
         t("settings.modifier_command"),
