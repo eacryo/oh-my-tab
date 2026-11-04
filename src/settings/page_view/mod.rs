@@ -1293,13 +1293,14 @@ pub(super) fn layout_rows(
         let section = described
             .first()
             .map(|index| view.rows[*index].section)
-            // A card with no described row names itself through the first page-drawn row's key:
-            // the hook that draws it knows the heading copy it opens under.
+            // A card with no described row names itself through its first page-drawn row's
+            // SECTION -- the heading key the page opened it under. Falling back to the row's own
+            // key printed the internal identifier ("device") where the heading belonged.
             .or_else(|| {
                 view.extra_rows
                     .iter()
                     .find(|extra| extra.card == card_index)
-                    .map(|extra| extra.key)
+                    .map(|extra| extra.section)
             })
             .unwrap_or("");
         let top = *card_top;
@@ -4884,6 +4885,44 @@ mod tests {
                     (control_mid - band_mid).abs() <= 1.0,
                     "{page:?} row {index}: the control's middle sits {:+.2}pt off the row's",
                     control_mid - band_mid
+                );
+            }
+        }
+    }
+
+    /// A card holding only page-drawn rows must still carry a translated heading.
+    ///
+    /// Its heading is taken from its first page-drawn row's SECTION key; falling back to the row's
+    /// own key printed the internal identifier (device) on the Mouse page where the design's
+    /// heading (Device / 裝置) belongs.
+    #[test]
+    fn a_page_drawn_only_card_names_a_translated_heading() {
+        let input = input();
+        for page in [
+            SettingsPageId::Mouse,
+            SettingsPageId::Switcher,
+            SettingsPageId::Clipboard,
+        ] {
+            let view = view_for(page, &input);
+            let layout_input = LayoutInput::for_test(620.0);
+            let metrics = PageMetrics::for_layout(layout_input.layout);
+            let layout = layout_rows(&view, &layout_input, &metrics);
+            for card in &layout.cards {
+                let has_described = view.rows.iter().any(|row| row.card == card.index);
+                if has_described {
+                    continue;
+                }
+                assert!(
+                    card.section.starts_with("settings."),
+                    "{page:?} card {} names {:?} instead of a copy key",
+                    card.index,
+                    card.section
+                );
+                assert!(
+                    t(card.section) != card.section,
+                    "{page:?} card {} has no translation for {}",
+                    card.index,
+                    card.section
                 );
             }
         }
