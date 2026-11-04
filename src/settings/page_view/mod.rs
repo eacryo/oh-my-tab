@@ -178,6 +178,21 @@ pub(super) struct MeasuredText {
     pub(super) subtitle_heights: Vec<f64>,
 }
 
+/// The width a CAPTIONED row's text block occupies.
+///
+/// The inline builder measured and drew captions at `content_w - label_x * 2 - 58`: the page's
+/// content width, inset by the label column on both sides, less the room a control needs. Stating
+/// it against the CONTROL column instead would stop the block at the control's leading edge, which
+/// is ~166pt narrower on a 464pt page and wraps the design's two-line descriptions to three.
+pub(super) fn captioned_text_width(layout: SettingsLayout, content_w: f64) -> f64 {
+    (content_w - layout.label_x * 2.0 - CAPTION_CONTROL_RESERVE)
+        .max(layout.label_w)
+        .max(1.0)
+}
+
+/// Room a control keeps clear of a captioned row's text block.
+const CAPTION_CONTROL_RESERVE: f64 = 58.0;
+
 impl MeasuredText {
     /// The text metrics the settings design system always uses. Only a caller that needs the
     /// measured value (a page with wrapping copy) replaces an entry.
@@ -194,14 +209,15 @@ impl MeasuredText {
 
     /// Measure the page's subtitles: the wrapped height of every row whose copy is a stacked
     /// block. The page supplies the strings; this is the only place a height is measured.
-    pub(super) fn measure(page: &PageView, text_w: f64) -> Self {
+    pub(super) fn measure(page: &PageView, layout: SettingsLayout, content_w: f64) -> Self {
         let mut measured = Self::base();
+        let caption_w = captioned_text_width(layout, content_w);
         measured.subtitle_heights = page
             .rows
             .iter()
             .map(|row| match row.copy {
                 RowCopy::Captioned => unsafe {
-                    super::widgets::wrapped_caption_height(&row.subtitle_text(), text_w)
+                    super::widgets::wrapped_caption_height(&row.subtitle_text(), caption_w)
                         .max(measured.caption_one_line_h)
                 },
                 RowCopy::Plain => 0.0,
@@ -1083,13 +1099,22 @@ pub(super) fn layout_rows(
                 let subtitle_h = text.subtitle_heights.get(index).copied().unwrap_or(0.0);
                 let height = row_height(row, subtitle_h, metrics, input);
                 cursor -= height;
-                let top = cursor + height;
                 card_bottoms[card] = card_bottoms[card].min(cursor);
 
-                let copy_x = metrics.card_inset + metrics.label_x;
-                // The copy column ends at the design system's fixed label width; the control column starts
-                // at the measured control edge, which stays clear of it on every page width.
-                let copy_w = layout.label_w.max(1.0);
+                // The card view spans the page's whole content width (x = 0, width = content_w),
+                // so a row's copy column starts at the label inset INSIDE the card -- the same
+                // \`label_x\` the inline builder used. Adding the card inset again indented every
+                // row's text 28pt further right than the inline pages drew it.
+                let copy_x = metrics.label_x;
+                // A captioned row's text block is WIDER than a plain row's single label: the inline
+                // builder measured and drew it up to the control column's leading edge
+                // (`content_w - label_x * 2 - 58`), which is what keeps the design's two-line
+                // description on two lines. Measuring it at the plain label width wrapped the same
+                // copy to three lines and grew the row, so the page stopped matching the design.
+                let copy_w = match row.copy {
+                    RowCopy::Plain => layout.label_w.max(1.0),
+                    RowCopy::Captioned => captioned_text_width(layout, content_w),
+                };
                 let (label, caption, stacked) = match row.copy {
                     RowCopy::Plain => (
                         BoxRect::new(
@@ -1119,11 +1144,11 @@ pub(super) fn layout_rows(
                 let (control, readout) = match &row.control {
                     ControlKind::Switch => {
                         let right_x = layout.control_x + layout.control_w;
-                        let y = if stacked {
-                            top - metrics.control_h
-                        } else {
-                            cursor + (height - metrics.control_h) / 2.0
-                        };
+                        // The switch is centred in the row's BAND, stacked copy or not: the inline
+                        // builder centred every captioned row's control (`center_control`), and
+                        // pinning it to the band's top edge put it 22pt above the row's middle on
+                        // every captioned row.
+                        let y = cursor + (height - metrics.control_h) / 2.0;
                         (
                             BoxRect::new(
                                 right_x - metrics.switch_w,
@@ -1171,10 +1196,13 @@ pub(super) fn layout_rows(
                     }
                     ControlKind::Button => {
                         let right_x = layout.control_x + layout.control_w;
+                        // A row's action button is centred in the band, like every other control:
+                        // the inline builder centred it, and pinning it to the band's top edge put
+                        // a captioned row's button 12pt above the row's middle.
                         (
                             BoxRect::new(
                                 right_x - metrics.action_btn_w,
-                                top - metrics.action_btn_h,
+                                cursor + (height - metrics.action_btn_h) / 2.0,
                                 metrics.action_btn_w,
                                 metrics.action_btn_h,
                             ),
@@ -2293,7 +2321,7 @@ pub(super) fn page_layout_input(
         // width under-reports its wrapped height -- a two-line caption gets one line's box, and the
         // control on the row below overlaps it. The inline builder measured at exactly the width it
         // drew at; this is the same number, taken from the layout that draws it.
-        text: MeasuredText::measure(view, layout.label_w.max(1.0)),
+        text: MeasuredText::measure(view, layout, content_w),
         extra_row_heights: view
             .extra_rows
             .iter()
@@ -2660,7 +2688,7 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             700.0,
         );
         let fixture_layout = SettingsLayout::new(600.0);
-        let measured = MeasuredText::measure(&view, fixture_layout.label_w.max(1.0));
+        let measured = MeasuredText::measure(&view, fixture_layout, 620.0);
         let layout_input = LayoutInput {
             content_w: 600.0,
             doc_top: document_fixture_height(),
@@ -2943,7 +2971,7 @@ pub(crate) unsafe fn about_update_flow_smoke_runner() -> bool {
         header_offset: canvas.header_offset(),
         banner_frame: BannerFrame::of(banner_parent_frame(28.0, 900.0, 600.0, banner_height())),
         layout,
-        text: MeasuredText::measure(&view, layout.label_w.max(1.0)),
+        text: MeasuredText::measure(&view, layout, 620.0),
         extra_row_heights: view
             .extra_rows
             .iter()
@@ -4815,6 +4843,35 @@ mod tests {
                     label_box.y + label_box.h <= row.frame.y + row.frame.h + 0.01,
                     "{page:?} row {index}: the label box reaches {:.2} above the band's top edge",
                     label_box.y + label_box.h - (row.frame.y + row.frame.h)
+                );
+            }
+        }
+    }
+
+    /// A captioned row's control is centred in the row, not pinned to its band's top edge.
+    ///
+    /// The inline builder centred every captioned row's control (`SettingsRow::captioned` calls
+    /// `center_control`). The migrated layout pinned it to `top - control_h` whenever the copy was
+    /// stacked, which lifted the switch 22pt above the row's middle on every captioned row --
+    /// visible as a switch sitting at the row's top edge instead of beside its two lines.
+    #[test]
+    fn a_captioned_rows_control_is_centred_in_its_band() {
+        let input = input();
+        for page in [SettingsPageId::General, SettingsPageId::Switcher] {
+            let view = view_for(page, &input);
+            let layout_input = LayoutInput::for_test(620.0);
+            let metrics = PageMetrics::for_layout(layout_input.layout);
+            let layout = layout_rows(&view, &layout_input, &metrics);
+            for (index, row) in layout.rows.iter().enumerate() {
+                if view.rows[index].copy != RowCopy::Captioned || row.control_frame.h <= 0.0 {
+                    continue;
+                }
+                let control_mid = row.control_frame.y + row.control_frame.h / 2.0;
+                let band_mid = row.frame.y + row.frame.h / 2.0;
+                assert!(
+                    (control_mid - band_mid).abs() <= 1.0,
+                    "{page:?} row {index}: the control's middle sits {:+.2}pt off the row's",
+                    control_mid - band_mid
                 );
             }
         }
