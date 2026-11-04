@@ -1,6 +1,6 @@
 # Separating the data from the rendering
 
-- Status: P0-P4 implemented; all eight settings pages are described (Mouse and Key Bindings included), with page hooks (before_page/extra_row/after_page) covering the controls a description cannot carry. The M1 gate passes; M2 is NOT RUN.
+- Status: P0-P4 implemented; all eight settings pages are described (Mouse and Key Bindings included), with page hooks (before_page/extra_row/after_page) covering the controls a description cannot carry. The M1 gate is **green on a clean checkout outside the repository, off any symlinked path** (HEAD 99057d6: selftests, fmt, check, clippy, release-check, cargo-test and m1 all PASSED; the red selftests inside the nested worktree are worktree placement, not this branch -- `docs/review-backlog.md` entry 78). M2 is NOT RUN. Pre-handoff equivalence check: all eight pages were compared against master page by page and every control row's position matches row for row (the About page additionally checked button copy, value column and link text; the Clipboard page additionally checked row order).
 - Date: 2026-11-03
 - Task key: `ui-data-decoupling`
 
