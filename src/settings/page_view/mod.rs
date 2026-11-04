@@ -1824,16 +1824,36 @@ unsafe fn render_row(
         }
         None => {
             // A plain row: the shared label builder, exactly the one the inline pages used.
+            //
+            // The VIEW occupies the row's band, not the layout's centred text box. The box says
+            // where the text's first line sits (the smoke and the search highlight read it), but a
+            // label that wraps to two lines needs the band's height: built at the centred box it
+            // was 18pt tall and the second line was truncated. Master's inline builder built the
+            // label as `(x, row_y)` with `row_h - 8`, so the band is also its vertical centring.
+            let band = NSRect::new(
+                NSPoint::new(placed.label_frame.x, placed.frame.y),
+                NSSize::new(placed.label_frame.w.max(1.0), placed.frame.h),
+            );
             let label = page_widgets::plain_row_label(
                 parent,
-                placed.label_frame.x,
-                placed.label_frame.y,
-                placed.label_frame.w,
-                placed.frame.h,
+                band.origin.x,
+                band.origin.y,
+                band.size.width,
+                band.size.height,
                 &title,
             );
-            let boxes = row_placement_boxes(row, placed);
-            canvas.place_pending_view(label, boxes[0].rect());
+            // The band is the VIEW's box, but the LABEL's frame is what the smoke and every
+            // geometry assertion in this repository measures. Master's inline builder centred it
+            // in the band (`SettingsRow::center_label`): fit the frame to the cell's measured
+            // height, then centre that, then apply the line-height correction. Without this the
+            // label kept the band's 48pt frame and its glyphs read 11pt above the row's centre.
+            crate::settings::components::SettingsRow::center_label(
+                label,
+                placed.frame.y,
+                placed.frame.h,
+            );
+            let label_frame: NSRect = msg_send![label, frame];
+            canvas.place_pending_view(label, label_frame);
             label
         }
     };
@@ -4755,6 +4775,45 @@ mod tests {
                     header.y >= card_top + header.h - 1.0e-6 || header.y > card_top,
                     "{page:?}: card {} heading ({header:?}) overlaps the card surface",
                     card.index
+                );
+            }
+        }
+    }
+
+    /// A described row's label VIEW must sit inside its own row band.
+    ///
+    /// The regression this pins: the renderer built the plain row's label at the row's band origin
+    /// with the band's height, while the band was also where the CONTROL was centred. The label's
+    /// frame therefore reached 11pt above the card's top edge on every page, and the settings-layout
+    /// smoke reported the first row of each card as a control overlapping the heading above it.
+    /// The layout states the label's centred box; the view is built in the band and centred, so the
+    /// box the smoke measures and the frame the reader sees agree.
+    #[test]
+    fn a_described_rows_label_box_sits_inside_its_row_band() {
+        let input = input();
+        for page in [
+            SettingsPageId::Switcher,
+            SettingsPageId::General,
+            SettingsPageId::Mouse,
+        ] {
+            let view = view_for(page, &input);
+            let layout_input = LayoutInput::for_test(620.0);
+            let metrics = PageMetrics::for_layout(layout_input.layout);
+            let layout = layout_rows(&view, &layout_input, &metrics);
+            for (index, row) in layout.rows.iter().enumerate() {
+                if row.frame.h <= 0.0 {
+                    continue;
+                }
+                let label_box = row.label_frame;
+                assert!(
+                    label_box.y >= row.frame.y - 0.01,
+                    "{page:?} row {index}: the label box starts {:.2} below the band's bottom edge",
+                    row.frame.y - label_box.y
+                );
+                assert!(
+                    label_box.y + label_box.h <= row.frame.y + row.frame.h + 0.01,
+                    "{page:?} row {index}: the label box reaches {:.2} above the band's top edge",
+                    label_box.y + label_box.h - (row.frame.y + row.frame.h)
                 );
             }
         }

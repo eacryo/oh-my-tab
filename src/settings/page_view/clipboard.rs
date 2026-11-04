@@ -202,20 +202,28 @@ impl PageHooks for ClipboardHooks {
         &mut self,
         canvas: &mut PageCanvas,
         rendered: &mut RenderedPage,
-        _ui: &mut SettingsUi,
+        ui: &mut SettingsUi,
         spec: &PageRowSpec,
         origin_y: f64,
         height: f64,
         target: *mut AnyObject,
     ) -> Result<(), RegisterError> {
         match spec.key {
-            CLIPBOARD_SHORTCUT_ROW => rendered.controls.push(draw_shortcut_row(
-                canvas,
-                origin_y,
-                height,
-                &self.shortcut_title,
-                target,
-            )),
+            CLIPBOARD_SHORTCUT_ROW => {
+                // The recorder aligns its chord button against the row BELOW it and the gap
+                // between them; the page states those two metrics here, where it knows them,
+                // instead of the smoke reading them back off a layout the page no longer owns.
+                let layout = canvas.layout();
+                ui.clipboard_pin_follow_row_height = layout.described_row_h;
+                ui.clipboard_row_gap = layout.row_gap;
+                rendered.controls.push(draw_shortcut_row(
+                    canvas,
+                    origin_y,
+                    height,
+                    &self.shortcut_title,
+                    target,
+                ))
+            }
             CLIPBOARD_MAX_ENTRIES_ROW => rendered
                 .controls
                 .push(draw_max_entries_row(canvas, origin_y, height)),
@@ -260,6 +268,11 @@ unsafe fn draw_shortcut_row(
         row_h,
         &t("settings.row_clipboard_shortcut"),
     );
+    // The label was built with the row's band as its height; `plain_row_label` insets that by 8,
+    // so the frame would be 52pt tall and its glyphs would read ~5pt above the row's centre. The
+    // inline builder centred it in the band (`SettingsRow::center_label`), so the frame is fitted
+    // to the measured cell height and centred -- the same call the described rows make.
+    crate::settings::components::SettingsRow::center_label(label, origin_y, row_h);
     let label_frame: NSRect = msg_send![label, frame];
     canvas.place_pending_view(label, label_frame);
     let button = SettingsControl::button(

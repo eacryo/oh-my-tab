@@ -4152,6 +4152,17 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         ));
 
         let page_view = |page: SettingsPageId| page_documents[settings_page_index(page)];
+        // The document may have been grown to the viewport when it was made, so its HEIGHT now is
+        // not the provisional value the page was created with. Every page's rows are laid out from
+        // the height the canvas anchors to, so the caller reads the real one back.
+        let settled_doc_h = |page: SettingsPageId| {
+            let document = page_view(page);
+            if document.is_null() {
+                return provisional_doc_h(page);
+            }
+            let frame: NSRect = msg_send![document, frame];
+            frame.size.height
+        };
         let general_view = page_view(SettingsPageId::General);
         let switcher_view = page_view(SettingsPageId::Switcher);
         let mouse_view = page_view(SettingsPageId::Mouse);
@@ -4173,7 +4184,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             page_builder::build_switcher_page(
                 &page_context,
                 switcher_view,
-                switcher_doc_h,
+                settled_doc_h(SettingsPageId::Switcher),
                 &mut ui,
             );
 
@@ -4188,7 +4199,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             page_builder::build_clipboard_page(
                 &page_context,
                 clipboard_view,
-                clipboard_doc_h,
+                settled_doc_h(SettingsPageId::Clipboard),
                 &mut ui,
             );
 
@@ -4196,7 +4207,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             page_builder::build_key_bindings_page(
                 &page_context,
                 key_bindings_view,
-                key_bindings_doc_h,
+                settled_doc_h(SettingsPageId::KeyBindings),
                 &mut ui,
             );
 
@@ -4204,7 +4215,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             page_builder::build_keystroke_display_page(
                 &page_context,
                 keystroke_display_view,
-                keystroke_display_doc_h,
+                settled_doc_h(SettingsPageId::KeystrokeDisplay),
                 &mut ui,
             );
 
@@ -4212,7 +4223,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             page_builder::build_finder_menu_page(
                 &page_context,
                 finder_menu_view,
-                finder_menu_doc_h,
+                settled_doc_h(SettingsPageId::FinderMenu),
                 &mut ui,
             );
 

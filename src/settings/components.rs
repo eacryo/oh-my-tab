@@ -526,7 +526,7 @@ impl SettingsRow {
     /// that leading-derived offset, signed for the superview's axis (see
     /// `ffi::text_field_line_height_correction`). A field whose line height was never forced
     /// reports 0 and is centred by its box alone, unchanged.
-    unsafe fn center_label(child: *mut AnyObject, y: f64, row_h: f64) {
+    pub(super) unsafe fn center_label(child: *mut AnyObject, y: f64, row_h: f64) {
         if child.is_null() {
             return;
         }
