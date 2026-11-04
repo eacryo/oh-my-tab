@@ -22,7 +22,26 @@ pub(crate) const MOUSE_DEVICE_ROW: &str = "device";
 pub(crate) const MOUSE_SCROLL_MODE_ROW: &str = "scroll_mode";
 pub(crate) const MOUSE_LINE_COUNT_ROW: &str = "line_count";
 pub(crate) const MOUSE_SMOOTH_PRESET_ROW: &str = "smooth_preset";
-pub(crate) const MOUSE_SMOOTH_SLIDERS_ROW: &str = "smooth_sliders";
+/// Which of the smooth-scrolling sliders a page-drawn row carries.
+///
+/// The four are four rows now, so a row's handler binds only its own `SettingsUi` slot instead of
+/// writing all four from one block.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SmoothSlider {
+    Response,
+    Speed,
+    Acceleration,
+    Inertia,
+}
+
+/// The four fractional sliders, one row each: the search mirror borrows a row's views and compares
+/// each to that row's band, so a single block row would give them a band they do not share.
+pub(crate) const MOUSE_SMOOTH_SLIDER_ROWS: [&str; 4] = [
+    "smooth_response",
+    "smooth_speed",
+    "smooth_acceleration",
+    "smooth_inertia",
+];
 pub(crate) const MOUSE_TRACKING_SPEED_ROW: &str = "tracking_speed";
 
 /// The device row's height: it has to cover the longest caption any connected device can produce,
@@ -94,11 +113,16 @@ pub(super) fn mouse_page_view(input: &PageInput) -> PageView {
         SettingsSelect::metrics().row_h,
         Some(RowGroup::SmoothScrolling),
     );
-    w.extra_row_in_group(
-        MOUSE_SMOOTH_SLIDERS_ROW,
-        4.0 * SettingsLayout::SINGLE_LINE_ROW_H,
-        Some(RowGroup::SmoothScrolling),
-    );
+    // The four sliders are four rows, not one 224pt block: the search mirror borrows a row's views
+    // and compares each to that row's band, and a block row would give the labels of its sub-rows a
+    // band 168pt tall that they do not share.
+    for key in MOUSE_SMOOTH_SLIDER_ROWS {
+        w.extra_row_in_group(
+            key,
+            SettingsLayout::SINGLE_LINE_ROW_H,
+            Some(RowGroup::SmoothScrolling),
+        );
+    }
 
     // ---- Pointer: the acceleration switch, then the tracking speed it reveals ----
     w.card("settings.header_mouse_pointer");
@@ -347,66 +371,91 @@ unsafe fn draw_mouse_row(
             bind_control(target, control);
             ui.smooth_scrolling_preset = control;
         }
-        MOUSE_SMOOTH_SLIDERS_ROW => {
+        "smooth_response" | "smooth_speed" | "smooth_acceleration" | "smooth_inertia" => {
             let defaults =
                 crate::mouse::smooth::presets::SmoothPreset::EaseInOut.default_settings();
             let specs = [
-                ("settings.row_mouse_smooth_response", 0.0, 2.0, defaults.0),
-                ("settings.row_mouse_smooth_speed", 0.0, 8.0, defaults.1),
+                (
+                    "settings.row_mouse_smooth_response",
+                    0.0,
+                    2.0,
+                    defaults.0,
+                    SmoothSlider::Response,
+                ),
+                (
+                    "settings.row_mouse_smooth_speed",
+                    0.0,
+                    8.0,
+                    defaults.1,
+                    SmoothSlider::Speed,
+                ),
                 (
                     "settings.row_mouse_smooth_acceleration",
                     0.0,
                     8.0,
                     defaults.2,
+                    SmoothSlider::Acceleration,
                 ),
-                ("settings.row_mouse_smooth_inertia", 0.0, 8.0, defaults.3),
+                (
+                    "settings.row_mouse_smooth_inertia",
+                    0.0,
+                    8.0,
+                    defaults.3,
+                    SmoothSlider::Inertia,
+                ),
             ];
-            let mut controls: Vec<(*mut AnyObject, *mut AnyObject)> = Vec::new();
-            for (index, (key, minimum, maximum, default_value)) in specs.into_iter().enumerate() {
-                // The block's origin is its BOTTOM edge, so its top is `origin_y + height` and the
-                // sub-rows are stacked downward from there: index 0 (response) is the topmost, in
-                // the order the inline builder drew them.
-                let y =
-                    origin_y + height - (index as f64 + 1.0) * SettingsLayout::SINGLE_LINE_ROW_H;
-                let slider = SettingsControl::double_slider(
-                    ctrl_x,
-                    y + 10.0,
-                    SettingsRow::slider_width(ctrl_w),
-                    row_h,
-                    minimum,
-                    maximum,
-                    default_value,
-                    Some(default_value),
-                );
-                record_settings_search_row(SettingsPageId::Mouse, canvas.last_row(), &t(key), None);
-                let (label, slider) = SettingsRow::tall_with_height(
-                    document,
-                    label_x,
-                    y,
-                    label_w,
-                    SettingsLayout::SINGLE_LINE_ROW_H,
-                    &t(key),
-                    slider,
-                );
-                let readout = SettingsRow::attach_slider_readout(
-                    document,
-                    slider,
-                    format!("{default_value:.1}"),
-                );
-                for view in [label, slider, readout] {
-                    canvas.place_pending_view(view, frame_of(view));
-                }
-                bind_control(target, slider);
-                controls.push((slider, readout));
+            let index = MOUSE_SMOOTH_SLIDER_ROWS
+                .iter()
+                .position(|row| *row == key)
+                .unwrap_or(0);
+            let (key, minimum, maximum, default_value, which) = specs[index];
+            // One slider per row: the row's own band holds it, exactly as the inline builder drew
+            // the four (each a `next_row(SINGLE_LINE_ROW_H)`). The four UI pointers are bound from
+            // the row index, so each row writes only its own slot.
+            let slider = SettingsControl::double_slider(
+                ctrl_x,
+                origin_y + 10.0,
+                SettingsRow::slider_width(ctrl_w),
+                row_h,
+                minimum,
+                maximum,
+                default_value,
+                Some(default_value),
+            );
+            record_settings_search_row(SettingsPageId::Mouse, canvas.last_row(), &t(key), None);
+            let (label, slider) = SettingsRow::tall_with_height(
+                document,
+                label_x,
+                origin_y,
+                label_w,
+                SettingsLayout::SINGLE_LINE_ROW_H,
+                &t(key),
+                slider,
+            );
+            let readout =
+                SettingsRow::attach_slider_readout(document, slider, format!("{default_value:.1}"));
+            for view in [label, slider, readout] {
+                canvas.place_pending_view(view, frame_of(view));
             }
-            ui.smooth_scrolling_response = controls[0].0;
-            ui.smooth_scrolling_response_value = controls[0].1;
-            ui.smooth_scrolling_speed = controls[1].0;
-            ui.smooth_scrolling_speed_value = controls[1].1;
-            ui.smooth_scrolling_acceleration = controls[2].0;
-            ui.smooth_scrolling_acceleration_value = controls[2].1;
-            ui.smooth_scrolling_inertia = controls[3].0;
-            ui.smooth_scrolling_inertia_value = controls[3].1;
+            bind_control(target, slider);
+            match which {
+                SmoothSlider::Response => {
+                    ui.smooth_scrolling_response = slider;
+                    ui.smooth_scrolling_response_value = readout;
+                }
+                SmoothSlider::Speed => {
+                    ui.smooth_scrolling_speed = slider;
+                    ui.smooth_scrolling_speed_value = readout;
+                }
+                SmoothSlider::Acceleration => {
+                    ui.smooth_scrolling_acceleration = slider;
+                    ui.smooth_scrolling_acceleration_value = readout;
+                }
+                SmoothSlider::Inertia => {
+                    ui.smooth_scrolling_inertia = slider;
+                    ui.smooth_scrolling_inertia_value = readout;
+                }
+            }
         }
         MOUSE_TRACKING_SPEED_ROW => {
             let slider = SettingsControl::double_slider(
@@ -625,7 +674,10 @@ mod tests {
                 MOUSE_SCROLL_MODE_ROW,
                 MOUSE_LINE_COUNT_ROW,
                 MOUSE_SMOOTH_PRESET_ROW,
-                MOUSE_SMOOTH_SLIDERS_ROW,
+                MOUSE_SMOOTH_SLIDER_ROWS[0],
+                MOUSE_SMOOTH_SLIDER_ROWS[1],
+                MOUSE_SMOOTH_SLIDER_ROWS[2],
+                MOUSE_SMOOTH_SLIDER_ROWS[3],
                 MOUSE_TRACKING_SPEED_ROW,
             ],
             "the page-drawn rows keep their document order"
@@ -706,10 +758,9 @@ mod tests {
             group_of(MOUSE_SMOOTH_PRESET_ROW),
             Some(RowGroup::SmoothScrolling)
         );
-        assert_eq!(
-            group_of(MOUSE_SMOOTH_SLIDERS_ROW),
-            Some(RowGroup::SmoothScrolling)
-        );
+        for key in MOUSE_SMOOTH_SLIDER_ROWS {
+            assert_eq!(group_of(key), Some(RowGroup::SmoothScrolling));
+        }
         assert_eq!(
             group_of(MOUSE_TRACKING_SPEED_ROW),
             Some(RowGroup::PointerAccel)
