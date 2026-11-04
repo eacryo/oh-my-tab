@@ -64,6 +64,10 @@ pub(super) enum ControlField {
     ClipboardMoveUsedToTop,
     ClipboardDeleteAfterPaste,
     ClipboardClearSystemPasteboardAfterPaste,
+    // No row carries this as a `ControlId::Field`: the entry limit is a TEXT FIELD that reaches its
+    // control through `text_field_of`. The variant stays because `settings_ui_slot` names the slot the
+    // field binds to; deleting it is its own change (see `docs/review-backlog.md`).
+    #[allow(dead_code)]
     ClipboardMaxEntries,
     ClipboardAutoExpireDays,
     ClipboardImageRows,
@@ -86,14 +90,18 @@ pub(super) enum ControlField {
     FinderMenuCopySha256,
 }
 
-/// Identify a field by its control pointer (the window is reused, pointers are stable).
+/// Identify a field by the control that sent the event.
 ///
-/// A DESCRIBED control is answered by the page's own registrations in `ControlTable`. The pointer
-/// comparison below stays for the controls a page draws itself through `PageHooks`: they are real
-/// controls the user clicks, they go through `handleControlChanged:`, but they are not described
-/// rows, so nothing registers them (the Mouse page's device popup, scroll mode, line count, the
-/// smooth sliders and the tracking speed). It is also the fallback for a control the table has not
-/// seen after a refused page build.
+/// Every control a page builds now carries an identity: a described row registers its own, and a
+/// control a page draws through `PageHooks` registers itself as it is drawn (`draw_mouse_row` does
+/// this for the Mouse page). The `ControlTable` is therefore the answer in every normal case, and
+/// this function asks it first.
+///
+/// What follows the lookup is not a migration leftover: it holds the two fields no page builds at
+/// all (`ShowFooterTitle`, `CornerRadius`). Their `SettingsUi` slots are never assigned, so those
+/// arms can never match — they stay only because deleting the fields themselves is a separate
+/// change. A hook-drawn control that stopped registering would show up here as a control that does
+/// nothing, not as a compile error, so the registration is asserted where the hook is tested.
 unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;
@@ -107,56 +115,15 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
         // own change (see `docs/review-backlog.md`).
         m(u.show_footer_title, ControlField::ShowFooterTitle)
             .or_else(|| m(u.corner_radius, ControlField::CornerRadius))
-            .or_else(|| m(u.scroll_mode, ControlField::ScrollMode))
-            .or_else(|| m(u.line_count, ControlField::LineCount))
-            .or_else(|| m(u.pointer_accel_slider, ControlField::PointerAcceleration))
-            .or_else(|| {
-                m(
-                    u.smooth_scrolling_preset,
-                    ControlField::SmoothScrollingPreset,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.smooth_scrolling_response,
-                    ControlField::SmoothScrollingResponse,
-                )
-            })
-            .or_else(|| m(u.smooth_scrolling_speed, ControlField::SmoothScrollingSpeed))
-            .or_else(|| {
-                m(
-                    u.smooth_scrolling_acceleration,
-                    ControlField::SmoothScrollingAcceleration,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.smooth_scrolling_inertia,
-                    ControlField::SmoothScrollingInertia,
-                )
-            })
-            .or_else(|| m(u.clipboard_max_entries, ControlField::ClipboardMaxEntries))
-            .or_else(|| m(u.finder_menu_enabled, ControlField::FinderMenuEnabled))
-            .or_else(|| m(u.finder_menu_layout, ControlField::FinderMenuLayout))
-            .or_else(|| {
-                u.finder_menu_new_file_switches
-                    .iter()
-                    .position(|ctrl| *ctrl as usize == ptr)
-                    .map(ControlField::FinderMenuNewFileType)
-            })
-            .or_else(|| {
-                u.finder_menu_terminal_switches
-                    .iter()
-                    .position(|ctrl| *ctrl as usize == ptr)
-                    .map(ControlField::FinderMenuTerminal)
-            })
-            .or_else(|| m(u.finder_menu_copy_path, ControlField::FinderMenuCopyPath))
-            .or_else(|| {
-                m(
-                    u.finder_menu_copy_sha256,
-                    ControlField::FinderMenuCopySha256,
-                )
-            })
+        // The Mouse page's own controls (scroll mode, line count, tracking speed and the five
+        // smooth-scrolling controls) are registered with their `ControlId` by the page hook, so
+        // the table above answers them; they need no pointer arm here.
+        // The clipboard entry limit is a TEXT FIELD: it reaches its field through
+        // `text_field_of`, which compares the pointer itself, so it is not a target/action row
+        // and never comes through this function.
+        //
+        // The Finder Menu rows are DESCRIBED rows, so the control table answers them first;
+        // their pointers are read from `rendered.controls`, not from this chain.
     })
 }
 

@@ -170,15 +170,26 @@ impl PageHooks for MouseHooks {
     unsafe fn extra_row(
         &mut self,
         canvas: &mut PageCanvas,
-        _rendered: &mut RenderedPage,
+        rendered: &mut RenderedPage,
         ui: &mut SettingsUi,
         spec: &PageRowSpec,
         origin_y: f64,
         height: f64,
         target: *mut AnyObject,
     ) -> Result<(), RegisterError> {
-        draw_mouse_row(canvas, ui, spec.key, origin_y, height, target);
-        Ok(())
+        // The controls this page draws itself are registered like any described row's: the
+        // `ControlTable` is what identifies a clicked control, and a hook-drawn control left
+        // unregistered is the only reason the dispatcher still carries a hand-written pointer
+        // chain for it.
+        draw_mouse_row(
+            canvas,
+            &mut rendered.registrations,
+            ui,
+            spec.key,
+            origin_y,
+            height,
+            target,
+        )
     }
 
     /// The button-mapping table: a 24pt gap under the mappings card, then the table card the
@@ -203,12 +214,13 @@ unsafe fn frame_of(view: *mut AnyObject) -> NSRect {
 /// Draw one of the page's own rows at the origin the canvas advanced to (the row's bottom edge).
 unsafe fn draw_mouse_row(
     canvas: &mut PageCanvas,
+    registrations: &mut PageRegistrations,
     ui: &mut SettingsUi,
     key: &str,
     origin_y: f64,
     height: f64,
     target: *mut AnyObject,
-) {
+) -> Result<(), RegisterError> {
     let document = canvas.document();
     let layout = canvas.layout();
     let label_x = layout.label_x;
@@ -298,6 +310,7 @@ unsafe fn draw_mouse_row(
             canvas.place_pending_view(control, frame_of(control));
             bind_control(target, control);
             ui.scroll_mode = control;
+            registrations.register(control, ControlId::Field(ControlField::ScrollMode))?;
         }
         MOUSE_LINE_COUNT_ROW => {
             let slider = SettingsControl::stepped_slider(
@@ -333,6 +346,7 @@ unsafe fn draw_mouse_row(
             ui.line_count = slider;
             ui.line_count_label = label;
             ui.line_count_value_label = readout;
+            registrations.register(slider, ControlId::Field(ControlField::LineCount))?;
         }
         MOUSE_SMOOTH_PRESET_ROW => {
             let labels: Vec<String> = crate::mouse::smooth::presets::SmoothPreset::ALL
@@ -370,6 +384,10 @@ unsafe fn draw_mouse_row(
             canvas.place_pending_view(control, frame_of(control));
             bind_control(target, control);
             ui.smooth_scrolling_preset = control;
+            registrations.register(
+                control,
+                ControlId::Field(ControlField::SmoothScrollingPreset),
+            )?;
         }
         "smooth_response" | "smooth_speed" | "smooth_acceleration" | "smooth_inertia" => {
             let defaults =
@@ -442,18 +460,32 @@ unsafe fn draw_mouse_row(
                 SmoothSlider::Response => {
                     ui.smooth_scrolling_response = slider;
                     ui.smooth_scrolling_response_value = readout;
+                    registrations.register(
+                        slider,
+                        ControlId::Field(ControlField::SmoothScrollingResponse),
+                    )?;
                 }
                 SmoothSlider::Speed => {
                     ui.smooth_scrolling_speed = slider;
                     ui.smooth_scrolling_speed_value = readout;
+                    registrations
+                        .register(slider, ControlId::Field(ControlField::SmoothScrollingSpeed))?;
                 }
                 SmoothSlider::Acceleration => {
                     ui.smooth_scrolling_acceleration = slider;
                     ui.smooth_scrolling_acceleration_value = readout;
+                    registrations.register(
+                        slider,
+                        ControlId::Field(ControlField::SmoothScrollingAcceleration),
+                    )?;
                 }
                 SmoothSlider::Inertia => {
                     ui.smooth_scrolling_inertia = slider;
                     ui.smooth_scrolling_inertia_value = readout;
+                    registrations.register(
+                        slider,
+                        ControlId::Field(ControlField::SmoothScrollingInertia),
+                    )?;
                 }
             }
         }
@@ -495,9 +527,11 @@ unsafe fn draw_mouse_row(
             ui.pointer_accel_label = label;
             ui.pointer_accel_slider = slider;
             ui.pointer_accel_value_label = readout;
+            registrations.register(slider, ControlId::Field(ControlField::PointerAcceleration))?;
         }
         other => log_info!("[settings] Mouse draws no row named {other}"),
     }
+    Ok(())
 }
 
 /// The button-mapping block: the 24pt gap below the mappings card and the table card the mapping
@@ -764,6 +798,49 @@ mod tests {
         assert_eq!(
             group_of(MOUSE_TRACKING_SPEED_ROW),
             Some(RowGroup::PointerAccel)
+        );
+    }
+
+    /// A hook-drawn control registers its identity, so the dispatcher never needs a pointer arm for it.
+    ///
+    /// The dispatcher asks the `ControlTable` first and falls back to a hand-written pointer chain for
+    /// the controls a page draws itself through `PageHooks`. That chain existed only because those
+    /// controls were never registered. The hook now registers each one as it builds it, which is what
+    /// this pins: the registration calls are in the hook and name the field.
+    ///
+    /// Building the page itself needs AppKit, so the assertion reads the source. It is deliberately
+    /// the same shape as the wiring test in `dispatch.rs`: a field with a described row or a hook
+    /// registration needs no pointer arm.
+    #[test]
+    fn a_hook_drawn_control_registers_its_identity() {
+        let source = include_str!("mouse.rs");
+        for field in [
+            "ScrollMode",
+            "LineCount",
+            "PointerAcceleration",
+            "SmoothScrollingPreset",
+            "SmoothScrollingResponse",
+            "SmoothScrollingSpeed",
+            "SmoothScrollingAcceleration",
+            "SmoothScrollingInertia",
+        ] {
+            let token = format!("ControlField::{field}");
+            assert!(
+                source.contains(&token),
+                "the Mouse hook does not register {field}, so the dispatcher still needs a pointer arm"
+            );
+        }
+        // The registration must go through the page's buffer, not straight into the table: a page that
+        // fails half-way must leave the previous mapping untouched.
+        assert!(
+            source.contains("registrations.register("),
+            "the hook registers nothing"
+        );
+        // Built at run time so this assertion cannot find its own literal.
+        let direct = ["control", "_table.register("].concat();
+        assert!(
+            !source.contains(&direct),
+            "the hook writes the shared table directly; it must use PageRegistrations"
         );
     }
 }

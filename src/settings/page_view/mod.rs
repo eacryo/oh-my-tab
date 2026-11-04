@@ -795,6 +795,15 @@ impl ControlTable {
         self.entries.len()
     }
 
+    /// Whether this page registered a control for `id`.
+    ///
+    /// A hook-drawn control that is not registered is the only reason the dispatcher still carries a
+    /// hand-written pointer arm for it, so a test asserts the registration rather than the arm.
+    #[cfg(test)]
+    pub(super) fn names(&self, id: &ControlId) -> bool {
+        self.entries.iter().any(|entry| &entry.id == id)
+    }
+
     #[cfg(test)]
     pub(super) fn is_empty(&self) -> bool {
         self.entries.is_empty()
