@@ -27,7 +27,14 @@ pub(super) fn about_page_view(input: &PageInput) -> PageView {
 
     // ---- App card: the guide, the website and the source repository ----
     w.in_first_card("settings.section_app");
-    w.push(button("settings.row_view_guide", "open_onboarding").into_spec());
+    w.push(
+        button(
+            "settings.row_view_guide",
+            "open_onboarding",
+            "settings.btn_open",
+        )
+        .into_spec(),
+    );
     w.push(link("settings.website_label", 0).value_column().into_spec());
     w.push(link("settings.github_label", 1).value_column().into_spec());
     w.push(

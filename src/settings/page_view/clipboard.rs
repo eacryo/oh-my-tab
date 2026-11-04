@@ -180,6 +180,7 @@ pub(super) fn clipboard_page_view(input: &PageInput) -> PageView {
         button(
             "settings.row_clipboard_excluded_restore",
             "restore_excluded",
+            "settings.clipboard_excluded_restore_action",
         )
         .into_spec(),
     );

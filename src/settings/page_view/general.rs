@@ -113,20 +113,32 @@ pub(super) fn general_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
     w.push(
-        button("settings.row_export_logs", "export_logs")
-            .desc("settings.desc_export_logs")
-            .into_spec(),
+        button(
+            "settings.row_export_logs",
+            "export_logs",
+            "settings.btn_export_logs",
+        )
+        .desc("settings.desc_export_logs")
+        .into_spec(),
     );
     w.card("settings.header_backup");
     w.push(
-        button("settings.row_export_settings", "export_settings")
-            .caption("settings.desc_export_settings")
-            .into_spec(),
+        button(
+            "settings.row_export_settings",
+            "export_settings",
+            "settings.btn_export_settings",
+        )
+        .caption("settings.desc_export_settings")
+        .into_spec(),
     );
     w.push(
-        button("settings.row_import_settings", "import_settings")
-            .caption("settings.desc_import_settings")
-            .into_spec(),
+        button(
+            "settings.row_import_settings",
+            "import_settings",
+            "settings.btn_import_settings",
+        )
+        .caption("settings.desc_import_settings")
+        .into_spec(),
     );
     let mut view = w.finish();
     // The storage/permission banner: the page reserves its strip, the refresh re-texts it.

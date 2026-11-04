@@ -1712,12 +1712,10 @@ fn slider(
     )
 }
 
-fn button(label_key: &'static str, action: &'static str) -> RowDraft {
+fn button(label_key: &'static str, action: &'static str, title_key: &'static str) -> RowDraft {
     RowDraft::new(
         label_key,
-        ControlKind::Button {
-            title_key: "settings.btn_open",
-        },
+        ControlKind::Button { title_key },
         ControlId::Action(action),
         Value::None,
     )
@@ -5113,5 +5111,51 @@ mod tests {
             checked >= 3,
             "the links and the version row take the value column"
         );
+    }
+
+    /// Every action button draws the copy its action names, not the row's label.
+    ///
+    /// The inline builder passed the button's own string (`Export`, `Import`, `Open`). Drawing the
+    /// row label instead made the General page's three buttons all read "Open" and the About
+    /// page's guide button repeat "View guide".
+    #[test]
+    fn an_action_button_draws_its_own_copy() {
+        let input = input();
+        let expected: [(&str, &str); 5] = [
+            ("settings.row_export_logs", "settings.btn_export_logs"),
+            (
+                "settings.row_export_settings",
+                "settings.btn_export_settings",
+            ),
+            (
+                "settings.row_import_settings",
+                "settings.btn_import_settings",
+            ),
+            ("settings.row_view_guide", "settings.btn_open"),
+            (
+                "settings.row_clipboard_excluded_restore",
+                "settings.clipboard_excluded_restore_action",
+            ),
+        ];
+        let mut seen: Vec<(&str, &str)> = Vec::new();
+        for page in [
+            SettingsPageId::General,
+            SettingsPageId::About,
+            SettingsPageId::Clipboard,
+        ] {
+            let view = view_for(page, &input);
+            for row in &view.rows {
+                if let ControlKind::Button { title_key } = row.control {
+                    seen.push((row.label_key, title_key));
+                    assert_ne!(
+                        title_key, row.label_key,
+                        "{page:?} button row {} draws its own row label",
+                        row.label_key
+                    );
+                    assert_ne!(t(title_key), title_key, "{title_key} has no translation");
+                }
+            }
+        }
+        assert_eq!(seen, expected);
     }
 }
