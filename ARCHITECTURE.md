@@ -240,8 +240,10 @@ clipboard/
 - `ControlTable` (on `SettingsUi`) is the control-to-identity mapping, produced while the page is built by a
   `PageRegistrations` buffer that validates the whole page before it replaces the old entries: a duplicate
   identity aborts the build and leaves the old views and the old mapping together. `dispatch.rs` asks the
-  table first and keeps the pointer comparison for the controls a page draws itself (they are clickable
-  controls but not described rows, so nothing registers them) and for a control no table has seen.
+  table first. Every control registers its identity: a described row through the renderer, and a
+  control a page draws itself through `PageHooks` as it is built (`draw_mouse_row` does this for the
+  Mouse page). What follows the lookup names the two fields no page builds any more, so it can no
+  longer match; it is not the path a hook-drawn control takes.
 - `settings/window.rs` + `settings/window/chrome.rs` own the window and its native classes; `sidebar.rs` the
   two-pane background; `page_builder.rs`/`page_canvas.rs` the page context, `build_page`/`publish_built_page`,
   and the vertical layout owner;

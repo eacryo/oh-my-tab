@@ -204,14 +204,20 @@ its `ControlId` in a `ControlTable` held by `SettingsUi` as it creates it, and `
 that table first**: a described row's control is answered by the table instead of the linear comparison.
 
 **What was actually delivered (verified against the code at hand-off, not against the plan's wording):**
-the linear comparison was **not deleted**. 43 arms remain, and they answer for the controls a page draws
-itself through `PageHooks` -- the Mouse page's device popup, scroll mode, lines per tick, the four smooth
-sliders and the tracking speed are not described rows (`extra_row` draws them), so nothing registers them.
-It is also the fallback after a refused page build. So: **on all eight migrated pages, every control the
-description produces is identified by the `ControlTable`; a hook-drawn control is still identified by its
-pointer.** The plan's wording read as though the whole chain had been replaced, and it had not. Removing
-the pointer chain needs those hook controls described (or the hooks registering their own `ControlId`),
-which is separate work -- see `docs/review-backlog.md`.
+the pointer chain is down to **2 arms**, from 65 when this work started. It converged in two steps: the
+first deleted 50 arms that a described row had already registered (the table was answering them before
+the chain ran); the second made the controls a page draws through `PageHooks` register their own
+`ControlId` as they are drawn (`draw_mouse_row` takes the `PageRegistrations` buffer), which removed the
+Mouse page's scroll-mode, line-count, tracking-speed and five smooth-scrolling arms -- and the same
+review showed the Finder Menu rows are described rows and the clipboard entry limit dispatches through
+`text_field_of`, so those five went too.
+
+The two arms that remain are not migration leftovers: they name **two fields no page builds any more**
+(`ShowFooterTitle`, `CornerRadius`), whose `SettingsUi` slots are never assigned, so the arms can never
+match. The fields and their variants stay in `ControlField`; deleting them reaches into `settings_ui_slot`
+and is its own change. See `docs/review-backlog.md`.
+
+So: **on all eight pages every control -- described or hook-drawn -- is identified by the `ControlTable`.**
 
 Lifecycle rules (missing from the first draft and required):
 
