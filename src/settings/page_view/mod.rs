@@ -5203,4 +5203,54 @@ mod tests {
             );
         }
     }
+
+    /// A read-only value is TEXT: it shares its row label's origin, not a control box's.
+    ///
+    /// The inline builder fitted a value label to its own line height and centred that in the
+    /// row band (`center_readonly_text_control`). Drawing it in the layout's 32pt control box put
+    /// it 7.5pt low and 15pt too tall on every About value row. The layout still reserves a
+    /// control-sized box -- the RENDERER fits the label into it and records the fitted frame --
+    /// so what M1 can pin here is the box the layout hands over: a value row is a described row
+    /// when it carries an action, and a single-line row when it does not.
+    #[test]
+    fn a_value_row_reserves_a_box_the_renderer_fits_the_label_into() {
+        let input = input();
+        let view = about_page_view(&input);
+        let layout_input = LayoutInput::for_test(620.0);
+        let metrics = PageMetrics::for_layout(layout_input.layout);
+        let layout = layout_rows(&view, &layout_input, &metrics);
+        let mut values = 0;
+        for (index, row) in view.rows.iter().enumerate() {
+            let ControlKind::Value { action, .. } = row.control else {
+                continue;
+            };
+            values += 1;
+            let placed = &layout.rows[index];
+            // The renderer fits the label into this box and centres it in `placed.frame`; the
+            // box must therefore be at least as tall as the row band's usable height, and the
+            // band must be a full row (the fit is centred in it, not in the box).
+            assert!(
+                placed.control_frame.h > 0.0,
+                "About row {index} reserves no control box"
+            );
+            assert!(
+                (placed.control_frame.h - metrics.control_h).abs() < 0.01,
+                "About row {index} reserves {}pt, not the control height",
+                placed.control_frame.h
+            );
+            // A value WITH an action keeps the described row height (the button makes it two
+            // lines); a bare value is a single-line row.
+            let want_band = if action.is_some() {
+                layout_input.layout.described_row_h
+            } else {
+                SettingsLayout::SINGLE_LINE_ROW_H
+            };
+            assert!(
+                (placed.frame.h - want_band).abs() < 0.01,
+                "About row {index} band is {}pt, not {want_band}",
+                placed.frame.h
+            );
+        }
+        assert_eq!(values, 4, "the About page's four value rows");
+    }
 }

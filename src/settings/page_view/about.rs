@@ -607,4 +607,26 @@ mod tests {
             "the divider must anchor at the row's bottom edge"
         );
     }
+
+    /// The About page's header block hangs below the top padding, like every other page's.
+    ///
+    /// The page draws its own header instead of the shared page title, so it states the distance
+    /// from the document's top edge down to its first section cursor. That distance starts with
+    /// `TOP_PADDING`: the block must not sit flush with the document's top edge, which is what the
+    /// M2 settings-layout scenario reports as `content sits under the page header padding: gap=0`.
+    #[test]
+    fn the_about_header_starts_below_the_page_top_padding() {
+        let view = about_page_view(&input());
+        let offset = view
+            .header_offset
+            .expect("About states its own header offset");
+        assert!(
+            offset >= SettingsPageHeader::TOP_PADDING + ABOUT_HEADER_BLOCK_H,
+            "the header block is {offset}pt from the top edge, which cannot hold it below the",
+        );
+        assert!(
+            offset > SettingsPageHeader::TOP_PADDING,
+            "the header block starts at the document's top edge"
+        );
+    }
 }
