@@ -1,6 +1,6 @@
 # 数据与渲染解耦方案
 
-- 状态：P0–P4 全部实施完成，八个设置页全部由描述生成（含 Mouse 与 Key Bindings）；页面级钩子（before_page/extra_row/after_page）覆盖描述无法承载的控件。M1 门禁**在一个仓库之外、非符号链接路径的干净 checkout 上全绿**（HEAD 99057d6：selftests/fmt/check/clippy/release-check/cargo-test/m1 全部 PASSED；嵌套 worktree 内的 selftests 红是 worktree 放置造成的环境问题，见 `docs/review-backlog.md` 条目 78）；M2 未运行。交付前的界面等价性核对：八页逐页与 master 对比，控件行位置逐行一致（关于页另核对按钮文案、值列与链接文案；剪贴板页另核实行序）。
+- 状态：P0–P4 全部实施完成，八个设置页全部由描述生成（含 Mouse 与 Key Bindings）；页面级钩子（before_page/extra_row/after_page）覆盖描述无法承载的控件。**M1 在一个仓库之外、非符号链接路径的干净 checkout 上全绿**（HEAD 1b29023：selftests/fmt/check/clippy/release-check/cargo-test/m1 全部 PASSED；嵌套 worktree 内的 selftests 红是 worktree 放置造成的环境问题，见 `docs/review-backlog.md` 条目 78）。**M2 已运行并与 master 逐项对照**（同一台机器、同一段配置、`--full` + 四个打扰开关）：本分支的 M2 失败项是 `toast_bubble_smoke` 与 e2e 的 6 个场景，其中 `toast_bubble`、`finder-quick-actions`、`panel-action-keys`、`panel-contrast`、`panel-edge`、`scrollbar-style-flip`、`settings-open-latency` **在 master（e8ded57）上同样失败**；`hud-settings` 与 `panel-drag` 在 master 上失败、在本分支上通过。两个 `settings_layout_smoke` 在本分支上**已修复并通过**（原先红于滑杆落位记录 bug）。交付前的界面等价性核对：八页逐页与 master 对比，控件行位置逐行一致。
 - 日期：2026-11-03
 - 任务键：`ui-data-decoupling`
 
