@@ -19,8 +19,12 @@
 //! refill and the in-place refresh all read the same [`RowSpec`], so a value the page shows and
 //! the value the refresh writes cannot come from two different expressions.
 //!
-//! Nothing in this file touches AppKit: every function here runs without a window and is
-//! asserted by the unit tests below.
+//! The description and layout stages are pure and are asserted by the unit tests below: nothing
+//! above the `MARK: - Rendering` section touches AppKit. That third stage -- `render_page` and the
+//! build, refill and `SettingsUi`-binding helpers beside it -- is the AppKit half and sits in the
+//! same file, so this module is two halves in one file rather than a pure module. The section
+//! markers are what keeps them apart; splitting them into separate files is recorded in
+//! `docs/review-backlog.md`.
 
 use super::*;
 

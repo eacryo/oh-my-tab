@@ -630,3 +630,5 @@ watch: run A1 with the app down, or the refusal probe reports AlreadyRunning.
 Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 
 - **气泡 smoke 里「面板宽度 = 该消息排版宽度」的期望带了一个未解释的 +4pt 余量**（2026-11-03，右键菜单通知气泡审查 R3，MEDIUM——覆盖缺口，延后）。`src/ui/toast.rs` 的 `toast_bubble_smoke` 用 `toast_width_for_text_width(字体测量) + 4.0` 作为期望值；实际差异来源是标签（`NSTextField`）自己的排版比 `NSFont` 的 `sizeWithAttributes:` 宽几个点，但差值没有被逐项核实，4.0 是观察值而不是推导值。同一规则的纯函数（`toast_width_for_text_width` 的边界与钳制）已由 M1 单测覆盖，这里缺的只是端到端那一跳的解释。**重新审视的触发条件：** 下一次改动气泡的排版或宽度规则时，把测量改成「对同一字符串取 `toast_width_for_field` 的结果作为期望」，并在同一次改动里删掉这个常数。
+
+- **共享模块是「一个文件两个半边」**（2026-11-04，交付前外部审查提出，MEDIUM——可维护性，延后）。`src/settings/page_view/mod.rs` 有 5184 行（含 1771 行测试），同时放着纯的描述/布局类型和 AppKit 的渲染、建页、回填、`SettingsUi` 绑定代码（`MARK: - Rendering` 之后，含 21 个 `unsafe fn`、44 处 `msg_send!`）。这不影响正确性：模块文档过去写成「本文件不触碰 AppKit」，与代码矛盾，已改成「描述与布局是纯的，渲染起是 AppKit 半边，拆分记入 backlog」，`ARCHITECTURE.md` 同步改正。**重新审视的触发条件：** 下一次向 `page_view/` 增加一条横切机制（新的渲染阶段、新的绑定路径、或再一次把两种职责塞进同一文件）时，按 `MARK: - Rendering` 切成 `render.rs` + `bind.rs`，先搬不改行为，再继续。
