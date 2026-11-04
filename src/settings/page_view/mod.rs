@@ -2067,6 +2067,10 @@ unsafe fn render_row(
     // label's origin instead of sitting in a 32pt control box. The fitted frame is what gets RECORDED
     // as the placement: the canvas re-applies a recorded frame on every reflow, so placing the
     // layout's box and centring afterwards would lose the fit on the next pass.
+    // The box recorded for THIS view: the control's own frame, never `row_placement_boxes(..).last()`.
+    // That list ends with the SLIDER READOUT when the row has one, so taking its last element made the
+    // canvas record the readout's box as the slider's placement -- and every reflow then moved the
+    // slider onto its own readout, 136pt right and past the document's edge on the Switcher page.
     let control_box = match row.control {
         // Every value row, with or without an action: the ACTION BUTTON is a second view drawn
         // below in its own branch, so fitting the text does not move it.
@@ -2080,9 +2084,7 @@ unsafe fn render_row(
                 frame.size.height,
             )
         }
-        _ => *row_placement_boxes(row, placed)
-            .last()
-            .unwrap_or(&placed.control_frame),
+        _ => placed.control_frame,
     };
     canvas.place_pending_view(control, control_box.rect());
     // The shared association contract: VoiceOver label + the ROW_LABELS pairing the freeze lists
@@ -5252,5 +5254,63 @@ mod tests {
             );
         }
         assert_eq!(values, 4, "the About page's four value rows");
+    }
+    #[test]
+    fn dbg_switcher_slider_frames() {
+        let input = input();
+        let view = switcher_page_view(&input);
+        let layout_input = LayoutInput::for_test(620.0);
+        let metrics = PageMetrics::for_layout(layout_input.layout);
+        let layout = layout_rows(&view, &layout_input, &metrics);
+        for (i, row) in view.rows.iter().enumerate() {
+            if matches!(row.control, ControlKind::Slider { .. }) {
+                let p = &layout.rows[i];
+                println!(
+                    "row {i} {} slider x={} w={} h={} readout={:?} content_w={}",
+                    row.label_key,
+                    p.control_frame.x,
+                    p.control_frame.w,
+                    p.control_frame.h,
+                    p.readout_frame.map(|r| (r.x, r.y, r.w, r.h)),
+                    layout_input.content_w
+                );
+            }
+        }
+    }
+
+    /// The placement recorded for a view is THAT view's box, not the last box in its row.
+    ///
+    /// `row_placement_boxes` ends with the SLIDER READOUT for a slider row, so taking its last element
+    /// as "the control's box" made the canvas record the readout's box as the slider's placement. The
+    /// canvas re-applies a recorded placement on every reflow, so the slider was moved onto its own
+    /// readout (136pt right on the Switcher page, past the document's edge) and the M2 layout smoke
+    /// caught it as `OhMyTabSlider escapes document` plus a control/label overlap.
+    #[test]
+    fn a_slider_records_its_own_box_not_its_readouts() {
+        let input = input();
+        let view = switcher_page_view(&input);
+        let layout_input = LayoutInput::for_test(620.0);
+        let metrics = PageMetrics::for_layout(layout_input.layout);
+        let layout = layout_rows(&view, &layout_input, &metrics);
+        let mut sliders = 0;
+        for (index, row) in view.rows.iter().enumerate() {
+            if !matches!(row.control, ControlKind::Slider { .. }) {
+                continue;
+            }
+            sliders += 1;
+            let placed = &layout.rows[index];
+            let boxes = row_placement_boxes(row, placed);
+            // The row's boxes end with the readout, and the control's own frame is NOT that box.
+            let last = *boxes.last().expect("a row places at least one box");
+            assert!(
+                (last.x - placed.control_frame.x).abs() > 0.01,
+                "row {index}: the last placement box IS the control's box, so taking the last one",
+            );
+            assert!(
+                (last.x - placed.readout_frame.expect("a slider has a readout").x).abs() < 0.01,
+                "row {index}: the last placement box is not the readout's"
+            );
+        }
+        assert_eq!(sliders, 2, "the Switcher page's two size sliders");
     }
 }

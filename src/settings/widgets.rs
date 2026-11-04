@@ -3983,6 +3983,8 @@ pub(super) fn rect_inside(outer: NSRect, inner: NSRect, margin: f64) -> bool {
 #[derive(Clone)]
 struct DebugLayoutEntry {
     index: usize,
+    /// The view's class name, so a diagnostic can say WHICH control escaped.
+    class: String,
     frame: NSRect,
     interactive: bool,
     embedded_in_button: bool,
@@ -4064,8 +4066,18 @@ unsafe fn collect_debug_layout(
             } else {
                 None
             };
+            let class: *mut AnyObject = msg_send![child, className];
+            let class: *const std::os::raw::c_char = msg_send![class, UTF8String];
+            let class = if class.is_null() {
+                String::new()
+            } else {
+                std::ffi::CStr::from_ptr(class)
+                    .to_string_lossy()
+                    .into_owned()
+            };
             entries.push(DebugLayoutEntry {
                 index,
+                class,
                 frame,
                 interactive: interactive && !inside_button,
                 embedded_in_button: is_text && inside_button,
@@ -4116,9 +4128,12 @@ pub(super) unsafe fn debug_validate_settings_page(scroll: *mut AnyObject, name: 
     collect_switch_visual_errors(document, &mut errors);
     for entry in &entries {
         if !rect_inside(document_rect, entry.frame, -1.0) {
+            // Name the bound AND the view: without both, the reader cannot tell a control placed
+            // past a too-narrow document from one placed outside a short document, nor which
+            // control it was.
             errors.push(format!(
-                "view[{}] escapes document: {:?}",
-                entry.index, entry.frame
+                "view[{}] {} escapes document {:?}: {:?}",
+                entry.index, entry.class, document_rect, entry.frame
             ));
         }
         if let Some(required_height) = entry.text_required_height {
