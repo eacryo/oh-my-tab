@@ -102,78 +102,13 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
         }
         let ptr = sender as usize;
         let m = |ctrl: *mut AnyObject, field: ControlField| (ptr == ctrl as usize).then_some(field);
-        m(u.theme, ControlField::Theme)
-            .or_else(|| m(u.panel_material, ControlField::PanelMaterial))
-            .or_else(|| m(u.glass_style, ControlField::GlassStyle))
-            .or_else(|| m(u.locale, ControlField::Locale))
-            .or_else(|| m(u.log_level, ControlField::LogLevel))
-            .or_else(|| m(u.launch_at_login, ControlField::LaunchAtLogin))
-            .or_else(|| m(u.hide_menu_bar_icon, ControlField::HideMenuBarIcon))
-            .or_else(|| m(u.windows_enabled, ControlField::WindowsEnabled))
-            .or_else(|| m(u.show_minimized, ControlField::ShowMinimized))
-            .or_else(|| {
-                m(
-                    u.show_hidden_app_windows,
-                    ControlField::ShowHiddenAppWindows,
-                )
-            })
-            .or_else(|| m(u.show_other_desktops, ControlField::ShowOtherDesktops))
-            .or_else(|| m(u.thumbnails_enabled, ControlField::ThumbnailsEnabled))
-            .or_else(|| m(u.thumbnail_size, ControlField::ThumbnailSize))
-            .or_else(|| {
-                m(
-                    u.focused_thumbnail_prewarm,
-                    ControlField::FocusedThumbnailPrewarm,
-                )
-            })
-            .or_else(|| m(u.show_app_name_in_cards, ControlField::ShowAppNameInCards))
-            .or_else(|| m(u.show_footer_title, ControlField::ShowFooterTitle))
-            .or_else(|| m(u.card_text_size, ControlField::CardTextSize))
-            .or_else(|| m(u.status_bar_text_size, ControlField::StatusBarTextSize))
-            .or_else(|| m(u.overlay_position, ControlField::OverlayPosition))
-            .or_else(|| m(u.activation_mode, ControlField::ActivationMode))
-            .or_else(|| m(u.panel_close_enabled, ControlField::PanelCloseEnabled))
-            .or_else(|| m(u.panel_minimize_enabled, ControlField::PanelMinimizeEnabled))
-            .or_else(|| m(u.panel_hide_enabled, ControlField::PanelHideEnabled))
-            .or_else(|| m(u.panel_quit_enabled, ControlField::PanelQuitEnabled))
+        // Two controls no page builds any more: their `SettingsUi` slots are never assigned, so these
+        // arms can never match. They stay rather than being deleted with their variants, which is its
+        // own change (see `docs/review-backlog.md`).
+        m(u.show_footer_title, ControlField::ShowFooterTitle)
             .or_else(|| m(u.corner_radius, ControlField::CornerRadius))
-            .or_else(|| m(u.modifier, ControlField::Modifier))
-            .or_else(|| {
-                m(
-                    u.keystroke_display_enabled,
-                    ControlField::KeystrokeDisplayEnabled,
-                )
-            })
-            .or_else(|| m(u.keystroke_display_mode, ControlField::KeystrokeDisplayMode))
-            .or_else(|| {
-                m(
-                    u.keystroke_display_tap_level,
-                    ControlField::KeystrokeDisplayTapLevel,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.keystroke_display_position,
-                    ControlField::KeystrokeDisplayPosition,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.keystroke_display_initial_position,
-                    ControlField::KeystrokeDisplayInitialPosition,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.keystroke_display_max_extent,
-                    ControlField::KeystrokeDisplayMaxExtent,
-                )
-            })
-            .or_else(|| m(u.enable_mouse, ControlField::MouseEnabled))
-            .or_else(|| m(u.reverse_scroll, ControlField::ReverseScroll))
             .or_else(|| m(u.scroll_mode, ControlField::ScrollMode))
             .or_else(|| m(u.line_count, ControlField::LineCount))
-            .or_else(|| m(u.disable_pointer_accel, ControlField::DisablePointerAccel))
             .or_else(|| m(u.pointer_accel_slider, ControlField::PointerAcceleration))
             .or_else(|| {
                 m(
@@ -200,63 +135,7 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
                     ControlField::SmoothScrollingInertia,
                 )
             })
-            .or_else(|| m(u.mapping_enabled, ControlField::MappingEnabled))
-            .or_else(|| m(u.clipboard_enabled, ControlField::ClipboardEnabled))
-            .or_else(|| m(u.clipboard_paused, ControlField::ClipboardPaused))
-            .or_else(|| {
-                m(
-                    u.clipboard_clear_on_quit,
-                    ControlField::ClipboardClearOnQuit,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.clipboard_separate_clear_all,
-                    ControlField::ClipboardSeparateClearAll,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.clipboard_show_source_app,
-                    ControlField::ClipboardShowSourceApp,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.clipboard_move_used_to_top,
-                    ControlField::ClipboardMoveUsedToTop,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.clipboard_delete_after_paste,
-                    ControlField::ClipboardDeleteAfterPaste,
-                )
-            })
-            .or_else(|| {
-                m(
-                    u.clipboard_clear_system_pasteboard_after_paste,
-                    ControlField::ClipboardClearSystemPasteboardAfterPaste,
-                )
-            })
             .or_else(|| m(u.clipboard_max_entries, ControlField::ClipboardMaxEntries))
-            .or_else(|| {
-                m(
-                    u.clipboard_auto_expire_days,
-                    ControlField::ClipboardAutoExpireDays,
-                )
-            })
-            .or_else(|| m(u.clipboard_image_rows, ControlField::ClipboardImageRows))
-            .or_else(|| m(u.clipboard_pin_follow, ControlField::ClipboardPinFollow))
-            .or_else(|| {
-                m(
-                    u.clipboard_picker_placement,
-                    ControlField::ClipboardPickerPlacement,
-                )
-            })
-            .or_else(|| m(u.key_bindings_enabled, ControlField::KeyBindingsEnabled))
-            .or_else(|| m(u.update_auto_check, ControlField::UpdateAutoCheck))
-            .or_else(|| m(u.update_auto_download, ControlField::UpdateAutoDownload))
             .or_else(|| m(u.finder_menu_enabled, ControlField::FinderMenuEnabled))
             .or_else(|| m(u.finder_menu_layout, ControlField::FinderMenuLayout))
             .or_else(|| {
@@ -3082,11 +2961,57 @@ mod tests {
             !apply.contains("fn control_field_of("),
             "the apply range swallowed the lookup function; the scan cannot decide"
         );
+        // A field with no control at all is legitimate for two historical entries
+        // (`ShowFooterTitle`, `CornerRadius`): no page builds them, their `SettingsUi` slots are never
+        // assigned, and their arms can never match. Naming them here keeps the assertion honest --
+        // the alternative is a test that passes because it stopped looking.
+        const ORPHANED: [&str; 2] = ["ShowFooterTitle", "CornerRadius"];
+        //
+        // Where a field's CONTROL comes from has two answers, and both are wiring:
+        //
+        // - a described row registers it in the `ControlTable`, which `control_field_of` asks first;
+        // - a control a page draws itself through `PageHooks` is not described, so the pointer chain
+        //   is the only thing that can name it.
+        //
+        // Requiring a pointer branch for EVERY variant would demand dead arms for the described ones
+        // (51 of them were exactly that), and deleting those arms without widening this assertion
+        // would report a working field as unwired.
+        let described = {
+            let mut text = String::new();
+            for page in [
+                "about",
+                "clipboard",
+                "finder_menu",
+                "general",
+                "key_bindings",
+                "keystroke_display",
+                "mouse",
+                "switcher",
+            ] {
+                let path = format!(
+                    "{}/src/settings/page_view/{page}.rs",
+                    env!("CARGO_MANIFEST_DIR")
+                );
+                text.push_str(&std::fs::read_to_string(&path).expect("a page description"));
+            }
+            text
+        };
+        assert!(
+            described.contains("ControlField::Theme"),
+            "the page descriptions were not read; the scan cannot decide"
+        );
         let mut missing = Vec::new();
         for variant in &variants {
             let token = format!("ControlField::{variant}");
-            if !lookup.contains(&token) {
-                missing.push(format!("{variant}: no control_field_of branch"));
+            // An orphaned field has no control to find, so neither source is required of it; what is
+            // required is that the list stays short and explicit.
+            if !ORPHANED.contains(&variant.as_str())
+                && !lookup.contains(&token)
+                && !described.contains(&token)
+            {
+                missing.push(format!(
+                    "{variant}: no description row and no control_field_of branch"
+                ));
             }
             // The apply match names the variant bare (`ControlField::Theme => {`), so search the
             // qualified form there too.
