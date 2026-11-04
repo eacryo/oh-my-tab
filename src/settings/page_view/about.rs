@@ -214,9 +214,12 @@ unsafe fn draw_about_header(canvas: &mut PageCanvas, ui: &mut SettingsUi) {
     let document = canvas.document();
     let content_w = canvas.content_width();
     let layout = canvas.layout();
-    // The header hangs from the document's top edge, which the canvas measured.
+    // The header block starts `TOP_PADDING` below the document's top edge, exactly like the shared
+    // page header on every other page: that is what keeps the `content sits under the page header
+    // padding` convention true here too. Hanging it from the raw top edge put the block flush with
+    // the edge (header gap 0 instead of 24) and lifted the title out of the header band.
     let doc_top: NSRect = msg_send![document, frame];
-    let header_top = doc_top.size.height;
+    let header_top = doc_top.size.height - SettingsPageHeader::TOP_PADDING;
     let header_mark = canvas.view_mark();
     const ABOUT_APP_ICON_TEXT_INSET: f64 = 73.0;
     // Offset the icon slot by its render overflow so the visible image aligns with the cards below.

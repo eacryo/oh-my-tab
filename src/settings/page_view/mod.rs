@@ -2062,11 +2062,29 @@ unsafe fn render_row(
     let _: () = msg_send![control, setFrame: placed.control_frame.rect()];
     let _: () = msg_send![parent, addSubview: control];
     release_obj(control);
-    let control_box = *row_placement_boxes(row, placed)
-        .last()
-        .unwrap_or(&placed.control_frame);
-    let _ = control_box;
-    canvas.place_pending_view(control, placed.control_frame.rect());
+    // A read-only value is TEXT, not a control: the inline builder fitted it to its own line height
+    // and centred that in the row band (\`center_readonly_text_control\`), so a value shares its row
+    // label's origin instead of sitting in a 32pt control box. The fitted frame is what gets RECORDED
+    // as the placement: the canvas re-applies a recorded frame on every reflow, so placing the
+    // layout's box and centring afterwards would lose the fit on the next pass.
+    let control_box = match row.control {
+        // Every value row, with or without an action: the ACTION BUTTON is a second view drawn
+        // below in its own branch, so fitting the text does not move it.
+        ControlKind::Value { .. } => {
+            SettingsRow::center_readonly_text_control(control, placed.frame.y, placed.frame.h);
+            let frame: NSRect = msg_send![control, frame];
+            BoxRect::new(
+                frame.origin.x,
+                frame.origin.y,
+                frame.size.width,
+                frame.size.height,
+            )
+        }
+        _ => *row_placement_boxes(row, placed)
+            .last()
+            .unwrap_or(&placed.control_frame),
+    };
+    canvas.place_pending_view(control, control_box.rect());
     // The shared association contract: VoiceOver label + the ROW_LABELS pairing the freeze lists
     // use to dim the row's label and give it the disabled tooltip.
     SettingsRow::register_label(title_label, control);

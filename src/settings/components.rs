@@ -552,7 +552,7 @@ impl SettingsRow {
     }
 
     /// Center a read-only text control without changing editable field geometry.
-    unsafe fn center_readonly_text_control(child: *mut AnyObject, y: f64, row_h: f64) {
+    pub(super) unsafe fn center_readonly_text_control(child: *mut AnyObject, y: f64, row_h: f64) {
         if child.is_null() {
             return;
         }
