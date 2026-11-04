@@ -142,7 +142,10 @@ pub(super) fn general_page_view(input: &PageInput) -> PageView {
     );
     let mut view = w.finish();
     // The storage/permission banner: the page reserves its strip, the refresh re-texts it.
-    let is_permission_migration = crate::update_notice::needs_permission_migration_copy();
+    // Read from the captured input, not from the system: the bundle version and the migration
+    // default are process state, so a description that queried them would not be a function of
+    // PageInput. The banner's HEIGHT depends on this too (see `banner_height`).
+    let is_permission_migration = input.permission_migration_copy;
     view.banner = Some(BannerSpec {
         copy_key: if is_permission_migration {
             "settings.permission_migration_warning"

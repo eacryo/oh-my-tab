@@ -682,7 +682,19 @@ impl ThemeInput {
     /// reading the business config they act on. What replaces this function is each entry taking one
     /// snapshot when its transaction starts and passing it down, so nothing here is a destination.
     pub(crate) fn current() -> ThemeInput {
-        let cfg = CONFIG.read().unwrap();
+        // One statement, one guard: the clone completes before `from_config` runs, so no caller can
+        // hold a config lock across the AppKit query inside it.
+        let config = CONFIG.read().unwrap().clone();
+        Self::from_config(&config)
+    }
+
+    /// The same snapshot, taken from a config the caller already owns.
+    ///
+    /// A caller that has just read `CONFIG` must not read it a second time: a nested read of a
+    /// `std::sync::RwLock` parks when a writer is queued between the two, and the outer guard is
+    /// then held by the thread waiting for itself. This constructor also keeps the AppKit query
+    /// below outside every config lock.
+    pub(crate) fn from_config(cfg: &crate::config::Config) -> ThemeInput {
         let palette = CustomPalette {
             dark: cfg.colors.dark.clone(),
             light: cfg.colors.light.clone(),
@@ -696,9 +708,8 @@ impl ThemeInput {
         let title_font_size = cfg.fonts.title_size;
         let app_name_font_size = cfg.fonts.app_name_size;
         let status_bar_font_size = cfg.fonts.status_bar_size;
-        drop(cfg);
-        // Resolved after the lock is released: "auto" asks NSUserDefaults, and AppKit work must not
-        // run while the config is held.
+        // Resolved here, with no lock held: "auto" asks NSUserDefaults, and AppKit work must never
+        // run while the config is locked.
         ThemeInput {
             dark: dark_for_theme(&theme),
             palette,

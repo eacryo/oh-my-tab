@@ -77,6 +77,11 @@ pub(super) struct PageInput {
     /// elected?) and from the recovery transaction's last result, so it is captured here rather
     /// than computed by a description.
     pub(super) finder_menu_status: String,
+    /// Whether the storage/permission banner carries the 0.2.3 permission-migration copy instead of
+    /// the ordinary accessibility warning. It comes from the bundle's version and from a system
+    /// default, so a description that asked the system itself would stop being a function of its
+    /// input -- and the banner's HEIGHT depends on it, which is a layout input.
+    pub(super) permission_migration_copy: bool,
 }
 
 impl PageInput {
@@ -85,15 +90,23 @@ impl PageInput {
     /// The single call site is a page's build; the concurrency source test in `settings.rs` counts
     /// these, so a description that reaches for a global instead is visible.
     pub(super) fn capture() -> Self {
+        // ONE read of CONFIG, then the theme snapshot is DERIVED from it. Reading it twice in one
+        // argument list used to nest a read inside a read (the first guard lives until the end of
+        // the statement): a writer queueing between them parks the inner read while the outer guard
+        // is held by the thread waiting for itself. It also held the guard across the AppKit query
+        // `ThemeInput` makes for the "auto" appearance.
+        let config = CONFIG.read().unwrap().clone();
+        let device = super::current_selected_device();
         let mut input = Self::from_config(
-            CONFIG.read().unwrap().clone(),
-            super::current_selected_device(),
-            crate::theme::ThemeInput::current(),
+            config.clone(),
+            device,
+            crate::theme::ThemeInput::from_config(&config),
         );
         // The one system read the descriptions cannot make: the extension's election and the
         // recovery transaction's outcome are process state, captured at build time.
         input.finder_menu_status =
             super::finder_menu_status_text_now(crate::finder_menu::extension_enabled());
+        input.permission_migration_copy = crate::update_notice::needs_permission_migration_copy();
         input
     }
 
@@ -107,6 +120,7 @@ impl PageInput {
             theme,
             device,
             finder_menu_status: String::new(),
+            permission_migration_copy: false,
         }
     }
 }
@@ -252,9 +266,9 @@ impl LayoutInput {
             header_offset: 111.0,
             banner_frame: BannerFrame {
                 x: 28.0,
-                y: 700.0 - SettingsPageHeader::TOP_PADDING - banner_height(),
+                y: 700.0 - SettingsPageHeader::TOP_PADDING - banner_height(false),
                 w: content_w,
-                h: banner_height(),
+                h: banner_height(false),
             },
             layout: SettingsLayout::new(content_w),
             text: MeasuredText::base(),
@@ -2404,7 +2418,7 @@ pub(super) fn page_layout_input(
             page_x,
             page_viewport_h,
             content_w,
-            banner_height(),
+            banner_height(input.permission_migration_copy),
         )),
         layout,
         // A caption is drawn inside the LABEL column, not across the page: measuring it at the page
@@ -2450,8 +2464,8 @@ pub(super) const BANNER_GAP: f64 = 12.0;
 /// Clearance between a value row's text and the action button beside it.
 pub(super) const VALUE_ACTION_GAP: f64 = 8.0;
 
-pub(super) fn banner_height() -> f64 {
-    let content_h = if crate::update_notice::needs_permission_migration_copy() {
+pub(super) fn banner_height(permission_migration_copy: bool) -> f64 {
+    let content_h = if permission_migration_copy {
         60.0
     } else {
         48.0
@@ -2527,7 +2541,7 @@ pub(super) unsafe fn build_page(
     // first: its rows are laid out below that band, and a canvas that started at the document edge
     // would place every card surface one band higher than the rows inside it.
     if view.banner.is_some() {
-        canvas.reserve_top_band(banner_height());
+        canvas.reserve_top_band(banner_height(input.permission_migration_copy));
     }
     // A page that draws its own header draws it now: the canvas exists (so `view_mark`/`pin_from_mark`
     // work) and no row has been placed yet, which is what the header block is pinned above.
@@ -2783,7 +2797,12 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             content_w: 600.0,
             doc_top: document_fixture_height(),
             header_offset: canvas.header_offset(),
-            banner_frame: BannerFrame::of(banner_parent_frame(28.0, 700.0, 600.0, banner_height())),
+            banner_frame: BannerFrame::of(banner_parent_frame(
+                28.0,
+                700.0,
+                600.0,
+                banner_height(false),
+            )),
             layout: fixture_layout,
             text: measured,
             extra_row_heights: view
@@ -3059,7 +3078,12 @@ pub(crate) unsafe fn about_update_flow_smoke_runner() -> bool {
         content_w: 600.0,
         doc_top: 1200.0,
         header_offset: canvas.header_offset(),
-        banner_frame: BannerFrame::of(banner_parent_frame(28.0, 900.0, 600.0, banner_height())),
+        banner_frame: BannerFrame::of(banner_parent_frame(
+            28.0,
+            900.0,
+            600.0,
+            banner_height(false),
+        )),
         layout,
         text: MeasuredText::measure(&view, layout, 620.0),
         extra_row_heights: view
@@ -4025,7 +4049,7 @@ mod tests {
             page_x,
             page_viewport_h,
             600.0,
-            banner_height(),
+            banner_height(false),
         ));
         let metrics = PageMetrics::for_layout(layout_input.layout);
         let layout = layout_rows(&view, &layout_input, &metrics);
@@ -4035,7 +4059,7 @@ mod tests {
             "the strip starts at the detail pane's inset"
         );
         assert_eq!(banner.strip.w, 600.0);
-        assert_eq!(banner.strip.h, banner_height());
+        assert_eq!(banner.strip.h, banner_height(false));
         let top = banner.strip.y + banner.strip.h;
         assert!(
             (top - (page_viewport_h - SettingsPageHeader::TOP_PADDING)).abs() < 1e-9,
@@ -4071,7 +4095,7 @@ mod tests {
         );
         assert_eq!(
             layout_input.banner_frame.y,
-            page_viewport_h - SettingsPageHeader::TOP_PADDING - banner_height(),
+            page_viewport_h - SettingsPageHeader::TOP_PADDING - banner_height(false),
             "the banner hangs from the VISIBLE viewport, not the page document"
         );
         assert_eq!(
@@ -4086,9 +4110,9 @@ mod tests {
             (strip.x, strip.y, strip.w, strip.h),
             (
                 page_x,
-                page_viewport_h - SettingsPageHeader::TOP_PADDING - banner_height(),
+                page_viewport_h - SettingsPageHeader::TOP_PADDING - banner_height(false),
                 content_w,
-                banner_height()
+                banner_height(false)
             )
         );
     }
@@ -5312,5 +5336,57 @@ mod tests {
             );
         }
         assert_eq!(sliders, 2, "the Switcher page's two size sliders");
+    }
+
+    /// A page's description reads only its `PageInput`, and the input is captured from ONE config read.
+    ///
+    /// Two regressions this pins, both found by an external review:
+    ///
+    /// - `PageInput::capture` used to call `CONFIG.read()` twice inside one argument list. The first
+    ///   guard lives until the end of the statement, so the second read was a NESTED read of a
+    ///   `std::sync::RwLock` -- which parks when a writer queues between them -- and the outer guard
+    ///   was held across the AppKit query `ThemeInput` makes for the "auto" appearance. A source
+    ///   assertion is the only static form available: the deadlock needs a concurrent writer.
+    /// - a description that calls into the system (the bundle version, a user default) stops being a
+    ///   function of its input, and the banner's HEIGHT -- a layout input -- depended on it.
+    #[test]
+    fn a_description_reads_only_its_input_and_capture_reads_the_config_once() {
+        let source = include_str!("mod.rs");
+        let general = include_str!("general.rs");
+        let capture_start = source
+            .find("    pub(super) fn capture() -> Self {")
+            .expect("capture exists");
+        let capture = &source[capture_start..];
+        let capture = &capture[..capture.find("\n    }\n").expect("capture ends")];
+        assert_eq!(
+            capture.matches("CONFIG.read()").count(),
+            1,
+            "capture must read the configuration exactly once: {capture}"
+        );
+        assert!(
+            !capture.contains("ThemeInput::current()"),
+            "capture must derive the theme from its own snapshot, not read CONFIG again"
+        );
+        // `capture` is the ONE place allowed to touch process state; every other part of the
+        // description layer must be a function of the input it was handed.
+        // Only the production half of the file, with `capture` itself removed: the test module
+        // below names these identifiers on purpose.
+        let production = &source[..source.find("\nmod tests {").expect("the test module")];
+        let outside_capture = production.replace(capture, "");
+        for (name, text) in [
+            ("page_view/mod.rs", outside_capture.as_str()),
+            ("general.rs", general),
+        ] {
+            for forbidden in [
+                "needs_permission_migration_copy()",
+                "system_dark_mode()",
+                "NSUserDefaults",
+            ] {
+                assert!(
+                    !text.contains(forbidden),
+                    "{name} reads {forbidden} outside its PageInput"
+                );
+            }
+        }
     }
 }
