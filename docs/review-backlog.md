@@ -631,6 +631,12 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 
 - **气泡 smoke 里「面板宽度 = 该消息排版宽度」的期望带了一个未解释的 +4pt 余量**（2026-11-03，右键菜单通知气泡审查 R3，MEDIUM——覆盖缺口，延后）。`src/ui/toast.rs` 的 `toast_bubble_smoke` 用 `toast_width_for_text_width(字体测量) + 4.0` 作为期望值；实际差异来源是标签（`NSTextField`）自己的排版比 `NSFont` 的 `sizeWithAttributes:` 宽几个点，但差值没有被逐项核实，4.0 是观察值而不是推导值。同一规则的纯函数（`toast_width_for_text_width` 的边界与钳制）已由 M1 单测覆盖，这里缺的只是端到端那一跳的解释。**重新审视的触发条件：** 下一次改动气泡的排版或宽度规则时，把测量改成「对同一字符串取 `toast_width_for_field` 的结果作为期望」，并在同一次改动里删掉这个常数。
 
-- **共享模块是「一个文件两个半边」**（2026-11-04，交付前外部审查提出，MEDIUM——可维护性，延后）。`src/settings/page_view/mod.rs` 有 5184 行（含 1771 行测试），同时放着纯的描述/布局类型和 AppKit 的渲染、建页、回填、`SettingsUi` 绑定代码（`MARK: - Rendering` 之后，含 21 个 `unsafe fn`、44 处 `msg_send!`）。这不影响正确性：模块文档过去写成「本文件不触碰 AppKit」，与代码矛盾，已改成「描述与布局是纯的，渲染起是 AppKit 半边，拆分记入 backlog」，`ARCHITECTURE.md` 同步改正。**重新审视的触发条件：** 下一次向 `page_view/` 增加一条横切机制（新的渲染阶段、新的绑定路径、或再一次把两种职责塞进同一文件）时，按 `MARK: - Rendering` 切成 `render.rs` + `bind.rs`，先搬不改行为，再继续。
+- **共享模块是「一个文件两个半边」**（2026-11-04，交付前外部审查提出，MEDIUM——可维护性，延后）。`src/settings/page_view/mod.rs` 有 5429 行（含 1951 行测试），同时放着纯的描述/布局类型和 AppKit 的渲染、建页、回填、`SettingsUi` 绑定代码（`MARK: - Rendering` 之后，含 22 个 `unsafe fn`、45 处 `msg_send!`）。这不影响正确性：模块文档过去写成「本文件不触碰 AppKit」，与代码矛盾，已改成「描述与布局是纯的，渲染起是 AppKit 半边，拆分记入 backlog」，`ARCHITECTURE.md` 同步改正。**重新审视的触发条件：** 下一次向 `page_view/` 增加一条横切机制（新的渲染阶段、新的绑定路径、或再一次把两种职责塞进同一文件）时，按 `MARK: - Rendering` 切成 `render.rs` + `bind.rs`，先搬不改行为，再继续。
 
 - **钩子自绘控件仍按指针分发**（2026-11-04，交付前外部审查提出，MEDIUM——与计划措辞不符，延后）。`ControlTable` 只覆盖「描述产生的控件」；Mouse 页的设备下拉、滚动模式、每 tick 行数、四个平滑滑杆与跟踪速度由 `extra_row` 自绘，因此仍在 `src/settings/dispatch.rs` 的 43 条手写指针链里被识别（该链同时是页面构建被拒后的兜底）。计划原文「44 行手写比对改为一次查表」读起来像整条链已替换，已在 `docs/ui-data-decoupling-plan.md` 与 `-en.md` 的 P2 一节按代码改成「已声明行查表、钩子自绘按指针」。**重新审视的触发条件：** 下一次给这四个控件中的任意一个添加字段、或打算让 Mouse 页从钩子迁到描述时，顺手让钩子登记自己的 `ControlId`（`PageRegistrations` 已支持），再删对应指针分支；指针分支数可作为进度指标（当前 43）。
+
+- **已修：外部审查的四条中三条已处理（2026-11-04）**。
+  1. `PageInput::capture` 在一条实参表里读了两次 `CONFIG`：外层 guard 活到语句结束，内层读因此是**嵌套读**（写者排队时会让线程等自己），且外层 guard 跨过了 `ThemeInput` 为 `auto` 外观做的 AppKit 查询。已改为**一次读取 + 派生**（新增 `ThemeInput::from_config(&Config)`），M1 断言 `capture` 只出现一次 `CONFIG.read()`、且不调用 `ThemeInput::current()`。
+  2. General 页横幅的 `needs_permission_migration_copy()`（读 bundle 版本 + 系统 defaults）与 `banner_height()` 里的同一调用，让描述不再是 `PageInput` 的函数，而横幅**高度是布局输入**。已改为 `PageInput::permission_migration_copy`（与 Finder 扩展状态同样在入口捕获），M1 断言生产半边不再出现 `needs_permission_migration_copy()` / `system_dark_mode()` / `NSUserDefaults`。
+  3. `ControlUpdate` 只带字符串，应用侧把弹窗下标与滑杆档位**从文本解析回来**。已加 `typed: Value`，应用侧按类型取值，字符串只留作显示契约；M1 断言应用函数体内没有 `parse::<`。
+  余下未做的是**模块拆分**（上方条目）与**去掉 43 条指针分发分支**（上方条目）：两者都需要先让钩子自绘控件进入描述，属独立工作。
