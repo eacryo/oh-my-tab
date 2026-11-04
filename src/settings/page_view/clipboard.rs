@@ -145,6 +145,10 @@ pub(super) fn clipboard_page_view(input: &PageInput) -> PageView {
         .group(RowGroup::ClipboardDeleteChild)
         .into_spec(),
     );
+    // The numeric entry limit is a text field, which the model's control kinds do not cover.
+    // It sits between the delete-after-paste switches and the retention sliders, exactly where
+    // the inline builder drew it.
+    w.extra_row(CLIPBOARD_MAX_ENTRIES_ROW, clipboard_max_entries_h());
     let auto_expire = (clipboard.auto_expire_days as i64)
         .clamp(CLIPBOARD_AUTO_EXPIRE_MIN, CLIPBOARD_AUTO_EXPIRE_MAX);
     w.push(
@@ -171,19 +175,12 @@ pub(super) fn clipboard_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
 
-    // ---- Excluded applications: the card's list is page-built (see the module doc); its
-    // restore action is a static row ----
-    // The numeric entry limit is a text field, which the model's control kinds do not cover.
-    w.extra_row(CLIPBOARD_MAX_ENTRIES_ROW, clipboard_max_entries_h());
+    // ---- Excluded applications ----
+    // The whole card is page-drawn (`after_page`): the list, the add popup and the restore
+    // action, in that order. A static restore ROW here would be drawn before the list, and the
+    // hook draws the same action again at the card's end -- the row appeared twice, the first
+    // copy directly under the heading.
     w.card("settings.header_clipboard_excluded");
-    w.push(
-        button(
-            "settings.row_clipboard_excluded_restore",
-            "restore_excluded",
-            "settings.clipboard_excluded_restore_action",
-        )
-        .into_spec(),
-    );
     w.finish()
 }
 
@@ -599,7 +596,9 @@ mod tests {
             Some(RowGroup::ClipboardDeleteChild),
             "the clear-pasteboard row is the child of delete-after-paste"
         );
-        // The action rows carry action identities, never a field.
+        // No described row carries an action identity: the excluded-applications card is
+        // page-drawn end to end (the list, the add popup and the restore action), so a static
+        // action row here would draw a second copy of one of them.
         let actions: Vec<&str> = view
             .rows
             .iter()
@@ -608,13 +607,13 @@ mod tests {
                 ControlId::Field(_) => None,
             })
             .collect();
-        assert_eq!(actions, vec!["restore_excluded"]);
+        assert!(actions.is_empty(), "{actions:?}");
         // The cards are the page's own, in order.
         assert_eq!(view.rows[0].section, "settings.header_clipboard");
         assert_eq!(view.rows[2].section, "settings.header_clipboard_options");
         assert_eq!(
             view.rows.last().unwrap().section,
-            "settings.header_clipboard_excluded"
+            "settings.header_clipboard_options"
         );
     }
 

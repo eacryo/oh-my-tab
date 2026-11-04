@@ -5121,7 +5121,9 @@ mod tests {
     #[test]
     fn an_action_button_draws_its_own_copy() {
         let input = input();
-        let expected: [(&str, &str); 5] = [
+        // The Clipboard page's restore button is drawn by its hook, not described, so it is not
+        // in this list: a described copy of it drew the action twice.
+        let expected: [(&str, &str); 4] = [
             ("settings.row_export_logs", "settings.btn_export_logs"),
             (
                 "settings.row_export_settings",
@@ -5132,10 +5134,6 @@ mod tests {
                 "settings.btn_import_settings",
             ),
             ("settings.row_view_guide", "settings.btn_open"),
-            (
-                "settings.row_clipboard_excluded_restore",
-                "settings.clipboard_excluded_restore_action",
-            ),
         ];
         let mut seen: Vec<(&str, &str)> = Vec::new();
         for page in [
@@ -5157,5 +5155,30 @@ mod tests {
             }
         }
         assert_eq!(seen, expected);
+    }
+
+    /// No described row duplicates an action the page's own hook draws.
+    ///
+    /// The Clipboard page draws its excluded-applications card end to end -- the list, the add
+    /// popup and the restore action. A static restore ROW in the description was drawn BEFORE the
+    /// hook, so the same action appeared twice: once directly under the card heading and once at
+    /// the card's end.
+    #[test]
+    fn no_described_row_duplicates_a_page_drawn_action() {
+        let input = input();
+        // Actions a page's hooks draw themselves, by page.
+        let hook_drawn: [(SettingsPageId, &str); 1] =
+            [(SettingsPageId::Clipboard, "restore_excluded")];
+        for (page, action) in hook_drawn {
+            let view = view_for(page, &input);
+            let duplicated = view
+                .rows
+                .iter()
+                .any(|row| matches!(row.id, ControlId::Action(id) if id == action));
+            assert!(
+                !duplicated,
+                "{page:?} describes {action}, which its hook already draws"
+            );
+        }
     }
 }
