@@ -218,7 +218,7 @@ pub(crate) fn refresh_for_summon(input: &crate::theme::ThemeInput, required_px_h
 /// suspended WebView still replaces the old frame -- one stale-appearance card
 /// amid the new theme looks worse than a temporary placeholder.
 pub(crate) fn refresh_for_theme(required_px_h: u32) {
-    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) {
+    if !crate::theme::thumbnails_enabled_setting() {
         return;
     }
     if !capture_allowed() {
@@ -330,7 +330,7 @@ pub(crate) fn refresh_for_theme(required_px_h: u32) {
 /// image (a real frame with the old aspect beats a correctly-shaped blank), and the
 /// geometry guard still drops frames captured mid-animation.
 pub(crate) fn refresh_for_display_change(required_px_h: u32) {
-    if !crate::theme::thumbnails_enabled(&crate::theme::ThemeInput::current()) {
+    if !crate::theme::thumbnails_enabled_setting() {
         return;
     }
     if !capture_allowed() {

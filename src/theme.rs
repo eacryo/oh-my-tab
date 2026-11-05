@@ -1368,6 +1368,19 @@ pub(crate) fn thumbnails_enabled(input: &ThemeInput) -> bool {
     input.thumbnails_enabled
 }
 
+/// The same switch, read straight from the configuration.
+///
+/// Thumbnail gating runs on capture workers, the startup observer thread and the pregen path, and
+/// it needs ONE boolean from the config. Building a `ThemeInput` for that clones the whole config
+/// and, for the "auto" appearance, queries NSUserDefaults -- off the main thread. This reads the
+/// single field under the lock instead, which is what the pre-snapshot code did.
+///
+/// It is deliberately not a general shortcut: any caller that needs more than this one field takes
+/// a snapshot, because reading several fields would no longer be one consistent read.
+pub(crate) fn thumbnails_enabled_setting() -> bool {
+    CONFIG.read().unwrap().layout.thumbnails_enabled
+}
+
 /// Whether the thumbnail card's caption prefixes the app name before the window title.
 pub(crate) fn show_app_name_in_cards(input: &ThemeInput) -> bool {
     input.show_app_name_in_cards
@@ -2689,6 +2702,37 @@ pub(crate) fn window_width(cards_in_row: usize) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two ways to read the thumbnail switch must agree.
+    ///
+    /// The snapshot form is what the pure layer sees; the direct form is what the capture workers,
+    /// the observer thread and the pregen path read, because cloning a whole `ThemeInput` there
+    /// costs a config clone and -- for the "auto" appearance -- an NSUserDefaults query off the main
+    /// thread. They must not drift: a page that says thumbnails are on while the scheduler says off
+    /// is a switch that does nothing.
+    #[test]
+    fn both_thumbnail_switch_reads_agree() {
+        let on = ThemeInput {
+            thumbnails_enabled: true,
+            ..fixed_input()
+        };
+        let off = ThemeInput {
+            thumbnails_enabled: false,
+            ..fixed_input()
+        };
+        // The snapshot form follows its own field, not the global.
+        assert!(thumbnails_enabled(&on));
+        assert!(!thumbnails_enabled(&off));
+        // The direct form answers from the configuration the process is running, and it is the
+        // same field `from_config` copies into the snapshot.
+        let live = CONFIG.read().unwrap().layout.thumbnails_enabled;
+        assert_eq!(thumbnails_enabled_setting(), live);
+        // Take the copy and drop the guard BEFORE constructing the snapshot: `from_config` queries
+        // NSUserDefaults for the "auto" appearance, and this very test must not be the example
+        // that shows the lock being held across it.
+        let config = CONFIG.read().unwrap().clone();
+        assert_eq!(ThemeInput::from_config(&config).thumbnails_enabled, live);
+    }
 
     /// A snapshot with every field set explicitly, so a layout assertion describes fixed inputs
     /// rather than whatever the developer's on-disk config file happens to contain.
