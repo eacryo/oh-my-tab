@@ -224,11 +224,11 @@ clipboard/
   (`RowLayout` frames from the page plus a `LayoutInput`), and `page_update_description` is the one
   field-to-value description both the refill and the in-place refresh consume. `page_widgets.rs` holds the
   copy widgets the renderer uses; it and `page_view/` are the page's two halves, description and drawing.
-  `page_view/mod.rs` holds the shared machinery (the row writer, layout, rendering, identities). Its
-  rendering, build, refill and `SettingsUi`-binding half is the AppKit half and sits in the same file
-  below the `MARK: - Rendering` marker, so the module is not pure as a whole -- only the sections
-  above that marker are. **One
-  file per page** sits beside it (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `about.rs`,
+  `page_view/mod.rs` is being split into one file per job: the module doc, the `mod` declarations and a
+  facade that re-exports today's names. `smoke.rs` (the M2 runners and their fixtures) is already out
+  of it; `model.rs`, `identity.rs`, `layout/`, `rows.rs`, `update.rs`, `render.rs`, `build.rs` and
+  `bind.rs` follow. The rendering half is AppKit; the description and layout halves are pure. **One
+  file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `about.rs`,
   `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
 - **Every settings page is described.** `page_builder.rs` is now one ~20-line entry point per page: it
   captures a `PageInput`, calls `build_page` and publishes (or falls back to `empty_page`). A page that
