@@ -227,10 +227,11 @@ clipboard/
   `page_view/mod.rs` is being split into one file per job: the module doc, the `mod` declarations and a
   facade that re-exports today's names. Out of it so far: `smoke.rs` (the M2 runners and their
   fixtures), `rows.rs` (the row constructors a description writes rows with), `update.rs` (the one
-  field-to-value description the refill and the in-place refresh consume) and `render.rs` (applying a
-  laid-out page to AppKit, and registering each control's identity as it is created). `model.rs`,
-  `identity.rs`, `layout/`, `build.rs` and `bind.rs` follow. The rendering half is AppKit; the
-  description and layout halves are pure. **One
+  field-to-value description the refill and the in-place refresh consume), `render.rs` (applying a
+  laid-out page to AppKit, registering each control's identity as it is created) and `bind.rs`
+  (handing a built page's controls to the `SettingsUi` fields the dispatcher, the refill and the
+  freeze lists read). `model.rs`, `identity.rs`, `layout/` and `build.rs` follow. The rendering half
+  is AppKit; the description and layout halves are pure. **One
   file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `about.rs`,
   `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
 - **Every settings page is described.** `page_builder.rs` is now one ~20-line entry point per page: it
