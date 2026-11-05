@@ -109,6 +109,24 @@ fn action_selector(action: &str) -> Sel {
     }
 }
 
+/// Whether a row's control is TEXT that the renderer fits to its own line before centring it.
+///
+/// A read-only value and a hyperlink are both read-only NSTextFields, and an NSTextField draws its
+/// cell from the TOP of its box: given the layout's full control box (32pt for an 18pt line) the
+/// glyphs sat ~7pt above the row's middle while the row's own label was centred, so the About
+/// page's value and link rows read visibly high. Controls that are not text (switch, popup, slider,
+/// button) are drawn as the layout places them.
+///
+/// The predicate is a function, not an inline `matches!`, so the renderer and its test can agree on
+/// the branch without the test re-implementing it: a link dropped from this list turns the row high
+/// again, and the test fails on that rather than on a copy of the formula.
+pub(super) fn fits_as_text(control: &ControlKind) -> bool {
+    matches!(
+        control,
+        ControlKind::Value { .. } | ControlKind::Link { .. }
+    )
+}
+
 /// The boxes a row's views are placed in, in the order the renderer places them: the copy (one
 /// box, or a title and a caption for a stacked row), the control, and a slider's readout.
 ///
@@ -331,20 +349,22 @@ pub(super) unsafe fn render_row(
     // That list ends with the SLIDER READOUT when the row has one, so taking its last element made the
     // canvas record the readout's box as the slider's placement -- and every reflow then moved the
     // slider onto its own readout, 136pt right and past the document's edge on the Switcher page.
-    let control_box = match row.control {
-        // Every value row, with or without an action: the ACTION BUTTON is a second view drawn
-        // below in its own branch, so fitting the text does not move it.
-        ControlKind::Value { .. } => {
-            SettingsRow::center_readonly_text_control(control, placed.frame.y, placed.frame.h);
-            let frame: NSRect = msg_send![control, frame];
-            BoxRect::new(
-                frame.origin.x,
-                frame.origin.y,
-                frame.size.width,
-                frame.size.height,
-            )
-        }
-        _ => placed.control_frame,
+    //
+    // A hyperlink is text under the same rule: an NSTextField draws its cell from the top of its
+    // box, so a link left in the layout's full 32pt control box sat ~7pt above the row's middle
+    // while its label was centred. Fitting it to its own line height and centring that in the row
+    // band puts its glyphs on the row's centre line, like a value label's.
+    let control_box = if fits_as_text(&row.control) {
+        SettingsRow::center_readonly_text_control(control, placed.frame.y, placed.frame.h);
+        let frame: NSRect = msg_send![control, frame];
+        BoxRect::new(
+            frame.origin.x,
+            frame.origin.y,
+            frame.size.width,
+            frame.size.height,
+        )
+    } else {
+        placed.control_frame
     };
     canvas.place_pending_view(control, control_box.rect());
     // The shared association contract: VoiceOver label + the ROW_LABELS pairing the freeze lists

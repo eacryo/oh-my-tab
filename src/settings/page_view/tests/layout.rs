@@ -592,3 +592,65 @@ fn a_slider_records_its_own_box_not_its_readouts() {
     }
     assert_eq!(sliders, 2, "the Switcher page's two size sliders");
 }
+
+/// A link is TEXT: the renderer sends it down the same fit-and-centre path as a value label.
+///
+/// The two About link rows drew their URL in the layout's full 32pt control box. An NSTextField
+/// draws its cell from the top of its box, so the URL sat 7pt above the row's middle while the row
+/// title beside it was centred -- the links read visibly high against their labels. The layout was
+/// never the fault (its box IS centred in the band); the RENDERER was, because it fitted only
+/// `ControlKind::Value` and drew a link at the bare control box.
+///
+/// M1 cannot run `center_readonly_text_control` (AppKit), so what it pins is the branch that
+/// decides to call it: the production predicate `fits_as_text`. A test that re-derived the
+/// centring formula here would pass with the link branch removed, and this one must not -- taking a
+/// link out of `fits_as_text` is exactly the regression, and it fails here.
+#[test]
+fn a_link_row_is_fitted_and_centred_like_a_value_label() {
+    let input = input();
+    let view = about_page_view(&input);
+    let layout_input = LayoutInput::for_test(620.0);
+    let metrics = PageMetrics::for_layout(layout_input.layout);
+    let layout = layout_rows(&view, &layout_input, &metrics);
+    let mut links = 0;
+    for (index, row) in view.rows.iter().enumerate() {
+        if !matches!(row.control, ControlKind::Link { .. }) {
+            continue;
+        }
+        links += 1;
+        assert!(
+            fits_as_text(&row.control),
+            "About row {index}: a link does not take the text-fitting branch, so its glyphs are \
+             drawn against the top of a control box instead of the row's centre line"
+        );
+        // The box the layout hands over IS centred in the band, and IS the full control height:
+        // the defect is that a full-height field draws its ink at the box's top.
+        let placed = &layout.rows[index];
+        let band_mid = placed.frame.y + placed.frame.h / 2.0;
+        assert!(
+            (placed.control_frame.y + metrics.control_h / 2.0 - band_mid).abs() < 0.01,
+            "About row {index}: the layout's control box is not centred in the band"
+        );
+        let unfitted_ink =
+            placed.control_frame.y + metrics.control_h - layout_input.text.title_h / 2.0;
+        assert!(
+            (unfitted_ink - band_mid).abs() > 6.0,
+            "the test cannot see the defect it guards: the full-height box already draws on the \
+             centre line"
+        );
+        assert!(
+            (placed.control_frame.h - metrics.control_h).abs() < 0.01,
+            "About row {index}: the layout no longer hands the renderer a control-sized box"
+        );
+    }
+    assert_eq!(links, 2, "the About page's two link rows");
+
+    // The value rows `fits_as_text` already served keep it; a control that is not text does not.
+    for row in view.rows.iter() {
+        if matches!(row.control, ControlKind::Value { .. }) {
+            assert!(fits_as_text(&row.control), "a value row lost its fit");
+        }
+    }
+    assert!(!fits_as_text(&ControlKind::Switch));
+    assert!(!fits_as_text(&ControlKind::Popup { options: vec![] }));
+}
