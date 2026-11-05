@@ -2665,7 +2665,6 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         theme: std::ptr::null_mut(),
         glass_style: std::ptr::null_mut(),
         panel_material: std::ptr::null_mut(),
-        corner_radius: std::ptr::null_mut(),
         thumbnails_enabled: std::ptr::null_mut(),
         focused_thumbnail_prewarm: std::ptr::null_mut(),
         show_app_name_in_cards: std::ptr::null_mut(),

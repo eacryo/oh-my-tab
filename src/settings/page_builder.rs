@@ -504,11 +504,78 @@ pub(super) unsafe fn publish_built_page(
     // The page is good: give its controls to the pointer fields the dispatcher, the refill's own
     // consumers and the freeze lists read, before the page becomes the one on screen.
     bind_page_controls(ui, &built.rendered);
+    // Every handle this page just bound must resolve back through the published table. A source
+    // reading of the hook cannot show this: what matters is that the pointer the app actually uses
+    // is the one the table names. The CALL carries the same cfg as the definition -- release builds
+    // compile the function out, so an unguarded call would not resolve there.
+    #[cfg(debug_assertions)]
+    debug_assert_page_slots_are_reachable(ui);
     ui.page_canvases[index] = built.canvas;
     // The banner's three pointers are bound from the page's own record before it is stored.
     bind_page_banner(ui, &built.rendered);
     ui.migrated_pages[index] = Some(built.rendered);
     built.content_bottom
+}
+
+/// Assert that every control a page drew ITSELF resolves through the published table.
+///
+/// A described row's handle is set from the control the table already identified, so a round trip
+/// through it proves little. The hook-drawn controls are the interesting ones: the page writes the
+/// pointer it built into `SettingsUi` and registers the same pointer separately, and only running
+/// the window shows whether those two agree. A mismatch is a control that looks alive and does
+/// nothing -- the failure the description layer exists to prevent.
+///
+/// Debug only, and it runs on every page publish: whichever page happens to be built last, any
+/// handle left over from an earlier build is still checked, so the assertion cannot be skipped by
+/// publishing a page that binds nothing.
+#[cfg(debug_assertions)]
+unsafe fn debug_assert_page_slots_are_reachable(ui: &SettingsUi) {
+    let hooks: [(&str, *mut AnyObject, ControlField); 8] = [
+        ("scroll_mode", ui.scroll_mode, ControlField::ScrollMode),
+        ("line_count", ui.line_count, ControlField::LineCount),
+        (
+            "pointer_accel_slider",
+            ui.pointer_accel_slider,
+            ControlField::PointerAcceleration,
+        ),
+        (
+            "smooth_scrolling_preset",
+            ui.smooth_scrolling_preset,
+            ControlField::SmoothScrollingPreset,
+        ),
+        (
+            "smooth_scrolling_response",
+            ui.smooth_scrolling_response,
+            ControlField::SmoothScrollingResponse,
+        ),
+        (
+            "smooth_scrolling_speed",
+            ui.smooth_scrolling_speed,
+            ControlField::SmoothScrollingSpeed,
+        ),
+        (
+            "smooth_scrolling_acceleration",
+            ui.smooth_scrolling_acceleration,
+            ControlField::SmoothScrollingAcceleration,
+        ),
+        (
+            "smooth_scrolling_inertia",
+            ui.smooth_scrolling_inertia,
+            ControlField::SmoothScrollingInertia,
+        ),
+    ];
+    for (name, pointer, field) in hooks {
+        if pointer.is_null() {
+            // The page that owns this control is not built (yet), or a rebuild dropped it.
+            continue;
+        }
+        let resolved = ui.control_table.lookup(pointer);
+        debug_assert_eq!(
+            resolved,
+            Some(ControlId::Field(field)),
+            "the {name} control is bound in SettingsUi but the table does not name it; clicking it would do nothing"
+        );
+    }
 }
 
 /// Build an empty layout owner for a page whose description could not be built.

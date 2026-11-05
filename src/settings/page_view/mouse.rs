@@ -801,19 +801,29 @@ mod tests {
         );
     }
 
-    /// A hook-drawn control registers its identity, so the dispatcher never needs a pointer arm for it.
+    /// The Mouse hook's controls reach the dispatcher through the table, which a RUNNING window
+    /// verifies -- not this test, and not a reading of the source.
     ///
-    /// The dispatcher asks the `ControlTable` first and falls back to a hand-written pointer chain for
-    /// the controls a page draws itself through `PageHooks`. That chain existed only because those
-    /// controls were never registered. The hook now registers each one as it builds it, which is what
-    /// this pins: the registration calls are in the hook and name the field.
+    /// `debug_assert_page_slots_are_reachable` runs on every page publish in a debug build: for each
+    /// control this page draws itself, it takes the pointer `SettingsUi` holds and asserts the
+    /// published table names it. That is the claim these tests cannot make from the outside -- a
+    /// source check can only show that a registration was written, not that the pointer the app uses
+    /// is the one it registered.
     ///
-    /// Building the page itself needs AppKit, so the assertion reads the source. It is deliberately
-    /// the same shape as the wiring test in `dispatch.rs`: a field with a described row or a hook
-    /// registration needs no pointer arm.
+    /// What is asserted HERE is the cheaper half, kept because it fails without a window: the hook
+    /// still registers, and it registers through the page buffer rather than straight into the table
+    /// (a page that fails half-way must leave the previous mapping untouched).
     #[test]
-    fn a_hook_drawn_control_registers_its_identity() {
+    fn the_mouse_hook_registers_through_the_page_buffer() {
         let source = include_str!("mouse.rs");
+        assert!(
+            source.contains("rendered.registrations"),
+            "the hook no longer reaches the page's registration buffer"
+        );
+        assert!(
+            !source.contains(&["control", "_table.register("].concat()),
+            "the hook writes the shared table directly; it must use PageRegistrations"
+        );
         for field in [
             "ScrollMode",
             "LineCount",
@@ -827,20 +837,8 @@ mod tests {
             let token = format!("ControlField::{field}");
             assert!(
                 source.contains(&token),
-                "the Mouse hook does not register {field}, so the dispatcher still needs a pointer arm"
+                "the Mouse hook does not register {field}"
             );
         }
-        // The registration must go through the page's buffer, not straight into the table: a page that
-        // fails half-way must leave the previous mapping untouched.
-        assert!(
-            source.contains("registrations.register("),
-            "the hook registers nothing"
-        );
-        // Built at run time so this assertion cannot find its own literal.
-        let direct = ["control", "_table.register("].concat();
-        assert!(
-            !source.contains(&direct),
-            "the hook writes the shared table directly; it must use PageRegistrations"
-        );
     }
 }

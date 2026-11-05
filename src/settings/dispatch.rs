@@ -1002,13 +1002,11 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
                     // Do not commit invalid values; restore the last effective config value.
                     let cfg = CONFIG.read().unwrap().clone();
                     let text = match field {
-                        TextField::CornerRadius => cfg.appearance.corner_radius.to_string(),
                         TextField::ClipboardMaxEntries => cfg.clipboard.max_entries.to_string(),
                     };
                     with_settings_ui(|ui| {
                         if let Some(u) = ui.as_ref() {
                             let ctrl = match field {
-                                TextField::CornerRadius => u.corner_radius,
                                 TextField::ClipboardMaxEntries => u.clipboard_max_entries,
                             };
                             set_field(ctrl, text);
@@ -1024,7 +1022,6 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
 /// target/action).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TextField {
-    CornerRadius,
     ClipboardMaxEntries,
 }
 
@@ -1032,13 +1029,7 @@ unsafe fn text_field_of(obj: *mut AnyObject) -> Option<TextField> {
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;
         let ptr = obj as usize;
-        if ptr == u.corner_radius as usize {
-            Some(TextField::CornerRadius)
-        } else if ptr == u.clipboard_max_entries as usize {
-            Some(TextField::ClipboardMaxEntries)
-        } else {
-            None
-        }
+        (ptr == u.clipboard_max_entries as usize).then_some(TextField::ClipboardMaxEntries)
     })
 }
 
@@ -1047,15 +1038,10 @@ unsafe fn parse_text_field(field: TextField) -> Option<(TextFieldValue, String)>
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;
         let (ctrl, bounds): (*mut AnyObject, (f64, f64)) = match field {
-            TextField::CornerRadius => (u.corner_radius, (0.0, 500.0)),
             TextField::ClipboardMaxEntries => (u.clipboard_max_entries, (1.0, 100.0)),
         };
         let raw = nsstring_to_rust(msg_send![ctrl, stringValue]);
         let value = match field {
-            TextField::CornerRadius => match parse_f64(&raw) {
-                Ok(v) if v.is_finite() && v >= bounds.0 && v <= bounds.1 => TextFieldValue::F64(v),
-                _ => return None,
-            },
             TextField::ClipboardMaxEntries => match parse_usize(&raw) {
                 Ok(v) if (bounds.0 as usize..=bounds.1 as usize).contains(&v) => {
                     TextFieldValue::U32(v as u32)
@@ -1069,7 +1055,6 @@ unsafe fn parse_text_field(field: TextField) -> Option<(TextFieldValue, String)>
 
 #[derive(Clone, Copy)]
 enum TextFieldValue {
-    F64(f64),
     U32(u32),
 }
 
@@ -1084,8 +1069,7 @@ static EDITED_TEXT_FIELDS: AtomicU32 = AtomicU32::new(0);
 
 fn text_field_bit(field: TextField) -> u32 {
     match field {
-        TextField::CornerRadius => 1 << 0,
-        TextField::ClipboardMaxEntries => 1 << 1,
+        TextField::ClipboardMaxEntries => 1 << 0,
     }
 }
 
@@ -1105,9 +1089,7 @@ fn write_text_field_config(field: TextField, value: TextFieldValue, apply_runtim
     let old_cfg = CONFIG.read().unwrap().clone();
     let mut cfg = old_cfg.clone();
     match (field, value) {
-        (TextField::CornerRadius, TextFieldValue::F64(v)) => cfg.appearance.corner_radius = v,
         (TextField::ClipboardMaxEntries, TextFieldValue::U32(v)) => cfg.clipboard.max_entries = v,
-        _ => {}
     }
     if let Ok(mut w) = CONFIG.write() {
         *w = cfg.clone();
@@ -1223,7 +1205,6 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
         ui.panel_minimize_enabled,
         ui.panel_hide_enabled,
         ui.panel_quit_enabled,
-        ui.corner_radius,
         ui.modifier,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
@@ -2738,28 +2719,27 @@ mod tests {
     fn only_a_field_the_user_edited_commits_on_end_editing() {
         let mask = std::sync::atomic::AtomicU32::new(0);
         assert!(
-            !take_edited_field(&mask, TextField::CornerRadius),
+            !take_edited_field(&mask, TextField::ClipboardMaxEntries),
             "an untouched field must not commit (the prewarmed window resigns it on every open)"
         );
-        mask.fetch_or(text_field_bit(TextField::CornerRadius), Ordering::SeqCst);
-        assert!(
-            take_edited_field(&mask, TextField::CornerRadius),
-            "a field the user typed into must commit on blur"
-        );
-        assert!(
-            !take_edited_field(&mask, TextField::CornerRadius),
-            "one edit must commit once, not on every later resign"
-        );
-        assert!(
-            !take_edited_field(&mask, TextField::ClipboardMaxEntries),
-            "the two fields must not share a bit"
-        );
-        mask.store(0, Ordering::SeqCst);
         mask.fetch_or(
             text_field_bit(TextField::ClipboardMaxEntries),
             Ordering::SeqCst,
         );
-        assert!(take_edited_field(&mask, TextField::ClipboardMaxEntries));
+        assert!(
+            take_edited_field(&mask, TextField::ClipboardMaxEntries),
+            "a field the user typed into must commit on blur"
+        );
+        assert!(
+            !take_edited_field(&mask, TextField::ClipboardMaxEntries),
+            "one edit must commit once, not on every later resign"
+        );
+        // A bit that is not this field's must never commit it.
+        mask.store(1 << 7, Ordering::SeqCst);
+        assert!(
+            !take_edited_field(&mask, TextField::ClipboardMaxEntries),
+            "an unrelated bit must not stand in for this field's edit"
+        );
     }
 
     /// The Finder Menu's vec-backed fields keep the catalog order however the boxes were ticked:

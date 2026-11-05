@@ -479,7 +479,6 @@ pub(super) struct SettingsUi {
     theme: *mut AnyObject,          // NSPopUpButton: auto / light / dark
     panel_material: *mut AnyObject, // NSPopUpButton: liquid-glass / frost / opaque
     glass_style: *mut AnyObject,    // NSPopUpButton: regular / clear (liquid glass only)
-    corner_radius: *mut AnyObject,  // NSTextField
     modifier: *mut AnyObject,       // NSPopUpButton: option / command
     locale: *mut AnyObject,         // NSPopUpButton: auto / en / zh-Hans / zh-Hant
     show_minimized: *mut AnyObject, // show minimized windows
@@ -1027,9 +1026,6 @@ pub(crate) use window::{
     settings_window_is_visible,
 };
 
-fn parse_f64(s: &str) -> Result<f64, ()> {
-    s.trim().parse::<f64>().map_err(|_| ())
-}
 fn parse_usize(s: &str) -> Result<usize, ()> {
     s.trim().parse::<usize>().map_err(|_| ())
 }
@@ -2103,7 +2099,6 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                     crate::glass::glass_style_index(&cfg.appearance.glass_style) as isize;
                 let _: () = msg_send![ui.glass_style, selectItemAtIndex: gs_idx];
             }
-            set_field(ui.corner_radius, cfg.appearance.corner_radius);
             let card_text_size = text_size_slider_value(cfg.layout.card_text_size);
             // The slider's domain is stop indices; the readout shows the point size the stop
             // means, so the label reads "0" (hidden) or "13".."20", never a raw index.

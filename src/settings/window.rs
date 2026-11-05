@@ -3927,7 +3927,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             theme: std::ptr::null_mut(),
             glass_style: std::ptr::null_mut(),
             panel_material: std::ptr::null_mut(),
-            corner_radius: std::ptr::null_mut(),
             thumbnails_enabled: std::ptr::null_mut(),
             focused_thumbnail_prewarm: std::ptr::null_mut(),
             show_app_name_in_cards: std::ptr::null_mut(),
@@ -4252,40 +4251,29 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         sidebar::build_settings_search_results(&mut ui.settings_search, content, page_frame);
 
         // --- Numeric text-field notifications: debounced apply while typing, immediate commit
-        // on blur / Enter ---
+        // on blur / Enter. One numeric field is left (the clipboard entry limit); the
+        // corner-radius field this used to cover no longer exists.
         {
             let center: *mut AnyObject = msg_send![class!(NSNotificationCenter), defaultCenter];
-            for (field_ptr, change_sel, end_sel) in [
-                (
-                    ui.corner_radius,
-                    sel!(handleControlTextDidChange:),
-                    sel!(handleControlTextDidEndEditing:),
-                ),
-                (
-                    ui.clipboard_max_entries,
-                    sel!(handleControlTextDidChange:),
-                    sel!(handleControlTextDidEndEditing:),
-                ),
-            ] {
-                let change_name = make_nsstring("NSControlTextDidChangeNotification");
-                let _: () = msg_send![
-                    center,
-                    addObserver: target,
-                    selector: change_sel,
-                    name: change_name,
-                    object: field_ptr
-                ];
-                CFRelease(change_name as *const c_void);
-                let end_name = make_nsstring("NSControlTextDidEndEditingNotification");
-                let _: () = msg_send![
-                    center,
-                    addObserver: target,
-                    selector: end_sel,
-                    name: end_name,
-                    object: field_ptr
-                ];
-                CFRelease(end_name as *const c_void);
-            }
+            let field_ptr = ui.clipboard_max_entries;
+            let change_name = make_nsstring("NSControlTextDidChangeNotification");
+            let _: () = msg_send![
+                center,
+                addObserver: target,
+                selector: sel!(handleControlTextDidChange:),
+                name: change_name,
+                object: field_ptr
+            ];
+            CFRelease(change_name as *const c_void);
+            let end_name = make_nsstring("NSControlTextDidEndEditingNotification");
+            let _: () = msg_send![
+                center,
+                addObserver: target,
+                selector: sel!(handleControlTextDidEndEditing:),
+                name: end_name,
+                object: field_ptr
+            ];
+            CFRelease(end_name as *const c_void);
         }
 
         // --- Sidebar search field: live filtering, the focused shell ring, and the clear chip ---
