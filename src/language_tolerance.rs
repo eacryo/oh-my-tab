@@ -222,7 +222,6 @@ mod tests {
                 "settings/tooltip.rs" => include_str!("settings/tooltip.rs"),
                 "settings/select.rs" => include_str!("settings/select.rs"),
                 "settings/page_widgets.rs" => include_str!("settings/page_widgets.rs"),
-                "settings/page_view/mod.rs" => include_str!("settings/page_view/mod.rs"),
                 "clipboard/text_style.rs" => include_str!("clipboard/text_style.rs"),
                 "clipboard/detail.rs" => include_str!("clipboard/detail.rs"),
                 "keystroke_display/panel.rs" => include_str!("keystroke_display/panel.rs"),

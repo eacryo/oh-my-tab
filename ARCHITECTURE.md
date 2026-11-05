@@ -224,14 +224,17 @@ clipboard/
   (`RowLayout` frames from the page plus a `LayoutInput`), and `page_update_description` is the one
   field-to-value description both the refill and the in-place refresh consume. `page_widgets.rs` holds the
   copy widgets the renderer uses; it and `page_view/` are the page's two halves, description and drawing.
-  `page_view/mod.rs` is being split into one file per job: the module doc, the `mod` declarations and a
-  facade that re-exports today's names. Out of it so far: `smoke.rs` (the M2 runners and their
+  `page_view/mod.rs` is now the module doc, the `mod` declarations and a facade re-exporting today's
+  names (~280 lines); the code lives in one file per job. Each of these sits beside it: `smoke.rs` (the M2 runners and their
   fixtures), `rows.rs` (the row constructors a description writes rows with), `update.rs` (the one
   field-to-value description the refill and the in-place refresh consume), `render.rs` (applying a
   laid-out page to AppKit, registering each control's identity as it is created) and `bind.rs`
   (handing a built page's controls to the `SettingsUi` fields the dispatcher, the refill and the
-  freeze lists read). `model.rs`, `identity.rs`, `layout/` and `build.rs` follow. The rendering half
-  is AppKit; the description and layout halves are pure. **One
+  freeze lists read), `build.rs` (building one page: description, layout, render, publish) and
+  `layout/` (`mod.rs` measures rows and boxes, `place.rs` decides where each row goes), `model.rs`
+  (the description types: what a page is) and `identity.rs` (which control each pointer is, and the
+  page-scoped buffer that fills the table only after the whole page built). The rendering half is
+  AppKit; the description and layout halves are pure. **One
   file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `about.rs`,
   `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
 - **Every settings page is described.** `page_builder.rs` is now one ~20-line entry point per page: it
