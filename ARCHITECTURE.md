@@ -226,9 +226,10 @@ clipboard/
   copy widgets the renderer uses; it and `page_view/` are the page's two halves, description and drawing.
   `page_view/mod.rs` is being split into one file per job: the module doc, the `mod` declarations and a
   facade that re-exports today's names. Out of it so far: `smoke.rs` (the M2 runners and their
-  fixtures), `rows.rs` (the row constructors a description writes rows with) and `update.rs` (the one
-  field-to-value description the refill and the in-place refresh consume). `model.rs`, `identity.rs`,
-  `layout/`, `render.rs`, `build.rs` and `bind.rs` follow. The rendering half is AppKit; the
+  fixtures), `rows.rs` (the row constructors a description writes rows with), `update.rs` (the one
+  field-to-value description the refill and the in-place refresh consume) and `render.rs` (applying a
+  laid-out page to AppKit, and registering each control's identity as it is created). `model.rs`,
+  `identity.rs`, `layout/`, `build.rs` and `bind.rs` follow. The rendering half is AppKit; the
   description and layout halves are pure. **One
   file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `about.rs`,
   `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
