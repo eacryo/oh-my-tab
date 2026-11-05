@@ -204,20 +204,23 @@ its `ControlId` in a `ControlTable` held by `SettingsUi` as it creates it, and `
 that table first**: a described row's control is answered by the table instead of the linear comparison.
 
 **What was actually delivered (verified against the code at hand-off, not against the plan's wording):**
-the pointer chain is down to **2 arms**, from 65 when this work started. It converged in two steps: the
-first deleted 50 arms that a described row had already registered (the table was answering them before
-the chain ran); the second made the controls a page draws through `PageHooks` register their own
-`ControlId` as they are drawn (`draw_mouse_row` takes the `PageRegistrations` buffer), which removed the
-Mouse page's scroll-mode, line-count, tracking-speed and five smooth-scrolling arms -- and the same
-review showed the Finder Menu rows are described rows and the clipboard entry limit dispatches through
-`text_field_of`, so those five went too.
+the pointer chain is **gone**, and `control_field_of` is a single `ControlTable` lookup (it was 65 arms
+when this work started). It converged in three steps: the first deleted 50 arms that a described row had
+already registered (the table answered them before the chain ran); the second made the controls a page
+draws through `PageHooks` register their own `ControlId` as they are drawn (`draw_mouse_row` takes the
+`PageRegistrations` buffer), which removed the Mouse page's scroll-mode, line-count, tracking-speed and
+five smooth-scrolling arms -- and the same review showed the Finder Menu rows are described rows and the
+clipboard entry limit dispatches through `text_field_of`; the third removed the fields the last two arms
+named, `ShowFooterTitle` and `CornerRadius`, whose `SettingsUi` slots are never assigned and whose arms
+could therefore never match.
 
-The two arms that remain are not migration leftovers: they name **two fields no page builds any more**
-(`ShowFooterTitle`, `CornerRadius`), whose `SettingsUi` slots are never assigned, so the arms can never
-match. The fields and their variants stay in `ControlField`; deleting them reaches into `settings_ui_slot`
-and is its own change. See `docs/review-backlog.md`.
+So: **on all eight pages every clickable control -- described or hook-drawn -- is identified by the
+`ControlTable`.** A control missing from the table is no longer a silent dead branch; it is a control
+that does nothing, which the wiring test reports as an unwired field.
 
-So: **on all eight pages every control -- described or hook-drawn -- is identified by the `ControlTable`.**
+One path is still dead and not touched: `TextField::CornerRadius` / `ui.corner_radius`. That slot is
+never assigned either, so the corner-radius text field cannot exist today; removing it reaches into the
+numeric text-field dispatcher, which is its own cleanup -- see `docs/review-backlog.md`.
 
 Lifecycle rules (missing from the first draft and required):
 

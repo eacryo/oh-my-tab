@@ -175,17 +175,19 @@ M2，但某页改动后若 M2 未获授权运行，交付时必须记为 NOT RUN
 控件的同时把它与 `ControlId` 成对登记到 `ControlTable`（挂在 `SettingsUi` 上），`control_field_of`
 **先查表**：已声明行的控件由表回答，不再走手写比对。
 
-**实际交付范围（交接时按代码核实，不按计划措辞）**：手写指针链现为 **2 条分支**（本次工作开始时是
-65 条）。分三步收敛：第一步删掉 50 条「描述行已经登记、查表必然先命中」的死分支；第二步让
-`PageHooks` 自绘的控件在绘制时登记自己的 `ControlId`（`draw_mouse_row` 接收 `PageRegistrations`），
-于是 Mouse 页的滚动模式、行数、跟踪速度与五个平滑滚动控件的分支也被删掉；同时核实出 Finder Menu
-的四行本来就是描述行、剪贴板最大条数走的是 `text_field_of`，这五条同样删除。
+**实际交付范围（交接时按代码核实，不按计划措辞）**：手写指针链**已完全删除**，`control_field_of` 现在
+只有一次 `ControlTable` 查询（本次工作开始时是 65 条分支）。收敛分三步：第一步删掉 50 条「描述行已经
+登记、查表必然先命中」的死分支；第二步让 `PageHooks` 自绘的控件在绘制时登记自己的 `ControlId`
+（`draw_mouse_row` 接收 `PageRegistrations`），Mouse 页的滚动模式、行数、跟踪速度与五个平滑滚动控件
+的分支随之删除，同一次核对还确认 Finder Menu 四行本来就是描述行、剪贴板最大条数走 `text_field_of`；
+第三步把最后两条分支对应的字段本身删掉——`ShowFooterTitle` 与 `CornerRadius` 从 `ControlField` 移除，
+它们的 `SettingsUi` 槽位从不被赋值，那两条分支永远不可能命中。
 
-剩下的 2 条不是迁移残留，而是**两个任何页面都不再构建的字段**（`ShowFooterTitle`、`CornerRadius`）：
-它们的 `SettingsUi` 槽位从不被赋值，所以这两条分支永不匹配。字段与变体本身仍留在 `ControlField`
-里，删除它们会牵动 `settings_ui_slot` 等映射，属独立清理，见 `docs/review-backlog.md`。
+也就是说：**八页里每一个用户可点的控件（描述行的和钩子自绘的）都由 `ControlTable` 识别**；表里查不到
+不再是一条静默的死分支，而是一个「点了没反应」的控件，由接线断言当作未接线报出来。
 
-也就是说：**八页里每一个控件（描述行的和钩子自绘的）现在都靠 `ControlTable` 识别**。
+仍未做的是 `TextField::CornerRadius` / `ui.corner_radius` 这一条：该槽位同样从不赋值（所以那个数字
+文本框今天并不存在），但删除它要动数字文本框分派器，属另一处清理，见 `docs/review-backlog.md`。
 
 生命周期约定（初稿缺失，必须补齐）：
 

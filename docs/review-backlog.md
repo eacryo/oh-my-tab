@@ -635,10 +635,12 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 
 - **钩子自绘控件仍按指针分发 —— 已解决**（2026-11-04 提出，2026-11-05 关闭）。`ControlTable` 原先只覆盖「描述产生的控件」；Mouse 页的滚动模式、每 tick 行数、跟踪速度与五个平滑滚动控件由 `extra_row` 自绘，因此仍在 `src/settings/dispatch.rs` 的手写指针链里被识别。现已让这些控件在绘制时登记自己的 `ControlId`：`draw_mouse_row` 接收 `PageRegistrations` 缓冲并逐个 `register`，登记走页面缓冲而非共享表，保持「页面半途失败则旧映射不动」的约定。同一次核对还确认 Finder Menu 的四行本来就是描述行（表必然先命中），剪贴板最大条数走 `text_field_of` 而非本函数，这五条一并删除。**指针链从 65 条降到 2 条**，剩下 2 条对应 `ShowFooterTitle` 与 `CornerRadius` 两个任何页面都不再构建的字段（槽位从不赋值、分支永不匹配）。
   **登记时机的核实过程（这是本项的关键前提）**：页面只在 `create_settings_window_for` 里构建一次；此后 `materialize_mouse_page` 只做 `set_switch_state_immediate` / `fill_mouse_device_controls` / `rebuild_device_popup`，其中设备弹窗只是 `removeAllItems` 后重填菜单项、对象本身不换，映射表重建的是它自己的行、不在登记的 8 个控件内。所以指针在「一次内容树生命周期」内稳定；内容树重建会创建新的 `SettingsUi` 与登记表并重新登记。独立审查复核了这一结论。
-  **仍开着的**：`ControlField::{ShowFooterTitle, CornerRadius, ClipboardMaxEntries}` 三个变体已无构造点（`ClipboardMaxEntries` 的实际工作是 `TextField::ClipboardMaxEntries`），删除会牵动 `settings_ui_slot` 等映射，属独立清理。**触发条件：** 下次改动 `settings_ui_slot` 或 `apply_control_field` 时一并删除。
+  **已一并清掉**：`ControlField::{ShowFooterTitle, CornerRadius, ClipboardMaxEntries}` 三个变体没有任何构造点（`ClipboardMaxEntries` 的实际工作是 `TextField::ClipboardMaxEntries`），已连同 apply 分支与 `settings_ui_slot` 映射删除；指针链因此归零，`control_field_of` 现在只有一次表查询。
 
 - **已修：外部审查的四条中三条已处理（2026-11-04）**。
   1. `PageInput::capture` 在一条实参表里读了两次 `CONFIG`：外层 guard 活到语句结束，内层读因此是**嵌套读**（写者排队时会让线程等自己），且外层 guard 跨过了 `ThemeInput` 为 `auto` 外观做的 AppKit 查询。已改为**一次读取 + 派生**（新增 `ThemeInput::from_config(&Config)`），M1 断言 `capture` 只出现一次 `CONFIG.read()`、且不调用 `ThemeInput::current()`。
   2. General 页横幅的 `needs_permission_migration_copy()`（读 bundle 版本 + 系统 defaults）与 `banner_height()` 里的同一调用，让描述不再是 `PageInput` 的函数，而横幅**高度是布局输入**。已改为 `PageInput::permission_migration_copy`（与 Finder 扩展状态同样在入口捕获），M1 断言生产半边不再出现 `needs_permission_migration_copy()` / `system_dark_mode()` / `NSUserDefaults`。
   3. `ControlUpdate` 只带字符串，应用侧把弹窗下标与滑杆档位**从文本解析回来**。已加 `typed: Value`，应用侧按类型取值，字符串只留作显示契约；M1 断言应用函数体内没有 `parse::<`。
   余下未做的是**模块拆分**（上方条目）与**去掉 43 条指针分发分支**（上方条目）：两者都需要先让钩子自绘控件进入描述，属独立工作。
+
+- **数字文本框的 `CornerRadius` 槽位是死的**（2026-11-05 发现，MEDIUM——死代码，延后）。`SettingsUi::corner_radius` 从不被赋值，`TextField::CornerRadius` 因此在 `text_field_of` 里永远与空指针比较、永不命中，`parse_text_field` / `apply_text_field` 里那几支也不可达——**转角半径这个数值文本框今天并不存在**（`appearance.corner_radius` 配置本身是活的，运行时照旧生效）。清理窗口是把 `ui.corner_radius`、`TextField::CornerRadius` 及其 4 处匹配分支一起删掉，只留 `TextField::ClipboardMaxEntries`；本次没做是因为它牵动数字文本框分派器，与「删指针链」不是同一处改动。**重新审视的触发条件：** 下次改动 `text_field_of` / `parse_text_field` / `apply_text_field` 任一处时，或决定给转角半径恢复 UI 时（那种情况下应给它一个描述行，而不是复活这条槽位）。
