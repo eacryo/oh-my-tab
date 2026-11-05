@@ -171,13 +171,7 @@ pub(super) unsafe fn render_row(
     // The in-card divider belongs to THIS row: created after the row opened, so the canvas
     // captures it with the row, placed through the row's placements, and hidden with its group.
     if row.separator_above {
-        let separator = SettingsRow::separator_above_row(
-            parent,
-            placed.frame.y,
-            placed.frame.h,
-            placed.frame.w,
-        );
-        canvas.place_pending_view(separator, separator_frame(placed));
+        place_row_separator(canvas, &placed.frame);
     }
     let title = t(row.label_key);
     // The row's title view: what the accessibility label and the disabled-row pairing name.
@@ -427,11 +421,41 @@ pub(super) unsafe fn render_row(
     Ok(())
 }
 
-/// The divider a row draws above itself: the row's top edge, full bleed across the page.
-pub(super) fn separator_frame(placed: &RowLayout) -> NSRect {
+/// Draw a row's in-card divider and hand it to the canvas, for either kind of row.
+///
+/// A described row and a page-drawn row are both rows of the card, so both take the divider the
+/// layout decided for them (`RowSpec::separator_above`, `PageLayout::drawn_separators`); a page
+/// that draws its own rows must not have to remember to draw the seam the canvas would otherwise
+/// put around it.
+pub(super) unsafe fn place_row_separator(canvas: &mut PageCanvas, band: &BoxRect) {
+    let separator = SettingsRow::separator_above_row(canvas.document(), band.y, band.h, band.w);
+    canvas.place_pending_view(separator, separator_frame_of(band));
+}
+
+/// Whether the CARD's divider is drawn above a page-drawn row.
+///
+/// One decision, used by the renderer and asserted by the test: the layout says "this row continues
+/// its card", and the page may overrule it either by drawing that line itself
+/// (`PageRowSpec::divides_with_own_line`, the About Updates band, which the update flow collapses)
+/// or by having no line there at all (`PageRowSpec::no_divider`, the update host under it).
+pub(super) fn card_divider_above(extra: &PageRowSpec, layout: &PageLayout, index: usize) -> bool {
+    !extra.divides_with_own_line
+        && !extra.no_divider
+        && layout.drawn_separators.get(index).copied().unwrap_or(false)
+}
+
+/// Draw the divider for a row whose band is known only by its bottom edge and height.
+unsafe fn place_row_separator_at(canvas: &mut PageCanvas, line: NSRect) {
+    let band = BoxRect::new(line.origin.x, line.origin.y - 1.0, line.size.width, 1.0);
+    let separator = SettingsRow::separator_above_row(canvas.document(), band.y, band.h, band.w);
+    canvas.place_pending_view(separator, line);
+}
+
+/// The line a row's divider draws: the row's top edge, full bleed across the page.
+pub(super) unsafe fn separator_frame_of(band: &BoxRect) -> NSRect {
     NSRect::new(
-        NSPoint::new(placed.frame.x, placed.frame.y + placed.frame.h),
-        NSSize::new(placed.frame.w.max(1.0), 1.0),
+        NSPoint::new(band.x, band.y + band.h),
+        NSSize::new(band.w.max(1.0), 1.0),
     )
 }
 
@@ -555,6 +579,28 @@ pub(in crate::settings) unsafe fn render_page(
                     // views are captured by the row and hidden with the group -- the same
                     // `set_group_visible` a mode switch already drives.
                     canvas.set_pending_group(extra.group);
+                    // The seam above this row is the CARD's, not this page's. It is drawn here,
+                    // into the row the canvas has just opened, so it is captured with that row and
+                    // a re-flow (or the row's group being hidden) moves it like any other row's
+                    // divider. A page-drawn row keeps the RELATIVE advance the canvas gave it: the
+                    // page's hook owns its views, and unregistered ones only move relatively --
+                    // turning the row absolute here would leave About's check-for-updates button
+                    // and update host, and the Key Bindings list block, behind on every re-flow.
+                    //
+                    // A row whose hook draws the line over this boundary itself opts out, or the
+                    // boundary would carry two: the About page's Updates band does, anchored to the
+                    // row above because the update flow collapses the row it sits in. The update
+                    // host under it opts out the other way --- it is part of that block and draws
+                    // no line at all.
+                    if card_divider_above(extra, layout, index) {
+                        place_row_separator_at(
+                            canvas,
+                            NSRect::new(
+                                NSPoint::new(0.0, origin_y + height),
+                                NSSize::new(canvas.content_width(), 1.0),
+                            ),
+                        );
+                    }
                     debug_assert!(
                         (drawn_origin - origin_y).abs() < 0.5,
                         "the canvas origin must be the one the layout reserved"

@@ -121,8 +121,13 @@ pub(super) fn about_page_view(input: &PageInput) -> PageView {
     );
     // The band and the host are drawn by `AboutHooks::extra_row`, inside this last card. The host
     // starts empty; the update flow grows it downward over the band's place.
-    w.extra_row(ABOUT_UPDATE_BAND, SettingsLayout::SINGLE_LINE_ROW_H);
-    w.extra_row(ABOUT_UPDATE_HOST, 0.0);
+    // The band draws the divider over its own top edge (anchored to the row above), because the
+    // update flow collapses the band and a line captured by it would slide over the row above.
+    w.extra_row(ABOUT_UPDATE_BAND, SettingsLayout::SINGLE_LINE_ROW_H)
+        .divides_with_own_line();
+    // The host is part of the band's block, not a row of the page: it starts empty and hidden under
+    // the band, whose line is the card's line there, so it draws no divider of its own.
+    w.extra_row(ABOUT_UPDATE_HOST, 0.0).draws_no_divider();
     let mut view = w.finish();
     // The page draws its own header instead of the shared page title, so the rows start below it:
     // the header's top padding, its 80pt block and one section step.

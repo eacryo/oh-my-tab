@@ -165,7 +165,14 @@ fn the_separator_belongs_to_the_row_below_it() {
         .position(|row| row.separator_above)
         .expect("a row with a divider above it");
     let placed = &layout.rows[row];
-    let separator = separator_frame(placed);
+    let separator = unsafe {
+        separator_frame_of(&BoxRect::new(
+            placed.frame.x,
+            placed.frame.y,
+            placed.frame.w,
+            placed.frame.h,
+        ))
+    };
     assert_eq!(separator.origin.y, placed.frame.y + placed.frame.h);
     assert_eq!(separator.size.width, placed.frame.w);
     // The renderer places it on the row's own capture, not before the row opens.
@@ -181,22 +188,34 @@ fn the_separator_belongs_to_the_row_below_it() {
     let body = &source[start..end];
     let open = body.find("canvas.next_row(").expect("the row opens");
     let divider = body
-        .find("SettingsRow::separator_above_row(")
+        .find("place_row_separator(")
         .expect("the divider is built");
     assert!(
             divider > open,
             "the divider must be created after its row opened, or the canvas captures it for the previous row"
         );
     assert!(
-            body.contains("canvas.place_pending_view(separator, separator_frame(placed))"),
+            body.contains("place_row_separator(canvas, &placed.frame)"),
             "the divider must go through the row's placements, so a re-flow moves it and its group hides it"
         );
-    // And the card loop no longer builds dividers before opening their row.
+    // And the card loop never draws a divider before opening its row: it opens the row
+    // (next_row) and only then hands the seam to it, which is what keeps the divider in that
+    // row's capture -- for a described row and for a row the page draws itself alike.
     let page_start = source.find("unsafe fn render_page(").expect("render_page");
     let page = &source[page_start..source.find("unsafe fn apply_control_update").unwrap()];
     assert!(
         !page.contains("SettingsRow::separator_above_row("),
         "render_page must not create dividers: they belong to the row's own capture"
+    );
+    let drawn_open = page
+        .find("let drawn_origin = canvas.next_row(height);")
+        .expect("the page-drawn row opens");
+    let drawn_divider = page
+        .find("place_row_separator_at(")
+        .expect("the page-drawn row's divider is built");
+    assert!(
+        drawn_divider > drawn_open,
+        "a page-drawn row's divider must be created after its row opened, or the canvas captures it for the previous row"
     );
 }
 

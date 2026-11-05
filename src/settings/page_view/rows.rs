@@ -45,7 +45,22 @@ impl RowWriter {
         debug_assert!(!self.section.is_empty(), "row pushed outside a card");
         row.card = self.card;
         row.section = self.section;
-        row.separator_above = self.rows.last().is_some_and(|last| last.card == self.card);
+        // The row BEFORE this one in the card may be a row the page draws itself (the clipboard
+        // page's shortcut recorder, its numeric entry limit), and that row already takes the
+        // divider for the boundary between them. Asking only the description's own list missed it:
+        // the first described row after a page-drawn one started a whole row after the card began
+        // and was given no seam at all.
+        let after_drawn_row = self
+            .extra
+            .iter()
+            .rev()
+            .find(|extra| extra.card == self.card)
+            .is_some_and(|extra| extra.after_row == self.rows_in_card());
+        row.separator_above = if after_drawn_row {
+            true
+        } else {
+            self.rows.last().is_some_and(|last| last.card == self.card)
+        };
         let header = if self.section.is_empty() {
             self.initial_section.clone()
         } else {
@@ -55,12 +70,44 @@ impl RowWriter {
         self.rows.push(row);
     }
 
+    /// How many described rows the current card has so far: the index a page-drawn row declared
+    /// now would carry in `PageRowSpec::after_row`.
+    fn rows_in_card(&self) -> usize {
+        self.rows.iter().filter(|row| row.card == self.card).count()
+    }
+
     /// Declare a row the PAGE draws itself, after the card's described rows so far.
     ///
     /// The row stays inside the current card, so the described rows that follow still land in the
     /// same card and the card closes where it would have closed anyway.
-    pub(super) fn extra_row(&mut self, key: &'static str, height: f64) {
+    pub(super) fn extra_row(&mut self, key: &'static str, height: f64) -> &mut Self {
         self.extra_row_in_group(key, height, None);
+        self
+    }
+
+    /// State that the row declared last by [`RowWriter::extra_row`] draws the line over its own
+    /// top edge, so the canvas must not draw the card's divider there too (see
+    /// [`PageRowSpec::divides_with_own_line`]).
+    pub(super) fn divides_with_own_line(&mut self) -> &mut Self {
+        if let Some(last) = self.extra.last_mut() {
+            last.divides_with_own_line = true;
+        }
+        self
+    }
+
+    /// State that the row declared last by [`RowWriter::extra_row`] draws NO card divider above
+    /// itself: it is part of the block above it, not a row of its own on the page.
+    ///
+    /// The About page's inline update host is the case: it sits under the Updates band, starts
+    /// empty and is hidden, and the band already owns the one line over that boundary. A divider
+    /// is a document subview of its own, so hiding the host does not hide it -- it would show as a
+    /// stray line under the band in the compact card, and travel with the host's bottom edge once
+    /// the flow expands it.
+    pub(super) fn draws_no_divider(&mut self) -> &mut Self {
+        if let Some(last) = self.extra.last_mut() {
+            last.no_divider = true;
+        }
+        self
     }
 
     /// Declare a page-drawn row that belongs to a conditional group: the canvas hides it with the
@@ -79,6 +126,8 @@ impl RowWriter {
             height: RowHeight::Fixed(height),
             after_row: after,
             group,
+            divides_with_own_line: false,
+            no_divider: false,
         });
     }
 
@@ -97,6 +146,8 @@ impl RowWriter {
             height: RowHeight::Measured(measure),
             after_row: after,
             group: None,
+            divides_with_own_line: false,
+            no_divider: false,
         });
     }
 

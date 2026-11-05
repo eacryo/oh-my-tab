@@ -654,3 +654,175 @@ fn a_link_row_is_fitted_and_centred_like_a_value_label() {
     assert!(!fits_as_text(&ControlKind::Switch));
     assert!(!fits_as_text(&ControlKind::Popup { options: vec![] }));
 }
+
+/// Every row of a card has a divider above it except the card's first row -- including the rows a
+/// PAGE draws itself.
+///
+/// The divider was decided when a described row was pushed, from the row before it in the
+/// description's own list, which holds no page-drawn row. So a described row after a page-drawn one
+/// drew its divider at the right place, but the page-drawn row never drew the one the row above had
+/// handed over: the Mouse page's device card (three page-drawn rows) had no divider at all, and the
+/// clipboard page's "max entries" row sat under the "delete after paste" switch with no line between
+/// them. `PageLayout::drawn_separators` is that decision for the page-drawn rows, taken from the
+/// one sequence both kinds of row share.
+#[test]
+fn a_card_puts_a_divider_above_every_row_including_the_pages_own() {
+    let input = input();
+    for page in [
+        SettingsPageId::Mouse,
+        SettingsPageId::Clipboard,
+        SettingsPageId::Switcher,
+        SettingsPageId::General,
+        SettingsPageId::About,
+    ] {
+        let view = view_for(page, &input);
+        let layout_input = LayoutInput::for_test(620.0);
+        let metrics = PageMetrics::for_layout(layout_input.layout);
+        let layout = layout_rows(&view, &layout_input, &metrics);
+        let mut previous_card: Option<usize> = None;
+        let mut page_drawn_with_divider = 0;
+        for placed in page_sequence(&view).iter().copied() {
+            let (card, has_divider) = match placed {
+                PlacedRow::Described(index) => {
+                    (view.rows[index].card, view.rows[index].separator_above)
+                }
+                PlacedRow::Drawn(index) => {
+                    (view.extra_rows[index].card, layout.drawn_separators[index])
+                }
+            };
+            // A row that belongs to a conditional group is a CHILD of the row above it (the
+            // clipboard page's "clear the system pasteboard" row under "delete after paste"):
+            // it is the switch's child option, not a sibling, so it draws no seam -- while it is
+            // hidden the row under it would show a divider under nothing, and while it is shown
+            // the pair reads as one setting.
+            let is_child_row = match placed {
+                PlacedRow::Described(index) => view.rows[index].group.is_some(),
+                PlacedRow::Drawn(_) => false,
+            };
+            // Only a card's FIRST row may go without a seam (it starts under the card's own edge).
+            // A row after a page-drawn one is the case this test exists for: the page-drawn row
+            // above it never drew the divider, and the described row below did not draw one either
+            // because `RowWriter::push` still saw its own list's previous row. A child option is
+            // the one other row that legitimately has none.
+            assert!(
+                has_divider || is_child_row || previous_card != Some(card),
+                "{page:?}: {placed:?} of card {card} is neither the card's first row nor a child \
+                 option, so it needs a divider above it and has none"
+            );
+            if matches!(placed, PlacedRow::Drawn(_)) && has_divider {
+                page_drawn_with_divider += 1;
+            }
+            previous_card = Some(card);
+        }
+        if page == SettingsPageId::Mouse {
+            // The device card and the pointer card are the two the user reported, and both are
+            // page-drawn or followed by a page-drawn row: the counterexample the fix removes is a
+            // page-drawn row that never got the divider.
+            assert_eq!(
+                page_drawn_with_divider, 7,
+                "the Mouse page's page-drawn rows that continue their card: the device card's \
+                 scroll mode and line count, the smooth preset and its four sliders, and the \
+                 tracking speed. Nothing drew one before the layout decided them."
+            );
+        }
+    }
+}
+
+/// The About page's Updates card keeps exactly ONE line over its boundary, drawn by the page.
+///
+/// The band draws that line itself, anchored to the row above, because the update flow collapses
+/// the band: a line captured by the band would travel with it and slide over the row above. So the
+/// card's divider must not also be drawn there -- two lines on one boundary -- and the empty,
+/// hidden update host right below the band must not carry one either (a divider is a document
+/// subview of its own, so hiding the host would not hide it).
+///
+/// What is asserted is the DECISION the renderer makes (`card_divider_above`), not the raw layout
+/// flag: the layout says "this row continues its card" for both of these rows, so a test that only
+/// read `drawn_separators` would go green while the renderer drew a stray line.
+#[test]
+fn about_draws_no_card_divider_over_its_update_band_or_host() {
+    let input = input();
+    let view = about_page_view(&input);
+    let layout_input = LayoutInput::for_test(620.0);
+    let metrics = PageMetrics::for_layout(layout_input.layout);
+    let layout = layout_rows(&view, &layout_input, &metrics);
+    let band = view
+        .extra_rows
+        .iter()
+        .position(|extra| extra.key == crate::settings::page_view::about::ABOUT_UPDATE_BAND)
+        .expect("the Updates band");
+    let host = view
+        .extra_rows
+        .iter()
+        .position(|extra| extra.key == crate::settings::page_view::about::ABOUT_UPDATE_HOST)
+        .expect("the update host");
+    // Both rows continue the card, so the layout would give each a divider on its own.
+    assert!(layout.drawn_separators[band], "the band continues its card");
+    assert!(layout.drawn_separators[host], "the host follows the band");
+    // The page's own answer, which is what the renderer obeys:
+    assert!(
+        view.extra_rows[band].divides_with_own_line,
+        "the band draws the one line over that boundary itself"
+    );
+    assert!(
+        view.extra_rows[host].no_divider,
+        "the host is part of the band's block and must draw no line of its own"
+    );
+    assert!(
+        !card_divider_above(&view.extra_rows[band], &layout, band),
+        "the band must not get a second line on its boundary"
+    );
+    assert!(
+        !card_divider_above(&view.extra_rows[host], &layout, host),
+        "the hidden host must not get a line under the band"
+    );
+    // And an ordinary page-drawn row still gets the card's line.
+    let ordinary = view.extra_rows.iter().position(|extra| {
+        extra.key != crate::settings::page_view::about::ABOUT_UPDATE_BAND
+            && extra.key != crate::settings::page_view::about::ABOUT_UPDATE_HOST
+    });
+    assert!(
+        ordinary.is_none(),
+        "the About page's only page-drawn rows are the band and the host"
+    );
+}
+
+/// A page-drawn row is never turned ABSOLUTE behind its page's back.
+///
+/// The canvas's Absolute walk re-places only the views a row REGISTERED through
+/// \`place_pending_view\`. A page's hook draws its own views and registers some of them (the
+/// Clipboard recorder's button) but not others (About's check-for-updates button and update host,
+/// the Key Bindings list block); those only move because the row keeps the Relative walk, which
+/// shifts everything captured since the row opened. Turning a page-drawn row absolute therefore
+/// strands exactly the unregistered content -- it stays behind while the card and its divider move.
+///
+/// The divider this change adds is drawn into the row, so it does not need Absolute: it is captured
+/// with the row and travels relatively like the row's other views.
+#[test]
+fn a_page_drawn_row_keeps_the_relative_walk() {
+    let source = std::fs::read_to_string(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/src/settings/page_view/render.rs"
+    ))
+    .expect("the page renderer's own source");
+    let page_start = source.find("unsafe fn render_page(").expect("render_page");
+    let page = &source[page_start..source.find("unsafe fn apply_control_update").unwrap()];
+    let drawn_arm = page
+        .find("PlacedRow::Drawn(index) =>")
+        .expect("the page-drawn arm");
+    let next_arm = page[drawn_arm..]
+        .find("\n                }")
+        .map(|offset| drawn_arm + offset)
+        .unwrap_or(page.len());
+    let body = &page[drawn_arm..next_arm];
+    assert!(
+        !body.contains("AdvanceState::Absolute"),
+        "the page-drawn arm must not set an absolute advance: the page's own views are not all \
+         registered, so they would stop following the row"
+    );
+    // The described arm still walks absolutely -- it re-places exactly what it registered.
+    assert!(
+        source.contains("let _: () = msg_send![control, setFrame: placed.control_frame.rect()];"),
+        "the described rows keep their absolute placement"
+    );
+}

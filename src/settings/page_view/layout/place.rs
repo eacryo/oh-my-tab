@@ -30,6 +30,19 @@ pub(in crate::settings) struct PageLayout {
     /// The height each page-drawn row took, in `PageView::extra_rows` order: the number the layout
     /// reserved, so the renderer advances by exactly that instead of measuring a second time.
     pub(in crate::settings::page_view) extra_row_heights: Vec<f64>,
+    /// Whether the divider belongs above each page-drawn row, in `PageView::extra_rows` order.
+    ///
+    /// A described row decides this when it is pushed (`RowWriter::push` sets `separator_above`
+    /// from the row before it in ITS OWN list, which only holds described rows). A page-drawn row
+    /// is not in that list, so a described row following one still drew its divider -- but the row
+    /// ABOVE the page-drawn one had already handed its divider to the page-drawn row, which never
+    /// drew it. The seams around every page-drawn row were therefore missing: the Mouse page's
+    /// device card (three page-drawn rows) had no divider at all, and the clipboard page's
+    /// "max entries" row lost the line under the switch above it.
+    ///
+    /// The sequence is the only place both kinds of row exist in document order, so the answer is
+    /// computed once here and the renderer draws the divider for either kind from it.
+    pub(in crate::settings::page_view) drawn_separators: Vec<bool>,
     pub(in crate::settings::page_view) banner: Option<BannerRect>,
     /// The first card's top edge (the first section cursor).
     pub(in crate::settings::page_view) first_card_top: f64,
@@ -141,6 +154,13 @@ pub(in crate::settings::page_view) fn layout_rows(
     // renderer draws it at exactly that origin with exactly that height.
     let mut drawn_rows: Vec<(usize, f64, f64)> =
         vec![(0, first_card_top, 0.0); view.extra_rows.len()];
+    // Which rows the divider belongs above, decided by the ONE walk that holds both kinds of row in
+    // document order (see `PageLayout::drawn_separators`): the first row of a card has none, every
+    // other row has one on its top edge. A page's own divider for a block it draws itself -- the
+    // clipboard page's excluded-applications card -- is created outside this list on purpose and is
+    // not counted here.
+    let mut drawn_separators = vec![false; view.extra_rows.len()];
+    let mut previous_card: Option<usize> = None;
     let mut placed_rows: Vec<Option<RowLayout>> = vec![None; view.rows.len()];
     for placed in sequence.iter().copied() {
         let card = match placed {
@@ -153,8 +173,11 @@ pub(in crate::settings::page_view) fn layout_rows(
             card_tops.push(cursor);
         }
         cursor -= metrics.row_gap;
+        let separator_above = previous_card.is_some_and(|previous| previous == card);
+        previous_card = Some(card);
         match placed {
             PlacedRow::Drawn(index) => {
+                drawn_separators[index] = separator_above;
                 let height = input.extra_row_heights.get(index).copied().unwrap_or(0.0);
                 cursor -= height;
                 drawn_rows[index] = (index, cursor, height);
@@ -417,6 +440,7 @@ pub(in crate::settings::page_view) fn layout_rows(
         sequence,
         drawn_rows,
         extra_row_heights: input.extra_row_heights.clone(),
+        drawn_separators,
         banner,
         first_card_top,
         rows,

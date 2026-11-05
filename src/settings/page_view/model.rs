@@ -258,6 +258,20 @@ pub(in crate::settings) struct PageRowSpec {
     /// page-drawn row that a mode switch hides must be hidden by the SAME canvas group list, or
     /// the page stops following the switch.
     pub(in crate::settings) group: Option<RowGroup>,
+    /// Whether this row's own page code draws the line over its top edge.
+    ///
+    /// The canvas draws a card's dividers, including the one above a page-drawn row. One row keeps
+    /// its line outside that capture -- the About page's Updates band -- because the update flow
+    /// collapses the row to nothing, and a line travelling with the row would land over the row
+    /// above. Such a page states it here instead of the canvas guessing from a row key.
+    pub(in crate::settings) divides_with_own_line: bool,
+    /// Whether this row must draw NO card divider above it at all.
+    ///
+    /// The complement of [`Self::divides_with_own_line`] for a row that is part of the block above
+    /// it rather than a row of the page: the About page's update host starts empty and hidden under
+    /// the Updates band, and the band's own line is the card's line there. A divider is a document
+    /// subview of its own, so the host being hidden would not hide it.
+    pub(in crate::settings) no_divider: bool,
 }
 
 /// A page-drawn row's height: a constant, or a measurement of the page input.

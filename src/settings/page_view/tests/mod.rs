@@ -5,7 +5,7 @@
 use super::super::*;
 use super::*;
 use crate::settings::page_view::render::{
-    dedicated_selector, row_placement_boxes, separator_frame,
+    dedicated_selector, row_placement_boxes, separator_frame_of,
 };
 use objc2::sel;
 

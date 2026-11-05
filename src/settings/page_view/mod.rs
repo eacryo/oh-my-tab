@@ -114,7 +114,9 @@ pub(in crate::settings::page_view) use bind::{
     settings_ui_readout_field, settings_ui_slot_field, settings_ui_slot_present,
 };
 #[cfg(test)]
-pub(in crate::settings::page_view) use render::{fits_as_text, row_placement_boxes};
+pub(in crate::settings::page_view) use render::{
+    card_divider_above, fits_as_text, row_placement_boxes,
+};
 pub(super) use render::{render_page, RenderedPage};
 pub(in crate::settings::page_view) use rows::{button, popup, slider, switch, RowDraft, RowWriter};
 pub(in crate::settings::page_view) use update::page_update_description;
