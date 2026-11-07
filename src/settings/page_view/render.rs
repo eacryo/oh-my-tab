@@ -83,6 +83,7 @@ pub(super) fn dedicated_selector(field: Option<ControlField>) -> Sel {
     match field {
         Some(ControlField::WindowsEnabled) => sel!(handleWindowsEnabledToggle:),
         Some(ControlField::MouseEnabled) => sel!(handleEnableMouseToggle:),
+        Some(ControlField::GestureExcludedAdd) => sel!(handleGestureExcludedAdd:),
         Some(ControlField::MappingEnabled) => sel!(handleMappingEnabledChanged:),
         Some(ControlField::ClipboardEnabled) => sel!(handleClipboardEnabledToggle:),
         Some(ControlField::ClipboardPaused) => sel!(handlePauseRecordingToggle:),
@@ -95,6 +96,28 @@ pub(super) fn dedicated_selector(field: Option<ControlField>) -> Sel {
 fn action_selector(action: &str) -> Sel {
     match action {
         "export_settings" => sel!(handleExportSettings:),
+        // The Gestures page's excluded-application rows: Remove one entry.
+        "gesture_excluded_remove" => sel!(handleGestureExcludedRemove:),
+        "gesture_excluded_add" => sel!(handleGestureExcludedAdd:),
+        // A gesture row's Delete, and the list's restore button. Both rebuild the page themselves.
+        action if crate::settings::page_view::delete_row_index(action).is_some() => {
+            sel!(handleGestureRowDelete:)
+        }
+        "gesture_restore_defaults" => sel!(handleGestureRestoreDefaults:),
+        // A gesture row's action popup: the list of buttons that row can start on.
+        action if crate::settings::page_view::is_gesture_row_identity(action) => {
+            sel!(handleGestureRowTrigger:)
+        }
+        // One line of that list.
+        action if crate::settings::page_view::is_trigger_row_identity(action) => {
+            sel!(handleGestureTriggerLine:)
+        }
+        // The Gestures page's recorder: start a recording, or cancel the one running.
+        "gesture_record" => sel!(handleGestureRecordStart:),
+        "gesture_record_cancel" => sel!(handleGestureRecordCancel:),
+        // The General page's "Export Logs" row. It used to be reached through the fallback arm,
+        // which the unknown-action safety net replaced -- so it is spelled out here.
+        "export_logs" => sel!(handleExportLogs:),
         "import_settings" => sel!(handleImportSettings:),
         // The Finder Menu page's status row opens the extension's System Settings pane.
         "open_finder_extension_settings" => sel!(handleOpenFinderExtensionManagement:),
@@ -105,7 +128,9 @@ fn action_selector(action: &str) -> Sel {
         "retry_keychain_access" => sel!(retryKeychainAccess:),
         // The About page's guide row opens the onboarding window.
         "open_onboarding" => sel!(handleOpenOnboarding:),
-        _ => sel!(handleExportLogs:),
+        // An action nobody handles must do NOTHING. Defaulting to export-logs made a wrong value
+        // run an unrelated feature -- and a read-only row's action is never called at all.
+        _ => sel!(handleUnknownPageAction:),
     }
 }
 
@@ -173,7 +198,8 @@ pub(super) unsafe fn render_row(
     if row.separator_above {
         place_row_separator(canvas, &placed.frame);
     }
-    let title = t(row.label_key);
+    // The row's label copy: the locale key, or the data the page computed for it.
+    let title = row.label_text.clone().unwrap_or_else(|| t(row.label_key));
     // The row's title view: what the accessibility label and the disabled-row pairing name.
     let title_label: *mut AnyObject = match row.caption_key {
         Some(caption_key) => {
@@ -228,10 +254,13 @@ pub(super) unsafe fn render_row(
     let control: *mut AnyObject = match &row.control {
         ControlKind::Switch => {
             let on = matches!(row.value, Value::Switch(true));
+            // The switch's visual is 42x26; build it on the ROW BAND so the whole trailing cell is
+            // its hit target. At the control box's own 26pt height a click a few points off centre
+            // misses the view and lands on the row, which reads as a switch that ignores clicks.
             SettingsControl::switch(
                 placed.control_frame.x + placed.control_frame.w,
-                placed.control_frame.y,
-                placed.control_frame.h,
+                placed.frame.y,
+                placed.frame.h,
                 on,
             )
         }
@@ -364,7 +393,13 @@ pub(super) unsafe fn render_row(
     // The shared association contract: VoiceOver label + the ROW_LABELS pairing the freeze lists
     // use to dim the row's label and give it the disabled tooltip.
     SettingsRow::register_label(title_label, control);
-    if !matches!(row.control, ControlKind::Button { .. }) {
+    // A POPUP is not bound. The custom settings select opens its options from its own `mouseDown:`
+    // and reports the choice through `sendPendingAction`; installing the unified change handler on
+    // it sets target/action AND arms NSButton's press tracking, which replaces that `mouseDown:` --
+    // the panel then never opened, and the row read as a control that does nothing. A row's identity
+    // still reaches the dispatcher, from the select's own action.
+    let is_popup = matches!(row.control, ControlKind::Popup { .. });
+    if !matches!(row.control, ControlKind::Button { .. }) && !is_popup {
         // `bind_control` is the unified handler; a field with a dedicated callback keeps it.
         let selector = dedicated_selector(row.field());
         let _: () = msg_send![control, setTarget: target];
@@ -392,6 +427,9 @@ pub(super) unsafe fn render_row(
             SettingsButtonRole::Action,
         );
         if !button.is_null() {
+            if let Some(tag) = row.action_tag {
+                let _: () = msg_send![button, setTag: tag];
+            }
             let _: () = msg_send![button, setFrame: frame.rect()];
             let _: () = msg_send![parent, addSubview: button];
             release_obj(button);

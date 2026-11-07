@@ -11,6 +11,8 @@
 //! commits the switch.
 
 use crate::event_monitor::GlobalEvent;
+use crate::mouse::gesture::modifiers::HolderId;
+
 use crate::event_tap::{
     tap_location, CGEventCreateKeyboardEvent, CGEventFlags, CGEventPost, CGEventSetFlags,
     CGEventSetIntegerValueField, CGEventSetType, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER,
@@ -24,6 +26,14 @@ use std::sync::{Mutex, OnceLock};
 
 /// Side button pressed: post the mapped keyDown (modifiers attached) to the session level.
 pub(crate) fn press_down(keycode: u16, flags: u32, desc: &str) {
+    // A direct caller (a one-off press, not a button mapping) owns its bits under the gesture slot
+    // so it can never collide with a mapped button's identity.
+    press_down_for(GESTURE_KEY_SLOT, keycode, flags, desc);
+}
+
+/// Press on behalf of \\`holder\\` (a button number, or the gesture slot).
+fn press_down_for(holder: u32, keycode: u16, flags: u32, desc: &str) {
+    hold_managed_for(HolderId::Button(holder), flags);
     // Binding our own global shortcuts (switcher/clipboard) dispatches internally instead
     // of synthesizing: session-level posts can't loop back to our tap, and HID-level
     // keyboard posts are dropped by the system (no IOHIDEvent, verified).
@@ -58,24 +68,24 @@ pub(crate) fn press_down(keycode: u16, flags: u32, desc: &str) {
 /// level. It loops back to the switcher tap, whose flagsChanged handler sees the modifier go
 /// up and fires CmdReleased to commit the switch.
 pub(crate) fn release_up(keycode: u16, flags: u32, desc: &str) {
-    // Internally dispatched combos: the switcher commits on release; the clipboard needs
-    // no release action.
-    if internal_dispatch(keycode, flags, false) {
+    release_up_for(GESTURE_KEY_SLOT, keycode, flags, desc);
+}
+
+/// Release on behalf of \\`holder\\`.
+fn release_up_for(holder: u32, keycode: u16, flags: u32, desc: &str) {
+    // Internally dispatched combos: the switcher commits on release, and nothing is synthesized --
+    // but the modifiers this holder took at press time are still ours to give back. Returning here
+    // used to leave them registered, which surfaced as a modifier stuck down for later input.
+    let dispatched_internally = internal_dispatch(keycode, flags, false);
+    release_managed_for(HolderId::Button(holder), flags);
+    if dispatched_internally {
         return;
     }
-    // Main keyUp, then the modifiers release in reverse order (flags winding down to zero),
-    // pairing with the press sequence.
+    // Main keyUp, then the modifiers this holder no longer needs -- in reverse order, and only the
+    // ones no other holder (another button mapping, a gesture, or the user's own fingers) still
+    // needs. Walking the flags to zero is what used to lift a key someone else was holding.
     unsafe {
         post_key(keycode, flags, false);
-    }
-    let mut acc = flags;
-    for (bit, vk) in MOD_KEYS.iter().rev() {
-        if flags & bit != 0 {
-            acc &= !bit;
-            unsafe {
-                post_modifier_change(*vk, acc);
-            }
-        }
     }
     log_debug!(
         "[mouse] button -> key up '{}' (keycode={} flags=0x{:x}) via session tap",
@@ -137,13 +147,30 @@ enum KeyJob {
         keycode: u16,
         flags: u32,
         desc: String,
+        /// The button this press belongs to; its release gives back only this button's bits.
+        holder: u32,
     },
     Up {
         keycode: u16,
         flags: u32,
         desc: String,
+        holder: u32,
     },
     SystemAction(&'static str),
+    /// A Dock-backed action asked for by a gesture; the worker re-checks the epoch first.
+    GestureSystemAction {
+        notification: &'static str,
+        epoch: u64,
+        generation: u64,
+    },
+    /// A complete gesture chord: pressed, released and its modifiers given back by the worker.
+    GestureChord {
+        keycode: u16,
+        flags: u32,
+        holder: u64,
+        epoch: u64,
+        generation: u64,
+    },
 }
 
 static KEY_JOBS: OnceLock<Option<SyncSender<KeyJob>>> = OnceLock::new();
@@ -164,14 +191,11 @@ fn active_system_buttons() -> &'static Mutex<HashSet<u32>> {
 }
 
 fn drain_release_backlog() {
-    let releases: Vec<_> = release_backlog()
-        .lock()
-        .unwrap()
-        .drain()
-        .map(|(_, binding)| binding)
-        .collect();
-    for (keycode, flags) in releases {
-        release_up(keycode, flags, "queued release");
+    // The button identity travels with the release: giving the bits back under a different holder
+    // would leave the real one registered forever once the queue had been full at release time.
+    let releases: Vec<(u32, (u16, u32))> = release_backlog().lock().unwrap().drain().collect();
+    for (button, (keycode, flags)) in releases {
+        release_up_for(button, keycode, flags, "queued release");
     }
 }
 
@@ -188,19 +212,42 @@ fn key_job_sender() -> Option<&'static SyncSender<KeyJob>> {
                                 keycode,
                                 flags,
                                 desc,
+                                holder,
                             } => {
                                 if !crate::mouse::event_tap::mouse_tap_stopping()
                                     && crate::input_monitor::taps_allowed()
                                 {
-                                    press_down(keycode, flags, &desc);
+                                    press_down_for(holder, keycode, flags, &desc);
                                 }
                             }
                             KeyJob::Up {
                                 keycode,
                                 flags,
                                 desc,
+                                holder,
                             } => {
-                                release_up(keycode, flags, &desc);
+                                release_up_for(holder, keycode, flags, &desc);
+                            }
+                            KeyJob::GestureChord {
+                                keycode,
+                                flags,
+                                holder,
+                                epoch,
+                                generation,
+                            } => run_gesture_chord(keycode, flags, holder, epoch, generation),
+                            KeyJob::GestureSystemAction {
+                                notification,
+                                epoch,
+                                generation,
+                            } => {
+                                if !crate::mouse::event_tap::mouse_tap_stopping()
+                                    && crate::input_monitor::taps_allowed()
+                                    && crate::mouse::gesture::runtime::still_authorized(
+                                        epoch, generation,
+                                    )
+                                {
+                                    crate::mouse::system_action::fire(notification);
+                                }
                             }
                             KeyJob::SystemAction(notification) => {
                                 if !crate::mouse::event_tap::mouse_tap_stopping()
@@ -271,6 +318,7 @@ pub(crate) fn queue_button_mapping(
             keycode,
             flags,
             desc: desc.to_owned(),
+            holder: button,
         };
         match sender.try_send(job) {
             Ok(()) => {
@@ -287,6 +335,7 @@ pub(crate) fn queue_button_mapping(
             keycode: active_keycode,
             flags: active_flags,
             desc: desc.to_owned(),
+            holder: button,
         };
         match sender.try_send(job) {
             Ok(()) => {
@@ -319,6 +368,7 @@ pub(crate) fn release_all_queued() {
                 keycode,
                 flags,
                 desc: "tap stopped".into(),
+                holder: button,
             }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {
@@ -333,6 +383,13 @@ pub(crate) fn release_all_queued() {
     }
 }
 
+/// The flags a synthetic event must carry: this binding's intent merged with every other holder's,
+/// so pressing Option while another button holds Command does not show the application a state with
+/// Command missing.
+fn arbitrated(flags: u32) -> u32 {
+    crate::mouse::gesture::runtime::forward_flags(flags)
+}
+
 /// Synthesize a modifier flagsChanged event (flags = the accumulated modifier state at that
 /// moment), posted to the session level.
 unsafe fn post_modifier_change(vk: u16, flags: u32) {
@@ -341,15 +398,20 @@ unsafe fn post_modifier_change(vk: u16, flags: u32) {
         return;
     }
     CGEventSetType(ev, 12); // kCGEventFlagsChanged
-    CGEventSetFlags(ev, flags as CGEventFlags);
+                            // The arbitrated state, never this holder's view of it: a synthetic event that omitted another
+                            // holder's modifier would tell the application the key went up.
+    CGEventSetFlags(ev, arbitrated(flags) as CGEventFlags);
     CGEventSetIntegerValueField(ev, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
     CGEventPost(tap_location::SESSION_EVENT_TAP, ev);
-    crate::ffi::CFRelease(ev as *const c_void);
+    // CFRelease, not CGEventRelease: the latter is an inline wrapper in the macOS headers and is
+    // not an exported symbol.
+    crate::event_tap::CFRelease(ev as *const _);
 }
 
 /// Synthesize a single keyboard event (keyDown/true or keyUp/false), tagged with userData and
 /// posted to the session level. HID-level keyboard posts are dropped by the system.
 unsafe fn post_key(keycode: u16, flags: u32, key_down: bool) {
+    let flags = arbitrated(flags);
     let ev = CGEventCreateKeyboardEvent(std::ptr::null(), keycode, key_down);
     if ev.is_null() {
         return;
@@ -358,4 +420,95 @@ unsafe fn post_key(keycode: u16, flags: u32, key_down: bool) {
     CGEventSetIntegerValueField(ev, K_CG_EVENT_SOURCE_USER_DATA, SYNTHETIC_MARKER);
     CGEventPost(tap_location::SESSION_EVENT_TAP, ev);
     crate::ffi::CFRelease(ev as *const c_void);
+}
+
+/// Press the managed modifier bits `flags` names, owned by `holder`.
+fn hold_managed_for(holder: HolderId, flags: u32) {
+    if let Some(next) = crate::mouse::gesture::runtime::acquire_modifiers(holder, flags) {
+        match next {
+            0 => {}
+            value => post_merged_modifier_change(value),
+        }
+    }
+}
+
+/// Release what `holder` held; a bit another holder still needs stays down.
+fn release_managed_for(holder: HolderId, flags: u32) {
+    if let Some(next) = crate::mouse::gesture::runtime::release_modifiers(holder, flags) {
+        post_merged_modifier_change(next);
+    }
+}
+
+/// Publish a merged modifier state as a flagsChanged, using the first modifier keycode as the carrier
+/// (the application keys on the flags value, not on which side produced it).
+fn post_merged_modifier_change(flags: u32) {
+    let keycode = MOD_KEYS
+        .iter()
+        .find(|(bit, _)| flags & bit != 0)
+        .map(|(_, vk)| *vk)
+        .unwrap_or(55);
+    unsafe {
+        post_modifier_change(keycode, flags);
+    }
+}
+
+/// A completed gesture's shortcut. One job carries the whole transaction: the worker takes the
+/// modifier bits, presses, releases and gives the bits back. Taking them here would leave them owned
+/// by a holder no release path knows about when the queue refuses the press.
+pub(crate) fn queue_gesture_keys(keycode: u16, flags: u32, epoch: u64, generation: u64) {
+    let Some(sender) = key_job_sender() else {
+        return;
+    };
+    let holder = GESTURE_HOLDER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let _ = sender.try_send(KeyJob::GestureChord {
+        keycode,
+        flags,
+        holder,
+        epoch,
+        generation,
+    });
+}
+
+/// Run one complete gesture chord on the poster thread. Every exit gives the modifier bits back.
+fn run_gesture_chord(keycode: u16, flags: u32, holder: u64, epoch: u64, generation: u64) {
+    if crate::mouse::event_tap::mouse_tap_stopping() || !crate::input_monitor::taps_allowed() {
+        return;
+    }
+    // Typing into a recorder, or a configuration that withdrew the gesture while this job waited:
+    // the consumer re-checks rather than trusting the decision made at release.
+    if !crate::mouse::gesture::runtime::still_authorized(epoch, generation) {
+        return;
+    }
+    let id = HolderId::Gesture(holder);
+    hold_managed_for(id, flags);
+    press_down(keycode, flags, "gesture");
+    release_up(keycode, flags, "gesture");
+    if let Some(next) = crate::mouse::gesture::runtime::release_modifiers(id, flags) {
+        post_merged_modifier_change(next);
+    }
+}
+
+/// Slot number the release backlog uses for a gesture chord. Button numbers start at 2 in this
+/// table, so 0 is free and cannot collide with a mapped button.
+const GESTURE_KEY_SLOT: u32 = 0;
+
+/// Distinguishes one gesture transaction from the next in the modifier arbiter.
+static GESTURE_HOLDER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Fire a Dock-backed system action on behalf of a gesture.
+pub(crate) fn queue_system_action_for_gesture(
+    notification: &'static str,
+    epoch: u64,
+    generation: u64,
+) {
+    let Some(sender) = key_job_sender() else {
+        return;
+    };
+    // Routed through the same re-check shape as a chord: the worker refuses once the gesture that
+    // asked for it has been withdrawn or a recorder took over.
+    let _ = sender.try_send(KeyJob::GestureSystemAction {
+        notification,
+        epoch,
+        generation,
+    });
 }

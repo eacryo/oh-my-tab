@@ -180,6 +180,24 @@ pub(crate) fn smooth_scroll_tick() {
     }
 }
 
+/// The gesture trail the HUD actually drew: the session id and its point count, or 0/0 when the
+/// window is hidden. Written on the main thread after the window changes, so a reader can tell
+/// "asked to hide" from "actually hidden".
+static GESTURE_TRAIL_SESSION: AtomicU64 = AtomicU64::new(0);
+static GESTURE_TRAIL_POINTS: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn record_gesture_trail(session: u64, points: usize) {
+    GESTURE_TRAIL_SESSION.store(session, Ordering::SeqCst);
+    GESTURE_TRAIL_POINTS.store(points as u64, Ordering::SeqCst);
+}
+
+pub(crate) fn gesture_trail() -> (u64, u64) {
+    (
+        GESTURE_TRAIL_SESSION.load(Ordering::SeqCst),
+        GESTURE_TRAIL_POINTS.load(Ordering::SeqCst),
+    )
+}
+
 pub(crate) fn smooth_scroll_phase(phase: crate::mouse::smooth::engine::Phase) {
     if !is_enabled() {
         return;
@@ -1159,6 +1177,25 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         SMOOTH_PHASES[4].load(Ordering::Relaxed),
         SMOOTH_PHASES[5].load(Ordering::Relaxed),
     ));
+    // Gestures: the phase the tap thread published, the trail the HUD actually drew (its own state,
+    // after the window changed -- not a pending request), and the published table's epoch, so a
+    // scenario can assert both what the user sees and that a config change took effect.
+    let (trail_session, trail_points) = gesture_trail();
+    json.push_str(&format!(
+        "  \"gesture\": {{\"phase\": \"{}\", \"hud_visible\": {}, \"trail_session\": {}, \"trail_points\": {}, \"epoch\": {}, \"rows\": {}}},\n",
+        crate::mouse::gesture::session_state::phase(),
+        crate::mouse::gesture::session_state::hud_visible(),
+        trail_session,
+        trail_points,
+        crate::mouse::gesture::session_state::epoch(),
+        crate::mouse::gesture::table::snapshot().table.len()
+    ));
+    let _ = crate::mouse::gesture::switcher::claim_active();
+    let _ = crate::mouse::gesture::switcher::claim_id();
+    let _ = crate::mouse::gesture::session_state::summary();
+    let _ = crate::mouse::gesture::session_state::trail_degraded();
+    let _ = crate::mouse::gesture::session_state::hud_last_request();
+    let _ = crate::mouse::gesture::session_state::last_action_session();
     let space_group_state = crate::space_groups::with_tracker(|tracker| {
         let unknown_active = tracker
             .topology()

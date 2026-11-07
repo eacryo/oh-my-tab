@@ -81,6 +81,11 @@ pub(super) enum ControlField {
     FinderMenuTerminal(usize),
     FinderMenuCopyPath,
     FinderMenuCopySha256,
+    // Gestures page: its own master switch, and the popup that adds an excluded application.
+    GesturesEnabled,
+    GestureShowTrail,
+    GestureShowHint,
+    GestureExcludedAdd,
 }
 
 /// Identify a field by the control that sent the event: a lookup in the page's `ControlTable`.
@@ -320,6 +325,99 @@ pub(super) unsafe fn update_finder_menu_controls_enabled(ui: &SettingsUi) {
     }
 }
 
+/// The action identity of a control whose row is an ACTION row rather than a field row.
+/// The identity the control table holds for a control.
+unsafe fn control_identity(sender: *mut AnyObject) -> Option<ControlId> {
+    with_settings_ui(|ui| ui.as_ref()?.control_table.lookup(sender))
+}
+
+unsafe fn action_control_of(sender: *mut AnyObject) -> Option<&'static str> {
+    with_settings_ui(|ui| {
+        let u = ui.as_ref()?;
+        match u.control_table.lookup(sender) {
+            Some(ControlId::Action(action)) => Some(action),
+            _ => None,
+        }
+    })
+}
+
+/// Write a gesture row's action popup back into the configuration: which entry the popup is on
+/// decides the binding, and the tag the page stamped on the control says which row.
+unsafe fn apply_row_action_popup(control: *mut AnyObject, action: &'static str) {
+    // Only the gesture rows carry an editable action popup today; an action id this path does not
+    // know must not write anything.
+    if !crate::settings::page_view::is_gesture_row_identity(action) {
+        return;
+    }
+    let tag: isize = msg_send![control, tag];
+    let index: isize = msg_send![control, indexOfSelectedItem];
+    let options = crate::settings::page_view::gesture_target_option_ids();
+    let Some(binding) = options.get(index.max(0) as usize).cloned() else {
+        return;
+    };
+    let old = CONFIG.read().unwrap().clone();
+    let mut updated = old.clone();
+    let Some(row) = updated.mouse.gestures.get_mut(tag.max(0) as usize) else {
+        return;
+    };
+    if row.binding == binding {
+        return;
+    }
+    // Picking an action is the user saying "run this": a row that stayed disabled would keep the
+    // tap thread away from it, which is the opposite of what the popup promised. Choosing "not
+    // set" leaves nothing to run, so the row is switched off instead of pointing at nothing.
+    row.binding = binding.clone();
+    row.enabled =
+        !binding.is_empty() && crate::mouse::gesture::table::Target::resolve(&binding).is_some();
+    if let Ok(mut config) = CONFIG.write() {
+        *config = updated.clone();
+    }
+    crate::settings::schedule_config_persist();
+    crate::runtime_config::apply_config_change(
+        &old,
+        &updated,
+        crate::runtime_config::ConfigChangeSource::Settings,
+    );
+}
+
+/// Run the button line of a trigger row the user clicked: the gesture moves to that button and the
+/// page goes back to the list, where its left column states the new button.
+unsafe fn apply_row_trigger_line(control: *mut AnyObject) {
+    let Some(ControlId::Action(identity)) = control_identity(control) else {
+        return;
+    };
+    let Some((index, slot)) = crate::settings::page_view::trigger_row_of(identity) else {
+        return;
+    };
+    let buttons = crate::settings::page_view::gesture_trigger_option_ids();
+    let Some(button) = buttons.get(slot).copied() else {
+        return;
+    };
+    if crate::settings::page_view::set_row_trigger(index, button).is_none() {
+        // The row already starts on this button: the click only closes the trigger row.
+        crate::settings::set_open_gesture_trigger_row(None);
+        super::rebuild_settings_content_deferred();
+        return;
+    }
+    crate::settings::schedule_config_persist();
+    crate::settings::set_open_gesture_trigger_row(None);
+    super::rebuild_settings_content_deferred();
+}
+
+/// Enter one gesture row's trigger row: the page is rebuilt to list the buttons that row can start
+/// on, with the one in use ticked. Working through the page rather than through a second floating
+/// list is what lets the row's dispatcher read a choice back from the control table it already owns.
+unsafe fn open_trigger_row(control: *mut AnyObject) {
+    let Some(ControlId::Action(identity)) = control_identity(control) else {
+        return;
+    };
+    let Some(index) = crate::settings::page_view::action_row_index(identity) else {
+        return;
+    };
+    crate::settings::set_open_gesture_trigger_row(Some(index));
+    super::rebuild_settings_content_deferred();
+}
+
 /// The unified control callback (switches/popups/sliders/color well): identify the field and
 /// apply its value.
 pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sender: *mut c_void) {
@@ -364,6 +462,12 @@ pub(crate) extern "C" fn on_control_changed(_self: *mut c_void, _cmd: Sel, sende
                 }
             });
             let Some(field) = control_field_of(ctrl) else {
+                // A row's control that names an ACTION instead of a field (a gesture row's target
+                // popup) edits the configuration directly: there is no field to look up.
+                if let Some(action) = action_control_of(ctrl) {
+                    apply_row_action_popup(ctrl, action);
+                    return;
+                }
                 log_debug!("[settings] control change from an unknown sender ignored");
                 return;
             };
@@ -793,6 +897,24 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.finder_menu_copy_sha256, state];
                     cfg.finder_menu.copy_sha256 = state == 1;
                 }
+                ControlField::GesturesEnabled => {
+                    let state: isize = msg_send![u.gestures_enabled, state];
+                    cfg.mouse.gestures_enabled = state == 1;
+                }
+                // A switch is read from the SENDER: this path knows which control was clicked, and
+                // going back through the page's slots would need one more field per switch.
+                ControlField::GestureShowTrail => {
+                    let state: isize = msg_send![u.gesture_show_trail, state];
+                    cfg.mouse.gesture_show_trail = state == 1;
+                }
+                ControlField::GestureShowHint => {
+                    let state: isize = msg_send![u.gesture_show_hint, state];
+                    cfg.mouse.gesture_show_hint = state == 1;
+                }
+                // The excluded-application popup writes the list itself in its own handler
+                // (`handleGestureExcludedAdd:`); the unified path only records that a value was
+                // applied, so the shared change plumbing below still runs.
+                ControlField::GestureExcludedAdd => {}
             }
         }
     });
@@ -2891,6 +3013,7 @@ mod tests {
                 "clipboard",
                 "finder_menu",
                 "general",
+                "gestures",
                 "key_bindings",
                 "keystroke_display",
                 "mouse",
@@ -2928,6 +3051,296 @@ mod tests {
             missing.join("\n  ")
         );
     }
+}
+
+/// The gesture list the page drew last, so a reload can tell "the rows changed" from "a value
+/// changed". A value can be written in place; a different LIST cannot -- there is no control to
+/// update into the new row -- so that difference is what asks for a rebuild.
+static DRAWN_GESTURE_ROWS: std::sync::Mutex<Option<Vec<crate::config::GestureBinding>>> =
+    std::sync::Mutex::new(None);
+
+/// Whether the configured gesture list differs from the one the page last drew.
+pub(crate) fn gesture_rows_changed(cfg: &crate::config::Config) -> bool {
+    DRAWN_GESTURE_ROWS
+        .lock()
+        .map(|drawn| {
+            drawn
+                .as_ref()
+                .is_none_or(|previous| *previous != cfg.mouse.gestures)
+        })
+        .unwrap_or(false)
+}
+
+/// Record the list the page has just drawn. Called by the builder, not by the change detector: a
+/// detector that advanced the snapshot itself would mark a change as handled on a page that never
+/// redrew, and coming back to the page would show the old rows.
+pub(crate) fn note_gesture_rows_drawn(cfg: &crate::config::Config) {
+    if let Ok(mut drawn) = DRAWN_GESTURE_ROWS.lock() {
+        *drawn = Some(cfg.mouse.gestures.clone());
+    }
+}
+
+// MARK: - Mouse gestures
+
+/// Start recording a gesture: the next press of a trigger button is captured instead of fired.
+pub(crate) extern "C" fn handle_gesture_record_start(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_record_start", || {
+        // Marked for the whole callback: work the tap thread schedules while this runs (the
+        // recording's own refresh) is routed back to the run loop instead of being attempted here.
+        let busy = crate::settings::settings_ui_busy();
+        // Read at entry: pressing the button while a recording runs is what cancels it. The guard
+        // set below says "a settings callback is running", not "the recorder is".
+        let was_recording = crate::mouse::gesture::recording::is_recording();
+        // Every step a recording can stop at says so in the same shape: the log gets the reason and
+        // the window gets one line. A recorder that answers a click with nothing reads as a dead
+        // button even while it is working.
+        fn notice(reason: &str, text: &str) {
+            crate::log_info!("[gesture] {reason}");
+            // The bubble is a nice-to-have: a toast that cannot be drawn (no opaque surface on this
+            // machine, a window that is mid-rebuild) must not take the action down with it -- a
+            // panic here is caught, and everything after it would silently not run.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                show_settings_toast(text)
+            }));
+        }
+        // One row, one action: the same button starts a recording and cancels the running one.
+        if was_recording {
+            crate::mouse::gesture::recording::cancel();
+            crate::settings::gesture_recorder::refresh_recording_row_on_main();
+            notice(
+                "recording cancelled",
+                &t("settings.gestures_record_cancelled"),
+            );
+            return;
+        }
+        // The tap is what feeds a recording; without it the row would promise a capture that can
+        // never arrive.
+        if !crate::mouse::event_tap::tap_running() {
+            notice(
+                "recording not started: the mouse tap is not running",
+                &t("settings.gestures_record_needs_tap"),
+            );
+            return;
+        }
+        // A recording needs the feature on: the page would otherwise capture a stroke and then
+        // discard it, which reads as a broken recorder rather than as a switched-off feature.
+        let armed = CONFIG
+            .read()
+            .map(|cfg| cfg.mouse.enabled && cfg.mouse.gestures_enabled)
+            .unwrap_or(false);
+        if !armed {
+            notice(
+                "recording not started: the feature is off",
+                &t("settings.gestures_record_needs_feature"),
+            );
+            return;
+        }
+        // The page is NOT rebuilt: a live capture is in flight, and the row is updated in place.
+        // That write is safe here because this callback holds the borrow it writes through.
+        crate::settings::gesture_recorder::show_record_row_text(
+            &crate::settings::gesture_recorder::record_row_text(
+                crate::mouse::gesture::recording::Stage::WaitingPress,
+                "",
+            ),
+        );
+        // Arming LAST, on the atomic path: the settings window's RefCell is still held by this
+        // callback, so this is the only point where the tap thread can be handed a capture whose
+        // UI half has already run. Without it the first sample of a stroke would be fed to a
+        // window that is busy, and the preview would be dropped.
+        crate::mouse::gesture::recording::begin();
+        crate::mouse::gesture::recording::mark_ui_ready();
+        // Announced BEFORE the busy mark is released, so a stroke's first preview cannot be
+        // overwritten by the "press a button" line a moment later.
+        notice(
+            "recording waiting for a press",
+            &t("settings.gestures_record_started"),
+        );
+        drop(busy);
+    });
+}
+
+/// Cancel the recording in progress.
+pub(crate) extern "C" fn handle_gesture_record_cancel(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_record_cancel", || {
+        crate::mouse::gesture::recording::cancel();
+        unsafe {
+            crate::settings::window::rebuild_settings_content_now_keeping_scroll(
+                SettingsPageId::Gestures,
+                None,
+            );
+        }
+    });
+}
+
+/// Add the selected running application to the gesture exclusion list.
+///
+/// The popup is selected by TITLE rather than by index: the menu was built from a snapshot of the
+/// running applications, and re-enumerating them here would let a start or quit in between make
+/// the same index mean a different application.
+pub(crate) extern "C" fn handle_gesture_excluded_add(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_excluded_add", || {
+        let selected: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
+        if selected <= 0 {
+            return;
+        }
+        let title_obj: *mut AnyObject =
+            unsafe { msg_send![sender as *mut AnyObject, titleOfSelectedItem] };
+        if title_obj.is_null() {
+            return;
+        }
+        let title = unsafe { crate::ffi::nsstring_to_rust(title_obj) };
+        // The popup lists INSTALLED applications (see the gestures page's candidate builder), so the
+        // lookup has to read the same list: matching against the running set only found an app that
+        // happened to be open, and silently dropped the choice for every other one.
+        let bundle = crate::settings::page_view::gesture_excluded_candidates()
+            .into_iter()
+            .find(|(_, name)| *name == title)
+            .map(|(bundle, _)| bundle);
+        let Some(bundle) = bundle else {
+            unsafe {
+                let _: () = msg_send![sender as *mut AnyObject, selectItemAtIndex: 0isize];
+            }
+            return;
+        };
+        let old = CONFIG.read().unwrap().clone();
+        let mut updated = old.clone();
+        if updated.mouse.gesture_excluded_apps.contains(&bundle) {
+            return;
+        }
+        updated.mouse.gesture_excluded_apps.push(bundle);
+        if let Ok(mut config) = CONFIG.write() {
+            *config = updated.clone();
+        }
+        crate::settings::schedule_config_persist();
+        crate::runtime_config::apply_config_change(
+            &old,
+            &updated,
+            crate::runtime_config::ConfigChangeSource::Settings,
+        );
+        unsafe {
+            crate::settings::window::rebuild_settings_content_now_keeping_scroll(
+                SettingsPageId::Gestures,
+                None,
+            );
+        }
+    });
+}
+
+/// Remove one excluded application. WHICH entry travels as the button's tag: a button knows its
+/// title, not the data beside it.
+pub(crate) extern "C" fn handle_gesture_excluded_remove(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_excluded_remove", || {
+        let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        let old = CONFIG.read().unwrap().clone();
+        let mut updated = old.clone();
+        let index = tag.max(0) as usize;
+        if index >= updated.mouse.gesture_excluded_apps.len() {
+            return;
+        }
+        updated.mouse.gesture_excluded_apps.remove(index);
+        if let Ok(mut config) = CONFIG.write() {
+            *config = updated.clone();
+        }
+        crate::settings::schedule_config_persist();
+        crate::runtime_config::apply_config_change(
+            &old,
+            &updated,
+            crate::runtime_config::ConfigChangeSource::Settings,
+        );
+        unsafe {
+            crate::settings::window::rebuild_settings_content_now_keeping_scroll(
+                SettingsPageId::Gestures,
+                None,
+            );
+        }
+    });
+}
+
+/// A page action no handler claims. It exists so the renderer never falls back to a real feature:
+/// an unrecognised action is a page bug, and running export-logs (the old default) hid it behind an
+/// unrelated dialog.
+/// The Gestures page: a row's action popup was clicked -- replace the list with that row's buttons.
+/// The Gestures page: delete one configured gesture. The page rebuilds right after, because the
+/// rows are addressed by position and removing one shifts every row after it.
+pub(crate) extern "C" fn handle_gesture_row_delete(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_row_delete", || unsafe {
+        let control = sender as *mut AnyObject;
+        let Some(ControlId::Action(identity)) = control_identity(control) else {
+            return;
+        };
+        let Some(index) = crate::settings::page_view::delete_row_index(identity) else {
+            return;
+        };
+        if crate::settings::page_view::remove_gesture_row(index).is_none() {
+            return;
+        }
+        crate::settings::schedule_config_persist();
+        super::rebuild_settings_content_deferred();
+    });
+}
+
+pub(crate) extern "C" fn handle_gesture_restore_defaults(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_restore_defaults", || {
+        let Some((_old, _updated)) = crate::settings::page_view::restore_default_gestures() else {
+            return;
+        };
+        crate::settings::schedule_config_persist();
+        super::rebuild_settings_content_deferred();
+    });
+}
+pub(crate) extern "C" fn handle_gesture_row_trigger(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_row_trigger", || unsafe {
+        open_trigger_row(sender as *mut AnyObject);
+    });
+}
+
+/// The Gestures page: a button line was clicked -- move the gesture to it and show the list again.
+pub(crate) extern "C" fn handle_gesture_trigger_line(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_trigger_line", || unsafe {
+        apply_row_trigger_line(sender as *mut AnyObject);
+    });
+}
+
+pub(crate) extern "C" fn handle_unknown_page_action(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_unknown_page_action", || {
+        crate::log_debug!("[settings] an unknown page action was pressed; nothing ran");
+    });
 }
 
 // MARK: - Settings search

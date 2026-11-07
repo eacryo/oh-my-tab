@@ -177,6 +177,9 @@ pub(super) struct RowDraft {
     depends_on: Option<ControlField>,
     group: Option<RowGroup>,
     value: Value,
+    action_tag: Option<isize>,
+    /// The row's label as DATA instead of a locale key, for a row whose copy the page computed.
+    label_text: Option<String>,
 }
 
 impl RowDraft {
@@ -198,6 +201,8 @@ impl RowDraft {
             depends_on: None,
             group: None,
             value,
+            action_tag: None,
+            label_text: None,
         }
     }
 
@@ -237,6 +242,19 @@ impl RowDraft {
         self
     }
 
+    /// The row's label as data: the label column shows this instead of the locale key.
+    pub(super) fn label_text(mut self, text: impl Into<String>) -> Self {
+        self.label_text = Some(text.into());
+        self
+    }
+
+    /// Stamp the row's action button with a number its callback can read back. The tag is the
+    /// only value that reaches the sender: a button knows its title, not the data beside it.
+    pub(super) fn action_tag(mut self, tag: isize) -> Self {
+        self.action_tag = Some(tag);
+        self
+    }
+
     pub(super) fn group(mut self, group: RowGroup) -> Self {
         self.group = Some(group);
         self
@@ -251,6 +269,7 @@ impl RowDraft {
             card: 0,
             section: "",
             label_key: self.label_key,
+            label_text: self.label_text,
             desc_key: self.desc_key,
             caption_key: self.caption_key,
             control: self.control,
@@ -262,6 +281,7 @@ impl RowDraft {
             separator_above: false,
             group: self.group,
             value: self.value,
+            action_tag: self.action_tag,
             search: SearchRow {
                 label: t(self.label_key),
                 desc: self.desc_key.map(t),

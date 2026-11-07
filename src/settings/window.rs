@@ -190,6 +190,9 @@ pub(super) enum PageEditor {
     BindingPanel,
     /// The Mouse page's mapping edit panel.
     MappingPanel,
+    /// A gesture recording in progress. It owns the pointer globally, so it may not outlive the page
+    /// that started it.
+    GestureRecording,
 }
 
 /// Which editor *classes* have to be wrapped up when the sidebar moves to `idx`.
@@ -206,6 +209,9 @@ pub(super) fn abandoned_page_editors(idx: usize) -> Vec<PageEditor> {
     }
     if idx != SETTINGS_MOUSE_PAGE_INDEX {
         editors.push(PageEditor::MappingPanel);
+    }
+    if idx != super::SETTINGS_GESTURES_PAGE_INDEX {
+        editors.push(PageEditor::GestureRecording);
     }
     editors
 }
@@ -238,6 +244,15 @@ fn close_page_editor(editor: PageEditor) -> bool {
             mapping::close_mapping_panel();
             true
         }
+        PageEditor::GestureRecording => {
+            // Leaving the page abandons the recording: it holds the pointer globally, and nothing on
+            // another page could show what it captured or cancel it.
+            if !crate::mouse::gesture::recording::is_recording() {
+                return false;
+            }
+            crate::mouse::gesture::recording::cancel();
+            true
+        }
     }
 }
 
@@ -249,6 +264,15 @@ pub(super) fn select_sidebar(idx: usize) {
     // outlive a switch to another page. The mouse page's mapping panel is closed on the same rule.
     for editor in abandoned_page_editors(idx) {
         close_page_editor(editor);
+    }
+    // The gesture list is data: if it changed while this page was hidden, the page on screen is
+    // the old one. Rebuilding here is what keeps "I edited the config, came back, and still see the
+    // old list" from happening.
+    if idx == super::SETTINGS_GESTURES_PAGE_INDEX {
+        let current = crate::config::CONFIG.read().unwrap().clone();
+        if super::dispatch::gesture_rows_changed(&current) {
+            unsafe { rebuild_settings_content_now_keeping_scroll(SettingsPageId::Gestures, None) };
+        }
     }
     // Dismiss the previous page's disabled hint so the bubble cannot remain across tabs.
     unsafe { tooltip::SettingsTooltip::dismiss() };
@@ -3962,6 +3986,10 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             hide_menu_bar_icon: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
+            gestures_enabled: std::ptr::null_mut(),
+            gesture_show_trail: std::ptr::null_mut(),
+            gesture_show_hint: std::ptr::null_mut(),
+            gesture_excluded_add: std::ptr::null_mut(),
             scroll_mode: std::ptr::null_mut(),
             line_count: std::ptr::null_mut(),
             line_count_label: std::ptr::null_mut(),
@@ -4111,6 +4139,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // (the bindings module hands the list's height to the page canvas), plus the add row. The
         // provisional height only has to be generous enough for the build pass; the rows reflow
         // themselves afterwards.
+        // The Gestures page: master switch, the recorder row and one row per configured gesture,
+        // so a small provisional height is enough; the rows settle it afterwards.
+        let gestures_doc_h = 620.0;
         let key_bindings_doc_h = 1500.0;
         let keystroke_display_doc_h = 650.0;
         // The Finder Menu page: five cards (status + master, layout, file types, terminals, copy
@@ -4126,6 +4157,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             SettingsPageId::Switcher => switcher_doc_h,
             SettingsPageId::Mouse => mouse_doc_h,
             SettingsPageId::Clipboard => clipboard_doc_h,
+            SettingsPageId::Gestures => gestures_doc_h,
             SettingsPageId::KeyBindings => key_bindings_doc_h,
             SettingsPageId::KeystrokeDisplay => keystroke_display_doc_h,
             SettingsPageId::FinderMenu => finder_menu_doc_h,
@@ -4166,6 +4198,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let switcher_view = page_view(SettingsPageId::Switcher);
         let mouse_view = page_view(SettingsPageId::Mouse);
         let clipboard_view = page_view(SettingsPageId::Clipboard);
+        let gestures_view = page_view(SettingsPageId::Gestures);
         let key_bindings_view = page_view(SettingsPageId::KeyBindings);
         let keystroke_display_view = page_view(SettingsPageId::KeystrokeDisplay);
         let finder_menu_view = page_view(SettingsPageId::FinderMenu);
@@ -4199,6 +4232,14 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
                 &page_context,
                 clipboard_view,
                 settled_doc_h(SettingsPageId::Clipboard),
+                &mut ui,
+            );
+
+        page_bottoms[settings_page_index(SettingsPageId::Gestures)] =
+            page_builder::build_gestures_page(
+                &page_context,
+                gestures_view,
+                settled_doc_h(SettingsPageId::Gestures),
                 &mut ui,
             );
 
@@ -4455,6 +4496,13 @@ mod tests {
             "staying on the Mouse page must not close its own panel: {mouse:?}"
         );
 
+        // The Gestures page keeps its own recording and abandons the other pages' editors.
+        let gestures = abandoned_page_editors(super::SETTINGS_GESTURES_PAGE_INDEX);
+        assert!(
+            !gestures.contains(&PageEditor::GestureRecording),
+            "staying on the Gestures page must not cancel its own recording: {gestures:?}"
+        );
+
         // Any other page abandons every editor.
         let other = abandoned_page_editors(0);
         assert_eq!(
@@ -4462,7 +4510,8 @@ mod tests {
             vec![
                 PageEditor::BindingRecording,
                 PageEditor::BindingPanel,
-                PageEditor::MappingPanel
+                PageEditor::MappingPanel,
+                PageEditor::GestureRecording
             ]
         );
     }

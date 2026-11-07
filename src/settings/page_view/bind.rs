@@ -25,6 +25,31 @@ pub(in crate::settings) unsafe fn refresh_migrated_pages(
     }
 }
 
+/// Rewrite one page action's value row in place. Used by a row whose text changes while the user is
+/// looking at it (a recording's live preview), where a rebuild per update would tear the page down.
+///
+/// The row is matched by the action identity its description gave it, so a caller names the row the
+/// way the page does -- the RECORD row's own `gesture_record` identity, not a second string that no
+/// description ever registers.
+pub(in crate::settings) unsafe fn set_action_row_text(
+    ui: &SettingsUi,
+    page: SettingsPageId,
+    action: &'static str,
+    text: &str,
+) {
+    let Some(rendered) = ui.migrated_pages[settings_page_index(page)].as_ref() else {
+        return;
+    };
+    let Some(control) = rendered
+        .controls
+        .iter()
+        .find(|control| control.id == ControlId::Action(action))
+    else {
+        return;
+    };
+    super::render::apply_control_update(control, &Value::Dynamic(text.to_string()), text);
+}
+
 /// The `SettingsUi` pointer the dispatcher, the refill's own consumers and the freeze lists read
 /// for a field. Field identity stays the single source: the table says what a control edits, and
 /// this table says which legacy pointer field that identity still fills.
@@ -81,6 +106,10 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::ClipboardPinFollow => &mut ui.clipboard_pin_follow,
         ControlField::ClipboardPickerPlacement => &mut ui.clipboard_picker_placement,
         ControlField::MouseEnabled => &mut ui.enable_mouse,
+        ControlField::GesturesEnabled => &mut ui.gestures_enabled,
+        ControlField::GestureShowTrail => &mut ui.gesture_show_trail,
+        ControlField::GestureShowHint => &mut ui.gesture_show_hint,
+        ControlField::GestureExcludedAdd => &mut ui.gesture_excluded_add,
         ControlField::ReverseScroll => &mut ui.reverse_scroll,
         ControlField::ScrollMode => &mut ui.scroll_mode,
         ControlField::LineCount => &mut ui.line_count,
@@ -251,6 +280,8 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::ClipboardPinFollow
             | ControlField::ClipboardPickerPlacement
             | ControlField::MouseEnabled
+            | ControlField::GesturesEnabled
+            | ControlField::GestureExcludedAdd
             | ControlField::ReverseScroll
             | ControlField::ScrollMode
             | ControlField::LineCount

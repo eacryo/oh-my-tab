@@ -302,6 +302,13 @@ fn restored_config_for_page(old: &Config, page: SettingsPageId) -> Config {
         SettingsPageId::Clipboard => {
             cfg.clipboard = d.clipboard;
         }
+        SettingsPageId::Gestures => {
+            // Gestures owns its own section, so restoring the page puts the factory list and the
+            // master switch back without touching the mouse page's scroll or device settings.
+            cfg.mouse.gestures_enabled = d.mouse.gestures_enabled;
+            cfg.mouse.gestures = d.mouse.gestures;
+            cfg.mouse.gesture_excluded_apps = d.mouse.gesture_excluded_apps;
+        }
         SettingsPageId::KeyBindings => {
             // One page, one section: restoring it puts the factory bindings and both group
             // switches back, which is also what drops every binding the user added.
@@ -386,6 +393,11 @@ mod tests {
                 prof.button_mappings_enabled = dp.button_mappings_enabled;
             }
             SettingsPageId::Clipboard => expected.clipboard = d.clipboard,
+            SettingsPageId::Gestures => {
+                expected.mouse.gestures_enabled = d.mouse.gestures_enabled;
+                expected.mouse.gestures = d.mouse.gestures;
+                expected.mouse.gesture_excluded_apps = d.mouse.gesture_excluded_apps;
+            }
             SettingsPageId::KeyBindings => expected.key_bindings = d.key_bindings,
             SettingsPageId::KeystrokeDisplay => expected.keystroke_display = d.keystroke_display,
             SettingsPageId::FinderMenu => expected.finder_menu = d.finder_menu,
@@ -401,6 +413,7 @@ mod tests {
             SettingsPageId::Switcher,
             SettingsPageId::Mouse,
             SettingsPageId::Clipboard,
+            SettingsPageId::Gestures,
             SettingsPageId::KeyBindings,
             SettingsPageId::KeystrokeDisplay,
             SettingsPageId::About,

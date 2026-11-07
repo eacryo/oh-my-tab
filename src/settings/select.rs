@@ -904,7 +904,7 @@ unsafe fn settings_select_make_item(
     width: f64,
     y: f64,
     row_h: f64,
-) {
+) -> *mut AnyObject {
     let item_w = (width - 8.0).max(1.0);
     let item: *mut AnyObject = msg_send![settings_select_item_class(), alloc];
     let item: *mut AnyObject = msg_send![
@@ -1018,7 +1018,8 @@ unsafe fn settings_select_make_item(
     release_obj(tracking);
     let _: () = msg_send![panel, addSubview: item];
     let _: () = msg_send![item, setAlphaValue: 1.0f64];
-    release_obj(item);
+    // The caller owns the returned +1 and releases it; the panel holds its own.
+    item
 }
 
 /// The resolved option-panel geometry.
@@ -1089,6 +1090,7 @@ fn settings_select_panel_geometry(
 }
 
 unsafe fn settings_select_open(button: *mut AnyObject) {
+    crate::log_info!("[settings-select] open called");
     let window: *mut AnyObject = msg_send![button, window];
     if window.is_null() {
         return;
@@ -1133,11 +1135,18 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
     let (items, selected) = {
         let states = SETTINGS_SELECT_STATES.lock().unwrap();
         let Some(state) = states.get(&(button as usize)) else {
+            crate::log_info!("[settings-select] open: not a registered select");
             return;
         };
         if state.items.is_empty() || state.open {
+            crate::log_info!(
+                "[settings-select] open: items={} open={}",
+                state.items.len(),
+                state.open
+            );
             return;
         }
+        crate::log_info!("[settings-select] open: {} items", state.items.len());
         (state.items.clone(), state.selected.max(0) as usize)
     };
 
@@ -1251,7 +1260,7 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
         // The row's position in the full list (natural_h == panel_h when nothing is scrolled, which
         // matches the previous formula).
         let item_y = natural_h - 4.0 - (index as f64 + 1.0) * row_h;
-        settings_select_make_item(
+        let item = settings_select_make_item(
             button,
             list_parent,
             index,
@@ -1261,6 +1270,7 @@ unsafe fn settings_select_open(button: *mut AnyObject) {
             item_y,
             row_h,
         );
+        release_obj(item);
     }
     // Container: the window is one shadow pad larger than the panel so its rounded shadow has room
     // (a window clips whatever exceeds its own frame).
@@ -1407,6 +1417,10 @@ extern "C" fn settings_select_send_pending_action(this: *mut c_void, _cmd: Sel) 
     callback_guard::void("settings_select_send_pending_action", || unsafe {
         let select = this as *mut AnyObject;
         let target: *mut AnyObject = msg_send![select, target];
+        crate::log_debug!(
+            "[settings-select] sendPendingAction target_null={}",
+            target.is_null()
+        );
         if !target.is_null() {
             let action: Sel = msg_send![select, action];
             let _: bool = msg_send![select, sendAction: action, to: target];
@@ -1421,6 +1435,8 @@ extern "C" fn settings_select_mouse_down(this: *mut c_void, _cmd: Sel, _event: *
             if !msg_send![button, isEnabled] {
                 return;
             }
+            crate::log_info!("[settings-select] mouseDown on a select");
+            crate::log_info!("[settings-select] debug-visible");
             let (open, popup) = {
                 let states = SETTINGS_SELECT_STATES.lock().unwrap();
                 match states.get(&(button as usize)) {

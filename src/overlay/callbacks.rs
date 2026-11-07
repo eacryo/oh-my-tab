@@ -20,6 +20,7 @@ fn prepare_first_summon_state(backward: bool) {
     with_tab_state(|state_opt| {
         let state = state_opt.as_mut().unwrap();
         state.visible = true;
+        crate::mouse::gesture::session_state::set_switcher_visible(true);
         let (_, frontmost_pid) = frontmost_app_info();
         let frontmost_pid = (frontmost_pid > 0).then_some(frontmost_pid);
         let focus_key = state

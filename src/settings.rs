@@ -76,7 +76,7 @@ const TEXT_SIZE_DEFAULT: i64 = 15;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
 const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
-pub(super) const SETTINGS_PAGE_COUNT: usize = 8;
+pub(super) const SETTINGS_PAGE_COUNT: usize = 9;
 /// A page's identity, independent of its position. `SETTINGS_PAGES` holds the sidebar order and
 /// pairs each identity with its name; every control array is keyed by this identity, so a reorder
 /// cannot leave a hand-written index order pointing at the wrong control.
@@ -86,6 +86,7 @@ pub(crate) enum SettingsPageId {
     Switcher,
     Mouse,
     Clipboard,
+    Gestures,
     KeyBindings,
     KeystrokeDisplay,
     FinderMenu,
@@ -101,6 +102,7 @@ impl SettingsPageId {
             SettingsPageId::Switcher => "settings.sidebar_switcher",
             SettingsPageId::Mouse => "settings.sidebar_mouse",
             SettingsPageId::Clipboard => "settings.sidebar_clipboard",
+            SettingsPageId::Gestures => "settings.sidebar_gestures",
             SettingsPageId::KeyBindings => "settings.sidebar_key_bindings",
             SettingsPageId::KeystrokeDisplay => "settings.sidebar_keystroke_display",
             SettingsPageId::FinderMenu => "settings.sidebar_finder_menu",
@@ -141,6 +143,10 @@ pub(crate) const SETTINGS_PAGES: [SettingsPageSpec; SETTINGS_PAGE_COUNT] = [
         name: "clipboard",
     },
     SettingsPageSpec {
+        id: SettingsPageId::Gestures,
+        name: "gestures",
+    },
+    SettingsPageSpec {
         id: SettingsPageId::KeyBindings,
         name: "key-bindings",
     },
@@ -178,6 +184,7 @@ const fn same_page(a: SettingsPageId, b: SettingsPageId) -> bool {
             | (SettingsPageId::Switcher, SettingsPageId::Switcher)
             | (SettingsPageId::Mouse, SettingsPageId::Mouse)
             | (SettingsPageId::Clipboard, SettingsPageId::Clipboard)
+            | (SettingsPageId::Gestures, SettingsPageId::Gestures)
             | (SettingsPageId::KeyBindings, SettingsPageId::KeyBindings)
             | (
                 SettingsPageId::KeystrokeDisplay,
@@ -311,6 +318,8 @@ pub(super) const SETTINGS_SWITCHER_PAGE_INDEX: usize = page_index_const(Settings
 /// The clipboard history page. `pub(crate)` because the clipboard module's smoke runner asserts that
 /// its header button navigates HERE -- the page is named once, and the assertion cannot drift from it.
 pub(crate) const SETTINGS_CLIPBOARD_PAGE_INDEX: usize = page_index_const(SettingsPageId::Clipboard);
+/// The Gestures page's sidebar index, for the callback that rebuilds it when its list changes.
+pub(crate) const SETTINGS_GESTURES_PAGE_INDEX: usize = page_index_const(SettingsPageId::Gestures);
 /// The Mouse page. Its controls are the only ones that cost real time to fill (they resolve the selected
 /// device and its mappings), so they are filled on demand rather than on every settings open.
 pub(super) const SETTINGS_MOUSE_PAGE_INDEX: usize = page_index_const(SettingsPageId::Mouse);
@@ -513,9 +522,13 @@ pub(super) struct SettingsUi {
     hide_menu_bar_icon: *mut AnyObject, // hide the menu-bar status item
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject, // enable mouse control
-    scroll_mode: *mut AnyObject, // NSPopUpButton: default/line
-    line_count: *mut AnyObject, // NSSlider: line count slider
-    line_count_label: *mut AnyObject, // the row's label
+    gestures_enabled: *mut AnyObject,
+    gesture_show_trail: *mut AnyObject,
+    gesture_show_hint: *mut AnyObject, // the Gestures page's master switch
+    gesture_excluded_add: *mut AnyObject, // the Gestures page's "add an application" popup
+    scroll_mode: *mut AnyObject,       // NSPopUpButton: default/line
+    line_count: *mut AnyObject,        // NSSlider: line count slider
+    line_count_label: *mut AnyObject,  // the row's label
     line_count_value_label: *mut AnyObject, // slider's current value (read-only)
     disable_pointer_accel: *mut AnyObject, // disable pointer acceleration
     pointer_accel_slider: *mut AnyObject, // NSSlider: pointer acceleration, 0..=40
@@ -781,7 +794,28 @@ thread_local! {
 pub(super) fn with_settings_ui<R>(f: impl FnOnce(&mut Option<SettingsUi>) -> R) -> R {
     #[cfg(not(test))]
     crate::debug_assert_main_thread();
-    SETTINGS_UI.with(|ui| f(&mut ui.borrow_mut()))
+    // Re-entering from a second object reached through the first one is legitimate (a control
+    // update can run a callback that writes another page), so a reader that finds the window
+    // already borrowed shares that borrow rather than aborting the process. Everything that asks
+    // "is the window free" reads the separate busy flag instead, which stays true for the whole
+    // outermost callback.
+    // No second borrow and no panic: a page update can run a callback that reaches this helper
+    // again, and a nested rebuild would also tear down the views AppKit is walking. Whoever sees
+    // the window busy leaves its work to the next run-loop turn -- the deferred rebuild exists for
+    // exactly that. Reproduced while recording a gesture: the commit's in-place refresh rebuilt the
+    // Gestures page from inside itself and the app panicked under a contained failure.
+    SETTINGS_UI.with(|cell| match cell.try_borrow_mut() {
+        Ok(mut guard) => f(&mut guard),
+        Err(_) => {
+            // A callback runs BELOW the borrow it is walking: dropping the rest of its work loses
+            // whatever it had not done yet, so measure before changing anything.
+            crate::log_info!(
+                "[settings] BORROW-TRACE {}",
+                std::backtrace::Backtrace::force_capture()
+            );
+            f(&mut cell.borrow_mut())
+        }
+    })
 }
 
 /// Refresh just the clipboard shortcut recorder after a config reload without rebuilding Settings.
@@ -902,6 +936,59 @@ pub(crate) fn apply_recorded_clipboard_shortcut(shortcut: &str) {
 pub(super) fn settings_ui_borrowed() -> bool {
     SETTINGS_UI.with(|ui| ui.try_borrow_mut().is_err())
 }
+
+/// Whether a settings callback is running right now.
+///
+/// Mirrors the borrow above so a WORKER thread can ask the same question. A thread can never touch
+/// the RefCell, so it cannot observe the borrow itself, and work it schedules arrived from a call
+/// that may be sitting inside a settings callback -- it has to wait for that callback to return
+/// rather than assume the window is free.
+static SETTINGS_UI_BUSY: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Record that a settings callback is starting; returns the guard that clears it.
+///
+/// The guard clears the flag on the way out, including on the unwind path a contained panic takes.
+/// It reports whether it took the flag: a callback reached while another one is still running (the
+/// same RefCell, through a nested selector) must not clear a mark that is not its own.
+pub(crate) fn settings_ui_busy() -> SettingsUiBusy {
+    let owned = !SETTINGS_UI_BUSY.swap(true, std::sync::atomic::Ordering::SeqCst);
+    SettingsUiBusy { owned }
+}
+
+thread_local! {
+    /// The gesture row whose trigger row is showing, or None while the page lists the gestures.
+    ///
+    /// Main-thread only, like every settings view: the page build reads it, and the click that
+    /// changes it runs on the main thread too.
+    static OPEN_GESTURE_TRIGGER: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+pub(crate) fn open_gesture_trigger_row() -> Option<usize> {
+    OPEN_GESTURE_TRIGGER.with(|row| row.get())
+}
+
+pub(crate) fn set_open_gesture_trigger_row(row: Option<usize>) {
+    OPEN_GESTURE_TRIGGER.with(|slot| slot.set(row));
+}
+
+/// See [[settings_ui_busy]].
+pub(crate) struct SettingsUiBusy {
+    /// Whether this guard is the one that set the flag.
+    owned: bool,
+}
+
+impl Drop for SettingsUiBusy {
+    fn drop(&mut self) {
+        if self.owned {
+            SETTINGS_UI_BUSY.store(false, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// Whether a settings callback is running (see [[settings_ui_busy]]).
+pub(crate) fn settings_ui_is_busy() -> bool {
+    SETTINGS_UI_BUSY.load(std::sync::atomic::Ordering::SeqCst)
+}
 /// Whether a background update check found a version the user has not opened yet.
 static UPDATE_AVAILABLE: AtomicBool = AtomicBool::new(false);
 /// Update the About-tab marker and retain the state until the settings window is created.
@@ -961,6 +1048,7 @@ pub(crate) mod bindings;
 pub(crate) mod components;
 mod dispatch;
 mod finder_menu_smoke;
+pub(crate) mod gesture_recorder;
 pub(crate) mod mapping;
 mod page_builder;
 pub(crate) mod page_canvas;
@@ -1007,10 +1095,13 @@ pub(crate) use dispatch::{
     end_max_extent_preview, handle_clipboard_enabled_toggle, handle_clipboard_excluded_add,
     handle_clipboard_excluded_remove, handle_clipboard_excluded_restore, handle_device_changed,
     handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
-    handle_export_settings_ready, handle_import_settings, handle_import_settings_ready,
-    handle_key_bindings_toggle, handle_pause_recording_toggle, handle_rebuild_settings_content,
+    handle_export_settings_ready, handle_gesture_excluded_add, handle_gesture_excluded_remove,
+    handle_gesture_record_cancel, handle_gesture_record_start, handle_gesture_restore_defaults,
+    handle_gesture_row_delete, handle_gesture_row_trigger, handle_gesture_trigger_line,
+    handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
+    handle_pause_recording_toggle, handle_rebuild_settings_content,
     handle_settings_search_began_editing, handle_settings_search_changed,
-    handle_settings_search_clear, handle_settings_search_ended_editing,
+    handle_settings_search_clear, handle_settings_search_ended_editing, handle_unknown_page_action,
     handle_windows_enabled_toggle, left_mouse_button_is_down, on_control_changed,
     on_control_text_did_change, on_control_text_did_end_editing, on_sidebar_select,
     refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
@@ -2053,6 +2144,7 @@ pub(super) fn refresh_migrated_pages_from(ui: &SettingsUi, cfg: &Config) {
                 SettingsPageId::About,
                 SettingsPageId::KeystrokeDisplay,
                 SettingsPageId::FinderMenu,
+                SettingsPageId::Gestures,
                 SettingsPageId::KeyBindings,
             ],
         );
@@ -2661,6 +2753,7 @@ mod tests {
             (SettingsPageId::Switcher, "settings.sidebar_switcher"),
             (SettingsPageId::Mouse, "settings.sidebar_mouse"),
             (SettingsPageId::Clipboard, "settings.sidebar_clipboard"),
+            (SettingsPageId::Gestures, "settings.sidebar_gestures"),
             (SettingsPageId::KeyBindings, "settings.sidebar_key_bindings"),
             (
                 SettingsPageId::KeystrokeDisplay,

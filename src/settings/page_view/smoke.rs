@@ -66,6 +66,10 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         hide_menu_bar_icon: std::ptr::null_mut(),
         reverse_scroll: std::ptr::null_mut(),
         enable_mouse: std::ptr::null_mut(),
+        gestures_enabled: std::ptr::null_mut(),
+        gesture_show_trail: std::ptr::null_mut(),
+        gesture_show_hint: std::ptr::null_mut(),
+        gesture_excluded_add: std::ptr::null_mut(),
         scroll_mode: std::ptr::null_mut(),
         line_count: std::ptr::null_mut(),
         line_count_label: std::ptr::null_mut(),
@@ -159,6 +163,7 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
         SettingsPageId::About,
         SettingsPageId::KeystrokeDisplay,
         SettingsPageId::FinderMenu,
+        SettingsPageId::Gestures,
         SettingsPageId::KeyBindings,
         SettingsPageId::Mouse,
     ] {

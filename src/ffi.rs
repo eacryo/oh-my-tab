@@ -251,6 +251,14 @@ extern "C" {
     /// The path's bounding box, for a smoke runner to check the *geometry* of a `shadowPath` rather than
     /// just its presence. Read-only: it takes a borrowed path.
     pub(crate) fn CGPathGetBoundingBox(path: *const c_void) -> CGRect;
+    /// A +1 mutable path, and the two segments the gesture trail draws with. Core Graphics owns the
+    /// storage behind the +1: release the path with `CFRelease`, never `release_obj`.
+    pub(crate) fn CGPathCreateMutable() -> *mut c_void;
+    pub(crate) fn CGPathMoveToPoint(path: *mut c_void, transform: *const c_void, x: f64, y: f64);
+    /// Close the current subpath, so a filled polygon has no seam between its first and last
+    /// corners.
+    pub(crate) fn CGPathCloseSubpath(path: *mut c_void);
+    pub(crate) fn CGPathAddLineToPoint(path: *mut c_void, transform: *const c_void, x: f64, y: f64);
 }
 
 /// CoreGraphics CGRect (C ABI: {origin:(x,y), size:(w,h)} -- four contiguous f64;
@@ -1213,6 +1221,41 @@ pub(crate) unsafe fn layer_set_border(layer: *mut AnyObject, cg: *mut c_void) {
     type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
     let f: F = std::mem::transmute(objc_msgSend as *const ());
     f(layer as *mut c_void, sel, cg);
+}
+
+/// Set CAShapeLayer.strokeColor / fillColor from a CGColorRef. Raw objc_msgSend for the same
+/// reason as the layer colours above: objc2 encodes a bare pointer as `void*`, and the runtime
+/// rejects it for a parameter declared `CGColorRef`.
+pub(crate) unsafe fn shape_layer_set_stroke_color(layer: *mut AnyObject, cg: *mut c_void) {
+    let sel = sel!(setStrokeColor:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, cg);
+}
+
+pub(crate) unsafe fn shape_layer_set_fill_color(layer: *mut AnyObject, cg: *mut c_void) {
+    let sel = sel!(setFillColor:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, cg);
+}
+
+/// Set CAShapeLayer.path from a +1 CGPathRef. Raw objc_msgSend for the same reason as the layer
+/// colours: objc2 encodes a bare pointer as `@` and the runtime rejects it for a CGPathRef.
+pub(crate) unsafe fn shape_layer_set_path(layer: *mut AnyObject, path: *mut c_void) {
+    let sel = sel!(setPath:);
+    extern "C" {
+        fn objc_msgSend();
+    }
+    type F = unsafe extern "C" fn(*mut c_void, Sel, *mut c_void);
+    let f: F = std::mem::transmute(objc_msgSend as *const ());
+    f(layer as *mut c_void, sel, path);
 }
 
 /// Set CALayer.shadowColor using raw objc_msgSend (CGColorRef, not NSColor*).

@@ -16,6 +16,7 @@ pub(super) fn view_for(page: SettingsPageId, input: &PageInput) -> PageView {
         SettingsPageId::KeyBindings => key_bindings_page_view(input),
         SettingsPageId::KeystrokeDisplay => keystroke_display_page_view(input),
         SettingsPageId::FinderMenu => finder_menu_page_view(input),
+        SettingsPageId::Gestures => gestures_page_view(input),
         SettingsPageId::Clipboard => clipboard_page_view(input),
         SettingsPageId::Mouse => mouse_page_view(input),
         SettingsPageId::About => about_page_view(input),

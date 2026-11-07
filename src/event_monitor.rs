@@ -25,6 +25,19 @@ pub enum GlobalEvent {
         trigger: crate::key_bindings::Trigger,
     },
     KeystrokeDisplayWake,
+    /// A gesture matched an app action. Carries the epoch the gesture started under, so the
+    /// main-thread consumer can drop it when the configuration withdrew the gesture in between.
+    GestureAction {
+        action: u16,
+        epoch: u64,
+        session: u64,
+        generation: u64,
+    },
+    /// A gesture asked the switcher to open. The claim id travels with the request so the consumer
+    /// can tell it apart from a trigger the user produced and refuse it once revoked.
+    GestureSwitcherOpen {
+        claim: u64,
+    },
 }
 
 // keyboard constants used by the window switcher

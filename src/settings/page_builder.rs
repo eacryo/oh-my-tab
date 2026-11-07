@@ -262,6 +262,46 @@ pub(super) unsafe fn build_mouse_page(
         Err(_) => empty_page(ui, SettingsPageId::Mouse, mouse_view, context, mouse_doc_h),
     }
 }
+/// Build the Gestures page: described rows only, so it needs no page-drawn canvas block.
+pub(super) unsafe fn build_gestures_page(
+    context: &SettingsPageBuildContext,
+    gestures_view: *mut AnyObject,
+    gestures_doc_h: f64,
+    ui: &mut SettingsUi,
+) -> f64 {
+    begin_settings_search_page();
+    let input = PageInput::capture();
+    let mut hooks = NoHooks;
+    match build_page(
+        ui,
+        SettingsPageId::Gestures,
+        gestures_view,
+        context.content_w,
+        context.layout,
+        gestures_doc_h,
+        context.page_frame.size.height,
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+        &mut hooks,
+    ) {
+        Ok(built) => {
+            // The list this build drew is now the one on screen; only this makes a later reload
+            // that changes it count as a change again.
+            super::dispatch::note_gesture_rows_drawn(&input.config);
+            publish_built_page(ui, SettingsPageId::Gestures, built)
+        }
+        Err(_) => empty_page(
+            ui,
+            SettingsPageId::Gestures,
+            gestures_view,
+            context,
+            gestures_doc_h,
+        ),
+    }
+}
+
 /// Build the Clipboard page: the described static rows, then the excluded-applications card the
 /// page draws itself (its list is not a row set the description can express).
 pub(super) unsafe fn build_clipboard_page(

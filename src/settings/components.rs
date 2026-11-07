@@ -2097,6 +2097,7 @@ pub(super) enum SettingsSidebarIcon {
     Switcher,
     Mouse,
     Clipboard,
+    Gestures,
     KeyBindings,
     KeystrokeDisplay,
     FinderMenu,
@@ -2112,6 +2113,7 @@ impl SettingsSidebarIcon {
             SettingsPageId::Switcher => Self::Switcher,
             SettingsPageId::Mouse => Self::Mouse,
             SettingsPageId::Clipboard => Self::Clipboard,
+            SettingsPageId::Gestures => Self::Gestures,
             SettingsPageId::KeyBindings => Self::KeyBindings,
             SettingsPageId::KeystrokeDisplay => Self::KeystrokeDisplay,
             SettingsPageId::FinderMenu => Self::FinderMenu,
@@ -2128,6 +2130,8 @@ impl SettingsSidebarIcon {
             // use the clean document outline so the sidebar stays visually balanced.
             Self::Clipboard => "doc.text",
             // A command-key square: the page is about key chords and the behaviours they run.
+            // A hand drawing a stroke: the page is about gestures, not key chords.
+            Self::Gestures => "hand.draw",
             Self::KeyBindings => "command.square",
             Self::KeystrokeDisplay => "keyboard",
             // The Finder menu is a folder-bound integration; folder is an SF Symbol available in

@@ -343,8 +343,24 @@ const GLOBAL_INPUT_CAPACITY: usize = 32;
 /// Bounded aggregate for global input events. Tab presses keep order, release is latched
 /// separately, and low-value control events use a finite queue so a blocked main thread cannot
 /// cause the CGEventTap backlog to grow without bound.
+/// One queued switcher step. It carries its own origin, so the drain can tell the gesture's own
+/// open from a step the user produced WITHOUT a side channel: a global "the next step is ours" flag
+/// is consumed by whichever step comes first, which is exactly the wrong one when the user's step
+/// was already queued.
+struct TabStep {
+    backward: bool,
+    /// The claim of the gesture that asked for this step, or 0 for a step the user produced.
+    /// Carried to the moment the step runs, so a request withdrawn while it queued cannot still
+    /// open the switcher.
+    gesture_claim: u64,
+}
+
 struct PendingGlobalInput {
-    tab_steps: VecDeque<bool>,
+    tab_steps: VecDeque<TabStep>,
+    /// The NEXT tab step pushed is the gesture's own opener and carries this claim. Set by the
+    /// gesture as it enqueues the step and cleared by that push, so the tag lands on exactly the
+    /// step it belongs to -- a step the user queued earlier keeps claim 0.
+    pending_gesture_open: u64,
     release_pending: bool,
     clipboard_pending: bool,
     keystroke_display_pending: bool,
@@ -360,7 +376,11 @@ impl PendingGlobalInput {
                     self.tab_steps.pop_front();
                     log_debug!("[kbd] coalesced oldest tab step (input queue full)");
                 }
-                self.tab_steps.push_back(backward);
+                self.tab_steps.push_back(TabStep {
+                    backward,
+                    gesture_claim: self.pending_gesture_open,
+                });
+                self.pending_gesture_open = 0;
             }
             GlobalEvent::CmdReleased => {
                 // Release must not be dropped: even when presses are coalesced, the main thread
@@ -373,7 +393,10 @@ impl PendingGlobalInput {
             GlobalEvent::KeystrokeDisplayWake => {
                 self.keystroke_display_pending = true;
             }
-            GlobalEvent::BindingAction { .. } => {
+            GlobalEvent::GestureSwitcherOpen { .. } => {
+                // Queued like any other global input; drained by on_global_input_drain.
+            }
+            GlobalEvent::GestureAction { .. } | GlobalEvent::BindingAction { .. } => {
                 if self.other.len() >= GLOBAL_INPUT_CAPACITY {
                     self.other.pop_front();
                     log_debug!("[kbd] dropped oldest auxiliary input (queue full)");
@@ -394,6 +417,7 @@ pub(crate) fn enqueue_global_event(event: GlobalEvent) {
     let pending = PENDING_GLOBAL_INPUT.get_or_init(|| {
         Mutex::new(PendingGlobalInput {
             tab_steps: VecDeque::new(),
+            pending_gesture_open: 0,
             release_pending: false,
             clipboard_pending: false,
             keystroke_display_pending: false,
@@ -401,6 +425,28 @@ pub(crate) fn enqueue_global_event(event: GlobalEvent) {
         })
     });
     pending.lock().unwrap().push(event);
+    schedule_global_input_drain();
+}
+
+/// Enqueue the switcher opener a gesture asked for. The step it produces is tagged as the gesture's
+/// own, so the drain can distinguish it from a step the user produced -- including one the user
+/// produced BEFORE this call and is still sitting in the queue.
+pub(crate) fn enqueue_gesture_switcher_step(claim: u64) {
+    let pending = PENDING_GLOBAL_INPUT.get_or_init(|| {
+        Mutex::new(PendingGlobalInput {
+            tab_steps: VecDeque::new(),
+            pending_gesture_open: 0,
+            release_pending: false,
+            clipboard_pending: false,
+            keystroke_display_pending: false,
+            other: VecDeque::new(),
+        })
+    });
+    {
+        let mut state = pending.lock().unwrap();
+        state.pending_gesture_open = claim;
+        state.push(GlobalEvent::CmdTabPressed);
+    }
     schedule_global_input_drain();
 }
 
@@ -420,6 +466,37 @@ fn schedule_global_input_drain() {
             waitUntilDone: false
         ];
     }
+}
+
+/// Ask the main thread to service a gesture HUD request. Uses the same controller hop as the global
+/// input drain: the tap thread publishes a request and never waits for it.
+/// Whether a gesture HUD task is already queued. Coalescing happens HERE rather than only inside the
+/// HUD module: a recording's preview, a gesture trail and a switcher revocation all share this one
+/// main-thread entry, and a fast drag would otherwise queue one task per sample.
+static GESTURE_HUD_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub(crate) fn schedule_gesture_hud() {
+    if GESTURE_HUD_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        GESTURE_HUD_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![
+            controller,
+            performSelectorOnMainThread: sel!(handleGestureHud:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+/// Release the gesture HUD scheduler's claim once its task has run, so the next request schedules.
+pub(crate) fn release_gesture_hud_claim() {
+    GESTURE_HUD_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
 }
 
 /// Main-thread consumer for the development text-hide: the panel's text fields are hidden, so a capture taken
@@ -544,7 +621,26 @@ fn on_global_input_drain_inner() {
         )
     };
 
-    for backward in tab_steps {
+    let had_tab_steps = !tab_steps.is_empty();
+    // Each step decides its own ownership: the gesture's opener keeps the claim, any other step is
+    // the user driving the switcher and hands it over. Deciding per step is what makes a user step
+    // queued BEFORE the gesture's opener behave correctly.
+    let mut saw_foreign_step = false;
+    let mut skipped: Vec<TabStep> = Vec::new();
+    for step in tab_steps {
+        if step.gesture_claim != 0 {
+            // The request is checked at the moment it runs: a claim withdrawn while this step
+            // queued must not still open the switcher.
+            if crate::mouse::gesture::switcher::claim_still_active(step.gesture_claim) {
+                crate::mouse::gesture::switcher::own_open_consumed();
+            } else {
+                skipped.push(step);
+                continue;
+            }
+        } else {
+            saw_foreign_step = true;
+        }
+        let backward = step.backward;
         if backward {
             on_cmd_shift_tab_pressed(
                 std::ptr::null_mut(),
@@ -576,12 +672,29 @@ fn on_global_input_drain_inner() {
             GlobalEvent::BindingAction { action, trigger } => {
                 key_bindings::execute_authorized(action, trigger)
             }
+            GlobalEvent::GestureAction {
+                action,
+                epoch,
+                session,
+                generation,
+            } => crate::mouse::gesture::executor::run_action_on_main(
+                action, epoch, session, generation,
+            ),
+            GlobalEvent::GestureSwitcherOpen { claim } => {
+                crate::mouse::gesture::switcher::open_on_main(claim);
+            }
             GlobalEvent::CmdTabPressed
             | GlobalEvent::CmdShiftTabPressed
             | GlobalEvent::CmdReleased
             | GlobalEvent::ClipboardToggled
             | GlobalEvent::KeystrokeDisplayWake => {}
         }
+    }
+    if saw_foreign_step {
+        crate::mouse::gesture::switcher::hand_off();
+    } else if !had_tab_steps && release_pending {
+        // A release with no step in this batch still ends whatever the user was holding.
+        crate::mouse::gesture::switcher::hand_off();
     }
     if release_pending {
         on_cmd_released(
@@ -651,6 +764,9 @@ fn on_app_activated_inner(notification: *mut c_void) {
         if app.is_null() {
             return;
         }
+        // The gesture module's exclusion list is matched on this id, and its tap thread may not ask
+        // AppKit, so the answer is published here.
+        publish_frontmost_bundle(app);
         // Clipboard target tracking above accepts Accessory apps, which may own input windows.
         // The switcher's window/MRU and icon paths intentionally handle only Regular apps.
         let policy: i64 = msg_send![app, activationPolicy];
@@ -670,6 +786,23 @@ fn on_app_activated_inner(notification: *mut c_void) {
         // ordering through this path. The kAXFocusedWindow AX query can block up
         // to 50ms (target app unresponsive), so it must run off the main thread.
         schedule_activation_focus(pid, activated_at);
+    }
+}
+
+/// Publish the activated application's bundle id for the gesture tap thread.
+unsafe fn publish_frontmost_bundle(app: *mut AnyObject) {
+    let identifier: *mut AnyObject = msg_send![app, bundleIdentifier];
+    let bundle = if identifier.is_null() {
+        None
+    } else {
+        Some(crate::ffi::nsstring_to_rust(identifier))
+    };
+    crate::mouse::gesture::runtime::publish_frontmost(bundle);
+    // The double-click interval is a user setting the replay's click counter has to follow; read it
+    // here, on the main thread, so the tap thread only ever reads the published number.
+    let interval: f64 = msg_send![class!(NSEvent), doubleClickInterval];
+    if interval.is_finite() && interval > 0.0 {
+        crate::mouse::gesture::runtime::publish_click_interval((interval * 1000.0).round() as u64);
     }
 }
 
@@ -1961,6 +2094,12 @@ fn controller_class() -> StaticClass {
         );
         class_addMethod(
             cls,
+            sel!(handleGestureHud:),
+            crate::mouse::gesture::hud::on_hud_request as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
             sel!(handleSmoothScrollE2eRecord:),
             on_smooth_scroll_e2e_record as *mut c_void,
             types_v_obj.as_ptr(),
@@ -2300,6 +2439,63 @@ fn menu_target_class() -> StaticClass {
             );
             // The Finder-menu settings page opens System Settings' extension pane (the extension is
             // enabled there, not by this app).
+            // A page action no handler claims. Registered so the renderer's fallback never has to
+            // point at a real feature: an unrecognised action must do nothing visible.
+            // The Gestures page's recorder: start a capture, or cancel one running.
+            class_addMethod(
+                cls,
+                sel!(handleGestureExcludedAdd:),
+                crate::settings::handle_gesture_excluded_add as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureExcludedRemove:),
+                crate::settings::handle_gesture_excluded_remove as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureRecordStart:),
+                crate::settings::handle_gesture_record_start as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureRecordCancel:),
+                crate::settings::handle_gesture_record_cancel as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureRowDelete:),
+                crate::settings::handle_gesture_row_delete as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureRestoreDefaults:),
+                crate::settings::handle_gesture_restore_defaults as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureRowTrigger:),
+                crate::settings::handle_gesture_row_trigger as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureTriggerLine:),
+                crate::settings::handle_gesture_trigger_line as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleUnknownPageAction:),
+                crate::settings::handle_unknown_page_action as *mut c_void,
+                types.as_ptr(),
+            );
             class_addMethod(
                 cls,
                 sel!(handleOpenFinderExtensionManagement:),
@@ -2406,6 +2602,12 @@ fn menu_target_class() -> StaticClass {
                 cls,
                 sel!(handleRebuildSettingsContent:),
                 handle_rebuild_settings_content as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureHudDeferred:),
+                crate::mouse::gesture::hud::on_deferred_request as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(

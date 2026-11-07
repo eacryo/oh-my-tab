@@ -46,6 +46,7 @@ mod build;
 mod clipboard;
 mod finder_menu;
 mod general;
+mod gestures;
 mod identity;
 mod key_bindings;
 mod keystroke_display;
@@ -67,6 +68,12 @@ pub(super) use clipboard::ClipboardHooks;
 use finder_menu::finder_menu_page_view;
 pub(super) use finder_menu::FinderMenuHooks;
 use general::general_page_view;
+use gestures::gestures_page_view;
+pub(crate) use gestures::{
+    action_row_index, delete_row_index, gesture_excluded_candidates, gesture_target_option_ids,
+    gesture_trigger_option_ids, is_gesture_row_identity, is_trigger_row_identity,
+    remove_gesture_row, restore_default_gestures, set_row_trigger, trigger_row_of,
+};
 use key_bindings::key_bindings_page_view;
 pub(super) use key_bindings::KeyBindingsHooks;
 use keystroke_display::keystroke_display_page_view;
@@ -78,6 +85,42 @@ pub(crate) use smoke::{about_update_flow_smoke_runner, migrated_pages_smoke_runn
 // page_view scope for everything the page files and the renderer's own callers use. Re-exporting
 // the second group at `pub(super)` would widen it to `settings`, which the compiler refuses.
 pub(super) use bind::{bind_page_banner, bind_page_controls, refresh_migrated_pages};
+
+/// The Gestures page's record row, matched by the action its description registers.
+///
+/// The string is written once: the page registers this row as `gesture_record`, and a refresh that
+/// addressed it by any other name would silently show nothing -- which is how a recorder that was
+/// armed looked like a button that did nothing.
+pub(crate) const GESTURE_RECORD_ROW_ACTION: &str = "gesture_record";
+
+/// Rewrite the Gestures page's record row, while a recording runs (its live preview) or after one
+/// ended (the row back to its resting text). A recording changes its text on every sample, so the
+/// row is updated in place: a rebuild per sample would tear the page down.
+pub(crate) fn sync_record_row_with_recorder() {
+    let stage = crate::mouse::gesture::recording::stage();
+    let text = if stage == crate::mouse::gesture::recording::Stage::Idle {
+        String::new()
+    } else {
+        crate::settings::gesture_recorder::record_row_text(
+            stage,
+            &crate::settings::gesture_recorder::preview_text(),
+        )
+    };
+    set_record_row_text(&text);
+}
+
+/// Write the record row's text, whatever the recorder's state is. Called from a settings callback
+/// that already holds the page (see `gesture_recorder::show_record_row_text`).
+pub(crate) fn set_record_row_text(text: &str) {
+    unsafe {
+        crate::settings::with_settings_ui(|ui| {
+            let Some(u) = ui.as_ref() else {
+                return;
+            };
+            bind::set_action_row_text(u, SettingsPageId::Gestures, GESTURE_RECORD_ROW_ACTION, text);
+        });
+    }
+}
 pub(in crate::settings::page_view) use build::{
     banner_height, banner_parent_frame, canvas_row_of_drawn_row, page_hooks, view_for,
     VALUE_ACTION_GAP,

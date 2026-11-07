@@ -241,6 +241,26 @@ pub(crate) const RADIUS_CONTROL: f64 = 8.0;
 pub(crate) const RADIUS_CARD: f64 = 12.0;
 pub(crate) const RADIUS_PANEL: f64 = 18.0;
 pub(crate) const RADIUS_FULL: f64 = 9999.0;
+
+// ---- Gesture hint card ----
+//
+// The card the trail shows while a gesture is being drawn: a dark plate under the pointer with the
+// stroke's direction as a large arrow and the action it would run below it. The reference is the
+// browser gesture-hint bubble; the numbers here are the ones it uses, at 2x the 4px grid.
+pub(crate) const GESTURE_HINT_BG: u32 = 0x3C3C3CFF;
+pub(crate) const GESTURE_HINT_INK: u32 = 0xFFFFFFFF;
+pub(crate) const GESTURE_HINT_RADIUS: f64 = 14.0;
+/// The plate is sized to its label: this is the minimum width, up to GESTURE_HINT_MAX_WIDTH.
+pub(crate) const GESTURE_HINT_MIN_WIDTH: f64 = 200.0;
+pub(crate) const GESTURE_HINT_MAX_WIDTH: f64 = 320.0;
+/// The minimum height; a label that wraps to two lines grows the plate.
+pub(crate) const GESTURE_HINT_HEIGHT: f64 = 140.0;
+pub(crate) const GESTURE_HINT_PADDING: f64 = 16.0;
+pub(crate) const GESTURE_HINT_LINE: f64 = 22.0;
+/// Between the arrow and its label inside the card.
+pub(crate) const GESTURE_HINT_GAP_INNER: f64 = 10.0;
+pub(crate) const GESTURE_HINT_GLYPH_SIZE: f64 = 96.0;
+pub(crate) const GESTURE_HINT_FONT: f64 = 19.0;
 pub(crate) const CLIPBOARD_EDGE_OUTER_WIDTH: f64 = 0.5;
 pub(crate) const CLIPBOARD_EDGE_INNER_WIDTH: f64 = 0.5;
 pub(crate) const CLIPBOARD_EDGE_OUTSET: f64 = 0.5;

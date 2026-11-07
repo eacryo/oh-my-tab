@@ -242,6 +242,22 @@ extern "C" {
     // bypassing HID-level taps and thus the system's natural-scroll override at the HID layer.
     pub(crate) fn CGEventPost(tap: i32, event: CGEventRef);
 
+    // Build a mouse down/up/dragged event. Used by the gesture replay to post the click a swallowed
+    // press stood for. Returns +1; release with CFRelease (CGEventRelease below).
+    pub(crate) fn CGEventCreateMouseEvent(
+        source: *const c_void,
+        mouse_type: CGEventType,
+        mouse_cursor_position: CGPoint,
+        mouse_button: i64,
+    ) -> CGEventRef;
+    // Create a brand-new event source in one of the CGEventSourceStateID states. Returns +1, or null;
+    // release with CGEventSourceRelease.
+    pub(crate) fn CGEventSourceCreate(state_id: i32) -> *mut c_void;
+    // Release any +1 Core Foundation object. CGEventRelease / CGEventSourceRelease are inline
+    // wrappers over CFRelease in the macOS headers rather than exported symbols, so the linker needs
+    // CFRelease itself.
+    pub(crate) fn CFRelease(object: *const c_void);
+
     // Create a keyboard event (keyDown=1 / keyUp=0), used by the history clipboard to
     // synthesize Cmd+V for pasting.
     pub(crate) fn CGEventCreateKeyboardEvent(

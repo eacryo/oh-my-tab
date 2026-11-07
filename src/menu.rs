@@ -35,7 +35,7 @@ pub(crate) struct ThumbnailState {
 }
 
 pub(crate) struct ServiceMenuState {
-    pub(crate) items: [*mut AnyObject; 5],
+    pub(crate) items: [*mut AnyObject; 6],
 }
 
 // Fixed-title menu items (settings / reload / clear_caches / quit); re-titled in bulk by refresh_menu_titles on locale change.
@@ -555,20 +555,22 @@ pub(crate) fn set_thumbnail_mode(thumbnails_enabled: bool) {
     }
 }
 
-const SERVICE_MENU_TITLE_KEYS: [&str; 5] = [
+const SERVICE_MENU_TITLE_KEYS: [&str; 6] = [
     "menu.service_windows",
     "menu.service_mouse",
     "menu.service_clipboard",
     "menu.service_key_bindings",
     "menu.service_keystroke_display",
+    "menu.service_gestures",
 ];
 
-const SERVICE_MENU_SYMBOLS: [&str; 5] = [
+const SERVICE_MENU_SYMBOLS: [&str; 6] = [
     "rectangle.on.rectangle",
     "computermouse",
     "doc.text",
     "command.square",
     "keyboard",
+    "hand.draw",
 ];
 
 /// The status-bar service switches. `KeyBindings` is one item over one master switch: window
@@ -580,6 +582,9 @@ pub(crate) enum ServiceToggle {
     Clipboard,
     KeyBindings,
     KeystrokeDisplay,
+    /// Mouse gestures. Their own switch, not the mouse module's: the two are independent settings
+    /// sections, and the dropdown must be able to say what the gesture page says.
+    Gestures,
 }
 
 impl ServiceToggle {
@@ -590,6 +595,7 @@ impl ServiceToggle {
             2 => Some(Self::Clipboard),
             3 => Some(Self::KeyBindings),
             4 => Some(Self::KeystrokeDisplay),
+            5 => Some(Self::Gestures),
             _ => None,
         }
     }
@@ -603,6 +609,9 @@ impl ServiceToggle {
             // the switch the engine actually consults.
             Self::KeyBindings => cfg.key_bindings.enabled,
             Self::KeystrokeDisplay => cfg.keystroke_display.enabled,
+            // A gesture still needs the mouse module, but that is the tap's business: the menu
+            // reports the switch this item owns.
+            Self::Gestures => cfg.mouse.gestures_enabled,
         }
     }
 
@@ -613,6 +622,7 @@ impl ServiceToggle {
             Self::Clipboard => cfg.clipboard.enabled = enabled,
             Self::KeyBindings => cfg.key_bindings.enabled = enabled,
             Self::KeystrokeDisplay => cfg.keystroke_display.enabled = enabled,
+            Self::Gestures => cfg.mouse.gestures_enabled = enabled,
         }
     }
 }
@@ -658,7 +668,7 @@ unsafe fn make_menu_item(
 
 /// Build the directly expanded service-toggle section between Settings and shortcut mode.
 pub(crate) unsafe fn build_service_menu(menu: *mut AnyObject, target: *mut AnyObject) {
-    let items: [*mut AnyObject; 5] = std::array::from_fn(|index| {
+    let items: [*mut AnyObject; 6] = std::array::from_fn(|index| {
         let item = make_menu_item(
             target,
             &t(SERVICE_MENU_TITLE_KEYS[index]),
@@ -686,7 +696,7 @@ pub(crate) fn refresh_service_menu() {
     // The pause item lives beside the service switches but carries its own state; refresh it here
     // so enabling/disabling the module also updates whether it can be pressed.
     refresh_clipboard_pause_item();
-    let enabled: [bool; 5] = {
+    let enabled: [bool; 6] = {
         let cfg = CONFIG.read().unwrap();
         std::array::from_fn(|index| {
             ServiceToggle::from_tag(index as isize)

@@ -29,9 +29,21 @@ const K_CG_EVENT_LEFT_MOUSE_DOWN: CGEventType = 1;
 const K_CG_EVENT_LEFT_MOUSE_UP: CGEventType = 2;
 const K_CG_EVENT_RIGHT_MOUSE_DOWN: CGEventType = 3;
 const K_CG_EVENT_RIGHT_MOUSE_UP: CGEventType = 4;
+const K_CG_EVENT_RIGHT_MOUSE_DRAGGED: CGEventType = 7;
 const K_CG_EVENT_OTHER_MOUSE_DOWN: CGEventType = 25;
 const K_CG_EVENT_OTHER_MOUSE_UP: CGEventType = 26;
+const K_CG_EVENT_OTHER_MOUSE_DRAGGED: CGEventType = 27;
 const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
+const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
+const K_CG_EVENT_KEY_UP: CGEventType = 11;
+const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
+
+/// Escape's virtual keycode.
+pub(crate) const VK_ESCAPE: u16 = 53;
+/// kCGKeyboardEventKeycode.
+const K_CG_KEYBOARD_EVENT_KEYCODE: i32 = 9;
+/// kCGKeyboardEventAutorepeat: non-zero when the key press is a repeat of a held key.
+const K_CG_KEYBOARD_EVENT_AUTOREPEAT: i32 = 8;
 
 // mouseEventButtonNumber field (field 3, NOT 0 -- 0 is kCGMouseEventNumber, an ever-increasing
 // event counter, so reading it yields the counter instead of the real button number, breaking
@@ -128,12 +140,50 @@ unsafe fn mouse_event_tap_callback_inner(
     user_info: *mut c_void,
 ) -> CGEventRef {
     if crate::input_monitor::handle_disabled_event(event_type, "mouse", mouse_tap_stopping()) {
+        // The tap was disabled under us. Whatever gesture was in flight lost its event stream: its
+        // release may never arrive, so invalidate rather than wait, and never replay a click whose
+        // press the application may or may not have seen.
+        if event_type == event_tap::TAP_DISABLED_BY_TIMEOUT
+            || event_type == event_tap::TAP_DISABLED_BY_USER_INPUT
+        {
+            let ending = crate::mouse::gesture::runtime::with(|rt| {
+                let session = rt.session_id();
+                rt.invalidate();
+                session
+            });
+            crate::mouse::gesture::hud::hide(ending);
+        }
         return event;
     }
     if mouse_tap_stopping() || !crate::input_monitor::taps_allowed() {
         return event;
     }
     let flags: CGEventFlags = CGEventGetFlags(event);
+
+    // Gestures first: the module owns its buttons end to end, so a press it took must never fall
+    // through to the button-mapping branch below (that branch would send a shortcut press at down
+    // and then never see the release, leaving the key stuck down).
+    if let Some(handled) = gesture_dispatch(event_type, event, flags) {
+        return handled;
+    }
+
+    // Modifier arbitration for everything else. A physical key event is rewritten so the
+    // application never sees a modifier released while a synthetic holder still needs it; with no
+    // synthetic holder the rewrite is the identity, which is why ordinary typing is unaffected.
+    // Maintained whenever the arbitration is in use, which is whenever button mappings can run --
+    // NOT gated on the gesture switch. A physical state that stopped updating when gestures were
+    // turned off would let a button mapping synthesise a modifier the user released minutes ago.
+    if matches!(
+        event_type,
+        K_CG_EVENT_KEY_DOWN | K_CG_EVENT_KEY_UP | K_CG_EVENT_FLAGS_CHANGED
+    ) {
+        let raw = flags as u32;
+        crate::mouse::gesture::runtime::observe_physical(raw);
+        let merged = crate::mouse::gesture::runtime::forward_flags(raw);
+        if merged != raw {
+            CGEventSetFlags(event, merged as CGEventFlags);
+        }
+    }
 
     if event_type == K_CG_EVENT_SCROLL_WHEEL {
         // Skip our own synthetic scroll events (defensive; session-posted events shouldn't reach HID tap).
@@ -319,6 +369,23 @@ pub(crate) fn mouse_tap_stopping() -> bool {
     STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Whether the tap is installed and still feeding events.
+///
+/// A recording and a gesture only exist while it does: its lifecycle stops a recording (see
+/// [[crate::mouse::stop]]), so the settings window has to be able to say "not ready" instead of
+/// arming a capture that nothing will ever feed. Reads the same state [[stop]] acts on, so it
+/// answers for the installed port rather than for a thread handle someone still holds.
+pub(crate) fn tap_running() -> bool {
+    if mouse_tap_stopping() {
+        return false;
+    }
+    let control = tap_control().lock().unwrap();
+    match control.tap {
+        Some(tap) => unsafe { event_tap::CGEventTapIsEnabled(tap) },
+        None => false,
+    }
+}
+
 /// Stop the mouse event thread at runtime: set the cancel flag + CFRunLoopStop, the thread
 /// exits naturally. Idempotent: no-op when not running. Called by settings.rs when the
 /// "Enable mouse control" switch is turned off.
@@ -350,14 +417,21 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         log_info!("[mouse] failed to start one or more asynchronous event-post workers.");
     }
 
-    // Listen mask: left/right/other button down/up + scroll wheel. Excludes mouseMoved.
+    // Listen mask: left/right/other button down/up, the right/other drags a gesture trail is drawn
+    // from, scroll wheel, and the keyboard events the gesture module needs (Esc, and the modifier
+    // flags it rewrites so a physical release cannot lift a modifier a synthetic holder still needs).
     let mask: CGEventMask = (1u64 << K_CG_EVENT_LEFT_MOUSE_DOWN)
         | (1u64 << K_CG_EVENT_LEFT_MOUSE_UP)
         | (1u64 << K_CG_EVENT_RIGHT_MOUSE_DOWN)
         | (1u64 << K_CG_EVENT_RIGHT_MOUSE_UP)
+        | (1u64 << K_CG_EVENT_RIGHT_MOUSE_DRAGGED)
         | (1u64 << K_CG_EVENT_OTHER_MOUSE_DOWN)
         | (1u64 << K_CG_EVENT_OTHER_MOUSE_UP)
-        | (1u64 << K_CG_EVENT_SCROLL_WHEEL);
+        | (1u64 << K_CG_EVENT_OTHER_MOUSE_DRAGGED)
+        | (1u64 << K_CG_EVENT_SCROLL_WHEEL)
+        | (1u64 << K_CG_EVENT_KEY_DOWN)
+        | (1u64 << K_CG_EVENT_KEY_UP)
+        | (1u64 << K_CG_EVENT_FLAGS_CHANGED);
 
     // Clear the stale stop flag before spawning; a subsequent stop() can no longer be overwritten
     // by the new thread starting late.
@@ -372,6 +446,9 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             as *mut c_void;
         // Enumerate connected devices once at startup (also lazily re-done on attribution failure).
         device::ensure_enumerated();
+        // Modifier baseline: whatever the user is holding now is the starting physical state. Only
+        // the seed uses it; every later event carries its own flags.
+        crate::mouse::gesture::runtime::seed_modifiers(event_tap::CGEventSourceFlagsState(0) as u32);
         // Create event tap (HID level, mutable). Pass the cancel flag: bails out early on a
         // stop request (even during the missing-permission retry window).
         let created = event_tap::create_tap_with_retry(
@@ -427,4 +504,217 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         }
         event_tap::teardown_event_tap(rl, created);
     })
+}
+
+/// Route one event through the gesture module. Returns `Some` with the event to hand back (null to
+/// swallow, the original to pass), or `None` when the module has nothing to say and the caller
+/// continues to the scroll / button-mapping branches.
+unsafe fn gesture_dispatch(
+    event_type: CGEventType,
+    event: CGEventRef,
+    flags: CGEventFlags,
+) -> Option<CGEventRef> {
+    use crate::mouse::gesture::engine::Decision;
+    use crate::mouse::gesture::runtime;
+
+    // A recording owns the pointer while it runs: it takes the press, the samples and the release
+    // before the gesture engine or the button mappings see any of them.
+    let button = || CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) as u32;
+    // A recording that was cancelled still owns the Up of the press it swallowed: the tail is
+    // consumed by the recorder whatever the stage, so the application never sees a bare release.
+    // Only a STOPPED recorder needs this: while a recording is active its own release handler
+    // finishes the capture, and treating that release as a tail would swallow the result.
+    if !crate::mouse::gesture::recording::is_recording()
+        && matches!(
+            event_type,
+            K_CG_EVENT_RIGHT_MOUSE_UP | K_CG_EVENT_OTHER_MOUSE_UP
+        )
+        && crate::mouse::gesture::recording::owns_tail(number_of(event))
+        && crate::mouse::gesture::recording::tap_release(number_of(event))
+    {
+        return Some(std::ptr::null_mut());
+    }
+    if crate::mouse::gesture::recording::is_recording() {
+        match event_type {
+            K_CG_EVENT_RIGHT_MOUSE_DOWN | K_CG_EVENT_OTHER_MOUSE_DOWN => {
+                let number = button();
+                if number != 0
+                    && crate::mouse::gesture::recording::tap_press(number, cg_point(event))
+                {
+                    return Some(std::ptr::null_mut());
+                }
+            }
+            K_CG_EVENT_RIGHT_MOUSE_DRAGGED | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
+                let number = button();
+                if crate::mouse::gesture::recording::tap_drag(number, cg_point(event)) {
+                    // The preview is coalesced: the tap only publishes, and one scheduled main-thread
+                    // task redraws the row with whatever the latest sample produced.
+                    crate::mouse::gesture::recording::request_preview();
+                    return Some(std::ptr::null_mut());
+                }
+            }
+            K_CG_EVENT_RIGHT_MOUSE_UP | K_CG_EVENT_OTHER_MOUSE_UP => {
+                let number = button();
+                if crate::mouse::gesture::recording::tap_release(number) {
+                    return Some(std::ptr::null_mut());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    // Our own replay must never be taken for a fresh press: it would swallow its own click.
+    if CGEventGetIntegerValueField(event, K_CG_EVENT_SOURCE_USER_DATA)
+        == crate::mouse::gesture::replay::REPLAY_MARKER
+    {
+        return Some(event);
+    }
+
+    let button = || CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) as u32;
+
+    // The tail of a press this module swallowed stays ours even after the module stops: letting
+    // the release fall through would send a mapping-up for a key that was never pressed.
+    if matches!(
+        event_type,
+        K_CG_EVENT_RIGHT_MOUSE_UP | K_CG_EVENT_OTHER_MOUSE_UP
+    ) {
+        let number = button();
+        let device = runtime::device_key(device::device_from_cgevent(event));
+        let owned = runtime::with(|rt| rt.owns_tail(number, device));
+        if owned {
+            runtime::with(|rt| {
+                rt.clear_tail(number, device);
+                rt.release_tail(number, device, cg_point(event), now_ms())
+            });
+            return Some(std::ptr::null_mut());
+        }
+    }
+    if event_type == K_CG_EVENT_KEY_UP {
+        let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
+        if keycode == VK_ESCAPE && runtime::with(|rt| rt.release_escape()) {
+            return Some(std::ptr::null_mut());
+        }
+    }
+
+    // An Esc this module already took keeps its repeats and its release EVEN AFTER the module is
+    // switched off: the application would otherwise see a key-up whose key-down it never got.
+    if event_type == K_CG_EVENT_KEY_DOWN {
+        let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
+        if keycode == VK_ESCAPE
+            && CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT) != 0
+            && runtime::with(|rt| rt.escape_owned())
+        {
+            return Some(std::ptr::null_mut());
+        }
+    }
+
+    match event_type {
+        K_CG_EVENT_RIGHT_MOUSE_DOWN | K_CG_EVENT_OTHER_MOUSE_DOWN => {
+            let number = button();
+            // The left button is not a gesture trigger; the right and the side buttons are.
+            if number == 0 {
+                return None;
+            }
+            let device = runtime::device_key(device::device_from_cgevent(event));
+            let point = cg_point(event);
+            let now = now_ms();
+            if runtime::with(|rt| rt.press(number, device, point, now, flags as u32)) {
+                Some(std::ptr::null_mut())
+            } else {
+                None
+            }
+        }
+        K_CG_EVENT_RIGHT_MOUSE_DRAGGED | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
+            let number = button();
+            let device = runtime::device_key(device::device_from_cgevent(event));
+            let point = cg_point(event);
+            let now = now_ms();
+            let (swallowed, trail) = runtime::with(|rt| rt.dragged(number, device, point, now));
+            if swallowed {
+                if let Some(trail) = trail {
+                    crate::mouse::gesture::hud::publish(trail);
+                }
+                Some(std::ptr::null_mut())
+            } else {
+                None
+            }
+        }
+        K_CG_EVENT_RIGHT_MOUSE_UP | K_CG_EVENT_OTHER_MOUSE_UP => {
+            let number = button();
+            let device = runtime::device_key(device::device_from_cgevent(event));
+            let point = cg_point(event);
+            let now = now_ms();
+            let (decision, target, ending_session, auth) = runtime::with(|rt| {
+                let session = rt.session_id();
+                let epoch = rt.epoch();
+                let (decision, target) = rt.release(number, device, point, now);
+                (
+                    decision,
+                    target,
+                    session,
+                    crate::mouse::gesture::executor::Authorization {
+                        epoch,
+                        session,
+                        generation: crate::mouse::gesture::runtime::service_generation(),
+                    },
+                )
+            });
+            match decision {
+                Decision::Execute => {
+                    runtime::with(|rt| rt.note_matched(number));
+                    crate::mouse::gesture::hud::hide(ending_session);
+                    if let Some(row) = target {
+                        crate::mouse::gesture::executor::run(row, auth);
+                    }
+                    Some(std::ptr::null_mut())
+                }
+                Decision::Replay | Decision::Swallow => {
+                    crate::mouse::gesture::hud::hide(ending_session);
+                    Some(std::ptr::null_mut())
+                }
+                Decision::Pass => None,
+            }
+        }
+        K_CG_EVENT_KEY_DOWN => {
+            let keycode = CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_KEYCODE) as u16;
+            if keycode != VK_ESCAPE {
+                return None;
+            }
+            // A repeat of an Esc this module already took is still ours and stays swallowed. Only an
+            // unowned repeat passes: its key-down went to the application before the gesture started,
+            // so taking the repeat (and the up after it) would leave a stuck key there.
+            if CGEventGetIntegerValueField(event, K_CG_KEYBOARD_EVENT_AUTOREPEAT) != 0 {
+                return if runtime::with(|rt| rt.escape_owned()) {
+                    Some(std::ptr::null_mut())
+                } else {
+                    None
+                };
+            }
+            // An Esc the module took keeps its repeats and its release: the application must never
+            // see the tail of a press it never got.
+            if runtime::with(|rt| rt.escape()) {
+                Some(std::ptr::null_mut())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The event's global point, in the coordinate space the recognizer uses.
+fn number_of(event: CGEventRef) -> u32 {
+    unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) as u32 }
+}
+
+unsafe fn cg_point(event: CGEventRef) -> crate::mouse::gesture::recognizer::Point {
+    let location = event_tap::CGEventGetLocation(event);
+    crate::mouse::gesture::recognizer::Point::new(location.x, location.y)
+}
+
+/// Milliseconds on a monotonic clock, for the recognizer's sample timing.
+fn now_ms() -> f64 {
+    static START: OnceLock<std::time::Instant> = OnceLock::new();
+    let start = START.get_or_init(std::time::Instant::now);
+    start.elapsed().as_secs_f64() * 1000.0
 }

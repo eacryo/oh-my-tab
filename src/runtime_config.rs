@@ -40,6 +40,9 @@ struct ChangeFlags {
     // switch now admits, so an open overlay must be dismissed rather than reused.
     show_other_desktops: bool,
     mouse: bool,
+    /// The gesture master switch moved. It lives in the mouse section but has its own page, so it
+    /// is compared separately from everything else on the Mouse page.
+    gestures: bool,
     clipboard_enabled: bool,
     clipboard_shortcut: bool,
     /// The persisted pause intent changed (menu, settings switch, or an edited config file).
@@ -155,6 +158,10 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         thumbnail_size: old.layout.thumbnail_size != new.layout.thumbnail_size,
         show_other_desktops: old.windows.show_other_desktops != new.windows.show_other_desktops,
         mouse: startup || old.mouse != new.mouse,
+        gestures: startup
+            || old.mouse.gestures_enabled != new.mouse.gestures_enabled
+            || old.mouse.gestures != new.mouse.gestures
+            || old.mouse.gesture_excluded_apps != new.mouse.gesture_excluded_apps,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
         clipboard_paused: startup || old.clipboard.paused != new.clipboard.paused,
@@ -402,6 +409,15 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
                 crate::mouse::stop();
             }
         }
+        // Publish the gesture table on every mouse-section reload, not only at start: editing the
+        // switch, the list or the exclusion list has to advance the epoch so a gesture in flight is
+        // revoked instead of running the configuration it started under.
+        crate::mouse::publish_gestures();
+    }
+    // The gesture switch has its own page, so its reload arrives with a flag of its own. It shares
+    // the same publisher, which is what advances the epoch and revokes a gesture in flight.
+    if flags.gestures && !flags.mouse {
+        crate::mouse::publish_gestures();
     }
 
     // The pause gate must be settled BEFORE the clipboard can poll. `start()` records the current

@@ -196,6 +196,21 @@ pub(crate) fn system_action_notification(name: &str) -> Option<&'static str> {
 pub(crate) const SYSTEM_ACTIONS: [&str; 4] =
     ["missioncontrol", "launchpad", "showdesktop", "appexpose"];
 
+/// A system action's Dock notification back to the name the UI shows for it.
+fn system_action_label(notification: &str) -> String {
+    for name in SYSTEM_ACTIONS {
+        if system_action_notification(name) == Some(notification) {
+            return match name {
+                "missioncontrol" => crate::i18n::t("settings.mapping_action_missioncontrol"),
+                "launchpad" => crate::i18n::t("settings.mapping_action_launchpad"),
+                "showdesktop" => crate::i18n::t("settings.mapping_action_showdesktop"),
+                _ => crate::i18n::t("settings.mapping_action_appexpose"),
+            };
+        }
+    }
+    crate::i18n::t("settings.gestures_target_none")
+}
+
 /// Parse a binding description: try system actions / explicit none first, then fall back to
 /// shortcut parsing. Values are "none", a system-action name (e.g. "missioncontrol"), or a
 /// shortcut like "cmd+shift+v".
@@ -333,6 +348,33 @@ pub(crate) fn display_shortcut(desc: &str) -> String {
     }
 }
 
+/// A parsed binding in the user's words: the shortcut's keycaps, the system action's name, the
+/// switcher, or "nothing". Never a config id.
+pub(crate) fn display_binding(binding: &Binding) -> String {
+    match binding {
+        Binding::Key(shortcut) => {
+            let mut display = String::new();
+            if shortcut.flags & FLAG_CMD != 0 {
+                display.push('⌘');
+            }
+            if shortcut.flags & FLAG_SHIFT != 0 {
+                display.push('⇧');
+            }
+            if shortcut.flags & FLAG_ALT != 0 {
+                display.push('⌥');
+            }
+            if shortcut.flags & FLAG_CTRL != 0 {
+                display.push('⌃');
+            }
+            display.push_str(&key_name_opt(shortcut.keycode).unwrap_or_default());
+            display
+        }
+        Binding::System(name) => system_action_label(name),
+        Binding::Switcher => crate::i18n::t("settings.gestures_target_switcher"),
+        Binding::None => crate::i18n::t("settings.gestures_target_none"),
+    }
+}
+
 /// Keycode + modifier bits -> description string (for serializing a recorded combo into the
 /// config, e.g. a ⌘⇧V event -> "cmd+shift+v"). Modifiers serialize in cmd,shift,alt,ctrl order.
 ///
@@ -387,6 +429,20 @@ pub(crate) fn describe_shortcut(keycode: u16, flags: u32) -> Option<String> {
 }
 
 /// Button-number display name (maps the 1-based number to a common name after 0-basing).
+/// A trigger button in the user's words, for the settings page. Never a bare number.
+pub(crate) fn button_label(button: u32) -> String {
+    match button {
+        1 => crate::i18n::t("settings.gestures_button_right"),
+        2 => crate::i18n::t("settings.gestures_button_middle"),
+        3 => crate::i18n::t("settings.gestures_button_side1"),
+        4 => crate::i18n::t("settings.gestures_button_side2"),
+        other => crate::i18n::tf(
+            "settings.gestures_button_other",
+            &[("number", &other.to_string())],
+        ),
+    }
+}
+
 pub(crate) fn button_name(button: u32) -> String {
     match button {
         2 => "Middle".to_string(),

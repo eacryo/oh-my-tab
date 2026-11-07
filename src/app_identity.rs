@@ -70,6 +70,55 @@ unsafe fn read_nsstring(obj: *mut AnyObject) -> Option<String> {
     Some(CStr::from_ptr(utf8).to_string_lossy().into_owned())
 }
 
+/// Every application installed in the standard locations, with its bundle identifier and the
+/// name the Finder shows.
+///
+/// The gesture exclusion list is about "this app must not act on my gestures", which includes apps
+/// that are not running, so the menu cannot be built from the running-application list alone: it
+/// lists what is INSTALLED, and the caller merges the running set into it for the ones started
+/// outside these folders (a disk image, a build output).
+///
+/// The standard folders are the ones macOS itself documents. Nested applications inside a bundle
+/// (a browser's helper app, an app's embedded framework) are not offered: they are not things the
+/// user launches.
+pub(crate) fn installed_application_bundles() -> Vec<(String, String)> {
+    let home = std::env::var_os("HOME")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_default();
+    let mut roots = vec![
+        std::path::PathBuf::from("/Applications"),
+        std::path::PathBuf::from("/Applications/Utilities"),
+        std::path::PathBuf::from("/System/Applications"),
+        std::path::PathBuf::from("/System/Applications/Utilities"),
+    ];
+    if !home.as_os_str().is_empty() {
+        roots.push(home.join("Applications"));
+    }
+    let mut found: Vec<(String, String)> = Vec::new();
+    for root in roots {
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) != Some("app") {
+                continue;
+            }
+            let Some(path) = path.to_str() else {
+                continue;
+            };
+            let Some((bundle_id, name)) = (unsafe { bundle_identity_at_path(path) }) else {
+                continue;
+            };
+            if !found.iter().any(|(existing, _)| *existing == bundle_id) {
+                found.push((bundle_id, name));
+            }
+        }
+    }
+    found.sort_by_key(|(_, name)| name.to_lowercase());
+    found
+}
+
 /// The bundle identifier and display name of an application bundle on disk.
 ///
 /// Used by the clipboard exclusion list's "choose an app" control, which must also reach an app that
@@ -149,6 +198,23 @@ pub(crate) unsafe fn running_apps_with_bundle_ids() -> Vec<(String, String)> {
     result
 }
 
+/// The bundle identifier of the application that is frontmost right now.
+///
+/// `NSWorkspace.frontmostApplication` is a property read, not a query that waits on another process,
+/// so a background tap may ask it: the gesture module uses it to answer "is the excluded app in
+/// front" at the moment a press arrives rather than at the last activation notification.
+pub(crate) unsafe fn frontmost_bundle_id() -> Option<String> {
+    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+    if workspace.is_null() {
+        return None;
+    }
+    let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+    if app.is_null() {
+        return None;
+    }
+    let identifier: *mut AnyObject = msg_send![app, bundleIdentifier];
+    read_nsstring(identifier).filter(|id| !id.is_empty())
+}
 /// The bundle identifier of an `NSRunningApplication` object the caller already holds.
 ///
 /// Separate from `bundle_id_for_pid` so a caller that needed the object anyway (to prove the PID is
@@ -236,6 +302,31 @@ pub(crate) unsafe fn identity_of_app(app: *mut AnyObject, pid: i32) -> AppIdenti
 #[cfg(test)]
 mod tests {
     use super::is_extension_process;
+
+    /// The exclusion list is about an app that is INSTALLED, not one that happens to be open:
+    /// building it from the running set alone was the reported defect (an app in /Applications that
+    /// the user had quit simply was not offered).
+    ///
+    /// Asserted against the real machine only in the shape that is true everywhere: the list is
+    /// sorted, deduplicated by bundle identifier, and never offers an entry without an identifier.
+    #[test]
+    fn installed_applications_are_deduplicated_and_sorted() {
+        let apps = super::installed_application_bundles();
+        let mut ids: Vec<&str> = apps.iter().map(|(id, _)| id.as_str()).collect();
+        let total = ids.len();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), total, "one bundle offered twice");
+        assert!(
+            apps.iter()
+                .all(|(id, name)| !id.is_empty() && !name.is_empty()),
+            "every installed entry has an identifier and a name"
+        );
+        let names: Vec<String> = apps.iter().map(|(_, name)| name.to_lowercase()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted, "the list is presented in name order");
+    }
 
     /// App extensions publish ordinary layer-0 windows and cannot be activated (-606), so the card
     /// never opens. The executable's location is the only evidence, and these are the three the

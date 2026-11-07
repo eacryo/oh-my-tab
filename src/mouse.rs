@@ -5,6 +5,7 @@
 pub(crate) mod device;
 pub(crate) mod event_tap;
 pub(crate) mod ffi;
+pub(crate) mod gesture;
 pub(crate) mod keysim;
 pub(crate) mod pointer;
 pub(crate) mod resolve;
@@ -72,7 +73,31 @@ pub(crate) fn start() {
     if let Some(handle) = finished {
         let _ = handle.join();
     }
+    publish_gestures();
     log_info!("Mouse control enabled.");
+}
+
+/// Publish the gesture table and switch the gesture runtime on, from the current config.
+///
+/// Called whenever the mouse module starts and whenever the config is applied. The runtime reads the
+/// table snapshot per event, so publishing here is what makes the feature live without restarting
+/// the tap thread.
+pub(crate) fn publish_gestures() {
+    let config = crate::config::CONFIG.read();
+    let Ok(config) = config else {
+        return;
+    };
+    let errors = gesture::table::publish(&config);
+    for (index, error) in errors {
+        log_info!("[gesture] row {index} ignored: {error:?}");
+    }
+    let active = config.mouse.enabled && config.mouse.gestures_enabled;
+    gesture::runtime::set_active(active);
+    // Every reload is a revocation of what the old configuration started: deleting a binding,
+    // retargeting one, or editing the exclusion list all leave a switcher session the OLD
+    // configuration opened with no owner. A session handed to the user is untouched (the claim is
+    // only revoked while it is still Active).
+    gesture::switcher::revoke();
 }
 
 /// Disable mouse control at runtime (settings hot-switch).
@@ -95,6 +120,20 @@ pub(crate) fn stop() {
     // Signal stop on the current thread, but move the potentially blocking join to a background
     // reaper so AppKit's mouse callback never stalls.
     event_tap::stop();
+    // A recording cannot complete either: the tap that feeds it is stopping, so its owner would keep
+    // the pointer with nothing to end it.
+    gesture::recording::cancel();
+    // A gesture in flight cannot complete: its release may never be delivered now.
+    let ending = gesture::runtime::with(|rt| {
+        let session = rt.session_id();
+        rt.invalidate();
+        session
+    });
+    gesture::hud::hide(ending);
+    // A switcher this gesture opened is dismissed (the same path Esc takes), and one the user took
+    // over is left alone.
+    gesture::switcher::revoke();
+    gesture::runtime::set_active(false);
     keysim::release_all_queued();
     keysim::clear_system_button_states();
     std::thread::spawn(move || {

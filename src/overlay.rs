@@ -2130,6 +2130,8 @@ pub(crate) fn hide_overlay() {
     // a session summoned in between.
     footer_settings::disarm();
     publish_panel_snapshot(false);
+    // Any gesture claim over this session ends with it, and another session can be opened later.
+    crate::mouse::gesture::session_state::set_switcher_visible(false);
     // The A2 layer asserts "the panel ended" by reading the snapshot, and this transition is what
     // it waits for; without a frame here the script keeps reading the previous visible=true.
     crate::e2e_state::record("panel-closed");

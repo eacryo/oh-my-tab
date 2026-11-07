@@ -140,6 +140,9 @@ pub(in crate::settings) struct RowSpec {
     /// The card's heading copy key (read when the card opens).
     pub(in crate::settings) section: &'static str,
     pub(in crate::settings) label_key: &'static str,
+    /// The row's label as DATA (a gesture's arrows, a recorded chord) instead of the locale key.
+    /// `label_key` stays the row's class, which the search index and the accessibility pairing use.
+    pub(in crate::settings) label_text: Option<String>,
     pub(in crate::settings) desc_key: Option<&'static str>,
     /// The caption a stacked row draws (a copy key, like the label). Read for the search entry and
     /// measured by [`MeasuredText::measure`].
@@ -153,6 +156,10 @@ pub(in crate::settings) struct RowSpec {
     /// instead of the default one that stops at the control column. One row in the design needs
     /// it: the General page's menu-bar switch.
     pub(in crate::settings) wide_caption: bool,
+    /// A number stamped on the row's ACTION BUTTON as its tag. The button is what the callback
+    /// receives, and its own text is its title, so this is how a row tells the handler WHICH entry
+    /// it is: an excluded-application row stamps its list index here.
+    pub(in crate::settings) action_tag: Option<isize>,
     /// The row's control identity. Every declared row carries one.
     pub(in crate::settings) id: ControlId,
     pub(in crate::settings) copy: RowCopy,

@@ -1119,11 +1119,46 @@ pub struct MouseProfile {
     pub button_mappings_enabled: Option<bool>,
 }
 
+/// One `[[mouse.gestures]]` entry: a direction sequence on a button, and what it runs.
+///
+/// The binding is a raw string for the same reason `[[key_bindings.items]]` keeps one: the config
+/// layer falls back per entry, so one unparseable binding drops that row and no other.
+#[derive(Debug, Clone, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(default)]
+pub struct GestureBinding {
+    /// Direction sequence, e.g. "RD" / "URU". Normalised to uppercase by validation.
+    pub gesture: String,
+    /// Trigger button: 1 right, 2 middle, 3/4 side. The left button is never a gesture trigger.
+    pub button: u32,
+    /// What the gesture runs: a shortcut ("cmd+shift+t"), an action id ("window.snap_left"),
+    /// "switcher", or a system action name. Empty is only legal while `enabled` is false.
+    pub binding: String,
+    #[serde(default = "default_gesture_enabled")]
+    pub enabled: bool,
+}
+
+/// A gesture row is off unless it says otherwise, so a hand-added row without `enabled` never runs
+/// something the user did not ask for. Only matters for hand-edited files: the settings UI always
+/// writes the field.
+fn default_gesture_enabled() -> bool {
+    false
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MouseSection {
     // Enable mouse control features (master switch). Default false.
     pub enabled: bool,
+    // Mouse gestures: hold a button, draw a direction sequence, release to run a binding.
+    // Independent of the scroll/button-mapping switches, but gated by `enabled` above.
+    pub gestures_enabled: bool,
+    // Direction sequences, one row per gesture.
+    pub gestures: Vec<GestureBinding>,
+    // Draw the stroke under the pointer while a gesture is drawn, and show what it will run.
+    pub gesture_show_trail: bool,
+    pub gesture_show_hint: bool,
+    // Applications where no gesture fires at all (bundle identifiers).
+    pub gesture_excluded_apps: Vec<String>,
     // Profile list: the first profile without a device field is the "All Mice" default layer;
     // subsequent per-device profiles override it. Merge semantics: all matching profiles are
     // traversed, later ones win.
@@ -1147,6 +1182,13 @@ impl Default for MouseSection {
     fn default() -> Self {
         Self {
             enabled: false,
+            gestures_enabled: false,
+            gestures: default_gestures(),
+            // The trail and the hint are what make a new gesture visible; off is the user's choice,
+            // not the starting point.
+            gesture_show_trail: true,
+            gesture_show_hint: true,
+            gesture_excluded_apps: Vec::new(),
             // Default includes an "All Mice" profile matching the old defaults.
             profiles: vec![MouseProfile {
                 reverse_scroll: Some(false),
@@ -1172,6 +1214,33 @@ impl Default for MouseSection {
             pointer: None,
         }
     }
+}
+
+/// The default gesture list, for the settings page's restore button.
+pub(crate) fn default_gestures_for_restore() -> Vec<GestureBinding> {
+    default_gestures()
+}
+
+/// The gestures a fresh configuration starts with, and what "restore the gesture list" puts back.
+///
+/// They mirror the four directions a browser binds by default, so the feature works the moment the
+/// master switches are on: a gesture list that starts empty shows a user a switch that does nothing.
+/// Faces here are the app's own actions, never a raw call to one particular browser.
+fn default_gestures() -> Vec<GestureBinding> {
+    [
+        ("L", "window.snap_left"),
+        ("R", "window.snap_right"),
+        ("U", "window.maximize"),
+        ("D", "window.minimize"),
+    ]
+    .into_iter()
+    .map(|(gesture, binding)| GestureBinding {
+        gesture: gesture.into(),
+        button: 1,
+        binding: binding.into(),
+        enabled: true,
+    })
+    .collect()
 }
 
 impl MouseSection {
