@@ -252,6 +252,12 @@ pub(super) unsafe fn render_row(
         }
     };
     let control: *mut AnyObject = match &row.control {
+        // A SELECT reports the chosen option through `sendPendingAction`, and that call reads the
+        // select's OWN target/action -- so the row has to install them. The unified change handler
+        // is the one thing a select must not get: installing it arms NSButton's press tracking and
+        // replaces the select's `mouseDown:`, so the panel never opens (the "popup that does
+        // nothing"). The generic bind below therefore skips popups, and the row's own handler is
+        // installed here instead; the panel-opening `mouseDown:` is left alone by target/action.
         ControlKind::Switch => {
             let on = matches!(row.value, Value::Switch(true));
             // The switch's visual is 42x26; build it on the ROW BAND so the whole trailing cell is
@@ -270,14 +276,19 @@ pub(super) unsafe fn render_row(
                 Value::Index(index) => index,
                 _ => 0,
             };
-            SettingsControl::popup(
+            let popup = SettingsControl::popup(
                 placed.control_frame.x,
                 placed.control_frame.y,
                 placed.control_frame.w,
                 placed.control_frame.h,
                 &refs,
                 selected,
-            )
+            );
+            if !popup.is_null() {
+                let _: () = msg_send![popup, setTarget: target];
+                let _: () = msg_send![popup, setAction: dedicated_selector(row.field())];
+            }
+            popup
         }
         // A hyperlink: the widget opens the URL its tag names on a click.
         ControlKind::Link { tag, text_key } => SettingsControl::external_link(

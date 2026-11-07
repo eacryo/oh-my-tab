@@ -618,7 +618,13 @@ unsafe fn gesture_dispatch(
             let device = runtime::device_key(device::device_from_cgevent(event));
             let point = cg_point(event);
             let now = now_ms();
-            if runtime::with(|rt| rt.press(number, device, point, now, flags as u32)) {
+            // WHICH application this press lands in has to be read before the decision: the
+            // exclusion list is about the app being clicked, not about whichever application macOS
+            // calls active (see `excluded_bundle`).
+            let bundle = runtime::excluded_bundle_for_event(window_under_pointer(event));
+            if runtime::with(|rt| {
+                rt.press(number, device, point, now, flags as u32, bundle.as_deref())
+            }) {
                 Some(std::ptr::null_mut())
             } else {
                 None
@@ -644,10 +650,11 @@ unsafe fn gesture_dispatch(
             let device = runtime::device_key(device::device_from_cgevent(event));
             let point = cg_point(event);
             let now = now_ms();
+            let bundle = runtime::excluded_bundle_for_event(window_under_pointer(event));
             let (decision, target, ending_session, auth) = runtime::with(|rt| {
                 let session = rt.session_id();
                 let epoch = rt.epoch();
-                let (decision, target) = rt.release(number, device, point, now);
+                let (decision, target) = rt.release(number, device, point, now, bundle.as_deref());
                 (
                     decision,
                     target,
@@ -700,6 +707,14 @@ unsafe fn gesture_dispatch(
         }
         _ => None,
     }
+}
+
+/// The window the event belongs to: `kCGMouseEventWindowUnderMousePointer`, which the WindowServer
+/// fills in for every mouse event with the number of the window under the pointer. 0 when the field
+/// is absent (a synthetic event), which the owner lookup reads as "unknown application".
+fn window_under_pointer(event: CGEventRef) -> i64 {
+    const K_CG_MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER: i32 = 91;
+    unsafe { CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_WINDOW_UNDER_MOUSE_POINTER) }
 }
 
 /// The event's global point, in the coordinate space the recognizer uses.

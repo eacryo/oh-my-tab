@@ -228,6 +228,30 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
 
+    // A list whose entries cannot match: the tap matches a bundle id, so an entry that is not one
+    // never excludes anything the user can see. Saying so is the difference between "the setting is
+    // broken" and "this line is wrong".
+    let unusable = cfg
+        .mouse
+        .gesture_excluded_apps
+        .iter()
+        .filter(|entry| !looks_like_bundle_id(entry))
+        .count();
+    if unusable > 0 {
+        w.push(
+            RowDraft::new(
+                "settings.gestures_row_excluded_invalid",
+                ControlKind::Value {
+                    action: None,
+                    align: ValueAlign::Right,
+                },
+                ControlId::Action("gesture_excluded_invalid"),
+                Value::Dynamic(format!("{unusable}")),
+            )
+            .into_spec(),
+        );
+    }
+
     // One row per excluded bundle, each with its own Remove action.
     if cfg.mouse.gesture_excluded_apps.is_empty() {
         w.push(
@@ -879,12 +903,11 @@ fn stroke_label(sequence: &str) -> String {
     out
 }
 
-/// The configured gestures in file order, each described in words a user recognises.
-/// The running applications that are not excluded yet, for the add popup: an application
-/// already on the list must not be offered twice.
-/// Every application offered by the exclusion picker, before the configured ones are removed: the
+/// Every application the exclusion picker can offer, before the configured ones are removed: the
 /// installed ones plus whatever is running but installed outside the standard folders.
-pub(crate) fn gesture_excluded_candidates() -> Vec<(String, String)> {
+///
+/// This is the raw catalogue; `running_app_candidates` is what the popup actually lists.
+fn gesture_excluded_candidates() -> Vec<(String, String)> {
     let mut apps = crate::app_identity::installed_application_bundles();
     // Reading the running-application list is AppKit work, and the page build runs on the
     // main thread.
@@ -897,16 +920,42 @@ pub(crate) fn gesture_excluded_candidates() -> Vec<(String, String)> {
     apps
 }
 
-fn running_app_candidates(cfg: &crate::config::Config) -> Vec<(String, String)> {
+/// The applications the "add an excluded application" popup offers, in the order it lists them.
+///
+/// INSTALLED applications, not just the running ones: the list answers "which app must never act on
+/// my gestures", and the app a user wants to exclude is usually the one they have open in another
+/// window. Apps started outside the standard folders (a disk image, a build output) are merged in
+/// from the running set, so nothing that is actually on screen is missing. Entries already excluded
+/// are dropped, and the placeholder the page prepends is NOT part of this list -- an option's index
+/// is one more than its position here, which is how the add callback reads the choice.
+pub(crate) fn running_app_candidates(cfg: &crate::config::Config) -> Vec<(String, String)> {
     let excluded = &cfg.mouse.gesture_excluded_apps;
-    // INSTALLED applications, not just the running ones: the list answers "which app must never act
-    // on my gestures", and the app a user wants to exclude is usually the one they have open in
-    // another window. Apps started outside the standard folders (a disk image, a build output) are
-    // merged in from the running set, so nothing that is actually on screen is missing.
     let mut apps = gesture_excluded_candidates();
     apps.retain(|(bundle, _)| !excluded.iter().any(|id| id == bundle));
     apps
 }
+/// The application a choice in the add popup names, from the control's selected INDEX.
+///
+/// Option 0 is the placeholder ("Add an app…"), so option N (N > 0) is `running_app_candidates()[N-1]`
+/// -- the very list the page built the options from. Reading the index instead of asking the control
+/// for a title is what keeps the two sides together: the select implements `indexOfSelectedItem` but
+/// has no `titleOfSelectedItem`, and matching by display name would also confuse two candidates that
+/// share a name.
+///
+/// `None` means "nothing to add": the placeholder, or an index the current list no longer covers
+/// (an application was excluded or quit while the popup was open).
+pub(crate) fn excluded_app_for_option(
+    cfg: &crate::config::Config,
+    selected: isize,
+) -> Option<String> {
+    if selected <= 0 {
+        return None;
+    }
+    running_app_candidates(cfg)
+        .get(selected as usize - 1)
+        .map(|(bundle, _)| bundle.clone())
+}
+
 fn configured_rows(cfg: &crate::config::Config) -> Vec<ShownRow> {
     cfg.mouse
         .gestures
@@ -948,6 +997,33 @@ fn row_problem(entry: &crate::config::GestureBinding) -> Option<&'static str> {
         return Some("bad_target");
     }
     None
+}
+
+/// Whether an exclusion entry can ever match: the tap compares it with an application's bundle
+/// identifier (`CFBundleIdentifier`, reverse-DNS, at least two dot-separated parts and no spaces).
+///
+/// An entry that is not a bundle id -- an application NAME, a path, an empty line edited into the
+/// file -- is accepted by the config but can never be equal to one, so the runtime ignores it. This
+/// is the same predicate the page uses to mark such entries, and it is deliberately conservative:
+/// a real bundle id always passes, and a non-conforming but genuinely registered identifier (an
+/// Apple utility from an unsigned bundle) is reported rather than silently kept.
+pub(crate) fn looks_like_bundle_id(entry: &str) -> bool {
+    let trimmed = entry.trim();
+    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
+        return false;
+    }
+    // No scheme, no slash: a bundle id is dots and ASCII name characters.
+    if trimmed.contains('/') || trimmed.contains(':') {
+        return false;
+    }
+    let parts: Vec<&str> = trimmed.split('.').collect();
+    parts.len() >= 2
+        && parts.iter().all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        })
 }
 
 /// A row state in the user's language. Never a config value.
@@ -1039,6 +1115,167 @@ mod tests {
         assert_eq!(view.title_key, "settings.sidebar_gestures");
         assert_eq!(view.rows[0].label_key, "settings.gestures_row_enabled");
         assert!(matches!(view.rows[0].value, Value::Switch(true)));
+    }
+
+    /// The add popup's true words: option N (N > 0) is `running_app_candidates[index N-1]`.
+    ///
+    /// The callback reads a choice by INDEX and looks it up in `running_app_candidates`; the page
+    /// prepends the placeholder and appends those same candidates. This test pins the offset, so a
+    /// later change to either side cannot make a pick exclude a different application than the one
+    /// whose name the user clicked (the clipboard page reads its list the same way).
+    #[test]
+    fn the_add_popups_option_index_maps_onto_the_candidate_list() {
+        let mut page_input = input(true, Vec::new());
+        // One entry already excluded: the page must drop it, and the callback must agree.
+        page_input.config.mouse.gesture_excluded_apps = vec!["com.example.already".into()];
+        let view = gestures_page_view(&page_input);
+        let row = view
+            .rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_add_app")
+            .expect("the add row is described");
+        let ControlKind::Popup { options } = &row.control else {
+            panic!("the add row is a popup: {:?}", row.control);
+        };
+        let candidates = running_app_candidates(&page_input.config);
+        assert_eq!(
+            options.len(),
+            candidates.len() + 1,
+            "placeholder + one option per candidate"
+        );
+        // The placeholder is index 0 and is the only option with no bundle behind it.
+        assert!(!candidates.iter().any(|(_, name)| *name == options[0]));
+        for (offset, (_, name)) in candidates.iter().enumerate() {
+            assert_eq!(
+                &options[offset + 1],
+                name,
+                "option {} must be candidate {offset}",
+                offset + 1
+            );
+        }
+        assert!(
+            !candidates
+                .iter()
+                .any(|(bundle, _)| bundle == "com.example.already"),
+            "an already excluded application is not offered again"
+        );
+    }
+
+    /// The callback's side of the add popup: an option index resolves to the application the user
+    /// saw on that row, the placeholder adds nothing, and an index past the list is refused instead
+    /// of clamping onto a neighbour (which would exclude the wrong app).
+    #[test]
+    fn an_option_index_resolves_to_the_application_it_listed() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.gesture_excluded_apps = vec!["com.example.already".into()];
+        let candidates = running_app_candidates(&page_input.config);
+        assert!(
+            candidates.len() >= 2,
+            "needs at least two installed applications to prove the offset"
+        );
+        assert_eq!(
+            excluded_app_for_option(&page_input.config, 0),
+            None,
+            "the placeholder adds nothing"
+        );
+        for (offset, (bundle, _)) in candidates.iter().enumerate() {
+            assert_eq!(
+                excluded_app_for_option(&page_input.config, offset as isize + 1).as_deref(),
+                Some(bundle.as_str()),
+                "option {} is candidate {offset}",
+                offset + 1
+            );
+        }
+        assert_eq!(
+            excluded_app_for_option(&page_input.config, candidates.len() as isize + 1),
+            None,
+            "an index past the list is refused, not clamped"
+        );
+        assert_eq!(excluded_app_for_option(&page_input.config, -1), None);
+    }
+
+    /// An entry the runtime can never match is marked, so a typo is not mistaken for a broken
+    /// feature. The empty state text changes too: "no applications excluded" would be a lie while
+    /// an entry sits there that excludes nothing.
+    #[test]
+    fn an_entry_that_cannot_match_is_marked_and_the_empty_text_says_so() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.gesture_excluded_apps = vec!["com.apple.Safari".into()];
+        let view = gestures_page_view(&page_input);
+        let labels: Vec<&str> = view.rows.iter().map(|r| r.label_key).collect();
+        assert!(
+            !labels.contains(&"settings.gestures_row_excluded_invalid"),
+            "a real bundle id is not marked: {labels:?}"
+        );
+        assert!(
+            !labels.contains(&"settings.gestures_row_excluded_empty"),
+            "a non-empty list must not say it is empty: {labels:?}"
+        );
+
+        page_input.config.mouse.gesture_excluded_apps = vec!["Safari".into()];
+        let view = gestures_page_view(&page_input);
+        let labels: Vec<&str> = view.rows.iter().map(|r| r.label_key).collect();
+        assert!(
+            labels.contains(&"settings.gestures_row_excluded_invalid"),
+            "an application name is not a bundle id: {labels:?}"
+        );
+        assert!(
+            view.rows.iter().any(|r| {
+                r.label_key == "settings.gestures_row_excluded_invalid"
+                    && matches!(r.value, Value::Dynamic(ref count) if count == "1")
+            }),
+            "the row counts the unusable entries: {labels:?}"
+        );
+    }
+
+    #[test]
+    fn the_bundle_id_predicate_is_conservative() {
+        for good in [
+            "com.apple.Safari",
+            "com.eacryo.oh-my-tab.dev",
+            "dev.zed.Zed",
+            "org.mozilla.firefox",
+        ] {
+            assert!(looks_like_bundle_id(good), "{good}");
+        }
+        for bad in [
+            "",
+            " ",
+            "Safari",
+            "Safari App",
+            "/Applications/Safari.app",
+            "file:///Applications/Safari.app",
+            "com.apple Safari",
+            "com..x",
+            ".com.x",
+            "com.apple.",
+        ] {
+            assert!(!looks_like_bundle_id(bad), "{bad:?}");
+        }
+    }
+
+    /// The refusal is about the application a gesture is DRAWN IN, so the switch that governs it is
+    /// the gestures switch; the mouse-section switch cannot stop it (`gesture::runtime::set_active`
+    /// gates on both). A page that let the mouse switch hide the list would describe a state the tap
+    /// does not implement.
+    #[test]
+    fn the_exclusion_list_stays_listed_while_the_mouse_section_is_off() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.enabled = false;
+        page_input.config.mouse.gesture_excluded_apps = vec!["com.apple.Safari".into()];
+        let view = gestures_page_view(&page_input);
+        let labels: Vec<&str> = view.rows.iter().map(|r| r.label_key).collect();
+        assert!(
+            labels.contains(&"settings.gestures_row_add_app"),
+            "the add row must still be described: {labels:?}"
+        );
+        assert!(
+            view.rows.iter().any(|r| {
+                r.label_key == "settings.gestures_row_excluded"
+                    && matches!(r.value, Value::Dynamic(ref bundle) if bundle == "com.apple.Safari")
+            }),
+            "the excluded bundle must still be listed: {labels:?}"
+        );
     }
 
     #[test]

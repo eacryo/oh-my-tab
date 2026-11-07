@@ -567,6 +567,37 @@ pub(crate) fn window_is_onscreen_now(cgwid: u32) -> bool {
     matches!(window_presence_now(cgwid), Some((true, Some(true))))
 }
 
+/// The process that owns the window `cgwid`, if the WindowServer still lists it.
+///
+/// `K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW` reaches a window that is not on screen, and the owner
+/// pid is what the gesture exclusion test needs: the app a click actually landed in, which is not
+/// always the app that owns the focused window (a click raises, and some panels never become key).
+/// `None` when the query produced nothing or the entry omits the pid -- unreadable, never "no app".
+pub(crate) fn owner_pid_for_window_now(cgwid: u32) -> Option<i32> {
+    if cgwid == 0 {
+        return None;
+    }
+    let array =
+        unsafe { CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW, cgwid) };
+    if array.is_null() {
+        return None;
+    }
+    let owner = unsafe {
+        if CFArrayGetCount(array) <= 0 {
+            None
+        } else {
+            let dict = CFArrayGetValueAtIndex(array, 0);
+            if dict.is_null() {
+                None
+            } else {
+                cf_dict_get_i32(dict, CgKey::OwnerPid).filter(|pid| *pid > 0)
+            }
+        }
+    };
+    unsafe { CFRelease(array) };
+    owner
+}
+
 /// The window number of the frontmost layer-0 window on screen, if one can be read.
 ///
 /// `CGWindowListCopyWindowInfo` returns the on-screen list front-to-back, so the first layer-0 entry

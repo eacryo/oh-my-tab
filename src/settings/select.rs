@@ -1809,6 +1809,12 @@ pub(crate) unsafe fn make_popup(
         },
     );
     let _: () = msg_send![popup, setEnabled: true];
+    // No target/action is installed here on purpose: the OWNER does it, and it must be the row's own
+    // handler, not the unified change handler. A select bound to the unified handler arms NSButton's
+    // press tracking and replaces the select's `mouseDown:`, so its panel never opens. Whoever builds
+    // the select installs the handler the choice is reported to: a described row's handler gets it in
+    // `render_row` (through `dedicated_selector`), the page-drawn popups in their own builders.
+    // The reported call is `sendPendingAction`, which forwards to that target.
     settings_select_apply_visual(popup, false);
     if let Some(first) = items.first() {
         settings_select_set_title(popup, first);

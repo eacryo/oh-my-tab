@@ -3180,11 +3180,15 @@ pub(crate) extern "C" fn handle_gesture_record_cancel(
     });
 }
 
-/// Add the selected running application to the gesture exclusion list.
+/// Add the selected application to the gesture exclusion list.
 ///
-/// The popup is selected by TITLE rather than by index: the menu was built from a snapshot of the
-/// running applications, and re-enumerating them here would let a start or quit in between make
-/// the same index mean a different application.
+/// The choice is read as an INDEX into the same candidate list the page built its options from --
+/// never by asking the control for a title. A select is `OhMyTabSettingsSelect`, a custom control
+/// that implements `indexOfSelectedItem`/`selectItemAtIndex:` but has no `titleOfSelectedItem` at
+/// all; asking it for one raised an Objective-C exception, the callback guard contained it, and the
+/// click did nothing at all. The index is also the more precise answer: it survives two candidates
+/// that share a display name (two builds of one app, a renamed duplicate), where matching by name
+/// quietly excluded the wrong bundle.
 pub(crate) extern "C" fn handle_gesture_excluded_add(
     _self: *mut c_void,
     _cmd: Sel,
@@ -3192,23 +3196,19 @@ pub(crate) extern "C" fn handle_gesture_excluded_add(
 ) {
     callback_guard::void("handle_gesture_excluded_add", || {
         let selected: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
+        // 0 is the placeholder ("Add an app…"): nothing was chosen.
         if selected <= 0 {
             return;
         }
-        let title_obj: *mut AnyObject =
-            unsafe { msg_send![sender as *mut AnyObject, titleOfSelectedItem] };
-        if title_obj.is_null() {
-            return;
-        }
-        let title = unsafe { crate::ffi::nsstring_to_rust(title_obj) };
-        // The popup lists INSTALLED applications (see the gestures page's candidate builder), so the
-        // lookup has to read the same list: matching against the running set only found an app that
-        // happened to be open, and silently dropped the choice for every other one.
-        let bundle = crate::settings::page_view::gesture_excluded_candidates()
-            .into_iter()
-            .find(|(_, name)| *name == title)
-            .map(|(bundle, _)| bundle);
-        let Some(bundle) = bundle else {
+        // The SAME list the page offered, in the same order: the page prepends the placeholder
+        // ("Add an app…") and then lists `running_app_candidates` -- installed applications that are
+        // not excluded yet. Option N (N > 0) is therefore entry N-1 here, and both sides read one
+        // function so an index can never mean a different application than the row on screen.
+        let cfg = CONFIG.read().map(|cfg| cfg.clone()).unwrap_or_default();
+        let Some(bundle) = crate::settings::page_view::excluded_app_for_option(&cfg, selected)
+        else {
+            // Older than the list the page offered (an app was excluded or quit meanwhile): put the
+            // placeholder back rather than guessing an application.
             unsafe {
                 let _: () = msg_send![sender as *mut AnyObject, selectItemAtIndex: 0isize];
             }

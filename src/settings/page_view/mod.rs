@@ -70,7 +70,7 @@ pub(super) use finder_menu::FinderMenuHooks;
 use general::general_page_view;
 use gestures::gestures_page_view;
 pub(crate) use gestures::{
-    action_row_index, delete_row_index, gesture_excluded_candidates, gesture_target_option_ids,
+    action_row_index, delete_row_index, excluded_app_for_option, gesture_target_option_ids,
     gesture_trigger_option_ids, is_gesture_row_identity, is_trigger_row_identity,
     remove_gesture_row, restore_default_gestures, set_row_trigger, trigger_row_of,
 };

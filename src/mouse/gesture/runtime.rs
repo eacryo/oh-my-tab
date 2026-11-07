@@ -139,20 +139,35 @@ pub(crate) fn still_authorized(epoch: u64, generation: u64) -> bool {
     if published.epoch != epoch {
         return false;
     }
-    !excluded_frontmost(&published.excluded)
+    // The exclusion is NOT re-asked here: this check runs from a timer with no event to name an
+    // application, and the frontmost fallback is exactly the answer that made the list look broken.
+    // What matters is that the job's own application was not excluded when it was queued (see
+    // `excluded_bundle`), and a gesture whose press was allowed keeps its authorization.
+    true
 }
 
-/// Whether the frontmost application is on the exclusion list.
+/// Whether the application the event belongs to is on the exclusion list.
 ///
-/// The answer comes from the PUBLISHED activation first (the tap thread cannot ask AppKit), but a
-/// user who switches to an excluded app and immediately draws a gesture must not be served a stale
-/// one: the publish path is a notification, and an app activated by another means can leave it
-/// behind. The live question is therefore asked whenever the published answer says "not excluded"
-/// and the list is not empty -- with `NSWorkspace.frontmostApplication`, a property read rather than
-/// a query that waits on another process.
-fn excluded_frontmost(excluded: &[String]) -> bool {
+/// `event_bundle` is the bundle id the TAP resolved for the event that is being decided: the app
+/// that owns the window under the pointer (`excluded_bundle_for_event`). It is the account that
+/// matters, because the exclusion is documented as "while one of these applications is in front",
+/// and the frontmost application is NOT always the app a click lands in:
+///
+///   * the settings window lives here, so reviewing the list and clicking straight into an excluded
+///     app behind it left `NSWorkspace.frontmostApplication` pointing at this app;
+///   * a panel that never becomes key, a menu-bar popover, a non-activating panel and a window of a
+///     background app all receive clicks while some other application stays "active";
+///   * `NSWorkspaceDidActivateApplicationNotification` is a notification: a switch completed a moment
+///     ago can still be unpublished.
+///
+/// The published activation and the live `NSWorkspace` answer are therefore used only as fallbacks,
+/// when the tap could not name the event's application at all.
+fn excluded_bundle(excluded: &[String], event_bundle: Option<&str>) -> bool {
     if excluded.is_empty() {
         return false;
+    }
+    if let Some(bundle) = event_bundle {
+        return excluded.iter().any(|id| id == bundle);
     }
     if let Ok(slot) = frontmost().read() {
         if let Some(bundle) = slot.as_deref() {
@@ -166,6 +181,50 @@ fn excluded_frontmost(excluded: &[String]) -> bool {
         Some(bundle) => excluded.iter().any(|id| id == &bundle),
         None => false,
     }
+}
+
+/// The bundle id of the application an event at `cgwid` belongs to, resolved on the tap thread.
+///
+/// Two rows read per event, one WindowServer query, no message to another process: the owner pid of
+/// the event's own window, then that pid's bundle id through the gesture module's small cache. `None`
+/// (no window number, WindowServer unreadable, a pid with no bundle) means "unknown", and the caller
+/// then falls back to the activation-based answer above.
+pub(crate) fn excluded_bundle_for_event(cgwid: i64) -> Option<String> {
+    if cgwid <= 0 {
+        return None;
+    }
+    /// pid -> its bundle id. One entry per application a gesture was drawn in.
+    type BundleCache = Vec<(i32, Option<String>)>;
+    static CACHE: OnceLock<Mutex<BundleCache>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| Mutex::new(Vec::new()));
+    let pid = crate::window_collector::owner_pid_for_window_now(cgwid as u32)?;
+    if let Ok(entries) = cache.lock() {
+        if let Some((_, bundle)) = entries.iter().find(|(cached, _)| *cached == pid) {
+            if bundle.is_some() {
+                return bundle.clone();
+            }
+        }
+    }
+    // SAFETY: one `NSRunningApplication` lookup by pid; the answer is copied into a `String` and the
+    // object is never retained here.
+    let bundle = unsafe {
+        let app: *mut objc2::runtime::AnyObject = objc2::msg_send![
+            objc2::class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        crate::app_identity::bundle_id_of(app)
+    };
+    if let Ok(mut entries) = cache.lock() {
+        // Bounded, and only a PRESENT bundle is remembered: an unreadable lookup (a process that has
+        // no bundle id, or is still starting) must be asked again, not cached as if it were final.
+        if let Some(bundle) = bundle.clone() {
+            if entries.len() >= 64 {
+                entries.remove(0);
+            }
+            entries.push((pid, Some(bundle)));
+        }
+    }
+    bundle
 }
 
 /// The trail as published to the HUD: a session id and the points to draw.
@@ -270,6 +329,7 @@ impl Runtime {
         point: Point,
         now_ms: f64,
         flags: u32,
+        event_bundle: Option<&str>,
     ) -> bool {
         if !ACTIVE.load(Ordering::SeqCst) {
             return false;
@@ -280,7 +340,7 @@ impl Runtime {
             return false;
         }
         let published = table::snapshot();
-        if excluded_frontmost(&published.excluded) || !published.table.claims(button) {
+        if excluded_bundle(&published.excluded, event_bundle) || !published.table.claims(button) {
             return false;
         }
         // Try the engine first: a press it refuses (another button already holds the session) must
@@ -380,6 +440,7 @@ impl Runtime {
         device: u64,
         at: Point,
         now_ms: f64,
+        event_bundle: Option<&str>,
     ) -> (Decision, Option<Row>) {
         let identity = Button {
             number: button,
@@ -402,7 +463,7 @@ impl Runtime {
             || {
                 published.epoch == epoch
                     && !crate::mouse::event_tap::RECORDING.load(Ordering::Relaxed)
-                    && !excluded_frontmost(&published.excluded)
+                    && !excluded_bundle(&published.excluded, event_bundle)
             },
         );
         self.publish_phase();
@@ -601,7 +662,7 @@ mod tests {
         let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
         set_active(false);
         let mut rt = Runtime::new();
-        assert!(!rt.press(1, 0, p(0.0, 0.0), 0.0, 0));
+        assert!(!rt.press(1, 0, p(0.0, 0.0), 0.0, 0, None));
         assert_eq!(crate::mouse::gesture::session_state::phase(), "Idle");
     }
 
@@ -615,10 +676,10 @@ mod tests {
             let mut rt = Runtime::new();
             set_active(true);
             publish_a_row();
-            assert!(rt.press(1, 0, p(100.0, 100.0), 0.0, 0));
+            assert!(rt.press(1, 0, p(100.0, 100.0), 0.0, 0, None));
             assert!(rt.escape(), "the first Esc belongs to the live gesture");
             // The mouse comes up first: the gesture is over.
-            let _ = rt.release(1, 0, p(140.0, 100.0), 20.0);
+            let _ = rt.release(1, 0, p(140.0, 100.0), 20.0, None);
             assert!(rt.escape(), "a repeat of the same Esc press is still ours");
             assert!(rt.release_escape(), "so is its key-up");
             assert!(!rt.release_escape(), "and only once");
@@ -633,12 +694,12 @@ mod tests {
             let mut rt = Runtime::new();
             set_active(true);
             publish_a_row();
-            assert!(rt.press(1, 0, p(100.0, 100.0), 0.0, 0));
+            assert!(rt.press(1, 0, p(100.0, 100.0), 0.0, 0, None));
             let session = rt.session_id();
             let epoch = rt.epoch;
             // A second, different trigger button: claimed only if the table has a row for it, and the
             // engine refuses while another session is live.
-            assert!(!rt.press(1, 0, p(0.0, 0.0), 1.0, 0) || rt.session_id() != session);
+            assert!(!rt.press(1, 0, p(0.0, 0.0), 1.0, 0, None) || rt.session_id() != session);
             assert_eq!(
                 rt.epoch, epoch,
                 "the live session keeps its authorization version"
@@ -655,8 +716,8 @@ mod tests {
             let mut rt = Runtime::new();
             set_active(true);
             publish_a_row();
-            assert!(rt.press(1, 0, p(100.0, 100.0), 0.0, 0));
-            let _ = rt.release(1, 0, p(140.0, 100.0), 20.0);
+            assert!(rt.press(1, 0, p(100.0, 100.0), 0.0, 0, None));
+            let _ = rt.release(1, 0, p(140.0, 100.0), 20.0, None);
             assert!(
                 !rt.owns_tail(1, 0),
                 "a finished press leaves no tail behind"
@@ -674,13 +735,13 @@ mod tests {
             publish_a_row();
             for round in 0..2 {
                 let t = round as f64 * 1000.0;
-                assert!(rt.press(1, 0, p(100.0, 100.0), t, 0), "round {round}");
+                assert!(rt.press(1, 0, p(100.0, 100.0), t, 0, None), "round {round}");
                 let mut at = p(100.0, 100.0);
                 for i in 1..=5 {
                     at = p(at.x + 10.0, at.y);
                     rt.dragged(1, 0, at, t + i as f64);
                 }
-                let (decision, _) = rt.release(1, 0, at, t + 10.0);
+                let (decision, _) = rt.release(1, 0, at, t + 10.0, None);
                 assert!(
                     matches!(decision, Decision::Execute | Decision::Replay),
                     "round {round}: {decision:?}"
@@ -719,9 +780,54 @@ mod tests {
     #[test]
     fn the_exclusion_predicate_matches_bundle_ids_only() {
         let excluded = ["com.example.excluded".to_string()];
-        assert!(excluded.iter().any(|id| id == "com.example.excluded"));
-        assert!(!excluded.iter().any(|id| id == "com.example.other"));
-        assert!(!excluded_frontmost(&[]), "an empty list excludes nothing");
+        assert!(excluded_bundle(&excluded, Some("com.example.excluded")));
+        assert!(!excluded_bundle(&excluded, Some("com.example.other")));
+        assert!(
+            !excluded_bundle(&[], Some("com.example.excluded")),
+            "an empty list excludes nothing"
+        );
+    }
+
+    /// The regression this covers: the app a gesture lands in is the event's own application, so it
+    /// decides even when the published/live frontmost answer names someone else. The settings window
+    /// (this app) used to be that "someone else" whenever the list was reviewed and an excluded app
+    /// behind it was clicked straight away.
+    #[test]
+    fn the_events_own_application_decides_even_when_it_is_not_frontmost() {
+        with_global_state(|| {
+            let mut cfg = crate::config::Config::default();
+            cfg.mouse.enabled = true;
+            cfg.mouse.gestures_enabled = true;
+            cfg.mouse.gesture_excluded_apps = vec!["com.example.excluded".into()];
+            cfg.mouse.gestures = vec![crate::config::GestureBinding {
+                gesture: "R".into(),
+                button: 1,
+                binding: "cmd+t".into(),
+                enabled: true,
+            }];
+            table::publish(&cfg);
+            // The activation feed still says this app, as it does while a settings window is up.
+            publish_frontmost(Some("com.example.ourselves".into()));
+            let mut rt = Runtime::new();
+            set_active(true);
+            assert!(
+                !rt.press(1, 0, p(100.0, 100.0), 0.0, 0, Some("com.example.excluded")),
+                "a press into the excluded application must not be claimed"
+            );
+            assert!(
+                rt.press(1, 0, p(100.0, 100.0), 0.0, 0, Some("com.example.allowed")),
+                "the same press into another application is a gesture"
+            );
+            // And the exclusion is consulted again at the release: the app moved under the gesture.
+            let (decision, target) =
+                rt.release(1, 0, p(160.0, 100.0), 20.0, Some("com.example.excluded"));
+            assert!(
+                matches!(decision, Decision::Swallow | Decision::Replay),
+                "an excluded application gets no action: {decision:?}"
+            );
+            assert!(target.is_none());
+            set_active(false);
+        });
     }
 
     #[test]
