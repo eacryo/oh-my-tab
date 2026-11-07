@@ -255,9 +255,6 @@ extern "C" {
     /// storage behind the +1: release the path with `CFRelease`, never `release_obj`.
     pub(crate) fn CGPathCreateMutable() -> *mut c_void;
     pub(crate) fn CGPathMoveToPoint(path: *mut c_void, transform: *const c_void, x: f64, y: f64);
-    /// Close the current subpath, so a filled polygon has no seam between its first and last
-    /// corners.
-    pub(crate) fn CGPathCloseSubpath(path: *mut c_void);
     pub(crate) fn CGPathAddLineToPoint(path: *mut c_void, transform: *const c_void, x: f64, y: f64);
 }
 

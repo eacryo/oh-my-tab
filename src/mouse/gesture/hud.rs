@@ -12,21 +12,12 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
-use std::sync::OnceLock;
 
 use objc2::runtime::{AnyObject, Sel};
-use objc2::{class, msg_send, sel};
+use objc2::{class, msg_send};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use std::ffi::c_void;
-
-// The framework's own attribute names: AppKit resolves these by identity, not by spelling.
-#[link(name = "AppKit", kind = "framework")]
-extern "C" {
-    static NSFontAttributeName: *mut AnyObject;
-    static NSParagraphStyleAttributeName: *mut AnyObject;
-    static NSForegroundColorAttributeName: *mut AnyObject;
-}
 
 use crate::ffi::{
     make_nsstring, CFRelease, CGPathAddLineToPoint, CGPathCreateMutable, CGPathMoveToPoint,
@@ -209,7 +200,7 @@ struct TrailView {
     window: *mut AnyObject,
     view: *mut AnyObject,
     stroke: *mut AnyObject,
-    /// The hint card, its glyph view and its text label.
+    /// The hint card (a dark plate), its glyph view and its text label.
     card: *mut AnyObject,
     glyph: *mut AnyObject,
     hint: *mut AnyObject,
@@ -362,15 +353,15 @@ impl TrailView {
         let _: () = msg_send![stroke, setFrame: layer_frame];
         let view_layer: *mut AnyObject = msg_send![view, layer];
         let _: () = msg_send![view_layer, addSublayer: stroke];
-        // The hint card: a dark plate with a large arrow standing for the stroke's direction and
-        // the action it would run below it.
+        // The hint card: a dark rounded plate with an arrow and the action's name under it.
         //
-        // Both children are DRAWN, not laid out by AppKit: an SF Symbol image view and a text field
-        // each position their own content inside their frame, and neither honoured the box this code
-        // gave it (the arrow stayed small inside a large frame, the label sat off its centre). The
-        // card owns the backing layer and paints the arrow and the text itself, so what the numbers
-        // say is what the pixels are.
-        let card: *mut AnyObject = msg_send![gesture_card_class(), alloc];
+        // Deliberately composed of AppKit's own controls -- a layer-backed plain NSView for the
+        // plate, an NSImageView for the arrow and an NSTextField for the label -- because that is the
+        // combination this app draws everywhere else. A hand-drawn card meant overriding drawRect:,
+        // and every crash this module had came from that path: the view's layer repaints from its
+        // contents, and a drawing that touches the wrong lifetime inside it takes the whole process
+        // down in the display transaction.
+        let card: *mut AnyObject = msg_send![class!(NSView), alloc];
         let card: *mut AnyObject = msg_send![
             card,
             initWithFrame: NSRect::new(
@@ -389,14 +380,49 @@ impl TrailView {
                 crate::ffi::hex_to_cg_color(crate::theme::GESTURE_HINT_BG),
             );
             let _: () = msg_send![card_layer, setCornerRadius: crate::theme::GESTURE_HINT_RADIUS];
-            let _: () = msg_send![card_layer, setMasksToBounds: true];
-            // A layer-backed view whose layer has a background paints BOTH the layer fill and this
-            // drawRect: over it; the content must be opaque enough to sit on that fill, which it is.
-            let _: () = msg_send![card, setLayerContentsRedrawPolicy: 2isize]; // on setNeedsDisplay
         }
+        // The arrow: an image view whose image is resized to the box, the way every other symbol in
+        // this app is drawn.
+        let glyph: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+        let glyph: *mut AnyObject = msg_send![
+            glyph,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(
+                    crate::theme::GESTURE_HINT_GLYPH_SIZE,
+                    crate::theme::GESTURE_HINT_GLYPH_SIZE
+                )
+            )
+        ];
+        let _: () = msg_send![glyph, setImageScaling: 3isize]; // proportionally, inside the box
+        let ink = crate::ffi::hex_to_ns_color(crate::theme::GESTURE_HINT_INK);
+        let _: () = msg_send![glyph, setContentTintColor: ink];
+        crate::release_obj(ink);
+        let _: () = msg_send![card, addSubview: glyph];
+        // The label: a plain text field, centred, on one line.
+        let hint: *mut AnyObject =
+            msg_send![class!(NSTextField), labelWithString: make_nsstring("")];
+        let _: () = msg_send![hint, setBezeled: false];
+        let _: () = msg_send![hint, setDrawsBackground: false];
+        let _: () = msg_send![hint, setEditable: false];
+        let _: () = msg_send![hint, setSelectable: false];
+        // A `labelWithString:` field carries its own cell metrics, and the alignment is set before the
+        // frame is known: set both again after every layout below, or the string is drawn from its
+        // cell's left inset and reads off-centre however wide the frame is.
+        let _: () = msg_send![hint, setAlignment: 2isize]; // NSTextAlignmentCenter
+        let _: () = msg_send![hint, setUsesSingleLineMode: true];
+        let font: *mut AnyObject =
+            msg_send![class!(NSFont), systemFontOfSize: crate::theme::GESTURE_HINT_FONT];
+        let _: () = msg_send![hint, setFont: font];
+        let text_color = crate::ffi::hex_to_ns_color(crate::theme::GESTURE_HINT_INK);
+        let _: () = msg_send![hint, setTextColor: text_color];
+        crate::release_obj(text_color);
+        let _: () = msg_send![card, addSubview: hint];
         let _: () = msg_send![card, setHidden: true];
         let _: () = msg_send![view, addSubview: card];
         self.card = card;
+        self.glyph = glyph;
+        self.hint = hint;
         self.screen_origin = screen_frame.origin;
         self.primary_top = primary_top;
         self.window = window;
@@ -443,32 +469,78 @@ impl TrailView {
 
             // The card's own class paints the arrow and the text (see `gesture_card_draw`), so
             // every position below is a painted coordinate, not a view frame AppKit may reinterpret.
+            // The card is centred on the screen the gesture is drawn on: it is a status readout, and
+            // one that follows the stroke is distracting while the hand is moving.
             let pad = crate::theme::GESTURE_HINT_PADDING;
+            let glyph_box = crate::theme::GESTURE_HINT_GLYPH_SIZE;
             let line = crate::theme::GESTURE_HINT_LINE;
-            let glyph = crate::theme::GESTURE_HINT_GLYPH_SIZE;
-            // Width follows the text, measured with the font the card draws it with.
-            let text_w = measure_hint_text(&hint.text);
-            let w = (text_w + pad * 2.0).clamp(
-                crate::theme::GESTURE_HINT_MIN_WIDTH,
-                crate::theme::GESTURE_HINT_MAX_WIDTH,
-            );
-            let content = glyph + crate::theme::GESTURE_HINT_GAP_INNER + line;
-            let h = (content + pad * 2.0).max(crate::theme::GESTURE_HINT_HEIGHT);
-            // The card sits at the CENTRE of the screen the gesture is drawn on, not under the
-            // pointer: it is a status readout, and one that follows the stroke is both distracting
-            // and hard to read while the hand is moving.
+            let w = crate::theme::GESTURE_HINT_MIN_WIDTH;
+            let h = (glyph_box + crate::theme::GESTURE_HINT_GAP_INNER + line + pad * 2.0)
+                .max(crate::theme::GESTURE_HINT_HEIGHT);
             let x = ((bounds.size.width - w) / 2.0).max(0.0);
             let y = ((bounds.size.height - h) / 2.0).max(0.0);
-            let frame = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-            let _: () = msg_send![self.card, setFrame: frame];
-            // The painted content is stored on the card and used by its drawRect:.
-            let direction = hint.direction.unwrap_or('R');
-            set_card_content(self.card, &hint.text, direction);
-            let _: () = msg_send![self.card, setNeedsDisplay: true];
+            let _: () = msg_send![
+                self.card,
+                setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
+            ];
+            // The arrow and the label are laid out inside the plate, top to bottom.
+            if !self.glyph.is_null() {
+                let _: () = msg_send![
+                    self.glyph,
+                    setFrame: NSRect::new(
+                        NSPoint::new((w - glyph_box) / 2.0, h - glyph_box - pad),
+                        NSSize::new(glyph_box, glyph_box)
+                    )
+                ];
+            }
+            if !self.hint.is_null() {
+                let _: () = msg_send![
+                    self.hint,
+                    setFrame: NSRect::new(
+                        NSPoint::new(pad, pad * 0.75),
+                        NSSize::new(w - pad * 2.0, line)
+                    )
+                ];
+            }
+            let symbol = match hint.direction {
+                Some('L') => "arrow.left",
+                Some('R') => "arrow.right",
+                Some('U') => "arrow.up",
+                Some('D') => "arrow.down",
+                _ => "arrow.right",
+            };
+            let symbol_ns = make_nsstring(symbol);
+            let image: *mut AnyObject = msg_send![
+                class!(NSImage),
+                imageWithSystemSymbolName: symbol_ns,
+                accessibilityDescription: std::ptr::null::<AnyObject>()
+            ];
+            CFRelease(symbol_ns as *const c_void);
+            if !image.is_null() && !self.glyph.is_null() {
+                let _: () = msg_send![image, setSize: NSSize::new(glyph_box, glyph_box)];
+                let _: () = msg_send![self.glyph, setImage: image];
+            }
+            if !self.hint.is_null() {
+                let title = make_nsstring(&hint.text);
+                let _: () = msg_send![self.hint, setStringValue: title];
+                CFRelease(title as *const c_void);
+                // Re-assert the centring after the text and the frame: a cell that was given its
+                // string while the frame was still the initial one lays the line out against that
+                // frame's left edge.
+                let _: () = msg_send![self.hint, setAlignment: 2isize];
+                let _: () = msg_send![self.hint, sizeToFit];
+                let fitted: NSRect = msg_send![self.hint, frame];
+                let _: () = msg_send![
+                    self.hint,
+                    setFrame: NSRect::new(
+                        NSPoint::new((w - fitted.size.width) / 2.0, pad * 0.75),
+                        NSSize::new(fitted.size.width, line)
+                    )
+                ];
+            }
             let _: () = msg_send![self.card, setHidden: false];
         }
     }
-
     /// A CG global point (origin at the primary display's top-left, y down) as a point in this view
     /// (origin at the window's bottom-left, y up).
     fn global_to_local(&self, x: f64, y: f64) -> NSPoint {
@@ -515,199 +587,6 @@ impl TrailView {
         }
         self.shown = false;
     }
-}
-// ---- The hint card's painted content -------------------------------------------------------
-//
-// An SF Symbol image view and an NSTextField each decide for themselves where their content goes
-// inside the frame they are given: the arrow kept its natural size inside a large box, and the
-// label did not sit where its frame said. The card therefore paints both itself in drawRect:, from
-// the numbers the layout computed, so the plate, the arrow and the text cannot disagree.
-
-/// The arrow's proportions, as fractions of its width.
-const ARROW_HEAD_LENGTH: f64 = 0.34;
-const ARROW_HEAD_HEIGHT: f64 = 0.80;
-const ARROW_SHAFT: f64 = 0.14;
-
-static CARD_TEXT: OnceLock<std::sync::Mutex<String>> = OnceLock::new();
-static CARD_DIRECTION: OnceLock<std::sync::Mutex<char>> = OnceLock::new();
-
-fn card_text() -> &'static std::sync::Mutex<String> {
-    CARD_TEXT.get_or_init(|| std::sync::Mutex::new(String::new()))
-}
-
-fn card_direction() -> &'static std::sync::Mutex<char> {
-    CARD_DIRECTION.get_or_init(|| std::sync::Mutex::new('R'))
-}
-
-static GESTURE_CARD_CLASS: OnceLock<crate::ffi::StaticClass> = OnceLock::new();
-
-fn gesture_card_class() -> *mut AnyObject {
-    crate::ffi::StaticClass::register_once(&GESTURE_CARD_CLASS, c"OhMyTabGestureHintCard", || {
-        crate::ffi::build_class(
-            c"OhMyTabGestureHintCard",
-            class!(NSView),
-            |builder| unsafe {
-                builder.add_method::<AnyObject, _>(
-                    sel!(drawRect:),
-                    gesture_card_draw as unsafe extern "C" fn(*mut AnyObject, Sel, NSRect),
-                );
-            },
-        )
-    })
-    .0 as *mut AnyObject
-}
-
-/// Store what the card paints on its next redraw.
-unsafe fn set_card_content(card: *mut AnyObject, text: &str, direction: char) {
-    let _ = card;
-    if let Ok(mut slot) = card_text().lock() {
-        *slot = text.to_string();
-    }
-    if let Ok(mut slot) = card_direction().lock() {
-        *slot = direction;
-    }
-}
-
-/// The seven corners of an arrow of `size`, pointing along `(dx, dy)`, centred on the origin.
-fn arrow_polygon(size: f64, dx: f64, dy: f64) -> [(f64, f64); 7] {
-    let half = size / 2.0;
-    let head = size * ARROW_HEAD_LENGTH;
-    let barb = size * ARROW_HEAD_HEIGHT / 2.0;
-    let shaft = size * ARROW_SHAFT / 2.0;
-    // `along` runs from the tail to the tip, `across` is perpendicular to it.
-    let point = |along: f64, across: f64| (dx * along - dy * across, dy * along + dx * across);
-    [
-        point(half, 0.0),
-        point(half - head, barb),
-        point(half - head, shaft),
-        point(-half, shaft),
-        point(-half, -shaft),
-        point(half - head, -shaft),
-        point(half - head, -barb),
-    ]
-}
-
-/// The width a single line of the hint text needs, in the font the card draws it with.
-unsafe fn measure_hint_text(text: &str) -> f64 {
-    if text.is_empty() {
-        return 0.0;
-    }
-    let attributes = hint_text_attributes();
-    let title = make_nsstring(text);
-    let attributed: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-    let attributed: *mut AnyObject =
-        msg_send![attributed, initWithString: title, attributes: attributes];
-    CFRelease(title as *const c_void);
-    let size: NSSize = msg_send![attributed, size];
-    crate::release_obj(attributed);
-    if size.width.is_finite() {
-        size.width.ceil()
-    } else {
-        0.0
-    }
-}
-
-/// The attributes the label is drawn with: the card's font, ink and a centred paragraph.
-///
-/// The keys are the framework's own attribute NAMES (the extern statics AppKit exports), picked
-/// through their addresses. Building a dictionary out of made-up string keys crashed the process
-/// inside the text layout: AppKit looks the keys up by identity, found an unknown one, and
-/// dereferenced it.
-unsafe fn hint_text_attributes() -> *mut AnyObject {
-    let font: *mut AnyObject = msg_send![
-        class!(NSFont),
-        systemFontOfSize: crate::theme::GESTURE_HINT_FONT
-    ];
-    let style: *mut AnyObject = msg_send![class!(NSMutableParagraphStyle), alloc];
-    let style: *mut AnyObject = msg_send![style, init];
-    let _: () = msg_send![style, setAlignment: 2isize]; // NSTextAlignmentCenter
-    let ink = crate::ffi::hex_to_ns_color(crate::theme::GESTURE_HINT_INK);
-    let attributes: *mut AnyObject = msg_send![class!(NSMutableDictionary), alloc];
-    let attributes: *mut AnyObject = msg_send![attributes, init];
-    let _: () = msg_send![attributes, setObject: font, forKey: NSFontAttributeName];
-    let _: () = msg_send![attributes, setObject: style, forKey: NSParagraphStyleAttributeName];
-    let _: () = msg_send![attributes, setObject: ink, forKey: NSForegroundColorAttributeName];
-    let attributes: *mut AnyObject = msg_send![attributes, autorelease];
-    let _ = ink;
-    attributes
-}
-
-/// Paint the card: its arrow, centred, then its label in the band under it.
-unsafe extern "C" fn gesture_card_draw(this: *mut AnyObject, _cmd: Sel, dirty: NSRect) {
-    crate::callback_guard::void("gesture_card_draw", || unsafe {
-        let bounds: NSRect = msg_send![this, bounds];
-        // drawRect: is clipped to its dirty rect, and a drawing that ignores it is drawn once and
-        // then clipped away on the next partial redraw. Pain in the view's own coordinates and stop
-        // when the dirty rect does not touch the card.
-        let paint = intersect_rects(bounds, dirty);
-        if paint.size.width < 1.0 || paint.size.height < 1.0 {
-            return;
-        }
-        let w = bounds.size.width.max(1.0);
-        let h = bounds.size.height.max(1.0);
-        let direction = card_direction().lock().map(|d| *d).unwrap_or('R');
-        let text = card_text().lock().map(|t| t.clone()).unwrap_or_default();
-        let pad = crate::theme::GESTURE_HINT_PADDING;
-        let glyph = crate::theme::GESTURE_HINT_GLYPH_SIZE.min(w - pad * 2.0);
-        let line = crate::theme::GESTURE_HINT_LINE;
-        let content = glyph + crate::theme::GESTURE_HINT_GAP_INNER + line;
-        let top = ((h - content) / 2.0).max(0.0);
-        let (dx, dy) = match direction {
-            'L' => (-1.0f64, 0.0f64),
-            'U' => (0.0, 1.0),
-            'D' => (0.0, -1.0),
-            _ => (1.0, 0.0),
-        };
-        // The arrow is a path, not a glyph: its geometry is exact, so its centre is the plate's
-        // centre and its size is the size asked for.
-        let cx = w / 2.0;
-        let cy = h - top - glyph / 2.0;
-        let ink = crate::ffi::hex_to_ns_color(crate::theme::GESTURE_HINT_INK);
-        let path = CGPathCreateMutable();
-        for (index, (px, py)) in arrow_polygon(glyph, dx, dy).iter().enumerate() {
-            if index == 0 {
-                CGPathMoveToPoint(path, std::ptr::null(), cx + px, cy + py);
-            } else {
-                CGPathAddLineToPoint(path, std::ptr::null(), cx + px, cy + py);
-            }
-        }
-        crate::ffi::CGPathCloseSubpath(path);
-        let _: () = msg_send![ink, setFill];
-        let path_obj = path as *mut AnyObject;
-        let _: () = msg_send![path_obj, fill];
-        CFRelease(path as *const c_void);
-        crate::release_obj(ink);
-        // The label, in the band below the arrow, centred on the plate.
-        if !text.is_empty() {
-            let attributes = hint_text_attributes();
-            let title = make_nsstring(&text);
-            let attributed: *mut AnyObject = msg_send![class!(NSAttributedString), alloc];
-            let attributed: *mut AnyObject =
-                msg_send![attributed, initWithString: title, attributes: attributes];
-            CFRelease(title as *const c_void);
-            let text_w = w - pad * 2.0;
-            let measured: NSSize = msg_send![attributed, size];
-            let draw_h = measured.height.max(line);
-            let rect = NSRect::new(
-                NSPoint::new(pad, top + (line - draw_h) / 2.0),
-                NSSize::new(text_w, draw_h),
-            );
-            let _: () = msg_send![attributed, drawInRect: rect];
-            crate::release_obj(attributed);
-        }
-    });
-}
-
-/// The overlap of two rectangles; empty when they do not meet.
-fn intersect_rects(a: NSRect, b: NSRect) -> NSRect {
-    let left = a.origin.x.max(b.origin.x);
-    let right = (a.origin.x + a.size.width).min(b.origin.x + b.size.width);
-    let bottom = a.origin.y.max(b.origin.y);
-    let top = (a.origin.y + a.size.height).min(b.origin.y + b.size.height);
-    NSRect::new(
-        NSPoint::new(left, bottom),
-        NSSize::new((right - left).max(0.0), (top - bottom).max(0.0)),
-    )
 }
 impl TrailWindow {
     fn draw(&mut self, trail: &Trail) {

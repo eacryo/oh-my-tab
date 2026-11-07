@@ -250,9 +250,7 @@ pub(crate) const RADIUS_FULL: f64 = 9999.0;
 pub(crate) const GESTURE_HINT_BG: u32 = 0x3C3C3CFF;
 pub(crate) const GESTURE_HINT_INK: u32 = 0xFFFFFFFF;
 pub(crate) const GESTURE_HINT_RADIUS: f64 = 14.0;
-/// The plate is sized to its label: this is the minimum width, up to GESTURE_HINT_MAX_WIDTH.
 pub(crate) const GESTURE_HINT_MIN_WIDTH: f64 = 200.0;
-pub(crate) const GESTURE_HINT_MAX_WIDTH: f64 = 320.0;
 /// The minimum height; a label that wraps to two lines grows the plate.
 pub(crate) const GESTURE_HINT_HEIGHT: f64 = 140.0;
 pub(crate) const GESTURE_HINT_PADDING: f64 = 16.0;
