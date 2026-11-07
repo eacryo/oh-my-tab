@@ -271,6 +271,9 @@ pub(super) fn select_sidebar(idx: usize) {
     if idx == super::SETTINGS_GESTURES_PAGE_INDEX {
         let current = crate::config::CONFIG.read().unwrap().clone();
         if super::dispatch::gesture_rows_changed(&current) {
+            // No preserved position: the user is ARRIVING at this page, so its top is where they
+            // expect to start. The in-place edits (remove/add) preserve it; see
+            // `rebuild_settings_content_now_preserving_scroll`.
             unsafe { rebuild_settings_content_now_keeping_scroll(SettingsPageId::Gestures, None) };
         }
     }
@@ -3740,6 +3743,16 @@ pub(super) fn scroll_target_from_distance(distance: f64, doc_h: f64, clip_h: f64
         return top;
     }
     (top - distance.clamp(0.0, top)).clamp(0.0, top)
+}
+
+/// Rebuild the settings content and leave `page` where the user had scrolled to.
+///
+/// The position has to be read BEFORE the page is torn down, so this is the call site's only job:
+/// a caller that passes `None` (or reads the position after the rebuild) throws a long page back to
+/// its top. Removing a row from the bottom of a page is exactly the case this exists for.
+pub(crate) unsafe fn rebuild_settings_content_now_preserving_scroll(page: SettingsPageId) {
+    let distance = page_scroll_distance_from_top(page);
+    rebuild_settings_content_now_keeping_scroll(page, distance);
 }
 
 /// Rebuild the settings content in an existing window while keeping `page` where the user left it.

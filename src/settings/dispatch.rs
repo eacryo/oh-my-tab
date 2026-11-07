@@ -3167,9 +3167,8 @@ pub(crate) extern "C" fn handle_gesture_record_cancel(
     callback_guard::void("handle_gesture_record_cancel", || {
         crate::mouse::gesture::recording::cancel();
         unsafe {
-            crate::settings::window::rebuild_settings_content_now_keeping_scroll(
+            crate::settings::window::rebuild_settings_content_now_preserving_scroll(
                 SettingsPageId::Gestures,
-                None,
             );
         }
     });
@@ -3241,9 +3240,8 @@ pub(crate) extern "C" fn handle_gesture_excluded_choose(
         };
         if add_excluded_application(&bundle_id) {
             unsafe {
-                crate::settings::window::rebuild_settings_content_now_keeping_scroll(
+                crate::settings::window::rebuild_settings_content_now_preserving_scroll(
                     SettingsPageId::Gestures,
-                    None,
                 );
             }
         }
@@ -3277,9 +3275,8 @@ pub(crate) extern "C" fn handle_gesture_excluded_remove(
             crate::runtime_config::ConfigChangeSource::Settings,
         );
         unsafe {
-            crate::settings::window::rebuild_settings_content_now_keeping_scroll(
+            crate::settings::window::rebuild_settings_content_now_preserving_scroll(
                 SettingsPageId::Gestures,
-                None,
             );
         }
     });
