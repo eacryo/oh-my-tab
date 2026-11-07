@@ -268,6 +268,10 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         );
     }
     let excluded_total = cfg.mouse.gesture_excluded_apps.len();
+    // The names of everything the picker knows, so a listed bundle can be shown under the name the
+    // user recognises instead of its reverse-DNS identifier.
+    let display_names: HashMap<String, String> =
+        gesture_excluded_candidates().into_iter().collect();
     for (index, bundle) in cfg
         .mouse
         .gesture_excluded_apps
@@ -276,11 +280,15 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         .enumerate()
     {
         let id = excluded_row_identity(index);
-        // The bundle id IS the value the configuration holds. It is also the only name that is
-        // always available: an excluded application need not be installed (the user may exclude it
-        // before opening it), and inventing a friendlier name for some entries but not others would
-        // make the list inconsistent.
-        let label = bundle.clone();
+        // The row's LABEL is the application, the way the gesture rows label themselves with the
+        // stroke they hold: a generic "Application" title beside a truncated identifier said nothing
+        // about which applications are excluded. The bundle id is the fallback, not the default --
+        // an entry can name an application that is no longer installed, and it still has to be
+        // listed and removable.
+        let label = display_names
+            .get(bundle)
+            .cloned()
+            .unwrap_or_else(|| bundle.clone());
         w.push(
             RowDraft::new(
                 "settings.gestures_row_excluded",
@@ -295,8 +303,10 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
                     align: ValueAlign::Right,
                 },
                 ControlId::Action(id),
-                Value::Dynamic(label),
+                // The value beside the label stays empty: the name IS the label now.
+                Value::None,
             )
+            .label_text(label)
             .action_tag(index as isize)
             .into_spec(),
         );
@@ -1194,6 +1204,48 @@ mod tests {
         assert_eq!(excluded_app_for_option(&page_input.config, -1), None);
     }
 
+    /// Each excluded row is LABELLED with the application's name and carries no second copy of it.
+    ///
+    /// The generic "Application" title said nothing, and the identifier beside it was truncated to
+    /// "com.o…" -- a list of rows that could not be told apart. The name is the label now, the same
+    /// way a gesture row labels itself with its stroke. An entry that names nothing installed keeps
+    /// its identifier, because it still has to be listed and removable.
+    #[test]
+    fn an_excluded_row_is_labelled_with_the_application_name() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.gesture_excluded_apps = vec![
+            "com.apple.Safari".into(),
+            "com.example.not-installed-anywhere".into(),
+        ];
+        let view = gestures_page_view(&page_input);
+        let excluded: Vec<&RowSpec> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_excluded")
+            .collect();
+        assert_eq!(excluded.len(), 2, "one row per entry");
+        let texts: Vec<Option<&str>> = excluded.iter().map(|r| r.label_text.as_deref()).collect();
+        assert_eq!(
+            texts,
+            vec![Some("Safari"), Some("com.example.not-installed-anywhere")],
+            "the name is the label; an unknown bundle keeps its identifier"
+        );
+        for row in excluded {
+            assert_eq!(
+                row.value,
+                Value::None,
+                "the name is the label, not repeated as the value"
+            );
+            assert!(matches!(
+                &row.control,
+                ControlKind::Value {
+                    action: Some(_),
+                    ..
+                }
+            ));
+        }
+    }
+
     /// An entry the runtime can never match is marked, so a typo is not mistaken for a broken
     /// feature. The empty state text changes too: "no applications excluded" would be a lie while
     /// an entry sits there that excludes nothing.
@@ -1272,9 +1324,9 @@ mod tests {
         assert!(
             view.rows.iter().any(|r| {
                 r.label_key == "settings.gestures_row_excluded"
-                    && matches!(r.value, Value::Dynamic(ref bundle) if bundle == "com.apple.Safari")
+                    && r.label_text.as_deref() == Some("Safari")
             }),
-            "the excluded bundle must still be listed: {labels:?}"
+            "the excluded application must still be listed, under its name: {labels:?}"
         );
     }
 
