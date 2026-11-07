@@ -180,6 +180,8 @@ pub(super) struct RowDraft {
     action_tag: Option<isize>,
     /// The row's label as DATA instead of a locale key, for a row whose copy the page computed.
     label_text: Option<String>,
+    /// The application bundle whose icon the row shows before its label (see `RowSpec`).
+    icon_bundle: Option<String>,
 }
 
 impl RowDraft {
@@ -203,6 +205,7 @@ impl RowDraft {
             value,
             action_tag: None,
             label_text: None,
+            icon_bundle: None,
         }
     }
 
@@ -248,6 +251,12 @@ impl RowDraft {
         self
     }
 
+    /// Show the icon of `bundle` before the row's label (see [`RowSpec::icon_bundle`]).
+    pub(super) fn icon_bundle(mut self, bundle: impl Into<String>) -> Self {
+        self.icon_bundle = Some(bundle.into());
+        self
+    }
+
     /// Stamp the row's action button with a number its callback can read back. The tag is the
     /// only value that reaches the sender: a button knows its title, not the data beside it.
     pub(super) fn action_tag(mut self, tag: isize) -> Self {
@@ -270,6 +279,7 @@ impl RowDraft {
             section: "",
             label_key: self.label_key,
             label_text: self.label_text,
+            icon_bundle: self.icon_bundle,
             desc_key: self.desc_key,
             caption_key: self.caption_key,
             control: self.control,

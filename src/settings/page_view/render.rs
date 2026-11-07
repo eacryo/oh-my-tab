@@ -83,7 +83,6 @@ pub(super) fn dedicated_selector(field: Option<ControlField>) -> Sel {
     match field {
         Some(ControlField::WindowsEnabled) => sel!(handleWindowsEnabledToggle:),
         Some(ControlField::MouseEnabled) => sel!(handleEnableMouseToggle:),
-        Some(ControlField::GestureExcludedAdd) => sel!(handleGestureExcludedAdd:),
         Some(ControlField::MappingEnabled) => sel!(handleMappingEnabledChanged:),
         Some(ControlField::ClipboardEnabled) => sel!(handleClipboardEnabledToggle:),
         Some(ControlField::ClipboardPaused) => sel!(handlePauseRecordingToggle:),
@@ -98,7 +97,8 @@ fn action_selector(action: &str) -> Sel {
         "export_settings" => sel!(handleExportSettings:),
         // The Gestures page's excluded-application rows: Remove one entry.
         "gesture_excluded_remove" => sel!(handleGestureExcludedRemove:),
-        "gesture_excluded_add" => sel!(handleGestureExcludedAdd:),
+        // The Gestures page's "Add an application": opens the system application chooser.
+        "gesture_excluded_choose" => sel!(handleGestureExcludedChoose:),
         // A gesture row's Delete, and the list's restore button. Both rebuild the page themselves.
         action if crate::settings::page_view::delete_row_index(action).is_some() => {
             sel!(handleGestureRowDelete:)
@@ -198,6 +198,22 @@ pub(super) unsafe fn render_row(
     if row.separator_above {
         place_row_separator(canvas, &placed.frame);
     }
+    // The row's application icon, when the row is about one. It is drawn in the label column's
+    // leading edge and the LABEL is moved right by exactly its width and gap, so the text keeps the
+    // inset every other row starts at. An application the system cannot locate draws no icon and
+    // keeps its plain label: a generic placeholder would claim the application is there.
+    let icon_width = match &row.icon_bundle {
+        Some(bundle) if place_row_icon(canvas, parent, bundle, placed) => {
+            ICON_SLOT_W + ICON_LABEL_GAP
+        }
+        _ => 0.0,
+    };
+    let mut placed = placed.clone();
+    if icon_width > 0.0 {
+        placed.label_frame.x += icon_width;
+        placed.label_frame.w = (placed.label_frame.w - icon_width).max(1.0);
+    }
+    let placed = &placed;
     // The row's label copy: the locale key, or the data the page computed for it.
     let title = row.label_text.clone().unwrap_or_else(|| t(row.label_key));
     // The row's title view: what the accessibility label and the disabled-row pairing name.
@@ -439,7 +455,14 @@ pub(super) unsafe fn render_row(
         );
         if !button.is_null() {
             if let Some(tag) = row.action_tag {
-                let _: () = msg_send![button, setTag: tag];
+                // WHICH entry a row's button acts on travels as its IDENTIFIER, never as its tag.
+                // The tag already carries the role's palette slot, and the hover callbacks read it
+                // to restore the right fill: overwriting it with a list index made every one of
+                // these buttons fall back to the generic hover wash and stay there after the
+                // pointer left (the fill a row kept was the HOVER color, not the row's own).
+                let identifier = crate::settings::ffi_identifier_for_action_tag(tag);
+                let _: () = msg_send![button, setIdentifier: identifier];
+                crate::ffi::CFRelease(identifier as *const c_void);
             }
             let _: () = msg_send![button, setFrame: frame.rect()];
             let _: () = msg_send![parent, addSubview: button];
@@ -468,6 +491,50 @@ pub(super) unsafe fn render_row(
         extra: RenderedExtra::None,
     });
     Ok(())
+}
+
+/// The width an application icon occupies in the label column, and the gap before the label.
+///
+/// The sidebar's own icon metrics (`SIDEBAR_ICON_SIZE`/`SIDEBAR_ICON_LABEL_GAP`) are the same visual
+/// relationship at a smaller size; a settings row's label is drawn at control size, so the icon is
+/// one line tall and the gap matches the sidebar's.
+const ICON_SLOT_W: f64 = 18.0;
+const ICON_LABEL_GAP: f64 = 8.0;
+
+/// Draw `bundle`'s application icon at the leading edge of the row's label band.
+///
+/// Returns whether a view was placed, which is what tells `render_row` to move the label right: a
+/// row whose bundle cannot be located (the application was moved or deleted) keeps its plain
+/// label and the whole column, rather than leaving a blank gap where an icon would have been.
+unsafe fn place_row_icon(
+    canvas: &mut PageCanvas,
+    parent: *mut AnyObject,
+    bundle: &str,
+    placed: &RowLayout,
+) -> bool {
+    let Some(image) = crate::app_identity::icon_for_bundle_id(bundle, ICON_SLOT_W) else {
+        return false;
+    };
+    let view: *mut AnyObject = msg_send![class!(NSImageView), alloc];
+    let frame = NSRect::new(
+        NSPoint::new(
+            placed.label_frame.x,
+            placed.frame.y + (placed.frame.h - ICON_SLOT_W).max(0.0) / 2.0,
+        ),
+        NSSize::new(ICON_SLOT_W, ICON_SLOT_W),
+    );
+    let view: *mut AnyObject = msg_send![view, initWithFrame: frame];
+    if view.is_null() {
+        release_obj(image);
+        return false;
+    }
+    let _: () = msg_send![view, setImage: image];
+    release_obj(image);
+    let _: () = msg_send![view, setImageScaling: 3isize]; // NSImageScaleProportionallyUpOrDown
+    let _: () = msg_send![parent, addSubview: view];
+    release_obj(view);
+    canvas.place_pending_view(view, frame);
+    true
 }
 
 /// Draw a row's in-card divider and hand it to the canvas, for either kind of row.

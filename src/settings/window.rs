@@ -2081,6 +2081,16 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             if !hover_probe.is_some_and(|button| widgets::sidebar_hover_style_smoke(button)) {
                 return Some(false);
             }
+            // Every styled action button must track the pointer from its LIVE bounds: the
+            // exclusion list's Remove buttons were placed after construction, and an area built on
+            // the creation frame left their hover fill stuck (see `action_button_tracking_area_smoke`).
+            for button in buttons.iter().copied() {
+                let responds: bool = msg_send![button, isKindOfClass: class!(NSButton)];
+                if responds && !widgets::action_button_tracking_area_smoke(button) {
+                    log_info!("[smoke-settings-layout] an action button lost its tracking area");
+                    return Some(false);
+                }
+            }
             let bounds: NSRect = msg_send![parent, bounds];
             let mut previous: Option<NSRect> = None;
             for button in buttons {
@@ -3989,7 +3999,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             gestures_enabled: std::ptr::null_mut(),
             gesture_show_trail: std::ptr::null_mut(),
             gesture_show_hint: std::ptr::null_mut(),
-            gesture_excluded_add: std::ptr::null_mut(),
             scroll_mode: std::ptr::null_mut(),
             line_count: std::ptr::null_mut(),
             line_count_label: std::ptr::null_mut(),

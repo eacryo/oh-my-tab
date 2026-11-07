@@ -525,7 +525,6 @@ pub(super) struct SettingsUi {
     gestures_enabled: *mut AnyObject,
     gesture_show_trail: *mut AnyObject,
     gesture_show_hint: *mut AnyObject, // the Gestures page's master switch
-    gesture_excluded_add: *mut AnyObject, // the Gestures page's "add an application" popup
     scroll_mode: *mut AnyObject,       // NSPopUpButton: default/line
     line_count: *mut AnyObject,        // NSSlider: line count slider
     line_count_label: *mut AnyObject,  // the row's label
@@ -1068,6 +1067,39 @@ use components::{
     SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H, ROW_ACTION_BTN_W,
     SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
 };
+/// The identifier text an action row's button carries its list index in.
+///
+/// A row's `action_tag` must NOT travel as the button's `tag`: that slot holds the role's palette
+/// slot, and the hover/focus styling reads it back. The identifier is display-only, so it carries
+/// the row's data safely.
+pub(crate) const ACTION_TAG_IDENTIFIER_PREFIX: &str = "omt.action-tag.";
+
+/// Build the identifier string for an action tag (caller releases the returned +1 object).
+pub(crate) unsafe fn ffi_identifier_for_action_tag(tag: isize) -> *mut objc2::runtime::AnyObject {
+    crate::ffi::make_nsstring(&format!("{ACTION_TAG_IDENTIFIER_PREFIX}{tag}"))
+}
+
+/// Read back the action tag a row's button carries, if any.
+///
+/// `None` means the sender is not one of our action-row buttons (or carries no tag), which every
+/// caller treats as "nothing to do" rather than guessing an index.
+pub(crate) unsafe fn action_tag_of_sender(sender: *mut c_void) -> Option<usize> {
+    if sender.is_null() {
+        return None;
+    }
+    let view = sender as *mut objc2::runtime::AnyObject;
+    let identifier: *mut objc2::runtime::AnyObject = objc2::msg_send![view, identifier];
+    if identifier.is_null() {
+        return None;
+    }
+    let text = crate::ffi::nsstring_to_rust(identifier);
+    let tag = text
+        .strip_prefix(ACTION_TAG_IDENTIFIER_PREFIX)?
+        .parse::<isize>()
+        .ok()?;
+    usize::try_from(tag).ok()
+}
+
 use dispatch::*;
 use mapping::*;
 pub(crate) use mapping::{
@@ -1095,7 +1127,7 @@ pub(crate) use dispatch::{
     end_max_extent_preview, handle_clipboard_enabled_toggle, handle_clipboard_excluded_add,
     handle_clipboard_excluded_remove, handle_clipboard_excluded_restore, handle_device_changed,
     handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
-    handle_export_settings_ready, handle_gesture_excluded_add, handle_gesture_excluded_remove,
+    handle_export_settings_ready, handle_gesture_excluded_choose, handle_gesture_excluded_remove,
     handle_gesture_record_cancel, handle_gesture_record_start, handle_gesture_restore_defaults,
     handle_gesture_row_delete, handle_gesture_row_trigger, handle_gesture_trigger_line,
     handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,

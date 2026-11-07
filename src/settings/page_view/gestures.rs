@@ -210,19 +210,25 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             .into_spec(),
         );
     }
-    // Applications where no gesture fires. The add row is a popup of the running
-    // applications, because a bundle id cannot be typed from memory; each excluded bundle then
-    // gets its own row.
+    // Applications where no gesture fires.
+    //
+    // Adding one is a COMMAND, not a selection: it opens the system's own application chooser. It
+    // used to be a dropdown of every installed application (137 on a normal Mac, no search), which
+    // made a one-shot action look like a setting that holds a value and then had to reset itself.
+    // `settings.gestures_desc_excluded` still states the rule the list implements.
     w.card("settings.gestures_header_excluded");
-    let candidates = running_app_candidates(cfg);
-    let mut options: Vec<String> = vec![t("settings.gestures_excluded_add_placeholder")];
-    options.extend(candidates.iter().map(|(_, name)| name.clone()));
     w.push(
         RowDraft::new(
             "settings.gestures_row_add_app",
-            ControlKind::Popup { options },
-            ControlId::Field(ControlField::GestureExcludedAdd),
-            Value::Index(0),
+            ControlKind::Value {
+                action: Some(ValueAction::new(
+                    "gesture_excluded_choose",
+                    "settings.gestures_excluded_choose_action",
+                )),
+                align: ValueAlign::Right,
+            },
+            ControlId::Action("gesture_excluded_choose"),
+            Value::None,
         )
         .desc("settings.gestures_desc_excluded")
         .into_spec(),
@@ -307,6 +313,10 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
                 Value::None,
             )
             .label_text(label)
+            // The icon is the row's shortest answer to "which application is this": a name alone
+            // has to be read, a Dock icon is recognised. An entry whose application is gone draws
+            // no icon and keeps its name (or its identifier) as plain text.
+            .icon_bundle(bundle.clone())
             .action_tag(index as isize)
             .into_spec(),
         );
@@ -930,42 +940,6 @@ fn gesture_excluded_candidates() -> Vec<(String, String)> {
     apps
 }
 
-/// The applications the "add an excluded application" popup offers, in the order it lists them.
-///
-/// INSTALLED applications, not just the running ones: the list answers "which app must never act on
-/// my gestures", and the app a user wants to exclude is usually the one they have open in another
-/// window. Apps started outside the standard folders (a disk image, a build output) are merged in
-/// from the running set, so nothing that is actually on screen is missing. Entries already excluded
-/// are dropped, and the placeholder the page prepends is NOT part of this list -- an option's index
-/// is one more than its position here, which is how the add callback reads the choice.
-pub(crate) fn running_app_candidates(cfg: &crate::config::Config) -> Vec<(String, String)> {
-    let excluded = &cfg.mouse.gesture_excluded_apps;
-    let mut apps = gesture_excluded_candidates();
-    apps.retain(|(bundle, _)| !excluded.iter().any(|id| id == bundle));
-    apps
-}
-/// The application a choice in the add popup names, from the control's selected INDEX.
-///
-/// Option 0 is the placeholder ("Add an app…"), so option N (N > 0) is `running_app_candidates()[N-1]`
-/// -- the very list the page built the options from. Reading the index instead of asking the control
-/// for a title is what keeps the two sides together: the select implements `indexOfSelectedItem` but
-/// has no `titleOfSelectedItem`, and matching by display name would also confuse two candidates that
-/// share a name.
-///
-/// `None` means "nothing to add": the placeholder, or an index the current list no longer covers
-/// (an application was excluded or quit while the popup was open).
-pub(crate) fn excluded_app_for_option(
-    cfg: &crate::config::Config,
-    selected: isize,
-) -> Option<String> {
-    if selected <= 0 {
-        return None;
-    }
-    running_app_candidates(cfg)
-        .get(selected as usize - 1)
-        .map(|(bundle, _)| bundle.clone())
-}
-
 fn configured_rows(cfg: &crate::config::Config) -> Vec<ShownRow> {
     cfg.mouse
         .gestures
@@ -1127,83 +1101,6 @@ mod tests {
         assert!(matches!(view.rows[0].value, Value::Switch(true)));
     }
 
-    /// The add popup's true words: option N (N > 0) is `running_app_candidates[index N-1]`.
-    ///
-    /// The callback reads a choice by INDEX and looks it up in `running_app_candidates`; the page
-    /// prepends the placeholder and appends those same candidates. This test pins the offset, so a
-    /// later change to either side cannot make a pick exclude a different application than the one
-    /// whose name the user clicked (the clipboard page reads its list the same way).
-    #[test]
-    fn the_add_popups_option_index_maps_onto_the_candidate_list() {
-        let mut page_input = input(true, Vec::new());
-        // One entry already excluded: the page must drop it, and the callback must agree.
-        page_input.config.mouse.gesture_excluded_apps = vec!["com.example.already".into()];
-        let view = gestures_page_view(&page_input);
-        let row = view
-            .rows
-            .iter()
-            .find(|r| r.label_key == "settings.gestures_row_add_app")
-            .expect("the add row is described");
-        let ControlKind::Popup { options } = &row.control else {
-            panic!("the add row is a popup: {:?}", row.control);
-        };
-        let candidates = running_app_candidates(&page_input.config);
-        assert_eq!(
-            options.len(),
-            candidates.len() + 1,
-            "placeholder + one option per candidate"
-        );
-        // The placeholder is index 0 and is the only option with no bundle behind it.
-        assert!(!candidates.iter().any(|(_, name)| *name == options[0]));
-        for (offset, (_, name)) in candidates.iter().enumerate() {
-            assert_eq!(
-                &options[offset + 1],
-                name,
-                "option {} must be candidate {offset}",
-                offset + 1
-            );
-        }
-        assert!(
-            !candidates
-                .iter()
-                .any(|(bundle, _)| bundle == "com.example.already"),
-            "an already excluded application is not offered again"
-        );
-    }
-
-    /// The callback's side of the add popup: an option index resolves to the application the user
-    /// saw on that row, the placeholder adds nothing, and an index past the list is refused instead
-    /// of clamping onto a neighbour (which would exclude the wrong app).
-    #[test]
-    fn an_option_index_resolves_to_the_application_it_listed() {
-        let mut page_input = input(true, Vec::new());
-        page_input.config.mouse.gesture_excluded_apps = vec!["com.example.already".into()];
-        let candidates = running_app_candidates(&page_input.config);
-        assert!(
-            candidates.len() >= 2,
-            "needs at least two installed applications to prove the offset"
-        );
-        assert_eq!(
-            excluded_app_for_option(&page_input.config, 0),
-            None,
-            "the placeholder adds nothing"
-        );
-        for (offset, (bundle, _)) in candidates.iter().enumerate() {
-            assert_eq!(
-                excluded_app_for_option(&page_input.config, offset as isize + 1).as_deref(),
-                Some(bundle.as_str()),
-                "option {} is candidate {offset}",
-                offset + 1
-            );
-        }
-        assert_eq!(
-            excluded_app_for_option(&page_input.config, candidates.len() as isize + 1),
-            None,
-            "an index past the list is refused, not clamped"
-        );
-        assert_eq!(excluded_app_for_option(&page_input.config, -1), None);
-    }
-
     /// Each excluded row is LABELLED with the application's name and carries no second copy of it.
     ///
     /// The generic "Application" title said nothing, and the identifier beside it was truncated to
@@ -1243,6 +1140,49 @@ mod tests {
                     ..
                 }
             ));
+        }
+    }
+
+    /// A row's action tag must not travel in the button's `tag`.
+    ///
+    /// That slot carries the ROLE's palette slot, which the hover and focus callbacks read to
+    /// restore the right fill. Stamping a list index there made both fill lookups fall through to
+    /// the generic hover wash, so an excluded row's Remove button was painted with the HOVER colour
+    /// from the moment it was built and never returned (measured: tag was 0/1 instead of -3).
+    /// The index travels as the button's identifier instead; this asserts the page hands the row an
+    /// action tag at all, and the identifier round-trip is covered where the identifier is made.
+    #[test]
+    fn an_excluded_row_carries_its_index_as_row_data() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.gesture_excluded_apps =
+            vec!["com.apple.Safari".into(), "com.apple.Notes".into()];
+        let view = gestures_page_view(&page_input);
+        let tags: Vec<Option<isize>> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_excluded")
+            .map(|r| r.action_tag)
+            .collect();
+        assert_eq!(
+            tags,
+            vec![Some(0), Some(1)],
+            "each row states its own entry"
+        );
+        for row in view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_excluded")
+        {
+            assert!(
+                matches!(
+                    &row.control,
+                    ControlKind::Value {
+                        action: Some(_),
+                        ..
+                    }
+                ),
+                "the row still offers its Remove action"
+            );
         }
     }
 

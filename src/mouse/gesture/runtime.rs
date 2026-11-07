@@ -663,7 +663,10 @@ mod tests {
         set_active(false);
         let mut rt = Runtime::new();
         assert!(!rt.press(1, 0, p(0.0, 0.0), 0.0, 0, None));
-        assert_eq!(crate::mouse::gesture::session_state::phase(), "Idle");
+        // The published PHASE is process-wide, so another test running in parallel can move it with
+        // its own press; what this test owns is that THIS runtime took nothing. Its own session id
+        // is the unshared witness: `press` only stamps it after the module agrees to claim.
+        assert_eq!(rt.session_id(), 0, "an inactive module opens no session");
     }
 
     /// The exclusion rule on its own: the runtime reads the published frontmost id, so this test

@@ -1405,6 +1405,19 @@ pub(crate) unsafe fn run_open_panel_for_app() -> Option<String> {
     let _: () = msg_send![panel, setCanChooseDirectories: false];
     let _: () = msg_send![panel, setAllowsMultipleSelection: false];
     let _: () = msg_send![panel, setTreatsFilePackagesAsDirectories: false];
+    // Open where applications live. Without a directory the panel starts wherever the last visit
+    // left the process, so "choose an application" opened a random folder and the user had to
+    // navigate to /Applications by hand every time. The panel's own search field is the way to
+    // reach anything outside it.
+    let start = make_nsstring("/Applications");
+    let start_url: *mut AnyObject = msg_send![class!(NSURL), fileURLWithPath: start];
+    CFRelease(start as *const c_void);
+    if !start_url.is_null() {
+        let _: () = msg_send![panel, setDirectoryURL: start_url];
+    }
+    let choose_title = make_nsstring("Choose an Application");
+    let _: () = msg_send![panel, setMessage: choose_title];
+    CFRelease(choose_title as *const c_void);
     let extensions = make_nsstring("app");
     let types: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: extensions];
     CFRelease(extensions as *const c_void);

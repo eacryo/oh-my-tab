@@ -69,7 +69,6 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         gestures_enabled: std::ptr::null_mut(),
         gesture_show_trail: std::ptr::null_mut(),
         gesture_show_hint: std::ptr::null_mut(),
-        gesture_excluded_add: std::ptr::null_mut(),
         scroll_mode: std::ptr::null_mut(),
         line_count: std::ptr::null_mut(),
         line_count_label: std::ptr::null_mut(),

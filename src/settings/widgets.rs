@@ -274,6 +274,11 @@ pub(super) fn html_action_button_class_handle() -> StaticClass {
                     html_action_button_resign_first_responder
                         as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
                 );
+                builder.add_method::<AnyObject, _>(
+                    sel!(updateTrackingAreas),
+                    html_action_button_update_tracking_areas
+                        as unsafe extern "C" fn(*mut AnyObject, Sel),
+                );
             },
         )
     })
@@ -337,6 +342,44 @@ pub(super) extern "C" fn html_action_button_mouse_entered(
                 layer,
                 crate::ffi::hex_to_cg_color(themed_settings_color(hover)),
             );
+        }
+    });
+}
+
+/// Rebuild the button's tracking area from its CURRENT bounds.
+///
+/// The tracking area used to be installed once, at construction, over the frame the button was
+/// created with. Anything that moves or resizes the button afterwards -- `render_row` sets its frame
+/// again when it places the action button, and a rebuild reuses a different geometry -- leaves that
+/// area describing where the button USED to be: the pointer then enters the real button with no
+/// `mouseEntered:`, or leaves it with no `mouseExited:`, and the hover fill sticks. AppKit asks a
+/// view to re-establish its areas exactly when its geometry changes, so the area is built there and
+/// nowhere else.
+pub(super) extern "C" fn html_action_button_update_tracking_areas(this: *mut AnyObject, _cmd: Sel) {
+    callback_guard::void("html_action_button_update_tracking_areas", || unsafe {
+        let button = this;
+        let existing: *mut AnyObject = msg_send![button, trackingAreas];
+        if !existing.is_null() {
+            let count: usize = msg_send![existing, count];
+            for index in 0..count {
+                let area: *mut AnyObject = msg_send![existing, objectAtIndex: index];
+                if !area.is_null() {
+                    let _: () = msg_send![button, removeTrackingArea: area];
+                }
+            }
+        }
+        let bounds: NSRect = msg_send![button, bounds];
+        let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+        let tracking: *mut AnyObject = msg_send![
+            tracking,
+            initWithRect: bounds,
+            options: 0x01u64 | 0x80u64 | 0x200u64, // mouseEnteredAndExited | activeAlways | inVisibleRect
+            owner: button,
+            userInfo: std::ptr::null::<AnyObject>()
+        ];
+        if !tracking.is_null() {
+            let _: () = msg_send![button, addTrackingArea: tracking];
+            release_obj(tracking);
         }
     });
 }
@@ -426,16 +469,8 @@ pub(super) unsafe fn make_settings_styled_button(
     // HTML .small-btn / footer buttons: translucent white surface with a hairline border.
     style_html_button(button, background_hex, text_hex);
     let _: () = msg_send![button, setTag: hover_tag];
-    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let tracking: *mut AnyObject = msg_send![
-        tracking,
-        initWithRect: NSRect::new(NSPoint::new(0.0, 0.0), frame.size),
-        options: 0x01u64 | 0x80u64 | 0x200u64,
-        owner: button,
-        userInfo: std::ptr::null::<AnyObject>()
-    ];
-    let _: () = msg_send![button, addTrackingArea: tracking];
-    release_obj(tracking);
+    // No tracking area here: `updateTrackingAreas` installs it from the button's live bounds, which
+    // is the only geometry that stays correct once the renderer places the button (see there).
     let _: () = msg_send![button, setTarget: target];
     let _: () = msg_send![button, setAction: action];
     button
@@ -2530,6 +2565,38 @@ unsafe fn set_sidebar_hovered(btn: *mut AnyObject, hovered: bool) {
         let _: () = msg_send![icon, setContentTintColor: color];
     }
     let _: () = msg_send![btn, setContentTintColor: color];
+}
+
+/// Whether a styled action button re-establishes its tracking area from its live bounds.
+///
+/// Regression: the area was installed ONCE at construction over the creation frame, and the
+/// renderer places the button afterwards -- so the area described the wrong rectangle and the
+/// hover fill could stick after the pointer left. A button that overrides `updateTrackingAreas`
+/// always ends up with exactly one area, matching its current bounds.
+pub(super) unsafe fn action_button_tracking_area_smoke(button: *mut AnyObject) -> bool {
+    if button.is_null() {
+        return false;
+    }
+    const MOUSE_ENTERED_AND_EXITED: u64 = 0x01;
+    const IN_VISIBLE_RECT: u64 = 0x200;
+    let areas: *mut AnyObject = msg_send![button, trackingAreas];
+    if areas.is_null() {
+        return false;
+    }
+    let count: usize = msg_send![areas, count];
+    if count != 1 {
+        return false;
+    }
+    let area: *mut AnyObject = msg_send![areas, objectAtIndex: 0];
+    if area.is_null() {
+        return false;
+    }
+    let options: u64 = msg_send![area, options];
+    let owner: *mut AnyObject = msg_send![area, owner];
+    options & MOUSE_ENTERED_AND_EXITED != 0
+        && options & IN_VISIBLE_RECT != 0
+        && owner == button
+        && msg_send![button, respondsToSelector: sel!(updateTrackingAreas)]
 }
 
 pub(super) unsafe fn sidebar_hover_style_smoke(button: *mut AnyObject) -> bool {

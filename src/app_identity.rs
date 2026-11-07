@@ -4,6 +4,7 @@
 
 use objc2::runtime::AnyObject;
 use objc2::{class, msg_send};
+use objc2_foundation::NSSize;
 use std::ffi::{c_char, CStr};
 
 use crate::ffi::{make_nsstring, CFRelease};
@@ -140,6 +141,50 @@ pub(crate) unsafe fn bundle_identity_at_path(path: &str) -> Option<(String, Stri
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_else(|| bundle_id.clone());
     Some((bundle_id, name))
+}
+
+/// The on-disk location of an installed application, by bundle identifier.
+///
+/// `NSWorkspace` resolves this without the application running, which is what an exclusion list
+/// needs: the applications a user excludes are usually NOT the ones they have open at that moment.
+/// `None` when no installed application carries that identifier (it was moved, deleted, or the entry
+/// names a development build that only existed on a disk image).
+pub(crate) unsafe fn path_for_bundle_id(bundle_id: &str) -> Option<String> {
+    if bundle_id.is_empty() {
+        return None;
+    }
+    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+    if workspace.is_null() {
+        return None;
+    }
+    let id_ns = make_nsstring(bundle_id);
+    let url: *mut AnyObject = msg_send![workspace, URLForApplicationWithBundleIdentifier: id_ns];
+    CFRelease(id_ns as *const c_void);
+    if url.is_null() {
+        return None;
+    }
+    let path_ns: *mut AnyObject = msg_send![url, path];
+    read_nsstring(path_ns).filter(|path| !path.is_empty())
+}
+
+/// The file icon of an application bundle, by bundle identifier, at `size` points (alloc +1).
+///
+/// The icon comes from the bundle on disk, so it is available for an application that is not
+/// running -- the same thing a Finder window shows beside a `.app`. `None` when the bundle has
+/// moved or was never installed; the caller draws its row without an icon rather than inventing a
+/// generic one, which would claim an application is present when it is not.
+pub(crate) unsafe fn icon_for_bundle_id(bundle_id: &str, size: f64) -> Option<*mut AnyObject> {
+    let path = path_for_bundle_id(bundle_id)?;
+    let path_ns = make_nsstring(&path);
+    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+    let image: *mut AnyObject = msg_send![workspace, iconForFile: path_ns];
+    CFRelease(path_ns as *const c_void);
+    if image.is_null() {
+        return None;
+    }
+    let retained: *mut AnyObject = msg_send![image, retain];
+    let _: () = msg_send![retained, setSize: NSSize::new(size, size)];
+    Some(retained)
 }
 
 /// The application's user-visible name, for the menu bar's application menu.

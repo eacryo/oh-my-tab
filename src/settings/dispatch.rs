@@ -85,7 +85,6 @@ pub(super) enum ControlField {
     GesturesEnabled,
     GestureShowTrail,
     GestureShowHint,
-    GestureExcludedAdd,
 }
 
 /// Identify a field by the control that sent the event: a lookup in the page's `ControlTable`.
@@ -911,10 +910,6 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.gesture_show_hint, state];
                     cfg.mouse.gesture_show_hint = state == 1;
                 }
-                // The excluded-application popup writes the list itself in its own handler
-                // (`handleGestureExcludedAdd:`); the unified path only records that a value was
-                // applied, so the shared change plumbing below still runs.
-                ControlField::GestureExcludedAdd => {}
             }
         }
     });
@@ -3180,60 +3175,77 @@ pub(crate) extern "C" fn handle_gesture_record_cancel(
     });
 }
 
-/// Add the selected application to the gesture exclusion list.
+/// The application picker: the system's own "choose an application" flow.
 ///
-/// The choice is read as an INDEX into the same candidate list the page built its options from --
-/// never by asking the control for a title. A select is `OhMyTabSettingsSelect`, a custom control
-/// that implements `indexOfSelectedItem`/`selectItemAtIndex:` but has no `titleOfSelectedItem` at
-/// all; asking it for one raised an Objective-C exception, the callback guard contained it, and the
-/// click did nothing at all. The index is also the more precise answer: it survives two candidates
-/// that share a display name (two builds of one app, a renamed duplicate), where matching by name
-/// quietly excluded the wrong bundle.
-pub(crate) extern "C" fn handle_gesture_excluded_add(
+/// Adding an exclusion is a ONE-SHOT command, so it opens a modal chooser instead of keeping a
+/// selection. `NSOpenPanel` restricted to `.app` bundles gives the user the file system's own
+/// search, favourites and sidebar for free, and it is the same control the clipboard page already
+/// uses for "choose from disk". Whatever is picked is resolved to a bundle id through the same
+/// helper the clipboard uses, so an application with no identifier is refused rather than stored as
+/// an entry the tap can never match.
+pub(crate) fn choose_application_from_disk() -> Option<(String, String)> {
+    let path = unsafe { crate::ffi::run_open_panel_for_app() }?;
+    let identity = unsafe { crate::app_identity::bundle_identity_at_path(&path) };
+    if identity.is_none() {
+        crate::log_info!("[settings] excluded app ignored: not an application bundle");
+    }
+    identity
+}
+
+/// Add `bundle_id` to the gesture exclusion list if it is not already there, and return whether the
+/// list changed. The caller owns persisting and applying the change.
+pub(crate) fn add_excluded_application(bundle_id: &str) -> bool {
+    let trimmed = bundle_id.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let Ok(old) = CONFIG.read().map(|cfg| cfg.clone()) else {
+        return false;
+    };
+    if old
+        .mouse
+        .gesture_excluded_apps
+        .iter()
+        .any(|id| id == trimmed)
+    {
+        // Already excluded: the click did what it could. Saying so would need a modal for a no-op.
+        return false;
+    }
+    let mut updated = old.clone();
+    updated
+        .mouse
+        .gesture_excluded_apps
+        .push(trimmed.to_string());
+    if let Ok(mut config) = CONFIG.write() {
+        *config = updated.clone();
+    }
+    crate::settings::schedule_config_persist();
+    crate::runtime_config::apply_config_change(
+        &old,
+        &updated,
+        crate::runtime_config::ConfigChangeSource::Settings,
+    );
+    true
+}
+
+/// The Gestures page's "Add an application": open the system application chooser and exclude what
+/// the user picks. One command, one row -- see `choose_application_from_disk`.
+pub(crate) extern "C" fn handle_gesture_excluded_choose(
     _self: *mut c_void,
     _cmd: Sel,
-    sender: *mut c_void,
+    _sender: *mut c_void,
 ) {
-    callback_guard::void("handle_gesture_excluded_add", || {
-        let selected: isize = unsafe { msg_send![sender as *mut AnyObject, indexOfSelectedItem] };
-        // 0 is the placeholder ("Add an app…"): nothing was chosen.
-        if selected <= 0 {
-            return;
-        }
-        // The SAME list the page offered, in the same order: the page prepends the placeholder
-        // ("Add an app…") and then lists `running_app_candidates` -- installed applications that are
-        // not excluded yet. Option N (N > 0) is therefore entry N-1 here, and both sides read one
-        // function so an index can never mean a different application than the row on screen.
-        let cfg = CONFIG.read().map(|cfg| cfg.clone()).unwrap_or_default();
-        let Some(bundle) = crate::settings::page_view::excluded_app_for_option(&cfg, selected)
-        else {
-            // Older than the list the page offered (an app was excluded or quit meanwhile): put the
-            // placeholder back rather than guessing an application.
-            unsafe {
-                let _: () = msg_send![sender as *mut AnyObject, selectItemAtIndex: 0isize];
-            }
+    callback_guard::void("handle_gesture_excluded_choose", || {
+        let Some((bundle_id, _name)) = choose_application_from_disk() else {
             return;
         };
-        let old = CONFIG.read().unwrap().clone();
-        let mut updated = old.clone();
-        if updated.mouse.gesture_excluded_apps.contains(&bundle) {
-            return;
-        }
-        updated.mouse.gesture_excluded_apps.push(bundle);
-        if let Ok(mut config) = CONFIG.write() {
-            *config = updated.clone();
-        }
-        crate::settings::schedule_config_persist();
-        crate::runtime_config::apply_config_change(
-            &old,
-            &updated,
-            crate::runtime_config::ConfigChangeSource::Settings,
-        );
-        unsafe {
-            crate::settings::window::rebuild_settings_content_now_keeping_scroll(
-                SettingsPageId::Gestures,
-                None,
-            );
+        if add_excluded_application(&bundle_id) {
+            unsafe {
+                crate::settings::window::rebuild_settings_content_now_keeping_scroll(
+                    SettingsPageId::Gestures,
+                    None,
+                );
+            }
         }
     });
 }
@@ -3246,10 +3258,11 @@ pub(crate) extern "C" fn handle_gesture_excluded_remove(
     sender: *mut c_void,
 ) {
     callback_guard::void("handle_gesture_excluded_remove", || {
-        let tag: isize = unsafe { msg_send![sender as *mut AnyObject, tag] };
+        let Some(index) = (unsafe { crate::settings::action_tag_of_sender(sender) }) else {
+            return;
+        };
         let old = CONFIG.read().unwrap().clone();
         let mut updated = old.clone();
-        let index = tag.max(0) as usize;
         if index >= updated.mouse.gesture_excluded_apps.len() {
             return;
         }

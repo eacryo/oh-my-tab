@@ -160,6 +160,13 @@ pub(in crate::settings) struct RowSpec {
     /// receives, and its own text is its title, so this is how a row tells the handler WHICH entry
     /// it is: an excluded-application row stamps its list index here.
     pub(in crate::settings) action_tag: Option<isize>,
+    /// The application bundle whose icon this row shows before its label, if any.
+    ///
+    /// Data, not a view: the page states WHICH application the row is about, and the renderer
+    /// resolves the icon from the bundle on disk. Only the exclusion rows use it today -- a list of
+    /// application names with no icons is a list a user has to read word by word, while the icon is
+    /// the thing they recognise at a glance.
+    pub(in crate::settings) icon_bundle: Option<String>,
     /// The row's control identity. Every declared row carries one.
     pub(in crate::settings) id: ControlId,
     pub(in crate::settings) copy: RowCopy,

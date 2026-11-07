@@ -2437,15 +2437,11 @@ fn menu_target_class() -> StaticClass {
                 onboarding::on_open_from_settings as *mut c_void,
                 types.as_ptr(),
             );
-            // The Finder-menu settings page opens System Settings' extension pane (the extension is
-            // enabled there, not by this app).
-            // A page action no handler claims. Registered so the renderer's fallback never has to
-            // point at a real feature: an unrecognised action must do nothing visible.
-            // The Gestures page's recorder: start a capture, or cancel one running.
+            // The Gestures page's "Add an application" row: the system application chooser.
             class_addMethod(
                 cls,
-                sel!(handleGestureExcludedAdd:),
-                crate::settings::handle_gesture_excluded_add as *mut c_void,
+                sel!(handleGestureExcludedChoose:),
+                crate::settings::handle_gesture_excluded_choose as *mut c_void,
                 types.as_ptr(),
             );
             class_addMethod(
