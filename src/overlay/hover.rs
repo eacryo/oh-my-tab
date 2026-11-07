@@ -130,21 +130,50 @@ unsafe impl Sync for TimerMutex {}
 
 pub(super) static HOVER_TIMER: TimerMutex = TimerMutex(Mutex::new(None));
 
+/// Drive hover selection from a POINTER EVENT's own coordinates (main thread).
+///
+/// The poll below can only see the system cursor, and while a button is held that value is not
+/// trustworthy (see `event_tap::cursor_location`). A drag event, however, carries the position it
+/// happened at. The switcher's summon is a side-button press, so every move that selects a card
+/// arrives as an `OtherMouseDragged` -- feeding that coordinate in is both exact and independent of
+/// whatever the cursor query reports.
+pub(crate) fn handle_hover_at_cg_point(x: f64, y: f64) {
+    if !activates_on_hover() {
+        return;
+    }
+    unsafe {
+        let Some(primary_frame) = primary_screen_frame() else {
+            return;
+        };
+        let pos = cg_to_appkit_point(NSPoint::new(x, y), primary_frame);
+        let container = match *CONTAINER.lock().unwrap() {
+            Some(c) => c.0,
+            None => return,
+        };
+        let win: *mut AnyObject = msg_send![container, window];
+        if win.is_null() {
+            return;
+        }
+        let win_frame: NSRect = msg_send![win, frame];
+        let loc = NSPoint::new(pos.x - win_frame.origin.x, pos.y - win_frame.origin.y);
+        update_thumbnail_pointer_state(loc);
+        handle_hover_at(loc);
+    }
+}
+
 /// Hover poll tick (main thread): reads the global cursor; on movement, selects the card.
 pub(super) unsafe extern "C" fn hover_tick_callback(
     _timer: event_tap::CFRunLoopTimerRef,
     _info: *mut c_void,
 ) {
     callback_guard::void("hover_tick_callback", || unsafe {
-        // Read the cursor via CGEventCreate: independent of the mouseMoved stream (while a side
-        // button is held the system emits no mouseMoved, freezing NSEvent.mouseLocation;
-        // CGEventCreate queries the system state directly).
-        let ev = event_tap::CGEventCreate(std::ptr::null_mut());
-        if ev.is_null() {
+        // Read the cursor through the HID-system source. The default source's location stops
+        // advancing while a button is held -- which is exactly the side-button summon: the overlay
+        // opened with the side button down polled the same point 89 times while the pointer crossed
+        // several cards, so hover selection never fired. See `event_tap::cursor_location`.
+        let Some(pos) = event_tap::cursor_location() else {
             return;
-        }
-        let pos = event_tap::CGEventGetLocation(ev);
-        CFRelease(ev as *const c_void);
+        };
         // CGEventGetLocation uses the CG coordinate space (primary-display top-left origin),
         // while window frames use AppKit's primary-display bottom-left origin. Flip y around the
         // top of NSScreen.screens[0], never NSScreen.mainScreen (which follows the key window);

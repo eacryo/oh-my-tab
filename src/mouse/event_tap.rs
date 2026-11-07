@@ -631,6 +631,16 @@ unsafe fn gesture_dispatch(
             }
         }
         K_CG_EVENT_RIGHT_MOUSE_DRAGGED | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
+            // While the switcher is on screen this module has no session to feed, and every drag it
+            // handled here cost a device lookup and a WindowServer round trip on the tap thread. The
+            // switcher's own hover selection follows the event instead: its location is exact,
+            // whereas the cursor the overlay's poll reads is not reliable while a button is held
+            // (the side-button summon keeps it down for the whole gesture).
+            if crate::mouse::gesture::session_state::switcher_visible() {
+                let location = event_tap::CGEventGetLocation(event);
+                crate::schedule_overlay_hover_at(location.x, location.y);
+                return Some(event);
+            }
             let number = button();
             let device = runtime::device_key(device::device_from_cgevent(event));
             let point = cg_point(event);

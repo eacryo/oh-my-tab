@@ -277,6 +277,35 @@ extern "C" {
     pub(crate) fn CGEventCreate(source: *const c_void) -> CGEventRef;
 }
 
+/// The live cursor position in CG screen coordinates (top-left origin, points).
+///
+/// `CGEventCreate(NULL)` is NOT enough while a button is held: it builds the event from the
+/// default source, whose location stops advancing during a drag -- measured, a side-button summon
+/// polled eighty-nine times at the same point while the pointer crossed several cards, so hover
+/// selection never fired. The HID-system source reads the hardware state instead, which keeps
+/// tracking the pointer for as long as the button is down.
+pub(crate) fn cursor_location() -> Option<CGPoint> {
+    const K_CG_EVENT_SOURCE_STATE_HID_SYSTEM: i32 = 1;
+    unsafe {
+        let source = CGEventSourceCreate(K_CG_EVENT_SOURCE_STATE_HID_SYSTEM);
+        // `CGEventCreate` takes the source: with the HID-system source the event reports the
+        // hardware cursor rather than the default source's last published location.
+        let event = CGEventCreate(source as *const c_void);
+        if event.is_null() {
+            if !source.is_null() {
+                CFRelease(source);
+            }
+            return None;
+        }
+        let point = CGEventGetLocation(event);
+        CFRelease(event);
+        if !source.is_null() {
+            CFRelease(source);
+        }
+        Some(point)
+    }
+}
+
 /// kCGEventSourceStateCombinedSessionState. Keep the raw enum value in one place rather than
 /// duplicating it across diagnostic callers.
 pub(crate) fn combined_session_flags() -> CGEventFlags {

@@ -494,6 +494,73 @@ pub(crate) fn schedule_gesture_hud() {
     }
 }
 
+/// The last pointer position an overlay hover request carried (CG screen points, x1000).
+static OVERLAY_HOVER_AT: (std::sync::atomic::AtomicI64, std::sync::atomic::AtomicI64) = (
+    std::sync::atomic::AtomicI64::new(0),
+    std::sync::atomic::AtomicI64::new(0),
+);
+static OVERLAY_HOVER_SCHEDULED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Feed a pointer event's position to the switcher's hover selection (safe off the main thread).
+///
+/// Coalesced: a fast drag produces many events, and the selection only needs the newest position, so
+/// one main-thread task is scheduled at a time -- the same shape as the gesture-HUD scheduler.
+pub(crate) fn schedule_overlay_hover_at(x: f64, y: f64) {
+    let (qx, qy) = overlay_hover_quantize(x, y);
+    OVERLAY_HOVER_AT
+        .0
+        .store(qx, std::sync::atomic::Ordering::Relaxed);
+    OVERLAY_HOVER_AT
+        .1
+        .store(qy, std::sync::atomic::Ordering::Relaxed);
+    if OVERLAY_HOVER_SCHEDULED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let Some(controller) = CONTROLLER.lock().unwrap().map(|ptr| ptr.0) else {
+        OVERLAY_HOVER_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        return;
+    };
+    unsafe {
+        let _: () = msg_send![
+            controller,
+            performSelectorOnMainThread: sel!(handleOverlayHoverAt:),
+            withObject: std::ptr::null::<AnyObject>(),
+            waitUntilDone: false
+        ];
+    }
+}
+
+/// The fixed-point form the hover request is parked in between threads (thousandths of a point).
+///
+/// The atoms must be integers, and a pointer position needs sub-point precision: rounding the
+/// request itself would bias every selection by up to a point on a 2x display.
+fn overlay_hover_quantize(x: f64, y: f64) -> (i64, i64) {
+    ((x * 1000.0).round() as i64, (y * 1000.0).round() as i64)
+}
+
+/// Read back the position [`schedule_overlay_hover_at`] last parked.
+fn overlay_hover_dequantize(x: i64, y: i64) -> (f64, f64) {
+    (x as f64 / 1000.0, y as f64 / 1000.0)
+}
+
+/// Main-thread consumer for [`schedule_overlay_hover_at`]: hands the last parked position to the
+/// switcher's hover selection.
+extern "C" fn on_overlay_hover_at(_self: *mut c_void, _cmd: Sel, _arg: *mut c_void) {
+    callback_guard::void("on_overlay_hover_at", || {
+        OVERLAY_HOVER_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
+        let (x, y) = overlay_hover_dequantize(
+            OVERLAY_HOVER_AT
+                .0
+                .load(std::sync::atomic::Ordering::Relaxed),
+            OVERLAY_HOVER_AT
+                .1
+                .load(std::sync::atomic::Ordering::Relaxed),
+        );
+        crate::overlay::hover::handle_hover_at_cg_point(x, y);
+    });
+}
+
 /// Release the gesture HUD scheduler's claim once its task has run, so the next request schedules.
 pub(crate) fn release_gesture_hud_claim() {
     GESTURE_HUD_SCHEDULED.store(false, std::sync::atomic::Ordering::Release);
@@ -2096,6 +2163,12 @@ fn controller_class() -> StaticClass {
             cls,
             sel!(handleGestureHud:),
             crate::mouse::gesture::hud::on_hud_request as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleOverlayHoverAt:),
+            on_overlay_hover_at as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -4445,9 +4518,32 @@ pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        orderly_exit_count, settings_prewarm_step, SettingsPrewarmStep,
-        SETTINGS_PREWARM_MAX_ATTEMPTS,
+        orderly_exit_count, overlay_hover_dequantize, overlay_hover_quantize,
+        settings_prewarm_step, SettingsPrewarmStep, SETTINGS_PREWARM_MAX_ATTEMPTS,
     };
+
+    /// A pointer position survives the trip between the tap thread and the main thread.
+    ///
+    /// The hover request is parked in integer atoms, so the test is that the round trip is exact for
+    /// the sub-point values a 2x display actually produces -- a request rounded here would shift
+    /// every hover selection by up to a point against the card the user pointed at.
+    #[test]
+    fn an_overlay_hover_request_round_trips_without_losing_precision() {
+        for (x, y) in [
+            (0.0, 0.0),
+            (736.0, 576.1953125),
+            (1290.5, 129.25),
+            (-40.0, -12.75),
+            (2940.0, 1912.0),
+        ] {
+            let (qx, qy) = overlay_hover_quantize(x, y);
+            let (rx, ry) = overlay_hover_dequantize(qx, qy);
+            assert!(
+                (rx - x).abs() <= 0.0005 && (ry - y).abs() <= 0.0005,
+                "({x},{y}) came back as ({rx},{ry})"
+            );
+        }
+    }
 
     /// A nested entry into the state projection fails loudly, and it fails where it happens.
     ///
