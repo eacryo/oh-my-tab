@@ -2537,6 +2537,18 @@ fn menu_target_class() -> StaticClass {
             );
             class_addMethod(
                 cls,
+                sel!(handleGestureTriggerLearn:),
+                crate::settings::handle_gesture_trigger_learn as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleGestureTriggerCaptured:),
+                crate::settings::handle_gesture_trigger_captured as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleGestureRowDelete:),
                 crate::settings::handle_gesture_row_delete as *mut c_void,
                 types.as_ptr(),

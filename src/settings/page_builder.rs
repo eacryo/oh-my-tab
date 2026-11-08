@@ -271,7 +271,19 @@ pub(super) unsafe fn build_gestures_page(
 ) -> f64 {
     begin_settings_search_page();
     let input = PageInput::capture();
-    let mut hooks = NoHooks;
+    let layer = input
+        .gesture_scope
+        .map(|scope| scope.layer(&input.config))
+        .unwrap_or_else(|| input.config.mouse.shared_gesture_layer());
+    let mut hooks = page_view::GesturesHooks {
+        trigger_title: crate::mouse::shortcut::button_label(layer.gesture_button.button()),
+        waiting: page_view::gesture_capture_waiting(),
+        mapping_note: crate::mouse::gesture::conflict::trigger_shadows_mapping(
+            &layer,
+            &input.config.mouse,
+            input.device,
+        ),
+    };
     match build_page(
         ui,
         SettingsPageId::Gestures,

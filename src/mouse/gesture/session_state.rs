@@ -73,8 +73,17 @@ pub(crate) fn hud_visible() -> bool {
 /// gesture would take, not the one it took last time. A stroke no row matches says so instead of
 /// borrowing an old answer -- that is what the user needs to know before releasing the button.
 pub(crate) fn hint_card() -> crate::mouse::gesture::hud::HintText {
-    let (key, button) = super::runtime::with(|rt| (rt.engine_sequence_key(), rt.engine_button()));
-    hint_card_for(key.as_deref(), button, &super::table::snapshot().table)
+    let (key, button, device) = super::runtime::with(|rt| {
+        (
+            rt.engine_sequence_key(),
+            rt.engine_button(),
+            rt.engine_device_key(),
+        )
+    });
+    // The device that started the stroke decides which layer's action is named: a mouse with its
+    // own list would otherwise be promised another mouse's action before the button is released.
+    let snapshot = super::table::snapshot();
+    hint_card_for(key.as_deref(), button, snapshot.table_for(device))
 }
 
 /// The card for one stroke: the action `sequence` would run on `button`, or the words that say

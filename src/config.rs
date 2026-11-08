@@ -1119,6 +1119,73 @@ pub struct MouseProfile {
     pub button_mappings_enabled: Option<bool>,
 }
 
+/// The button a mouse's gestures start on.
+///
+/// Two forms, because a mouse may have a button this app has no name for: one of the four standard
+/// numbers, or a number the user taught the app by pressing it on that mouse. The learned form is
+/// stored with the number only — the device is the layer the setting lives on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(untagged)]
+pub enum GestureTrigger {
+    /// 1 right, 2 middle, 3 side (back), 4 side (forward).
+    Button(u32),
+    /// A button number the user recorded on their own mouse.
+    Learned { learned_button: u32 },
+}
+
+impl GestureTrigger {
+    /// The button number the tap matches a press against.
+    pub fn button(self) -> u32 {
+        match self {
+            GestureTrigger::Button(button) => button,
+            GestureTrigger::Learned { learned_button } => learned_button,
+        }
+    }
+
+    /// Whether the number is one the tap can take: the left button (0) starts every ordinary click,
+    /// and 1..=4 are the only buttons a mouse is guaranteed to have.
+    pub fn is_usable(self) -> bool {
+        (1..=4).contains(&self.button()) || self.button() >= 5
+    }
+
+    /// Whether this is one of the four standard choices rather than a learned button.
+    #[cfg(test)]
+    pub fn is_standard(self) -> bool {
+        matches!(self, GestureTrigger::Button(_))
+    }
+}
+
+impl Default for GestureTrigger {
+    fn default() -> Self {
+        GestureTrigger::Button(default_gesture_button())
+    }
+}
+
+/// How a trigger reads in a diagnostic: the button number, and whether the user taught it.
+fn gesture_trigger_text(trigger: GestureTrigger) -> String {
+    match trigger {
+        GestureTrigger::Button(button) => button.to_string(),
+        GestureTrigger::Learned { learned_button } => format!("learned {learned_button}"),
+    }
+}
+
+/// One mouse's gestures: the list and the one button they start on, as one unit.
+///
+/// The list and its trigger are one setting because they are edited as one page: a mouse that has a
+/// gesture layer has its OWN list, and an empty list means "no gestures on this mouse", never "fall
+/// back to the shared page".
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(default)]
+pub struct GestureLayer {
+    /// Device matcher; None = the shared "All Mice" layer.
+    #[serde(flatten)]
+    pub device: DeviceMatcher,
+    /// Direction sequences, one row per gesture.
+    pub gestures: Vec<GestureBinding>,
+    /// The one button these gestures start on.
+    pub gesture_button: GestureTrigger,
+}
+
 /// One `[[mouse.gestures]]` entry: a direction sequence on a button, and what it runs.
 ///
 /// The binding is a raw string for the same reason `[[key_bindings.items]]` keeps one: the config
@@ -1153,12 +1220,17 @@ pub(crate) fn default_gesture_button() -> u32 {
     1
 }
 
-fn deserialize_gesture_button<'de, D>(deserializer: D) -> Result<u32, D::Error>
+/// The trigger a fresh configuration, and a repaired one, starts with.
+pub(crate) fn default_gesture_trigger() -> GestureTrigger {
+    GestureTrigger::Button(default_gesture_button())
+}
+
+fn deserialize_gesture_button<'de, D>(deserializer: D) -> Result<GestureTrigger, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
-    Option::<u32>::deserialize(deserializer)
-        .map(|button| button.unwrap_or_else(default_gesture_button))
+    Option::<GestureTrigger>::deserialize(deserializer)
+        .map(|trigger| trigger.unwrap_or_else(GestureTrigger::default))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
@@ -1169,16 +1241,17 @@ pub struct MouseSection {
     // Mouse gestures: hold a button, draw a direction sequence, release to run a binding.
     // Independent of the scroll/button-mapping switches, but gated by `enabled` above.
     pub gestures_enabled: bool,
-    /// Direction sequences, one row per gesture.
+    /// Direction sequences, one row per gesture, for the mice without a layer of their own.
     pub gestures: Vec<GestureBinding>,
-    /// The one button every gesture starts on: 1 right, 2 middle, 3 side (back), 4 side (forward).
+    /// The shared layer's trigger: the button the shared gestures start on.
     ///
     /// Every row is drawn on this button and every other button is left to the application, so this
-    /// is the page's single trigger rather than a property of each row. The value is always one of
-    /// the four: a file written before the key existed, and a value outside the range, both load as
-    /// the right button and are reported, so the file on disk is repaired to match what runs.
+    /// is one trigger per layer rather than a property of each row.
     #[serde(deserialize_with = "deserialize_gesture_button")]
-    pub gesture_button: u32,
+    pub gesture_button: GestureTrigger,
+    /// Configured gestures for one particular mouse. A mouse with a layer here uses THAT list and
+    /// trigger and inherits nothing; a mouse without one uses the shared list above.
+    pub gesture_devices: Vec<GestureLayer>,
     // Draw the stroke under the pointer while a gesture is drawn, and show what it will run.
     pub gesture_show_trail: bool,
     pub gesture_show_hint: bool,
@@ -1206,6 +1279,29 @@ pub struct MouseSection {
     pub pointer: Option<PointerSection>,
 }
 
+impl MouseSection {
+    /// The shared layer: the list and trigger the mice without a layer of their own use.
+    pub fn shared_gesture_layer(&self) -> GestureLayer {
+        GestureLayer {
+            device: DeviceMatcher::default(),
+            gestures: self.gestures.clone(),
+            gesture_button: self.gesture_button,
+        }
+    }
+
+    /// The gesture layer a device uses, if it has one of its own.
+    ///
+    /// EXACT identity, not the runtime's matching rule: the runtime lets the shared layer serve any
+    /// device as a base, so looking a device up with it would find the shared layer for every mouse
+    /// and an edit meant for one mouse would land in the shared list.
+    #[cfg(test)]
+    pub fn gesture_layer_of(&self, device: &DeviceMatcher) -> Option<&GestureLayer> {
+        self.gesture_devices
+            .iter()
+            .find(|layer| layer.device == *device)
+    }
+}
+
 impl Default for MouseSection {
     fn default() -> Self {
         Self {
@@ -1213,7 +1309,8 @@ impl Default for MouseSection {
             gestures_enabled: false,
             gestures: default_gestures(),
             // Every gesture starts on the right button until the user chooses another.
-            gesture_button: 1,
+            gesture_button: GestureTrigger::Button(default_gesture_button()),
+            gesture_devices: Vec::new(),
             // The trail and the hint are what make a new gesture visible; off is the user's choice,
             // not the starting point.
             gesture_show_trail: true,
@@ -1776,14 +1873,24 @@ impl Config {
             self.key_bindings.items.as_ref(),
         ));
 
-        /* the gesture trigger is one of the four buttons */
-        {
-            if !(1..=4).contains(&self.mouse.gesture_button) {
+        // The gesture trigger of the shared layer and of every device layer: a button the tap can
+        // take, never the left one.
+        if !self.mouse.gesture_button.is_usable() {
+            errs.push(format!(
+                "mouse.gesture_button: {}",
+                tf(
+                    "errors.mouse_gesture_button_invalid",
+                    &[("value", &gesture_trigger_text(self.mouse.gesture_button))]
+                )
+            ));
+        }
+        for (index, layer) in self.mouse.gesture_devices.iter().enumerate() {
+            if !layer.gesture_button.is_usable() {
                 errs.push(format!(
-                    "mouse.gesture_button: {}",
+                    "mouse.gesture_devices[{index}].gesture_button: {}",
                     tf(
                         "errors.mouse_gesture_button_invalid",
-                        &[("value", &self.mouse.gesture_button.to_string())]
+                        &[("value", &gesture_trigger_text(layer.gesture_button))]
                     )
                 ));
             }
@@ -2155,6 +2262,24 @@ impl Config {
         if !errs.iter().any(|e| e.starts_with("mouse.gesture_button")) {
             self.mouse.gesture_button = other.mouse.gesture_button;
         }
+        // Device layers are their own healthy section, merged layer by layer: an invalid trigger in
+        // one layer must not cost another mouse its gestures, and an unrelated error elsewhere must
+        // not cost all of them.
+        self.mouse.gesture_devices = other
+            .mouse
+            .gesture_devices
+            .iter()
+            .enumerate()
+            .map(|(index, layer)| {
+                let prefix = format!("mouse.gesture_devices[{index}].gesture_button");
+                let mut kept = layer.clone();
+                if errs.iter().any(|e| e.starts_with(&prefix)) {
+                    // Only the trigger falls back; the layer and its list are kept.
+                    kept.gesture_button = default_gesture_trigger();
+                }
+                kept
+            })
+            .collect();
         // Migrate other's legacy fields (if any) before merging.
         let mut other_mouse = other.mouse;
         other_mouse.migrate_legacy();
@@ -2269,6 +2394,41 @@ impl Config {
     }
 }
 
+/// One gesture row as the schema describes it: every field a row may carry, with the type it has.
+fn gesture_binding_schema() -> toml::Value {
+    let mut row = toml::map::Map::new();
+    row.insert("gesture".into(), toml::Value::String(String::new()));
+    row.insert("button".into(), toml::Value::Integer(1));
+    row.insert("binding".into(), toml::Value::String(String::new()));
+    row.insert("enabled".into(), toml::Value::Boolean(true));
+    toml::Value::Table(row)
+}
+
+/// Whether a written trigger has one of the two legal shapes: the standard button number, or the
+/// learned table with its one field.
+fn sanitize_gesture_trigger(value: &toml::Value) -> Option<toml::Value> {
+    // The RANGE matters as much as the type: the field is a u32, so a negative number or one past
+    // u32 would pass a type check and then fail the whole document's deserialization -- the one
+    // failure the per-field sanitiser exists to prevent.
+    let in_range = |value: &toml::Value| {
+        value
+            .as_integer()
+            .is_some_and(|number| (0..=u32::MAX as i64).contains(&number))
+    };
+    match value {
+        toml::Value::Integer(_) if in_range(value) => Some(value.clone()),
+        toml::Value::Table(table) => {
+            let learned = table.get("learned_button")?;
+            if in_range(learned) {
+                Some(value.clone())
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 /// Return a TOML value containing the expected type shape for every configuration field.
 ///
 /// `serde(default)` handles missing fields, but Serde rejects a whole struct when one field
@@ -2326,6 +2486,37 @@ fn config_type_schema() -> toml::Value {
         clipboard.insert(
             "picker_position".into(),
             toml::Value::String("mouse".into()),
+        );
+    }
+
+    // Gesture layers are described explicitly: the sanitizer walks an array element-by-element
+    // against the schema's FIRST element, so without one a single mistyped field inside one mouse's
+    // layer would fail the whole document. The element states the layer's own identity fields (the
+    // flattened matcher the serializer omits when wildcard), so an ordinary per-device layer is not
+    // read as a type error.
+    if let Some(mouse) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("mouse"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        let mut layer = toml::map::Map::new();
+        layer.insert("device_vendor_id".into(), toml::Value::Integer(0));
+        layer.insert("device_product_id".into(), toml::Value::Integer(0));
+        // The virtual-pointer matcher: a wrong type here must be repaired like any other field,
+        // or it reaches Serde and fails the whole document.
+        layer.insert("device_injected".into(), toml::Value::Boolean(false));
+        layer.insert(
+            "gestures".into(),
+            toml::Value::Array(vec![gesture_binding_schema()]),
+        );
+        layer.insert("gesture_button".into(), toml::Value::Integer(1));
+        mouse.insert(
+            "gesture_devices".into(),
+            toml::Value::Array(vec![toml::Value::Table(layer)]),
+        );
+        mouse.insert(
+            "gestures".into(),
+            toml::Value::Array(vec![gesture_binding_schema()]),
         );
     }
 
@@ -2463,6 +2654,35 @@ fn sanitize_config_value(
 ) -> Option<toml::Value> {
     // `button_mappings` is a dynamic string map, so an empty default table cannot describe its
     // value type. Validate each value explicitly instead of adding a fake schema key.
+    // A trigger is one of two shapes (the standard number or the learned table), so it is checked
+    // as a shape rather than against a single schema type: a schema would read one of the two as a
+    // type error and repair a perfectly valid choice.
+    // The device identity numbers are u32 too: a negative or oversized value passes a type check and
+    // then fails the whole document's deserialization, which is the failure this sanitiser prevents.
+    if path.ends_with(".device_vendor_id") || path.ends_with(".device_product_id") {
+        let ok = actual
+            .as_integer()
+            .is_some_and(|number| (0..=u32::MAX as i64).contains(&number));
+        return if ok {
+            Some(actual.clone())
+        } else {
+            errors.push(type_error(path, actual, schema));
+            // Omitted, so Serde takes the field's own default: the layer becomes the wildcard
+            // matcher's shape only when the whole layer is dropped below, never a wider match.
+            None
+        };
+    }
+
+    if path == "mouse.gesture_button" || path.ends_with(".gesture_button") {
+        return match sanitize_gesture_trigger(actual) {
+            Some(value) => Some(value),
+            None => {
+                errors.push(type_error(path, actual, schema));
+                fallback.cloned()
+            }
+        };
+    }
+
     if path.ends_with(".button_mappings") {
         let Some(table) = actual.as_table() else {
             errors.push(type_error(path, actual, schema));
@@ -3468,19 +3688,23 @@ mod tests {
     #[test]
     fn the_gesture_trigger_survives_an_unrelated_invalid_field() {
         let mut loaded = Config::default();
-        loaded.mouse.gesture_button = 3;
+        loaded.mouse.gesture_button = GestureTrigger::Button(3);
         loaded.appearance.theme = "neon".into();
         let errors = loaded.validate();
         assert!(errors.iter().any(|e| e.starts_with("appearance.theme")));
         let mut merged = Config::default();
         merged.merge_valid(loaded, &errors);
-        assert_eq!(merged.mouse.gesture_button, 3, "a valid trigger is kept");
+        assert_eq!(
+            merged.mouse.gesture_button,
+            GestureTrigger::Button(3),
+            "a valid trigger is kept"
+        );
 
         // The repair path must not cost the user their gesture configuration: only the bad trigger
         // falls back, and the list, the switches, the exclusion list and the presentation flags
         // survive -- otherwise one hand-edited number wipes the section on the next launch.
         let mut bad = Config::default();
-        bad.mouse.gesture_button = 9;
+        bad.mouse.gesture_button = GestureTrigger::Button(0);
         bad.mouse.gestures_enabled = true;
         bad.mouse.gestures = vec![crate::config::GestureBinding {
             gesture: "UL".into(),
@@ -3497,7 +3721,7 @@ mod tests {
             .find(|error| error.starts_with("mouse.gesture_button"))
             .expect("the trigger is reported");
         assert!(
-            message.contains('9'),
+            message.contains(" 0") || message.ends_with('0') || message.contains("0。"),
             "the message names the value: {message}"
         );
         assert!(
@@ -3508,7 +3732,7 @@ mod tests {
         merged.merge_valid(bad, &errors);
         assert_eq!(
             merged.mouse.gesture_button,
-            default_gesture_button(),
+            GestureTrigger::Button(default_gesture_button()),
             "an impossible trigger falls back to the default"
         );
         assert!(
@@ -3530,7 +3754,195 @@ mod tests {
         );
     }
 
+    /// A repair never costs another mouse its gestures: an unrelated invalid field, or one layer's
+    /// bad trigger, must leave every device layer (and its list) in place.
     #[test]
+    fn a_repair_keeps_every_device_gesture_layer() {
+        let layer = |button: crate::config::GestureTrigger| crate::config::GestureLayer {
+            device: crate::config::DeviceMatcher {
+                vendor_id: Some(0x046d),
+                product_id: Some(0xc52b),
+                ..Default::default()
+            },
+            gestures: vec![crate::config::GestureBinding {
+                gesture: "UL".into(),
+                button: 1,
+                binding: "cmd+t".into(),
+                enabled: true,
+            }],
+            gesture_button: button,
+        };
+        let mut loaded = Config::default();
+        loaded.appearance.theme = "neon".into();
+        loaded.mouse.gesture_devices = vec![layer(GestureTrigger::Button(3))];
+        let errors = loaded.validate();
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert_eq!(
+            merged.mouse.gesture_devices.len(),
+            1,
+            "an unrelated error must not drop the device layers"
+        );
+        assert_eq!(merged.mouse.gesture_devices[0].gestures.len(), 1);
+        assert_eq!(
+            merged.mouse.gesture_devices[0].gesture_button,
+            GestureTrigger::Button(3)
+        );
+
+        let mut bad_layer = Config::default();
+        bad_layer.mouse.gesture_devices = vec![layer(GestureTrigger::Button(0))];
+        let errors = bad_layer.validate();
+        let mut merged = Config::default();
+        merged.merge_valid(bad_layer, &errors);
+        assert_eq!(
+            merged.mouse.gesture_devices[0].gesture_button,
+            default_gesture_trigger(),
+            "only the layer's trigger falls back"
+        );
+        assert_eq!(
+            merged.mouse.gesture_devices[0].gestures.len(),
+            1,
+            "the layer's own list survives the repair"
+        );
+    }
+
+    /// The loader (not bare Serde) accepts both trigger shapes, round-trips the learned one, and
+    /// isolates a mistyped field to the layer it is in.
+    #[test]
+    fn the_loader_accepts_both_trigger_shapes_and_isolates_a_bad_layer() {
+        let learned = r#"
+[mouse]
+gesture_button = { learned_button = 7 }
+gestures_enabled = true
+
+[[mouse.gestures]]
+gesture = "L"
+button = 1
+binding = "window.snap_left"
+enabled = true
+"#;
+        let (config, errors, _) = parse_config_content(learned).expect("the document loads");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            config.mouse.gesture_button,
+            GestureTrigger::Learned { learned_button: 7 },
+            "a learned trigger round-trips through the loader"
+        );
+
+        let standard = r#"
+[mouse]
+gesture_button = 3
+"#;
+        let (config, _errors, _) = parse_config_content(standard).expect("the document loads");
+        assert_eq!(config.mouse.gesture_button, GestureTrigger::Button(3));
+
+        // A round trip through the real serializer and loader keeps the learned trigger.
+        let mut round_trip = Config::default();
+        round_trip.mouse.gesture_button = GestureTrigger::Learned { learned_button: 6 };
+        let written = toml::to_string(&round_trip).expect("serialize");
+        let (loaded, errors, _) = parse_config_content(&written).expect("the document loads");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            loaded.mouse.gesture_button,
+            GestureTrigger::Learned { learned_button: 6 }
+        );
+
+        // BAD VALUES, not just valid ones: a learned trigger past u32, and a wrong type in a
+        // layer's identity field. Each must cost only its own field, never the document.
+        let bad = r#"
+[mouse]
+gestures_enabled = true
+gesture_button = { learned_button = -1 }
+
+[[mouse.gesture_devices]]
+device_vendor_id = "not a number"
+device_product_id = 49261
+device_injected = "no"
+gesture_button = 2
+
+[[mouse.gesture_devices.gestures]]
+gesture = "UL"
+button = 1
+binding = "window.maximize"
+enabled = true
+"#;
+        let (bad_config, errors, _) = parse_config_content(bad).expect("the document still loads");
+        assert!(!errors.is_empty(), "the bad values are reported");
+
+        // The identity NUMBERS are u32 fields: a negative or oversized value must not reach Serde.
+        let bad_identity = r#"
+[mouse]
+
+[[mouse.gesture_devices]]
+device_vendor_id = -1
+device_product_id = 4294967296
+gesture_button = 2
+
+[[mouse.gesture_devices.gestures]]
+gesture = "UL"
+button = 1
+binding = "window.maximize"
+enabled = true
+"#;
+        let (identity_config, errors, _) =
+            parse_config_content(bad_identity).expect("the document still loads");
+        assert!(!errors.is_empty(), "the identity numbers are reported");
+        assert_eq!(
+            identity_config.mouse.gesture_devices.len(),
+            1,
+            "the layer survives with a defaulted identity"
+        );
+        assert_eq!(
+            bad_config.mouse.gesture_button,
+            default_gesture_trigger(),
+            "an impossible learned trigger falls back"
+        );
+        assert_eq!(
+            bad_config.mouse.gesture_devices.len(),
+            1,
+            "the layer survives"
+        );
+        assert_eq!(
+            bad_config.mouse.gesture_devices[0].gestures.len(),
+            1,
+            "its list survives"
+        );
+        assert_eq!(
+            bad_config.mouse.gesture_devices[0].gesture_button,
+            GestureTrigger::Button(2),
+            "its own valid trigger survives"
+        );
+    }
+
+    #[test]
+    /// Switching back to a standard entry replaces a learned trigger, and a learned one survives a
+    /// round trip: the page must never show one thing and store another.
+    #[test]
+    fn a_learned_trigger_and_a_standard_one_replace_each_other() {
+        let mut cfg = Config::default();
+        cfg.mouse.gesture_button = GestureTrigger::Learned { learned_button: 7 };
+        let written = toml::to_string(&cfg).expect("serialize");
+        assert!(
+            written.contains("learned_button"),
+            "the learned form is written: {written}"
+        );
+        let (loaded, errors, _) = parse_config_content(&written).expect("reload");
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(loaded.mouse.gesture_button.button(), 7);
+        assert!(!loaded.mouse.gesture_button.is_standard());
+
+        loaded_still_standard();
+    }
+
+    /// A standard choice is stored as the standard variant, so nothing downstream has to guess.
+    fn loaded_still_standard() {
+        let mut cfg = Config::default();
+        cfg.mouse.gesture_button = GestureTrigger::Learned { learned_button: 7 };
+        cfg.mouse.gesture_button = GestureTrigger::Button(2);
+        assert!(cfg.mouse.gesture_button.is_standard());
+        assert_eq!(cfg.mouse.gesture_button.button(), 2);
+    }
+
     fn validate_catches_appearance_theme() {
         let mut cfg = Config::default();
         cfg.appearance.theme = "neon".into();

@@ -116,6 +116,17 @@ pub(crate) fn device_key(key: Option<(u32, u32)>) -> u64 {
     key.map_or(0, |(vid, pid)| ((vid as u64) << 32) | pid as u64)
 }
 
+/// The (VID, PID) a press's device slot stands for, or `None` when the press could not be attributed.
+///
+/// Slot 0 means "no device known", which is NOT the virtual pointer (that one has a real slot), so
+/// an unattributed press must fall back to the shared layer rather than to a virtual layer.
+fn device_key_to_key(slot: u64) -> Option<crate::mouse::device::DeviceKey> {
+    if slot == 0 {
+        return None;
+    }
+    Some(((slot >> 32) as u32, slot as u32))
+}
+
 /// Whether the gesture that produced a queued job may still run: same epoch, not recording, and the
 /// frontmost application is not excluded. A frontmost change does not advance the epoch, so the
 /// exclusion has to be read at consumption time rather than trusted from release time.
@@ -340,7 +351,12 @@ impl Runtime {
             return false;
         }
         let published = table::snapshot();
-        if excluded_bundle(&published.excluded, event_bundle) || !published.table.claims(button) {
+        // The device that produced the press decides WHICH layer's rules apply, and the same layer
+        // answers at release: a mouse with its own list must never run the shared list's action.
+        // No slot (0) means attribution failed, and the press falls back to the shared layer, which
+        // is exactly what an unattributed button mapping does.
+        let layer_table = published.table_for(device_key_to_key(device));
+        if excluded_bundle(&published.excluded, event_bundle) || !layer_table.claims(button) {
             return false;
         }
         // Try the engine first: a press it refuses (another button already holds the session) must
@@ -450,13 +466,14 @@ impl Runtime {
             return (Decision::Pass, None);
         }
         let published = table::snapshot();
+        let layer_table = published.table_for(device_key_to_key(device));
         let epoch = self.epoch;
         self.clear_tail(button, device);
         let decision = self.engine.release(
             identity,
             at,
             now_ms,
-            |key| published.table.lookup(button, key).is_some(),
+            |key| layer_table.lookup(button, key).is_some(),
             // The three ways a gesture stops being allowed to run, checked at the moment it would:
             // the configuration changed under it, a recorder took the keyboard, or the frontmost
             // application moved into the exclusion list while the user was drawing.
@@ -471,7 +488,9 @@ impl Runtime {
         match decision {
             Decision::Execute => {
                 if let Some(key) = self.engine.sequence_key() {
-                    if let Some(row) = published.table.lookup(button, &key).cloned() {
+                    // The row that ran is the one THIS device's layer names: the same table that
+                    // authorized the stroke, never the shared one that another mouse uses.
+                    if let Some(row) = layer_table.lookup(button, &key).cloned() {
                         target = Some(row);
                     }
                 }
@@ -609,6 +628,12 @@ impl Runtime {
         self.press.as_ref().map(|press| press.button).unwrap_or(0)
     }
 
+    /// The device the live session started on, for the layer its hint reads.
+    pub(crate) fn engine_device_key(&self) -> Option<crate::mouse::device::DeviceKey> {
+        let button = self.owned_tail?;
+        device_key_to_key(button.device)
+    }
+
     pub(crate) fn trail_snapshot(&self) -> Trail {
         Trail {
             session: self.session,
@@ -727,6 +752,62 @@ mod tests {
             );
             set_active(false);
             assert!(!rt.owns_tail(1, 0));
+        });
+    }
+
+    /// A press from a mouse that has its own layer runs THAT layer's action on release: the row
+    /// used to execute came from the shared table, which is the wrong mouse's gesture.
+    #[test]
+    fn a_press_runs_the_action_of_its_own_devices_layer() {
+        with_global_state(|| {
+            let mut cfg = crate::config::Config::default();
+            cfg.mouse.enabled = true;
+            cfg.mouse.gestures_enabled = true;
+            cfg.mouse.gestures = vec![crate::config::GestureBinding {
+                gesture: "R".into(),
+                button: 1,
+                binding: "window.snap_left".into(),
+                enabled: true,
+            }];
+            let device = (0x046du32, 0xc52bu32);
+            cfg.mouse.gesture_devices = vec![crate::config::GestureLayer {
+                device: crate::config::DeviceMatcher {
+                    vendor_id: Some(device.0),
+                    product_id: Some(device.1),
+                    ..Default::default()
+                },
+                gestures: vec![crate::config::GestureBinding {
+                    gesture: "R".into(),
+                    button: 1,
+                    binding: "window.maximize".into(),
+                    enabled: true,
+                }],
+                gesture_button: crate::config::GestureTrigger::Button(1),
+            }];
+            table::publish(&cfg);
+            publish_frontmost(Some("com.example.foreground".into()));
+            set_active(true);
+
+            let mut rt = Runtime::new();
+            let slot = device_key(Some(device));
+            assert!(
+                rt.press(1, slot, p(100.0, 100.0), 0.0, 0, None),
+                "the layer claims it"
+            );
+            let mut at = p(100.0, 100.0);
+            for i in 1..=5 {
+                at = p(at.x + 10.0, at.y);
+                rt.dragged(1, slot, at, i as f64);
+            }
+            let (_, target) = rt.release(1, slot, at, 10.0, None);
+            assert_eq!(
+                target.map(|row| row.target),
+                Some(super::super::table::Target::Action(
+                    crate::key_bindings::Action::Maximize
+                )),
+                "the mouse's own layer decided the action"
+            );
+            set_active(false);
         });
     }
 

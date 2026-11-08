@@ -69,10 +69,11 @@ use finder_menu::finder_menu_page_view;
 pub(super) use finder_menu::FinderMenuHooks;
 use general::general_page_view;
 use gestures::gestures_page_view;
+pub(super) use gestures::GesturesHooks;
 pub(crate) use gestures::{
     action_row_index, delete_row_index, gesture_target_option_ids, gesture_trigger_option_ids,
     is_gesture_row_identity, is_trigger_row_identity, remove_gesture_row, set_row_trigger,
-    trigger_row_of, GESTURE_TRIGGER_BUTTONS,
+    trigger_row_of,
 };
 use key_bindings::key_bindings_page_view;
 pub(super) use key_bindings::KeyBindingsHooks;
@@ -92,6 +93,20 @@ pub(super) use bind::{bind_page_banner, bind_page_controls, refresh_migrated_pag
 /// addressed it by any other name would silently show nothing -- which is how a recorder that was
 /// armed looked like a button that did nothing.
 pub(crate) const GESTURE_RECORD_ROW_ACTION: &str = "gesture_record";
+
+/// Whether the Gestures page is waiting for the user to press the trigger button they are learning.
+static GESTURE_CAPTURE_WAITING: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Tell the Gestures page (and its trigger row) that a capture is running.
+pub(crate) fn set_gesture_capture_waiting(waiting: bool) {
+    GESTURE_CAPTURE_WAITING.store(waiting, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Whether a trigger capture is waiting for a press.
+pub(crate) fn gesture_capture_waiting() -> bool {
+    GESTURE_CAPTURE_WAITING.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// Rewrite the Gestures page's record row, while a recording runs (its live preview) or after one
 /// ended (the row back to its resting text). A recording changes its text on every sample, so the
@@ -191,6 +206,9 @@ impl PageInput {
         input.finder_menu_status =
             super::finder_menu_status_text_now(crate::finder_menu::extension_enabled());
         input.permission_migration_copy = crate::update_notice::needs_permission_migration_copy();
+        // This capture owns the config; making sure the device's gesture layer exists is a write, so
+        // it happens here and the page only reads the scope.
+        input.gesture_scope = Some(super::selected_gesture_layer(&mut input.config));
         input
     }
 
@@ -205,6 +223,7 @@ impl PageInput {
             device,
             finder_menu_status: String::new(),
             permission_migration_copy: false,
+            gesture_scope: None,
         }
     }
 }

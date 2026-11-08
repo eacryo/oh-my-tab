@@ -255,6 +255,31 @@ unsafe fn draw_shortcut_row(
     title: &str,
     target: *mut AnyObject,
 ) -> RenderedControl {
+    draw_capture_row(
+        canvas,
+        origin_y,
+        row_h,
+        "settings.row_clipboard_shortcut",
+        title,
+        target,
+        sel!(handleClipboardShortcutRecord:),
+        ControlId::Action("record_shortcut"),
+    )
+}
+
+/// The shared shape of a "press a key/button to record it" row: the Gestures page's hotkey row is
+/// the same control with a different label, selector and identity, so the two cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn draw_capture_row(
+    canvas: &mut PageCanvas,
+    origin_y: f64,
+    row_h: f64,
+    label_key: &str,
+    title: &str,
+    target: *mut AnyObject,
+    selector: Sel,
+    id: ControlId,
+) -> RenderedControl {
     let document = canvas.document();
     let layout = canvas.layout();
     canvas.set_pending_advance(AdvanceState::Absolute);
@@ -264,7 +289,7 @@ unsafe fn draw_shortcut_row(
         origin_y,
         220.0,
         row_h,
-        &t("settings.row_clipboard_shortcut"),
+        &t(label_key),
     );
     // The label was built with the row's band as its height; `plain_row_label` insets that by 8,
     // so the frame would be 52pt tall and its glyphs would read ~5pt above the row's centre. The
@@ -280,7 +305,7 @@ unsafe fn draw_shortcut_row(
         ROW_ACTION_BTN_H,
         title,
         target,
-        sel!(handleClipboardShortcutRecord:),
+        selector,
         SettingsButtonRole::ControlField,
     );
     let button_frame: NSRect = msg_send![button, frame];
@@ -288,7 +313,7 @@ unsafe fn draw_shortcut_row(
     canvas.place_pending_view(button, button_frame);
     release_obj(button);
     SettingsRow::register_label(label, button);
-    let tooltip = make_nsstring(&t("settings.desc_clipboard_shortcut"));
+    let tooltip = make_nsstring(&t(label_key));
     let _: () = msg_send![button, setToolTip: tooltip];
     release_obj(tooltip);
     // The inline capture error: a value label under the button, hidden until a capture reports
@@ -307,7 +332,7 @@ unsafe fn draw_shortcut_row(
     canvas.place_pending_view(error, error_frame);
     release_obj(error);
     RenderedControl {
-        id: ControlId::Action("record_shortcut"),
+        id,
         kind: ControlKind::Button {
             title_key: "settings.btn_open",
         },

@@ -429,10 +429,36 @@ enum RecMode {
     ClipboardShortcut,
     /// Recording a chord for a new key binding on the Key Bindings page.
     KeyBinding,
+    /// Learning the Gestures page's trigger button: the next mouse down that is not the left button
+    /// becomes the trigger, and that whole press passes through to whatever is underneath.
+    GestureTrigger,
 }
 
 /// The current recording mode (main-thread; handle_recording_finished finishes per mode).
 static REC_MODE: Mutex<RecMode> = Mutex::new(RecMode::Idle);
+
+/// One gesture-trigger capture: which layer it writes, and the session its result belongs to.
+#[derive(Clone, Copy)]
+///
+/// The layer is recorded as a STABLE identity at start, not as an index: a config reload during
+/// the capture can delete or reorder device layers, and an index would then name another mouse.
+struct GestureCapture {
+    /// The session number, so a late result cannot overwrite a newer capture.
+    session: u64,
+    /// The mouse the capture was started for; `None` = the shared layer.
+    device: Option<crate::mouse::device::DeviceKey>,
+}
+static GESTURE_CAPTURE: Mutex<Option<GestureCapture>> = Mutex::new(None);
+static GESTURE_CAPTURE_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The press being learned, while it is held. Its drags and its up belong to the capture and pass
+/// through: clearing `RECORDING` at the DOWN would let the gesture path or a button mapping take
+/// the UP that no DOWN was ever let through for.
+struct LearnPress {
+    session: u64,
+    button: u32,
+    device: u64,
+}
+static LEARN_PRESS: Mutex<Option<LearnPress>> = Mutex::new(None);
 
 /// The action a `RecMode::KeyBinding` recording is binding a chord to, held from the moment the
 /// add button is pressed until the recording finishes or is cancelled.
@@ -1049,12 +1075,17 @@ pub(crate) mod components;
 mod dispatch;
 mod finder_menu_smoke;
 pub(crate) mod gesture_recorder;
+mod gesture_trigger_capture;
 pub(crate) mod mapping;
 mod page_builder;
 pub(crate) mod page_canvas;
 mod page_view;
 mod page_widgets;
 pub(crate) mod portability;
+pub(crate) use gesture_trigger_capture::{
+    begin_trigger_capture, cancel_trigger_capture, handle_gesture_trigger_captured,
+    learn_press_owned, learn_press_released, observe_button_down,
+};
 pub(crate) mod restore;
 pub(crate) mod select;
 mod sidebar;
@@ -1130,11 +1161,11 @@ pub(crate) use dispatch::{
     handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
     handle_export_settings_ready, handle_gesture_excluded_choose, handle_gesture_excluded_remove,
     handle_gesture_record_cancel, handle_gesture_record_start, handle_gesture_row_delete,
-    handle_gesture_row_trigger, handle_gesture_trigger_line, handle_import_settings,
-    handle_import_settings_ready, handle_key_bindings_toggle, handle_pause_recording_toggle,
-    handle_rebuild_settings_content, handle_settings_search_began_editing,
-    handle_settings_search_changed, handle_settings_search_clear,
-    handle_settings_search_ended_editing, handle_unknown_page_action,
+    handle_gesture_row_trigger, handle_gesture_trigger_learn, handle_gesture_trigger_line,
+    handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
+    handle_pause_recording_toggle, handle_rebuild_settings_content,
+    handle_settings_search_began_editing, handle_settings_search_changed,
+    handle_settings_search_clear, handle_settings_search_ended_editing, handle_unknown_page_action,
     handle_windows_enabled_toggle, left_mouse_button_is_down, on_control_changed,
     on_control_text_did_change, on_control_text_did_end_editing, on_sidebar_select,
     refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
@@ -1200,6 +1231,147 @@ use crate::config::{DeviceMatcher, MouseProfile};
 fn current_selected_device() -> Option<crate::mouse::device::DeviceKey> {
     // SELECTED_DEVICE: outer Option = "initialized?"; inner None = "All Mice".
     SELECTED_DEVICE.lock().unwrap().unwrap_or(None) // uninitialized -> None (All Mice)
+}
+
+/// The gesture layer the Gestures page is editing right now.
+///
+/// A connected device edits its OWN layer, created on first write, so a change made while looking at
+/// one mouse's name can never land in another mouse's list. With no device connected the page edits
+/// the shared layer, which is the one every device without a layer of its own uses.
+pub(crate) fn selected_gesture_layer(cfg: &mut Config) -> GestureLayerScope {
+    match current_selected_device() {
+        Some(key) => {
+            // The virtual pointer has no VID/PID: it is identified the same way its mouse profile is,
+            // by "another process injected this event", so its layer uses that matcher.
+            let matcher = if key == crate::mouse::device::VIRTUAL_DEVICE_KEY {
+                DeviceMatcher {
+                    injected: Some(true),
+                    ..Default::default()
+                }
+            } else {
+                DeviceMatcher {
+                    vendor_id: Some(key.0),
+                    product_id: Some(key.1),
+                    ..Default::default()
+                }
+            };
+            let index = match cfg
+                .mouse
+                .gesture_devices
+                .iter()
+                .position(|layer| layer.device == matcher)
+            {
+                Some(index) => index,
+                None => {
+                    // A new layer starts from what this mouse used until now, so the first edit
+                    // changes one thing instead of silently dropping the shared list.
+                    let inherited = cfg.mouse.shared_gesture_layer();
+                    cfg.mouse.gesture_devices.push(crate::config::GestureLayer {
+                        device: matcher,
+                        ..inherited
+                    });
+                    cfg.mouse.gesture_devices.len() - 1
+                }
+            };
+            GestureLayerScope::Device(index)
+        }
+        _ => GestureLayerScope::Shared,
+    }
+}
+
+/// Everything the Gestures page draws, in one comparable value: which layer it is, that layer's
+/// list and trigger, and the switches and exclusions the page draws beside them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DrawnGestureLayer {
+    scope: Option<GestureLayerScope>,
+    gestures: Vec<crate::config::GestureBinding>,
+    trigger: crate::config::GestureTrigger,
+    enabled: bool,
+    trail: bool,
+    hint: bool,
+    excluded: Vec<String>,
+}
+
+/// What the Gestures page would show for `cfg` right now.
+pub(crate) fn drawn_gesture_layer(cfg: &Config) -> DrawnGestureLayer {
+    let scope = selected_gesture_scope();
+    let layer = scope
+        .map(|scope| scope.layer(cfg))
+        .unwrap_or_else(|| cfg.mouse.shared_gesture_layer());
+    DrawnGestureLayer {
+        scope,
+        gestures: layer.gestures,
+        trigger: layer.gesture_button,
+        enabled: cfg.mouse.gestures_enabled,
+        trail: cfg.mouse.gesture_show_trail,
+        hint: cfg.mouse.gesture_show_hint,
+        excluded: cfg.mouse.gesture_excluded_apps.clone(),
+    }
+}
+
+/// The layer the page is editing WITHOUT creating one: a device's own layer when it has one, and
+/// `Some(Shared)` when no device is selected. A device's layer appears on the first write, not on
+/// every page build.
+pub(crate) fn selected_gesture_scope() -> Option<GestureLayerScope> {
+    let device = current_selected_device()?;
+    let matcher = if device == crate::mouse::device::VIRTUAL_DEVICE_KEY {
+        DeviceMatcher {
+            injected: Some(true),
+            ..Default::default()
+        }
+    } else {
+        DeviceMatcher {
+            vendor_id: Some(device.0),
+            product_id: Some(device.1),
+            ..Default::default()
+        }
+    };
+    let cfg = crate::config::CONFIG.read().ok()?;
+    let index = cfg
+        .mouse
+        .gesture_devices
+        .iter()
+        .position(|layer| layer.device == matcher)?;
+    Some(GestureLayerScope::Device(index))
+}
+
+/// Where the edited gesture layer lives, once `selected_gesture_layer` has made sure a device's
+/// layer exists: the shared one (the section's own fields) or an entry of `gesture_devices`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GestureLayerScope {
+    Shared,
+    Device(usize),
+}
+
+impl GestureLayerScope {
+    /// The layer's value, as the page reads it.
+    pub(crate) fn layer(self, cfg: &Config) -> crate::config::GestureLayer {
+        match self {
+            GestureLayerScope::Shared => cfg.mouse.shared_gesture_layer(),
+            GestureLayerScope::Device(index) => cfg
+                .mouse
+                .gesture_devices
+                .get(index)
+                .cloned()
+                .unwrap_or_default(),
+        }
+    }
+
+    /// Write the layer back, wherever it lives.
+    #[cfg(test)]
+    pub(crate) fn store(self, cfg: &mut Config, layer: &crate::config::GestureLayer) {
+        match self {
+            GestureLayerScope::Shared => {
+                cfg.mouse.gestures = layer.gestures.clone();
+                cfg.mouse.gesture_button = layer.gesture_button;
+            }
+            GestureLayerScope::Device(index) => {
+                if let Some(slot) = cfg.mouse.gesture_devices.get_mut(index) {
+                    *slot = layer.clone();
+                }
+            }
+        }
+    }
 }
 
 /// Find the index of the profile matching (VID,PID) in CONFIG. None = find "All Mice".

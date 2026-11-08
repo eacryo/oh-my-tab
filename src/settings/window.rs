@@ -265,6 +265,10 @@ pub(super) fn select_sidebar(idx: usize) {
     for editor in abandoned_page_editors(idx) {
         close_page_editor(editor);
     }
+    // A waiting trigger capture belongs to the Gestures page: leaving it cancels the capture.
+    if idx != super::SETTINGS_GESTURES_PAGE_INDEX {
+        crate::settings::cancel_trigger_capture("left the Gestures page");
+    }
     // The gesture list is data: if it changed while this page was hidden, the page on screen is
     // the old one. Rebuilding here is what keeps "I edited the config, came back, and still see the
     // old list" from happening.
@@ -922,6 +926,9 @@ pub(super) fn hide_settings() {
     // The panel size preview belongs to a live drag on this window: closing Settings must take it
     // down (and restore the panel's window level) even if the drag never produced its mouse-up.
     dispatch::end_max_extent_preview();
+    // A trigger capture waits for a press on a page that is going away: cancel it, so the next
+    // mouse button pressed anywhere else is not learned by accident.
+    crate::settings::cancel_trigger_capture("the settings window is closing");
     // Defensive: wrap up any in-progress recording and every floating editor when the window closes.
     // The two panels are separate windows that outlive a `hide`, and each holds a dim layer added to
     // the settings content view -- which is what this function is about to stop owning.

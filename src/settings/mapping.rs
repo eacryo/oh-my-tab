@@ -573,11 +573,22 @@ unsafe fn recording_tap_callback_inner(
         return event;
     }
     match event_type {
-        25 => {
-            // Button number lives in field 3 (same as mouse/event_tap.rs). Only capture/
-            // swallow while WaitingButton; a lingering tap after cancel passes everything.
+        // A left/right button down reaches the learning mode too (the panel's recorder only ever
+        // wanted the side buttons, and refuses the right one below).
+        1 | 3 | 25 => {
+            // Button number lives in field 3 (same as mouse/event_tap.rs); the left and right
+            // buttons use the event's own number, which field 3 also carries.
             if *REC_STAGE.lock().unwrap() == RecStage::WaitingButton {
                 let btn = CGEventGetIntegerValueField(event, 3) as u32;
+                if *REC_MODE.lock().unwrap() == RecMode::GestureTrigger {
+                    let device = crate::mouse::gesture::runtime::device_key(
+                        crate::mouse::device::device_from_cgevent(event),
+                    );
+                    // The learning press PASSES THROUGH, whatever the outcome: it is the click the
+                    // application underneath is owed.
+                    crate::settings::observe_button_down(btn, device);
+                    return event;
+                }
                 if btn >= 2 {
                     *REC_BUTTON.lock().unwrap() = btn;
                     // Panel trigger recording: the side button completes it; the callback
@@ -718,8 +729,11 @@ pub(super) unsafe fn recording_thread() {
     *REC_RUNLOOP.0.lock().unwrap() = Some(rl);
     // otherMouseDown(25) | keyDown(10) | keyUp(11) | flagsChanged(12); keyUp is what ends the
     // release wait after a chord is captured.
+    // otherMouseDown(25) for the panel's side buttons; leftMouseDown(1) and rightMouseDown(3) so a
+    // gesture trigger can be learned on ANY button (a right button is a legal trigger); keyDown(10)
+    // | keyUp(11) | flagsChanged(12) for the chord recorders.
     let mask: crate::event_tap::CGEventMask =
-        (1u64 << 25) | (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+        (1u64 << 25) | (1u64 << 1) | (1u64 << 3) | (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
     let created = crate::event_tap::create_tap_with_retry(
         crate::event_tap::tap_location::HID_EVENT_TAP,
         crate::event_tap::tap_placement::HEAD_INSERT,
@@ -795,7 +809,28 @@ pub(crate) extern "C" fn handle_mapping_edit(_self: *mut c_void, _cmd: Sel, send
 /// session would stay "recording" for ever -- `key_bindings::engine` then skips global bindings because
 /// a recording is believed to be in progress. A failed spawn is therefore rolled back to Idle, and the
 /// panel button is re-enabled, so the next attempt starts from a clean state.
-fn spawn_recording_thread() {
+pub(super) fn spawn_recording_thread() {
+    // Ends the capture as soon as the button is seen, without waiting for a release: the learned
+    // press is passed through by the latch, not by this tap.
+}
+
+/// Stop the recording tap after a capture that completes at the DOWN.
+pub(super) fn finish_capture_now() {
+    *REC_STAGE.lock().unwrap() = RecStage::Completing;
+    REC_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+    crate::mouse::event_tap::RECORDING.store(false, Ordering::Relaxed);
+    disable_rec_tap();
+    if let Some(rl) = *REC_RUNLOOP.0.lock().unwrap() {
+        unsafe {
+            crate::event_tap::CFRunLoopStop(rl);
+        }
+    }
+    *REC_STAGE.lock().unwrap() = RecStage::Idle;
+    *REC_MODE.lock().unwrap() = RecMode::Idle;
+}
+
+#[allow(dead_code)]
+fn unused_spawn_recording_thread() {
     match std::thread::Builder::new()
         .name("mouse-recording".into())
         .spawn(|| unsafe { recording_thread() })
@@ -824,6 +859,8 @@ fn roll_back_recording_session() {
             // The clipboard row shows a recording prompt; put it back to idle.
             super::set_clipboard_shortcut_recording_ui(false, None);
         }
+        // The gesture capture disables nothing on the page; the page re-reads its own state.
+        RecMode::GestureTrigger => {}
         RecMode::PanelTrigger | RecMode::PanelCombo | RecMode::Idle => {
             // The mapping panel's OK button was disabled for this session (and for Idle there is
             // nothing to restore, but the button is harmless to re-enable).
@@ -1356,6 +1393,8 @@ pub(crate) extern "C" fn handle_recording_finished(
         match mode {
             // No recording was in flight (a late callback): nothing to apply.
             RecMode::Idle => return,
+            // The Gestures page learned a trigger button: its own callback owns the commit.
+            RecMode::GestureTrigger => return,
             // The panel recorded the trigger: update the panel.
             RecMode::PanelTrigger => {
                 *EDIT_BUTTON.lock().unwrap() = Some(btn);

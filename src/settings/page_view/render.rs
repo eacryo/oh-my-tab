@@ -113,6 +113,8 @@ fn action_selector(action: &str) -> Sel {
         }
         // The Gestures page's recorder: start a recording, or cancel the one running.
         "gesture_record" => sel!(handleGestureRecordStart:),
+        // The Gestures page's trigger row: learn the next button the user presses.
+        "gesture_trigger_learn" => sel!(handleGestureTriggerLearn:),
         "gesture_record_cancel" => sel!(handleGestureRecordCancel:),
         // The General page's "Export Logs" row. It used to be reached through the fallback arm,
         // which the unknown-action safety net replaced -- so it is spelled out here.

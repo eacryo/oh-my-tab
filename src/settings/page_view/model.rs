@@ -54,6 +54,9 @@ pub(in crate::settings) struct PageInput {
     /// default, so a description that asked the system itself would stop being a function of its
     /// input -- and the banner's HEIGHT depends on it, which is a layout input.
     pub(in crate::settings) permission_migration_copy: bool,
+    /// The gesture layer the Gestures page edits (`None` = the shared layer). Captured with the
+    /// device for the same reason: the page must not look the device up again while it renders.
+    pub(in crate::settings) gesture_scope: Option<crate::settings::GestureLayerScope>,
 }
 
 /// The measured page a description is laid out into.

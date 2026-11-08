@@ -21,6 +21,69 @@ use super::*;
 /// The page's master switch: it owns whether any gesture fires.
 pub(super) const GESTURES_ENABLED_FIELD: ControlField = ControlField::GesturesEnabled;
 
+/// The page-drawn "gesture hotkey" row: label on the left, the current hotkey on a button that
+/// records a new one -- the same shape as the clipboard page's shortcut row.
+pub(super) const GESTURE_HOTKEY_ROW: &str = "gesture_hotkey";
+pub(super) const GESTURE_HOTKEY_ROW_H: f64 = 60.0;
+/// The Gestures page's own row: the hotkey recorder.
+#[derive(Default)]
+pub(crate) struct GesturesHooks {
+    /// The edited layer's hotkey, in the user's words ("侧键 1").
+    pub(crate) trigger_title: String,
+    /// Whether a capture is waiting for a press.
+    pub(crate) waiting: bool,
+    /// Whether the trigger button also carries a button mapping.
+    pub(crate) mapping_note: bool,
+}
+
+impl PageHooks for GesturesHooks {
+    unsafe fn extra_row(
+        &mut self,
+        canvas: &mut PageCanvas,
+        rendered: &mut RenderedPage,
+        ui: &mut SettingsUi,
+        spec: &PageRowSpec,
+        origin_y: f64,
+        height: f64,
+        target: *mut AnyObject,
+    ) -> Result<(), RegisterError> {
+        if spec.key != GESTURE_HOTKEY_ROW {
+            return Ok(());
+        }
+        let title = if self.waiting {
+            t("settings.gestures_trigger_learn_waiting")
+        } else {
+            self.trigger_title.clone()
+        };
+        let row = super::clipboard::draw_capture_row(
+            canvas,
+            origin_y,
+            height,
+            "settings.gestures_row_gesture_button",
+            &title,
+            target,
+            sel!(handleGestureTriggerLearn:),
+            ControlId::Field(ControlField::GestureTriggerButton),
+        );
+        // The row's tooltip states what the button does; the overlap note is the row's readout, so
+        // it sits under the button like a shortcut capture's error line.
+        let note = if self.mapping_note {
+            t("settings.gestures_trigger_mapping_note")
+        } else {
+            String::new()
+        };
+        ui.gesture_trigger_button = row.control;
+        if !row.readout.is_null() {
+            let text = crate::ffi::make_nsstring(&note);
+            let _: () = msg_send![row.readout, setStringValue: text];
+            crate::ffi::CFRelease(text as *const c_void);
+            let _: () = msg_send![row.readout, setHidden: note.is_empty()];
+        }
+        rendered.controls.push(row);
+        Ok(())
+    }
+}
+
 /// The trigger choices, in the order the popup lists them: the buttons a mouse has, and nothing
 /// else -- the left button stays out on purpose, because a gesture on it would swallow every click.
 pub(crate) const GESTURE_TRIGGER_BUTTONS: [u32; 4] = [1, 2, 3, 4];
@@ -68,6 +131,13 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         crate::settings::set_open_gesture_trigger_row(None);
     }
     let cfg = &input.config;
+    // The layer this page edits: the connected mouse's own list and trigger, or the shared layer
+    // when no device is selected. Everything below reads it, so what is shown and what is written
+    // are the same layer.
+    let layer = input
+        .gesture_scope
+        .map(|scope| scope.layer(&input.config))
+        .unwrap_or_else(|| cfg.mouse.shared_gesture_layer());
     let mut w = RowWriter::new(SettingsPageId::Gestures, t("settings.sidebar_gestures"));
 
     w.in_first_card("settings.gestures_header");
@@ -103,31 +173,11 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
 
-    // The one button every gesture starts on. The list itself is one button's list, so the rows
-    // below say only what they run, and this row is the single place the button is chosen -- it
-    // sits in the switches' own card, where a trigger belongs to that set of choices.
+    // One row, drawn by the page itself exactly like the clipboard page's shortcut row: the row
+    // label on the left and a button on the right whose TEXT is the current hotkey, pressed to
+    // record a new one. Learning and the mapping note are states of that one control, not rows.
     w.card("settings.gestures_header");
-    let trigger_choices = trigger_options();
-    let trigger_selected = trigger_choices
-        .iter()
-        .position(|option| option.button == cfg.mouse.gesture_button)
-        .unwrap_or(0);
-    w.push(
-        RowDraft::new(
-            "settings.gestures_row_gesture_button",
-            ControlKind::Popup {
-                options: trigger_choices
-                    .iter()
-                    .map(|option| option.label.clone())
-                    .collect(),
-            },
-            ControlId::Field(ControlField::GestureTriggerButton),
-            Value::Index(trigger_selected),
-        )
-        .desc("settings.gestures_desc_trigger")
-        .into_spec(),
-    );
-
+    w.extra_row(GESTURE_HOTKEY_ROW, GESTURE_HOTKEY_ROW_H);
     w.card("settings.gestures_header_list");
     if GESTURE_ROWS_EDITABLE {
         // The recorder row: its value IS the recording's state, so the page follows the pointer while
@@ -162,7 +212,7 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
     // page can only show a bounded number of rows. That bound is stated rather than hidden: a
     // configuration with more rows than this gets an explicit "and N more" line instead of two rows
     // silently sharing one identity (which the table would refuse, failing the whole page build).
-    let all_rows = configured_rows(cfg);
+    let all_rows = configured_rows(&layer);
     let overflow = all_rows.len().saturating_sub(MAX_SHOWN_ROWS);
     let rows: Vec<ShownRow> = all_rows.into_iter().take(MAX_SHOWN_ROWS).collect();
     if rows.is_empty() {
@@ -181,7 +231,12 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
     }
     // Conflicts are reported ON the row they concern: the user is looking at the list, and a
     // separate summary would make them hunt for which row is wrong.
-    let conflicts = crate::mouse::gesture::conflict::by_row(cfg);
+    // Conflicts are this LAYER's: two mice may run the same stroke with different actions, which is
+    // the point of giving them layers.
+    let conflicts = crate::mouse::gesture::conflict::by_row_in_layer(&layer);
+    // A stroke whose shortcut is also a key binding still runs -- it is a warning about the chord,
+    // not a conflict -- and it is drawn on its own row like every other problem.
+    let shadowed = crate::mouse::gesture::conflict::rows_shadowed_by_bindings(&layer, cfg);
     let options = target_options();
     for row in rows {
         let selected = options
@@ -201,6 +256,9 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         if let Some(conflict) = conflicts.get(&row.index) {
             stroke.push_str(" · ");
             stroke.push_str(&t(conflict.message));
+        } else if shadowed.contains(&row.index) {
+            stroke.push_str(" · ");
+            stroke.push_str(&t("errors.errors_gesture_shadowed_by_binding"));
         }
         if !GESTURE_ROWS_EDITABLE {
             // A fixed row: the stroke on the left, what it runs on the right, nothing to press.
@@ -864,8 +922,8 @@ fn gesture_excluded_candidates() -> Vec<(String, String)> {
     apps
 }
 
-fn configured_rows(cfg: &crate::config::Config) -> Vec<ShownRow> {
-    cfg.mouse
+fn configured_rows(layer: &crate::config::GestureLayer) -> Vec<ShownRow> {
+    layer
         .gestures
         .iter()
         .enumerate()
@@ -1058,6 +1116,30 @@ mod tests {
         );
     }
 
+    /// A stroke that runs a shortcut a key binding also uses says so on its row: the same chord has
+    /// two producers, which is a warning the user should see rather than a silent overlap.
+    #[test]
+    fn a_row_whose_shortcut_is_also_a_binding_says_so() {
+        let mut page_input = input(true, vec![row("l", 1, "cmd+t", true)]);
+        page_input.config.key_bindings.items = Some(vec![crate::key_bindings::KeyBinding {
+            action: "open_finder".into(),
+            trigger: "cmd+t".into(),
+            enabled: true,
+        }]);
+        let view = gestures_page_view(&page_input);
+        let labels: Vec<String> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_gesture")
+            .filter_map(|r| r.label_text.clone())
+            .collect();
+        assert_eq!(labels.len(), 1);
+        assert!(
+            labels[0].contains(&t("errors.errors_gesture_shadowed_by_binding")),
+            "the overlap is stated on the row: {labels:?}"
+        );
+    }
+
     /// A conflicting row says so in the user's language: the words are looked up, and a raw
     /// translation key on a row is a key that does not exist.
     #[test]
@@ -1118,43 +1200,32 @@ mod tests {
         assert_eq!(stroke_words(""), "");
     }
 
-    /// The trigger is one row, a popup over the four buttons a mouse has, and it shows the button
-    /// the configuration actually uses.
+    /// The hotkey is ONE page-drawn row (the clipboard shortcut row's shape), so there is no
+    /// popup and no second row: the button's own text carries the current hotkey.
     #[test]
-    fn the_page_offers_one_trigger_popup_with_four_buttons() {
-        let mut page_input = input(true, vec![row("l", 1, "window.snap_left", true)]);
-        page_input.config.mouse.gesture_button = 3;
+    fn the_hotkey_is_one_page_drawn_row() {
+        let page_input = input(true, vec![row("l", 1, "window.snap_left", true)]);
         let view = gestures_page_view(&page_input);
-        let trigger = view
-            .rows
-            .iter()
-            .find(|r| r.label_key == "settings.gestures_row_gesture_button")
-            .expect("the trigger row");
-        match &trigger.control {
-            ControlKind::Popup { options } => assert_eq!(
-                options.len(),
-                4,
-                "right, middle and both side buttons: {options:?}"
-            ),
-            other => panic!("the trigger is a popup, not {other:?}"),
-        }
-        assert_eq!(
-            trigger.id,
-            ControlId::Field(ControlField::GestureTriggerButton)
+        assert!(
+            view.extra_rows
+                .iter()
+                .any(|row| row.key == GESTURE_HOTKEY_ROW),
+            "the page declares the hotkey row"
         );
-        assert_eq!(trigger.value, Value::Index(2), "side button 1 is selected");
-        // No gesture row names a button any more.
-        for row in view
-            .rows
-            .iter()
-            .filter(|r| r.label_key == "settings.gestures_row_gesture")
-        {
-            let label = row.label_text.clone().unwrap_or_default();
-            assert!(
-                !label.contains(&crate::mouse::shortcut::button_label(1)),
-                "{label}"
-            );
-        }
+        assert!(
+            !view
+                .rows
+                .iter()
+                .any(|r| r.label_key == "settings.gestures_row_trigger_learn"),
+            "there is no second row for learning"
+        );
+        assert!(
+            !view
+                .rows
+                .iter()
+                .any(|r| matches!(r.control, ControlKind::Popup { .. })),
+            "the hotkey is not a popup"
+        );
     }
 
     /// The shipped default list fits the page: an overflow line under the app's own rows read as

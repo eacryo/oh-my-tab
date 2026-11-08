@@ -97,18 +97,30 @@ pub(crate) enum RowError {
 /// requires of config values, and why the table is the place the decision is made rather than the
 /// deserialiser.
 pub(crate) fn build(mouse: &crate::config::MouseSection) -> (GestureTable, Vec<(usize, RowError)>) {
+    build_layer(mouse, &mouse.shared_gesture_layer())
+}
+
+/// One device's table: the rows of ITS layer, drawn on ITS trigger.
+///
+/// A device with a layer of its own has a different list, a different trigger and therefore a
+/// different set of claims; building one table for everything would let a press on the right button
+/// run a gesture that belongs to another mouse.
+pub(crate) fn build_layer(
+    mouse: &crate::config::MouseSection,
+    layer: &crate::config::GestureLayer,
+) -> (GestureTable, Vec<(usize, RowError)>) {
     let mut table = GestureTable::default();
     let mut errors = Vec::new();
     if !mouse.enabled || !mouse.gestures_enabled {
         return (table, errors);
     }
-    for (index, row) in mouse.gestures.iter().enumerate() {
+    for (index, row) in layer.gestures.iter().enumerate() {
         match row_error(row) {
             Ok((key, target)) => {
                 // Every row lands on the effective trigger, not on the button it was written with:
                 // a global trigger makes the list one button's list, and two rows that were
                 // distinct only by their buttons now claim the same slot.
-                let button = effective_trigger_button(mouse);
+                let button = layer.gesture_button.button();
                 let slot = (button, key.clone());
                 if table.rows.contains_key(&slot) {
                     errors.push((index, RowError::Duplicate));
@@ -130,12 +142,29 @@ pub(crate) fn build(mouse: &crate::config::MouseSection) -> (GestureTable, Vec<(
     (table, errors)
 }
 
-/// The button a row is drawn on: the configuration's one trigger.
+/// The gesture layer a device uses: its own layer when it has one, the shared layer otherwise.
 ///
-/// The row's own `button` is not consulted. Validation keeps the trigger inside 1..=4, so a
-/// hand-written value outside it is repaired by the per-field merge rather than guessed at here.
-pub(crate) fn effective_trigger_button(mouse: &crate::config::MouseSection) -> u32 {
-    mouse.gesture_button
+/// The snapshot indexes the same choice by (VID, PID) for the tap; this is the rule itself, kept
+/// where it can be asserted without a published snapshot.
+#[cfg(test)]
+pub(crate) fn layer_for<'a>(
+    mouse: &'a crate::config::MouseSection,
+    shared: &'a crate::config::GestureLayer,
+    device: Option<crate::mouse::device::DeviceKey>,
+) -> &'a crate::config::GestureLayer {
+    let Some(device) = device else {
+        return shared;
+    };
+    mouse
+        .gesture_devices
+        .iter()
+        .find(|layer| {
+            if layer.device.is_virtual() {
+                return device == crate::mouse::device::VIRTUAL_DEVICE_KEY;
+            }
+            layer.device.vendor_id == Some(device.0) && layer.device.product_id == Some(device.1)
+        })
+        .unwrap_or(shared)
 }
 
 /// A configured sequence as the key the tap matches against.
@@ -201,9 +230,49 @@ fn row_error(row: &GestureBinding) -> Result<(String, Target), RowError> {
 #[derive(Debug, Clone)]
 pub(crate) struct Published {
     pub(crate) table: Arc<GestureTable>,
+    /// One table per device layer, keyed by the device's (VID, PID). A device without an entry, and
+    /// a press whose device could not be attributed, uses `table`.
+    pub(crate) device_tables: Arc<DeviceTables>,
     pub(crate) epoch: u64,
     pub(crate) excluded: Arc<Vec<String>>,
 }
+
+/// Whether two snapshot sets hold the same rows on the same devices.
+fn same_device_tables(
+    left: &[((u32, u32), Arc<GestureTable>)],
+    right: &[((u32, u32), Arc<GestureTable>)],
+) -> bool {
+    left.len() == right.len()
+        && left.iter().all(|(device, table)| {
+            right
+                .iter()
+                .find(|(candidate, _)| candidate == device)
+                .is_some_and(|(_, other)| other.rows == table.rows)
+        })
+}
+
+impl Published {
+    /// The table a press from `device` is decided by: that device's layer, else the shared one.
+    ///
+    /// `None` is a press that could not be attributed, and it falls back to the shared layer --
+    /// the same fallback an unattributed button mapping takes.
+    pub(crate) fn table_for(
+        &self,
+        device: Option<crate::mouse::device::DeviceKey>,
+    ) -> &GestureTable {
+        device
+            .and_then(|key| {
+                self.device_tables
+                    .iter()
+                    .find(|(candidate, _)| *candidate == key)
+                    .map(|(_, table)| table.as_ref())
+            })
+            .unwrap_or(&self.table)
+    }
+}
+
+/// The per-device tables a snapshot carries: one per device, keyed by its (VID, PID).
+type DeviceTables = Vec<((u32, u32), Arc<GestureTable>)>;
 
 static EPOCH: AtomicU64 = AtomicU64::new(1);
 static PUBLISHED: OnceLock<Mutex<Published>> = OnceLock::new();
@@ -212,6 +281,7 @@ fn cell() -> &'static Mutex<Published> {
     PUBLISHED.get_or_init(|| {
         Mutex::new(Published {
             table: Arc::new(GestureTable::default()),
+            device_tables: Arc::new(Vec::new()),
             epoch: 0,
             excluded: Arc::new(Vec::new()),
         })
@@ -235,6 +305,26 @@ pub(crate) fn snapshot() -> Published {
 /// is a revocation too.
 pub(crate) fn publish(cfg: &Config) -> Vec<(usize, RowError)> {
     let (table, errors) = build(&cfg.mouse);
+    // Each device layer is published beside the shared one, keyed by its device: the tap picks the
+    // layer by the device that produced the press, and never reads the configuration itself.
+    let mut device_tables = Vec::with_capacity(cfg.mouse.gesture_devices.len());
+    for layer in cfg.mouse.gesture_devices.iter() {
+        // The KEY first, from the layer's own identity, and the layer itself is what gets built: a
+        // virtual-pointer layer has no VID/PID, so asking the (VID, PID) lookup for it would find the
+        // shared layer and publish that mouse's gestures under the virtual device's name.
+        let key = if layer.device.is_virtual() {
+            Some(crate::mouse::device::VIRTUAL_DEVICE_KEY)
+        } else {
+            match (layer.device.vendor_id, layer.device.product_id) {
+                (Some(vendor_id), Some(product_id)) => Some((vendor_id, product_id)),
+                _ => None,
+            }
+        };
+        let (built, _layer_errors) = build_layer(&cfg.mouse, layer);
+        if let Some(key) = key {
+            device_tables.push((key, Arc::new(built)));
+        }
+    }
     let excluded: Vec<String> = cfg
         .mouse
         .gesture_excluded_apps
@@ -244,11 +334,13 @@ pub(crate) fn publish(cfg: &Config) -> Vec<(usize, RowError)> {
         .collect();
     let next = Published {
         table: Arc::new(table),
+        device_tables: Arc::new(device_tables),
         epoch: 0,
         excluded: Arc::new(excluded),
     };
     let mut guard = cell().lock().unwrap();
     let changed = guard.table.rows != next.table.rows
+        || !same_device_tables(&guard.device_tables, &next.device_tables)
         || guard.excluded.as_slice() != next.excluded.as_slice()
         || !cfg.mouse.enabled
         || !cfg.mouse.gestures_enabled;
@@ -257,6 +349,7 @@ pub(crate) fn publish(cfg: &Config) -> Vec<(usize, RowError)> {
         // would pass its authorization check again.
         let epoch = EPOCH.fetch_add(1, Ordering::SeqCst) + 1;
         guard.table = next.table;
+        guard.device_tables = next.device_tables;
         guard.excluded = next.excluded;
         guard.epoch = epoch;
     }
@@ -358,7 +451,7 @@ mod tests {
     #[test]
     fn the_trigger_is_the_only_button_the_table_claims() {
         let mut cfg = config(true, vec![row("L", 1, "window.snap_left", true)]);
-        cfg.mouse.gesture_button = 3;
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Button(3);
         let (table, errors) = build(&cfg.mouse);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(
@@ -385,7 +478,7 @@ mod tests {
                 row("L", 3, "window.maximize", true),
             ],
         );
-        cfg.mouse.gesture_button = 1;
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Button(1);
         let (table, errors) = build(&cfg.mouse);
         assert_eq!(
             errors,
@@ -406,13 +499,16 @@ mod tests {
         assert_eq!(loaded.gestures_enabled, true, "the fixture text is read");
         assert_eq!(
             loaded.gesture_button,
-            crate::config::default_gesture_button(),
+            crate::config::GestureTrigger::Button(crate::config::default_gesture_button()),
             "a missing key takes the default trigger"
         );
         // A trigger that WAS written is kept.
         let stated: crate::config::MouseSection =
             toml::from_str("enabled = true\ngesture_button = 3").expect("a mouse section");
-        assert_eq!(stated.gesture_button, 3);
+        assert_eq!(
+            stated.gesture_button,
+            crate::config::GestureTrigger::Button(3)
+        );
     }
 
     /// The stroke characters are one spelling of the direction letters, in every reader: the table
@@ -425,10 +521,13 @@ mod tests {
         assert!(errors.is_empty(), "{errors:?}");
         let loaded = table.lookup(1, "DL").expect("BL is the stroke DL");
         assert_eq!(loaded.key, "DL");
-        let conflicts = crate::mouse::gesture::conflict::find_conflicts(&config(
+        let aliased = config(
             true,
             vec![row("BL", 1, "cmd+t", true), row("DL", 1, "cmd+s", true)],
-        ));
+        );
+        let conflicts = crate::mouse::gesture::conflict::find_layer_conflicts(
+            &aliased.mouse.shared_gesture_layer(),
+        );
         assert!(
             conflicts
                 .iter()
@@ -442,20 +541,188 @@ mod tests {
     #[test]
     fn an_out_of_range_trigger_is_a_validation_error() {
         let mut cfg = crate::config::Config::default();
-        cfg.mouse.gesture_button = 9;
+        // The left button starts every ordinary click, so it can never start a gesture.
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Button(0);
         assert!(
             cfg.validate()
                 .iter()
                 .any(|error| error.starts_with("mouse.gesture_button")),
-            "an impossible trigger must be reported"
+            "the left button must be reported"
         );
-        cfg.mouse.gesture_button = 3;
+        // A number beyond the four standard ones is what a recorded side button looks like: the tap
+        // can take it, so validation must not refuse it.
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Learned { learned_button: 9 };
+        assert!(
+            !cfg.validate()
+                .iter()
+                .any(|error| error.starts_with("mouse.gesture_button")),
+            "a recorded side button is a valid trigger"
+        );
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Button(3);
         assert!(
             !cfg.validate()
                 .iter()
                 .any(|error| error.starts_with("mouse.gesture_button")),
             "a side button is a valid trigger"
         );
+    }
+
+    /// A device with its own layer runs ITS list, and a device without one runs the shared list.
+    /// The same button and stroke on two mice can therefore run two different actions.
+    #[test]
+    fn each_device_runs_its_own_layer() {
+        let mut cfg = config(true, vec![row("L", 1, "window.snap_left", true)]);
+        let shared = cfg.mouse.shared_gesture_layer();
+        let mouse_a = crate::config::DeviceMatcher {
+            vendor_id: Some(0x046d),
+            product_id: Some(0xc52b),
+            ..Default::default()
+        };
+        cfg.mouse.gesture_devices.push(crate::config::GestureLayer {
+            device: mouse_a.clone(),
+            gestures: vec![row("L", 1, "window.maximize", true)],
+            gesture_button: crate::config::GestureTrigger::Button(1),
+        });
+
+        let (shared_table, shared_errors) = build_layer(&cfg.mouse, &shared);
+        assert!(shared_errors.is_empty(), "{shared_errors:?}");
+        let own = cfg
+            .mouse
+            .gesture_layer_of(&mouse_a)
+            .expect("the device layer");
+        let (own_table, own_errors) = build_layer(&cfg.mouse, own);
+        assert!(own_errors.is_empty(), "{own_errors:?}");
+
+        assert_eq!(
+            shared_table.lookup(1, "L").map(|row| row.target),
+            Some(Target::Action(Action::SnapLeft)),
+            "a mouse without a layer uses the shared list"
+        );
+        assert_eq!(
+            own_table.lookup(1, "L").map(|row| row.target),
+            Some(Target::Action(Action::Maximize)),
+            "the mouse with a layer uses its own list"
+        );
+    }
+
+    /// An empty device layer means "no gestures on this mouse", never "fall back to the shared
+    /// list": deleting every gesture on one mouse must delete them there.
+    #[test]
+    fn an_empty_device_layer_claims_nothing() {
+        let mut cfg = config(true, vec![row("L", 1, "window.snap_left", true)]);
+        cfg.mouse.gesture_devices.push(crate::config::GestureLayer {
+            device: crate::config::DeviceMatcher {
+                vendor_id: Some(0x046d),
+                product_id: Some(0xc52b),
+                ..Default::default()
+            },
+            gestures: Vec::new(),
+            gesture_button: crate::config::GestureTrigger::Button(1),
+        });
+        let empty = cfg
+            .mouse
+            .gesture_layer_of(&cfg.mouse.gesture_devices[0].device)
+            .expect("the device layer");
+        let (table, errors) = build_layer(&cfg.mouse, empty);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(!table.claims(1), "an empty layer takes no button");
+    }
+
+    /// The published snapshot answers per device: the same button and stroke on two mice runs each
+    /// mouse's own action, and an unattributed press falls back to the shared layer.
+    #[test]
+    fn the_snapshot_answers_with_each_devices_own_layer() {
+        with_global_snapshot(|| {
+            let mut cfg = config(true, vec![row("L", 1, "window.snap_left", true)]);
+            cfg.mouse.gesture_devices.push(crate::config::GestureLayer {
+                device: crate::config::DeviceMatcher {
+                    vendor_id: Some(0x046d),
+                    product_id: Some(0xc52b),
+                    ..Default::default()
+                },
+                gestures: vec![row("L", 1, "window.maximize", true)],
+                gesture_button: crate::config::GestureTrigger::Button(1),
+            });
+            publish(&cfg);
+            let published = snapshot();
+            let own = published.table_for(Some((0x046d, 0xc52b)));
+            assert_eq!(
+                own.lookup(1, "L").map(|row| row.target),
+                Some(Target::Action(Action::Maximize)),
+                "the mouse with a layer runs its own action"
+            );
+            let shared = published.table_for(Some((0x1234, 0x5678)));
+            let unattributed = published.table_for(None);
+            assert_eq!(
+                shared.lookup(1, "L").map(|row| row.target),
+                Some(Target::Action(Action::SnapLeft)),
+                "another mouse runs the shared action"
+            );
+            assert_eq!(
+                unattributed.lookup(1, "L").map(|row| row.target),
+                Some(Target::Action(Action::SnapLeft)),
+                "an unattributed press uses the shared layer"
+            );
+        });
+    }
+
+    /// The layer a device uses is its own when it has one, and the shared layer otherwise.
+    #[test]
+    fn layer_for_picks_the_devices_own_layer() {
+        let mut cfg = config(true, vec![row("L", 1, "window.snap_left", true)]);
+        let shared = cfg.mouse.shared_gesture_layer();
+        cfg.mouse.gesture_devices.push(crate::config::GestureLayer {
+            device: crate::config::DeviceMatcher {
+                vendor_id: Some(0x046d),
+                product_id: Some(0xc52b),
+                ..Default::default()
+            },
+            gestures: vec![row("L", 1, "window.maximize", true)],
+            gesture_button: crate::config::GestureTrigger::Button(1),
+        });
+        let own = layer_for(&cfg.mouse, &shared, Some((0x046d, 0xc52b)));
+        assert_eq!(own.gestures.len(), 1);
+        assert_eq!(own.gestures[0].binding, "window.maximize");
+        let other = layer_for(&cfg.mouse, &shared, Some((0x1234, 0x5678)));
+        assert_eq!(other.gestures[0].binding, "window.snap_left");
+        let unattributed = layer_for(&cfg.mouse, &shared, None);
+        assert_eq!(unattributed.gestures[0].binding, "window.snap_left");
+    }
+
+    /// A virtual-pointer layer is published under its own key with ITS OWN list: the (VID, PID)
+    /// lookup answers only for real devices, so asking it for the virtual one used to publish the
+    /// shared layer under the virtual device.
+    #[test]
+    fn the_virtual_pointer_runs_its_own_layer() {
+        with_global_snapshot(|| {
+            let mut cfg = config(true, vec![row("L", 1, "window.snap_left", true)]);
+            cfg.mouse.gesture_devices.push(crate::config::GestureLayer {
+                device: crate::config::DeviceMatcher {
+                    injected: Some(true),
+                    ..Default::default()
+                },
+                gestures: vec![row("L", 1, "window.maximize", true)],
+                gesture_button: crate::config::GestureTrigger::Button(2),
+            });
+            publish(&cfg);
+            let published = snapshot();
+            let virtual_table = published.table_for(Some(crate::mouse::device::VIRTUAL_DEVICE_KEY));
+            assert_eq!(
+                virtual_table.lookup(2, "L").map(|row| row.target),
+                Some(Target::Action(Action::Maximize)),
+                "the virtual pointer's own layer decides"
+            );
+            assert!(
+                !virtual_table.claims(1),
+                "the virtual layer's own trigger is the one it claims"
+            );
+            let shared = published.table_for(None);
+            assert_eq!(
+                shared.lookup(1, "L").map(|row| row.target),
+                Some(Target::Action(Action::SnapLeft)),
+                "the shared layer is untouched"
+            );
+        });
     }
 
     #[test]

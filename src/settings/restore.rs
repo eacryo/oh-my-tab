@@ -316,16 +316,28 @@ fn restored_config_for_page(old: &Config, page: SettingsPageId) -> Config {
             cfg.clipboard = d.clipboard;
         }
         SettingsPageId::Gestures => {
-            // Gestures owns its own section, so restoring the page puts the factory list and the
-            // page's own switches back without touching the mouse page's scroll or device settings.
-            // The trail and hint switches are drawn on this page, so leaving them behind would show
-            // the user switches that survived a restore of the page they are on.
-            cfg.mouse.gestures_enabled = d.mouse.gestures_enabled;
-            cfg.mouse.gestures = d.mouse.gestures;
-            cfg.mouse.gesture_button = d.mouse.gesture_button;
-            cfg.mouse.gesture_show_trail = d.mouse.gesture_show_trail;
-            cfg.mouse.gesture_show_hint = d.mouse.gesture_show_hint;
-            cfg.mouse.gesture_excluded_apps = d.mouse.gesture_excluded_apps;
+            // The page edits ONE layer: the selected mouse's own list and trigger, or the shared
+            // layer. Restoring the page therefore restores that layer and nothing else -- another
+            // mouse's gestures are its own, and the switches beside the list (master, trail, hint,
+            // exclusions) belong to the page rather than to a layer, so they go back together.
+            // A DEVICE's layer owns its list and its trigger and nothing else: resetting the page
+            // there must not switch gestures off for every other mouse (the master switch, the
+            // trail and hint flags and the exclusion list are the page's, not a mouse's).
+            let scope = crate::settings::selected_gesture_layer(&mut cfg);
+            match scope {
+                crate::settings::GestureLayerScope::Shared => {
+                    cfg.mouse.gestures = d.mouse.gestures;
+                    cfg.mouse.gesture_button = d.mouse.gesture_button;
+                    cfg.mouse.gestures_enabled = d.mouse.gestures_enabled;
+                    cfg.mouse.gesture_show_trail = d.mouse.gesture_show_trail;
+                    cfg.mouse.gesture_show_hint = d.mouse.gesture_show_hint;
+                    cfg.mouse.gesture_excluded_apps = d.mouse.gesture_excluded_apps.clone();
+                }
+                crate::settings::GestureLayerScope::Device(index) => {
+                    cfg.mouse.gesture_devices[index].gestures = d.mouse.gestures;
+                    cfg.mouse.gesture_devices[index].gesture_button = d.mouse.gesture_button;
+                }
+            }
         }
         SettingsPageId::KeyBindings => {
             // One page, one section: restoring it puts the factory bindings and both group
@@ -367,7 +379,7 @@ mod tests {
         cfg.mouse.profiles[0].line_count = Some(9);
         cfg.mouse.gesture_show_trail = false;
         cfg.mouse.gesture_show_hint = false;
-        cfg.mouse.gesture_button = 3;
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Button(3);
         cfg.key_bindings.enabled = true;
         cfg.keystroke_display.max_extent_percent = 80;
         cfg.updates.automatically_check = false;

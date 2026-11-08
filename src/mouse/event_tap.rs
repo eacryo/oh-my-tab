@@ -541,6 +541,23 @@ unsafe fn gesture_dispatch(
     // A recording owns the pointer while it runs: it takes the press, the samples and the release
     // before the gesture engine or the button mappings see any of them.
     let button = || CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER) as u32;
+    // A press that is being LEARNED as a trigger button is passed through end to end. RECORDING is
+    // cleared the moment the button is captured, but the user is still holding it: letting the
+    // release (or a drag) reach the gesture path would act on a half press the application never
+    // saw the down of.
+    let learn_device =
+        crate::mouse::gesture::runtime::device_key(device::device_from_cgevent(event));
+    if crate::settings::learn_press_owned(button(), learn_device) {
+        // The right and the side buttons have their own release types; the left button's release is
+        // a leftMouseUp, which this path never sees (the gesture module is not its owner).
+        if matches!(
+            event_type,
+            K_CG_EVENT_RIGHT_MOUSE_UP | K_CG_EVENT_OTHER_MOUSE_UP
+        ) {
+            crate::settings::learn_press_released(button());
+        }
+        return None;
+    }
     // A recording that was cancelled still owns the Up of the press it swallowed: the tail is
     // consumed by the recorder whatever the stage, so the application never sees a bare release.
     // Only a STOPPED recorder needs this: while a recording is active its own release handler

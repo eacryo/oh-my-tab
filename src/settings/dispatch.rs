@@ -168,6 +168,36 @@ pub(super) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option
     });
 }
 
+/// The Gestures page's hotkey button: its text IS the current hotkey, and while a capture runs it
+/// asks for a press. Called on every start, cancel and finish, and after a config reload.
+pub(crate) fn refresh_gesture_hotkey_control() {
+    let waiting = crate::settings::page_view::gesture_capture_waiting();
+    let title = if waiting {
+        t("settings.gestures_trigger_learn_waiting")
+    } else {
+        let cfg = CONFIG.read().unwrap();
+        let layer = crate::settings::selected_gesture_scope()
+            .map(|scope| scope.layer(&cfg))
+            .unwrap_or_else(|| cfg.mouse.shared_gesture_layer());
+        crate::mouse::shortcut::button_label(layer.gesture_button.button())
+    };
+    with_settings_ui(|slot| {
+        let Some(ui) = slot.as_ref() else { return };
+        if ui.gesture_trigger_button.is_null() {
+            return;
+        }
+        let visible: bool = unsafe { msg_send![ui.window, isVisible] };
+        if !visible {
+            return;
+        }
+        let text = make_nsstring(&title);
+        unsafe {
+            let _: () = msg_send![ui.gesture_trigger_button, setTitle: text];
+            CFRelease(text as *const c_void);
+        }
+    });
+}
+
 pub(super) fn refresh_clipboard_shortcut_record_control() {
     let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
         && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
@@ -903,16 +933,9 @@ fn apply_control_field(field: ControlField) {
                     cfg.mouse.gestures_enabled = state == 1;
                 }
                 ControlField::GestureTriggerButton => {
-                    let index: isize = msg_send![u.gesture_trigger_button, indexOfSelectedItem];
-                    // An index outside the popup's own list must never write a button: the popup and
-                    // the runtime read the same four values.
-                    let buttons: [u32; 4] = crate::settings::page_view::GESTURE_TRIGGER_BUTTONS;
-                    if let Some(&button) = usize::try_from(index)
-                        .ok()
-                        .and_then(|index| buttons.get(index))
-                    {
-                        cfg.mouse.gesture_button = button;
-                    }
+                    // The hotkey row is a RECORDER button, not a popup: pressing it is handled by its
+                    // own selector and the commit writes the chosen button. A value change here has
+                    // nothing to read, and writing one would invent a choice the user never made.
                 }
                 // A switch is read from the SENDER: this path knows which control was clicked, and
                 // going back through the page's slots would need one more field per switch.
@@ -1870,11 +1893,14 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             // description the refill uses (computed from this config), so the two write paths
             // cannot disagree. The pages still built inline keep their own writes below, untouched.
             {
-                let input = PageInput::from_config(
+                let mut input = PageInput::from_config(
                     cfg.clone(),
                     current_selected_device(),
                     crate::theme::ThemeInput::current(),
                 );
+                // The Gestures page draws the LAYER it edits: without the scope the refill would
+                // write the shared trigger back over a device layer's value.
+                input.gesture_scope = crate::settings::selected_gesture_scope();
                 // Every migrated page, the Gestures page included: its switches are what the HUD
                 // reads, so a reload that skipped it would leave the page showing the old state
                 // while the gesture already obeys the new one.
@@ -3061,7 +3087,7 @@ mod tests {
 /// changed". A value can be written in place; a different LIST cannot -- there is no control to
 /// update into the new row -- so that difference is what asks for a rebuild.
 /// The list and the trigger the page drew last, as one value: they are one page's inputs.
-static DRAWN_GESTURE_ROWS: std::sync::Mutex<Option<(Vec<crate::config::GestureBinding>, u32)>> =
+static DRAWN_GESTURE_ROWS: std::sync::Mutex<Option<crate::settings::DrawnGestureLayer>> =
     std::sync::Mutex::new(None);
 
 /// Whether the Gestures page would draw a DIFFERENT page than the one it drew last.
@@ -3074,9 +3100,9 @@ pub(crate) fn gesture_rows_changed(cfg: &crate::config::Config) -> bool {
     DRAWN_GESTURE_ROWS
         .lock()
         .map(|drawn| {
-            drawn.as_ref().is_none_or(|previous| {
-                *previous != (cfg.mouse.gestures.clone(), cfg.mouse.gesture_button)
-            })
+            drawn
+                .as_ref()
+                .is_none_or(|previous| *previous != crate::settings::drawn_gesture_layer(cfg))
         })
         .unwrap_or(false)
 }
@@ -3086,13 +3112,29 @@ pub(crate) fn gesture_rows_changed(cfg: &crate::config::Config) -> bool {
 /// redrew, and coming back to the page would show the old rows.
 pub(crate) fn note_gesture_rows_drawn(cfg: &crate::config::Config) {
     if let Ok(mut drawn) = DRAWN_GESTURE_ROWS.lock() {
-        *drawn = Some((cfg.mouse.gestures.clone(), cfg.mouse.gesture_button));
+        *drawn = Some(crate::settings::drawn_gesture_layer(cfg));
     }
 }
 
 // MARK: - Mouse gestures
 
 /// Start recording a gesture: the next press of a trigger button is captured instead of fired.
+/// The Gestures page's trigger row: learn the next mouse button the user presses.
+pub(crate) extern "C" fn handle_gesture_trigger_learn(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_gesture_trigger_learn", || {
+        // A second press cancels the capture (the same button stops what it started).
+        if crate::settings::page_view::gesture_capture_waiting() {
+            crate::settings::cancel_trigger_capture("pressed again");
+            return;
+        }
+        crate::settings::begin_trigger_capture();
+    });
+}
+
 pub(crate) extern "C" fn handle_gesture_record_start(
     _self: *mut c_void,
     _cmd: Sel,
