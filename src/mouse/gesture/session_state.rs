@@ -143,9 +143,17 @@ pub(crate) fn trail_degraded() -> bool {
 ///
 /// The "is one already showing?" guard has to cover the pending phase too: a gesture opening the
 /// switcher right after a summon would otherwise post a second press into a session it does not own.
+/// Main-thread only: the pending phase belongs to the UI runtime.
 pub(crate) fn switcher_visible() -> bool {
-    SWITCHER_VISIBLE.load(Ordering::SeqCst)
+    crate::assert_main_thread("switcher pending visibility");
+    switcher_shown()
         || crate::with_tab_state(|state| state.as_ref().is_some_and(|s| s.pending_first_show))
+}
+
+/// Published visibility for the tap thread's hover routing. A pending first show has no visible
+/// cards to hover, and its main-thread UI state must not be read from the event callback.
+pub(crate) fn switcher_shown() -> bool {
+    SWITCHER_VISIBLE.load(Ordering::SeqCst)
 }
 
 /// Publish the switcher's visibility. Called by the overlay code that actually knows.
@@ -161,4 +169,12 @@ pub(crate) fn set_switcher_visible(visible: bool) {
 /// change actually advanced it.
 pub(crate) fn epoch() -> u64 {
     super::table::current_epoch()
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn published_switcher_visibility_is_readable_off_main_thread() {
+        assert!(std::thread::spawn(super::switcher_shown).join().is_ok());
+    }
 }

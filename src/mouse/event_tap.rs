@@ -19,7 +19,7 @@ use crate::mouse::resolve;
 use crate::mouse::scrolling::compute_delta;
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -37,6 +37,13 @@ const K_CG_EVENT_SCROLL_WHEEL: CGEventType = 22;
 const K_CG_EVENT_KEY_DOWN: CGEventType = 10;
 const K_CG_EVENT_KEY_UP: CGEventType = 11;
 const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
+
+/// The button that opened the switcher and is therefore being HELD while it is on screen.
+///
+/// `u32::MAX` means "no side-button summon in progress". Only this button's drags belong to the
+/// switcher's hover selection; a right-button stroke drawn while the switcher happens to be up still
+/// belongs to the gesture module (the two are different physical buttons).
+static SWITCHER_HELD_BUTTON: AtomicU32 = AtomicU32::new(u32::MAX);
 
 /// Escape's virtual keycode.
 pub(crate) const VK_ESCAPE: u16 = 53;
@@ -313,11 +320,15 @@ unsafe fn mouse_event_tap_callback_inner(
                                 "[mouse] switcher source event: button={} phase=down",
                                 button
                             );
+                            // Remember WHICH button is being held: its drags feed the switcher's
+                            // hover selection, and no other button's drags do.
+                            SWITCHER_HELD_BUTTON.store(button as u32, Ordering::SeqCst);
                             crate::enqueue_global_event(
                                 crate::event_monitor::GlobalEvent::CmdTabPressed,
                             );
                         } else if event_type == K_CG_EVENT_OTHER_MOUSE_UP {
                             log_debug!("[mouse] switcher source event: button={} phase=up", button);
+                            SWITCHER_HELD_BUTTON.store(u32::MAX, Ordering::SeqCst);
                             crate::enqueue_global_event(
                                 crate::event_monitor::GlobalEvent::CmdReleased,
                             );
@@ -506,6 +517,16 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
     })
 }
 
+/// Whether a drag of `button` belongs to the switcher's hover selection rather than to a gesture.
+///
+/// Only the button that opened the switcher qualifies. The distinction is the whole point: a
+/// side-button summon leaves that button held, so its drags must select cards, while a
+/// right-button stroke drawn at the same moment is a gesture in progress and has to reach the
+/// engine (swallowing it here is what stopped the trail from being drawn).
+fn feeds_switcher_hover(held_button: u32, button: u32, switcher_visible: bool) -> bool {
+    switcher_visible && held_button != u32::MAX && held_button == button
+}
+
 /// Route one event through the gesture module. Returns `Some` with the event to hand back (null to
 /// swallow, the original to pass), or `None` when the module has nothing to say and the caller
 /// continues to the scroll / button-mapping branches.
@@ -631,12 +652,19 @@ unsafe fn gesture_dispatch(
             }
         }
         K_CG_EVENT_RIGHT_MOUSE_DRAGGED | K_CG_EVENT_OTHER_MOUSE_DRAGGED => {
-            // While the switcher is on screen this module has no session to feed, and every drag it
-            // handled here cost a device lookup and a WindowServer round trip on the tap thread. The
-            // switcher's own hover selection follows the event instead: its location is exact,
-            // whereas the cursor the overlay's poll reads is not reliable while a button is held
-            // (the side-button summon keeps it down for the whole gesture).
-            if crate::mouse::gesture::session_state::switcher_visible() {
+            // The button that OPENED the switcher feeds its hover selection from the event's own
+            // position: that button stays held for the whole summon, and a cursor query is not
+            // reliable while it is (see `event_tap::cursor_location`). The event position is exact,
+            // so selection does not depend on what any query reports.
+            //
+            // No OTHER button's drag is touched. A right-button stroke drawn while the switcher
+            // happened to be on screen still belongs to the gesture module, and swallowing it here
+            // is what stopped the trail from being drawn.
+            if feeds_switcher_hover(
+                SWITCHER_HELD_BUTTON.load(Ordering::SeqCst),
+                button(),
+                crate::mouse::gesture::session_state::switcher_shown(),
+            ) {
                 let location = event_tap::CGEventGetLocation(event);
                 crate::schedule_overlay_hover_at(location.x, location.y);
                 return Some(event);
@@ -742,4 +770,22 @@ fn now_ms() -> f64 {
     static START: OnceLock<std::time::Instant> = OnceLock::new();
     let start = START.get_or_init(std::time::Instant::now);
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod switcher_hover_tests {
+    use super::feeds_switcher_hover;
+
+    #[test]
+    fn only_the_summoning_button_feeds_the_switcher_hover() {
+        // Side button 3 opened the switcher and is still held: its drags select cards.
+        assert!(feeds_switcher_hover(3, 3, true));
+        // The right button drawn while the switcher is up is a GESTURE, not hover input. Swallowing
+        // it was the regression that stopped the trail from being drawn.
+        assert!(!feeds_switcher_hover(3, 1, true));
+        // No summon in progress: nothing feeds hover, whatever is visible.
+        assert!(!feeds_switcher_hover(u32::MAX, 3, true));
+        // Switcher gone: the held record is stale until its up arrives, and it must not swallow.
+        assert!(!feeds_switcher_hover(3, 3, false));
+    }
 }
