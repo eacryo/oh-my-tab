@@ -430,9 +430,13 @@ impl TrailView {
         self.stroke = stroke;
     }
 
-    /// Draw one frame: the stroke through `points` (CG global points, top-left origin) and the text
-    /// that says what the stroke would run.
-    fn draw_stroke(&mut self, points: &[crate::mouse::gesture::recognizer::Point], hint: HintText) {
+    /// Draw one frame: the stroke through `points` (CG global points, top-left origin) and, when
+    /// `hint` is Some, the text that says what the stroke would run.
+    fn draw_stroke(
+        &mut self,
+        points: &[crate::mouse::gesture::recognizer::Point],
+        hint: Option<HintText>,
+    ) {
         unsafe {
             // The view's bounds on the FIRST frame of a freshly built window can still be the
             // pre-layout size; the window's own frame is what the screen says, so the card lands
@@ -458,6 +462,10 @@ impl TrailView {
             }
             crate::ffi::shape_layer_set_path(self.stroke, path);
             CFRelease(path as *const c_void);
+            let Some(hint) = hint else {
+                let _: () = msg_send![self.card, setHidden: true];
+                return;
+            };
 
             // The card's own class paints the arrow and the text (see `gesture_card_draw`), so
             // every position below is a painted coordinate, not a view frame AppKit may reinterpret.
@@ -588,9 +596,23 @@ impl TrailWindow {
             self.hide(trail.session);
             return;
         }
-        // The stroke and the card naming what it would run are part of the gesture itself, not a
-        // setting: a gesture the user cannot see is one they cannot trust.
-        let hint = crate::mouse::gesture::session_state::hint_card();
+        // The trail and the hint are the user's own switches: with the trail off the window stays
+        // hidden, and the request is still recorded as handled.
+        let settings = crate::config::CONFIG.read().ok();
+        let show_trail = settings
+            .as_ref()
+            .map(|cfg| cfg.mouse.gesture_show_trail)
+            .unwrap_or(true);
+        if !show_trail {
+            self.hide(trail.session);
+            crate::mouse::gesture::session_state::note_hud_request(trail.session);
+            return;
+        }
+        let hint = settings
+            .as_ref()
+            .map(|cfg| cfg.mouse.gesture_show_hint)
+            .unwrap_or(true);
+        let hint = hint.then(crate::mouse::gesture::session_state::hint_card);
         self.ensure_window().show();
         self.ensure_window().draw_stroke(&trail.points, hint);
         DRAWN_SESSION.store(trail.session, Ordering::SeqCst);

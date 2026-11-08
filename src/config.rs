@@ -1154,6 +1154,9 @@ pub struct MouseSection {
     pub gestures_enabled: bool,
     // Direction sequences, one row per gesture.
     pub gestures: Vec<GestureBinding>,
+    // Draw the stroke under the pointer while a gesture is drawn, and show what it will run.
+    pub gesture_show_trail: bool,
+    pub gesture_show_hint: bool,
     // Applications where no gesture fires at all (bundle identifiers).
     pub gesture_excluded_apps: Vec<String>,
     // Profile list: the first profile without a device field is the "All Mice" default layer;
@@ -1181,6 +1184,10 @@ impl Default for MouseSection {
             enabled: false,
             gestures_enabled: false,
             gestures: default_gestures(),
+            // The trail and the hint are what make a new gesture visible; off is the user's choice,
+            // not the starting point.
+            gesture_show_trail: true,
+            gesture_show_hint: true,
             gesture_excluded_apps: Vec::new(),
             // Default includes an "All Mice" profile matching the old defaults.
             profiles: vec![MouseProfile {

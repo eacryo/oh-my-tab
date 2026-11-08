@@ -251,6 +251,7 @@ fn every_described_field_of_every_page_has_a_settings_ui_slot() {
         SettingsPageId::About,
         SettingsPageId::KeystrokeDisplay,
         SettingsPageId::FinderMenu,
+        SettingsPageId::Gestures,
         SettingsPageId::KeyBindings,
         SettingsPageId::Mouse,
     ] {

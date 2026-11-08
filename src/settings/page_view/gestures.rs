@@ -70,6 +70,28 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
 
+    // Two presentation switches, beside the master one: a user who has just turned gestures on needs
+    // to SEE the trail to trust the feature, and the hint comes with it. Both are theirs to turn off.
+    w.push(
+        switch(
+            "settings.gestures_row_show_trail",
+            ControlField::GestureShowTrail,
+            cfg.mouse.gesture_show_trail,
+        )
+        .desc("settings.gestures_desc_show_trail")
+        .into_spec(),
+    );
+    w.push(
+        switch(
+            "settings.gestures_row_show_hint",
+            ControlField::GestureShowHint,
+            cfg.mouse.gesture_show_hint,
+        )
+        .desc("settings.gestures_desc_show_hint")
+        .into_spec(),
+    );
+
+    w.card("settings.gestures_header_list");
     // The recorder row: its value IS the recording's state, so the page follows the pointer while
     // the user draws. The button beside it starts a recording, and cancels one already running.
     // The state text is the same pure description the in-place refresh writes, so the row a user
@@ -1045,22 +1067,52 @@ mod tests {
         assert!(matches!(view.rows[0].value, Value::Switch(true)));
     }
 
-    /// The trail and the hint are always drawn, so the page offers no switch for them: a switch
-    /// here would be a promise that the gesture can be made invisible, which it cannot any more.
+    /// The master switch and the two presentation switches, in that order, each reading its own
+    /// configuration field: the page exists to let a user turn the trail or the hint off.
     #[test]
-    fn the_page_has_no_switch_for_the_trail_or_the_hint() {
-        let view = gestures_page_view(&input(true, Vec::new()));
-        let switches: Vec<&str> = view
+    fn the_page_offers_the_master_switch_and_both_presentation_switches() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.gesture_show_trail = false;
+        page_input.config.mouse.gesture_show_hint = true;
+        let view = gestures_page_view(&page_input);
+        let switches: Vec<(&str, bool)> = view
             .rows
             .iter()
-            .filter(|row| matches!(row.control, ControlKind::Switch))
-            .map(|row| row.label_key)
+            .filter_map(|row| match (&row.control, &row.value) {
+                (ControlKind::Switch, Value::Switch(on)) => Some((row.label_key, *on)),
+                _ => None,
+            })
             .collect();
         assert_eq!(
             switches,
-            vec!["settings.gestures_row_enabled"],
-            "the master switch is the page's only switch"
+            vec![
+                ("settings.gestures_row_enabled", true),
+                ("settings.gestures_row_show_trail", false),
+                ("settings.gestures_row_show_hint", true),
+            ],
+            "the switches read the configuration, in page order"
         );
+    }
+
+    /// The in-place refresh can write both presentation switches, because the shared update
+    /// description carries them: a switch the description skipped would keep showing the old state
+    /// after a config reload while the HUD already obeyed the new one.
+    #[test]
+    fn the_update_description_carries_both_presentation_switches() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.gesture_show_trail = false;
+        page_input.config.mouse.gesture_show_hint = false;
+        let updates = page_update_description(&page_input, &[SettingsPageId::Gestures]);
+        for (field, name) in [
+            (ControlField::GestureShowTrail, "GestureShowTrail"),
+            (ControlField::GestureShowHint, "GestureShowHint"),
+        ] {
+            let update = updates
+                .iter()
+                .find(|update| update.field == field)
+                .unwrap_or_else(|| panic!("the description must carry {name}"));
+            assert_eq!(update.value, "off", "{name} follows the configuration");
+        }
     }
 
     /// Each excluded row is LABELLED with the application's name and carries no second copy of it.

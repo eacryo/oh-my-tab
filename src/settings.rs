@@ -522,10 +522,12 @@ pub(super) struct SettingsUi {
     hide_menu_bar_icon: *mut AnyObject, // hide the menu-bar status item
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject, // enable mouse control
-    gestures_enabled: *mut AnyObject, // the Gestures page's master switch
-    scroll_mode: *mut AnyObject, // NSPopUpButton: default/line
-    line_count: *mut AnyObject, // NSSlider: line count slider
-    line_count_label: *mut AnyObject, // the row's label
+    gestures_enabled: *mut AnyObject,
+    gesture_show_trail: *mut AnyObject,
+    gesture_show_hint: *mut AnyObject, // the Gestures page's master switch
+    scroll_mode: *mut AnyObject,       // NSPopUpButton: default/line
+    line_count: *mut AnyObject,        // NSSlider: line count slider
+    line_count_label: *mut AnyObject,  // the row's label
     line_count_value_label: *mut AnyObject, // slider's current value (read-only)
     disable_pointer_accel: *mut AnyObject, // disable pointer acceleration
     pointer_accel_slider: *mut AnyObject, // NSSlider: pointer acceleration, 0..=40
@@ -2167,16 +2169,7 @@ pub(super) fn refresh_migrated_pages_from(ui: &SettingsUi, cfg: &Config) {
         page_view::refresh_migrated_pages(
             ui,
             &input,
-            &[
-                SettingsPageId::Switcher,
-                SettingsPageId::General,
-                SettingsPageId::Clipboard,
-                SettingsPageId::About,
-                SettingsPageId::KeystrokeDisplay,
-                SettingsPageId::FinderMenu,
-                SettingsPageId::Gestures,
-                SettingsPageId::KeyBindings,
-            ],
+            &crate::runtime_config::IN_PLACE_REFRESH_PAGES,
         );
     }
 }

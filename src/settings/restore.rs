@@ -304,9 +304,13 @@ fn restored_config_for_page(old: &Config, page: SettingsPageId) -> Config {
         }
         SettingsPageId::Gestures => {
             // Gestures owns its own section, so restoring the page puts the factory list and the
-            // master switch back without touching the mouse page's scroll or device settings.
+            // page's own switches back without touching the mouse page's scroll or device settings.
+            // The trail and hint switches are drawn on this page, so leaving them behind would show
+            // the user switches that survived a restore of the page they are on.
             cfg.mouse.gestures_enabled = d.mouse.gestures_enabled;
             cfg.mouse.gestures = d.mouse.gestures;
+            cfg.mouse.gesture_show_trail = d.mouse.gesture_show_trail;
+            cfg.mouse.gesture_show_hint = d.mouse.gesture_show_hint;
             cfg.mouse.gesture_excluded_apps = d.mouse.gesture_excluded_apps;
         }
         SettingsPageId::KeyBindings => {
@@ -347,6 +351,8 @@ mod tests {
         cfg.clipboard.max_entries = 7;
         cfg.mouse.enabled = true;
         cfg.mouse.profiles[0].line_count = Some(9);
+        cfg.mouse.gesture_show_trail = false;
+        cfg.mouse.gesture_show_hint = false;
         cfg.key_bindings.enabled = true;
         cfg.keystroke_display.max_extent_percent = 80;
         cfg.updates.automatically_check = false;
@@ -396,6 +402,8 @@ mod tests {
             SettingsPageId::Gestures => {
                 expected.mouse.gestures_enabled = d.mouse.gestures_enabled;
                 expected.mouse.gestures = d.mouse.gestures;
+                expected.mouse.gesture_show_trail = d.mouse.gesture_show_trail;
+                expected.mouse.gesture_show_hint = d.mouse.gesture_show_hint;
                 expected.mouse.gesture_excluded_apps = d.mouse.gesture_excluded_apps;
             }
             SettingsPageId::KeyBindings => expected.key_bindings = d.key_bindings,

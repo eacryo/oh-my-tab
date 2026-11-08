@@ -104,9 +104,29 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.clipboard_picker_placement
         || flags.keystroke_display
         || flags.mouse
+        // The Gestures page draws the trail and hint switches, and the HUD reads the values they
+        // edit: a reload that only flips one of them must reach the switches, or the page shows a
+        // state the next stroke will not obey.
+        || flags.gestures
         || flags.key_bindings
         || flags.finder_menu
 }
+
+/// The pages the in-place refresh writes when the settings window is open.
+///
+/// A hand-written list is the kind that drifts: a migrated page left out of it keeps showing the
+/// values a reload replaced while the runtime already uses the new ones. It lives here so the list
+/// is assertable without a window, and every caller reads this one.
+pub(crate) const IN_PLACE_REFRESH_PAGES: [crate::settings::SettingsPageId; 8] = [
+    crate::settings::SettingsPageId::Switcher,
+    crate::settings::SettingsPageId::General,
+    crate::settings::SettingsPageId::Clipboard,
+    crate::settings::SettingsPageId::About,
+    crate::settings::SettingsPageId::KeystrokeDisplay,
+    crate::settings::SettingsPageId::FinderMenu,
+    crate::settings::SettingsPageId::Gestures,
+    crate::settings::SettingsPageId::KeyBindings,
+];
 
 /// Appearance fields that, when they change, require rebuilding the settings content: the window's
 /// own layers are painted from concrete palette colors at construction time. `panel_material` is
@@ -158,9 +178,13 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         thumbnail_size: old.layout.thumbnail_size != new.layout.thumbnail_size,
         show_other_desktops: old.windows.show_other_desktops != new.windows.show_other_desktops,
         mouse: startup || old.mouse != new.mouse,
-        gestures: startup
-            || old.mouse.gestures_enabled != new.mouse.gestures_enabled
+        // The page's own fields, traced one by one. The `mouse` flag above is set on every launch
+        // (it is `startup || ...`), so leaning on it would hide a reload that only turned one
+        // presentation switch off behind a flag that was already set.
+        gestures: old.mouse.gestures_enabled != new.mouse.gestures_enabled
             || old.mouse.gestures != new.mouse.gestures
+            || old.mouse.gesture_show_trail != new.mouse.gesture_show_trail
+            || old.mouse.gesture_show_hint != new.mouse.gesture_show_hint
             || old.mouse.gesture_excluded_apps != new.mouse.gesture_excluded_apps,
         clipboard_enabled: startup || old.clipboard.enabled != new.clipboard.enabled,
         clipboard_shortcut: startup || old.clipboard.shortcut != new.clipboard.shortcut,
@@ -547,6 +571,32 @@ mod tests {
             change_flags(&cfg, &cfg, ConfigChangeSource::Settings),
             ChangeFlags::default()
         );
+    }
+
+    /// An open settings window must follow a reload: the Gestures page draws the trail and hint
+    /// switches, so a reload that only flips one of them has to reach the in-place refresh, and
+    /// that refresh has to WRITE the page. Both halves are asserted here, because either one alone
+    /// leaves the window showing a state the next stroke will not obey.
+    #[test]
+    fn a_trail_or_hint_reload_reaches_the_in_place_refresh_of_the_gestures_page() {
+        for set in [
+            |c: &mut Config| c.mouse.gesture_show_trail = false,
+            |c: &mut Config| c.mouse.gesture_show_hint = false,
+        ] {
+            let old = Config::default();
+            let mut new = old.clone();
+            set(&mut new);
+            // ROUTING: the reload asks for the in-place refresh at all.
+            let flags = change_flags(&old, &new, ConfigChangeSource::Reload);
+            assert!(flags.gestures, "a presentation switch must be its own flag");
+            assert!(
+                needs_in_place_control_sync(&flags),
+                "a gesture presentation switch must reach the in-place refresh"
+            );
+            // DESTINATION: the refresh writes the page. The page's own tests assert that its
+            // description carries both switches, which is what makes this write reach them.
+            assert!(IN_PLACE_REFRESH_PAGES.contains(&crate::settings::SettingsPageId::Gestures));
+        }
     }
 
     #[test]

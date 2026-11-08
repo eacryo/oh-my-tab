@@ -83,6 +83,8 @@ pub(super) enum ControlField {
     FinderMenuCopySha256,
     // Gestures page: its own master switch, and the popup that adds an excluded application.
     GesturesEnabled,
+    GestureShowTrail,
+    GestureShowHint,
 }
 
 /// Identify a field by the control that sent the event: a lookup in the page's `ControlTable`.
@@ -897,6 +899,16 @@ fn apply_control_field(field: ControlField) {
                 ControlField::GesturesEnabled => {
                     let state: isize = msg_send![u.gestures_enabled, state];
                     cfg.mouse.gestures_enabled = state == 1;
+                }
+                // A switch is read from the SENDER: this path knows which control was clicked, and
+                // going back through the page's slots would need one more field per switch.
+                ControlField::GestureShowTrail => {
+                    let state: isize = msg_send![u.gesture_show_trail, state];
+                    cfg.mouse.gesture_show_trail = state == 1;
+                }
+                ControlField::GestureShowHint => {
+                    let state: isize = msg_send![u.gesture_show_hint, state];
+                    cfg.mouse.gesture_show_hint = state == 1;
                 }
             }
         }
@@ -1849,18 +1861,13 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                     current_selected_device(),
                     crate::theme::ThemeInput::current(),
                 );
+                // Every migrated page, the Gestures page included: its switches are what the HUD
+                // reads, so a reload that skipped it would leave the page showing the old state
+                // while the gesture already obeys the new one.
                 page_view::refresh_migrated_pages(
                     u,
                     &input,
-                    &[
-                        SettingsPageId::Switcher,
-                        SettingsPageId::General,
-                        SettingsPageId::Clipboard,
-                        SettingsPageId::About,
-                        SettingsPageId::KeystrokeDisplay,
-                        SettingsPageId::FinderMenu,
-                        SettingsPageId::KeyBindings,
-                    ],
+                    &crate::runtime_config::IN_PLACE_REFRESH_PAGES,
                 );
             }
 
