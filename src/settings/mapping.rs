@@ -729,11 +729,16 @@ pub(super) unsafe fn recording_thread() {
     *REC_RUNLOOP.0.lock().unwrap() = Some(rl);
     // otherMouseDown(25) | keyDown(10) | keyUp(11) | flagsChanged(12); keyUp is what ends the
     // release wait after a chord is captured.
-    // otherMouseDown(25) for the panel's side buttons; leftMouseDown(1) and rightMouseDown(3) so a
-    // gesture trigger can be learned on ANY button (a right button is a legal trigger); keyDown(10)
-    // | keyUp(11) | flagsChanged(12) for the chord recorders.
-    let mask: crate::event_tap::CGEventMask =
-        (1u64 << 25) | (1u64 << 1) | (1u64 << 3) | (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+    //
+    // The left and right button downs are listened to only for the GESTURE capture: a gesture hotkey
+    // may be learned on any button >= 1. The keyboard recorders must not see them at all -- this tap
+    // is a HEAD-INSERT HID tap, so it runs BEFORE the app, and their button branch would read a
+    // right click's number 1 as "a side button" and complete the recording from a click.
+    let mut mask: crate::event_tap::CGEventMask =
+        (1u64 << 25) | (1u64 << 10) | (1u64 << 11) | (1u64 << 12);
+    if *REC_MODE.lock().unwrap() == RecMode::GestureTrigger {
+        mask |= (1u64 << 1) | (1u64 << 3);
+    }
     let created = crate::event_tap::create_tap_with_retry(
         crate::event_tap::tap_location::HID_EVENT_TAP,
         crate::event_tap::tap_placement::HEAD_INSERT,
