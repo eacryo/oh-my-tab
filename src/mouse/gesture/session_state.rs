@@ -74,15 +74,36 @@ pub(crate) fn hud_visible() -> bool {
 /// borrowing an old answer -- that is what the user needs to know before releasing the button.
 pub(crate) fn hint_card() -> crate::mouse::gesture::hud::HintText {
     let (key, button) = super::runtime::with(|rt| (rt.engine_sequence_key(), rt.engine_button()));
-    let direction = key.as_ref().and_then(|key| key.chars().last());
-    let text = match key.filter(|key| !key.is_empty()) {
-        Some(key) => match super::table::snapshot().table.lookup(button, &key) {
-            Some(row) => super::table::row_label(row),
-            None => crate::i18n::t("settings.gestures_hint_unmatched"),
+    hint_card_for(key.as_deref(), button, &super::table::snapshot().table)
+}
+
+/// The card for one stroke: the action `sequence` would run on `button`, or the words that say
+/// nothing matches it.
+///
+/// The card for a stroke nothing matches points nowhere -- `direction` is `None` -- because an
+/// arrow would read as the direction of an action the stroke is about to run.
+fn hint_card_for(
+    sequence: Option<&str>,
+    button: u32,
+    table: &super::table::GestureTable,
+) -> crate::mouse::gesture::hud::HintText {
+    let direction = sequence.as_ref().and_then(|key| key.chars().last());
+    match sequence.filter(|key| !key.is_empty()) {
+        Some(key) => match table.lookup(button, key) {
+            Some(row) => crate::mouse::gesture::hud::HintText {
+                direction,
+                text: super::table::row_label(row),
+            },
+            None => crate::mouse::gesture::hud::HintText {
+                direction: None,
+                text: crate::i18n::t("settings.gestures_hint_unmatched"),
+            },
         },
-        None => String::new(),
-    };
-    crate::mouse::gesture::hud::HintText { direction, text }
+        None => crate::mouse::gesture::hud::HintText {
+            direction,
+            text: String::new(),
+        },
+    }
 }
 
 /// A one-line summary for the settings page's gesture section: how many rows are live, which epoch
@@ -176,5 +197,51 @@ mod tests {
     #[test]
     fn published_switcher_visibility_is_readable_off_main_thread() {
         assert!(std::thread::spawn(super::switcher_shown).join().is_ok());
+    }
+
+    fn one_gesture() -> super::super::table::GestureTable {
+        let mut mouse = crate::config::MouseSection::default();
+        mouse.enabled = true;
+        mouse.gestures_enabled = true;
+        mouse.gestures = vec![crate::config::GestureBinding {
+            gesture: "L".into(),
+            button: 1,
+            binding: "window.snap_left".into(),
+            enabled: true,
+        }];
+        let (table, errors) = super::super::table::build(&mouse);
+        assert!(errors.is_empty(), "the fixture gesture must be valid");
+        table
+    }
+
+    /// A stroke nothing matches is not a gesture, and its card says so in words alone: the arrow
+    /// points at the action the stroke would run, so there is no arrow to draw when nothing runs.
+    #[test]
+    fn an_unmatched_stroke_gets_a_card_with_no_arrow() {
+        let table = one_gesture();
+        let unmatched = super::hint_card_for(Some("RD"), 1, &table);
+        assert_eq!(unmatched.direction, None, "no direction, so no arrow");
+        assert!(!unmatched.has_arrow());
+        assert_eq!(
+            unmatched.text,
+            crate::i18n::t("settings.gestures_hint_unmatched")
+        );
+        assert!(
+            !unmatched.text.is_empty(),
+            "the card must still say something"
+        );
+    }
+
+    /// A matched stroke keeps the arrow: its direction is what the user reads without looking away.
+    #[test]
+    fn a_matched_stroke_keeps_its_arrow() {
+        let table = one_gesture();
+        let matched = super::hint_card_for(Some("L"), 1, &table);
+        assert_eq!(matched.direction, Some('L'));
+        assert!(matched.has_arrow());
+        assert_eq!(
+            matched.text,
+            super::super::table::row_label(table.lookup(1, "L").expect("the fixture row"))
+        );
     }
 }

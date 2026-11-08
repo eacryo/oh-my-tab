@@ -247,6 +247,19 @@ pub(crate) fn restore_page_defaults(page: SettingsPageId) {
         if !rebuilt {
             load_settings_values();
         }
+    } else if page == SettingsPageId::Gestures
+        && crate::settings::dispatch::gesture_rows_changed(&cfg)
+    {
+        // A new gesture LIST cannot be refilled into the rows the page drew -- there is no control
+        // to write the new rows into -- so the page rebuilds, the same way the gestures page already
+        // does when arriving on it with a list edited elsewhere. The in-place path below would
+        // leave the old rows on screen while the runtime already used the new ones.
+        apply_config_change(&old, &cfg, ConfigChangeSource::RestoreDefaults);
+        unsafe {
+            crate::settings::window::rebuild_settings_content_now_preserving_scroll(
+                SettingsPageId::Gestures,
+            );
+        }
     } else {
         // Other tabs: refill the controls (freeze states / conditional visibility refresh
         // with load_settings_from) and apply the tab's side effects.

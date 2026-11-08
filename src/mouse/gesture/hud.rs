@@ -234,10 +234,20 @@ impl Default for TrailView {
 ///
 /// The direction is part of the answer, not decoration: the card's arrow is how a user reads which
 /// way the stroke is heading without looking away from the pointer.
+///
+/// A stroke no row matches has no direction to point at, so its card carries no arrow and
+/// `direction` is `None`; the words alone say the stroke is not a gesture.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HintText {
     pub(crate) direction: Option<char>,
     pub(crate) text: String,
+}
+
+impl HintText {
+    /// Whether the card has an arrow to draw: only a direction names one.
+    pub(crate) fn has_arrow(&self) -> bool {
+        self.direction.is_some()
+    }
 }
 
 /// CALayer's `lineCap` / `lineJoin` are NSString constants (`kCALineCapRound` ...), not integers.
@@ -475,29 +485,45 @@ impl TrailView {
             let glyph_box = crate::theme::GESTURE_HINT_GLYPH_SIZE;
             let line = crate::theme::GESTURE_HINT_LINE;
             let w = crate::theme::GESTURE_HINT_MIN_WIDTH;
-            let h = (glyph_box + crate::theme::GESTURE_HINT_GAP_INNER + line + pad * 2.0)
-                .max(crate::theme::GESTURE_HINT_HEIGHT);
+            // A card with no arrow keeps the same plate and puts its single line in the middle: a
+            // stroke nothing matches has no direction to show, only the words that say so.
+            let has_arrow = hint.has_arrow();
+            let h = if has_arrow {
+                (glyph_box + crate::theme::GESTURE_HINT_GAP_INNER + line + pad * 2.0)
+                    .max(crate::theme::GESTURE_HINT_HEIGHT)
+            } else {
+                crate::theme::GESTURE_HINT_HEIGHT
+            };
             let x = ((bounds.size.width - w) / 2.0).max(0.0);
             let y = ((bounds.size.height - h) / 2.0).max(0.0);
             let _: () = msg_send![
                 self.card,
                 setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w, h))
             ];
-            // The arrow and the label are laid out inside the plate, top to bottom.
+            // The arrow (when there is one) and the label are laid out inside the plate, top to
+            // bottom; a text-only card centres its line instead.
             if !self.glyph.is_null() {
-                let _: () = msg_send![
-                    self.glyph,
-                    setFrame: NSRect::new(
-                        NSPoint::new((w - glyph_box) / 2.0, h - glyph_box - pad),
-                        NSSize::new(glyph_box, glyph_box)
-                    )
-                ];
+                let _: () = msg_send![self.glyph, setHidden: !has_arrow];
+                if has_arrow {
+                    let _: () = msg_send![
+                        self.glyph,
+                        setFrame: NSRect::new(
+                            NSPoint::new((w - glyph_box) / 2.0, h - glyph_box - pad),
+                            NSSize::new(glyph_box, glyph_box)
+                        )
+                    ];
+                }
             }
+            let label_y = if has_arrow {
+                pad * 0.75
+            } else {
+                (h - line) / 2.0
+            };
             if !self.hint.is_null() {
                 let _: () = msg_send![
                     self.hint,
                     setFrame: NSRect::new(
-                        NSPoint::new(pad, pad * 0.75),
+                        NSPoint::new(pad, label_y),
                         NSSize::new(w - pad * 2.0, line)
                     )
                 ];
@@ -516,7 +542,7 @@ impl TrailView {
                 accessibilityDescription: std::ptr::null::<AnyObject>()
             ];
             CFRelease(symbol_ns as *const c_void);
-            if !image.is_null() && !self.glyph.is_null() {
+            if has_arrow && !image.is_null() && !self.glyph.is_null() {
                 let _: () = msg_send![image, setSize: NSSize::new(glyph_box, glyph_box)];
                 let _: () = msg_send![self.glyph, setImage: image];
             }
@@ -533,7 +559,7 @@ impl TrailView {
                 let _: () = msg_send![
                     self.hint,
                     setFrame: NSRect::new(
-                        NSPoint::new((w - fitted.size.width) / 2.0, pad * 0.75),
+                        NSPoint::new((w - fitted.size.width) / 2.0, label_y),
                         NSSize::new(fitted.size.width, line)
                     )
                 ];

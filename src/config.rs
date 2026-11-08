@@ -1157,7 +1157,10 @@ pub struct MouseSection {
     // Draw the stroke under the pointer while a gesture is drawn, and show what it will run.
     pub gesture_show_trail: bool,
     pub gesture_show_hint: bool,
-    // Applications where no gesture fires at all (bundle identifiers).
+    /// Applications where no gesture fires at all (bundle identifiers).
+    ///
+    /// A list rather than a table: the exclusion picker is a shipped command, while an entry has to
+    /// be hand-written, so there is no writer that could disagree with the reader.
     pub gesture_excluded_apps: Vec<String>,
     // Profile list: the first profile without a device field is the "All Mice" default layer;
     // subsequent per-device profiles override it. Merge semantics: all matching profiles are
@@ -1219,7 +1222,7 @@ impl Default for MouseSection {
 /// The gestures a fresh configuration starts with, and what the Gestures page's "Restore Page
 /// Defaults" puts back.
 ///
-/// They mirror the four directions a browser binds by default, so the feature works the moment the
+/// They mirror the directions a browser binds by default, so the feature works the moment the
 /// master switches are on: a gesture list that starts empty shows a user a switch that does nothing.
 /// Faces here are the app's own actions, never a raw call to one particular browser.
 fn default_gestures() -> Vec<GestureBinding> {
@@ -1228,6 +1231,15 @@ fn default_gestures() -> Vec<GestureBinding> {
         ("R", "window.snap_right"),
         ("U", "window.maximize"),
         ("D", "window.minimize"),
+        // Rows written in the recogniser's own stroke characters, which the gesture table can
+        // match but hand edits rarely get exactly right.
+        ("UL", "window.snap_left"),
+        ("UR", "window.snap_right"),
+        ("LU", "window.maximize"),
+        ("RU", "window.minimize"),
+        ("DL", "switcher"),
+        ("DR", "window.snap_left"),
+        ("UD", "window.snap_right"),
     ]
     .into_iter()
     .map(|(gesture, binding)| GestureBinding {

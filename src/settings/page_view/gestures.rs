@@ -42,6 +42,14 @@ struct ShownRow {
     problem: Option<&'static str>,
 }
 
+/// Whether a gesture row can be edited on the page.
+///
+/// The list is fixed for now: every default gesture is configured in code, a row a user recorded
+/// cannot be acted on yet, and the only writer of `mouse.gestures` in the settings UI is the
+/// recorder's own "add" step. So the page LISTS the rows and does not edit them -- no action popup,
+/// no trigger choice, no delete -- which is why it draws them as plain values.
+pub(super) const GESTURE_ROWS_EDITABLE: bool = false;
+
 /// The page's description: its rows, their values and their identities.
 pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
     // A row's action popup puts the page into that row's TRIGGER row: the same gesture, listed once
@@ -92,31 +100,34 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
     );
 
     w.card("settings.gestures_header_list");
-    // The recorder row: its value IS the recording's state, so the page follows the pointer while
-    // the user draws. The button beside it starts a recording, and cancels one already running.
-    // The state text is the same pure description the in-place refresh writes, so the row a user
-    // sees after a rebuild and the row a live preview rewrites cannot disagree.
-    let state = crate::settings::gesture_recorder::record_row_text(
-        crate::mouse::gesture::recording::stage(),
-        &crate::settings::gesture_recorder::preview_text(),
-    );
-    // ONE action for the row, whatever the state: a row's action identity is fixed when the page is
-    // built, so a live row cannot switch which handler it runs without a rebuild -- and rebuilding
-    // during a capture is wrong. The handler reads the recording state and starts or cancels.
-    let action = crate::settings::page_view::GESTURE_RECORD_ROW_ACTION;
-    w.push(
-        RowDraft::new(
-            "settings.gestures_row_record",
-            ControlKind::Value {
-                action: Some(ValueAction::new(action, "settings.gestures_record_action")),
-                align: ValueAlign::Right,
-            },
-            ControlId::Action(action),
-            Value::Dynamic(state),
-        )
-        .desc("settings.gestures_desc_record")
-        .into_spec(),
-    );
+    if GESTURE_ROWS_EDITABLE {
+        // The recorder row: its value IS the recording's state, so the page follows the pointer while
+        // the user draws. The button beside it starts a recording, and cancels one already running.
+        // The state text is the same pure description the in-place refresh writes, so the row a user
+        // sees after a rebuild and the row a live preview rewrites cannot disagree.
+        let state = crate::settings::gesture_recorder::record_row_text(
+            crate::mouse::gesture::recording::stage(),
+            &crate::settings::gesture_recorder::preview_text(),
+        );
+        // ONE action for the row, whatever the state: a row's action identity is fixed when the page
+        // is built, so a live row cannot switch which handler it runs without a rebuild -- and
+        // rebuilding during a capture is wrong. The handler reads the recording state and starts or
+        // cancels.
+        let action = crate::settings::page_view::GESTURE_RECORD_ROW_ACTION;
+        w.push(
+            RowDraft::new(
+                "settings.gestures_row_record",
+                ControlKind::Value {
+                    action: Some(ValueAction::new(action, "settings.gestures_record_action")),
+                    align: ValueAlign::Right,
+                },
+                ControlId::Action(action),
+                Value::Dynamic(state),
+            )
+            .desc("settings.gestures_desc_record")
+            .into_spec(),
+        );
+    }
 
     // The control table addresses a row by its identity, and the identity is a `&'static str`, so the
     // page can only show a bounded number of rows. That bound is stated rather than hidden: a
@@ -168,6 +179,23 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             stroke.push_str(" · ");
             stroke.push_str(&t(conflict.message));
         }
+        if !GESTURE_ROWS_EDITABLE {
+            // A fixed row: the stroke on the left, what it runs on the right, nothing to press.
+            w.push(
+                RowDraft::new(
+                    "settings.gestures_row_gesture",
+                    ControlKind::Value {
+                        action: None,
+                        align: ValueAlign::Right,
+                    },
+                    ControlId::Action(row_identity(row.index)),
+                    Value::Dynamic(row.target.clone()),
+                )
+                .label_text(stroke)
+                .into_spec(),
+            );
+            continue;
+        }
         w.push(
             RowDraft::new(
                 // The key stays the row's class (the search index and the tests match it); the
@@ -190,6 +218,23 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             // gesture can start on, and picking one replaces the page with that row's trigger row.
             // (The submenu entries themselves are informational: the row's own action reopens the
             // trigger row, because the click lands on the row, not on a submenu entry.)
+            .into_spec(),
+        );
+    }
+    // The rows past the identity bound are stated at the END of the gesture list, where the reader
+    // looks for them: drawn after the exclusion card it read as part of that list, "+3" with no
+    // gesture in sight.
+    if overflow > 0 {
+        w.push(
+            RowDraft::new(
+                "settings.gestures_row_more",
+                ControlKind::Value {
+                    action: None,
+                    align: ValueAlign::Right,
+                },
+                ControlId::Action("gesture_rows_more"),
+                Value::Dynamic(format!("+{overflow}")),
+            )
             .into_spec(),
         );
     }
@@ -322,20 +367,6 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             .into_spec(),
         );
     }
-    if overflow > 0 {
-        w.push(
-            RowDraft::new(
-                "settings.gestures_row_more",
-                ControlKind::Value {
-                    action: None,
-                    align: ValueAlign::Right,
-                },
-                ControlId::Action("gesture_rows_more"),
-                Value::Dynamic(format!("+{overflow}")),
-            )
-            .into_spec(),
-        );
-    }
     w.finish()
 }
 
@@ -372,234 +403,11 @@ pub(crate) fn gesture_target_option_ids() -> Vec<String> {
 /// identities are spelled apart: the row's own popup names what the gesture RUNS, while the trigger
 /// row that replaces the page names the button it starts on.
 fn gesture_control_identity(index: usize, trigger: Option<usize>) -> &'static str {
-    const ACTIONS: [&str; 32] = [
-        "gesture_row_a",
-        "gesture_row_b",
-        "gesture_row_c",
-        "gesture_row_d",
-        "gesture_row_e",
-        "gesture_row_f",
-        "gesture_row_g",
-        "gesture_row_h",
-        "gesture_row_i",
-        "gesture_row_j",
-        "gesture_row_k",
-        "gesture_row_l",
-        "gesture_row_m",
-        "gesture_row_n",
-        "gesture_row_o",
-        "gesture_row_p",
-        "gesture_row_q",
-        "gesture_row_r",
-        "gesture_row_s",
-        "gesture_row_t",
-        "gesture_row_u",
-        "gesture_row_v",
-        "gesture_row_w",
-        "gesture_row_x",
-        "gesture_row_y",
-        "gesture_row_z",
-        "gesture_row_aa",
-        "gesture_row_ab",
-        "gesture_row_ac",
-        "gesture_row_ad",
-        "gesture_row_ae",
-        "gesture_row_af",
-    ];
-    const TRIGGERS: [[&str; 4]; 32] = [
-        [
-            "gesture_trigger_a_0",
-            "gesture_trigger_a_1",
-            "gesture_trigger_a_2",
-            "gesture_trigger_a_3",
-        ],
-        [
-            "gesture_trigger_b_0",
-            "gesture_trigger_b_1",
-            "gesture_trigger_b_2",
-            "gesture_trigger_b_3",
-        ],
-        [
-            "gesture_trigger_c_0",
-            "gesture_trigger_c_1",
-            "gesture_trigger_c_2",
-            "gesture_trigger_c_3",
-        ],
-        [
-            "gesture_trigger_d_0",
-            "gesture_trigger_d_1",
-            "gesture_trigger_d_2",
-            "gesture_trigger_d_3",
-        ],
-        [
-            "gesture_trigger_e_0",
-            "gesture_trigger_e_1",
-            "gesture_trigger_e_2",
-            "gesture_trigger_e_3",
-        ],
-        [
-            "gesture_trigger_f_0",
-            "gesture_trigger_f_1",
-            "gesture_trigger_f_2",
-            "gesture_trigger_f_3",
-        ],
-        [
-            "gesture_trigger_g_0",
-            "gesture_trigger_g_1",
-            "gesture_trigger_g_2",
-            "gesture_trigger_g_3",
-        ],
-        [
-            "gesture_trigger_h_0",
-            "gesture_trigger_h_1",
-            "gesture_trigger_h_2",
-            "gesture_trigger_h_3",
-        ],
-        [
-            "gesture_trigger_i_0",
-            "gesture_trigger_i_1",
-            "gesture_trigger_i_2",
-            "gesture_trigger_i_3",
-        ],
-        [
-            "gesture_trigger_j_0",
-            "gesture_trigger_j_1",
-            "gesture_trigger_j_2",
-            "gesture_trigger_j_3",
-        ],
-        [
-            "gesture_trigger_k_0",
-            "gesture_trigger_k_1",
-            "gesture_trigger_k_2",
-            "gesture_trigger_k_3",
-        ],
-        [
-            "gesture_trigger_l_0",
-            "gesture_trigger_l_1",
-            "gesture_trigger_l_2",
-            "gesture_trigger_l_3",
-        ],
-        [
-            "gesture_trigger_m_0",
-            "gesture_trigger_m_1",
-            "gesture_trigger_m_2",
-            "gesture_trigger_m_3",
-        ],
-        [
-            "gesture_trigger_n_0",
-            "gesture_trigger_n_1",
-            "gesture_trigger_n_2",
-            "gesture_trigger_n_3",
-        ],
-        [
-            "gesture_trigger_o_0",
-            "gesture_trigger_o_1",
-            "gesture_trigger_o_2",
-            "gesture_trigger_o_3",
-        ],
-        [
-            "gesture_trigger_p_0",
-            "gesture_trigger_p_1",
-            "gesture_trigger_p_2",
-            "gesture_trigger_p_3",
-        ],
-        [
-            "gesture_trigger_q_0",
-            "gesture_trigger_q_1",
-            "gesture_trigger_q_2",
-            "gesture_trigger_q_3",
-        ],
-        [
-            "gesture_trigger_r_0",
-            "gesture_trigger_r_1",
-            "gesture_trigger_r_2",
-            "gesture_trigger_r_3",
-        ],
-        [
-            "gesture_trigger_s_0",
-            "gesture_trigger_s_1",
-            "gesture_trigger_s_2",
-            "gesture_trigger_s_3",
-        ],
-        [
-            "gesture_trigger_t_0",
-            "gesture_trigger_t_1",
-            "gesture_trigger_t_2",
-            "gesture_trigger_t_3",
-        ],
-        [
-            "gesture_trigger_u_0",
-            "gesture_trigger_u_1",
-            "gesture_trigger_u_2",
-            "gesture_trigger_u_3",
-        ],
-        [
-            "gesture_trigger_v_0",
-            "gesture_trigger_v_1",
-            "gesture_trigger_v_2",
-            "gesture_trigger_v_3",
-        ],
-        [
-            "gesture_trigger_w_0",
-            "gesture_trigger_w_1",
-            "gesture_trigger_w_2",
-            "gesture_trigger_w_3",
-        ],
-        [
-            "gesture_trigger_x_0",
-            "gesture_trigger_x_1",
-            "gesture_trigger_x_2",
-            "gesture_trigger_x_3",
-        ],
-        [
-            "gesture_trigger_y_0",
-            "gesture_trigger_y_1",
-            "gesture_trigger_y_2",
-            "gesture_trigger_y_3",
-        ],
-        [
-            "gesture_trigger_z_0",
-            "gesture_trigger_z_1",
-            "gesture_trigger_z_2",
-            "gesture_trigger_z_3",
-        ],
-        [
-            "gesture_trigger_aa_0",
-            "gesture_trigger_aa_1",
-            "gesture_trigger_aa_2",
-            "gesture_trigger_aa_3",
-        ],
-        [
-            "gesture_trigger_ab_0",
-            "gesture_trigger_ab_1",
-            "gesture_trigger_ab_2",
-            "gesture_trigger_ab_3",
-        ],
-        [
-            "gesture_trigger_ac_0",
-            "gesture_trigger_ac_1",
-            "gesture_trigger_ac_2",
-            "gesture_trigger_ac_3",
-        ],
-        [
-            "gesture_trigger_ad_0",
-            "gesture_trigger_ad_1",
-            "gesture_trigger_ad_2",
-            "gesture_trigger_ad_3",
-        ],
-        [
-            "gesture_trigger_ae_0",
-            "gesture_trigger_ae_1",
-            "gesture_trigger_ae_2",
-            "gesture_trigger_ae_3",
-        ],
-        [
-            "gesture_trigger_af_0",
-            "gesture_trigger_af_1",
-            "gesture_trigger_af_2",
-            "gesture_trigger_af_3",
-        ],
-    ];
+    // One identity list, generated from one alphabet, so the page's row bound cannot outgrow it:
+    // a hand-written table long enough for today's rows is a page that fails to build on the
+    // first row it cannot name, and a row that silently shares another's identity.
+    const ACTIONS: [&str; MAX_IDENTITY_SLOTS] = IDENTITY_NAMES;
+    const TRIGGERS: [[&str; 4]; MAX_IDENTITY_SLOTS] = TRIGGER_IDENTITY_NAMES;
     match trigger {
         None => ACTIONS.get(index).copied().unwrap_or("gesture_row_over"),
         Some(slot) => TRIGGERS
@@ -747,7 +555,10 @@ pub(crate) fn remove_gesture_row(
 
 /// The most rows the page shows. Matched by [[row_identity]]'s table: a row count above this is
 /// reported as a "+N" line, never by sharing an identity.
-const MAX_SHOWN_ROWS: usize = 8;
+///
+/// Eleven, because that is what the shipped default list holds: a bound under it would present the
+/// app's own configuration as an overflow.
+const MAX_SHOWN_ROWS: usize = 11;
 
 /// The identity of one excluded-application row. Same bound and same reason as the gesture rows:
 /// the control table addresses a row by a \`&'static str\` identity.
@@ -775,42 +586,118 @@ fn excluded_row_identity(index: usize) -> &'static str {
     IDS.get(index).copied().unwrap_or("gesture_excluded_over")
 }
 
+/// The most rows any identity table can name: the page's own row bound.
+///
+/// A table shorter than the bound is a page that fails to build at the first row it cannot name.
+const MAX_IDENTITY_SLOTS: usize = MAX_SHOWN_ROWS;
+
+/// The control identities this page hands to the control table, one per row slot.
+///
+/// Written out rather than formatted: an identity is a `&'static str` the table looks up, and
+/// a value that never changes should not allocate on every page build. `MAX_IDENTITY_SLOTS`
+/// is the page's row bound, so a table shorter than the bound cannot happen.
+const IDENTITY_NAMES: [&str; MAX_IDENTITY_SLOTS] = [
+    "gesture_row_a",
+    "gesture_row_b",
+    "gesture_row_c",
+    "gesture_row_d",
+    "gesture_row_e",
+    "gesture_row_f",
+    "gesture_row_g",
+    "gesture_row_h",
+    "gesture_row_i",
+    "gesture_row_j",
+    "gesture_row_k",
+];
+
+/// The four trigger-button lines of each row's trigger page.
+const TRIGGER_IDENTITY_NAMES: [[&str; 4]; MAX_IDENTITY_SLOTS] = [
+    [
+        "gesture_trigger_a_0",
+        "gesture_trigger_a_1",
+        "gesture_trigger_a_2",
+        "gesture_trigger_a_3",
+    ],
+    [
+        "gesture_trigger_b_0",
+        "gesture_trigger_b_1",
+        "gesture_trigger_b_2",
+        "gesture_trigger_b_3",
+    ],
+    [
+        "gesture_trigger_c_0",
+        "gesture_trigger_c_1",
+        "gesture_trigger_c_2",
+        "gesture_trigger_c_3",
+    ],
+    [
+        "gesture_trigger_d_0",
+        "gesture_trigger_d_1",
+        "gesture_trigger_d_2",
+        "gesture_trigger_d_3",
+    ],
+    [
+        "gesture_trigger_e_0",
+        "gesture_trigger_e_1",
+        "gesture_trigger_e_2",
+        "gesture_trigger_e_3",
+    ],
+    [
+        "gesture_trigger_f_0",
+        "gesture_trigger_f_1",
+        "gesture_trigger_f_2",
+        "gesture_trigger_f_3",
+    ],
+    [
+        "gesture_trigger_g_0",
+        "gesture_trigger_g_1",
+        "gesture_trigger_g_2",
+        "gesture_trigger_g_3",
+    ],
+    [
+        "gesture_trigger_h_0",
+        "gesture_trigger_h_1",
+        "gesture_trigger_h_2",
+        "gesture_trigger_h_3",
+    ],
+    [
+        "gesture_trigger_i_0",
+        "gesture_trigger_i_1",
+        "gesture_trigger_i_2",
+        "gesture_trigger_i_3",
+    ],
+    [
+        "gesture_trigger_j_0",
+        "gesture_trigger_j_1",
+        "gesture_trigger_j_2",
+        "gesture_trigger_j_3",
+    ],
+    [
+        "gesture_trigger_k_0",
+        "gesture_trigger_k_1",
+        "gesture_trigger_k_2",
+        "gesture_trigger_k_3",
+    ],
+];
+
+/// One identity per row's DELETE action.
+const DELETE_IDENTITY_NAMES: [&str; MAX_IDENTITY_SLOTS] = [
+    "gesture_del_a",
+    "gesture_del_b",
+    "gesture_del_c",
+    "gesture_del_d",
+    "gesture_del_e",
+    "gesture_del_f",
+    "gesture_del_g",
+    "gesture_del_h",
+    "gesture_del_i",
+    "gesture_del_j",
+    "gesture_del_k",
+];
+
 /// The identity of one gesture row's DELETE action.
 fn delete_row_identity(index: usize) -> &'static str {
-    const IDS: [&str; 32] = [
-        "gesture_del_a",
-        "gesture_del_b",
-        "gesture_del_c",
-        "gesture_del_d",
-        "gesture_del_e",
-        "gesture_del_f",
-        "gesture_del_g",
-        "gesture_del_h",
-        "gesture_del_i",
-        "gesture_del_j",
-        "gesture_del_k",
-        "gesture_del_l",
-        "gesture_del_m",
-        "gesture_del_n",
-        "gesture_del_o",
-        "gesture_del_p",
-        "gesture_del_q",
-        "gesture_del_r",
-        "gesture_del_s",
-        "gesture_del_t",
-        "gesture_del_u",
-        "gesture_del_v",
-        "gesture_del_w",
-        "gesture_del_x",
-        "gesture_del_y",
-        "gesture_del_z",
-        "gesture_del_aa",
-        "gesture_del_ab",
-        "gesture_del_ac",
-        "gesture_del_ad",
-        "gesture_del_ae",
-        "gesture_del_af",
-    ];
+    const IDS: [&str; MAX_IDENTITY_SLOTS] = DELETE_IDENTITY_NAMES;
     IDS.get(index).copied().unwrap_or("gesture_del_over")
 }
 
@@ -1047,6 +934,12 @@ mod tests {
             .map(|r| {
                 let stroke = r.label_text.clone().unwrap_or_default();
                 let action = match &r.control {
+                    // A fixed row carries what it runs as its own value; an editable one as the
+                    // selected entry of its action popup.
+                    ControlKind::Value { .. } => match r.value {
+                        Value::Dynamic(ref text) => text.clone(),
+                        _ => String::new(),
+                    },
                     ControlKind::Popup { options } => match r.value {
                         Value::Index(index) => options.get(index).cloned().unwrap_or_default(),
                         _ => String::new(),
@@ -1091,6 +984,90 @@ mod tests {
                 ("settings.gestures_row_show_hint", true),
             ],
             "the switches read the configuration, in page order"
+        );
+    }
+
+    /// The shipped default list fits the page: an overflow line under the app's own rows read as
+    /// part of the exclusion card, with no gesture in sight.
+    #[test]
+    fn the_shipped_defaults_fit_without_an_overflow_line() {
+        let shipped = crate::config::MouseSection::default().gestures;
+        let view = gestures_page_view(&input(true, shipped));
+        let more = view
+            .rows
+            .iter()
+            .filter(|r| r.id == ControlId::Action("gesture_rows_more"))
+            .count();
+        assert_eq!(more, 0, "the shipped list is not an overflow");
+    }
+
+    /// Rows past the bound are stated at the END of the gesture list, before the exclusion card:
+    /// the line has to be readable as part of the list it summarises.
+    #[test]
+    fn the_overflow_line_sits_under_the_gesture_rows() {
+        let many: Vec<_> = (0..MAX_SHOWN_ROWS + 3)
+            .map(|_| row("u", 1, "cmd+t", true))
+            .collect();
+        let view = gestures_page_view(&input(true, many));
+        // Cards are what the writer numbers: the gesture rows and their overflow line belong to
+        // one card, and the exclusion rows to the next.
+        let gesture_card = view
+            .rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_gesture")
+            .map(|r| r.card)
+            .expect("gesture rows");
+        let more = view
+            .rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_more")
+            .expect("the overflow line");
+        assert_eq!(
+            more.card, gesture_card,
+            "the overflow line is drawn in the gesture rows' own card"
+        );
+        let excluded_card = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key.starts_with("settings.gestures_row_excluded"))
+            .map(|r| r.card)
+            .next()
+            .expect("the exclusion rows");
+        assert!(
+            more.card < excluded_card,
+            "the overflow line belongs before the exclusion card"
+        );
+    }
+
+    /// The list is fixed, so the rows cannot be edited: every gesture row is a plain value with
+    /// nothing to press, and the recorder that would add a row is not on the page. This is the
+    /// assertion that keeps a half-editable page from coming back unnoticed.
+    #[test]
+    fn a_fixed_list_draws_plain_rows_and_no_recorder() {
+        assert!(!GESTURE_ROWS_EDITABLE, "this test pins the shipped state");
+        let view = gestures_page_view(&input(true, vec![row("l", 1, "window.snap_left", true)]));
+        assert!(
+            !view
+                .rows
+                .iter()
+                .any(|r| r.label_key == "settings.gestures_row_record"),
+            "the recorder adds a row, which a fixed list does not offer"
+        );
+        let gesture_rows: Vec<&RowSpec> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_gesture")
+            .collect();
+        assert_eq!(gesture_rows.len(), 1);
+        match &gesture_rows[0].control {
+            ControlKind::Value { action, .. } => {
+                assert!(action.is_none(), "a fixed row has no action button")
+            }
+            other => panic!("a fixed row is a plain value, not {other:?}"),
+        }
+        assert!(
+            matches!(gesture_rows[0].value, Value::Dynamic(ref text) if !text.is_empty()),
+            "the row still says what it runs"
         );
     }
 
@@ -1475,7 +1452,10 @@ mod tests {
     #[test]
     fn the_idle_record_row_does_not_repeat_the_buttons_title() {
         // A value row with its own action draws the button; the value cell must not repeat it,
-        // or the page shows two "Record" controls.
+        // or the page shows two "Record" controls. The row only exists on the editable page.
+        if !GESTURE_ROWS_EDITABLE {
+            return;
+        }
         let view = gestures_page_view(&input(true, Vec::new()));
         let record = view
             .rows
@@ -1519,6 +1499,9 @@ mod tests {
     /// silently finds nothing -- how an armed recorder came to look like a dead button.
     #[test]
     fn the_record_row_refresh_addresses_the_registered_action() {
+        if !GESTURE_ROWS_EDITABLE {
+            return;
+        }
         let view = gestures_page_view(&input(true, Vec::new()));
         let record = view
             .rows

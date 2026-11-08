@@ -126,12 +126,44 @@ pub(crate) fn build(mouse: &crate::config::MouseSection) -> (GestureTable, Vec<(
     (table, errors)
 }
 
+/// A configuration gesture written in stroke characters ("DB", "BU", "UL") as direction letters.
+///
+/// `None` when the text holds anything else, including a mix: a stroke is one kind of line.
+fn stroke_directions(text: &str) -> Option<String> {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let mut out = String::with_capacity(trimmed.len());
+    for c in trimmed.chars() {
+        out.push(match c.to_ascii_uppercase() {
+            'U' => 'U',
+            'D' => 'D',
+            'L' => 'L',
+            'R' => 'R',
+            'B' => 'D',
+            'F' => 'U',
+            _ => return None,
+        });
+    }
+    Some(out)
+}
+
 fn row_error(row: &GestureBinding) -> Result<(String, Target), RowError> {
     if !(1..=4).contains(&row.button) {
         // The left button (0) is refused on purpose: a gesture on it would swallow ordinary clicks.
         return Err(RowError::BadButton);
     }
-    let key = parse_key(&row.gesture, 8).ok_or(RowError::BadGesture)?;
+    // The rows this app ships are written in the recogniser's own stroke characters ("DB", "BU"),
+    // which a mouse can produce and a user cannot type: the four direction letters cannot spell
+    // them, so the table reads the stroke directly where `parse_key` would refuse it. A hand-written
+    // row that neither reads loads exactly as before.
+    let key = parse_key(&row.gesture, 8)
+        .or_else(|| {
+            parse_key(&stroke_directions(&row.gesture)?, 8)
+                .map(|_| stroke_directions(&row.gesture))?
+        })
+        .ok_or(RowError::BadGesture)?;
     if row.binding.trim().is_empty() {
         // Covers both the shipped default (disabled, unbound) and an enabled row the user left
         // unbound: neither may claim the button.
@@ -281,6 +313,24 @@ mod tests {
         let (table, errors) = build(&on.mouse);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(table.claims(1), "the default rows are live once enabled");
+    }
+
+    /// The list a user meets on a fresh install: eleven rows, four of them two-step strokes the
+    /// four direction letters cannot spell. A row that did not load would look configured and do
+    /// nothing, which is the failure the shipped list exists to prevent.
+    #[test]
+    fn the_shipped_defaults_are_eleven_live_rows() {
+        let rows = crate::config::MouseSection::default().gestures;
+        assert_eq!(rows.len(), 11);
+        let multi_step = rows
+            .iter()
+            .filter(|row| row.gesture.chars().count() > 1)
+            .count();
+        assert_eq!(multi_step, 7, "seven two-direction defaults: {rows:?}");
+        let on = config(true, rows);
+        let (table, errors) = build(&on.mouse);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(table.len(), 11, "every shipped row is live");
     }
 
     struct MouseSectionDefault;
