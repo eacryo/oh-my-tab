@@ -99,11 +99,10 @@ fn action_selector(action: &str) -> Sel {
         "gesture_excluded_remove" => sel!(handleGestureExcludedRemove:),
         // The Gestures page's "Add an application": opens the system application chooser.
         "gesture_excluded_choose" => sel!(handleGestureExcludedChoose:),
-        // A gesture row's Delete, and the list's restore button. Both rebuild the page themselves.
+        // A gesture row's Delete. It rebuilds the page itself.
         action if crate::settings::page_view::delete_row_index(action).is_some() => {
             sel!(handleGestureRowDelete:)
         }
-        "gesture_restore_defaults" => sel!(handleGestureRestoreDefaults:),
         // A gesture row's action popup: the list of buttons that row can start on.
         action if crate::settings::page_view::is_gesture_row_identity(action) => {
             sel!(handleGestureRowTrigger:)

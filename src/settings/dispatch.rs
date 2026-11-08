@@ -83,8 +83,6 @@ pub(super) enum ControlField {
     FinderMenuCopySha256,
     // Gestures page: its own master switch, and the popup that adds an excluded application.
     GesturesEnabled,
-    GestureShowTrail,
-    GestureShowHint,
 }
 
 /// Identify a field by the control that sent the event: a lookup in the page's `ControlTable`.
@@ -899,16 +897,6 @@ fn apply_control_field(field: ControlField) {
                 ControlField::GesturesEnabled => {
                     let state: isize = msg_send![u.gestures_enabled, state];
                     cfg.mouse.gestures_enabled = state == 1;
-                }
-                // A switch is read from the SENDER: this path knows which control was clicked, and
-                // going back through the page's slots would need one more field per switch.
-                ControlField::GestureShowTrail => {
-                    let state: isize = msg_send![u.gesture_show_trail, state];
-                    cfg.mouse.gesture_show_trail = state == 1;
-                }
-                ControlField::GestureShowHint => {
-                    let state: isize = msg_send![u.gesture_show_hint, state];
-                    cfg.mouse.gesture_show_hint = state == 1;
                 }
             }
         }
@@ -3309,19 +3297,6 @@ pub(crate) extern "C" fn handle_gesture_row_delete(
     });
 }
 
-pub(crate) extern "C" fn handle_gesture_restore_defaults(
-    _self: *mut c_void,
-    _cmd: Sel,
-    _sender: *mut c_void,
-) {
-    callback_guard::void("handle_gesture_restore_defaults", || {
-        let Some((_old, _updated)) = crate::settings::page_view::restore_default_gestures() else {
-            return;
-        };
-        crate::settings::schedule_config_persist();
-        super::rebuild_settings_content_deferred();
-    });
-}
 pub(crate) extern "C" fn handle_gesture_row_trigger(
     _self: *mut c_void,
     _cmd: Sel,

@@ -522,12 +522,10 @@ pub(super) struct SettingsUi {
     hide_menu_bar_icon: *mut AnyObject, // hide the menu-bar status item
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject, // enable mouse control
-    gestures_enabled: *mut AnyObject,
-    gesture_show_trail: *mut AnyObject,
-    gesture_show_hint: *mut AnyObject, // the Gestures page's master switch
-    scroll_mode: *mut AnyObject,       // NSPopUpButton: default/line
-    line_count: *mut AnyObject,        // NSSlider: line count slider
-    line_count_label: *mut AnyObject,  // the row's label
+    gestures_enabled: *mut AnyObject, // the Gestures page's master switch
+    scroll_mode: *mut AnyObject, // NSPopUpButton: default/line
+    line_count: *mut AnyObject, // NSSlider: line count slider
+    line_count_label: *mut AnyObject, // the row's label
     line_count_value_label: *mut AnyObject, // slider's current value (read-only)
     disable_pointer_accel: *mut AnyObject, // disable pointer acceleration
     pointer_accel_slider: *mut AnyObject, // NSSlider: pointer acceleration, 0..=40
@@ -1128,12 +1126,12 @@ pub(crate) use dispatch::{
     handle_clipboard_excluded_remove, handle_clipboard_excluded_restore, handle_device_changed,
     handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
     handle_export_settings_ready, handle_gesture_excluded_choose, handle_gesture_excluded_remove,
-    handle_gesture_record_cancel, handle_gesture_record_start, handle_gesture_restore_defaults,
-    handle_gesture_row_delete, handle_gesture_row_trigger, handle_gesture_trigger_line,
-    handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
-    handle_pause_recording_toggle, handle_rebuild_settings_content,
-    handle_settings_search_began_editing, handle_settings_search_changed,
-    handle_settings_search_clear, handle_settings_search_ended_editing, handle_unknown_page_action,
+    handle_gesture_record_cancel, handle_gesture_record_start, handle_gesture_row_delete,
+    handle_gesture_row_trigger, handle_gesture_trigger_line, handle_import_settings,
+    handle_import_settings_ready, handle_key_bindings_toggle, handle_pause_recording_toggle,
+    handle_rebuild_settings_content, handle_settings_search_began_editing,
+    handle_settings_search_changed, handle_settings_search_clear,
+    handle_settings_search_ended_editing, handle_unknown_page_action,
     handle_windows_enabled_toggle, left_mouse_button_is_down, on_control_changed,
     on_control_text_did_change, on_control_text_did_end_editing, on_sidebar_select,
     refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,

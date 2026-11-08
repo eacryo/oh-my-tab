@@ -107,8 +107,6 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::ClipboardPickerPlacement => &mut ui.clipboard_picker_placement,
         ControlField::MouseEnabled => &mut ui.enable_mouse,
         ControlField::GesturesEnabled => &mut ui.gestures_enabled,
-        ControlField::GestureShowTrail => &mut ui.gesture_show_trail,
-        ControlField::GestureShowHint => &mut ui.gesture_show_hint,
         ControlField::ReverseScroll => &mut ui.reverse_scroll,
         ControlField::ScrollMode => &mut ui.scroll_mode,
         ControlField::LineCount => &mut ui.line_count,

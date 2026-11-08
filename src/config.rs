@@ -1154,9 +1154,6 @@ pub struct MouseSection {
     pub gestures_enabled: bool,
     // Direction sequences, one row per gesture.
     pub gestures: Vec<GestureBinding>,
-    // Draw the stroke under the pointer while a gesture is drawn, and show what it will run.
-    pub gesture_show_trail: bool,
-    pub gesture_show_hint: bool,
     // Applications where no gesture fires at all (bundle identifiers).
     pub gesture_excluded_apps: Vec<String>,
     // Profile list: the first profile without a device field is the "All Mice" default layer;
@@ -1184,10 +1181,6 @@ impl Default for MouseSection {
             enabled: false,
             gestures_enabled: false,
             gestures: default_gestures(),
-            // The trail and the hint are what make a new gesture visible; off is the user's choice,
-            // not the starting point.
-            gesture_show_trail: true,
-            gesture_show_hint: true,
             gesture_excluded_apps: Vec::new(),
             // Default includes an "All Mice" profile matching the old defaults.
             profiles: vec![MouseProfile {
@@ -1216,12 +1209,8 @@ impl Default for MouseSection {
     }
 }
 
-/// The default gesture list, for the settings page's restore button.
-pub(crate) fn default_gestures_for_restore() -> Vec<GestureBinding> {
-    default_gestures()
-}
-
-/// The gestures a fresh configuration starts with, and what "restore the gesture list" puts back.
+/// The gestures a fresh configuration starts with, and what the Gestures page's "Restore Page
+/// Defaults" puts back.
 ///
 /// They mirror the four directions a browser binds by default, so the feature works the moment the
 /// master switches are on: a gesture list that starts empty shows a user a switch that does nothing.

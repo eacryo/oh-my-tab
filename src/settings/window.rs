@@ -4010,8 +4010,6 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
             gestures_enabled: std::ptr::null_mut(),
-            gesture_show_trail: std::ptr::null_mut(),
-            gesture_show_hint: std::ptr::null_mut(),
             scroll_mode: std::ptr::null_mut(),
             line_count: std::ptr::null_mut(),
             line_count_label: std::ptr::null_mut(),

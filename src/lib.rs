@@ -2543,12 +2543,6 @@ fn menu_target_class() -> StaticClass {
             );
             class_addMethod(
                 cls,
-                sel!(handleGestureRestoreDefaults:),
-                crate::settings::handle_gesture_restore_defaults as *mut c_void,
-                types.as_ptr(),
-            );
-            class_addMethod(
-                cls,
                 sel!(handleGestureRowTrigger:),
                 crate::settings::handle_gesture_row_trigger as *mut c_void,
                 types.as_ptr(),

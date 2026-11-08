@@ -70,28 +70,6 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
 
-    // Two presentation switches, beside the master one: a user who has just turned gestures on needs
-    // to SEE the trail to trust the feature, and the hint comes with it. Both are theirs to turn off.
-    w.push(
-        switch(
-            "settings.gestures_row_show_trail",
-            ControlField::GestureShowTrail,
-            cfg.mouse.gesture_show_trail,
-        )
-        .desc("settings.gestures_desc_show_trail")
-        .into_spec(),
-    );
-    w.push(
-        switch(
-            "settings.gestures_row_show_hint",
-            ControlField::GestureShowHint,
-            cfg.mouse.gesture_show_hint,
-        )
-        .desc("settings.gestures_desc_show_hint")
-        .into_spec(),
-    );
-
-    w.card("settings.gestures_header_list");
     // The recorder row: its value IS the recording's state, so the page follows the pointer while
     // the user draws. The button beside it starts a recording, and cancels one already running.
     // The state text is the same pure description the in-place refresh writes, so the row a user
@@ -115,23 +93,6 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             Value::Dynamic(state),
         )
         .desc("settings.gestures_desc_record")
-        .into_spec(),
-    );
-
-    w.push(
-        RowDraft::new(
-            "settings.gestures_row_restore",
-            ControlKind::Value {
-                action: Some(ValueAction::new(
-                    "gesture_restore_defaults",
-                    "settings.gestures_restore_action",
-                )),
-                align: ValueAlign::Right,
-            },
-            ControlId::Action("gesture_restore_defaults"),
-            Value::None,
-        )
-        .desc("settings.gestures_desc_restore")
         .into_spec(),
     );
 
@@ -746,23 +707,6 @@ fn trigger_page_view(index: usize, config: &crate::config::Config) -> PageView {
     w.finish()
 }
 
-/// Put the default gesture list back, and say whether anything changed.
-///
-/// Only the gesture list: the excluded applications and every other mouse setting belong to the
-/// user's other choices, and a "restore the gestures" button must not reach them.
-pub(crate) fn restore_default_gestures() -> Option<(crate::config::Config, crate::config::Config)> {
-    let old = crate::config::CONFIG.read().ok()?.clone();
-    let mut updated = old.clone();
-    updated.mouse.gestures = crate::config::default_gestures_for_restore();
-    if updated.mouse.gestures == old.mouse.gestures {
-        return None;
-    }
-    if let Ok(mut config) = crate::config::CONFIG.write() {
-        *config = updated.clone();
-    }
-    Some((old, updated))
-}
-
 /// Remove one configured gesture, and report the configuration before and after.
 pub(crate) fn remove_gesture_row(
     index: usize,
@@ -1099,6 +1043,24 @@ mod tests {
         assert_eq!(view.title_key, "settings.sidebar_gestures");
         assert_eq!(view.rows[0].label_key, "settings.gestures_row_enabled");
         assert!(matches!(view.rows[0].value, Value::Switch(true)));
+    }
+
+    /// The trail and the hint are always drawn, so the page offers no switch for them: a switch
+    /// here would be a promise that the gesture can be made invisible, which it cannot any more.
+    #[test]
+    fn the_page_has_no_switch_for_the_trail_or_the_hint() {
+        let view = gestures_page_view(&input(true, Vec::new()));
+        let switches: Vec<&str> = view
+            .rows
+            .iter()
+            .filter(|row| matches!(row.control, ControlKind::Switch))
+            .map(|row| row.label_key)
+            .collect();
+        assert_eq!(
+            switches,
+            vec!["settings.gestures_row_enabled"],
+            "the master switch is the page's only switch"
+        );
     }
 
     /// Each excluded row is LABELLED with the application's name and carries no second copy of it.

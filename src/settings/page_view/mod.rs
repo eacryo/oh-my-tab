@@ -71,8 +71,8 @@ use general::general_page_view;
 use gestures::gestures_page_view;
 pub(crate) use gestures::{
     action_row_index, delete_row_index, gesture_target_option_ids, gesture_trigger_option_ids,
-    is_gesture_row_identity, is_trigger_row_identity, remove_gesture_row, restore_default_gestures,
-    set_row_trigger, trigger_row_of,
+    is_gesture_row_identity, is_trigger_row_identity, remove_gesture_row, set_row_trigger,
+    trigger_row_of,
 };
 use key_bindings::key_bindings_page_view;
 pub(super) use key_bindings::KeyBindingsHooks;
