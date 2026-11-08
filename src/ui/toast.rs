@@ -94,6 +94,23 @@ const TOAST_SLIDE_EASING: (f64, f64, f64, f64) = (0.22, 1.0, 0.36, 1.0);
 /// has nothing to click.
 const TOAST_VISIBLE: Duration = Duration::from_millis(2000);
 
+/// What the badge says. The bubble reports a finished action either way; the badge is the half
+/// that says whether it worked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ToastKind {
+    /// The reference's emerald circle with a white tick: the action succeeded.
+    #[default]
+    Success,
+    /// A red circle with a white cross: the action was refused, and the text says why.
+    Error,
+}
+
+/// Which badge the NEXT presentation draws. The badge view paints through `drawRect:`, which takes
+/// no argument of ours, so the kind travels as process state and every presentation sets it before
+/// invalidating the view. One bubble exists per slot and presentations are serialised on the main
+/// thread, so a single value is enough.
+static BADGE_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
 struct State {
     /// Which bubble this is (see `SLOTS`); the close button carries it in its tag.
     slot: usize,
@@ -101,7 +118,7 @@ struct State {
     /// The fixed host view the carrier moves inside; kept so the window's content is never rebound.
     host: *mut AnyObject,
     label: *mut AnyObject,
-    /// The emerald status badge (a circle and its tick), kept so a redraw can recolour it.
+    /// The status badge (a circle and its glyph), kept so a redraw can recolour it.
     badge: *mut AnyObject,
     /// The trailing close button.
     close: *mut AnyObject,
@@ -147,7 +164,18 @@ thread_local! {
 /// expire before the work does on a large file, leaving the user unable to tell whether it is
 /// still running. A later call replaces both the text and any pending timer.
 pub(crate) fn show(text: &str, dismiss_after: Option<Duration>) {
+    show_kind(text, ToastKind::Success, dismiss_after);
+}
+
+fn show_kind(text: &str, kind: ToastKind, dismiss_after: Option<Duration>) {
     crate::debug_assert_main_thread();
+    BADGE_KIND.store(
+        match kind {
+            ToastKind::Success => 0,
+            ToastKind::Error => 1,
+        },
+        std::sync::atomic::Ordering::SeqCst,
+    );
     let shown = SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         if slots.is_empty() {
@@ -155,6 +183,22 @@ pub(crate) fn show(text: &str, dismiss_after: Option<Duration>) {
         }
         unsafe { show_in(&mut slots[0], text, 0.0, dismiss_after) }
     });
+    // The badge paints through drawRect: and reads the kind from the process state, so it has to be
+    // invalidated on EVERY presentation: a bubble reused for an error after a success would
+    // otherwise keep drawing the tick.
+    if shown {
+        SLOTS.with(|slots| {
+            let mut slots = slots.borrow_mut();
+            if let Some(state) = slots.first_mut() {
+                if !state.badge.is_null() {
+                    unsafe {
+                        let yes = objc2::runtime::Bool::YES;
+                        let _: () = msg_send![state.badge, setNeedsDisplay: yes];
+                    }
+                }
+            }
+        });
+    }
     if !shown {
         crate::log_info!("[toast] could not present a message");
     }
@@ -485,6 +529,8 @@ unsafe fn toast_width_for_field(label: *mut AnyObject, text: &str) -> f64 {
 /// label and accent tokens follow the theme and would invert in dark mode.
 const TOAST_MESSAGE_INK: u32 = 0x262626FF;
 const TOAST_BADGE_FILL: u32 = 0x10B981FF;
+/// The refused badge fill: the reference page bg-red-500, with the same white glyph.
+const TOAST_ERROR_BADGE_FILL: u32 = 0xEF4444FF;
 const TOAST_CLOSE_INK: u32 = 0xA3A3A3FF;
 
 /// The message line: a field that does not draw its own background, so it is the panel's flat surface with one
@@ -537,9 +583,35 @@ unsafe extern "C" fn draw_badge(view: *mut AnyObject, _cmd: Sel, _dirty: NSRect)
             class!(NSBezierPath),
             bezierPathWithOvalInRect: bounds
         ];
-        let fill = crate::ffi::hex_to_ns_color(TOAST_BADGE_FILL);
+        let error = BADGE_KIND.load(std::sync::atomic::Ordering::SeqCst) == 1;
+        let fill = crate::ffi::hex_to_ns_color(if error {
+            TOAST_ERROR_BADGE_FILL
+        } else {
+            TOAST_BADGE_FILL
+        });
         let _: () = msg_send![fill, setFill];
         let _: () = msg_send![circle, fill];
+        if error {
+            // The reference's lucide `X`: `M18 6 6 18M6 6l12 12`, same 11pt box, width and caps.
+            let glyph = TOAST_CHECK_SIZE;
+            let unit = glyph / 24.0;
+            let origin_x = bounds.origin.x + (bounds.size.width - glyph) / 2.0;
+            let origin_y = bounds.origin.y + (bounds.size.height - glyph) / 2.0;
+            let px = |x: f64| origin_x + x * unit;
+            let py = |y: f64| origin_y + glyph - y * unit;
+            let cross: *mut AnyObject = msg_send![class!(NSBezierPath), bezierPath];
+            let _: () = msg_send![cross, moveToPoint: NSPoint::new(px(18.0), py(6.0))];
+            let _: () = msg_send![cross, lineToPoint: NSPoint::new(px(6.0), py(18.0))];
+            let _: () = msg_send![cross, moveToPoint: NSPoint::new(px(6.0), py(6.0))];
+            let _: () = msg_send![cross, lineToPoint: NSPoint::new(px(18.0), py(18.0))];
+            let _: () = msg_send![cross, setLineWidth: 3.0 * unit];
+            let _: () = msg_send![cross, setLineCapStyle: 1isize];
+            let _: () = msg_send![cross, setLineJoinStyle: 1isize];
+            let white = crate::ffi::hex_to_ns_color(0xFFFF_FFFF);
+            let _: () = msg_send![white, setStroke];
+            let _: () = msg_send![cross, stroke];
+            return;
+        }
         // The reference's glyph exactly: a lucide `Check` at 11x11 (its `width={11} height={11}`),`M20 6 9 17l-5-5`
         // in a 24-unit viewBox, stroke-width 3, round caps and joins, centred in the 20pt circle. Scaling that
         // viewBox to the whole badge instead -- the first attempt -- drew a tick nearly twice the size the
@@ -1158,7 +1230,15 @@ pub(crate) fn show_working(text: &str) {
 
 /// A finished message: shown, then dismissed after the standard duration.
 pub(crate) fn show_done(text: &str) {
-    show(text, Some(TOAST_VISIBLE));
+    show_kind(text, ToastKind::Success, Some(TOAST_VISIBLE));
+}
+
+/// A REFUSED action: the same bubble with a red cross, because the message says what did not happen.
+///
+/// The text alone would be read as a status line about something that succeeded; the badge is what
+/// makes the two cases tell apart at a glance.
+pub(crate) fn show_refused(text: &str) {
+    show_kind(text, ToastKind::Error, Some(TOAST_VISIBLE));
 }
 
 /// The bubble the smoke scenario reads: its message, its laid-out width, the shared panel outline it carries
@@ -1457,6 +1537,17 @@ unsafe fn swap_for_material(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The two kinds must not collapse into one badge: a refusal shown in the success green would say
+    /// the action worked while its own text says it did not.
+    #[test]
+    fn a_refused_message_has_its_own_badge() {
+        assert_ne!(TOAST_ERROR_BADGE_FILL, TOAST_BADGE_FILL);
+        assert_ne!(ToastKind::Success, ToastKind::Error);
+        // Both glyphs are the reference's 11pt lucide icons in the same badge box.
+        assert_eq!(TOAST_CHECK_SIZE, 11.0);
+        assert!(TOAST_CHECK_SIZE < TOAST_BADGE_SIZE);
+    }
 
     /// The panel needs the AppKit main thread, and libtest runs cases on worker threads, so these
     /// assert the geometry rule the panel is placed by rather than building it.

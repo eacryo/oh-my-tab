@@ -1429,7 +1429,7 @@ pub(crate) extern "C" fn handle_recording_finished(
                 // and hash results. The row itself stays one line: a recording that refused keeps
                 // the old chord, and the bubble is what says why it did not change.
                 super::set_clipboard_shortcut_recording_ui(false, None);
-                crate::ui::toast::show_done(&t("errors.shortcut_key_unbindable"));
+                crate::ui::toast::show_refused(&t("errors.shortcut_key_unbindable"));
             }
             RecMode::ClipboardShortcut => {
                 // The chord is checked against the effective config, so it cannot take a chord a
@@ -1464,7 +1464,7 @@ pub(crate) extern "C" fn handle_recording_finished(
                 // nothing extra -- the button's new text is the result.
                 super::set_clipboard_shortcut_recording_ui(false, None);
                 if let Some(message) = error.as_deref() {
-                    crate::ui::toast::show_done(message);
+                    crate::ui::toast::show_refused(message);
                 }
             }
         }
