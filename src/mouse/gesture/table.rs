@@ -105,7 +105,11 @@ pub(crate) fn build(mouse: &crate::config::MouseSection) -> (GestureTable, Vec<(
     for (index, row) in mouse.gestures.iter().enumerate() {
         match row_error(row) {
             Ok((key, target)) => {
-                let slot = (row.button, key.clone());
+                // Every row lands on the effective trigger, not on the button it was written with:
+                // a global trigger makes the list one button's list, and two rows that were
+                // distinct only by their buttons now claim the same slot.
+                let button = effective_trigger_button(mouse);
+                let slot = (button, key.clone());
                 if table.rows.contains_key(&slot) {
                     errors.push((index, RowError::Duplicate));
                     continue;
@@ -114,7 +118,7 @@ pub(crate) fn build(mouse: &crate::config::MouseSection) -> (GestureTable, Vec<(
                     slot,
                     Row {
                         key,
-                        button: row.button,
+                        button,
                         target,
                         index,
                     },
@@ -124,6 +128,24 @@ pub(crate) fn build(mouse: &crate::config::MouseSection) -> (GestureTable, Vec<(
         }
     }
     (table, errors)
+}
+
+/// The button a row is drawn on: the configuration's one trigger.
+///
+/// The row's own `button` is not consulted. Validation keeps the trigger inside 1..=4, so a
+/// hand-written value outside it is repaired by the per-field merge rather than guessed at here.
+pub(crate) fn effective_trigger_button(mouse: &crate::config::MouseSection) -> u32 {
+    mouse.gesture_button
+}
+
+/// A configured sequence as the key the tap matches against.
+///
+/// Two spellings name the same stroke: the four direction letters, and the stroke characters
+/// ("B" down, "F" up) some gesture lists use. One function decides that, and the table, conflict
+/// detection and the settings page all read it, so a row cannot be valid in one place and unknown
+/// in another.
+pub(crate) fn row_sequence(text: &str) -> Option<String> {
+    parse_key(text, 8).or_else(|| parse_key(&stroke_directions(text)?, 8))
 }
 
 /// A configuration gesture written in stroke characters ("DB", "BU", "UL") as direction letters.
@@ -150,6 +172,9 @@ fn stroke_directions(text: &str) -> Option<String> {
 }
 
 fn row_error(row: &GestureBinding) -> Result<(String, Target), RowError> {
+    // The row's own button is no longer a trigger, but an impossible one still means a hand-written
+    // row whose author meant something else: it is refused here, and the page reports it with the
+    // same rule (`row.problem`), so the two cannot disagree about which rows are live.
     if !(1..=4).contains(&row.button) {
         // The left button (0) is refused on purpose: a gesture on it would swallow ordinary clicks.
         return Err(RowError::BadButton);
@@ -158,12 +183,7 @@ fn row_error(row: &GestureBinding) -> Result<(String, Target), RowError> {
     // which a mouse can produce and a user cannot type: the four direction letters cannot spell
     // them, so the table reads the stroke directly where `parse_key` would refuse it. A hand-written
     // row that neither reads loads exactly as before.
-    let key = parse_key(&row.gesture, 8)
-        .or_else(|| {
-            parse_key(&stroke_directions(&row.gesture)?, 8)
-                .map(|_| stroke_directions(&row.gesture))?
-        })
-        .ok_or(RowError::BadGesture)?;
+    let key = row_sequence(&row.gesture).ok_or(RowError::BadGesture)?;
     if row.binding.trim().is_empty() {
         // Covers both the shipped default (disabled, unbound) and an enabled row the user left
         // unbound: neither may claim the button.
@@ -243,10 +263,25 @@ pub(crate) fn publish(cfg: &Config) -> Vec<(usize, RowError)> {
     errors
 }
 
+/// Serialises every test that publishes to, or reads, the process-global published snapshot.
+///
+/// Cargo runs test functions in parallel threads; without this one module's `publish` lands between
+/// another module's press and release, and a test that only asserts a stroke's state fails on a
+/// table it never wrote.
+#[cfg(test)]
+pub(crate) static GLOBAL_SNAPSHOT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::MouseProfile;
+
+    fn with_global_snapshot<R>(f: impl FnOnce() -> R) -> R {
+        let _guard = GLOBAL_SNAPSHOT
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        f()
+    }
 
     fn config(enabled: bool, rows: Vec<GestureBinding>) -> Config {
         let mut cfg = Config::default();
@@ -318,6 +353,111 @@ mod tests {
     /// The list a user meets on a fresh install: eleven rows, four of them two-step strokes the
     /// four direction letters cannot spell. A row that did not load would look configured and do
     /// nothing, which is the failure the shipped list exists to prevent.
+    /// The trigger is the only button the table claims: the button a row was written with is left to
+    /// the application.
+    #[test]
+    fn the_trigger_is_the_only_button_the_table_claims() {
+        let mut cfg = config(true, vec![row("L", 1, "window.snap_left", true)]);
+        cfg.mouse.gesture_button = 3;
+        let (table, errors) = build(&cfg.mouse);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            !table.claims(1),
+            "the right button is left to the application"
+        );
+        assert!(table.claims(3), "the chosen side button is claimed");
+        assert_eq!(
+            table.lookup(3, "L").map(|row| row.target),
+            Some(Target::Action(Action::SnapLeft)),
+            "the row answers on the chosen button"
+        );
+        assert!(table.lookup(1, "L").is_none());
+    }
+
+    /// Two rows written for different buttons claim one slot under the single trigger, and the table
+    /// says so instead of silently dropping the second.
+    #[test]
+    fn rows_written_for_different_buttons_are_duplicates() {
+        let mut cfg = config(
+            true,
+            vec![
+                row("L", 1, "window.snap_left", true),
+                row("L", 3, "window.maximize", true),
+            ],
+        );
+        cfg.mouse.gesture_button = 1;
+        let (table, errors) = build(&cfg.mouse);
+        assert_eq!(
+            errors,
+            vec![(1, RowError::Duplicate)],
+            "the second row is refused"
+        );
+        assert_eq!(table.len(), 1);
+    }
+
+    /// A file written before `gesture_button` existed loads as the right button, and the value it
+    /// loads with is what the table claims.
+    #[test]
+    fn a_file_without_a_trigger_loads_as_the_right_button() {
+        // The mouse section's own default truth is the section, not a bare table: read the whole
+        // module so a missing key is exercised through the deserializer the app uses.
+        let loaded: crate::config::MouseSection =
+            toml::from_str("enabled = true\ngestures_enabled = true").expect("a mouse section");
+        assert_eq!(loaded.gestures_enabled, true, "the fixture text is read");
+        assert_eq!(
+            loaded.gesture_button,
+            crate::config::default_gesture_button(),
+            "a missing key takes the default trigger"
+        );
+        // A trigger that WAS written is kept.
+        let stated: crate::config::MouseSection =
+            toml::from_str("enabled = true\ngesture_button = 3").expect("a mouse section");
+        assert_eq!(stated.gesture_button, 3);
+    }
+
+    /// The stroke characters are one spelling of the direction letters, in every reader: the table
+    /// loads "BL" as "DL" (B is down), and conflict detection sees two spellings of one stroke as a
+    /// duplicate.
+    #[test]
+    fn stroke_characters_and_direction_letters_name_the_same_stroke() {
+        let cfg = config(true, vec![row("BL", 1, "window.snap_left", true)]);
+        let (table, errors) = build(&cfg.mouse);
+        assert!(errors.is_empty(), "{errors:?}");
+        let loaded = table.lookup(1, "DL").expect("BL is the stroke DL");
+        assert_eq!(loaded.key, "DL");
+        let conflicts = crate::mouse::gesture::conflict::find_conflicts(&config(
+            true,
+            vec![row("BL", 1, "cmd+t", true), row("DL", 1, "cmd+s", true)],
+        ));
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.severity == crate::mouse::gesture::conflict::Severity::Blocking),
+            "one stroke written twice must be reported: {conflicts:?}"
+        );
+    }
+
+    /// An out-of-range trigger is a validation error, so the load repairs the file instead of the
+    /// table guessing which button the user meant.
+    #[test]
+    fn an_out_of_range_trigger_is_a_validation_error() {
+        let mut cfg = crate::config::Config::default();
+        cfg.mouse.gesture_button = 9;
+        assert!(
+            cfg.validate()
+                .iter()
+                .any(|error| error.starts_with("mouse.gesture_button")),
+            "an impossible trigger must be reported"
+        );
+        cfg.mouse.gesture_button = 3;
+        assert!(
+            !cfg.validate()
+                .iter()
+                .any(|error| error.starts_with("mouse.gesture_button")),
+            "a side button is a valid trigger"
+        );
+    }
+
     #[test]
     fn the_shipped_defaults_are_eleven_live_rows() {
         let rows = crate::config::MouseSection::default().gestures;
@@ -387,36 +527,42 @@ mod tests {
 
     #[test]
     fn the_epoch_advances_for_an_exclusion_only_change() {
-        // The reviewer's counter-example: the row set is identical, only the exclusion list moved.
-        let mut cfg = config(true, vec![row("R", 1, "cmd+t", true)]);
-        publish(&cfg);
-        let before = current_epoch();
-        cfg.mouse.gesture_excluded_apps = vec!["com.apple.Safari".into()];
-        publish(&cfg);
-        assert!(current_epoch() > before, "an exclusion change revokes");
+        with_global_snapshot(|| {
+            // The reviewer's counter-example: the row set is identical, only the exclusion list moved.
+            let mut cfg = config(true, vec![row("R", 1, "cmd+t", true)]);
+            publish(&cfg);
+            let before = current_epoch();
+            cfg.mouse.gesture_excluded_apps = vec!["com.apple.Safari".into()];
+            publish(&cfg);
+            assert!(current_epoch() > before, "an exclusion change revokes");
+        });
     }
 
     #[test]
     fn the_epoch_advances_when_the_parent_switch_flips_on_an_empty_table() {
-        let mut cfg = config(true, vec![]);
-        publish(&cfg);
-        let before = current_epoch();
-        cfg.mouse.enabled = false;
-        publish(&cfg);
-        assert!(current_epoch() > before, "the parent switch revokes");
+        with_global_snapshot(|| {
+            let mut cfg = config(true, vec![]);
+            publish(&cfg);
+            let before = current_epoch();
+            cfg.mouse.enabled = false;
+            publish(&cfg);
+            assert!(current_epoch() > before, "the parent switch revokes");
+        });
     }
 
     #[test]
     fn the_epoch_is_monotonic_across_a_round_trip() {
-        let cfg_a = config(true, vec![row("R", 1, "cmd+t", true)]);
-        let cfg_b = config(true, vec![row("R", 1, "cmd+s", true)]);
-        publish(&cfg_a);
-        let epoch_a = current_epoch();
-        publish(&cfg_b);
-        publish(&cfg_a);
-        assert!(
-            current_epoch() > epoch_a,
-            "A -> B -> A must not restore the old epoch"
-        );
+        with_global_snapshot(|| {
+            let cfg_a = config(true, vec![row("R", 1, "cmd+t", true)]);
+            let cfg_b = config(true, vec![row("R", 1, "cmd+s", true)]);
+            publish(&cfg_a);
+            let epoch_a = current_epoch();
+            publish(&cfg_b);
+            publish(&cfg_a);
+            assert!(
+                current_epoch() > epoch_a,
+                "A -> B -> A must not restore the old epoch"
+            );
+        });
     }
 }

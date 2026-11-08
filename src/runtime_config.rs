@@ -183,6 +183,9 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         // presentation switch off behind a flag that was already set.
         gestures: old.mouse.gestures_enabled != new.mouse.gestures_enabled
             || old.mouse.gestures != new.mouse.gestures
+            // The trigger moves every row to another button, so a change to it alone is a change of
+            // what the tap claims.
+            || old.mouse.gesture_button != new.mouse.gesture_button
             || old.mouse.gesture_show_trail != new.mouse.gesture_show_trail
             || old.mouse.gesture_show_hint != new.mouse.gesture_show_hint
             || old.mouse.gesture_excluded_apps != new.mouse.gesture_excluded_apps,

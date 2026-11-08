@@ -67,6 +67,7 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         reverse_scroll: std::ptr::null_mut(),
         enable_mouse: std::ptr::null_mut(),
         gestures_enabled: std::ptr::null_mut(),
+        gesture_trigger_button: std::ptr::null_mut(),
         gesture_show_trail: std::ptr::null_mut(),
         gesture_show_hint: std::ptr::null_mut(),
         scroll_mode: std::ptr::null_mut(),

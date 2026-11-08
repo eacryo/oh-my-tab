@@ -21,6 +21,10 @@ use super::*;
 /// The page's master switch: it owns whether any gesture fires.
 pub(super) const GESTURES_ENABLED_FIELD: ControlField = ControlField::GesturesEnabled;
 
+/// The trigger choices, in the order the popup lists them: the buttons a mouse has, and nothing
+/// else -- the left button stays out on purpose, because a gesture on it would swallow every click.
+pub(crate) const GESTURE_TRIGGER_BUTTONS: [u32; 4] = [1, 2, 3, 4];
+
 /// One configured gesture, as the page shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ShownRow {
@@ -99,6 +103,31 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
 
+    // The one button every gesture starts on. The list itself is one button's list, so the rows
+    // below say only what they run, and this row is the single place the button is chosen -- it
+    // sits in the switches' own card, where a trigger belongs to that set of choices.
+    w.card("settings.gestures_header");
+    let trigger_choices = trigger_options();
+    let trigger_selected = trigger_choices
+        .iter()
+        .position(|option| option.button == cfg.mouse.gesture_button)
+        .unwrap_or(0);
+    w.push(
+        RowDraft::new(
+            "settings.gestures_row_gesture_button",
+            ControlKind::Popup {
+                options: trigger_choices
+                    .iter()
+                    .map(|option| option.label.clone())
+                    .collect(),
+            },
+            ControlId::Field(ControlField::GestureTriggerButton),
+            Value::Index(trigger_selected),
+        )
+        .desc("settings.gestures_desc_trigger")
+        .into_spec(),
+    );
+
     w.card("settings.gestures_header_list");
     if GESTURE_ROWS_EDITABLE {
         // The recorder row: its value IS the recording's state, so the page follows the pointer while
@@ -159,15 +188,9 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             .iter()
             .position(|option| option.id == row.binding)
             .unwrap_or(0);
-        // The stroke itself, with the state it will not run in when there is one: the sequence and
-        // the button never leave the left column, so the right one holds only what it runs.
-        // The left column is the whole trigger: which button starts the gesture and the stroke it
-        // wants. The action alone is in the right column, so the row still reads as two columns.
-        let mut stroke = format!(
-            "{} · {}",
-            crate::mouse::shortcut::button_label(row.trigger),
-            stroke_label(&row.sequence)
-        );
+        // The stroke's arrows and its name in words, with the state it will not run in when there is
+        // one. The button is not part of the row: it is the page's one trigger, chosen above.
+        let mut stroke = stroke_words(&row.sequence);
         if let Some(problem) = row.problem {
             let label = problem_label(problem);
             if !label.is_empty() {
@@ -444,7 +467,7 @@ pub(crate) struct TriggerOption {
 }
 
 pub(crate) fn trigger_options() -> Vec<TriggerOption> {
-    [1u32, 2, 3, 4]
+    GESTURE_TRIGGER_BUTTONS
         .into_iter()
         .map(|button| TriggerOption {
             button,
@@ -765,15 +788,63 @@ fn stroke_label(sequence: &str) -> String {
     }
     let mut out = String::new();
     for direction in sequence.chars() {
-        match direction {
-            'L' => out.push('←'),
-            'R' => out.push('→'),
-            'U' => out.push('↑'),
-            'D' => out.push('↓'),
-            other => out.push(other),
-        }
+        out.push(direction_arrow(direction));
     }
     out
+}
+
+/// One direction as the arrow the stroke is drawn with.
+fn direction_arrow(direction: char) -> char {
+    match direction {
+        'L' => '←',
+        'R' => '→',
+        'U' => '↑',
+        'D' => '↓',
+        other => other,
+    }
+}
+
+/// The stroke in words beside its arrows: "← 左", "↑← 先向上再向左".
+///
+/// The arrows are the shape of a gesture and the words are its name -- the same words the list has
+/// always used for the trigger page ("先向上再向左"), so a row and the trigger page it opens read
+/// alike. They are glued into the row's own label instead of its caption: a caption would double
+/// every row's height, and the list is the page's main body.
+fn stroke_words(sequence: &str) -> String {
+    let directions: Vec<char> = crate::mouse::gesture::table::row_sequence(sequence)
+        .map(|key| key.chars().collect())
+        .unwrap_or_default();
+    if directions.is_empty() {
+        // A sequence the recognizer refused keeps its raw text: there are no directions to name.
+        return sequence.to_string();
+    }
+    let arrows: String = directions.iter().copied().map(direction_arrow).collect();
+    let named: Vec<String> = directions.iter().copied().map(direction_word).collect();
+    match named.as_slice() {
+        [only] => format!("{arrows} {only}"),
+        [first, rest @ ..] => {
+            let mut text =
+                crate::i18n::tf("settings.gestures_stroke_first", &[("direction", first)]);
+            for direction in rest {
+                text = crate::i18n::tf(
+                    "settings.gestures_stroke_next",
+                    &[("text", &text), ("direction", direction)],
+                );
+            }
+            format!("{arrows} {text}")
+        }
+        [] => sequence.to_string(),
+    }
+}
+
+/// One direction in the user's words.
+fn direction_word(direction: char) -> String {
+    match direction {
+        'L' => t("settings.gestures_direction_left"),
+        'R' => t("settings.gestures_direction_right"),
+        'U' => t("settings.gestures_direction_up"),
+        _ => t("settings.gestures_direction_down"),
+    }
 }
 
 /// Every application the exclusion picker can offer, before the configured ones are removed: the
@@ -821,7 +892,7 @@ fn row_problem(entry: &crate::config::GestureBinding) -> Option<&'static str> {
     if !(1..=4).contains(&entry.button) {
         return Some("bad_button");
     }
-    if crate::mouse::gesture::recognizer::parse_key(&entry.gesture, 8).is_none() {
+    if crate::mouse::gesture::table::row_sequence(&entry.gesture).is_none() {
         return Some("bad_sequence");
     }
     if !entry.enabled {
@@ -985,6 +1056,105 @@ mod tests {
             ],
             "the switches read the configuration, in page order"
         );
+    }
+
+    /// A conflicting row says so in the user's language: the words are looked up, and a raw
+    /// translation key on a row is a key that does not exist.
+    #[test]
+    fn a_conflicting_row_says_so_in_words() {
+        let view = gestures_page_view(&input(
+            true,
+            vec![
+                row("rd", 1, "window.snap_left", true),
+                row("rd", 1, "window.maximize", true),
+            ],
+        ));
+        let labels: Vec<String> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_gesture")
+            .filter_map(|r| r.label_text.clone())
+            .collect();
+        assert_eq!(labels.len(), 2);
+        for label in &labels {
+            assert!(
+                !label.contains("errors.") && !label.contains("settings."),
+                "a raw translation key reached a row: {label}"
+            );
+        }
+        assert!(
+            labels[1].contains(&crate::i18n::t("errors.errors_gesture_duplicate")),
+            "the shadowed row says why it will not run: {labels:?}"
+        );
+    }
+
+    /// A row names its stroke in words as well as in arrows, so a user does not have to read a
+    /// sequence of symbols: one direction is named, and a longer stroke is told step by step.
+    #[test]
+    fn a_row_names_its_stroke_in_words() {
+        let view = gestures_page_view(&input(
+            true,
+            vec![
+                row("l", 1, "window.snap_left", true),
+                row("ul", 1, "window.snap_left", true),
+                row("udl", 1, "window.snap_left", true),
+            ],
+        ));
+        let labels: Vec<String> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_gesture")
+            .filter_map(|r| r.label_text.clone())
+            .collect();
+        assert_eq!(labels[0], "← 向左", "{labels:?}");
+        assert_eq!(labels[1], "↑← 先向上再向左", "{labels:?}");
+        assert_eq!(labels[2], "↑↓← 先向上再向下再向左", "{labels:?}");
+    }
+
+    /// A sequence the recognizer refused keeps its raw text: there are no directions to name.
+    #[test]
+    fn a_refused_sequence_keeps_its_own_text_in_the_row() {
+        assert_eq!(stroke_words("XYZ"), "XYZ");
+        assert_eq!(stroke_words(""), "");
+    }
+
+    /// The trigger is one row, a popup over the four buttons a mouse has, and it shows the button
+    /// the configuration actually uses.
+    #[test]
+    fn the_page_offers_one_trigger_popup_with_four_buttons() {
+        let mut page_input = input(true, vec![row("l", 1, "window.snap_left", true)]);
+        page_input.config.mouse.gesture_button = 3;
+        let view = gestures_page_view(&page_input);
+        let trigger = view
+            .rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_gesture_button")
+            .expect("the trigger row");
+        match &trigger.control {
+            ControlKind::Popup { options } => assert_eq!(
+                options.len(),
+                4,
+                "right, middle and both side buttons: {options:?}"
+            ),
+            other => panic!("the trigger is a popup, not {other:?}"),
+        }
+        assert_eq!(
+            trigger.id,
+            ControlId::Field(ControlField::GestureTriggerButton)
+        );
+        assert_eq!(trigger.value, Value::Index(2), "side button 1 is selected");
+        // No gesture row names a button any more.
+        for row in view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_gesture")
+        {
+            let label = row.label_text.clone().unwrap_or_default();
+            assert!(
+                !label.contains(&crate::mouse::shortcut::button_label(1)),
+                "{label}"
+            );
+        }
     }
 
     /// The shipped default list fits the page: an overflow line under the app's own rows read as
@@ -1335,10 +1505,10 @@ mod tests {
             "a raw config id reached the page: {text}"
         );
         assert!(!text.contains("snap_left"), "{text}");
-        // The left column is the button plus the stroke's arrows; the right column is the action's
-        // own name.
+        // The left column is the stroke alone -- the button is the page's one trigger, chosen
+        // above the list -- and the right column is the action's own name.
         assert!(
-            text.starts_with(&crate::mouse::shortcut::button_label(1)),
+            !text.contains(&crate::mouse::shortcut::button_label(1)),
             "{text}"
         );
         assert!(text.contains("→↓"), "{text}");

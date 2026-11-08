@@ -757,7 +757,9 @@ mod tests {
     /// Serialises the tests that publish to the global table and flip the global active flag.
     /// Cargo runs test functions in parallel threads, so without this one test's publish lands
     /// between another's press and release.
-    static GLOBAL_STATE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// The snapshot lock the gesture test modules share: a table test's `publish` interleaving a
+    /// runtime test's press/release is what made two of them fail intermittently.
+    static GLOBAL_STATE: &std::sync::Mutex<()> = &super::super::table::GLOBAL_SNAPSHOT;
 
     fn with_global_state<R>(f: impl FnOnce() -> R) -> R {
         let _guard = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());

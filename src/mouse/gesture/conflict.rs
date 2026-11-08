@@ -10,8 +10,7 @@
 use std::collections::HashMap;
 
 use crate::config::{Config, GestureBinding};
-use crate::mouse::gesture::recognizer::parse_key;
-use crate::mouse::gesture::table::Target;
+use crate::mouse::gesture::table::{self, Target};
 
 /// How serious a conflict is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -37,29 +36,35 @@ pub(crate) fn find_conflicts(cfg: &Config) -> Vec<Conflict> {
     let mut conflicts = Vec::new();
     let mut seen: HashMap<(u32, String), usize> = HashMap::new();
     for (index, row) in cfg.mouse.gestures.iter().enumerate() {
-        let Some(key) = parse_key(&row.gesture, 8) else {
+        // The SAME sequence key the runtime builds on, aliases included: two rows that spell one
+        // stroke differently would otherwise read as distinct here and collide in the table.
+        let Some(key) = table::row_sequence(&row.gesture) else {
             // An unparseable sequence is already reported by validation; nothing to cross-check.
             continue;
         };
-        if !(1..=4).contains(&row.button) {
+        // The button is the configuration's one trigger, as in the table.
+        let button = table::effective_trigger_button(&cfg.mouse);
+        if !(1..=4).contains(&button) {
             continue;
         }
-        // Only a row the runtime would actually load can occupy a button+sequence. A disabled or
-        // unbound default row must not make a later, properly enabled row look like a duplicate.
-        let claims = row.enabled
+        // Only a row the runtime would actually load can occupy the trigger+sequence. A disabled,
+        // unbound, impossible-button or unknown-target row is refused by the table, so it must not
+        // make a later, healthy row look like a duplicate here.
+        let claims = (1..=4).contains(&row.button)
+            && row.enabled
             && !row.binding.trim().is_empty()
             && Target::resolve(&row.binding).is_some();
         if !claims {
             continue;
         }
-        match seen.get(&(row.button, key.clone())) {
+        match seen.get(&(button, key.clone())) {
             Some(_first) => conflicts.push(Conflict {
                 row: index,
                 severity: Severity::Blocking,
-                message: "errors.gesture_duplicate",
+                message: "errors.errors_gesture_duplicate",
             }),
             None => {
-                seen.insert((row.button, key), index);
+                seen.insert((button, key), index);
             }
         }
     }
@@ -69,7 +74,7 @@ pub(crate) fn find_conflicts(cfg: &Config) -> Vec<Conflict> {
             conflicts.push(Conflict {
                 row: index,
                 severity: Severity::Blocking,
-                message: "errors.gesture_unknown_target",
+                message: "errors.errors_gesture_unknown_target",
             });
         }
         // A gesture output that matches a keyboard binding's trigger is a warning: it may be exactly
@@ -82,7 +87,7 @@ pub(crate) fn find_conflicts(cfg: &Config) -> Vec<Conflict> {
                 conflicts.push(Conflict {
                     row: index,
                     severity: Severity::Warning,
-                    message: "errors.gesture_shadowed_by_binding",
+                    message: "errors.errors_gesture_shadowed_by_binding",
                 });
             }
         }
@@ -152,13 +157,22 @@ mod tests {
         );
     }
 
+    /// Two rows written for different buttons both start on the one trigger, so the second can never
+    /// fire and the page has to say so.
     #[test]
-    fn the_same_sequence_on_different_buttons_does_not_conflict() {
-        let conflicts = find_conflicts(&config(vec![
+    fn rows_written_for_different_buttons_conflict_on_the_trigger() {
+        let global = config(vec![
             row("rd", 1, "cmd+t", true),
             row("rd", 2, "cmd+s", true),
-        ]));
-        assert!(conflicts.is_empty(), "{conflicts:?}");
+        ]);
+        assert_eq!(global.mouse.gesture_button, 1, "the fixture's trigger");
+        let conflicts = find_conflicts(&global);
+        assert!(
+            conflicts
+                .iter()
+                .any(|c| c.severity == Severity::Blocking && c.row == 1),
+            "the second row is shadowed by the first: {conflicts:?}"
+        );
     }
 
     #[test]

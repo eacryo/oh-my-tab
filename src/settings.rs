@@ -523,6 +523,7 @@ pub(super) struct SettingsUi {
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject, // enable mouse control
     gestures_enabled: *mut AnyObject,
+    gesture_trigger_button: *mut AnyObject, // NSPopUpButton: the one button gestures start on
     gesture_show_trail: *mut AnyObject,
     gesture_show_hint: *mut AnyObject, // the Gestures page's master switch
     scroll_mode: *mut AnyObject,       // NSPopUpButton: default/line

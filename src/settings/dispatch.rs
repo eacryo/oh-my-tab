@@ -81,8 +81,10 @@ pub(super) enum ControlField {
     FinderMenuTerminal(usize),
     FinderMenuCopyPath,
     FinderMenuCopySha256,
-    // Gestures page: its own master switch, and the popup that adds an excluded application.
+    // Gestures page: its master switch, the one trigger every gesture starts on, its two
+    // presentation switches, and the popup that adds an excluded application.
     GesturesEnabled,
+    GestureTriggerButton,
     GestureShowTrail,
     GestureShowHint,
 }
@@ -899,6 +901,18 @@ fn apply_control_field(field: ControlField) {
                 ControlField::GesturesEnabled => {
                     let state: isize = msg_send![u.gestures_enabled, state];
                     cfg.mouse.gestures_enabled = state == 1;
+                }
+                ControlField::GestureTriggerButton => {
+                    let index: isize = msg_send![u.gesture_trigger_button, indexOfSelectedItem];
+                    // An index outside the popup's own list must never write a button: the popup and
+                    // the runtime read the same four values.
+                    let buttons: [u32; 4] = crate::settings::page_view::GESTURE_TRIGGER_BUTTONS;
+                    if let Some(&button) = usize::try_from(index)
+                        .ok()
+                        .and_then(|index| buttons.get(index))
+                    {
+                        cfg.mouse.gesture_button = button;
+                    }
                 }
                 // A switch is read from the SENDER: this path knows which control was clicked, and
                 // going back through the page's slots would need one more field per switch.
@@ -3046,17 +3060,23 @@ mod tests {
 /// The gesture list the page drew last, so a reload can tell "the rows changed" from "a value
 /// changed". A value can be written in place; a different LIST cannot -- there is no control to
 /// update into the new row -- so that difference is what asks for a rebuild.
-static DRAWN_GESTURE_ROWS: std::sync::Mutex<Option<Vec<crate::config::GestureBinding>>> =
+/// The list and the trigger the page drew last, as one value: they are one page's inputs.
+static DRAWN_GESTURE_ROWS: std::sync::Mutex<Option<(Vec<crate::config::GestureBinding>, u32)>> =
     std::sync::Mutex::new(None);
 
-/// Whether the configured gesture list differs from the one the page last drew.
+/// Whether the Gestures page would draw a DIFFERENT page than the one it drew last.
+///
+/// The list is one input; the trigger is the other, because it decides which rows collide and the
+/// collision words are part of each row's label. An in-place refresh writes values only, so a page
+/// whose labels changed has to be rebuilt, or it keeps saying a row collides after the user moved
+/// the conflict away.
 pub(crate) fn gesture_rows_changed(cfg: &crate::config::Config) -> bool {
     DRAWN_GESTURE_ROWS
         .lock()
         .map(|drawn| {
-            drawn
-                .as_ref()
-                .is_none_or(|previous| *previous != cfg.mouse.gestures)
+            drawn.as_ref().is_none_or(|previous| {
+                *previous != (cfg.mouse.gestures.clone(), cfg.mouse.gesture_button)
+            })
         })
         .unwrap_or(false)
 }
@@ -3066,7 +3086,7 @@ pub(crate) fn gesture_rows_changed(cfg: &crate::config::Config) -> bool {
 /// redrew, and coming back to the page would show the old rows.
 pub(crate) fn note_gesture_rows_drawn(cfg: &crate::config::Config) {
     if let Ok(mut drawn) = DRAWN_GESTURE_ROWS.lock() {
-        *drawn = Some(cfg.mouse.gestures.clone());
+        *drawn = Some((cfg.mouse.gestures.clone(), cfg.mouse.gesture_button));
     }
 }
 

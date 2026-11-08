@@ -1144,6 +1144,23 @@ fn default_gesture_enabled() -> bool {
     false
 }
 
+/// The trigger button of a file that does not state one: the right button.
+///
+/// The gesture list is a development feature with no released file format to keep, so a file
+/// written before `gesture_button` existed simply takes this value -- and validation refuses any
+/// value outside the range, which is what keeps the runtime, the page and the file in agreement.
+pub(crate) fn default_gesture_button() -> u32 {
+    1
+}
+
+fn deserialize_gesture_button<'de, D>(deserializer: D) -> Result<u32, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<u32>::deserialize(deserializer)
+        .map(|button| button.unwrap_or_else(default_gesture_button))
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct MouseSection {
@@ -1152,8 +1169,16 @@ pub struct MouseSection {
     // Mouse gestures: hold a button, draw a direction sequence, release to run a binding.
     // Independent of the scroll/button-mapping switches, but gated by `enabled` above.
     pub gestures_enabled: bool,
-    // Direction sequences, one row per gesture.
+    /// Direction sequences, one row per gesture.
     pub gestures: Vec<GestureBinding>,
+    /// The one button every gesture starts on: 1 right, 2 middle, 3 side (back), 4 side (forward).
+    ///
+    /// Every row is drawn on this button and every other button is left to the application, so this
+    /// is the page's single trigger rather than a property of each row. The value is always one of
+    /// the four: a file written before the key existed, and a value outside the range, both load as
+    /// the right button and are reported, so the file on disk is repaired to match what runs.
+    #[serde(deserialize_with = "deserialize_gesture_button")]
+    pub gesture_button: u32,
     // Draw the stroke under the pointer while a gesture is drawn, and show what it will run.
     pub gesture_show_trail: bool,
     pub gesture_show_hint: bool,
@@ -1187,6 +1212,8 @@ impl Default for MouseSection {
             enabled: false,
             gestures_enabled: false,
             gestures: default_gestures(),
+            // Every gesture starts on the right button until the user chooses another.
+            gesture_button: 1,
             // The trail and the hint are what make a new gesture visible; off is the user's choice,
             // not the starting point.
             gesture_show_trail: true,
@@ -1749,6 +1776,18 @@ impl Config {
             self.key_bindings.items.as_ref(),
         ));
 
+        /* the gesture trigger is one of the four buttons */
+        {
+            if !(1..=4).contains(&self.mouse.gesture_button) {
+                errs.push(format!(
+                    "mouse.gesture_button: {}",
+                    tf(
+                        "errors.mouse_gesture_button_invalid",
+                        &[("value", &self.mouse.gesture_button.to_string())]
+                    )
+                ));
+            }
+        }
         for (i, p) in self.mouse.profiles.iter().enumerate() {
             let prefix = format!("mouse.profiles[{i}]");
             if let Some(ref mode) = p.scroll_mode {
@@ -2105,6 +2144,17 @@ impl Config {
         // enabled and bool fields are always valid; each profile's fields are kept or dropped
         // based on per-field validation results.
         self.mouse.enabled = other.mouse.enabled;
+        // The gesture list is its own section of health: none of these fields can make another
+        // invalid, so all of them are taken as written, and only the trigger -- whose validation is
+        // what sent this load into the merge at all -- falls back to the default when it is bad.
+        self.mouse.gestures_enabled = other.mouse.gestures_enabled;
+        self.mouse.gestures = other.mouse.gestures.clone();
+        self.mouse.gesture_show_trail = other.mouse.gesture_show_trail;
+        self.mouse.gesture_show_hint = other.mouse.gesture_show_hint;
+        self.mouse.gesture_excluded_apps = other.mouse.gesture_excluded_apps.clone();
+        if !errs.iter().any(|e| e.starts_with("mouse.gesture_button")) {
+            self.mouse.gesture_button = other.mouse.gesture_button;
+        }
         // Migrate other's legacy fields (if any) before merging.
         let mut other_mouse = other.mouse;
         other_mouse.migrate_legacy();
@@ -3411,6 +3461,73 @@ mod tests {
         assert!(cfg.window_control.display_down);
         assert!(cfg.window_control.display_left);
         assert!(cfg.window_control.display_right);
+    }
+
+    /// The gesture trigger is one field among many: an unrelated invalid value must not throw away a
+    /// valid side-button choice, and an impossible one must be repaired to the default.
+    #[test]
+    fn the_gesture_trigger_survives_an_unrelated_invalid_field() {
+        let mut loaded = Config::default();
+        loaded.mouse.gesture_button = 3;
+        loaded.appearance.theme = "neon".into();
+        let errors = loaded.validate();
+        assert!(errors.iter().any(|e| e.starts_with("appearance.theme")));
+        let mut merged = Config::default();
+        merged.merge_valid(loaded, &errors);
+        assert_eq!(merged.mouse.gesture_button, 3, "a valid trigger is kept");
+
+        // The repair path must not cost the user their gesture configuration: only the bad trigger
+        // falls back, and the list, the switches, the exclusion list and the presentation flags
+        // survive -- otherwise one hand-edited number wipes the section on the next launch.
+        let mut bad = Config::default();
+        bad.mouse.gesture_button = 9;
+        bad.mouse.gestures_enabled = true;
+        bad.mouse.gestures = vec![crate::config::GestureBinding {
+            gesture: "UL".into(),
+            button: 2,
+            binding: "cmd+t".into(),
+            enabled: true,
+        }];
+        bad.mouse.gesture_show_trail = false;
+        bad.mouse.gesture_show_hint = false;
+        bad.mouse.gesture_excluded_apps = vec!["com.apple.Safari".into()];
+        let errors = bad.validate();
+        let message = errors
+            .iter()
+            .find(|error| error.starts_with("mouse.gesture_button"))
+            .expect("the trigger is reported");
+        assert!(
+            message.contains('9'),
+            "the message names the value: {message}"
+        );
+        assert!(
+            !message.contains("errors."),
+            "a raw translation key reached the diagnostic: {message}"
+        );
+        let mut merged = Config::default();
+        merged.merge_valid(bad, &errors);
+        assert_eq!(
+            merged.mouse.gesture_button,
+            default_gesture_button(),
+            "an impossible trigger falls back to the default"
+        );
+        assert!(
+            merged.mouse.gestures_enabled,
+            "the switch survives the repair"
+        );
+        assert_eq!(
+            merged.mouse.gestures.len(),
+            1,
+            "the list survives the repair"
+        );
+        assert_eq!(merged.mouse.gestures[0].gesture, "UL");
+        assert!(!merged.mouse.gesture_show_trail, "the trail flag survives");
+        assert!(!merged.mouse.gesture_show_hint, "the hint flag survives");
+        assert_eq!(
+            merged.mouse.gesture_excluded_apps,
+            vec!["com.apple.Safari".to_string()],
+            "the exclusion list survives the repair"
+        );
     }
 
     #[test]
