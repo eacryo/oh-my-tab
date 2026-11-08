@@ -815,8 +815,18 @@ pub(crate) extern "C" fn handle_mapping_edit(_self: *mut c_void, _cmd: Sel, send
 /// a recording is believed to be in progress. A failed spawn is therefore rolled back to Idle, and the
 /// panel button is re-enabled, so the next attempt starts from a clean state.
 pub(super) fn spawn_recording_thread() {
-    // Ends the capture as soon as the button is seen, without waiting for a release: the learned
-    // press is passed through by the latch, not by this tap.
+    match std::thread::Builder::new()
+        .name("mouse-recording".into())
+        .spawn(|| unsafe { recording_thread() })
+    {
+        Ok(handle) => {
+            *RECORD_THREAD.lock().unwrap() = Some(handle);
+        }
+        Err(error) => {
+            log_info!("[mouse] recording thread could not start: {error}");
+            roll_back_recording_session();
+        }
+    }
 }
 
 /// Stop the recording tap after a capture that completes at the DOWN.
@@ -832,22 +842,6 @@ pub(super) fn finish_capture_now() {
     }
     *REC_STAGE.lock().unwrap() = RecStage::Idle;
     *REC_MODE.lock().unwrap() = RecMode::Idle;
-}
-
-#[allow(dead_code)]
-fn unused_spawn_recording_thread() {
-    match std::thread::Builder::new()
-        .name("mouse-recording".into())
-        .spawn(|| unsafe { recording_thread() })
-    {
-        Ok(handle) => {
-            *RECORD_THREAD.lock().unwrap() = Some(handle);
-        }
-        Err(error) => {
-            log_info!("[mouse] recording thread could not start: {error}");
-            roll_back_recording_session();
-        }
-    }
 }
 
 /// Undo the state a caller sets up before `spawn_recording_thread`.

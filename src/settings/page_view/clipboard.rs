@@ -280,6 +280,24 @@ pub(super) unsafe fn draw_capture_row(
     selector: Sel,
     id: ControlId,
 ) -> RenderedControl {
+    draw_capture_row_with(
+        canvas, origin_y, row_h, label_key, title, target, selector, id,
+    )
+}
+
+/// The same row, with the binding branch the caller needs. Callers that bind their own slot ask
+/// for it here; the row's drawing is one implementation so the two pages cannot drift apart.
+#[allow(clippy::too_many_arguments)]
+pub(super) unsafe fn draw_capture_row_with(
+    canvas: &mut PageCanvas,
+    origin_y: f64,
+    row_h: f64,
+    label_key: &str,
+    title: &str,
+    target: *mut AnyObject,
+    selector: Sel,
+    id: ControlId,
+) -> RenderedControl {
     let document = canvas.document();
     let layout = canvas.layout();
     canvas.set_pending_advance(AdvanceState::Absolute);

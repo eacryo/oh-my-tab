@@ -129,6 +129,7 @@ pub(super) unsafe fn set_clipboard_shortcut_capture_state(
     };
     set_control_title(ui.clipboard_shortcut, &title);
     let mut button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
+
     let Some(row_label) = SettingsRow::label_for(ui.clipboard_shortcut) else {
         return;
     };
@@ -160,7 +161,9 @@ pub(super) unsafe fn set_clipboard_shortcut_capture_state(
 pub(super) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option<&str>) {
     let current = CONFIG.read().unwrap().clipboard.shortcut.clone();
     with_settings_ui(|slot| {
-        let Some(ui) = slot.as_ref() else { return };
+        let Some(ui) = slot.as_ref() else {
+            return;
+        };
         let visible: bool = unsafe { msg_send![ui.window, isVisible] };
         if visible {
             unsafe { set_clipboard_shortcut_capture_state(ui, &current, recording, error) };

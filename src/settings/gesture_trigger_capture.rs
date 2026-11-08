@@ -38,6 +38,8 @@ pub(crate) fn begin_trigger_capture() {
     page_view::set_gesture_capture_waiting(true);
     dispatch::refresh_gesture_hotkey_control();
     log_debug!("[gesture] waiting for the trigger button");
+    // The shared recorder tap observes the press; this mode ends the capture AT the down, and the
+    // press itself keeps passing through until it is released (see observe_button_down).
     mapping::spawn_recording_thread();
 }
 

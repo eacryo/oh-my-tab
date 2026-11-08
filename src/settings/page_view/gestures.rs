@@ -41,7 +41,7 @@ impl PageHooks for GesturesHooks {
         &mut self,
         canvas: &mut PageCanvas,
         rendered: &mut RenderedPage,
-        ui: &mut SettingsUi,
+        _ui: &mut SettingsUi,
         spec: &PageRowSpec,
         origin_y: f64,
         height: f64,
@@ -55,7 +55,7 @@ impl PageHooks for GesturesHooks {
         } else {
             self.trigger_title.clone()
         };
-        let row = super::clipboard::draw_capture_row(
+        let mut row = super::clipboard::draw_capture_row(
             canvas,
             origin_y,
             height,
@@ -65,6 +65,9 @@ impl PageHooks for GesturesHooks {
             sel!(handleGestureTriggerLearn:),
             ControlId::Field(ControlField::GestureTriggerButton),
         );
+        // Its OWN binding branch: the binder gives this row the gesture slot and the clipboard's
+        // row the clipboard slot, so neither refresh can land on the other page's button.
+        row.extra = RenderedExtra::GestureHotkey;
         // The row's tooltip states what the button does; the overlap note is the row's readout, so
         // it sits under the button like a shortcut capture's error line.
         let note = if self.mapping_note {
@@ -72,7 +75,6 @@ impl PageHooks for GesturesHooks {
         } else {
             String::new()
         };
-        ui.gesture_trigger_button = row.control;
         if !row.readout.is_null() {
             let text = crate::ffi::make_nsstring(&note);
             let _: () = msg_send![row.readout, setStringValue: text];

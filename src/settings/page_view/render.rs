@@ -38,6 +38,10 @@ pub(super) enum RenderedExtra {
     /// The clipboard shortcut recorder: its row height follows the recorded chord, and the capture
     /// state machine reads it back.
     Shortcut { row_height: f64 },
+    /// The Gestures page's hotkey recorder. A SEPARATE variant on purpose: two page-drawn
+    /// recorders sharing one binding branch overwrote each other's slot, and the refresh then wrote
+    /// the "press a key" title onto a button nobody could see.
+    GestureHotkey,
     /// The clipboard history limit: a numeric field whose callback looks it up by pointer.
     MaxEntries,
 }
