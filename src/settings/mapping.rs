@@ -1425,12 +1425,11 @@ pub(crate) extern "C" fn handle_recording_finished(
                 }
             }
             RecMode::ClipboardShortcut if unbindable => {
-                // Same honest report as the Key Bindings panel: this row's error surface would
-                // otherwise quote an empty chord.
-                super::set_clipboard_shortcut_recording_ui(
-                    false,
-                    Some(&t("errors.shortcut_key_unbindable")),
-                );
+                // The refusal is said in the shared bubble, the way the Finder menu reports its copy
+                // and hash results. The row itself stays one line: a recording that refused keeps
+                // the old chord, and the bubble is what says why it did not change.
+                super::set_clipboard_shortcut_recording_ui(false, None);
+                crate::ui::toast::show_done(&t("errors.shortcut_key_unbindable"));
             }
             RecMode::ClipboardShortcut => {
                 // The chord is checked against the effective config, so it cannot take a chord a
@@ -1459,7 +1458,14 @@ pub(crate) extern "C" fn handle_recording_finished(
                         Some(t("errors.clipboard_shortcut_conflict"))
                     }
                 };
-                super::set_clipboard_shortcut_recording_ui(false, error.as_deref());
+                // The row carries no error line any more: a REFUSED chord is said in the shared
+                // bubble (the same surface the Finder menu uses for its results), because the button
+                // keeps the old shortcut and would otherwise look ignored. An applied chord says
+                // nothing extra -- the button's new text is the result.
+                super::set_clipboard_shortcut_recording_ui(false, None);
+                if let Some(message) = error.as_deref() {
+                    crate::ui::toast::show_done(message);
+                }
             }
         }
         *REC_COMPLETED_DESC.lock().unwrap() = String::new();

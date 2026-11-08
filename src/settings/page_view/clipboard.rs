@@ -24,8 +24,12 @@ use super::*;
 pub(super) const CLIPBOARD_SHORTCUT_ROW: &str = "shortcut_recorder";
 pub(super) const CLIPBOARD_MAX_ENTRIES_ROW: &str = "max_entries";
 
-/// The recorder row's height: the old builder's `(row_h + 22).max(60)`.
-pub(super) const CLIPBOARD_SHORTCUT_ROW_H: f64 = 60.0;
+/// The recorder row's height: a single-line row, like every other described row.
+///
+/// It was taller while the row carried an inline error line under the button. A refused chord is
+/// now reported in the shared bubble (the surface the Finder menu uses for its results), so the
+/// row itself stays one line and the gap under the button is gone.
+pub(super) const CLIPBOARD_SHORTCUT_ROW_H: f64 = SettingsLayout::SINGLE_LINE_ROW_H;
 /// The numeric entry-limit row's height: a described (single-line) row, as the old builder had it.
 fn clipboard_max_entries_h() -> f64 {
     SettingsLayout::SINGLE_LINE_ROW_H
