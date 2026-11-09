@@ -2077,11 +2077,24 @@ pub(super) extern "C" fn html_switch_set_state(this: *mut AnyObject, _cmd: Sel, 
 /// off-to-on transition nobody made. Routes through `setState:` so the state and the
 /// accessibility value update, then drops the spring it started and repaints the visual at its
 /// final position.
+///
+/// A call whose state already matches must not touch animations: the in-place config refresh
+/// echoes the clicked switch back through this function inside the same runloop turn as the
+/// click (`apply_config_change` → `refresh_switcher_keystroke_and_mouse_controls_from_config`),
+/// and `removeAllAnimations` there killed the press-scale keyframe and the knob spring the click
+/// had just started -- the animation never reached a frame. An echo leaves the running
+/// animations alone; a real state change has none to preserve (the fill paths call this before
+/// the user could have started one).
 pub(super) unsafe fn set_switch_state_immediate(button: *mut AnyObject, on: bool) {
     if button.is_null() {
         return;
     }
-    let _: () = msg_send![button, setState: if on { 1isize } else { 0isize }];
+    let wanted: isize = if on { 1 } else { 0 };
+    let current: isize = msg_send![button, state];
+    if current == wanted {
+        return;
+    }
+    let _: () = msg_send![button, setState: wanted];
     html_switch_apply_visual(button, None);
     let knob = html_switch_knob(button);
     if !knob.is_null() {
@@ -4957,7 +4970,7 @@ mod tests {
     #[test]
     #[ignore]
     fn switch_hit_test_and_focus_ring_smoke() {
-        smoke_runner!("switch_hit_test_and_focus_ring_smoke", 1, {
+        smoke_runner!("switch_hit_test_and_focus_ring_smoke", 6, {
             unsafe {
                 // Switch hit-test: the padded click rect answers, points outside it do not.
                 let sw = super::make_switch(200.0, 0.0, 52.0, false);
@@ -4970,6 +4983,45 @@ mod tests {
                 assert!(
                     outside.is_null(),
                     "a click far outside must miss the switch"
+                );
+                release_obj(sw);
+
+                // The click-echo regression: the in-place config refresh re-writes the clicked
+                // switch through set_switch_state_immediate inside the same runloop turn, and that
+                // used to call removeAllAnimations unconditionally -- killing the animations the
+                // click had just started, so the knob jumped with no animation. An echo (state
+                // already matches) must leave running animations alone; a real change must still
+                // clear them. A test-owned animation with a fixed key stands in for the spring:
+                // the production spring depends on the system's Reduce Motion setting, which a
+                // gate must not read as a failure.
+                let sw = super::make_switch(200.0, 0.0, 52.0, false);
+                let knob = super::html_switch_knob(sw);
+                assert!(!knob.is_null(), "the switch must have its knob layer");
+                // Land the switch ON first (a real change, free to clear), then install the
+                // test-owned animation, so the echo below starts from an animated ON switch --
+                // exactly the state a click leaves behind when the refresh echoes it back.
+                super::set_switch_state_immediate(sw, true);
+                let key = crate::ffi::make_nsstring("test-echo-guard");
+                let animation: *mut AnyObject = msg_send![class!(CABasicAnimation), animation];
+                let _: () = msg_send![knob, addAnimation: animation, forKey: key];
+                crate::ffi::CFRelease(key as *const c_void);
+                unsafe fn has_animations(knob: *mut AnyObject) -> bool {
+                    let keys: *mut AnyObject = msg_send![knob, animationKeys];
+                    !keys.is_null() && {
+                        let count: usize = msg_send![keys, count];
+                        count > 0
+                    }
+                }
+                assert!(has_animations(knob), "the test animation must be installed");
+                super::set_switch_state_immediate(sw, true);
+                assert!(
+                    has_animations(knob),
+                    "a same-state write (the click echo) must not kill running animations"
+                );
+                super::set_switch_state_immediate(sw, false);
+                assert!(
+                    !has_animations(knob),
+                    "a real state change must still settle the switch immediately"
                 );
                 release_obj(sw);
 
