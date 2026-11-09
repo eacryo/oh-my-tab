@@ -2458,15 +2458,17 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             // copy height, not one line. A caption measured into the label column instead of the
             // captioned one wraps further and its last line is cut off inside a fixed frame.
             let caption_frame: NSRect = msg_send![ui.clipboard_shortcut_caption, frame];
-            let caption_field: *mut AnyObject =
-                msg_send![ui.clipboard_shortcut_caption, stringValue];
-            let caption_value = crate::ffi::nsstring_to_rust(caption_field);
-            let caption_needs = crate::settings::widgets::caption_cell_height(
-                &caption_value,
-                caption_frame.size.width,
-            );
-            let caption_fits =
-                caption_frame.size.width > 0.0 && caption_needs <= caption_frame.size.height + 0.5;
+            // Measured from the live label's cell, not from the helper that sized the row: the
+            // helper's own under-measurement would compute both sides and pass.
+            let caption_fits = match page_view::caption_frame_fits_its_cell(
+                ui.clipboard_shortcut_caption,
+            ) {
+                Ok(()) => caption_frame.size.width > 0.0,
+                Err(error) => {
+                    log_info!("[smoke-settings-layout] clipboard shortcut caption: {error}");
+                    false
+                }
+            };
 
             let current_shortcut = crate::config::CONFIG
                 .read()
@@ -2498,12 +2500,37 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             let recording_button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
             // The frame is sized for the TALLEST copy either state can show, so the state that was
             // not on screen when the page was built must fit it too.
-            let recording_caption_frame: NSRect = msg_send![ui.clipboard_shortcut_caption, frame];
-            let recording_needs = crate::settings::widgets::caption_cell_height(
-                &caption_text(),
-                recording_caption_frame.size.width,
-            );
-            let recording_fits = recording_needs <= recording_caption_frame.size.height + 0.5;
+            // The recorder says it is listening with the accent ring, and clears it when the
+            // capture ends: the ring is the state the button can carry without changing its text.
+            let ring_state = |button: *mut AnyObject, listening: bool| -> bool {
+                let layer: *mut AnyObject = msg_send![button, layer];
+                if layer.is_null() {
+                    return false;
+                }
+                let width: f64 = msg_send![layer, borderWidth];
+                let border = crate::ffi::layer_border_color(layer);
+                let wanted = if listening {
+                    crate::theme::ui_palette().accent
+                } else {
+                    crate::theme::ui_palette().card_border
+                };
+                let colour_ok =
+                    crate::ffi::CGColorEqualToColor(border, crate::ffi::hex_to_cg_color(wanted));
+                let width_ok = (width - if listening { 2.0 } else { 1.0 }).abs() <= 0.01;
+                colour_ok && width_ok
+            };
+            let ring_ok = ring_state(ui.clipboard_shortcut, true);
+            let recording_fits = match page_view::caption_frame_fits_its_cell(
+                ui.clipboard_shortcut_caption,
+            ) {
+                Ok(()) => true,
+                Err(error) => {
+                    log_info!(
+                        "[smoke-settings-layout] clipboard shortcut caption while recording: {error}"
+                    );
+                    false
+                }
+            };
             let button_title: *mut AnyObject = msg_send![ui.clipboard_shortcut, title];
             let recording_copy_ok = caption_text() == recording_caption
                 && recording_fits
@@ -2513,8 +2540,10 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             let idle_button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
             let idle_copy_restored =
                 caption_text() == idle_caption && same_frame(button_frame, idle_button_frame);
+            let ring_cleared = ring_state(ui.clipboard_shortcut, false);
+            let ring_ok = ring_ok && ring_cleared;
 
-            Some(layout_ok && idle_copy_ok && recording_copy_ok && idle_copy_restored)
+            Some(layout_ok && idle_copy_ok && recording_copy_ok && idle_copy_restored && ring_ok)
         })
         .unwrap_or(false);
         if !clipboard_shortcut_layout_ok {
@@ -4449,6 +4478,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
 /// paths.
 fn clear_settings_content_registries() {
     SettingsRow::clear_runtime_registry();
+    widgets::clear_settings_ring_states();
     sidebar::reset_settings_search_rows();
     widgets::clear_settings_select_registry(select::SelectOwner::SettingsPage);
     tooltip::SettingsTooltip::clear_runtime_registries();

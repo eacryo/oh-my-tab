@@ -90,6 +90,7 @@ impl PageHooks for GesturesHooks {
                 shown: if self.waiting { &waiting } else { &idle },
                 states: &states,
             }),
+            self.waiting,
             &title,
             target,
             sel!(handleGestureTriggerLearn:),

@@ -77,7 +77,7 @@ auxiliary panels). Never inline a hex value in a view builder.
 | `text_muted` | `#6B6862` | `#9E9EA6` | Version strings, subtitles, empty-state text |
 | `text_disabled` | `#7E7B83` | `#7C7C84` | Disabled control labels |
 | `scroll_indicator` | `rgba(0,0,0,.35)` | `rgba(255,255,255,.35)` | Custom scrollbar knobs |
-| `accent` | `#2F6FED` | `#5B9BFF` | Switches, sliders, primary action, selection ring |
+| `accent` | `#2F6FED` | `#5B9BFF` | Switches, sliders, primary action, selection ring, and the 2pt inset ring that marks a recorder waiting for its input |
 | `accent_hover` | `#1F5CDA` | `#7DB2FF` | Pressed/hover state of the accent |
 | `link_text` | `#1F5CDA` | `#409CFF` | Link-colored body text (clipboard URL rows and their detail view, settings external links) |
 | `link_text_hover` | `#17439F` | `#66ADFF` | Hover state of link text (settings external links) |
@@ -100,6 +100,11 @@ auxiliary panels). Never inline a hex value in a view builder.
 | `selection_plate_bg` | `rgba(47,111,237,.278)` | `rgba(91,155,255,.278)` | The switcher's icon plate. Heavier than a row wash because it carries a whole icon on translucent glass, where the row wash reads as nothing |
 | `hover_bg` | `rgba(118,118,128,.12)` | `rgba(255,255,255,.102)` | Hovered row / list item |
 | `shadow` | `rgba(0,0,0,.06)` | `rgba(0,0,0,.35)` | Elevation shadows (see §7) |
+
+**The accent ring is also the "listening" state.** A recorder — the Clipboard page's chord button, the
+Gestures page's hotkey button — keeps showing its value while it waits, so it cannot spell out that it
+is recording; it wears the same 2pt inset accent ring as a focused control until the capture ends or is
+cancelled. The ring is a state, not decoration: a capture that ends must clear it.
 
 **The sheet's translucent surfaces are stored composited.** The design sheet paints the light card as
 `rgba(255,255,255,.66)` over the page and the dark card as `rgba(32,32,37,.92)` over its page. The

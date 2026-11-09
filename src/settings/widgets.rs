@@ -75,6 +75,86 @@ pub(super) unsafe fn apply_inset_focus_ring(
     }
 }
 
+/// Why a button wears the accent ring: keyboard focus, or a recorder that is listening.
+///
+/// Both states write the SAME layer border, so they cannot be tracked separately: a recorder that is
+/// focused and then starts a capture must keep the ring after focus moves elsewhere, and a capture
+/// that ends while the button still has focus must keep the focus ring. One merged state per button
+/// is what makes either order come out right.
+#[derive(Clone, Copy, Default)]
+struct RingState {
+    focused: bool,
+    listening: bool,
+}
+
+impl RingState {
+    /// Whether the accent ring is due.
+    fn wants_accent(self) -> bool {
+        self.focused || self.listening
+    }
+}
+
+/// The ring states that exist right now, keyed by the button's address.
+///
+/// Address-keyed like every other settings registry: `clear_settings_ring_states` empties it when the
+/// content hierarchy is replaced, before those views are released.
+static RING_STATES: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, RingState>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+/// Update one flag of a button's ring state, dropping the entry when neither state applies.
+fn update_ring_state(button: *mut AnyObject, update: impl FnOnce(&mut RingState)) {
+    if button.is_null() {
+        return;
+    }
+    let Ok(mut states) = RING_STATES.lock() else {
+        return;
+    };
+    let key = button as usize;
+    let state = states.entry(key).or_default();
+    update(state);
+    if !state.wants_accent() {
+        states.remove(&key);
+    }
+}
+
+/// Paint the ring from the merged state: accent while focused or listening, else the resting border.
+unsafe fn apply_ring_state(button: *mut AnyObject) {
+    if button.is_null() {
+        return;
+    }
+    let state = RING_STATES
+        .lock()
+        .ok()
+        .and_then(|states| states.get(&(button as usize)).copied())
+        .unwrap_or_default();
+    apply_inset_focus_ring(
+        button,
+        state.wants_accent(),
+        settings_palette().card_border,
+        1.0,
+    );
+}
+
+/// Mark a recorder button as LISTENING for its input, or clear the mark.
+///
+/// The accent ring is the design's contract for a control in an active state, so the recorder wears
+/// it while it waits for a chord or a mouse button: the button itself says it is live. Its text
+/// cannot carry that (a prompt inside the 110pt value box is truncated), and the row's caption
+/// already says what to press. Clearing the mark leaves only the focus ring, if the button still has
+/// it.
+pub(super) unsafe fn set_recorder_listening(button: *mut AnyObject, listening: bool) {
+    update_ring_state(button, |state| state.listening = listening);
+    apply_ring_state(button);
+}
+
+/// Drop every ring state before the settings views they name are released.
+pub(super) fn clear_settings_ring_states() {
+    if let Ok(mut states) = RING_STATES.lock() {
+        states.clear();
+    }
+}
+
 /// Shared NSTextField delegate: shows the inset accent ring while the field is being edited.
 extern "C" fn settings_text_field_focus_did_begin(
     _self: *mut AnyObject,
@@ -417,8 +497,10 @@ extern "C" fn html_action_button_become_first_responder(this: *mut AnyObject, _c
                 let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
                 let accepted = send(&mut sup, sel!(becomeFirstResponder));
                 if accepted.as_bool() {
-                    // Idle border is the 1pt card_border; focus swaps it for the 2pt accent ring.
-                    apply_inset_focus_ring(this, true, settings_palette().card_border, 1.0);
+                    // Idle border is the 1pt card_border; focus swaps it for the 2pt accent ring,
+                    // and a recorder that is also listening keeps it for whichever reason holds.
+                    update_ring_state(this, |state| state.focused = true);
+                    apply_ring_state(this);
                 }
                 accepted
             }
@@ -439,7 +521,9 @@ extern "C" fn html_action_button_resign_first_responder(this: *mut AnyObject, _c
             let send: F = std::mem::transmute(objc_msgSendSuper as *const ());
             let accepted = send(&mut sup, sel!(resignFirstResponder));
             if accepted.as_bool() {
-                apply_inset_focus_ring(this, false, settings_palette().card_border, 1.0);
+                // Focus is gone, but a recorder that is still listening keeps the ring.
+                update_ring_state(this, |state| state.focused = false);
+                apply_ring_state(this);
             }
             accepted
         },
@@ -3796,9 +3880,10 @@ pub(super) unsafe fn wrapped_caption_height(text: &str, width: f64) -> f64 {
 /// second line was clipped (the clipboard recorder's recording copy, measured 218.5pt in a 220pt
 /// frame). Asking the cell answers what will really be drawn.
 ///
-/// The result is snapped to whole lines of the design's caption grid, so a measured row keeps the
-/// same heights as a described captioned row (`18 + 3 + lines * 16 + 19`) rather than carrying the
-/// label's extra leading into the layout.
+/// It returns the height the CELL reports, not a count of lines times the design's 16pt caption
+/// step: the drawn line box is `FONT_SETTING_DESC * LINE_HEIGHT_SETTING_DESC_RATIO` (17.4pt) tall,
+/// and a two-line frame snapped to 2 * 16 = 32 clipped its second line. Described captioned rows
+/// size their copy the same way (the measured subtitle height), so the two agree.
 pub(super) unsafe fn caption_cell_height(text: &str, width: f64) -> f64 {
     if text.is_empty() {
         return 0.0;
@@ -3832,12 +3917,10 @@ pub(super) unsafe fn caption_cell_height(text: &str, width: f64) -> f64 {
         cellSizeForBounds: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width.max(1.0), 1.0e4))
     ];
     release_obj(label);
-    let line_h = crate::theme::line_height(
+    measured.height.max(crate::theme::line_height(
         crate::theme::FONT_SETTING_DESC,
         crate::theme::LINE_HEIGHT_SETTING_DESC_RATIO,
-    );
-    let lines = (measured.height / line_h).ceil().max(1.0);
-    lines * CAPTION_H
+    ))
 }
 
 /// The row height a `captioned` row needs for `caption` wrapped at `text_w`: the mock's
@@ -3848,7 +3931,8 @@ pub(super) unsafe fn captioned_row_height(caption: &str, text_w: f64) -> f64 {
 }
 
 /// The same rule for a caption height that was measured as the CELL will use it
-/// (`caption_cell_height`), for a page that draws its own captioned row.
+/// (`caption_cell_height`), for a page that draws its own captioned row. The measured height is
+/// used as-is, exactly like a described captioned row's measured subtitle height.
 pub(super) fn captioned_row_height_for(caption_h: f64) -> f64 {
     let stack = 18.0 + TITLE_CAPTION_GAP + caption_h.max(CAPTION_H);
     (stack + 19.0).max(crate::settings::components::SettingsLayout::SINGLE_LINE_ROW_H)
@@ -4380,6 +4464,30 @@ pub(super) unsafe fn scroll_page_to_top(scroll: *mut AnyObject) {
 
 #[cfg(test)]
 mod tests {
+    /// The accent ring is due for EITHER state, which is what keeps a focus change and a capture
+    /// from clearing each other's ring: two writers on one layer border cannot be independent.
+    #[test]
+    fn the_accent_ring_is_due_for_focus_or_listening() {
+        use super::RingState;
+        let none = RingState::default();
+        let focused = RingState {
+            focused: true,
+            listening: false,
+        };
+        let listening = RingState {
+            focused: false,
+            listening: true,
+        };
+        let both = RingState {
+            focused: true,
+            listening: true,
+        };
+        assert!(!none.wants_accent(), "resting");
+        assert!(focused.wants_accent(), "keyboard focus");
+        assert!(listening.wants_accent(), "a capture that is waiting");
+        assert!(both.wants_accent(), "both reasons at once");
+    }
+
     use crate::smoke_verdict::smoke_runner;
 
     /// A settings row can be retired from the page while its refresher still walks every known

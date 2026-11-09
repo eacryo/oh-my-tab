@@ -80,7 +80,9 @@ pub(super) use key_bindings::KeyBindingsHooks;
 use keystroke_display::keystroke_display_page_view;
 use mouse::mouse_page_view;
 pub(super) use mouse::MouseHooks;
-pub(crate) use smoke::{about_update_flow_smoke_runner, migrated_pages_smoke_runner};
+pub(crate) use smoke::{
+    about_update_flow_smoke_runner, caption_frame_fits_its_cell, migrated_pages_smoke_runner,
+};
 // Re-exported at the scope each item is VISIBLE at: `pub(super)` for the two `settings` reaches
 // (the page builder calls `render_page` and the settings root stores a `RenderedPage`), and
 // page_view scope for everything the page files and the renderer's own callers use. Re-exporting

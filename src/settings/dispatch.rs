@@ -133,6 +133,8 @@ pub(super) unsafe fn set_clipboard_shortcut_capture_state(
     // "请按下快捷键…按", and refused chords are reported in the shared bubble.
     let title = crate::mouse::shortcut::display_shortcut(current);
     set_control_title(ui.clipboard_shortcut, &title);
+    // The button says it is live with the accent ring: its text must keep showing the chord.
+    crate::settings::widgets::set_recorder_listening(ui.clipboard_shortcut, recording);
     if !ui.clipboard_shortcut_caption.is_null() {
         let caption = if recording {
             t("settings.desc_clipboard_shortcut_recording")
@@ -184,6 +186,9 @@ pub(crate) fn refresh_gesture_hotkey_control() {
             let _: () = msg_send![ui.gesture_trigger_button, setTitle: text];
             CFRelease(text as *const c_void);
         }
+        unsafe {
+            crate::settings::widgets::set_recorder_listening(ui.gesture_trigger_button, waiting)
+        };
         if !ui.gesture_hotkey_caption.is_null() {
             let caption = if waiting {
                 t("settings.desc_gestures_row_gesture_button_recording")

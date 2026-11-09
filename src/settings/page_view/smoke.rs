@@ -12,6 +12,38 @@ use super::*;
 /// A `SettingsUi` with no views behind it: the smoke runner builds pages on a detached
 /// document to check what the renderer places, and the bindings it writes there are
 /// discarded with it. Every field is empty, so a page hook writing one is harmless.
+/// Whether a page-drawn caption can hold what its OWN CELL will draw.
+///
+/// Read from the live label's cell (`cellSizeForBounds:`), never from the measuring helper the page
+/// used to size the row: a helper that under-measures computes the frame and the "needed" height
+/// from the same wrong number, so a check built on it passes straight over the clipped line it was
+/// written for. This is the assertion that fails when `caption_cell_height` starts snapping two
+/// lines to one.
+pub(crate) unsafe fn caption_frame_fits_its_cell(caption: *mut AnyObject) -> Result<(), String> {
+    if caption.is_null() {
+        return Err("the row owns no caption".to_string());
+    }
+    let frame: NSRect = msg_send![caption, frame];
+    let cell: *mut AnyObject = msg_send![caption, cell];
+    if cell.is_null() {
+        return Err("the caption has no cell".to_string());
+    }
+    let needed: NSSize = msg_send![
+        cell,
+        cellSizeForBounds: NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(frame.size.width.max(1.0), 1.0e4)
+        )
+    ];
+    if needed.height > frame.size.height + 0.5 {
+        return Err(format!(
+            "the caption needs {:.1}pt in a {:.1}pt-wide frame but the frame is {:.1}pt tall",
+            needed.height, frame.size.width, frame.size.height
+        ));
+    }
+    Ok(())
+}
+
 pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
     SettingsUi {
         permission_warning_label: std::ptr::null_mut(),
@@ -271,8 +303,20 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
                 .find(|control| matches!(&control.extra, RenderedExtra::GestureHotkey { .. }));
             // It owns its instruction caption and no inline readout: the mapping-conflict note is
             // said in the shared bubble, and the row's copy is what states how to record.
-            let caption_bound = hotkey_row
-                .is_some_and(|control| matches!(&control.extra, RenderedExtra::GestureHotkey { caption } if !caption.is_null()));
+            let caption_ptr = hotkey_row.and_then(|control| match control.extra {
+                RenderedExtra::GestureHotkey { caption } => Some(caption),
+                _ => None,
+            });
+            let caption_bound = caption_ptr.is_some_and(|caption| !caption.is_null());
+            // The caption's frame must hold what its own cell draws: the idle copy wraps to two
+            // lines at a narrow column, and a frame sized for one clipped the second one.
+            let caption_fits = caption_ptr
+                .map(|caption| caption_frame_fits_its_cell(caption))
+                .unwrap_or_else(|| Err("the hotkey row owns no caption".to_string()));
+            if let Err(error) = caption_fits {
+                log_info!("[smoke-migrated-pages] Gestures: {error}");
+                placed_ok = false;
+            }
             if !hotkey_row.is_some_and(|control| control.readout.is_null()) || !caption_bound {
                 log_info!(
                     "[smoke-migrated-pages] Gestures: the hotkey row drew an inline readout again"

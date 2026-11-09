@@ -302,6 +302,7 @@ unsafe fn draw_shortcut_row(
             shown: if recording { &waiting } else { &idle },
             states: &states,
         }),
+        recording,
         title,
         target,
         sel!(handleClipboardShortcutRecord:),
@@ -339,6 +340,9 @@ pub(super) unsafe fn draw_capture_row_with(
     row_h: f64,
     label_key: &str,
     caption: Option<CaptureCaption<'_>>,
+    // Whether the recorder is waiting for its input: the button wears the accent ring then, so the
+    // control the user pressed says it is live (its text has to keep showing the current value).
+    listening: bool,
     title: &str,
     target: *mut AnyObject,
     selector: Sel,
@@ -407,6 +411,7 @@ pub(super) unsafe fn draw_capture_row_with(
         selector,
         SettingsButtonRole::ControlField,
     );
+    crate::settings::widgets::set_recorder_listening(button, listening);
     let button_frame: NSRect = msg_send![button, frame];
     let _: () = msg_send![document, addSubview: button];
     canvas.place_pending_view(button, button_frame);
