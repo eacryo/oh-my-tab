@@ -326,6 +326,7 @@ pub(super) unsafe fn build_clipboard_page(
     let input = PageInput::capture();
     let mut hooks = ClipboardHooks {
         shortcut_title: crate::mouse::shortcut::display_shortcut(&input.config.clipboard.shortcut),
+        recording: crate::settings::mapping::clipboard_shortcut_recording(),
     };
     match build_page(
         ui,

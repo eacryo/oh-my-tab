@@ -24,12 +24,37 @@ use super::*;
 pub(super) const CLIPBOARD_SHORTCUT_ROW: &str = "shortcut_recorder";
 pub(super) const CLIPBOARD_MAX_ENTRIES_ROW: &str = "max_entries";
 
-/// The recorder row's height: a single-line row, like every other described row.
+/// The two copies the recorder row's caption can show: the instruction while idle, and the state
+/// while a capture waits for its chord. Both are measured when the row's height is decided.
+const CAPTURE_CAPTION_KEYS: [&str; 2] = [
+    "settings.desc_clipboard_shortcut",
+    "settings.desc_clipboard_shortcut_recording",
+];
+
+/// The recorder row's height: a captioned row's, MEASURED over both caption copies at the column a
+/// captioned row's copy wraps in.
 ///
-/// It was taller while the row carried an inline error line under the button. A refused chord is
-/// now reported in the shared bubble (the surface the Finder menu uses for its results), so the
-/// row itself stays one line and the gap under the button is gone.
-pub(super) const CLIPBOARD_SHORTCUT_ROW_H: f64 = SettingsLayout::SINGLE_LINE_ROW_H;
+/// A fixed height clipped the caption: the instruction does not fit one line of a 56pt row in every
+/// language, and the state that is not on screen when the page is built still has to fit. The row
+/// follows the tallest copy, the same way the Mouse page's device row follows the longest device
+/// caption.
+fn shortcut_row_height(_input: &PageInput, content_w: f64) -> f64 {
+    // Measuring a caption reads AppKit text metrics; the page build runs on the main thread.
+    unsafe { shortcut_row_height_inner(content_w) }
+}
+
+unsafe fn shortcut_row_height_inner(content_w: f64) -> f64 {
+    let caption_w =
+        crate::settings::page_view::layout::caption_column_width(SettingsLayout::new(content_w));
+    // The label's CELL decides where the copy wraps, so the row is sized from the cell: an
+    // attributed-string probe alone promised one line for a copy that wraps to two and clipped it.
+    let caption_h = CAPTURE_CAPTION_KEYS
+        .iter()
+        .map(|key| crate::settings::widgets::caption_cell_height(&t(key), caption_w))
+        .fold(0.0, f64::max);
+    crate::settings::widgets::captioned_row_height_for(caption_h)
+}
+
 /// The numeric entry-limit row's height: a described (single-line) row, as the old builder had it.
 fn clipboard_max_entries_h() -> f64 {
     SettingsLayout::SINGLE_LINE_ROW_H
@@ -68,9 +93,9 @@ pub(super) fn clipboard_page_view(input: &PageInput) -> PageView {
     // ---- History: the shortcut recorder stays page-built (a button with a capture state), then
     // where the picker opens ----
     w.card("settings.header_clipboard_options");
-    // The recorder is a button with a capture state machine and an inline error label: the page
-    // draws it itself, as the card's first row (the old builder's height: row_h + 22, at least 60).
-    w.extra_row(CLIPBOARD_SHORTCUT_ROW, CLIPBOARD_SHORTCUT_ROW_H);
+    // The recorder is a button with a capture state machine: the page draws it itself, and its row
+    // is measured because its caption is the instruction and wraps like any captioned row's copy.
+    w.extra_row_measured(CLIPBOARD_SHORTCUT_ROW, shortcut_row_height);
     let pin_labels = vec![
         t("settings.pin_follow_entry"),
         t("settings.pin_keep_position"),
@@ -195,6 +220,8 @@ pub(super) fn clipboard_page_view(input: &PageInput) -> PageView {
 /// inline builder put them. Their views are placed through the canvas like any described row's, so
 /// a re-flow moves them with their row.
 pub(crate) struct ClipboardHooks {
+    /// Whether a capture is running: the row's caption says so and its button asks for a chord.
+    pub(crate) recording: bool,
     /// The recorded chord, as the button shows it before any capture starts.
     pub(crate) shortcut_title: String,
 }
@@ -223,6 +250,7 @@ impl PageHooks for ClipboardHooks {
                     origin_y,
                     height,
                     &self.shortcut_title,
+                    self.recording,
                     target,
                 ))
             }
@@ -250,20 +278,29 @@ impl PageHooks for ClipboardHooks {
     }
 }
 
-/// The shortcut recorder row: the row label on the left and the chord button on the right, with
-/// the capture error label underneath the button (hidden until a capture reports one).
+/// The shortcut recorder row: the row label and its instruction caption on the left, and the chord
+/// button on the right.
 unsafe fn draw_shortcut_row(
     canvas: &mut PageCanvas,
     origin_y: f64,
     row_h: f64,
     title: &str,
+    recording: bool,
     target: *mut AnyObject,
 ) -> RenderedControl {
-    draw_capture_row(
+    // The row's caption carries both the instruction and the capture state: the 110pt button can
+    // only hold the chord, so "what this button does" and "a capture is waiting" are the row's copy.
+    let caption = if recording {
+        t("settings.desc_clipboard_shortcut_recording")
+    } else {
+        t("settings.desc_clipboard_shortcut")
+    };
+    draw_capture_row_with(
         canvas,
         origin_y,
         row_h,
         "settings.row_clipboard_shortcut",
+        Some(&caption),
         title,
         target,
         sel!(handleClipboardShortcutRecord:),
@@ -273,6 +310,9 @@ unsafe fn draw_shortcut_row(
 
 /// The shared shape of a "press a key/button to record it" row: the Gestures page's hotkey row is
 /// the same control with a different label, selector and identity, so the two cannot drift apart.
+///
+/// A caller with no caption of its own gets the single-line form (the label centred in the band),
+/// which is the shape the Gestures page has always had.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn draw_capture_row(
     canvas: &mut PageCanvas,
@@ -284,19 +324,46 @@ pub(super) unsafe fn draw_capture_row(
     selector: Sel,
     id: ControlId,
 ) -> RenderedControl {
-    draw_capture_row_with(
-        canvas, origin_y, row_h, label_key, title, target, selector, id,
-    )
+    let mut row = draw_capture_row_with(
+        canvas, origin_y, row_h, label_key, None, title, target, selector, id,
+    );
+    // The Gestures row's overlap note is THIS page's readout: it explains why a button mapping on
+    // the same button will not run while it is the gesture hotkey. It lives here rather than in the
+    // shared row because the Clipboard recorder's refusals go to the shared toast, and a row that
+    // owns a label it never shows is a label that silently disappears when the code moves.
+    row.readout = draw_capture_readout(canvas, origin_y);
+    row
 }
 
-/// The same row, with the binding branch the caller needs. Callers that bind their own slot ask
-/// for it here; the row's drawing is one implementation so the two pages cannot drift apart.
+/// The hidden readout a capture row can report into, created under the row's copy.
+unsafe fn draw_capture_readout(canvas: &mut PageCanvas, origin_y: f64) -> *mut AnyObject {
+    let document = canvas.document();
+    let layout = canvas.layout();
+    let readout = make_value_label(
+        layout.label_x,
+        origin_y + 2.0,
+        layout.control_x + layout.control_w - layout.label_x - 12.0,
+        18.0,
+        "",
+    );
+    apply_settings_text_role(readout, SettingsTextRole::Destructive);
+    let _: () = msg_send![readout, setHidden: true];
+    let readout_frame: NSRect = msg_send![readout, frame];
+    let _: () = msg_send![document, addSubview: readout];
+    canvas.place_pending_view(readout, readout_frame);
+    release_obj(readout);
+    readout
+}
+
+/// The same row, with the caption the caller needs. `caption` is the row's instruction (or its
+/// recording state), translated by the caller; `None` keeps the plain single-line row.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn draw_capture_row_with(
     canvas: &mut PageCanvas,
     origin_y: f64,
     row_h: f64,
     label_key: &str,
+    caption: Option<&str>,
     title: &str,
     target: *mut AnyObject,
     selector: Sel,
@@ -305,23 +372,61 @@ pub(super) unsafe fn draw_capture_row_with(
     let document = canvas.document();
     let layout = canvas.layout();
     canvas.set_pending_advance(AdvanceState::Absolute);
-    let label = page_widgets::plain_row_label(
-        document,
-        layout.label_x,
-        origin_y,
-        220.0,
-        row_h,
-        &t(label_key),
-    );
-    // The label was built with the row's band as its height; `plain_row_label` insets that by 8,
-    // so the frame would be 52pt tall and its glyphs would read ~5pt above the row's centre. The
-    // inline builder centred it in the band (`SettingsRow::center_label`), so the frame is fitted
-    // to the measured cell height and centred -- the same call the described rows make.
-    crate::settings::components::SettingsRow::center_label(label, origin_y, row_h);
-    let label_frame: NSRect = msg_send![label, frame];
-    canvas.place_pending_view(label, label_frame);
+    // A captioned row's copy is the design system's stack: the title's line above the caption's,
+    // centred as ONE block in the band, and the button is centred in the same band. Both frames take
+    // a captioned row's copy column, and the caption's height is the TALLEST copy any capture state
+    // can show -- the same measurement the row's height was declared from. Sizing the frame for the
+    // state that happens to be on screen would clip the other one: a state change only rewrites the
+    // string, so the frame has to have room for both from the start.
+    let (label, caption_label) = match caption {
+        Some(caption) => {
+            let copy_w = crate::settings::page_view::layout::caption_column_width(layout);
+            let metrics = crate::settings::page_view::layout::MeasuredText::base();
+            let caption_h = CAPTURE_CAPTION_KEYS
+                .iter()
+                .map(|key| crate::settings::widgets::caption_cell_height(&t(key), copy_w))
+                .fold(metrics.caption_one_line_h, f64::max);
+            let stack_h = metrics.title_h + metrics.title_caption_gap + caption_h;
+            let stack_y = origin_y + (row_h - stack_h) / 2.0;
+            let (label, caption_label) =
+                page_widgets::stacked_row_labels(document, &t(label_key), caption);
+            let label_frame = NSRect::new(
+                NSPoint::new(
+                    layout.label_x,
+                    stack_y + caption_h + metrics.title_caption_gap,
+                ),
+                NSSize::new(copy_w, metrics.title_h),
+            );
+            let caption_frame = NSRect::new(
+                NSPoint::new(layout.label_x, stack_y),
+                NSSize::new(copy_w, caption_h),
+            );
+            let _: () = msg_send![label, setFrame: label_frame];
+            canvas.place_pending_view(label, label_frame);
+            let _: () = msg_send![caption_label, setFrame: caption_frame];
+            canvas.place_pending_view(caption_label, caption_frame);
+            (label, caption_label)
+        }
+        None => {
+            let label = page_widgets::plain_row_label(
+                document,
+                layout.label_x,
+                origin_y,
+                220.0,
+                row_h,
+                &t(label_key),
+            );
+            // `plain_row_label` insets the band by 8, so the frame has to be fitted to the measured
+            // cell height and centred: the same call a single-line described row makes.
+            crate::settings::components::SettingsRow::center_label(label, origin_y, row_h);
+            let label_frame: NSRect = msg_send![label, frame];
+            canvas.place_pending_view(label, label_frame);
+            (label, std::ptr::null_mut())
+        }
+    };
     let button = SettingsControl::button(
         layout.control_x + layout.control_w - ROW_ACTION_BTN_W,
+        // Centred in the ROW's band, like every described captioned row's control.
         origin_y + (row_h - ROW_ACTION_BTN_H) / 2.0,
         ROW_ACTION_BTN_W,
         ROW_ACTION_BTN_H,
@@ -338,30 +443,22 @@ pub(super) unsafe fn draw_capture_row_with(
     let tooltip = make_nsstring(&t(label_key));
     let _: () = msg_send![button, setToolTip: tooltip];
     release_obj(tooltip);
-    // The inline capture error: a value label under the button, hidden until a capture reports
-    // one. It is this row's READOUT, which is how the page finds it again.
-    let error = make_value_label(
-        layout.label_x,
-        origin_y + 2.0,
-        layout.control_x + layout.control_w - layout.label_x - 12.0,
-        18.0,
-        "",
-    );
-    apply_settings_text_role(error, SettingsTextRole::Destructive);
-    let _: () = msg_send![error, setHidden: true];
-    let error_frame: NSRect = msg_send![error, frame];
-    let _: () = msg_send![document, addSubview: error];
-    canvas.place_pending_view(error, error_frame);
-    release_obj(error);
     RenderedControl {
         id,
         kind: ControlKind::Button {
             title_key: "settings.btn_open",
         },
         control: button,
-        readout: error,
+        readout: std::ptr::null_mut(),
         action: std::ptr::null_mut(),
-        extra: RenderedExtra::Shortcut { row_height: row_h },
+        // The row's height and the caption that states its capture state. The capture machine writes
+        // the caption's copy and NOTHING else: the page drew the button in the row it belongs to, and
+        // the canvas -- or a search result row, which borrows this row's views -- owns where the row
+        // sits. A frame written from here would be in neither coordinate space.
+        extra: RenderedExtra::Shortcut {
+            row_height: row_h,
+            caption: caption_label,
+        },
     }
 }
 
@@ -604,6 +701,45 @@ mod tests {
             None,
             crate::theme::ThemeInput::current(),
         )
+    }
+
+    #[test]
+    fn the_shortcut_row_measures_its_caption() {
+        // The recorder's row carries a caption, and its copy wraps: the height has to be the
+        // measured captioned-row height for both capture copies, not the single-line constant. A
+        // fixed height clipped the instruction in any language where it did not fit one line.
+        let view = clipboard_page_view(&input());
+        let row = view
+            .extra_rows
+            .iter()
+            .find(|row| row.key == CLIPBOARD_SHORTCUT_ROW)
+            .expect("the page declares the recorder row");
+        assert!(
+            matches!(row.height, RowHeight::Measured(_)),
+            "the recorder's row height must be measured from its caption"
+        );
+        // Both states are measured, so neither copy can be the one that overflows.
+        assert_eq!(CAPTURE_CAPTION_KEYS.len(), 2);
+    }
+
+    #[test]
+    fn the_capture_state_is_stated_in_the_row_caption() {
+        // The 110pt button can only hold the chord, so the row's caption is where the instruction
+        // and the recording state live: a missing key would ship the raw key as the row's copy.
+        let idle = t("settings.desc_clipboard_shortcut");
+        let recording = t("settings.desc_clipboard_shortcut_recording");
+        assert_ne!(
+            idle, "settings.desc_clipboard_shortcut",
+            "the idle key is missing"
+        );
+        assert_ne!(
+            recording, "settings.desc_clipboard_shortcut_recording",
+            "the recording key is missing"
+        );
+        assert_ne!(
+            idle, recording,
+            "the two capture states must not read the same, or pressing the button says nothing"
+        );
     }
 
     #[test]

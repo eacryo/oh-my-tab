@@ -113,52 +113,37 @@ unsafe fn control_field_of(sender: *mut AnyObject) -> Option<ControlField> {
         }
     })
 }
+/// Restate the recorder row's capture state: the chord on the button, the instruction -- or the
+/// fact that a capture is waiting -- in the row's caption.
+///
+/// It writes COPY ONLY. The page drew the button centred in the row it belongs to, and the row's
+/// position belongs to the canvas (a re-flow moves it) or to a search result row (which borrows the
+/// row's views into its own coordinate space), so a frame written from here is correct in neither.
+/// Deriving the row's middle from a label frame instead -- which this used to do -- was what put the
+/// button 9.5pt above its row once the row grew a caption: a captioned row's title is not its centre.
 pub(super) unsafe fn set_clipboard_shortcut_capture_state(
     ui: &SettingsUi,
     current: &str,
     recording: bool,
-    error: Option<&str>,
 ) {
     if ui.clipboard_shortcut.is_null() {
         return;
     }
-    let title = if recording {
-        t("settings.clipboard_shortcut_record_prompt")
-    } else {
-        crate::mouse::shortcut::display_shortcut(current)
-    };
+    // The BUTTON shows the shortcut, always: a prompt inside the 110pt button was cut to
+    // "请按下快捷键…按", and refused chords are reported in the shared bubble.
+    let title = crate::mouse::shortcut::display_shortcut(current);
     set_control_title(ui.clipboard_shortcut, &title);
-    let mut button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
-
-    let Some(row_label) = SettingsRow::label_for(ui.clipboard_shortcut) else {
-        return;
-    };
-    let row_label_frame: NSRect = msg_send![row_label, frame];
-    // The LABEL's centre is not the ROW's centre: `center_label` adds
-    // `text_field_line_height_correction` so the glyphs sit optically centred, and that correction
-    // (1.30pt here) moves the label's frame away from the row's midline. The row's midline is the
-    // label's baseline position plus the correction the row itself applied, i.e. the uncorrected
-    // centre -- which is what a control centred in the row must use. Using the corrected centre
-    // pushed the button 1.30pt off and made `--smoke-settings-layout` fail for a correct panel.
-    let correction = crate::ffi::text_field_line_height_correction(row_label);
-    let row_center = row_label_frame.origin.y + row_label_frame.size.height / 2.0 - correction;
-    if error.is_some() && !ui.clipboard_shortcut_error.is_null() {
-        let mut error_frame: NSRect = msg_send![ui.clipboard_shortcut_error, frame];
-        let row_origin = row_center - ui.clipboard_shortcut_row_height / 2.0;
-        error_frame.origin.y = row_origin + 2.0;
-        let _: () = msg_send![ui.clipboard_shortcut_error, setFrame: error_frame];
-        button_frame.origin.y = error_frame.origin.y + error_frame.size.height + 2.0;
-    } else {
-        button_frame.origin.y = row_center - button_frame.size.height / 2.0;
-    }
-    let _: () = msg_send![ui.clipboard_shortcut, setFrame: button_frame];
-    if !ui.clipboard_shortcut_error.is_null() {
-        set_field(ui.clipboard_shortcut_error, error.unwrap_or_default());
-        let _: () = msg_send![ui.clipboard_shortcut_error, setHidden: error.is_none()];
+    if !ui.clipboard_shortcut_caption.is_null() {
+        let caption = if recording {
+            t("settings.desc_clipboard_shortcut_recording")
+        } else {
+            t("settings.desc_clipboard_shortcut")
+        };
+        set_field(ui.clipboard_shortcut_caption, caption);
     }
 }
 
-pub(super) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option<&str>) {
+pub(super) fn set_clipboard_shortcut_recording_ui(recording: bool) {
     let current = CONFIG.read().unwrap().clipboard.shortcut.clone();
     with_settings_ui(|slot| {
         let Some(ui) = slot.as_ref() else {
@@ -166,7 +151,7 @@ pub(super) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option
         };
         let visible: bool = unsafe { msg_send![ui.window, isVisible] };
         if visible {
-            unsafe { set_clipboard_shortcut_capture_state(ui, &current, recording, error) };
+            unsafe { set_clipboard_shortcut_capture_state(ui, &current, recording) };
         }
     });
 }
@@ -204,7 +189,7 @@ pub(crate) fn refresh_gesture_hotkey_control() {
 pub(super) fn refresh_clipboard_shortcut_record_control() {
     let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
         && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
-    set_clipboard_shortcut_recording_ui(recording, None);
+    set_clipboard_shortcut_recording_ui(recording);
 }
 
 /// Re-read the "separate clear all" switch from CONFIG. A config reload (file edit, defaults
@@ -1886,7 +1871,7 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
 
             let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
                 && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
-            set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording, None);
+            set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording);
 
             // Not mouse-specific: the display-mode pair and the clipboard-delete rows need this on every
             // config change, whatever page is on screen.
@@ -1960,7 +1945,7 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             // rows keep their writes: the recorded chord and the numeric entry limit.
             let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
                 && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
-            set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording, None);
+            set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording);
             set_field(
                 u.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),

@@ -35,9 +35,13 @@ pub(super) enum RenderedExtra {
     /// Nothing beyond the identity (every described row).
     #[default]
     None,
-    /// The clipboard shortcut recorder: its row height follows the recorded chord, and the capture
-    /// state machine reads it back.
-    Shortcut { row_height: f64 },
+    /// The clipboard shortcut recorder: its row height, and the caption that states the capture
+    /// instruction and its recording state. The capture machine writes that caption's copy and
+    /// nothing else -- the page owns the control's frame.
+    Shortcut {
+        row_height: f64,
+        caption: *mut AnyObject,
+    },
     /// The Gestures page's hotkey recorder. A SEPARATE variant on purpose: two page-drawn
     /// recorders sharing one binding branch overwrote each other's slot, and the refresh then wrote
     /// the "press a key" title onto a button nobody could see.

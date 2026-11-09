@@ -805,6 +805,13 @@ pub(crate) extern "C" fn handle_mapping_edit(_self: *mut c_void, _cmd: Sel, send
     });
 }
 
+/// Whether a clipboard-shortcut capture is waiting for its chord. The Clipboard page reads it to
+/// say so under the row, instead of the button spelling the instruction out in its 110pt box.
+pub(crate) fn clipboard_shortcut_recording() -> bool {
+    *REC_STAGE.lock().unwrap() != RecStage::Idle
+        && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut
+}
+
 /// Start the recording thread, rolling the session back if the thread cannot be created.
 ///
 /// Why this exists: the callers set `REC_STAGE`, `RECORDING` and the panel button BEFORE spawning,
@@ -856,7 +863,7 @@ fn roll_back_recording_session() {
         }
         RecMode::ClipboardShortcut => {
             // The clipboard row shows a recording prompt; put it back to idle.
-            super::set_clipboard_shortcut_recording_ui(false, None);
+            super::set_clipboard_shortcut_recording_ui(false);
         }
         // The gesture capture disables nothing on the page; the page re-reads its own state.
         RecMode::GestureTrigger => {}
@@ -1428,7 +1435,7 @@ pub(crate) extern "C" fn handle_recording_finished(
                 // The refusal is said in the shared bubble, the way the Finder menu reports its copy
                 // and hash results. The row itself stays one line: a recording that refused keeps
                 // the old chord, and the bubble is what says why it did not change.
-                super::set_clipboard_shortcut_recording_ui(false, None);
+                super::set_clipboard_shortcut_recording_ui(false);
                 crate::ui::toast::show_refused(&t("errors.shortcut_key_unbindable"));
             }
             RecMode::ClipboardShortcut => {
@@ -1462,7 +1469,7 @@ pub(crate) extern "C" fn handle_recording_finished(
                 // bubble (the same surface the Finder menu uses for its results), because the button
                 // keeps the old shortcut and would otherwise look ignored. An applied chord says
                 // nothing extra -- the button's new text is the result.
-                super::set_clipboard_shortcut_recording_ui(false, None);
+                super::set_clipboard_shortcut_recording_ui(false);
                 if let Some(message) = error.as_deref() {
                     crate::ui::toast::show_refused(message);
                 }
@@ -1487,7 +1494,7 @@ pub(crate) extern "C" fn handle_recording_cancelled(
 ) {
     callback_guard::void("handle_recording_cancelled", || {
         if *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut {
-            super::set_clipboard_shortcut_recording_ui(false, None);
+            super::set_clipboard_shortcut_recording_ui(false);
         }
         // Unconditional: the caller may already have reset the mode (that is exactly what the
         // background cancellation path does), and `recording_ended` is idempotent -- it clears a draft
@@ -1524,7 +1531,7 @@ pub(crate) extern "C" fn handle_clipboard_shortcut_record(
         *REC_STAGE.lock().unwrap() = RecStage::WaitingCombo;
         REC_CANCEL.store(false, std::sync::atomic::Ordering::SeqCst);
         crate::mouse::event_tap::RECORDING.store(true, Ordering::Relaxed);
-        super::set_clipboard_shortcut_recording_ui(true, None);
+        super::set_clipboard_shortcut_recording_ui(true);
         log_debug!("[settings] clipboard shortcut recording started");
         spawn_recording_thread();
     });

@@ -97,7 +97,7 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         mapping_rows: Vec::new(),
         clipboard_enabled: std::ptr::null_mut(),
         clipboard_shortcut: std::ptr::null_mut(),
-        clipboard_shortcut_error: std::ptr::null_mut(),
+        clipboard_shortcut_caption: std::ptr::null_mut(),
         clipboard_shortcut_row_height: 0.0,
         clipboard_pin_follow_row_height: 0.0,
         clipboard_row_gap: 0.0,
@@ -225,7 +225,17 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
         // detached document. This is what catches a control that never entered the view tree and a
         // placement that ignored the row's origin.
         let mut ui = headless_settings_ui();
-        let mut hooks = page_hooks(page);
+        // The Gestures page's hotkey row is driven with its overlap note ON: the note is the only
+        // copy that proves the row still owns a readout, and it is the surface a user needs when a
+        // button mapping silently does not run.
+        let mut hooks: Box<dyn PageHooks> = match page {
+            SettingsPageId::Gestures => Box::new(GesturesHooks {
+                trigger_title: t("settings.gestures_row_gesture_button"),
+                waiting: false,
+                mapping_note: true,
+            }),
+            _ => page_hooks(page),
+        };
         let rendered = match render_page(
             &mut canvas,
             std::ptr::null_mut(),
@@ -260,6 +270,30 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             );
         }
         let mut placed_ok = scene_holds_placements(&canvas, &view, &layout);
+        if page == SettingsPageId::Gestures {
+            // The hotkey row must still be able to say why its own button mapping will not run: the
+            // note is written into the row's READOUT, so a null readout drops it without an error.
+            let note_row = rendered
+                .controls
+                .iter()
+                .find(|control| matches!(&control.extra, RenderedExtra::GestureHotkey));
+            let note_ok = note_row.is_some_and(|control| {
+                if control.readout.is_null() {
+                    return false;
+                }
+                let text: *mut AnyObject = msg_send![control.readout, stringValue];
+                let hidden: bool = msg_send![control.readout, isHidden];
+                !hidden
+                    && crate::ffi::nsstring_to_rust(text)
+                        == t("settings.gestures_trigger_mapping_note")
+            });
+            if !note_ok {
+                log_info!(
+                    "[smoke-migrated-pages] Gestures: the hotkey row lost its mapping-conflict note"
+                );
+                placed_ok = false;
+            }
+        }
         // Every page-drawn row placed at least one view, inside the row the layout reserved.
         for (index, spec) in view.extra_rows.iter().enumerate() {
             let Some(row) = canvas_row_of_drawn_row(&layout, index) else {

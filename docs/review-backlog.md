@@ -650,3 +650,8 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 - **建窗时每页各采一次系统状态，未测量、可合并为一次**（2026-11-05，外部审查提出，**延后**——缺开窗延迟的实测证据）。建窗时八个页面各自调用 `PageInput::capture()`，每次都会查 Finder 扩展状态与旧版权限迁移标记；它们之外建窗路径上还有 `selected_page_warning()` 与横幅文案各查一次 `needs_permission_migration_copy()`，合计约十次。其中 `needs_permission_migration_copy()` **并不是零成本**：它在版本短路之前就要先读一次 bundle 版本号。
   **正确做法是建窗入口采一次、八页共享**，不是按页面收窄。收窄既不必要也不解决问题：只有 General 设置 `view.banner`，而 `layout_rows` 里 `banner_h` 只在 `view.banner` 为 `Some` 时才有高度，Clipboard 页的横幅是用窗口层**换文案**复用 General 建好的那一个实例（见 `warning_for_page`），因此收窄到「实际使用这些状态的页面」并不能省下什么，而采一次共享还能顺带保证**同一次建窗内采样一致**——现在八次各自采样，理论上建窗过程中状态变化会让前后几页看到不同事实。
   **触发条件：** 有开窗延迟的实测证据，或再次改动 `PageInput::capture()` 时一并做。
+
+- **共享 caption 探针比实际绘制的标签窄约 6pt，落在该差值带内的文案会被裁掉第二行**（2026-11-09，剪贴板历史快捷键行审查 R3 发现同类机制，MEDIUM——潜伏的同类缺陷，**延后**）。`settings::widgets::wrapped_caption_height` 用 `NSAttributedString.boundingRect` 探测，把传入宽度当作可用宽度；而真正绘制的字幕是 `NSTextField`，其 cell 会预留水平内边距，因此**比探针早约 6pt 换行**。实测（`swift` 直接建同款标签）：`正在录制…按下快捷键，按 Escape 取消。` 自然宽 218.53pt，探针在 220pt 下报一行，真正的 cell 要到 ≥224pt 才保持一行（内边距约 5.5pt）。于是自然宽落在 `(列宽-6, 列宽]` 的描述行字幕会被按一行排（行高与文本框都只给一行），却在标签里折成两行而**第二行被裁**。
+  本次只修了剪贴板历史快捷键这一行：它改用 `widgets::caption_cell_height`（直接问 cell），并顺带把两种状态的中文文案缩短到留有裕量；**所有描述型 captioned 行仍在用旧探针**。
+  **延后的原因：** 把探针改成按 cell 测量会改变所有页面里落在该差值带内的行高（这是修，不是回归，但影响面跨页且需要逐页视觉证据），本次改动无法产出 M2 证据；且这是既有潜伏缺陷，不是本次改动引入的。
+  **重新审视的触发条件：** 下一次改动 captioned 行测量/字号刻度、新增语言、或收到「某页字幕被裁」的报告时，把 `wrapped_caption_height`（或渲染器的行高路径）统一改为 cell 测量，并重跑 `--smoke-settings-layout` 与逐页截图。

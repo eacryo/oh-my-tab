@@ -68,12 +68,24 @@ pub(in crate::settings) struct MeasuredText {
 /// A row therefore states which block it takes (\`PageRowSpec::wide_caption\`) instead of the layout
 /// guessing from the control: guessing gave every switch the wide block and wrapped the clipboard
 /// page's three-line warnings onto two.
+/// The width a captioned row's copy takes before the control column: the column every captioned
+/// row's caption wraps in.
+///
+/// A page that draws a captioned row itself states its copy in the same column, so the page-drawn
+/// and the described captions cannot wrap at different widths. Derive it here, from the layout,
+/// instead of writing the expression a second time.
+pub(in crate::settings) fn caption_column_width(layout: SettingsLayout) -> f64 {
+    (layout.control_x - layout.label_x - super::SETTINGS_CONTROL_LABEL_GAP)
+        .max(layout.label_w)
+        .max(1.0)
+}
+
 pub(in crate::settings) fn captioned_text_width(
     layout: SettingsLayout,
     content_w: f64,
     row: &RowSpec,
 ) -> f64 {
-    let narrow = (layout.control_x - layout.label_x - super::SETTINGS_CONTROL_LABEL_GAP).max(1.0);
+    let narrow = caption_column_width(layout);
     let width = if row.wide_caption {
         (content_w - layout.label_x * 2.0 - CAPTION_CONTROL_RESERVE).max(narrow)
     } else {

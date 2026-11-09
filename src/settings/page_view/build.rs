@@ -254,6 +254,7 @@ pub(super) unsafe fn page_hooks(page: SettingsPageId) -> Box<dyn PageHooks> {
         }),
         SettingsPageId::Clipboard => Box::new(ClipboardHooks {
             shortcut_title: String::new(),
+            recording: false,
         }),
         SettingsPageId::KeyBindings => Box::new(KeyBindingsHooks::default()),
         SettingsPageId::FinderMenu => Box::new(FinderMenuHooks {}),

@@ -156,9 +156,12 @@ pub(in crate::settings) unsafe fn bind_page_controls(ui: &mut SettingsUi, render
         // never reach.
         match &control.extra {
             RenderedExtra::None => {}
-            RenderedExtra::Shortcut { row_height } => {
+            RenderedExtra::Shortcut {
+                row_height,
+                caption,
+            } => {
                 ui.clipboard_shortcut = control.control;
-                ui.clipboard_shortcut_error = control.readout;
+                ui.clipboard_shortcut_caption = *caption;
                 ui.clipboard_shortcut_row_height = *row_height;
             }
             // The Gestures page's hotkey row has its own slot: sharing the clipboard's is what made

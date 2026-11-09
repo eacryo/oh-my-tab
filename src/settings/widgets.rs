@@ -3787,11 +3787,70 @@ pub(super) unsafe fn wrapped_caption_height(text: &str, width: f64) -> f64 {
     laid_out.size.height
 }
 
+/// The height a caption label's CELL will use for `text` at `width`, on the design's caption grid.
+///
+/// `wrapped_caption_height` probes the attributed string, which reports the width it is handed as
+/// usable; the label the renderer actually draws is an `NSTextField`, and its cell reserves a
+/// horizontal inset, so it wraps a few points earlier. A copy whose natural width lands in that gap
+/// measured as one line and drew as TWO: the row and the frame were sized for one line and the
+/// second line was clipped (the clipboard recorder's recording copy, measured 218.5pt in a 220pt
+/// frame). Asking the cell answers what will really be drawn.
+///
+/// The result is snapped to whole lines of the design's caption grid, so a measured row keeps the
+/// same heights as a described captioned row (`18 + 3 + lines * 16 + 19`) rather than carrying the
+/// label's extra leading into the layout.
+pub(super) unsafe fn caption_cell_height(text: &str, width: f64) -> f64 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let label: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(width.max(1.0), 1.0)
+    )];
+    set_field(label, text);
+    let _: () = msg_send![label, setBezeled: false];
+    let _: () = msg_send![label, setDrawsBackground: false];
+    let _: () = msg_send![label, setEditable: false];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setUsesSingleLineMode: false];
+    let _: () = msg_send![label, setLineBreakMode: 0isize]; // NSLineBreakByWordWrapping
+    let font: *mut AnyObject =
+        msg_send![class!(NSFont), systemFontOfSize: crate::theme::FONT_SETTING_DESC];
+    let _: () = msg_send![label, setFont: font];
+    // The line height is what the drawn caption carries, and it moves the measured wrap.
+    crate::ffi::set_text_field_line_height(
+        label,
+        crate::theme::line_height(
+            crate::theme::FONT_SETTING_DESC,
+            crate::theme::LINE_HEIGHT_SETTING_DESC_RATIO,
+        ),
+    );
+    let cell: *mut AnyObject = msg_send![label, cell];
+    let measured: NSSize = msg_send![
+        cell,
+        cellSizeForBounds: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width.max(1.0), 1.0e4))
+    ];
+    release_obj(label);
+    let line_h = crate::theme::line_height(
+        crate::theme::FONT_SETTING_DESC,
+        crate::theme::LINE_HEIGHT_SETTING_DESC_RATIO,
+    );
+    let lines = (measured.height / line_h).ceil().max(1.0);
+    lines * CAPTION_H
+}
+
 /// The row height a `captioned` row needs for `caption` wrapped at `text_w`: the mock's
 /// `.setting-row` is `min-height: 56px`, so the row grows rather than clipping the
 /// description. The 19pt padding keeps the 56pt one-line row unchanged (18+3+16+19 = 56).
 pub(super) unsafe fn captioned_row_height(caption: &str, text_w: f64) -> f64 {
-    let stack = 18.0 + TITLE_CAPTION_GAP + wrapped_caption_height(caption, text_w).max(CAPTION_H);
+    captioned_row_height_for(wrapped_caption_height(caption, text_w))
+}
+
+/// The same rule for a caption height that was measured as the CELL will use it
+/// (`caption_cell_height`), for a page that draws its own captioned row.
+pub(super) fn captioned_row_height_for(caption_h: f64) -> f64 {
+    let stack = 18.0 + TITLE_CAPTION_GAP + caption_h.max(CAPTION_H);
     (stack + 19.0).max(crate::settings::components::SettingsLayout::SINGLE_LINE_ROW_H)
 }
 

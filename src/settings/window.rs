@@ -2414,38 +2414,45 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         let clipboard_shortcut_layout_ok = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             if ui.clipboard_shortcut.is_null()
-                || ui.clipboard_shortcut_error.is_null()
+                || ui.clipboard_shortcut_caption.is_null()
                 || ui.clipboard_pin_follow.is_null()
             {
                 return Some(false);
             }
             let button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
             let pin_frame: NSRect = msg_send![ui.clipboard_pin_follow, frame];
-            let error_hidden: bool = msg_send![ui.clipboard_shortcut_error, isHidden];
             let button_is_native: bool =
                 msg_send![ui.clipboard_shortcut, isKindOfClass: class!(NSButton)];
-            let button_center = button_frame.origin.y + button_frame.size.height / 2.0;
-            let button_label = SettingsRow::label_for(ui.clipboard_shortcut)?;
-            let label_frame: NSRect = msg_send![button_label, frame];
-            let label_center = label_frame.origin.y + label_frame.size.height / 2.0;
+            // The recorder's row is CAPTIONED, so its band -- not its title -- is what the control
+            // has to share a middle with: the title's line sits above the band's centre by design.
+            // Centring the button on `SettingsRow::label_for` is what put it 9.5pt high once the row
+            // grew a caption, so the assertion is made against the described row BELOW it, whose
+            // control the shared layout centred: an equal split of the two heights plus the gap can
+            // only hold when both controls are centred in their own band.
             let controls_center_gap = ((button_frame.origin.y + button_frame.size.height / 2.0)
                 - (pin_frame.origin.y + pin_frame.size.height / 2.0))
                 .abs();
             let expected_center_gap =
                 (ui.clipboard_shortcut_row_height + ui.clipboard_pin_follow_row_height) / 2.0
                     + ui.clipboard_row_gap;
-            let default_layout_ok = button_is_native
+            let layout_ok = button_is_native
                 && (button_frame.size.width - ROW_ACTION_BTN_W).abs() <= 0.5
                 && (button_frame.size.height - ROW_ACTION_BTN_H).abs() <= 0.5
-                && error_hidden
-                // The label frame carries `text_field_line_height_correction`, so its middle sits
-                // 1.3pt off the row middle by design: the GLYPHS are centred, not the box. Comparing a
-                // correctly-centred control against that corrected middle demands it be wrong.
-                && (button_center - label_center
-                    + crate::ffi::text_field_line_height_correction(button_label))
-                    .abs()
-                    <= 1.0
                 && (controls_center_gap - expected_center_gap).abs() <= 1.0;
+
+            // The caption is the row's instruction, and it wraps: its frame has to be the measured
+            // copy height, not one line. A caption measured into the label column instead of the
+            // captioned one wraps further and its last line is cut off inside a fixed frame.
+            let caption_frame: NSRect = msg_send![ui.clipboard_shortcut_caption, frame];
+            let caption_field: *mut AnyObject =
+                msg_send![ui.clipboard_shortcut_caption, stringValue];
+            let caption_value = crate::ffi::nsstring_to_rust(caption_field);
+            let caption_needs = crate::settings::widgets::caption_cell_height(
+                &caption_value,
+                caption_frame.size.width,
+            );
+            let caption_fits =
+                caption_frame.size.width > 0.0 && caption_needs <= caption_frame.size.height + 0.5;
 
             let current_shortcut = crate::config::CONFIG
                 .read()
@@ -2453,20 +2460,47 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
                 .clipboard
                 .shortcut
                 .clone();
-            dispatch::set_clipboard_shortcut_capture_state(
-                ui,
-                &current_shortcut,
-                false,
-                Some("layout smoke"),
+            // The caption states the capture instruction and its recording state. A capture that
+            // only changed the caption's copy would still pass a geometry check, so read it back:
+            // pressing the button must SAY it is recording, and the button must keep showing the
+            // chord (the row's copy owns the instruction, the button owns the value). The button must
+            // also not MOVE: its frame belongs to the page and the canvas, so a state change that
+            // writes it lands in the wrong coordinate space.
+            let idle_caption = t("settings.desc_clipboard_shortcut");
+            let recording_caption = t("settings.desc_clipboard_shortcut_recording");
+            let caption_text = || -> String {
+                let field: *mut AnyObject = msg_send![ui.clipboard_shortcut_caption, stringValue];
+                crate::ffi::nsstring_to_rust(field)
+            };
+            let same_frame = |a: NSRect, b: NSRect| -> bool {
+                (a.origin.x - b.origin.x).abs() <= 0.25
+                    && (a.origin.y - b.origin.y).abs() <= 0.25
+                    && (a.size.width - b.size.width).abs() <= 0.25
+                    && (a.size.height - b.size.height).abs() <= 0.25
+            };
+            let chord = crate::mouse::shortcut::display_shortcut(&current_shortcut);
+            let idle_copy_ok = caption_text() == idle_caption && caption_fits;
+            dispatch::set_clipboard_shortcut_capture_state(ui, &current_shortcut, true);
+            let recording_button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
+            // The frame is sized for the TALLEST copy either state can show, so the state that was
+            // not on screen when the page was built must fit it too.
+            let recording_caption_frame: NSRect = msg_send![ui.clipboard_shortcut_caption, frame];
+            let recording_needs = crate::settings::widgets::caption_cell_height(
+                &caption_text(),
+                recording_caption_frame.size.width,
             );
-            let error_button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
-            let error_frame: NSRect = msg_send![ui.clipboard_shortcut_error, frame];
-            let error_hidden: bool = msg_send![ui.clipboard_shortcut_error, isHidden];
-            let error_layout_ok = !error_hidden
-                && error_button_frame.origin.y >= error_frame.origin.y + error_frame.size.height;
-            dispatch::set_clipboard_shortcut_capture_state(ui, &current_shortcut, false, None);
+            let recording_fits = recording_needs <= recording_caption_frame.size.height + 0.5;
+            let button_title: *mut AnyObject = msg_send![ui.clipboard_shortcut, title];
+            let recording_copy_ok = caption_text() == recording_caption
+                && recording_fits
+                && crate::ffi::nsstring_to_rust(button_title) == chord
+                && same_frame(button_frame, recording_button_frame);
+            dispatch::set_clipboard_shortcut_capture_state(ui, &current_shortcut, false);
+            let idle_button_frame: NSRect = msg_send![ui.clipboard_shortcut, frame];
+            let idle_copy_restored =
+                caption_text() == idle_caption && same_frame(button_frame, idle_button_frame);
 
-            Some(default_layout_ok && error_layout_ok)
+            Some(layout_ok && idle_copy_ok && recording_copy_ok && idle_copy_restored)
         })
         .unwrap_or(false);
         if !clipboard_shortcut_layout_ok {
@@ -4047,7 +4081,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             mapping_rows: Vec::new(),
             clipboard_enabled: std::ptr::null_mut(),
             clipboard_shortcut: std::ptr::null_mut(),
-            clipboard_shortcut_error: std::ptr::null_mut(),
+            clipboard_shortcut_caption: std::ptr::null_mut(),
             clipboard_shortcut_row_height: 0.0,
             clipboard_pin_follow_row_height: 0.0,
             clipboard_row_gap: 0.0,

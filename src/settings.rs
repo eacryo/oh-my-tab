@@ -583,7 +583,9 @@ pub(super) struct SettingsUi {
     mapping_rows: Vec<MappingRow>,      // live binding rows
     clipboard_enabled: *mut AnyObject,  // enable clipboard history
     clipboard_shortcut: *mut AnyObject, // action button that records the global history chord
-    clipboard_shortcut_error: *mut AnyObject, // inline validation error under the capture button
+    /// The recorder row's caption: it carries the instruction and the recording state, which is
+    /// why the capture machine writes it (the 110pt button holds only the chord).
+    clipboard_shortcut_caption: *mut AnyObject,
     clipboard_shortcut_row_height: f64,
     clipboard_pin_follow_row_height: f64,
     clipboard_row_gap: f64,
@@ -945,8 +947,8 @@ pub(crate) fn refresh_appearance_controls_from_config() {
     dispatch::refresh_appearance_controls_from_config();
 }
 
-pub(crate) fn set_clipboard_shortcut_recording_ui(recording: bool, error: Option<&str>) {
-    dispatch::set_clipboard_shortcut_recording_ui(recording, error);
+pub(crate) fn set_clipboard_shortcut_recording_ui(recording: bool) {
+    dispatch::set_clipboard_shortcut_recording_ui(recording);
 }
 
 pub(crate) fn apply_recorded_clipboard_shortcut(shortcut: &str) {
@@ -2525,12 +2527,7 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 ui.key_bindings_enabled,
                 setState: if cfg.key_bindings.enabled { 1isize } else { 0isize }
             ];
-            dispatch::set_clipboard_shortcut_capture_state(
-                ui,
-                &cfg.clipboard.shortcut,
-                recording,
-                None,
-            );
+            dispatch::set_clipboard_shortcut_capture_state(ui, &cfg.clipboard.shortcut, recording);
             set_field(
                 ui.clipboard_max_entries,
                 cfg.clipboard.max_entries.to_string(),
