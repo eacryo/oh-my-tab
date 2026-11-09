@@ -552,7 +552,6 @@ gestures_hint_unmatched = "No gesture for this stroke"
 gestures_row_delete = "Delete"
 gestures_header = "Gestures"
 gestures_header_trigger = "Trigger"
-gestures_trigger_mapping_note = "This button also has a mapping, which the gesture hotkey overrides."
 gestures_row_trigger_learn = "Use another button"
 desc_gestures_row_gesture_button = "Click to record; middle, right or side buttons. Escape cancels."
 desc_gestures_row_gesture_button_recording = "Recording… press middle, right or side button. Escape cancels."
@@ -646,6 +645,10 @@ accessibility_open = "Open Privacy & Security"
 accessibility_later = "Later"
 
 [errors]
+# The gesture hotkey's button also carries a button mapping. Same shape as the clipboard's
+# conflict: name the two things that conflict, then which one loses.
+gestures_hotkey_mapping_conflict = "This button conflicts with a button mapping."
+gestures_hotkey_shadows_mapping = "This button conflicts with a button mapping, so the mapping will not run."
 errors_gesture_duplicate = "Another gesture uses this button and sequence"
 mouse_gesture_button_invalid = "The gesture trigger must be one of the mouse buttons (1 right, 2 middle, 3 back side, 4 forward side), not {value}."
 errors_gesture_unknown_target = "Unknown action"

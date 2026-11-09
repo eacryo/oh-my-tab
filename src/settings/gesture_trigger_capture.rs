@@ -26,7 +26,9 @@ pub(crate) fn begin_trigger_capture() {
     let device = current_selected_device();
     let session = GESTURE_CAPTURE_SESSION.fetch_add(1, Ordering::SeqCst) + 1;
     *GESTURE_CAPTURE.lock().unwrap() = Some(GestureCapture { session, device });
-    *LEARN_PRESS.lock().unwrap() = None;
+    // The press latch is NOT cleared here: a refused learning ends at its DOWN (the capture is over)
+    // while the user may still be holding that button, and its tail has to stay owned until it is
+    // released -- starting another capture must not turn that release into a bare one.
     *REC_BUTTON.lock().unwrap() = 0;
     REC_COMPLETED_DESC.lock().unwrap().clear();
     *REC_MODE.lock().unwrap() = RecMode::GestureTrigger;
@@ -59,10 +61,10 @@ pub(crate) fn cancel_trigger_capture(reason: &str) {
 pub(crate) fn learn_press_owned(button: u32, device: u64) -> bool {
     LEARN_PRESS
         .lock()
-        .map(|press| {
-            press
-                .as_ref()
-                .is_some_and(|press| press.button == button && press.device == device)
+        .map(|presses| {
+            presses
+                .iter()
+                .any(|press| press.button == button && press.device == device)
         })
         .unwrap_or(false)
 }
@@ -100,22 +102,64 @@ pub(crate) fn abandon_gesture_capture() {
 }
 
 /// Take the completion result: the button and the session it was learned for.
-fn take_gesture_result() -> Option<(u64, u32)> {
+fn take_gesture_result() -> Option<(u64, u32, bool)> {
     GESTURE_RESULT.lock().unwrap().take()
 }
 
+/// Whether a learned press was REFUSED, so its tail must be swallowed with it.
+///
+/// An accepted learning passes the whole press through (the application is owed the click). A
+/// refused one was swallowed at the down, so its up and its drags must go too: a bare release the
+/// application never saw the press of is not owed to it, and the mapping that caused the refusal
+/// must not fire after the app has already said it will not learn that button.
+pub(crate) fn learn_press_refused(button: u32, device: u64) -> bool {
+    LEARN_PRESS
+        .lock()
+        .map(|presses| {
+            presses
+                .iter()
+                .any(|press| press.refused && press.button == button && press.device == device)
+        })
+        .unwrap_or(false)
+}
+
+/// Whether learning `button` RIGHT NOW would be refused, answered from the runtime's published
+/// state: the recording tap cannot read the configuration, so it asks the gesture table the tap
+/// consults and the mouse resolution the mapping path uses -- the same two facts the page's check
+/// is built from.
+///
+/// The LAYER is the capture's own target device, fixed at `begin_trigger_capture`, not the device
+/// the press came from: the commit writes the capture's layer, so a refusal decided against another
+/// mouse's layer would swallow a press the commit then accepts (or accept one it refuses).
+pub(crate) fn learn_would_refuse_now(button: u32) -> bool {
+    let Some(capture) = pending_capture() else {
+        return false;
+    };
+    let device = capture.device;
+    // The layer is ACTIVE (it has rows the tap would run), not "this button is already its
+    // trigger": learning a NEW button is exactly the case where the candidate is not claimed yet.
+    let published = crate::mouse::gesture::table::snapshot();
+    let resolved = crate::mouse::resolve::resolve(device);
+    crate::mouse::gesture::conflict::hotkey_conflicts_with_mapping(
+        crate::mouse::gesture::conflict::layer_is_active(published.table_for(device)),
+        crate::mouse::gesture::conflict::mapping_runs_for(&resolved, button).as_deref(),
+    )
+}
+
 /// The release of the press being learned: it has been passed through, so the latch goes.
-pub(crate) fn learn_press_released(button: u32) {
-    let mut press = LEARN_PRESS.lock().unwrap();
-    if press.as_ref().is_some_and(|press| press.button == button) {
-        *press = None;
+///
+/// The DEVICE is part of the identity: two mice can be holding the same button number, and freeing
+/// one must not drop the other's tail ownership.
+pub(crate) fn learn_press_released(button: u32, device: u64) {
+    if let Ok(mut presses) = LEARN_PRESS.lock() {
+        presses.retain(|press| !(press.button == button && press.device == device));
     }
 }
 
 /// Observe a mouse button DOWN from the recording tap. The event is never swallowed.
 ///
 /// `false` means "not ours": the recording tap passes the event and keeps waiting.
-pub(crate) fn observe_button_down(button: u32, device: u64) -> bool {
+pub(crate) fn observe_button_down(button: u32, device: u64, refused: bool) -> bool {
     if button == 0 {
         // The left button starts every ordinary click and can never be a gesture trigger.
         return false;
@@ -126,8 +170,22 @@ pub(crate) fn observe_button_down(button: u32, device: u64) -> bool {
     *REC_BUTTON.lock().unwrap() = button;
     // The RESULT carries the session to the main thread; the latch below only owns the pass-through
     // of the press, and the mouse-up clears it without touching the result.
-    *GESTURE_RESULT.lock().unwrap() = Some((capture.session, button));
-    *LEARN_PRESS.lock().unwrap() = Some(LearnPress { button, device });
+    *GESTURE_RESULT.lock().unwrap() = Some((capture.session, button, refused));
+    if let Ok(mut presses) = LEARN_PRESS.lock() {
+        // One entry per button and device: a second press of the same button replaces the first,
+        // and a press whose release was lost is bounded rather than kept for the life of the
+        // process. A DIFFERENT button's held press stays owned: it may still be refused and held
+        // while this capture runs.
+        presses.retain(|press| !(press.button == button && press.device == device));
+        if presses.len() >= MAX_HELD_LEARN_PRESSES {
+            presses.remove(0);
+        }
+        presses.push(LearnPress {
+            button,
+            device,
+            refused,
+        });
+    }
     // The capture is COMPLETE at the down. The tap and the flags stand down now, but the press
     // stays latched, so its drags and its up are still passed through by the gesture path.
     mapping::finish_capture_now();
@@ -158,10 +216,19 @@ pub(crate) extern "C" fn handle_gesture_trigger_captured(
     _sender: *mut c_void,
 ) {
     crate::callback_guard::void("handle_gesture_trigger_captured", || {
-        let Some((session, button)) = take_gesture_result() else {
+        let Some((session, button, refused)) = take_gesture_result() else {
             log_debug!("[gesture] completion with no learned button");
             return;
         };
+        if refused {
+            // The press was refused AND swallowed while it was learned: nothing is written, the row
+            // keeps its hotkey, and the bubble says why. The capture session is dropped with it.
+            log_debug!("[gesture] trigger {button} refused: the button already carries a mapping");
+            let _ = take_capture_for_session(session);
+            dispatch::refresh_gesture_hotkey_control();
+            crate::ui::toast::show_refused(&t("errors.gestures_hotkey_mapping_conflict"));
+            return;
+        }
         let Some(capture) = take_capture_for_session(session) else {
             // A newer capture (or none): this result belongs to nothing.
             log_debug!("[gesture] late trigger result {button} (session {session}) dropped");
@@ -182,34 +249,63 @@ fn commit_trigger(button: u32, device: Option<crate::mouse::device::DeviceKey>) 
     let trigger = crate::config::GestureTrigger::Learned {
         learned_button: button,
     };
+    // The layer the capture started for, by identity: a device layer that no longer exists is not
+    // recreated (the user deleted it), and the refusal below has to ask about THAT layer.
     let matcher = match device {
-        None => {
-            cfg.mouse.gesture_button = trigger;
-            finish_commit(&old, &cfg, button);
-            return;
-        }
+        None => None,
         Some(device) if device == crate::mouse::device::VIRTUAL_DEVICE_KEY => {
-            crate::config::DeviceMatcher {
+            Some(crate::config::DeviceMatcher {
                 injected: Some(true),
                 ..Default::default()
-            }
+            })
         }
-        Some((vendor_id, product_id)) => crate::config::DeviceMatcher {
+        Some((vendor_id, product_id)) => Some(crate::config::DeviceMatcher {
             vendor_id: Some(vendor_id),
             product_id: Some(product_id),
             ..Default::default()
-        },
+        }),
     };
-    let Some(layer) = cfg
-        .mouse
-        .gesture_devices
-        .iter_mut()
-        .find(|layer| layer.device == matcher)
-    else {
-        log_debug!("[gesture] the gesture layer is gone; result dropped");
+    let layer = match &matcher {
+        None => cfg.mouse.shared_gesture_layer(),
+        Some(matcher) => {
+            let Some(layer) = cfg
+                .mouse
+                .gesture_devices
+                .iter()
+                .find(|l| l.device == *matcher)
+            else {
+                log_debug!("[gesture] the gesture layer is gone; result dropped");
+                return;
+            };
+            layer.clone()
+        }
+    };
+    // A button that already carries a mapping is REFUSED, the way the clipboard refuses a chord a
+    // binding owns: the hotkey keeps its old button and the shared bubble says why. The check is
+    // the standing warning's rule asked about this button, so the two cannot disagree.
+    if crate::mouse::gesture::conflict::learning_would_shadow_mapping(&layer, &cfg, device, button)
+    {
+        log_debug!("[gesture] trigger {button} refused: the button already carries a mapping");
+        // Nothing is written: the row keeps the hotkey it had, so put its idle copy and ring back.
+        dispatch::refresh_gesture_hotkey_control();
+        crate::ui::toast::show_refused(&t("errors.gestures_hotkey_mapping_conflict"));
         return;
-    };
-    layer.gesture_button = trigger;
+    }
+    match &matcher {
+        None => cfg.mouse.gesture_button = trigger,
+        Some(matcher) => {
+            let Some(layer) = cfg
+                .mouse
+                .gesture_devices
+                .iter_mut()
+                .find(|layer| layer.device == *matcher)
+            else {
+                log_debug!("[gesture] the gesture layer is gone; result dropped");
+                return;
+            };
+            layer.gesture_button = trigger;
+        }
+    }
     finish_commit(&old, &cfg, button);
 }
 
@@ -259,17 +355,100 @@ mod tests {
     fn a_quick_click_keeps_its_result_after_the_press_is_released() {
         let _guard = TEST_LOCK.lock().unwrap();
         *GESTURE_CAPTURE.lock().unwrap() = Some(capture_with(3));
-        *GESTURE_RESULT.lock().unwrap() = Some((3, 1));
+        *GESTURE_RESULT.lock().unwrap() = Some((3, 1, false));
         // The up path: the pass-through latch goes, the result does not.
-        *LEARN_PRESS.lock().unwrap() = None;
-        let (session, button) = take_gesture_result().expect("the completion has a result");
-        assert_eq!((session, button), (3, 1));
+        LEARN_PRESS.lock().unwrap().clear();
+        let (session, button, refused) =
+            take_gesture_result().expect("the completion has a result");
+        assert_eq!((session, button, refused), (3, 1, false));
         let capture = take_capture_for_session(session).expect("the capture it belongs to");
         assert_eq!(capture.session, 3);
         assert!(
             pending_capture().is_none(),
             "the slot is cleared by the commit"
         );
+    }
+
+    /// A refused press owns its tail until it is released, so its up and drags are swallowed with
+    /// the down it never let through.
+    #[test]
+    fn a_refused_press_owns_its_tail_until_released() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        LEARN_PRESS.lock().unwrap().push(LearnPress {
+            button: 3,
+            device: 7,
+            refused: true,
+        });
+        assert!(learn_press_refused(3, 7), "the held press is refused");
+        assert!(!learn_press_refused(2, 7), "another button is not");
+        assert!(!learn_press_refused(3, 8), "another device is not");
+        learn_press_released(3, 7);
+        assert!(
+            !learn_press_owned(3, 7),
+            "the release ends the ownership of the tail"
+        );
+    }
+
+    /// A second capture must not take the tail of a press that is still held.
+    ///
+    /// The reachable order: a side-button learning is refused and the user keeps holding it, another
+    /// capture starts on the recorder button, a DIFFERENT button is pressed for it, and then the
+    /// first button is released. With one latch slot the second press overwrote the first and its
+    /// release escaped the swallow; every held press keeps its own entry until its own release.
+    #[test]
+    fn a_later_capture_does_not_take_over_a_held_refused_press() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        LEARN_PRESS.lock().unwrap().push(LearnPress {
+            button: 3,
+            device: 7,
+            refused: true,
+        });
+        // The next capture's press is a different button.
+        LEARN_PRESS.lock().unwrap().push(LearnPress {
+            button: 2,
+            device: 7,
+            refused: false,
+        });
+        assert!(
+            learn_press_refused(3, 7),
+            "the first, refused press still owns its tail"
+        );
+        assert!(
+            !learn_press_refused(2, 7),
+            "the accepted one is not refused"
+        );
+        learn_press_released(2, 7);
+        assert!(
+            learn_press_refused(3, 7),
+            "releasing the second press must not free the first"
+        );
+        learn_press_released(3, 7);
+        assert!(LEARN_PRESS.lock().unwrap().is_empty());
+    }
+
+    /// Two mice can hold the SAME button number: freeing one must not drop the other's tail.
+    #[test]
+    fn releasing_one_mouse_keeps_the_other_mouses_tail() {
+        let _guard = TEST_LOCK.lock().unwrap();
+        LEARN_PRESS.lock().unwrap().clear();
+        for device in [7u64, 8u64] {
+            LEARN_PRESS.lock().unwrap().push(LearnPress {
+                button: 3,
+                device,
+                refused: true,
+            });
+        }
+        learn_press_released(3, 7);
+        assert!(
+            !learn_press_refused(3, 7),
+            "the released mouse no longer owns its tail"
+        );
+        assert!(
+            learn_press_refused(3, 8),
+            "the other mouse still holds the same button number"
+        );
+        learn_press_released(3, 8);
+        assert!(LEARN_PRESS.lock().unwrap().is_empty());
     }
 
     /// Learning a button must not consume the capture: the completion still finds it.
@@ -308,7 +487,7 @@ mod tests {
     fn escape_abandons_the_capture_before_the_main_thread_runs() {
         let _guard = TEST_LOCK.lock().unwrap();
         *GESTURE_CAPTURE.lock().unwrap() = Some(capture_with(11));
-        *GESTURE_RESULT.lock().unwrap() = Some((11, 1));
+        *GESTURE_RESULT.lock().unwrap() = Some((11, 1, false));
         abandon_gesture_capture();
         assert!(pending_capture().is_none(), "nothing waits to be learned");
         assert!(

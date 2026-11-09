@@ -554,7 +554,18 @@ unsafe fn gesture_dispatch(
             event_type,
             K_CG_EVENT_RIGHT_MOUSE_UP | K_CG_EVENT_OTHER_MOUSE_UP
         ) {
-            crate::settings::learn_press_released(button());
+            // A refused learning swallowed its down, so its tail is swallowed too: no bare release,
+            // and no mapping firing after the refusal.
+            let refused = crate::settings::learn_press_refused(button(), learn_device);
+            crate::settings::learn_press_released(button(), learn_device);
+            return if refused {
+                Some(std::ptr::null_mut())
+            } else {
+                None
+            };
+        }
+        if crate::settings::learn_press_refused(button(), learn_device) {
+            return Some(std::ptr::null_mut());
         }
         return None;
     }

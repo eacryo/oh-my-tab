@@ -96,31 +96,91 @@ pub(crate) fn rows_shadowed_by_bindings(
 /// there is nothing to warn about either.
 pub(crate) fn trigger_shadows_mapping(
     layer: &crate::config::GestureLayer,
-    mouse: &crate::config::MouseSection,
+    cfg: &crate::config::Config,
     device: Option<crate::mouse::device::DeviceKey>,
 ) -> bool {
-    if !mouse.gestures_enabled || !layer.gestures.iter().any(|row| row.enabled) {
-        return false;
+    learning_would_shadow_mapping(layer, cfg, device, layer.gesture_button.button())
+}
+
+/// Whether LEARNING `button` as the layer's trigger would shadow an existing button mapping.
+///
+/// Same rule as the standing warning, asked about a button that is not configured yet: the capture
+/// refuses the press instead of accepting a hotkey whose own mapping would silently stop running.
+/// Both conditions come from the runtime, not from a copy of its rules:
+///
+/// * the mapping is the one `resolve_from_config` would actually run (profiles merged per key, the
+///   switch merged on its own -- a profile that disables mappings does NOT delete a mapping another
+///   profile contributes);
+/// * the layer takes the button only if the gesture TABLE built for it claims that button, so an
+///   enabled row whose direction does not parse, whose binding does not resolve or whose button is
+///   illegal -- none of which ever fires -- does not turn a working mapping into a refusal.
+pub(crate) fn learning_would_shadow_mapping(
+    layer: &crate::config::GestureLayer,
+    cfg: &crate::config::Config,
+    device: Option<crate::mouse::device::DeviceKey>,
+    button: u32,
+) -> bool {
+    hotkey_conflicts_with_mapping(
+        layer_takes_its_button(&cfg.mouse, layer),
+        mapping_for_button(button, cfg, device).as_deref(),
+    )
+}
+
+/// The conflict rule itself, from the two facts the runtime can answer anywhere.
+///
+/// The recording tap cannot read the configuration -- it runs before the main thread and works from
+/// the published gesture table and the cached mouse resolution -- but it has to decide whether to
+/// swallow a refused learning press. Both callers therefore compose this same rule from their own
+/// facts rather than restating it.
+pub(crate) fn hotkey_conflicts_with_mapping(takes_button: bool, mapping: Option<&str>) -> bool {
+    takes_button && mapping.is_some()
+}
+
+/// The mapping that would RUN on `button` in this resolution, if any.
+pub(crate) fn mapping_runs_for(
+    resolved: &crate::mouse::resolve::ResolvedMouse,
+    button: u32,
+) -> Option<String> {
+    if !resolved.button_mappings_enabled {
+        return None;
     }
-    let button = layer.gesture_button.button().to_string();
-    // Resolve the way the mouse page does: the wildcard profile first, then every profile that
-    // matches this device, later ones winning.
-    let mut mapping = None;
-    for profile in &mouse.profiles {
-        if !crate::mouse::resolve::matches(profile, device) {
-            continue;
-        }
-        if let Some(entry) = profile.button_mappings.get(&button) {
-            mapping = Some(entry.clone());
-        }
-        if profile.button_mappings_enabled.is_some() {
-            // Disabled on this device drops the inherited mapping.
-            if profile.button_mappings_enabled == Some(false) {
-                mapping = None;
-            }
-        }
-    }
-    mapping.is_some()
+    resolved.button_mappings.get(&button.to_string()).cloned()
+}
+
+/// The mapping the runtime would run on `button` for this device, if any.
+///
+/// `resolve_from_config` is the runtime's own merge (later profiles win per key; the enable switch
+/// is merged separately), so this cannot drift from what the tap executes.
+fn mapping_for_button(
+    button: u32,
+    cfg: &crate::config::Config,
+    device: Option<crate::mouse::device::DeviceKey>,
+) -> Option<String> {
+    let resolved = crate::mouse::resolve::resolve_from_config(cfg, device);
+    mapping_runs_for(&resolved, button)
+}
+
+/// Whether the layer's gesture rows really take its trigger button.
+///
+/// The gesture TABLE is the authority: it and the tap are built from the same rules, so a row that
+/// contributes nothing to it cannot make the mapping stop running.
+fn layer_takes_its_button(
+    mouse: &crate::config::MouseSection,
+    layer: &crate::config::GestureLayer,
+) -> bool {
+    let (table, _errors) = crate::mouse::gesture::table::build_layer(mouse, layer);
+    layer_is_active(&table)
+}
+
+/// Whether this table would run anything: the one fact "gestures take their button" reduces to.
+///
+/// Every row of a table sits on that layer's trigger, so a non-empty table is the layer taking its
+/// button. Learning a NEW button is the case where the candidate is deliberately NOT claimed yet, so
+/// a check written as `claims(candidate)` answers "no gestures at all" and lets the mapping run --
+/// which is exactly the bug a live test caught. This is the fact both the page and the recording tap
+/// ask for, and it is assertable on a table built from a configuration.
+pub(crate) fn layer_is_active(table: &crate::mouse::gesture::table::GestureTable) -> bool {
+    table.len() > 0
 }
 
 /// The conflicts the page shows for the layer it is editing, keyed by row.
@@ -164,6 +224,142 @@ mod tests {
         cfg.mouse.gestures_enabled = true;
         cfg.mouse.gestures = rows;
         cfg
+    }
+
+    fn profile(mappings: &[(&str, &str)], enabled: Option<bool>) -> crate::config::MouseProfile {
+        let mut profile = crate::config::MouseProfile::default();
+        for (button, binding) in mappings {
+            profile
+                .button_mappings
+                .insert((*button).to_string(), (*binding).to_string());
+        }
+        profile.button_mappings_enabled = enabled;
+        profile
+    }
+
+    fn device_profile(
+        device: (u32, u32),
+        mappings: &[(&str, &str)],
+        enabled: Option<bool>,
+    ) -> crate::config::MouseProfile {
+        let mut profile = profile(mappings, enabled);
+        profile.device.vendor_id = Some(device.0);
+        profile.device.product_id = Some(device.1);
+        profile
+    }
+
+    /// The conflict rule's two facts, and the only combination that is a conflict.
+    #[test]
+    fn the_conflict_rule_needs_both_a_taken_button_and_a_running_mapping() {
+        use super::hotkey_conflicts_with_mapping;
+        assert!(!hotkey_conflicts_with_mapping(false, None));
+        assert!(!hotkey_conflicts_with_mapping(false, Some("switcher")));
+        assert!(!hotkey_conflicts_with_mapping(true, None));
+        assert!(hotkey_conflicts_with_mapping(true, Some("switcher")));
+    }
+
+    /// A button that already carries a mapping cannot be LEARNED as the hotkey: the capture refuses
+    /// it (the clipboard's rule), and the check is the standing warning's rule asked about that
+    /// button, so the refusal and the bubble cannot disagree.
+    #[test]
+    fn learning_a_button_that_carries_a_mapping_is_refused() {
+        let mut cfg = config(vec![row("rd", 1, "window.snap_left", true)]);
+        cfg.mouse.profiles = vec![profile(&[("3", "switcher")], None)];
+        let layer = cfg.mouse.shared_gesture_layer();
+        assert!(
+            learning_would_shadow_mapping(&layer, &cfg, None, 3),
+            "button 3 carries a mapping"
+        );
+        assert!(
+            !learning_would_shadow_mapping(&layer, &cfg, None, 1),
+            "button 1 carries none"
+        );
+        // A profile that switches mappings off stops them running, so nothing is refused.
+        cfg.mouse.profiles[0].button_mappings_enabled = Some(false);
+        assert!(!learning_would_shadow_mapping(&layer, &cfg, None, 3));
+    }
+
+    /// The runtime merges the mapping TABLE per key and the enable SWITCH on its own: a profile that
+    /// disables mappings does not delete one another profile contributes, and a profile that adds a
+    /// mapping does not switch the feature on. Both orders are a real configuration a user can build
+    /// by selecting a device on the Mouse page, and a check that folds them together got each wrong.
+    #[test]
+    fn the_mapping_check_merges_the_table_and_the_switch_like_the_runtime() {
+        let device = (0x1234, 0x5678);
+        // Shared: maps button 3, mappings off. Device: mappings on, map untouched -> button 3 runs.
+        let mut cfg = config(vec![row("rd", 1, "window.snap_left", true)]);
+        cfg.mouse.profiles = vec![
+            profile(&[("3", "switcher")], Some(false)),
+            device_profile(device, &[], Some(true)),
+        ];
+        let layer = cfg.mouse.shared_gesture_layer();
+        assert!(
+            learning_would_shadow_mapping(&layer, &cfg, Some(device), 3),
+            "the device profile switches mappings back on, and the shared map survives"
+        );
+        // Shared: mappings off. Device: adds a mapping and leaves the switch alone -> off wins.
+        cfg.mouse.profiles = vec![
+            profile(&[], Some(false)),
+            device_profile(device, &[("3", "switcher")], None),
+        ];
+        assert!(
+            !learning_would_shadow_mapping(&layer, &cfg, Some(device), 3),
+            "mappings stay switched off, so nothing runs to be shadowed"
+        );
+    }
+
+    /// The fact the tap needs: a layer whose trigger is one button is still ACTIVE when the
+    /// candidate being learned is a different one. Asking "does the table claim the candidate"
+    /// answers no for every learnable button and lets the conflicting mapping run -- the bug this
+    /// pins, which no test of the boolean composition would have caught.
+    #[test]
+    fn an_active_layer_is_not_a_claim_on_the_candidate_button() {
+        let mut cfg = config(vec![row("rd", 1, "window.snap_left", true)]);
+        cfg.mouse.profiles = vec![profile(&[("2", "switcher")], None)];
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Learned { learned_button: 3 };
+        let layer = cfg.mouse.shared_gesture_layer();
+        let (table, _errors) = crate::mouse::gesture::table::build_layer(&cfg.mouse, &layer);
+        assert!(
+            !table.claims(2),
+            "the candidate is not the layer's trigger, so nothing claims it yet"
+        );
+        assert!(
+            layer_is_active(&table),
+            "but the layer will run its rows, so a mapping on the candidate is shadowed"
+        );
+        assert!(hotkey_conflicts_with_mapping(
+            layer_is_active(&table),
+            Some("switcher")
+        ));
+        assert!(!hotkey_conflicts_with_mapping(
+            layer_is_active(&table),
+            None
+        ));
+    }
+
+    /// Only a row the runtime would actually run counts: an enabled row with an unusable direction
+    /// or binding never takes the button, so the mapping keeps working and the capture must accept.
+    #[test]
+    fn a_row_that_never_fires_does_not_refuse_the_hotkey() {
+        let mut cfg = config(vec![row("rd", 1, "not-a-target", true)]);
+        cfg.mouse.profiles = vec![profile(&[("3", "switcher")], None)];
+        // The layer's own trigger is button 3, so the warning below asks the same question the
+        // refusal does.
+        cfg.mouse.gesture_button = crate::config::GestureTrigger::Learned { learned_button: 3 };
+        let layer = cfg.mouse.shared_gesture_layer();
+        assert!(
+            !learning_would_shadow_mapping(&layer, &cfg, None, 3),
+            "an unresolvable binding never fires"
+        );
+        assert!(
+            !trigger_shadows_mapping(&layer, &cfg, None),
+            "and the standing warning agrees with the refusal"
+        );
+        // A usable row does take the button, and then the mapping is refused.
+        cfg.mouse.gestures = vec![row("rd", 1, "window.snap_left", true)];
+        let layer = cfg.mouse.shared_gesture_layer();
+        assert!(learning_would_shadow_mapping(&layer, &cfg, None, 3));
+        assert!(trigger_shadows_mapping(&layer, &cfg, None));
     }
 
     #[test]

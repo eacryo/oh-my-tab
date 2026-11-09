@@ -1384,7 +1384,7 @@ pub(crate) fn smoke_runner() -> Result<(), String> {
     // A PRODUCT message must read in full: the bubble caps its width and cuts the rest with an
     // ellipsis, so the Gestures page's mapping-conflict note -- the longest sentence it carries --
     // has to fit under the cap. A copy that grows past it loses its explanation silently.
-    let note = crate::i18n::t("settings.gestures_trigger_mapping_note");
+    let note = crate::i18n::t("errors.gestures_hotkey_shadows_mapping");
     if let Some(snapshot) = snapshot(&note) {
         if snapshot.width >= TOAST_MAX_WIDTH {
             failures.push(format!(

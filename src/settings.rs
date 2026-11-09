@@ -437,6 +437,10 @@ enum RecMode {
 /// The current recording mode (main-thread; handle_recording_finished finishes per mode).
 static REC_MODE: Mutex<RecMode> = Mutex::new(RecMode::Idle);
 
+/// The most held presses the latch keeps: a mouse has five buttons and a stalled release is a bug,
+/// so anything past this is dropped oldest-first rather than kept forever.
+const MAX_HELD_LEARN_PRESSES: usize = 8;
+
 /// One gesture-trigger capture: which layer it writes, and the session its result belongs to.
 ///
 /// The layer is recorded as a STABLE identity at start, not as an index: a config reload during
@@ -456,8 +460,15 @@ static GESTURE_CAPTURE_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic
 struct LearnPress {
     button: u32,
     device: u64,
+    /// The learning was refused, so its press was SWALLOWED: the tail must go with it.
+    refused: bool,
 }
-static LEARN_PRESS: Mutex<Option<LearnPress>> = Mutex::new(None);
+/// The presses being learned, one entry per (button, device) still held.
+///
+/// A LIST, not one slot: a refused learning ends at its DOWN, so the user can still be holding that
+/// button when another capture starts. Overwriting a single slot then dropped the old press's tail
+/// ownership, and its up escaped the swallow.
+static LEARN_PRESS: Mutex<Vec<LearnPress>> = Mutex::new(Vec::new());
 /// The learned button and the session it belongs to, held from the press until the main-thread
 /// completion consumes it.
 ///
@@ -465,7 +476,7 @@ static LEARN_PRESS: Mutex<Option<LearnPress>> = Mutex::new(None);
 /// main thread runs the completion. Reading the session from the latch then yielded 0 for a quick
 /// click, and the learned button was dropped as "late" -- the same silent failure as the bug the
 /// capture slot had.
-static GESTURE_RESULT: Mutex<Option<(u64, u32)>> = Mutex::new(None);
+static GESTURE_RESULT: Mutex<Option<(u64, u32, bool)>> = Mutex::new(None);
 
 /// The action a `RecMode::KeyBinding` recording is binding a chord to, held from the moment the
 /// add button is pressed until the recording finishes or is cancelled.
@@ -1097,7 +1108,7 @@ pub(crate) mod portability;
 pub(crate) use gesture_trigger_capture::{
     abandon_gesture_capture, begin_trigger_capture, cancel_trigger_capture,
     handle_gesture_trigger_capture_cancelled, handle_gesture_trigger_captured, learn_press_owned,
-    learn_press_released, observe_button_down,
+    learn_press_refused, learn_press_released, learn_would_refuse_now, observe_button_down,
 };
 pub(crate) mod restore;
 pub(crate) mod select;

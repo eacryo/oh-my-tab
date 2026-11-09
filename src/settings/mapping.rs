@@ -581,13 +581,16 @@ unsafe fn recording_tap_callback_inner(
             if *REC_STAGE.lock().unwrap() == RecStage::WaitingButton {
                 let btn = CGEventGetIntegerValueField(event, 3) as u32;
                 if *REC_MODE.lock().unwrap() == RecMode::GestureTrigger {
-                    let device = crate::mouse::gesture::runtime::device_key(
-                        crate::mouse::device::device_from_cgevent(event),
-                    );
-                    // The learning press PASSES THROUGH, whatever the outcome: it is the click the
-                    // application underneath is owed.
-                    crate::settings::observe_button_down(btn, device);
-                    return event;
+                    let dev_key = crate::mouse::device::device_from_cgevent(event);
+                    let device = crate::mouse::gesture::runtime::device_key(dev_key);
+                    // A REFUSED learning (the button already carries a mapping) is swallowed, down
+                    // and tail: passing it through ran the very mapping that caused the refusal --
+                    // measured: the side button opened the switcher while the bubble said the
+                    // hotkey had been refused. An accepted learning still passes the whole press
+                    // through, which is the click the application underneath is owed.
+                    let refused = crate::settings::learn_would_refuse_now(btn);
+                    crate::settings::observe_button_down(btn, device, refused);
+                    return if refused { std::ptr::null_mut() } else { event };
                 }
                 if btn >= 2 {
                     *REC_BUTTON.lock().unwrap() = btn;

@@ -219,12 +219,12 @@ pub(crate) fn announce_gesture_mapping_conflict() {
         .unwrap_or_else(|| input.config.mouse.shared_gesture_layer());
     if !crate::mouse::gesture::conflict::trigger_shadows_mapping(
         &layer,
-        &input.config.mouse,
+        &input.config,
         input.device,
     ) {
         return;
     }
-    crate::ui::toast::show_refused(&t("settings.gestures_trigger_mapping_note"));
+    crate::ui::toast::show_refused(&t("errors.gestures_hotkey_shadows_mapping"));
 }
 
 pub(super) fn refresh_clipboard_shortcut_record_control() {
