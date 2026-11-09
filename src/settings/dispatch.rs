@@ -160,9 +160,10 @@ pub(super) fn set_clipboard_shortcut_recording_ui(recording: bool) {
 /// asks for a press. Called on every start, cancel and finish, and after a config reload.
 pub(crate) fn refresh_gesture_hotkey_control() {
     let waiting = crate::settings::page_view::gesture_capture_waiting();
-    let title = if waiting {
-        t("settings.gestures_trigger_learn_waiting")
-    } else {
+    // The BUTTON holds the current hotkey in both states: a prompt inside it was cut off. What the
+    // button does, and that a capture is waiting, are the row's CAPTION -- the same split the
+    // Clipboard page's recorder uses.
+    let title = {
         let cfg = CONFIG.read().unwrap();
         let layer = crate::settings::selected_gesture_scope()
             .map(|scope| scope.layer(&cfg))
@@ -183,7 +184,42 @@ pub(crate) fn refresh_gesture_hotkey_control() {
             let _: () = msg_send![ui.gesture_trigger_button, setTitle: text];
             CFRelease(text as *const c_void);
         }
+        if !ui.gesture_hotkey_caption.is_null() {
+            let caption = if waiting {
+                t("settings.desc_gestures_row_gesture_button_recording")
+            } else {
+                t("settings.desc_gestures_row_gesture_button")
+            };
+            unsafe { set_field(ui.gesture_hotkey_caption, caption) };
+        }
     });
+}
+
+/// Say, in the shared bubble, that the gesture hotkey also carries a button mapping, so that
+/// mapping cannot run while the button is the gesture hotkey.
+///
+/// The Gestures row used to carry this under its button as a red line, where the sentence was cut
+/// off. The bubble is where the app says a status an inline row cannot hold (the clipboard
+/// recorder's refused chords go there for the same reason), and it is said when the user arrives at
+/// the Gestures page and when a learned hotkey creates the conflict -- a standing warning in a
+/// transient surface is only useful at the moment it is read.
+pub(crate) fn announce_gesture_mapping_conflict() {
+    if !crate::settings::window::settings_window_is_visible() {
+        return;
+    }
+    let input = page_view::PageInput::capture();
+    let layer = input
+        .gesture_scope
+        .map(|scope| scope.layer(&input.config))
+        .unwrap_or_else(|| input.config.mouse.shared_gesture_layer());
+    if !crate::mouse::gesture::conflict::trigger_shadows_mapping(
+        &layer,
+        &input.config.mouse,
+        input.device,
+    ) {
+        return;
+    }
+    crate::ui::toast::show_refused(&t("settings.gestures_trigger_mapping_note"));
 }
 
 pub(super) fn refresh_clipboard_shortcut_record_control() {

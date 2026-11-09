@@ -44,8 +44,9 @@ pub(super) enum RenderedExtra {
     },
     /// The Gestures page's hotkey recorder. A SEPARATE variant on purpose: two page-drawn
     /// recorders sharing one binding branch overwrote each other's slot, and the refresh then wrote
-    /// the "press a key" title onto a button nobody could see.
-    GestureHotkey,
+    /// the "press a key" title onto a button nobody could see. `caption` is the row's instruction
+    /// and its waiting state, the same contract the clipboard recorder's caption has.
+    GestureHotkey { caption: *mut AnyObject },
     /// The clipboard history limit: a numeric field whose callback looks it up by pointer.
     MaxEntries,
 }

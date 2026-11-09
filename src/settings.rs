@@ -438,10 +438,10 @@ enum RecMode {
 static REC_MODE: Mutex<RecMode> = Mutex::new(RecMode::Idle);
 
 /// One gesture-trigger capture: which layer it writes, and the session its result belongs to.
-#[derive(Clone, Copy)]
 ///
 /// The layer is recorded as a STABLE identity at start, not as an index: a config reload during
 /// the capture can delete or reorder device layers, and an index would then name another mouse.
+#[derive(Clone, Copy)]
 struct GestureCapture {
     /// The session number, so a late result cannot overwrite a newer capture.
     session: u64,
@@ -454,11 +454,18 @@ static GESTURE_CAPTURE_SESSION: std::sync::atomic::AtomicU64 = std::sync::atomic
 /// through: clearing `RECORDING` at the DOWN would let the gesture path or a button mapping take
 /// the UP that no DOWN was ever let through for.
 struct LearnPress {
-    session: u64,
     button: u32,
     device: u64,
 }
 static LEARN_PRESS: Mutex<Option<LearnPress>> = Mutex::new(None);
+/// The learned button and the session it belongs to, held from the press until the main-thread
+/// completion consumes it.
+///
+/// NOT the press latch above: the mouse-up releases that latch, and the up can arrive before the
+/// main thread runs the completion. Reading the session from the latch then yielded 0 for a quick
+/// click, and the learned button was dropped as "late" -- the same silent failure as the bug the
+/// capture slot had.
+static GESTURE_RESULT: Mutex<Option<(u64, u32)>> = Mutex::new(None);
 
 /// The action a `RecMode::KeyBinding` recording is binding a chord to, held from the moment the
 /// add button is pressed until the recording finishes or is cancelled.
@@ -586,6 +593,9 @@ pub(super) struct SettingsUi {
     /// The recorder row's caption: it carries the instruction and the recording state, which is
     /// why the capture machine writes it (the 110pt button holds only the chord).
     clipboard_shortcut_caption: *mut AnyObject,
+    /// The Gestures hotkey row's caption, on the same contract: the state that waits for a mouse
+    /// button is said here, because the row's button can only hold the current hotkey.
+    gesture_hotkey_caption: *mut AnyObject,
     clipboard_shortcut_row_height: f64,
     clipboard_pin_follow_row_height: f64,
     clipboard_row_gap: f64,
@@ -1085,8 +1095,9 @@ mod page_view;
 mod page_widgets;
 pub(crate) mod portability;
 pub(crate) use gesture_trigger_capture::{
-    begin_trigger_capture, cancel_trigger_capture, handle_gesture_trigger_captured,
-    learn_press_owned, learn_press_released, observe_button_down,
+    abandon_gesture_capture, begin_trigger_capture, cancel_trigger_capture,
+    handle_gesture_trigger_capture_cancelled, handle_gesture_trigger_captured, learn_press_owned,
+    learn_press_released, observe_button_down,
 };
 pub(crate) mod restore;
 pub(crate) mod select;

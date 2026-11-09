@@ -166,7 +166,10 @@ pub(in crate::settings) unsafe fn bind_page_controls(ui: &mut SettingsUi, render
             }
             // The Gestures page's hotkey row has its own slot: sharing the clipboard's is what made
             // a refresh write onto whichever button was bound last.
-            RenderedExtra::GestureHotkey => ui.gesture_trigger_button = control.control,
+            RenderedExtra::GestureHotkey { caption } => {
+                ui.gesture_trigger_button = control.control;
+                ui.gesture_hotkey_caption = *caption;
+            }
             RenderedExtra::MaxEntries => ui.clipboard_max_entries = control.control,
         }
         // About's status rows are VALUES with their own action: the refresh function writes the

@@ -278,11 +278,6 @@ pub(super) unsafe fn build_gestures_page(
     let mut hooks = page_view::GesturesHooks {
         trigger_title: crate::mouse::shortcut::button_label(layer.gesture_button.button()),
         waiting: page_view::gesture_capture_waiting(),
-        mapping_note: crate::mouse::gesture::conflict::trigger_shadows_mapping(
-            &layer,
-            &input.config.mouse,
-            input.device,
-        ),
     };
     match build_page(
         ui,

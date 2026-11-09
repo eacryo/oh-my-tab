@@ -337,6 +337,12 @@ pub(super) fn select_sidebar(idx: usize) {
     // scripts/e2e. It must sit outside the with_settings_ui closure -- a nested borrow there is
     // silently swallowed by the reentrancy guard.
     crate::e2e_state::record("settings");
+    // Arriving at the Gestures page is when the user needs to know that the hotkey they picked
+    // shadows a button mapping: the row carries no note of its own any more, so the shared bubble
+    // says it. Outside the closure above for the same reentrancy reason.
+    if idx == super::SETTINGS_GESTURES_PAGE_INDEX {
+        dispatch::announce_gesture_mapping_conflict();
+    }
 }
 
 /// Refresh the About page's live TCC status labels without reloading user settings.
@@ -901,6 +907,14 @@ fn show_settings_inner(
         &mut phase_started,
         total_started,
     );
+    // A window that opens straight onto the Gestures page never passes through a page switch, so the
+    // select above ran while it was still hidden and said nothing. Say the conflict note now that the
+    // page is really on screen; a later page switch announces on its own.
+    if present_window
+        && SIDEBAR_SELECTED.load(Ordering::SeqCst) == super::SETTINGS_GESTURES_PAGE_INDEX
+    {
+        dispatch::announce_gesture_mapping_conflict();
+    }
     // A2 E2E: the app's own wall time for this open, published so a scenario can bound the open path
     // without parsing the debug log. Only a presenting call publishes it -- a prewarm is not an open.
     if present_window {
@@ -4082,6 +4096,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             clipboard_enabled: std::ptr::null_mut(),
             clipboard_shortcut: std::ptr::null_mut(),
             clipboard_shortcut_caption: std::ptr::null_mut(),
+            gesture_hotkey_caption: std::ptr::null_mut(),
             clipboard_shortcut_row_height: 0.0,
             clipboard_pin_follow_row_height: 0.0,
             clipboard_row_gap: 0.0,

@@ -290,17 +290,18 @@ unsafe fn draw_shortcut_row(
 ) -> RenderedControl {
     // The row's caption carries both the instruction and the capture state: the 110pt button can
     // only hold the chord, so "what this button does" and "a capture is waiting" are the row's copy.
-    let caption = if recording {
-        t("settings.desc_clipboard_shortcut_recording")
-    } else {
-        t("settings.desc_clipboard_shortcut")
-    };
+    let idle = t("settings.desc_clipboard_shortcut");
+    let waiting = t("settings.desc_clipboard_shortcut_recording");
+    let states = [idle.clone(), waiting.clone()];
     draw_capture_row_with(
         canvas,
         origin_y,
         row_h,
         "settings.row_clipboard_shortcut",
-        Some(&caption),
+        Some(CaptureCaption {
+            shown: if recording { &waiting } else { &idle },
+            states: &states,
+        }),
         title,
         target,
         sel!(handleClipboardShortcutRecord:),
@@ -308,62 +309,36 @@ unsafe fn draw_shortcut_row(
     )
 }
 
-/// The shared shape of a "press a key/button to record it" row: the Gestures page's hotkey row is
-/// the same control with a different label, selector and identity, so the two cannot drift apart.
+/// What a capture row's caption says, for the caller's own state keys.
 ///
-/// A caller with no caption of its own gets the single-line form (the label centred in the band),
-/// which is the shape the Gestures page has always had.
-#[allow(clippy::too_many_arguments)]
-pub(super) unsafe fn draw_capture_row(
-    canvas: &mut PageCanvas,
-    origin_y: f64,
-    row_h: f64,
-    label_key: &str,
-    title: &str,
-    target: *mut AnyObject,
-    selector: Sel,
-    id: ControlId,
-) -> RenderedControl {
-    let mut row = draw_capture_row_with(
-        canvas, origin_y, row_h, label_key, None, title, target, selector, id,
-    );
-    // The Gestures row's overlap note is THIS page's readout: it explains why a button mapping on
-    // the same button will not run while it is the gesture hotkey. It lives here rather than in the
-    // shared row because the Clipboard recorder's refusals go to the shared toast, and a row that
-    // owns a label it never shows is a label that silently disappears when the code moves.
-    row.readout = draw_capture_readout(canvas, origin_y);
-    row
+/// A recorder's caption has one copy per capture state (idle, waiting), and a state change only
+/// rewrites the string -- so the frame and the row are sized from the TALLEST copy, not from the one
+/// that happens to be on screen when the page is built. The caller supplies all of them: the drawer
+/// cannot know another page's state keys, and guessing them sized the Gestures row from the
+/// Clipboard page's copy (one line for a two-line sentence, and it was cut).
+pub(super) struct CaptureCaption<'a> {
+    /// The copy shown now.
+    pub(super) shown: &'a str,
+    /// Every copy the row can show, in any state.
+    pub(super) states: &'a [String],
 }
 
-/// The hidden readout a capture row can report into, created under the row's copy.
-unsafe fn draw_capture_readout(canvas: &mut PageCanvas, origin_y: f64) -> *mut AnyObject {
-    let document = canvas.document();
-    let layout = canvas.layout();
-    let readout = make_value_label(
-        layout.label_x,
-        origin_y + 2.0,
-        layout.control_x + layout.control_w - layout.label_x - 12.0,
-        18.0,
-        "",
-    );
-    apply_settings_text_role(readout, SettingsTextRole::Destructive);
-    let _: () = msg_send![readout, setHidden: true];
-    let readout_frame: NSRect = msg_send![readout, frame];
-    let _: () = msg_send![document, addSubview: readout];
-    canvas.place_pending_view(readout, readout_frame);
-    release_obj(readout);
-    readout
+impl CaptureCaption<'_> {
+    /// The tallest height these copies need in a `width`-wide column.
+    fn height(&self, width: f64) -> f64 {
+        self.states
+            .iter()
+            .map(|state| unsafe { crate::settings::widgets::caption_cell_height(state, width) })
+            .fold(0.0, f64::max)
+    }
 }
-
-/// The same row, with the caption the caller needs. `caption` is the row's instruction (or its
-/// recording state), translated by the caller; `None` keeps the plain single-line row.
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn draw_capture_row_with(
     canvas: &mut PageCanvas,
     origin_y: f64,
     row_h: f64,
     label_key: &str,
-    caption: Option<&str>,
+    caption: Option<CaptureCaption<'_>>,
     title: &str,
     target: *mut AnyObject,
     selector: Sel,
@@ -382,14 +357,11 @@ pub(super) unsafe fn draw_capture_row_with(
         Some(caption) => {
             let copy_w = crate::settings::page_view::layout::caption_column_width(layout);
             let metrics = crate::settings::page_view::layout::MeasuredText::base();
-            let caption_h = CAPTURE_CAPTION_KEYS
-                .iter()
-                .map(|key| crate::settings::widgets::caption_cell_height(&t(key), copy_w))
-                .fold(metrics.caption_one_line_h, f64::max);
+            let caption_h = caption.height(copy_w).max(metrics.caption_one_line_h);
             let stack_h = metrics.title_h + metrics.title_caption_gap + caption_h;
             let stack_y = origin_y + (row_h - stack_h) / 2.0;
             let (label, caption_label) =
-                page_widgets::stacked_row_labels(document, &t(label_key), caption);
+                page_widgets::stacked_row_labels(document, &t(label_key), caption.shown);
             let label_frame = NSRect::new(
                 NSPoint::new(
                     layout.label_x,

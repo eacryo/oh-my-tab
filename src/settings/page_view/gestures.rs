@@ -24,7 +24,31 @@ pub(super) const GESTURES_ENABLED_FIELD: ControlField = ControlField::GesturesEn
 /// The page-drawn "gesture hotkey" row: label on the left, the current hotkey on a button that
 /// records a new one -- the same shape as the clipboard page's shortcut row.
 pub(super) const GESTURE_HOTKEY_ROW: &str = "gesture_hotkey";
-pub(super) const GESTURE_HOTKEY_ROW_H: f64 = 60.0;
+
+/// The two copies the row's caption can show: the instruction while idle, and the state while a
+/// capture waits for a mouse button. Both are measured when the row's height is decided.
+const HOTKEY_CAPTION_KEYS: [&str; 2] = [
+    "settings.desc_gestures_row_gesture_button",
+    "settings.desc_gestures_row_gesture_button_recording",
+];
+
+/// The row's height: a captioned row's, MEASURED over both caption copies, exactly like the
+/// Clipboard page's shortcut recorder. The button holds the current hotkey, so the instruction and
+/// the waiting state are the row's caption -- and a caption that wraps has to grow its row.
+fn gesture_hotkey_row_height(_input: &PageInput, content_w: f64) -> f64 {
+    // Measuring a caption reads AppKit text metrics; the page build runs on the main thread.
+    unsafe { gesture_hotkey_row_height_inner(content_w) }
+}
+
+unsafe fn gesture_hotkey_row_height_inner(content_w: f64) -> f64 {
+    let caption_w =
+        crate::settings::page_view::layout::caption_column_width(SettingsLayout::new(content_w));
+    let caption_h = HOTKEY_CAPTION_KEYS
+        .iter()
+        .map(|key| crate::settings::widgets::caption_cell_height(&t(key), caption_w))
+        .fold(0.0, f64::max);
+    crate::settings::widgets::captioned_row_height_for(caption_h)
+}
 /// The Gestures page's own row: the hotkey recorder.
 #[derive(Default)]
 pub(crate) struct GesturesHooks {
@@ -32,8 +56,6 @@ pub(crate) struct GesturesHooks {
     pub(crate) trigger_title: String,
     /// Whether a capture is waiting for a press.
     pub(crate) waiting: bool,
-    /// Whether the trigger button also carries a button mapping.
-    pub(crate) mapping_note: bool,
 }
 
 impl PageHooks for GesturesHooks {
@@ -50,37 +72,39 @@ impl PageHooks for GesturesHooks {
         if spec.key != GESTURE_HOTKEY_ROW {
             return Ok(());
         }
-        let title = if self.waiting {
-            t("settings.gestures_trigger_learn_waiting")
-        } else {
-            self.trigger_title.clone()
-        };
-        let mut row = super::clipboard::draw_capture_row(
+        // The button always shows the CURRENT hotkey, as the Clipboard page's button always shows
+        // the chord: "a capture is waiting" is the caption's job, and inside the 110pt button the
+        // prompt was cut off anyway.
+        let title = self.trigger_title.clone();
+        // The row states HOW to record under its title, the way the Clipboard page's recorder does:
+        // the button can only hold the current hotkey, and a prompt inside it was cut off.
+        let idle = t("settings.desc_gestures_row_gesture_button");
+        let waiting = t("settings.desc_gestures_row_gesture_button_recording");
+        let states = [idle.clone(), waiting.clone()];
+        let mut row = super::clipboard::draw_capture_row_with(
             canvas,
             origin_y,
             height,
             "settings.gestures_row_gesture_button",
+            Some(super::clipboard::CaptureCaption {
+                shown: if self.waiting { &waiting } else { &idle },
+                states: &states,
+            }),
             &title,
             target,
             sel!(handleGestureTriggerLearn:),
             ControlId::Field(ControlField::GestureTriggerButton),
         );
         // Its OWN binding branch: the binder gives this row the gesture slot and the clipboard's
-        // row the clipboard slot, so neither refresh can land on the other page's button.
-        row.extra = RenderedExtra::GestureHotkey;
-        // The row's tooltip states what the button does; the overlap note is the row's readout, so
-        // it sits under the button like a shortcut capture's error line.
-        let note = if self.mapping_note {
-            t("settings.gestures_trigger_mapping_note")
-        } else {
-            String::new()
+        // row the clipboard slot, so neither refresh can land on the other page's button. The
+        // caption travels with it: the capture state machine writes that copy live.
+        let caption_ptr = match row.extra {
+            RenderedExtra::Shortcut { caption, .. } => caption,
+            _ => std::ptr::null_mut(),
         };
-        if !row.readout.is_null() {
-            let text = crate::ffi::make_nsstring(&note);
-            let _: () = msg_send![row.readout, setStringValue: text];
-            crate::ffi::CFRelease(text as *const c_void);
-            let _: () = msg_send![row.readout, setHidden: note.is_empty()];
-        }
+        row.extra = RenderedExtra::GestureHotkey {
+            caption: caption_ptr,
+        };
         rendered.controls.push(row);
         Ok(())
     }
@@ -179,7 +203,7 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
     // label on the left and a button on the right whose TEXT is the current hotkey, pressed to
     // record a new one. Learning and the mapping note are states of that one control, not rows.
     w.card("settings.gestures_header");
-    w.extra_row(GESTURE_HOTKEY_ROW, GESTURE_HOTKEY_ROW_H);
+    w.extra_row_measured(GESTURE_HOTKEY_ROW, gesture_hotkey_row_height);
     w.card("settings.gestures_header_list");
     if GESTURE_ROWS_EDITABLE {
         // The recorder row: its value IS the recording's state, so the page follows the pointer while

@@ -657,6 +657,25 @@ unsafe fn recording_tap_callback_inner(
                     ReleaseStep::PassThrough => event,
                 };
             }
+            // keyDown: a bare Escape abandons the BUTTON capture as well. The row's copy promises
+            // it, and the only other way out was pressing the recorder's own button again.
+            if *REC_STAGE.lock().unwrap() == RecStage::WaitingButton
+                && *REC_MODE.lock().unwrap() == RecMode::GestureTrigger
+            {
+                let keycode = CGEventGetIntegerValueField(event, 9) as u16;
+                let flags = CGEventGetFlags(event) as u32;
+                let mods = flags & (0x0010_0000 | 0x0008_0000 | 0x0004_0000 | 0x0002_0000);
+                if keycode == 53 && mods == 0 {
+                    // Invalidate the session HERE, on the recording thread, before the main thread
+                    // runs the cancel: otherwise a button down that lands in between completes the
+                    // capture and commits a hotkey the user just cancelled.
+                    crate::settings::abandon_gesture_capture();
+                    // The UI half touches the page and the settings window, so it runs on the main
+                    // thread; this callback is the recording thread.
+                    notify_main(sel!(handleGestureTriggerCaptureCancelled:));
+                    return std::ptr::null_mut();
+                }
+            }
             // keyDown: only handled while waiting for the combo.
             if *REC_STAGE.lock().unwrap() == RecStage::WaitingCombo {
                 let keycode = CGEventGetIntegerValueField(event, 9) as u16;

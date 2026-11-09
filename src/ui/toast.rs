@@ -1381,6 +1381,20 @@ pub(crate) fn smoke_runner() -> Result<(), String> {
             ));
         }
     }
+    // A PRODUCT message must read in full: the bubble caps its width and cuts the rest with an
+    // ellipsis, so the Gestures page's mapping-conflict note -- the longest sentence it carries --
+    // has to fit under the cap. A copy that grows past it loses its explanation silently.
+    let note = crate::i18n::t("settings.gestures_trigger_mapping_note");
+    if let Some(snapshot) = snapshot(&note) {
+        if snapshot.width >= TOAST_MAX_WIDTH {
+            failures.push(format!(
+                "the gesture mapping note is {:.1}pt wide, at the bubble's {:.1}pt cap: it would be cut",
+                snapshot.width, TOAST_MAX_WIDTH
+            ));
+        }
+    } else {
+        failures.push("the gesture mapping note produced no bubble".to_string());
+    }
     // The shadow check has to fail when the bubble has no carrier: build one whose elevation resolves to nothing
     // (the `--panel-shadow=off` path), and require the check to notice.
     if let Some(snapshot) = snapshot_without_shadow() {
