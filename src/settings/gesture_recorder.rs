@@ -117,14 +117,20 @@ pub(crate) fn commit_published_result() {
         return;
     }
     let mut updated = old.clone();
+    // The stroke is appended to the SELECTED layer (a device edits its own list, created on first
+    // write): the shared list is what other mice inherit, and a row written there while a device
+    // layer is selected would be invisible on the page that is open.
+    let scope = crate::settings::selected_gesture_layer(&mut updated);
+    let mut layer = scope.layer(&updated);
     // The button is the one the user actually pressed, so a side-button recording binds a side
     // button.
-    updated.mouse.gestures.push(crate::config::GestureBinding {
+    layer.gestures.push(crate::config::GestureBinding {
         gesture: key,
         button,
         binding: String::new(),
         enabled: false,
     });
+    scope.store(&mut updated, &layer);
     if let Ok(mut config) = crate::config::CONFIG.write() {
         *config = updated.clone();
     }
@@ -133,6 +139,14 @@ pub(crate) fn commit_published_result() {
         &old,
         &updated,
         crate::runtime_config::ConfigChangeSource::Settings,
+    );
+    // A committed stroke is a NEW row: the in-place refresh rewrites existing controls and cannot
+    // create one, so the page rebuilds on the next run-loop turn (keeping the scroll position) and
+    // the popup for the new row is on screen without a leave-and-return. Deferred, not immediate:
+    // this runs from the HUD task, which may sit inside a settings callback that holds the window's
+    // borrow -- the immediate rebuild from inside itself panicked once already.
+    crate::settings::rebuild_settings_content_deferred_keeping_scroll(
+        crate::settings::SettingsPageId::Gestures,
     );
 }
 

@@ -1382,7 +1382,6 @@ impl GestureLayerScope {
     }
 
     /// Write the layer back, wherever it lives.
-    #[cfg(test)]
     pub(crate) fn store(self, cfg: &mut Config, layer: &crate::config::GestureLayer) {
         match self {
             GestureLayerScope::Shared => {
@@ -2287,6 +2286,9 @@ pub(super) fn note_settings_content_rebuilt() {
     // The numeric fields are new too: an edit recorded against the old controls must not commit through a
     // fresh field the user has never touched.
     dispatch::note_text_fields_rebuilt();
+    // The gesture rows' popup option lists belong to the old controls: a stale entry would let a
+    // click read an index against a list the popup on screen no longer shows.
+    crate::settings::page_view::clear_popup_option_ids();
 }
 
 /// The mouse page was just filled from the live config.

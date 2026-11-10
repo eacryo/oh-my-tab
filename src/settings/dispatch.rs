@@ -402,22 +402,37 @@ unsafe fn action_control_of(sender: *mut AnyObject) -> Option<&'static str> {
 }
 
 /// Write a gesture row's action popup back into the configuration: which entry the popup is on
-/// decides the binding, and the tag the page stamped on the control says which row.
+/// decides the binding, and the control's identity says which row -- the identity is what the
+/// control table registered for THIS popup, so it cannot point at another row the way a shared
+/// numeric tag would.
 unsafe fn apply_row_action_popup(control: *mut AnyObject, action: &'static str) {
     // Only the gesture rows carry an editable action popup today; an action id this path does not
     // know must not write anything.
-    if !crate::settings::page_view::is_gesture_row_identity(action) {
-        return;
-    }
-    let tag: isize = msg_send![control, tag];
-    let index: isize = msg_send![control, indexOfSelectedItem];
-    let options = crate::settings::page_view::gesture_target_option_ids();
-    let Some(binding) = options.get(index.max(0) as usize).cloned() else {
+    let Some(index) = crate::settings::page_view::action_row_index(action) else {
         return;
     };
+    let index = index as isize;
+    let selection: isize = msg_send![control, indexOfSelectedItem];
     let old = CONFIG.read().unwrap().clone();
+    // The EXACT list of binding ids the popup was built with, registry-stamped at the page build.
+    // It may hold a row's own custom binding past the fixed list, and the registry is cleared on
+    // every rebuild, so an index always means the entry the popup on screen shows.
+    let options = crate::settings::page_view::popup_option_ids(action);
+    let options = if options.is_empty() {
+        crate::settings::page_view::gesture_target_option_ids()
+    } else {
+        options
+    };
+    let Some(binding) = options.get(selection.max(0) as usize).cloned() else {
+        return;
+    };
     let mut updated = old.clone();
-    let Some(row) = updated.mouse.gestures.get_mut(tag.max(0) as usize) else {
+    // The page shows the SELECTED layer's rows (a device edits its own list, created on first
+    // write); writing the shared list instead would move another mouse's row, or miss the row
+    // whose index only exists in the device layer.
+    let scope = crate::settings::selected_gesture_layer(&mut updated);
+    let mut layer = scope.layer(&updated);
+    let Some(row) = layer.gestures.get_mut(index as usize) else {
         return;
     };
     if row.binding == binding {
@@ -429,6 +444,7 @@ unsafe fn apply_row_action_popup(control: *mut AnyObject, action: &'static str) 
     row.binding = binding.clone();
     row.enabled =
         !binding.is_empty() && crate::mouse::gesture::table::Target::resolve(&binding).is_some();
+    scope.store(&mut updated, &layer);
     if let Ok(mut config) = CONFIG.write() {
         *config = updated.clone();
     }
@@ -437,6 +453,14 @@ unsafe fn apply_row_action_popup(control: *mut AnyObject, action: &'static str) 
         &old,
         &updated,
         crate::runtime_config::ConfigChangeSource::Settings,
+    );
+    // The row's LEFT column carries its live state ("停用", a refused target, a conflict), and the
+    // in-place refresh only rewrites field controls -- it never touches an action row's label.
+    // The page rebuilds on the next run-loop turn, so the label agrees with what the row now runs.
+    // Deferred, not immediate: this runs inside the popup's own action, and the rebuild would
+    // release the control AppKit is dispatching to.
+    crate::settings::rebuild_settings_content_deferred_keeping_scroll(
+        crate::settings::SettingsPageId::Gestures,
     );
 }
 

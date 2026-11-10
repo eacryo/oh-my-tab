@@ -186,6 +186,12 @@ pub(in crate::settings) struct RowSpec {
     /// The value the control starts with; `None` for an action row.
     pub(in crate::settings) value: Value,
     pub(in crate::settings) search: SearchRow,
+    /// The option IDS a popup row's entries map to, in display order, when the row is a gesture
+    /// row's action popup: the page may append the row's own binding (a custom shortcut) as an
+    /// extra entry, so an index past the fixed list means something the fixed id list cannot name.
+    /// The renderer stores this where the CONTROL is created and the dispatcher reads it back, so
+    /// the chosen index always resolves to the exact binding the popup showed. Empty elsewhere.
+    pub(in crate::settings) popup_option_ids: Vec<String>,
 }
 
 /// The search-index entry a row contributes, produced as a value by the page description.

@@ -138,11 +138,10 @@ struct ShownRow {
 
 /// Whether a gesture row can be edited on the page.
 ///
-/// The list is fixed for now: every default gesture is configured in code, a row a user recorded
-/// cannot be acted on yet, and the only writer of `mouse.gestures` in the settings UI is the
-/// recorder's own "add" step. So the page LISTS the rows and does not edit them -- no action popup,
-/// no trigger choice, no delete -- which is why it draws them as plain values.
-pub(super) const GESTURE_ROWS_EDITABLE: bool = false;
+/// The rows are editable again: the action popup writes the row's binding back through
+/// `apply_row_action_popup`, and the recorder row appends a freshly drawn stroke. The list is
+/// built from the configuration either way, so an edit and the next rebuild show the same list.
+pub(super) const GESTURE_ROWS_EDITABLE: bool = true;
 
 /// The page's description: its rows, their values and their identities.
 pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
@@ -266,7 +265,20 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
     let shadowed = crate::mouse::gesture::conflict::rows_shadowed_by_bindings(&layer, cfg);
     let options = target_options();
     for row in rows {
-        let selected = options
+        // A binding the fixed list does not carry (a custom shortcut like "cmd+t") still has to be
+        // SHOWN and selectable: falling back to index 0 would present a live gesture as "not set".
+        // The row's own binding is appended as an extra entry when it is missing, and the popup
+        // handler reads the option-id list the CONTROL was built with (registry-stamped in
+        // render.rs's popup branch), so the round-trip is exact even after a custom entry is
+        // re-picked following a built-in choice.
+        let mut option_list = options.clone();
+        if !row.binding.is_empty() && !option_list.iter().any(|o| o.id == row.binding) {
+            option_list.push(TargetOption {
+                id: row.binding.clone(),
+                label: row.target.clone(),
+            });
+        }
+        let selected = option_list
             .iter()
             .position(|option| option.id == row.binding)
             .unwrap_or(0);
@@ -304,6 +316,7 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             );
             continue;
         }
+        let option_ids: Vec<String> = option_list.iter().map(|option| option.id.clone()).collect();
         w.push(
             RowDraft::new(
                 // The key stays the row's class (the search index and the tests match it); the
@@ -311,7 +324,10 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
                 // the row's label text rather than as a locale key.
                 "settings.gestures_row_gesture",
                 ControlKind::Popup {
-                    options: options.iter().map(|option| option.label.clone()).collect(),
+                    options: option_list
+                        .iter()
+                        .map(|option| option.label.clone())
+                        .collect(),
                 },
                 // Every row needs its OWN identity: the control table refuses a duplicate, and a
                 // refused registration fails the whole page build.
@@ -320,6 +336,10 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             )
             .label_text(stroke)
             .action_tag(row.index as isize)
+            // The option ids travel ON the row spec, so the renderer stores them exactly when it
+            // builds this row's control -- an in-place refresh re-derives the description but
+            // builds nothing, and the mapping on screen stays in force.
+            .popup_option_ids(option_ids)
             // Delete is parked until the renderer draws a popup row action button: the row action
             // button is placed from a Value row today, so a popup row drew nothing pressable.
             // The action popup also carries the row's trigger: its submenu lists the buttons the
@@ -505,6 +525,50 @@ pub(crate) fn gesture_target_option_ids() -> Vec<String> {
         .collect()
 }
 
+// The pending (identity, ids) hand-off from the page description to the renderer. The option ids
+// each gesture row's popup was built with, keyed by the row's identity, travel in it: the page may
+// APPEND a row's own binding (a custom shortcut the fixed list does not carry) as an extra entry,
+// so an index past the fixed list means something different per row -- and a binding can CHANGE
+// between the build and the click (the user picks a built-in action, then re-picks the custom
+// entry still listed). The dispatcher therefore reads the exact list THIS row was built with
+// rather than re-deriving anything. The registry is written where the CONTROL is created
+// (`render.rs`'s popup branch, reached only by `build_page`) and cleared with the rest of the
+// control table's state, so an in-place refresh -- which re-derives the page description but
+// touches no control -- can never overwrite the mapping the on-screen popup was built with.
+/// Store one row's popup option ids for the control that was just built.
+pub(crate) fn record_popup_option_ids(identity: &'static str, ids: &[String]) {
+    POPUP_OPTION_IDS
+        .lock()
+        .unwrap()
+        .insert(identity, ids.to_vec());
+}
+
+/// The popup option ids one gesture row was built with; empty when the row is not on screen.
+pub(crate) fn popup_option_ids(identity: &str) -> Vec<String> {
+    POPUP_OPTION_IDS
+        .lock()
+        .unwrap()
+        .get(identity)
+        .cloned()
+        .unwrap_or_default()
+}
+
+pub(crate) fn clear_popup_option_ids() {
+    POPUP_OPTION_IDS.lock().unwrap().clear();
+}
+
+// The registry of option-id lists per gesture-row identity. The page may APPEND a row's own
+// binding (a custom shortcut the fixed list does not carry) as an extra popup entry, so an index
+// past the fixed list means something different per row -- and a binding can CHANGE between the
+// build and the click (the user picks a built-in action, then re-picks the custom entry still
+// listed). The dispatcher therefore reads the exact list THIS row was built with rather than
+// re-deriving anything. The registry is written where the CONTROL is created (`render.rs`'s popup
+// branch, reached only by `build_page`) and cleared with the rest of the control table's state, so
+// an in-place refresh -- which re-derives the page description but touches no control -- can never
+// overwrite the mapping the on-screen popup was built with.
+static POPUP_OPTION_IDS: std::sync::LazyLock<std::sync::Mutex<HashMap<&'static str, Vec<String>>>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
 /// The identity of a gesture control: the row itself, or one button line of its trigger row.
 ///
 /// The action path and the trigger path answer different questions about the same row, so their
@@ -583,11 +647,16 @@ pub(crate) fn set_row_trigger(
     }
     let old = crate::config::CONFIG.read().ok()?.clone();
     let mut updated = old.clone();
-    let row = updated.mouse.gestures.get_mut(index)?;
+    // The rows the page lists belong to the SELECTED layer, not always the shared one; move the
+    // row where the page reads it from.
+    let scope = crate::settings::selected_gesture_layer(&mut updated);
+    let mut layer = scope.layer(&updated);
+    let row = layer.gestures.get_mut(index)?;
     if row.button == button {
         return None;
     }
     row.button = button;
+    scope.store(&mut updated, &layer);
     if let Ok(mut config) = crate::config::CONFIG.write() {
         *config = updated.clone();
     }
@@ -650,11 +719,16 @@ pub(crate) fn remove_gesture_row(
     index: usize,
 ) -> Option<(crate::config::Config, crate::config::Config)> {
     let old = crate::config::CONFIG.read().ok()?.clone();
-    if index >= old.mouse.gestures.len() {
+    let mut updated = old.clone();
+    // Same layer rule as the popup and the trigger move: the row the page lists lives in the
+    // SELECTED layer.
+    let scope = crate::settings::selected_gesture_layer(&mut updated);
+    let mut layer = scope.layer(&updated);
+    if index >= layer.gestures.len() {
         return None;
     }
-    let mut updated = old.clone();
-    updated.mouse.gestures.remove(index);
+    layer.gestures.remove(index);
+    scope.store(&mut updated, &layer);
     if let Ok(mut config) = crate::config::CONFIG.write() {
         *config = updated.clone();
     }
@@ -1227,8 +1301,8 @@ mod tests {
         assert_eq!(stroke_words(""), "");
     }
 
-    /// The hotkey is ONE page-drawn row (the clipboard shortcut row's shape), so there is no
-    /// popup and no second row: the button's own text carries the current hotkey.
+    /// The hotkey is ONE page-drawn row (the clipboard shortcut row's shape), and the gesture
+    /// rows' own popups do not turn it into one: the button's text carries the current hotkey.
     #[test]
     fn the_hotkey_is_one_page_drawn_row() {
         let page_input = input(true, vec![row("l", 1, "window.snap_left", true)]);
@@ -1246,12 +1320,14 @@ mod tests {
                 .any(|r| r.label_key == "settings.gestures_row_trigger_learn"),
             "there is no second row for learning"
         );
+        // The hotkey row itself is a page-drawn extra row, not a popup row among the list rows;
+        // the popups the list draws belong to the gesture rows.
         assert!(
             !view
                 .rows
                 .iter()
-                .any(|r| matches!(r.control, ControlKind::Popup { .. })),
-            "the hotkey is not a popup"
+                .any(|r| r.label_key == "settings.gestures_row_gesture_button"),
+            "the hotkey keeps its own row"
         );
     }
 
@@ -1307,20 +1383,10 @@ mod tests {
         );
     }
 
-    /// The list is fixed, so the rows cannot be edited: every gesture row is a plain value with
-    /// nothing to press, and the recorder that would add a row is not on the page. This is the
-    /// assertion that keeps a half-editable page from coming back unnoticed.
     #[test]
-    fn a_fixed_list_draws_plain_rows_and_no_recorder() {
-        assert!(!GESTURE_ROWS_EDITABLE, "this test pins the shipped state");
+    fn an_editable_list_draws_action_popups() {
+        assert!(GESTURE_ROWS_EDITABLE, "this test pins the shipped state");
         let view = gestures_page_view(&input(true, vec![row("l", 1, "window.snap_left", true)]));
-        assert!(
-            !view
-                .rows
-                .iter()
-                .any(|r| r.label_key == "settings.gestures_row_record"),
-            "the recorder adds a row, which a fixed list does not offer"
-        );
         let gesture_rows: Vec<&RowSpec> = view
             .rows
             .iter()
@@ -1328,15 +1394,141 @@ mod tests {
             .collect();
         assert_eq!(gesture_rows.len(), 1);
         match &gesture_rows[0].control {
-            ControlKind::Value { action, .. } => {
-                assert!(action.is_none(), "a fixed row has no action button")
+            ControlKind::Popup { options } => {
+                assert!(
+                    options.len() > 1,
+                    "the popup lists the actions: {options:?}"
+                );
             }
-            other => panic!("a fixed row is a plain value, not {other:?}"),
+            other => panic!("an editable row is a popup, not {other:?}"),
         }
         assert!(
-            matches!(gesture_rows[0].value, Value::Dynamic(ref text) if !text.is_empty()),
-            "the row still says what it runs"
+            matches!(gesture_rows[0].value, Value::Index(_)),
+            "the popup starts on the row's current binding"
         );
+        assert_eq!(
+            gesture_rows[0].action_tag,
+            Some(0),
+            "the row states its index"
+        );
+    }
+
+    /// A binding the fixed option list does not carry (a custom shortcut like "cmd+t") must still
+    /// be SHOWN as the popup's selection: falling back to index 0 presented a live gesture as
+    /// "not set" while it kept running.
+    #[test]
+    fn a_custom_binding_is_shown_not_reported_unset() {
+        let view = gestures_page_view(&input(true, vec![row("l", 1, "cmd+t", true)]));
+        let gesture_row = view
+            .rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_gesture")
+            .expect("the gesture row");
+        match (&gesture_row.control, &gesture_row.value) {
+            (ControlKind::Popup { options }, Value::Index(index)) => {
+                let shown = options.get(*index).cloned().unwrap_or_default();
+                assert!(
+                    !shown.is_empty() && shown != t("settings.gestures_target_unset"),
+                    "a custom binding is shown as itself, not as unset: {shown:?}"
+                );
+            }
+            other => panic!("unexpected row: {other:?}"),
+        }
+    }
+
+    /// A row's left column states its live state ("停用" while disabled), and the action popup's
+    /// write-back re-enables the row when the chosen action is runnable. The rebuilt page -- what
+    /// the dispatcher schedules after the write -- must show the row WITHOUT the disabled mark:
+    /// a label that kept saying "停用" beside a running gesture described a state that was gone.
+    #[test]
+    fn a_re_enabled_row_no_longer_says_it_is_off() {
+        // A recorded gesture starts disabled with no binding (the recorder's own commit shape).
+        let before = gestures_page_view(&input(true, vec![row("l", 2, "", false)]));
+        let label = before
+            .rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_gesture")
+            .map(|r| r.label_text.clone().unwrap_or_default())
+            .expect("the gesture row");
+        assert!(
+            label.contains(&t("settings.gestures_state_off")),
+            "a disabled row says so: {label}"
+        );
+        // The popup's write-back: a runnable binding is chosen and the row is enabled.
+        let mut updated = input(true, vec![row("l", 2, "", false)]);
+        updated.config.mouse.gestures[0].binding = "window.snap_left".into();
+        updated.config.mouse.gestures[0].enabled = true;
+        let after = gestures_page_view(&updated);
+        let label = after
+            .rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_gesture")
+            .map(|r| r.label_text.clone().unwrap_or_default())
+            .expect("the gesture row");
+        assert!(
+            !label.contains(&t("settings.gestures_state_off")),
+            "the rebuilt row drops the disabled mark once it runs: {label}"
+        );
+    }
+
+    /// Each gesture row's spec carries the option ids ITS popup maps to: with two rows, each
+    /// holding a different custom shortcut, both ids survive the whole description (an earlier
+    /// single-slot hand-off kept only the last row's list, and the first row's custom entry then
+    /// resolved to nothing). The renderer stores a row's list only where it BUILDS that row's
+    /// control, so the mapping an index resolves through is the one the popup showed.
+    #[test]
+    fn every_row_carries_its_own_popup_option_ids() {
+        let view = gestures_page_view(&input(
+            true,
+            vec![row("l", 1, "cmd+t", true), row("r", 1, "cmd+shift+p", true)],
+        ));
+        let rows: Vec<&RowSpec> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_gesture")
+            .collect();
+        assert_eq!(rows.len(), 2);
+        for (index, spec) in rows.iter().enumerate() {
+            let ids = &spec.popup_option_ids;
+            assert!(!ids.is_empty(), "row {index} carries its option ids");
+            // The last entry of each row's list is that row's own custom binding.
+            let expected = if index == 0 { "cmd+t" } else { "cmd+shift+p" };
+            assert_eq!(
+                ids.last().map(String::as_str),
+                Some(expected),
+                "row {index}'s own binding closes its list: {ids:?}"
+            );
+        }
+        assert_ne!(
+            rows[0].popup_option_ids, rows[1].popup_option_ids,
+            "two rows with different custom bindings carry different lists"
+        );
+        // The lists are per-row: writing one row's list where the other's control is built would
+        // break the round-trip, so the renderer matches them by identity.
+        crate::settings::page_view::clear_popup_option_ids();
+        crate::settings::page_view::record_popup_option_ids(
+            row_identity(0),
+            &rows[0].popup_option_ids,
+        );
+        crate::settings::page_view::record_popup_option_ids(
+            row_identity(1),
+            &rows[1].popup_option_ids,
+        );
+        assert_eq!(
+            crate::settings::page_view::popup_option_ids(row_identity(0))
+                .last()
+                .map(String::as_str),
+            Some("cmd+t"),
+            "row 0 reads back its own list"
+        );
+        assert_eq!(
+            crate::settings::page_view::popup_option_ids(row_identity(1))
+                .last()
+                .map(String::as_str),
+            Some("cmd+shift+p"),
+            "row 1 reads back its own list"
+        );
+        crate::settings::page_view::clear_popup_option_ids();
     }
 
     /// The in-place refresh can write both presentation switches, because the shared update

@@ -314,6 +314,20 @@ pub(super) unsafe fn render_row(
                 let _: () = msg_send![popup, setTarget: target];
                 let _: () = msg_send![popup, setAction: dedicated_selector(row.field())];
             }
+            // A gesture row's popup records the option-id list it was built with, at the moment
+            // the CONTROL exists: the dispatcher reads the chosen index back against THIS list.
+            // The ids travel on the row spec, so only a real build writes them -- an in-place
+            // refresh re-derives the description but builds no control.
+            if !row.popup_option_ids.is_empty() {
+                if let ControlId::Action(identity) = row.id {
+                    if is_gesture_row_identity(identity) {
+                        crate::settings::page_view::record_popup_option_ids(
+                            identity,
+                            &row.popup_option_ids,
+                        );
+                    }
+                }
+            }
             popup
         }
         // A hyperlink: the widget opens the URL its tag names on a click.

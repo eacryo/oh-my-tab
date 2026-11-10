@@ -182,6 +182,8 @@ pub(super) struct RowDraft {
     label_text: Option<String>,
     /// The application bundle whose icon the row shows before its label (see `RowSpec`).
     icon_bundle: Option<String>,
+    /// The option ids a gesture row's popup maps its entries to (see `RowSpec`).
+    popup_option_ids: Vec<String>,
 }
 
 impl RowDraft {
@@ -206,6 +208,7 @@ impl RowDraft {
             action_tag: None,
             label_text: None,
             icon_bundle: None,
+            popup_option_ids: Vec::new(),
         }
     }
 
@@ -264,6 +267,12 @@ impl RowDraft {
         self
     }
 
+    /// Give a gesture row's popup the option ids its entries map to (see `RowSpec`).
+    pub(super) fn popup_option_ids(mut self, ids: Vec<String>) -> Self {
+        self.popup_option_ids = ids;
+        self
+    }
+
     pub(super) fn group(mut self, group: RowGroup) -> Self {
         self.group = Some(group);
         self
@@ -292,6 +301,7 @@ impl RowDraft {
             group: self.group,
             value: self.value,
             action_tag: self.action_tag,
+            popup_option_ids: self.popup_option_ids,
             search: SearchRow {
                 label: t(self.label_key),
                 desc: self.desc_key.map(t),
