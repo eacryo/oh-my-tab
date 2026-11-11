@@ -934,8 +934,8 @@ fn queue_settings_content_rebuild() {
 /// The request is COALESCED with `REBUILD_PENDING`: several edits in one run-loop turn queue ONE
 /// rebuild. Without that, two queued callbacks would let the first consume the record and restore
 /// the position, and the second fall through to a plain rebuild that jumps back to the top.
-static PENDING_PAGE_SCROLL: std::sync::Mutex<Option<(SettingsPageId, f64)>> =
-    std::sync::Mutex::new(None);
+static PENDING_PAGE_SCROLL: std::sync::Mutex<Vec<(SettingsPageId, f64)>> =
+    std::sync::Mutex::new(Vec::new());
 
 /// Whether a rebuild is already queued for this run-loop turn.
 static REBUILD_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -943,23 +943,112 @@ static REBUILD_QUEUED: std::sync::atomic::AtomicBool = std::sync::atomic::Atomic
 /// Rebuild the content while keeping the clipboard page where the user left it: removing or
 /// restoring a row must not throw a long page back to its top.
 pub(crate) fn rebuild_settings_content_deferred_keeping_scroll(page: SettingsPageId) {
-    // Captured synchronously, before the queued rebuild tears the page down.
-    let distance = unsafe { window::page_scroll_distance_from_top(page) };
+    rebuild_settings_content_deferred_keeping_scrolls(&[page]);
+}
+
+/// Rebuild the content while keeping SEVERAL pages where the user left them.
+///
+/// A rebuild recreates EVERY page, so restoring one position throws the others back to the top --
+/// including whichever page the user is looking at, whose jump is the one they see. The positions
+/// are captured synchronously, before the queued rebuild tears the pages down, and a coalesced
+/// request keeps what this run-loop turn already recorded.
+pub(crate) fn rebuild_settings_content_deferred_keeping_scrolls(pages: &[SettingsPageId]) {
+    let captured: Vec<(SettingsPageId, f64)> = pages
+        .iter()
+        // Captured synchronously, before the queued rebuild tears the page down.
+        .filter_map(|page| {
+            unsafe { window::page_scroll_distance_from_top(*page) }
+                .map(|distance| (*page, distance))
+        })
+        .collect();
     if let Ok(mut pending) = PENDING_PAGE_SCROLL.lock() {
-        *pending = distance.map(|d| (page, d));
+        merge_pending_scrolls(&mut pending, captured);
     }
     queue_settings_content_rebuild();
+}
+
+/// Fold newly captured positions into the pending set: the EARLIEST capture wins, because it
+/// describes the page before this turn's rebuild started tearing it down.
+fn merge_pending_scrolls(
+    pending: &mut Vec<(SettingsPageId, f64)>,
+    fresh: Vec<(SettingsPageId, f64)>,
+) {
+    for (page, distance) in fresh {
+        if !pending.iter().any(|(recorded, _)| *recorded == page) {
+            pending.push((page, distance));
+        }
+    }
 }
 
 /// Open the next run-loop turn for a new rebuild request and hand this one's scroll record to the
 /// handler. Clearing the queued flag FIRST is what makes a rebuild requested during this handler
 /// queue a fresh one instead of being swallowed.
-pub(crate) fn take_rebuild_request() -> Option<(SettingsPageId, f64)> {
+pub(crate) fn take_rebuild_request() -> Vec<(SettingsPageId, f64)> {
     release_rebuild_slot();
     PENDING_PAGE_SCROLL
         .lock()
         .ok()
-        .and_then(|mut pending| pending.take())
+        .map(|mut pending| std::mem::take(&mut *pending))
+        .unwrap_or_default()
+}
+
+/// The bubble explaining why the app switcher cannot take the modifier `cfg` is on, or `None` when
+/// it can.
+///
+/// ONE builder for all three surfaces (the popup's pre-commit rule, the runtime refusal and the
+/// reload announcement), so the words and the count cannot disagree. The copy says WHERE the
+/// blocking gestures live, because the page only draws the selected layer: a user who cleared
+/// their mouse's layer and still reads "2 gestures" would be looking at a page that shows none.
+pub(crate) fn switcher_modifier_conflict_message(cfg: &Config) -> Option<String> {
+    let (shared, device) = page_view::switcher_conflict_counts(cfg);
+    let count = shared + device;
+    if count == 0 {
+        return None;
+    }
+    let where_key = match (shared > 0, device > 0) {
+        (true, true) => "errors.switcher_gestures_in_both",
+        (true, false) => "errors.switcher_gestures_in_shared",
+        _ => "errors.switcher_gestures_in_device",
+    };
+    let chord = page_view::chord_label_for_modifier(&cfg.keyboard.modifier);
+    let where_label = crate::i18n::t(where_key);
+    Some(crate::i18n::tf(
+        &crate::i18n::t_count("errors.errors_switcher_modifier_taken_by_gestures", count),
+        &[("chord", &chord), ("where", &where_label)],
+    ))
+}
+
+/// Rebuild the settings content after the app switcher's modifier changed.
+///
+/// The Gestures page's action popup filters the Tab chords the switcher owns, and a gesture row
+/// marks its own chord when the switcher shadows it -- both decided while the page is BUILT. The
+/// in-place refresh writes field controls only, so the page has to be rebuilt (deferred, scroll
+/// kept) or it keeps describing the modifier the switcher no longer uses.
+pub(crate) fn rebuild_gestures_page_after_switcher_modifier_change() {
+    // The page the user is looking at keeps its position too: the rebuild recreates every page,
+    // and a modifier change made from the Switcher page must not throw that page to its top.
+    let mut pages = Vec::with_capacity(2);
+    if let Some(current) = current_settings_page() {
+        pages.push(current);
+    }
+    pages.push(SettingsPageId::Gestures);
+    rebuild_settings_content_deferred_keeping_scrolls(&pages);
+}
+
+/// The settings page the pane is currently showing, or `None` when no window is built (or the
+/// search results stand in for the pages, which are all hidden then).
+pub(crate) fn current_settings_page() -> Option<SettingsPageId> {
+    with_settings_ui(|ui| {
+        let ui = ui.as_ref()?;
+        (0..SETTINGS_PAGE_COUNT).find_map(|index| {
+            let view = ui.page_views[index];
+            if view.is_null() {
+                return None;
+            }
+            let hidden: bool = unsafe { msg_send![view, isHidden] };
+            (!hidden).then(|| settings_page_identity(index))
+        })
+    })
 }
 
 /// Re-read the General appearance controls after a non-rebuilding appearance change (a panel-material
@@ -1166,7 +1255,9 @@ pub(crate) use mapping::{
 };
 use page_canvas::*;
 use page_view::*;
-pub(crate) use page_view::{about_update_flow_smoke_runner, migrated_pages_smoke_runner};
+pub(crate) use page_view::{
+    about_update_flow_smoke_runner, migrated_pages_smoke_runner, rows_shadowed_by_switcher,
+};
 pub(super) use restore::{
     collapse_restore_confirmations, collapse_restore_confirmations_on_external_click,
 };
@@ -1180,7 +1271,8 @@ use window::*;
 // Entry points exposed to the rest of the crate (implemented in child modules; main.rs
 // consumes them through use settings::*).
 pub(crate) use dispatch::{
-    end_max_extent_preview, handle_clipboard_enabled_toggle, handle_clipboard_excluded_add,
+    announce_gestures_shadowed_by_switcher, end_max_extent_preview,
+    handle_clipboard_enabled_toggle, handle_clipboard_excluded_add,
     handle_clipboard_excluded_remove, handle_clipboard_excluded_restore, handle_device_changed,
     handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
     handle_export_settings_ready, handle_gesture_excluded_choose, handle_gesture_excluded_remove,
@@ -2928,7 +3020,7 @@ mod tests {
     fn rebuild_requests_coalesce_into_one_turn_and_keep_the_scroll_record() {
         // Isolate the process-wide slot/record from any other test in this binary.
         super::release_rebuild_slot();
-        *super::PENDING_PAGE_SCROLL.lock().unwrap() = None;
+        super::PENDING_PAGE_SCROLL.lock().unwrap().clear();
 
         assert!(
             super::claim_rebuild_slot(),
@@ -2938,20 +3030,64 @@ mod tests {
             !super::claim_rebuild_slot(),
             "a request in the same turn must fold into the queued rebuild"
         );
-        *super::PENDING_PAGE_SCROLL.lock().unwrap() = Some((SettingsPageId::Clipboard, 120.0));
+        super::PENDING_PAGE_SCROLL
+            .lock()
+            .unwrap()
+            .push((SettingsPageId::Clipboard, 120.0));
 
         // The handler turns the record over exactly once...
         assert_eq!(
             super::take_rebuild_request(),
-            Some((SettingsPageId::Clipboard, 120.0))
+            vec![(SettingsPageId::Clipboard, 120.0)]
         );
-        assert_eq!(super::take_rebuild_request(), None, "consumed once");
+        assert!(super::take_rebuild_request().is_empty(), "consumed once");
         // ...and opens the next turn, so a later edit still gets its own rebuild.
         assert!(
             super::claim_rebuild_slot(),
             "the slot is free again for the next run-loop turn"
         );
         super::release_rebuild_slot();
+    }
+
+    /// A rebuild recreates EVERY page, so the record holds one position per page: the page the
+    /// user is looking at keeps its place even when the change is about another page (a modifier
+    /// change made from the Switcher page must not throw the Switcher page to the top), and two
+    /// captures of the same page in one turn keep the FIRST -- the one taken before the rebuild
+    /// started tearing it down.
+    #[test]
+    fn a_rebuild_keeps_every_affected_page_position() {
+        let mut pending: Vec<(SettingsPageId, f64)> = Vec::new();
+        super::merge_pending_scrolls(
+            &mut pending,
+            vec![
+                (SettingsPageId::Switcher, 40.0),
+                (SettingsPageId::Gestures, 260.0),
+            ],
+        );
+        assert_eq!(
+            pending,
+            vec![
+                (SettingsPageId::Switcher, 40.0),
+                (SettingsPageId::Gestures, 260.0)
+            ]
+        );
+        // A later capture in the same turn does not overwrite the earlier one...
+        super::merge_pending_scrolls(
+            &mut pending,
+            vec![
+                (SettingsPageId::Gestures, 10.0),
+                (SettingsPageId::Mouse, 5.0),
+            ],
+        );
+        assert_eq!(
+            pending,
+            vec![
+                (SettingsPageId::Switcher, 40.0),
+                (SettingsPageId::Gestures, 260.0),
+                (SettingsPageId::Mouse, 5.0)
+            ],
+            "the first capture of a page wins, and a new page is added"
+        );
     }
 
     use super::{settings_ui_borrowed, with_settings_ui};

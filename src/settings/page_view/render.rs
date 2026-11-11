@@ -313,6 +313,26 @@ pub(super) unsafe fn render_row(
             if !popup.is_null() {
                 let _: () = msg_send![popup, setTarget: target];
                 let _: () = msg_send![popup, setAction: dedicated_selector(row.field())];
+                // Two popups carry a value another feature can veto: the app switcher's modifier
+                // (a gesture already using the Tab chord it would take) and a gesture row's action
+                // (the chord the switcher owns). The rule lives on the CONTROL so the refusal
+                // happens before the choice is committed, and the trigger never paints a value
+                // that is taken back a frame later.
+                if row.field() == Some(ControlField::Modifier) {
+                    crate::settings::select::set_select_acceptance(
+                        popup,
+                        crate::settings::dispatch::modifier_choice_refusal,
+                        0,
+                    );
+                } else if let ControlId::Action(identity) = row.id {
+                    if let Some(index) = crate::settings::page_view::action_row_index(identity) {
+                        crate::settings::select::set_select_acceptance(
+                            popup,
+                            crate::settings::dispatch::gesture_row_choice_refusal,
+                            index,
+                        );
+                    }
+                }
             }
             // A gesture row's popup records the option-id list it was built with, at the moment
             // the CONTROL exists: the dispatcher reads the chosen index back against THIS list.

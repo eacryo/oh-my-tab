@@ -71,9 +71,11 @@ use general::general_page_view;
 use gestures::gestures_page_view;
 pub(super) use gestures::GesturesHooks;
 pub(crate) use gestures::{
-    action_row_index, clear_popup_option_ids, delete_row_index, gesture_target_option_ids,
-    gesture_trigger_option_ids, is_gesture_row_identity, is_trigger_row_identity, popup_option_ids,
-    record_popup_option_ids, remove_gesture_row, set_row_trigger, trigger_row_of,
+    action_row_index, chord_label_for_modifier, chord_target_is_shadowed, clear_popup_option_ids,
+    delete_row_index, gesture_row_identity, gesture_target_option_ids, gesture_trigger_option_ids,
+    is_gesture_row_identity, is_trigger_row_identity, popup_option_ids, record_popup_option_ids,
+    remove_gesture_row, rows_shadowed_by_switcher, set_row_trigger, switcher_chord_label,
+    switcher_conflict_counts, trigger_row_of,
 };
 use key_bindings::key_bindings_page_view;
 pub(super) use key_bindings::KeyBindingsHooks;

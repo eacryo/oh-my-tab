@@ -1827,6 +1827,11 @@ pub(super) unsafe fn activate_settings_search_result(index: usize) {
     refresh_settings_search();
     // Switching through the sidebar keeps its page-editor bookkeeping.
     select_sidebar(entry.page);
+    // A search result is the user choosing a page too, so the arrival notes apply exactly as they
+    // do for a sidebar click (a rebuild's silent re-select is the case they must NOT cover).
+    crate::settings::window::note_user_arrived_at_page(crate::settings::settings_page_identity(
+        entry.page,
+    ));
     refresh_settings_search();
     flash_pending_row();
 }

@@ -208,6 +208,64 @@ pub(crate) fn refresh_gesture_hotkey_control() {
 /// recorder's refused chords go there for the same reason), and it is said when the user arrives at
 /// the Gestures page and when a learned hotkey creates the conflict -- a standing warning in a
 /// transient surface is only useful at the moment it is read.
+/// The bubble explaining why the app switcher cannot take the modifier at `index`, or `None` when
+/// it can.
+///
+/// This is the acceptance rule the modifier popup carries (see `select::set_select_acceptance`):
+/// it answers BEFORE the choice is committed, so a refused value is never painted. It is
+/// index-based because the popup's items are labels, not config values.
+pub(crate) fn modifier_choice_refusal(index: usize, _context: usize) -> Option<String> {
+    let modifier = crate::config::switcher_modifier_value_at(index);
+    let mut probe = CONFIG.read().ok()?.clone();
+    if probe.keyboard.modifier == modifier {
+        return None;
+    }
+    probe.keyboard.modifier = modifier.to_string();
+    crate::settings::switcher_modifier_conflict_message(&probe)
+}
+
+/// The bubble explaining why a gesture row cannot take the action at `index`, or `None` when it
+/// can. `row` (the registered context) says which row's popup is asking, because the popup's entry
+/// list is per row.
+pub(crate) fn gesture_row_choice_refusal(index: usize, row: usize) -> Option<String> {
+    let identity = crate::settings::page_view::gesture_row_identity(row)?;
+    let options = {
+        let stamped = crate::settings::page_view::popup_option_ids(identity);
+        if stamped.is_empty() {
+            crate::settings::page_view::gesture_target_option_ids()
+        } else {
+            stamped
+        }
+    };
+    let binding = options.get(index)?;
+    let modifier = CONFIG.read().ok()?.keyboard.modifier.clone();
+    if !crate::settings::page_view::chord_target_is_shadowed(binding, &modifier) {
+        return None;
+    }
+    Some(crate::i18n::tf(
+        "errors.errors_gestures_target_shadowed_by_switcher",
+        &[("chord", &crate::settings::switcher_chord_label())],
+    ))
+}
+
+/// The app switcher's modifier was changed onto a chord configured gestures use: say so where the
+/// change was made.
+///
+/// The row that explains the conflict lives on the Gestures page, in the layer being edited -- and
+/// the switcher's modifier is global, so a row in another device layer would never be drawn there.
+/// This counts every layer and reports once, when the settings window is visible (the bubble is
+/// drawn in it; a menu-bar change with no window is answered by the row notes on the next visit).
+pub(crate) fn announce_gestures_shadowed_by_switcher() {
+    if !crate::settings::window::settings_window_is_visible() {
+        return;
+    }
+    let cfg = CONFIG.read().unwrap().clone();
+    let Some(text) = crate::settings::switcher_modifier_conflict_message(&cfg) else {
+        return;
+    };
+    crate::ui::toast::show_refused(&text);
+}
+
 pub(crate) fn announce_gesture_mapping_conflict() {
     if !crate::settings::window::settings_window_is_visible() {
         return;
@@ -401,6 +459,46 @@ unsafe fn action_control_of(sender: *mut AnyObject) -> Option<&'static str> {
     })
 }
 
+/// What one action-popup pick does to a gesture row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PickOutcome {
+    /// The row takes this binding.
+    Apply(String),
+    /// The pick is refused: the row keeps what it had and the bubble says why.
+    Refused,
+}
+
+/// Decide one pick.
+///
+/// A chord the app switcher owns cannot work: its tap swallows the Tab keyDown the gesture
+/// synthesizes (it accepts session-synthesized chords on purpose, so a mouse mapping can send
+/// Cmd+Tab), and the gesture's own modifier release then commits the switch. The entry stays in
+/// the picker -- a hidden entry leaves the user guessing where their browser chord went -- and the
+/// pick is what gets refused.
+fn pick_outcome(picked: &str, switcher_modifier: &str) -> PickOutcome {
+    if crate::settings::page_view::chord_target_is_shadowed(picked, switcher_modifier) {
+        PickOutcome::Refused
+    } else {
+        PickOutcome::Apply(picked.to_string())
+    }
+}
+
+/// The binding a gesture row holds now, read WITHOUT creating a device layer.
+///
+/// The page may be showing a device layer that does not exist in the file yet (it is created on
+/// the first write), so this looks the layer up without side effects and falls back to the shared
+/// one: a refused pick only needs to restore the popup, and a missing entry simply skips that.
+fn current_gesture_binding(index: usize) -> Option<String> {
+    let cfg = CONFIG.read().ok()?;
+    let scope = crate::settings::selected_gesture_scope()
+        .unwrap_or(crate::settings::GestureLayerScope::Shared);
+    scope
+        .layer(&cfg)
+        .gestures
+        .get(index)
+        .map(|row| row.binding.clone())
+}
+
 /// Write a gesture row's action popup back into the configuration: which entry the popup is on
 /// decides the binding, and the control's identity says which row -- the identity is what the
 /// control table registered for THIS popup, so it cannot point at another row the way a shared
@@ -424,6 +522,29 @@ unsafe fn apply_row_action_popup(control: *mut AnyObject, action: &'static str) 
         options
     };
     let Some(binding) = options.get(selection.max(0) as usize).cloned() else {
+        return;
+    };
+    // A chord the app switcher owns is OFFERED -- hiding it would leave the user guessing where
+    // their browser chord went -- but the pick is REFUSED: the switcher's tap swallows the Tab
+    // keyDown the gesture synthesizes (it accepts synthesized chords on purpose, for mouse
+    // mappings), so the row cannot do what the entry says. Nothing is written, the popup is put
+    // back on the row's current entry, and the bubble says why.
+    let outcome = pick_outcome(&binding, &old.keyboard.modifier);
+    if let PickOutcome::Refused = outcome {
+        let current = current_gesture_binding(index as usize);
+        if let Some(shown) =
+            current.and_then(|current| options.iter().position(|id| *id == current))
+        {
+            let _: () = msg_send![control, selectItemAtIndex: shown as isize];
+        }
+        let text = crate::i18n::tf(
+            "errors.errors_gestures_target_shadowed_by_switcher",
+            &[("chord", &crate::settings::page_view::switcher_chord_label())],
+        );
+        crate::ui::toast::show_refused(&text);
+        return;
+    }
+    let PickOutcome::Apply(binding) = outcome else {
         return;
     };
     let mut updated = old.clone();
@@ -1601,12 +1722,14 @@ pub(crate) extern "C" fn handle_rebuild_settings_content(
     _sender: *mut c_void,
 ) {
     callback_guard::void("handle_rebuild_settings_content", || {
-        let pending = crate::settings::take_rebuild_request();
-        match pending {
-            Some((page, offset)) => unsafe {
-                super::window::rebuild_settings_content_now_keeping_scroll(page, Some(offset));
-            },
-            None => unsafe { super::window::rebuild_settings_content_now() },
+        let positions = crate::settings::take_rebuild_request();
+        unsafe {
+            // One rebuild for the turn, then each recorded page is put back where it was: the
+            // rebuild recreates every page, so restoring only one leaves the rest at the top.
+            super::window::rebuild_settings_content_now();
+            for (page, offset) in positions {
+                super::window::set_page_scroll_distance_from_top(page, offset);
+            }
         }
     });
 }
@@ -2239,6 +2362,13 @@ pub(crate) extern "C" fn on_sidebar_select(_self: *mut c_void, _cmd: Sel, sender
             return;
         }
         select_sidebar(tag as usize);
+        // Arriving at the Gestures page is when the user needs to know that the hotkey they picked
+        // shadows a button mapping: the row carries no note of its own, so the shared bubble says
+        // it. Announced HERE, not in `select_sidebar`, which a content rebuild also calls: a
+        // rebuild must not talk over the message that caused it.
+        crate::settings::window::note_user_arrived_at_page(
+            crate::settings::settings_page_identity(tag as usize),
+        );
         // A click in the sidebar is the user choosing where they work: this is the page the next launch reopens on.
         // The programmatic entries do not record, so opening Settings from the clipboard picker or the updater does not
         // steal the choice.
@@ -2872,6 +3002,165 @@ mod portability_ui_tests {
 
 #[cfg(test)]
 mod tests {
+    /// A pick of the app switcher's chord is REFUSED: the row keeps its binding, the popup goes
+    /// back to it, and the bubble says why. Everything else applies.
+    #[test]
+    fn a_refused_pick_does_not_apply() {
+        for (chord, modifier) in [("ctrl+tab", "control"), ("cmd+tab", "command")] {
+            assert_eq!(
+                super::pick_outcome(chord, modifier),
+                super::PickOutcome::Refused,
+                "{chord} with the switcher on {modifier}"
+            );
+        }
+        for (chord, modifier) in [
+            ("ctrl+tab", "command"),
+            // Only the EXACT chord conflicts: the shifted variant is a chord of its own.
+            ("ctrl+shift+tab", "control"),
+            ("ctrl+shift+tab", "option"),
+            ("cmd+q", "control"),
+            ("cmd+w", "control"),
+            ("window.snap_left", "control"),
+            ("", "control"),
+        ] {
+            assert_eq!(
+                super::pick_outcome(chord, modifier),
+                super::PickOutcome::Apply(chord.to_string()),
+                "{chord} with the switcher on {modifier}"
+            );
+        }
+    }
+
+    /// Picking a chord the app switcher owns is answered with a bubble, at the moment of the pick,
+    /// and the refusal happens BEFORE anything is written.
+    ///
+    /// Scanned from the source, like the other wiring assertions: the pick path needs AppKit and a
+    /// real popup, so a behavioural test cannot reach it, and a removed call would otherwise pass
+    /// every other test (the row mark is produced by the page rebuild, not by this branch).
+    #[test]
+    fn picking_a_shadowed_chord_reports_it() {
+        let source = include_str!("dispatch.rs");
+        let start = source
+            .find("unsafe fn apply_row_action_popup")
+            .expect("the popup handler is in this file");
+        let body = &source[start..];
+        let end = body.find("\n}\n").unwrap_or(body.len());
+        let body = &body[..end];
+        assert!(
+            body.contains("pick_outcome"),
+            "the pick must be decided by the refusal rule: {body}"
+        );
+        assert!(
+            body.contains("show_refused")
+                && body.contains("errors_gestures_target_shadowed_by_switcher"),
+            "the pick must be reported with the conflict copy: {body}"
+        );
+        // Refused means NOT APPLIED: the refusal block returns before the write, and it puts the
+        // popup back on the entry the row still holds.
+        let refusal = body
+            .find("PickOutcome::Refused")
+            .expect("the refusal block is in the handler");
+        let write = body
+            .find("row.binding = binding.clone()")
+            .expect("the write is in the handler");
+        assert!(
+            refusal < write,
+            "the refusal must come before the write: {body}"
+        );
+        let refusal_block = &body[refusal..write];
+        assert!(
+            refusal_block.contains("return"),
+            "a refused pick must not fall through to the write: {refusal_block}"
+        );
+        assert!(
+            refusal_block.contains("selectItemAtIndex"),
+            "a refused pick restores the popup selection: {refusal_block}"
+        );
+        // The UI path refuses EARLIER than this: the popup carries a rule consulted before the
+        // choice is committed, so an illegal value is never painted even for one frame.
+        let select_source = include_str!("select.rs");
+        let accepted = select_source
+            .find("select_acceptance(select)")
+            .expect("the select consults its rule");
+        let committed = select_source
+            .find("state.selected = index;")
+            .expect("the select commits the choice");
+        assert!(
+            accepted < committed,
+            "the rule must answer BEFORE the choice is committed"
+        );
+        let render_source = include_str!("page_view/render.rs");
+        for rule in ["modifier_choice_refusal", "gesture_row_choice_refusal"] {
+            assert!(
+                render_source.contains(rule),
+                "the renderer installs {rule} on its popup"
+            );
+        }
+        // The reverse direction: the modifier change reports the rows it shadows.
+        let start = source
+            .find("pub(crate) fn announce_gestures_shadowed_by_switcher")
+            .expect("the announcement exists");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("switcher_modifier_conflict_message") && body.contains("show_refused"),
+            "the announcement reports the shared conflict copy: {body}"
+        );
+    }
+
+    /// A conflict bubble must not be talked over by the page rebuild that follows it.
+    ///
+    /// Both new notices (a chord the switcher takes, picked or taken by a modifier change) are
+    /// shown immediately and then the Gestures page rebuilds. `select_sidebar` runs during that
+    /// rebuild and used to announce the mapping conflict on the same bubble slot -- replacing the
+    /// message that caused the rebuild before it could be read. The arrival announcement therefore
+    /// lives on the user's own navigation and on the open path, never in `select_sidebar`.
+    #[test]
+    fn the_rebuild_path_does_not_announce_over_a_conflict_bubble() {
+        let window_source = include_str!("window.rs");
+        let start = window_source
+            .find("pub(super) fn select_sidebar")
+            .expect("select_sidebar is in window.rs");
+        let body = &window_source[start..];
+        let body = &body[..body
+            .find(
+                "
+}
+",
+            )
+            .unwrap_or(body.len())];
+        assert!(
+            !body.contains("announce_gesture_mapping_conflict"),
+            "select_sidebar also runs for a rebuild and must stay silent: {body}"
+        );
+        // ...while the two real arrivals do announce.
+        // ...while every REAL arrival goes through the one helper: the opening window, the
+        // sidebar click and a search result (a jump the user asked for, which an earlier version
+        // of this fix missed because it only covered the sidebar).
+        let start = window_source
+            .find("if present_window {\n        note_user_arrived_at_page")
+            .expect("the open path announces through the helper");
+        assert!(window_source[start..].starts_with("if present_window"));
+        let helper_start = window_source
+            .find("pub(crate) fn note_user_arrived_at_page")
+            .expect("the arrival helper exists");
+        let helper = &window_source[helper_start..];
+        let helper = &helper[..helper.find("\n}\n").unwrap_or(helper.len())];
+        assert!(
+            helper.contains("announce_gesture_mapping_conflict"),
+            "the helper is what announces: {helper}"
+        );
+        for (name, source) in [
+            ("the sidebar click", include_str!("dispatch.rs")),
+            ("a search result", include_str!("sidebar.rs")),
+        ] {
+            assert!(
+                source.contains("note_user_arrived_at_page"),
+                "{name} must go through the arrival helper"
+            );
+        }
+    }
+
     /// The popup's items and the stored strings are one mapping, and it must survive a round trip.
     ///
     /// Counter-example this is built to fail on: reordering `PICKER_PLACEMENT_VALUES` shows "Follow

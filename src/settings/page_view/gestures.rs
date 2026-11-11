@@ -299,6 +299,9 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             stroke.push_str(" · ");
             stroke.push_str(&t("errors.errors_gesture_shadowed_by_binding"));
         }
+        // The switcher's Tab chord is NOT noted on a row: the two choices refuse each other, so a
+        // row can never be given the switcher's chord from the interface (a hand-written file is
+        // the only way in, and a note there was noise on a page whose rows cannot fix it).
         if !GESTURE_ROWS_EDITABLE {
             // A fixed row: the stroke on the left, what it runs on the right, nothing to press.
             w.push(
@@ -893,6 +896,12 @@ fn row_identity(index: usize) -> &'static str {
     gesture_control_identity(index, None)
 }
 
+/// The identity of the gesture row at `index`, for a caller holding only the row's position (the
+/// popup's pre-commit acceptance rule is registered with that position).
+pub(crate) fn gesture_row_identity(index: usize) -> Option<&'static str> {
+    (index < MAX_SHOWN_ROWS).then(|| row_identity(index))
+}
+
 /// One entry of every gesture row's action popup: the binding the configuration holds, and the
 /// words the page shows for it.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -901,14 +910,100 @@ struct TargetOption {
     label: String,
 }
 
+/// The window and tab actions the popup offers beyond the key bindings' own list: each id is a
+/// chord the runtime synthesizes for the FRONTMOST application, so the entry behaves exactly like
+/// the user pressing that combination.
+const CHORD_TARGETS: [(&str, &str); 4] = [
+    ("cmd+q", "settings.gestures_target_quit_app"),
+    ("cmd+w", "settings.gestures_target_close_window"),
+    ("ctrl+tab", "settings.gestures_target_next_tab"),
+    ("ctrl+shift+tab", "settings.gestures_target_previous_tab"),
+];
+
+/// Whether a chord is EXACTLY the app switcher's own chord.
+///
+/// The switcher's event tap swallows every Tab keyDown carrying its modifier -- and it accepts
+/// SESSION-SYNTHESIZED events on purpose, so a side-button mapping can send Cmd+Tab -- which means
+/// a gesture pointed at the same chord is hijacked: its Tab opens the switcher, and the modifier
+/// release the gesture posts commits the switch. The entries stay OFFERED: picking one is the
+/// user's call, and the popup answers the pick instead of hiding the entry.
+///
+/// The comparison is EXACT on both sides (the same Tab and the same modifier set, no extra ones):
+/// the decision was that only "Control+Tab versus Control+Tab" is a conflict. Control+Shift+Tab is
+/// a chord of its own and is left alone here, even though the switcher's tap reads it as its
+/// backward step.
+pub(crate) fn chord_target_is_shadowed(chord: &str, switcher_modifier: &str) -> bool {
+    use crate::mouse::shortcut::{FLAG_ALT, FLAG_CMD, FLAG_CTRL, FLAG_SHIFT};
+    const MODIFIER_MASK: u32 = FLAG_CMD | FLAG_ALT | FLAG_CTRL | FLAG_SHIFT;
+    let Some(flag) = crate::key_bindings::modifier_flag(switcher_modifier) else {
+        return false;
+    };
+    let Ok(shortcut) = crate::mouse::shortcut::parse_shortcut(chord) else {
+        return false;
+    };
+    let Ok(tab) = crate::mouse::shortcut::parse_shortcut("tab") else {
+        return false;
+    };
+    shortcut.keycode == tab.keycode && (shortcut.flags & MODIFIER_MASK) == flag
+}
+
+/// The gesture rows in EVERY layer whose chord the app switcher owns right now.
+///
+/// The switcher's modifier is global, so a row in a device layer the page is not editing is just
+/// as broken as one in the layer on screen -- and the page marks only what it draws. A modifier
+/// change asks this question about the whole configuration.
+pub(crate) fn rows_shadowed_by_switcher(cfg: &crate::config::Config) -> usize {
+    let (shared, device) = switcher_conflict_counts(cfg);
+    shared + device
+}
+
+/// The same count, split by where the rows live: the SHARED layer (which applies to every mouse
+/// without a layer of its own) and the per-device layers.
+///
+/// The split is what lets the bubble say WHERE to look: a user who cleared their own mouse's layer
+/// and still reads "2 gestures" would otherwise be looking at a page that shows none of them.
+pub(crate) fn switcher_conflict_counts(cfg: &crate::config::Config) -> (usize, usize) {
+    let modifier = cfg.keyboard.modifier.as_str();
+    let shared = cfg
+        .mouse
+        .gestures
+        .iter()
+        .filter(|row| chord_target_is_shadowed(&row.binding, modifier))
+        .count();
+    let device = cfg
+        .mouse
+        .gesture_devices
+        .iter()
+        .flat_map(|layer| layer.gestures.iter())
+        .filter(|row| chord_target_is_shadowed(&row.binding, modifier))
+        .count();
+    (shared, device)
+}
+
+/// A switcher modifier's chord, in the words the menu uses for it ("Control+Tab").
+///
+/// Takes the modifier as data because a REFUSED change asks about the value that was requested,
+/// while the runtime still holds the previous one.
+pub(crate) fn chord_label_for_modifier(modifier: &str) -> String {
+    crate::i18n::t(&format!("menu.shortcut.{modifier}"))
+}
+
+/// The app switcher's own chord, as the runtime currently has it.
+pub(crate) fn switcher_chord_label() -> String {
+    chord_label_for_modifier(crate::event_monitor::switcher_modifier_name())
+}
+
 /// The action popup's entries, in one fixed order: the app's own actions first (grouped as the
-/// binding page groups them), then the switcher, the system actions and finally "none".
+/// binding page groups them), then the window and tab chords, the switcher, the system actions and
+/// finally "none".
 ///
 /// One shared list is what lets a popup show the row's CURRENT target: the page matches the row's
 /// binding string against these ids, so an action or a shortcut the user picked stays selected.
-/// The list is built once per page build rather than per row.
+/// The list is built once per page build rather than per row. It does NOT depend on the app
+/// switcher's modifier: a chord the switcher owns stays selectable, and picking it is answered
+/// with a bubble that says what will happen.
 fn target_options() -> Vec<TargetOption> {
-    let mut options = Vec::with_capacity(crate::key_bindings::ALL.len() + 6);
+    let mut options = Vec::with_capacity(crate::key_bindings::ALL.len() + 10);
     options.push(TargetOption {
         id: String::new(),
         label: t("settings.gestures_target_unset"),
@@ -917,6 +1012,12 @@ fn target_options() -> Vec<TargetOption> {
         options.push(TargetOption {
             id: action.config_id().to_string(),
             label: crate::key_bindings::action_label(action),
+        });
+    }
+    for (id, key) in CHORD_TARGETS {
+        options.push(TargetOption {
+            id: id.to_string(),
+            label: t(key),
         });
     }
     for (id, key) in [
@@ -1119,6 +1220,12 @@ fn target_label(binding: &str) -> String {
     match trimmed.to_ascii_lowercase().as_str() {
         "switcher" => t("settings.gestures_target_switcher"),
         "none" => t("settings.gestures_target_none"),
+        // The chord actions the popup offers by name; a hand-written config resolves to the same
+        // words the picker would have shown.
+        "cmd+q" => t("settings.gestures_target_quit_app"),
+        "cmd+w" => t("settings.gestures_target_close_window"),
+        "ctrl+tab" => t("settings.gestures_target_next_tab"),
+        "ctrl+shift+tab" => t("settings.gestures_target_previous_tab"),
         // The Dock-backed system actions the button mappings already name in the UI; reusing their
         // keys means one product term has one string in every language.
         "missioncontrol" => t("settings.mapping_action_missioncontrol"),
@@ -1411,6 +1518,134 @@ mod tests {
             Some(0),
             "the row states its index"
         );
+    }
+
+    /// The option ids one gesture row's popup was built with, as the page hands them to the
+    /// renderer.
+    fn popup_ids(view: &PageView) -> Vec<String> {
+        view.rows
+            .iter()
+            .find(|r| r.label_key == "settings.gestures_row_gesture")
+            .map(|r| r.popup_option_ids.clone())
+            .unwrap_or_default()
+    }
+
+    /// The four window/tab chord targets are built-in actions and are ALWAYS offered: a chord the
+    /// app switcher owns is still the user's to pick, and the popup answers the pick with a bubble
+    /// instead of hiding the entry. Every modifier therefore shows the same four ids.
+    #[test]
+    fn chord_targets_are_offered_under_every_switcher_modifier() {
+        for modifier in ["command", "option", "control"] {
+            let mut page = input(true, vec![row("l", 1, "", false)]);
+            page.config.keyboard.modifier = modifier.into();
+            let ids = popup_ids(&gestures_page_view(&page));
+            for id in ["cmd+q", "cmd+w", "ctrl+tab", "ctrl+shift+tab"] {
+                assert!(
+                    ids.iter().any(|candidate| candidate == id),
+                    "{id} missing with the switcher on {modifier}: {ids:?}"
+                );
+            }
+        }
+    }
+
+    /// The conflict query a modifier change asks: it counts the rows of EVERY layer whose chord is
+    /// EXACTLY the switcher's (only "Control+Tab versus Control+Tab" is a conflict; Control+Shift+Tab
+    /// is a chord of its own and is left alone), and reports the two layers apart so the bubble can
+    /// say where to look.
+    #[test]
+    fn the_conflict_query_counts_every_layer_and_only_the_exact_switcher_chord() {
+        let mut cfg = crate::config::Config::default();
+        cfg.keyboard.modifier = "control".into();
+        let row = |gesture: &str, binding: &str| crate::config::GestureBinding {
+            gesture: gesture.into(),
+            button: 2,
+            binding: binding.into(),
+            enabled: true,
+        };
+        cfg.mouse.gestures = vec![row("l", "ctrl+tab"), row("r", "cmd+w")];
+        cfg.mouse.gesture_devices = vec![crate::config::GestureLayer {
+            // Control+Shift+Tab is its own chord: it is NOT a conflict with Control+Tab.
+            gestures: vec![row("u", "ctrl+shift+tab"), row("d", "ctrl+tab")],
+            ..Default::default()
+        }];
+        assert_eq!(
+            rows_shadowed_by_switcher(&cfg),
+            2,
+            "exactly one per layer, and never Control+Shift+Tab"
+        );
+        assert_eq!(
+            switcher_conflict_counts(&cfg),
+            (1, 1),
+            "the two layers are reported apart"
+        );
+        // The switcher on Command leaves the Control chord alone: nothing is shadowed.
+        cfg.keyboard.modifier = "command".into();
+        assert_eq!(rows_shadowed_by_switcher(&cfg), 0);
+        // A hand-written Command+Tab row IS the switcher's chord while it owns Command...
+        cfg.mouse.gestures.push(row("d", "cmd+tab"));
+        assert_eq!(switcher_conflict_counts(&cfg), (1, 0));
+        // ...and Command+Shift+Tab is not.
+        cfg.mouse.gestures = vec![row("d", "cmd+shift+tab")];
+        assert_eq!(rows_shadowed_by_switcher(&cfg), 0);
+    }
+
+    /// A row that holds the switcher's Tab chord (only a hand-written file can produce one now)
+    /// is drawn like any other row: no warning note, and its popup still shows the chord it holds.
+    ///
+    /// The note existed while the interface could still create the state; with the two choices
+    /// refusing each other it was noise on a page whose rows cannot resolve it.
+    #[test]
+    fn a_row_holding_the_switcher_chord_is_drawn_without_a_note() {
+        for chord in ["cmd+q", "cmd+w", "ctrl+tab", "ctrl+shift+tab"] {
+            assert!(
+                crate::mouse::gesture::table::Target::resolve(chord).is_some(),
+                "{chord} must stay loadable"
+            );
+        }
+        for modifier in ["control", "command"] {
+            let mut page = input(true, vec![row("l", 1, "ctrl+tab", true)]);
+            page.config.keyboard.modifier = modifier.into();
+            let view = gestures_page_view(&page);
+            let spec = view
+                .rows
+                .iter()
+                .find(|r| r.label_key == "settings.gestures_row_gesture")
+                .expect("the gesture row");
+            let stroke = spec.label_text.clone().unwrap_or_default();
+            assert!(
+                !stroke.contains(&t("settings.gestures_state_bad_target")),
+                "the chord is a valid target: {stroke}"
+            );
+            assert!(
+                !stroke.contains(" · "),
+                "no note is appended ({modifier}): {stroke}"
+            );
+            // The popup lists and shows the chord it holds.
+            let selected = match &spec.value {
+                Value::Index(index) => spec
+                    .popup_option_ids
+                    .get(*index)
+                    .cloned()
+                    .unwrap_or_default(),
+                other => panic!("unexpected value: {other:?}"),
+            };
+            assert_eq!(
+                selected, "ctrl+tab",
+                "{modifier}: {:?}",
+                spec.popup_option_ids
+            );
+        }
+    }
+
+    /// The chord targets are named in the user's language, and the name is not a raw config id.
+    #[test]
+    fn chord_targets_are_labelled_in_words() {
+        for (id, key) in CHORD_TARGETS {
+            let label = target_label(id);
+            assert_eq!(label, t(key), "{id}");
+            assert!(!label.contains("cmd"), "{label}");
+            assert!(!label.contains("ctrl"), "{label}");
+        }
     }
 
     /// A binding the fixed option list does not carry (a custom shortcut like "cmd+t") must still

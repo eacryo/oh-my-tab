@@ -216,6 +216,57 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
     }
 }
 
+/// Whether a modifier change must be refused because configured gestures already use the chord.
+///
+/// Only a change the USER made is refused (the settings popup or the menu): a file, an import or a
+/// restore states a whole configuration at once and is honoured as written -- silently contradicting
+/// it would leave the runtime disagreeing with the disk. A change that keeps the value, or one that
+/// moves the switcher OFF a conflicting chord, is always allowed.
+fn modifier_change_is_refused(
+    source: ConfigChangeSource,
+    old: &Config,
+    requested: &Config,
+) -> bool {
+    if !matches!(
+        source,
+        ConfigChangeSource::Settings | ConfigChangeSource::Menu
+    ) {
+        return false;
+    }
+    if old.keyboard.modifier == requested.keyboard.modifier {
+        return false;
+    }
+    crate::settings::rows_shadowed_by_switcher(requested) > 0
+}
+
+/// Put the stored modifier back and say why the change was refused.
+///
+/// The control and the menu keep the old value, so the page never shows a mode the switcher is not
+/// in; the runtime mode is untouched because it was never changed.
+fn refuse_modifier_change(old: &Config, requested: &Config) {
+    let keep = old.keyboard.modifier.clone();
+    if let Ok(mut cfg) = crate::config::CONFIG.write() {
+        cfg.keyboard.modifier = keep;
+    }
+    // The menu path persisted the requested value before it applied the change; this writes the
+    // restored one, and the settings path is covered by the same call.
+    crate::config::persist_config_now();
+    crate::settings::refresh_switcher_keystroke_and_mouse_controls_from_config();
+    if let Some(text) = crate::settings::switcher_modifier_conflict_message(requested) {
+        crate::ui::toast::show_refused(&text);
+    }
+}
+
+/// Whether the swapper's modifier change makes the built Gestures page describe the old value.
+///
+/// The page's action popup filters the Tab chords the switcher owns, and a gesture row says when
+/// its own chord is shadowed -- both are decided from `keyboard.modifier` while the page is built.
+/// The in-place refresh only writes `ControlId::Field` controls, so a gesture row's popup and label
+/// keep the previous value until the page is rebuilt.
+fn gestures_page_needs_rebuild(flags: &ChangeFlags) -> bool {
+    flags.modifier
+}
+
 /// Whether this change can create or dissolve a reserved-chord collision: the switcher's modifier,
 /// the clipboard shortcut and the binding list are the three inputs the coordination reads.
 ///
@@ -344,7 +395,30 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
 
     if flags.modifier {
-        crate::menu::set_shortcut_mode(&effective.keyboard.modifier);
+        if modifier_change_is_refused(source, old, &effective) {
+            // A chord a configured gesture already uses cannot be taken by the switcher either:
+            // the two choices are symmetric, and the user's decision was that the SECOND one loses.
+            // The stored value goes back, the control and the menu keep the old modifier, and the
+            // bubble names what blocked it. Everything else in this change still applies: only the
+            // modifier is put back.
+            refuse_modifier_change(old, &effective);
+        } else {
+            crate::menu::set_shortcut_mode(&effective.keyboard.modifier);
+            // The reverse direction of the gesture/chord conflict: the switcher just took a chord a
+            // configured gesture uses (a file or a reload can still state one). The bubble is the
+            // only surface at the point of the change -- the row that explains it lives on another
+            // page, possibly in a layer not being edited.
+            if !matches!(source, ConfigChangeSource::Startup) {
+                crate::settings::announce_gestures_shadowed_by_switcher();
+            }
+            if gestures_page_needs_rebuild(&flags) {
+                // The Gestures page decides which Tab chords its action popup offers, and whether a
+                // row's own chord is shadowed, when it is BUILT; the in-place refresh rewrites field
+                // controls only, so it never reaches those rows. Without this the page keeps
+                // describing the previous modifier -- offering a chord the switcher now eats.
+                crate::settings::rebuild_gestures_page_after_switcher_modifier_change();
+            }
+        }
     }
     if flags.startup {
         crate::autostart::sync(new.startup.launch_at_login);
@@ -785,6 +859,214 @@ mod tests {
         assert!(!needs_reserved_shortcut_coordination(&flags_for(|cfg| {
             cfg.appearance.theme = "dark".into()
         })));
+    }
+
+    /// A switcher-modifier change must rebuild the Gestures page, in BOTH directions.
+    ///
+    /// The page decides which Tab chords its popup offers, and marks a row whose own chord the
+    /// switcher shadows, while it is BUILT. The in-place refresh writes field controls only, so
+    /// without the rebuild an open page kept offering a chord the switcher had just taken (and
+    /// kept hiding one it had just released).
+    #[test]
+    fn a_switcher_modifier_change_requires_the_gestures_page_rebuild_in_both_directions() {
+        let base = Config::default();
+        for (from, to) in [("command", "control"), ("control", "command")] {
+            let mut old = base.clone();
+            old.keyboard.modifier = from.into();
+            let mut new = old.clone();
+            new.keyboard.modifier = to.into();
+            let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+            assert!(
+                gestures_page_needs_rebuild(&flags),
+                "{from} -> {to} must rebuild the Gestures page"
+            );
+            // It is this rebuild and no other: an unrelated edit does not pay for a page rebuild.
+            let mut unrelated = old.clone();
+            unrelated.mouse.gesture_show_trail = !old.mouse.gesture_show_trail;
+            let flags = change_flags(&old, &unrelated, ConfigChangeSource::Settings);
+            assert!(!gestures_page_needs_rebuild(&flags));
+        }
+    }
+
+    /// The rebuild decision is only half the wiring: `apply_config_change` must actually take it,
+    /// or a modifier change leaves the built Gestures page describing the previous chord. Scanned
+    /// from the source, like the motion-token and settled-field assertions -- a removed call would
+    /// otherwise pass every behavioural test, because those rebuild the page themselves.
+    #[test]
+    fn the_modifier_branch_rebuilds_the_gestures_page() {
+        let source = include_str!("runtime_config.rs");
+        let body_start = source
+            .find("pub(crate) fn apply_config_change")
+            .expect("apply_config_change is in this file");
+        let body = &source[body_start..];
+        let body_end = body.find("\n#[cfg(test)]").unwrap_or(body.len());
+        let body = &body[..body_end];
+        let modifier_branch = body
+            .split("if flags.modifier {")
+            .nth(1)
+            .expect("the modifier branch is in apply_config_change");
+        let branch = &modifier_branch[..modifier_branch
+            .find("\n    }")
+            .unwrap_or(modifier_branch.len())];
+        assert!(
+            branch.contains("set_shortcut_mode"),
+            "the branch still arms the runtime mode: {branch}"
+        );
+        // B policy: the branch must be able to REFUSE the change (a chord a gesture owns), and the
+        // refusal must put the stored value back, refresh the control and say why.
+        assert!(
+            branch.contains("modifier_change_is_refused")
+                && branch.contains("refuse_modifier_change"),
+            "the branch must offer the refusal: {branch}"
+        );
+        // The refusal itself: stored value put back, control refreshed, copy shown.
+        let helper_start = source
+            .find("fn refuse_modifier_change")
+            .expect("the refusal helper is in this file");
+        let helper = &source[helper_start..];
+        let helper = &helper[..helper.find("\n}\n").unwrap_or(helper.len())];
+        for required in [
+            "CONFIG.write",
+            "persist_config_now",
+            "refresh_switcher_keystroke_and_mouse_controls_from_config",
+            "switcher_modifier_conflict_message",
+            "show_refused",
+        ] {
+            assert!(
+                helper.contains(required),
+                "the refusal must {required}: {helper}"
+            );
+        }
+        assert!(
+            branch.contains("gestures_page_needs_rebuild")
+                && branch.contains("rebuild_gestures_page_after_switcher_modifier_change"),
+            "a modifier change must rebuild the Gestures page: {branch}"
+        );
+        // The reverse conflict is reported where the change happens: the row that explains it is
+        // on another page, and the switcher's modifier is global.
+        assert!(
+            branch.contains("announce_gestures_shadowed_by_switcher"),
+            "a modifier change must report the gestures it shadows: {branch}"
+        );
+        // And the helper really performs the deferred, scroll-preserving rebuild.
+        let settings = include_str!("settings.rs");
+        let helper_start = settings
+            .find("pub(crate) fn rebuild_gestures_page_after_switcher_modifier_change")
+            .expect("the settings helper exists");
+        let helper = &settings[helper_start..];
+        let helper = &helper[..helper.find("\n}").unwrap_or(helper.len())];
+        assert!(
+            helper.contains("rebuild_settings_content_deferred_keeping_scrolls"),
+            "the helper rebuilds deferred and keeps the scroll positions: {helper}"
+        );
+        // A rebuild recreates every page, so the position of the page the user is LOOKING at has
+        // to be part of the record -- otherwise a modifier change made from the Switcher page
+        // throws that page to the top.
+        assert!(
+            helper.contains("current_settings_page"),
+            "the helper keeps the visible page in place: {helper}"
+        );
+        assert!(
+            helper.contains("SettingsPageId::Gestures"),
+            "the helper still rebuilds the Gestures page: {helper}"
+        );
+    }
+
+    /// B policy: the switcher may not take a chord a configured gesture already uses.
+    ///
+    /// The two directions are symmetric (a refused pick in the gesture popup, a refused modifier
+    /// here), so this predicate is what makes the second one "not apply". Only a change the USER
+    /// made is refused: a file, an import or a restore states a whole configuration and is honoured.
+    #[test]
+    fn a_switcher_modifier_change_is_refused_when_a_gesture_owns_the_chord() {
+        let row = |gesture: &str, binding: &str| crate::config::GestureBinding {
+            gesture: gesture.into(),
+            button: 2,
+            binding: binding.into(),
+            enabled: true,
+        };
+        let base = Config::default();
+        let with_gesture = |binding: &str| {
+            let mut cfg = base.clone();
+            cfg.mouse.gestures = vec![row("r", binding)];
+            cfg
+        };
+        let switched = |cfg: &Config, modifier: &str| {
+            let mut next = cfg.clone();
+            next.keyboard.modifier = modifier.into();
+            next
+        };
+
+        // Control+Tab may not be taken while a gesture uses it...
+        let ordered = with_gesture("ctrl+tab");
+        for source in [ConfigChangeSource::Settings, ConfigChangeSource::Menu] {
+            assert!(
+                modifier_change_is_refused(source, &base, &switched(&ordered, "control")),
+                "{source:?} must refuse"
+            );
+        }
+        // ...but a file or a restore is the user's own statement about the whole configuration.
+        for source in [
+            ConfigChangeSource::Reload,
+            ConfigChangeSource::Startup,
+            ConfigChangeSource::RestoreDefaults,
+        ] {
+            assert!(
+                !modifier_change_is_refused(source, &base, &switched(&ordered, "control")),
+                "{source:?} is honoured as written"
+            );
+        }
+        // A device layer counts: the modifier is global.
+        let mut layered = base.clone();
+        layered.mouse.gesture_devices = vec![crate::config::GestureLayer {
+            gestures: vec![row("u", "ctrl+tab")],
+            ..Default::default()
+        }];
+        assert!(modifier_change_is_refused(
+            ConfigChangeSource::Settings,
+            &base,
+            &switched(&layered, "control")
+        ));
+        // Only the EXACT chord: Control+Shift+Tab is not a conflict with Control+Tab, so it blocks
+        // nothing (the user's decision -- the shifted chord is a target of its own).
+        let mut shifted = base.clone();
+        shifted.mouse.gestures = vec![row("u", "ctrl+shift+tab")];
+        for modifier in ["control", "command", "option"] {
+            assert!(!modifier_change_is_refused(
+                ConfigChangeSource::Settings,
+                &base,
+                &switched(&shifted, modifier)
+            ));
+        }
+        // Moving to a modifier that owns NO gesture chord is allowed, even out of a conflicting
+        // state -- otherwise a hand-written conflict could never be escaped from the UI.
+        let stuck = switched(&ordered, "control");
+        assert!(!modifier_change_is_refused(
+            ConfigChangeSource::Settings,
+            &stuck,
+            &switched(&stuck, "command")
+        ));
+        // An unrelated chord does not block the switcher, and neither does keeping the value.
+        let harmless = with_gesture("cmd+q");
+        assert!(!modifier_change_is_refused(
+            ConfigChangeSource::Settings,
+            &base,
+            &switched(&harmless, "control")
+        ));
+        assert!(!modifier_change_is_refused(
+            ConfigChangeSource::Settings,
+            &switched(&ordered, "control"),
+            &switched(&ordered, "control")
+        ));
+        // The other direction of the pair: a hand-written Command+Tab gesture blocks Command+Tab
+        // (the default is Command, so the change has to come FROM another value).
+        let cmd_tab_gesture = with_gesture("cmd+tab");
+        let from_option = switched(&cmd_tab_gesture, "option");
+        assert!(modifier_change_is_refused(
+            ConfigChangeSource::Settings,
+            &from_option,
+            &switched(&cmd_tab_gesture, "command")
+        ));
     }
 
     #[test]

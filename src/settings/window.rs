@@ -337,10 +337,23 @@ pub(super) fn select_sidebar(idx: usize) {
     // scripts/e2e. It must sit outside the with_settings_ui closure -- a nested borrow there is
     // silently swallowed by the reentrancy guard.
     crate::e2e_state::record("settings");
-    // Arriving at the Gestures page is when the user needs to know that the hotkey they picked
-    // shadows a button mapping: the row carries no note of its own any more, so the shared bubble
-    // says it. Outside the closure above for the same reentrancy reason.
-    if idx == super::SETTINGS_GESTURES_PAGE_INDEX {
+    // The "hotkey shadows a button mapping" note is NOT announced here: this function also runs
+    // for a content REBUILD, which selects the same page again without the user arriving
+    // anywhere -- and a rebuild often follows a message of its own (a chord the switcher takes),
+    // which a second bubble in the same slot would replace before it could be read. The arrival
+    // announcement belongs to the user's own navigation (`on_sidebar_select`) and to the open
+    // path below.
+}
+
+/// The user ARRIVED at a page: say what that page needs said on arrival.
+///
+/// Called from every path a person can take to a page -- the sidebar, a search result, and a
+/// window that opens straight onto it -- and never from a rebuild, which re-selects the same page
+/// without anyone arriving. The mapping-conflict note is the reason the distinction exists: its
+/// bubble shares a slot with the notices a rebuild may be following (a chord the app switcher
+/// takes), and talking over one of those is how a message nobody could read appears.
+pub(crate) fn note_user_arrived_at_page(page: SettingsPageId) {
+    if page == SettingsPageId::Gestures {
         dispatch::announce_gesture_mapping_conflict();
     }
 }
@@ -907,13 +920,13 @@ fn show_settings_inner(
         &mut phase_started,
         total_started,
     );
-    // A window that opens straight onto the Gestures page never passes through a page switch, so the
-    // select above ran while it was still hidden and said nothing. Say the conflict note now that the
-    // page is really on screen; a later page switch announces on its own.
-    if present_window
-        && SIDEBAR_SELECTED.load(Ordering::SeqCst) == super::SETTINGS_GESTURES_PAGE_INDEX
-    {
-        dispatch::announce_gesture_mapping_conflict();
+    // A window that opens straight onto a page never passes through a page switch, so the select
+    // above ran while it was still hidden and said nothing: the arrival notes wait until the page is
+    // really on screen. A later page switch (or search jump) announces on its own.
+    if present_window {
+        note_user_arrived_at_page(super::settings_page_identity(
+            SIDEBAR_SELECTED.load(Ordering::SeqCst),
+        ));
     }
     // A2 E2E: the app's own wall time for this open, published so a scenario can bound the open path
     // without parsing the debug log. Only a presenting call publishes it -- a prewarm is not an open.

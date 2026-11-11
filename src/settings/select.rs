@@ -143,6 +143,41 @@ pub(super) fn clear_settings_select_registry(owner: SelectOwner) {
     for key in keys {
         unsafe { forget_settings_select(key as *mut AnyObject) };
     }
+    // A rebuilt page brings new controls, so a rule attached to the old ones must not outlive
+    // them (a recycled address would carry a stale acceptance into an unrelated select).
+    clear_select_acceptance();
+}
+
+/// A select's rule for a choice it must REFUSE before committing it.
+///
+/// Refusing here, inside the popup's own handler, is what keeps the trigger from painting a value
+/// the page then takes back one run-loop turn later (the user read that as "it applied, then
+/// reverted"). The rule receives the chosen index and the CONTEXT the owner registered with it --
+/// a described field ignores it, a gesture row's popup uses it to say which row it belongs to --
+/// and returns the bubble copy explaining the refusal, or `None` to accept.
+type AcceptanceRule = fn(usize, usize) -> Option<String>;
+
+static SELECT_ACCEPTANCE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<usize, (AcceptanceRule, usize)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+pub(super) fn set_select_acceptance(select: *mut AnyObject, rule: AcceptanceRule, context: usize) {
+    SELECT_ACCEPTANCE
+        .lock()
+        .unwrap()
+        .insert(select as usize, (rule, context));
+}
+
+fn clear_select_acceptance() {
+    SELECT_ACCEPTANCE.lock().unwrap().clear();
+}
+
+fn select_acceptance(select: *mut AnyObject) -> Option<(AcceptanceRule, usize)> {
+    SELECT_ACCEPTANCE
+        .lock()
+        .unwrap()
+        .get(&(select as usize))
+        .copied()
 }
 
 unsafe fn settings_select_set_title(button: *mut AnyObject, title: &str) {
@@ -1390,6 +1425,16 @@ pub(super) extern "C" fn settings_select_select_option(
                 .is_some_and(|state| index >= 0 && (index as usize) < state.items.len());
             if !valid {
                 return;
+            }
+            // A choice this select must refuse is refused HERE, before the selection is committed:
+            // the trigger keeps the value it had, so an illegal value is never painted even for one
+            // frame, and the target's action is not sent at all.
+            if let Some((rule, context)) = select_acceptance(select) {
+                if let Some(refusal) = rule(index as usize, context) {
+                    settings_select_close(select);
+                    crate::ui::toast::show_refused(&refusal);
+                    return;
+                }
             }
             if let Some(state) = SETTINGS_SELECT_STATES
                 .lock()
