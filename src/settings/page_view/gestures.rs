@@ -153,8 +153,12 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             return trigger_page_view(index, &input.config);
         }
         // The list shrank under the open trigger row (a recording was added, a row was removed):
-        // fall back to the list rather than showing a row that no longer exists.
+        // fall back to the list rather than showing a row that no longer exists. The round-trip
+        // this fallback abandons had saved a list position for a return that is not happening
+        // through the ordinary path; the fallback's rebuild captures the list live instead, so
+        // the stale save must not survive into some later rebuild.
         crate::settings::set_open_gesture_trigger_row(None);
+        crate::settings::discard_gestures_list_scroll_return();
     }
     let cfg = &input.config;
     // The layer this page edits: the connected mouse's own list and trigger, or the shared layer
@@ -2113,6 +2117,10 @@ mod tests {
     fn a_trigger_row_falls_back_to_the_list_when_its_row_is_gone() {
         // The list can shrink under an open trigger row (a row removed, the config reloaded). The
         // page must show the gestures again rather than a trigger row for a row that is gone.
+        // The fallback now clears the process-wide round-trip record, so this test must hold the
+        // same test-only serialization lock the record tests hold (see settings.rs tests):
+        // without it a concurrent record test's saved value could be cleared mid-sequence.
+        let _serial = crate::settings::tests::rebuild_record_test_lock();
         crate::settings::set_open_gesture_trigger_row(Some(7));
         let view = gestures_page_view(&input(true, vec![row("u", 1, "cmd+t", true)]));
         assert_eq!(

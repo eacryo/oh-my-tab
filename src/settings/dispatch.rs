@@ -601,11 +601,15 @@ unsafe fn apply_row_trigger_line(control: *mut AnyObject) {
     if crate::settings::page_view::set_row_trigger(index, button).is_none() {
         // The row already starts on this button: the click only closes the trigger row.
         crate::settings::set_open_gesture_trigger_row(None);
+        // Back to the list: restore the position saved on the way in.
+        crate::settings::record_gestures_list_return_scroll();
         super::rebuild_settings_content_deferred();
         return;
     }
     crate::settings::schedule_config_persist();
     crate::settings::set_open_gesture_trigger_row(None);
+    // Back to the list: restore the position saved on the way in.
+    crate::settings::record_gestures_list_return_scroll();
     super::rebuild_settings_content_deferred();
 }
 
@@ -619,6 +623,15 @@ unsafe fn open_trigger_row(control: *mut AnyObject) {
     let Some(index) = crate::settings::page_view::action_row_index(identity) else {
         return;
     };
+    // The trigger row replaces the list with a different, much shorter page. The list's position
+    // is read NOW (before the queued rebuild tears it down) and kept for the return; passing it
+    // through the ordinary pending-scroll record would clamp it to the trigger page's document
+    // and lose it after one round-trip. The trigger page itself opens at the top, as before.
+    if let Some(distance) = crate::settings::window::page_scroll_distance_from_top(
+        crate::settings::SettingsPageId::Gestures,
+    ) {
+        crate::settings::save_gestures_list_scroll_for_return(distance);
+    }
     crate::settings::set_open_gesture_trigger_row(Some(index));
     super::rebuild_settings_content_deferred();
 }
@@ -3106,6 +3119,59 @@ mod tests {
             body.contains("switcher_modifier_conflict_message") && body.contains("show_refused"),
             "the announcement reports the shared conflict copy: {body}"
         );
+    }
+
+    /// The trigger-row round-trip must keep the list's scroll position, and every call site must
+    /// cooperate: entering saves the list's position BEFORE the rebuild is queued (the rebuild
+    /// tears the list down), and both return branches record the saved position before queueing.
+    /// Scanned from the source like the other wiring assertions: the paths need AppKit and a real
+    /// popup, so a removed call would otherwise pass every other test.
+    #[test]
+    fn every_trigger_row_path_participates_in_the_scroll_round_trip() {
+        let source = include_str!("dispatch.rs");
+
+        let start = source
+            .find("unsafe fn open_trigger_row(")
+            .expect("the enter handler is in this file");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let save = body
+            .find("save_gestures_list_scroll_for_return")
+            .expect("entering must save the list position");
+        let queue = body
+            .find("rebuild_settings_content_deferred()")
+            .expect("entering queues the rebuild");
+        assert!(
+            save < queue,
+            "the position must be saved BEFORE the rebuild is queued (the rebuild tears the list \
+             down): {body}"
+        );
+
+        // Both return branches record the round-trip record; the count pins "no branch missed".
+        let start = source
+            .find("unsafe fn apply_row_trigger_line(")
+            .expect("the return handler is in this file");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        let records = body.matches("record_gestures_list_return_scroll").count();
+        assert_eq!(
+            records, 2,
+            "both return branches (the no-op close and the applied close) must record the saved \
+             position: {body}"
+        );
+        for record_at in body
+            .match_indices("record_gestures_list_return_scroll")
+            .map(|(i, _)| i)
+        {
+            let queue = body[record_at..]
+                .find("rebuild_settings_content_deferred()")
+                .expect("each branch queues its rebuild after recording");
+            // The record call comes first within the branch's tail; the queue call must follow it.
+            assert!(
+                queue > 0,
+                "each record must be followed by its own rebuild request: {body}"
+            );
+        }
     }
 
     /// A conflict bubble must not be talked over by the page rebuild that follows it.

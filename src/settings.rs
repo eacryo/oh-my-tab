@@ -903,6 +903,75 @@ fn claim_rebuild_slot() -> bool {
     !REBUILD_QUEUED.swap(true, std::sync::atomic::Ordering::SeqCst)
 }
 
+/// Where the Gestures page's LIST was scrolled when the user entered a row's trigger row.
+///
+/// The trigger row is a different, much shorter page: passing the list's position through the
+/// ordinary pending-scroll record would clamp it to the trigger page's document, and the return
+/// would then recapture the clamped value -- the original position would be lost after one
+/// round-trip. This slot holds the list's position across exactly one round-trip: written on the
+/// way in, consumed on the way back, cleared when the round-trip is abandoned (the row vanished,
+/// the user navigated away).
+static GESTURES_LIST_SCROLL_RETURN: std::sync::Mutex<Option<f64>> = std::sync::Mutex::new(None);
+
+/// Save the Gestures list's scroll position for one round-trip into a trigger row.
+///
+/// The lock only covers the store; the caller reads the position (an AppKit query) BEFORE calling
+/// this and queues the rebuild AFTER it returns, so no AppKit call happens under the lock.
+pub(crate) fn save_gestures_list_scroll_for_return(distance: f64) {
+    if let Ok(mut slot) = GESTURES_LIST_SCROLL_RETURN.lock() {
+        *slot = Some(distance);
+    }
+}
+
+/// Consume the saved list position, if a round-trip is in flight. Reading takes it: one save is
+/// spent by exactly one return.
+fn take_gestures_list_scroll_return() -> Option<f64> {
+    GESTURES_LIST_SCROLL_RETURN
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take())
+}
+
+/// Drop a saved list position without consuming it into a rebuild: an abandoned round-trip must
+/// not restore a position the user never asked to go back to. Reached from page switches and from
+/// the return path's fallbacks.
+pub(crate) fn discard_gestures_list_scroll_return() {
+    if let Ok(mut slot) = GESTURES_LIST_SCROLL_RETURN.lock() {
+        *slot = None;
+    }
+}
+
+/// Record a scroll position for the next queued rebuild WITHOUT reading it off a live page.
+///
+/// The trigger-row return path needs this: the list page it is returning to is about to be torn
+/// down by the rebuild, so its position cannot be captured then -- it was captured on the way in.
+/// The record merges into the pending set with the same earliest-capture-wins rule the capture
+/// path uses, and the caller still queues the rebuild afterwards.
+pub(crate) fn record_pending_scroll(page: SettingsPageId, distance: f64) {
+    if let Ok(mut pending) = PENDING_PAGE_SCROLL.lock() {
+        merge_pending_scrolls(&mut pending, vec![(page, distance)]);
+    }
+}
+
+/// Record the return scroll for the Gestures list from the saved round-trip slot, falling back to
+/// a live capture when nothing is saved. Call BEFORE queueing the rebuild; both reads happen
+/// outside the slot's lock.
+pub(crate) fn record_gestures_list_return_scroll() {
+    let saved = take_gestures_list_scroll_return();
+    match saved {
+        Some(distance) => record_pending_scroll(SettingsPageId::Gestures, distance),
+        // An abandoned round-trip (the slot was cleared on a page switch, or this return is the
+        // rebuild's first leg): behave like every other rebuild, capture what is on screen now.
+        None => {
+            if let Some(distance) =
+                unsafe { window::page_scroll_distance_from_top(SettingsPageId::Gestures) }
+            {
+                record_pending_scroll(SettingsPageId::Gestures, distance);
+            }
+        }
+    }
+}
+
 /// Open the next run-loop turn for a new request.
 fn release_rebuild_slot() {
     REBUILD_QUEUED.store(false, std::sync::atomic::Ordering::SeqCst);
@@ -3012,6 +3081,23 @@ mod mouse_page_lazy_fill_tests {
 #[cfg(test)]
 mod tests {
     use crate::smoke_verdict::smoke_runner;
+    /// Serializes every test that touches the process-wide rebuild slot, pending-scroll record
+    /// and the Gestures round-trip slot. Each single operation is atomic, but a test's whole
+    /// save->consume->assert SEQUENCE is not: interleaved tests overwrite and clear each other's
+    /// records, so a correct implementation can fail under scheduling (the pre-fix flake). One
+    /// test-only lock, held for the whole sequence, is the fix; no production synchronization.
+    /// Shared through `rebuild_record_test_lock` because tests in other modules (the gestures
+    /// fallback test) reach the same records through production code paths.
+    static REBUILD_RECORD_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    /// The test-only serialization lock for the rebuild-record globals, for tests in other
+    /// modules whose production path touches those records. Not a production API.
+    #[cfg(test)]
+    pub(crate) fn rebuild_record_test_lock() -> std::sync::MutexGuard<'static, ()> {
+        REBUILD_RECORD_TEST_LOCK.lock().unwrap()
+    }
+
     /// The coalescing contract: several rebuild requests in one run-loop turn queue ONE callback,
     /// and the scroll record survives that folding. If the slot arbitration is removed (every request
     /// queues its own callback), the second claim below returns true and this test fails -- which is
@@ -3019,6 +3105,7 @@ mod tests {
     #[test]
     fn rebuild_requests_coalesce_into_one_turn_and_keep_the_scroll_record() {
         // Isolate the process-wide slot/record from any other test in this binary.
+        let _serial = REBUILD_RECORD_TEST_LOCK.lock().unwrap();
         super::release_rebuild_slot();
         super::PENDING_PAGE_SCROLL.lock().unwrap().clear();
 
@@ -3047,6 +3134,142 @@ mod tests {
             "the slot is free again for the next run-loop turn"
         );
         super::release_rebuild_slot();
+    }
+
+    /// The Gestures list's saved round-trip position must survive the clamp that the ordinary
+    /// record applies: the trigger row's page is much shorter, so a position passed through the
+    /// normal pending-scroll path is clamped to that document, and the return would recapture the
+    /// CLAMPED value -- losing the original after one round-trip. The dedicated slot holds the
+    /// exact value across the trip; the pure clamp functions here stand in for the geometry.
+    #[test]
+    fn the_gestures_list_round_trip_keeps_the_unclamped_position() {
+        // Isolate the process-wide slot from any other test in this binary.
+        let _serial = REBUILD_RECORD_TEST_LOCK.lock().unwrap();
+        super::discard_gestures_list_scroll_return();
+        super::PENDING_PAGE_SCROLL.lock().unwrap().clear();
+
+        // The list was scrolled 600pt down when the user entered the trigger row.
+        super::save_gestures_list_scroll_for_return(600.0);
+        // The trigger page is short: 100pt of scrollable content. The clamp is what the ordinary
+        // record would apply on the way IN -- the dedicated slot must not be subject to it.
+        let trigger_doc_h = 500.0;
+        let clip_h = 400.0;
+        let clamped = super::window::scroll_target_from_distance(600.0, trigger_doc_h, clip_h);
+        assert!(
+            clamped < 600.0,
+            "the scenario requires the ordinary record to clamp: {clamped}"
+        );
+
+        // Simulate the return: consume the slot into the pending record...
+        let saved = super::take_gestures_list_scroll_return();
+        assert_eq!(
+            saved,
+            Some(600.0),
+            "the round-trip slot holds the exact value"
+        );
+        if let Some(distance) = saved {
+            super::record_pending_scroll(SettingsPageId::Gestures, distance);
+        }
+        // ...and the pending record carries the ORIGINAL distance...
+        assert!(
+            super::PENDING_PAGE_SCROLL
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(page, d)| *page == SettingsPageId::Gestures && (*d - 600.0).abs() < 1e-9),
+            "the return record must hold the saved distance, not the clamped one"
+        );
+        // ...which restores exactly 600 from the top on the rebuilt (long) list document.
+        let restored = super::window::scroll_target_from_distance(600.0, 3000.0, clip_h);
+        assert!((restored - (3000.0 - 400.0 - 600.0)).abs() < 1e-9);
+
+        // One save is spent by exactly one return.
+        assert_eq!(
+            super::take_gestures_list_scroll_return(),
+            None,
+            "the record is consumed by the return"
+        );
+        super::PENDING_PAGE_SCROLL.lock().unwrap().clear();
+    }
+
+    /// An abandoned round-trip must not leak: a record left behind would restore a position on
+    /// some later, unrelated rebuild. Consumption clears it, an explicit discard clears it, and
+    /// the fallback (return with nothing saved) behaves like every other rebuild -- capture live.
+    #[test]
+    fn an_abandoned_round_trip_leaves_no_record_behind() {
+        let _serial = REBUILD_RECORD_TEST_LOCK.lock().unwrap();
+        super::discard_gestures_list_scroll_return();
+        super::PENDING_PAGE_SCROLL.lock().unwrap().clear();
+
+        // Save, then discard (the page-switch hook): nothing may remain.
+        super::save_gestures_list_scroll_for_return(240.0);
+        super::discard_gestures_list_scroll_return();
+        assert_eq!(super::take_gestures_list_scroll_return(), None);
+
+        // A return with nothing saved falls back to a live capture. No window exists under test,
+        // so the capture yields None and nothing is recorded -- the same "no record" the ordinary
+        // deferred path produces, not a stale value from an earlier trip.
+        super::record_gestures_list_return_scroll();
+        assert!(
+            super::PENDING_PAGE_SCROLL.lock().unwrap().is_empty(),
+            "the fallback must not invent a record"
+        );
+        super::PENDING_PAGE_SCROLL.lock().unwrap().clear();
+    }
+
+    /// The round-trip record's lifecycle is part of the agreed plan: EVERY exit from the Gestures
+    /// page or from the settings window must clear it, or a save made for one round-trip restores
+    /// a position on some later, unrelated rebuild. The exits need AppKit, so the wiring is
+    /// asserted from the source, like the other call-site scans.
+    #[test]
+    fn every_exit_path_clears_the_round_trip_record() {
+        // Leaving the Gestures page (the page-switch hook).
+        let source = include_str!("settings/window.rs");
+        let start = source
+            .find("pub(super) fn select_sidebar(")
+            .expect("select_sidebar is in window.rs");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("discard_gestures_list_scroll_return"),
+            "leaving the Gestures page must abandon the round-trip record: {body}"
+        );
+
+        // Closing the settings window.
+        let start = source
+            .find("pub(super) fn hide_settings(")
+            .expect("hide_settings is in window.rs");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("discard_gestures_list_scroll_return"),
+            "closing the window must abandon the round-trip record: {body}"
+        );
+
+        // Dropping the cached window (locale/theme rebuild path).
+        let start = source
+            .find("pub(crate) fn invalidate_settings_window(")
+            .expect("invalidate_settings_window is in window.rs");
+        let body = &source[start..];
+        let body = &body[..body.find("\n}\n").unwrap_or(body.len())];
+        assert!(
+            body.contains("discard_gestures_list_scroll_return"),
+            "dropping the cached window must abandon the round-trip record: {body}"
+        );
+
+        // The trigger row vanishing under an open round-trip (the list-shrank fallback).
+        let gestures = include_str!("settings/page_view/gestures.rs");
+        let start = gestures
+            .find("pub(super) fn gestures_page_view(")
+            .expect("gestures_page_view is in gestures.rs");
+        let body = &gestures[start..];
+        let body = &body[..body
+            .find("\n    let cfg = &input.config;")
+            .unwrap_or(body.len())];
+        assert!(
+            body.contains("discard_gestures_list_scroll_return"),
+            "the list-shrank fallback must clear the stale save: {body}"
+        );
     }
 
     /// A rebuild recreates EVERY page, so the record holds one position per page: the page the

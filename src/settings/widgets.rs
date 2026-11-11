@@ -1888,6 +1888,16 @@ pub(super) use super::select::{
 pub(super) const HTML_SWITCH_W: f64 = 40.0;
 pub(super) const HTML_SWITCH_H: f64 = 24.0;
 pub(super) const HTML_SWITCH_KNOB_D: f64 = 18.0;
+
+/// The knob's x when the switch is ON, restated for the state-sync smoke's final-state readback
+/// (the smoke module sits above `super::super`, so it cannot name the private arithmetic).
+pub(crate) const KNOB_ON_X_FOR_CHECK: f64 = HTML_SWITCH_W - HTML_SWITCH_KNOB_D - 2.0;
+
+/// The knob layer of a switch, for the state-sync smoke's final-state readback only. Same lookup
+/// as `html_switch_knob`; a pub(crate) alias because window.rs reaches it from outside this module.
+pub(crate) unsafe fn html_switch_knob_for_check(button: *mut AnyObject) -> *mut AnyObject {
+    html_switch_knob(button)
+}
 // Keep switches on the same trailing edge as popup fields in the settings column.
 pub(super) const HTML_SWITCH_TRAILING_INSET: f64 = 0.0;
 const HTML_SWITCH_SPRING_MASS: f64 = 4.0;
@@ -2291,10 +2301,23 @@ pub(super) unsafe fn make_switch(right_x: f64, y: f64, h: f64, checked: bool) ->
     ];
     let _: () = msg_send![sw, setWantsLayer: true];
     let layer: *mut AnyObject = msg_send![sw, layer];
+    // The initial state is set BEFORE the first visual pass: the visual is then painted once at
+    // its final position, with no off->on transition to replay.
+    if checked {
+        // Route through super so the state-changing override (`html_switch_set_state`) never sees
+        // this call: a settings-content rebuild recreates every control, and going through the
+        // overridden setter would start a knob spring on EVERY enabled switch the rebuild makes --
+        // the "switches close and reopen" flicker the rebuild was reported for. The overridden
+        // setter keeps the animated path for the user's own click (`html_switch_mouse_down`).
+        type SetState = unsafe extern "C" fn(*mut ObjcSuper, Sel, isize);
+        let mut sup = ObjcSuper::for_defined_class(sw as *mut c_void, html_switch_class_handle());
+        let send: SetState = std::mem::transmute(objc_msgSendSuper as *const ());
+        send(&mut sup, sel!(setState:), 1);
+    }
     if !layer.is_null() {
+        // `previous_state = None`: the paint has no transition to animate from, by construction.
         html_switch_apply_visual(sw, None);
     }
-    let _: () = msg_send![sw, setState: if checked { 1isize } else { 0isize }];
     sw
 }
 
@@ -4511,6 +4534,57 @@ mod tests {
     fn set_field_tolerates_a_retired_control() {
         unsafe { super::set_field(std::ptr::null_mut(), 18.0) };
     }
+
+    /// `make_switch` must place its initial state WITHOUT the animated state setter.
+    ///
+    /// The defect this locks out: construction used to call the overridden `setState:` on the fresh
+    /// switch, which starts a knob spring whenever `checked` is true -- so every settings-content
+    /// rebuild replayed an off->on animation on every enabled switch (the reported "switches close
+    /// and reopen" flicker). A behavioural readback cannot catch a regression here: the old animated
+    /// path also ends with state 1 and the model knob frame at the ON x (it only ADDS a spring), and
+    /// CALayer's animation list is emptied under Reduce Motion. The construction sequence itself is
+    /// therefore asserted from the source: the initial state must go through the SUPER setter (the
+    /// documented pattern in this file) and the first visual pass must be transition-free (`None`).
+    /// Restoring the old `msg_send![sw, setState: ...]` line fails the first assertion immediately.
+    #[test]
+    fn make_switch_sets_its_initial_state_without_the_animated_setter() {
+        let source = include_str!("widgets.rs");
+        let start = source
+            .find("pub(super) unsafe fn make_switch(")
+            .expect("make_switch is in this file");
+        let body = &source[start..];
+        let end = body.find("\n}\n").expect("make_switch's closing brace");
+        let body = &body[..end];
+        // The super call is the ONLY sanctioned route for construction-time state.
+        assert!(
+            body.contains(
+                "ObjcSuper::for_defined_class(sw as *mut c_void, html_switch_class_handle())"
+            ),
+            "make_switch must set its initial state through the SUPER setter so the overridden \
+             animated setter never sees construction: {body}"
+        );
+        assert!(
+            body.contains("send(&mut sup, sel!(setState:), 1)"),
+            "the super route must be the one that carries the initial ON state: {body}"
+        );
+        // No direct, overridden-setter state write on the freshly created switch. The old line was
+        // `msg_send![sw, setState: if checked ...]`; any revival of it fails this scan.
+        assert!(
+            !body.contains("msg_send![sw, setState:"),
+            "make_switch must not call the overridden setState: during construction: {body}"
+        );
+        // The first visual pass is transition-free by construction; no animation may be created in
+        // the constructor itself.
+        assert!(
+            body.contains("html_switch_apply_visual(sw, None)"),
+            "construction paints the final position with no transition: {body}"
+        );
+        assert!(
+            !body.contains("CASpringAnimation") && !body.contains("addAnimation"),
+            "make_switch must not animate anything itself: {body}"
+        );
+    }
+
     use super::{
         derived_label_width, html_switch_knob_radius, html_switch_track_radius,
         pixel_rows_to_parent_span, rect_inside, rects_overlap, row_text_block_y_positions,

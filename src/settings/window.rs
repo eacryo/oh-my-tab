@@ -268,6 +268,10 @@ pub(super) fn select_sidebar(idx: usize) {
     // A waiting trigger capture belongs to the Gestures page: leaving it cancels the capture.
     if idx != super::SETTINGS_GESTURES_PAGE_INDEX {
         crate::settings::cancel_trigger_capture("left the Gestures page");
+        // A saved list position belongs to one in-flight round-trip into a trigger row: leaving
+        // the page abandons that round-trip, so the record must not outlive it and restore a
+        // position on some later, unrelated rebuild.
+        crate::settings::discard_gestures_list_scroll_return();
     }
     // The gesture list is data: if it changed while this page was hidden, the page on screen is
     // the old one. Rebuilding here is what keeps "I edited the config, came back, and still see the
@@ -956,6 +960,8 @@ pub(super) fn hide_settings() {
     // A trigger capture waits for a press on a page that is going away: cancel it, so the next
     // mouse button pressed anywhere else is not learned by accident.
     crate::settings::cancel_trigger_capture("the settings window is closing");
+    // A saved list position belongs to one in-flight round-trip; the window closing abandons it.
+    crate::settings::discard_gestures_list_scroll_return();
     // Defensive: wrap up any in-progress recording and every floating editor when the window closes.
     // The two panels are separate windows that outlive a `hide`, and each holds a dim layer added to
     // the settings content view -- which is what this function is about to stop owning.
@@ -3176,6 +3182,26 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 msg_send![ui.keystroke_display_initial_position, indexOfSelectedItem],
             ))
         });
+
+        // FINAL-STATE readback for the switch-construction change: a rebuilt enabled switch must
+        // hold state 1 with its knob at the ON position. This verifies the value survived the
+        // rebuild; it is NOT the proof that construction requested no transition -- that proof is
+        // the source assertion over make_switch in widgets.rs, because the old animated path also
+        // left the state and the model frame at their final values (it only added a spring).
+        let rebuilt_switch_final_state = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            let sw = ui.focused_thumbnail_prewarm;
+            if sw.is_null() {
+                return None;
+            }
+            let state: isize = msg_send![sw, state];
+            let knob = super::widgets::html_switch_knob_for_check(sw);
+            if knob.is_null() {
+                return None;
+            }
+            let frame: NSRect = msg_send![knob, frame];
+            Some((state, frame.origin.x))
+        });
         // The "separate clear all" switch must follow a config reload in both directions while
         // the window stays open: the reload path in apply_config_change re-reads the switch
         // (the picker header relayout rides the same flag), so an open window never shows a
@@ -3213,6 +3239,10 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
             ));
         let refreshed_matches = refreshed == Some((0isize, 1isize, 0isize, 0isize, 2isize));
         let switch_follows_reload = switch_off == Some(0) && switch_on == Some(1);
+        // HTML_SWITCH_W - HTML_SWITCH_KNOB_D - 2.0, restated here because the widget constants are
+        // pub(super): a construction that left the knob at the OFF x (2.0) fails this comparison.
+        let switch_final_state_matches = rebuilt_switch_final_state
+            == Some((1isize, super::super::widgets::KNOB_ON_X_FOR_CHECK));
         if !rebuilt_matches {
             log_info!("[smoke-settings-state-sync] rebuilt control state mismatch: {states:?}");
         }
@@ -3226,7 +3256,12 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 "[smoke-settings-state-sync] separate-clear-all switch mismatch: off={switch_off:?} on={switch_on:?}"
             );
         }
-        rebuilt_matches && refreshed_matches && switch_follows_reload
+        if !switch_final_state_matches {
+            log_info!(
+                "[smoke-settings-state-sync] rebuilt switch final state mismatch: {rebuilt_switch_final_state:?}"
+            );
+        }
+        rebuilt_matches && refreshed_matches && switch_follows_reload && switch_final_state_matches
     }
 }
 
@@ -4520,6 +4555,9 @@ unsafe fn detach_settings_window_runtime() {
 /// Invalidate the cached settings window (release + set None) so it is rebuilt with the
 pub(crate) fn invalidate_settings_window() {
     SYSTEM_APPEARANCE_REBUILD_PENDING.store(false, Ordering::SeqCst);
+    // The cached window going away abandons any in-flight round-trip: the saved position names
+    // views this call is about to release, and no return path can consume it afterwards.
+    crate::settings::discard_gestures_list_scroll_return();
     let ui = with_settings_ui(|slot| slot.take());
     if let Some(u) = ui {
         unsafe {
