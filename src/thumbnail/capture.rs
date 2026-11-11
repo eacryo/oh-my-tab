@@ -774,6 +774,9 @@ static THUMB_GEOMETRY_REJECTED: AtomicU64 = AtomicU64::new(0);
 static THUMB_GEOMETRY_TOO_SMALL: AtomicU64 = AtomicU64::new(0);
 static THUMB_GEOMETRY_SOURCE_ASPECT: AtomicU64 = AtomicU64::new(0);
 static THUMB_GEOMETRY_EXPECTED_ASPECT: AtomicU64 = AtomicU64::new(0);
+static THUMB_OFFSCREEN_FULL: AtomicU64 = AtomicU64::new(0);
+static THUMB_OFFSCREEN_FALLBACK: AtomicU64 = AtomicU64::new(0);
+static THUMB_OFFSCREEN_ASPECT_ANOMALY: AtomicU64 = AtomicU64::new(0);
 static GEOMETRY_RETRY_SCHEDULER: OnceLock<flume::Sender<GeometryRetryDeadline>> = OnceLock::new();
 static GEOMETRY_RETRY_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const GEOMETRY_RETRY_INITIAL_DELAY: Duration = Duration::from_millis(300);
@@ -1028,6 +1031,189 @@ pub(super) fn geometry_reject_reason(
     }
 }
 
+/// How much of a window lies outside the display set.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum WindowExtent {
+    /// Every point of the window is inside the union of the display rectangles.
+    FullyOnScreen,
+    /// Part of the window lies outside every display: only a full-window capture can show it.
+    PartlyOffScreen,
+    /// The display set or the window's bounds could not be read. The incumbent capture path is
+    /// kept, because "could not tell" must never be read as "partly off screen".
+    Unknown,
+}
+
+/// The displays' bounds in CG global coordinates, or None when the set could not be read.
+///
+/// A failed enumeration, an empty list or a list that filled the buffer (so there may be more
+/// displays) is None, never an empty set: the caller must keep its incumbent path rather than
+/// conclude anything about the window.
+fn display_bounds() -> Option<Vec<(f64, f64, f64, f64)>> {
+    const MAX_DISPLAYS: u32 = 16;
+    let mut ids = [0u32; MAX_DISPLAYS as usize];
+    let mut count: u32 = 0;
+    let error = unsafe { CGGetActiveDisplayList(MAX_DISPLAYS, ids.as_mut_ptr(), &mut count) };
+    if error != 0 || count == 0 || count >= MAX_DISPLAYS {
+        return None;
+    }
+    let mut bounds = Vec::with_capacity(count as usize);
+    for id in &ids[..count as usize] {
+        let rect = unsafe { CGDisplayBounds(*id) };
+        if rect.w > 0.0 && rect.h > 0.0 {
+            bounds.push((rect.x, rect.y, rect.w, rect.h));
+        }
+    }
+    (!bounds.is_empty()).then_some(bounds)
+}
+
+/// The window's extent against the display set as it is now (reads the displays itself).
+pub(super) fn current_window_extent(window: Option<(f64, f64, f64, f64)>) -> WindowExtent {
+    window_extent(window, display_bounds().as_deref())
+}
+
+/// The window's extent against the display set.
+pub(super) fn window_extent(
+    window: Option<(f64, f64, f64, f64)>,
+    displays: Option<&[(f64, f64, f64, f64)]>,
+) -> WindowExtent {
+    let Some(window) = window else {
+        return WindowExtent::Unknown;
+    };
+    let Some(displays) = displays else {
+        return WindowExtent::Unknown;
+    };
+    match rect_covered_by_rects(window, displays) {
+        Some(true) => WindowExtent::FullyOnScreen,
+        Some(false) => WindowExtent::PartlyOffScreen,
+        None => WindowExtent::Unknown,
+    }
+}
+
+/// Whether `rect` is fully covered by the union of `covers`, measured by area.
+///
+/// The union is measured rather than approximated: a bounding box would call a window that straddles
+/// two displays' gap "covered", and "one display contains it" would call a window that straddles two
+/// adjacent displays "off screen". Both answers would pick the wrong capture path. None means the
+/// question cannot be answered (degenerate inputs, no covers).
+pub(super) fn rect_covered_by_rects(
+    rect: (f64, f64, f64, f64),
+    covers: &[(f64, f64, f64, f64)],
+) -> Option<bool> {
+    let (x, y, w, h) = rect;
+    if !(x.is_finite() && y.is_finite() && w.is_finite() && h.is_finite()) || w <= 0.0 || h <= 0.0 {
+        return None;
+    }
+    if covers.is_empty() {
+        return None;
+    }
+    // Sweep the distinct x edges of the rect and of the covers clipped to it, and for each slab add
+    // the length of the merged y intervals of the covers that span it. A handful of displays keeps
+    // this trivial, and it is exact for axis-aligned rectangles.
+    let mut xs: Vec<f64> = vec![x, x + w];
+    for (cx, _, cw, _) in covers {
+        if cx.is_finite() && cw.is_finite() && *cw > 0.0 {
+            let left = cx.max(x);
+            let right = (cx + cw).min(x + w);
+            if right > left {
+                xs.push(left);
+                xs.push(right);
+            }
+        }
+    }
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    xs.dedup();
+    let mut covered = 0.0;
+    for pair in xs.windows(2) {
+        let (left, right) = (pair[0], pair[1]);
+        let width = right - left;
+        if !width.is_finite() || width <= 0.0 {
+            continue;
+        }
+        let mid = (left + right) / 2.0;
+        let mut intervals: Vec<(f64, f64)> = covers
+            .iter()
+            .filter_map(|(cx, cy, cw, ch)| {
+                let inside_x = mid >= *cx && mid <= cx + cw && *cw > 0.0;
+                let inside_y = *ch > 0.0;
+                (inside_x && inside_y)
+                    .then(|| (cy.max(y), (cy + ch).min(y + h)))
+                    .filter(|(bottom, top)| top > bottom)
+            })
+            .collect();
+        intervals.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+        let mut union_len = 0.0;
+        let mut current: Option<(f64, f64)> = None;
+        for (bottom, top) in intervals {
+            match current {
+                Some((start, end)) if bottom <= end => current = Some((start, end.max(top))),
+                Some((start, end)) => {
+                    union_len += end - start;
+                    current = Some((bottom, top));
+                }
+                None => current = Some((bottom, top)),
+            }
+        }
+        if let Some((start, end)) = current {
+            union_len += end - start;
+        }
+        covered += width * union_len;
+    }
+    let area = w * h;
+    Some(covered >= area - area.max(1.0) * 1e-6)
+}
+
+/// How far a full-window frame's aspect may drift from the window's own before it is recorded as
+/// anomalous. The full-window call reproduces the window's bounds, so the only legitimate drift is a
+/// resize during the capture; a frame clipped to the visible part is off by roughly the visible
+/// fraction and lands far outside this band.
+pub(super) const FULL_WINDOW_ASPECT_TOLERANCE: f64 = 0.25;
+
+/// Whether a captured frame has the window's own aspect ratio.
+///
+/// An anomaly is evidence that the frame was clipped to the visible part, but a match is not proof
+/// of completeness: a proportional clip keeps the aspect, and a resize during the capture can make a
+/// complete frame look anomalous. It is a diagnostic, never a gate on whether a frame is stored.
+/// None when either side is unusable.
+pub(super) fn capture_matches_window_aspect(
+    source_w_px: u32,
+    source_h_px: u32,
+    window: (f64, f64, f64, f64),
+) -> Option<bool> {
+    let (_, _, window_w, window_h) = window;
+    if source_w_px == 0
+        || source_h_px == 0
+        || !(window_w.is_finite() && window_h.is_finite())
+        || window_w <= 0.0
+        || window_h <= 0.0
+    {
+        return None;
+    }
+    let ratio = (source_w_px as f64 / source_h_px as f64) / (window_w / window_h);
+    Some((1.0 - FULL_WINDOW_ASPECT_TOLERANCE..=1.0 + FULL_WINDOW_ASPECT_TOLERANCE).contains(&ratio))
+}
+
+/// Which entry point produced a frame.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum CaptureBackend {
+    /// The private SkyLight list call: it clips a window to the display it is visible on.
+    PrivateWindowList,
+    /// The full-window call, for a window that lies partly outside every display.
+    FullWindow,
+    /// The full-window call could not produce a usable frame, so the private call ran instead and
+    /// the result may be clipped.
+    FullWindowFallback,
+}
+
+impl CaptureBackend {
+    fn label(self) -> &'static str {
+        match self {
+            Self::PrivateWindowList => "private",
+            Self::FullWindow => "full-window",
+            Self::FullWindowFallback => "full-window-fallback",
+        }
+    }
+}
+
 /// Reject thin or clipped source frames and keep independent counters per reason.
 fn capture_geometry_reject_reason(
     key: ThumbKey,
@@ -1037,6 +1223,22 @@ fn capture_geometry_reject_reason(
         .into_iter()
         .find_map(|(wid, bounds)| (wid == key.wid).then_some(bounds));
     geometry_reject_reason(captured.source_w_px, captured.source_h_px, expected_bounds)
+}
+
+/// Record how the off-screen capture path ended, for the metrics line and the logs.
+fn record_offscreen_capture(outcome: CaptureBackend, matched_aspect: Option<bool>) {
+    match outcome {
+        CaptureBackend::FullWindow => {
+            THUMB_OFFSCREEN_FULL.fetch_add(1, Ordering::Relaxed);
+            if matched_aspect == Some(false) {
+                THUMB_OFFSCREEN_ASPECT_ANOMALY.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        CaptureBackend::FullWindowFallback => {
+            THUMB_OFFSCREEN_FALLBACK.fetch_add(1, Ordering::Relaxed);
+        }
+        CaptureBackend::PrivateWindowList => {}
+    }
 }
 
 fn record_geometry_rejection(reason: GeometryRejectReason) {
@@ -1189,7 +1391,7 @@ pub(crate) fn log_capture_metrics(context: &str) {
     let avg_queue_ms = queue_total.checked_div(queue_samples.max(1)).unwrap_or(0);
     let avg_capture_ms = capture_total.checked_div(completed.max(1)).unwrap_or(0);
     log_debug!(
-        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} geometry_rejected={} geometry_too_small={} geometry_source_aspect={} geometry_expected_aspect={} queue_samples={} interaction_deferred={} transition_deferred={} transition_retry_exhausted={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
+        "[perf] thumbnail metrics context={} enqueued={} completed={} failed={} geometry_rejected={} geometry_too_small={} geometry_source_aspect={} geometry_expected_aspect={} offscreen_full={} offscreen_fallback={} offscreen_aspect_anomaly={} queue_samples={} interaction_deferred={} transition_deferred={} transition_retry_exhausted={} avg_queue_ms={} max_queue_ms={} avg_capture_ms={} max_capture_ms={}",
         context,
         enqueued,
         completed,
@@ -1198,6 +1400,9 @@ pub(crate) fn log_capture_metrics(context: &str) {
         THUMB_GEOMETRY_TOO_SMALL.load(Ordering::Relaxed),
         THUMB_GEOMETRY_SOURCE_ASPECT.load(Ordering::Relaxed),
         THUMB_GEOMETRY_EXPECTED_ASPECT.load(Ordering::Relaxed),
+        THUMB_OFFSCREEN_FULL.load(Ordering::Relaxed),
+        THUMB_OFFSCREEN_FALLBACK.load(Ordering::Relaxed),
+        THUMB_OFFSCREEN_ASPECT_ANOMALY.load(Ordering::Relaxed),
         queue_samples,
         THUMB_INTERACTION_DEFERRED.load(Ordering::Relaxed),
         THUMB_TRANSITION_DEFERRED.load(Ordering::Relaxed),
@@ -1945,7 +2150,12 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         return CaptureJobResult::Finished;
     }
     let job_started = Instant::now();
-    let Some(captured) = (unsafe { capture_window(key.wid, job.target_px_h) }) else {
+    // The entry point depends on where the window lies, so its public bounds are read at capture
+    // time rather than taken from the (possibly stale) collection pass. None keeps the incumbent
+    // private path: a window the WindowServer will not describe is not treated as off screen.
+    let window_bounds = crate::window_collector::window_public_bounds(key.wid);
+    let Some(captured) = (unsafe { capture_window(key.wid, job.target_px_h, window_bounds) })
+    else {
         record_thumb_capture_failed();
         if job.priority == CapturePriority::FocusedPrewarm {
             note_focused_prewarm_failure(key, "capture-failed");
@@ -1972,7 +2182,7 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
     }
     log_debug!(
-        "[thumb] capture result pid={} wid={} source={}x{} cached={}x{} target_h={} priority={}",
+        "[thumb] capture result pid={} wid={} source={}x{} cached={}x{} target_h={} priority={} backend={}",
         key.pid,
         key.wid,
         captured.source_w_px,
@@ -1980,7 +2190,8 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         captured.thumb.w_px,
         captured.thumb.h_px,
         job.target_px_h,
-        job.priority.label()
+        job.priority.label(),
+        captured.backend.label()
     );
     if let Some(reason) = capture_geometry_reject_reason(key, &captured) {
         unsafe {
@@ -2274,17 +2485,21 @@ fn enqueue_ready_delivery(key: ThumbKey) {
     }
 }
 
-/// Capture one window: CGSHWCCaptureWindowList (count=1) -> first CGImage ->
-/// proportionally downscale to the target pixel height (native retina frames can
-/// reach tens of MB).
+/// Capture one window -> one CGImage -> proportionally downscale to the target pixel height
+/// (native retina frames can reach tens of MB).
 pub(super) struct CapturedWindow {
-    source_w_px: u32,
-    source_h_px: u32,
+    pub(super) source_w_px: u32,
+    pub(super) source_h_px: u32,
+    /// Which entry point produced the frame; recorded so a clipped fallback is visible in the log
+    /// and never mistaken for a complete window.
+    pub(super) backend: CaptureBackend,
     pub(super) thumb: CachedThumb,
 }
 static CONNECTION_ID: OnceLock<u32> = OnceLock::new();
 
-pub(super) unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<CapturedWindow> {
+/// Capture through the private SkyLight list call, which clips a window to the display it is
+/// visible on. Returns an owned CGImage.
+pub(super) unsafe fn capture_private_window(wid: u32) -> Option<*const c_void> {
     let cap = *CGS_CAPTURE_LIST.as_ref()?;
     // The connection ID is process-wide constant; cache it once (0 = unavailable).
     let cid = *CONNECTION_ID.get_or_init(|| skylight::cgs_main_connection().unwrap_or(0));
@@ -2311,6 +2526,91 @@ pub(super) unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<Captur
     }
     CFRetain(raw); // the array goes away; keep our own ref
     CFRelease(arr);
+    Some(raw)
+}
+
+/// Whether the full-window entry point resolved at all (false = the symbol is gone on this macOS).
+pub(super) fn full_window_capture_symbol_available() -> bool {
+    CG_WINDOW_LIST_CREATE_IMAGE.is_some()
+}
+
+/// Capture the whole window through `CGWindowListCreateImage`, off-screen part included.
+///
+/// Returns an owned CGImage, or None when the symbol is gone, the call fails, the frame is
+/// degenerate, or it is the transparent black image the header documents for a window that could
+/// not be read (a window with sharing type `kCGWindowSharingNone`, for instance) -- an invalid
+/// result, not a blank window, so the caller must keep its fallback.
+unsafe fn capture_full_window(wid: u32) -> Option<*const c_void> {
+    let create = *CG_WINDOW_LIST_CREATE_IMAGE.as_ref()?;
+    let raw = create(
+        CG_RECT_NULL,
+        K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW,
+        wid,
+        K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING,
+    );
+    if raw.is_null() {
+        return None;
+    }
+    let width = CGImageGetWidth(raw) as u32;
+    let height = CGImageGetHeight(raw) as u32;
+    if width == 0 || height == 0 || frame_is_fully_transparent(raw, width, height).unwrap_or(false)
+    {
+        CFRelease(raw);
+        return None;
+    }
+    Some(raw)
+}
+
+/// Capture one window: choose the entry point from the window's extent against the display set,
+/// then downscale. `window_bounds` is the window's public CG bounds read at capture time; None (a
+/// window the WindowServer would not describe) keeps the incumbent private path.
+pub(super) unsafe fn capture_window(
+    wid: u32,
+    target_px_h: u32,
+    window_bounds: Option<(f64, f64, f64, f64)>,
+) -> Option<CapturedWindow> {
+    let (raw, backend) = match current_window_extent(window_bounds) {
+        // Only a window that really extends past every display takes the full-window call: for an
+        // on-screen window the private call is the incumbent, validated path, and for an unknown
+        // extent the app must not guess.
+        WindowExtent::PartlyOffScreen => match capture_full_window(wid) {
+            Some(raw) => {
+                let matched = window_bounds.and_then(|window| {
+                    capture_matches_window_aspect(
+                        CGImageGetWidth(raw) as u32,
+                        CGImageGetHeight(raw) as u32,
+                        window,
+                    )
+                });
+                if matched == Some(false) {
+                    log_debug!(
+                        "[thumb] full-window capture aspect anomaly wid={} source={}x{} expected={:?} (suspected clipped frame)",
+                        wid,
+                        CGImageGetWidth(raw),
+                        CGImageGetHeight(raw),
+                        window_bounds
+                    );
+                }
+                record_offscreen_capture(CaptureBackend::FullWindow, matched);
+                (raw, CaptureBackend::FullWindow)
+            }
+            None => {
+                log_debug!(
+                    "[thumb] full-window capture unavailable wid={} extent=partly-offscreen; falling back to the clipped private path",
+                    wid
+                );
+                record_offscreen_capture(CaptureBackend::FullWindowFallback, None);
+                (
+                    capture_private_window(wid)?,
+                    CaptureBackend::FullWindowFallback,
+                )
+            }
+        },
+        WindowExtent::FullyOnScreen | WindowExtent::Unknown => (
+            capture_private_window(wid)?,
+            CaptureBackend::PrivateWindowList,
+        ),
+    };
     let src_w = CGImageGetWidth(raw) as u32;
     let src_h = CGImageGetHeight(raw) as u32;
     let target_px_h = target_px_h.clamp(BASE_TARGET_PX_H, MAX_TARGET_PX_H);
@@ -2331,6 +2631,7 @@ pub(super) unsafe fn capture_window(wid: u32, target_px_h: u32) -> Option<Captur
     Some(CapturedWindow {
         source_w_px: src_w,
         source_h_px: src_h,
+        backend,
         thumb: CachedThumb {
             img,
             w_px: tw,

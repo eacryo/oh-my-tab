@@ -167,9 +167,9 @@ is not presented as minimized. When the ordered-in field
 could not be read, the accessibility answer decides alone and the WindowServer tag is consulted only
 for a window accessibility does not publish at all.
 
-Thumbnails: such a card never *requests* a capture -- the private capture call this app uses
-(`SLSHWCaptureWindowList`) cannot capture a window off the active desktop, and no reference
-implementation asks it to -- but it does show a frame the cache already holds from when the window was
+Thumbnails: such a card never *requests* a capture -- the capture calls this app uses
+(`SLSHWCaptureWindowList`, plus `CGWindowListCreateImage` for a window that extends past a display)
+cannot capture a window off the active desktop, and no reference implementation asks it to -- but it does show a frame the cache already holds from when the window was
 on its own desktop -- the producers filter it out while the renderer keeps reading the cache, and the e2e
 (M2) snapshot publishes `thumbnail_ready` so that behaviour is assertable. Refusing to render that frame as well was
 wrong: a user who visits both desktops has one for most cards, and reference implementations keep the
@@ -331,6 +331,49 @@ maximized window chose 1.10 (248pt) and summoning from a non-maximized one chose
 1.10 the same multiset packed into three rows in one MRU order and four in the other. The recorded trade-off is "fit without scrolling wins over a
 stable size"; the alternative -- accept at most one overflowing teaser row before stepping down, and
 stop the width cap from following a single maximized window -- is tracked in `docs/review-backlog.md`.
+
+## Thumbnail capture: on-screen windows and windows past the display edge
+
+Two capture entry points exist, and which one runs is a property of the window:
+
+- the private `SLSHWCaptureWindowList` call (`thumbnail/capture.rs`) for the normal case. It clips a
+  window to the display it is visible on.
+- `CGWindowListCreateImage` for a window that lies partly outside every display. Its `CGRectNull`
+  bounds ask for the window's own bounding box, so the frame keeps the part that hangs past the edge.
+
+The decision compares the window's public CG bounds with the **union** of the display rectangles
+(`window_extent` -> `rect_covered_by_rects`): a window straddling two adjacent displays is fully on
+screen, one that sits inside the bounding box of two displays but in the gap between them is not, and
+the menu-bar/Dock reservations are part of the display (they never make a window off screen). When the
+window's bounds or the display set cannot be read, the private path runs -- "could not tell" is never
+treated as "partly off screen".
+
+Measured 2026-11-11 on macOS 27.2.1, on a 1470x923 window whose bottom 500pt lies below a 1920x1080
+display (reproduce by capturing such a window with both calls): `CGWindowListCreateImage(CGRectNull,
+kCGWindowListOptionIncludingWindow, wid, kCGWindowImageBoundsIgnoreFraming)` returns 2940x1846 px --
+the whole window, the off-screen part with real content -- while `SLSHWCaptureWindowList` returns
+2940x846 px, the visible part only. Every `CGSWindowCaptureOptions` bit tried (bestResolution, nominal,
+fullSize, ignoreGlobalClipShape and their combinations) returns the clipped size, so no flag makes the
+private call unclip.
+
+`CGWindowListCreateImage` is deprecated in macOS 14 and obsoleted in macOS 15, and the macOS 15 release
+notes say applications using such capture APIs "can trigger system alerts indicating they might be able
+to collect detailed information about the user". That is why it is used only for the case the private
+call cannot serve, and why the symbol is resolved at runtime (`skylight.rs`): a future macOS that drops
+it falls back to the clipped private path instead of the app failing to launch.
+
+A frame is not called complete because it came from the full-window call: its aspect ratio is compared
+with the window's (`capture_matches_window_aspect`, +-25%), and a frame whose aspect still matches only
+the visible part is counted as an aspect anomaly (`offscreen_aspect_anomaly` in the thumbnail metrics
+line) and logged. That is evidence of clipping, not proof of the opposite -- a proportional clip keeps
+the aspect, and a resize during the capture can make a complete frame look anomalous -- so the count is
+diagnostic and never decides whether a frame is stored. The
+header also documents a transparent black image for a window that could not be read (sharing type
+`kCGWindowSharingNone`, for instance); such a frame is rejected as invalid and the private call runs
+instead. The regression assertion is the M2 runner `offscreen_capture_smoke`: it creates its own window
+with a magenta marker in the part that hangs below the lowest display and asserts, through the
+production `capture_window`, that the frame has the window's aspect **and** still contains the marker --
+a size-only check would pass a frame whose off-screen part is black.
 
 ## Logging and memory diagnostics
 

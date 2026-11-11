@@ -1,6 +1,7 @@
-//! Central entry point for private-framework dlopen/dlsym. Every lazily resolved
-//! private symbol goes through this module, so the dlopen boilerplate and the
-//! SkyLight/HIServices paths aren't duplicated per module (thumbnail, window_server,
+//! Central entry point for dlopen/dlsym. Every lazily resolved private symbol -- and every
+//! public symbol the SDK has deprecated or obsoleted, which must not become a link-time
+//! dependency -- goes through this module, so the dlopen boilerplate and the
+//! SkyLight/HIServices/CoreGraphics paths aren't duplicated per module (thumbnail, window_server,
 //! and window_collector each used to carry their own copy).
 
 use std::collections::HashMap;
@@ -25,7 +26,8 @@ pub(crate) const SKYLIGHT_PATH: &str =
 /// The HIServices framework path (home of _AXUIElementGetWindow / GetProcessForPID).
 pub(crate) const HISERVICES_PATH: &str = "/System/Library/Frameworks/ApplicationServices.framework/Frameworks/HIServices.framework/HIServices";
 
-/// Path containing CoreGraphics' private CGS window-geometry APIs.
+/// Path containing CoreGraphics' CGS window-geometry APIs and the obsoleted window-capture
+/// entry point.
 const COREGRAPHICS_PATH: &str = "/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics";
 
 /// dlopen a framework path, returning the handle (null on failure).
@@ -48,6 +50,15 @@ pub(crate) unsafe fn load_private_symbol<T>(framework_path: &str, name: &str) ->
     } else {
         Some(std::mem::transmute_copy(&pointer))
     }
+}
+
+/// Resolve a CoreGraphics symbol at runtime.
+///
+/// For the obsoleted public entry points (the full-window capture call): the SDK marks them
+/// deprecated/obsoleted, and a link-time reference would make the app fail to launch if a future
+/// macOS dropped the symbol. Resolving it here keeps the caller's fallback reachable instead.
+pub(crate) unsafe fn load_coregraphics_symbol<T>(name: &str) -> Option<T> {
+    load_private_symbol(COREGRAPHICS_PATH, name)
 }
 
 type CgsMainConnFn = unsafe extern "C" fn() -> u32;

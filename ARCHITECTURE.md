@@ -163,12 +163,18 @@ lib.rs (run)                                                      wiring + run l
 
 ## Thumbnails
 
-- Capture goes through the private `SLSHWCaptureWindowList`; frames live in a **memory-only LRU on purpose** —
-  plaintext screen content under `~/Library/Caches` is a privacy risk.
-- `thumbnail/capture.rs` is the queue and its single rate-limited worker plus focused prewarm and geometry
-  retries; `thumbnail/cache.rs` the LRU core; `thumbnail/pregen.rs` the AX observer that pre-generates frames on
-  window creation; `thumbnail/summon.rs` the summon-time refresh; `thumbnail/blank_frame.rs` detects blank
-  frames from background-suspended WKWebView windows.
+- Capture has two entry points, chosen by the window's extent: the private `SLSHWCaptureWindowList`
+  (which clips a window to the display it is visible on) for a window fully inside the display set, and
+  the runtime-resolved `CGWindowListCreateImage` for a window that lies partly outside every display, so
+  the frame keeps the off-screen part. An unreadable display set or window bounds keep the private path;
+  a frame that still comes back clipped is counted, never reported as complete. Frames live in a
+  **memory-only LRU on purpose** — plaintext screen content under `~/Library/Caches` is a privacy risk.
+- `thumbnail/capture.rs` is the queue and its single rate-limited worker plus focused prewarm, the capture
+  entry points and the extent decision, and geometry retries; `thumbnail/cache.rs` the LRU core;
+  `thumbnail/pregen.rs` the AX observer that pre-generates frames on window creation; `thumbnail/summon.rs`
+  the summon-time refresh; `thumbnail/blank_frame.rs` detects blank frames from background-suspended
+  WKWebView windows and supplies the frame sampling both the blank and the transparency tests use;
+  `thumbnail/smoke.rs` is the M2 off-screen capture runner's app child.
 - Thumbnails require Screen Recording and must degrade to icons/fallbacks without it. Keep layout helpers pure.
 
 ## Clipboard subsystem

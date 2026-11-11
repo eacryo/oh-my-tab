@@ -178,6 +178,37 @@ pub(super) unsafe fn frame_blankness_verdict(
     w_px: u32,
     h_px: u32,
 ) -> Option<BlankVerdict> {
+    with_frame_sample(img, w_px, h_px, |sample, sw, sh| {
+        let skip_rows = ((sh as f64) * BLANK_TITLE_STRIP_FRACTION).round() as usize;
+        blank_verdict_from_sample(sample, sw, skip_rows, sh)
+    })
+}
+
+/// Whether the frame is entirely transparent.
+///
+/// `CGWindowListCreateImage` documents a transparent black image for "no windows meet the
+/// criteria, or the windows can't be read", so that result must not be mistaken for a real frame
+/// (a blank window still has an opaque title bar and body). None when the frame cannot be sampled;
+/// the caller decides what an undecidable answer means for it.
+pub(super) unsafe fn frame_is_fully_transparent(
+    img: *const c_void,
+    w_px: u32,
+    h_px: u32,
+) -> Option<bool> {
+    with_frame_sample(img, w_px, h_px, |sample, _, _| {
+        // An unreadable sample is not evidence of transparency: conservatively keep the frame.
+        sample.is_some_and(|rgba| rgba.chunks_exact(4).all(|pixel| pixel[3] == 0))
+    })
+}
+
+/// Redraw the frame into a small (<=64px) RGBA bitmap and hand the sample to `f`, which runs while
+/// the context (and therefore the sample) is alive.
+pub(super) unsafe fn with_frame_sample<T>(
+    img: *const c_void,
+    w_px: u32,
+    h_px: u32,
+    f: impl FnOnce(Option<&[u8]>, usize, usize) -> T,
+) -> Option<T> {
     if img.is_null() || w_px == 0 || h_px == 0 {
         return None;
     }
@@ -196,6 +227,18 @@ pub(super) unsafe fn frame_blankness_verdict(
     if ctx.is_null() {
         return None;
     }
+    // The bitmap context's buffer is not documented as zeroed, and both readers below interpret
+    // undrawn bytes: clear it so an area the frame does not cover reads as transparent black
+    // instead of whatever the allocation held.
+    CGContextClearRect(
+        ctx,
+        CGRect {
+            x: 0.0,
+            y: 0.0,
+            w: sw as f64,
+            h: sh as f64,
+        },
+    );
     CGContextDrawImage(
         ctx,
         CGRect {
@@ -207,15 +250,14 @@ pub(super) unsafe fn frame_blankness_verdict(
         img,
     );
     let data = CGBitmapContextGetData(ctx) as *const u8;
-    let skip_rows = ((sh as f64) * BLANK_TITLE_STRIP_FRACTION).round() as usize;
     let sample = if data.is_null() {
         None
     } else {
         Some(std::slice::from_raw_parts(data, sw * sh * 4))
     };
-    let verdict = blank_verdict_from_sample(sample, sw, skip_rows, sh);
+    let out = f(sample, sw, sh);
     CFRelease(ctx);
-    Some(verdict)
+    Some(out)
 }
 
 /// Drop a terminated app's pending blank-retry slots (called from pregen's

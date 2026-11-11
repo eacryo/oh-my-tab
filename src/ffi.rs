@@ -238,6 +238,7 @@ extern "C" {
         bitmap_info: u32,
     ) -> *mut c_void;
     pub(crate) fn CGContextDrawImage(ctx: *mut c_void, rect: CGRect, image: *const c_void);
+    pub(crate) fn CGContextClearRect(ctx: *mut c_void, rect: CGRect);
     pub(crate) fn CGBitmapContextCreateImage(ctx: *mut c_void) -> *const c_void;
     pub(crate) fn CGBitmapContextGetData(ctx: *mut c_void) -> *mut c_void;
     /// A +1 rounded-rect path (pass a null transform for identity). Core Graphics object, not an

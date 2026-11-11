@@ -371,6 +371,37 @@ pub(crate) fn owner_pid_for_cgwid(window_id: u32) -> Option<i32> {
         .find_map(|(candidate, pid)| (candidate == window_id).then_some(pid))
 }
 
+/// One window's public CG bounds, this process's own windows included.
+///
+/// The thumbnail capture path reads it at capture time, because which capture entry point to use
+/// depends on whether the window lies inside the display set, and the bounds include the part that
+/// lies outside every display -- that part is what a full-window capture must recover.
+/// `ordinary_onscreen_window_bounds` cannot answer this: it drops our own windows (the switcher must
+/// not offer itself) and keeps only the three largest, which the off-screen capture smoke also
+/// cannot use for the window it owns.
+pub(crate) fn window_public_bounds(window_id: u32) -> Option<(f64, f64, f64, f64)> {
+    unsafe {
+        let array =
+            CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW, window_id);
+        if array.is_null() {
+            return None;
+        }
+        let count = CFArrayGetCount(array);
+        let bounds = if count > 0 {
+            let dict = CFArrayGetValueAtIndex(array, 0);
+            if dict.is_null() {
+                None
+            } else {
+                cf_dict_get_bounds(dict, CgKey::Bounds)
+            }
+        } else {
+            None
+        };
+        CFRelease(array);
+        bounds
+    }
+}
+
 /// Prune MRU entries not in the live window set (prevents CGWindowID-reuse inheriting a dead
 /// timestamp); returns how many were dropped.
 fn prune_mru(mru: &mut MruMap, live_set: &HashSet<(i32, u32)>) -> usize {

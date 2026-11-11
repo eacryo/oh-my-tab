@@ -3503,6 +3503,7 @@ pub fn run() {
             || arg == "--smoke-panel-keys"
             || arg == "--smoke-main-thread-slot"
             || arg == "--smoke-toast"
+            || arg == "--smoke-offscreen-capture"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -3562,6 +3563,14 @@ pub fn run() {
         );
     }
     log_launch_identity();
+
+    // Smoke-test entry (--smoke-offscreen-capture): create a marked window that hangs past the
+    // display edge and capture it through the production path. The window is AppKit main-thread
+    // work, so the #[ignore] runner in thumbnail.rs drives it as an app child.
+    if crate::dev_flags::present("smoke-offscreen-capture") {
+        let passed = thumbnail::smoke_offscreen_capture();
+        std::process::exit(if passed { 0 } else { 1 });
+    }
 
     // 2. Register custom ObjC classes
     overlay::register_card_class();

@@ -123,8 +123,8 @@ WindowServer 字段。`--space-state-record` 让应用自建的 probe 窗口依�
 都是保守的那一条：只要 WindowServer 说窗口已回到屏幕，就不把它呈现为仍在最小化。当 ordered-in 字段读不到时，由 AX 读数单独决定，只有对
 AX 完全不发布的窗口才看 WindowServer 的 tag。
 
-缩略图：这类卡片**不会请求**新的抓图（本应用使用的私有抓图调用 `SLSHWCaptureWindowList` 抓不到不在活跃
-桌面上的窗口，参考实现也不会去请求），但会显示缓存里已有的那一张——那是它还在自己桌面上时抓到的。生产端把它过滤掉，渲染端照旧读缓存；e2e（M2）快照为此发布
+缩略图：这类卡片**不会请求**新的抓图（本应用使用的抓图调用 `SLSHWCaptureWindowList`，以及针对越过显示器
+的窗口所用的 `CGWindowListCreateImage`，都抓不到不在活跃桌面上的窗口；参考实现也不会去请求），但会显示缓存里已有的那一张——那是它还在自己桌面上时抓到的。生产端把它过滤掉，渲染端照旧读缓存；e2e（M2）快照为此发布
 `thumbnail_ready`，让这个行为可断言。连缓存帧一起拒绝是错的：两个桌面都去过的用户，大多数卡片本来就有
 一张，参考实现也是保留上一张缩略图。
 
@@ -255,6 +255,39 @@ DockDoor 用 `layer == 0` 加一条 bundle id 黑名单。三者都保留了扩�
 在另一种里排成四行。记录在案的取舍是「优先不滚动，而不是优先尺寸稳定」；另一种
 做法——先接受最多一行 teaser 溢出再降档，并且不再让宽度上限跟随单个最大化窗口——登记在
 `docs/review-backlog.md`。
+
+## 缩略图抓图：在屏窗口与越过屏幕边缘的窗口
+
+抓图有两个入口，用哪一个由窗口本身决定：
+
+- 常规情况走私有 `SLSHWCaptureWindowList`（`thumbnail/capture.rs`），它会把窗口裁剪到它所在的那块显示器内。
+- 窗口有一部分落在所有显示器之外时走 `CGWindowListCreateImage`：它的 `CGRectNull` 边界表示「按窗口自身的
+  外接矩形」，因此屏幕外的那部分也会留在帧里。
+
+判定用窗口的 public CG bounds 与**显示器矩形并集**比较（`window_extent` → `rect_covered_by_rects`）：横跨两块
+相邻显示器的窗口仍算完整在屏；落在两块显示器外接矩形之内、却处在两者之间空隙里的窗口不算；菜单栏与 Dock 的
+预留区属于显示器（它们不会让窗口变成屏外）。窗口 bounds 或显示器集合读不到时走私有路径——「判断不了」永远
+不会被当成「部分在屏外」。
+
+2026-11-11 在 macOS 27.2.1 上实测：一个 1470x923 的窗口，底部 500pt 落在 1920x1080 显示器下方，用两种调用
+分别抓图——`CGWindowListCreateImage(CGRectNull, kCGWindowListOptionIncludingWindow, wid,
+kCGWindowImageBoundsIgnoreFraming)` 返回 2940x1846 px（完整窗口，屏外部分是真实内容），
+`SLSHWCaptureWindowList` 返回 2940x846 px（只有可见部分）。逐个试过的 `CGSWindowCaptureOptions` 位
+（bestResolution、nominal、fullSize、ignoreGlobalClipShape 及其组合）都返回裁剪后的尺寸，也就是说没有任何
+flag 能让私有调用不裁剪。
+
+`CGWindowListCreateImage` 在 macOS 14 废弃、macOS 15 obsoleted，且 macOS 15 发布说明写明使用这类抓图 API 的
+应用「can trigger system alerts indicating they might be able to collect detailed information about the
+user」。所以它只用于私有调用做不到的那一种情况，并且符号在运行时解析（`skylight.rs`）：未来某个 macOS 若
+删掉这个符号，应用会退回被裁剪的私有路径，而不是启动失败。
+
+来自完整窗口调用的帧也不会被直接当成「完整」：帧的宽高比会与窗口自身比较
+（`capture_matches_window_aspect`，±25%），宽高比仍只匹配可见部分的帧会按「比例异常」计数（缩略图 metrics
+行里的 `offscreen_aspect_anomaly`）并记日志。那只是裁剪的证据，不是「未命中即完整」的证明——等比裁剪不会
+改变比例，抓图期间窗口改尺寸也会让完整帧看起来异常——所以这个计数只用于诊断，不决定帧是否入库。头文件还写明：窗口读不到时（例如 sharing type 为
+`kCGWindowSharingNone`）会返回一张全透明的黑图；这种结果按无效处理，转而走私有调用。回归断言是 M2 runner
+`offscreen_capture_smoke`：它自建一个窗口，在挂在最低显示器下方的那一半画一块洋红色标记，再经生产路径
+`capture_window` 断言帧具有窗口的宽高比**且**仍包含那块标记——只断言尺寸的话，屏外部分被填黑的帧也会通过。
 
 ## 日志与内存诊断
 

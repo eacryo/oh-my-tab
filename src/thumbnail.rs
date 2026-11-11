@@ -34,6 +34,12 @@
 //! 7. WindowServer geometry transitions: defer captures during display/Space/window
 //!    animations and retry with bounded backoff; the scheduler is process-wide and
 //!    exits with the process.
+//! 8. Off-screen windows: the private list call clips a window to the part that is visible on a
+//!    display, so a window dragged past the edge used to show half of itself inside a frame sized
+//!    for the whole one. A window that lies partly outside every display is captured through
+//!    `CGWindowListCreateImage` instead (runtime-resolved: the SDK obsoletes it in macOS 15), with
+//!    the private call as the fallback. A frame that still comes back clipped is counted as a
+//!    degraded result, never presented as the complete window.
 //!
 //! Without the Screen Recording TCC permission the whole module sleeps and the
 //! overlay keeps rendering icons only; granting permission mid-run resumes
@@ -54,8 +60,9 @@ use std::time::{Duration, Instant};
 use crate::ffi::{
     CFArrayGetCount, CFArrayGetValueAtIndex, CFRelease, CFRetain, CFStringCompare,
     CGBitmapContextCreate, CGBitmapContextCreateImage, CGBitmapContextGetData,
-    CGColorSpaceCreateDeviceRGB, CGContextDrawImage, CGImageGetHeight, CGImageGetWidth,
-    CGPreflightScreenCaptureAccess, CGRect, CGRequestScreenCaptureAccess, RetainedCf,
+    CGColorSpaceCreateDeviceRGB, CGContextClearRect, CGContextDrawImage, CGDisplayBounds,
+    CGGetActiveDisplayList, CGImageGetHeight, CGImageGetWidth, CGPreflightScreenCaptureAccess,
+    CGRect, CGRequestScreenCaptureAccess, RetainedCf,
 };
 use crate::skylight;
 use crate::{log_debug, log_info};
@@ -65,12 +72,14 @@ mod cache;
 pub(crate) use cache::ScopePass;
 mod capture;
 mod pregen;
+mod smoke;
 mod summon;
 use blank_frame::*;
 use cache::*;
 use capture::*;
 // The parent no longer calls summon directly (overlay does); the glob is test-only.
 pub(crate) use pregen::{app_launched, app_terminated, backfill_after_permission_grant, start};
+pub(crate) use smoke::smoke_offscreen_capture;
 #[cfg(test)]
 use summon::*;
 // Entry points exposed to the rest of the crate (implemented in the child modules).
@@ -116,6 +125,31 @@ static CGS_CAPTURE_LIST: LazyLock<Option<CgsCaptureListFn>> = LazyLock::new(|| u
     // SLSHWCaptureWindowList must be used.
     skylight::load_private_symbol(skylight::SKYLIGHT_PATH, "SLSHWCaptureWindowList")
 });
+
+/// `CGWindowListCreateImage`: the full-window capture entry point, used only for a window that
+/// lies partly outside every display (the private list call above clips such a window to the
+/// part that is on screen). The SDK marks it deprecated in macOS 14 and obsoleted in macOS 15 in
+/// favour of ScreenCaptureKit, so it is resolved at runtime -- `None` means the symbol is gone and
+/// the private call keeps its incumbent behaviour instead of the app failing to launch.
+type CgWindowListCreateImageFn = unsafe extern "C" fn(CGRect, u32, u32, u32) -> *const c_void;
+
+/// kCGWindowListOptionIncludingWindow.
+const K_CG_WINDOW_LIST_OPTION_INCLUDING_WINDOW: u32 = 1 << 3;
+/// kCGWindowImageBoundsIgnoreFraming: the image covers the window's bounds, without the shadow.
+const K_CG_WINDOW_IMAGE_BOUNDS_IGNORE_FRAMING: u32 = 1 << 0;
+
+/// CGRectNull: `CGWindowListCreateImage` documents it as "use the bounding box of the specified
+/// windows", which is what asks for the whole window rather than the on-screen part. It is the
+/// infinity-origin null rect, not a zero rect (a zero rect would ask for nothing).
+const CG_RECT_NULL: CGRect = CGRect {
+    x: f64::INFINITY,
+    y: f64::INFINITY,
+    w: 0.0,
+    h: 0.0,
+};
+
+static CG_WINDOW_LIST_CREATE_IMAGE: LazyLock<Option<CgWindowListCreateImageFn>> =
+    LazyLock::new(|| unsafe { skylight::load_coregraphics_symbol("CGWindowListCreateImage") });
 
 // The public-framework CG/CF externs and CGRect now live in ffi.rs; this module keeps
 // only its private capture symbols.
@@ -858,6 +892,127 @@ mod tests {
         let anomaly = geometry_anomaly(public_bounds, identity, clipped).unwrap();
         assert!(!anomaly.center_shift);
         assert!(anomaly.heavily_clipped);
+    }
+
+    /// The window that reported the defect: 1470x923 with its bottom 500pt below a 1920x1080
+    /// display. The private list call returns the visible 1470x423 part, which the card used to
+    /// show inside a frame sized for the whole window.
+    #[test]
+    fn a_window_hanging_past_the_display_needs_the_full_window_path() {
+        let window = (235.0, 657.0, 1470.0, 923.0);
+        let display = (0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(
+            window_extent(Some(window), Some(&[display])),
+            WindowExtent::PartlyOffScreen
+        );
+        // The private call's frame (the visible 1470x423 at 2x) is not the window's shape...
+        assert_eq!(
+            capture_matches_window_aspect(2940, 846, window),
+            Some(false)
+        );
+        // ...while the full-window frame (1470x923 at 2x) is.
+        assert_eq!(
+            capture_matches_window_aspect(2940, 1846, window),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn a_window_is_fully_on_screen_only_when_the_display_union_covers_it() {
+        let left = (0.0, 0.0, 1000.0, 1000.0);
+        let right = (2000.0, 0.0, 1000.0, 1000.0);
+        // Contained by one display.
+        assert_eq!(
+            rect_covered_by_rects((100.0, 100.0, 400.0, 300.0), &[left, right]),
+            Some(true)
+        );
+        // Straddles two adjacent displays: no single display contains it, the union does.
+        let adjacent = [(0.0, 0.0, 1000.0, 1000.0), (1000.0, 0.0, 1000.0, 1000.0)];
+        assert_eq!(
+            rect_covered_by_rects((900.0, 100.0, 200.0, 300.0), &adjacent),
+            Some(true)
+        );
+        // Inside the bounding box of two displays but in the gap between them: the bounding box
+        // would answer "covered", the real union does not.
+        assert_eq!(
+            rect_covered_by_rects((900.0, 100.0, 300.0, 200.0), &[left, right]),
+            Some(false)
+        );
+        // Hanging past the bottom edge.
+        assert_eq!(
+            rect_covered_by_rects((100.0, 900.0, 400.0, 300.0), &[left]),
+            Some(false)
+        );
+        // Hanging past the bottom of one display but covered by a display below it.
+        let below = (0.0, 1000.0, 1000.0, 1000.0);
+        assert_eq!(
+            rect_covered_by_rects((100.0, 900.0, 400.0, 300.0), &[left, below]),
+            Some(true)
+        );
+        // A window larger than every display.
+        assert_eq!(
+            rect_covered_by_rects((-10.0, -10.0, 1200.0, 1200.0), &[left]),
+            Some(false)
+        );
+        // Displays entirely outside the window cover none of it.
+        assert_eq!(
+            rect_covered_by_rects(
+                (0.0, 0.0, 100.0, 100.0),
+                &[(-300.0, 0.0, 100.0, 100.0), (200.0, 0.0, 100.0, 100.0)]
+            ),
+            Some(false)
+        );
+        // Degenerate inputs cannot decide.
+        assert_eq!(rect_covered_by_rects((0.0, 0.0, 0.0, 100.0), &[left]), None);
+        assert_eq!(
+            rect_covered_by_rects((f64::NAN, 0.0, 10.0, 10.0), &[left]),
+            None
+        );
+        assert_eq!(rect_covered_by_rects((0.0, 0.0, 10.0, 10.0), &[]), None);
+    }
+
+    #[test]
+    fn an_unreadable_extent_keeps_the_incumbent_path() {
+        let display = (0.0, 0.0, 1920.0, 1080.0);
+        assert_eq!(window_extent(None, Some(&[display])), WindowExtent::Unknown);
+        assert_eq!(
+            window_extent(Some((0.0, 0.0, 100.0, 100.0)), None),
+            WindowExtent::Unknown
+        );
+        assert_eq!(
+            window_extent(Some((0.0, 0.0, 100.0, 100.0)), Some(&[display])),
+            WindowExtent::FullyOnScreen
+        );
+    }
+
+    #[test]
+    fn the_full_window_aspect_check_tolerates_a_resize_but_not_a_clipped_frame() {
+        let window = (0.0, 0.0, 1600.0, 1000.0); // aspect 1.6
+        assert_eq!(
+            capture_matches_window_aspect(1600, 1000, window),
+            Some(true)
+        );
+        // 10% wider than the window: inside the tolerance (a resize during the capture).
+        assert_eq!(
+            capture_matches_window_aspect(1760, 1000, window),
+            Some(true)
+        );
+        // Half the window: far outside it.
+        assert_eq!(
+            capture_matches_window_aspect(1600, 500, window),
+            Some(false)
+        );
+        // A taller-than-wide clip of the same window.
+        assert_eq!(
+            capture_matches_window_aspect(800, 1000, window),
+            Some(false)
+        );
+        // Unusable inputs have no verdict.
+        assert_eq!(capture_matches_window_aspect(0, 1000, window), None);
+        assert_eq!(
+            capture_matches_window_aspect(1600, 1000, (0.0, 0.0, 0.0, 0.0)),
+            None
+        );
     }
 
     #[test]
@@ -2072,7 +2227,8 @@ fn cgshwc_capture_smoke() {
     // Drive the real capture with a maximally enlarged card preview; the current 2x Retina
     // environment takes the 640px path, covering bestResolution plus dynamic downscaling.
     let target_px_h = target_px_height(271.25, scale);
-    let t = unsafe { capture_window(wid, target_px_h) }
+    let bounds = crate::window_collector::window_public_bounds(wid);
+    let t = unsafe { capture_window(wid, target_px_h, bounds) }
         .expect("CGSHWCCaptureWindowList failed")
         .thumb;
     assert!(t.w_px > 0 && t.h_px > 0, "degenerate capture size");
@@ -2094,5 +2250,20 @@ fn cgshwc_capture_smoke() {
     crate::smoke_verdict::report(
         "cgshwc_capture_smoke",
         crate::smoke_verdict::Verdict::Passed { checks: 1 },
+    );
+}
+
+/// The full-window capture path for a window that hangs past the display edge.
+// SMOKE_CELL=M2 -- read by scripts/smoke-runners.sh, which refuses a runner
+// without exactly one declaration. Creates and shows a marked test window, then captures it.
+// SMOKE_DISTURBS=focus,screen
+#[test]
+#[ignore]
+fn offscreen_capture_smoke() {
+    // The window is AppKit main-thread work and the capture needs Screen Recording, so the
+    // assertions run in an app child; the child records its own verdict and this runner forwards it.
+    crate::smoke_verdict::run_smoke_child(
+        "offscreen_capture_smoke",
+        &["--smoke-offscreen-capture"],
     );
 }
