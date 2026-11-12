@@ -111,9 +111,11 @@ toast_dismiss = "關閉"
 untitled = "未命名"
 
 [finder_menu.new_file_item]
-md = "Markdown 文件"
-txt = "文字檔案"
-json = "JSON 檔案"
+# 副檔名寫進標籤：flat 版面下這些項目沒有「新增檔案」父項，「文字檔案」看不出會建立哪個副檔名。
+md = "新增 .md 檔案"
+txt = "新增 .txt 檔案"
+json = "新增 .json 檔案"
+other = "新增 {extension} 檔案"
 
 [menu]
 shortcut.current = "應用切換浮窗快速鍵：{shortcut}"

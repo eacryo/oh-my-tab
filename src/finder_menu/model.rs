@@ -140,12 +140,23 @@ pub(crate) fn build(
 
 /// The menu label for one file type. Written as literal keys so the translation inventory scan in
 /// i18n.rs sees them.
+///
+/// The extension is part of every label: the flat layout puts these items straight into the context
+/// menu with no "New File" parent, so "Text File" did not say which file it would create.
 fn new_file_label(extension: &str) -> String {
     match extension {
         "md" => t("finder_menu.new_file_item.md"),
         "txt" => t("finder_menu.new_file_item.txt"),
         "json" => t("finder_menu.new_file_item.json"),
-        other => format!(".{other}"),
+        // A type that is allowed but has no dedicated label yet: keep the same shape instead of
+        // degrading to a bare extension.
+        other => {
+            let extension = format!(".{other}");
+            tf(
+                "finder_menu.new_file_item.other",
+                &[("extension", extension.as_str())],
+            )
+        }
     }
 }
 
@@ -236,6 +247,51 @@ mod tests {
     fn unknown_layout_falls_back_to_grouped() {
         let model = build(&config("garbage"), "com.example.app", "instance", 1);
         assert_eq!(model.items.len(), 4);
+    }
+
+    /// Every label names the extension it creates, including a type without its own wording: the
+    /// menu must not fall back to a bare ".exe" beside labels that say "New .md File".
+    #[test]
+    fn every_new_file_label_names_its_extension() {
+        for extension in ["md", "txt", "json", "exe"] {
+            let label = super::new_file_label(extension);
+            assert!(
+                label.contains(&format!(".{extension}")),
+                "{extension} is not named in {label:?}"
+            );
+        }
+    }
+
+    /// The flat layout has no "New File" parent, so the label itself has to say what it creates.
+    /// This pins the rendered titles, not just the locale lookup.
+    #[test]
+    fn a_flat_menu_names_each_new_file_extension() {
+        let mut config = config("flat");
+        config.finder_menu.new_file_types = vec!["md".into(), "txt".into(), "json".into()];
+        let model = build(&config, "com.example.app", "instance", 1);
+        let titles: Vec<&str> = model
+            .items
+            .iter()
+            .filter_map(|node| match node {
+                MenuNode::Item { title, .. } => Some(title.as_str()),
+                MenuNode::Submenu { .. } | MenuNode::Separator => None,
+            })
+            .collect();
+        for (extension, key) in [
+            ("md", "finder_menu.new_file_item.md"),
+            ("txt", "finder_menu.new_file_item.txt"),
+            ("json", "finder_menu.new_file_item.json"),
+        ] {
+            let title = t(key);
+            assert!(
+                titles.contains(&title.as_str()),
+                "{extension} is missing from {titles:?} (expected {title:?})"
+            );
+            assert!(
+                title.contains(&format!(".{extension}")),
+                "the title {title:?} does not name its extension"
+            );
+        }
     }
 
     #[test]

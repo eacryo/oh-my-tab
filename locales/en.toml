@@ -110,9 +110,12 @@ toast_dismiss = "Dismiss"
 untitled = "Untitled"
 
 [finder_menu.new_file_item]
-md = "Markdown Document"
-txt = "Text File"
-json = "JSON File"
+# The extension is part of the label: the flat layout shows these items with no "New File"
+# parent, so "Text File" left the user guessing which extension it would create.
+md = "New .md File"
+txt = "New .txt File"
+json = "New .json File"
+other = "New {extension} file"
 
 [menu]
 shortcut.current = "App switcher shortcut: {shortcut}"

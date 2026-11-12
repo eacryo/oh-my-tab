@@ -111,9 +111,11 @@ toast_dismiss = "关闭"
 untitled = "未命名"
 
 [finder_menu.new_file_item]
-md = "Markdown 文档"
-txt = "文本文件"
-json = "JSON 文件"
+# 后缀名写进标签：flat 布局下这些条目没有「新建文件」父项，「文本文件」看不出会创建哪个后缀。
+md = "新建 .md 文件"
+txt = "新建 .txt 文件"
+json = "新建 .json 文件"
+other = "新建 {extension} 文件"
 
 [menu]
 shortcut.current = "应用切换浮窗快捷键：{shortcut}"
