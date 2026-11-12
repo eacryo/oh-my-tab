@@ -395,6 +395,8 @@ Bluetooth keyboards are excluded even when their HID descriptors advertise point
 
 The device picker refreshes when devices connect or disconnect. These events are debounced, and delayed rechecks cover short BLE sleep and wake cycles.
 
+Enumeration itself runs off both the main thread and the HID tap's thread. One worker owns the IOHID client and every slow step — creating a client waits about 30ms for asynchronous matching, the recovery batch retries twice with 50ms sleeps, property reads are CF calls, and a reconnect has to re-apply the pointer properties — and publishes an immutable snapshot when a batch finishes. The tap attributes an event by looking its sender id up in that snapshot's registry-id map, and the settings page reads the same snapshot, so neither can wait for IOKit; an empty lookup submits a rebuild request instead of enumerating. A miss-driven rebuild is admitted at most once every two seconds, while a real plug still rebuilds and re-applies immediately. The batch line in the debug log names the reason, the rebuilt flag, the device and attribution counts, and the miss totals (see `src/mouse/device.rs`).
+
 ## Clipboard recording controls (pause, excluded applications)
 
 Two controls sit in front of every write path:

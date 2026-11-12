@@ -24,14 +24,10 @@ extern "C" {
     );
     // Returns a CFArrayRef of IOHIDServiceClient (+1 owned by caller).
     pub(crate) fn IOHIDEventSystemClientCopyServices(client: *mut c_void) -> *mut c_void;
-    // Look up an IOHIDServiceClient by sender ID (+1 owned, caller CFReleases). This is the key
-    // link of the attribution chain: the IOHIDEventGetSenderID result feeds this function, and
-    // the returned IOHIDServiceClient is the same instance as in the enumerated list (pointer
-    // comparison works). Same chain as LinearMouse.
-    pub(crate) fn IOHIDEventSystemClientCopyServiceForRegistryID(
-        client: *mut c_void,
-        registry_id: u64,
-    ) -> *mut c_void;
+    // Each enumerated service's IOHID registry ID: the same id an event carries as its sender ID,
+    // so the published snapshot can map sender -> device without calling back into IOKit per event.
+    // A "Get" function: +0, not owned.
+    pub(crate) fn IOHIDServiceClientGetRegistryID(service: *mut c_void) -> *mut c_void;
     // Schedule the client on a runloop: an unscheduled client's matching / registry-ID map is
     // incomplete and CopyServiceForRegistryID keeps failing (measured). Scheduling keeps the
     // matching live and makes attribution reliable.

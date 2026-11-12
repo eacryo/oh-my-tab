@@ -503,7 +503,10 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
 
     if flags.mouse {
         crate::mouse::resolve::invalidate_cache();
-        crate::mouse::pointer::apply();
+        // Through the device lane: the write and the property snapshot the settings page reads back
+        // must not interleave with another apply (the lane owns both). It resolves the config itself,
+        // so the cache invalidation above is what it sees.
+        crate::mouse::device::request_pointer_reapply();
         if old.mouse.enabled != new.mouse.enabled || matches!(source, ConfigChangeSource::Startup) {
             if crate::mouse::effective_enabled() {
                 crate::mouse::start();

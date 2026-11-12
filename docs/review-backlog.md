@@ -656,3 +656,6 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
   本次只修了剪贴板历史快捷键这一行：它改用 `widgets::caption_cell_height`（直接问 cell），并顺带把两种状态的中文文案缩短到留有裕量；**所有描述型 captioned 行仍在用旧探针**。
   **延后的原因：** 把探针改成按 cell 测量会改变所有页面里落在该差值带内的行高（这是修，不是回归，但影响面跨页且需要逐页视觉证据），本次改动无法产出 M2 证据；且这是既有潜伏缺陷，不是本次改动引入的。
   **重新审视的触发条件：** 下一次改动 captioned 行测量/字号刻度、新增语言、或收到「某页字幕被裁」的报告时，把 `wrapped_caption_height`（或渲染器的行高路径）统一改为 cell 测量，并重跑 `--smoke-settings-layout` 与逐页截图。
+
+- **Mouse 页的描述型行在一次页面构建里两次独立读取设备快照**（设备 lane 代码审查 R2，2026-11-12，LOW——**延后**）。`settings/page_view/mouse.rs` 的设备行测高（`device_row_height_inner`）与 `extra_row` 钩子各自调用 `connected_devices()`；lane 若正好在两次读取之间发布，同一页可能按两份列表构建。**这个问题不会因为发布而消失**：发布走的是 `refresh_device_popup_if_open`（就地重建弹窗条目与 caption）与 `materialize_mouse_page_if_visible`（重填页面自绘控件），**不会**重新测量描述行的高度。剩下的风险是**行高**：`device_row_height_inner` 只量「硬件 ID caption」与「未检测到设备」两种文案，**没有量**本轮新增的 `settings.devices_loading` / `settings.devices_unavailable`，也没有量虚拟指针的 `settings.virtual_mouse_caption`。这三种文案只在特定状态下出现，出现时描述行仍用建页时量出的高度——是否裁切取决于这些文案在目标语言下的自然高度，目前没有测量证据，不能声称安全。要彻底合并，需要把快照作为 `PageInput` 的字段传入描述层。
+  **重新审视的触发条件：** 下次改动 Mouse 页的描述行、`PageInput::capture()`、`device_row_height_inner` 的测量集合，或 caption 文案长度变化（新增语言、把设备名放进 caption）时：把快照穿进 `PageInput`，并让测高覆盖全部空列表状态文案与虚拟指针 caption；补一条「同一页两次读取必须是同一快照」的断言。

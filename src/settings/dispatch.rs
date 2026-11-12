@@ -2166,7 +2166,8 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
     // Outside the borrow (the refill re-borrows the settings slot): if the mouse page is the one on screen,
     // fill it from the reloaded config -- including the mapping rows and the device popup, which the old
     // in-place patch skipped while it still marked the page clean.
-    super::materialize_mouse_page_if_visible();
+    let snapshot = crate::mouse::device::snapshot();
+    super::materialize_mouse_page_if_visible(&snapshot);
 }
 
 /// Mapping from popup-item index to DeviceKey (1:1 with popup items), used by
@@ -2182,28 +2183,16 @@ static DEVICE_POPUP_KEYS: Mutex<Vec<crate::mouse::device::DeviceKey>> = Mutex::n
 ///
 /// With no devices connected, clears the selection (edits the "All Mice" base layer).
 /// Recalibrated on every settings open, so hot-plug (device add/remove) is handled naturally.
-pub(super) fn ensure_selected_device() {
-    let connected = crate::mouse::device::connected_devices();
-    let cur = current_selected_device();
-
-    if connected.is_empty() {
-        // No device connected: clear the selection (edits the "All Mice" base layer).
-        *SELECTED_DEVICE.lock().unwrap() = Some(None);
-        return;
-    }
-
-    // Keep the current device if it's still connected; otherwise (uninitialized or unplugged)
-    // fall back to the first device.
-    let still_connected = cur
-        .map(|c| {
-            connected
-                .iter()
-                .any(|d| d.vendor_id == c.0 && d.product_id == c.1)
-        })
-        .unwrap_or(false);
-    if !still_connected {
-        let first = &connected[0];
-        *SELECTED_DEVICE.lock().unwrap() = Some(Some((first.vendor_id, first.product_id)));
+pub(super) fn ensure_selected_device(snapshot: &crate::mouse::device::DeviceSnapshot) {
+    let connected = crate::mouse::device::devices_with_virtual(snapshot);
+    let next = crate::mouse::device::selection_after_refresh(
+        current_selected_device(),
+        &connected,
+        snapshot.status,
+    );
+    // None = the list is not an answer (still loading, or the query failed): keep the user's choice.
+    if let Some(next) = next {
+        *SELECTED_DEVICE.lock().unwrap() = Some(next);
     }
 }
 
@@ -2239,18 +2228,38 @@ pub(super) fn device_info_caption(device: Option<&crate::mouse::device::DeviceId
     }
 }
 
-pub(super) fn device_info_caption_for_key(key: Option<crate::mouse::device::DeviceKey>) -> String {
-    let connected = crate::mouse::device::connected_devices();
+pub(super) fn device_info_caption_for_key(
+    snapshot: &crate::mouse::device::DeviceSnapshot,
+    key: Option<crate::mouse::device::DeviceKey>,
+) -> String {
+    let connected = crate::mouse::device::devices_with_virtual(snapshot);
     let device = key.and_then(|key| {
         connected
             .iter()
             .find(|device| (device.vendor_id, device.product_id) == key)
     });
-    device_info_caption(device)
+    match device {
+        Some(device) => device_info_caption(Some(device)),
+        None => t(empty_device_list_key(snapshot.status)),
+    }
 }
 
-pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
-    let connected = crate::mouse::device::connected_devices();
+/// What an empty device list means, which is not always "no device is connected": a list that has
+/// not been queried yet, or whose query failed, is not an answer and must say so instead.
+pub(super) fn empty_device_list_key(status: crate::mouse::device::SnapshotStatus) -> &'static str {
+    use crate::mouse::device::SnapshotStatus;
+    match status {
+        SnapshotStatus::NotQueried => "settings.devices_loading",
+        SnapshotStatus::Failed => "settings.devices_unavailable",
+        SnapshotStatus::Ready => "settings.no_device_detected",
+    }
+}
+
+pub(super) unsafe fn rebuild_device_popup(
+    ui: &SettingsUi,
+    snapshot: &crate::mouse::device::DeviceSnapshot,
+) {
+    let connected = crate::mouse::device::devices_with_virtual(snapshot);
     let cur = current_selected_device();
 
     // Build the popup items and the key mapping: devices only.
@@ -2279,14 +2288,16 @@ pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
     } else {
         // Keep one explicit, non-selectable status item when the list is empty so the popup
         // does not look like a failed or incomplete load.
-        let ns = make_nsstring(&t("settings.no_device_detected"));
+        let ns = make_nsstring(&t(empty_device_list_key(snapshot.status)));
         let _: () = msg_send![ui.device_indicator, addItemWithTitle: ns];
         CFRelease(ns as *const c_void);
     }
+    // The caption follows the same status decision as the status item above: a list that is still
+    // being read, or whose query failed, must not be captioned "no device detected".
     let caption = keys
         .get(sel_idx)
-        .map(|key| device_info_caption_for_key(Some(*key)))
-        .unwrap_or_else(|| device_info_caption(None));
+        .map(|key| device_info_caption_for_key(snapshot, Some(*key)))
+        .unwrap_or_else(|| t(empty_device_list_key(snapshot.status)));
     if !ui.device_info_caption.is_null() {
         set_field(ui.device_info_caption, &caption);
     }
@@ -2301,7 +2312,7 @@ pub(super) unsafe fn rebuild_device_popup(ui: &SettingsUi) {
 /// immediately without OK or reopening. The rebuild restores the selection from the in-memory
 /// SELECTED_DEVICE, so unsaved choices survive. No-op when the window isn't open (it is
 /// rebuilt on next open via load_settings_values anyway).
-pub(crate) fn refresh_device_popup_if_open() {
+pub(crate) fn refresh_device_popup_if_open(snapshot: &crate::mouse::device::DeviceSnapshot) {
     // The device list is an input of the mouse page, and this path only rebuilds the popup -- and only
     // while the window is visible. A hot-plug with the window hidden must still invalidate the page, or the
     // next open would show the device list it had before the change.
@@ -2311,7 +2322,7 @@ pub(crate) fn refresh_device_popup_if_open() {
             if let Some(u) = ui.as_ref() {
                 let visible: bool = msg_send![u.window, isVisible];
                 if visible {
-                    rebuild_device_popup(u);
+                    rebuild_device_popup(u, snapshot);
                 }
             }
         });
@@ -2334,13 +2345,17 @@ pub(crate) extern "C" fn handle_device_changed(_self: *mut c_void, _cmd: Sel, se
         // touch it).
         let cfg = CONFIG.read().unwrap().clone();
         let resolved = resolve_selected_from(&cfg);
+        let snapshot = crate::mouse::device::snapshot();
         unsafe {
             with_settings_ui(|ui_guard| {
                 if let Some(u) = ui_guard.as_mut() {
                     if !u.device_info_caption.is_null() {
-                        set_field(u.device_info_caption, device_info_caption_for_key(new_dev));
+                        set_field(
+                            u.device_info_caption,
+                            device_info_caption_for_key(&snapshot, new_dev),
+                        );
                     }
-                    fill_mouse_device_controls(u, &resolved);
+                    fill_mouse_device_controls(u, &resolved, &snapshot);
                     // Keep the user's current enable_mouse state; only recompute freeze + visibility.
                     update_mouse_controls_enabled(u);
                     update_mode_dependent_visibility(u);
@@ -3015,6 +3030,45 @@ mod portability_ui_tests {
 
 #[cfg(test)]
 mod tests {
+    /// An empty device list means three different things, and only one of them is "no device":
+    /// a list still being read says so, a failed read says so, and neither claims the device is gone.
+    #[test]
+    fn an_empty_device_list_is_not_always_no_device() {
+        use crate::mouse::device::SnapshotStatus;
+        assert_eq!(
+            super::empty_device_list_key(SnapshotStatus::NotQueried),
+            "settings.devices_loading"
+        );
+        assert_eq!(
+            super::empty_device_list_key(SnapshotStatus::Failed),
+            "settings.devices_unavailable"
+        );
+        assert_eq!(
+            super::empty_device_list_key(SnapshotStatus::Ready),
+            "settings.no_device_detected"
+        );
+    }
+
+    /// The caption and the status item must agree, in every snapshot state: the path that builds them
+    /// is `device_info_caption_for_key(None)` + `empty_device_list_key`, and only `Ready` may say "no
+    /// device detected".
+    #[test]
+    fn an_empty_device_caption_matches_the_status_item() {
+        use crate::mouse::device::SnapshotStatus;
+        for (status, key) in [
+            (SnapshotStatus::NotQueried, "settings.devices_loading"),
+            (SnapshotStatus::Failed, "settings.devices_unavailable"),
+            (SnapshotStatus::Ready, "settings.no_device_detected"),
+        ] {
+            let snapshot = crate::mouse::device::snapshot_for_test(status, Vec::new());
+            // The caption path used by `rebuild_device_popup` when the popup holds no device.
+            let caption = super::device_info_caption_for_key(&snapshot, None);
+            assert_eq!(caption, crate::i18n::t(key), "{status:?}");
+            // And the status item's key is the same decision.
+            assert_eq!(super::empty_device_list_key(snapshot.status), key);
+        }
+    }
+
     /// A pick of the app switcher's chord is REFUSED: the row keeps its binding, the popup goes
     /// back to it, and the bubble says why. Everything else applies.
     #[test]

@@ -2690,7 +2690,8 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 MOUSE_PAGE_MATERIALIZED.load(Ordering::SeqCst),
                 MOUSE_PAGE_DIRTY.load(Ordering::SeqCst),
             ) {
-                materialize_mouse_page(ui, cfg);
+                let snapshot = crate::mouse::device::snapshot();
+                materialize_mouse_page(ui, cfg, &snapshot);
             }
             // The migrated pages take their values from the same update description the in-place
             // refresh writes, so a field cannot show its build value in one path and its refilled
@@ -2735,11 +2736,15 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
 ///
 /// Extracted from `load_settings_from` so the page can be materialized on demand (see
 /// `mouse_page_needs_fill`) and from outside the value load (the sidebar selection).
-unsafe fn materialize_mouse_page(ui: &mut SettingsUi, cfg: &Config) {
+unsafe fn materialize_mouse_page(
+    ui: &mut SettingsUi,
+    cfg: &Config,
+    snapshot: &crate::mouse::device::DeviceSnapshot,
+) {
     // Calibrate SELECTED_DEVICE first (against the current device list; falls back to the first device
     // when uninitialized/unplugged), then resolve, so the UI shows the actually effective device's config
     // (fixes the wrong-profile display on first open).
-    ensure_selected_device();
+    ensure_selected_device(snapshot);
     // Resolve the selected device's effective config from the given cfg (Config::default() during the
     // restore-defaults preview).
     let resolved = resolve_selected_from(cfg);
@@ -2747,7 +2752,7 @@ unsafe fn materialize_mouse_page(ui: &mut SettingsUi, cfg: &Config) {
     // sidebar has already shown (see materialize_mouse_page_if_visible), so it must not animate.
     widgets::set_switch_state_immediate(ui.enable_mouse, cfg.mouse.enabled);
     // Fill the mouse page's per-device controls (reverse/accel/mode/line count/preset).
-    fill_mouse_device_controls(ui, &resolved);
+    fill_mouse_device_controls(ui, &resolved, snapshot);
 
     // The mappings in-edit = the selected device's OWN profile mappings (not the merged values:
     // edits/deletes only touch this device's dedicated profile; the wildcard "All Mice" profile has no UI
@@ -2761,7 +2766,7 @@ unsafe fn materialize_mouse_page(ui: &mut SettingsUi, cfg: &Config) {
     render_mapping_rows_locked(ui);
 
     // Rebuild the device popup (refreshed on each settings open to reflect hot-plug).
-    rebuild_device_popup(ui);
+    rebuild_device_popup(ui, snapshot);
 
     // Freeze/unfreeze the controls below based on the enable_mouse state, and recompute the two conditional
     // row groups THIS page owns (the line-count and tracking-speed blocks). The combined
@@ -2776,7 +2781,14 @@ unsafe fn materialize_mouse_page(ui: &mut SettingsUi, cfg: &Config) {
 
 /// Fill the mouse page if the page on screen is the Mouse page and its data is stale. Called after a
 /// sidebar selection (never from inside `with_settings_ui`: the value load re-borrows the settings slot).
-pub(super) fn materialize_mouse_page_if_visible() {
+pub(super) fn materialize_mouse_page_if_visible(snapshot: &crate::mouse::device::DeviceSnapshot) {
+    // Entering the page is the one moment that can notice a device set the plug monitor missed (the
+    // mouse feature may never have been enabled). Deliberately outside the "does the page need
+    // refilling" gate: a clean page still needs a fresh external answer. The reply arrives
+    // asynchronously and lands through the ordinary dirty + refill path.
+    if SIDEBAR_SELECTED.load(Ordering::SeqCst) == SETTINGS_MOUSE_PAGE_INDEX {
+        crate::mouse::device::request_device_refresh();
+    }
     if !mouse_page_needs_fill(
         None,
         SIDEBAR_SELECTED.load(Ordering::SeqCst),
@@ -2789,21 +2801,23 @@ pub(super) fn materialize_mouse_page_if_visible() {
     unsafe {
         with_settings_ui(|ui_guard| {
             if let Some(ui) = ui_guard.as_mut() {
-                materialize_mouse_page(ui, &cfg);
+                materialize_mouse_page(ui, &cfg, snapshot);
             }
         });
     }
 }
 
 pub(super) fn materialize_mouse_page_for_search() {
+    crate::mouse::device::request_device_refresh();
     if MOUSE_PAGE_MATERIALIZED.load(Ordering::SeqCst) && !MOUSE_PAGE_DIRTY.load(Ordering::SeqCst) {
         return;
     }
     let cfg = CONFIG.read().unwrap().clone();
+    let snapshot = crate::mouse::device::snapshot();
     unsafe {
         with_settings_ui(|ui| {
             if let Some(ui) = ui.as_mut() {
-                materialize_mouse_page(ui, &cfg);
+                materialize_mouse_page(ui, &cfg, &snapshot);
             }
         });
     }
@@ -2814,6 +2828,7 @@ pub(super) fn materialize_mouse_page_for_search() {
 unsafe fn fill_mouse_device_controls(
     ui: &SettingsUi,
     resolved: &crate::mouse::resolve::ResolvedMouse,
+    snapshot: &crate::mouse::device::DeviceSnapshot,
 ) {
     // reverse_scroll / disable_pointer_accel: effective values, applied without the spring (the
     // fill lands on an already visible page).
@@ -2838,13 +2853,16 @@ unsafe fn fill_mouse_device_controls(
     // With "All Mice" selected there is no single device to read, so fall back to the first
     // connected one (LinearMouse does the same via firstMatchedDevice).
     let source_device = current_selected_device().or_else(|| {
-        crate::mouse::device::connected_devices()
+        crate::mouse::device::devices_with_virtual(snapshot)
             .first()
             .map(|d| (d.vendor_id, d.product_id))
     });
     let acceleration = resolved
         .acceleration
-        .or_else(|| source_device.and_then(crate::mouse::pointer::read_acceleration))
+        .or_else(|| {
+            source_device
+                .and_then(|device| crate::mouse::pointer::read_acceleration_from(snapshot, device))
+        })
         .unwrap_or(crate::mouse::pointer::FALLBACK_ACCELERATION);
     // The slider is linear (0..=10); a value outside the range (the device value may come from
     // another tool) is clamped so the readout and the handle stay consistent.

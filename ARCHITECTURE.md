@@ -373,7 +373,9 @@ short-lived Accessibility cache. **Never log key text**; `--e2e-state` includes 
 ## Mouse
 
 `mouse.rs` is the root; profiles match by VID/PID. `mouse/event_tap.rs` is the mouse tap (separate from the
-switcher's), `device.rs`/`ffi.rs` the IOHID reverse lookup, `resolve.rs` config resolution ("All Mice" merged
+switcher's), `device.rs`/`ffi.rs` the IOHID reverse lookup — `device.rs` runs every slow IOHID step on one
+worker (the **device lane**) and publishes an immutable snapshot that the tap and the settings page read, so
+neither touches the registry, `resolve.rs` config resolution ("All Mice" merged
 with per-device profiles), `scrolling.rs` the scroll modes, `smooth/` the pure LinearMouse-derived wheel engine
 (`engine.rs`, `delivery.rs`, `presets.rs`) plus `transformer.rs`, which posts from the tap's own run-loop thread,
 `pointer.rs` pointer acceleration, `shortcut.rs` shortcut parsing/display, `keysim.rs` synthesized shortcuts,

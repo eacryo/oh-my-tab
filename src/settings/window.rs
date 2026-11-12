@@ -330,7 +330,8 @@ pub(super) fn select_sidebar(idx: usize) {
     // Landing on the Mouse page has to fill it: the value load skipped it when this open came in on
     // another page. This runs after the closure above, because the materialization re-borrows the settings
     // slot and a nested borrow would be swallowed by the reentrancy guard.
-    crate::settings::materialize_mouse_page_if_visible();
+    let snapshot = crate::mouse::device::snapshot();
+    crate::settings::materialize_mouse_page_if_visible(&snapshot);
     // With a query active the pages are not what the pane shows: the results stand in for them, so
     // the visibility just applied above has to be corrected (and a rebuild's results re-rendered
     // from the current locale). Runs outside the closure for the same reentrancy reason.

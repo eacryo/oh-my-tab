@@ -1237,7 +1237,10 @@ pub(crate) fn orderly_exit_duties() {
     crate::finder_menu::shutdown();
     // Restore pointer acceleration settings (otherwise the mouse stays linear until the user
     // resets it manually). Idempotent: restoring an already-restored system value is a no-op.
-    crate::mouse::pointer::restore();
+    // The device lane's write path and this restore share one lock: the lane is the other writer of
+    // those properties, and an apply admitted before the shutdown flag flipped must not land after
+    // the restore. The helper holds the lock across `restore()`.
+    crate::mouse::device::restore_pointer_settings_on_quit();
     // `clear_on_quit` clears the history file and the cached images on an orderly exit. The purge
     // is a verified transaction and takes the writer's I/O lock, so a snapshot prepared before it
     // cannot land afterwards.
@@ -1513,11 +1516,14 @@ fn on_devices_changed_inner(_self: *mut c_void) {
             return;
         }
     }
-    crate::settings::refresh_device_popup_if_open();
+    // One snapshot for the whole refresh: the popup, the selection calibration and the controls the
+    // fill writes must describe the same device set, or the page shows A's values under B's name.
+    let snapshot = crate::mouse::device::snapshot();
+    crate::settings::refresh_device_popup_if_open(&snapshot);
     // A plug/unplug can change which device is selected, so the mappings on screen are stale too. The popup
     // refresh above marks the page dirty; this fills it (no-op unless the mouse page is the one in use and
     // the page really is stale).
-    crate::settings::materialize_mouse_page_if_visible();
+    crate::settings::materialize_mouse_page_if_visible(&snapshot);
 }
 
 /// Build the settings window during the first idle moment after launch, so the first real open -- the
@@ -3422,7 +3428,8 @@ fn application_reopen_smoke() -> bool {
         // The plug/unplug entry (what `on_devices_changed_inner` calls) must stale the page the same way.
         CONFIG.write().unwrap().mouse.enabled = previous_enabled;
         settings::show_settings_page(settings::SETTINGS_CLIPBOARD_PAGE_INDEX);
-        settings::refresh_device_popup_if_open();
+        let snapshot = crate::mouse::device::snapshot();
+        settings::refresh_device_popup_if_open(&snapshot);
         settings::show_settings_page(settings::SETTINGS_MOUSE_PAGE_INDEX);
         let after_device_change = settings::e2e_mouse_enabled_state();
         if after_device_change != isize::from(previous_enabled) {

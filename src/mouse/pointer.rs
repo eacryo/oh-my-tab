@@ -559,16 +559,23 @@ pub(crate) fn apply() {
 /// A negative value (the -1 sentinel written by the legacy fallback path) counts as unreadable
 /// and yields None, keeping it out of the slider's 0..=40 range; a missing device or property
 /// is None as well.
-pub(crate) fn read_acceleration(device: crate::mouse::device::DeviceKey) -> Option<f64> {
+pub(crate) fn read_acceleration_from(
+    snapshot: &crate::mouse::device::DeviceSnapshot,
+    device: crate::mouse::device::DeviceKey,
+) -> Option<f64> {
     // The key choice must match the write path (`accel_property_key`): otherwise this reads the
     // value left in the wrong key and shows a never-effective 0 to the user as the device's live
     // value (how the settings page ended up displaying 0.00).
-    let declared = crate::mouse::device::device_string_property(device, KEY_ACCEL_TYPE);
+    //
+    // The values come from the device lane's published snapshot: the settings page must not read
+    // IOHID properties itself (that read could wait on the lane's enumeration work). The caller
+    // passes the same snapshot it used for the device list, so a fill cannot mix two publishes.
+    let properties = snapshot.properties_for(device)?;
     let key = choose_accel_key(
-        declared.as_deref(),
-        crate::mouse::device::device_int_property(device, KEY_POINTER_ACCEL).is_some(),
+        properties.accel_type.as_deref(),
+        properties.has_pointer_acceleration(),
     );
-    let raw = crate::mouse::device::device_int_property(device, &key)?;
+    let raw = properties.accel_value(&key)?;
     if raw < 0 {
         return None;
     }
