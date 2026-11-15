@@ -1400,9 +1400,37 @@ mod tests {
             .filter(|r| r.label_key == "settings.gestures_row_gesture")
             .filter_map(|r| r.label_text.clone())
             .collect();
-        assert_eq!(labels[0], "← 向左", "{labels:?}");
-        assert_eq!(labels[1], "↑← 先向上再向左", "{labels:?}");
-        assert_eq!(labels[2], "↑↓← 先向上再向下再向左", "{labels:?}");
+        // The expectation is built from the same copy keys the page uses. The suite runs in the
+        // system language, not in a fixed one: the test config home is empty, so the locale stays
+        // "auto" and resolves from the system preferred languages. A hard-coded Chinese literal
+        // therefore fails on any machine whose UI language is not Chinese.
+        let left = t("settings.gestures_direction_left");
+        let up = t("settings.gestures_direction_up");
+        let down = t("settings.gestures_direction_down");
+        // Every configured gesture appears: `zip` below stops at the shorter side, so a missing row
+        // would otherwise check fewer strokes and still pass.
+        assert_eq!(
+            labels.len(),
+            3,
+            "one row per configured gesture: {labels:?}"
+        );
+        // One direction: the arrows, then its name, and nothing else.
+        assert_eq!(labels[0], format!("← {left}"), "{labels:?}");
+        // A longer stroke leads with the arrows and names every direction in the order it is drawn.
+        let longer = [
+            ("↑← ", vec![up.as_str(), left.as_str()]),
+            ("↑↓← ", vec![up.as_str(), down.as_str(), left.as_str()]),
+        ];
+        for (label, (arrows, directions)) in labels[1..].iter().zip(longer.iter()) {
+            assert!(label.starts_with(arrows), "{label:?}");
+            let mut rest = &label[arrows.len()..];
+            for direction in directions {
+                let at = rest
+                    .find(direction)
+                    .unwrap_or_else(|| panic!("{label:?} does not name {direction:?} in order"));
+                rest = &rest[at + direction.len()..];
+            }
+        }
     }
 
     /// A sequence the recognizer refused keeps its raw text: there are no directions to name.
@@ -2058,29 +2086,23 @@ mod tests {
             ],
         ));
         let values = row_values(&view);
-        for text in &values {
-            assert!(!text.contains("switcher"), "internal target id: {text}");
-            assert!(!text.contains("bad_"), "internal state: {text}");
-            assert!(
-                !text.contains("unbound") && !text.contains("off"),
-                "internal state: {text}"
-            );
-        }
-        // The left button is refused by the loader, and the row says so instead of looking live;
-        // the sequence that cannot be drawn keeps its own letters.
-        let button = values
-            .iter()
-            .find(|text| text.contains('↓'))
-            .unwrap_or_else(|| panic!("the left-button row: {values:?}"));
+        // The rows state their target and their state in the user's words. The assertions are
+        // POSITIVE on purpose: in another language an internal id is a normal part of the visible
+        // copy ("switcher" is inside the English "App switcher"), so "the text must not contain
+        // the id" cannot tell a leak from a translation, while "the text carries the localized
+        // copy" can, in whichever language the suite runs in.
         assert!(
-            button.contains(&t("settings.gestures_state_bad_button")),
-            "{button}"
+            values[0].ends_with(&t("settings.gestures_target_switcher")),
+            "the action column names the system switcher: {values:?}"
         );
         assert!(
-            values
-                .iter()
-                .any(|text| text.contains(&t("settings.gestures_state_bad_target"))),
-            "{values:?}"
+            values[1].contains(&t("settings.gestures_state_bad_target")),
+            "an action the parser refuses says so on its row: {values:?}"
+        );
+        // The left button is refused by the loader, and the row says so instead of looking live.
+        assert!(
+            values[2].contains(&t("settings.gestures_state_bad_button")),
+            "a refused button says so on its row: {values:?}"
         );
     }
 
