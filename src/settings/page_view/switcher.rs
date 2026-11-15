@@ -67,6 +67,7 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
             ControlField::FocusedThumbnailPrewarm,
             cfg.layout.focused_thumbnail_prewarm,
         )
+        .caption("settings.desc_focused_thumbnail_prewarm")
         .group(RowGroup::ThumbnailOnly)
         .into_spec(),
     );

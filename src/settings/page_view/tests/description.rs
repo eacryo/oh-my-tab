@@ -69,6 +69,13 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
         .map(|(index, _)| index)
         .collect();
     assert_eq!(grouped, vec![5, 6, 7]);
+    // The prewarm switch's label only names the mechanism; the row's caption is where the page
+    // says what it is for and that it is worth leaving on. A caption, not a search-only desc: this
+    // one has to be readable on the page.
+    assert_eq!(
+        view.rows[5].caption_key,
+        Some("settings.desc_focused_thumbnail_prewarm")
+    );
 }
 
 #[test]

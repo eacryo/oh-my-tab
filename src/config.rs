@@ -671,7 +671,8 @@ pub struct Layout {
     // Screen Recording permission (see the thumbnail module).
     pub thumbnails_enabled: bool,
     // Focused-window thumbnail prewarm: when enabled, refresh the frontmost window at a low rate
-    // while the overlay is hidden. Default off to keep background work bounded.
+    // while the overlay is hidden. Default on: the work is one capped-height capture per interval,
+    // and it is what keeps video and dynamic content current when the overlay opens.
     pub focused_thumbnail_prewarm: bool,
     // App name in card titles: when enabled the thumbnail card's caption shows the app name
     // before the window title, separated by " · "; a titleless window, or one whose title equals
@@ -1485,7 +1486,7 @@ impl Default for Layout {
     fn default() -> Self {
         Layout {
             thumbnails_enabled: true,
-            focused_thumbnail_prewarm: false,
+            focused_thumbnail_prewarm: true,
             show_app_name_in_cards: false,
             show_footer_title: true,
             card_text_size: 15.0,
@@ -4090,6 +4091,13 @@ enabled = true
         let cfg = Config::default();
         assert_eq!(cfg.layout.card_text_size, 15.0);
         assert_eq!(cfg.fonts.status_bar_size, 15.0);
+    }
+
+    #[test]
+    fn focused_thumbnail_prewarm_is_on_by_default() {
+        // A default is the recommendation the page does not state: the caption calls the option a
+        // small cost and suggests it, so the shipped default has to agree with that copy.
+        assert!(Config::default().layout.focused_thumbnail_prewarm);
     }
 
     #[test]
