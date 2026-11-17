@@ -148,6 +148,9 @@ fn new_file_label(extension: &str) -> String {
         "md" => t("finder_menu.new_file_item.md"),
         "txt" => t("finder_menu.new_file_item.txt"),
         "json" => t("finder_menu.new_file_item.json"),
+        "docx" => t("finder_menu.new_file_item.docx"),
+        "xlsx" => t("finder_menu.new_file_item.xlsx"),
+        "pptx" => t("finder_menu.new_file_item.pptx"),
         // A type that is allowed but has no dedicated label yet: keep the same shape instead of
         // degrading to a bare extension.
         other => {
@@ -253,7 +256,7 @@ mod tests {
     /// menu must not fall back to a bare ".exe" beside labels that say "New .md File".
     #[test]
     fn every_new_file_label_names_its_extension() {
-        for extension in ["md", "txt", "json", "exe"] {
+        for extension in ["md", "txt", "json", "docx", "xlsx", "pptx", "exe"] {
             let label = super::new_file_label(extension);
             assert!(
                 label.contains(&format!(".{extension}")),

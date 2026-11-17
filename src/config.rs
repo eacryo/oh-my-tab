@@ -865,7 +865,7 @@ pub(crate) const FINDER_MENU_LAYOUTS: [&str; 3] = ["flat", "grouped", "submenu"]
 pub(crate) const FINDER_MENU_DEFAULT_LAYOUT: &str = "grouped";
 
 /// The file types the menu can create. A type is an extension without the dot.
-pub(crate) const FINDER_MENU_FILE_TYPES: [&str; 3] = ["md", "txt", "json"];
+pub(crate) const FINDER_MENU_FILE_TYPES: [&str; 6] = ["md", "txt", "json", "docx", "xlsx", "pptx"];
 
 /// Known terminal applications, in menu order. Only the installed ones are offered; this list is
 /// the identity table the config is validated against, so an unknown bundle id in a hand-written

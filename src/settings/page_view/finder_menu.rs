@@ -149,10 +149,13 @@ pub(super) fn finder_menu_page_view(input: &PageInput) -> PageView {
 
 /// The copy keys of the "New File" rows, in catalog order. The label is copy and `RowSpec::label_key`
 /// is a key, not the extension itself -- the extension is data and appears nowhere in the UI.
-const NEW_FILE_LABEL_KEYS: [&str; 3] = [
+const NEW_FILE_LABEL_KEYS: [&str; 6] = [
     "settings.finder_menu.new_file_md",
     "settings.finder_menu.new_file_txt",
     "settings.finder_menu.new_file_json",
+    "settings.finder_menu.new_file_docx",
+    "settings.finder_menu.new_file_xlsx",
+    "settings.finder_menu.new_file_pptx",
 ];
 
 /// Whether the config has the file type at `index`, in catalog order.
