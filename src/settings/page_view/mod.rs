@@ -164,8 +164,9 @@ pub(in crate::settings::page_view) use layout::{
 pub(in crate::settings) use model::{
     BannerFrame, BannerSpec, ControlId, ControlKind, ControlUpdate, NoHooks, PageHooks, PageInput,
     PageRowSpec, PageView, RowCopy, RowHeight, RowLayout, RowSpec, SearchRow, Value, ValueAction,
-    ValueAlign,
+    ValueAlign, ValueTone,
 };
+pub(in crate::settings) use render::apply_value_tone;
 pub(in crate::settings::page_view) use render::{
     apply_page_updates, description_groups, RenderedControl, RenderedExtra,
 };
@@ -207,8 +208,9 @@ impl PageInput {
         );
         // The one system read the descriptions cannot make: the extension's election and the
         // recovery transaction's outcome are process state, captured at build time.
-        input.finder_menu_status =
-            super::finder_menu_status_text_now(crate::finder_menu::extension_enabled());
+        let finder_menu_enabled = crate::finder_menu::extension_enabled();
+        input.finder_menu_status = super::finder_menu_status_text_now(finder_menu_enabled);
+        input.finder_menu_status_tone = super::finder_menu_status_tone(finder_menu_enabled);
         input.permission_migration_copy = crate::update_notice::needs_permission_migration_copy();
         // This capture owns the config; making sure the device's gesture layer exists is a write, so
         // it happens here and the page only reads the scope.
@@ -226,6 +228,7 @@ impl PageInput {
             theme,
             device,
             finder_menu_status: String::new(),
+            finder_menu_status_tone: ValueTone::Neutral,
             permission_migration_copy: false,
             gesture_scope: None,
         }

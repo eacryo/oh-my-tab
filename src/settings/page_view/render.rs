@@ -400,6 +400,8 @@ pub(super) unsafe fn render_row(
                 placed.control_frame.h,
                 &text,
             );
+            // The row's own ink for its state, which the label's construction cannot know.
+            apply_value_tone(label, row.value_tone);
             // The shipped pages are not uniform about this (see [`ValueAlign`]), so the row states
             // it rather than leaving every value on the platform default.
             if matches!(align, ValueAlign::Right) && !label.is_null() {
@@ -617,6 +619,22 @@ pub(super) unsafe fn separator_frame_of(band: &BoxRect) -> NSRect {
         NSPoint::new(band.x, band.y + band.h),
         NSSize::new(band.w.max(1.0), 1.0),
     )
+}
+
+/// Draw a read-only value in the ink its state calls for.
+///
+/// `Neutral` maps to the label's own primary role rather than "leave it alone", because the same
+/// label is refreshed in place when the state changes: a value that was green must be able to
+/// become ordinary text again, or the row keeps claiming a state it no longer has.
+pub(in crate::settings) unsafe fn apply_value_tone(label: *mut AnyObject, tone: ValueTone) {
+    if label.is_null() {
+        return;
+    }
+    let role = match tone {
+        ValueTone::Neutral => SettingsTextRole::Primary,
+        ValueTone::Success => SettingsTextRole::Success,
+    };
+    apply_settings_text_role(label, role);
 }
 
 /// Put a view in the box the layout computed.

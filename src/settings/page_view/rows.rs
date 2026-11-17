@@ -177,6 +177,7 @@ pub(super) struct RowDraft {
     depends_on: Option<ControlField>,
     group: Option<RowGroup>,
     value: Value,
+    value_tone: ValueTone,
     action_tag: Option<isize>,
     /// The row's label as DATA instead of a locale key, for a row whose copy the page computed.
     label_text: Option<String>,
@@ -205,6 +206,7 @@ impl RowDraft {
             depends_on: None,
             group: None,
             value,
+            value_tone: ValueTone::Neutral,
             action_tag: None,
             label_text: None,
             icon_bundle: None,
@@ -245,6 +247,12 @@ impl RowDraft {
     /// A `Value::Dynamic` control: its content is data the caller computed, not a locale key.
     pub(super) fn dynamic(mut self, text: impl Into<String>) -> Self {
         self.value = Value::Dynamic(text.into());
+        self
+    }
+
+    /// The semantic ink this row's read-only value draws its state in (see [`RowSpec::value_tone`]).
+    pub(super) fn value_tone(mut self, tone: ValueTone) -> Self {
+        self.value_tone = tone;
         self
     }
 
@@ -300,6 +308,7 @@ impl RowDraft {
             separator_above: false,
             group: self.group,
             value: self.value,
+            value_tone: self.value_tone,
             action_tag: self.action_tag,
             popup_option_ids: self.popup_option_ids,
             search: SearchRow {

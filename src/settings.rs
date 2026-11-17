@@ -346,6 +346,19 @@ pub(super) fn finder_menu_status_text_now(enabled: bool) -> String {
     finder_menu_status_text(enabled)
 }
 
+/// The ink the Finder Menu page's status row uses, from the same state as its text.
+///
+/// An elected extension is the page's one success state; every other state keeps ordinary text.
+/// Status colors are semantic (`docs/design-style-en.md` §3.1), so the page states a TONE and the
+/// palette decides the color in either appearance.
+pub(in crate::settings) fn finder_menu_status_tone(enabled: bool) -> ValueTone {
+    if enabled {
+        ValueTone::Success
+    } else {
+        ValueTone::Neutral
+    }
+}
+
 /// Recording stage.
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum RecStage {

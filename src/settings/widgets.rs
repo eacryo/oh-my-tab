@@ -248,6 +248,9 @@ pub(super) enum SettingsTextRole {
     /// Hover state of `Link`, related to it as the palette's `accent_hover` is to `accent`.
     LinkHover,
     Destructive,
+    /// Status text in a state the user wants (`success_text`): permission granted, an extension
+    /// elected. Semantic, so it never labels a category (see `docs/design-style-en.md` §3.1).
+    Success,
 }
 
 /// Resolve one text role from the active light/dark palette.
@@ -264,6 +267,7 @@ pub(super) fn settings_text_color(role: SettingsTextRole) -> *mut AnyObject {
         SettingsTextRole::Link => palette.link_text,
         SettingsTextRole::LinkHover => palette.link_text_hover,
         SettingsTextRole::Destructive => palette.destructive,
+        SettingsTextRole::Success => palette.success_text,
     };
     crate::ffi::hex_to_ns_color(color)
 }

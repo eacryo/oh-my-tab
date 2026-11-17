@@ -49,6 +49,10 @@ pub(in crate::settings) struct PageInput {
     /// elected?) and from the recovery transaction's last result, so it is captured here rather
     /// than computed by a description.
     pub(in crate::settings) finder_menu_status: String,
+    /// The ink that status row draws its text in, captured from the same state as the text: a row
+    /// that says "enabled" in the disabled ink, or the other way round, is a page arguing with
+    /// itself.
+    pub(in crate::settings) finder_menu_status_tone: ValueTone,
     /// Whether the storage/permission banner carries the 0.2.3 permission-migration copy instead of
     /// the ordinary accessibility warning. It comes from the bundle's version and from a system
     /// default, so a description that asked the system itself would stop being a function of its
@@ -185,6 +189,10 @@ pub(in crate::settings) struct RowSpec {
     pub(in crate::settings) group: Option<RowGroup>,
     /// The value the control starts with; `None` for an action row.
     pub(in crate::settings) value: Value,
+    /// The ink a read-only value row draws that value in. Values have a state, and a state the user
+    /// wants (the Finder extension being elected) has to read as one; every other control kind
+    /// ignores it, because only a value row carries state text.
+    pub(in crate::settings) value_tone: ValueTone,
     pub(in crate::settings) search: SearchRow,
     /// The option IDS a popup row's entries map to, in display order, when the row is a gesture
     /// row's action popup: the page may append the row's own binding (a custom shortcut) as an
@@ -214,6 +222,18 @@ pub(in crate::settings) enum Value {
     Dynamic(String),
     /// An action row has no value.
     None,
+}
+
+/// The semantic ink a read-only status value is drawn in.
+///
+/// Status colors are semantic, not decorative (`docs/design-style-en.md` §3.1): `Success` is a
+/// state the user wants, and every other value keeps the row's ordinary ink. The description states
+/// the TONE, never a color, so the palette decides what it looks like in either appearance.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(in crate::settings) enum ValueTone {
+    #[default]
+    Neutral,
+    Success,
 }
 
 /// One "field -> value" entry of the refill / in-place refresh description.

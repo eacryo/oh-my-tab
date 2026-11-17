@@ -527,10 +527,11 @@ pub(crate) fn refresh_finder_menu_status_if_visible() {
                 if !visible || ui.finder_menu_status.is_null() {
                     return;
                 }
-                widgets::set_field(
-                    ui.finder_menu_status,
-                    finder_menu_status_text_now(crate::finder_menu::extension_enabled()),
-                );
+                // The text and its ink come from one state: the row is refreshed in place, so a
+                // state that flipped must take its color with it.
+                let enabled = crate::finder_menu::extension_enabled();
+                widgets::set_field(ui.finder_menu_status, finder_menu_status_text_now(enabled));
+                apply_value_tone(ui.finder_menu_status, finder_menu_status_tone(enabled));
             }
         }
     });

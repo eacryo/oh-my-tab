@@ -53,6 +53,7 @@ pub(super) fn finder_menu_page_view(input: &PageInput) -> PageView {
         )
         .desc("settings.finder_menu.desc_status")
         .dynamic(input.finder_menu_status.clone())
+        .value_tone(input.finder_menu_status_tone)
         .into_spec(),
     );
     // The master switch: it owns whether any item below reaches Finder's context menu. It shares
@@ -449,6 +450,14 @@ mod tests {
     }
 
     #[test]
+    fn finder_menu_status_tone_follows_the_election() {
+        // The one state the page calls success: an extension the system has elected. Every other
+        // state -- not enabled, or a failed restore -- keeps the row's ordinary text.
+        assert_eq!(finder_menu_status_tone(true), ValueTone::Success);
+        assert_eq!(finder_menu_status_tone(false), ValueTone::Neutral);
+    }
+
+    #[test]
     fn finder_menu_status_row_carries_the_captured_text_and_its_action() {
         // The status text is an input of the description (the extension's election is process
         // state, so the page cannot read it): whatever was captured is what the row shows, and it
@@ -457,6 +466,7 @@ mod tests {
         config.finder_menu.enabled = true;
         let mut input = PageInput::from_config(config, None, crate::theme::ThemeInput::current());
         input.finder_menu_status = "Enabled".to_string();
+        input.finder_menu_status_tone = ValueTone::Success;
         let view = finder_menu_page_view(&input);
         assert_eq!(
             view.rows[0].id,
@@ -464,6 +474,13 @@ mod tests {
         );
         assert_eq!(view.rows[0].value, Value::Dynamic("Enabled".to_string()));
         assert_eq!(view.rows[0].value.describe(), "Enabled");
+        // The row states the ink too: the state a user wants is not drawn in ordinary text, which
+        // is what made an enabled extension read like a plain label in the first place.
+        assert_eq!(view.rows[0].value_tone, ValueTone::Success);
+        // Every other row is a control, not state text, so it keeps the neutral ink.
+        assert!(view.rows[1..]
+            .iter()
+            .all(|row| row.value_tone == ValueTone::Neutral));
         // The row is not a config field, so IT contributes no update entry: nothing about the
         // extension state is persisted. The master switch next to it does have one, and that is
         // the correct behaviour for a described config field.
