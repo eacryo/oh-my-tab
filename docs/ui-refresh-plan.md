@@ -154,7 +154,7 @@
 - **文件**：`settings/components.rs`、`settings.rs`、`settings/widgets.rs`。
 - **风险**：页面文档高度会变化；布局校验器和测试里写死的几何值必须在同一次改动里更新。做成一个自包含的
   **改动**（self-contained change），使 diff 可以被当作「同一套布局，吸附到网格」来评审。
-- **验收**：`--smoke-settings-layout` 八个页面全部通过；测试断言具名度量为 4 的整数倍。
+- **验收**：`--smoke-settings-layout` 全部页面通过；测试断言具名度量为 4 的整数倍。
 
 ### P1-4 · 调色板对比度
 

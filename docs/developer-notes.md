@@ -557,7 +557,7 @@ cargo build
 cargo test settings_layout_smoke -- --ignored
 ```
 
-它会以 `--smoke-settings-layout` 启动 debug 二进制，在主线程打开真实设置窗口，遍历全部八个页面，校验其子视图 frame 后退出。
+它会以 `--smoke-settings-layout` 启动 debug 二进制，在主线程打开真实设置窗口，遍历全部页面，校验其子视图 frame 后退出。
 
 浮窗运行路径也有一个被忽略的子进程冒烟测试。先运行 `cargo build`，再执行 `cargo test overlay_runtime_smoke -- --ignored`；`--smoke-overlay` 会跳过单实例锁，避免已有开发版实例导致测试未执行却误判通过。
 

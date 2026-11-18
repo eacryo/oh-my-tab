@@ -759,7 +759,7 @@ cargo build
 cargo test settings_layout_smoke -- --ignored
 ```
 
-It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits all eight pages, validates their descendant view frames, and exits.
+It runs the debug binary with `--smoke-settings-layout`, opens the actual settings window on the main thread, visits every page, validates their descendant view frames, and exits.
 
 The Finder Menu settings page has its own smoke (`cargo test finder_menu_page_smoke -- --ignored`, or
 `./target/debug/oh-my-tab --smoke-finder-menu`): it opens the real window on that page and asserts the

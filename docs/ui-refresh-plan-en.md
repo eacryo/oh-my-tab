@@ -188,7 +188,7 @@ onto them. The visible result is a UI that stops looking almost-aligned.
 - **Risk**: page document heights change; the layout smoke validator and any hardcoded geometry in
   tests must be updated in the same change. Land it as one self-contained change so the diff is
   reviewable as "the same layout, snapped".
-- **Acceptance**: `--smoke-settings-layout` passes on all eight pages; a test asserting the named
+- **Acceptance**: `--smoke-settings-layout` passes on every page; a test asserting the named
   metrics are multiples of 4.
 
 ### P1-4 · Palette contrast

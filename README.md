@@ -26,7 +26,7 @@
 
 <br />
 
-oh-my-tab is a macOS menu-bar tool written in native Rust. It centers on window switching and integrates mouse control, clipboard history, window control, the keystroke display and key bindings. It does not depend on an Electron or Tauri runtime, and every interface is drawn natively.
+oh-my-tab is a macOS menu-bar tool written in native Rust. It centers on window switching and integrates mouse control, mouse gestures, clipboard history, window control, the keystroke display, key bindings and the Finder menu. It does not depend on an Electron or Tauri runtime, and every interface is drawn natively.
 
 **Every optional feature can be turned on as needed and toggled at runtime**: the following features are included
 
@@ -35,6 +35,7 @@ oh-my-tab is a macOS menu-bar tool written in native Rust. It centers on window 
 - <img height="14" src="docs/icons/sliders.svg"> **Mouse control**: adjust scroll speed, acceleration and similar parameters without affecting the trackpad.
 - <img height="14" src="docs/icons/zap.svg"> **Key bindings**: bind keys to quick actions, or remap keys (key remapping is in development)
 - <img height="14" src="docs/icons/eye.svg"> **Keystroke display**: shows the key being pressed right now; nothing is shown while you type a password.
+- <img height="14" src="docs/icons/terminal.svg"> **Finder menu**: adds "New File", "Open in Terminal" and path / SHA-256 copies to Finder's right-click menu through the bundled Finder extension.
 
 <br />
 
@@ -63,6 +64,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 - **Panel actions**: while the panel is open, Command+W / M / H / Q close the highlighted window, minimize it (or restore it when it is already minimized), hide its app, or ask that app to quit. Each is a separate switch, all off by default.
 - **Clipboard history**: once enabled, press **Option+V** to summon it; it supports both keyboard and mouse, and closes when you click outside.
 - **Key bindings**: open **Settings → Key Bindings** to edit the shortcut list. Every row can be changed, switched off or deleted; the picker offers actions that are not bound by default.
+- **Gestures**: hold a mouse button, draw a direction sequence (left / right / up / down), then release to run the binding set for it; a trail follows the pointer while you draw, and **Settings → Gestures** records one in a single drag.
 - **Finder menu**: **Settings → Finder Menu** adds "New File" (Markdown / text / JSON / Word / Excel / PowerPoint) and "Open in Terminal" to Finder's right-click menu, in a flat, grouped or single-submenu layout. It needs the bundled Finder extension enabled once in **System Settings → General → Login Items & Extensions → Finder Extensions**; the settings page shows that state and opens the pane for you. Terminals are offered only once they are installed.
 - **Permissions**: window switching needs Accessibility permission; thumbnails need Screen Recording; clipboard history needs the keychain key it creates on first use. Without Screen Recording, switching still works and cards simply fall back to icons.
 
@@ -169,7 +171,7 @@ Some managed Macs only allow approved `.app` bundles to launch. `scripts/install
 
 ## <img height="16" src="docs/icons/gear.svg">&nbsp;&nbsp;Settings
 
-Options are managed from the in-app Settings window, and most changes take effect immediately. The sidebar has eight pages: **General Settings** (launch at login, menu-bar icon, appearance, language, logging, and settings backup/restore), **App Switcher**, **Mouse**, **Clipboard History**, **Key Bindings** (window control and quick actions in one editable list), **Keystroke Display**, **Finder Menu**, and **About** (version, guide, permission and keychain state, updates).
+Options are managed from the in-app Settings window, and most changes take effect immediately. The sidebar has nine pages: **General Settings** (launch at login, menu-bar icon, appearance, language, logging, and settings backup/restore), **App Switcher**, **Mouse**, **Clipboard History**, **Gestures** (direction sequences and the buttons that trigger them), **Key Bindings** (window control and quick actions in one editable list), **Keystroke Display**, **Finder Menu**, and **About** (version, guide, permission and keychain state, updates).
 
 **Backup**: "Export settings" writes the whole configuration as one portable TOML file; "Import settings" replaces the current configuration from such a file. This Mac's login item, log path and clipboard-history storage settings are preserved rather than imported, and a file from a newer version still imports what this version understands.
 

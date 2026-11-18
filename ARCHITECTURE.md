@@ -73,7 +73,8 @@ src/
 ├── ui_coordinator.rs            # cross-surface refresh (theme/locale changes reach menu + overlay + settings)
 ├── ui/                          # shared UI mechanics used by more than one surface
 │   ├── mod.rs
-│   └── corner_glyph.rs          # the corner-glyph button family (footer gear, picker header glyphs)
+│   ├── corner_glyph.rs          # the corner-glyph button family (footer gear, picker header glyphs)
+│   └── toast.rs                 # transient non-activating message (Finder menu copy results)
 ├── update_notice.rs             # post-install "update installed" notification
 ├── updater.rs                   # Sparkle 2 integration, loaded dynamically
 ├── version_consistency.rs       # workspace release-version agreement (root Cargo.toml vs every member)
@@ -231,7 +232,7 @@ clipboard/
   field-to-value description both the refill and the in-place refresh consume. `page_widgets.rs` holds the
   copy widgets the renderer uses; it and `page_view/` are the page's two halves, description and drawing.
   `page_view/mod.rs` is now the module doc, the `mod` declarations and a facade re-exporting today's
-  names (~280 lines); the code lives in one file per job. Each of these sits beside it: `smoke.rs` (the M2 runners and their
+  names (~360 lines); the code lives in one file per job. Each of these sits beside it: `smoke.rs` (the M2 runners and their
   fixtures), `rows.rs` (the row constructors a description writes rows with), `update.rs` (the one
   field-to-value description the refill and the in-place refresh consume), `render.rs` (applying a
   laid-out page to AppKit, registering each control's identity as it is created) and `bind.rs`
@@ -241,8 +242,8 @@ clipboard/
   (the description types: what a page is) and `identity.rs` (which control each pointer is, and the
   page-scoped buffer that fills the table only after the whole page built). The rendering half is
   AppKit; the description and layout halves are pure. **One
-  file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `about.rs`,
-  `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
+  file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `gestures.rs`,
+  `about.rs`, `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
 - **Every settings page is described.** `page_builder.rs` is now one ~20-line entry point per page: it
   captures a `PageInput`, calls `build_page` and publishes (or falls back to `empty_page`). A page that
   needs something the description cannot carry states it in `PageHooks`: `before_page` for a page-drawn
@@ -265,6 +266,8 @@ clipboard/
   family; `widgets.rs` the concrete control classes; `select.rs` the custom select; `tooltip.rs` the
   disabled-setting hint; `dispatch.rs` the control-event dispatch and dependent enable/refresh;
   `mapping.rs` the mouse-mapping rows and side-button recorder; `bindings.rs` the key-bindings page;
+  `gesture_recorder.rs` the sample buffer behind an interactive gesture recording and the tap-thread hooks
+  that feed it, `gesture_trigger_capture.rs` learning the trigger button for a gesture layer;
   `finder_menu_smoke.rs` the Finder Menu page's own M1 GUI smoke.
 - Migrating a page to the description is one change: the `*_page_view` function, its `view_for` arm, the
   `build_<page>_page` body replaced by `build_page`/(`publish_built_page` | `empty_page`), and the page added
@@ -295,6 +298,7 @@ finder_menu/
 ├── ipc.rs                # DistributedNotificationCenter bridge, host identity, click dispatch
 ├── actions.rs            # executes a click: new file / open terminal / copy path (re-validated)
 ├── new_file.rs           # Finder-style collision-safe file creation (O_EXCL, "Untitled 2")
+├── hash.rs               # SHA-256 of a selected file, streamed on a worker for "Copy SHA-256"
 ├── recovery.rs           # restores the extension's system election after our own app update
 └── terminals.rs          # known terminals, install detection, per-terminal launch adapters
 
@@ -380,6 +384,16 @@ with per-device profiles), `scrolling.rs` the scroll modes, `smooth/` the pure L
 (`engine.rs`, `delivery.rs`, `presets.rs`) plus `transformer.rs`, which posts from the tap's own run-loop thread,
 `pointer.rs` pointer acceleration, `shortcut.rs` shortcut parsing/display, `keysim.rs` synthesized shortcuts,
 and `system_action.rs` Dock/Exposé actions. Reconnects must reapply pointer settings.
+
+`gesture/` is the mouse-gesture subsystem: `mod.rs` takes the press and decides what to do with it,
+`engine.rs` the state machine and the decision it hands back to the tap, `recognizer.rs` a sample path
+into an R/L/U/D sequence, `runtime.rs` the tap-thread runtime that owns the engine and the replay state,
+`replay.rs` replaying a press that turned out to be a plain click, `recording.rs` interactive capture of
+one drag, `executor.rs` running a matched target, `table.rs` the published binding table and the epoch
+that revokes work in flight, `conflict.rs` gesture rows against the rest of the configuration,
+`modifiers.rs` modifier ownership, `hud.rs` the click-through trail window, `session_state.rs` the
+published state diagnostics and the settings page read, and `switcher.rs` ownership of a switcher
+session a gesture opened.
 
 ## Text, theme, and shared UI
 
