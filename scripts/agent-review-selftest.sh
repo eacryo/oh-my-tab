@@ -97,12 +97,12 @@ start() {
 # archived `service_tier_rejected` off this sentence. The tier named is the one actually requested, so a
 # detection that matched a hard-coded value instead of the round's own would not be flattered by it.
 tier_rejected_item() {
-    python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured service tier `%s` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests." % (sys.argv[1] or "none")}}, ensure_ascii=False))' "${tier:-}"
+    python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured service tier `%s` is not advertised as supported for model `gpt-6.2-sol` and will be omitted from requests." % (sys.argv[1] or "none")}}, ensure_ascii=False))' "${tier:-}"
 }
 # The real CLI's wording when it will not use the requested reasoning effort: the same shape as the
 # tier rejection, naming the level actually requested so a hard-coded match would not be flattered.
 reasoning_rejected_item() {
-    python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured reasoning effort `%s` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests." % (sys.argv[1] or "none")}}, ensure_ascii=False))' "${reasoning:-}"
+    python3 -c 'import json,sys; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured reasoning effort `%s` is not advertised as supported for model `gpt-6.2-sol` and will be omitted from requests." % (sys.argv[1] or "none")}}, ensure_ascii=False))' "${reasoning:-}"
 }
 # An unrelated error item: the tier warning must not fire on every error the CLI prints.
 unrelated_error_item() {
@@ -112,7 +112,7 @@ unrelated_error_item() {
 # does not classify. A match that only looked for "not advertised as supported for model" would
 # archive a rejection here.
 other_setting_rejected_item() {
-    python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured verbosity `loud` is not advertised as supported for model `gpt-6.1-sol` and will be omitted from requests."}}, ensure_ascii=False))'
+    python3 -c 'import json; print(json.dumps({"type":"item.completed","item":{"type":"error","message":"Configured verbosity `loud` is not advertised as supported for model `gpt-6.2-sol` and will be omitted from requests."}}, ensure_ascii=False))'
 }
 msg() {
     [[ -n "$out" ]] && printf '%s\n' "$1" > "$out"
@@ -343,7 +343,7 @@ echo "  session: $(cat .agent-review/codex-session-id)  stdin: $(cat "$tmp/stdin
 check "the CLI cannot read stdin" 0 "rc=1" "$tmp/stdin.txt"
 
 echo "the model the reviewer runs on"
-expect_value "the first review asks for gpt-6.1-sol" "gpt-6.1-sol" "$tmp/last-model.txt"
+expect_value "the first review asks for gpt-6.2-sol" "gpt-6.2-sol" "$tmp/last-model.txt"
 # Read here, where that round really was the first one: later in the harness the same file holds the
 # id of a resume, so asserting it there would be asserting the wrong round.
 expect_value "and it really was a first review" "0" "$tmp/last-resume.txt"
@@ -539,7 +539,7 @@ echo "the --retry framing"
 run ok --retry
 check "the retry succeeds" 0 - "$tmp/out.txt"
 expect "it says the run was interrupted" "You were interrupted" "$tmp/last-prompt.txt"
-expect_value "the resumed review keeps the model" "gpt-6.1-sol" "$tmp/last-model.txt"
+expect_value "the resumed review keeps the model" "gpt-6.2-sol" "$tmp/last-model.txt"
 expect_value "and it really was a resume" "1" "$tmp/last-resume.txt"
 expect_absent "it does not claim the code changed" "has updated the code" "$tmp/last-prompt.txt"
 
@@ -1073,10 +1073,10 @@ echo "the model and speed the reviewer runs on, on every round"
 # The default case is the file absent, which is the state of this harness: the built-in default model
 # with Fast mode off. Both halves are asserted, because "off" is a value the helper sends
 # (service_tier=default) rather than the absence of an argument.
-expect_value "the reviewer runs on gpt-6.1-sol" "gpt-6.1-sol" "$tmp/last-model.txt"
+expect_value "the reviewer runs on gpt-6.2-sol" "gpt-6.2-sol" "$tmp/last-model.txt"
 expect_value "with Fast mode off" "default" "$tmp/last-tier.txt"
 expect_value "with no reasoning effort by default" "" "$tmp/last-reasoning.txt"
-expect "the round says which settings it used" "reviewer: model=gpt-6.1-sol (the built-in default), fast=off (the built-in default)" "$tmp/out.txt"
+expect "the round says which settings it used" "reviewer: model=gpt-6.2-sol (the built-in default), fast=off (the built-in default)" "$tmp/out.txt"
 expect "and says the effort is unset" "reasoning_effort=- (the built-in default)" "$tmp/out.txt"
 
 # A resume has to repeat the tier: codex resolves it per turn, so a resumed round that omits it runs at
@@ -1139,9 +1139,9 @@ expect "the round names the file as the source" "model=file-model (agent-review.
 expect "and names the reviewer it chose" "reviewer: codex (agent-review.toml)" "$tmp/out.txt"
 write_config 'reviewer = "codex"' '[codex]' 'fast = true'
 run ok
-expect_value "a missing model falls back on its own" "gpt-6.1-sol" "$tmp/last-model.txt"
+expect_value "a missing model falls back on its own" "gpt-6.2-sol" "$tmp/last-model.txt"
 expect_value "while the file's fast still applies" "priority" "$tmp/last-tier.txt"
-expect "each setting's source is reported separately" "model=gpt-6.1-sol (the built-in default), fast=on (agent-review.toml)" "$tmp/out.txt"
+expect "each setting's source is reported separately" "model=gpt-6.2-sol (the built-in default), fast=on (agent-review.toml)" "$tmp/out.txt"
 write_config 'reviewer = "codex"' '[codex]' 'reasoning_effort = "xhigh"'
 run ok
 expect_value "the file's reasoning_effort is used" "xhigh" "$tmp/last-reasoning.txt"
@@ -1400,7 +1400,7 @@ write_config 'reviewer = "codex"'
 echo "the requested speed is archived with every round"
 run ok
 last_outcome="$(ls -t .agent-review/rounds/*-outcome.txt | head -1)"
-expect "the outcome names the model" "model=gpt-6.1-sol" "$last_outcome"
+expect "the outcome names the model" "model=gpt-6.2-sol" "$last_outcome"
 expect "and its source" "model_source=the built-in default" "$last_outcome"
 expect "and the speed" "fast=off" "$last_outcome"
 expect "and the tier actually requested" "service_tier=default" "$last_outcome"

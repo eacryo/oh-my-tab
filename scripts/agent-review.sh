@@ -99,7 +99,7 @@ cd "$ROOT"
 # empty value refuses the round rather than quietly picking one.
 REVIEWER=""
 REVIEWER_SOURCE=""
-DEFAULT_MODEL="gpt-6.1-sol"
+DEFAULT_MODEL="gpt-6.2-sol"
 MODEL="$DEFAULT_MODEL"
 MODEL_SOURCE="the built-in default"
 FAST=0
@@ -534,7 +534,7 @@ announce_task
 #
 # The reviewer is explicit and has no default. An unknown key, a wrong type, a missing reviewer, an
 # unreadable file or a missing TOML reader refuses the round rather than falling back: "the reviewer
-# ran on gpt-6.1-sol" is a claim about the review that a silent fallback would make false. Every
+# ran on gpt-6.2-sol" is a claim about the review that a silent fallback would make false. Every
 # message names the file and the offending key.
 #
 # A path that is *present* but is not a readable regular file -- a directory, a dangling or looping
