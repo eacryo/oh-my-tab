@@ -54,7 +54,7 @@ brew install --cask eacryo/tap/oh-my-tab
 
 <div align="center"><img src="docs/pictures/main_window.png" width="640" alt="主界面"></div>
 
-<div align="center"><img src="docs/videos/settings_page.gif" width="560" alt="设置页面演示"></div>
+<div align="center"><img src="docs/videos/settings_page_zh.gif" width="560" alt="设置页面演示"></div>
 
 ## 快速使用
 

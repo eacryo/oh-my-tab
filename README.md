@@ -55,7 +55,7 @@ This taps the [homebrew-tap](https://github.com/eacryo/homebrew-tap) repo and in
 
 <div align="center"><img src="docs/pictures/main_window.png" width="640" alt="Main window"></div>
 
-<div align="center"><img src="docs/videos/settings_page.gif" width="560" alt="Settings page demo"></div>
+<div align="center"><img src="docs/videos/settings_page_en.gif" width="560" alt="Settings page demo"></div>
 
 ## Quick start
 
