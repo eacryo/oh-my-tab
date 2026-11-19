@@ -28,6 +28,10 @@ pub(crate) enum Stage {
 static STAGE: AtomicU8 = AtomicU8::new(0);
 /// Set while a recording owns the pointer: the gesture runtime must not also claim the press.
 static OWNING_BUTTON: AtomicU8 = AtomicU8::new(0);
+/// The tap generation that armed `OWNING_BUTTON`. A cancel keeps the button as a tail so its Up is
+/// not delivered alone; that promise belongs to the tap that swallowed the Down. After a restart the
+/// next Up belongs to another press, and swallowing it would eat a button mapping's release.
+static OWNING_GENERATION: AtomicU64 = AtomicU64::new(0);
 static RESULT: Mutex<Option<Finished>> = Mutex::new(None);
 
 /// A finished recording, published and consumed as one value: the sequence, the button it was drawn
@@ -95,6 +99,12 @@ pub(crate) fn mark_ui_ready() {
 
 /// Stop recording and forget whatever was collected.
 pub(crate) fn cancel() {
+    // Idempotent. The gesture switch publishes on every mouse-section reload, and `RECORDING` is
+    // shared with the mapping recorder: a cancel with nothing armed must leave both that flag and
+    // the tail ownership a previous cancel deliberately kept alone.
+    if stage() == Stage::Idle && !is_recording() {
+        return;
+    }
     // A cancelled recording never reaches its armed state, so a later press must not be taken by
     // the delay [[UI_READY]] exists for.
     UI_READY.store(true, Ordering::SeqCst);
@@ -146,13 +156,22 @@ pub(crate) fn session() -> u64 {
 
 /// A press forwarded from the tap. Returns whether the recorder consumed it.
 pub(crate) fn on_press(button: u32) -> bool {
+    // The session is what a cancel advances, so it is the token that keeps a press from arming a
+    // recording the main thread cancelled between this read and the stores below.
+    let session = SESSION.load(Ordering::SeqCst);
     match stage() {
         // An armed recorder takes the press even while it is still being set up: letting it
         // through would hand the frontmost application a click the user aimed at the recorder.
         Stage::WaitingPress if !UI_READY.load(Ordering::SeqCst) => true,
         Stage::WaitingPress => {
             OWNING_BUTTON.store(button.min(255) as u8, Ordering::SeqCst);
+            OWNING_GENERATION.store(crate::mouse::event_tap::tap_generation(), Ordering::SeqCst);
             STAGE.store(u8_from_stage(Stage::Drawing), Ordering::SeqCst);
+            if SESSION.load(Ordering::SeqCst) != session {
+                // Cancelled while this press was being armed. The press stays a tail -- its Up must
+                // not reach the application on its own -- but nothing is recorded or drawn.
+                STAGE.store(u8_from_stage(Stage::Idle), Ordering::SeqCst);
+            }
             true
         }
         _ => false,
@@ -177,6 +196,13 @@ pub(crate) fn on_release(button: u32) -> bool {
     if OWNING_BUTTON.load(Ordering::SeqCst) as u32 != button || button == 0 {
         return false;
     }
+    if OWNING_GENERATION.load(Ordering::SeqCst) != crate::mouse::event_tap::tap_generation() {
+        // The tail is from a tap that no longer exists: this Up belongs to a later press and must
+        // reach whatever owns that press (a mapping, usually), not die here.
+        OWNING_BUTTON.store(0, Ordering::SeqCst);
+        return false;
+    }
+    let session = SESSION.load(Ordering::SeqCst);
     if stage() != Stage::Drawing {
         OWNING_BUTTON.store(0, Ordering::SeqCst);
         return true;
@@ -187,8 +213,12 @@ pub(crate) fn on_release(button: u32) -> bool {
         .map(|s| s.to_key().is_empty())
         .unwrap_or(true);
     if empty {
-        // Nothing was drawn: the recording stays armed so a stray click does not end it.
-        STAGE.store(u8_from_stage(Stage::WaitingPress), Ordering::SeqCst);
+        // Nothing was drawn: the recording stays armed so a stray click does not end it -- unless
+        // the main thread cancelled it while this release was being decided, in which case re-arming
+        // would leave a switched-off feature still swallowing the next click.
+        if SESSION.load(Ordering::SeqCst) == session {
+            STAGE.store(u8_from_stage(Stage::WaitingPress), Ordering::SeqCst);
+        }
         crate::settings::gesture_recorder::reset();
         return true;
     }

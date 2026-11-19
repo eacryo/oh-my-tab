@@ -1965,9 +1965,10 @@ mod tests {
     }
 
     /// The refusal is about the application a gesture is DRAWN IN, so the switch that governs it is
-    /// the gestures switch; the mouse-section switch cannot stop it (`gesture::runtime::set_active`
-    /// gates on both). A page that let the mouse switch hide the list would describe a state the tap
-    /// does not implement.
+    /// the gestures switch alone. Mouse control owns scrolling, the pointer and the side-button
+    /// mappings, and a gesture keeps working while it is off (`mouse::tap_wanted` installs the tap
+    /// for either feature, and `gesture::table::build_layer` reads only the gesture switch), so a
+    /// page that hid this list under the mouse switch would describe a state the tap does not have.
     #[test]
     fn the_exclusion_list_stays_listed_while_the_mouse_section_is_off() {
         let mut page_input = input(true, Vec::new());

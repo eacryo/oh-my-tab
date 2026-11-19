@@ -19,7 +19,7 @@ use crate::mouse::resolve;
 use crate::mouse::scrolling::compute_delta;
 use crate::{log_debug, log_info};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{self, SyncSender, TrySendError};
 use std::sync::{Mutex, OnceLock};
 use std::thread;
@@ -44,6 +44,15 @@ const K_CG_EVENT_FLAGS_CHANGED: CGEventType = 12;
 /// switcher's hover selection; a right-button stroke drawn while the switcher happens to be up still
 /// belongs to the gesture module (the two are different physical buttons).
 static SWITCHER_HELD_BUTTON: AtomicU32 = AtomicU32::new(u32::MAX);
+
+/// Which event-tap generation is current. A press tail (a Down this module swallowed whose Up has
+/// not arrived) belongs to the generation that swallowed it: a tail from an older tap must not
+/// swallow an Up produced after the tap was restarted, because that Up belongs to a different press.
+static TAP_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn tap_generation() -> u64 {
+    TAP_GENERATION.load(Ordering::SeqCst)
+}
 
 /// Escape's virtual keycode.
 pub(crate) const VK_ESCAPE: u16 = 53;
@@ -206,6 +215,13 @@ unsafe fn mouse_event_tap_callback_inner(
             return event;
         }
 
+        // The tap also runs when only gestures are on, and then the wheel is none of this app's
+        // business: no smoothing, no line normalization, no reversal. Asked AFTER the two returns
+        // above, so the high-rate continuous stream never pays for a configuration read.
+        if !crate::mouse::module_active() {
+            return event;
+        }
+
         // deltaAxis1 = vertical delta, deltaAxis2 = horizontal delta.
         let dy = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_1);
         let dx = CGEventGetIntegerValueField(event, K_CG_SCROLL_WHEEL_EVENT_DELTA_AXIS_2);
@@ -246,6 +262,16 @@ unsafe fn mouse_event_tap_callback_inner(
             event
         }
     } else {
+        // Same reason as the wheel: a gesture-only tap must not run the button mappings, which are
+        // mouse-control behaviour. The gesture branch above has already had its say.
+        //
+        // The switch is read UNDER the module gate, and the gate is held until this branch returns:
+        // a press registered here must be visible to `release_holds`, which takes the same lock
+        // before it gives a held button's state back.
+        let _module_gate = crate::mouse::module_gate();
+        if !crate::mouse::module_active() {
+            return event;
+        }
         let button = CGEventGetIntegerValueField(event, K_CG_MOUSE_EVENT_BUTTON_NUMBER);
         // Button mappings: only middle/side buttons (>= 2) take part; left (0)/right (1)
         // are never bound so the user can't lock themselves out of clicking. Skipped while
@@ -449,6 +475,15 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
     STOP_REQUESTED.store(false, std::sync::atomic::Ordering::SeqCst);
 
     thread::spawn(move || unsafe {
+        // A new generation: any press tail recorded by a previous tap is no longer this module's.
+        TAP_GENERATION.fetch_add(1, Ordering::SeqCst);
+        // Nothing is installed for a configuration that stopped wanting this tap while the caller
+        // was deciding (the permission monitor starts from a snapshot): the enumeration and the
+        // HID manager would otherwise be attached to a run loop that never runs.
+        if !crate::mouse::tap_wanted() {
+            log_info!("[mouse] tap not started: no feature wants it");
+            return;
+        }
         crate::performance::set_current_thread_qos(crate::performance::ThreadQos::UserInteractive);
         let mut smooth_transformer =
             Box::new(crate::mouse::smooth::transformer::SmoothTransformer::new());
@@ -494,8 +529,12 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
             control.run_loop = Some(rl);
         }
         let watchdog = event_tap::start_tap_watchdog(created.tap, &STOP_REQUESTED);
+        // Ask the live configuration, not the caller's snapshot: the permission monitor and the
+        // stop reaper both decide to start from one, and the last switch can be turned off between
+        // that decision and this point. A tap no feature wants must not run.
         if !STOP_REQUESTED.load(std::sync::atomic::Ordering::SeqCst)
             && crate::input_monitor::taps_allowed()
+            && crate::mouse::tap_wanted()
         {
             log_debug!("Mouse event tap started.");
             // Block on the RunLoop until stop() fires CFRunLoopStop or the thread is killed.
@@ -515,6 +554,46 @@ pub(crate) fn start() -> thread::JoinHandle<()> {
         }
         event_tap::teardown_event_tap(rl, created);
     })
+}
+
+/// Give back the switcher-side state a button mapping owns when the mouse module's own behaviour is
+/// switched off while the tap keeps running for gestures.
+///
+/// A side button mapped to the switcher holds `SWITCHER_HELD_BUTTON` from its press to its release,
+/// and the release is what ends the session. With the mappings branch gated off, that release never
+/// reaches it, so the held button would keep feeding the overlay's hover selection.
+pub(crate) fn release_holds() {
+    // Only the local state is given back. Posting a global CmdReleased here would act on whatever
+    // session is on screen NOW -- the session this mapping opened may have been dismissed with Esc,
+    // and another input may have opened a new one since -- so a session it opened is left for the
+    // user to finish (Return/Escape) rather than committed blind.
+    SWITCHER_HELD_BUTTON.store(u32::MAX, Ordering::SeqCst);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A mapped side button that opened the switcher is still "held" after the module is switched
+    /// off, so the release path that would clear it never runs. This is the state that has to be
+    /// given back: a stale held button keeps feeding the overlay's hover selection from that
+    /// button's drags.
+    #[test]
+    fn switching_the_module_off_gives_back_a_held_switcher_button() {
+        SWITCHER_HELD_BUTTON.store(3, Ordering::SeqCst);
+        release_holds();
+        assert_eq!(SWITCHER_HELD_BUTTON.load(Ordering::SeqCst), u32::MAX);
+    }
+
+    /// A tail belongs to the tap generation that swallowed its press. Anything else would let a
+    /// press the module took before a restart swallow an Up from a press it never saw.
+    #[test]
+    fn a_tail_is_bound_to_the_tap_generation_that_recorded_it() {
+        let before = tap_generation();
+        TAP_GENERATION.fetch_add(1, Ordering::SeqCst);
+        assert_ne!(before, tap_generation(), "a restart is a new generation");
+        TAP_GENERATION.store(before, Ordering::SeqCst);
+    }
 }
 
 /// Whether a drag of `button` belongs to the switcher's hover selection rather than to a gesture.

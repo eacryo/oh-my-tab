@@ -113,7 +113,9 @@ pub(crate) fn commit_published_result() {
         return;
     }
     let old = crate::config::CONFIG.read().unwrap().clone();
-    if !old.mouse.enabled || !old.mouse.gestures_enabled {
+    // The gesture switch alone: a recording made while mouse control is off still belongs to a
+    // feature that is on, so refusing it would drop a stroke the user just drew.
+    if !crate::mouse::gestures_on_for(&old.mouse) {
         return;
     }
     let mut updated = old.clone();

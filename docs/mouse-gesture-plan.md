@@ -70,13 +70,18 @@ Abandoned
 
 ### 2.2 接管条件（全部满足才吞 Down）
 
-1. `mouse.enabled` 为真；
-2. `mouse.gestures_enabled` 为真；
-3. 该 button 在 gestures 列表中至少有一条 `enabled` 且 `binding` 非空的条目；
-4. 前台应用不在 `gesture_excluded_apps`；
-5. 模块处于运行态（非录制、非停止中）。
+1. `mouse.gestures_enabled` 为真；
+2. 该 button 在 gestures 列表中至少有一条 `enabled` 且 `binding` 非空的条目；
+3. 前台应用不在 `gesture_excluded_apps`；
+4. 模块处于运行态（非录制、非停止中）。
 
-默认四条 disabled 手势 → **不接管**，功能实际关闭。
+出厂 `gestures_enabled = false`，而默认手势表是 11 条已启用、已绑定动作的行（`config::default_gestures()`）：
+开关关着时 **不接管**，打开后立刻可用。早期方案里的「四条 disabled 行」已被这一实现取代。
+
+**变更（2026-11-19，用户决定）：`mouse.enabled` 不再是接管条件。** 鼠标控制只管滚动、指针与侧键映射；
+手势是独立输入路径，有自己的开关。两者共用同一个 HID tap，因此 tap 的安装条件是
+`mouse.enabled || mouse.gestures_enabled`（`mouse::tap_wanted`），而 tap 内每个分支各问自己的开关：
+滚动与按键映射读 `mouse::module_active`，手势只读 `gestures_enabled`。
 
 ### 2.3 所有权
 
@@ -223,7 +228,7 @@ Tab 会打开切换器，手势收尾释放的修饰键又让切换器**提交**
 
 ### 5.2 授权在消费端检查
 
-动作执行前重新检查：父开关、`gestures_enabled`、该条目是否仍在有效配置中（**`GestureEpoch` 单调序号**）、
+动作执行前重新检查：`gestures_enabled`、该条目是否仍在有效配置中（**`GestureEpoch` 单调序号**）、
 前台应用排除、录制状态。任一不满足 → **取消（不执行、不重放）**。
 
 `GestureEpoch` 每变化一次单调递增，不回退。事务记住开始时的 epoch；**epoch 不同即判定撤销并终结**，
@@ -383,25 +388,26 @@ enabled = true
 | 8 | `src/settings.rs` `load_settings_from` | 回填初值 |
 | 9 | `log_config_changes` | 一条 `changed!(gestures)` |
 | 10 | `dispatch.rs` ControlField 三件套 | 开关、列表、行编辑、录制 |
-| 11 | `update_windows_controls_enabled` | 父开关关闭时冻结手势区 |
+| 11 | `update_mouse_controls_enabled` | 只冻结滚动与指针行；手势页不随鼠标控制冻结 |
 | 12 | `runtime_config.rs` ChangeFlags | 新增 `GESTURES` |
 | 13 | `needs_in_place_control_sync` | 加入 `GESTURES` |
 | 14 | `dispatch.rs` 就地回填函数 | 与第 13 步**成对** |
-| 15 | 消费点 | `gesture::table::publish(cfg)`；父开关关闭时清空并作废会话 |
+| 15 | 消费点 | `gesture::table::publish(cfg)`；手势开关关闭时清空并作废会话 |
 | 16 | 测试 | 见 §10 |
 
 **`ChangeFlags::GESTURES` 的派生快照**（整体比较，不用单一「条目集合」）：
 
 ```
 GestureSnapshot {
-    parent_enabled: bool,        // mouse.enabled
     gestures_enabled: bool,
     excluded: Vec<String>,       // 排序规范化
     entries: Vec<(button, gesture_key, target_key, enabled)>,
 }
 ```
 
-任一字段变化都触发；**只改排除名单**与**有效表为空时翻转父开关**都必须触发刷新。
+任一字段变化都触发；**只改排除名单**与**有效表为空时翻转手势开关**都必须触发刷新。
+`mouse.enabled` 不在快照里：它不参与手势授权，翻转它不得递增 `GestureEpoch`（见
+`the_mouse_master_switch_does_not_revoke_a_gesture`）。
 `GestureEpoch` 是这个快照的单调序号，同时用于「运行期刷新」与「动作授权」。
 
 ## 10. 评审记录（8 轮）
@@ -446,7 +452,7 @@ claim 记录在请求与会话终结后应回收。** 实现审查会据此核�
 - 修饰键：双方持有两种顺序、物理状态变化、最后一个持有者结束、无合成持有时逐位恒等
 - 切换器：四种请求交错、撤销后重开、容量丢弃、HandedOff 后停止、首帧完成后不显示
 - HUD：退场交错测试（dirty 最后一次检查）、会话隔离
-- GESTURES 派生快照：只改排除名单、有效表为空时翻转父开关
+- GESTURES 派生快照：只改排除名单、翻转手势开关；`mouse.enabled` 不在授权里，翻转它不得递增 epoch
 - recognizer：阈值边界、超长序列、斜折返、相邻重复、多屏负坐标、严格 45°、不同采样密度（含转向落在采样间隙）
 - config：往返、逐字段 fallback、默认四条的合法性
 - conflict 矩阵

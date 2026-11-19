@@ -111,7 +111,9 @@ pub(crate) fn build_layer(
 ) -> (GestureTable, Vec<(usize, RowError)>) {
     let mut table = GestureTable::default();
     let mut errors = Vec::new();
-    if !mouse.enabled || !mouse.gestures_enabled {
+    // The gesture switch alone decides this. Mouse control owns scrolling, the pointer and the
+    // side-button mappings; a gesture is a separate input path and keeps working without it.
+    if !crate::mouse::gestures_on_for(mouse) {
         return (table, errors);
     }
     for (index, row) in layer.gestures.iter().enumerate() {
@@ -235,6 +237,10 @@ pub(crate) struct Published {
     pub(crate) device_tables: Arc<DeviceTables>,
     pub(crate) epoch: u64,
     pub(crate) excluded: Arc<Vec<String>>,
+    /// Whether the gesture feature was on when this snapshot was built, compared as a VALUE so a
+    /// flip in either direction is a change. The off direction used to be forced, which made every
+    /// publish advance the epoch while the switch was off and none advance it when it came back.
+    pub(crate) gestures_enabled: bool,
 }
 
 /// Whether two snapshot sets hold the same rows on the same devices.
@@ -284,6 +290,7 @@ fn cell() -> &'static Mutex<Published> {
             device_tables: Arc::new(Vec::new()),
             epoch: 0,
             excluded: Arc::new(Vec::new()),
+            gestures_enabled: false,
         })
     })
 }
@@ -301,7 +308,7 @@ pub(crate) fn snapshot() -> Published {
 }
 
 /// Replace the published table. The epoch advances only when the *derived* snapshot changes, which
-/// includes the parent switch and the exclusion list -- a reload that only edits the exclusion list
+/// includes the gesture switch and the exclusion list -- a reload that only edits the exclusion list
 /// is a revocation too.
 pub(crate) fn publish(cfg: &Config) -> Vec<(usize, RowError)> {
     let (table, errors) = build(&cfg.mouse);
@@ -337,13 +344,13 @@ pub(crate) fn publish(cfg: &Config) -> Vec<(usize, RowError)> {
         device_tables: Arc::new(device_tables),
         epoch: 0,
         excluded: Arc::new(excluded),
+        gestures_enabled: cfg.mouse.gestures_enabled,
     };
     let mut guard = cell().lock().unwrap();
     let changed = guard.table.rows != next.table.rows
         || !same_device_tables(&guard.device_tables, &next.device_tables)
         || guard.excluded.as_slice() != next.excluded.as_slice()
-        || !cfg.mouse.enabled
-        || !cfg.mouse.gestures_enabled;
+        || guard.gestures_enabled != next.gestures_enabled;
     if changed {
         // Monotonic: an A -> B -> A round trip must not restore the old epoch, or a stale session
         // would pass its authorization check again.
@@ -351,6 +358,7 @@ pub(crate) fn publish(cfg: &Config) -> Vec<(usize, RowError)> {
         guard.table = next.table;
         guard.device_tables = next.device_tables;
         guard.excluded = next.excluded;
+        guard.gestures_enabled = next.gestures_enabled;
         guard.epoch = epoch;
     }
     errors
@@ -415,29 +423,49 @@ mod tests {
         assert_eq!(Target::resolve("not-a-thing"), None);
     }
 
+    /// The switch that leaves every button alone is the GESTURE switch. Mouse control used to be a
+    /// second gate; it is not one any more, and this is the counter-example that fails if it comes
+    /// back.
     #[test]
-    fn the_master_switch_is_enough_to_leave_every_button_alone() {
-        let cfg = config(false, vec![row("R", 1, "cmd+t", true)]);
-        let (table, _) = build(&cfg.mouse);
+    fn only_the_gesture_switch_leaves_every_button_alone() {
+        let cfg = config(true, vec![row("R", 1, "cmd+t", true)]);
+        assert!(
+            build(&cfg.mouse).0.claims(1),
+            "mouse control must not disarm"
+        );
+
+        let mut gesture_only = cfg.clone();
+        gesture_only.mouse.enabled = false;
+        assert!(
+            build(&gesture_only.mouse).0.claims(1),
+            "a gesture-only configuration is armed"
+        );
+
+        let mut gestures_off = cfg;
+        gestures_off.mouse.gestures_enabled = false;
+        let (table, _) = build(&gestures_off.mouse);
         assert!(!table.claims(1));
         assert_eq!(table.len(), 0);
     }
 
     #[test]
-    fn the_shipped_defaults_are_live_once_the_switches_are_on() {
+    fn the_shipped_defaults_are_live_once_the_gesture_switch_is_on() {
         // A shipped list of disabled, unbound rows made gestures look dead: the switch could be on
         // and the button still did nothing. The defaults are real rows, refused only while the
-        // master switches are off.
+        // gesture switch is off.
         let rows = MouseSectionDefault::rows();
         assert!(!rows.is_empty());
-        let off = config(false, rows.clone());
+        let mut off = config(true, rows.clone());
+        off.mouse.gestures_enabled = false;
         let (table, _) = build(&off.mouse);
         assert!(
             !table.claims(1),
-            "the master switch still governs every row"
+            "the gesture switch still governs every row"
         );
 
-        let on = config(true, rows);
+        // Off is about the gesture switch, not the mouse module: the defaults are live with mouse
+        // control off, which is what a gesture-only configuration is.
+        let on = config(false, rows);
         let (table, errors) = build(&on.mouse);
         assert!(errors.is_empty(), "{errors:?}");
         assert!(table.claims(1), "the default rows are live once enabled");
@@ -806,15 +834,65 @@ mod tests {
     }
 
     #[test]
-    fn the_epoch_advances_when_the_parent_switch_flips_on_an_empty_table() {
+    fn the_epoch_advances_when_the_gesture_switch_flips_on_an_empty_table() {
+        with_global_snapshot(|| {
+            let mut cfg = config(true, vec![]);
+            publish(&cfg);
+            let before = current_epoch();
+            cfg.mouse.gestures_enabled = false;
+            publish(&cfg);
+            assert!(current_epoch() > before, "the gesture switch revokes");
+        });
+    }
+
+    /// The counter-example to the old gate: mouse control is not part of a gesture's authorization,
+    /// so flipping it must not revoke anything. A gesture in flight keeps running when the user
+    /// turns scrolling off.
+    #[test]
+    fn the_mouse_master_switch_does_not_revoke_a_gesture() {
+        with_global_snapshot(|| {
+            let mut cfg = config(true, vec![row("R", 1, "cmd+t", true)]);
+            publish(&cfg);
+            let before = current_epoch();
+            cfg.mouse.enabled = false;
+            publish(&cfg);
+            assert_eq!(
+                current_epoch(),
+                before,
+                "mouse control is not part of the gesture's authorization"
+            );
+        });
+    }
+
+    /// The same rule on an EMPTY table: with the gesture switch on, flipping mouse control leaves
+    /// the derived snapshot identical, so the epoch -- the token a queued gesture carries -- must
+    /// not move.
+    #[test]
+    fn the_mouse_master_switch_keeps_the_epoch_on_an_empty_table_too() {
         with_global_snapshot(|| {
             let mut cfg = config(true, vec![]);
             publish(&cfg);
             let before = current_epoch();
             cfg.mouse.enabled = false;
             publish(&cfg);
-            assert!(current_epoch() > before, "the parent switch revokes");
+            assert_eq!(current_epoch(), before, "no authorization changed");
         });
+    }
+
+    /// A gesture is its own input path: the table arms on its own switch, with the mouse module off.
+    #[test]
+    fn a_table_builds_while_mouse_control_is_off() {
+        let mut cfg = config(false, vec![row("R", 1, "cmd+t", true)]);
+        let (table, errors) = build(&cfg.mouse);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            table.rows.len(),
+            1,
+            "the gesture switch alone arms the table"
+        );
+        cfg.mouse.gestures_enabled = false;
+        let (table, _) = build(&cfg.mouse);
+        assert!(table.rows.is_empty(), "the gesture switch off disarms it");
     }
 
     #[test]

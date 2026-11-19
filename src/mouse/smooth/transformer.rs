@@ -135,7 +135,12 @@ impl SmoothTransformer {
     }
 
     unsafe fn tick(&mut self) {
-        if crate::mouse::event_tap::mouse_tap_stopping() || !crate::input_monitor::taps_allowed() {
+        // A gesture-only tap keeps the thread alive; the stream it started belongs to the mouse
+        // module and must stop with it, not keep emitting pixels after the switch went off.
+        if crate::mouse::event_tap::mouse_tap_stopping()
+            || !crate::input_monitor::taps_allowed()
+            || !crate::mouse::module_active()
+        {
             self.shutdown();
             return;
         }

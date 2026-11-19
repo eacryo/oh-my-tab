@@ -3644,7 +3644,7 @@ pub(crate) extern "C" fn handle_gesture_record_start(
         // discard it, which reads as a broken recorder rather than as a switched-off feature.
         let armed = CONFIG
             .read()
-            .map(|cfg| cfg.mouse.enabled && cfg.mouse.gestures_enabled)
+            .map(|cfg| crate::mouse::gestures_on_for(&cfg.mouse))
             .unwrap_or(false);
         if !armed {
             notice(

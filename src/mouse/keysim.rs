@@ -68,15 +68,19 @@ fn press_down_for(holder: u32, keycode: u16, flags: u32, desc: &str) {
 /// level. It loops back to the switcher tap, whose flagsChanged handler sees the modifier go
 /// up and fires CmdReleased to commit the switch.
 pub(crate) fn release_up(keycode: u16, flags: u32, desc: &str) {
-    release_up_for(GESTURE_KEY_SLOT, keycode, flags, desc);
+    release_up_for(GESTURE_KEY_SLOT, keycode, flags, desc, false);
 }
 
 /// Release on behalf of \\`holder\\`.
-fn release_up_for(holder: u32, keycode: u16, flags: u32, desc: &str) {
-    // Internally dispatched combos: the switcher commits on release, and nothing is synthesized --
-    // but the modifiers this holder took at press time are still ours to give back. Returning here
-    // used to leave them registered, which surfaced as a modifier stuck down for later input.
-    let dispatched_internally = internal_dispatch(keycode, flags, false);
+///
+/// `cleanup` marks a release the switch-off path queued, not a physical one. Cleanup still gives the
+/// holder's modifiers back -- that is what keeps a modifier from being stuck down -- but it must not
+/// let a mapped switcher chord commit: `internal_dispatch` would post a `CmdReleased` with no session
+/// identity, and the session that mapping opened may be gone while another one is on screen now.
+fn release_up_for(holder: u32, keycode: u16, flags: u32, desc: &str, cleanup: bool) {
+    // `internal_dispatch` has the side effect (it posts CmdReleased for the switcher chord), so a
+    // cleanup release skips it outright and only gives the modifiers back.
+    let dispatched_internally = !cleanup && internal_dispatch(keycode, flags, false);
     release_managed_for(HolderId::Button(holder), flags);
     if dispatched_internally {
         return;
@@ -155,6 +159,8 @@ enum KeyJob {
         flags: u32,
         desc: String,
         holder: u32,
+        /// A switch-off cleanup release: give the modifiers back, commit nothing.
+        cleanup: bool,
     },
     SystemAction(&'static str),
     /// A Dock-backed action asked for by a gesture; the worker re-checks the epoch first.
@@ -195,7 +201,9 @@ fn drain_release_backlog() {
     // would leave the real one registered forever once the queue had been full at release time.
     let releases: Vec<(u32, (u16, u32))> = release_backlog().lock().unwrap().drain().collect();
     for (button, (keycode, flags)) in releases {
-        release_up_for(button, keycode, flags, "queued release");
+        // The backlog only ever holds releases the cleanup path could not enqueue, so none of them
+        // may commit a session.
+        release_up_for(button, keycode, flags, "queued release", true);
     }
 }
 
@@ -214,8 +222,12 @@ fn key_job_sender() -> Option<&'static SyncSender<KeyJob>> {
                                 desc,
                                 holder,
                             } => {
+                                // `module_active` is re-read HERE, on the worker: a press queued
+                                // just before the switch went off would otherwise post a key-down
+                                // whose cleanup release has already been sent, leaving it down.
                                 if !crate::mouse::event_tap::mouse_tap_stopping()
                                     && crate::input_monitor::taps_allowed()
+                                    && crate::mouse::module_active()
                                 {
                                     press_down_for(holder, keycode, flags, &desc);
                                 }
@@ -225,8 +237,9 @@ fn key_job_sender() -> Option<&'static SyncSender<KeyJob>> {
                                 flags,
                                 desc,
                                 holder,
+                                cleanup,
                             } => {
-                                release_up_for(holder, keycode, flags, &desc);
+                                release_up_for(holder, keycode, flags, &desc, cleanup);
                             }
                             KeyJob::GestureChord {
                                 keycode,
@@ -252,6 +265,7 @@ fn key_job_sender() -> Option<&'static SyncSender<KeyJob>> {
                             KeyJob::SystemAction(notification) => {
                                 if !crate::mouse::event_tap::mouse_tap_stopping()
                                     && crate::input_monitor::taps_allowed()
+                                    && crate::mouse::module_active()
                                 {
                                     crate::mouse::system_action::fire(notification);
                                 }
@@ -336,6 +350,7 @@ pub(crate) fn queue_button_mapping(
             flags: active_flags,
             desc: desc.to_owned(),
             holder: button,
+            cleanup: false,
         };
         match sender.try_send(job) {
             Ok(()) => {
@@ -369,6 +384,7 @@ pub(crate) fn release_all_queued() {
                 flags,
                 desc: "tap stopped".into(),
                 holder: button,
+                cleanup: true,
             }) {
                 Ok(()) => {}
                 Err(TrySendError::Full(_)) => {

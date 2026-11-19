@@ -507,12 +507,25 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // must not interleave with another apply (the lane owns both). It resolves the config itself,
         // so the cache invalidation above is what it sees.
         crate::mouse::device::request_pointer_reapply();
-        if old.mouse.enabled != new.mouse.enabled || matches!(source, ConfigChangeSource::Startup) {
-            if crate::mouse::effective_enabled() {
+        // The tap is one HID stream for scrolling, pointer, button mappings AND gestures, so it
+        // lives while either feature is on. Turning mouse control off leaves a gesture-only tap
+        // installed, which is why this compares both switches.
+        if old.mouse.enabled != new.mouse.enabled
+            || old.mouse.gestures_enabled != new.mouse.gestures_enabled
+            || matches!(source, ConfigChangeSource::Startup)
+        {
+            if crate::mouse::tap_wanted() {
                 crate::mouse::start();
             } else if !matches!(source, ConfigChangeSource::Startup) {
                 crate::mouse::stop();
             }
+        }
+        if old.mouse.enabled && !new.mouse.enabled {
+            // The module's own behaviour left while the tap may stay for gestures: give back what a
+            // held button still owns -- synthetic keys and modifiers, a system action's button
+            // state, and the switcher session a mapping opened. `stop()` does this for the whole
+            // tap; here only one feature leaves, so its own releases would never be delivered.
+            crate::mouse::release_holds();
         }
         // Publish the gesture table on every mouse-section reload, not only at start: editing the
         // switch, the list or the exclusion list has to advance the epoch so a gesture in flight is

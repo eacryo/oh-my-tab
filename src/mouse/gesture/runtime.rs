@@ -303,9 +303,16 @@ pub(crate) struct Runtime {
     matched: Option<Row>,
     /// An Esc this module took is still held down: its release must be swallowed too.
     escape_owned: bool,
+    /// The tap generation that took that Esc. A restart means the key-up will not arrive at the tap
+    /// that swallowed the key-down, so the claim expires with its generation.
+    escape_generation: u64,
     /// A button whose Down this module swallowed but whose Up has not arrived, kept after the
     /// module stops or a gesture is invalidated so the tail of a press we took stays ours.
     owned_tail: Option<Button>,
+    /// The event-tap generation the tail was recorded under. A tail outlives a stop on purpose, but
+    /// it must not outlive the TAP: after a restart the next Up belongs to a different press, and
+    /// swallowing it would eat a button mapping's release.
+    tail_generation: u64,
 }
 
 impl Default for Runtime {
@@ -325,7 +332,9 @@ impl Runtime {
             epoch: 0,
             matched: None,
             escape_owned: false,
+            escape_generation: 0,
             owned_tail: None,
+            tail_generation: 0,
         }
     }
 
@@ -386,6 +395,7 @@ impl Runtime {
             number: button,
             device,
         });
+        self.tail_generation = crate::mouse::event_tap::tap_generation();
         self.publish_phase();
         true
     }
@@ -532,11 +542,15 @@ impl Runtime {
         // same press belongs to it, including repeats that arrive after the mouse was released and
         // the engine is back to Idle. Leaking them would hand the application a key-up whose key-down
         // it never saw.
-        if self.escape_owned {
+        if self.escape_owned && self.escape_generation == crate::mouse::event_tap::tap_generation()
+        {
             return true;
         }
+        // A claim from a previous tap cannot be honoured: that tap never sees the key-up.
+        self.escape_owned = false;
         if self.engine.escape() {
             self.escape_owned = true;
+            self.escape_generation = crate::mouse::event_tap::tap_generation();
             self.publish_phase();
             return true;
         }
@@ -550,10 +564,12 @@ impl Runtime {
 
     /// The key-up of an Esc this module took. Only this clears the claim.
     pub(crate) fn release_escape(&mut self) -> bool {
-        if self.escape_owned {
+        if self.escape_owned && self.escape_generation == crate::mouse::event_tap::tap_generation()
+        {
             self.escape_owned = false;
             return true;
         }
+        self.escape_owned = false;
         false
     }
 
@@ -576,7 +592,11 @@ impl Runtime {
     /// A live session never takes this path: its release has to go through the normal decision, or
     /// every gesture would be swallowed before it could execute or replay.
     pub(crate) fn owns_tail(&self, button: u32, device: u64) -> bool {
-        self.is_tail(button, device) && self.engine.phase() == Phase::Idle
+        // Same tap generation, or the tail describes a press from a tap that is gone: its release
+        // can no longer be the Up that arrives now.
+        self.is_tail(button, device)
+            && self.tail_generation == crate::mouse::event_tap::tap_generation()
+            && self.engine.phase() == Phase::Idle
     }
 
     /// Whether the recorded tail is this button's, regardless of whether a live session owns it.

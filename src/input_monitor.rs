@@ -161,7 +161,13 @@ fn start_configured_services() {
         Ok(config) => config.clone(),
         Err(_) => return,
     };
-    if config.mouse.enabled || crate::dev_flags::present("smooth-scroll-force-on") {
+    // The tap serves scrolling, the pointer and the side-button mappings AND mouse gestures. Its
+    // lifecycle therefore asks the predicate that covers both switches: a gesture-only
+    // configuration has to be brought up here too, or granting Accessibility permission would
+    // leave gestures inert until some later config write.
+    if crate::mouse::tap_wanted_for(&config.mouse)
+        || crate::dev_flags::present("smooth-scroll-force-on")
+    {
         crate::mouse::start();
     }
     // One engine serves both groups. Publishing belongs to the main thread (`apply_config_change`

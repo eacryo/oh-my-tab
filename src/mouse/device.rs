@@ -1565,7 +1565,20 @@ unsafe extern "C" fn device_removal_callback(
 pub(crate) unsafe fn start_plug_monitor(runloop: crate::event_tap::CFRunLoopRef) {
     let m = manager_static();
     let mut m = m.lock().unwrap();
+    // Whatever was scheduled (the monitor and the registry's event-system client) was scheduled on
+    // the run loop of the tap that just ended. A new run loop is a new generation: let the next
+    // enumeration schedule the client again on THIS loop instead of trusting the old "already
+    // scheduled" flag, which would leave device matching on a loop that never runs.
+    registry().lock().unwrap().client_scheduled = false;
     if !m.is_null() {
+        // A restarted tap brings a NEW RunLoop. The manager lives for the process (releasing it would
+        // invalidate its callbacks), so re-schedule it on the new loop: plug events left on the
+        // previous, exited thread's run loop are never delivered, and a Bluetooth reconnect would
+        // then not re-apply that device's settings.
+        *mouse_runloop_static().lock().unwrap() = Some(runloop);
+        IOHIDManagerScheduleWithRunLoop(*m, runloop, crate::event_tap::kCFRunLoopDefaultMode);
+        drop(m);
+        submit(LaneRequest::EnsureEnumerated);
         return;
     }
     // Record the mouse thread's runloop for enumerate_locked to schedule the registry client
