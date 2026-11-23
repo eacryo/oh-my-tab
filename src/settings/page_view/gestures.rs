@@ -1014,8 +1014,8 @@ fn target_options() -> Vec<TargetOption> {
         .map(crate::key_bindings::Action::config_id)
         .filter(|id| !GROUPED_GESTURE_TARGETS.contains(id));
     std::iter::once("")
-        .chain(remaining_actions)
         .chain(GROUPED_GESTURE_TARGETS)
+        .chain(remaining_actions)
         .chain(["launchpad", "showdesktop", "appexpose", "none"])
         .map(|id| TargetOption {
             id: id.to_string(),
@@ -1692,13 +1692,13 @@ mod tests {
             "feature.open_clipboard_panel",
         ];
         let mut expected = vec![""];
+        expected.extend(reordered);
         expected.extend(
             crate::key_bindings::ALL
                 .into_iter()
                 .map(crate::key_bindings::Action::config_id)
                 .filter(|id| !reordered.contains(id)),
         );
-        expected.extend(reordered);
         expected.extend(["launchpad", "showdesktop", "appexpose", "none"]);
         let gesture_rows: Vec<_> = view
             .rows
