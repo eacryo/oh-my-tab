@@ -95,6 +95,48 @@ pub(crate) use summon::{
     refresh_for_display_change, refresh_for_summon, refresh_for_theme, refresh_selected_for_summon,
 };
 
+/// The Dock preview's capture epoch. A request enqueued for one panel carries the epoch it was
+/// made under; the worker drops it before the capture call once the panel that asked has been
+/// replaced, hidden or disabled. One process-wide counter is enough because only one Dock preview
+/// panel exists at a time.
+static DOCK_CAPTURE_EPOCH: AtomicU64 = AtomicU64::new(0);
+
+/// The process generation the capture ledger holds for `pid` (see `request_frame`).
+pub(crate) fn pid_generation_now(pid: i32) -> u64 {
+    capture::pid_generation_now(pid)
+}
+
+/// The number of capture jobs currently running, for the preview's in-flight budget.
+pub(crate) fn in_flight_count() -> usize {
+    capture::in_flight_now()
+}
+
+/// Start a new Dock-preview capture epoch, invalidating every capture request enqueued by the
+/// previous panel. Returns the new epoch for the requests this panel makes.
+pub(crate) fn begin_dock_capture_epoch() -> u64 {
+    DOCK_CAPTURE_EPOCH.fetch_add(1, Ordering::AcqRel) + 1
+}
+
+/// The epoch the Dock preview's pending requests are checked against.
+pub(crate) fn current_dock_capture_epoch() -> u64 {
+    DOCK_CAPTURE_EPOCH.load(Ordering::Acquire)
+}
+
+/// Request a window frame for the Dock preview. `capture_allowed()` is checked here so a session
+/// without Screen Recording never queues work it cannot complete.
+pub(crate) fn request_frame(
+    pid: i32,
+    wid: u32,
+    target_px_h: u32,
+    dock_ticket: u64,
+    expected_generation: u64,
+) -> bool {
+    if !capture_allowed() {
+        return false;
+    }
+    capture::request_dock_preview(pid, wid, target_px_h, dock_ticket, expected_generation)
+}
+
 /// Thumbnail cache key: (process id, CG window id). The pair guards against
 /// recycled PIDs serving another window's frame.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
@@ -1312,6 +1354,7 @@ mod tests {
             CapturePriority::NewWindow,
             old_generation,
             false,
+            None
         ));
         assert!(state.request(running_key, 640, CapturePriority::Selected));
         assert!(!state.finish(running));
@@ -1785,7 +1828,7 @@ mod tests {
         let gen = state.pid_generation(key.pid);
 
         // A standalone appearance request: the flag rides out with the job.
-        assert!(state.request_for_generation(key, 512, CapturePriority::Visible, gen, true));
+        assert!(state.request_for_generation(key, 512, CapturePriority::Visible, gen, true, None));
         let job = state.take_next().unwrap();
         assert!(job.appearance_refresh);
         assert!(!state.finish(job));
@@ -1799,7 +1842,7 @@ mod tests {
         // An appearance request merging into a pending ordinary job lights the
         // flag up (OR semantics).
         assert!(state.request(key, 512, CapturePriority::Startup));
-        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, gen, true));
+        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, gen, true, None));
         let job = state.take_next().unwrap();
         assert!(job.appearance_refresh);
         assert_eq!(job.priority, CapturePriority::Visible);
@@ -1825,7 +1868,7 @@ mod tests {
         assert!(state.request(key, 512, CapturePriority::Visible));
         let running = state.take_next().unwrap();
         assert!(!running.appearance_refresh);
-        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, gen, true));
+        assert!(!state.request_for_generation(key, 512, CapturePriority::Visible, gen, true, None));
 
         // Finishing the old job must keep the pending entry for the appearance
         // recapture instead of silently dropping it.
@@ -2078,12 +2121,20 @@ mod tests {
                 100,
                 CapturePriority::Visible,
                 old_generation,
-                false
+                false,
+                None
             ),
             "an old job for the previous incarnation must still be refused"
         );
         assert!(
-            state.request_for_generation(key, 100, CapturePriority::Visible, new_generation, false),
+            state.request_for_generation(
+                key,
+                100,
+                CapturePriority::Visible,
+                new_generation,
+                false,
+                None
+            ),
             "the new incarnation is capturable"
         );
     }
@@ -2104,7 +2155,14 @@ mod tests {
         assert!(state.ledger_pids().is_empty(), "the row is gone");
         // The old job must still be refused: a missing row approves nothing.
         assert!(
-            !state.request_for_generation(key, 100, CapturePriority::Visible, generation, false),
+            !state.request_for_generation(
+                key,
+                100,
+                CapturePriority::Visible,
+                generation,
+                false,
+                None
+            ),
             "an old job must not be re-admitted once its row has been reclaimed"
         );
     }

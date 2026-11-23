@@ -20,6 +20,7 @@ pub(super) enum ControlField {
     LogLevel,
     LaunchAtLogin,
     HideMenuBarIcon,
+    DockPreviewEnabled,
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
@@ -909,6 +910,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::HideMenuBarIcon => {
                     let state: isize = msg_send![u.hide_menu_bar_icon, state];
                     cfg.startup.hide_menu_bar_icon = state == 1;
+                }
+                ControlField::DockPreviewEnabled => {
+                    let state: isize = msg_send![u.dock_preview_enabled, state];
+                    cfg.dock_preview.enabled = state == 1;
                 }
                 ControlField::WindowsEnabled => {
                     let state: isize = msg_send![u.windows_enabled, state];

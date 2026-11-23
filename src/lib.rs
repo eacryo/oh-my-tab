@@ -6,6 +6,7 @@ mod clipboard_highlight;
 mod config;
 mod dev_backdrop;
 mod dev_flags;
+mod dock_preview;
 mod e2e_state;
 mod event_monitor;
 mod event_tap;
@@ -1223,6 +1224,7 @@ mod main_thread_slot_smoke_tests {
     }
 }
 pub(crate) fn orderly_exit_duties() {
+    crate::dock_preview::stop();
     ORDERLY_EXITS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     // The config first: everything below may be recorded in it (the clipboard session state, the
     // pointer values being restored), and a write after the flush would be lost.
@@ -1308,6 +1310,7 @@ fn on_app_terminated_inner(notification: *mut c_void) {
             }
         });
         thumbnail::app_terminated(pid);
+        crate::dock_preview::handle_app_terminated(pid);
     }
 }
 
@@ -1494,6 +1497,7 @@ fn on_screen_parameters_changed_inner(_self: *mut c_void) {
         }
     }
     log_debug!("[display] screen parameters change notification received");
+    crate::dock_preview::handle_screen_params_changed();
     overlay::schedule_display_reconfiguration_refresh();
 }
 
@@ -3524,6 +3528,7 @@ pub fn run() {
             || arg == "--smoke-main-thread-slot"
             || arg == "--smoke-toast"
             || arg == "--smoke-offscreen-capture"
+            || arg == "--smoke-dock-preview"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -3833,6 +3838,52 @@ pub fn run() {
         log_info!("[smoke-toast] the bubble keeps its outline and shadow on every material and sizes to its message");
         crate::smoke_verdict::report("smoke", crate::smoke_verdict::Verdict::Passed { checks: 1 });
         exit_smoke_passed();
+    }
+
+    // Smoke-test entry (--smoke-dock-preview): build the real Dock preview panel for a controlled
+    // window of this process and assert what it owns -- visibility, card count, geometry inside the
+    // screen, renderable cards -- then assert the settings switch's runtime path tears both windows
+    // down. The child that reports the verdict is the child that ran the checks.
+    if crate::dev_flags::present("smoke-dock-preview") {
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        let outcome = crate::dock_preview::smoke_runner();
+        crate::dock_preview::smoke_cleanup();
+        match outcome {
+            Ok(checks) => {
+                log_info!("[smoke-dock-preview] {checks} checks passed");
+                crate::smoke_verdict::report(
+                    "dock_preview_smoke",
+                    crate::smoke_verdict::Verdict::Passed {
+                        checks: checks as usize,
+                    },
+                );
+                // The last bare line is what the parent reads; `exit_smoke_passed` writes a fixed
+                // "PASSED 1", so record the real check count before exiting.
+                crate::smoke_verdict::record_for_child(&format!("PASSED {checks}"));
+                std::process::exit(0);
+            }
+            // An environment limitation is NOT RUN and exits cleanly, so the parent forwards the
+            // child's own verdict instead of classifying the run as a failure.
+            Err(crate::dock_preview::SmokeFailure::NotRun(reason)) => {
+                eprintln!("[smoke-dock-preview] NOT RUN: {reason}");
+                crate::smoke_verdict::report(
+                    "dock_preview_smoke",
+                    crate::smoke_verdict::Verdict::NotRun(reason),
+                );
+                std::process::exit(0);
+            }
+            Err(crate::dock_preview::SmokeFailure::Failed(reason)) => {
+                eprintln!("[smoke-dock-preview] FAILED: {reason}");
+                crate::smoke_verdict::report(
+                    "dock_preview_smoke",
+                    crate::smoke_verdict::Verdict::NotRun(reason),
+                );
+                std::process::exit(1);
+            }
+        }
     }
 
     // Development switch: show the toast once at launch so its material, corner and shadow can be
@@ -4499,6 +4550,13 @@ pub fn run() {
         // unattended). The panel is nonactivating, so this does not steal focus.
         if show_overlay_request() {
             crate::overlay::show_overlay_for_development();
+        }
+        // Development switch: show the Dock preview panel for a bundle id or PID without a real
+        // Dock hover, so an automated check can assert the panel's real views and geometry.
+        if let Some(target) = crate::dev_flags::value("show-dock-preview") {
+            if !target.trim().is_empty() {
+                crate::dock_preview::dev_show(target.trim());
+            }
         }
         // Development switch: seed a visible key panel so an A2 scenario can click its trailing
         // settings gear (the panel otherwise only appears from a real keystroke).

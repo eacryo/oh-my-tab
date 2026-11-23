@@ -4144,6 +4144,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             log_level: std::ptr::null_mut(),
             launch_at_login: std::ptr::null_mut(),
             hide_menu_bar_icon: std::ptr::null_mut(),
+            dock_preview_enabled: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
             gestures_enabled: std::ptr::null_mut(),
@@ -4291,8 +4292,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // frames are assigned: the pages use manual top-anchored coordinates, so post-hoc
         // shrinking would let AppKit move the children a second time. Every height includes
         // SettingsPageHeader's 42pt top padding (18 more than the old 24pt inset).
-        // Includes the Backup section: two described rows plus its header.
-        let general_doc_h = 1320.0;
+        // Includes the Backup section: two described rows plus its header. The trailing Dock
+        // preview card (a header plus one captioned switch) is budgeted on top.
+        let general_doc_h = 1440.0;
         let switcher_doc_h = 1432.0;
         let mouse_doc_h = 1620.0;
         let clipboard_doc_h = 978.0;

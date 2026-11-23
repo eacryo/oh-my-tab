@@ -30,6 +30,8 @@ pub struct Config {
     pub keystroke_display: KeystrokeDisplaySection,
     /// Finder context-menu items, rendered by the Finder Sync app extension.
     pub finder_menu: FinderMenuSection,
+    /// Dock previews: whether hovering an app in the Dock shows thumbnails of its windows.
+    pub dock_preview: DockPreviewSection,
     /// What the windows remembered between launches. Not a preference the user sets: this section is written by
     /// the app when the user moves a window's own state (today: which settings page is on screen).
     pub window_state: WindowStateSection,
@@ -888,6 +890,24 @@ pub(crate) const FINDER_MENU_TERMINALS: [&str; 7] = [
     "net.kovidgoyal.kitty",
     "org.alacritty",
 ];
+/// Dock previews: hovering an app's Dock icon shows thumbnails of all its windows.
+///
+/// A single switch, on by default: it is the feature the Dock side of the app exists for, and it
+/// can still be turned off for a machine that wants no thumbnail work near the Dock. The runtime
+/// consumption belongs to the dock-preview module, not to the settings layer.
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+#[serde(default)]
+pub struct DockPreviewSection {
+    /// Whether hovering an app in the Dock shows its window thumbnails. Default true.
+    pub enabled: bool,
+}
+
+impl Default for DockPreviewSection {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
+}
+
 /// The clipboard history's entry-limit bounds. The config validation, the runtime clamp and the
 /// settings field's accepted range all read these, so the three cannot disagree about what a valid
 /// limit is.
@@ -2229,6 +2249,9 @@ impl Config {
         // finder menu: booleans are always valid; the layout and the two lists are normalized.
         self.finder_menu = other.finder_menu;
         self.normalize_finder_menu();
+
+        // dock preview: a single boolean, always valid, so it is adopted unconditionally.
+        self.dock_preview = other.dock_preview;
 
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
@@ -4159,6 +4182,36 @@ enabled = true
         assert!(
             !merged.layout.show_footer_title,
             "a per-field fallback elsewhere in [layout] must not reset this switch"
+        );
+    }
+
+    /// `dock_preview.enabled` is additive and defaults ON: an old file without the section must
+    /// load with the feature on (not silently disabled), an explicit `false` must survive a round
+    /// trip, and a sibling section's per-field fallback must not reset it.
+    #[test]
+    fn the_dock_preview_switch_defaults_on_round_trips_and_survives_a_sibling_fallback() {
+        // An old file has no `[dock_preview]` section at all.
+        let old: Config = toml::from_str("[layout]\ncard_text_size = 15.0\n").unwrap();
+        assert!(
+            old.dock_preview.enabled,
+            "an absent section must load as enabled"
+        );
+
+        // Explicitly off survives serialization.
+        let mut cfg = Config::default();
+        cfg.dock_preview.enabled = false;
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert!(!back.dock_preview.enabled);
+
+        // A fallback in another section must not discard it: the boolean is adopted unconditionally.
+        let mut other = Config::default();
+        other.dock_preview.enabled = false;
+        let mut merged = Config::default();
+        merged.merge_valid(other, &["appearance.theme: invalid value".to_string()]);
+        assert!(
+            !merged.dock_preview.enabled,
+            "a per-field fallback elsewhere must not reset this switch"
         );
     }
 

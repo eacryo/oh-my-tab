@@ -197,6 +197,30 @@ pub(crate) struct FocusedCollection {
     pub(crate) subscriptions: Option<Vec<(u32, i32)>>,
 }
 
+/// The switcher's window-admission policy for one directed pass. Kept as one value instead of
+/// reading CONFIG at each admission site so a pass cannot mix two configurations, and so a caller
+/// with a different admission rule (the Dock preview) states it instead of inheriting the
+/// switcher's display switches.
+pub(crate) struct DirectedCollectionPolicy {
+    pub(crate) show_minimized: bool,
+    pub(crate) show_hidden_app_windows: bool,
+    pub(crate) show_other_desktops: bool,
+    pub(crate) excluded_apps: Vec<String>,
+}
+
+impl DirectedCollectionPolicy {
+    /// The switcher's policy (one CONFIG read), with `excluded` overriding the exclusion list.
+    fn from_config(excluded: Option<Vec<String>>) -> Self {
+        let cfg = CONFIG.read().unwrap();
+        Self {
+            show_minimized: cfg.windows.show_minimized,
+            show_hidden_app_windows: cfg.windows.show_hidden_app_windows,
+            show_other_desktops: cfg.windows.show_other_desktops,
+            excluded_apps: excluded.unwrap_or_else(|| cfg.windows.excluded_apps.clone()),
+        }
+    }
+}
+
 /// A directed refresh for the SWITCHER: an excluded application answers with no windows, the same
 /// shape as the hidden-app early return.
 pub(crate) fn collect_windows_for_pid(
@@ -204,16 +228,12 @@ pub(crate) fn collect_windows_for_pid(
     pid: i32,
     focused_cgwid: u32,
 ) -> Option<FocusedCollection> {
-    let excluded_apps = CONFIG
-        .read()
-        .map(|cfg| cfg.windows.excluded_apps.clone())
-        .unwrap_or_default();
-    unsafe {
-        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid, &excluded_apps);
-        let _: () = msg_send![pool, drain];
-        result
-    }
+    collect_windows_for_pid_with_policy(
+        mru,
+        pid,
+        focused_cgwid,
+        DirectedCollectionPolicy::from_config(None),
+    )
 }
 
 /// The directed collection behind the thumbnail prewarm. The exclusion list is a switcher display
@@ -225,9 +245,40 @@ pub(crate) fn collect_windows_for_capture(
     pid: i32,
     focused_cgwid: u32,
 ) -> Option<FocusedCollection> {
+    collect_windows_for_pid_with_policy(
+        mru,
+        pid,
+        focused_cgwid,
+        DirectedCollectionPolicy::from_config(Some(Vec::new())),
+    )
+}
+
+/// A directed collection for the Dock preview: every window the app can be asked about, including
+/// minimized windows and Command+H-hidden apps. Other desktops are included too: the cards show a
+/// title (a capture is impossible off the current Space) and activating one follows the Dock's own
+/// Space-switching behaviour. The switcher's exclusion list still applies -- a user who keeps an app
+/// out of the switcher does not want its windows previewed from the Dock either.
+pub(crate) fn collect_windows_for_dock_preview(
+    mru: &mut MruMap,
+    pid: i32,
+    focused_cgwid: u32,
+) -> Option<FocusedCollection> {
+    let mut policy = DirectedCollectionPolicy::from_config(None);
+    policy.show_minimized = true;
+    policy.show_hidden_app_windows = true;
+    policy.show_other_desktops = true;
+    collect_windows_for_pid_with_policy(mru, pid, focused_cgwid, policy)
+}
+
+fn collect_windows_for_pid_with_policy(
+    mru: &mut MruMap,
+    pid: i32,
+    focused_cgwid: u32,
+    policy: DirectedCollectionPolicy,
+) -> Option<FocusedCollection> {
     unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid, &[]);
+        let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid, policy);
         let _: () = msg_send![pool, drain];
         result
     }
@@ -284,17 +335,14 @@ unsafe fn collect_windows_for_pid_inner(
     mru: &mut MruMap,
     pid: i32,
     focused_cgwid: u32,
-    excluded_apps: &[String],
+    policy: DirectedCollectionPolicy,
 ) -> Option<FocusedCollection> {
-    // One policy snapshot for the whole pass, guard released before the system calls.
-    let (show_minimized, show_hidden_app_windows, show_other_desktops) = {
-        let cfg = CONFIG.read().unwrap();
-        (
-            cfg.windows.show_minimized,
-            cfg.windows.show_hidden_app_windows,
-            cfg.windows.show_other_desktops,
-        )
-    };
+    // One policy snapshot for the whole pass, already taken by the caller.
+    let (show_minimized, show_hidden_app_windows, show_other_desktops) = (
+        policy.show_minimized,
+        policy.show_hidden_app_windows,
+        policy.show_other_desktops,
+    );
     // See the full-collection entry: staging is per pass and published only on acceptance.
     crate::thumbnail::begin_scope_pass();
     let _identity_pass = begin_ax_identity_pass();
@@ -317,7 +365,7 @@ unsafe fn collect_windows_for_pid_inner(
     // AFTER the enumeration so the pass can record each refused window's own reason: an accepted
     // directed pass then carries `excluded_app` evidence instead of an unexplained empty answer.
     if crate::window_collector::excluded_app_matches(
-        excluded_apps,
+        &policy.excluded_apps,
         unsafe { crate::app_identity::bundle_id_for_pid(pid) }.as_deref(),
     ) {
         log_debug!("[collect] excluded app refused (directed): pid={}", pid);

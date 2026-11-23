@@ -2711,7 +2711,7 @@ pub(super) unsafe fn action_button_tracking_area_smoke(button: *mut AnyObject) -
     if count != 1 {
         return false;
     }
-    let area: *mut AnyObject = msg_send![areas, objectAtIndex: 0];
+    let area: *mut AnyObject = msg_send![areas, objectAtIndex: 0usize];
     if area.is_null() {
         return false;
     }

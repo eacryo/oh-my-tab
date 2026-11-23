@@ -46,8 +46,8 @@ pub(crate) use space_state_probe::{run as run_space_state_probe, ProbeMode};
 pub(crate) use window_state::{ax_app_hidden_tag, StateSource, WindowStateEvidence};
 // Entry points exposed to the rest of the crate (implemented in the child modules).
 pub(crate) use collect::{
-    collect_windows, collect_windows_for_pid, collect_windows_with_frontmost_bump,
-    switchable_capture_window_for_pid, CollectionPass,
+    collect_windows, collect_windows_for_dock_preview, collect_windows_for_pid,
+    collect_windows_with_frontmost_bump, switchable_capture_window_for_pid, CollectionPass,
 };
 pub(crate) use raise::activate_pid_with_api;
 pub(crate) use raise::{

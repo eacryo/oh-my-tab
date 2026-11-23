@@ -79,6 +79,8 @@ struct ChangeFlags {
     // toggling the icon must not re-register the app with the system, and a login-item change must
     // not restyle the status item.
     menu_bar_icon: bool,
+    // The Dock previews switch: start/stop the observer, hide the panel, refresh the settings row.
+    dock_preview: bool,
     // Any Finder Menu field changed. The extension renders a model the main app pushes, so it has
     // to be broadcast; an open Settings page has to follow in place like any other section.
     finder_menu: bool,
@@ -120,6 +122,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.gestures
         || flags.key_bindings
         || flags.finder_menu
+        || flags.dock_preview
 }
 
 /// The pages the in-place refresh writes when the settings window is open.
@@ -172,6 +175,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         modifier: startup || old.keyboard.modifier != new.keyboard.modifier,
         startup: startup || old.startup.launch_at_login != new.startup.launch_at_login,
         menu_bar_icon: startup || old.startup.hide_menu_bar_icon != new.startup.hide_menu_bar_icon,
+        dock_preview: old.dock_preview.enabled != new.dock_preview.enabled,
         logging: startup || old.logging.level != new.logging.level,
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
@@ -438,6 +442,11 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
     if flags.menu_bar_icon {
         crate::menu::set_status_item_visible(!new.startup.hide_menu_bar_icon);
+    }
+    if flags.dock_preview || matches!(source, ConfigChangeSource::Startup) {
+        // Startup seeds the observer's on/off state from the stored switch; a live change starts or
+        // stops it. Stopping hides the panel and its tooltip before the observer goes away.
+        crate::dock_preview::apply_config_change(new.dock_preview.enabled);
     }
     if flags.logging {
         let level = match new.logging.level.as_str() {

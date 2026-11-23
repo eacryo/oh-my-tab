@@ -1122,6 +1122,13 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             None => "null".to_string(),
         }
     ));
+    // The Dock preview: the panel's own geometry (cards, title/close rectangles, tooltip) and the
+    // Dock's tile list, so a scenario can move the real pointer onto a known tile and then click a
+    // card without deriving any coordinate from the panel rectangle.
+    json.push_str(&format!(
+        "  \"dock_preview\": {},\n",
+        crate::dock_preview::e2e_json()
+    ));
     json.push_str(&format!(
         "  \"clipboard_picker\": {},\n",
         match crate::clipboard::picker_frame_top_left() {

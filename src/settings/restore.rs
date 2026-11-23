@@ -277,13 +277,14 @@ fn restored_config_for_page(old: &Config, page: SettingsPageId) -> Config {
     // Per-page config scope: partitioned by page ownership, strictly limited to this page.
     match page {
         SettingsPageId::General => {
-            // General: appearance + locale + logging. launch_at_login (system-level) is kept;
-            // hide_menu_bar_icon is a plain display preference, so it returns to its default
-            // (visible) with the rest of the page.
+            // General: appearance + locale + logging + the page's own Dock preview switch.
+            // launch_at_login (system-level) is kept; hide_menu_bar_icon is a plain display
+            // preference, so it returns to its default (visible) with the rest of the page.
             cfg.appearance = d.appearance;
             cfg.i18n = d.i18n;
             cfg.logging = d.logging;
             cfg.startup.hide_menu_bar_icon = d.startup.hide_menu_bar_icon;
+            cfg.dock_preview = d.dock_preview;
         }
         SettingsPageId::Switcher => {
             // Switcher page: windows/layout/fonts/keyboard + corner radius (lives on this page).
@@ -383,6 +384,9 @@ mod tests {
         cfg.key_bindings.enabled = true;
         cfg.keystroke_display.max_extent_percent = 80;
         cfg.updates.automatically_check = false;
+        // Opposite of the shipped default (true), so a General restore that forgets the Dock
+        // preview switch is visible: the sentinel value must change back.
+        cfg.dock_preview.enabled = false;
         cfg
     }
 
@@ -398,6 +402,7 @@ mod tests {
                 expected.appearance = d.appearance;
                 expected.i18n = d.i18n;
                 expected.logging = d.logging;
+                expected.dock_preview = d.dock_preview;
             }
             SettingsPageId::Switcher => {
                 expected.windows = d.windows;

@@ -203,6 +203,11 @@ extern "C" {
         refcon: *mut c_void,
     ) -> i32;
     pub(crate) fn AXObserverGetRunLoopSource(observer: AxObserverRef) -> *mut c_void;
+    pub(crate) fn AXObserverRemoveNotification(
+        observer: AxObserverRef,
+        element: *const c_void,
+        notification: *const c_void,
+    ) -> i32;
 }
 
 #[link(name = "CoreGraphics", kind = "framework")]

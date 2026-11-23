@@ -28,6 +28,13 @@ src/
 ├── config.rs                    # Config: the TOML schema, per-field defaults, debounced persistence
 ├── dev_backdrop.rs              # dev-only controlled backdrops for M2 pixel instruments
 ├── dev_flags.rs                 # argv-only development switches (never the environment)
+├── dock_preview/                # Dock hover window previews (see below)
+│   ├── mod.rs                   # public surface, main-thread orchestration, tick timer, e2e
+│   ├── observer.rs              # Dock AX observer thread: selection, list frame, edge, health
+│   ├── panel.rs                 # the preview NSPanel, cards, tooltip panel, capture fill
+│   ├── windows.rs               # directed window collection, identity checks, sorting
+│   ├── layout.rs                # pure card/panel/tooltip/transition geometry
+│   └── decisions.rs             # pure hover/close/tooltip/capture decisions
 ├── e2e_state.rs                 # --e2e-state JSON snapshot of internal state for tier M2
 ├── event_monitor.rs             # switcher shortcut matching (Cmd/Opt/Ctrl+Tab) over event_tap
 ├── event_tap.rs                 # shared CGEventTap leaf: types, FFI, semantic constants, start helper
@@ -166,6 +173,42 @@ lib.rs (run)                                                      wiring + run l
   committed candidates and only a completed full pass clears the invalidation.
 - `space_groups.rs`, `space_swipe.rs`, and `space_transition.rs` own Space bookkeeping: which desktop owns a
   fullscreen Space, how a switch is committed, and how long a Space change is considered settling.
+
+## Dock preview subsystem
+
+Optional (on by default) and independent of the switcher: hovering an application tile in the Dock
+shows that app's windows as thumbnail cards above the Dock. The feature has no keyboard surface and
+never becomes the key or main window, so the app the pointer came from keeps focus.
+
+- `dock_preview/observer.rs` owns every Accessibility call for the Dock on one dedicated run-loop
+  thread: it subscribes to `AXSelectedChildrenChanged` on the Dock's list element, reads the hovered
+  tile (bundle, title, frame) and the list/screen frames, and publishes plain `DockEvent`s. An
+  auto-hidden Dock parks its list outside the screen, so the revealed state and the edge are part of
+  the event; a 500ms re-read covers a missed notification, and a 2s health check rebuilds a
+  subscription the Dock dropped (a Dock restart or UI rebuild invalidates the element silently).
+- `dock_preview/mod.rs` is the only owner of the panel's lifetime on the main thread: it merges the
+  observer's events, runs one 50ms tick (open delay, close grace, pointer zone, collector results),
+  and keeps two generations — the observer session and the per-hover request. Every asynchronous
+  result (collected windows, capture fills, animation completions) is validated against them before
+  it may touch the panel.
+- `dock_preview/windows.rs` collects one app's windows on a worker thread through
+  `window_collector::collect_windows_for_dock_preview` (the switcher's admission policy widened to
+  minimized, hidden and other-desktop windows, still honoring `[windows] excluded_apps`). Each card
+  carries the process identity (start time + identity key) so activation and close re-check that the
+  target is still the app instance that was hovered.
+- `dock_preview/panel.rs` builds one borderless non-activating `NSPanel` (status level, joins all
+  Spaces, never key) with the shared glass backdrop, a flipped card host, and a passive tooltip
+  panel. Cards show a captured frame when the shared thumbnail cache has one, an app-icon placeholder
+  otherwise; the full title is shown only after the pointer rests on a truncated title's own box.
+- `dock_preview/layout.rs` and `dock_preview/decisions.rs` are pure and headless-tested: the card
+  grid, the panel's anchor on each Dock edge, the transition band, the pointer zones, the close and
+  tooltip rules. The Dock preview's captures are bound to a capture epoch
+  (`thumbnail::begin_dock_capture_epoch`), so a request from a replaced or disabled panel never
+  reaches the system capture call.
+- The feature is gated by `[dock_preview] enabled` (default true). Disabling it through the settings
+  switch stops the observer, hides the panel and its tooltip, and is exercised by the
+  `--smoke-dock-preview` M2 runner; `--show-dock-preview=<bundle|pid>` opens the panel without a real
+  hover for review and screenshots.
 
 ## Thumbnails
 

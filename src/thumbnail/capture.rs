@@ -2,6 +2,11 @@
 
 use super::*;
 
+/// How many shared-capture jobs one Dock preview panel may have queued or running. The preview
+/// asks one card at a time and the ledger is the only owner of this number: a preview that asked
+/// after a stale ledger read cannot exceed it, because the check and the insert share one lock.
+const MAX_DOCK_IN_FLIGHT: usize = 4;
+
 /// Capture priority. Higher values run first; equal priorities retain initial FIFO
 /// order. Startup prewarm work can be promoted in place by later selected/visible
 /// requests without duplicating the job.
@@ -196,6 +201,10 @@ pub(super) struct PendingCapture {
     pub(super) geometry_retry_not_before: Option<Instant>,
     pub(super) geometry_retry_attempts: u8,
     pub(super) geometry_retry_started_at: Option<Instant>,
+    /// Dock-preview capture epoch this request belongs to, `None` for every other producer.
+    /// Checked immediately before a capture so a request from a panel that was already replaced
+    /// (or whose feature was turned off) never reaches the system capture call.
+    pub(super) dock_ticket: Option<u64>,
     focused_target_revision: Option<u64>,
     /// Appearance (light/dark) transition recapture: blank frames MAY overwrite the
     /// cached frame -- a stale-appearance frame clashes with every other card worse
@@ -220,6 +229,7 @@ pub(super) struct CaptureJob {
     pub(super) appearance_refresh: bool,
     pub(super) focused_target_revision: Option<u64>,
     pub(super) blank_retry: bool,
+    pub(super) dock_ticket: Option<u64>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -331,7 +341,7 @@ impl CaptureState {
         priority: CapturePriority,
     ) -> bool {
         let pid_generation = self.pid_generation(key.pid);
-        self.request_for_generation(key, target_px_h, priority, pid_generation, false)
+        self.request_for_generation(key, target_px_h, priority, pid_generation, false, None)
     }
 
     pub(super) fn request_for_generation(
@@ -341,6 +351,7 @@ impl CaptureState {
         priority: CapturePriority,
         pid_generation: u64,
         appearance_refresh: bool,
+        dock_ticket: Option<u64>,
     ) -> bool {
         if !self.job_is_current(key.pid, pid_generation) {
             return false;
@@ -365,6 +376,7 @@ impl CaptureState {
                     geometry_retry_not_before: None,
                     geometry_retry_attempts: 0,
                     geometry_retry_started_at: None,
+                    dock_ticket,
                     focused_target_revision: None,
                     appearance_refresh,
                     blank_retry: false,
@@ -376,6 +388,15 @@ impl CaptureState {
                 pending.target_px_h = pending.target_px_h.max(target_px_h);
                 pending.priority = pending.priority.max(priority);
                 pending.appearance_refresh |= appearance_refresh;
+                // A merged Dock-preview request moves to the newest epoch of that producer. A
+                // request from another producer clears the Dock ticket instead of inheriting it:
+                // the shared job must never be dropped because a preview that queued it first went
+                // away, or the switcher's own frame would be lost with it.
+                match (dock_ticket, pending.dock_ticket) {
+                    (Some(ticket), Some(_)) => pending.dock_ticket = Some(ticket),
+                    (Some(_), None) => {}
+                    (None, _) => pending.dock_ticket = None,
+                }
                 if priority == CapturePriority::Selected && pending.activation_at.take().is_some() {
                     pending.freshness_sequence = freshness_sequence;
                 }
@@ -408,6 +429,7 @@ impl CaptureState {
             CapturePriority::Activation,
             pid_generation,
             false,
+            None,
         );
         if let Some(pending) = self.desired.get_mut(&key) {
             // Duplicate scheduling of the SAME activation token (the 808 path and
@@ -480,6 +502,7 @@ impl CaptureState {
             appearance_refresh: pending.appearance_refresh,
             focused_target_revision: pending.focused_target_revision,
             blank_retry: pending.blank_retry,
+            dock_ticket: pending.dock_ticket,
         })
     }
 
@@ -559,6 +582,33 @@ impl CaptureState {
         })
     }
 
+    /// The final gate before a job reaches the system capture call. A Dock job's ticket may have
+    /// been replaced by a newer preview epoch (both then stale) or cleared by a normal producer
+    /// merging into it; the ledger, not the job's copy, decides.
+    pub(super) fn dock_job_may_capture(&mut self, key: ThumbKey, ticket: Option<u64>) -> bool {
+        let Some(ticket) = ticket else {
+            return true;
+        };
+        match self
+            .desired
+            .get(&key)
+            .and_then(|pending| pending.dock_ticket)
+        {
+            // A normal producer merged: the frame is still owed to it.
+            None => true,
+            Some(ledger_ticket) => {
+                let current = crate::thumbnail::current_dock_capture_epoch();
+                if ledger_ticket == current {
+                    true
+                } else {
+                    let _ = ticket;
+                    self.desired.remove(&key);
+                    false
+                }
+            }
+        }
+    }
+
     pub(super) fn finish(&mut self, job: CaptureJob) -> bool {
         let Some(pending) = self.desired.get_mut(&job.key) else {
             return false;
@@ -569,6 +619,10 @@ impl CaptureState {
         if pending.target_px_h > job.target_px_h
             || pending.priority > job.priority
             || pending.freshness_sequence > job.freshness_sequence
+            // The job ran for the Dock preview (or a Dock ticket merged away); if the ledger's
+            // ticket no longer matches the job's copy, another producer's request has merged and
+            // must be kept for the worker instead of being finished off by this job.
+            || pending.dock_ticket != job.dock_ticket
             // An appearance refresh merging into a running job changes none of the
             // three fields above, so it needs its own check -- otherwise finish()
             // silently swallows the theme recapture and the window keeps a
@@ -674,6 +728,15 @@ impl CaptureState {
     /// Doing it here rather than at each call site matters: this is the entry point every
     /// ordinary enqueue, activation refresh, prewarm and AX notification uses, and a single
     /// forgotten caller is how a pid's whole lifecycle ends up never reclaiming anything.
+    /// The number of jobs the ledger currently considers in flight. The Dock preview budgets its
+    /// own requests against the real number instead of guessing from its card timers.
+    pub(super) fn in_flight(&self) -> usize {
+        self.desired
+            .values()
+            .filter(|pending| pending.running)
+            .count()
+    }
+
     pub(super) fn pid_generation(&mut self, pid: i32) -> u64 {
         let (generation, grew) = self.pid_generation_reporting_growth(pid);
         if grew {
@@ -758,6 +821,17 @@ impl CaptureState {
 
 pub(super) static CAPTURE_STATE: LazyLock<Mutex<CaptureState>> =
     LazyLock::new(|| Mutex::new(CaptureState::default()));
+
+/// The process generation the ledger holds for `pid` right now. A collector records it with the
+/// window list, so a preview capture is bound to the process instance that was actually collected.
+pub(super) fn pid_generation_now(pid: i32) -> u64 {
+    CAPTURE_STATE.lock().unwrap().pid_generation(pid)
+}
+
+/// How many capture jobs the ledger currently has running, for the Dock preview's in-flight budget.
+pub(super) fn in_flight_now() -> usize {
+    CAPTURE_STATE.lock().unwrap().in_flight()
+}
 static JOB_TX: OnceLock<flume::Sender<()>> = OnceLock::new();
 static THUMB_ENQUEUED: AtomicU64 = AtomicU64::new(0);
 static THUMB_INTERACTION_DEFERRED: AtomicU64 = AtomicU64::new(0);
@@ -1822,6 +1896,58 @@ pub(super) fn enqueue_blank_retry_job(
     })
 }
 
+/// A capture request owned by the Dock preview: it is dropped before the capture call when the
+/// panel that asked for it is no longer the current one (`super::current_dock_capture_epoch`).
+pub(super) fn request_dock_preview(
+    pid: i32,
+    wid: u32,
+    target_px_h: u32,
+    dock_ticket: u64,
+    expected_generation: u64,
+) -> bool {
+    let key = ThumbKey { pid, wid };
+    let tx = ensure_capture_worker();
+    let accepted = {
+        let mut state = CAPTURE_STATE.lock().unwrap();
+        // One lock covers the identity check, the budget and the insert: a request from a process
+        // instance that has already been replaced, or one that would exceed the preview's share of
+        // the worker, is rejected here rather than after it has consumed a slot.
+        if state.pid_generation(pid) != expected_generation {
+            return false;
+        }
+        let already_mine = state
+            .desired
+            .get(&key)
+            .is_some_and(|pending| pending.dock_ticket == Some(dock_ticket));
+        let dock_jobs = state
+            .desired
+            .values()
+            .filter(|pending| pending.dock_ticket.is_some())
+            .count();
+        if !already_mine && dock_jobs >= MAX_DOCK_IN_FLIGHT {
+            return false;
+        }
+        state.request_for_generation(
+            key,
+            target_px_h,
+            CapturePriority::Visible,
+            expected_generation,
+            false,
+            Some(dock_ticket),
+        )
+    };
+    if !accepted {
+        return false;
+    }
+    THUMB_ENQUEUED.fetch_add(1, Ordering::Relaxed);
+    if matches!(tx.try_send(()), Err(flume::TrySendError::Disconnected(_))) {
+        CAPTURE_STATE.lock().unwrap().desired.remove(&key);
+        return false;
+    }
+    crate::thumbnail::pregen::reclaim_if_growth_pending();
+    true
+}
+
 fn enqueue_job_inner(
     pid: i32,
     wid: u32,
@@ -1845,6 +1971,7 @@ fn enqueue_job_inner(
             priority,
             generation,
             appearance_refresh,
+            None,
         );
         if let Some(target_revision) = focused_target_revision {
             state.set_focused_target_revision(key, target_revision);
@@ -2061,6 +2188,30 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         );
         return CaptureJobResult::Finished;
     }
+    // The Dock preview's request is bound to the panel that asked for it. A request from a panel
+    // that has since been replaced, hidden or disabled must not reach the capture call: that call
+    // is what raises the system's screen-recording indicator.
+    if let Some(ticket) = job.dock_ticket {
+        if ticket != super::current_dock_capture_epoch() {
+            // The job was taken from the queue with the Dock ticket still on it. A normal request
+            // may have merged since (which clears the ledger's ticket): the capture is still owed
+            // to that producer, so only a ledger that still carries this exact ticket is dropped.
+            let mut state = CAPTURE_STATE.lock().unwrap();
+            let ledger_ticket = state
+                .desired
+                .get(&key)
+                .and_then(|pending| pending.dock_ticket);
+            if ledger_ticket == Some(ticket) {
+                state.desired.remove(&key);
+                log_debug!(
+                    "[thumb] dock-preview job dropped after panel change pid={} wid={}",
+                    key.pid,
+                    key.wid
+                );
+                return CaptureJobResult::Finished;
+            }
+        }
+    }
     if job.priority == CapturePriority::FocusedPrewarm
         && crate::performance::switcher_interaction_active()
     {
@@ -2154,6 +2305,20 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
     // time rather than taken from the (possibly stale) collection pass. None keeps the incumbent
     // private path: a window the WindowServer will not describe is not treated as off screen.
     let window_bounds = crate::window_collector::window_public_bounds(key.wid);
+    // Last checkpoint: the preview may have been hidden or replaced while the probes above ran,
+    // and the capture call is what raises the system's recording indicator.
+    if !CAPTURE_STATE
+        .lock()
+        .unwrap()
+        .dock_job_may_capture(key, job.dock_ticket)
+    {
+        log_debug!(
+            "[thumb] dock-preview job dropped at the capture call pid={} wid={}",
+            key.pid,
+            key.wid
+        );
+        return CaptureJobResult::Finished;
+    }
     let Some(captured) = (unsafe { capture_window(key.wid, job.target_px_h, window_bounds) })
     else {
         record_thumb_capture_failed();
@@ -2676,4 +2841,149 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
     let out = CGBitmapContextCreateImage(ctx);
     CFRelease(ctx);
     out
+}
+
+#[cfg(test)]
+mod dock_ticket_tests {
+    use super::*;
+
+    /// How many shared-capture jobs one Dock preview panel may have queued or running. The preview
+    /// asks one card at a time and the ledger is the only owner of this number: a preview that asked
+    /// after a stale ledger read cannot exceed it, because the check and the insert share one lock.
+    const MAX_DOCK_IN_FLIGHT: usize = 4;
+
+    /// A shared capture job must not inherit a Dock-preview lifetime from a producer that is no
+    /// longer the one asking: the worker drops jobs whose Dock epoch is stale, which would take an
+    /// unrelated producer's frame with it.
+    #[test]
+    fn a_normal_request_that_merges_into_a_dock_job_clears_the_dock_ticket() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 4242, wid: 7 };
+        let generation = state.pid_generation(key.pid);
+        assert!(state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            Some(11),
+        ));
+        let _merged = state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            None,
+        );
+        let pending = state.desired.get(&key).expect("one pending job");
+        assert_eq!(
+            pending.dock_ticket, None,
+            "a normal requester must not inherit the Dock preview's epoch"
+        );
+    }
+
+    #[test]
+    fn a_job_taken_before_a_normal_request_merged_still_runs_for_it() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 4245, wid: 10 };
+        let generation = state.pid_generation(key.pid);
+        let ticket = crate::thumbnail::begin_dock_capture_epoch();
+        let _ = state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            Some(ticket),
+        );
+        // The normal producer merges after the worker took the job: the ledger's ticket is gone.
+        let _ = state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            None,
+        );
+        assert!(state.dock_job_may_capture(key, Some(ticket)));
+    }
+
+    #[test]
+    fn a_job_whose_epoch_was_replaced_twice_is_dropped() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 4246, wid: 11 };
+        let generation = state.pid_generation(key.pid);
+        let first = crate::thumbnail::begin_dock_capture_epoch();
+        let _ = state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            Some(first),
+        );
+        let second = crate::thumbnail::begin_dock_capture_epoch();
+        let _ = state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            Some(second),
+        );
+        // A newer preview replaced the ticket and that newer preview was then replaced as well.
+        let _ = crate::thumbnail::begin_dock_capture_epoch();
+        assert!(!state.dock_job_may_capture(key, Some(first)));
+    }
+
+    #[test]
+    fn a_second_dock_request_moves_the_job_to_the_newer_epoch() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 4243, wid: 8 };
+        let generation = state.pid_generation(key.pid);
+        assert!(state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            Some(11),
+        ));
+        let _merged = state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            Some(12),
+        );
+        let pending = state.desired.get(&key).expect("one pending job");
+        assert_eq!(pending.dock_ticket, Some(12));
+    }
+
+    #[test]
+    fn a_dock_request_never_takes_over_a_normal_job() {
+        let mut state = CaptureState::default();
+        let key = ThumbKey { pid: 4244, wid: 9 };
+        let generation = state.pid_generation(key.pid);
+        assert!(state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            None,
+        ));
+        let _merged = state.request_for_generation(
+            key,
+            120,
+            CapturePriority::Visible,
+            generation,
+            false,
+            Some(11),
+        );
+        let pending = state.desired.get(&key).expect("one pending job");
+        assert_eq!(pending.dock_ticket, None);
+    }
 }
