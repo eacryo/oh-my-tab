@@ -12,8 +12,11 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
 
 use crate::ffi::{build_class, make_nsstring, nsstring_to_rust, release_obj, StaticClass};
+use crate::i18n::{t, tf};
 use crate::log_info;
-use finder_protocol::{decode, encode, AppToExt, ExtToApp};
+use finder_protocol::{
+    decode, encode, AppToExt, ClickRefusal, ExtToApp, MenuAction, PromisedSelection,
+};
 
 /// Identity of this app process and the menu model it is publishing.
 struct Host {
@@ -73,13 +76,23 @@ pub(crate) fn shutdown() {
 }
 
 /// Publish the current model (or an empty one when the feature is off).
+///
+/// A broadcast is addressed to the current protocol. An extension process left over from before an
+/// update speaks v2 and drops it; its own next `Sync` is answered with the v2 model instead, so its
+/// menu keeps working until Finder replaces it.
 pub(crate) fn broadcast_model() {
     let Some(host) = host() else {
         return;
     };
     let version = host.model_version.fetch_add(1, Ordering::SeqCst) + 1;
     let config = crate::config::CONFIG.read().unwrap().clone();
-    let model = crate::finder_menu::model::build(&config, &host.bundle_id, &host.instance, version);
+    let model = crate::finder_menu::model::build(
+        &config,
+        &host.bundle_id,
+        &host.instance,
+        version,
+        finder_protocol::PROTOCOL_VERSION,
+    );
     post(
         &host.bundle_id,
         &AppToExt::State {
@@ -253,9 +266,13 @@ fn handle_message(json: &str) {
             host_instance,
             model_version,
         } => {
-            if protocol_version != finder_protocol::PROTOCOL_VERSION
-                || host_bundle_id != host.bundle_id
-            {
+            // A v2 extension is the process an update left behind; it is answered in its own
+            // shapes so its menu keeps working until Finder replaces it. Anything else is a
+            // stranger and is dropped exactly as before.
+            let Some(peer_protocol) = finder_protocol::app_peer_protocol(protocol_version) else {
+                return;
+            };
+            if host_bundle_id != host.bundle_id {
                 return;
             }
             let current = host.model_version.load(Ordering::SeqCst);
@@ -267,12 +284,13 @@ fn handle_message(json: &str) {
                         &host.bundle_id,
                         &host.instance,
                         current,
+                        peer_protocol,
                     )
                 });
             post(
                 &host.bundle_id,
                 &AppToExt::State {
-                    protocol_version: finder_protocol::PROTOCOL_VERSION,
+                    protocol_version: peer_protocol,
                     host_bundle_id: host.bundle_id.clone(),
                     host_instance: host.instance.clone(),
                     model,
@@ -294,20 +312,39 @@ fn handle_message(json: &str) {
                 paths.len(),
                 host_instance == host.instance
             );
-            if protocol_version != finder_protocol::PROTOCOL_VERSION
-                || host_bundle_id != host.bundle_id
-            {
+            // A v2 extension can only send the two single-selection actions; the shape check below
+            // is what stops a v3 action from being acted on with a v2 banner.
+            if finder_protocol::app_peer_protocol(protocol_version).is_none() {
                 log_info!(
-                    "[finder-menu] dropped a click: protocol {} vs {} / host {host_bundle_id}",
-                    protocol_version,
+                    "[finder-menu] dropped a click: protocol {protocol_version} vs {}",
                     finder_protocol::PROTOCOL_VERSION
                 );
+                return;
+            }
+            if host_bundle_id != host.bundle_id {
+                log_info!("[finder-menu] dropped a click from another host channel");
                 return;
             }
             if host_instance != host.instance {
                 // A menu built by an earlier app process asked for this; its model may not
                 // describe the current config, so the click is dropped.
                 log_info!("[finder-menu] dropped a click from a previous app instance");
+                return;
+            }
+            // The item promised a shape. A menu can outlive a selection change, and a distributed
+            // notification can name any action, so a click that no longer matches its item is
+            // refused instead of doing something the label did not promise.
+            if !action_enabled_now(&action) {
+                log_info!("[finder-menu] dropped a click for an action that is now disabled");
+                return;
+            }
+            if !click_matches_promise(&action, paths.len(), protocol_version) {
+                log_info!(
+                    "[finder-menu] dropped a click that no longer matches its item ({} path(s), promised {:?})",
+                    paths.len(),
+                    action.promised_selection()
+                );
+                crate::ui::toast::show_refused(&t("finder_menu.selection_changed"));
                 return;
             }
             post(
@@ -317,6 +354,39 @@ fn handle_message(json: &str) {
                 },
             );
             crate::finder_menu::actions::execute(action, paths, trigger.context());
+        }
+        ExtToApp::ClickRefused {
+            protocol_version,
+            host_bundle_id,
+            host_instance,
+            action,
+            count,
+            reason,
+        } => {
+            if protocol_version != finder_protocol::PROTOCOL_VERSION
+                || host_bundle_id != host.bundle_id
+                || host_instance != host.instance
+            {
+                log_info!("[finder-menu] dropped a refusal from another instance or protocol");
+                return;
+            }
+            log_info!("[finder-menu] click refused: {reason:?} for {action:?} ({count} item(s))");
+            // A refusal is a status message about an action the user can no longer take; with the
+            // feature or that action switched off it must be as quiet as a click would be.
+            if !action_enabled_now(&action) {
+                log_info!("[finder-menu] dropped a refusal for an action that is now disabled");
+                return;
+            }
+            // The click never arrived, so this is the only feedback the user gets. It is worth a
+            // message: a menu that silently did nothing is indistinguishable from a broken one.
+            let message = match reason {
+                ClickRefusal::TooLarge => tf(
+                    "finder_menu.selection_too_large",
+                    &[("count", &count.to_string())],
+                ),
+                ClickRefusal::IncompletePaths => t("finder_menu.selection_incomplete"),
+            };
+            crate::ui::toast::show_refused(&message);
         }
     }
 }
@@ -334,9 +404,36 @@ fn sync_needs_model(
     our_instance != their_instance || their_version < our_version
 }
 
+/// Whether the live config still enables the action a message names, so a stale menu cannot make
+/// the app speak about something the user has turned off.
+fn action_enabled_now(action: &MenuAction) -> bool {
+    let config = crate::config::CONFIG.read().unwrap();
+    crate::finder_menu::actions::action_enabled(&config, action)
+}
+
+/// Whether a click still has the shape its menu item promised.
+///
+/// The action, not the item's target, is what the app has: a v2 click carries no target at all, and
+/// a spoofed click can name any action. `Any` actions are unconstrained. Pure, so the rule is
+/// asserted without a notification.
+fn click_matches_promise(action: &MenuAction, paths: usize, protocol: u32) -> bool {
+    // A v2 menu's "Copy Path" item was built for any selection and always copied the first path.
+    // Within the compatibility window that item is still in the menu for several selected items, so
+    // applying v3's "exactly one" rule would take a working action away from the user.
+    if protocol < 3 && matches!(action, MenuAction::CopyPath) {
+        return paths >= 1;
+    }
+    match action.promised_selection() {
+        PromisedSelection::Any => true,
+        PromisedSelection::One => paths == 1,
+        PromisedSelection::Many => paths >= 2,
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::sync_needs_model;
+    use super::{click_matches_promise, sync_needs_model};
+    use finder_protocol::{MenuAction, PathLayout};
 
     #[test]
     fn a_restarted_app_resends_even_to_a_higher_cached_version() {
@@ -353,5 +450,71 @@ mod tests {
     #[test]
     fn an_older_version_within_the_same_instance_is_resent() {
         assert!(sync_needs_model("same", "same", 1, 3));
+    }
+
+    /// The single item must never act on several paths, and the multiple items must never act on
+    /// one: a menu that outlived a selection change would otherwise do something its label did not
+    /// say. The unconstrained actions keep working on any count.
+    #[test]
+    fn a_click_is_accepted_only_with_the_shape_its_item_promised() {
+        let single = [MenuAction::CopyPath, MenuAction::CopySha256];
+        for action in &single {
+            for paths in [0, 1, 2, 50] {
+                assert_eq!(
+                    click_matches_promise(action, paths, 3),
+                    paths == 1,
+                    "{action:?} with {paths} path(s)"
+                );
+            }
+        }
+        let many = [
+            MenuAction::CopyPaths {
+                layout: PathLayout::Newline,
+            },
+            MenuAction::CopyPaths {
+                layout: PathLayout::SingleLine,
+            },
+            MenuAction::CopySha256Many { with_name: false },
+            MenuAction::CopySha256Many { with_name: true },
+        ];
+        for action in &many {
+            for paths in [0, 1, 2, 50] {
+                assert_eq!(
+                    click_matches_promise(action, paths, 3),
+                    paths >= 2,
+                    "{action:?} with {paths} path(s)"
+                );
+            }
+        }
+        let any = [
+            MenuAction::NewFile {
+                extension: "md".into(),
+            },
+            MenuAction::OpenTerminal {
+                bundle_id: "com.apple.Terminal".into(),
+            },
+        ];
+        for action in &any {
+            for paths in [0, 1, 2, 50] {
+                assert!(
+                    click_matches_promise(action, paths, 3),
+                    "{action:?} {paths}"
+                );
+            }
+        }
+    }
+
+    /// The compatibility window must keep the v2 action working: its menu shows "Copy Path" for a
+    /// multi-selection too, and v2 copied the first path. v3's stricter rule would make that click
+    /// do nothing.
+    #[test]
+    fn a_v2_copy_path_keeps_its_first_path_behavior() {
+        assert!(click_matches_promise(&MenuAction::CopyPath, 2, 2));
+        assert!(click_matches_promise(&MenuAction::CopyPath, 50, 2));
+        assert!(!click_matches_promise(&MenuAction::CopyPath, 0, 2));
+        assert!(!click_matches_promise(&MenuAction::CopyPath, 2, 3));
+        // v2's digest item was already single-only, and stays that way.
+        assert!(!click_matches_promise(&MenuAction::CopySha256, 2, 2));
+        assert!(click_matches_promise(&MenuAction::CopySha256, 1, 2));
     }
 }

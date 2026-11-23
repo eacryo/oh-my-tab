@@ -10,7 +10,26 @@ use serde::{Deserialize, Serialize};
 
 /// Bumped whenever a wire shape changes incompatibly. Both sides refuse a message from another
 /// protocol version.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// v3 added the multi-selection targets, the two "many paths / many digests" actions and the
+/// `ClickRefused` message. The app still answers a v2 extension (see `app_peer_protocol`): the appex
+/// is replaced with the bundle, but the process Finder started before the update keeps running and
+/// would otherwise sit on a model it can no longer decode, leaving an empty menu until Finder
+/// restarts it. A v2 peer therefore receives today's two single-selection items until it is replaced.
+pub const PROTOCOL_VERSION: u32 = 3;
+
+/// The protocol versions the app can answer. Everything else is dropped before parsing, exactly as
+/// before: this is a compatibility window for the one appex process an update leaves behind, not a
+/// general promise to speak older dialects.
+pub const MIN_APP_PROTOCOL: u32 = 2;
+
+/// The version to use when answering a peer that announced `announced`. `None` means the peer is
+/// outside the window and no message is sent. Pure, so the window is asserted instead of inferred.
+pub fn app_peer_protocol(announced: u32) -> Option<u32> {
+    (MIN_APP_PROTOCOL..=PROTOCOL_VERSION)
+        .contains(&announced)
+        .then_some(announced)
+}
 
 /// Cap on a single notification payload. Menu models are small; anything larger is a bug or a
 /// spoof attempt and is rejected before parsing.
@@ -39,6 +58,12 @@ pub enum MenuTarget {
     /// Applies to whatever the other rules already allow.
     #[default]
     Any,
+    /// Shown only when exactly one item is selected, whatever it is. Used by "Copy Path": the path
+    /// of a folder is as useful as the path of a file.
+    Single,
+    /// Shown only when two or more items are selected. Used by the four multi-selection items;
+    /// whether any of the selected items can be hashed is decided at click time, not here.
+    Multiple,
     /// Shown only when exactly one regular file is selected. A folder, a special file (a FIFO,
     /// a device), more than one item, or a selection the extension could not inspect all hide it.
     SingleRegularFile,
@@ -50,27 +75,80 @@ pub enum MenuTarget {
 /// every `SingleRegularFile` item is hidden for any other count.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Selection {
-    /// Exactly one item is selected.
-    pub single: bool,
-    /// That item is a regular file. False when it is not, or when it could not be inspected.
+    /// How many items the selection holds. Zero means nothing is selected.
+    pub count: usize,
+    /// That one item is a regular file. False when it is not, when it could not be inspected, or
+    /// when more than one item is selected.
     pub regular_file: bool,
 }
 
 impl Selection {
     pub const NONE: Self = Self {
-        single: false,
+        count: 0,
         regular_file: false,
     };
 }
 
+/// How the text of several paths is laid out on the clipboard.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PathLayout {
+    /// One path per line.
+    Newline,
+    /// One line, each path shell-quoted where it needs to be.
+    SingleLine,
+}
+
 /// What clicking a leaf does.
+///
+/// The singular and plural variants are separate on purpose: a menu item promised a shape, and the
+/// app re-checks the click against it. `CopyPath`/`CopySha256` are also what a v2 extension still
+/// sends from a menu built before the update, so they stay executable.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum MenuAction {
-    NewFile { extension: String },
-    OpenTerminal { bundle_id: String },
+    NewFile {
+        extension: String,
+    },
+    OpenTerminal {
+        bundle_id: String,
+    },
+    /// One path, exactly as clicking it copied before.
     CopyPath,
+    /// Two or more paths.
+    CopyPaths {
+        layout: PathLayout,
+    },
+    /// One digest.
     CopySha256,
+    /// Two or more digests; `with_name` adds `digest  path` lines instead of bare digests.
+    CopySha256Many {
+        with_name: bool,
+    },
+}
+
+/// The selection shape an action promised when its item was built.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PromisedSelection {
+    /// No shape: the action works on whatever it is given (new file, open terminal).
+    Any,
+    /// Exactly one path.
+    One,
+    /// Two or more paths.
+    Many,
+}
+
+impl MenuAction {
+    /// The selection shape this action promises, for the app's click-time re-validation. A menu can
+    /// stay open while the selection changes, and a distributed notification can name any action,
+    /// so the action's own promise is what the click must still satisfy.
+    pub fn promised_selection(&self) -> PromisedSelection {
+        match self {
+            Self::CopyPath | Self::CopySha256 => PromisedSelection::One,
+            Self::CopyPaths { .. } | Self::CopySha256Many { .. } => PromisedSelection::Many,
+            Self::NewFile { .. } | Self::OpenTerminal { .. } => PromisedSelection::Any,
+        }
+    }
 }
 
 /// One rendered menu element. The app builds the tree; the extension only walks it.
@@ -154,7 +232,9 @@ impl MenuNode {
         match self {
             Self::Item { targets, .. } => match targets {
                 MenuTarget::Any => true,
-                MenuTarget::SingleRegularFile => selection.single && selection.regular_file,
+                MenuTarget::Single => selection.count == 1,
+                MenuTarget::Multiple => selection.count >= 2,
+                MenuTarget::SingleRegularFile => selection.count == 1 && selection.regular_file,
             },
             _ => true,
         }
@@ -264,6 +344,18 @@ impl Trigger {
     }
 }
 
+/// Why the extension could not send the click it was asked to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClickRefusal {
+    /// The encoded click is larger than `MAX_MESSAGE_BYTES`. It is refused rather than truncated:
+    /// copying a subset of the selection would look like a success.
+    TooLarge,
+    /// The selection had items, but at least one of them could not be turned into a path, so the
+    /// click would have named fewer items than the user selected.
+    IncompletePaths,
+}
+
 /// Extension -> app.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -285,6 +377,17 @@ pub enum ExtToApp {
         /// The selected items, or the folder for a background click. Paths are absolute.
         paths: Vec<String>,
         trigger: Trigger,
+    },
+    /// A click the extension could not deliver. It carries the same identity as a click, so the
+    /// app can drop one from an earlier process, and only says why: it never names paths.
+    ClickRefused {
+        protocol_version: u32,
+        host_bundle_id: String,
+        host_instance: String,
+        action: MenuAction,
+        /// How many items were selected when the click was attempted.
+        count: usize,
+        reason: ClickRefusal,
     },
 }
 
@@ -325,7 +428,7 @@ mod tests {
 
     /// The "Copy SHA-256" item is offered only for one regular file. Every other selection shape
     /// must hide it, because the app reads whatever the menu names and a folder, a FIFO or a
-    /// multi-item selection has no single digest to copy.
+    /// multi-item selection has no single digest to copy. (Several files are the *other* item.)
     #[test]
     fn a_single_regular_file_item_needs_exactly_that_selection() {
         let item = MenuNode::item_targeting(
@@ -338,7 +441,7 @@ mod tests {
         let cases = [
             (
                 Selection {
-                    single: true,
+                    count: 1,
                     regular_file: true,
                 },
                 true,
@@ -346,7 +449,7 @@ mod tests {
             ),
             (
                 Selection {
-                    single: true,
+                    count: 1,
                     regular_file: false,
                 },
                 false,
@@ -354,7 +457,7 @@ mod tests {
             ),
             (
                 Selection {
-                    single: false,
+                    count: 2,
                     regular_file: false,
                 },
                 false,
@@ -372,6 +475,79 @@ mod tests {
         }
     }
 
+    /// The single and multiple items are mutually exclusive: exactly one of them is offered for any
+    /// selection, so the menu never shows both "Copy Path" and "Copy Paths".
+    #[test]
+    fn single_and_multiple_targets_are_mutually_exclusive() {
+        let single = MenuNode::item_targeting(
+            "Copy Path",
+            None,
+            MenuAction::CopyPath,
+            &[Context::Items],
+            MenuTarget::Single,
+        );
+        let many = MenuNode::item_targeting(
+            "Copy Paths",
+            None,
+            MenuAction::CopyPaths {
+                layout: PathLayout::Newline,
+            },
+            &[Context::Items],
+            MenuTarget::Multiple,
+        );
+        for count in 0..4 {
+            let selection = Selection {
+                count,
+                regular_file: count == 1,
+            };
+            assert_eq!(
+                single.target_applies(selection),
+                count == 1,
+                "a single target with {count} items"
+            );
+            assert_eq!(
+                many.target_applies(selection),
+                count >= 2,
+                "a multiple target with {count} items"
+            );
+        }
+    }
+
+    /// The action's own promise is what the app checks the click against, so it must not be
+    /// inferred from the item's target: the app never sees the target.
+    #[test]
+    fn each_copy_action_promises_the_selection_it_was_built_for() {
+        let cases = [
+            (MenuAction::CopyPath, PromisedSelection::One),
+            (MenuAction::CopySha256, PromisedSelection::One),
+            (
+                MenuAction::CopyPaths {
+                    layout: PathLayout::SingleLine,
+                },
+                PromisedSelection::Many,
+            ),
+            (
+                MenuAction::CopySha256Many { with_name: true },
+                PromisedSelection::Many,
+            ),
+            (
+                MenuAction::NewFile {
+                    extension: "md".into(),
+                },
+                PromisedSelection::Any,
+            ),
+            (
+                MenuAction::OpenTerminal {
+                    bundle_id: "com.apple.Terminal".into(),
+                },
+                PromisedSelection::Any,
+            ),
+        ];
+        for (action, promised) in cases {
+            assert_eq!(action.promised_selection(), promised, "{action:?}");
+        }
+    }
+
     /// A plain item is unaffected by the selection: the new field must not change anything that
     /// was already in the menu.
     #[test]
@@ -380,11 +556,11 @@ mod tests {
         for selection in [
             Selection::NONE,
             Selection {
-                single: true,
+                count: 1,
                 regular_file: true,
             },
             Selection {
-                single: false,
+                count: 3,
                 regular_file: false,
             },
         ] {
@@ -415,17 +591,41 @@ mod tests {
             )],
         };
         let folder = Selection {
-            single: true,
+            count: 1,
             regular_file: false,
         };
         assert!(filter_model(&model, Context::Items, folder)
             .items
             .is_empty());
         let file = Selection {
-            single: true,
+            count: 1,
             regular_file: true,
         };
         assert_eq!(filter_model(&model, Context::Items, file).items.len(), 1);
+    }
+
+    /// An update replaces the appex with the bundle but not the appex process Finder already
+    /// started. That process announces v2, and it must still receive a model it can decode (the
+    /// two single items) instead of an empty menu; anything outside the window is dropped.
+    #[test]
+    fn the_app_answers_only_the_protocols_it_speaks() {
+        assert_eq!(app_peer_protocol(2), Some(2));
+        assert_eq!(app_peer_protocol(PROTOCOL_VERSION), Some(PROTOCOL_VERSION));
+        assert_eq!(app_peer_protocol(1), None);
+        assert_eq!(app_peer_protocol(PROTOCOL_VERSION + 1), None);
+    }
+
+    /// A v2 model must not contain a shape v2 never learned: these are the exact wire spellings the
+    /// old decoder maps to its own enum, so a typo here would empty the menu instead of failing a
+    /// build.
+    #[test]
+    fn the_v2_shapes_still_decode_as_v2_knows_them() {
+        let json = r#"{"kind":"item","title":"Copy Path","symbol":null,"action":{"type":"copy_path"},"contexts":["items"],"targets":"any"}"#;
+        let node: MenuNode = serde_json::from_str(json).expect("a v2 item decodes");
+        assert!(node.target_applies(Selection::NONE));
+        let json = r#"{"kind":"item","title":"Copy SHA-256","symbol":null,"action":{"type":"copy_sha256"},"contexts":["items"],"targets":"single_regular_file"}"#;
+        let node: MenuNode = serde_json::from_str(json).expect("a v2 item decodes");
+        assert!(!node.target_applies(Selection::NONE));
     }
 
     /// A model written before `targets` existed decodes as `Any`, so an older build's model is
@@ -436,7 +636,6 @@ mod tests {
         let node: MenuNode = serde_json::from_str(json).expect("legacy model decodes");
         assert!(node.target_applies(Selection::NONE));
     }
-    use super::*;
 
     fn model() -> MenuModel {
         MenuModel {
@@ -510,8 +709,35 @@ mod tests {
         assert_eq!(decoded, click);
     }
 
+    /// The refusal is what the user sees instead of a click that silently vanished, and it travels
+    /// through the same identity checks as a click.
+    #[test]
+    fn a_refused_click_round_trips() {
+        let refused = ExtToApp::ClickRefused {
+            protocol_version: PROTOCOL_VERSION,
+            host_bundle_id: "com.example.app".into(),
+            host_instance: "instance".into(),
+            action: MenuAction::CopyPaths {
+                layout: PathLayout::Newline,
+            },
+            count: 1200,
+            reason: ClickRefusal::TooLarge,
+        };
+        let decoded: ExtToApp = decode(&encode(&refused).expect("encode")).expect("decode");
+        assert_eq!(decoded, refused);
+    }
+
+    /// The cap is on the whole encoded message, and it is a hard edge: a message whose JSON is
+    /// exactly at the cap is sent, one byte more is refused rather than truncated.
     #[test]
     fn oversized_messages_are_refused() {
+        // serde_json adds the two quotes around a string, so this encodes to exactly the cap.
+        let at_limit = "x".repeat(MAX_MESSAGE_BYTES - 2);
+        let encoded = encode(&at_limit).expect("exactly at the cap is still a message");
+        assert_eq!(encoded.len(), MAX_MESSAGE_BYTES);
+        assert!(decode::<String>(&encoded).is_some());
+        let one_byte_over = "x".repeat(MAX_MESSAGE_BYTES - 1);
+        assert!(encode(&one_byte_over).is_none());
         let big = "x".repeat(MAX_MESSAGE_BYTES + 1);
         assert!(encode(&big).is_none());
     }

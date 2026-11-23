@@ -59,6 +59,10 @@ pub(super) fn finder_menu_page_view(input: &PageInput) -> PageView {
     // The master switch: it owns whether any item below reaches Finder's context menu. It shares
     // the "Finder Integration" card with the status row above, so the card bookkeeping gives it
     // the internal divider every multi-row card draws above its second row.
+    //
+    // Its caption is the one place the wire's size limit is visible to the user: a click is a
+    // single notification, and a selection too large for it is refused. The copy rows cannot say
+    // that, and a limit nobody can see is indistinguishable from a bug when it is hit.
     w.push(
         switch(
             "settings.finder_menu.row_enabled",
@@ -66,6 +70,7 @@ pub(super) fn finder_menu_page_view(input: &PageInput) -> PageView {
             menu.enabled,
         )
         .desc("settings.finder_menu.desc_enabled")
+        .caption("settings.finder_menu.caption_selection_limit")
         .into_spec(),
     );
 
@@ -450,6 +455,32 @@ mod tests {
             row_of(&view, ControlField::FinderMenuCopySha256).value,
             Value::Switch(false)
         );
+    }
+
+    #[test]
+    fn the_master_switch_states_the_selection_size_limit() {
+        // A click is one notification with a byte cap, and a selection too large for it is
+        // refused. The caption is the only place a user can learn that before hitting it, so the
+        // row must carry one and its copy must resolve to real text rather than the key.
+        let view = finder_menu_page_view(&input());
+        let row = row_of(&view, ControlField::FinderMenuEnabled);
+        assert_eq!(row.copy, RowCopy::Captioned);
+        assert_eq!(
+            row.caption_key,
+            Some("settings.finder_menu.caption_selection_limit")
+        );
+        let caption = row.subtitle_text();
+        assert_eq!(
+            caption,
+            t("settings.finder_menu.caption_selection_limit"),
+            "the caption is the translated copy"
+        );
+        assert_ne!(
+            caption, "settings.finder_menu.caption_selection_limit",
+            "a missing key would ship the raw key to the row"
+        );
+        // It is not the search-only `desc` line: that one is never rendered.
+        assert!(row.desc_key.is_some(), "the search description stays too");
     }
 
     #[test]

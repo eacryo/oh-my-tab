@@ -296,9 +296,10 @@ finder_menu/
 ├── mod.rs                # root: what the module exposes (start/shutdown/broadcast_model/terminals/status)
 ├── model.rs              # Config + locale + installed terminals -> the menu tree the extension draws
 ├── ipc.rs                # DistributedNotificationCenter bridge, host identity, click dispatch
-├── actions.rs            # executes a click: new file / open terminal / copy path (re-validated)
+├── actions.rs            # executes a click: new file / open terminal / copy paths / copy digests
+├── format.rs             # the exact clipboard text: path layouts, sha256sum lines
 ├── new_file.rs           # Finder-style collision-safe file creation (O_EXCL, "Untitled 2")
-├── hash.rs               # SHA-256 of a selected file, streamed on a worker for "Copy SHA-256"
+├── hash.rs               # SHA-256 of the selected files, streamed on a worker
 ├── recovery.rs           # restores the extension's system election after our own app update
 └── terminals.rs          # known terminals, install detection, per-terminal launch adapters
 
@@ -334,6 +335,23 @@ assets/FinderExtension/   # Info.plist and the sandbox entitlement the bundle sc
   its own items through `representedObject` (a `ClickTemplate`), and the app re-validates the action
   against the live config before doing anything — a settings change cannot turn a stale menu item
   into an action the user no longer allows.
+- **The menu's selection filter and the click's paths come from one function.** `picked_urls(trigger)`
+  is what both `selection()` and `selection_paths()` read, so the shape a menu was drawn for and the
+  paths the app acts on cannot disagree (`Items` uses `selectedItemURLs`, every other trigger only
+  `targetedURL`). A copy item's action states the shape it was built for — `CopyPath`/`CopySha256`
+  for one item, `CopyPaths`/`CopySha256Many` for several — and the app refuses a click whose path
+  count no longer satisfies it.
+- **Only one item is ever stat-ed at menu time.** `SingleRegularFile` stats the one selected item;
+  the multiple-selection digest items ask nothing and let the app skip whatever is not a regular
+  file at click time, because a stalled volume must not hold Finder's menu open.
+- **A click that cannot be delivered says so.** A click is one distributed notification capped at
+  64 KiB. When the encoded click exceeds that (or an item has no path), the extension posts a small
+  `ClickRefused` instead of dropping it, and the app shows a refusal bubble; the settings page states
+  the limit under the master switch.
+- **A protocol bump keeps the previous appex working.** The appex is replaced with the bundle but the
+  process Finder started before the update keeps running, so the app answers a v2 `Sync` with the
+  two single-selection items that process can decode. A hard cut would leave an empty menu until
+  Finder restarted the extension.
 - **Sign inside-out: the extension first, the app last.** `codesign --deep` on the app re-signs
   nested code and strips the extension's sandbox entitlement (measured — Finder then refuses to load
   it), and it seals the nested bundle by cdhash, so re-signing the extension afterwards invalidates

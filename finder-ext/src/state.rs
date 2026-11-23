@@ -9,7 +9,8 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use finder_protocol::{
-    decode, encode, AppToExt, ClickTemplate, ExtToApp, MenuModel, Trigger, PROTOCOL_VERSION,
+    decode, encode, AppToExt, ClickRefusal, ClickTemplate, ExtToApp, MenuModel, Trigger,
+    PROTOCOL_VERSION,
 };
 use objc2::runtime::{AnyObject, Sel};
 use objc2::{class, msg_send, sel};
@@ -108,8 +109,8 @@ fn send_sync() {
 /// The model to render, or None when the app is gone.
 ///
 /// Takes the whole `Trigger`, not just its `Context`: a toolbar click also reports `Items`, but its
-/// selection comes from a different place, and the `SingleRegularFile` items must not appear there
-/// on the strength of a stale item selection.
+/// selection comes from a different place, and the single/multiple items must not appear there on
+/// the strength of a stale item selection.
 pub(crate) fn model(trigger: Trigger) -> Option<MenuModel> {
     let shared = shared()?;
     let fresh = *shared
@@ -124,18 +125,34 @@ pub(crate) fn model(trigger: Trigger) -> Option<MenuModel> {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .clone()?;
-    let selection = unsafe { self::selection(trigger == Trigger::Toolbar) };
+    let selection = unsafe { self::selection(trigger) };
     let filtered = finder_protocol::filter_model(&model, trigger.context(), selection);
     (!filtered.items.is_empty()).then_some(filtered)
 }
 
 /// Report a click. The app resolves the selection paths; a spoofed message cannot name an action
 /// the config does not enable.
+///
+/// When the click cannot be delivered — because it does not fit one notification, or because an
+/// item could not be turned into a path — a small `ClickRefused` is posted instead. A click that
+/// vanished without a word is the one outcome the user cannot tell apart from a broken menu.
 pub(crate) fn send_click(template: ClickTemplate) {
     let Some(shared) = shared() else {
         return;
     };
-    let paths = unsafe { selection_paths(template.trigger) };
+    // The same source the menu was filtered from, read again: a selection that changed while the
+    // menu was open is the app's to re-validate, but a path that cannot be produced is not.
+    let urls = unsafe { picked_urls(template.trigger) };
+    let count = urls.len();
+    let paths = unsafe { paths_from(&urls) };
+    if paths.len() != count {
+        log(&format!(
+            "click refused: {count} item(s), only {} had a path",
+            paths.len()
+        ));
+        post_refusal(shared, &template, count, ClickRefusal::IncompletePaths);
+        return;
+    }
     let request = format!(
         "{}-{}",
         std::process::id(),
@@ -146,37 +163,69 @@ pub(crate) fn send_click(template: ClickTemplate) {
         host_bundle_id: shared.host_bundle_id.clone(),
         // The template's own identity, not the cache's: a menu built by an earlier app process
         // must be reported as such so the app can reject it.
-        host_instance: template.host_instance,
+        host_instance: template.host_instance.clone(),
         model_version: template.model_version,
         request_id: request,
-        action: template.action,
+        action: template.action.clone(),
         paths,
         trigger: template.trigger,
     };
-    post(&shared.host_bundle_id, &message);
+    match post(&shared.host_bundle_id, &message) {
+        Posted::Ok => {}
+        Posted::TooLarge => {
+            log(&format!("click refused: too large ({count} item(s))"));
+            post_refusal(shared, &template, count, ClickRefusal::TooLarge);
+        }
+        // The notification centre itself is unavailable; a refusal would not arrive either, so
+        // nothing claims the click was too large.
+        Posted::Unavailable => log("click could not be posted: no notification centre"),
+    }
+}
+
+/// Report a click the extension could not send. Carries the template's identity so the app drops a
+/// refusal from a menu built by an earlier process, exactly like a click.
+fn post_refusal(shared: &Shared, template: &ClickTemplate, count: usize, reason: ClickRefusal) {
+    let message = ExtToApp::ClickRefused {
+        protocol_version: PROTOCOL_VERSION,
+        host_bundle_id: shared.host_bundle_id.clone(),
+        host_instance: template.host_instance.clone(),
+        action: template.action.clone(),
+        count,
+        reason,
+    };
+    if !matches!(post(&shared.host_bundle_id, &message), Posted::Ok) {
+        log("the refusal itself could not be posted");
+    }
 }
 
 /// What the extension can tell about the selection for menu filtering.
 ///
-/// Stats AT MOST ONE item: every `SingleRegularFile` item is hidden for any other count, so
-/// paying a filesystem query per selected item on each menu open would cost without deciding
-/// anything. A query that fails (an unreadable volume, a sandbox refusal) reports `regular_file:
-/// false`, which hides the item rather than guessing.
+/// Stats AT MOST ONE item. A `SingleRegularFile` item is the only one that asks, and it is hidden
+/// for every other count, so a filesystem query per selected item on each menu open would cost
+/// without deciding anything. Whether the items of a multiple selection can be hashed is decided
+/// by the app at click time, where the answer is needed and a slow volume cannot hold up Finder's
+/// menu.
 ///
 /// Uses `NSURLIsRegularFileKey`, not the negation of `isDirectory`: a FIFO or a device is also
 /// "not a directory", and reading one would block the hashing thread forever.
-pub(crate) unsafe fn selection(toolbar: bool) -> finder_protocol::Selection {
-    let none = finder_protocol::Selection::NONE;
-    let Some(urls) = selected_urls(toolbar) else {
-        return none;
-    };
-    if urls.is_empty() {
-        return none;
+pub(crate) unsafe fn selection(trigger: Trigger) -> finder_protocol::Selection {
+    let urls = picked_urls(trigger);
+    let count = urls.len();
+    if count != 1 {
+        return finder_protocol::Selection {
+            count,
+            regular_file: false,
+        };
     }
-    if urls.len() != 1 {
-        return none;
+    finder_protocol::Selection {
+        count,
+        regular_file: is_regular_file(urls[0]),
     }
-    let url = urls[0];
+}
+
+/// Whether one URL is a regular file. False when it is not, or when the query fails (an unreadable
+/// volume, a sandbox refusal): hiding an item is better than guessing it applies.
+unsafe fn is_regular_file(url: *mut AnyObject) -> bool {
     let key = nsstring("NSURLIsRegularFileKey");
     let keys: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: key];
     let values: *mut AnyObject = msg_send![
@@ -184,66 +233,20 @@ pub(crate) unsafe fn selection(toolbar: bool) -> finder_protocol::Selection {
         resourceValuesForKeys: keys,
         error: std::ptr::null_mut::<*mut AnyObject>()
     ];
-    let regular = if values.is_null() {
-        false
-    } else {
-        let number: *mut AnyObject = msg_send![
-            values,
-            objectForKey: nsstring("NSURLIsRegularFileKey")
-        ];
-        !number.is_null() && msg_send![number, boolValue]
-    };
-    finder_protocol::Selection {
-        single: true,
-        regular_file: regular,
+    if values.is_null() {
+        return false;
     }
+    let number: *mut AnyObject = msg_send![values, objectForKey: nsstring("NSURLIsRegularFileKey")];
+    !number.is_null() && msg_send![number, boolValue]
 }
 
-/// The selected URLs as objects, without converting them to paths.
+/// The URLs a menu build and a click both work from.
 ///
-/// `selection_paths` drops a URL it cannot turn into a path, so its length is not the selection's.
-/// This keeps the count honest: two selected items stay two even if one has no usable path.
-unsafe fn selected_urls(toolbar: bool) -> Option<Vec<*mut AnyObject>> {
-    let controller: *mut AnyObject = msg_send![class!(FIFinderSyncController), defaultController];
-    if controller.is_null() {
-        return None;
-    }
-    let urls: *mut AnyObject = if toolbar {
-        std::ptr::null_mut()
-    } else {
-        msg_send![controller, selectedItemURLs]
-    };
-    let urls = if urls.is_null() {
-        let targeted: *mut AnyObject = msg_send![controller, targetedURL];
-        if targeted.is_null() {
-            return Some(Vec::new());
-        }
-        let is_array: bool = msg_send![targeted, isKindOfClass: class!(NSArray)];
-        if is_array {
-            targeted
-        } else {
-            let one: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: targeted];
-            one
-        }
-    } else {
-        urls
-    };
-    let is_array: bool = msg_send![urls, isKindOfClass: class!(NSArray)];
-    if !is_array {
-        return Some(vec![urls]);
-    }
-    let count: usize = msg_send![urls, count];
-    let mut out = Vec::with_capacity(count);
-    for index in 0..count {
-        let url: *mut AnyObject = msg_send![urls, objectAtIndex: index];
-        if !url.is_null() {
-            out.push(url);
-        }
-    }
-    Some(out)
-}
-
-unsafe fn selection_paths(trigger: Trigger) -> Vec<String> {
+/// This is the single source for "what is selected": the Items menu filters and its click both use
+/// `selectedItemURLs`, while a container, sidebar or toolbar menu filters and acts on `targetedURL`
+/// only. Reading them differently once made the menu show an item for one selection shape and then
+/// send another; keeping one function is what makes the two agree.
+unsafe fn picked_urls(trigger: Trigger) -> Vec<*mut AnyObject> {
     let controller: *mut AnyObject = msg_send![class!(FIFinderSyncController), defaultController];
     if controller.is_null() {
         return Vec::new();
@@ -260,43 +263,63 @@ unsafe fn selection_paths(trigger: Trigger) -> Vec<String> {
     }
     // selectedItemURLs is an NSArray; targetedURL is a single NSURL.
     let is_array: bool = msg_send![urls, isKindOfClass: class!(NSArray)];
-    let mut paths = Vec::new();
-    if is_array {
-        let count: usize = msg_send![urls, count];
-        for index in 0..count {
-            let url: *mut AnyObject = msg_send![urls, objectAtIndex: index];
-            push_url_path(url, &mut paths);
+    if !is_array {
+        return vec![urls];
+    }
+    let count: usize = msg_send![urls, count];
+    let mut out = Vec::with_capacity(count);
+    for index in 0..count {
+        let url: *mut AnyObject = msg_send![urls, objectAtIndex: index];
+        if !url.is_null() {
+            out.push(url);
         }
-    } else {
-        push_url_path(urls, &mut paths);
+    }
+    out
+}
+
+/// The paths of `urls`, dropping any URL that has none. The caller compares the length against the
+/// URL count: a dropped item is reported as a refused click rather than silently copied around.
+unsafe fn paths_from(urls: &[*mut AnyObject]) -> Vec<String> {
+    let mut paths = Vec::with_capacity(urls.len());
+    for url in urls {
+        if url.is_null() {
+            continue;
+        }
+        let path: *mut AnyObject = msg_send![*url, path];
+        let path = nsstring_to_rust(path);
+        if !path.is_empty() {
+            paths.push(path);
+        }
     }
     paths
 }
 
-unsafe fn push_url_path(url: *mut AnyObject, paths: &mut Vec<String>) {
-    if url.is_null() {
-        return;
-    }
-    let path: *mut AnyObject = msg_send![url, path];
-    let path = nsstring_to_rust(path);
-    if !path.is_empty() {
-        paths.push(path);
-    }
+/// What became of an attempt to post a message.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Posted {
+    Ok,
+    /// The encoded message is larger than the wire cap.
+    TooLarge,
+    /// Encoding worked, but the notification centre itself was unavailable.
+    Unavailable,
 }
 
-fn post(bundle_id: &str, message: &ExtToApp) {
+fn post(bundle_id: &str, message: &ExtToApp) -> Posted {
     let Some(json) = encode(message) else {
-        log("could not encode an extension message");
-        return;
+        return Posted::TooLarge;
     };
+    post_json(bundle_id, &json)
+}
+
+fn post_json(bundle_id: &str, json: &str) -> Posted {
     unsafe {
         let center: *mut AnyObject =
             msg_send![class!(NSDistributedNotificationCenter), defaultCenter];
         if center.is_null() {
-            return;
+            return Posted::Unavailable;
         }
         let name = nsstring(&format!("{bundle_id}.finder.ext2app"));
-        let payload = nsstring(&json);
+        let payload = nsstring(json);
         let _: () = msg_send![
             center,
             postNotificationName: name,
@@ -305,6 +328,7 @@ fn post(bundle_id: &str, message: &ExtToApp) {
             deliverImmediately: true
         ];
     }
+    Posted::Ok
 }
 
 unsafe fn register_observer(bundle_id: &str) {

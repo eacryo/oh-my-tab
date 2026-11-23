@@ -665,6 +665,64 @@ of this feature: the action set is deliberately non-destructive (create an empty
 the user right-clicked, open a configured terminal, write the clipboard), and the app re-validates
 rather than trusting the message.
 
+**Multi-selection.** The copy actions are two sets of items in one model: `Copy Path` and
+`Copy SHA-256` for exactly one item (`MenuTarget::Single`, `SingleRegularFile`), and four items for
+two or more (`MenuTarget::Multiple`) — paths one per line, paths on one comma-separated line, bare
+digests, and `digest  name` lines. The extension filters the cached model per right-click, so the
+menu is two items or four without rebuilding anything.
+
+The two shapes are also separated in the action (`CopyPath`/`CopySha256` versus
+`CopyPaths`/`CopySha256Many`), because the app has to re-validate a click after a menu may have
+outlived its selection: a click whose path count no longer matches the action's promise is refused
+with a message instead of doing something the label did not say. The newline layout is the raw
+`join("\n")` in Finder's selection order (which is not guaranteed to be the list's display order).
+The single-line layout joins with `", "` and adds no quoting: it is a list to read and paste into a
+message, not a command line, so `a, b, c` is three items and a path containing `", "` is the one
+ambiguity it accepts (the per-line form is the answer to that). The named digest lines follow
+GNU `sha256sum`'s rule — a line prefixed with `\` when the name contains a backslash, a newline or a
+carriage return, with those three characters escaped (`cksum.c`'s `strcspn (s, "\\\n\r")`, measured
+2026-11-23). Which verifier can undo that is a property of the verifier, not of the text: GNU's
+`sha256sum -c` undoes all three, macOS's `/usr/bin/shasum` (Perl) undoes `\\` and `\n` but not `\r`,
+and macOS 26's own `/sbin/sha256sum` undoes none of them (it reads a name with an escape as a literal
+path and reports the line as improperly formatted). A name containing a carriage return is therefore
+verifiable with GNU coreutils only. The bare-digest form keeps the selection order, so a skipped
+entry shifts every later line; the result message therefore names the skipped count whenever there
+is one.
+
+A multiple selection is not stat-ed while the menu is being built. `SingleRegularFile` stats its one
+item (as before), but the four multi items are offered for any two or more, and the app skips
+whatever is not a regular file when the click arrives: the menu is built on Finder's thread, and one
+stalled volume must not hold it open. The bottom line is the user's: a folder in the selection is
+reported as skipped, and a selection with no readable file at all gets a refusal bubble.
+
+**The clipboard commit happens on the main thread.** The hashing worker only produces digests; the
+pasteboard write, the result message and the release of the single-flight flag all run in the main
+thread callback (`finishPendingSha256`), so the next click cannot replace the clipboard under a
+result that is still being committed. AppKit and `NSPasteboard` are main-thread only, which the old
+single-file path got wrong by copying from the worker.
+
+**The 64 KiB cap is a product limit, not an internal detail.** A click is one notification, and
+`encode` refuses anything larger; a folder's worth of paths can exceed it, so "select the whole
+folder, Copy Paths" is a real case. The extension therefore encodes first and, when the click does
+not fit, posts a small `ClickRefused` (never a truncated click, which would look like success). The
+app answers it with a refusal bubble — but only after the same live-config check a click gets, so a
+stale menu cannot speak about a feature the user has switched off. The message says the selection
+carries too much data rather than blaming a count, because the cap is on the encoded message; the
+settings page states the limit under the master switch. The refusal carries the same host/instance
+identity as a click, so one from an earlier app process is dropped like a stale click.
+
+**A protocol bump is answered, not cut.** v3 added the targets, the two "many" actions and
+`ClickRefused`. The appex ships inside the app, but the appex *process* Finder started before an
+update keeps running with v2 and would reject a v3 model — an empty menu until Finder replaced it.
+The app therefore accepts a v2 `Sync` and answers it with the two single-selection items in v2's own
+shapes (`targets: any` / `single_regular_file`, actions `copy_path` / `copy_sha256`), which the old
+process still renders and still executes in the new app. Its `Copy Path` item is `any` in v2, so it
+still appears for a multi-selection there; the click check is protocol-aware and keeps v2's
+copy-the-first-path behavior instead of applying v3's "exactly one" rule to it, which would take a
+working action away for the length of the window. Its next model, after Finder restarts the
+extension, is the v3 one. A broadcast (config change) is v3 and is simply dropped by a v2 process
+until its next `Sync`.
+
 **Staleness / offline.** The extension syncs every 10 s. If no app message has arrived for 45 s the
 model is treated as stale and no items are offered — an idle app is not mistaken for a dead one
 because the sync itself keeps the timestamp fresh, and a crash expires the menu instead of leaving

@@ -6,7 +6,7 @@
 
 use std::path::{Path, PathBuf};
 
-use finder_protocol::{Context, MenuAction};
+use finder_protocol::{Context, MenuAction, PathLayout};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -15,7 +15,7 @@ use objc2::runtime::AnyObject;
 
 use crate::config::CONFIG;
 use crate::finder_menu::{hash, new_file, terminals};
-use crate::i18n::t;
+use crate::i18n::{t, t_count, tf};
 use crate::log_info;
 
 /// Run one action. Called on the main thread.
@@ -27,16 +27,12 @@ pub(crate) fn execute(action: MenuAction, paths: Vec<String>, context: Context) 
         "[finder-menu] executing {action:?} ({} target(s))",
         paths.len()
     );
-    if !config.finder_menu.enabled {
-        log_info!("[finder-menu] ignored a click while the menu is disabled");
+    if !action_enabled(&config, &action) {
+        log_info!("[finder-menu] ignored {action:?} while it is disabled");
         return;
     }
     match action {
         MenuAction::NewFile { extension } => {
-            if !config.finder_menu.new_file_types.contains(&extension) {
-                log_info!("[finder-menu] ignored a file type that is no longer enabled");
-                return;
-            }
             // Directory resolution and creation both touch the filesystem: a disconnected network
             // volume can block for seconds, so neither runs on the main thread.
             std::thread::spawn(move || {
@@ -54,10 +50,6 @@ pub(crate) fn execute(action: MenuAction, paths: Vec<String>, context: Context) 
             });
         }
         MenuAction::OpenTerminal { bundle_id } => {
-            if !config.finder_menu.terminals.contains(&bundle_id) {
-                log_info!("[finder-menu] ignored a terminal that is no longer enabled");
-                return;
-            }
             std::thread::spawn(move || {
                 let Some(directory) = target_directory(&paths, context) else {
                     log_info!("[finder-menu] open terminal needs an existing directory");
@@ -69,121 +61,173 @@ pub(crate) fn execute(action: MenuAction, paths: Vec<String>, context: Context) 
             });
         }
         MenuAction::CopyPath => {
-            if !config.finder_menu.copy_path {
-                log_info!("[finder-menu] ignored copy path while it is disabled");
-                return;
-            }
             let Some(path) = paths.first() else {
                 return;
             };
-            // The bubble says what happened, for the same reason SHA-256 has one: a menu item that
-            // silently did nothing and one that copied are otherwise indistinguishable, and the
-            // pasteboard can refuse the write.
-            copy_path_and_report(path);
+            copy_paths_and_report(std::slice::from_ref(path), PathLayout::Newline);
+        }
+        MenuAction::CopyPaths { layout } => {
+            copy_paths_and_report(&paths, layout);
         }
         MenuAction::CopySha256 => {
-            if !config.finder_menu.copy_sha256 {
-                log_info!("[finder-menu] ignored copy sha256 while it is disabled");
-                return;
-            }
-            // Re-validate everything the menu decided, because the notification can name any
-            // action and the selection may have changed since the menu was built.
-            if paths.len() != 1 {
-                log_info!("[finder-menu] sha256 needs exactly one selection");
-                return;
-            }
-            let path = std::path::PathBuf::from(&paths[0]);
-            start_sha256(path);
+            start_sha256(paths, false);
+        }
+        MenuAction::CopySha256Many { with_name } => {
+            start_sha256(paths, with_name);
         }
     }
+}
+
+/// Whether the live config still enables `action`.
+///
+/// A menu can stay open across a settings change, and a distributed notification can name any
+/// action. Everything that can produce a user-visible result — a click, a shape refusal and a
+/// `ClickRefused` — goes through this one answer, so a switch turned off can never still speak
+/// through one path and not another.
+pub(crate) fn action_enabled(config: &crate::config::Config, action: &MenuAction) -> bool {
+    let section = &config.finder_menu;
+    section.enabled
+        && match action {
+            MenuAction::NewFile { extension } => section.new_file_types.contains(extension),
+            MenuAction::OpenTerminal { bundle_id } => section.terminals.contains(bundle_id),
+            MenuAction::CopyPath | MenuAction::CopyPaths { .. } => section.copy_path,
+            MenuAction::CopySha256 | MenuAction::CopySha256Many { .. } => section.copy_sha256,
+        }
 }
 
 /// One SHA-256 run at a time across the whole app.
 ///
-/// Two concurrent runs would read two large files at once and could finish out of order, letting
-/// the earlier click overwrite the later digest on the clipboard. A second click while one is
-/// running is refused with a message rather than queued: the user can see it is busy.
+/// Two concurrent runs would read two large selections at once and could finish out of order,
+/// letting the earlier click overwrite the later result on the clipboard. A second click while one
+/// is running is refused with a message rather than queued: the user can see it is busy. The flag
+/// is released on the main thread **after** the clipboard write and the message, not when the
+/// worker returns, so the next click cannot replace the pasteboard under a result that is still
+/// being committed.
 static SHA256_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
 
-fn start_sha256(path: PathBuf) {
-    if SHA256_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-        crate::ui::toast::show_done(&t("finder_menu.sha256_busy"));
+fn start_sha256(paths: Vec<String>, with_name: bool) {
+    if paths.is_empty() {
         return;
     }
-    // The computing message has no deadline: a large file outlives any fixed timeout, and a
+    // Build the callback target here, on the main thread, BEFORE anything is claimed. Class
+    // registration panics when it fails, and a panic after the claim would stage a result that
+    // no callback can ever deliver; a null target would swallow the dispatch the same way.
+    if unsafe { sha256_target() }.is_null() {
+        log_info!("[finder-menu] sha256 callback target unavailable");
+        crate::ui::toast::show_refused(&t("finder_menu.sha256_error"));
+        return;
+    }
+    if SHA256_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        crate::ui::toast::show_refused(&t("finder_menu.sha256_busy"));
+        return;
+    }
+    // The claim and its guard are created together. The guard travels with the job — the worker
+    // moves it into the pending result, and the main thread drops it after the clipboard write and
+    // the message — so every exit from here on releases the claim exactly once: a panic while
+    // showing the message, a failed spawn (the closure is dropped), a worker panic before staging,
+    // a delivery failure, or the commit itself unwinding.
+    let flight = Flight(&SHA256_IN_FLIGHT);
+    // The computing message has no deadline: a large selection outlives any fixed timeout, and a
     // bubble that vanished early would leave the user unable to tell it is still working.
     crate::ui::toast::show_working(&t("finder_menu.sha256_working"));
-    std::thread::spawn(move || {
-        let digest = hash::sha256_file(&path);
-        SHA256_IN_FLIGHT.store(false, Ordering::SeqCst);
-        deliver_sha256(digest);
-    });
-}
-
-/// Hand the worker's result back to the main thread. AppKit and the pasteboard are main-thread
-/// only, so the work is re-dispatched rather than done here.
-fn deliver_sha256(result: std::io::Result<String>) {
-    enum Outcome {
-        Copied,
-        Failed,
-        Unwritable,
-    }
-    let outcome = match result {
-        Ok(digest) => {
-            if copy_text(&digest) {
-                log_info!("[finder-menu] sha256 copied");
-                Outcome::Copied
-            } else {
-                log_info!("[finder-menu] sha256 could not reach the pasteboard");
-                Outcome::Unwritable
+    let started = std::thread::Builder::new()
+        .name("finder-sha256".to_string())
+        .spawn(move || {
+            // A panic in the hashing path must still produce a finished state; otherwise the
+            // computing bubble stays up and the claim is never released.
+            let dispatched = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let staged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    hash::sha256_paths(&paths)
+                }));
+                let pending = match staged {
+                    Ok(batched) => PendingSha256::Ready {
+                        batched,
+                        with_name,
+                        flight,
+                    },
+                    Err(_) => {
+                        log_info!("[finder-menu] the sha256 worker panicked");
+                        PendingSha256::Failed { flight }
+                    }
+                };
+                PENDING_SHA256
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .replace(pending);
+                finish_sha256_on_main();
+            }));
+            if dispatched.is_err() {
+                // Nothing reached the main thread, so no callback will commit (and release) the
+                // claim: withdraw the staged result — a later dispatch must not commit a batch
+                // nobody waits for — and let the guard inside it drop.
+                PENDING_SHA256
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .take();
+                log_info!("[finder-menu] could not hand the sha256 batch to the main thread");
             }
-        }
-        Err(error) => {
-            log_info!("[finder-menu] sha256 failed: {error}");
-            Outcome::Failed
-        }
-    };
-    let message = match outcome {
-        Outcome::Copied => t("finder_menu.sha256_copied"),
-        Outcome::Failed => t("finder_menu.sha256_failed"),
-        Outcome::Unwritable => t("finder_menu.sha256_unavailable"),
-    };
-    // AppKit and the pasteboard are main-thread only, so the message is staged for the main
-    // thread and a selector wakes it. The staged text is the only thing shared, and it is taken
-    // out once, so a delayed dispatch can never show a stale result twice.
-    PENDING_TOAST.lock().unwrap().replace(message);
-    deliver_toast_on_main();
+        });
+    if started.is_err() {
+        // The failed spawn dropped the closure, and the claim guard went with it.
+        log_info!("[finder-menu] could not start the sha256 worker");
+        crate::ui::toast::show_refused(&t("finder_menu.sha256_error"));
+    }
 }
 
-/// The message a worker finished with, waiting for the main thread to take it.
-static PENDING_TOAST: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// A worker's outcome, waiting for the main thread to commit it.
+///
+/// Each variant owns the claim guard, so the claim cannot outlive its job or be released twice:
+/// the main thread takes the variant, commits, and drops the guard at the end of the match arm.
+enum PendingSha256 {
+    Ready {
+        batched: hash::Batched,
+        with_name: bool,
+        flight: Flight<'static>,
+    },
+    /// The worker panicked. It is reported on the main thread like any other failed run, so the
+    /// "computing" bubble cannot stay up forever.
+    Failed { flight: Flight<'static> },
+}
 
-/// Wake the main thread to show whatever is staged. Safe to call from any thread: it only posts.
-fn deliver_toast_on_main() {
+/// Releases the single-flight claim when the job is committed, or dropped.
+///
+/// It releases on unwind too: the callback boundary catches a panic, and a claim left set would
+/// make every later click report "still computing" until the app restarted.
+struct Flight<'a>(&'a AtomicBool);
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::SeqCst);
+    }
+}
+
+/// The batch a worker finished with, waiting for the main thread to take it.
+static PENDING_SHA256: std::sync::Mutex<Option<PendingSha256>> = std::sync::Mutex::new(None);
+
+/// Wake the main thread to finish whatever batch is staged. Safe from any thread: it only posts.
+fn finish_sha256_on_main() {
     unsafe {
-        use objc2::msg_send;
-        use objc2::runtime::AnyObject;
-        let target = toast_target();
+        let target = sha256_target();
         let _: () = msg_send![
             target,
-            performSelectorOnMainThread: objc2::sel!(showPendingToast),
+            performSelectorOnMainThread: objc2::sel!(finishPendingSha256),
             withObject: std::ptr::null::<AnyObject>(),
             waitUntilDone: false
         ];
     }
 }
 
-static TOAST_TARGET: std::sync::OnceLock<crate::ffi::CallbackTarget> = std::sync::OnceLock::new();
+static SHA256_TARGET: std::sync::OnceLock<crate::ffi::CallbackTarget> = std::sync::OnceLock::new();
 
-unsafe fn toast_target() -> *mut AnyObject {
-    TOAST_TARGET
+unsafe fn sha256_target() -> *mut AnyObject {
+    SHA256_TARGET
         .get_or_init(|| {
-            let name = c"OhMyTabFinderToastTarget";
-            let class = crate::ffi::StaticClass::register_once(&TOAST_CLASS, name, || {
+            let name = c"OhMyTabFinderSha256Target";
+            let class = crate::ffi::StaticClass::register_once(&SHA256_CLASS, name, || {
                 crate::ffi::build_class(name, objc2::class!(NSObject), |builder| {
                     builder.add_method::<AnyObject, _>(
-                        objc2::sel!(showPendingToast),
-                        show_pending_toast
+                        objc2::sel!(finishPendingSha256),
+                        finish_pending_sha256
                             as unsafe extern "C" fn(*mut AnyObject, objc2::runtime::Sel),
                     );
                 })
@@ -194,21 +238,96 @@ unsafe fn toast_target() -> *mut AnyObject {
         .0
 }
 
-static TOAST_CLASS: std::sync::OnceLock<crate::ffi::StaticClass> = std::sync::OnceLock::new();
+static SHA256_CLASS: std::sync::OnceLock<crate::ffi::StaticClass> = std::sync::OnceLock::new();
 
-unsafe extern "C" fn show_pending_toast(_this: *mut AnyObject, _cmd: objc2::runtime::Sel) {
-    crate::callback_guard::void("finder_show_pending_toast", || {
-        // Taken, not peeked: a second dispatch for the same message would otherwise show it
-        // again after the user had already seen it.
-        let Some(message) = PENDING_TOAST.lock().unwrap().take() else {
+unsafe extern "C" fn finish_pending_sha256(_this: *mut AnyObject, _cmd: objc2::runtime::Sel) {
+    crate::callback_guard::void("finder_finish_sha256", || {
+        // Taken, not peeked: a second dispatch for the same batch would otherwise write the
+        // clipboard again after the user had already pasted it.
+        let Some(pending) = PENDING_SHA256
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
+        else {
             return;
         };
-        crate::ui::toast::show_done(&message);
+        finish_sha256(pending);
     });
 }
 
-/// Put `text` on the general pasteboard. Returns whether the write succeeded: `copy_path` ignored
-/// this answer, and reporting "copied" for a failed write is worse than saying nothing.
+/// Write the batch and say what happened, on the main thread.
+///
+/// AppKit and the pasteboard are main-thread only, which is why the worker hands the digests here
+/// instead of copying them itself. The single-flight flag is released last: the clipboard and the
+/// message are part of the same commit.
+fn finish_sha256(pending: PendingSha256) {
+    match pending {
+        // The claim is held by the pattern binding until the end of the arm, so it outlives the
+        // message the arm shows and is released on unwind as well.
+        PendingSha256::Failed { flight: _flight } => {
+            crate::ui::toast::show_refused(&t("finder_menu.sha256_error"));
+        }
+        PendingSha256::Ready {
+            batched,
+            with_name,
+            flight: _flight,
+        } => {
+            commit_sha256(batched, with_name);
+        }
+    }
+}
+
+/// Write a finished batch and report it. Called on the main thread; the caller owns the claim.
+fn commit_sha256(batched: hash::Batched, with_name: bool) {
+    let copied = batched.entries.len();
+    if copied == 0 {
+        log_info!(
+            "[finder-menu] sha256: no regular file in the selection ({} skipped)",
+            batched.skipped
+        );
+        crate::ui::toast::show_refused(&t("finder_menu.sha256_failed"));
+    } else {
+        let text = crate::finder_menu::format::digests_text(&batched.entries, with_name);
+        if copy_text(&text) {
+            let message = sha256_message(copied, batched.skipped);
+            log_info!(
+                "[finder-menu] sha256 copied ({copied} item(s), {} skipped)",
+                batched.skipped
+            );
+            crate::ui::toast::show_done(&message);
+        } else {
+            log_info!("[finder-menu] sha256 could not reach the pasteboard");
+            crate::ui::toast::show_refused(&t("finder_menu.sha256_unavailable"));
+        }
+    }
+}
+
+/// What a finished batch says. One item keeps the wording it always had; a partial batch names
+/// both counts, because "copied" alone would hide that some selected items are missing from the
+/// clipboard.
+fn sha256_message(copied: usize, skipped: usize) -> String {
+    if skipped == 0 {
+        if copied == 1 {
+            t("finder_menu.sha256_copied")
+        } else {
+            tf(
+                "finder_menu.sha256_count_copied",
+                &[("count", &copied.to_string())],
+            )
+        }
+    } else {
+        tf(
+            "finder_menu.sha256_partial",
+            &[
+                ("copied", &copied.to_string()),
+                ("skipped", &skipped.to_string()),
+            ],
+        )
+    }
+}
+
+/// Put `text` on the general pasteboard. Returns whether the write succeeded: reporting "copied"
+/// for a failed write is worse than saying nothing, and the bubble's badge would lie.
 fn copy_text(text: &str) -> bool {
     unsafe {
         use crate::ffi::{make_nsstring, release_obj};
@@ -248,36 +367,24 @@ fn target_directory(paths: &[String], context: Context) -> Option<PathBuf> {
     })
 }
 
-/// Copy `path` and say so: the successful bubble, or the same refusal SHA-256 reports when the
+/// Copy the paths and say so: the successful bubble with its count, or the refusal when the
 /// pasteboard will not take the text.
-fn copy_path_and_report(path: &str) {
-    if copy_path(path) {
-        log_info!("[finder-menu] path copied");
-        crate::ui::toast::show_done(&t("finder_menu.path_copied"));
-    } else {
-        log_info!("[finder-menu] path could not reach the pasteboard");
-        crate::ui::toast::show_done(&t("finder_menu.path_unavailable"));
+fn copy_paths_and_report(paths: &[String], layout: PathLayout) {
+    let text = crate::finder_menu::format::paths_text(paths, layout);
+    if text.is_empty() {
+        return;
     }
-}
-
-/// Put `path` on the general pasteboard as plain text. Returns whether the write succeeded: the
-/// bubble reports the answer, so a refused write cannot read as a copy.
-fn copy_path(path: &str) -> bool {
-    unsafe {
-        use crate::ffi::{make_nsstring, release_obj};
-        use objc2::runtime::AnyObject;
-        use objc2::{class, msg_send};
-        let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
-        if pasteboard.is_null() {
-            return false;
-        }
-        let _: isize = msg_send![pasteboard, clearContents];
-        let value = make_nsstring(path);
-        let kind = make_nsstring("public.utf8-plain-text");
-        let written: bool = msg_send![pasteboard, setString: value, forType: kind];
-        release_obj(value);
-        release_obj(kind);
-        written
+    let message = if paths.len() == 1 {
+        t("finder_menu.path_copied")
+    } else {
+        t_count("finder_menu.paths_copied", paths.len())
+    };
+    if copy_text(&text) {
+        log_info!("[finder-menu] {} path(s) copied", paths.len());
+        crate::ui::toast::show_done(&message);
+    } else {
+        log_info!("[finder-menu] path(s) could not reach the pasteboard");
+        crate::ui::toast::show_refused(&t("finder_menu.path_unavailable"));
     }
 }
 
@@ -343,4 +450,38 @@ unsafe fn reveal(path: &Path) {
     }
     let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
     let _: () = msg_send![workspace, activateFileViewerSelecting: array];
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Flight;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// The commit runs at the edge of an Objective-C callback, where a panic is caught for us. A
+    /// claim left set there would make every later click report "still computing" until the app
+    /// restarted, so the release has to survive the unwind.
+    #[test]
+    fn the_flight_claim_is_released_when_the_commit_panics() {
+        let flag = AtomicBool::new(true);
+        let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _flight = Flight(&flag);
+            panic!("the commit panicked");
+        }));
+        assert!(panicked.is_err(), "the fixture must actually panic");
+        assert!(
+            !flag.load(Ordering::SeqCst),
+            "the claim must be released by the guard, not by the last line of the commit"
+        );
+    }
+
+    /// The guard releases on a normal return too, which is the path every batch takes.
+    #[test]
+    fn the_flight_claim_is_released_on_a_normal_return() {
+        let flag = AtomicBool::new(true);
+        {
+            let _flight = Flight(&flag);
+            assert!(flag.load(Ordering::SeqCst), "held while the commit runs");
+        }
+        assert!(!flag.load(Ordering::SeqCst));
+    }
 }

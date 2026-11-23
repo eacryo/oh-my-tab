@@ -35,7 +35,7 @@ oh-my-tab is a macOS menu-bar tool written in native Rust. It centers on window 
 - <img height="14" src="docs/icons/sliders.svg"> **Mouse control**: adjust scroll speed, acceleration and similar parameters without affecting the trackpad.
 - <img height="14" src="docs/icons/zap.svg"> **Key bindings**: bind keys to quick actions, or remap keys (key remapping is in development)
 - <img height="14" src="docs/icons/eye.svg"> **Keystroke display**: shows the key being pressed right now; nothing is shown while you type a password.
-- <img height="14" src="docs/icons/terminal.svg"> **Finder menu**: adds "New File", "Open in Terminal" and path / SHA-256 copies to Finder's right-click menu through the bundled Finder extension.
+- <img height="14" src="docs/icons/terminal.svg"> **Finder menu**: adds "New File", "Open in Terminal" and path / SHA-256 copies (one file or several) to Finder's right-click menu through the bundled Finder extension.
 
 <br />
 

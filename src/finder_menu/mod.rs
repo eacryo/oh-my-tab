@@ -9,6 +9,7 @@
 //! DistributedNotificationCenter, and runs the actions a click asks for.
 
 mod actions;
+mod format;
 mod hash;
 mod ipc;
 mod model;
