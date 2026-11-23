@@ -895,6 +895,19 @@ pub(crate) fn refresh_clipboard_pause_switch_from_config() {
     dispatch::refresh_clipboard_pause_switch_from_config();
 }
 
+/// Re-read the numeric entry limit after a change that did not come from the field itself (a config
+/// reload, an import, or a defaults restore).
+pub(crate) fn refresh_clipboard_max_entries_from_config() {
+    dispatch::refresh_clipboard_max_entries_from_config();
+}
+
+/// The text the entry-limit field must show: the uncommitted draft when the user typed one,
+/// otherwise the committed value. A page build and a content rebuild both read this, so neither can
+/// replace what the user typed with the older committed number.
+pub(super) fn max_entries_field_text() -> String {
+    dispatch::max_entries_field_text()
+}
+
 /// Rebuild the settings content on the next run-loop turn.
 ///
 /// The excluded-applications card is laid out from the current list, so adding or removing an entry
@@ -2727,10 +2740,7 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 setState: if cfg.key_bindings.enabled { 1isize } else { 0isize }
             ];
             dispatch::set_clipboard_shortcut_capture_state(ui, &cfg.clipboard.shortcut, recording);
-            set_field(
-                ui.clipboard_max_entries,
-                cfg.clipboard.max_entries.to_string(),
-            );
+            set_field(ui.clipboard_max_entries, max_entries_field_text());
             // The clipboard controls are populated after the initial conditional-row pass, so
             // apply visibility once more from the saved config here.
             update_clipboard_delete_dependent_visibility_from_config(ui, cfg);

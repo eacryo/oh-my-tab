@@ -1685,12 +1685,7 @@ pub(super) fn undo_deleted_clipboard_entry() -> Option<ClipEntry> {
     let mut history = CLIP_HISTORY.lock().unwrap();
     let (_, inserted) = restore_entry_at(&mut history, pending.entry, pending.original_index);
     let max = max_entries();
-    if history.len() > max {
-        let dropped: Vec<ClipEntry> = history.drain(max..).collect();
-        for entry in &dropped {
-            cache_delete_for_removed(&history, entry);
-        }
-    }
+    trim_to_max(&mut history, max);
     let restored_h_idx = history
         .iter()
         .position(|entry| same_clip_entry_identity(entry, &restored));

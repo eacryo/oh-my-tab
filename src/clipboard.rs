@@ -485,7 +485,7 @@ const FOOTER_LABEL_HEIGHT_SLACK: f64 = 2.0;
 /// the text itself would have fit. Measured: "Tab" needs 28.37pt of cell for 20.37pt of text.
 const KBD_CELL_PADDING: f64 = 8.0;
 /// Width reserved for the footer's entry-count label. Bounded, not arbitrary: the count is at
-/// most three digits (`clipboard.max_entries` is validated to 1..=100) and every locale's
+/// most three digits (`clipboard.max_entries` is validated to 1..=500) and every locale's
 /// template is "{count} 个项目" / "{count} items", whose widest form measures 59.9pt at
 /// FONT_CAPTION. It is a ceiling, not a measurement: the shortcut legends are laid out
 /// right-to-left and must clear this label's right edge, so an oversized reservation silently
@@ -1843,6 +1843,66 @@ pub(crate) fn refresh_clear_actions_after_config_change() {
     }
     text_style::update_clear_action_labels();
 }
+
+/// Apply a changed entry limit NOW instead of leaving it to the next copy.
+///
+/// Called from the config-change path on the main thread. Expired records go first, then the entries
+/// beyond the limit (their image cache files go too, unless a survivor still shares the hash); the
+/// history is rewritten so disk and memory agree, and an open picker rebuilds from the shorter list
+/// -- its selection is clamped there. When the entry the detail pane is showing is one that the trim
+/// or the expiry removed, the pane closes rather than keep presenting a deleted record.
+pub(crate) fn enforce_entry_limit() {
+    let max = max_entries();
+    let selection = picker_selection();
+    let mut history = CLIP_HISTORY.lock().unwrap();
+    // The entry the detail pane shows, by IDENTITY: expiry and the trim both move indices, so an
+    // index comparison would name a different record once anything ahead of it is gone.
+    let selected_entry = if selection == NO_SELECTION {
+        None
+    } else {
+        mapped_index(selection)
+            .and_then(|index| history.get(index))
+            .cloned()
+    };
+    let (expired, dropped) = trim_history_to_limit(&mut history, max, now_secs(), ttl_secs());
+    let changed = expired > 0 || dropped > 0;
+    // Carry the SELECTION with the entry as well: the list is rebuilt from the shorter history, and
+    // a clamped old index would land on a different record while the detail pane still showed the
+    // one the user had opened (its save button reads the selection, so it would save the wrong one).
+    let selected_display_index = if changed {
+        let query = with_clipboard_ui(|ui| ui.search_query.clone());
+        let filter = *CLIP_FILTER.lock().unwrap();
+        let filtered = filtered_indices(&history, &query, filter);
+        with_clipboard_ui(|ui| ui.filtered = filtered.clone());
+        selected_entry
+            .as_ref()
+            .and_then(|entry| display_index_of_entry(&history, &filtered, entry))
+    } else {
+        None
+    };
+    let snapshot = changed.then(|| history.clone());
+    drop(history);
+    if !changed {
+        return;
+    }
+    bump_history_revision();
+    // The snapshot is persisted EXACTLY: `save_history` would run expiry again, deleting records
+    // after the selection was positioned against them (and the detail's save target would move).
+    if let Some(snapshot) = snapshot {
+        save_history_snapshot(snapshot);
+    }
+    if let Some(index) = selected_display_index {
+        set_picker_selection(index);
+    } else if selected_entry.is_some() {
+        // The entry that was selected is gone (trimmed, expired, or no longer matching the search):
+        // keeping the pane open would present a record the list no longer offers.
+        hide_detail();
+    }
+    schedule_picker_refresh();
+    if dropped > 0 {
+        log_info!("[clip] trimmed {dropped} entries to the new limit ({max})");
+    }
+}
 /// The options popover view itself (built lazily by `toggle_filter_popover`).
 pub(super) static FILTER_POPOVER: MainThreadSlot<Option<ObjPtr>> =
     unsafe { MainThreadSlot::new(None) };
@@ -3071,6 +3131,91 @@ mod tests {
         );
         assert!(cache_read_image(imgs[1].hash).is_some());
         assert!(cache_read_image(imgs[2].hash).is_some());
+    }
+    #[test]
+    fn trim_to_max_is_a_no_op_within_the_limit_and_reports_the_tail_it_drops() {
+        // The config-change path trims through this helper: it has to answer "how many went" so
+        // the caller can skip the disk rewrite when nothing did, and it must keep the newest
+        // entries (the tail is the oldest).
+        use super::trim_to_max;
+        let mut h = Vec::new();
+        for text in ["A", "B", "C", "D"] {
+            record_text(&mut h, text, 10);
+        }
+        assert_eq!(
+            trim_to_max(&mut h, 4),
+            0,
+            "within the limit nothing is dropped"
+        );
+        assert_eq!(
+            trim_to_max(&mut h, 2),
+            2,
+            "the tail is what the limit drops"
+        );
+        assert_eq!(texts(&h), vec!["D", "C"], "newest entries survive");
+    }
+    #[test]
+    fn the_limit_change_persists_the_history_it_positioned_the_selection_against() {
+        // `save_history` expires before writing. The limit path has already expired and trimmed in
+        // one transaction and positions the selection against that result; a second expiry inside
+        // the write could delete a record AFTER the positioning, and the index would again name a
+        // different entry than the detail pane shows. Asserted from the source, the same way the
+        // runtime path pins its settled fields: the write must be the exact snapshot.
+        let source = include_str!("clipboard.rs");
+        let start = source
+            .find("pub(crate) fn enforce_entry_limit")
+            .expect("the limit path is in this file");
+        let body = &source[start..];
+        let end = body.find("\n}").expect("a function body");
+        let body = &body[..end];
+        assert!(
+            body.contains("save_history_snapshot("),
+            "the limit path must persist its own snapshot"
+        );
+        assert!(
+            !body.contains("save_history()"),
+            "save_history() expires again after the selection was positioned"
+        );
+    }
+    #[test]
+    fn a_selection_carries_across_a_shorter_list_by_identity() {
+        // The selected entry must be found again after the records ahead of it are removed. The
+        // old display index (1, pointing at B) would name C in the shorter list -- and the detail
+        // pane's save action reads the selection, so it would save the wrong entry.
+        use super::{display_index_of_entry, same_clip_entry_identity};
+        let a = entry("A");
+        let b = entry("B");
+        let c = entry("C");
+        let old = vec![a.clone(), b.clone(), c.clone()];
+        let selected_entry = old[1].clone();
+        assert!(same_clip_entry_identity(&selected_entry, &b));
+        // A is expired, so the list is [B, C]; B now sits at display 0, not the old 1.
+        let shorter = vec![b.clone(), c];
+        let filtered: Vec<usize> = (0..shorter.len()).collect();
+        assert_eq!(
+            display_index_of_entry(&shorter, &filtered, &selected_entry),
+            Some(0)
+        );
+        // An entry that is gone has no position (the detail pane closes for it).
+        assert_eq!(display_index_of_entry(&shorter, &filtered, &a), None);
+    }
+    #[test]
+    fn an_expired_entry_does_not_hold_a_slot_against_the_cap() {
+        // Unpinning moves an entry to the front of the unpinned block and keeps its timestamp, so
+        // an EXPIRED record can sit ahead of a live one. Trimming before expiry would drop the live
+        // neighbour to keep the dead record, and the write that follows would delete the dead one
+        // too -- both records gone. The limit change expires first; this pins that order.
+        use super::trim_history_to_limit;
+        let now = 1_000_000u64;
+        let mut old = entry("old");
+        old.copied_at = Some(now - 86_400);
+        let mut new = entry("new");
+        new.copied_at = Some(now);
+        let mut h = vec![old, new];
+        let (expired, dropped) = trim_history_to_limit(&mut h, 1, now + 1, Some(30));
+        assert_eq!(expired, 1, "the old record is expired");
+        assert_eq!(dropped, 0, "the cap never had to drop a live entry");
+        assert_eq!(texts(&h), vec!["new"], "the live record survives");
     }
     #[test]
     fn text_record_trim_deletes_dropped_image_cache_files() {

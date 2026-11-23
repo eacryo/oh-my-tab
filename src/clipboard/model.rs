@@ -794,6 +794,22 @@ pub(super) fn same_clip_entry_identity(a: &ClipEntry, b: &ClipEntry) -> bool {
     }
 }
 
+/// Where `entry` sits in a display list over `history`, by IDENTITY; `None` when it is not in it.
+///
+/// A selection is an index into the filtered list, and expiry or a lowered entry limit removes
+/// records BEFORE the selected one. Clamping the old index would therefore name a different record
+/// -- and the detail pane's save action reads the selection, so it would save the wrong entry. The
+/// callers carry the selection across such a change through this function instead.
+pub(super) fn display_index_of_entry(
+    history: &[ClipEntry],
+    filtered: &[usize],
+    entry: &ClipEntry,
+) -> Option<usize> {
+    filtered
+        .iter()
+        .position(|&index| same_clip_entry_identity(&history[index], entry))
+}
+
 /// Remove an entry without deleting its image cache, so a short-lived undo can restore it.
 pub(super) fn remove_entry_for_undo(history: &mut Vec<ClipEntry>, idx: usize) -> Option<ClipEntry> {
     let removed = history.get(idx).cloned()?;
@@ -997,15 +1013,7 @@ pub(super) fn record_text(
             copied_at: Some(now_secs()),
         },
     );
-    if history.len() > max {
-        // When trimming beyond the cap, drop the trimmed image entries' cache files too --
-        // but only when the hash is no longer referenced by a survivor (same-hash
-        // file/data entries may coexist and share the cache).
-        for dropped in &history[max..] {
-            cache_delete_for_removed(&history[..max], dropped);
-        }
-        history.truncate(max);
-    }
+    trim_to_max(history, max);
     super::bump_history_revision();
     true
 }
@@ -1092,15 +1100,7 @@ pub(super) fn record_image(
             copied_at: Some(now_secs()),
         },
     );
-    if history.len() > max {
-        // When trimming beyond the cap, drop the trimmed image entries' cache files too --
-        // but only when the hash is no longer referenced by a survivor (same-hash
-        // file/data entries may coexist and share the cache).
-        for dropped in &history[max..] {
-            cache_delete_for_removed(&history[..max], dropped);
-        }
-        history.truncate(max);
-    }
+    trim_to_max(history, max);
     super::bump_history_revision();
     true
 }
@@ -1305,5 +1305,44 @@ pub(super) fn max_entries() -> usize {
         .read()
         .map(|c| c.clipboard.max_entries as usize)
         .unwrap_or(50)
-        .clamp(1, 100)
+        .clamp(
+            crate::config::CLIPBOARD_MAX_ENTRIES_MIN as usize,
+            crate::config::CLIPBOARD_MAX_ENTRIES_MAX as usize,
+        )
+}
+
+/// Trim `history` to at most `max` entries, deleting the cache files of dropped image entries that
+/// no survivor still references. Returns how many entries were dropped.
+///
+/// The cap counts pinned entries too: they sit at the front, so trimming takes the tail first, and
+/// a pinned block larger than `max` is trimmed like any other (the rule recording applies).
+pub(super) fn trim_to_max(history: &mut Vec<ClipEntry>, max: usize) -> usize {
+    if history.len() <= max {
+        return 0;
+    }
+    let dropped = history.len() - max;
+    for entry in &history[max..] {
+        cache_delete_for_removed(&history[..max], entry);
+    }
+    history.truncate(max);
+    dropped
+}
+
+/// The trim a changed entry limit applies: expiry FIRST, then the cap. Returns
+/// (expired, dropped).
+///
+/// The order is not cosmetic. An expired entry can sit in front of a live one -- unpinning moves an
+/// entry to the front of the unpinned block and keeps its original timestamp -- so trimming first
+/// would drop the LIVE neighbour to keep a record that is about to be deleted anyway, and the write
+/// that follows would remove both. The recording poll cleans expiry after recording for the same
+/// reason: a dead record must never hold a slot against the cap.
+pub(super) fn trim_history_to_limit(
+    history: &mut Vec<ClipEntry>,
+    max: usize,
+    now_secs: u64,
+    ttl_secs: Option<u64>,
+) -> (usize, usize) {
+    let expired = expire_entries(history, now_secs, ttl_secs);
+    let dropped = trim_to_max(history, max);
+    (expired, dropped)
 }

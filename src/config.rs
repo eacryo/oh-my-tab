@@ -879,6 +879,12 @@ pub(crate) const FINDER_MENU_TERMINALS: [&str; 7] = [
     "net.kovidgoyal.kitty",
     "org.alacritty",
 ];
+/// The clipboard history's entry-limit bounds. The config validation, the runtime clamp and the
+/// settings field's accepted range all read these, so the three cannot disagree about what a valid
+/// limit is.
+pub(crate) const CLIPBOARD_MAX_ENTRIES_MIN: u32 = 1;
+pub(crate) const CLIPBOARD_MAX_ENTRIES_MAX: u32 = 500;
+
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct ClipboardSection {
@@ -886,7 +892,7 @@ pub struct ClipboardSection {
     pub enabled: bool,
     // Global key chord that opens history. Uses the mouse button-mapping shortcut grammar.
     pub shortcut: String,
-    // Max history entries (1..=100, default 50).
+    // Max history entries (1..=500, default 50).
     pub max_entries: u32,
     // Show the source app: the source is ALWAYS recorded at copy time (ClipEntry.source_app);
     // this switch only controls whether the row displays the app name. Default false.
@@ -1828,7 +1834,9 @@ impl Config {
             }
         }
 
-        if !(1..=100).contains(&self.clipboard.max_entries) {
+        if !(CLIPBOARD_MAX_ENTRIES_MIN..=CLIPBOARD_MAX_ENTRIES_MAX)
+            .contains(&self.clipboard.max_entries)
+        {
             errs.push(tf(
                 "errors.clipboard_max_entries_invalid",
                 &[("value", &self.clipboard.max_entries.to_string())],
@@ -3498,13 +3506,34 @@ pub fn flush_config_sync() -> Result<(), String> {
         .map_err(|_| "config persistence writer stopped".to_string())?
 }
 
+/// The entry limit a reload must end up with.
+///
+/// A rejected limit (out of range in the file) is repaired to the factory default by `merge_valid`.
+/// For this field that repair is destructive: the repaired value is applied at once and trims the
+/// history, so a typo in the file would delete records the user never asked to lose. A reload whose
+/// limit was rejected therefore keeps the value that was already accepted, while every other field
+/// still falls back to the default exactly as before. The caller persists the result, so the file is
+/// rewritten with the preserved value.
+fn limit_after_reload(previous: u32, repaired: &Config, errors: &[String]) -> u32 {
+    if errors
+        .iter()
+        .any(|error| error.starts_with("clipboard.max_entries"))
+    {
+        previous
+    } else {
+        repaired.clipboard.max_entries
+    }
+}
+
 /// Reload config from disk and apply. Returns validation errors (empty = success).
 pub fn reload_config() -> Vec<String> {
-    let (new_cfg, errs, needs_persist) = match Config::reload() {
+    let (mut new_cfg, errs, needs_persist) = match Config::reload() {
         Ok(result) => result,
         Err(errs) => return errs,
     };
     let old_cfg = CONFIG.read().unwrap().clone();
+    new_cfg.clipboard.max_entries =
+        limit_after_reload(old_cfg.clipboard.max_entries, &new_cfg, &errs);
     if let Ok(mut cfg) = CONFIG.write() {
         *cfg = new_cfg.clone();
     }
@@ -4195,12 +4224,15 @@ enabled = true
 
     #[test]
     fn validate_rejects_out_of_range_clipboard_max_entries() {
-        // Clipboard max entries must be within 1..=100.
+        // Clipboard max entries must be within 1..=500.
         let mut cfg = Config::default();
         cfg.clipboard.max_entries = 0;
         assert_err_count(&cfg, 1);
-        cfg.clipboard.max_entries = 101;
+        cfg.clipboard.max_entries = 501;
         assert_err_count(&cfg, 1);
+        // The upper bound itself is valid: the setting offers it.
+        cfg.clipboard.max_entries = CLIPBOARD_MAX_ENTRIES_MAX;
+        assert_err_count(&cfg, 0);
         cfg.clipboard.max_entries = 50;
         assert_err_count(&cfg, 0);
     }
@@ -5164,6 +5196,42 @@ corner_radius = -5.0
         // Valid fields survive; the out-of-range value falls back to its default, on its own.
         assert_eq!(cfg.appearance.theme, "dark");
         assert_eq!(cfg.appearance.corner_radius, 32.0);
+    }
+
+    #[test]
+    fn a_reload_that_rejects_the_entry_limit_keeps_the_accepted_one() {
+        // The entry limit is destructive to lower, so the repair of an out-of-range value (to the
+        // factory default 50) must not become the value a reload applies: that would trim the
+        // history over a typo in the file. This pins both halves -- the repair itself, and the
+        // value the reload path ends up using.
+        let (repaired, errors, _) =
+            parse_config_content("[clipboard]\nmax_entries = 501\n").expect("parse");
+        assert!(errors
+            .iter()
+            .any(|error| error.starts_with("clipboard.max_entries")));
+        assert_eq!(
+            repaired.clipboard.max_entries, 50,
+            "the repair alone falls back to the default"
+        );
+        assert_eq!(
+            limit_after_reload(480, &repaired, &errors),
+            480,
+            "a rejected limit keeps the value that was already accepted"
+        );
+
+        // A type error is rejected the same way, and keeps the accepted value too.
+        let (typed, errors, _) =
+            parse_config_content("[clipboard]\nmax_entries = \"many\"\n").expect("parse");
+        assert!(errors
+            .iter()
+            .any(|error| error.starts_with("clipboard.max_entries")));
+        assert_eq!(limit_after_reload(480, &typed, &errors), 480);
+
+        // A valid file states a limit, and that is the one used.
+        let (valid, errors, _) =
+            parse_config_content("[clipboard]\nmax_entries = 80\n").expect("parse");
+        assert!(errors.is_empty());
+        assert_eq!(limit_after_reload(480, &valid, &errors), 80);
     }
 
     #[test]

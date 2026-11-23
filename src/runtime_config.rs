@@ -56,6 +56,11 @@ struct ChangeFlags {
     // summoned -- the rule the pointer-relative placement has always followed -- so this only has to
     // reach an open Settings page; the next summon reads it.
     clipboard_picker_placement: bool,
+    // The entry limit changed. Lowering it trims the history NOW rather than on the next copy (the
+    // settings field's commit is where a destructive limit takes effect), and an open settings page
+    // has to show the committed number. Deliberately not tied to `startup`: the load path trims the
+    // merged history on its own, and this branch would only ever run against an empty one.
+    clipboard_max_entries: bool,
     // The binding list or either group switch changed: the engine republishes its table and starts
     // or stops the tap. The two legacy switches (which used to own a tap each) are covered by this
     // one flag: one engine now serves both groups.
@@ -200,6 +205,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         clipboard_image_rows: startup || old.clipboard.image_rows != new.clipboard.image_rows,
         clipboard_picker_placement: startup
             || old.clipboard.picker_placement != new.clipboard.picker_placement,
+        clipboard_max_entries: old.clipboard.max_entries != new.clipboard.max_entries,
         key_bindings: startup || old.key_bindings != new.key_bindings,
         keystroke_display: startup || old.keystroke_display != new.keystroke_display,
         updates: startup
@@ -449,6 +455,14 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // An already-open settings window must re-read the switch too, or it shows the old
         // value while the picker header already follows the new one.
         crate::settings::refresh_clipboard_separate_clear_all_switch_from_config();
+    }
+    if flags.clipboard_max_entries {
+        // Lowering the limit is part of the change, not of the next copy: trim the history now, so
+        // the list the user sees is the list the app keeps. The refresh covers a limit that moved
+        // without the field (an edited config file, an import, a defaults restore); the field's own
+        // commit already shows what was typed.
+        crate::clipboard::enforce_entry_limit();
+        crate::settings::refresh_clipboard_max_entries_from_config();
     }
     if flags.windows_disabled {
         crate::overlay::reset_switcher();
@@ -761,6 +775,33 @@ mod tests {
         new.key_bindings.enabled = true;
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.mouse && flags.clipboard_enabled && flags.key_bindings);
+    }
+
+    /// The entry limit is its own flag: a change only to it must reach the branch that trims the
+    /// history immediately (and refreshes an open settings page), without waking the clipboard
+    /// gate, the shortcut recorder or any other clipboard surface.
+    #[test]
+    fn a_clipboard_max_entries_change_is_detected_alone() {
+        let old = Config::default();
+        let mut lower = old.clone();
+        lower.clipboard.max_entries = 20;
+        let flags = change_flags(&old, &lower, ConfigChangeSource::Settings);
+        assert!(flags.clipboard_max_entries, "a lowered limit is a change");
+        assert!(!flags.clipboard_enabled);
+        assert!(!flags.clipboard_shortcut);
+        assert!(!flags.clipboard_paused);
+        assert!(!flags.clipboard_image_rows);
+
+        // Raising it is the same flag: the history is not trimmed, but an open page must show the
+        // committed number.
+        let mut higher = old.clone();
+        higher.clipboard.max_entries = 300;
+        assert!(change_flags(&old, &higher, ConfigChangeSource::Settings).clipboard_max_entries);
+
+        // A different clipboard field must not raise it.
+        let mut other = old.clone();
+        other.clipboard.image_rows = 3;
+        assert!(!change_flags(&old, &other, ConfigChangeSource::Settings).clipboard_max_entries);
     }
 
     /// A panel-material change must not rebuild the settings content -- the material's only

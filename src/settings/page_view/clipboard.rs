@@ -24,6 +24,10 @@ use super::*;
 pub(super) const CLIPBOARD_SHORTCUT_ROW: &str = "shortcut_recorder";
 pub(super) const CLIPBOARD_MAX_ENTRIES_ROW: &str = "max_entries";
 
+/// The entry-limit row's caption: the accepted range and what lowering it does. One copy, because
+/// both facts explain the same control and the box under the label has room for one stack.
+pub(super) const MAX_ENTRIES_CAPTION_KEY: &str = "settings.desc_clipboard_max_entries";
+
 /// The two copies the recorder row's caption can show: the instruction while idle, and the state
 /// while a capture waits for its chord. Both are measured when the row's height is decided.
 const CAPTURE_CAPTION_KEYS: [&str; 2] = [
@@ -55,9 +59,21 @@ unsafe fn shortcut_row_height_inner(content_w: f64) -> f64 {
     crate::settings::widgets::captioned_row_height_for(caption_h)
 }
 
-/// The numeric entry-limit row's height: a described (single-line) row, as the old builder had it.
-fn clipboard_max_entries_h() -> f64 {
-    SettingsLayout::SINGLE_LINE_ROW_H
+/// The numeric entry-limit row's height: a captioned row's, measured over the caption at the column
+/// its copy wraps in. The copy states the range and the trimming consequence, which does not fit one
+/// line in every language, so the row follows the measured wrap instead of the single-line constant
+/// (the same rule the recorder row above it follows).
+fn max_entries_row_height(_input: &PageInput, content_w: f64) -> f64 {
+    // Measuring a caption reads AppKit text metrics; the page build runs on the main thread.
+    unsafe { max_entries_row_height_inner(content_w) }
+}
+
+unsafe fn max_entries_row_height_inner(content_w: f64) -> f64 {
+    let caption_w =
+        crate::settings::page_view::layout::caption_column_width(SettingsLayout::new(content_w));
+    let caption_h =
+        crate::settings::widgets::caption_cell_height(&t(MAX_ENTRIES_CAPTION_KEY), caption_w);
+    crate::settings::widgets::captioned_row_height_for(caption_h)
 }
 
 /// The Clipboard page's static rows: its rows, their values and their identities.
@@ -174,10 +190,10 @@ pub(super) fn clipboard_page_view(input: &PageInput) -> PageView {
         .group(RowGroup::ClipboardDeleteChild)
         .into_spec(),
     );
-    // The numeric entry limit is a text field, which the model's control kinds do not cover.
-    // It sits between the delete-after-paste switches and the retention sliders, exactly where
-    // the inline builder drew it.
-    w.extra_row(CLIPBOARD_MAX_ENTRIES_ROW, clipboard_max_entries_h());
+    // The numeric entry limit is a text field, which the model's control kinds do not cover. It
+    // sits between the delete-after-paste switches and the retention sliders, exactly where
+    // the inline builder drew it, and carries a measured caption under its label.
+    w.extra_row_measured(CLIPBOARD_MAX_ENTRIES_ROW, max_entries_row_height);
     let auto_expire = (clipboard.auto_expire_days as i64)
         .clamp(CLIPBOARD_AUTO_EXPIRE_MIN, CLIPBOARD_AUTO_EXPIRE_MAX);
     w.push(
@@ -333,6 +349,46 @@ impl CaptureCaption<'_> {
             .fold(0.0, f64::max)
     }
 }
+
+/// Place a captioned row's copy: the title's line above the caption's, centred as ONE block in the
+/// band, both frames taking the column a captioned row's copy wraps in.
+///
+/// `caption_h` is the height the row was measured for, not the wrapped height of whatever string is
+/// passed: a capture row hands over the TALLEST copy any state can show, so a state change that only
+/// rewrites the string cannot clip it.
+unsafe fn place_captioned_copy(
+    canvas: &mut PageCanvas,
+    origin_y: f64,
+    row_h: f64,
+    title: &str,
+    caption: &str,
+    caption_h: f64,
+) -> (*mut AnyObject, *mut AnyObject) {
+    let layout = canvas.layout();
+    let copy_w = crate::settings::page_view::layout::caption_column_width(layout);
+    let metrics = crate::settings::page_view::layout::MeasuredText::base();
+    let caption_h = caption_h.max(metrics.caption_one_line_h);
+    let stack_h = metrics.title_h + metrics.title_caption_gap + caption_h;
+    let stack_y = origin_y + (row_h - stack_h) / 2.0;
+    let (label, caption_label) =
+        page_widgets::stacked_row_labels(canvas.document(), title, caption);
+    let label_frame = NSRect::new(
+        NSPoint::new(
+            layout.label_x,
+            stack_y + caption_h + metrics.title_caption_gap,
+        ),
+        NSSize::new(copy_w, metrics.title_h),
+    );
+    let caption_frame = NSRect::new(
+        NSPoint::new(layout.label_x, stack_y),
+        NSSize::new(copy_w, caption_h),
+    );
+    let _: () = msg_send![label, setFrame: label_frame];
+    canvas.place_pending_view(label, label_frame);
+    let _: () = msg_send![caption_label, setFrame: caption_frame];
+    canvas.place_pending_view(caption_label, caption_frame);
+    (label, caption_label)
+}
 #[allow(clippy::too_many_arguments)]
 pub(super) unsafe fn draw_capture_row_with(
     canvas: &mut PageCanvas,
@@ -360,28 +416,14 @@ pub(super) unsafe fn draw_capture_row_with(
     let (label, caption_label) = match caption {
         Some(caption) => {
             let copy_w = crate::settings::page_view::layout::caption_column_width(layout);
-            let metrics = crate::settings::page_view::layout::MeasuredText::base();
-            let caption_h = caption.height(copy_w).max(metrics.caption_one_line_h);
-            let stack_h = metrics.title_h + metrics.title_caption_gap + caption_h;
-            let stack_y = origin_y + (row_h - stack_h) / 2.0;
-            let (label, caption_label) =
-                page_widgets::stacked_row_labels(document, &t(label_key), caption.shown);
-            let label_frame = NSRect::new(
-                NSPoint::new(
-                    layout.label_x,
-                    stack_y + caption_h + metrics.title_caption_gap,
-                ),
-                NSSize::new(copy_w, metrics.title_h),
-            );
-            let caption_frame = NSRect::new(
-                NSPoint::new(layout.label_x, stack_y),
-                NSSize::new(copy_w, caption_h),
-            );
-            let _: () = msg_send![label, setFrame: label_frame];
-            canvas.place_pending_view(label, label_frame);
-            let _: () = msg_send![caption_label, setFrame: caption_frame];
-            canvas.place_pending_view(caption_label, caption_frame);
-            (label, caption_label)
+            place_captioned_copy(
+                canvas,
+                origin_y,
+                row_h,
+                &t(label_key),
+                caption.shown,
+                caption.height(copy_w),
+            )
         }
         None => {
             let label = page_widgets::plain_row_label(
@@ -439,31 +481,31 @@ pub(super) unsafe fn draw_capture_row_with(
     }
 }
 
-/// The numeric entry limit row: the label on the left and the text field in the control column.
+/// The numeric entry limit row: the label and its caption on the left, the text field in the control
+/// column.
+///
+/// The caption is where the two facts the field cannot state live: the accepted range, and that
+/// lowering the limit deletes the entries beyond it immediately (the commit path trims the history
+/// rather than waiting for the next copy).
 unsafe fn draw_max_entries_row(
     canvas: &mut PageCanvas,
     origin_y: f64,
     row_h: f64,
 ) -> RenderedControl {
-    let document = canvas.document();
     let layout = canvas.layout();
     canvas.set_pending_advance(AdvanceState::Absolute);
-    let label = page_widgets::plain_row_label(
-        document,
-        layout.label_x,
+    let caption = t(MAX_ENTRIES_CAPTION_KEY);
+    let copy_w = crate::settings::page_view::layout::caption_column_width(layout);
+    let caption_h = crate::settings::widgets::caption_cell_height(&caption, copy_w);
+    let (label, _caption_label) = place_captioned_copy(
+        canvas,
         origin_y,
-        layout.label_w,
         row_h,
         &t("settings.row_clipboard_max_entries"),
+        &caption,
+        caption_h,
     );
-    let label_frame: NSRect = msg_send![label, frame];
-    canvas.place_pending_view(label, label_frame);
-    let initial = crate::config::CONFIG
-        .read()
-        .unwrap()
-        .clipboard
-        .max_entries
-        .to_string();
+    let initial = max_entries_field_text();
     let field = SettingsControl::text_input(
         layout.control_x,
         origin_y + (row_h - layout.row_h) / 2.0,
@@ -472,7 +514,7 @@ unsafe fn draw_max_entries_row(
         &initial,
     );
     let field_frame: NSRect = msg_send![field, frame];
-    let _: () = msg_send![document, addSubview: field];
+    let _: () = msg_send![canvas.document(), addSubview: field];
     canvas.place_pending_view(field, field_frame);
     release_obj(field);
     SettingsRow::register_label(label, field);
@@ -697,6 +739,44 @@ mod tests {
         );
         // Both states are measured, so neither copy can be the one that overflows.
         assert_eq!(CAPTURE_CAPTION_KEYS.len(), 2);
+    }
+
+    #[test]
+    fn the_entry_limit_row_measures_its_caption() {
+        // The limit's caption states the accepted range and that lowering it deletes the extra
+        // entries. The row is a captioned row and its height is MEASURED: the copy wraps at the
+        // column a captioned row's copy takes, and a fixed single-line height clipped it exactly
+        // like the recorder's caption before.
+        assert_ne!(
+            t(MAX_ENTRIES_CAPTION_KEY),
+            MAX_ENTRIES_CAPTION_KEY,
+            "the entry-limit caption key is missing"
+        );
+        let input = input();
+        let view = clipboard_page_view(&input);
+        let row = view
+            .extra_rows
+            .iter()
+            .find(|row| row.key == CLIPBOARD_MAX_ENTRIES_ROW)
+            .expect("the page declares the entry-limit row");
+        assert!(
+            matches!(row.height, RowHeight::Measured(_)),
+            "the entry-limit row height must be measured from its caption"
+        );
+        // The measurement, not a constant, decides the height: at a width where the copy must wrap
+        // the row is TALLER than at a width where it fits one line. Comparing two widths is what
+        // makes the assertion decisive -- a captioned row's one-line height is already above
+        // SINGLE_LINE_ROW_H, so that constant alone would pass even if the wrap were ignored.
+        let wide = row.height.resolve(&input, 1000.0);
+        let narrow = row.height.resolve(&input, 420.0);
+        assert!(
+            narrow > wide,
+            "the wrapped caption did not grow the row (wide {wide}, narrow {narrow})"
+        );
+        assert!(
+            wide >= SettingsLayout::SINGLE_LINE_ROW_H,
+            "a captioned row is at least the single-line band (wide {wide})"
+        );
     }
 
     #[test]

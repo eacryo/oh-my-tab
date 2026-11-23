@@ -589,12 +589,36 @@ pub(super) fn save_history() {
         log_save_skipped_once();
         return;
     }
-    let mut hist = CLIP_HISTORY.lock().unwrap();
-    // Expire before writing: the disk file never keeps expired entries (expiry applies
-    // to memory and persistence alike).
-    expire_entries(&mut hist, now_secs(), ttl_secs());
-    let entries = hist.clone();
-    drop(hist);
+    let entries = {
+        let mut hist = CLIP_HISTORY.lock().unwrap();
+        // Expire before writing: the disk file never keeps expired entries (expiry applies
+        // to memory and persistence alike).
+        expire_entries(&mut hist, now_secs(), ttl_secs());
+        hist.clone()
+    };
+    enqueue_history_snapshot(entries);
+}
+
+/// Persist this EXACT history, with no expiry pass of its own.
+///
+/// The entry-limit path expires, trims and positions the selection in one transaction. An expiry
+/// pass inside the write would delete records AFTER that positioning, so the display index it
+/// computed could name a different entry than the one the detail pane shows -- and the detail's
+/// save action reads the selection. A caller that hands over a snapshot has already settled which
+/// records exist.
+pub(super) fn save_history_snapshot(entries: Vec<ClipEntry>) {
+    if !storage::writable() {
+        log_save_skipped_once();
+        return;
+    }
+    if storage::key().is_none() {
+        log_save_skipped_once();
+        return;
+    }
+    enqueue_history_snapshot(entries);
+}
+
+fn enqueue_history_snapshot(entries: Vec<ClipEntry>) {
     let generation = PERSIST_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     let job = PersistJob {
         generation,
@@ -1553,15 +1577,7 @@ fn merge_loaded_entries(entries: Vec<ClipEntry>) {
         }
         history_changed = true;
     }
-    if hist.len() > max {
-        // Dropped entries' cache files go too -- but only when the hash is no longer
-        // referenced by a survivor.
-        for dropped in &hist[max..] {
-            cache_delete_for_removed(&hist[..max], dropped);
-        }
-        hist.truncate(max);
-        history_changed = true;
-    }
+    history_changed |= trim_to_max(&mut hist, max) > 0;
     if history_changed {
         super::bump_history_revision();
     }

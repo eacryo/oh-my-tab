@@ -3,11 +3,12 @@
 use super::sidebar;
 use super::*;
 use crate::callback_guard;
+use std::sync::Mutex;
 
 // Every change is written to the in-memory CONFIG immediately with a debounced disk write;
-// no pending/staged state exists anymore. Numeric text fields may hold transient invalid
-// values while typing (applied only when valid); sliders take effect live while drags
-// persist with a debounce.
+// no pending/staged state exists anymore. The numeric text field holds a draft until it is
+// committed: its value is destructive (lowering the entry limit trims the history), so a
+// half-typed number must never reach the runtime, and the draft survives a content rebuild.
 
 /// Editable control ids. The pointer → field mapping lives in control_field_of.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -306,6 +307,21 @@ pub(super) fn refresh_clipboard_separate_clear_all_switch_from_config() {
             }
         }
     });
+}
+
+/// Re-read the numeric entry limit from CONFIG. The field's own edits are drafts (shown as typed,
+/// and a reload must not overwrite them); a config reload, an import or a defaults restore can move
+/// the committed limit while the settings window stays open, and without this the page keeps
+/// describing a limit the app no longer uses.
+pub(super) fn refresh_clipboard_max_entries_from_config() {
+    let text = max_entries_field_text();
+    unsafe {
+        with_settings_ui(|ui| {
+            if let Some(u) = ui.as_ref() {
+                set_field(u.clipboard_max_entries, text);
+            }
+        });
+    }
 }
 
 pub(super) fn apply_recorded_clipboard_shortcut(shortcut: &str) {
@@ -1277,9 +1293,108 @@ fn write_selected_profile(cfg: &mut Config, f: impl FnOnce(&mut MouseProfile)) {
     f(&mut cfg.mouse.profiles[idx]);
 }
 
-/// While typing in a numeric text field (NSControlTextDidChange): apply only when the value
-/// is valid; invalid input leaves the in-memory config untouched and persistence goes
-/// through the debounce. Transient invalid states are allowed while typing.
+/// The entry limit's uncommitted draft, exactly as typed.
+///
+/// The value is applied on end editing (blur / Enter) or when the settings window closes. A content
+/// rebuild replaces the control first, so the draft lives here rather than in the view: the rebuilt
+/// field shows it again, and the commit still happens exactly once. Keeping the draft OUT of the
+/// config is what makes the commit a real change: `apply_config_change` compares the committed value
+/// with the new one, and while typing the poll keeps reading the committed limit.
+static MAX_ENTRIES_DRAFT: Mutex<Option<String>> = Mutex::new(None);
+
+/// The text the entry-limit field must show: the uncommitted draft when the user is typing in it,
+/// otherwise the committed value. A page build, a rebuild and a reload all ask for this, so none of
+/// them can silently replace what the user typed with the older committed number.
+pub(super) fn max_entries_field_text() -> String {
+    match MAX_ENTRIES_DRAFT.lock().unwrap().clone() {
+        Some(draft) => draft,
+        None => CONFIG.read().unwrap().clipboard.max_entries.to_string(),
+    }
+}
+
+fn set_max_entries_draft(raw: &str) {
+    *MAX_ENTRIES_DRAFT.lock().unwrap() = Some(raw.to_string());
+}
+
+fn take_max_entries_draft() -> Option<String> {
+    MAX_ENTRIES_DRAFT.lock().unwrap().take()
+}
+
+/// Whether the user has typed an entry limit that has not been committed yet. A content rebuild
+/// clears the per-field edit bit (it belongs to the old control), so this is what still says the
+/// value in the rebuilt field is the user's own.
+fn has_max_entries_draft() -> bool {
+    MAX_ENTRIES_DRAFT.lock().unwrap().is_some()
+}
+
+/// The change a typed draft produces against the committed limit: `None` when the text is not a
+/// number, is out of range, or does not change the limit.
+///
+/// Pure, so the rule the commit depends on is assertable: a typed `20` over a committed `50` IS a
+/// change (the flag that trims the history must fire at commit), while an out-of-range draft applies
+/// nothing and an unchanged one must not rewrite the file.
+fn committed_limit_change(committed: u32, draft: &str) -> Option<u32> {
+    let parsed = parse_usize(draft).ok()?;
+    if !(crate::config::CLIPBOARD_MAX_ENTRIES_MIN as usize
+        ..=crate::config::CLIPBOARD_MAX_ENTRIES_MAX as usize)
+        .contains(&parsed)
+    {
+        return None;
+    }
+    let value = parsed as u32;
+    (value != committed).then_some(value)
+}
+
+/// Apply the entry limit the user typed as a draft when it is a valid change, and persist now.
+/// Returns whether a change was applied.
+///
+/// Reads the draft, not the field: the commit must work even when the control was rebuilt under it.
+/// The draft is the LATEST text, valid or not (the keystroke handler stores it before validating),
+/// so closing the window can never commit an older, half-validated number.
+unsafe fn commit_max_entries_draft() -> bool {
+    let Some(draft) = take_max_entries_draft() else {
+        return false;
+    };
+    let committed = CONFIG.read().unwrap().clipboard.max_entries;
+    let Some(value) = committed_limit_change(committed, &draft) else {
+        // Invalid, out of range, or the same number: nothing to apply.
+        log_debug!("[settings] numeric draft {draft:?} commits no change");
+        return false;
+    };
+    write_text_field_config(TextField::ClipboardMaxEntries, value);
+    persist_config_now();
+    log_debug!("[settings] entry limit committed as {value}");
+    true
+}
+
+/// Show the committed value again after a draft was rejected (invalid, out of range, unchanged).
+unsafe fn restore_max_entries_field() {
+    let text = CONFIG.read().unwrap().clipboard.max_entries.to_string();
+    with_settings_ui(|ui| {
+        if let Some(u) = ui.as_ref() {
+            set_field(u.clipboard_max_entries, text);
+        }
+    });
+}
+
+/// Commit a typed entry limit when the settings window is closing: AppKit's end-editing is what
+/// normally does this, but a hide must not depend on it having fired first.
+pub(super) fn commit_pending_max_entries_edit() {
+    let edited = take_edited_field(&EDITED_TEXT_FIELDS, TextField::ClipboardMaxEntries);
+    if !edited && !has_max_entries_draft() {
+        return;
+    }
+    callback_guard::void("commit_pending_max_entries_edit", || unsafe {
+        let _ = commit_max_entries_draft();
+    });
+}
+
+/// While typing in a numeric text field (NSControlTextDidChange): keep the typed value as a DRAFT.
+/// Nothing is written to the config and nothing is applied.
+///
+/// The entry limit is destructive to lower: every digit on the way to `500` (`5`, then `50`) is
+/// itself a valid number, and applying one would trim the history to it. The draft is applied
+/// exactly once, on commit, where `apply_config_change` compares it with the committed limit.
 pub(crate) extern "C" fn on_control_text_did_change(
     _self: *mut c_void,
     _cmd: Sel,
@@ -1291,17 +1406,15 @@ pub(crate) extern "C" fn on_control_text_did_change(
             Some(f) => f,
             None => return,
         };
-        let Some((value, raw)) = parse_text_field(field) else {
+        // The LATEST text, stored before any validation: a draft that only kept valid values
+        // would stop at the last valid number on the way to an invalid one (50 -> 501 kept 50 and
+        // a window close would then trim the history to 50).
+        let Some(raw) = text_field_text(field) else {
             return;
         };
-        let _ = raw;
         EDITED_TEXT_FIELDS.fetch_or(text_field_bit(field), Ordering::SeqCst);
-        write_text_field_config(field, value, false);
-        schedule_config_persist();
-        log_debug!(
-            "[settings] numeric field {:?} applied (debounced persist)",
-            field
-        );
+        set_max_entries_draft(&raw);
+        log_debug!("[settings] numeric field {field:?} kept as a draft until commit");
     });
 }
 
@@ -1319,42 +1432,24 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
                 Some(f) => f,
                 None => return,
             };
-            match parse_text_field(field) {
-                Some((value, _)) => {
-                    // Only a field the user actually typed into commits here. An untouched field is AppKit
-                    // resigning the window's automatic initial first responder (see `EDITED_TEXT_FIELDS`), and
-                    // committing it would rewrite the config file on every open.
-                    if !take_edited_field(&EDITED_TEXT_FIELDS, field) {
-                        log_debug!(
-                            "[settings] numeric field {field:?} untouched on end editing; not persisted"
-                        );
-                        return;
-                    }
-                    write_text_field_config(field, value, true);
-                    persist_config_now();
-                    log_debug!(
-                        "[settings] numeric field {:?} committed on end editing",
-                        field
-                    );
-                }
-                None => {
-                    // The edit session is over either way, so the bit does not outlive it.
-                    let _ = take_edited_field(&EDITED_TEXT_FIELDS, field);
-                    // Do not commit invalid values; restore the last effective config value.
-                    let cfg = CONFIG.read().unwrap().clone();
-                    let text = match field {
-                        TextField::ClipboardMaxEntries => cfg.clipboard.max_entries.to_string(),
-                    };
-                    with_settings_ui(|ui| {
-                        if let Some(u) = ui.as_ref() {
-                            let ctrl = match field {
-                                TextField::ClipboardMaxEntries => u.clipboard_max_entries,
-                            };
-                            set_field(ctrl, text);
-                        }
-                    });
-                }
+            // A field the user typed into has a draft; one nobody touched has neither. The edit
+            // bit alone is not enough: a content rebuild clears it with the old control, while the
+            // draft survives and still holds the newest text.
+            let edited = take_edited_field(&EDITED_TEXT_FIELDS, field);
+            if !edited && !has_max_entries_draft() {
+                log_debug!(
+                    "[settings] numeric field {field:?} untouched on end editing; not persisted"
+                );
+                return;
             }
+            if !commit_max_entries_draft() {
+                // Invalid, out of range or unchanged: never commit it; show the committed value.
+                restore_max_entries_field();
+            }
+            log_debug!(
+                "[settings] numeric field {:?} finished on end editing",
+                field
+            );
         }
     });
 }
@@ -1366,6 +1461,20 @@ enum TextField {
     ClipboardMaxEntries,
 }
 
+/// The numeric field's text as typed, whatever it holds (a null control -> None).
+unsafe fn text_field_text(field: TextField) -> Option<String> {
+    with_settings_ui(|ui| {
+        let u = ui.as_ref()?;
+        let ctrl = match field {
+            TextField::ClipboardMaxEntries => u.clipboard_max_entries,
+        };
+        if ctrl.is_null() {
+            return None;
+        }
+        Some(nsstring_to_rust(msg_send![ctrl, stringValue]))
+    })
+}
+
 unsafe fn text_field_of(obj: *mut AnyObject) -> Option<TextField> {
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;
@@ -1374,38 +1483,13 @@ unsafe fn text_field_of(obj: *mut AnyObject) -> Option<TextField> {
     })
 }
 
-/// Parse a numeric text field: returns (normalized value, raw text); None when invalid.
-unsafe fn parse_text_field(field: TextField) -> Option<(TextFieldValue, String)> {
-    with_settings_ui(|ui| {
-        let u = ui.as_ref()?;
-        let (ctrl, bounds): (*mut AnyObject, (f64, f64)) = match field {
-            TextField::ClipboardMaxEntries => (u.clipboard_max_entries, (1.0, 100.0)),
-        };
-        let raw = nsstring_to_rust(msg_send![ctrl, stringValue]);
-        let value = match field {
-            TextField::ClipboardMaxEntries => match parse_usize(&raw) {
-                Ok(v) if (bounds.0 as usize..=bounds.1 as usize).contains(&v) => {
-                    TextFieldValue::U32(v as u32)
-                }
-                _ => return None,
-            },
-        };
-        Some((value, raw))
-    })
-}
-
-#[derive(Clone, Copy)]
-enum TextFieldValue {
-    U32(u32),
-}
-
 /// One bit per numeric field, set by a real keystroke and consumed by the commit on end editing.
 ///
-/// The distinction matters because `on_control_text_did_change` already wrote a valid keystroke into
-/// `CONFIG`, so "did this field change?" cannot tell the two cases apart. What can is whether the user ever
-/// typed into the field at all: the prewarmed settings window takes AppKit's automatic initial first
-/// responder, so the first real open resigns a field nobody touched, and committing that would rewrite
-/// `config.toml` on every open.
+/// The distinction matters because "did this field change?" cannot tell a user's edit from AppKit
+/// machinery: the prewarmed settings window takes the automatic initial first responder, so the first
+/// real open resigns a field nobody touched, and committing that would rewrite `config.toml` on every
+/// open. A content rebuild clears the bit with the old control; the draft is what still proves the
+/// user typed something after that (see `has_max_entries_draft`).
 static EDITED_TEXT_FIELDS: AtomicU32 = AtomicU32::new(0);
 
 fn text_field_bit(field: TextField) -> u32 {
@@ -1425,19 +1509,19 @@ pub(super) fn note_text_fields_rebuilt() {
     EDITED_TEXT_FIELDS.store(0, Ordering::SeqCst);
 }
 
-/// Write a valid numeric value into the in-memory CONFIG.
-fn write_text_field_config(field: TextField, value: TextFieldValue, apply_runtime: bool) {
+/// Write a committed numeric value into the in-memory CONFIG and apply it: this is the path where
+/// the entry limit's destructive trim runs, so only a completed edit (end editing, or a window
+/// close with a pending draft) may call it.
+fn write_text_field_config(field: TextField, value: u32) {
     let old_cfg = CONFIG.read().unwrap().clone();
     let mut cfg = old_cfg.clone();
-    match (field, value) {
-        (TextField::ClipboardMaxEntries, TextFieldValue::U32(v)) => cfg.clipboard.max_entries = v,
+    match field {
+        TextField::ClipboardMaxEntries => cfg.clipboard.max_entries = value,
     }
     if let Ok(mut w) = CONFIG.write() {
         *w = cfg.clone();
     }
-    if apply_runtime {
-        apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
-    }
+    apply_config_change(&old_cfg, &cfg, ConfigChangeSource::Settings);
 }
 
 /// Freeze or unfreeze all mouse controls below the enable_mouse switch based on its state.
@@ -3315,8 +3399,9 @@ mod tests {
     }
 
     use super::{
-        checked_ids, clipboard_delete_dependent_visibility_from_config, smooth_slider_display,
-        smooth_slider_value, take_edited_field, text_field_bit, Config, Ordering, TextField,
+        checked_ids, clipboard_delete_dependent_visibility_from_config, committed_limit_change,
+        max_entries_field_text, set_max_entries_draft, smooth_slider_display, smooth_slider_value,
+        take_edited_field, take_max_entries_draft, text_field_bit, Config, Ordering, TextField,
     };
 
     #[test]
@@ -3354,6 +3439,39 @@ mod tests {
             !take_edited_field(&mask, TextField::ClipboardMaxEntries),
             "an unrelated bit must not stand in for this field's edit"
         );
+    }
+
+    #[test]
+    fn a_typed_limit_is_a_change_only_against_the_committed_value() {
+        // Typing 20 over a committed 50 must be a real change: that is what makes the commit raise
+        // `clipboard_max_entries` and trim the history at once. The case this guards: the keystroke
+        // used to write 20 into CONFIG, so the commit compared 20 with 20 and the trim never ran.
+        assert_eq!(committed_limit_change(50, "20"), Some(20));
+        assert_eq!(committed_limit_change(50, "500"), Some(500));
+        // The same number is not a change: no apply, no rewrite, no trim.
+        assert_eq!(committed_limit_change(50, "50"), None);
+        assert_eq!(
+            committed_limit_change(50, " 50 "),
+            None,
+            "the parse trims, so this is the same number"
+        );
+        // Out of range and not-a-number apply nothing.
+        assert_eq!(committed_limit_change(50, "0"), None);
+        assert_eq!(committed_limit_change(50, "501"), None);
+        assert_eq!(committed_limit_change(50, "many"), None);
+        assert_eq!(committed_limit_change(50, ""), None);
+    }
+
+    #[test]
+    fn the_draft_keeps_the_newest_text_even_when_it_is_no_longer_valid() {
+        // 500 -> delete a digit (50, valid) -> type 1 (501, invalid): closing the window must not
+        // commit the older 50 and trim the history to it. The draft holds the LATEST text, so the
+        // commit sees an invalid value and applies nothing.
+        set_max_entries_draft("50");
+        set_max_entries_draft("501");
+        assert_eq!(max_entries_field_text(), "501");
+        assert_eq!(committed_limit_change(500, "501"), None);
+        let _ = take_max_entries_draft();
     }
 
     /// The Finder Menu's vec-backed fields keep the catalog order however the boxes were ticked:

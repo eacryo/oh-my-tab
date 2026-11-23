@@ -345,6 +345,7 @@ desc_clipboard_shortcut_recording = "Recording… press a key chord. Escape canc
 row_clipboard_clear_system_pasteboard_after_paste = "Delete system clipboard item too"
 row_clipboard_show_source_app = "Show source app"
 row_clipboard_max_entries = "Max entries"
+desc_clipboard_max_entries = "Range 1–500; lowering it deletes the extra entries immediately."
 row_clipboard_auto_expire_days = "Auto-delete days (0 = never)"
 row_clipboard_image_rows = "Image row height (in rows)"
 row_clipboard_pin_follow = "Selection after pinning"
@@ -707,7 +708,7 @@ logging_level_invalid = 'logging.level: "{value}" is invalid (expect: debug, inf
 config_read_failed = "cannot read config: {error}"
 config_field_type_invalid = "{field}: invalid type {actual} (expected {expected}); using default"
 mouse_scroll_mode_invalid = 'scroll_mode: "{value}" is not one of default, line, smooth'
-clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=100"
+clipboard_max_entries_invalid = "clipboard.max_entries: {value} must be 1..=500"
 clipboard_auto_expire_days_invalid = "clipboard.auto_expire_days: {value} must be 0..=7 (0 = never)"
 clipboard_image_rows_invalid = "clipboard.image_rows: {value} must be 1..=3"
 clipboard_picker_placement_invalid = 'clipboard.picker_placement: "{value}" is not one of cursor, center'

@@ -956,6 +956,9 @@ pub(super) fn close_floating_editors() {
 }
 
 pub(super) fn hide_settings() {
+    // A typed entry limit is a draft: the field's value is applied on end editing, but a hide must
+    // not depend on that notification having fired first. Commit while the control still exists.
+    dispatch::commit_pending_max_entries_edit();
     // The panel size preview belongs to a live drag on this window: closing Settings must take it
     // down (and restore the panel's window level) even if the drag never produced its mouse-up.
     dispatch::end_max_extent_preview();
