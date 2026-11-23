@@ -668,6 +668,7 @@ fn tick() {
         let scheduled = *CLOSE_AT.lock().unwrap();
         match decisions::close_decision(zone, now, scheduled) {
             CloseDecision::Keep => *CLOSE_AT.lock().unwrap() = None,
+            CloseDecision::Wait => {}
             CloseDecision::Schedule(at) => *CLOSE_AT.lock().unwrap() = Some(at),
             CloseDecision::HideNow => hide_panel(),
         }

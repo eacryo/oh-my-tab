@@ -59,6 +59,11 @@ pub(crate) enum CloseDecision {
     /// Pointer still over the panel, its cards, the crossing or the anchor tile: keep it open and
     /// cancel any pending close.
     Keep,
+    /// Pointer is elsewhere and a close is already scheduled: wait for its deadline. This is
+    /// distinct from `Keep` because the caller cancels on `Keep`; folding the two together made
+    /// every tick cancel the deadline the previous tick had just scheduled, so the panel never
+    /// closed after the pointer left.
+    Wait,
     /// Pointer is elsewhere: schedule a close at this instant.
     Schedule(Instant),
     /// The grace period has elapsed: hide now.
@@ -79,26 +84,42 @@ pub(crate) fn close_decision(
         | PointerZone::Anchor => CloseDecision::Keep,
         PointerZone::Outside => match scheduled {
             Some(deadline) if now >= deadline => CloseDecision::HideNow,
-            Some(_) => CloseDecision::Keep,
+            Some(_) => CloseDecision::Wait,
             None => CloseDecision::Schedule(now + CLOSE_GRACE),
         },
     }
 }
 
-/// Whether the real pointer is resting on the Dock but no longer on the tile the open panel
-/// belongs to.
+/// Whether the real pointer is resting on the Dock but over a different tile than the one the
+/// open panel is anchored to.
 ///
 /// The observer's selected-tile notification is not enough on its own: hovering a Dock tile whose
 /// application is not running can leave the previously selected tile in place, and the panel would
-/// then keep describing an app the pointer has already left. This check is geometric and uses the
-/// pointer the tick already reads; a pointer above the Dock (crossing towards the cards) is not
-/// "on another tile", so the panel survives that transit.
+/// then keep describing an app the pointer has already left.
+///
+/// Only the tile axis counts. A horizontal Dock's tiles are separated along x, so a pointer still
+/// within the anchored icon's x-span is on that icon's tile even when it has moved above the icon
+/// top (the 6pt strip between the icon and the list edge that every trip towards the cards crosses);
+/// comparing both axes made that strip read as "another tile" and dismissed the panel on the way up.
 pub(crate) fn pointer_is_on_other_dock_tile(
     dock_list: Rect,
     anchor: Rect,
     pointer: (f64, f64),
 ) -> bool {
-    dock_list.contains(pointer) && !anchor.contains(pointer)
+    if !dock_list.contains(pointer) {
+        return false;
+    }
+    if dock_list.w >= dock_list.h {
+        // Only the icon row counts as a tile. A pointer above the icon's top is the strip towards
+        // the cards: it stays "the same hover" even when the path drifts sideways, because the
+        // panel is wider than the icon and the trip to a card is often diagonal.
+        let in_tile_row = pointer.1 >= anchor.y;
+        in_tile_row && (pointer.0 < anchor.x || pointer.0 > anchor.max_x())
+    } else {
+        // A side Dock stacks its tiles vertically; beside the column is the way to the cards.
+        let in_tile_column = pointer.0 <= anchor.max_x();
+        in_tile_column && (pointer.1 < anchor.y || pointer.1 > anchor.max_y())
+    }
 }
 
 /// What the title-hover tooltip should do.
@@ -232,7 +253,8 @@ mod tests {
         let scheduled = now + CLOSE_GRACE;
         assert_eq!(
             close_decision(PointerZone::Outside, now + CLOSE_GRACE / 2, Some(scheduled)),
-            CloseDecision::Keep
+            CloseDecision::Wait,
+            "outside with a pending deadline must not be reported as the cancelling Keep"
         );
         assert_eq!(
             close_decision(PointerZone::Outside, now + CLOSE_GRACE, Some(scheduled)),
@@ -338,7 +360,27 @@ mod dock_tile_tests {
             anchor(),
             (290.0, 922.0)
         ));
-        // Above the Dock, on the way to the cards: not "another tile".
+        // Above the icon but still in its column: the strip between the icon top and the Dock's
+        // list edge. This is the path every trip from the icon towards the cards takes, so it must
+        // not end the preview.
+        assert!(!pointer_is_on_other_dock_tile(
+            list(),
+            anchor(),
+            (290.0, 891.0)
+        ));
+        // A diagonal trip to a card drifts sideways while crossing that strip: still the same hover.
+        assert!(!pointer_is_on_other_dock_tile(
+            list(),
+            anchor(),
+            (350.0, 891.0)
+        ));
+        // In the icon row, a neighbouring tile still ends it.
+        assert!(pointer_is_on_other_dock_tile(
+            list(),
+            anchor(),
+            (336.0, 900.0)
+        ));
+        // Above the Dock, on the way to the cards.
         assert!(!pointer_is_on_other_dock_tile(
             list(),
             anchor(),
@@ -349,6 +391,30 @@ mod dock_tile_tests {
             list(),
             anchor(),
             (290.0, 400.0)
+        ));
+    }
+
+    #[test]
+    fn a_side_dock_compares_the_tile_axis_vertically() {
+        let side_list = Rect::new(0.0, 100.0, 56.0, 800.0);
+        let side_anchor = Rect::new(0.0, 400.0, 56.0, 44.0);
+        // Another tile above the anchored icon.
+        assert!(pointer_is_on_other_dock_tile(
+            side_list,
+            side_anchor,
+            (28.0, 300.0)
+        ));
+        // Same icon, beside it on the way to the cards.
+        assert!(!pointer_is_on_other_dock_tile(
+            side_list,
+            side_anchor,
+            (60.0, 420.0)
+        ));
+        // Same tile column, same icon row: still the hovered tile.
+        assert!(!pointer_is_on_other_dock_tile(
+            side_list,
+            side_anchor,
+            (28.0, 420.0)
         ));
     }
 }
