@@ -498,6 +498,30 @@ unsafe fn cancel_detail_close(window: *mut AnyObject) {
     ];
 }
 
+/// How long the detail pane's content takes to enter.
+///
+/// `duration-fast`, not `duration-medium`: the panel's own resize is this action's spatial change
+/// and it is applied instantly, so the pane body is revealed *inside* an already-settled frame
+/// (design-style §8). The medium token therefore bought no motion the user could read, only a
+/// longer veil over content whose layout had already finished.
+pub(super) fn detail_content_entrance_duration() -> f64 {
+    crate::theme::ANIMATION_DURATION_FAST
+}
+
+/// The duration both of the content's Core Animations run with: the entrance token, or its
+/// `animation_exit_duration` counterpart when the content leaves.
+///
+/// One function for the pair on purpose: the slide and the fade must never disagree, and a test
+/// can pin both directions without a window (the two `setDuration:` call sites take this value).
+pub(super) fn detail_animation_duration(opening: bool) -> f64 {
+    let entrance = detail_content_entrance_duration();
+    if opening {
+        entrance
+    } else {
+        crate::theme::animation_exit_duration(entrance)
+    }
+}
+
 /// Animate the existing detail content horizontally without rebuilding views or images.
 unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
     let _: () = msg_send![content, setWantsLayer: true];
@@ -513,6 +537,7 @@ unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
     let _: () = msg_send![layer, removeAnimationForKey: transform_animation_key];
     let _: () = msg_send![layer, removeAnimationForKey: opacity_animation_key];
 
+    let duration = detail_animation_duration(opening);
     let (from_x, to_x, from_opacity, to_opacity) = if opening {
         (DETAIL_CONTENT_ANIMATION_OFFSET, 0.0, 0.0f32, 1.0f32)
     } else {
@@ -529,14 +554,7 @@ unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
     ];
     let _: () = msg_send![transform_animation, setFromValue: from_x_value];
     let _: () = msg_send![transform_animation, setToValue: to_x_value];
-    let _: () = msg_send![
-        transform_animation,
-        setDuration: if opening {
-            crate::theme::ANIMATION_DURATION_MEDIUM
-        } else {
-            crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
-        }
-    ];
+    let _: () = msg_send![transform_animation, setDuration: duration];
     let timing = crate::theme::ease_standard_timing_function();
     if !timing.is_null() {
         let _: () = msg_send![transform_animation, setTimingFunction: timing];
@@ -563,14 +581,7 @@ unsafe fn animate_detail_content(content: *mut AnyObject, opening: bool) {
     ];
     let _: () = msg_send![opacity_animation, setFromValue: from_opacity_value];
     let _: () = msg_send![opacity_animation, setToValue: to_opacity_value];
-    let _: () = msg_send![
-        opacity_animation,
-        setDuration: if opening {
-            crate::theme::ANIMATION_DURATION_MEDIUM
-        } else {
-            crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_MEDIUM)
-        }
-    ];
+    let _: () = msg_send![opacity_animation, setDuration: duration];
     let timing = crate::theme::ease_standard_timing_function();
     if !timing.is_null() {
         let _: () = msg_send![opacity_animation, setTimingFunction: timing];
@@ -1075,6 +1086,7 @@ pub(super) fn hide_detail() {
     if !take_detail_visible() {
         return;
     }
+    let mut clock = DetailPhaseClock::new();
     unsafe {
         let detail_content = *DETAIL_CONTENT.lock().unwrap();
         let picker_window = *PICKER_WINDOW.lock().unwrap();
@@ -1113,12 +1125,21 @@ pub(super) fn hide_detail() {
             crate::glass::set_panel_frame(window.0, frame, true);
             layout_picker_chrome(frame.size);
         }
-        rebuild_rows();
+        clock.lap("frame");
+        let rows_summary = rebuild_rows();
+        clock.lap("rows");
         if let Some(container) = picker_container_ptr() {
             scroll_selection_into_view(container, picker_selection());
         }
+        let _ = rows_summary;
     }
     refresh_detail_action_visuals();
+    clock.lap("visuals");
+    if clock.enabled {
+        let total_us = clock.elapsed_us();
+        let phases = clock.rendered();
+        log_debug!("[clip] detail_close {} total_us={}", phases, total_us);
+    }
 }
 
 /// The detail panel's window class, as a handle: it defines `finishDetailClose:`, the delayed
@@ -1746,6 +1767,56 @@ fn selected_detail_entry() -> Option<ClipEntry> {
     history.get(h_idx).cloned()
 }
 
+/// Phase clock for one detail open or close.
+///
+/// Development instrumentation for the "the detail does not expand immediately" report: it
+/// separates the synchronous build (which postpones the entrance animation) from the animation
+/// itself. Records phase names and durations only, never any clipboard content.
+struct DetailPhaseClock {
+    /// Decided once, at construction: with the diagnostic tier off the phases are never read, so a
+    /// lap must not read the clock or grow the Vec on the interaction path.
+    enabled: bool,
+    started: Instant,
+    last: Instant,
+    phases: Vec<(&'static str, u128)>,
+}
+
+impl DetailPhaseClock {
+    fn new() -> Self {
+        let now = Instant::now();
+        Self {
+            enabled: crate::logger::debug_enabled(),
+            started: now,
+            last: now,
+            phases: Vec::new(),
+        }
+    }
+
+    /// Close the current phase and name it. A no-op when the phases cannot be logged.
+    fn lap(&mut self, phase: &'static str) {
+        if !self.enabled {
+            return;
+        }
+        let now = Instant::now();
+        self.phases
+            .push((phase, now.duration_since(self.last).as_micros()));
+        self.last = now;
+    }
+
+    fn elapsed_us(&self) -> u128 {
+        self.started.elapsed().as_micros()
+    }
+
+    /// `name=us name=us ...`, for one log line.
+    fn rendered(&self) -> String {
+        self.phases
+            .iter()
+            .map(|(name, us)| format!("{name}={us}us"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+}
+
 /// Show the selected entry's detail: the expanding pane when [`detail_expands_in_pane`] says the
 /// panel is narrow, else the side panel right of the picker.
 pub(super) unsafe fn show_detail_for_sel() {
@@ -1757,11 +1828,15 @@ pub(super) unsafe fn show_detail_for_sel() {
         log_info!("[clip] detail open skipped: not on the main thread");
         return;
     }
+    let mut clock = DetailPhaseClock::new();
     let Some(entry) = selected_detail_entry() else {
         return;
     };
+    clock.lap("pick");
     let detail_was_visible = detail_visible();
+    let window_existed = DETAIL_WINDOW.lock().unwrap().is_some();
     ensure_detail_window();
+    clock.lap("window");
     let window = match *DETAIL_WINDOW.lock().unwrap() {
         Some(w) => w.0,
         None => return,
@@ -1787,6 +1862,7 @@ pub(super) unsafe fn show_detail_for_sel() {
     // lay the body out for a panel rect, which is the only difference between the two modes.
     let layout = picker_layout(screen_frame.size.width, true);
     let in_pane = !layout.split;
+    let picker_w_before = picker_frame.size.width;
     let width_changed = (picker_frame.size.width - layout.panel_w).abs() > 0.5
         || DETAIL_SPLIT.load(Ordering::SeqCst) != layout.split;
     DETAIL_SPLIT.store(layout.split, Ordering::SeqCst);
@@ -1810,6 +1886,7 @@ pub(super) unsafe fn show_detail_for_sel() {
         super::drag::clamp_picker_origin(target_frame.origin, target_frame.size, screen_frame);
     crate::glass::set_panel_frame(picker_win, target_frame, true);
     layout_picker_chrome(target_frame.size);
+    clock.lap("frame");
     let body = detail_content_frame(target_frame.size);
     let target_w = layout.detail_w;
     let target_h = body.size.height;
@@ -1853,20 +1930,22 @@ pub(super) unsafe fn show_detail_for_sel() {
         let v: *mut AnyObject = msg_send![subs, objectAtIndex: i as isize];
         let _: () = msg_send![v, removeFromSuperview];
     }
+    clock.lap("clear");
 
     // The pane body: shared by both modes, laid out at the target panel's width and height.
-    let (w, h) = build_detail_body(content, &entry, target_w, target_h);
+    let (w, h) = build_detail_body(content, &entry, target_w, target_h, &mut clock);
 
     let _ = (w, h);
     if !detail_was_visible {
         animate_detail_content(content, true);
     }
-    if width_changed {
-        rebuild_rows();
-    }
+    clock.lap("animate");
+    let rows_summary = if width_changed { rebuild_rows() } else { None };
+    clock.lap("rows");
     install_detail_divider(parent, body, layout.list_w, layout.split);
     super::drag::raise_drag_surface(parent);
     set_detail_visible(true);
+    clock.lap("show");
     // Once full document layout and the final window frame are both applied, unconditionally
     // set AppKit's actual constrained top. Mouse detail clicks, keyboard Right, and Up/Down
     // navigation while detail is open all converge here and therefore behave identically.
@@ -1884,6 +1963,39 @@ pub(super) unsafe fn show_detail_for_sel() {
         }
     }
     refresh_detail_action_visuals();
+    clock.lap("visuals");
+    if clock.enabled {
+        // Sampled before the phase string is built: formatting is diagnostic overhead, not part of
+        // the synchronous build this number describes.
+        let total_us = clock.elapsed_us();
+        let phases = clock.rendered();
+        let (rows_ms, rows_image_rows) = rows_summary
+            .map(|s| (s.elapsed_ms, s.image_rows))
+            .unwrap_or((0, 0));
+        // `configured_entrance_ms` is the animation the code would install, not the one this open
+        // used: under Reduce Motion the animation is skipped entirely.
+        log_debug!(
+            "[clip] detail_open kind={} text_bytes={} in_pane={} split={} width_changed={} first_open={} window_created={} picker_w_before={:.1} rows_ms={} rows_image_rows={} configured_entrance_ms={:.1} reduce_motion={} phases: {} total_us={}",
+            if entry.image.is_some() { "image" } else { "text" },
+            entry.text.len(),
+            in_pane,
+            layout.split,
+            width_changed,
+            !detail_was_visible,
+            !window_existed,
+            picker_w_before,
+            rows_ms,
+            rows_image_rows,
+            if detail_was_visible {
+                0.0
+            } else {
+                detail_content_entrance_duration() * 1000.0
+            },
+            crate::theme::reduce_motion_enabled(),
+            phases,
+            total_us
+        );
+    }
 }
 
 /// Build the detail body into `content`: the full untruncated text for text entries, the large
@@ -1894,6 +2006,7 @@ unsafe fn build_detail_body(
     entry: &ClipEntry,
     panel_w: f64,
     max_detail_h: f64,
+    clock: &mut DetailPhaseClock,
 ) -> (f64, f64) {
     let pane = detail_pane_layout_with(
         detail_insets(picker_shows_detail_in_pane(), panel_w),
@@ -1914,6 +2027,7 @@ unsafe fn build_detail_body(
                 installed = true;
             }
         }
+        clock.lap("media");
         if !installed {
             add_detail_text(
                 content,
@@ -1940,6 +2054,7 @@ unsafe fn build_detail_body(
         } else {
             None
         };
+        clock.lap("media");
         add_detail_text(
             content,
             &entry.text,
@@ -1953,10 +2068,12 @@ unsafe fn build_detail_body(
             kind,
         );
     }
+    clock.lap("text");
     add_detail_actions(entry, panel_w, max_detail_h);
     if picker_shows_detail_in_pane() {
         add_detail_back_button(content);
     }
+    clock.lap("actions");
     (panel_w, max_detail_h)
 }
 

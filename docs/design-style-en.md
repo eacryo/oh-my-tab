@@ -857,3 +857,42 @@ represented the same way (`ELEVATION_HIGH_*`), and the floating panels use it: t
 The development-only `--panel-backdrop=image:/absolute/path` fixture displays a supplied reference image
 below floating panels without changing the desktop wallpaper or activating another app. It is removed
 when that development instance stops.
+
+## 8. Animation
+
+| Token | Value | Use |
+| --- | --- | --- |
+| `duration-fast` | 175 ms | Micro-interactions; a component's own press feedback uses its own duration; content revealed inside a panel whose size this action has already settled |
+| `duration-medium` | 380 ms | Spatial change: panel open/close, expand/collapse, page switches |
+| `ease-standard` | `cubic-bezier(0.24, 1, 0.4, 1)` | Every animation unless there is a stated reason |
+| Exit duration | 0.75× the entrance, same curve | Closing panels, closing dialogs |
+
+Rules:
+
+- **Contextual UI only animates its entrance.** Tooltips, hover cards and dropdown menus may disappear
+  instantly; panels, dialogs and expanded rows animate in both directions, and the exit travels back
+  along the entrance path.
+- **The test is what the animation itself carries, not how much the action changed.** When a detail
+  expands, the panel widening, the list narrowing and the chrome/footer relayout all settle in the
+  same frame with no animation of their own; the `duration-fast` animation carries **only the body's
+  opacity and offset**. Spending `duration-medium` there would keep already-laid-out content hidden
+  under a fade without adding any spatial information. Conversely the settings window's page switch
+  and a panel opening animate **the surface itself moving or being replaced**, and keep
+  `duration-medium`.
+- **The clipboard detail is a named instance of that rule, in both layouts.** On a wide screen it is
+  the panel's instant 640→960 widening (960 is a cap; a narrower available width widens to that width
+  instead, e.g. 884pt at 900pt available); on a narrow screen (available width ≤ 840pt) it is the
+  list/detail swap inside one panel — **the named exception where a surface is swapped but the
+  animation still carries only local content**. It is not a licence to read any page switch inside a
+  fixed window as `fast`.
+
+**Recorded deviation: the clipboard detail still collapses instantly.** That conflicts with the
+two-direction rule above. The reason is that the panel width, the chrome and the list widths all
+settle in the same frame, so fading only the content would read as two stages ("content fades, panel
+jumps"); the correct fix animates the window frame together with its sibling surfaces and is separate
+work, tracked in `docs/review-backlog.md` #86. The deviation is limited to the clipboard detail panel
+and is removed once #86 lands.
+
+The development-only `--panel-backdrop=image:/absolute/path` switch places a supplied reference image
+below floating panels without changing the desktop wallpaper or activating another app; stopping that
+development instance removes it.

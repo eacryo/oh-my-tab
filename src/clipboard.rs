@@ -5583,6 +5583,22 @@ mod tests {
         assert!(!collapsed.split);
         assert_eq!(collapsed.panel_w, 640.0);
     }
+
+    /// The pane body enters inside an already-settled frame, so it is a micro-transition: pinning
+    /// both directions here is what keeps a "make the expand feel more deliberate" edit from
+    /// silently restoring the 380ms veil over content whose layout has already finished.
+    #[test]
+    fn detail_content_animates_with_the_fast_duration() {
+        let entrance = super::detail_animation_duration(true);
+        assert_eq!(entrance, crate::theme::ANIMATION_DURATION_FAST);
+        assert!(entrance < crate::theme::ANIMATION_DURATION_MEDIUM);
+        // The exit keeps the shared 0.75x rule rather than a duration of its own.
+        assert_eq!(
+            super::detail_animation_duration(false),
+            crate::theme::animation_exit_duration(crate::theme::ANIMATION_DURATION_FAST)
+        );
+    }
+
     /// The body rect is what the list and the in-pane detail take turns occupying: under the header
     /// strip, above the footer, the full width.
     #[test]

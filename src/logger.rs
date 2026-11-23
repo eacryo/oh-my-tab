@@ -57,12 +57,19 @@ macro_rules! log_debug {
         $crate::logger::_log($crate::logger::LogLevel::Debug, format_args!($($arg)*))
     };
 }
+
 /// Normal runtime info (startup / toggles / menu / error notices), emitted at both tiers.
 #[macro_export]
 macro_rules! log_info {
     ($($arg:tt)*) => {
         $crate::logger::_log($crate::logger::LogLevel::Info, format_args!($($arg)*))
     };
+}
+
+/// Whether the diagnostic tier is on, so a caller can skip building a message it would only
+/// throw away (the macro's `format_args!` is lazy, but expression arguments are evaluated first).
+pub fn debug_enabled() -> bool {
+    LOG_LEVEL.load(Ordering::Relaxed) == LogLevel::Debug as usize
 }
 
 /// Core function called by macros: threshold filter + timestamp + send to channel.
