@@ -641,6 +641,23 @@ fn tick() {
     let now = Instant::now();
     let pointer = pointer_in_cg().unwrap_or((f64::NAN, f64::NAN));
     if panel::is_visible() {
+        // Moving along the Dock from the previewed icon to a different tile (including a tile
+        // whose app is not running) ends the preview immediately: the observer's selection event
+        // can lag or not change at all for a non-running tile, and a panel describing the previous
+        // app must never outlive the hover.
+        let other_tile = {
+            let dock = *DOCK_STATE.lock().unwrap();
+            match (dock.list, panel::anchor_rect()) {
+                (Some(list), Some((anchor, _))) => {
+                    decisions::pointer_is_on_other_dock_tile(list, anchor, pointer)
+                }
+                _ => false,
+            }
+        };
+        if other_tile {
+            hide_panel();
+            return;
+        }
         let outcome = panel::tick(now, pointer);
         panel::flush_records();
         if outcome == panel::TickOutcome::Empty {

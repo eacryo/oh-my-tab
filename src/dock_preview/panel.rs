@@ -139,6 +139,15 @@ pub(crate) fn panel_frame() -> Option<Rect> {
         .map(|state| state.geometry.panel)
 }
 
+/// The hovered tile rectangle and Dock edge the open panel is anchored to.
+pub(crate) fn anchor_rect() -> Option<(Rect, DockEdge)> {
+    PANEL
+        .lock()
+        .ok()?
+        .as_ref()
+        .map(|state| (state.geometry.anchor, state.geometry.edge))
+}
+
 pub(crate) fn is_visible() -> bool {
     PANEL
         .lock()

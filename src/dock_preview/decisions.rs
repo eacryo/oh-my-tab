@@ -1,7 +1,7 @@
 //! Pure decisions for the Dock preview. The AppKit/observer code reads these answers instead of
 //! re-deriving them, so the timing and hand-off rules are assertable without a screen or a Dock.
 
-use crate::dock_preview::layout::PointerZone;
+use crate::dock_preview::layout::{PointerZone, Rect};
 use std::time::{Duration, Instant};
 
 /// How long the pointer must rest on a Dock tile before the panel opens. Short enough to feel
@@ -83,6 +83,22 @@ pub(crate) fn close_decision(
             None => CloseDecision::Schedule(now + CLOSE_GRACE),
         },
     }
+}
+
+/// Whether the real pointer is resting on the Dock but no longer on the tile the open panel
+/// belongs to.
+///
+/// The observer's selected-tile notification is not enough on its own: hovering a Dock tile whose
+/// application is not running can leave the previously selected tile in place, and the panel would
+/// then keep describing an app the pointer has already left. This check is geometric and uses the
+/// pointer the tick already reads; a pointer above the Dock (crossing towards the cards) is not
+/// "on another tile", so the panel survives that transit.
+pub(crate) fn pointer_is_on_other_dock_tile(
+    dock_list: Rect,
+    anchor: Rect,
+    pointer: (f64, f64),
+) -> bool {
+    dock_list.contains(pointer) && !anchor.contains(pointer)
 }
 
 /// What the title-hover tooltip should do.
@@ -290,5 +306,49 @@ mod tests {
     fn a_retired_observer_session_cannot_post_events() {
         assert!(event_is_current(3, 3));
         assert!(!event_is_current(2, 3));
+    }
+}
+
+#[cfg(test)]
+mod dock_tile_tests {
+    use super::*;
+
+    fn list() -> Rect {
+        Rect::new(37.0, 890.0, 1396.0, 56.0)
+    }
+
+    fn anchor() -> Rect {
+        Rect::new(268.0, 894.0, 44.0, 56.0)
+    }
+
+    #[test]
+    fn the_neighbouring_tile_ends_the_preview() {
+        // One tile to the right: still inside the Dock's list, outside the hovered icon.
+        assert!(pointer_is_on_other_dock_tile(
+            list(),
+            anchor(),
+            (336.0, 922.0)
+        ));
+    }
+
+    #[test]
+    fn the_hovered_tile_and_the_crossing_keep_it() {
+        assert!(!pointer_is_on_other_dock_tile(
+            list(),
+            anchor(),
+            (290.0, 922.0)
+        ));
+        // Above the Dock, on the way to the cards: not "another tile".
+        assert!(!pointer_is_on_other_dock_tile(
+            list(),
+            anchor(),
+            (290.0, 850.0)
+        ));
+        // Somewhere else on the desktop.
+        assert!(!pointer_is_on_other_dock_tile(
+            list(),
+            anchor(),
+            (290.0, 400.0)
+        ));
     }
 }
