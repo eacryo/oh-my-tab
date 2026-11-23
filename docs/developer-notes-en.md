@@ -290,6 +290,34 @@ BetterCmdTab drops `layer >= 20 || layer < 0`, alt-tab-macos drops *phantom* win
 `alpha == 0`), and DockDoor takes `layer == 0` plus one bundle-identifier denylist. All three keep
 the extension's window, because all three rules describe the window and the window is normal.
 
+### Applications excluded from the switcher
+
+`[windows] excluded_apps` is a list of bundle identifiers whose windows never become cards. It is a
+*display* filter, unlike the clipboard's list: an entry is matched after trimming and case-folded, and
+a process whose bundle id cannot be resolved is never excluded (fail-open -- hiding an application we
+cannot identify would be the worse failure). One pure predicate
+(`window_collector::excluded_app_matches`) is shared by the loader's sanitizer, the settings card and
+the collector, so the three cannot disagree about what an entry means.
+
+The filter is enforced where candidates are PUBLISHED (`window_collector/collect.rs`), not by dropping
+the pid from the Accessibility query: `native_fullscreen_cg_window_ids` reads the AX maps to decode
+fullscreen state, so pruning the AX input would take the fullscreen-transition evidence with it, and a
+transition into or out of an excluded fullscreen application could be missed. The CG publication loop
+and the AX backfill loop therefore both refuse an excluded pid and record
+`CardRejection::ExcludedApp`, and the directed (single-application) refresh answers with no windows for
+an excluded application -- otherwise a focus change into one while the panel is open would put its
+cards straight back. The thumbnail prewarm keeps collecting an excluded application: this list is a
+switcher display policy, not a capture policy.
+
+A change to the list is a candidate-policy change, exactly like `windows.show_other_desktops`: the
+committed candidates are discarded, in-flight results invalidated and the panel dismissed, because a
+slow first summon would otherwise fall back to the previous snapshot (and a fast release could commit
+an excluded window). Until a full pass with a COMPLETED primary enumeration arrives, a directed result
+may update observation data only; a failed enumeration is retried (bounded, three attempts) instead of
+being read as "nothing is admissible". The settings card lists at most 16 entries and states the rest
+as "+N", edited in the config file -- the same bound and overflow shape as the Gestures page's
+exclusion card, which shares its description (`settings/page_view/excluded_apps.rs`).
+
 ## Thumbnail card sizing
 
 The overlay's thumbnail grid gives every card **one** height. The user pins it with the App Switcher

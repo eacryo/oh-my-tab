@@ -178,6 +178,14 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
     ] {
         w.push(switch(label_key, field, on).desc(desc_key).into_spec());
     }
+    // Applications whose windows never appear in the switcher. Same card shape as the Gestures
+    // page's exclusion list (one description, two pages): its own copy, actions and row identities.
+    push_excluded_apps_card(
+        &mut w,
+        &switcher_excluded_card(),
+        &cfg.windows.excluded_apps,
+        &input.known_app_names,
+    );
     // The modifier popup lives in a THIRD card with its own heading ("Keyboard"), not at the tail
     // of Window Options: the inline builder opened a section for it after closing the options card,
     // and merging the two put a keyboard setting under a window-options heading.
@@ -197,4 +205,44 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
     w.finish()
+}
+
+/// The Switcher page's exclusion card: its copy keys, its action ids and the static row identities
+/// its control table addresses. The card sits between "Window Options" and "Keyboard".
+fn switcher_excluded_card() -> ExcludedAppsCardSpec {
+    static IDENTITIES: [&str; MAX_SHOWN_EXCLUDED] = [
+        "switcher_excluded_a",
+        "switcher_excluded_b",
+        "switcher_excluded_c",
+        "switcher_excluded_d",
+        "switcher_excluded_e",
+        "switcher_excluded_f",
+        "switcher_excluded_g",
+        "switcher_excluded_h",
+        "switcher_excluded_i",
+        "switcher_excluded_j",
+        "switcher_excluded_k",
+        "switcher_excluded_l",
+        "switcher_excluded_m",
+        "switcher_excluded_n",
+        "switcher_excluded_o",
+        "switcher_excluded_p",
+    ];
+    ExcludedAppsCardSpec {
+        header_key: "settings.header_switcher_excluded",
+        desc_key: "settings.desc_switcher_excluded",
+        add_row_key: "settings.row_switcher_excluded_add",
+        add_action_id: "switcher_excluded_choose",
+        add_action_key: "settings.switcher_excluded_choose_action",
+        invalid_key: "settings.row_switcher_excluded_invalid",
+        invalid_identity: "switcher_excluded_invalid",
+        empty_key: "settings.row_switcher_excluded_empty",
+        empty_identity: "switcher_excluded_empty",
+        row_label_key: "settings.row_switcher_excluded",
+        remove_action_id: "switcher_excluded_remove",
+        remove_action_key: "settings.switcher_excluded_remove",
+        more_key: "settings.row_switcher_excluded_more",
+        more_identity: "switcher_excluded_more",
+        identities: &IDENTITIES,
+    }
 }

@@ -1,6 +1,44 @@
 //! The rendering and building a page.
 
 use super::*;
+
+/// Every action a page row can run routes to its own handler. A wrong entry here is silent in both
+/// directions: the wrong handler runs (a Remove deletes something else) or the unknown-action guard
+/// runs and the button does nothing. The exclusion cards are the case that made this explicit -- a
+/// Remove that resolved nowhere looked exactly like a working one.
+#[test]
+fn exclusion_actions_route_to_their_own_handlers() {
+    use objc2::sel;
+    for (action, expected) in [
+        (
+            "switcher_excluded_remove",
+            sel!(handleSwitcherExcludedRemove:),
+        ),
+        (
+            "switcher_excluded_choose",
+            sel!(handleSwitcherExcludedChoose:),
+        ),
+        (
+            "gesture_excluded_remove",
+            sel!(handleGestureExcludedRemove:),
+        ),
+        (
+            "gesture_excluded_choose",
+            sel!(handleGestureExcludedChoose:),
+        ),
+    ] {
+        assert_eq!(
+            super::super::render::action_selector(action),
+            expected,
+            "{action} must run its own handler"
+        );
+    }
+    // An action nobody handles must not fall through to a real feature.
+    assert_eq!(
+        super::super::render::action_selector("not_an_action"),
+        sel!(handleUnknownPageAction:)
+    );
+}
 #[test]
 fn a_migrated_page_indexes_every_row_the_inline_sweep_used_to() {
     // The sweep the inline pages ran filled a row's entry from the strings its views render.

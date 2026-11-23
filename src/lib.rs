@@ -2529,6 +2529,19 @@ fn menu_target_class() -> StaticClass {
                 crate::settings::handle_gesture_excluded_remove as *mut c_void,
                 types.as_ptr(),
             );
+            // The Switcher page's excluded-application list: the same two commands, its own list.
+            class_addMethod(
+                cls,
+                sel!(handleSwitcherExcludedChoose:),
+                crate::settings::handle_switcher_excluded_choose as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleSwitcherExcludedRemove:),
+                crate::settings::handle_switcher_excluded_remove as *mut c_void,
+                types.as_ptr(),
+            );
             class_addMethod(
                 cls,
                 sel!(handleGestureRecordStart:),

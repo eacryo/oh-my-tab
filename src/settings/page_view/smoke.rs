@@ -205,10 +205,32 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             document,
             initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(600.0, 800.0))
         ];
-        let input = PageInput::from_config(
-            crate::config::Config::default(),
-            None,
-            crate::theme::ThemeInput::current(),
+        // The exclusion cards are laid out from their list, so the layout probe exercises a
+        // NON-EMPTY one: the default configuration draws only the empty state, and a row measured
+        // only in its empty shape is not measured at all. Unknown bundles keep their identifier as
+        // the label, which is the wider copy the card has to survive.
+        let mut config = crate::config::Config::default();
+        match page {
+            SettingsPageId::Switcher => {
+                config.windows.excluded_apps = vec![
+                    "com.apple.Safari".into(),
+                    "com.example.not-installed-anywhere".into(),
+                    "com.example.third".into(),
+                ];
+            }
+            SettingsPageId::Gestures => {
+                config.mouse.gesture_excluded_apps = vec![
+                    "com.apple.Safari".into(),
+                    "com.example.not-installed-anywhere".into(),
+                ];
+            }
+            _ => {}
+        }
+        let mut input = PageInput::from_config(config, None, crate::theme::ThemeInput::current());
+        input.known_app_names = std::sync::Arc::new(
+            [("com.apple.Safari".to_string(), "Safari".to_string())]
+                .into_iter()
+                .collect(),
         );
         let view = view_for(page, &input);
         let metrics = PageMetrics::for_layout(SettingsLayout::new(600.0));
@@ -291,6 +313,31 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
                 "[smoke-migrated-pages] {page:?}: a described row placed no control ({} controls)",
                 rendered.controls.len()
             );
+        }
+        // The exclusion rows' Remove buttons carry their BUNDLE ID as the view identifier. The
+        // callback receives the BUTTON while the control table holds the row's value LABEL, so a
+        // handler that looked the sender up there removed nothing at all -- the defect this pins.
+        // The assertion walks the rows the page described, so description and renderer must agree
+        // per row instead of assuming an order.
+        let mut exclusion_ok = true;
+        for row in view.rows.iter().filter(|row| row.action_bundle.is_some()) {
+            let Some(expected) = row.action_bundle.as_deref() else {
+                continue;
+            };
+            let actual = rendered
+                .controls
+                .iter()
+                .find(|control| control.id == row.id)
+                .map(|control| unsafe { view_identifier(control.action) });
+            match actual {
+                Some(Some(actual)) if actual == expected => {}
+                other => {
+                    log_info!(
+                        "[smoke-migrated-pages] {page:?}: an exclusion row's Remove button has identifier {other:?}, expected {expected:?}"
+                    );
+                    exclusion_ok = false;
+                }
+            }
         }
         let mut placed_ok = scene_holds_placements(&canvas, &view, &layout);
         if page == SettingsPageId::Gestures {
@@ -375,14 +422,27 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             );
             ok = false;
         }
-        if !(described_ok && placed_ok) {
+        if !(described_ok && placed_ok && exclusion_ok) {
             log_info!(
-                "[smoke-migrated-pages] {page:?}: controls={described_ok} placements={placed_ok}"
+                "[smoke-migrated-pages] {page:?}: controls={described_ok} placements={placed_ok} exclusion_identifiers={exclusion_ok}"
             );
             ok = false;
         }
     }
     ok
+}
+
+/// The view's `identifier`, read back as text. The exclusion rows' Remove buttons carry their
+/// bundle id there, which is what their callback reads (see `render_row`).
+unsafe fn view_identifier(view: *mut AnyObject) -> Option<String> {
+    if view.is_null() {
+        return None;
+    }
+    let identifier: *mut AnyObject = msg_send![view, identifier];
+    if identifier.is_null() {
+        return None;
+    }
+    Some(crate::ffi::nsstring_to_rust(identifier))
 }
 
 /// Each card's surface must cover every row inside it, described or page-drawn.

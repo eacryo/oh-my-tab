@@ -465,6 +465,54 @@ unsafe fn control_identity(sender: *mut AnyObject) -> Option<ControlId> {
     with_settings_ui(|ui| ui.as_ref()?.control_table.lookup(sender))
 }
 
+/// The bundle id a Remove button was built for, read back from the button's IDENTIFIER.
+///
+/// The callback's sender is the BUTTON, while the `ControlTable` holds the row's value LABEL: a
+/// table lookup answers nothing for the button (that defect made every Remove button on both pages
+/// do nothing). The identifier is stamped where the button is created, from the row's
+/// `action_bundle`, so the value describes exactly the entry that row showed.
+///
+/// `None` means the button carries NO identifier (a row that has no bundle id). An EMPTY string is a
+/// payload, not absence: a hand-edited gesture list can hold an empty entry, and its row must still
+/// be removable.
+unsafe fn action_bundle_of_sender(sender: *mut AnyObject) -> Option<String> {
+    if sender.is_null() {
+        return None;
+    }
+    let identifier: *mut AnyObject = msg_send![sender, identifier];
+    if identifier.is_null() {
+        return None;
+    }
+    Some(crate::ffi::nsstring_to_rust(identifier))
+}
+
+/// Add `bundle_id` to an exclusion list unless an equivalent entry is already there. Pure, so the
+/// add rule (trim, case-insensitive duplicate check, empty refused) is asserted without AppKit.
+pub(crate) fn push_excluded_entry(list: &mut Vec<String>, bundle_id: &str) -> bool {
+    let trimmed = crate::window_collector::normalize_excluded_bundle(bundle_id);
+    if trimmed.is_empty() {
+        return false;
+    }
+    if list
+        .iter()
+        .any(|entry| entry.trim().eq_ignore_ascii_case(trimmed))
+    {
+        return false;
+    }
+    list.push(trimmed.to_string());
+    true
+}
+
+/// Remove the one entry whose stored text is exactly `bundle_id` (the text its row was built for).
+/// Pure: an entry that is already gone, or a row for another entry, changes nothing.
+pub(crate) fn remove_excluded_entry(list: &mut Vec<String>, bundle_id: &str) -> bool {
+    let Some(index) = list.iter().position(|entry| entry == bundle_id) else {
+        return false;
+    };
+    list.remove(index);
+    true
+}
+
 unsafe fn action_control_of(sender: *mut AnyObject) -> Option<&'static str> {
     with_settings_ui(|ui| {
         let u = ui.as_ref()?;
@@ -3400,9 +3448,59 @@ mod tests {
 
     use super::{
         checked_ids, clipboard_delete_dependent_visibility_from_config, committed_limit_change,
-        max_entries_field_text, set_max_entries_draft, smooth_slider_display, smooth_slider_value,
-        take_edited_field, take_max_entries_draft, text_field_bit, Config, Ordering, TextField,
+        max_entries_field_text, push_excluded_entry, remove_excluded_entry, set_max_entries_draft,
+        smooth_slider_display, smooth_slider_value, take_edited_field, take_max_entries_draft,
+        text_field_bit, Config, Ordering, TextField,
     };
+
+    /// Adding trims, refuses an empty identifier and refuses a duplicate that differs only in case or
+    /// surrounding whitespace. The runtime matcher folds both, so a second entry would be an entry
+    /// the user could never see a difference in.
+    #[test]
+    fn adding_an_exclusion_trims_and_refuses_duplicates() {
+        let mut list = vec!["com.apple.Safari".to_string()];
+        assert!(push_excluded_entry(&mut list, "  com.example.Editor  "));
+        assert_eq!(
+            list,
+            vec![
+                "com.apple.Safari".to_string(),
+                "com.example.Editor".to_string()
+            ]
+        );
+        assert!(!push_excluded_entry(&mut list, "com.example.editor"));
+        assert!(!push_excluded_entry(&mut list, " COM.APPLE.SAFARI "));
+        assert!(!push_excluded_entry(&mut list, "   "));
+        assert!(!push_excluded_entry(&mut list, ""));
+        assert_eq!(list.len(), 2, "no duplicate and no blank entry was added");
+    }
+
+    /// Removing takes exactly the entry whose stored text the row was built for, one per click. A
+    /// list that legitimately holds the same text twice loses one entry, not both.
+    #[test]
+    fn removing_an_exclusion_takes_one_exact_entry() {
+        let mut list = vec![
+            "com.apple.Safari".to_string(),
+            String::new(),
+            "com.apple.Safari".to_string(),
+            "com.example.Editor".to_string(),
+        ];
+        assert!(remove_excluded_entry(&mut list, ""));
+        assert_eq!(
+            list,
+            vec![
+                "com.apple.Safari".to_string(),
+                "com.apple.Safari".to_string(),
+                "com.example.Editor".to_string()
+            ],
+            "the empty entry is removable and the others stay"
+        );
+        assert!(remove_excluded_entry(&mut list, "com.apple.Safari"));
+        assert_eq!(list.len(), 2, "one duplicate went, the other stayed");
+        assert!(!remove_excluded_entry(&mut list, "com.example.gone"));
+        assert_eq!(list.len(), 2, "a missing entry changes nothing");
+        // The rule is exact: a case-different text is another entry, not this one.
+        assert!(!remove_excluded_entry(&mut list, "COM.APPLE.SAFARI"));
+    }
 
     #[test]
     fn clipboard_delete_dependent_row_matches_initial_config() {
@@ -3885,23 +3983,29 @@ pub(crate) extern "C" fn handle_gesture_excluded_choose(
     });
 }
 
-/// Remove one excluded application. WHICH entry travels as the button's tag: a button knows its
-/// title, not the data beside it.
+/// Remove one excluded application.
+///
+/// WHICH entry is removed comes from the bundle id the row was BUILT for (recorded where the button
+/// was created), never from the row index: a reload, a rebuild or a reordered list can make the same
+/// slot describe another application, and removing the wrong entry is a persisted change. The
+/// Switcher page's exclusion card shares this rule.
 pub(crate) extern "C" fn handle_gesture_excluded_remove(
     _self: *mut c_void,
     _cmd: Sel,
     sender: *mut c_void,
 ) {
     callback_guard::void("handle_gesture_excluded_remove", || {
-        let Some(index) = (unsafe { crate::settings::action_tag_of_sender(sender) }) else {
+        let Some(bundle) = (unsafe { action_bundle_of_sender(sender as *mut AnyObject) }) else {
             return;
         };
         let old = CONFIG.read().unwrap().clone();
         let mut updated = old.clone();
-        if index >= updated.mouse.gesture_excluded_apps.len() {
+        // Exactly the entry the row was built for, one per click: the gesture list's own matching is
+        // exact string equality, and an entry that is only whitespace (or the empty string) is still
+        // listed and must stay removable.
+        if !remove_excluded_entry(&mut updated.mouse.gesture_excluded_apps, &bundle) {
             return;
         }
-        updated.mouse.gesture_excluded_apps.remove(index);
         if let Ok(mut config) = CONFIG.write() {
             *config = updated.clone();
         }
@@ -3911,12 +4015,101 @@ pub(crate) extern "C" fn handle_gesture_excluded_remove(
             &updated,
             crate::runtime_config::ConfigChangeSource::Settings,
         );
-        unsafe {
-            crate::settings::window::rebuild_settings_content_now_preserving_scroll(
-                SettingsPageId::Gestures,
+        // Deferred: rebuilding inside the button's own action would release the control AppKit is
+        // currently dispatching to.
+        crate::settings::rebuild_settings_content_deferred_keeping_scroll(SettingsPageId::Gestures);
+    });
+}
+
+/// The Switcher page's "Add an application": the same system chooser, writing the switcher's own
+/// list. One command, one row -- see `choose_application_from_disk`.
+pub(crate) extern "C" fn handle_switcher_excluded_choose(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_switcher_excluded_choose", || {
+        let Some((bundle_id, _name)) = choose_application_from_disk() else {
+            return;
+        };
+        if add_switcher_excluded_application(&bundle_id) {
+            crate::settings::rebuild_settings_content_deferred_keeping_scroll(
+                SettingsPageId::Switcher,
             );
         }
     });
+}
+
+/// Remove the entry whose Remove button was pressed.
+///
+/// WHICH entry is removed comes from the bundle id the row was BUILT for (recorded where the button
+/// was created), never from the row index: a reload, a rebuild or a reordered list can make the same
+/// slot describe another application, and removing the wrong entry is a persisted change. A missing
+/// record, or an entry that is already gone, does nothing.
+pub(crate) extern "C" fn handle_switcher_excluded_remove(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    callback_guard::void("handle_switcher_excluded_remove", || {
+        let Some(bundle) = (unsafe { action_bundle_of_sender(sender as *mut AnyObject) }) else {
+            return;
+        };
+        if remove_switcher_excluded_application(&bundle) {
+            crate::settings::rebuild_settings_content_deferred_keeping_scroll(
+                SettingsPageId::Switcher,
+            );
+        }
+    });
+}
+
+/// Add one bundle id to the switcher's exclusion list if it is not already there, and return whether
+/// the list changed. The caller owns the settings-page rebuild; `apply_config_change` persists the
+/// value, applies it and invalidates the committed candidates.
+pub(crate) fn add_switcher_excluded_application(bundle_id: &str) -> bool {
+    let Ok(old) = CONFIG.read().map(|cfg| cfg.clone()) else {
+        return false;
+    };
+    let mut updated = old.clone();
+    // Already excluded (or empty): the click did what it could. Saying so would need a modal for a
+    // no-op.
+    if !push_excluded_entry(&mut updated.windows.excluded_apps, bundle_id) {
+        return false;
+    }
+    if let Ok(mut config) = CONFIG.write() {
+        *config = updated.clone();
+    }
+    crate::settings::schedule_config_persist();
+    crate::runtime_config::apply_config_change(
+        &old,
+        &updated,
+        crate::runtime_config::ConfigChangeSource::Settings,
+    );
+    true
+}
+
+/// Remove one bundle id (case-insensitively) from the switcher's exclusion list. Returns whether the
+/// list changed; the same persist/apply path as adding.
+pub(crate) fn remove_switcher_excluded_application(bundle_id: &str) -> bool {
+    let Ok(old) = CONFIG.read().map(|cfg| cfg.clone()) else {
+        return false;
+    };
+    let mut updated = old.clone();
+    // Exactly the entry the row was built for (the loader trimmed the list, so the stored text is
+    // what the row shows), one entry per click.
+    if !remove_excluded_entry(&mut updated.windows.excluded_apps, bundle_id) {
+        return false;
+    }
+    if let Ok(mut config) = CONFIG.write() {
+        *config = updated.clone();
+    }
+    crate::settings::schedule_config_persist();
+    crate::runtime_config::apply_config_change(
+        &old,
+        &updated,
+        crate::runtime_config::ConfigChangeSource::Settings,
+    );
+    true
 }
 
 /// A page action no handler claims. It exists so the renderer never falls back to a real feature:

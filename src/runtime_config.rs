@@ -39,6 +39,11 @@ struct ChangeFlags {
     // The candidate scope itself changed: the cards already built no longer describe what the
     // switch now admits, so an open overlay must be dismissed rather than reused.
     show_other_desktops: bool,
+    // The switcher's exclusion list changed. Same consequence as `show_other_desktops` -- the
+    // committed candidates no longer describe the policy -- plus the settings page's list card has
+    // to be rebuilt when the change came from outside the page. NOT set on startup: the collection
+    // reads the configuration directly, and a startup flag would queue a pointless invalidation.
+    switcher_excluded_apps: bool,
     mouse: bool,
     /// The gesture master switch moved. It lives in the mouse section but has its own page, so it
     /// is compared separately from everything else on the Mouse page.
@@ -182,6 +187,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         status_bar_size: old.fonts.status_bar_size != new.fonts.status_bar_size,
         thumbnail_size: old.layout.thumbnail_size != new.layout.thumbnail_size,
         show_other_desktops: old.windows.show_other_desktops != new.windows.show_other_desktops,
+        switcher_excluded_apps: old.windows.excluded_apps != new.windows.excluded_apps,
         mouse: startup || old.mouse != new.mouse,
         // The page's own fields, traced one by one. The `mouse` flag above is set on every launch
         // (it is `startup || ...`), so leaning on it would hide a reload that only turned one
@@ -308,14 +314,15 @@ pub(crate) fn pause_gate_action(old_paused: bool, new_paused: bool) -> PauseGate
     }
 }
 
-/// Whether a change to the exclusion list has to rebuild the settings content.
+/// Whether a change to an exclusion list has to rebuild the settings content. Used by both lists
+/// (the clipboard's and the switcher's), because both cards are laid out from their list.
 ///
 /// The settings UI's own edits queue that rebuild themselves, and startup is not a list change:
-/// `change_flags` marks this field true for every startup, so queueing there would leave a rebuild
-/// request behind that runs on a later run-loop turn -- possibly while someone is interacting with
-/// the page it replaces. A change from an edited config file, a restore, or the menu still is a list
-/// change and rebuilds.
-fn rebuilds_settings_for_excluded_list(list_changed: bool, source: ConfigChangeSource) -> bool {
+/// `change_flags` marks the clipboard field true for every startup, so queueing there would leave a
+/// rebuild request behind that runs on a later run-loop turn -- possibly while someone is
+/// interacting with the page it replaces. A change from an edited config file, a restore, or the
+/// menu still is a list change and rebuilds.
+fn rebuilds_settings_for_list_change(list_changed: bool, source: ConfigChangeSource) -> bool {
     list_changed
         && !matches!(
             source,
@@ -501,12 +508,17 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::overlay::reset_switcher();
     }
 
-    if flags.show_other_desktops {
-        // The candidate scope changed: dismiss the overlay so the cards are rebuilt for the new
-        // policy, and invalidate a collection already running under the old one so its result
-        // cannot be applied -- or reused by the next summon -- after the switch moved.
-        crate::overlay::reset_switcher();
+    if flags.show_other_desktops || flags.switcher_excluded_apps {
+        // The candidate policy changed: the committed cards no longer describe what it admits, and
+        // a collection already running under the old policy must not be applied or reused. One
+        // recovery rule for both changes, in an order that matters:
+        // 1. invalidate and discard the committed candidates first (generation, pending result,
+        //    the candidate list itself, the full pass that repopulates it -- see
+        //    `invalidate_collection_for_policy_change`), so nothing can show, navigate to or
+        //    commit an old or partial card set;
+        // 2. only then dismiss the overlay, because that involves AppKit and can re-enter.
         crate::window_refresh::invalidate_collection_for_policy_change();
+        crate::overlay::reset_switcher();
     }
 
     if needs_in_place_control_sync(&flags) {
@@ -589,7 +601,10 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::clipboard::refresh_pause_button();
         crate::settings::refresh_clipboard_pause_switch_from_config();
     }
-    if rebuilds_settings_for_excluded_list(flags.clipboard_excluded_apps, source) {
+    if rebuilds_settings_for_list_change(
+        flags.clipboard_excluded_apps || flags.switcher_excluded_apps,
+        source,
+    ) {
         // The list card is laid out from the list, so a change from an edited config file has to
         // rebuild the page. The settings UI's own edits already queue that rebuild themselves, and
         // startup is not a list change: `change_flags` marks this field true for every startup, so
@@ -707,33 +722,75 @@ mod tests {
         }
     }
 
+    /// A switcher exclusion edit is a candidate-policy change: it invalidates the committed
+    /// candidates (through the shared `show_other_desktops` recovery path) and the settings list card
+    /// follows the same rebuild rule as the clipboard's. A startup does neither -- the collection
+    /// reads the configuration directly, so a startup flag would only queue pointless work.
+    #[test]
+    fn a_switcher_exclusion_change_is_a_policy_change_but_a_startup_is_not() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.windows.excluded_apps = vec!["com.apple.Safari".into()];
+
+        let settings = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(settings.switcher_excluded_apps);
+        assert!(
+            !settings.show_other_desktops,
+            "the two policy fields have their own flags: a failure in one must not hide the other"
+        );
+        // The page's own edit queues its rebuild itself, so the apply pass must not queue a second
+        // one; an external change (reload / restore / menu) must.
+        assert!(!rebuilds_settings_for_list_change(
+            settings.switcher_excluded_apps,
+            ConfigChangeSource::Settings
+        ));
+        assert!(rebuilds_settings_for_list_change(
+            settings.switcher_excluded_apps,
+            ConfigChangeSource::Reload
+        ));
+        assert!(!rebuilds_settings_for_list_change(
+            settings.switcher_excluded_apps,
+            ConfigChangeSource::Startup
+        ));
+
+        // Not startup-gated: an identical startup config queues nothing, while a launch whose file
+        // really states a different list (as `show_other_desktops` already behaves) is a change.
+        assert!(!change_flags(&old, &old, ConfigChangeSource::Startup).switcher_excluded_apps);
+        assert!(change_flags(&old, &new, ConfigChangeSource::Startup).switcher_excluded_apps);
+
+        // The setting is its own flag: a sibling windows change does not set it.
+        let mut sibling = old.clone();
+        sibling.windows.show_minimized = true;
+        assert!(!change_flags(&old, &sibling, ConfigChangeSource::Settings).switcher_excluded_apps);
+    }
+
     #[test]
     fn only_a_real_list_change_rebuilds_the_settings_content() {
         // Startup sets `clipboard_excluded_apps` on every launch, so queueing a rebuild there left a
         // request that ran on a later run-loop turn -- which replaced the settings page while a smoke
         // (or the user) was interacting with it. The settings UI's own edits already queue theirs.
-        assert!(!rebuilds_settings_for_excluded_list(
+        assert!(!rebuilds_settings_for_list_change(
             false,
             ConfigChangeSource::Reload
         ));
-        assert!(!rebuilds_settings_for_excluded_list(
+        assert!(!rebuilds_settings_for_list_change(
             true,
             ConfigChangeSource::Startup
         ));
-        assert!(!rebuilds_settings_for_excluded_list(
+        assert!(!rebuilds_settings_for_list_change(
             true,
             ConfigChangeSource::Settings
         ));
         // A real external change still rebuilds: an edited config file, a restore, or the menu.
-        assert!(rebuilds_settings_for_excluded_list(
+        assert!(rebuilds_settings_for_list_change(
             true,
             ConfigChangeSource::Reload
         ));
-        assert!(rebuilds_settings_for_excluded_list(
+        assert!(rebuilds_settings_for_list_change(
             true,
             ConfigChangeSource::RestoreDefaults
         ));
-        assert!(rebuilds_settings_for_excluded_list(
+        assert!(rebuilds_settings_for_list_change(
             true,
             ConfigChangeSource::Menu
         ));

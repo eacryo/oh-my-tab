@@ -146,6 +146,33 @@ pub fn note_app_terminated(pid: i32) {
     LAST_ACTIVATED.lock().unwrap().remove(&pid);
 }
 
+/// Normalize one configured exclusion entry (a bundle identifier) for storage and comparison.
+///
+/// One rule for the loader, the settings page's add/remove, the matcher and the de-duplication:
+/// surrounding whitespace is not part of an identifier. Case is folded only when comparing, so the
+/// stored file keeps what the user wrote.
+pub(crate) fn normalize_excluded_bundle(entry: &str) -> &str {
+    entry.trim()
+}
+
+/// Whether `bundle_id` names an application on the switcher's exclusion list.
+///
+/// Fail-open by design: an empty list, an empty identifier, or an identifier that could not be
+/// resolved excludes nothing. This is a display filter, not the clipboard's privacy gate, so an
+/// application that cannot be identified must keep its cards instead of silently disappearing.
+pub(crate) fn excluded_app_matches(excluded: &[String], bundle_id: Option<&str>) -> bool {
+    let Some(bundle_id) = bundle_id else {
+        return false;
+    };
+    let bundle_id = bundle_id.trim();
+    if bundle_id.is_empty() || excluded.is_empty() {
+        return false;
+    }
+    excluded
+        .iter()
+        .any(|entry| normalize_excluded_bundle(entry).eq_ignore_ascii_case(bundle_id))
+}
+
 /// Activate the most recently activated still-running application that is neither this one nor the
 /// one already in front, for the `app.previous` binding. Returns whether anything was activated.
 ///
@@ -1151,6 +1178,39 @@ mod ax_identity_tests {
 mod tests {
     use super::*;
     use crate::smoke_verdict::smoke_runner;
+
+    /// The exclusion matcher: exact bundle id, surrounding whitespace ignored, case folded. It is
+    /// the one rule the loader, the settings list and the collector share, so a change here changes
+    /// all three.
+    #[test]
+    fn the_exclusion_matcher_folds_case_and_whitespace() {
+        let list = vec![
+            "  com.apple.Safari  ".to_string(),
+            "com.example.Editor".to_string(),
+        ];
+        assert!(excluded_app_matches(&list, Some("com.apple.Safari")));
+        assert!(excluded_app_matches(&list, Some(" COM.APPLE.SAFARI ")));
+        assert!(excluded_app_matches(&list, Some("com.example.editor")));
+        assert!(!excluded_app_matches(&list, Some("com.apple.Safari2")));
+        assert!(!excluded_app_matches(&list, Some("com.other.App")));
+        // A prefix is not a match: the whole identifier is compared.
+        assert!(!excluded_app_matches(&list, Some("com.apple.Saf")));
+    }
+
+    /// Fail-open: an unresolved or empty identifier, and an empty list, exclude nothing. The
+    /// clipboard's list is fail-closed because a leaked copy is irreversible; this one is a display
+    /// filter, so hiding an app it cannot identify would be the worse failure.
+    #[test]
+    fn the_exclusion_matcher_never_matches_an_unresolved_application() {
+        let list = vec!["com.apple.Safari".to_string()];
+        assert!(!excluded_app_matches(&list, None));
+        assert!(!excluded_app_matches(&list, Some("")));
+        assert!(!excluded_app_matches(&list, Some("   ")));
+        assert!(!excluded_app_matches(&[], Some("com.apple.Safari")));
+        // An entry that is nothing but whitespace cannot match anything either.
+        let blank = vec!["   ".to_string()];
+        assert!(!excluded_app_matches(&blank, Some("")));
+    }
 
     /// The subscription rule, and the counter-example that keeps it from being confused with the
     /// display list: a fully transparent layer-0 window is subscribed (it can become visible

@@ -61,6 +61,11 @@ pub(in crate::settings) struct PageInput {
     /// The gesture layer the Gestures page edits (`None` = the shared layer). Captured with the
     /// device for the same reason: the page must not look the device up again while it renders.
     pub(in crate::settings) gesture_scope: Option<crate::settings::GestureLayerScope>,
+    /// Display names for bundle identifiers, prepared on the main thread once per settings build.
+    /// The excluded-application cards label a row with the application's name; resolving that in the
+    /// description would make a "pure" page scan the disk and ask AppKit, so it arrives here.
+    pub(in crate::settings) known_app_names:
+        std::sync::Arc<std::collections::HashMap<String, String>>,
 }
 
 /// The measured page a description is laid out into.
@@ -163,10 +168,10 @@ pub(in crate::settings) struct RowSpec {
     /// instead of the default one that stops at the control column. One row in the design needs
     /// it: the General page's menu-bar switch.
     pub(in crate::settings) wide_caption: bool,
-    /// A number stamped on the row's ACTION BUTTON as its tag. The button is what the callback
-    /// receives, and its own text is its title, so this is how a row tells the handler WHICH entry
-    /// it is: an excluded-application row stamps its list index here.
-    pub(in crate::settings) action_tag: Option<isize>,
+    /// The bundle identifier this row's ACTION acts on, captured when the row was built. The Remove
+    /// handler removes THAT entry instead of "whatever is at index N": a reload, a rebuild or a
+    /// reordered list can otherwise make the click remove a different application.
+    pub(in crate::settings) action_bundle: Option<String>,
     /// The application bundle whose icon this row shows before its label, if any.
     ///
     /// Data, not a view: the page states WHICH application the row is about, and the renderer

@@ -159,6 +159,11 @@ lib.rs (run)                                                      wiring + run l
   to its legacy policy instead of failing; `raise_diagnostics.rs` holds the pure decisions (which activation API,
   whether the target desktop was reached, how a raise ended); `space_state_probe.rs` is the state-matrix
   instrument and `window_state.rs` the pure decode of one window's state evidence.
+- `[windows] excluded_apps` is enforced where candidates are PUBLISHED (`collect.rs`: the CG loop, the
+  AX backfill and the directed refresh), never by pruning the AX query -- the AX maps carry the
+  fullscreen evidence `native_fullscreen_cg_window_ids` needs. A change to the list is a
+  candidate-policy change: `window_refresh::invalidate_collection_for_policy_change` discards the
+  committed candidates and only a completed full pass clears the invalidation.
 - `space_groups.rs`, `space_swipe.rs`, and `space_transition.rs` own Space bookkeeping: which desktop owns a
   fullscreen Space, how a switch is committed, and how long a Space change is considered settling.
 
@@ -244,6 +249,8 @@ clipboard/
   AppKit; the description and layout halves are pure. **One
   file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `gestures.rs`,
   `about.rs`, `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
+  `excluded_apps.rs` is the one card two pages share (the Gestures and Switcher exclusion lists), so
+  their rows, copy rules and Remove semantics cannot drift apart.
 - **Every settings page is described.** `page_builder.rs` is now one ~20-line entry point per page: it
   captures a `PageInput`, calls `build_page` and publishes (or falls back to `empty_page`). A page that
   needs something the description cannot carry states it in `PageHooks`: `before_page` for a page-drawn

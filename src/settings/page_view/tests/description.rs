@@ -5,7 +5,11 @@ use super::*;
 fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
     let view = switcher();
     assert_eq!(view.page, SettingsPageId::Switcher);
-    assert_eq!(view.rows.len(), 17);
+    assert_eq!(
+        view.rows.len(),
+        19,
+        "17 settings rows plus the exclusion card's add and empty-state rows"
+    );
     // Every declared row carries a label key and an identity; the copy keys are the ones the
     // page's own labels used before the migration.
     let labels: Vec<&str> = view.rows.iter().map(|row| row.label_key).collect();
@@ -13,7 +17,9 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
     assert_eq!(labels[1], "settings.row_show_minimized");
     assert_eq!(labels[4], "settings.row_window_display_mode");
     assert_eq!(labels[8], "settings.row_card_text_size");
-    assert_eq!(labels[16], "settings.row_modifier");
+    assert_eq!(labels[16], "settings.row_switcher_excluded_add");
+    assert_eq!(labels[17], "settings.row_switcher_excluded_empty");
+    assert_eq!(labels[18], "settings.row_modifier");
     // The field order is the page's own order: a reorder is a visible change, not a detail.
     assert_eq!(
         fields(&view),
@@ -47,10 +53,13 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
     assert_eq!(sections[0], "settings.header_windows");
     assert_eq!(sections[1], "settings.header_window_options");
     assert_eq!(sections[12], "settings.header_window_options");
-    assert_eq!(sections[16], "settings.header_keyboard");
+    assert_eq!(sections[16], "settings.header_switcher_excluded");
+    assert_eq!(sections[17], "settings.header_switcher_excluded");
+    assert_eq!(sections[18], "settings.header_keyboard");
     assert_eq!(view.rows[0].card, 0);
     assert_eq!(view.rows[1].card, 1);
     assert_eq!(view.rows[16].card, 2);
+    assert_eq!(view.rows[18].card, 3);
     // The first row of every card has no divider above it; every later row in the card does.
     for (index, row) in view.rows.iter().enumerate() {
         let first_of_card = index == 0 || view.rows[index - 1].card != row.card;
@@ -76,6 +85,123 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
         view.rows[5].caption_key,
         Some("settings.desc_focused_thumbnail_prewarm")
     );
+}
+
+/// The Switcher page's exclusion card: one row per entry, the invalid count, the empty state and
+/// the overflow row, with the bundle id each Remove action must act on. The same shapes are asserted
+/// for the Gestures card in its own module; this one pins the switcher's copy, identities and the
+/// card's own placement.
+#[test]
+fn the_switcher_exclusion_card_lists_every_entry_by_bundle_id() {
+    let mut config = Config::default();
+    config.windows.excluded_apps = vec![
+        "com.apple.Safari".into(),
+        "not a bundle id".into(),
+        "com.apple.Notes".into(),
+    ];
+    let mut input = PageInput::from_config(config, None, crate::theme::ThemeInput::current());
+    input.known_app_names = std::sync::Arc::new(
+        [
+            ("com.apple.Safari".to_string(), "Safari".to_string()),
+            ("com.apple.Notes".to_string(), "Notes".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let view = switcher_page_view(&input);
+
+    let excluded: Vec<&RowSpec> = view
+        .rows
+        .iter()
+        .filter(|row| row.label_key == "settings.row_switcher_excluded")
+        .collect();
+    assert_eq!(excluded.len(), 3, "one row per entry");
+    let labels: Vec<Option<&str>> = excluded
+        .iter()
+        .map(|row| row.label_text.as_deref())
+        .collect();
+    assert_eq!(
+        labels,
+        vec![Some("Safari"), Some("not a bundle id"), Some("Notes")],
+        "a known application is labelled with its name; an unknown entry keeps its text"
+    );
+    let bundles: Vec<Option<String>> = excluded
+        .iter()
+        .map(|row| row.action_bundle.clone())
+        .collect();
+    assert_eq!(
+        bundles,
+        vec![
+            Some("com.apple.Safari".to_string()),
+            Some("not a bundle id".to_string()),
+            Some("com.apple.Notes".to_string()),
+        ],
+        "the Remove action is bound to its own entry, not to a row index"
+    );
+    // The invalid entry is counted: the matcher compares bundle ids, so this line can never match.
+    let invalid = view
+        .rows
+        .iter()
+        .find(|row| row.label_key == "settings.row_switcher_excluded_invalid")
+        .expect("the invalid-entry row is stated");
+    assert_eq!(invalid.value, Value::Dynamic("1".to_string()));
+    // The card's controls: the add command, the invalid-entry line, and one Remove per entry. There
+    // is no empty-state row while the list has entries.
+    let actions: Vec<&str> = view
+        .rows
+        .iter()
+        .filter_map(|row| match row.id {
+            ControlId::Action(action) => Some(action),
+            ControlId::Field(_) => None,
+        })
+        .filter(|action| action.starts_with("switcher_excluded"))
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            "switcher_excluded_choose",
+            "switcher_excluded_invalid",
+            "switcher_excluded_a",
+            "switcher_excluded_b",
+            "switcher_excluded_c",
+        ],
+        "the add command, the invalid line and one Remove per entry"
+    );
+    assert!(
+        !view
+            .rows
+            .iter()
+            .any(|row| row.label_key == "settings.row_switcher_excluded_empty"),
+        "the empty state is not drawn beside entries"
+    );
+}
+
+/// More than the identity bound is stated as a "+N" row (gesture parity), not silently dropped, and
+/// the copy says where the rest are edited.
+#[test]
+fn the_switcher_exclusion_card_states_the_overflow() {
+    let mut config = Config::default();
+    config.windows.excluded_apps = (0..(MAX_SHOWN_EXCLUDED + 2))
+        .map(|index| format!("com.example.app{index}"))
+        .collect();
+    let view = switcher_page_view(&PageInput::from_config(
+        config,
+        None,
+        crate::theme::ThemeInput::current(),
+    ));
+    let rows: Vec<&RowSpec> = view
+        .rows
+        .iter()
+        .filter(|row| row.label_key == "settings.row_switcher_excluded")
+        .collect();
+    assert_eq!(rows.len(), MAX_SHOWN_EXCLUDED);
+    let overflow = view
+        .rows
+        .iter()
+        .find(|row| row.label_key == "settings.row_switcher_excluded_more")
+        .expect("the overflow row is stated");
+    assert_eq!(overflow.value, Value::Dynamic("+2".to_string()));
+    assert!(!t(overflow.label_key).is_empty());
 }
 
 #[test]

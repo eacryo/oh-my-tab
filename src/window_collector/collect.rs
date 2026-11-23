@@ -197,14 +197,37 @@ pub(crate) struct FocusedCollection {
     pub(crate) subscriptions: Option<Vec<(u32, i32)>>,
 }
 
+/// A directed refresh for the SWITCHER: an excluded application answers with no windows, the same
+/// shape as the hidden-app early return.
 pub(crate) fn collect_windows_for_pid(
+    mru: &mut MruMap,
+    pid: i32,
+    focused_cgwid: u32,
+) -> Option<FocusedCollection> {
+    let excluded_apps = CONFIG
+        .read()
+        .map(|cfg| cfg.windows.excluded_apps.clone())
+        .unwrap_or_default();
+    unsafe {
+        let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
+        let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid, &excluded_apps);
+        let _: () = msg_send![pool, drain];
+        result
+    }
+}
+
+/// The directed collection behind the thumbnail prewarm. The exclusion list is a switcher display
+/// policy, not a capture policy: `switchable_capture_window_for_pid` wants the frontmost app's
+/// geometry, and refusing here would turn a working prewarm into a silent "nothing to capture".
+/// The focused capture target is presentation-only -- no card reads it.
+pub(crate) fn collect_windows_for_capture(
     mru: &mut MruMap,
     pid: i32,
     focused_cgwid: u32,
 ) -> Option<FocusedCollection> {
     unsafe {
         let pool: *mut AnyObject = msg_send![class!(NSAutoreleasePool), new];
-        let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid);
+        let result = collect_windows_for_pid_inner(mru, pid, focused_cgwid, &[]);
         let _: () = msg_send![pool, drain];
         result
     }
@@ -248,7 +271,7 @@ pub(crate) fn switchable_capture_window_for_pid(
     let focused_cgwid = unsafe { focused_window_cgwid(pid) };
     let mut mru = MruMap::new();
     let collected =
-        collect_windows_for_pid(&mut mru, pid, focused_cgwid.unwrap_or(preferred_cgwid));
+        collect_windows_for_capture(&mut mru, pid, focused_cgwid.unwrap_or(preferred_cgwid));
     // This caller only wants one window to capture, not the pass's scope observations: consume and
     // drop them on *every* path, including the failure return below, or an idle prewarm thread would
     // keep its last pass -- and with it the oldest destruction epoch -- alive forever.
@@ -261,10 +284,17 @@ unsafe fn collect_windows_for_pid_inner(
     mru: &mut MruMap,
     pid: i32,
     focused_cgwid: u32,
+    excluded_apps: &[String],
 ) -> Option<FocusedCollection> {
-    let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
-    let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
-    let show_other_desktops = CONFIG.read().unwrap().windows.show_other_desktops;
+    // One policy snapshot for the whole pass, guard released before the system calls.
+    let (show_minimized, show_hidden_app_windows, show_other_desktops) = {
+        let cfg = CONFIG.read().unwrap();
+        (
+            cfg.windows.show_minimized,
+            cfg.windows.show_hidden_app_windows,
+            cfg.windows.show_other_desktops,
+        )
+    };
     // See the full-collection entry: staging is per pass and published only on acceptance.
     crate::thumbnail::begin_scope_pass();
     let _identity_pass = begin_ax_identity_pass();
@@ -281,6 +311,41 @@ unsafe fn collect_windows_for_pid_inner(
     let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
     if array.is_null() {
         return None;
+    }
+    // The same answer for an excluded application: without this, a focus change into an excluded
+    // app while the overlay is open would put its cards straight back into the candidate list. Asked
+    // AFTER the enumeration so the pass can record each refused window's own reason: an accepted
+    // directed pass then carries `excluded_app` evidence instead of an unexplained empty answer.
+    if crate::window_collector::excluded_app_matches(
+        excluded_apps,
+        unsafe { crate::app_identity::bundle_id_for_pid(pid) }.as_deref(),
+    ) {
+        log_debug!("[collect] excluded app refused (directed): pid={}", pid);
+        let count = CFArrayGetCount(array);
+        for index in 0..count {
+            let dict = CFArrayGetValueAtIndex(array, index);
+            if dict.is_null() {
+                continue;
+            }
+            if cf_dict_get_i32(dict, CgKey::OwnerPid) != Some(pid) {
+                continue;
+            }
+            let cgwid = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
+            crate::e2e_state::card_rejected(
+                pid,
+                cgwid,
+                crate::e2e_state::CardRejection::ExcludedApp,
+            );
+        }
+        // The array this pass already enumerated answers the subscription question too: returning
+        // None here would make the worker enumerate the whole window list again just to learn which
+        // windows to observe.
+        let subscriptions = Some(unsafe { subscriptions_from_cg_list(array) });
+        CFRelease(array);
+        return Some(FocusedCollection {
+            windows: Vec::new(),
+            subscriptions,
+        });
     }
     let display_bounds = active_display_bounds();
 
@@ -1573,6 +1638,12 @@ pub(super) fn fold_tab_group(windows: Vec<AxWindowInfo>) -> Vec<AxWindowInfo> {
 pub(crate) struct CollectionPass {
     pub(crate) windows: Vec<WindowInfo>,
     pub(crate) subscriptions: Option<Vec<(u32, i32)>>,
+    /// Whether this pass's PRIMARY candidate enumeration (the CG window list every card is paired
+    /// against) completed. A failed enumeration answers with an empty window list, which is NOT the
+    /// same answer as "this policy admits no windows"; the refresh pipeline keeps a policy-change
+    /// invalidation pending until a full pass reports a completed enumeration, so the two can never
+    /// be confused.
+    pub(crate) candidates_complete: bool,
 }
 
 pub(crate) fn collect_windows_with_frontmost_bump(
@@ -1587,19 +1658,30 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // pass is ever published (see the main thread apply and `WindowRefreshResult`).
     crate::thumbnail::begin_scope_pass();
     let _identity_pass = begin_ax_identity_pass();
-    let show_minimized = CONFIG.read().unwrap().windows.show_minimized;
-    let show_hidden_app_windows = CONFIG.read().unwrap().windows.show_hidden_app_windows;
-    let show_other_desktops = CONFIG.read().unwrap().windows.show_other_desktops;
+    // ONE snapshot of the candidate policy for the whole pass: every filter below must describe the
+    // same configuration, and the guard is released before the system calls start.
+    let (show_minimized, show_hidden_app_windows, show_other_desktops, excluded_apps) = {
+        let cfg = CONFIG.read().unwrap();
+        (
+            cfg.windows.show_minimized,
+            cfg.windows.show_hidden_app_windows,
+            cfg.windows.show_other_desktops,
+            cfg.windows.excluded_apps.clone(),
+        )
+    };
     crate::e2e_state::set_space_membership_source(false);
     // Enumerate all CG windows. SkyLight membership, not transient onscreen state, decides which
     // Space's switchable windows are candidates; AX remains authoritative for window identity.
     let cg_option = K_C_G_WINDOW_LIST_OPTION_ALL;
     let array = unsafe { CGWindowListCopyWindowInfo(cg_option, 0) };
     if array.is_null() {
-        // No snapshot: the caller keeps its existing subscriptions rather than clearing them.
+        // No snapshot: the caller keeps its existing subscriptions rather than clearing them, and
+        // the empty window list is reported as an INCOMPLETE enumeration so no policy change can
+        // read it as "nothing is admissible".
         return CollectionPass {
             windows: Vec::new(),
             subscriptions: None,
+            candidates_complete: false,
         };
     }
 
@@ -1670,9 +1752,14 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     // The filter runs on the collection thread, which is not a Cocoa main thread and owns no
     // pool, so the NSRunningApplication / NSURL / NSString temporaries each lookup creates need a
     // boundary of their own: the AX phase has one per chunk, and this pass runs before those.
+    // The same loop decides the switcher's exclusion list, from the same single lookup: the pids
+    // stay in the AX input on purpose (dropping them would also drop the AX evidence
+    // `native_fullscreen_cg_window_ids` needs, so a transition into or out of an excluded fullscreen
+    // app could be missed). Exclusion is enforced where candidates are PUBLISHED, below.
+    let mut excluded_pids: HashSet<i32> = HashSet::new();
     objc2::rc::autoreleasepool(|_pool| {
         pids.retain(|&pid| {
-            let executable = unsafe { crate::app_identity::executable_path_of(pid) };
+            let (executable, bundle_id) = unsafe { crate::app_identity::process_identity(pid) };
             let is_extension = executable
                 .as_deref()
                 .is_some_and(crate::app_identity::is_extension_process);
@@ -1682,8 +1769,18 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                     pid,
                     pid_names.get(&pid).map(String::as_str).unwrap_or("?")
                 );
+                return false;
             }
-            !is_extension
+            if crate::window_collector::excluded_app_matches(&excluded_apps, bundle_id.as_deref()) {
+                log_debug!(
+                    "[collect] excluded app refused: pid={} app=\"{}\" bundle=\"{}\"",
+                    pid,
+                    pid_names.get(&pid).map(String::as_str).unwrap_or("?"),
+                    bundle_id.as_deref().unwrap_or("?")
+                );
+                excluded_pids.insert(pid);
+            }
+            true
         });
     });
 
@@ -1940,6 +2037,21 @@ pub(crate) fn collect_windows_with_frontmost_bump(
                 cgwid,
                 is_off_current_space(staged_scope),
             );
+        }
+        // The switcher's exclusion list is enforced HERE, where candidates are published -- not by
+        // dropping the pid from the AX input (that would take the fullscreen evidence with it) --
+        // and AFTER the scope observation above: the capture pipeline consumes that observation for
+        // windows that are not cards, so refusing earlier would freeze a stale scope for an excluded
+        // window that moves desktops. A refused window is recorded with its own reason, so a
+        // scenario can assert the app's own decision for one window id instead of inferring
+        // exclusion from absence.
+        if excluded_pids.contains(&owner_pid) {
+            crate::e2e_state::card_rejected(
+                owner_pid,
+                cgwid,
+                crate::e2e_state::CardRejection::ExcludedApp,
+            );
+            continue;
         }
         // Fully transparent windows (alpha=0) are invisible; Mission Control doesn't show them.
         let alpha = cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(1.0);
@@ -2254,6 +2366,12 @@ pub(crate) fn collect_windows_with_frontmost_bump(
         // Own windows (the settings window) go through the CG isOnscreen filter; not
         // backfilled here: when closed (orderOut) they must not show.
         if pid == std::process::id() as i32 {
+            continue;
+        }
+        // An excluded application's windows are refused on this path too: the AX backfill publishes
+        // windows the CG enumeration lacks, so without this the policy would be enforced on exactly
+        // the wrong subset.
+        if excluded_pids.contains(&pid) {
             continue;
         }
         let mut entries: Vec<(u32, &AxWindowInfo)> =
@@ -2634,6 +2752,7 @@ pub(crate) fn collect_windows_with_frontmost_bump(
     CollectionPass {
         windows,
         subscriptions,
+        candidates_complete: true,
     }
 }
 

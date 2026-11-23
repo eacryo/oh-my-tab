@@ -101,13 +101,16 @@ pub(super) fn dedicated_selector(field: Option<ControlField>) -> Sel {
 }
 
 /// The selector an action row's button runs.
-fn action_selector(action: &str) -> Sel {
+pub(super) fn action_selector(action: &str) -> Sel {
     match action {
         "export_settings" => sel!(handleExportSettings:),
         // The Gestures page's excluded-application rows: Remove one entry.
         "gesture_excluded_remove" => sel!(handleGestureExcludedRemove:),
         // The Gestures page's "Add an application": opens the system application chooser.
         "gesture_excluded_choose" => sel!(handleGestureExcludedChoose:),
+        // The Switcher page's excluded-application list: the same commands, its own list.
+        "switcher_excluded_remove" => sel!(handleSwitcherExcludedRemove:),
+        "switcher_excluded_choose" => sel!(handleSwitcherExcludedChoose:),
         // A gesture row's Delete. It rebuilds the page itself.
         action if crate::settings::page_view::delete_row_index(action).is_some() => {
             sel!(handleGestureRowDelete:)
@@ -500,13 +503,15 @@ pub(super) unsafe fn render_row(
             SettingsButtonRole::Action,
         );
         if !button.is_null() {
-            if let Some(tag) = row.action_tag {
-                // WHICH entry a row's button acts on travels as its IDENTIFIER, never as its tag.
-                // The tag already carries the role's palette slot, and the hover callbacks read it
-                // to restore the right fill: overwriting it with a list index made every one of
-                // these buttons fall back to the generic hover wash and stay there after the
-                // pointer left (the fill a row kept was the HOVER color, not the row's own).
-                let identifier = crate::settings::ffi_identifier_for_action_tag(tag);
+            if let Some(bundle) = row.action_bundle.as_deref() {
+                // The Remove handler acts on THIS entry, not on "whatever is at row N": a reload or
+                // a reordered list can make the same row slot describe another application.
+                //
+                // The value travels on the BUTTON's identifier. The callback receives the button,
+                // while the `ControlTable` holds the row's value LABEL -- a lookup there answers a
+                // different pointer and found nothing, which made both pages' Remove buttons do
+                // nothing at all. The identifier is stamped here, where the button is created.
+                let identifier = crate::ffi::make_nsstring(bundle);
                 let _: () = msg_send![button, setIdentifier: identifier];
                 crate::ffi::CFRelease(identifier as *const c_void);
             }

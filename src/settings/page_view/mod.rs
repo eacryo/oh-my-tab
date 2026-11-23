@@ -44,6 +44,7 @@ mod about;
 mod bind;
 mod build;
 mod clipboard;
+mod excluded_apps;
 mod finder_menu;
 mod general;
 mod gestures;
@@ -65,6 +66,11 @@ use about::about_page_view;
 pub(super) use about::AboutHooks;
 use clipboard::clipboard_page_view;
 pub(super) use clipboard::ClipboardHooks;
+#[cfg(test)]
+pub(super) use excluded_apps::looks_like_bundle_id;
+pub(in crate::settings) use excluded_apps::refresh_known_app_names;
+pub(super) use excluded_apps::MAX_SHOWN_EXCLUDED;
+use excluded_apps::{push_excluded_apps_card, ExcludedAppsCardSpec};
 use finder_menu::finder_menu_page_view;
 pub(super) use finder_menu::FinderMenuHooks;
 use general::general_page_view;
@@ -215,6 +221,9 @@ impl PageInput {
         // This capture owns the config; making sure the device's gesture layer exists is a write, so
         // it happens here and the page only reads the scope.
         input.gesture_scope = Some(super::selected_gesture_layer(&mut input.config));
+        // Display names for the excluded-application cards: cached, so nine page descriptions do not
+        // each rescan the application folders or ask AppKit.
+        input.known_app_names = excluded_apps::known_app_names();
         input
     }
 
@@ -231,6 +240,7 @@ impl PageInput {
             finder_menu_status_tone: ValueTone::Neutral,
             permission_migration_copy: false,
             gesture_scope: None,
+            known_app_names: std::sync::Arc::new(std::collections::HashMap::new()),
         }
     }
 }

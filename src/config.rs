@@ -750,6 +750,14 @@ pub struct WindowsSection {
     // a window has no AX element (the AX window list is Space-filtered), so its card keeps the CG
     // title and is icon-only.
     pub show_other_desktops: bool,
+    // Applications whose windows never appear in the switcher overlay, by bundle identifier
+    // (com.apple.Safari). Empty by default. Matched case-insensitively after trimming, against the
+    // bundle id the collector resolved for the owning process; an entry that is not a bundle id, or
+    // a process whose bundle id cannot be resolved, excludes nothing (fail-open: this is a display
+    // filter, not the clipboard's privacy gate). The list is user data, so the loader drops a
+    // malformed element on its own instead of rejecting the document, and the settings page marks
+    // entries that can never match.
+    pub excluded_apps: Vec<String>,
     // In-overlay action keys (⌘W / ⌘M / ⌘H / ⌘Q). Each acts on the HIGHLIGHTED card while the
     // switcher panel is open, and each is gated by its own switch. All default off: ⌘Q quits an
     // app and ⌘H hides one, so the honest default is opt-in -- and the panel already closes the
@@ -775,6 +783,7 @@ impl Default for WindowsSection {
             show_minimized: false,
             show_hidden_app_windows: false,
             show_other_desktops: true,
+            excluded_apps: Vec::new(),
             panel_close_enabled: false,
             panel_minimize_enabled: false,
             panel_hide_enabled: false,
@@ -2102,6 +2111,11 @@ impl Config {
             // A boolean cannot fail validation, so it is adopted unconditionally like the
             // other switches (same convention as the layout booleans above).
             self.windows.show_other_desktops = other.windows.show_other_desktops;
+            // User data, and already repaired element by element by the loader: the sanitizer
+            // dropped whatever was not a string, so the parsed list is the repaired one. Resetting
+            // it because a *sibling* windows field failed would silently discard the valid entries
+            // this file stated.
+            self.windows.excluded_apps = other.windows.excluded_apps;
             self.windows.panel_close_enabled = other.windows.panel_close_enabled;
             self.windows.panel_minimize_enabled = other.windows.panel_minimize_enabled;
             self.windows.panel_hide_enabled = other.windows.panel_hide_enabled;
@@ -2707,6 +2721,45 @@ fn sanitize_config_value(
             }
         }
         return Some(toml::Value::Table(sanitized));
+    }
+
+    // The switcher's exclusion list is user data too, and has no required key: each element must be
+    // a bundle-identifier string. A non-string element, or one that is only whitespace, is dropped
+    // on its own (with an error) instead of failing the whole document; surrounding whitespace is
+    // not part of an identifier, so entries are trimmed. Without this branch the empty default
+    // array's schema would carry no element type, the sanitizer would accept ANY array and Serde
+    // would then reject the whole file -- the opposite of the per-field tolerance invariant.
+    if path == "windows.excluded_apps" {
+        let Some(array) = actual.as_array() else {
+            errors.push(type_error(path, actual, schema));
+            return fallback.cloned();
+        };
+        let mut sanitized = Vec::with_capacity(array.len());
+        for (index, item) in array.iter().enumerate() {
+            let item_path = toml_path_index(path, index);
+            let Some(entry) = item.as_str() else {
+                errors.push(type_error(
+                    &item_path,
+                    item,
+                    &toml::Value::String(String::new()),
+                ));
+                continue;
+            };
+            let entry = entry.trim();
+            if entry.is_empty() {
+                errors.push(format!("{item_path}: empty bundle id"));
+                continue;
+            }
+            // The value reaches an NSString-backed view identifier and an icon lookup, both of which
+            // build a C string: a NUL (or any other control character, which no bundle id contains)
+            // would either truncate the payload or abort the render. Refuse it here, per element.
+            if entry.chars().any(char::is_control) {
+                errors.push(format!("{item_path}: control character in a bundle id"));
+                continue;
+            }
+            sanitized.push(toml::Value::String(entry.to_string()));
+        }
+        return Some(toml::Value::Array(sanitized));
     }
 
     // The exclusion list is user data: one malformed entry (a missing or non-string bundle_id,
@@ -3620,6 +3673,97 @@ mod tests {
         assert_eq!(
             ours.clipboard.excluded_apps,
             vec![ExcludedApp::new("com.example.pm", "PM")]
+        );
+    }
+
+    /// The switcher's exclusion list defaults to empty, so a config written before the field
+    /// existed loads as "nothing excluded" rather than carrying a built-in list (unlike the
+    /// clipboard's), and an explicit list is taken exactly as written.
+    #[test]
+    fn switcher_excluded_apps_defaults_to_empty_and_old_files_keep_it_empty() {
+        assert!(Config::default().windows.excluded_apps.is_empty());
+
+        let legacy: Config = toml::from_str("[windows]\nshow_minimized = true\n").unwrap();
+        assert!(legacy.windows.excluded_apps.is_empty());
+        assert!(legacy.windows.show_minimized, "the sibling still loads");
+
+        let custom: Config =
+            toml::from_str("[windows]\nexcluded_apps = [\"com.apple.Safari\"]\n").unwrap();
+        assert_eq!(
+            custom.windows.excluded_apps,
+            vec!["com.apple.Safari".to_string()]
+        );
+    }
+
+    /// One malformed element is dropped on its own. This is the case the empty default array would
+    /// otherwise break: with no element type in the type schema, the sanitizer accepted the whole
+    /// array and Serde then failed the ENTIRE document, discarding every other setting with it.
+    #[test]
+    fn a_malformed_switcher_excluded_app_element_does_not_reject_the_rest_of_the_config() {
+        // Surrounding whitespace is trimmed (it is not part of an identifier), and a whitespace-only
+        // element is dropped like a non-string one.
+        let content = "[windows]\nshow_minimized = true\nexcluded_apps = [\"  com.example.good  \", 42, \"   \", \"com.example.also\"]\n";
+        let (config, errors, needs_persist) =
+            parse_config_content(content).expect("the rest of the file must still load");
+        assert!(config.windows.show_minimized);
+        assert_eq!(
+            config.windows.excluded_apps,
+            vec![
+                "com.example.good".to_string(),
+                "com.example.also".to_string()
+            ],
+            "the valid entries survive, the malformed one does not"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("windows.excluded_apps")),
+            "the dropped element is reported: {errors:?}"
+        );
+        assert!(needs_persist, "the repaired file is written back");
+
+        let not_a_list = "[windows]\nshow_minimized = true\nexcluded_apps = \"com.example.one\"\n";
+        let (config, errors, _) =
+            parse_config_content(not_a_list).expect("a wrong type must not reject the file");
+        assert!(config.windows.show_minimized, "the sibling is kept");
+        assert!(config.windows.excluded_apps.is_empty());
+        assert!(
+            !errors.is_empty(),
+            "the wrong-typed field is reported, not silently ignored"
+        );
+    }
+
+    /// A value that cannot be passed through a C string (a NUL or any control character) is refused
+    /// per element: the renderer builds the Remove button's identifier from it, and `make_nsstring`
+    /// aborts on an interior NUL.
+    #[test]
+    fn a_control_character_in_an_exclusion_entry_is_refused_alone() {
+        let content = "[windows]\nexcluded_apps = [\"com.example.good\", \"com.exa\\u0000mple\", \"com.example.also\"]\n";
+        let (config, errors, _) = parse_config_content(content).expect("the rest must still load");
+        assert_eq!(
+            config.windows.excluded_apps,
+            vec![
+                "com.example.good".to_string(),
+                "com.example.also".to_string()
+            ],
+            "the unsafe entry is dropped, its siblings stay"
+        );
+        assert!(
+            errors.iter().any(|e| e.contains("control character")),
+            "the refusal is reported: {errors:?}"
+        );
+    }
+
+    /// A sibling's validation failure must not reset the list: it is user data the loader already
+    /// repaired element by element.
+    #[test]
+    fn merge_valid_keeps_the_switcher_excluded_list_when_a_sibling_fails() {
+        let mut other = Config::default();
+        other.windows.show_minimized = true;
+        other.windows.excluded_apps = vec!["com.apple.Safari".into()];
+        let mut ours = Config::default();
+        ours.merge_valid(other, &["windows.show_minimized: invalid".to_string()]);
+        assert_eq!(
+            ours.windows.excluded_apps,
+            vec!["com.apple.Safari".to_string()]
         );
     }
 

@@ -44,19 +44,34 @@ pub(crate) fn is_extension_process(executable_path: &str) -> bool {
         .any(|component| component.ends_with(".appex"))
 }
 
-/// The executable path of a running process, or None when the process cannot be resolved.
-pub(crate) unsafe fn executable_path_of(pid: i32) -> Option<String> {
+/// The executable path and bundle identifier of a running process from ONE
+/// `NSRunningApplication` lookup.
+///
+/// The collector asks both questions about every candidate pid (is this an app extension? is this
+/// application excluded?). Two lookups would be two answers that can disagree if the process quits
+/// in between, and one per pid is enough: the object is a property read, not a query that waits on
+/// another process. Empty strings are reported as `None`, so a caller never matches "".
+pub(crate) unsafe fn process_identity(pid: i32) -> (Option<String>, Option<String>) {
     let app: *mut AnyObject =
         msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
     if app.is_null() {
-        return None;
+        return (None, None);
     }
     let exec_url: *mut AnyObject = msg_send![app, executableURL];
-    if exec_url.is_null() {
-        return None;
-    }
-    let path_obj: *mut AnyObject = msg_send![exec_url, path];
-    read_nsstring(path_obj)
+    let exec_path = if exec_url.is_null() {
+        None
+    } else {
+        let path_obj: *mut AnyObject = msg_send![exec_url, path];
+        read_nsstring(path_obj)
+    };
+    (exec_path, bundle_id_of(app))
+}
+
+/// The bundle identifier of a running process, or None when it has none (or is gone).
+pub(crate) unsafe fn bundle_id_for_pid(pid: i32) -> Option<String> {
+    let app: *mut AnyObject =
+        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    bundle_id_of(app)
 }
 
 /// Read an NSString into a Rust String (nil -> None). The object is autoreleased; caller must be in a pool.

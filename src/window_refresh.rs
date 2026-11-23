@@ -8,7 +8,7 @@ use objc2::runtime::{AnyObject, Sel};
 use objc2::{msg_send, sel};
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{LazyLock, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -112,6 +112,13 @@ struct WindowRefreshResult {
     /// subscriptions instead of clearing them. Carrying this is what removed a full
     /// `CGWindowListCopyWindowInfo` from the main thread on every apply.
     subscriptions: Option<Vec<(u32, i32)>>,
+    /// Whether the pass's PRIMARY candidate enumeration completed. A full pass with a failed
+    /// enumeration answers with an empty window list, which is not the same answer as "this policy
+    /// admits no windows" (see `CollectionPass::candidates_complete`).
+    candidates_complete: bool,
+    /// The per-window refusal reasons this pass recorded, taken on the collection thread and
+    /// published only if the main thread accepts the result.
+    rejections: Vec<(i32, u32, crate::e2e_state::CardRejection)>,
 }
 
 static WINDOW_REFRESH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
@@ -120,6 +127,15 @@ static WINDOW_REFRESH_PENDING: AtomicU8 = AtomicU8::new(0);
 static WINDOW_REFRESH_PENDING_FOCUS: LazyLock<Mutex<Option<(i32, u32)>>> =
     LazyLock::new(|| Mutex::new(None));
 static WINDOW_REFRESH_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Set when a candidate-policy change (the "other desktops" switch, the exclusion list) discarded
+/// the committed candidates and asked for a full pass under the new policy. While it stands, a
+/// directed result may update observation data but must not write the candidate list, and only a
+/// full pass whose primary enumeration completed clears it.
+static CANDIDATES_INVALID: AtomicBool = AtomicBool::new(false);
+/// How many consecutive failed primary enumerations were retried since the invalidation. Bounded, so
+/// a persistently failing enumeration cannot spin the collection thread forever.
+static POLICY_FULL_RETRIES: AtomicU32 = AtomicU32::new(0);
+const POLICY_FULL_RETRY_LIMIT: u32 = 3;
 static WINDOW_REFRESH_RESULT: LazyLock<Mutex<Option<WindowRefreshResult>>> =
     LazyLock::new(|| Mutex::new(None));
 static LIFECYCLE_BACKSTOP_STARTED: OnceLock<()> = OnceLock::new();
@@ -169,15 +185,48 @@ pub(crate) fn request_window_refresh() {
     request_window_refresh_for(WindowRefreshReason::Summon);
 }
 
-/// Invalidate any collection already running and ask for a full one.
+/// A candidate-policy change (the "other desktops" switch, the exclusion list): the committed
+/// candidates no longer describe what the policy admits, and a collection already running under the
+/// old policy must not be applied or reused.
 ///
-/// A candidate-policy change (the "other desktops" switch) makes a snapshot taken under the old
-/// policy inapplicable. The apply path already discards a result whose generation is stale, so
-/// bumping the generation here is what stops "collected while the switch was on" from being applied
-/// after it was turned off -- or from being consumed by the next summon through the pending state.
+/// The order is part of the contract:
+/// 1. bump the generation, so every result already in flight -- full OR directed -- is stale;
+/// 2. discard the committed candidates and mark the pipeline as having no valid snapshot for the
+///    current policy, so nothing can show, navigate to or commit an old or partial card set (the
+///    first-frame deadline then shows the empty state instead);
+/// 3. go through the FORMAL request entry, so the full pass starts immediately when the pipeline is
+///    idle.
+///
+/// The queued result is deliberately NOT taken here: a main-thread callback may already be posted
+/// for it, and that callback owns the release of `WINDOW_REFRESH_IN_FLIGHT`. Taking the result would
+/// leave the callback with nothing to consume and the in-flight flag armed with no owner -- the
+/// refresh pipeline would stay wedged and later summons, focus events and backstops could only
+/// queue. The bumped generation above is what makes the callback reject that result, release the
+/// flag and start the pass this function asked for.
+///
+/// The caller dismisses the overlay (`overlay::reset_switcher`) on this same main-thread turn.
 pub(crate) fn invalidate_collection_for_policy_change() {
+    mark_policy_invalidated();
+    with_tab_state(|state_opt| {
+        if let Some(state) = state_opt.as_mut() {
+            state.windows.clear();
+            state.selected = 0;
+            state.summon_keys = None;
+            state.user_picked = false;
+            state.selected_target_key = None;
+            WINDOW_COUNT.store(0, Ordering::Release);
+        }
+    });
+    request_window_refresh_request(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
+}
+
+/// The statics half of a candidate-policy invalidation: newest generation, the mark, and a reset retry
+/// budget. Split out so the one invariant that caused a wedged pipeline is asserted headlessly: the
+/// queued result is NOT taken here (a posted main-thread callback owns its release).
+fn mark_policy_invalidated() {
     WINDOW_REFRESH_GENERATION.fetch_add(1, Ordering::AcqRel);
-    queue_refresh_request(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
+    CANDIDATES_INVALID.store(true, Ordering::Release);
+    POLICY_FULL_RETRIES.store(0, Ordering::Release);
 }
 
 /// Periodically reconcile the window/thumbnail set when private WindowServer lifecycle
@@ -379,7 +428,69 @@ fn take_pending_refresh_request() -> Option<WindowRefreshRequest> {
         .map(|(pid, window_id)| WindowRefreshRequest::Focused { pid, window_id })
 }
 
+/// While a candidate invalidation stands, a directed refresh is promoted to a full one: the
+/// candidate list has no valid snapshot, so the pass that can clear the mark must not be starved by
+/// focus changes, and a partial list must never be what the switcher shows or commits.
+fn promoted_request_under_invalidation(
+    request: WindowRefreshRequest,
+    candidates_invalid: bool,
+) -> WindowRefreshRequest {
+    match (request, candidates_invalid) {
+        (WindowRefreshRequest::Focused { .. }, true) => {
+            WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle)
+        }
+        (request, _) => request,
+    }
+}
+
+/// What the apply stage may do with a result while a candidate invalidation stands.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PolicyApply {
+    /// No invalidation: apply the result normally.
+    Apply,
+    /// A full pass whose primary enumeration completed: apply it and clear the invalidation.
+    ApplyClearing,
+    /// A directed pass arrived first: adopt observation data only (scope, subscriptions, MRU
+    /// memory), never the candidate list, selection or first-frame state.
+    ObservationOnly,
+    /// A full pass whose primary enumeration failed: adopt nothing, keep the invalidation and retry.
+    Retry,
+    /// The retry budget is spent: STOP the immediate retry loop but KEEP the invalidation. The
+    /// lifecycle paths (the 5s backstop, any focus change promoted to a full pass) keep trying, and
+    /// until a completed full pass is actually applied, no directed result may write candidates --
+    /// accepting a failed enumeration as "nothing is admissible" would let the next directed pass
+    /// become the whole candidate list.
+    RetryBudgetExhausted,
+}
+
+/// The apply contract for one result. Pure, so the orderings (directed-first, failed full pass,
+/// budget exhaustion, completed full pass) are asserted without AppKit or a real collection.
+fn policy_apply_decision(
+    candidates_invalid: bool,
+    is_full_pass: bool,
+    candidates_complete: bool,
+    retries: u32,
+    retry_limit: u32,
+) -> PolicyApply {
+    if !candidates_invalid {
+        return PolicyApply::Apply;
+    }
+    if !is_full_pass {
+        return PolicyApply::ObservationOnly;
+    }
+    if candidates_complete {
+        return PolicyApply::ApplyClearing;
+    }
+    if retries < retry_limit {
+        PolicyApply::Retry
+    } else {
+        PolicyApply::RetryBudgetExhausted
+    }
+}
+
 fn queue_refresh_request(request: WindowRefreshRequest) {
+    let request =
+        promoted_request_under_invalidation(request, CANDIDATES_INVALID.load(Ordering::Acquire));
     match request {
         WindowRefreshRequest::Full(reason) => merge_pending_refresh_reason(reason),
         WindowRefreshRequest::Focused { pid, window_id } => {
@@ -393,6 +504,8 @@ fn request_window_refresh_for(reason: WindowRefreshReason) {
 }
 
 fn request_window_refresh_request(request: WindowRefreshRequest) {
+    let request =
+        promoted_request_under_invalidation(request, CANDIDATES_INVALID.load(Ordering::Acquire));
     if crate::space_transition::snapshot().active {
         queue_refresh_request(request);
         return;
@@ -494,9 +607,13 @@ fn start_window_refresh(
                             // A directed pass that took no snapshot carries None, which the apply
                             // stage treats as "keep the current subscriptions"; it is not an
                             // empty set and must not clear the registry.
+                            // A directed pass is not a candidate-set pass: it never clears the
+                            // policy invalidation (only a full pass can), and `replace_pid` already
+                            // says which pid it describes.
                             let pass = CollectionPass {
                                 windows: collected.windows,
                                 subscriptions: collected.subscriptions,
+                                candidates_complete: false,
                             };
                             (pass, Some(pid), active_key, None)
                         }
@@ -534,6 +651,11 @@ fn start_window_refresh(
             let scope_pass = crate::thumbnail::take_current_scope_pass();
             // The AX pid evidence this pass produced, carried so only an accepted result publishes it.
             let ax_pid_evidence = crate::e2e_state::take_staged_ax_pid_evidence();
+            // Same hand-off for the refusal reasons: they are staged on THIS thread (the collection
+            // thread), and the apply stage runs on the main thread -- reading the staging there
+            // would read a thread-local no collection ever wrote.
+            let rejections = crate::e2e_state::take_staged_rejections();
+            let candidates_complete = pass.candidates_complete;
             *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
                 generation,
                 space_transition_generation,
@@ -545,6 +667,8 @@ fn start_window_refresh(
                 active_key,
                 summon_focus_key,
                 subscriptions,
+                candidates_complete,
+                rejections,
             });
             let controller = CONTROLLER.lock().unwrap().map(|ptr| ptr.0);
             if let Some(controller) = controller {
@@ -730,6 +854,73 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     // clearing them: an unavailable snapshot is not evidence that nothing should be watched.
     let subscriptions = result.subscriptions;
 
+    // Candidate-policy invalidation: the candidate list has no valid snapshot for the current
+    // policy. See `policy_apply_decision` for the contract; every branch below returns before the
+    // candidate list, selection or first-frame state can be written by a partial or failed pass.
+    let policy_decision = policy_apply_decision(
+        CANDIDATES_INVALID.load(Ordering::Acquire),
+        applied_replace_pid.is_none(),
+        result.candidates_complete,
+        POLICY_FULL_RETRIES.load(Ordering::Acquire),
+        POLICY_FULL_RETRY_LIMIT,
+    );
+    match policy_decision {
+        PolicyApply::ObservationOnly => {
+            // A directed pass arrived while the invalidation stands. Its observations stay current;
+            // the candidates do not (a focus change must not make one app's windows the whole list,
+            // which the 0.12s deadline or a fast release could then show or commit).
+            let mru_update = result.mru;
+            with_tab_state(|state_opt| {
+                if let Some(state) = state_opt.as_mut() {
+                    for (key, timestamp) in mru_update {
+                        if state
+                            .mru
+                            .get(&key)
+                            .is_none_or(|current| *current < timestamp)
+                        {
+                            state.mru.insert(key, timestamp);
+                        }
+                    }
+                }
+            });
+            if let Some(pass) = scope_pass {
+                pass.publish();
+            }
+            if let Some(subscriptions) = subscriptions.as_deref() {
+                crate::window_server::update_subscriptions(subscriptions);
+            }
+            drop(in_flight);
+            return;
+        }
+        PolicyApply::Retry => {
+            POLICY_FULL_RETRIES.fetch_add(1, Ordering::AcqRel);
+            log_debug!(
+                "[windows] the primary candidate enumeration failed after a policy change; retrying"
+            );
+            queue_refresh_request(WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle));
+            drop(in_flight);
+            if let Some(pending_request) = take_pending_refresh_request() {
+                request_window_refresh_request(pending_request);
+            }
+            return;
+        }
+        PolicyApply::RetryBudgetExhausted => {
+            // Stop the immediate retry loop; the invalidation stays. A backstop or focus event will
+            // start another full pass, and until one is APPLIED no directed result may write
+            // candidates.
+            crate::log_info!(
+                "[windows] the primary candidate enumeration kept failing after {} retries; waiting for the next lifecycle pass",
+                POLICY_FULL_RETRY_LIMIT
+            );
+            drop(in_flight);
+            return;
+        }
+        PolicyApply::ApplyClearing | PolicyApply::Apply => {}
+    }
+    // Only a completed full pass that is actually applied clears the invalidation (below, after the
+    // apply closure and its generation/space-transition guards accepted it).
+    let clear_invalidation_after_apply = matches!(policy_decision, PolicyApply::ApplyClearing);
+
     let applied =
         crate::space_transition::while_stable(result.space_transition_generation, || {
             with_tab_state(|state_opt| {
@@ -833,6 +1024,13 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
             return;
         }
     };
+    // The completed full pass was applied: the candidate list now describes the current policy, so
+    // the invalidation can go (and the retry budget resets). A pass that was rejected by the
+    // generation/space-transition guards or by an empty `while_stable` never reaches this point.
+    if clear_invalidation_after_apply {
+        CANDIDATES_INVALID.store(false, Ordering::Release);
+        POLICY_FULL_RETRIES.store(0, Ordering::Release);
+    }
     // The result was applied, so its scope observations are the current truth for the capture
     // pipeline. Every other path drops the guard, which discards them instead (a superseded pass
     // or a prewarm collection must never move eligibility evidence).
@@ -844,7 +1042,10 @@ fn apply_window_refresh_inner(in_flight: InFlightGuard) {
     crate::e2e_state::publish_ax_pid_evidence(ax_pid_evidence, applied_replace_pid);
     // The per-window rejection reasons travel with the same accepted result, for the same reason: a
     // superseded pass or a prewarm collection must not rewrite the evidence a frame's cards carry.
-    crate::e2e_state::publish_staged_rejections(applied_replace_pid);
+    crate::e2e_state::publish_staged_rejections(result.rejections, applied_replace_pid);
+    // Which kind of pass produced the frame a scenario is looking at (and, for a directed pass, its
+    // pid): a scenario proving the refresh it triggered was accepted reads this.
+    crate::e2e_state::record_accepted_refresh(applied_replace_pid);
     // The snapshot is applied, so the flag can go: a panic in the rebuild/subscription steps
     // below can no longer wedge the pipeline.
     drop(in_flight);
@@ -1141,14 +1342,129 @@ pub(crate) fn best_effort_bump_focus_key(state: &mut AppState, pid: i32, cgwid: 
 #[cfg(test)]
 mod tests {
     use super::{
-        merge_refreshed_windows, preserve_existing_window_order, run_apply_with_in_flight_guard,
-        selection_index_after_refresh, WindowRefreshReason, WindowRefreshResult,
+        merge_refreshed_windows, policy_apply_decision, preserve_existing_window_order,
+        promoted_request_under_invalidation, run_apply_with_in_flight_guard,
+        selection_index_after_refresh, PolicyApply, WindowRefreshReason, WindowRefreshRequest,
+        WindowRefreshResult,
     };
     use crate::window_collector::WindowInfo;
     use std::collections::HashMap;
     use std::sync::{LazyLock, Mutex};
 
     static IN_FLIGHT_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    /// A policy invalidation must NOT take the result that a main-thread callback may already have
+    /// been posted for. Taking it left that callback with nothing to consume: it handed the in-flight
+    /// flag off to a later stage that never ran, so the flag stayed set and every later summon, focus
+    /// event and backstop could only queue -- the refresh pipeline stopped for good.
+    #[test]
+    fn a_policy_invalidation_leaves_the_delivered_result_to_its_callback() {
+        use super::{
+            mark_policy_invalidated, CANDIDATES_INVALID, POLICY_FULL_RETRIES,
+            WINDOW_REFRESH_GENERATION, WINDOW_REFRESH_RESULT,
+        };
+        use std::sync::atomic::Ordering;
+
+        let _lock = IN_FLIGHT_TEST_LOCK.lock().unwrap();
+        let generation_before = WINDOW_REFRESH_GENERATION.load(Ordering::Acquire);
+        *WINDOW_REFRESH_RESULT.lock().unwrap() = Some(WindowRefreshResult {
+            generation: generation_before,
+            space_transition_generation: 0,
+            scope_pass: None,
+            ax_pid_evidence: None,
+            windows: Vec::new(),
+            mru: HashMap::new(),
+            replace_pid: None,
+            active_key: None,
+            summon_focus_key: None,
+            subscriptions: None,
+            candidates_complete: true,
+            rejections: Vec::new(),
+        });
+        mark_policy_invalidated();
+        assert!(
+            CANDIDATES_INVALID.load(Ordering::Acquire),
+            "the invalidation is marked"
+        );
+        assert_eq!(
+            WINDOW_REFRESH_GENERATION.load(Ordering::Acquire),
+            generation_before + 1,
+            "in-flight results become stale"
+        );
+        assert!(
+            WINDOW_REFRESH_RESULT.lock().unwrap().is_some(),
+            "the posted callback still owns the result it will reject by generation and release"
+        );
+        // Leave the shared statics as this test found them.
+        WINDOW_REFRESH_RESULT.lock().unwrap().take();
+        CANDIDATES_INVALID.store(false, Ordering::Release);
+        POLICY_FULL_RETRIES.store(0, Ordering::Release);
+    }
+
+    /// The candidate-policy apply contract, ordering by ordering. These are the cases a policy
+    /// change can meet: a directed pass arriving first (observation only), a full pass whose primary
+    /// enumeration failed (retry, then a bounded give-up), and a completed full pass (apply and
+    /// clear). Without the directed case a focus change could become the whole candidate list and a
+    /// fast release could commit it; without the failed case an enumeration failure would read as
+    /// "nothing is admissible".
+    #[test]
+    fn the_policy_apply_contract_covers_every_ordering() {
+        // No invalidation: everything applies as before.
+        assert_eq!(
+            policy_apply_decision(false, true, true, 0, 3),
+            PolicyApply::Apply
+        );
+        assert_eq!(
+            policy_apply_decision(false, false, false, 0, 3),
+            PolicyApply::Apply
+        );
+        // Invalidated + directed pass: observations only, whatever its completeness says.
+        assert_eq!(
+            policy_apply_decision(true, false, false, 0, 3),
+            PolicyApply::ObservationOnly
+        );
+        assert_eq!(
+            policy_apply_decision(true, false, true, 0, 3),
+            PolicyApply::ObservationOnly
+        );
+        // Invalidated + full pass whose primary enumeration completed: apply and clear.
+        assert_eq!(
+            policy_apply_decision(true, true, true, 0, 3),
+            PolicyApply::ApplyClearing
+        );
+        // Invalidated + failed primary enumeration: retry inside the budget; once the budget is
+        // spent the invalidation STAYS (the next lifecycle pass tries again), only the immediate
+        // retry loop stops.
+        assert_eq!(
+            policy_apply_decision(true, true, false, 0, 3),
+            PolicyApply::Retry
+        );
+        assert_eq!(
+            policy_apply_decision(true, true, false, 2, 3),
+            PolicyApply::Retry
+        );
+        assert_eq!(
+            policy_apply_decision(true, true, false, 3, 3),
+            PolicyApply::RetryBudgetExhausted
+        );
+    }
+
+    /// While the invalidation stands a focus change must not start a directed pass: the pass that
+    /// can clear the mark is the full one, and a partial list must never precede it.
+    #[test]
+    fn a_focused_request_is_promoted_while_the_candidates_are_invalid() {
+        let focused = WindowRefreshRequest::Focused {
+            pid: 7,
+            window_id: 20,
+        };
+        assert_eq!(
+            promoted_request_under_invalidation(focused, true),
+            WindowRefreshRequest::Full(WindowRefreshReason::Lifecycle)
+        );
+        assert_eq!(promoted_request_under_invalidation(focused, false), focused);
+        let full = WindowRefreshRequest::Full(WindowRefreshReason::Summon);
+        assert_eq!(promoted_request_under_invalidation(full, true), full);
+    }
 
     fn window(pid: i32, window_id: u32) -> WindowInfo {
         WindowInfo {
@@ -1221,6 +1537,8 @@ mod tests {
             active_key: None,
             summon_focus_key: None,
             subscriptions: None,
+            candidates_complete: true,
+            rejections: Vec::new(),
         });
 
         assert!(recover_stalled_deferred_refresh(generation, token));
@@ -1240,6 +1558,8 @@ mod tests {
             active_key: None,
             summon_focus_key: None,
             subscriptions: None,
+            candidates_complete: true,
+            rejections: Vec::new(),
         });
         assert!(!recover_stalled_deferred_refresh(generation, token + 1));
         assert!(WINDOW_REFRESH_IN_FLIGHT.load(Ordering::Acquire));

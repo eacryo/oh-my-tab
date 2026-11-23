@@ -342,7 +342,6 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
                 Value::Index(selected),
             )
             .label_text(stroke)
-            .action_tag(row.index as isize)
             // The option ids travel ON the row spec, so the renderer stores them exactly when it
             // builds this row's control -- an in-place refresh re-derives the description but
             // builds nothing, and the mapping on screen stays in force.
@@ -373,136 +372,55 @@ pub(super) fn gestures_page_view(input: &PageInput) -> PageView {
             .into_spec(),
         );
     }
-    // Applications where no gesture fires.
-    //
-    // Adding one is a COMMAND, not a selection: it opens the system's own application chooser. It
-    // used to be a dropdown of every installed application (137 on a normal Mac, no search), which
-    // made a one-shot action look like a setting that holds a value and then had to reset itself.
-    // `settings.gestures_desc_excluded` still states the rule the list implements.
-    w.card("settings.gestures_header_excluded");
-    w.push(
-        RowDraft::new(
-            "settings.gestures_row_add_app",
-            ControlKind::Value {
-                action: Some(ValueAction::new(
-                    "gesture_excluded_choose",
-                    "settings.gestures_excluded_choose_action",
-                )),
-                align: ValueAlign::Right,
-            },
-            ControlId::Action("gesture_excluded_choose"),
-            Value::None,
-        )
-        .desc("settings.gestures_desc_excluded")
-        .into_spec(),
+    // Applications where no gesture fires: the shared exclusion card shape (the Switcher page's
+    // list is the same card with its own copy, actions and row identities -- see `excluded_apps.rs`).
+    push_excluded_apps_card(
+        &mut w,
+        &gestures_excluded_card(),
+        &cfg.mouse.gesture_excluded_apps,
+        &input.known_app_names,
     );
-
-    // A list whose entries cannot match: the tap matches a bundle id, so an entry that is not one
-    // never excludes anything the user can see. Saying so is the difference between "the setting is
-    // broken" and "this line is wrong".
-    let unusable = cfg
-        .mouse
-        .gesture_excluded_apps
-        .iter()
-        .filter(|entry| !looks_like_bundle_id(entry))
-        .count();
-    if unusable > 0 {
-        w.push(
-            RowDraft::new(
-                "settings.gestures_row_excluded_invalid",
-                ControlKind::Value {
-                    action: None,
-                    align: ValueAlign::Right,
-                },
-                ControlId::Action("gesture_excluded_invalid"),
-                Value::Dynamic(format!("{unusable}")),
-            )
-            .into_spec(),
-        );
-    }
-
-    // One row per excluded bundle, each with its own Remove action.
-    if cfg.mouse.gesture_excluded_apps.is_empty() {
-        w.push(
-            RowDraft::new(
-                "settings.gestures_row_excluded_empty",
-                ControlKind::Value {
-                    action: None,
-                    align: ValueAlign::Right,
-                },
-                ControlId::Action("gesture_excluded_empty"),
-                Value::None,
-            )
-            .into_spec(),
-        );
-    }
-    let excluded_total = cfg.mouse.gesture_excluded_apps.len();
-    // The names of everything the picker knows, so a listed bundle can be shown under the name the
-    // user recognises instead of its reverse-DNS identifier.
-    let display_names: HashMap<String, String> =
-        gesture_excluded_candidates().into_iter().collect();
-    for (index, bundle) in cfg
-        .mouse
-        .gesture_excluded_apps
-        .iter()
-        .take(MAX_SHOWN_EXCLUDED)
-        .enumerate()
-    {
-        let id = excluded_row_identity(index);
-        // The row's LABEL is the application, the way the gesture rows label themselves with the
-        // stroke they hold: a generic "Application" title beside a truncated identifier said nothing
-        // about which applications are excluded. The bundle id is the fallback, not the default --
-        // an entry can name an application that is no longer installed, and it still has to be
-        // listed and removable.
-        let label = display_names
-            .get(bundle)
-            .cloned()
-            .unwrap_or_else(|| bundle.clone());
-        w.push(
-            RowDraft::new(
-                "settings.gestures_row_excluded",
-                ControlKind::Value {
-                    // One action identity for every Remove button. WHICH entry is removed travels
-                    // as the button's tag below, because the callback receives the button and its
-                    // own text is only its title.
-                    action: Some(ValueAction::new(
-                        "gesture_excluded_remove",
-                        "settings.gestures_excluded_remove",
-                    )),
-                    align: ValueAlign::Right,
-                },
-                ControlId::Action(id),
-                // The value beside the label stays empty: the name IS the label now.
-                Value::None,
-            )
-            .label_text(label)
-            // The icon is the row's shortest answer to "which application is this": a name alone
-            // has to be read, a Dock icon is recognised. An entry whose application is gone draws
-            // no icon and keeps its name (or its identifier) as plain text.
-            .icon_bundle(bundle.clone())
-            .action_tag(index as isize)
-            .into_spec(),
-        );
-    }
-
-    // The exclusion list has the same identity bound as the gesture rows; the overflow is
-    // stated rather than collapsed onto one shared identity.
-    let excluded_overflow = excluded_total.saturating_sub(MAX_SHOWN_EXCLUDED);
-    if excluded_overflow > 0 {
-        w.push(
-            RowDraft::new(
-                "settings.gestures_row_more",
-                ControlKind::Value {
-                    action: None,
-                    align: ValueAlign::Right,
-                },
-                ControlId::Action("gesture_excluded_more"),
-                Value::Dynamic(format!("+{excluded_overflow}")),
-            )
-            .into_spec(),
-        );
-    }
     w.finish()
+}
+
+/// The Gestures page's exclusion card: its copy keys, its action ids and the static row identities
+/// its control table addresses.
+fn gestures_excluded_card() -> ExcludedAppsCardSpec {
+    static IDENTITIES: [&str; MAX_SHOWN_EXCLUDED] = [
+        "gesture_excluded_a",
+        "gesture_excluded_b",
+        "gesture_excluded_c",
+        "gesture_excluded_d",
+        "gesture_excluded_e",
+        "gesture_excluded_f",
+        "gesture_excluded_g",
+        "gesture_excluded_h",
+        "gesture_excluded_i",
+        "gesture_excluded_j",
+        "gesture_excluded_k",
+        "gesture_excluded_l",
+        "gesture_excluded_m",
+        "gesture_excluded_n",
+        "gesture_excluded_o",
+        "gesture_excluded_p",
+    ];
+    ExcludedAppsCardSpec {
+        header_key: "settings.gestures_header_excluded",
+        desc_key: "settings.gestures_desc_excluded",
+        add_row_key: "settings.gestures_row_add_app",
+        add_action_id: "gesture_excluded_choose",
+        add_action_key: "settings.gestures_excluded_choose_action",
+        invalid_key: "settings.gestures_row_excluded_invalid",
+        invalid_identity: "gesture_excluded_invalid",
+        empty_key: "settings.gestures_row_excluded_empty",
+        empty_identity: "gesture_excluded_empty",
+        row_label_key: "settings.gestures_row_excluded",
+        remove_action_id: "gesture_excluded_remove",
+        remove_action_key: "settings.gestures_excluded_remove",
+        more_key: "settings.gestures_row_more",
+        more_identity: "gesture_excluded_more",
+        identities: &IDENTITIES,
+    }
 }
 
 /// Whether a row identity names one of this page's gesture rows.
@@ -748,32 +666,6 @@ pub(crate) fn remove_gesture_row(
 /// Eleven, because that is what the shipped default list holds: a bound under it would present the
 /// app's own configuration as an overflow.
 const MAX_SHOWN_ROWS: usize = 11;
-
-/// The identity of one excluded-application row. Same bound and same reason as the gesture rows:
-/// the control table addresses a row by a \`&'static str\` identity.
-const MAX_SHOWN_EXCLUDED: usize = 16;
-
-fn excluded_row_identity(index: usize) -> &'static str {
-    const IDS: [&str; MAX_SHOWN_EXCLUDED] = [
-        "gesture_excluded_a",
-        "gesture_excluded_b",
-        "gesture_excluded_c",
-        "gesture_excluded_d",
-        "gesture_excluded_e",
-        "gesture_excluded_f",
-        "gesture_excluded_g",
-        "gesture_excluded_h",
-        "gesture_excluded_i",
-        "gesture_excluded_j",
-        "gesture_excluded_k",
-        "gesture_excluded_l",
-        "gesture_excluded_m",
-        "gesture_excluded_n",
-        "gesture_excluded_o",
-        "gesture_excluded_p",
-    ];
-    IDS.get(index).copied().unwrap_or("gesture_excluded_over")
-}
 
 /// The most rows any identity table can name: the page's own row bound.
 ///
@@ -1095,23 +987,6 @@ fn direction_word(direction: char) -> String {
     }
 }
 
-/// Every application the exclusion picker can offer, before the configured ones are removed: the
-/// installed ones plus whatever is running but installed outside the standard folders.
-///
-/// This is the raw catalogue; `running_app_candidates` is what the popup actually lists.
-fn gesture_excluded_candidates() -> Vec<(String, String)> {
-    let mut apps = crate::app_identity::installed_application_bundles();
-    // Reading the running-application list is AppKit work, and the page build runs on the
-    // main thread.
-    for entry in unsafe { crate::app_identity::running_apps_with_bundle_ids() } {
-        if !apps.iter().any(|(bundle, _)| *bundle == entry.0) {
-            apps.push(entry);
-        }
-    }
-    apps.sort_by_key(|(_, name)| name.to_lowercase());
-    apps
-}
-
 fn configured_rows(layer: &crate::config::GestureLayer) -> Vec<ShownRow> {
     layer
         .gestures
@@ -1153,33 +1028,6 @@ fn row_problem(entry: &crate::config::GestureBinding) -> Option<&'static str> {
         return Some("bad_target");
     }
     None
-}
-
-/// Whether an exclusion entry can ever match: the tap compares it with an application's bundle
-/// identifier (`CFBundleIdentifier`, reverse-DNS, at least two dot-separated parts and no spaces).
-///
-/// An entry that is not a bundle id -- an application NAME, a path, an empty line edited into the
-/// file -- is accepted by the config but can never be equal to one, so the runtime ignores it. This
-/// is the same predicate the page uses to mark such entries, and it is deliberately conservative:
-/// a real bundle id always passes, and a non-conforming but genuinely registered identifier (an
-/// Apple utility from an unsigned bundle) is reported rather than silently kept.
-pub(crate) fn looks_like_bundle_id(entry: &str) -> bool {
-    let trimmed = entry.trim();
-    if trimmed.is_empty() || trimmed.contains(char::is_whitespace) {
-        return false;
-    }
-    // No scheme, no slash: a bundle id is dots and ASCII name characters.
-    if trimmed.contains('/') || trimmed.contains(':') {
-        return false;
-    }
-    let parts: Vec<&str> = trimmed.split('.').collect();
-    parts.len() >= 2
-        && parts.iter().all(|part| {
-            !part.is_empty()
-                && part
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
-        })
 }
 
 /// A row state in the user's language. Never a config value.
@@ -1528,11 +1376,6 @@ mod tests {
         assert!(
             matches!(gesture_rows[0].value, Value::Index(_)),
             "the popup starts on the row's current binding"
-        );
-        assert_eq!(
-            gesture_rows[0].action_tag,
-            Some(0),
-            "the row states its index"
         );
     }
 
@@ -1912,29 +1755,52 @@ mod tests {
         }
     }
 
-    /// A row's action tag must not travel in the button's `tag`.
-    ///
-    /// That slot carries the ROLE's palette slot, which the hover and focus callbacks read to
-    /// restore the right fill. Stamping a list index there made both fill lookups fall through to
-    /// the generic hover wash, so an excluded row's Remove button was painted with the HOVER colour
-    /// from the moment it was built and never returned (measured: tag was 0/1 instead of -3).
-    /// The index travels as the button's identifier instead; this asserts the page hands the row an
-    /// action tag at all, and the identifier round-trip is covered where the identifier is made.
+    /// A hand-edited list can hold an empty entry: the page must still list it, or it exists in the
+    /// config with no way to remove it through the UI. The row's action is bound to that exact text
+    /// (`action_bundle`), which is what its Remove button carries.
     #[test]
-    fn an_excluded_row_carries_its_index_as_row_data() {
+    fn an_empty_exclusion_entry_is_listed_and_carries_its_own_action_payload() {
+        let mut page_input = input(true, Vec::new());
+        page_input.config.mouse.gesture_excluded_apps =
+            vec![String::new(), "com.apple.Safari".into()];
+        let view = gestures_page_view(&page_input);
+        let rows: Vec<&RowSpec> = view
+            .rows
+            .iter()
+            .filter(|r| r.label_key == "settings.gestures_row_excluded")
+            .collect();
+        assert_eq!(rows.len(), 2, "the empty entry is not hidden");
+        assert_eq!(
+            rows[0].action_bundle.as_deref(),
+            Some(""),
+            "an empty entry still carries its exact text, so its Remove can act on it"
+        );
+        assert_eq!(rows[1].action_bundle.as_deref(), Some("com.apple.Safari"));
+    }
+
+    /// A row's Remove action is bound to the BUNDLE ID the row was built for, not to its index.
+    ///
+    /// The index is only a row slot: a reload, a rebuild or a reordered list can make the same slot
+    /// describe another application, and the handler persists the removal. The bundle id travels on
+    /// the row spec (`action_bundle`), which the renderer records where the button is created.
+    #[test]
+    fn an_excluded_row_carries_the_bundle_its_action_acts_on() {
         let mut page_input = input(true, Vec::new());
         page_input.config.mouse.gesture_excluded_apps =
             vec!["com.apple.Safari".into(), "com.apple.Notes".into()];
         let view = gestures_page_view(&page_input);
-        let tags: Vec<Option<isize>> = view
+        let bundles: Vec<Option<String>> = view
             .rows
             .iter()
             .filter(|r| r.label_key == "settings.gestures_row_excluded")
-            .map(|r| r.action_tag)
+            .map(|r| r.action_bundle.clone())
             .collect();
         assert_eq!(
-            tags,
-            vec![Some(0), Some(1)],
+            bundles,
+            vec![
+                Some("com.apple.Safari".to_string()),
+                Some("com.apple.Notes".to_string())
+            ],
             "each row states its own entry"
         );
         for row in view

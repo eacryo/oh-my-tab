@@ -1307,39 +1307,6 @@ use components::{
     SettingsSection, SettingsSelect, SettingsSidebar, ROW_ACTION_BTN_H, ROW_ACTION_BTN_W,
     SLIDER_READOUT_GAP, SLIDER_READOUT_H, SLIDER_READOUT_W,
 };
-/// The identifier text an action row's button carries its list index in.
-///
-/// A row's `action_tag` must NOT travel as the button's `tag`: that slot holds the role's palette
-/// slot, and the hover/focus styling reads it back. The identifier is display-only, so it carries
-/// the row's data safely.
-pub(crate) const ACTION_TAG_IDENTIFIER_PREFIX: &str = "omt.action-tag.";
-
-/// Build the identifier string for an action tag (caller releases the returned +1 object).
-pub(crate) unsafe fn ffi_identifier_for_action_tag(tag: isize) -> *mut objc2::runtime::AnyObject {
-    crate::ffi::make_nsstring(&format!("{ACTION_TAG_IDENTIFIER_PREFIX}{tag}"))
-}
-
-/// Read back the action tag a row's button carries, if any.
-///
-/// `None` means the sender is not one of our action-row buttons (or carries no tag), which every
-/// caller treats as "nothing to do" rather than guessing an index.
-pub(crate) unsafe fn action_tag_of_sender(sender: *mut c_void) -> Option<usize> {
-    if sender.is_null() {
-        return None;
-    }
-    let view = sender as *mut objc2::runtime::AnyObject;
-    let identifier: *mut objc2::runtime::AnyObject = objc2::msg_send![view, identifier];
-    if identifier.is_null() {
-        return None;
-    }
-    let text = crate::ffi::nsstring_to_rust(identifier);
-    let tag = text
-        .strip_prefix(ACTION_TAG_IDENTIFIER_PREFIX)?
-        .parse::<isize>()
-        .ok()?;
-    usize::try_from(tag).ok()
-}
-
 use dispatch::*;
 use mapping::*;
 pub(crate) use mapping::{
@@ -1376,7 +1343,8 @@ pub(crate) use dispatch::{
     handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
     handle_pause_recording_toggle, handle_rebuild_settings_content,
     handle_settings_search_began_editing, handle_settings_search_changed,
-    handle_settings_search_clear, handle_settings_search_ended_editing, handle_unknown_page_action,
+    handle_settings_search_clear, handle_settings_search_ended_editing,
+    handle_switcher_excluded_choose, handle_switcher_excluded_remove, handle_unknown_page_action,
     handle_windows_enabled_toggle, left_mouse_button_is_down, on_control_changed,
     on_control_text_did_change, on_control_text_did_end_editing, on_sidebar_select,
     refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
@@ -2476,6 +2444,9 @@ pub(super) fn note_settings_content_rebuilt() {
     // The gesture rows' popup option lists belong to the old controls: a stale entry would let a
     // click read an index against a list the popup on screen no longer shows.
     crate::settings::page_view::clear_popup_option_ids();
+    // Display names for the exclusion cards are re-read with the new page, so an application
+    // installed or uninstalled since the last build is named correctly.
+    crate::settings::page_view::refresh_known_app_names();
 }
 
 /// The mouse page was just filled from the live config.

@@ -178,7 +178,8 @@ pub(super) struct RowDraft {
     group: Option<RowGroup>,
     value: Value,
     value_tone: ValueTone,
-    action_tag: Option<isize>,
+    /// The bundle identifier this row's action acts on (see `RowSpec::action_bundle`).
+    action_bundle: Option<String>,
     /// The row's label as DATA instead of a locale key, for a row whose copy the page computed.
     label_text: Option<String>,
     /// The application bundle whose icon the row shows before its label (see `RowSpec`).
@@ -207,7 +208,7 @@ impl RowDraft {
             group: None,
             value,
             value_tone: ValueTone::Neutral,
-            action_tag: None,
+            action_bundle: None,
             label_text: None,
             icon_bundle: None,
             popup_option_ids: Vec::new(),
@@ -268,10 +269,9 @@ impl RowDraft {
         self
     }
 
-    /// Stamp the row's action button with a number its callback can read back. The tag is the
-    /// only value that reaches the sender: a button knows its title, not the data beside it.
-    pub(super) fn action_tag(mut self, tag: isize) -> Self {
-        self.action_tag = Some(tag);
+    /// State which bundle identifier this row's action acts on (see `RowSpec::action_bundle`).
+    pub(super) fn action_bundle(mut self, bundle: impl Into<String>) -> Self {
+        self.action_bundle = Some(bundle.into());
         self
     }
 
@@ -309,7 +309,7 @@ impl RowDraft {
             group: self.group,
             value: self.value,
             value_tone: self.value_tone,
-            action_tag: self.action_tag,
+            action_bundle: self.action_bundle,
             popup_option_ids: self.popup_option_ids,
             search: SearchRow {
                 label: t(self.label_key),

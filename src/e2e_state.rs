@@ -240,6 +240,10 @@ pub(crate) enum CardRejection {
     Shape,
     /// The app's AX answer identified no window at all, so its CG entries are panels.
     Unpaired,
+    /// The window belongs to an application on the switcher's exclusion list. It is refused where
+    /// candidates are published, so this reason also proves the policy was enforced on a window the
+    /// enumeration actually saw.
+    ExcludedApp,
 }
 
 impl CardRejection {
@@ -250,6 +254,7 @@ impl CardRejection {
             CardRejection::Title => "title",
             CardRejection::Shape => "shape",
             CardRejection::Unpaired => "unpaired",
+            CardRejection::ExcludedApp => "excluded_app",
         }
     }
 }
@@ -285,11 +290,23 @@ pub(crate) fn card_rejected(pid: i32, cgwid: u32, reason: CardRejection) {
     });
 }
 
+/// Take the rejections staged by the collection running on THIS thread.
+///
+/// The worker takes them immediately after the pass and carries them in the refresh result; the
+/// main-thread apply publishes them only when it accepts that result (`publish_staged_rejections`).
+/// Reading the staging from the apply stage instead would read the MAIN thread's thread-local, which
+/// no collection ever wrote -- `rejected_windows` was empty for that reason.
+pub(crate) fn take_staged_rejections() -> Vec<(i32, u32, CardRejection)> {
+    STAGED_REJECTIONS.with(|staged| std::mem::take(&mut *staged.borrow_mut()))
+}
+
 /// Publish an accepted pass's rejections, next to the AX evidence they belong with. A full pass
 /// replaces the list (even with nothing recorded: its cards are the truth); a directed pass replaces
 /// only that pid's entries, so the other cards keep the reasons they were built from.
-pub(crate) fn publish_staged_rejections(replace_pid: Option<i32>) {
-    let staged = STAGED_REJECTIONS.with(|staged| std::mem::take(&mut *staged.borrow_mut()));
+pub(crate) fn publish_staged_rejections(
+    staged: Vec<(i32, u32, CardRejection)>,
+    replace_pid: Option<i32>,
+) {
     let mut published = REJECTED_WINDOWS.lock().unwrap();
     match replace_pid {
         None => *published = staged,
@@ -461,6 +478,27 @@ pub(crate) fn publish_ax_pid_evidence(
     }
 }
 
+/// The kind of the last ACCEPTED refresh result: a full pass, or a directed pass (whose pid a
+/// scenario needs, to assert that the refresh it just triggered was accepted at all).
+#[derive(Clone, Copy, Default)]
+struct LastRefresh {
+    full: bool,
+    pid: Option<i32>,
+}
+
+static LAST_ACCEPTED_REFRESH: LazyLock<Mutex<Option<LastRefresh>>> =
+    LazyLock::new(|| Mutex::new(None));
+
+pub(crate) fn record_accepted_refresh(replace_pid: Option<i32>) {
+    if !is_enabled() {
+        return;
+    }
+    *LAST_ACCEPTED_REFRESH.lock().unwrap() = Some(LastRefresh {
+        full: replace_pid.is_none(),
+        pid: replace_pid,
+    });
+}
+
 pub(crate) fn set_space_membership_source(skylight: bool) {
     if is_enabled() {
         SPACE_MEMBERSHIP_SOURCE.store(u8::from(skylight), Ordering::Relaxed);
@@ -557,6 +595,10 @@ struct Card {
     pid: i32,
     window_id: u32,
     app: String,
+    /// The owning application's bundle identifier (diagnostics only). It is what the exclusion list
+    /// matches on, so a scenario can name the exact application it wrote into the config instead of
+    /// matching a localized display name. `null` when the process has no identifier.
+    bundle: Option<String>,
     title: String,
     active: bool,
     minimized: bool,
@@ -817,6 +859,27 @@ fn collect() -> Snapshot {
     // Which apps' AX read failed in the pass these cards came from; only their cards get the
     // on-screen measurement (one targeted query each, and only for diagnostics).
     let failed_pids: Vec<i32> = AX_PID_EVIDENCE.lock().unwrap().failed.clone();
+    // One NSRunningApplication lookup per distinct pid, OUTSIDE the state borrow: the bundle id is
+    // what the exclusion policy matches, so a scenario can name the application it wrote into the
+    // config instead of matching a localized display name. Diagnostics only; the product model does
+    // not carry it.
+    let pids: Vec<i32> = crate::with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .map(|state| state.windows.iter().map(|window| window.pid).collect())
+            .unwrap_or_default()
+    });
+    let bundles: std::collections::HashMap<i32, Option<String>> = {
+        let mut bundles = std::collections::HashMap::new();
+        objc2::rc::autoreleasepool(|_pool| {
+            for pid in pids {
+                bundles
+                    .entry(pid)
+                    .or_insert_with(|| unsafe { crate::app_identity::bundle_id_for_pid(pid) });
+            }
+        });
+        bundles
+    };
     crate::with_tab_state(|state_opt| match state_opt.as_ref() {
         Some(state) => Snapshot {
             visible: state.visible,
@@ -828,6 +891,7 @@ fn collect() -> Snapshot {
                     pid: w.pid,
                     window_id: w.window_id,
                     app: w.app_name.clone(),
+                    bundle: bundles.get(&w.pid).cloned().flatten(),
                     title: w.window_title.clone(),
                     active: w.is_active,
                     minimized: w.minimized,
@@ -1299,6 +1363,17 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
         "  \"rejected_windows\": [{}],\n",
         rejected_windows
     ));
+    let last_refresh = LAST_ACCEPTED_REFRESH.lock().unwrap().map(|last| {
+        format!(
+            "{{\"kind\": \"{}\", \"pid\": {}}}",
+            if last.full { "full" } else { "directed" },
+            last.pid.map_or("null".to_string(), |pid| pid.to_string())
+        )
+    });
+    json.push_str(&format!(
+        "  \"last_refresh\": {},\n",
+        last_refresh.unwrap_or_else(|| "null".to_string())
+    ));
     json.push_str(&format!(
         "  \"space_filter\": {{\"recovered_accepted\": {}, \"gate_rejected\": {}, \"other_desktop_accepted\": {}, \"show_other_desktops\": {}}},\n",
         SPACE_RECOVERED_ACCEPTED.load(Ordering::Relaxed),
@@ -1634,10 +1709,11 @@ fn write(event: &str, committed: Option<(i32, u32, String, usize)>) {
             json.push(',');
         }
         json.push_str(&format!(
-            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"fullscreen\": {}, \"other_desktop\": {}, \"thumbnail_ready\": {}, \"thumbnail_rendered\": {}, \"ax_identified\": {}, \"on_screen\": {}, \"bounds\": [{}, {}, {}, {}], \"minimized_source\": {}, \"fullscreen_source\": {}, \"app_hidden_source\": {}, \"ordered_in\": {}, \"ax_pairing\": {}, \"window_server_hidden\": {}, \"ws_attributes\": {}, \"ws_tags\": {}, \"ws_space_type_mask\": {}}}",
+            "\n    {{\"index\": {index}, \"pid\": {}, \"window_id\": {}, \"app\": {}, \"bundle\": {}, \"title\": {}, \"active\": {}, \"minimized\": {}, \"fullscreen\": {}, \"other_desktop\": {}, \"thumbnail_ready\": {}, \"thumbnail_rendered\": {}, \"ax_identified\": {}, \"on_screen\": {}, \"bounds\": [{}, {}, {}, {}], \"minimized_source\": {}, \"fullscreen_source\": {}, \"app_hidden_source\": {}, \"ordered_in\": {}, \"ax_pairing\": {}, \"window_server_hidden\": {}, \"ws_attributes\": {}, \"ws_tags\": {}, \"ws_space_type_mask\": {}}}",
             card.pid,
             card.window_id,
             json_string(&card.app),
+            card.bundle.as_deref().map_or("null".to_string(), json_string),
             json_string(&card.title),
             card.active,
             card.minimized,
@@ -1749,7 +1825,7 @@ mod ax_pid_evidence_tests {
         // publishing and the previous reasons stay.
         begin_collection_pass();
         card_rejected(7, 20, CardRejection::AxExcluded);
-        publish_staged_rejections(None);
+        publish_staged_rejections(take_staged_rejections(), None);
         assert_eq!(
             *REJECTED_WINDOWS.lock().unwrap(),
             vec![(7, 20, CardRejection::AxExcluded)]
@@ -1763,14 +1839,14 @@ mod ax_pid_evidence_tests {
         );
         // The accepted pass replaces them: an old `ax_excluded` must never survive a new reason, or a
         // scenario would report the accepted narrowing for a window refused for a real reason.
-        publish_staged_rejections(None);
+        publish_staged_rejections(take_staged_rejections(), None);
         assert_eq!(
             *REJECTED_WINDOWS.lock().unwrap(),
             vec![(7, 20, CardRejection::Space)]
         );
         // A full pass that recorded nothing still clears the list: its cards are the truth.
         begin_collection_pass();
-        publish_staged_rejections(None);
+        publish_staged_rejections(take_staged_rejections(), None);
         assert!(REJECTED_WINDOWS.lock().unwrap().is_empty());
     }
 
@@ -1780,11 +1856,11 @@ mod ax_pid_evidence_tests {
         begin_collection_pass();
         card_rejected(7, 20, CardRejection::AxExcluded);
         card_rejected(8, 30, CardRejection::Title);
-        publish_staged_rejections(None);
+        publish_staged_rejections(take_staged_rejections(), None);
         begin_collection_pass();
         card_rejected(7, 20, CardRejection::Space);
         card_rejected(7, 21, CardRejection::Unpaired);
-        publish_staged_rejections(Some(7));
+        publish_staged_rejections(take_staged_rejections(), Some(7));
         assert_eq!(
             *REJECTED_WINDOWS.lock().unwrap(),
             vec![
