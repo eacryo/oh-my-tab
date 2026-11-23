@@ -914,14 +914,20 @@ struct TargetOption {
     label: String,
 }
 
-/// The window and tab actions the popup offers beyond the key bindings' own list: each id is a
-/// chord the runtime synthesizes for the FRONTMOST application, so the entry behaves exactly like
-/// the user pressing that combination.
-const CHORD_TARGETS: [(&str, &str); 4] = [
-    ("cmd+q", "settings.gestures_target_quit_app"),
-    ("cmd+w", "settings.gestures_target_close_window"),
-    ("ctrl+tab", "settings.gestures_target_next_tab"),
-    ("ctrl+shift+tab", "settings.gestures_target_previous_tab"),
+// These actions sit together in the gesture popup. Keep the ordering local: the key binding
+// catalogue also defines the stable indices used to dispatch actions across threads.
+const GROUPED_GESTURE_TARGETS: [&str; 11] = [
+    "switcher",
+    "missioncontrol",
+    "ctrl+shift+tab",
+    "ctrl+tab",
+    "quick.show_all_windows",
+    "quick.hide_all_windows",
+    "window.restore_previous",
+    "cmd+w",
+    "cmd+q",
+    "quick.open_finder_small",
+    "feature.open_clipboard_panel",
 ];
 
 /// Whether a chord is EXACTLY the app switcher's own chord.
@@ -997,47 +1003,25 @@ pub(crate) fn switcher_chord_label() -> String {
     chord_label_for_modifier(crate::event_monitor::switcher_modifier_name())
 }
 
-/// The action popup's entries, in one fixed order: the app's own actions first (grouped as the
-/// binding page groups them), then the window and tab chords, the switcher, the system actions and
-/// finally "none".
-///
 /// One shared list is what lets a popup show the row's CURRENT target: the page matches the row's
 /// binding string against these ids, so an action or a shortcut the user picked stays selected.
 /// The list is built once per page build rather than per row. It does NOT depend on the app
 /// switcher's modifier: a chord the switcher owns stays selectable, and picking it is answered
 /// with a bubble that says what will happen.
 fn target_options() -> Vec<TargetOption> {
-    let mut options = Vec::with_capacity(crate::key_bindings::ALL.len() + 10);
-    options.push(TargetOption {
-        id: String::new(),
-        label: t("settings.gestures_target_unset"),
-    });
-    for action in crate::key_bindings::ALL {
-        options.push(TargetOption {
-            id: action.config_id().to_string(),
-            label: crate::key_bindings::action_label(action),
-        });
-    }
-    for (id, key) in CHORD_TARGETS {
-        options.push(TargetOption {
+    let remaining_actions = crate::key_bindings::ALL
+        .into_iter()
+        .map(crate::key_bindings::Action::config_id)
+        .filter(|id| !GROUPED_GESTURE_TARGETS.contains(id));
+    std::iter::once("")
+        .chain(remaining_actions)
+        .chain(GROUPED_GESTURE_TARGETS)
+        .chain(["launchpad", "showdesktop", "appexpose", "none"])
+        .map(|id| TargetOption {
             id: id.to_string(),
-            label: t(key),
-        });
-    }
-    for (id, key) in [
-        ("switcher", "settings.gestures_target_switcher"),
-        ("missioncontrol", "settings.mapping_action_missioncontrol"),
-        ("launchpad", "settings.mapping_action_launchpad"),
-        ("showdesktop", "settings.mapping_action_showdesktop"),
-        ("appexpose", "settings.mapping_action_appexpose"),
-        ("none", "settings.gestures_target_none"),
-    ] {
-        options.push(TargetOption {
-            id: id.to_string(),
-            label: t(key),
-        });
-    }
-    options
+            label: target_label(id),
+        })
+        .collect()
 }
 
 /// The stroke in the left column: the arrows for each direction the user drew, or the letters
@@ -1672,11 +1656,76 @@ mod tests {
     /// The chord targets are named in the user's language, and the name is not a raw config id.
     #[test]
     fn chord_targets_are_labelled_in_words() {
-        for (id, key) in CHORD_TARGETS {
+        for (id, key) in [
+            ("cmd+q", "settings.gestures_target_quit_app"),
+            ("cmd+w", "settings.gestures_target_close_window"),
+            ("ctrl+tab", "settings.gestures_target_next_tab"),
+            ("ctrl+shift+tab", "settings.gestures_target_previous_tab"),
+        ] {
             let label = target_label(id);
             assert_eq!(label, t(key), "{id}");
             assert!(!label.contains("cmd"), "{label}");
             assert!(!label.contains("ctrl"), "{label}");
+        }
+    }
+
+    #[test]
+    fn gesture_popup_groups_actions_and_preserves_existing_selections() {
+        let view = gestures_page_view(&input(
+            true,
+            vec![
+                row("L", 1, "system.mission_control", true),
+                row("R", 1, "missioncontrol", true),
+            ],
+        ));
+        let reordered = [
+            "switcher",
+            "missioncontrol",
+            "ctrl+shift+tab",
+            "ctrl+tab",
+            "quick.show_all_windows",
+            "quick.hide_all_windows",
+            "window.restore_previous",
+            "cmd+w",
+            "cmd+q",
+            "quick.open_finder_small",
+            "feature.open_clipboard_panel",
+        ];
+        let mut expected = vec![""];
+        expected.extend(
+            crate::key_bindings::ALL
+                .into_iter()
+                .map(crate::key_bindings::Action::config_id)
+                .filter(|id| !reordered.contains(id)),
+        );
+        expected.extend(reordered);
+        expected.extend(["launchpad", "showdesktop", "appexpose", "none"]);
+        let gesture_rows: Vec<_> = view
+            .rows
+            .iter()
+            .filter(|row| row.label_key == "settings.gestures_row_gesture")
+            .collect();
+        assert_eq!(gesture_rows.len(), 2);
+        for (row, binding) in gesture_rows
+            .into_iter()
+            .zip(["system.mission_control", "missioncontrol"])
+        {
+            assert_eq!(row.popup_option_ids, expected);
+            let (ControlKind::Popup { options }, Value::Index(index)) = (&row.control, &row.value)
+            else {
+                panic!("expected a gesture action popup with a selected index");
+            };
+            assert_eq!(row.popup_option_ids[*index], binding);
+            assert_eq!(options[*index], t("settings.mapping_action_missioncontrol"));
+            for (key, shadowed) in [
+                ("settings.gestures_target_previous_tab", false),
+                ("settings.gestures_target_next_tab", true),
+            ] {
+                let label = t(key);
+                let index = options.iter().position(|option| *option == label).unwrap();
+                let id = &row.popup_option_ids[index];
+                assert_eq!(chord_target_is_shadowed(id, "control"), shadowed, "{id}");
+            }
         }
     }
 
@@ -1693,6 +1742,8 @@ mod tests {
             .expect("the gesture row");
         match (&gesture_row.control, &gesture_row.value) {
             (ControlKind::Popup { options }, Value::Index(index)) => {
+                assert_eq!(*index, gesture_row.popup_option_ids.len() - 1);
+                assert_eq!(gesture_row.popup_option_ids[*index], "cmd+t");
                 let shown = options.get(*index).cloned().unwrap_or_default();
                 assert!(
                     !shown.is_empty() && shown != t("settings.gestures_target_unset"),
