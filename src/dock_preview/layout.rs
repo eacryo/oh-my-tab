@@ -58,17 +58,19 @@ impl DockEdge {
     }
 }
 
-// Card metrics: one 4pt-grid stack of padding / header / thumbnail. Sizes are points.
+// Card metrics: one 4pt-grid stack of padding / header / thumbnail. Sizes are points. The padding
+// is deliberately the small step: the cards have no fill of their own (the panel material is the
+// surface), so anything larger reads as empty space around the thumbnail rather than around a card.
 pub(crate) const CARD_W: f64 = 216.0;
 pub(crate) const CARD_H: f64 = 164.0;
-pub(crate) const CARD_PAD: f64 = 8.0;
-pub(crate) const HEADER_H: f64 = 36.0;
+pub(crate) const CARD_PAD: f64 = 4.0;
+pub(crate) const HEADER_H: f64 = 32.0;
 pub(crate) const THUMB_H: f64 = CARD_H - CARD_PAD * 2.0 - HEADER_H;
 pub(crate) const CARD_ICON: f64 = 16.0;
 pub(crate) const CARD_ICON_GAP: f64 = 6.0;
 pub(crate) const CLOSE_SIZE: f64 = 20.0;
 pub(crate) const CLOSE_MARGIN: f64 = 4.0;
-pub(crate) const PANEL_PAD: f64 = 8.0;
+pub(crate) const PANEL_PAD: f64 = 4.0;
 /// Cards sit edge to edge, like the reference: the panel's material is the surface, and a card is
 /// a header plus its thumbnail rather than a separate filled tile with a gutter around it.
 pub(crate) const CARD_GAP: f64 = 0.0;
@@ -499,7 +501,7 @@ mod tests {
 
     #[test]
     fn a_single_card_takes_its_thumbnail_width_so_there_is_no_letterbox() {
-        // A 3:2 window: the thumbnail is 112 high, so it should be 168 wide and the panel should be
+        // A 3:2 window: the thumbnail is 124 high, so it should be 186 wide and the panel should be
         // exactly card + panel padding -- the defect was a fixed 216pt card leaving blank space at
         // the right of a narrower preview.
         let aspect = 1.5;
