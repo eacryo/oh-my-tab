@@ -714,32 +714,14 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
         state.window_ids = request.windows.iter().map(|window| window.wid).collect();
         state.total_windows = request.windows.len();
         let icon = crate::app_identity::icon_for_bundle_id(&request.bundle, layout::CARD_ICON);
-        let (panel_w, panel_h) = grid.panel_size();
-        let mut row = 0usize;
-        let mut column = 0usize;
-        let mut row_len = grid.row_lengths.first().copied().unwrap_or(1).max(1);
+        let plates = layout::plates_for_rects(&grid, &rects);
         for (index, window) in request.windows.iter().take(rects.len()).enumerate() {
-            if column >= row_len {
-                row += 1;
-                column = 0;
-                row_len = grid.row_lengths.get(row).copied().unwrap_or(row_len).max(1);
-            }
-            let card_rect = rects[index];
-            let (plate_rect, plate_radius) = layout::hover_plate_rect(
-                card_rect,
-                row,
-                column,
-                row_len,
-                grid.rows,
-                (panel_w, panel_h),
-            );
-            column += 1;
-            let rect = card_rect;
+            let rect = rects[index];
+            let (plate_rect, plate_radius) = plates[index];
             let palette = theme::ui_palette();
             // The cards themselves do not paint: the panel's material is the surface between and
-            // inside them (the switcher's own rule). A hovered card draws the switcher's selection
-            // plate -- `selection_plate_bg` wash plus an `accent` rim -- instead of changing a
-            // filled tile.
+            // inside them (the switcher's own rule). A hovered card draws a brightness-only plate
+            // that follows the tile out to the panel edge (see `layout::hover_plate_rect`).
             let plate = passthrough_view(plate_rect);
             let plate_layer: *mut AnyObject = msg_send![plate, layer];
             layer_set_background(plate_layer, hex_to_cg_color(layout::HOVER_PLATE_FILL));
@@ -983,13 +965,17 @@ fn relayout_after_removal(state: &mut PanelState) {
     );
     state.geometry.panel = panel;
     state.geometry.cards = layout::card_rects(&grid);
+    let plates = layout::plates_for_rects(&grid, &state.geometry.cards);
     state.geometry.band =
         layout::transition_band(state.geometry.edge, state.geometry.anchor, panel);
     state.window_ids = state.cards.iter().map(|card| card.window.wid).collect();
     for (index, card) in state.cards.iter().enumerate() {
         let rect = state.geometry.cards[index];
+        let (plate_rect, plate_radius) = plates[index];
         unsafe {
-            place_view(card.plate, rect);
+            place_view(card.plate, plate_rect);
+            let plate_layer: *mut AnyObject = msg_send![card.plate, layer];
+            let _: () = msg_send![plate_layer, setCornerRadius: plate_radius];
             let thumb = layout::thumb_rect(rect);
             place_view(card.thumbnail, thumb);
             place_view(card.placeholder, thumb);
@@ -1399,6 +1385,20 @@ pub(crate) fn update_anchor(anchor: Rect, edge: DockEdge, visible: Rect) {
     state.geometry.anchor = anchor;
     state.geometry.edge = edge;
     state.geometry.visible = visible;
+    // A smaller visible area can fit fewer cards than the panel was built with: unload the tail
+    // before the geometry is recomputed, so the plate/card layout is derived from the cards that
+    // will actually be shown (a stale tail would put the last card's plate at an interior edge).
+    let aspects: Vec<Option<f64>> = state.cards.iter().map(|card| card.window.aspect).collect();
+    let widths = layout::widths_for_aspects(&aspects);
+    let capacity = layout::grid_for(&widths, visible.w, visible.h).visible_cards;
+    if state.cards.len() > capacity {
+        while state.cards.len() > capacity {
+            if let Some(card) = state.cards.pop() {
+                remove_card_views(&card);
+            }
+        }
+        state.window_ids = state.cards.iter().map(|card| card.window.wid).collect();
+    }
     let aspects: Vec<Option<f64>> = state.cards.iter().map(|card| card.window.aspect).collect();
     let widths = layout::widths_for_aspects(&aspects);
     let grid = layout::grid_for(&widths, visible.w, visible.h);
@@ -1406,22 +1406,15 @@ pub(crate) fn update_anchor(anchor: Rect, edge: DockEdge, visible: Rect) {
     let panel = layout::panel_frame(anchor, (w, h), edge, visible);
     state.geometry.panel = panel;
     state.geometry.cards = layout::card_rects(&grid);
+    let plates = layout::plates_for_rects(&grid, &state.geometry.cards);
     state.geometry.band = layout::transition_band(edge, anchor, panel);
-    // A smaller visible area can fit fewer cards than the panel was built with: unload the tail
-    // instead of indexing a shorter rectangle list, and let the published hidden count account for
-    // the difference.
-    if state.cards.len() > state.geometry.cards.len() {
-        while state.cards.len() > state.geometry.cards.len() {
-            if let Some(card) = state.cards.pop() {
-                remove_card_views(&card);
-            }
-        }
-        state.window_ids = state.cards.iter().map(|card| card.window.wid).collect();
-    }
     for (index, card) in state.cards.iter().enumerate() {
         let rect = state.geometry.cards[index];
+        let (plate_rect, plate_radius) = plates[index];
         unsafe {
-            place_view(card.plate, rect);
+            place_view(card.plate, plate_rect);
+            let plate_layer: *mut AnyObject = msg_send![card.plate, layer];
+            let _: () = msg_send![plate_layer, setCornerRadius: plate_radius];
             place_view(card.thumbnail, layout::thumb_rect(rect));
             place_view(card.placeholder, layout::thumb_rect(rect));
             place_view(card.header_icon, layout::icon_rect(rect));

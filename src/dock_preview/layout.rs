@@ -285,6 +285,27 @@ pub(crate) fn hover_plate_rect(
     (plate, radius)
 }
 
+/// The hover plate for every visible card, in card order. Kept next to [`hover_plate_rect`] so
+/// every call site (initial build, anchor follow, post-close reflow) derives the same geometry:
+/// a reflow that placed the plate back at the plain card rect was exactly the defect this prevents.
+pub(crate) fn plates_for_rects(grid: &Grid, rects: &[Rect]) -> Vec<(Rect, f64)> {
+    let panel = grid.panel_size();
+    let mut plates = Vec::with_capacity(rects.len());
+    let mut index = 0;
+    for (row, &length) in grid.row_lengths.iter().enumerate() {
+        for column in 0..length {
+            let Some(card) = rects.get(index).copied() else {
+                return plates;
+            };
+            plates.push(hover_plate_rect(
+                card, row, column, length, grid.rows, panel,
+            ));
+            index += 1;
+        }
+    }
+    plates
+}
+
 /// The card's header band: the icon, the title and the close-slot live here.
 pub(crate) fn header_rect(card: Rect) -> Rect {
     Rect::new(card.x, card.y, card.w, HEADER_H + CARD_PAD)
@@ -605,6 +626,39 @@ mod tests {
         let (plate, radius) = hover_plate_rect(mid_row, 1, 1, 3, 3, panel);
         assert_eq!(plate, mid_row);
         assert_eq!(radius, CARD_RADIUS);
+    }
+
+    #[test]
+    fn plate_layout_comes_from_the_grid_so_a_reflow_cannot_shrink_it_back() {
+        // Every placement path asks this one function for the plates. It must give the same
+        // geometry as the initial build (the defect was a reflow placing the plain card rect,
+        // leaving the panel's 4pt padding visible as a ring around the hovered card).
+        let widths = widths_for_aspects(&[Some(1.5)]);
+        let grid = grid_for(&widths, 1200.0, 900.0);
+        let rects = card_rects(&grid);
+        let (panel_w, panel_h) = grid.panel_size();
+        let plates = plates_for_rects(&grid, &rects);
+        assert_eq!(plates.len(), 1);
+        assert_eq!(
+            plates[0].0,
+            Rect::new(0.0, 0.0, panel_w, panel_h),
+            "a single card's plate is the whole panel"
+        );
+        assert_eq!(plates[0].1, PANEL_RADIUS);
+
+        let widths = widths_for_aspects(&[Some(1.5), Some(1.5), Some(1.5)]);
+        let grid = grid_for(&widths, 1200.0, 900.0);
+        let rects = card_rects(&grid);
+        let plates = plates_for_rects(&grid, &rects);
+        assert_eq!(plates.len(), 3);
+        for (plate, card) in plates.iter().zip(&rects) {
+            assert!(plate.0.x <= card.x + 0.001 && plate.0.max_x() >= card.max_x() - 0.001);
+            assert!(plate.0.y <= card.y + 0.001 && plate.0.max_y() >= card.max_y() - 0.001);
+        }
+        // The row's edge cards cover the panel's left/right padding; the middle one does not.
+        assert_eq!(plates[0].0.x, 0.0);
+        assert!((plates[2].0.max_x() - grid.panel_size().0).abs() < 0.001);
+        assert!(plates[1].0.x > 0.0);
     }
 
     fn width_one_card() -> (f64, f64) {
