@@ -723,10 +723,10 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
             // filled tile.
             let plate = passthrough_view(rect);
             let plate_layer: *mut AnyObject = msg_send![plate, layer];
-            layer_set_background(plate_layer, hex_to_cg_color(palette.selection_plate_bg));
+            layer_set_background(plate_layer, hex_to_cg_color(layout::HOVER_PLATE_FILL));
             let _: () = msg_send![plate_layer, setCornerRadius: CARD_RADIUS];
             let _: () = msg_send![plate_layer, setBorderWidth: 1.0f64];
-            layer_set_border(plate_layer, hex_to_cg_color(palette.accent));
+            layer_set_border(plate_layer, hex_to_cg_color(layout::HOVER_PLATE_BORDER));
             let _: () = msg_send![plate, setHidden: true];
 
             let thumb_rect = layout::thumb_rect(rect);

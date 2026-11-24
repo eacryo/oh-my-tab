@@ -200,8 +200,9 @@ never becomes the key or main window, so the app the pointer came from keeps foc
 - `dock_preview/panel.rs` builds one borderless non-activating `NSPanel` (status level, joins all
   Spaces, never key) with the shared glass backdrop, a flipped card host, and a passive tooltip
   panel. Cards do not paint their own surface and sit edge to edge: the panel's material is the
-  surface, and a hovered card draws the switcher's own selection plate (`selection_plate_bg` wash +
-  `accent` rim). Every card keeps one fixed height and takes the width of its own thumbnail (its
+  surface, and a hovered card draws a brightness-only plate (a white wash slightly stronger than
+  the plain hover background, plus a white hairline rim) -- the Windows-style "a little brighter
+  than the unselected card" state, not an accent fill. Every card keeps one fixed height and takes the width of its own thumbnail (its
   WindowServer bounds aspect) -- the same rule the app switcher uses, so a portrait or wide window
   does not sit letterboxed in a card shaped for the average one; a row of mixed aspects stays
   edge to edge and the panel is as wide as its widest row. Cards show a captured

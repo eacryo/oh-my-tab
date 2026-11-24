@@ -76,6 +76,12 @@ pub(crate) const PANEL_PAD: f64 = 4.0;
 pub(crate) const CARD_GAP: f64 = 0.0;
 pub(crate) const PANEL_RADIUS: f64 = 14.0;
 pub(crate) const CARD_RADIUS: f64 = 10.0;
+/// The hovered card's plate: brightness only, no accent fill. The wash is deliberately stronger
+/// than the shared `hover_bg` (0xFFFFFF1A) so it reads as a brighter card against the glass, and
+/// the hairline rim is white rather than `accent` -- the design's "Windows-style" selected state
+/// (a little brighter than the unselected card) instead of a blue selection.
+pub(crate) const HOVER_PLATE_FILL: u32 = 0xFFFFFF4A;
+pub(crate) const HOVER_PLATE_BORDER: u32 = 0xFFFFFF8C;
 pub(crate) const THUMB_RADIUS: f64 = 6.0;
 pub(crate) const MAX_COLUMNS: usize = 4;
 pub(crate) const MAX_ROWS: usize = 4;
@@ -522,6 +528,30 @@ mod tests {
 
     fn visible() -> Rect {
         Rect::new(0.0, 24.0, 1470.0, 862.0)
+    }
+
+    #[test]
+    fn the_hover_plate_is_a_brightness_wash_not_an_accent_selection() {
+        // Windows-style selected state: the plate is a white wash that reads brighter than the
+        // unselected glass, and the rim is white too. Any blue channel bias would make it an
+        // accent selection again, which is the style this replaced.
+        for color in [HOVER_PLATE_FILL, HOVER_PLATE_BORDER] {
+            let (r, g, b, alpha) = (
+                (color >> 24) & 0xFF,
+                (color >> 16) & 0xFF,
+                (color >> 8) & 0xFF,
+                color & 0xFF,
+            );
+            assert_eq!((r, g, b), (0xFF, 0xFF, 0xFF), "the plate is pure white");
+            assert!(
+                alpha > 0x1A,
+                "the wash must be stronger than the shared hover_bg to read as brighter"
+            );
+        }
+        assert!(
+            HOVER_PLATE_BORDER & 0xFF > HOVER_PLATE_FILL & 0xFF,
+            "the hairline rim stays visible over the wash"
+        );
     }
 
     #[test]
