@@ -208,7 +208,7 @@ fn the_switcher_exclusion_card_states_the_overflow() {
 fn general_page_view_describes_every_row_with_its_identity_and_copy() {
     let view = general();
     assert_eq!(view.page, SettingsPageId::General);
-    assert_eq!(view.rows.len(), 11);
+    assert_eq!(view.rows.len(), 10);
     assert_eq!(
         fields(&view),
         vec![
@@ -219,7 +219,6 @@ fn general_page_view_describes_every_row_with_its_identity_and_copy() {
             ControlField::GlassStyle,
             ControlField::Locale,
             ControlField::LogLevel,
-            ControlField::DockPreviewEnabled,
         ]
     );
     // The three action rows carry an action identity and no config field.
@@ -239,17 +238,6 @@ fn general_page_view_describes_every_row_with_its_identity_and_copy() {
     assert_eq!(view.rows[4].group, Some(RowGroup::GlassStyle));
     assert_eq!(view.rows[8].copy, RowCopy::Captioned);
     assert_eq!(view.rows[9].copy, RowCopy::Captioned);
-    // The Dock preview card closes the page: its own heading, a captioned switch, and the copy the
-    // page shows for it. A card inserted before the existing ones would move them, which is the
-    // visible regression this row's position pins.
-    assert_eq!(view.rows[10].section, "settings.header_dock_preview");
-    assert_eq!(view.rows[10].label_key, "settings.row_dock_preview_enabled");
-    assert_eq!(
-        view.rows[10].caption_key,
-        Some("settings.desc_dock_preview_enabled")
-    );
-    assert_eq!(view.rows[10].copy, RowCopy::Captioned);
-    assert_eq!(view.rows[10].value, Value::Switch(true));
     // The permission banner belongs to the page, with the action its button runs.
     let banner = view.banner.as_ref().expect("General carries the banner");
     assert_eq!(banner.action_id, "open_privacy");
@@ -866,4 +854,28 @@ fn a_description_reads_only_its_input_and_capture_reads_the_config_once() {
             );
         }
     }
+}
+
+#[test]
+fn dock_page_view_owns_the_preview_switch() {
+    // The Dock feature has its own page: one card, one captioned switch, and the copy that says
+    // exactly what it does. The switch must not appear on another page (General pins its own rows
+    // above), so the page boundary is asserted here.
+    let view = dock();
+    assert_eq!(view.page, SettingsPageId::Dock);
+    assert_eq!(view.title_key, "settings.sidebar_dock");
+    assert_eq!(view.rows.len(), 1);
+    assert_eq!(view.rows[0].section, "settings.header_dock_preview");
+    assert_eq!(view.rows[0].label_key, "settings.row_dock_preview_enabled");
+    assert_eq!(
+        view.rows[0].caption_key,
+        Some("settings.desc_dock_preview_enabled")
+    );
+    assert_eq!(view.rows[0].copy, RowCopy::Captioned);
+    assert_eq!(view.rows[0].value, Value::Switch(true));
+    assert_eq!(
+        view.rows[0].search.label,
+        t("settings.row_dock_preview_enabled")
+    );
+    assert_eq!(view.banner, None);
 }

@@ -41,6 +41,10 @@ fn input() -> PageInput {
 fn switcher() -> PageView {
     switcher_page_view(&input())
 }
+fn dock() -> PageView {
+    dock_page_view(&input())
+}
+
 fn general() -> PageView {
     general_page_view(&input())
 }

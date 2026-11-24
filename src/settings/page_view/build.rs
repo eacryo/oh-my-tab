@@ -13,6 +13,7 @@ pub(super) fn view_for(page: SettingsPageId, input: &PageInput) -> PageView {
     match page {
         SettingsPageId::Switcher => switcher_page_view(input),
         SettingsPageId::General => general_page_view(input),
+        SettingsPageId::Dock => dock_page_view(input),
         SettingsPageId::KeyBindings => key_bindings_page_view(input),
         SettingsPageId::KeystrokeDisplay => keystroke_display_page_view(input),
         SettingsPageId::FinderMenu => finder_menu_page_view(input),

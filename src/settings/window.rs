@@ -2063,7 +2063,10 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // its consequence line has to be a visible label in the real view tree. It was previously
         // handed to a `described` row, whose subtitle this app never renders, and the warning
         // silently did not exist.
-        if !page_shows_visible_caption(pages[3], &t("settings.desc_clipboard_enabled")) {
+        if !page_shows_visible_caption(
+            pages[SETTINGS_CLIPBOARD_PAGE_INDEX],
+            &t("settings.desc_clipboard_enabled"),
+        ) {
             log_info!("[smoke-settings-layout] the clipboard disable warning is not visible");
             hide_settings();
             return false;
@@ -2076,7 +2079,7 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
             "settings.desc_import_settings",
             "settings.desc_export_settings",
         ] {
-            if !page_shows_visible_caption(pages[0], &t(key)) {
+            if !page_shows_visible_caption(pages[SETTINGS_GENERAL_PAGE_INDEX], &t(key)) {
                 log_info!("[smoke-settings-layout] backup caption {key} is not visible");
                 hide_settings();
                 return false;
@@ -2087,7 +2090,10 @@ pub(crate) fn settings_layout_smoke_runner() -> bool {
         // description is what tells the user Settings can still be reached. It sits on a `described`
         // row, whose subtitle this app never renders -- exactly the shape that silently lost the
         // clipboard warning above -- so the promise has to be asserted on the real view tree.
-        if !page_shows_visible_caption(pages[0], &t("settings.desc_hide_menu_bar_icon")) {
+        if !page_shows_visible_caption(
+            pages[SETTINGS_GENERAL_PAGE_INDEX],
+            &t("settings.desc_hide_menu_bar_icon"),
+        ) {
             log_info!("[smoke-settings-layout] the hide-menu-bar-icon explanation is not visible");
             hide_settings();
             return false;
@@ -4294,7 +4300,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // SettingsPageHeader's 42pt top padding (18 more than the old 24pt inset).
         // Includes the Backup section: two described rows plus its header. The trailing Dock
         // preview card (a header plus one captioned switch) is budgeted on top.
-        let general_doc_h = 1440.0;
+        let general_doc_h = 1320.0;
         let switcher_doc_h = 1432.0;
         let mouse_doc_h = 1620.0;
         let clipboard_doc_h = 978.0;
@@ -4311,12 +4317,15 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // path), so its provisional height is generous before the first re-flow settles it.
         let finder_menu_doc_h = 1180.0;
         let about_doc_h = 1300.0;
+        // The Dock page: one card with the previews switch.
+        let dock_doc_h = 1000.0;
 
         // One page per identity, in `SETTINGS_PAGES` order. The provisional height is looked up by
         // identity, so a table reorder moves the page with its height instead of pairing one page
         // with another page's provisional document height.
         let provisional_doc_h = |page: SettingsPageId| match page {
             SettingsPageId::General => general_doc_h,
+            SettingsPageId::Dock => dock_doc_h,
             SettingsPageId::Switcher => switcher_doc_h,
             SettingsPageId::Mouse => mouse_doc_h,
             SettingsPageId::Clipboard => clipboard_doc_h,
@@ -4358,6 +4367,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             frame.size.height
         };
         let general_view = page_view(SettingsPageId::General);
+        let dock_view = page_view(SettingsPageId::Dock);
         let switcher_view = page_view(SettingsPageId::Switcher);
         let mouse_view = page_view(SettingsPageId::Mouse);
         let clipboard_view = page_view(SettingsPageId::Clipboard);
@@ -4374,6 +4384,9 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         let mut page_bottoms = [0.0f64; SETTINGS_PAGE_COUNT];
         page_bottoms[settings_page_index(SettingsPageId::General)] =
             page_builder::build_general_page(&page_context, general_view, general_doc_h, &mut ui);
+
+        page_bottoms[settings_page_index(SettingsPageId::Dock)] =
+            page_builder::build_dock_page(&page_context, dock_view, dock_doc_h, &mut ui);
 
         page_bottoms[settings_page_index(SettingsPageId::Switcher)] =
             page_builder::build_switcher_page(

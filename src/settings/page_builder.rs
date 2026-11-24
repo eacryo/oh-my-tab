@@ -225,6 +225,34 @@ pub(super) unsafe fn build_general_page(
         ),
     }
 }
+/// Build the Dock page from its description (one card with the previews switch).
+pub(super) unsafe fn build_dock_page(
+    context: &SettingsPageBuildContext,
+    dock_view: *mut AnyObject,
+    dock_doc_h: f64,
+    ui: &mut SettingsUi,
+) -> f64 {
+    begin_settings_search_page();
+    let input = PageInput::capture();
+    match build_page(
+        ui,
+        SettingsPageId::Dock,
+        dock_view,
+        context.content_w,
+        context.layout,
+        dock_doc_h,
+        context.page_frame.size.height,
+        context.page_x,
+        context.page_viewport_h,
+        &input,
+        context.target,
+        &mut page_view::NoHooks,
+    ) {
+        Ok(built) => publish_built_page(ui, SettingsPageId::Dock, built),
+        Err(_) => empty_page(ui, SettingsPageId::Dock, dock_view, context, dock_doc_h),
+    }
+}
+
 /// Build the Mouse page: the described rows, with the rows whose values are device-resolved or
 /// fractional drawn by `MouseHooks` and the button-mapping table drawn as its trailing block.
 pub(super) unsafe fn build_mouse_page(

@@ -140,18 +140,6 @@ pub(super) fn general_page_view(input: &PageInput) -> PageView {
         .caption("settings.desc_import_settings")
         .into_spec(),
     );
-    // The Dock preview card is the page's last: an existing card order is a visible promise, so a
-    // new switch joins the page at its end instead of pushing the startup/backup cards down.
-    w.card("settings.header_dock_preview");
-    w.push(
-        switch(
-            "settings.row_dock_preview_enabled",
-            ControlField::DockPreviewEnabled,
-            cfg.dock_preview.enabled,
-        )
-        .caption("settings.desc_dock_preview_enabled")
-        .into_spec(),
-    );
     let mut view = w.finish();
     // The storage/permission banner: the page reserves its strip, the refresh re-texts it.
     // Read from the captured input, not from the system: the bundle version and the migration

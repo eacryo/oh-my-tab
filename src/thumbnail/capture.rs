@@ -2847,11 +2847,6 @@ unsafe fn downscale_cgimage(src: *const c_void, tw: u32, th: u32) -> *const c_vo
 mod dock_ticket_tests {
     use super::*;
 
-    /// How many shared-capture jobs one Dock preview panel may have queued or running. The preview
-    /// asks one card at a time and the ledger is the only owner of this number: a preview that asked
-    /// after a stale ledger read cannot exceed it, because the check and the insert share one lock.
-    const MAX_DOCK_IN_FLIGHT: usize = 4;
-
     /// A shared capture job must not inherit a Dock-preview lifetime from a producer that is no
     /// longer the one asking: the worker drops jobs whose Dock epoch is stale, which would take an
     /// unrelated producer's frame with it.

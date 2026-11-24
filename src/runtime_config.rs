@@ -130,9 +130,10 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
 /// A hand-written list is the kind that drifts: a migrated page left out of it keeps showing the
 /// values a reload replaced while the runtime already uses the new ones. It lives here so the list
 /// is assertable without a window, and every caller reads this one.
-pub(crate) const IN_PLACE_REFRESH_PAGES: [crate::settings::SettingsPageId; 8] = [
+pub(crate) const IN_PLACE_REFRESH_PAGES: [crate::settings::SettingsPageId; 9] = [
     crate::settings::SettingsPageId::Switcher,
     crate::settings::SettingsPageId::General,
+    crate::settings::SettingsPageId::Dock,
     crate::settings::SettingsPageId::Clipboard,
     crate::settings::SettingsPageId::About,
     crate::settings::SettingsPageId::KeystrokeDisplay,

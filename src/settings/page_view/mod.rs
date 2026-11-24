@@ -44,6 +44,7 @@ mod about;
 mod bind;
 mod build;
 mod clipboard;
+mod dock;
 mod excluded_apps;
 mod finder_menu;
 mod general;
@@ -66,6 +67,7 @@ use about::about_page_view;
 pub(super) use about::AboutHooks;
 use clipboard::clipboard_page_view;
 pub(super) use clipboard::ClipboardHooks;
+use dock::dock_page_view;
 #[cfg(test)]
 pub(super) use excluded_apps::looks_like_bundle_id;
 pub(in crate::settings) use excluded_apps::refresh_known_app_names;

@@ -2094,6 +2094,7 @@ pub(super) struct SettingsSidebar;
 #[derive(Clone, Copy, Debug)]
 pub(super) enum SettingsSidebarIcon {
     General,
+    Dock,
     Switcher,
     Mouse,
     Clipboard,
@@ -2110,6 +2111,7 @@ impl SettingsSidebarIcon {
     pub(super) fn for_page(page: SettingsPageId) -> Self {
         match page {
             SettingsPageId::General => Self::General,
+            SettingsPageId::Dock => Self::Dock,
             SettingsPageId::Switcher => Self::Switcher,
             SettingsPageId::Mouse => Self::Mouse,
             SettingsPageId::Clipboard => Self::Clipboard,
@@ -2124,6 +2126,8 @@ impl SettingsSidebarIcon {
     fn symbol_name(self) -> &'static str {
         match self {
             Self::General => "gearshape",
+            // A Dock outline: the page owns the Dock hover previews.
+            Self::Dock => "dock.rectangle",
             Self::Switcher => "rectangle.on.rectangle",
             Self::Mouse => "computermouse",
             // `doc.on.clipboard` has a dark overlapping foreground layer in the system glyph;

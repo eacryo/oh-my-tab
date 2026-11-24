@@ -277,13 +277,16 @@ fn restored_config_for_page(old: &Config, page: SettingsPageId) -> Config {
     // Per-page config scope: partitioned by page ownership, strictly limited to this page.
     match page {
         SettingsPageId::General => {
-            // General: appearance + locale + logging + the page's own Dock preview switch.
+            // General: appearance + locale + logging.
             // launch_at_login (system-level) is kept; hide_menu_bar_icon is a plain display
             // preference, so it returns to its default (visible) with the rest of the page.
             cfg.appearance = d.appearance;
             cfg.i18n = d.i18n;
             cfg.logging = d.logging;
             cfg.startup.hide_menu_bar_icon = d.startup.hide_menu_bar_icon;
+        }
+        SettingsPageId::Dock => {
+            // Dock page: the Dock previews master switch.
             cfg.dock_preview = d.dock_preview;
         }
         SettingsPageId::Switcher => {
@@ -402,8 +405,8 @@ mod tests {
                 expected.appearance = d.appearance;
                 expected.i18n = d.i18n;
                 expected.logging = d.logging;
-                expected.dock_preview = d.dock_preview;
             }
+            SettingsPageId::Dock => expected.dock_preview = d.dock_preview,
             SettingsPageId::Switcher => {
                 expected.windows = d.windows;
                 expected.layout = d.layout;
@@ -451,6 +454,7 @@ mod tests {
     fn every_page_restore_changes_exactly_its_own_scope() {
         let pages = [
             SettingsPageId::General,
+            SettingsPageId::Dock,
             SettingsPageId::Switcher,
             SettingsPageId::Mouse,
             SettingsPageId::Clipboard,

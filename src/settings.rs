@@ -76,13 +76,14 @@ const TEXT_SIZE_DEFAULT: i64 = 15;
 const CLIPBOARD_AUTO_EXPIRE_MIN: i64 = 0;
 const CLIPBOARD_AUTO_EXPIRE_MAX: i64 = 7;
 const CLIPBOARD_AUTO_EXPIRE_DEFAULT: i64 = 3;
-pub(super) const SETTINGS_PAGE_COUNT: usize = 9;
+pub(super) const SETTINGS_PAGE_COUNT: usize = 10;
 /// A page's identity, independent of its position. `SETTINGS_PAGES` holds the sidebar order and
 /// pairs each identity with its name; every control array is keyed by this identity, so a reorder
 /// cannot leave a hand-written index order pointing at the wrong control.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum SettingsPageId {
     General,
+    Dock,
     Switcher,
     Mouse,
     Clipboard,
@@ -99,6 +100,7 @@ impl SettingsPageId {
     pub(super) fn title_key(self) -> &'static str {
         match self {
             SettingsPageId::General => "settings.sidebar_general",
+            SettingsPageId::Dock => "settings.sidebar_dock",
             SettingsPageId::Switcher => "settings.sidebar_switcher",
             SettingsPageId::Mouse => "settings.sidebar_mouse",
             SettingsPageId::Clipboard => "settings.sidebar_clipboard",
@@ -129,6 +131,10 @@ pub(crate) const SETTINGS_PAGES: [SettingsPageSpec; SETTINGS_PAGE_COUNT] = [
     SettingsPageSpec {
         id: SettingsPageId::General,
         name: "general",
+    },
+    SettingsPageSpec {
+        id: SettingsPageId::Dock,
+        name: "dock",
     },
     SettingsPageSpec {
         id: SettingsPageId::Switcher,
@@ -181,6 +187,7 @@ const fn same_page(a: SettingsPageId, b: SettingsPageId) -> bool {
     matches!(
         (a, b),
         (SettingsPageId::General, SettingsPageId::General)
+            | (SettingsPageId::Dock, SettingsPageId::Dock)
             | (SettingsPageId::Switcher, SettingsPageId::Switcher)
             | (SettingsPageId::Mouse, SettingsPageId::Mouse)
             | (SettingsPageId::Clipboard, SettingsPageId::Clipboard)
@@ -3344,6 +3351,7 @@ mod tests {
         use super::SettingsPageId;
         let expected = [
             (SettingsPageId::General, "settings.sidebar_general"),
+            (SettingsPageId::Dock, "settings.sidebar_dock"),
             (SettingsPageId::Switcher, "settings.sidebar_switcher"),
             (SettingsPageId::Mouse, "settings.sidebar_mouse"),
             (SettingsPageId::Clipboard, "settings.sidebar_clipboard"),

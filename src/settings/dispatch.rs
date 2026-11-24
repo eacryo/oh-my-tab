@@ -3724,6 +3724,7 @@ mod tests {
             for page in [
                 "about",
                 "clipboard",
+                "dock",
                 "finder_menu",
                 "general",
                 "gestures",
