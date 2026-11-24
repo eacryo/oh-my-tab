@@ -81,7 +81,12 @@ pub(crate) const MAX_ROWS: usize = 4;
 /// e2e/state answer carries `hidden_window_count` so the limitation is observable instead of silent.
 pub(crate) const MAX_CARDS: usize = MAX_COLUMNS * MAX_ROWS;
 /// Distance between the Dock tile and the panel's facing edge.
-pub(crate) const ANCHOR_GAP: f64 = 8.0;
+///
+/// Zero, not a positive gap: the Dock draws its app-name tooltip above the tile, and the tooltip's
+/// small tail sits in the space between the tile and the panel. A gap left that tail visible below
+/// the cards as a floating arrow. Touching the tile's top edge covers the tail without covering the
+/// icon itself, so a pointer resting on the icon still hits the Dock.
+pub(crate) const ANCHOR_GAP: f64 = 0.0;
 pub(crate) const TOOLTIP_GAP: f64 = 8.0;
 pub(crate) const TOOLTIP_MAX_W: f64 = 360.0;
 pub(crate) const TOOLTIP_PAD: f64 = 10.0;
@@ -565,7 +570,9 @@ mod tests {
 
     #[test]
     fn the_panel_faces_each_dock_edge_on_the_tile_centre_line() {
-        let anchor = Rect::new(700.0, 890.0, 44.0, 56.0);
+        // The tile's top is high enough that the panel's bottom edge (which now touches the tile,
+        // ANCHOR_GAP = 0) still fits inside the visible frame.
+        let anchor = Rect::new(700.0, 840.0, 44.0, 56.0);
         let size = (300.0, 180.0);
 
         let bottom = panel_frame(anchor, size, DockEdge::Bottom, visible());
