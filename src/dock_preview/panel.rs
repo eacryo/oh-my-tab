@@ -773,7 +773,7 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
             let close_rect = layout::close_rect(rect);
             let close = passthrough_view(close_rect);
             let close_layer: *mut AnyObject = msg_send![close, layer];
-            let _: () = msg_send![close_layer, setCornerRadius: 6.0f64];
+            let _: () = msg_send![close_layer, setCornerRadius: 4.0f64];
             // Same shape as the switcher's card close button: a plain × in `muted_text` on the
             // surface, with the destructive emphasis only while the pointer is on the button.
             let cross_rect = Rect::new(3.0, 2.0, CLOSE_SIZE - 6.0, CLOSE_SIZE - 4.0);

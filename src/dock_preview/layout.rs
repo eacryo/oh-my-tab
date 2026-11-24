@@ -74,15 +74,18 @@ pub(crate) const PANEL_PAD: f64 = 4.0;
 /// Cards sit edge to edge, like the reference: the panel's material is the surface, and a card is
 /// a header plus its thumbnail rather than a separate filled tile with a gutter around it.
 pub(crate) const CARD_GAP: f64 = 0.0;
-pub(crate) const PANEL_RADIUS: f64 = 14.0;
-pub(crate) const CARD_RADIUS: f64 = 10.0;
+// Nearly square corners: the reference taskbar preview's own corner is a few pixels on a card
+// several hundred wide, so the Dock panel keeps only a hint of rounding (the switcher's 8pt
+// control step) rather than the rounder panel shape its glass can carry.
+pub(crate) const PANEL_RADIUS: f64 = 8.0;
+pub(crate) const CARD_RADIUS: f64 = 6.0;
 /// The hovered card's plate: brightness only, no accent fill. The wash is deliberately stronger
 /// than the shared `hover_bg` (0xFFFFFF1A) so it reads as a brighter card against the glass, and
 /// the hairline rim is white rather than `accent` -- the design's "Windows-style" selected state
 /// (a little brighter than the unselected card) instead of a blue selection.
 pub(crate) const HOVER_PLATE_FILL: u32 = 0xFFFFFF8C;
 pub(crate) const HOVER_PLATE_BORDER: u32 = 0xFFFFFFE6;
-pub(crate) const THUMB_RADIUS: f64 = 6.0;
+pub(crate) const THUMB_RADIUS: f64 = 4.0;
 pub(crate) const MAX_COLUMNS: usize = 4;
 pub(crate) const MAX_ROWS: usize = 4;
 /// The most window cards one panel shows. Beyond it the tail windows have no direct entry; the
