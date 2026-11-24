@@ -28,6 +28,7 @@ mod decisions;
 mod layout;
 mod observer;
 mod panel;
+mod reveal;
 mod windows;
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
@@ -71,6 +72,8 @@ static COLLECT_CONTEXT: LazyLock<Mutex<Option<CollectContext>>> =
 static OBSERVER: MainThreadSlot<Option<observer::ObserverHandle>> =
     unsafe { MainThreadSlot::new(None) };
 static TICK_TIMER: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::new(None) };
+/// Keeps an auto-hidden Dock on screen while the panel is open (see `reveal`).
+static DOCK_REVEAL: MainThreadSlot<Option<reveal::Handle>> = unsafe { MainThreadSlot::new(None) };
 
 #[derive(Clone)]
 struct PendingOpen {
@@ -157,6 +160,7 @@ pub(crate) fn stop() {
     PENDING_OPEN.lock().unwrap().take();
     *CLOSE_AT.lock().unwrap() = None;
     *CURRENT_APP.lock().unwrap() = None;
+    stop_dock_reveal_keeper();
     panel::hide();
     panel::flush_records();
     crate::thumbnail::begin_dock_capture_epoch();
@@ -320,12 +324,56 @@ fn drain_close_results() {
     }
 }
 
+/// Start (or re-point) the Dock reveal keeper for an open panel.
+fn start_dock_reveal_keeper(anchor: Rect, edge: DockEdge) {
+    if !reveal::dock_auto_hide_enabled() {
+        return;
+    }
+    let Some(screen) = DOCK_STATE.lock().unwrap().screen else {
+        return;
+    };
+    let Some(pid) = running_pid_for_bundle("com.apple.dock") else {
+        return;
+    };
+    let point = reveal::reveal_point(edge, anchor, screen);
+    let mut slot = DOCK_REVEAL.lock().unwrap();
+    if slot.is_none() {
+        *slot = Some(reveal::spawn());
+    }
+    if let Some(handle) = slot.as_ref() {
+        handle.start(pid, point);
+    }
+}
+
+/// Follow the Dock icon when it moves under magnification while the panel is open.
+fn update_dock_reveal_keeper(anchor: Rect, edge: DockEdge) {
+    let Some(screen) = DOCK_STATE.lock().unwrap().screen else {
+        return;
+    };
+    let point = reveal::reveal_point(edge, anchor, screen);
+    if let Some(handle) = DOCK_REVEAL.lock().unwrap().as_ref() {
+        handle.update(point);
+    }
+}
+
+/// Release the Dock so it can hide again once the panel is gone. A pointer that is back on the
+/// Dock keeps it visible by itself, so no farewell event is posted in that case.
+fn stop_dock_reveal_keeper() {
+    let pointer_on_dock = pointer_in_cg()
+        .zip(DOCK_STATE.lock().unwrap().list)
+        .is_some_and(|(pointer, list)| list.contains(pointer));
+    if let Some(handle) = DOCK_REVEAL.lock().unwrap().as_ref() {
+        handle.stop(!pointer_on_dock);
+    }
+}
+
 fn other_panel_visible() -> bool {
     crate::overlay::panel_is_visible_for_e2e() || crate::clipboard::picker_is_visible()
 }
 
 fn hide_panel() {
     let was_visible = panel::is_visible();
+    stop_dock_reveal_keeper();
     panel::hide();
     panel::flush_records();
     *CLOSE_AT.lock().unwrap() = None;
@@ -585,6 +633,7 @@ fn handle_event(event: DockEvent) {
             {
                 if let Some(visible) = event.screen_frame.map(visible_frame_of) {
                     panel::update_anchor(icon, edge, visible);
+                    update_dock_reveal_keeper(icon, edge);
                     if let Some(app) = CURRENT_APP.lock().unwrap().as_mut() {
                         app.anchor = icon;
                         app.edge = edge;
@@ -798,6 +847,9 @@ fn drain_results() {
         if panel::show(panel_request, request, ticket) {
             *CURRENT_APP.lock().unwrap() = Some(app);
             *CLOSE_AT.lock().unwrap() = None;
+            if !context.dev {
+                start_dock_reveal_keeper(anchor, edge);
+            }
             log_info!("[dock-preview] panel shown for pid={}", collected.pid);
             crate::e2e_state::record("dock_preview_show");
         }

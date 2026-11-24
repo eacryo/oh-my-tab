@@ -189,6 +189,22 @@ pub(crate) mod tap_options {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    /// A tap scoped to one process's event stream (10.11+). A listen-only tap observes without
+    /// consuming; the Dock preview uses it to notice the Dock's own "mouse exited" and answer it.
+    pub(crate) fn CGEventTapCreateForPid(
+        pid: i32,
+        place: i32,
+        options: u32,
+        events_of_interest: CGEventMask,
+        callback: CGEventTapCallBack,
+        user_info: *mut c_void,
+    ) -> CFMachPortRef;
+
+    /// Post an event directly into one process's queue (10.11+). It does not move the real pointer
+    /// and is not seen by other applications, which is what keeps the Dock revealed without
+    /// stealing or relocating the user's cursor.
+    pub(crate) fn CGEventPostToPid(pid: i32, event: CGEventRef);
+
     pub(crate) fn CGEventTapCreate(
         tap: i32,
         place: i32,

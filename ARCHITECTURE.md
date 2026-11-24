@@ -34,7 +34,8 @@ src/
 │   ├── panel.rs                 # the preview NSPanel, cards, tooltip panel, capture fill
 │   ├── windows.rs               # directed window collection, identity checks, sorting
 │   ├── layout.rs                # pure card/panel/tooltip/transition geometry
-│   └── decisions.rs             # pure hover/close/tooltip/capture decisions
+│   ├── decisions.rs             # pure hover/close/tooltip/capture decisions
+│   └── reveal.rs                # keeps an auto-hidden Dock revealed while the panel is open
 ├── e2e_state.rs                 # --e2e-state JSON snapshot of internal state for tier M2
 ├── event_monitor.rs             # switcher shortcut matching (Cmd/Opt/Ctrl+Tab) over event_tap
 ├── event_tap.rs                 # shared CGEventTap leaf: types, FFI, semantic constants, start helper
@@ -205,6 +206,11 @@ never becomes the key or main window, so the app the pointer came from keeps foc
   tooltip rules. The Dock preview's captures are bound to a capture epoch
   (`thumbnail::begin_dock_capture_epoch`), so a request from a replaced or disabled panel never
   reaches the system capture call.
+- `dock_preview/reveal.rs` keeps an auto-hidden Dock on screen while the panel is open. It installs a
+  listen-only per-PID event tap on the Dock, answers only the Dock's own `mouseExited` with a
+  `CGEventPostToPid` `mouseMoved` at the Dock's screen edge, and posts a `mouseExited` back when the
+  panel closes so the Dock hides again. The real cursor never moves and no other process sees the
+  synthetic events; with the Dock pinned (auto-hide off) the keeper is not started at all.
 - The feature is gated by `[dock_preview] enabled` (default true). Disabling it through the settings
   switch stops the observer, hides the panel and its tooltip, and is exercised by the
   `--smoke-dock-preview` M2 runner; `--show-dock-preview=<bundle|pid>` opens the panel without a real

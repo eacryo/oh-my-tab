@@ -71,6 +71,13 @@ extern "C" {
         value: *mut c_void,
     ) -> bool;
     pub(crate) fn CFBooleanGetValue(boolean: *const c_void) -> bool;
+    pub(crate) fn CFBooleanGetTypeID() -> usize;
+    /// A domain's preference value (public CoreFoundation API). Used to read the Dock's own
+    /// `autohide` flag instead of parsing its plist.
+    pub(crate) fn CFPreferencesCopyAppValue(
+        key: *const c_void,
+        application_id: *const c_void,
+    ) -> *const c_void;
     pub(crate) fn CFStringGetCString(
         string: *const c_void,
         buffer: *mut c_char,
