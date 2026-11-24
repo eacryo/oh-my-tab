@@ -57,6 +57,10 @@ struct CardEntry {
     header_icon: *mut AnyObject,
     title: *mut AnyObject,
     close: *mut AnyObject,
+    /// The × glyph inside `close`; its colour carries the hover emphasis (see `set_close_style`).
+    close_cross: *mut AnyObject,
+    /// Whether the pointer is on the close button itself (not merely on the card).
+    close_hot: bool,
     title_truncated: bool,
     has_frame: bool,
     requested_at: Option<Instant>,
@@ -433,6 +437,18 @@ fn update_hover(state: &mut PanelState, zone: PointerZone) {
         apply_hover(state, hovered);
         defer_record("dock_preview_hover");
     }
+    // The card's hover does not paint the close button; the button's own rectangle does.
+    let hot = match zone {
+        PointerZone::Close(index) => Some(index),
+        _ => None,
+    };
+    for index in 0..state.cards.len() {
+        let want = hot == Some(index);
+        if state.cards[index].close_hot != want {
+            state.cards[index].close_hot = want;
+            set_close_style(&state.cards[index], want);
+        }
+    }
     if let (PointerZone::Title(index), Some(card)) = (zone, hovered) {
         let truncated = state
             .cards
@@ -756,22 +772,23 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
             let close_rect = layout::close_rect(rect);
             let close = passthrough_view(close_rect);
             let close_layer: *mut AnyObject = msg_send![close, layer];
-            layer_set_background(close_layer, hex_to_cg_color(palette.destructive));
             let _: () = msg_send![close_layer, setCornerRadius: 6.0f64];
+            // Same shape as the switcher's card close button: a plain × in `muted_text` on the
+            // surface, with the destructive emphasis only while the pointer is on the button.
             let cross_rect = Rect::new(3.0, 2.0, CLOSE_SIZE - 6.0, CLOSE_SIZE - 4.0);
             let cross = passthrough_label_at(
                 NSRect::new(
                     NSPoint::new(cross_rect.x, cross_rect.y),
                     NSSize::new(cross_rect.w, cross_rect.h),
                 ),
-                "✕",
+                "×",
             );
             let _: () = msg_send![cross, setAlignment: 2isize]; // centered
-            let bold: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: theme::FONT_CAPTION, weight: theme::FONT_WEIGHT_BOLD];
-            let _: () = msg_send![cross, setFont: bold];
-            let _: () = msg_send![cross, setTextColor: hex_to_ns_color(0xFFFFFFFF)];
+            let font: *mut AnyObject =
+                msg_send![class!(NSFont), systemFontOfSize: theme::FONT_CAPTION];
+            let _: () = msg_send![cross, setFont: font];
+            let _: () = msg_send![cross, setTextColor: hex_to_ns_color(palette.muted_text)];
             let _: () = msg_send![close, addSubview: cross];
-            release_obj(cross);
             let _: () = msg_send![close, setHidden: true];
 
             // Flat siblings: the hover plate is behind everything, the thumbnail over it, and the
@@ -798,6 +815,8 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
                 header_icon,
                 title,
                 close,
+                close_cross: cross,
+                close_hot: false,
                 title_truncated: truncated,
                 has_frame: false,
                 requested_at: None,
@@ -887,11 +906,43 @@ unsafe fn style_label(label: *mut AnyObject, size: f64) {
 }
 
 fn apply_hover(state: &mut PanelState, hovered: Option<usize>) {
-    for (index, card) in state.cards.iter().enumerate() {
+    for index in 0..state.cards.len() {
         let active = hovered == Some(index);
-        unsafe {
-            let _: () = msg_send![card.plate, setHidden: !active];
-            let _: () = msg_send![card.close, setHidden: !active];
+        {
+            let card = &state.cards[index];
+            unsafe {
+                let _: () = msg_send![card.plate, setHidden: !active];
+                let _: () = msg_send![card.close, setHidden: !active];
+            }
+            if !active {
+                set_close_style(card, false);
+            }
+        }
+        if !active {
+            state.cards[index].close_hot = false;
+        }
+    }
+}
+
+/// The switcher's close-button emphasis: at rest the glyph is `muted_text` on the bare surface;
+/// only the pointer being on the button itself turns it `destructive` and adds the matching wash.
+fn set_close_style(card: &CardEntry, hot: bool) {
+    let palette = theme::ui_palette();
+    let tint = if hot {
+        palette.destructive
+    } else {
+        palette.muted_text
+    };
+    unsafe {
+        let _: () = msg_send![card.close_cross, setTextColor: hex_to_ns_color(tint)];
+        let layer: *mut AnyObject = msg_send![card.close, layer];
+        if hot {
+            layer_set_background(
+                layer,
+                hex_to_cg_color(palette.destructive & 0xFFFF_FF00 | 0x12),
+            );
+        } else {
+            layer_set_background(layer, std::ptr::null_mut());
         }
     }
 }
