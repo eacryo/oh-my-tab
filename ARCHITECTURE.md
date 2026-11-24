@@ -34,7 +34,8 @@ src/
 │   ├── panel.rs                 # the preview NSPanel, cards, tooltip panel, capture fill
 │   ├── windows.rs               # directed window collection, identity checks, sorting
 │   ├── layout.rs                # pure card/panel/tooltip/transition geometry
-│   ├── decisions.rs             # pure hover/close/tooltip/capture decisions
+│   ├── decisions.rs             # pure hover/close/tooltip/capture/press decisions
+│   ├── dock_click.rs            # per-PID Dock press tap: dismiss on the press that starts a switch
 │   └── reveal.rs                # keeps an auto-hidden Dock revealed while the panel is open
 ├── e2e_state.rs                 # --e2e-state JSON snapshot of internal state for tier M2
 ├── event_monitor.rs             # switcher shortcut matching (Cmd/Opt/Ctrl+Tab) over event_tap
@@ -218,6 +219,21 @@ never becomes the key or main window, so the app the pointer came from keeps foc
   `CGEventPostToPid` `mouseMoved` at the Dock's screen edge, and posts a `mouseExited` back when the
   panel closes so the Dock hides again. The real cursor never moves and no other process sees the
   synthetic events; with the Dock pinned (auto-hide off) the keeper is not started at all.
+- `dock_preview/dock_click.rs` closes the preview on the press that starts a switch, the way the
+  Windows taskbar closes its thumbnail flyout. The panel sits above the tile without covering it, so
+  the press belongs to the Dock; a listen-only per-PID tap on the Dock reports `leftMouseDown` and
+  `rightMouseDown` to the main thread, which dismisses the panel on the press itself rather than
+  waiting for the switch. The tap is passive, so it cannot order that dismissal against the
+  activation the Dock performs; what it guarantees is that no switch is waited for. The tap lives
+  for the enabled session, not for one panel, because a press often falls inside the hover's open
+  delay. It injects nothing, so the Dock still performs the click. A press latches the tile
+  (`DISMISSED_TILE`, with the app it belonged to) until the pointer leaves it or a notification for
+  another app arrives: the Dock keeps reporting the pressed tile as selected, and neither its
+  notifications nor a collector result already in flight may re-open the preview the press closed. A
+  press that reaches the main thread before the tile's own hover notification is matched by its
+  point, so the open that follows is still recognized as the press's. `--e2e-state` publishes the
+  monotonic `press_dismissals` counter with the dock preview, which is what lets a scenario prove a
+  press, rather than a hover-leave, closed a panel.
 - The feature is gated by `[dock_preview] enabled` (default true). Disabling it through the settings
   switch stops the observer, hides the panel and its tooltip, and is exercised by the
   `--smoke-dock-preview` M2 runner; `--show-dock-preview=<bundle|pid>` opens the panel without a real

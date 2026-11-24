@@ -25,6 +25,7 @@ use crate::ffi::{make_nsstring, MainThreadSlot};
 use crate::{log_debug, log_info};
 
 mod decisions;
+mod dock_click;
 mod layout;
 mod observer;
 mod panel;
@@ -74,6 +75,34 @@ static OBSERVER: MainThreadSlot<Option<observer::ObserverHandle>> =
 static TICK_TIMER: MainThreadSlot<Option<*mut AnyObject>> = unsafe { MainThreadSlot::new(None) };
 /// Keeps an auto-hidden Dock on screen while the panel is open (see `reveal`).
 static DOCK_REVEAL: MainThreadSlot<Option<reveal::Handle>> = unsafe { MainThreadSlot::new(None) };
+/// Reports the Dock's own mouse presses, so a press on the previewed icon closes the preview before
+/// the switch starts (see `dock_click`).
+static DOCK_CLICK: MainThreadSlot<Option<dock_click::Handle>> =
+    unsafe { MainThreadSlot::new(None) };
+/// A press on the Dock was reported from the watcher thread and the main thread has not handled it
+/// yet. The value is the observer session the press belongs to (0 = nothing pending): a press
+/// reported while an older session was current must not act on the new one.
+static DOCK_CLICK_PENDING: AtomicU64 = AtomicU64::new(0);
+/// The Dock tile a press dismissed, with the app it belonged to. While the pointer stays on that
+/// tile no preview opens again: Windows does not re-show the flyout for the button it just closed,
+/// and the Dock keeps reporting the same selected tile after a click. A notification for another app
+/// (or for a non-app tile) means the pointer moved on, and the tick also clears the latch as soon as
+/// the pointer leaves the tile.
+static DISMISSED_TILE: LazyLock<Mutex<Option<(i32, Rect)>>> = LazyLock::new(|| Mutex::new(None));
+/// The last press on the Dock. A press can reach the main thread in the same turn as the hover
+/// notification for the tile it pressed, when there is no panel, pending open or collection yet; the
+/// session, point and time are what let the open that follows recognize that press.
+static DOCK_PRESS: LazyLock<Mutex<Option<DockPress>>> = LazyLock::new(|| Mutex::new(None));
+/// Presses that dismissed a preview. `--e2e-state` publishes it as a delta so a scenario can tell a
+/// press-dismissal from a hover-leave one instead of reading a single overwritten event name.
+static PRESS_DISMISSALS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy)]
+struct DockPress {
+    session: u64,
+    at: Instant,
+    point: (f64, f64),
+}
 
 #[derive(Clone)]
 struct PendingOpen {
@@ -110,6 +139,9 @@ struct CollectContext {
 #[derive(Clone, Copy, Default)]
 struct DockState {
     list: Option<Rect>,
+    /// When `list` was pushed by the observer. A boundary observed before a press says nothing
+    /// about where the pointer is after it (an auto-hidden Dock reveals in the meantime).
+    list_at: Option<Instant>,
     screen: Option<Rect>,
     edge: Option<DockEdge>,
     revealed: bool,
@@ -127,6 +159,9 @@ pub(crate) fn start() {
     }
     let session = SESSION.fetch_add(1, Ordering::AcqRel) + 1;
     crate::assert_main_thread("dock_preview::start");
+    *DISMISSED_TILE.lock().unwrap() = None;
+    DOCK_CLICK_PENDING.store(0, Ordering::Release);
+    *DOCK_PRESS.lock().unwrap() = None;
     let sink: observer::EventSink = Arc::new(|event| {
         EVENTS.lock().unwrap().push(event);
         post_event_to_main();
@@ -146,6 +181,7 @@ pub(crate) fn start() {
     handle.rebuild(session);
     drop(slot);
     start_tick_timer();
+    start_dock_click_watcher();
     log_info!("Dock preview: observer started");
 }
 
@@ -161,6 +197,10 @@ pub(crate) fn stop() {
     *CLOSE_AT.lock().unwrap() = None;
     *CURRENT_APP.lock().unwrap() = None;
     stop_dock_reveal_keeper();
+    stop_dock_click_watcher();
+    DOCK_CLICK_PENDING.store(0, Ordering::Release);
+    *DISMISSED_TILE.lock().unwrap() = None;
+    *DOCK_PRESS.lock().unwrap() = None;
     panel::hide();
     panel::flush_records();
     crate::thumbnail::begin_dock_capture_epoch();
@@ -375,6 +415,130 @@ fn other_panel_visible() -> bool {
     crate::overlay::panel_is_visible_for_e2e() || crate::clipboard::picker_is_visible()
 }
 
+// ---------------------------------------------------------------------------------------------
+// Press on the Dock
+// ---------------------------------------------------------------------------------------------
+
+/// Start (or re-point) the Dock press watcher. Called when the feature starts and from the hover
+/// path: a press often lands inside the open delay, before any panel exists, and the watcher has to
+/// be listening by then. Re-pointing covers a Dock that restarted since the last call.
+fn start_dock_click_watcher() {
+    let session = SESSION.load(Ordering::Acquire);
+    if session == 0 {
+        return;
+    }
+    let Some(pid) = running_pid_for_bundle("com.apple.dock") else {
+        return;
+    };
+    let mut slot = DOCK_CLICK.lock().unwrap();
+    if slot.is_none() {
+        *slot = Some(dock_click::spawn());
+    }
+    if let Some(handle) = slot.as_ref() {
+        handle.start(pid, session);
+    }
+}
+
+fn stop_dock_click_watcher() {
+    if let Some(handle) = DOCK_CLICK.lock().unwrap().as_ref() {
+        handle.stop();
+    }
+}
+
+/// A press landed on the Dock at `point`, reported by the tap installed for `session`. Called on the
+/// watcher thread: record the fact and wake the main thread, which owns the panel.
+pub(crate) fn note_dock_click(point: (f64, f64), session: u64) {
+    if session == 0 {
+        return;
+    }
+    *DOCK_PRESS.lock().unwrap() = Some(DockPress {
+        session,
+        at: Instant::now(),
+        point,
+    });
+    // A later press replaces the pending one: only the newest press describes the pointer, and the
+    // main thread judges its session when it runs.
+    DOCK_CLICK_PENDING.store(session, Ordering::Release);
+    post_event_to_main();
+}
+
+/// A press on the Dock closes the preview on the press itself, the way the Windows taskbar closes
+/// its thumbnail flyout; the switch the press starts is not waited for.
+fn dismiss_for_dock_click(session: u64) {
+    if session != SESSION.load(Ordering::Acquire) {
+        log_debug!("[dock-preview] ignoring a press from a retired session");
+        return;
+    }
+    let pending_target = PENDING_OPEN
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|open| (open.pid, open.icon));
+    // A hover between its open delay and its panel has neither a panel nor a pending entry: its
+    // collector is already running. That press must dismiss the preview too, or the panel would
+    // appear just after the click that was meant to close it. A context left behind by a request
+    // that is already invalid describes nothing.
+    let collecting_target = {
+        let context = COLLECT_CONTEXT.lock().unwrap();
+        context
+            .as_ref()
+            .filter(|context| {
+                decisions::event_is_current(context.request, REQUEST.load(Ordering::Acquire))
+            })
+            .map(|context| (context.pid, context.anchor))
+    };
+    let visible = panel::is_visible();
+    if !visible && pending_target.is_none() && collecting_target.is_none() {
+        return;
+    }
+    // The panel's geometry survives a hide, so trust the hover's own record first: after a hide it
+    // is the only thing that still describes this hover.
+    let target = pending_target.or(collecting_target).or_else(|| {
+        CURRENT_APP
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|app| (app.pid, app.anchor))
+    });
+    // The press stays for the pressed tile's own open. Pressing tile B while tile A's preview is
+    // shown dismisses A here, and B's hover notification may arrive after this: the press point is
+    // what keeps the preview from opening under the finger that is still pressing B. It is consumed
+    // when it matches such an open, when a post-press notification shows the pointer on another
+    // tile, and when the tick sees the pointer leave the Dock.
+    if visible {
+        // Before the hide, so the frame `dock_preview_hide` writes carries the new count: with no
+        // later event the file would otherwise keep the old value forever, and a scenario reads it.
+        PRESS_DISMISSALS.fetch_add(1, Ordering::AcqRel);
+    }
+    hide_panel();
+    if let Some(target) = target {
+        *DISMISSED_TILE.lock().unwrap() = Some(target);
+    }
+    log_debug!("[dock-preview] Dock press dismissed the preview");
+}
+
+/// Apply one tick's pointer sample to the press/latch state. The tick is the only observer whose
+/// sample describes where the pointer is *now*; a queued Dock notification describes an older
+/// position, which is why nothing here is driven by notifications.
+fn release_dismiss_state(pointer: (f64, f64)) {
+    let dock = *DOCK_STATE.lock().unwrap();
+    let mut latch = DISMISSED_TILE.lock().unwrap();
+    let mut press = DOCK_PRESS.lock().unwrap();
+    // The cached boundary is evidence only when it was observed after the press. With an auto-hidden
+    // Dock, the reveal that follows a press has not updated the rectangle yet, and an absent or
+    // older rectangle would otherwise read as "the pointer left the Dock" and drop a live press.
+    let on_dock = match (dock.list, dock.list_at, *press) {
+        (Some(list), Some(at), Some(press)) if at > press.at => Some(list.contains(pointer)),
+        (Some(list), _, None) => Some(list.contains(pointer)),
+        _ => None,
+    };
+    let press_tuple = press.map(|press| (press.session, press.at, press.point));
+    let (latched_now, press_now) =
+        decisions::released_by_pointer(*latch, press_tuple, pointer, on_dock);
+    *latch = latched_now;
+    *press = press_now.map(|(session, at, point)| DockPress { session, at, point });
+}
+
 fn hide_panel() {
     let was_visible = panel::is_visible();
     stop_dock_reveal_keeper();
@@ -384,6 +548,8 @@ fn hide_panel() {
     *CURRENT_APP.lock().unwrap() = None;
     PENDING_OPEN.lock().unwrap().take();
     REQUEST.fetch_add(1, Ordering::AcqRel);
+    // The press latch is not cleared here: hide_panel also runs for a queued notification that can
+    // predate the press, and the tick's pointer sample is what releases the latch.
     // Invalidate every capture request the closed panel queued: a hidden preview must not keep
     // capturing windows for a panel that no longer exists.
     crate::thumbnail::begin_dock_capture_epoch();
@@ -531,10 +697,17 @@ pub(crate) fn e2e_json() -> String {
         items.join(", ")
     );
     let preview = crate::dock_preview::panel::e2e_json();
+    // Monotonic, so a scenario asserts a delta across its injected press instead of reading a
+    // single event name that the next write would overwrite.
+    let press_dismissals = PRESS_DISMISSALS.load(Ordering::Relaxed);
     if preview == "null" {
-        format!("{{\"visible\": false, \"dock\": {dock_json}}}")
+        format!(
+            "{{\"visible\": false, \"dock\": {dock_json}, \"press_dismissals\": {press_dismissals}}}"
+        )
     } else {
-        format!("{{\"panel\": {preview}, \"dock\": {dock_json}}}")
+        format!(
+            "{{\"panel\": {preview}, \"dock\": {dock_json}, \"press_dismissals\": {press_dismissals}}}"
+        )
     }
 }
 
@@ -560,6 +733,12 @@ fn post_event_to_main() {
 extern "C" fn on_event(_self: *mut AnyObject, _cmd: objc2::runtime::Sel, _arg: *mut AnyObject) {
     crate::callback_guard::void("dock_preview_event", || {
         EVENT_POSTED.store(false, Ordering::Release);
+        // The press is handled before the queued results: it happened first, and the dismissal it
+        // recorded must be able to reject a collector result from the same turn.
+        let press_session = DOCK_CLICK_PENDING.swap(0, Ordering::AcqRel);
+        if press_session != 0 {
+            dismiss_for_dock_click(press_session);
+        }
         drain_events();
         drain_results();
         drain_close_results();
@@ -569,6 +748,12 @@ extern "C" fn on_event(_self: *mut AnyObject, _cmd: objc2::runtime::Sel, _arg: *
 
 extern "C" fn on_tick(_self: *mut AnyObject, _cmd: objc2::runtime::Sel, _timer: *mut AnyObject) {
     crate::callback_guard::void("dock_preview_tick", || {
+        // Safety net for a press whose main-thread hop was lost: the tick already runs at the
+        // feature's 50ms cadence, so the dismissal cannot be missed entirely.
+        let press_session = DOCK_CLICK_PENDING.swap(0, Ordering::AcqRel);
+        if press_session != 0 {
+            dismiss_for_dock_click(press_session);
+        }
         if is_enabled() {
             tick();
         }
@@ -592,6 +777,9 @@ fn handle_event(event: DockEvent) {
     {
         let mut state = DOCK_STATE.lock().unwrap();
         state.list = event.list_frame;
+        if event.list_frame.is_some() {
+            state.list_at = Some(event.sampled_at);
+        }
         state.screen = event.screen_frame;
         state.revealed = event.revealed;
         if let Selection::App { edge, .. } = &event.selection {
@@ -631,6 +819,28 @@ fn handle_event(event: DockEvent) {
                 hide_panel();
                 return;
             }
+            // A sample that *started* after the press describes a position the pointer has taken
+            // since then: if it is not the pressed tile, the press can no longer explain an open. A
+            // sample that started before the press may reach the queue afterwards and still carry
+            // an older selection, so it must not clear it.
+            {
+                let mut press = DOCK_PRESS.lock().unwrap();
+                if press
+                    .is_some_and(|press| event.sampled_at > press.at && !icon.contains(press.point))
+                {
+                    *press = None;
+                }
+            }
+            // The press that dismissed this tile also keeps it dismissed: the pointer is still on
+            // the icon, and the Dock keeps reporting it as selected, so a notification (or its own
+            // forced re-read) must not re-open what the press just closed.
+            if decisions::dismissed_tile_suppresses(
+                *DISMISSED_TILE.lock().unwrap(),
+                pid,
+                pointer_in_cg(),
+            ) {
+                return;
+            }
             // Same app: keep the panel and follow the tile's current rectangle.
             let current_pid = CURRENT_APP.lock().unwrap().as_ref().map(|app| app.pid);
             if panel::is_visible()
@@ -659,7 +869,34 @@ fn handle_event(event: DockEvent) {
                 }
                 return;
             }
+            // The press that produced this notification may have been handled first, when there was
+            // nothing to dismiss yet: the point it carried is what ties the two together. The match
+            // and the consumption happen under one lock, so a press the watcher writes in between
+            // cannot be dropped unseen.
+            let suppressed = {
+                let mut press = DOCK_PRESS.lock().unwrap();
+                let snapshot = press.map(|press| (press.session, press.at, press.point));
+                if decisions::press_suppresses_open(
+                    snapshot,
+                    SESSION.load(Ordering::Acquire),
+                    icon,
+                    Instant::now(),
+                ) {
+                    *press = None;
+                    true
+                } else {
+                    false
+                }
+            };
+            if suppressed {
+                log_debug!("[dock-preview] open suppressed: this tile was just pressed");
+                *DISMISSED_TILE.lock().unwrap() = Some((pid, icon));
+                return;
+            }
             hide_panel();
+            // A press can land inside the open delay, when no panel exists yet: the watcher has to
+            // be listening before the panel is, or that press would show a preview afterwards.
+            start_dock_click_watcher();
             let request = REQUEST.fetch_add(1, Ordering::AcqRel) + 1;
             *PENDING_OPEN.lock().unwrap() = Some(PendingOpen {
                 at: Instant::now() + decisions::OPEN_DELAY,
@@ -671,7 +908,9 @@ fn handle_event(event: DockEvent) {
             });
         }
         // A non-application tile or no tile: the panel's close timer decides using the real
-        // pointer, so a Dock that hides under a card does not dismiss it.
+        // pointer, so a Dock that hides under a card does not dismiss it. `Selection::None` also
+        // covers a failed selection read and a teardown, so it is not evidence that the pointer
+        // left; the press and the latch are released by the tick's pointer sample.
         Selection::NonApp | Selection::None => {}
     }
 }
@@ -694,6 +933,9 @@ fn tick() {
     }
     let now = Instant::now();
     let pointer = pointer_in_cg().unwrap_or((f64::NAN, f64::NAN));
+    // Releasing the press and its latch happens here, before any decision this tick makes: leaving
+    // the dismissed tile is what makes the next hover able to open a preview again.
+    release_dismiss_state(pointer);
     if panel::is_visible() {
         // Moving along the Dock from the previewed icon to a different tile (including a tile
         // whose app is not running) ends the preview immediately: the observer's selection event
@@ -739,6 +981,17 @@ fn tick() {
         let Some(screen) = state.screen else {
             return;
         };
+        // A press that dismissed this tile holds it closed until the pointer leaves it. The pending
+        // entry is already consumed, so this only drops the open; the latch stays for the next
+        // notification.
+        if decisions::dismissed_tile_suppresses(
+            *DISMISSED_TILE.lock().unwrap(),
+            open.pid,
+            pointer_in_cg(),
+        ) {
+            log_debug!("[dock-preview] open suppressed: the tile was pressed");
+            return;
+        }
         // An unreadable pointer is not a hover: only a pointer that is actually inside the tile may
         // open a preview, or a notification that lagged behind a slide to the neighbouring tile
         // would still open this one.
@@ -1018,6 +1271,11 @@ pub(crate) fn panel_rect() -> Option<Rect> {
     panel::panel_frame()
 }
 
+/// Presses that dismissed a preview, for the smoke assertion.
+pub(crate) fn press_dismissals() -> u64 {
+    PRESS_DISMISSALS.load(Ordering::Relaxed)
+}
+
 /// Whether the panel's cards are all with a frame or an icon placeholder (never a blank card).
 pub(crate) fn cards_are_renderable() -> bool {
     panel::cards_are_renderable()
@@ -1163,6 +1421,40 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     if panel::tooltip_state().0 {
         return Err(SmokeFailure::Failed(
             "the tooltip stayed visible after the pointer left the title".into(),
+        ));
+    }
+    checks += 1;
+    // A press on the Dock dismisses the preview on the press itself. The check drives the entry the
+    // Dock tap calls, so the panel's teardown is asserted without a real Dock click; the pump stays
+    // well inside the pointer-left close grace, so only the press can explain a hidden panel.
+    if !dev_show_synthetic(&[long_title, "Second window"]) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not reappear for the Dock-press check".into(),
+        ));
+    }
+    pump(Duration::from_millis(60));
+    if !panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel was already hidden before the Dock-press check".into(),
+        ));
+    }
+    let dismissals = press_dismissals();
+    let session = SESSION.load(Ordering::Acquire);
+    if session == 0 {
+        return Err(SmokeFailure::Failed(
+            "the smoke has no observer session to report a press for".into(),
+        ));
+    }
+    note_dock_click((screen.x + screen.w / 2.0, screen.max_y() - 30.0), session);
+    pump(Duration::from_millis(60));
+    if panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel stayed open after a press on the Dock".into(),
+        ));
+    }
+    if press_dismissals() != dismissals + 1 {
+        return Err(SmokeFailure::Failed(
+            "the press did not take the dismissal path".into(),
         ));
     }
     checks += 1;

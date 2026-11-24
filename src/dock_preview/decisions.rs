@@ -90,6 +90,91 @@ pub(crate) fn close_decision(
     }
 }
 
+/// Whether a press on the Dock must keep `tile`'s preview closed.
+///
+/// A press dismisses the preview, but the pointer stays on the icon it just pressed and the Dock
+/// keeps reporting that tile as selected, so the notifications that follow would otherwise re-open
+/// the preview the press closed. The latch names the app the tile belonged to: a notification for a
+/// different app means the pointer has moved on, which ends the hover the press dismissed. The latch
+/// is only true while the pointer is still on the pressed tile, and an unreadable pointer never
+/// keeps the preview closed.
+pub(crate) fn dismissed_tile_suppresses(
+    latched: Option<(i32, Rect)>,
+    pid: i32,
+    pointer: Option<(f64, f64)>,
+) -> bool {
+    match (latched, pointer) {
+        (Some((latched_pid, tile)), Some(point)) => latched_pid == pid && tile.contains(point),
+        _ => false,
+    }
+}
+
+/// A press as the decision functions see it: the feature session it belongs to, when it happened,
+/// and where.
+pub(crate) type PressAt = (u64, Instant, (f64, f64));
+
+/// How long after a press the press itself still explains an open. The Dock's hover notification
+/// for the tile that was pressed can reach the main thread in the same turn as the press, or just
+/// after it, when there is no pending entry for the press to cancel yet.
+pub(crate) const PRESS_OPEN_WINDOW: Duration = Duration::from_millis(500);
+
+/// Whether a press that arrived while nothing was open explains this pending open: the press
+/// happened on this tile, in this session, within the window, so the open is the notification for
+/// that press and must be dropped instead of showing a preview the user just closed. The press is
+/// one-shot: the caller consumes it, so a hover after the pointer has been away is not suppressed by
+/// an older press.
+pub(crate) fn press_suppresses_open(
+    press: Option<PressAt>,
+    session: u64,
+    tile: Rect,
+    now: Instant,
+) -> bool {
+    match press {
+        Some((press_session, at, point)) => {
+            press_session == session
+                && now.duration_since(at) <= PRESS_OPEN_WINDOW
+                && tile.contains(point)
+        }
+        None => false,
+    }
+}
+
+/// One tick's pointer sample against the press/latch state. Pure so the release rules are asserted
+/// without a Dock:
+///
+/// - the latch dies when the pointer leaves its tile;
+/// - the press dies with that latch when it landed on that tile: the pointer has left the tile the
+///   press belonged to, so the press can no longer explain an open, and keeping it would suppress
+///   the next hover of the tile the pointer comes back to;
+/// - the press also dies when the pointer is off the Dock's tiles entirely.
+///
+/// A press that landed on a different tile than the latched one survives (the pointer may still be
+/// pressing it while an older panel is dismissed), which is why the rule is keyed on the latch's
+/// tile rather than on the latch alone. `on_dock` is `None` when the Dock boundary is unknown or was
+/// observed before the press: an auto-hidden Dock reveals after the press, so an absent or older
+/// rectangle must not read as "the pointer left".
+pub(crate) fn released_by_pointer(
+    latched: Option<(i32, Rect)>,
+    press: Option<PressAt>,
+    pointer: (f64, f64),
+    on_dock: Option<bool>,
+) -> (Option<(i32, Rect)>, Option<PressAt>) {
+    let latched_now = match latched {
+        Some((_, tile)) if !tile.contains(pointer) => None,
+        other => other,
+    };
+    let press_died_with_tile = match (latched, latched_now) {
+        (Some((_, tile)), None) => press.is_some_and(|(_, _, point)| tile.contains(point)),
+        _ => false,
+    };
+    let press_now = if press_died_with_tile || on_dock == Some(false) {
+        None
+    } else {
+        press
+    };
+    (latched_now, press_now)
+}
+
 /// Whether the real pointer is resting on the Dock but over a different tile than the one the
 /// open panel is anchored to.
 ///
@@ -392,6 +477,115 @@ mod dock_tile_tests {
             anchor(),
             (290.0, 400.0)
         ));
+    }
+
+    #[test]
+    fn a_press_latches_the_tile_until_the_pointer_leaves_it() {
+        let tile = anchor();
+        let latched = Some((7, tile));
+        // The pointer is still on the icon the press closed.
+        assert!(dismissed_tile_suppresses(latched, 7, Some((290.0, 922.0))));
+        // The strip above the icon is outside the tile: it cannot carry a press, and an open there
+        // is already rejected by the hover check.
+        assert!(!dismissed_tile_suppresses(latched, 7, Some((290.0, 891.0))));
+        // Off the tile: the next hover may open the preview again.
+        assert!(!dismissed_tile_suppresses(latched, 7, Some((336.0, 922.0))));
+        assert!(!dismissed_tile_suppresses(latched, 7, Some((290.0, 400.0))));
+        // A notification for another app means the pointer moved on: the latch no longer applies.
+        assert!(!dismissed_tile_suppresses(latched, 8, Some((290.0, 922.0))));
+        // No press, or no readable pointer: nothing is suppressed.
+        assert!(!dismissed_tile_suppresses(None, 7, Some((290.0, 922.0))));
+        assert!(!dismissed_tile_suppresses(latched, 7, None));
+    }
+
+    #[test]
+    fn a_press_before_the_hover_notification_still_keeps_the_tile_closed() {
+        let tile = anchor();
+        let now = Instant::now();
+        let press = |session: u64, at: Instant, point: (f64, f64)| Some((session, at, point));
+        // The press was on this tile, in this session, and just happened: the open is its
+        // notification.
+        assert!(press_suppresses_open(
+            press(4, now, (290.0, 922.0)),
+            4,
+            tile,
+            now
+        ));
+        assert!(press_suppresses_open(
+            press(4, now - PRESS_OPEN_WINDOW, (290.0, 922.0)),
+            4,
+            tile,
+            now
+        ));
+        // A press on another tile, a stale press, another session, or no press does not suppress.
+        assert!(!press_suppresses_open(
+            press(4, now, (336.0, 922.0)),
+            4,
+            tile,
+            now
+        ));
+        assert!(!press_suppresses_open(
+            press(
+                4,
+                now - PRESS_OPEN_WINDOW - Duration::from_millis(1),
+                (290.0, 922.0)
+            ),
+            4,
+            tile,
+            now
+        ));
+        assert!(!press_suppresses_open(
+            press(3, now, (290.0, 922.0)),
+            4,
+            tile,
+            now
+        ));
+        assert!(!press_suppresses_open(None, 4, tile, now));
+    }
+
+    #[test]
+    fn a_pointer_sample_releases_the_latch_and_the_press_it_belongs_to() {
+        let tile = anchor();
+        let now = Instant::now();
+        let latched = Some((7, tile));
+        let press = Some((4, now, (290.0, 922.0))); // inside the tile
+                                                    // Still on the tile: nothing is released.
+        assert_eq!(
+            released_by_pointer(latched, press, (290.0, 922.0), Some(true)),
+            (latched, press)
+        );
+        // Left the tile and still on the Dock: the latch and the press that landed on it are gone.
+        assert_eq!(
+            released_by_pointer(latched, press, (336.0, 922.0), Some(true)),
+            (None, None)
+        );
+        // The press landed on another tile (a stale panel was dismissed): it survives the latch.
+        let press_elsewhere = Some((4, now, (336.0, 922.0)));
+        assert_eq!(
+            released_by_pointer(latched, press_elsewhere, (336.0, 922.0), Some(true)),
+            (None, press_elsewhere)
+        );
+        // Off the Dock's tiles entirely: the press cannot explain an open there.
+        assert_eq!(
+            released_by_pointer(latched, press, (290.0, 400.0), Some(false)),
+            (None, None)
+        );
+        // An unknown or pre-press boundary says nothing about the pointer: a press with no latch
+        // survives even off the Dock, where a trusted boundary would have released it.
+        assert_eq!(
+            released_by_pointer(None, press, (290.0, 400.0), None),
+            (None, press)
+        );
+        // Nothing recorded: nothing to release.
+        assert_eq!(
+            released_by_pointer(None, None, (290.0, 400.0), Some(false)),
+            (None, None)
+        );
+        // No latch, a press on the Dock: the press waits for the tile's own notification.
+        assert_eq!(
+            released_by_pointer(None, press, (290.0, 922.0), Some(true)),
+            (None, press)
+        );
     }
 
     #[test]

@@ -73,6 +73,11 @@ pub(crate) enum Selection {
 #[derive(Clone, Debug)]
 pub(crate) struct DockEvent {
     pub(crate) session: u64,
+    /// When this sample *started*, before any Accessibility read. A consumer that compares the
+    /// event with another event on the main thread needs the sample's own start, not the moment it
+    /// was enqueued: a sample that began before a press may carry a selection from before it even
+    /// if it reaches the queue afterwards.
+    pub(crate) sampled_at: Instant,
     pub(crate) selection: Selection,
     pub(crate) list_frame: Option<Rect>,
     pub(crate) screen_frame: Option<Rect>,
@@ -262,6 +267,7 @@ impl ObserverContext {
             log_debug!("[dock-preview] Dock process not found");
             (self.sink)(DockEvent {
                 session,
+                sampled_at: Instant::now(),
                 selection: Selection::None,
                 list_frame: None,
                 screen_frame: None,
@@ -346,6 +352,7 @@ impl ObserverContext {
         self.last_signature = None;
         (self.sink)(DockEvent {
             session: self.session,
+            sampled_at: Instant::now(),
             selection: Selection::None,
             list_frame: None,
             screen_frame: None,
@@ -376,6 +383,9 @@ impl ObserverContext {
     /// notification may carry a new tile rectangle for the same tile, which the panel needs for
     /// anchoring after Dock magnification).
     fn emit(&mut self, force: bool) {
+        // Stamped before the first Accessibility read: every value in this event belongs to a
+        // sample that started no earlier than this instant.
+        let sampled_at = Instant::now();
         let Some(list) = self.list else {
             return;
         };
@@ -400,6 +410,7 @@ impl ObserverContext {
         self.last_signature = Some(signature);
         (self.sink)(DockEvent {
             session: self.session,
+            sampled_at,
             selection,
             list_frame: Some(list_frame),
             screen_frame: screen,

@@ -16,7 +16,7 @@
 //! hide again instead of staying up until the pointer happens to move.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError, Sender};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -25,7 +25,7 @@ use crate::event_tap::{
     kCFRunLoopDefaultMode, tap_options, tap_placement, CFMachPortCreateRunLoopSource,
     CFRunLoopAddSource, CGEventCreateMouseEvent, CGEventPostToPid, CGEventRef, CGEventSetType,
     CGEventTapCreateForPid, CGEventTapEnable, CGEventTapProxy, CGEventType, CGPoint,
-    TAP_DISABLED_BY_TIMEOUT, TAP_DISABLED_BY_USER_INPUT,
+    TAP_DISABLED_BY_TIMEOUT,
 };
 use crate::ffi::{
     make_nsstring, release_obj, CFBooleanGetTypeID, CFBooleanGetValue, CFGetTypeID,
@@ -49,6 +49,9 @@ struct Context {
     pid: i32,
     point: Mutex<(f64, f64)>,
     tap: AtomicPtr<c_void>,
+    /// Set immediately before this module disables its own tap: the disable pseudo-event that
+    /// `CGEventTapEnable(tap, false)` delivers must not be read as the system's terminal disable.
+    stopping: AtomicBool,
 }
 
 /// Command channel shared with the keeper thread.
@@ -147,10 +150,17 @@ fn run(receiver: Receiver<Command>) {
 
 /// Install the per-PID tap, serve the run loop, and tear down on `Stop`.
 fn run_active(receiver: &Receiver<Command>, pid: i32, point: (f64, f64)) -> ActiveOutcome {
+    // A terminal disable or a revoked permission may have happened since the keeper last started:
+    // check before installing, including a restart after the Dock changed process.
+    if !crate::input_monitor::taps_allowed() {
+        log_debug!("[dock-preview] Dock reveal keeper skipped: taps unavailable");
+        return ActiveOutcome::Stopped;
+    }
     let context = Box::into_raw(Box::new(Context {
         pid,
         point: Mutex::new(point),
         tap: AtomicPtr::new(std::ptr::null_mut()),
+        stopping: AtomicBool::new(false),
     }));
     let mask: u64 = 1 << MOUSE_EXITED;
     let tap = unsafe {
@@ -170,12 +180,10 @@ fn run_active(receiver: &Receiver<Command>, pid: i32, point: (f64, f64)) -> Acti
     }
     let source = unsafe { CFMachPortCreateRunLoopSource(std::ptr::null_mut(), tap, 0) };
     if source.is_null() {
+        // CFRelease on a null source would crash, so this branch releases only what was created.
         log_info!("[dock-preview] Dock reveal tap has no run-loop source");
         unsafe {
-            crate::event_tap::teardown_event_tap(
-                crate::event_tap::CFRunLoopGetCurrent(),
-                crate::event_tap::CreatedEventTap { tap, source },
-            );
+            crate::ffi::CFRelease(tap as *const c_void);
             drop(Box::from_raw(context));
         }
         return ActiveOutcome::Stopped;
@@ -198,12 +206,26 @@ fn run_active(receiver: &Receiver<Command>, pid: i32, point: (f64, f64)) -> Acti
         unsafe {
             CFRunLoopRunInMode(kCFRunLoopDefaultMode, 0.05, 1);
         }
+        if !crate::input_monitor::taps_allowed() {
+            // A terminal disable or a revoked permission: stop serving and never post again.
+            unsafe {
+                (*context).stopping.store(true, Ordering::SeqCst);
+                crate::event_tap::teardown_event_tap(
+                    run_loop,
+                    crate::event_tap::CreatedEventTap { tap, source },
+                );
+                drop(Box::from_raw(context));
+            }
+            log_info!("[dock-preview] Dock reveal keeper released: input taps no longer allowed");
+            return ActiveOutcome::Stopped;
+        }
         match receiver.recv_timeout(IDLE_POLL) {
             Ok(Command::Start {
                 pid: new_pid,
                 point: new_point,
             }) if new_pid != pid => {
                 unsafe {
+                    (*context).stopping.store(true, Ordering::SeqCst);
                     crate::event_tap::teardown_event_tap(
                         run_loop,
                         crate::event_tap::CreatedEventTap { tap, source },
@@ -224,10 +246,13 @@ fn run_active(receiver: &Receiver<Command>, pid: i32, point: (f64, f64)) -> Acti
                     .lock()
                     .map(|point| *point)
                     .unwrap_or(point);
-                if post_leave {
+                // The farewell move exists to reveal nothing; with input taps no longer allowed it
+                // must not be injected either.
+                if post_leave && crate::input_monitor::taps_allowed() {
                     unsafe { post_mouse(pid, last, MOUSE_EXITED) };
                 }
                 unsafe {
+                    (*context).stopping.store(true, Ordering::SeqCst);
                     crate::event_tap::teardown_event_tap(
                         run_loop,
                         crate::event_tap::CreatedEventTap { tap, source },
@@ -241,6 +266,7 @@ fn run_active(receiver: &Receiver<Command>, pid: i32, point: (f64, f64)) -> Acti
             Err(RecvTimeoutError::Disconnected) => {
                 // Process is going away: remove the tap without a farewell event.
                 unsafe {
+                    (*context).stopping.store(true, Ordering::SeqCst);
                     crate::event_tap::teardown_event_tap(
                         run_loop,
                         crate::event_tap::CreatedEventTap { tap, source },
@@ -265,11 +291,23 @@ unsafe extern "C" fn dock_exit_callback(
             return event;
         }
         let context = &*(user_info as *const Context);
-        if event_type == TAP_DISABLED_BY_TIMEOUT || event_type == TAP_DISABLED_BY_USER_INPUT {
-            let tap = context.tap.load(Ordering::SeqCst);
-            if !tap.is_null() {
-                CGEventTapEnable(tap, true);
+        // The shared policy separates this module's own stop from the system's terminal disable. A
+        // timeout is recoverable while taps are still allowed; a UserInput disable is terminal for
+        // the process, so nothing here re-enables it.
+        let stopping = context.stopping.load(Ordering::SeqCst);
+        if crate::input_monitor::handle_disabled_event(event_type, "dock-preview-reveal", stopping)
+        {
+            if event_type == TAP_DISABLED_BY_TIMEOUT && crate::input_monitor::taps_allowed() {
+                let tap = context.tap.load(Ordering::SeqCst);
+                if !tap.is_null() {
+                    CGEventTapEnable(tap, true);
+                }
             }
+            return event;
+        }
+        // A global terminal state (another tap's UserInput disable, or a revoked permission) stops
+        // this tap from acting even if its own disable event has not arrived yet.
+        if !crate::input_monitor::taps_allowed() {
             return event;
         }
         if event_type == MOUSE_EXITED {
