@@ -49,7 +49,8 @@ pub(crate) enum TickOutcome {
 
 struct CardEntry {
     window: PreviewWindow,
-    background: *mut AnyObject,
+    /// The hover plate: the switcher's selection wash + accent rim, hidden until the card is hovered.
+    plate: *mut AnyObject,
     thumbnail: *mut AnyObject,
     placeholder: *mut AnyObject,
     placeholder_icon: *mut AnyObject,
@@ -692,25 +693,26 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
         for (index, window) in request.windows.iter().take(rects.len()).enumerate() {
             let rect = rects[index];
             let palette = theme::ui_palette();
-            let background = passthrough_view(rect);
-            layer_set_background(
-                msg_send![background, layer],
-                hex_to_cg_color(palette.card_bg),
-            );
-            let background_layer: *mut AnyObject = msg_send![background, layer];
-            let _: () = msg_send![background_layer, setCornerRadius: CARD_RADIUS];
-            let _: () = msg_send![background_layer, setBorderWidth: 1.0f64];
-            layer_set_border(
-                msg_send![background, layer],
-                hex_to_cg_color(palette.card_border),
-            );
+            // The cards themselves do not paint: the panel's material is the surface between and
+            // inside them (the switcher's own rule). A hovered card draws the switcher's selection
+            // plate -- `selection_plate_bg` wash plus an `accent` rim -- instead of changing a
+            // filled tile.
+            let plate = passthrough_view(rect);
+            let plate_layer: *mut AnyObject = msg_send![plate, layer];
+            layer_set_background(plate_layer, hex_to_cg_color(palette.selection_plate_bg));
+            let _: () = msg_send![plate_layer, setCornerRadius: CARD_RADIUS];
+            let _: () = msg_send![plate_layer, setBorderWidth: 1.0f64];
+            layer_set_border(plate_layer, hex_to_cg_color(palette.accent));
+            let _: () = msg_send![plate, setHidden: true];
 
             let thumb_rect = layout::thumb_rect(rect);
             let thumbnail = passthrough_view(thumb_rect);
             let thumb_layer: *mut AnyObject = msg_send![thumbnail, layer];
             let _: () = msg_send![thumb_layer, setCornerRadius: layout::THUMB_RADIUS];
             let _: () = msg_send![thumb_layer, setMasksToBounds: true];
+            let _: () = msg_send![thumb_layer, setBorderWidth: 1.0f64];
             layer_set_background(thumb_layer, hex_to_cg_color(palette.field_bg));
+            layer_set_border(thumb_layer, hex_to_cg_color(palette.card_border));
             let gravity = make_nsstring("resizeAspect");
             let _: () = msg_send![thumb_layer, setContentsGravity: gravity];
             release_obj(gravity);
@@ -764,10 +766,10 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
             release_obj(cross);
             let _: () = msg_send![close, setHidden: true];
 
-            // The layers are flat siblings inside the container, so the thumbnail must draw over
-            // the card background and under the header copy.
-            let _: () = msg_send![state.container, addSubview: background];
-            release_obj(background);
+            // Flat siblings: the hover plate is behind everything, the thumbnail over it, and the
+            // header copy (icon/title/close) above.
+            let _: () = msg_send![state.container, addSubview: plate];
+            release_obj(plate);
             let _: () = msg_send![state.container, addSubview: thumbnail];
             release_obj(thumbnail);
             let _: () = msg_send![state.container, addSubview: placeholder];
@@ -781,7 +783,7 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
 
             state.cards.push(CardEntry {
                 window: window.clone(),
-                background,
+                plate,
                 thumbnail,
                 placeholder,
                 placeholder_icon: placeholder_image,
@@ -823,7 +825,7 @@ unsafe fn header_icon_view(rect: Rect, image: Option<*mut AnyObject>) -> *mut An
 fn remove_card_views(card: &CardEntry) {
     unsafe {
         for view in [
-            card.background,
+            card.plate,
             card.thumbnail,
             card.placeholder,
             card.header_icon,
@@ -877,18 +879,10 @@ unsafe fn style_label(label: *mut AnyObject, size: f64) {
 }
 
 fn apply_hover(state: &mut PanelState, hovered: Option<usize>) {
-    let palette = theme::ui_palette();
     for (index, card) in state.cards.iter().enumerate() {
         let active = hovered == Some(index);
         unsafe {
-            layer_set_background(
-                msg_send![card.background, layer],
-                hex_to_cg_color(if active {
-                    palette.hover_bg
-                } else {
-                    palette.card_bg
-                }),
-            );
+            let _: () = msg_send![card.plate, setHidden: !active];
             let _: () = msg_send![card.close, setHidden: !active];
         }
     }
@@ -916,7 +910,7 @@ fn relayout_after_removal(state: &mut PanelState) {
     for (index, card) in state.cards.iter().enumerate() {
         let rect = state.geometry.cards[index];
         unsafe {
-            place_view(card.background, rect);
+            place_view(card.plate, rect);
             let thumb = layout::thumb_rect(rect);
             place_view(card.thumbnail, thumb);
             place_view(card.placeholder, thumb);
@@ -1346,7 +1340,7 @@ pub(crate) fn update_anchor(anchor: Rect, edge: DockEdge, visible: Rect) {
     for (index, card) in state.cards.iter().enumerate() {
         let rect = state.geometry.cards[index];
         unsafe {
-            place_view(card.background, rect);
+            place_view(card.plate, rect);
             place_view(card.thumbnail, layout::thumb_rect(rect));
             place_view(card.placeholder, layout::thumb_rect(rect));
             place_view(card.header_icon, layout::icon_rect(rect));

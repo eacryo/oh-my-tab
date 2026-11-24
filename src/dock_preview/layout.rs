@@ -70,7 +70,9 @@ pub(crate) const CARD_ICON_GAP: f64 = 6.0;
 pub(crate) const CLOSE_SIZE: f64 = 20.0;
 pub(crate) const CLOSE_MARGIN: f64 = 4.0;
 pub(crate) const PANEL_PAD: f64 = 8.0;
-pub(crate) const CARD_GAP: f64 = 8.0;
+/// Cards sit edge to edge, like the reference: the panel's material is the surface, and a card is
+/// a header plus its thumbnail rather than a separate filled tile with a gutter around it.
+pub(crate) const CARD_GAP: f64 = 0.0;
 pub(crate) const PANEL_RADIUS: f64 = 14.0;
 pub(crate) const CARD_RADIUS: f64 = 10.0;
 pub(crate) const THUMB_RADIUS: f64 = 6.0;
@@ -451,6 +453,23 @@ mod tests {
         assert_eq!(
             grid.panel_size(),
             (CARD_W + PANEL_PAD * 2.0, CARD_H + PANEL_PAD * 2.0)
+        );
+    }
+
+    #[test]
+    fn cards_sit_edge_to_edge_with_no_gutter() {
+        let grid = grid_for(2, 1000.0, 800.0);
+        let rects = card_rects(grid);
+        assert_eq!(rects.len(), 2);
+        assert!(
+            (rects[1].x - rects[0].max_x()).abs() < 0.001,
+            "adjacent cards share an edge: {} vs {}",
+            rects[1].x,
+            rects[0].max_x()
+        );
+        assert_eq!(
+            grid.panel_size(),
+            (PANEL_PAD * 2.0 + 2.0 * CARD_W, PANEL_PAD * 2.0 + CARD_H)
         );
     }
 

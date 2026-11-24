@@ -199,8 +199,11 @@ never becomes the key or main window, so the app the pointer came from keeps foc
   target is still the app instance that was hovered.
 - `dock_preview/panel.rs` builds one borderless non-activating `NSPanel` (status level, joins all
   Spaces, never key) with the shared glass backdrop, a flipped card host, and a passive tooltip
-  panel. Cards show a captured frame when the shared thumbnail cache has one, an app-icon placeholder
-  otherwise; the full title is shown only after the pointer rests on a truncated title's own box.
+  panel. Cards do not paint their own surface and sit edge to edge: the panel's material is the
+  surface, and a hovered card draws the switcher's own selection plate (`selection_plate_bg` wash +
+  `accent` rim). Cards show a captured frame when the shared thumbnail cache has one, an app-icon
+  placeholder otherwise; the full title is shown only after the pointer rests on a truncated
+  title's own box.
 - `dock_preview/layout.rs` and `dock_preview/decisions.rs` are pure and headless-tested: the card
   grid, the panel's anchor on each Dock edge, the transition band, the pointer zones, the close and
   tooltip rules. The Dock preview's captures are bound to a capture epoch
