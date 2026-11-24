@@ -28,8 +28,6 @@ use crate::theme;
 /// One app's panel content, as the collector produced it.
 pub(crate) struct PanelRequest {
     pub(crate) pid: i32,
-    /// Width of one card in this panel (a single window takes its own thumbnail's aspect).
-    pub(crate) card_width: f64,
     pub(crate) thumbnail_generation: u64,
     pub(crate) bundle: String,
     pub(crate) identity_key: String,
@@ -80,7 +78,6 @@ struct Geometry {
 struct PanelState {
     panel: *mut AnyObject,
     content_size: (f64, f64),
-    card_width: f64,
     container: *mut AnyObject,
     tooltip_panel: *mut AnyObject,
     tooltip_label: *mut AnyObject,
@@ -197,7 +194,6 @@ pub(crate) fn show(request: PanelRequest, request_epoch: u64, ticket: u64) -> bo
         rebuild_cards(state, &request, request_epoch, ticket);
     }
     state.pid = request.pid;
-    state.card_width = request.card_width;
     state.thumbnail_generation = request.thumbnail_generation;
     state.bundle = request.bundle.clone();
     state.identity_key = request.identity_key.clone();
@@ -461,12 +457,9 @@ fn visible_now(state: &PanelState) -> bool {
 }
 
 fn geometry_for(request: &PanelRequest) -> Geometry {
-    let grid = layout::grid_for(
-        request.windows.len(),
-        request.visible.w,
-        request.visible.h,
-        request.card_width,
-    );
+    let aspects: Vec<Option<f64>> = request.windows.iter().map(|window| window.aspect).collect();
+    let widths = layout::widths_for_aspects(&aspects);
+    let grid = layout::grid_for(&widths, request.visible.w, request.visible.h);
     let (panel_w, panel_h) = grid.panel_size();
     let panel = layout::panel_frame(
         request.anchor,
@@ -476,7 +469,7 @@ fn geometry_for(request: &PanelRequest) -> Geometry {
     );
     Geometry {
         band: layout::transition_band(request.edge, request.anchor, panel),
-        cards: layout::card_rects(grid),
+        cards: layout::card_rects(&grid),
         panel,
         anchor: request.anchor,
         edge: request.edge,
@@ -601,7 +594,6 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
         Some(PanelState {
             panel,
             content_size: (panel_w, panel_h),
-            card_width: layout::CARD_W,
             container,
             tooltip_panel: tooltip_panel.0,
             tooltip_label: tooltip_panel.1,
@@ -695,13 +687,14 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
         for card in state.cards.drain(..) {
             remove_card_views(&card);
         }
-        let grid = layout::grid_for(
-            request.windows.len(),
-            request.visible.w,
-            request.visible.h,
-            request.card_width,
-        );
-        let rects = layout::card_rects(grid);
+        let aspects: Vec<Option<f64>> =
+            request.windows.iter().map(|window| window.aspect).collect();
+        let widths = layout::widths_for_aspects(&aspects);
+        let grid = layout::grid_for(&widths, request.visible.w, request.visible.h);
+        let rects: Vec<layout::Rect> = layout::card_rects(&grid)
+            .into_iter()
+            .take(request.windows.len())
+            .collect();
         state.window_ids = request.windows.iter().map(|window| window.wid).collect();
         state.total_windows = request.windows.len();
         let icon = crate::app_identity::icon_for_bundle_id(&request.bundle, layout::CARD_ICON);
@@ -908,13 +901,9 @@ unsafe fn set_close_enabled(card: &CardEntry, enabled: bool) {
 }
 
 fn relayout_after_removal(state: &mut PanelState) {
-    let count = state.cards.len();
-    let grid = layout::grid_for(
-        count,
-        state.geometry.visible.w,
-        state.geometry.visible.h,
-        state.card_width,
-    );
+    let aspects: Vec<Option<f64>> = state.cards.iter().map(|card| card.window.aspect).collect();
+    let widths = layout::widths_for_aspects(&aspects);
+    let grid = layout::grid_for(&widths, state.geometry.visible.w, state.geometry.visible.h);
     let (w, h) = grid.panel_size();
     let panel = layout::panel_frame(
         state.geometry.anchor,
@@ -923,7 +912,7 @@ fn relayout_after_removal(state: &mut PanelState) {
         state.geometry.visible,
     );
     state.geometry.panel = panel;
-    state.geometry.cards = layout::card_rects(grid);
+    state.geometry.cards = layout::card_rects(&grid);
     state.geometry.band =
         layout::transition_band(state.geometry.edge, state.geometry.anchor, panel);
     state.window_ids = state.cards.iter().map(|card| card.window.wid).collect();
@@ -1340,11 +1329,13 @@ pub(crate) fn update_anchor(anchor: Rect, edge: DockEdge, visible: Rect) {
     state.geometry.anchor = anchor;
     state.geometry.edge = edge;
     state.geometry.visible = visible;
-    let grid = layout::grid_for(state.cards.len(), visible.w, visible.h, state.card_width);
+    let aspects: Vec<Option<f64>> = state.cards.iter().map(|card| card.window.aspect).collect();
+    let widths = layout::widths_for_aspects(&aspects);
+    let grid = layout::grid_for(&widths, visible.w, visible.h);
     let (w, h) = grid.panel_size();
     let panel = layout::panel_frame(anchor, (w, h), edge, visible);
     state.geometry.panel = panel;
-    state.geometry.cards = layout::card_rects(grid);
+    state.geometry.cards = layout::card_rects(&grid);
     state.geometry.band = layout::transition_band(edge, anchor, panel);
     // A smaller visible area can fit fewer cards than the panel was built with: unload the tail
     // instead of indexing a shorter rectangle list, and let the published hidden count account for

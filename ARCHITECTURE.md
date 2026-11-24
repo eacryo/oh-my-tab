@@ -201,9 +201,10 @@ never becomes the key or main window, so the app the pointer came from keeps foc
   Spaces, never key) with the shared glass backdrop, a flipped card host, and a passive tooltip
   panel. Cards do not paint their own surface and sit edge to edge: the panel's material is the
   surface, and a hovered card draws the switcher's own selection plate (`selection_plate_bg` wash +
-  `accent` rim). A single-window panel takes the width of that window's own thumbnail (its
-  WindowServer bounds aspect), so a portrait or wide window does not sit letterboxed in a card
-  shaped for the average one; multi-window panels keep the fixed design width. Cards show a captured
+  `accent` rim). Every card keeps one fixed height and takes the width of its own thumbnail (its
+  WindowServer bounds aspect) -- the same rule the app switcher uses, so a portrait or wide window
+  does not sit letterboxed in a card shaped for the average one; a row of mixed aspects stays
+  edge to edge and the panel is as wide as its widest row. Cards show a captured
   frame when the shared thumbnail cache has one, an app-icon placeholder otherwise; the full title
   is shown only after the pointer rests on a truncated title's own box.
 - `dock_preview/layout.rs` and `dock_preview/decisions.rs` are pure and headless-tested: the card
