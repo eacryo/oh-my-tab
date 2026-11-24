@@ -419,6 +419,7 @@ pub(crate) fn dev_show_synthetic(titles: &[&str]) -> bool {
             app_hidden: false,
             other_desktop: false,
             active: index == 0,
+            aspect: None,
             may_capture: false,
         })
         .collect();
@@ -435,6 +436,7 @@ pub(crate) fn dev_show_synthetic(titles: &[&str]) -> bool {
     let shown = panel::show(
         panel::PanelRequest {
             pid,
+            card_width: crate::dock_preview::layout::card_width_for(titles.len(), None),
             thumbnail_generation: crate::thumbnail::pid_generation_now(pid),
             bundle: String::new(),
             identity_key: String::new(),
@@ -837,8 +839,13 @@ fn drain_results() {
             edge,
             request,
         };
+        let card_width = crate::dock_preview::layout::card_width_for(
+            collected.windows.len(),
+            collected.windows.first().and_then(|window| window.aspect),
+        );
         let panel_request = panel::PanelRequest {
             pid: collected.pid,
+            card_width,
             thumbnail_generation: collected.thumbnail_generation,
             bundle: bundle.clone(),
             identity_key: collected.identity_key.clone(),

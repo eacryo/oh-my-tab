@@ -22,6 +22,9 @@ pub(crate) struct PreviewWindow {
     pub(crate) other_desktop: bool,
     /// The window is the app's focused one when it was collected.
     pub(crate) active: bool,
+    /// The window's own width/height from its WindowServer bounds. A single-card panel uses it to
+    /// give the card the thumbnail's own shape instead of letterboxing the preview.
+    pub(crate) aspect: Option<f64>,
     /// At least one capture path can produce a frame for it now. A minimized window can show a
     /// frame if the cache still holds the last one; it cannot ask for a new capture.
     pub(crate) may_capture: bool,
@@ -70,6 +73,10 @@ pub(crate) fn collect(pid: i32) -> Option<CollectedWindows> {
                 app_hidden: window.app_hidden,
                 other_desktop: window.on_other_desktop,
                 active: window.is_active,
+                aspect: {
+                    let (_, _, width, height) = window.bounds;
+                    (width > 1.0 && height > 1.0).then_some(width / height)
+                },
                 // A capture of a minimized, hidden or off-desktop window cannot succeed; those
                 // cards use a cached frame when one exists, otherwise an icon placeholder.
                 may_capture: !window.minimized && !window.app_hidden && !window.on_other_desktop,
@@ -173,6 +180,7 @@ mod tests {
             app_hidden: false,
             other_desktop: false,
             active,
+            aspect: None,
             may_capture: true,
         }
     }

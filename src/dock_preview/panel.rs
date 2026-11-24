@@ -28,6 +28,8 @@ use crate::theme;
 /// One app's panel content, as the collector produced it.
 pub(crate) struct PanelRequest {
     pub(crate) pid: i32,
+    /// Width of one card in this panel (a single window takes its own thumbnail's aspect).
+    pub(crate) card_width: f64,
     pub(crate) thumbnail_generation: u64,
     pub(crate) bundle: String,
     pub(crate) identity_key: String,
@@ -78,6 +80,7 @@ struct Geometry {
 struct PanelState {
     panel: *mut AnyObject,
     content_size: (f64, f64),
+    card_width: f64,
     container: *mut AnyObject,
     tooltip_panel: *mut AnyObject,
     tooltip_label: *mut AnyObject,
@@ -194,6 +197,7 @@ pub(crate) fn show(request: PanelRequest, request_epoch: u64, ticket: u64) -> bo
         rebuild_cards(state, &request, request_epoch, ticket);
     }
     state.pid = request.pid;
+    state.card_width = request.card_width;
     state.thumbnail_generation = request.thumbnail_generation;
     state.bundle = request.bundle.clone();
     state.identity_key = request.identity_key.clone();
@@ -457,7 +461,12 @@ fn visible_now(state: &PanelState) -> bool {
 }
 
 fn geometry_for(request: &PanelRequest) -> Geometry {
-    let grid = layout::grid_for(request.windows.len(), request.visible.w, request.visible.h);
+    let grid = layout::grid_for(
+        request.windows.len(),
+        request.visible.w,
+        request.visible.h,
+        request.card_width,
+    );
     let (panel_w, panel_h) = grid.panel_size();
     let panel = layout::panel_frame(
         request.anchor,
@@ -592,6 +601,7 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
         Some(PanelState {
             panel,
             content_size: (panel_w, panel_h),
+            card_width: layout::CARD_W,
             container,
             tooltip_panel: tooltip_panel.0,
             tooltip_label: tooltip_panel.1,
@@ -685,7 +695,12 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
         for card in state.cards.drain(..) {
             remove_card_views(&card);
         }
-        let grid = layout::grid_for(request.windows.len(), request.visible.w, request.visible.h);
+        let grid = layout::grid_for(
+            request.windows.len(),
+            request.visible.w,
+            request.visible.h,
+            request.card_width,
+        );
         let rects = layout::card_rects(grid);
         state.window_ids = request.windows.iter().map(|window| window.wid).collect();
         state.total_windows = request.windows.len();
@@ -894,7 +909,12 @@ unsafe fn set_close_enabled(card: &CardEntry, enabled: bool) {
 
 fn relayout_after_removal(state: &mut PanelState) {
     let count = state.cards.len();
-    let grid = layout::grid_for(count, state.geometry.visible.w, state.geometry.visible.h);
+    let grid = layout::grid_for(
+        count,
+        state.geometry.visible.w,
+        state.geometry.visible.h,
+        state.card_width,
+    );
     let (w, h) = grid.panel_size();
     let panel = layout::panel_frame(
         state.geometry.anchor,
@@ -1320,7 +1340,7 @@ pub(crate) fn update_anchor(anchor: Rect, edge: DockEdge, visible: Rect) {
     state.geometry.anchor = anchor;
     state.geometry.edge = edge;
     state.geometry.visible = visible;
-    let grid = layout::grid_for(state.cards.len(), visible.w, visible.h);
+    let grid = layout::grid_for(state.cards.len(), visible.w, visible.h, state.card_width);
     let (w, h) = grid.panel_size();
     let panel = layout::panel_frame(anchor, (w, h), edge, visible);
     state.geometry.panel = panel;

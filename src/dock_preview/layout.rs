@@ -63,7 +63,6 @@ pub(crate) const CARD_W: f64 = 216.0;
 pub(crate) const CARD_H: f64 = 164.0;
 pub(crate) const CARD_PAD: f64 = 8.0;
 pub(crate) const HEADER_H: f64 = 36.0;
-pub(crate) const THUMB_W: f64 = CARD_W - CARD_PAD * 2.0;
 pub(crate) const THUMB_H: f64 = CARD_H - CARD_PAD * 2.0 - HEADER_H;
 pub(crate) const CARD_ICON: f64 = 16.0;
 pub(crate) const CARD_ICON_GAP: f64 = 6.0;
@@ -91,18 +90,37 @@ pub(crate) const TOOLTIP_PAD: f64 = 10.0;
 /// the panel stays inside it.
 pub(crate) const TRANSITION_SLACK: f64 = 24.0;
 
+/// The width one card takes. Multi-window panels keep the fixed design width so their cards line
+/// up; a single window instead takes the width of its own thumbnail, so a portrait or an
+/// ultra-wide window does not leave letterbox bars inside a card shaped for the average window.
+pub(crate) fn card_width_for(count: usize, aspect: Option<f64>) -> f64 {
+    if count != 1 {
+        return CARD_W;
+    }
+    let Some(aspect) = aspect.filter(|aspect| aspect.is_finite() && *aspect > 0.05) else {
+        return CARD_W;
+    };
+    // The thumbnail keeps its height; its width follows the window's own aspect ratio, and the card
+    // adds the two inner paddings back. Clamped so a degenerate report cannot produce a panel that
+    // is too narrow to hold the header or wider than the screen can be expected to show.
+    let thumb_w = (THUMB_H * aspect).round().clamp(120.0, 360.0);
+    thumb_w + CARD_PAD * 2.0
+}
+
 /// The card grid the panel can fit: at most [`MAX_COLUMNS`] columns and [`MAX_ROWS`] rows.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Grid {
     pub(crate) columns: usize,
     pub(crate) rows: usize,
     pub(crate) visible_cards: usize,
+    /// The width every card in this grid takes (see `card_width_for`).
+    pub(crate) card_w: f64,
 }
 
 impl Grid {
     pub(crate) fn panel_size(self) -> (f64, f64) {
         let w = PANEL_PAD * 2.0
-            + self.columns as f64 * CARD_W
+            + self.columns as f64 * self.card_w
             + (self.columns.saturating_sub(1)) as f64 * CARD_GAP;
         let h = PANEL_PAD * 2.0
             + self.rows as f64 * CARD_H
@@ -113,9 +131,9 @@ impl Grid {
 
 /// The grid for `count` cards inside an available area. A narrow screen falls back to fewer
 /// columns; the caller can therefore trust the returned panel size to fit the area it was given.
-pub(crate) fn grid_for(count: usize, available_w: f64, available_h: f64) -> Grid {
-    let usable_w = (available_w - PANEL_PAD * 2.0).max(CARD_W);
-    let by_width = ((usable_w + CARD_GAP) / (CARD_W + CARD_GAP))
+pub(crate) fn grid_for(count: usize, available_w: f64, available_h: f64, card_w: f64) -> Grid {
+    let usable_w = (available_w - PANEL_PAD * 2.0).max(card_w);
+    let by_width = ((usable_w + CARD_GAP) / (card_w + CARD_GAP))
         .floor()
         .max(1.0) as usize;
     // Fewer cards than columns do not stretch the panel: one window is one column, three are
@@ -135,6 +153,7 @@ pub(crate) fn grid_for(count: usize, available_w: f64, available_h: f64) -> Grid
         columns,
         rows,
         visible_cards,
+        card_w,
     }
 }
 
@@ -145,9 +164,9 @@ pub(crate) fn card_rects(grid: Grid) -> Vec<Rect> {
         let column = index % grid.columns;
         let row = index / grid.columns;
         rects.push(Rect::new(
-            PANEL_PAD + column as f64 * (CARD_W + CARD_GAP),
+            PANEL_PAD + column as f64 * (grid.card_w + CARD_GAP),
             PANEL_PAD + row as f64 * (CARD_H + CARD_GAP),
-            CARD_W,
+            grid.card_w,
             CARD_H,
         ));
     }
@@ -196,7 +215,7 @@ pub(crate) fn thumb_rect(card: Rect) -> Rect {
     Rect::new(
         card.x + CARD_PAD,
         card.y + CARD_PAD + HEADER_H,
-        THUMB_W,
+        (card.w - CARD_PAD * 2.0).max(1.0),
         THUMB_H,
     )
 }
@@ -446,7 +465,7 @@ mod tests {
 
     #[test]
     fn one_card_panel_fits_the_card_and_its_padding() {
-        let grid = grid_for(1, 1000.0, 800.0);
+        let grid = grid_for(1, 1000.0, 800.0, CARD_W);
         assert_eq!(grid.columns, 1);
         assert_eq!(grid.rows, 1);
         assert_eq!(grid.visible_cards, 1);
@@ -458,7 +477,7 @@ mod tests {
 
     #[test]
     fn cards_sit_edge_to_edge_with_no_gutter() {
-        let grid = grid_for(2, 1000.0, 800.0);
+        let grid = grid_for(2, 1000.0, 800.0, CARD_W);
         let rects = card_rects(grid);
         assert_eq!(rects.len(), 2);
         assert!(
@@ -474,8 +493,30 @@ mod tests {
     }
 
     #[test]
+    fn a_single_card_takes_its_thumbnail_width_so_there_is_no_letterbox() {
+        // A 3:2 window: the thumbnail is 112 high, so it should be 168 wide and the panel should be
+        // exactly card + panel padding -- the defect was a fixed 216pt card leaving blank space at
+        // the right of a narrower preview.
+        let aspect = 1.5;
+        let card_w = card_width_for(1, Some(aspect));
+        let panel_w = grid_for(1, 2000.0, 800.0, card_w).panel_size().0;
+        let thumb_w = card_w - CARD_PAD * 2.0;
+        assert!(
+            (thumb_w / THUMB_H - aspect).abs() < 0.01,
+            "thumbnail {thumb_w}x{THUMB_H} must keep the window's aspect"
+        );
+        assert_eq!(panel_w, card_w + PANEL_PAD * 2.0);
+        let rects = card_rects(grid_for(1, 2000.0, 800.0, card_w));
+        assert_eq!(rects[0].w, card_w);
+        // Multi-window panels keep the design width regardless of one window's aspect.
+        assert_eq!(card_width_for(2, Some(aspect)), CARD_W);
+        // A missing aspect falls back to the design width.
+        assert_eq!(card_width_for(1, None), CARD_W);
+    }
+
+    #[test]
     fn cards_wrap_at_four_columns_and_the_panel_grows_down() {
-        let grid = grid_for(7, 1300.0, 900.0);
+        let grid = grid_for(7, 1300.0, 900.0, CARD_W);
         assert_eq!(grid.columns, 4);
         assert_eq!(grid.rows, 2);
         let (w, h) = grid.panel_size();
@@ -490,7 +531,7 @@ mod tests {
 
     #[test]
     fn a_narrow_screen_degrades_to_fewer_columns() {
-        let grid = grid_for(6, 260.0, 900.0);
+        let grid = grid_for(6, 260.0, 900.0, CARD_W);
         assert_eq!(grid.columns, 1);
         assert_eq!(grid.visible_cards, 4, "four rows at most");
         let (w, _) = grid.panel_size();
@@ -499,7 +540,7 @@ mod tests {
 
     #[test]
     fn more_windows_than_the_panel_can_show_are_counted_not_dropped_silently() {
-        let grid = grid_for(20, 1300.0, 900.0);
+        let grid = grid_for(20, 1300.0, 900.0, CARD_W);
         assert_eq!(grid.visible_cards, MAX_CARDS);
         assert!(grid.visible_cards < 20);
         assert_eq!(card_rects(grid).len(), MAX_CARDS);
@@ -507,7 +548,7 @@ mod tests {
 
     #[test]
     fn card_children_sit_inside_the_card_without_overlap() {
-        let card = card_rects(grid_for(2, 1000.0, 800.0))[0];
+        let card = card_rects(grid_for(2, 1000.0, 800.0, CARD_W))[0];
         let icon = icon_rect(card);
         let title = title_rect(card);
         let close = close_rect(card);
