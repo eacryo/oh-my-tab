@@ -36,7 +36,7 @@
 //! as 0, which fabricates a fake "slowest" state -- see `restore`).
 
 use crate::config::{CONFIG, MOUSE_ACCELERATION_MAX, MOUSE_ACCELERATION_MIN};
-use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease};
+use crate::ffi::{make_nsstring, nsstring_to_rust, CFRelease, CFRetain};
 use crate::mouse::ffi::*;
 use crate::mouse::resolve;
 use crate::{log_debug, log_info};
@@ -82,16 +82,36 @@ struct SavedProp {
     /// live macOS system value (see `restore`), same as LinearMouse -- a snapshot dies with the
     /// process, the system value is always readable.
     existed_before: bool,
+    /// The device this property belongs to: restore gives back values per device, so a device
+    /// a later enumeration cannot see is not restored with nothing written back. The registry
+    /// id distinguishes identical-model devices that share a VID/PID.
+    registry_id: Option<u64>,
+    /// The record holds a +1 on `service` itself: a re-pointed (adopted) record then stays
+    /// valid inside whatever batch lists it, instead of silently dying when the array that
+    /// owned its old handle is released. Records in tests keep this false so fake pointers
+    /// never reach CFRetain/CFRelease.
+    service_owned: bool,
 }
 
-/// Applied pointer state: holds the event system client + services array (keeping service
-/// clients alive), plus the saved-properties list.
+/// One enumeration generation's unrestored records plus the services array their service
+/// objects live in (kept alive by the retained array). A batch dies when its last record is
+/// restored, so a pass that wrote everything releases its array instead of accumulating it.
+struct SavedBatch {
+    /// CFArrayRef of IOHIDServiceClient (+1)
+    services: *mut c_void,
+    props: Vec<SavedProp>,
+}
+
+/// Applied pointer state: holds the services array the saved properties were written against
+/// (keeping the service clients alive), plus earlier generations' unrestored batches.
 struct PointerState {
-    /// IOHIDEventSystemClientRef (+1)
-    client: *mut c_void,
     /// CFArrayRef of IOHIDServiceClient (+1)
     services: *mut c_void,
     saved: Vec<SavedProp>,
+    /// Earlier generations whose records this pass could not restore: a device enumeration
+    /// could not see keeps its applied values and its restore record, carried forward until a
+    /// later pass (or `restore`) can write the system values back.
+    prior: Vec<SavedBatch>,
 }
 
 // Raw pointers' Send/Sync (same pattern as SettingsUi/ObjPtr: Mutex guards all access).
@@ -247,24 +267,55 @@ fn desired_pointer_values(
     }
 }
 
-/// Write one property and record it (for restore). Returns whether the write succeeded.
-unsafe fn write_and_record(
+/// One write candidate's identity, bundled so `write_and_record` stays under the arity lint.
+struct WriteTarget<'a> {
     service: *mut c_void,
+    name: &'a str,
+}
+
+/// Write one property and record it (for restore). `saved` is `None` when the pass may not
+/// take on more restore debt (an unidentifiable device while the prior-batch cap is full):
+/// a write with no record behind it could never be undone, so the device is left alone.
+/// `existed_before` is the caller's merged knowledge (rescued survivors first, then a fresh
+/// `prop_exists`), not a bare read: the property existing because WE put it there must not be
+/// recorded as "existed before". Returns whether the write succeeded.
+unsafe fn write_and_record(
+    target: &WriteTarget,
     key: &str,
     value: i64,
     label: &str,
-    device: &str,
-    saved: &mut Vec<SavedProp>,
+    existed_before: bool,
+    saved: Option<&mut Vec<SavedProp>>,
 ) -> bool {
-    let existed_before = prop_exists(service, key);
-    let ok = set_prop_int(service, key, value);
-    log_debug!("[pointer] {}: {} via {} (ok={})", device, label, key, ok);
+    let Some(saved) = saved else {
+        return false;
+    };
+    let ok = set_prop_int(target.service, key, value);
+    log_debug!(
+        "[pointer] {}: {} via {} (ok={})",
+        target.name,
+        label,
+        key,
+        ok
+    );
+    // Record only a write that took: a failed write left the device untouched, so nothing
+    // needs restoring -- and a recorded failure would later claim `existed_before` knowledge
+    // it never applied against.
+    if !ok {
+        return false;
+    }
+    // The record retains its own handle (+1): a record's service stays valid no matter which
+    // array/batch lists it -- adoption can re-point in place and the record never outlives the
+    // object it writes to.
+    CFRetain(target.service as *const c_void);
     saved.push(SavedProp {
-        service,
+        service: target.service,
         key: make_nsstring(key),
         existed_before,
+        registry_id: crate::mouse::device::service_registry_id(target.service),
+        service_owned: true,
     });
-    ok
+    true
 }
 
 /// Read the device product name (for logs).
@@ -321,69 +372,220 @@ unsafe fn accel_property_key(service: *mut c_void) -> String {
     )
 }
 
-/// Disable pointer acceleration: enumerate mouse/trackpad devices, save originals, set the
-/// linear-scaling switch.
-unsafe fn disable() {
+/// Whether a saved record verifiably names THIS service's device: the same service object is
+/// the same device (a reused client returns the same objects), and registry ids decide when
+/// both exist. VID/PID alone never qualifies: two same-model units are indistinguishable on
+/// it, and restoring one unit's records because the OTHER enumerated would strip a device
+/// this pass is not rewriting. Only a verified device is "identified": a speculative match
+/// cannot prove the enumeration covers its device, so its fresh records stay capacity-gated
+/// like an unknown one's.
+fn record_verified(sp: &SavedProp, rid: Option<u64>, service: *mut c_void) -> bool {
+    sp.service == service || (sp.registry_id.is_some() && sp.registry_id == rid)
+}
+
+/// Drop a rescued record for a (service, key) pair this pass just recorded freshly: the
+/// fresh record's `existed_before` already merged the survivor's claim (see the `existed_of`
+/// lookup in `disable`), and its pointer is owned by the confirmed array, so folding it
+/// forward is safe and keeps the debt from duplicating.
+unsafe fn consume_superseded(rescued: &mut Vec<SavedProp>, service: *mut c_void, key: &str) {
+    for sp in take_props_for(rescued, |sp| {
+        sp.service == service && nsstring_to_rust(sp.key) == key
+    }) {
+        release_record(sp);
+    }
+}
+
+/// How many unrestored generations a state may carry before the oldest batch is let go.
+/// Object-identity matching means a batch normally only survives until its device is next
+/// enumerated; growth past the cap needs a permanently ambiguous device set, and the cap
+/// bounds that retention at the documented cost of dropping the oldest restore records.
+const PRIOR_BATCH_CAP: usize = 16;
+
+/// Release a record's owned objects: its +1 key, and the service handle it retains when
+/// `service_owned` (records created by `write_and_record` always do).
+unsafe fn release_record(sp: SavedProp) {
+    CFRelease(sp.key as *const c_void);
+    if sp.service_owned {
+        CFRelease(sp.service as *const c_void);
+    }
+}
+
+/// Release a batch's owned objects: each record's +1 key (and self-owned service handle),
+/// then the services array its service pointers live in.
+unsafe fn release_batch(batch: SavedBatch) {
+    for sp in batch.props {
+        release_record(sp);
+    }
+    if !batch.services.is_null() {
+        CFRelease(batch.services as *const c_void);
+    }
+}
+
+/// Take the records matching `pred` out of `props`; returns them and leaves the rest.
+fn take_props_for(props: &mut Vec<SavedProp>, pred: impl Fn(&SavedProp) -> bool) -> Vec<SavedProp> {
+    let (for_this, rest): (Vec<SavedProp>, Vec<SavedProp>) =
+        std::mem::take(props).into_iter().partition(|sp| pred(sp));
+    *props = rest;
+    for_this
+}
+
+/// Re-point a record at `live`: the record's own +1 transfers across (retain the new handle,
+/// release the stale one), so the record stays valid in whatever batch lists it -- no move
+/// into another array's batch, no batch split. Unowned records (tests) skip the CF dance and
+/// just take the new pointer.
+unsafe fn retarget(sp: &mut SavedProp, live: *mut c_void) {
+    if sp.service == live {
+        return;
+    }
+    if sp.service_owned {
+        CFRetain(live as *const c_void);
+        CFRelease(sp.service as *const c_void);
+    }
+    sp.service = live;
+}
+
+/// Take every record verified to belong to one of the `(registry id, live handle)` targets
+/// out of `props`, re-pointing each at its verified handle (see `retarget`). The record's own
+/// +1 keeps it valid wherever it lands, so the caller may drop it into any generation.
+unsafe fn adopt_records(
+    props: &mut Vec<SavedProp>,
+    verified: &[(Option<u64>, *mut c_void)],
+) -> Vec<SavedProp> {
+    let mut adopted = Vec::new();
+    for mut sp in take_props_for(props, |sp| {
+        verified.iter().any(|&(r, t)| record_verified(sp, r, t))
+    }) {
+        let (_, live) = verified
+            .iter()
+            .find(|&&(r, t)| record_verified(&sp, r, t))
+            .copied()
+            .expect("predicate above already verified a target");
+        retarget(&mut sp, live);
+        adopted.push(sp);
+    }
+    adopted
+}
+
+/// Whether this pass must commit a fresh state at all: any record bound to the new backing
+/// array -- written or rescued -- requires the commit so the record stays owned by the array
+/// that keeps its handle alive. Only an entirely untouched pass may hand the old state back.
+fn pass_commits(saved: &[SavedProp], rescued: &[SavedProp]) -> bool {
+    !saved.is_empty() || !rescued.is_empty()
+}
+
+/// How many carried-batch slots remain AFTER this pass's merges: a batch survives only while
+/// it still holds a record no target can claim, since verified records all merge into this
+/// generation (restored, folded, or rescued). Computed once for the pass so a device's
+/// admission cannot depend on the order its siblings happen to be visited.
+fn projected_batch_slots(old: &PointerState, verified: &[(Option<u64>, *mut c_void)]) -> usize {
+    let claimable = |sp: &SavedProp| verified.iter().any(|&(r, s)| record_verified(sp, r, s));
+    let occupied = [&old.saved]
+        .into_iter()
+        .chain(old.prior.iter().map(|batch| &batch.props))
+        .filter(|props| props.iter().any(|sp| !claimable(sp)))
+        .count();
+    PRIOR_BATCH_CAP.saturating_sub(occupied)
+}
+
+/// Apply the configured pointer properties to the device lane's CONFIRMED device set:
+/// `targets` is the published device list's service clients (already usage- and
+/// Bluetooth-keyboard-filtered -- a keyboard faking a Mouse usage never reaches a write),
+/// and `backing` is the services array owning those objects (+1, ownership transferred).
+/// Reusing the lane's enumeration rather than a second client of our own is what keeps the
+/// write set identical to the device set the lane just published -- a fresh client's
+/// unmatched window is exactly where a just-reconnected device used to be missed. A null
+/// backing means the lane has no confirmed set yet: nothing is written and the applied
+/// state is kept for a later pass.
+unsafe fn disable(targets: &[*mut c_void], backing: *mut c_void) {
     let mut guard = POINTER_STATE.lock().unwrap();
-    if guard.is_some() {
-        return; // already applied
-    }
-
-    // Create the event system client, matching the Generic Desktop page (mice/keyboards/trackpads;
-    // filtered by usage below).
-    let client = IOHIDEventSystemClientCreate(std::ptr::null());
-    if client.is_null() {
-        log_info!("[pointer] failed to create IOHIDEventSystemClient");
-        return;
-    }
-    let page_key = make_nsstring(KEY_PRIMARY_USAGE_PAGE);
-    let page_val: *mut AnyObject =
-        msg_send![class!(NSNumber), numberWithInt: USAGE_PAGE_GENERIC_DESKTOP as i32];
-    // dictionaryWithObject:/arrayWithObject: return autoreleased (+0); must not be released
-    // manually - the autorelease pool handles them.
-    let dict: *mut AnyObject =
-        msg_send![class!(NSDictionary), dictionaryWithObject: page_val, forKey: page_key];
-    let arr: *mut AnyObject = msg_send![class!(NSArray), arrayWithObject: dict];
-    IOHIDEventSystemClientSetMatchingMultiple(client, arr as *const c_void);
-    CFRelease(page_key as *const c_void);
-    // Same race as device.rs: CopyServices right after creating the client can return an
-    // empty list (the log shows "no devices found" while the device was present). Wait
-    // ~30ms for the asynchronous matching to settle.
-    std::thread::sleep(std::time::Duration::from_millis(30));
-
-    let services = IOHIDEventSystemClientCopyServices(client);
-    if services.is_null() {
-        log_debug!("[pointer] no services returned by IOHIDEventSystemClient");
-        CFRelease(client as *const c_void);
+    if backing.is_null() {
+        log_debug!("[pointer] no confirmed services to apply to; state kept");
         return;
     }
 
-    // Iterate services (CFArrayRef) with C functions, not msg_send!(objectAtIndex:),
-    // to avoid objc2's type-encoding panic (method returns '@', Rust declares '^v').
-    let count = CFArrayGetCount(services);
+    // The applied state is taken now but given back per device, just before that device's
+    // first write: a service this enumeration cannot see keeps its applied values instead of
+    // being restored with nothing written back, and an enumeration yielding nothing writable
+    // restores nothing at all.
+    let mut old_state = guard.take();
+
     let mut saved: Vec<SavedProp> = Vec::new();
+    // Debt this pass re-homed onto `backing`: adopted cross-object records plus same-object
+    // restore survivors. Every entry's service is one of `targets`, so the +1 on `backing`
+    // keeps them valid even when their original batch's array is released.
+    let mut rescued: Vec<SavedProp> = Vec::new();
     // Pointer devices enumerated: distinguishes "no device found at all" from "devices present
     // but none needs changing".
-    let mut pointer_devices = 0usize;
+    let pointer_devices = targets.len();
 
-    for i in 0..count {
-        let service = CFArrayGetValueAtIndex(services, i) as *mut c_void;
-        // Same pointer-mouse-trackpad test as device.rs enumeration: use ConformsTo, not the
-        // PrimaryUsage scalar -- some real mice (e.g. ATK A9 SE Nearlink) report PrimaryUsage =
-        // Keyboard, which a {1,2,5} whitelist would drop; ConformsTo inspects DeviceUsagePairs.
-        let is_pointer = IOHIDServiceClientConformsTo(service, 1, USAGE_GD_POINTER as u32) != 0
-            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_MOUSE as u32) != 0
-            || IOHIDServiceClientConformsTo(service, 1, USAGE_GD_TRACKPAD as u32) != 0;
-        if !is_pointer {
-            continue;
-        }
-        pointer_devices += 1;
+    // The confirmed devices' registry ids, read once for adoption and the capacity verdict.
+    let verified: Vec<(Option<u64>, *mut c_void)> = if old_state.is_some() {
+        targets
+            .iter()
+            .map(|&s| (crate::mouse::device::service_registry_id(s), s))
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // The capacity verdict is computed ONCE for the whole pass, so admission cannot depend
+    // on the order devices happen to be visited: a carried batch survives only while it
+    // still holds a record no confirmed device can claim -- verified records all merge into
+    // this generation (restored, folded, or rescued onto `backing`), emptying their batch.
+    let batch_slots_left = old_state
+        .as_ref()
+        .map(|old| projected_batch_slots(old, &verified))
+        .unwrap_or(PRIOR_BATCH_CAP);
+
+    for (i, &service) in targets.iter().enumerate() {
         let name = device_name(service);
 
         // Read VID/PID and resolve whether this device needs any pointer property changed
         // (per-device config).
         let vid = prop_int(service, KEY_VENDOR_ID) as u32;
         let pid = prop_int(service, KEY_PRODUCT_ID) as u32;
+        let rid = verified.get(i).and_then(|&(r, _)| r);
+
+        // Give back THIS device's saved system values, and only this device's: a device the
+        // enumeration did not return keeps its applied state untouched. Only verified
+        // identity may claim records (see `record_verified`); records verified on a
+        // different service object are adopted by re-pointing them at the live handle --
+        // the matching registry id proved the handles name the same HID service, so the
+        // debt merges into this generation instead of staying unmergeable in its old batch
+        // or being restored through a stale handle.
+        let mut for_this: Vec<SavedProp> = Vec::new();
+        if let Some(old) = old_state.as_mut() {
+            let claim = [(rid, service)];
+            for_this.extend(adopt_records(&mut old.saved, &claim));
+            for batch in &mut old.prior {
+                for_this.extend(adopt_records(&mut batch.props, &claim));
+            }
+        }
+        let identified = !for_this.is_empty();
+        // Restores run for every claimed record: `identified` always qualifies below, so the
+        // device is always rewritten afterwards. Survivors go to `rescued` -- their service
+        // pointer is the live handle now, so `backing` keeps them valid and they merge into
+        // this generation instead of pinning their old batch.
+        rescued.extend(restore_entries(for_this));
+        // An identified device may always rewrite (its records all sit on the live handle
+        // and fold into this generation); an unknown one takes a slot only if the pass's
+        // post-merge projection still has one -- skipping it keeps its configuration.
+        let record_ok = identified || batch_slots_left > 0;
+        // Merged "did the property exist before us" knowledge: a surviving record that says we
+        // created the key beats a fresh `prop_exists`, which can only see that the key is
+        // there -- possibly because our own earlier write put it there.
+        let existed_of = |rescued: &[SavedProp], key: &str| {
+            rescued
+                .iter()
+                .find(|sp| sp.service == service && nsstring_to_rust(sp.key) == key)
+                .map(|sp| sp.existed_before)
+                .unwrap_or_else(|| prop_exists(service, key))
+        };
+        let target = WriteTarget {
+            service,
+            name: &name,
+        };
+        let sink_allowed = record_ok;
         let resolved = resolve::resolve(Some((vid, pid)));
         let accel_key = accel_property_key(service);
         let desired = desired_pointer_values(
@@ -408,14 +610,16 @@ unsafe fn disable() {
             // Linear switch: 1 when disabling is requested, otherwise the system value (usually 0),
             // which clears a 1 left behind by a previous run/version (same as LinearMouse's
             // disablePointerAcceleration = false).
-            write_and_record(
-                service,
+            if write_and_record(
+                &target,
                 KEY_LINEAR_SCALING,
                 desired.linear,
                 &format!("linear scaling -> {}", desired.linear),
-                &name,
-                &mut saved,
-            );
+                existed_of(&rescued, KEY_LINEAR_SCALING),
+                sink_allowed.then_some(&mut saved),
+            ) {
+                consume_superseded(&mut rescued, service, KEY_LINEAR_SCALING);
+            }
             // Acceleration / tracking speed: in linear mode the configured value (unconfigured ->
             // the system value); with linear mode off, the system value.
             if resolved.disable_acceleration && resolved.acceleration == Some(0.0) {
@@ -433,14 +637,16 @@ unsafe fn disable() {
                 (true, Some(v)) => format!("tracking speed {v}"),
                 _ => "acceleration -> system value".to_string(),
             };
-            write_and_record(
-                service,
+            if write_and_record(
+                &target,
                 &accel_key,
                 desired.accel,
                 &format!("{accel_desc} (raw {})", desired.accel),
-                &name,
-                &mut saved,
-            );
+                existed_of(&rescued, &accel_key),
+                sink_allowed.then_some(&mut saved),
+            ) {
+                consume_superseded(&mut rescued, service, &accel_key);
+            }
         } else {
             // Legacy fallback: -1 (IOFixed: value × 65536) when disabling is requested; otherwise
             // the system value. The key comes from the device's declaration (see
@@ -458,7 +664,16 @@ unsafe fn disable() {
             } else {
                 format!("acceleration -> system value (raw {value}, legacy)")
             };
-            write_and_record(service, &accel_key, value, &label, &name, &mut saved);
+            if write_and_record(
+                &target,
+                &accel_key,
+                value,
+                &label,
+                existed_of(&rescued, &accel_key),
+                sink_allowed.then_some(&mut saved),
+            ) {
+                consume_superseded(&mut rescued, service, &accel_key);
+            }
             if disabling && resolved.acceleration.is_some() {
                 log_debug!(
                     "[pointer] {}: tracking speed ignored (no linear-scaling property on this system)",
@@ -468,7 +683,7 @@ unsafe fn disable() {
         }
     }
 
-    if saved.is_empty() {
+    if !pass_commits(&saved, &rescued) {
         // Keep the two cases apart: nothing enumerated (common while the mouse sleeps or right
         // after launch) versus devices present but nothing configured.
         if pointer_devices == 0 {
@@ -479,8 +694,11 @@ unsafe fn disable() {
                 pointer_devices
             );
         }
-        CFRelease(services as *const c_void);
-        CFRelease(client as *const c_void);
+        CFRelease(backing as *const c_void);
+        // Nothing was written and no debt moved onto this array, so nothing about the applied
+        // state changed: every saved entry (and its restore path on disable/quit) is put
+        // back as it was.
+        *guard = old_state;
         return;
     }
 
@@ -488,10 +706,43 @@ unsafe fn disable() {
         "[pointer] applied pointer settings to {} device(s).",
         saved.len()
     );
+    // Rescued debt (adopted records and restore survivors) belongs to this generation too:
+    // its service pointers are the confirmed devices' own handles, which `backing` owns.
+    saved.extend(rescued);
+    // Records this pass could not restore stay recorded -- their applied values remain on the
+    // device -- carried forward grouped with the services array that owns their service
+    // objects. A batch whose last record just got restored releases its array here, so a
+    // fully-written pass never retains anything.
+    let mut prior: Vec<SavedBatch> = Vec::new();
+    if let Some(old) = old_state {
+        for batch in old.prior {
+            if batch.props.is_empty() {
+                unsafe { release_batch(batch) };
+            } else {
+                prior.push(batch);
+            }
+        }
+        if old.saved.is_empty() {
+            if !old.services.is_null() {
+                unsafe { CFRelease(old.services as *const c_void) };
+            }
+        } else {
+            prior.push(SavedBatch {
+                services: old.services,
+                props: old.saved,
+            });
+        }
+    }
+    // Ambiguous records (a same-model pair no enumeration can tell apart) could otherwise
+    // keep one batch alive per apply; the cap bounds retention at the documented cost of
+    // dropping the oldest unrestored records.
+    while prior.len() > PRIOR_BATCH_CAP {
+        unsafe { release_batch(prior.remove(0)) };
+    }
     *guard = Some(PointerState {
-        client,
-        services,
+        services: backing,
         saved,
+        prior,
     });
 }
 
@@ -500,56 +751,154 @@ unsafe fn disable() {
 /// `restorePointerAcceleration()`: the system value is always readable while a snapshot dies with
 /// the process (crashes included), and writing it back also clears stale values on the device.
 /// Keys we created are removed (back to "never existed").
-pub(crate) fn restore() {
-    let mut guard = POINTER_STATE.lock().unwrap();
+/// Write the live system values back for a set of saved properties (see `restore`): for keys
+/// the device already had, the live system value; for keys we created, removal.
+/// Returns the records whose write did not take: the device still carries our applied value,
+/// so the record keeps both the +1 key and the `existed_before` knowledge for the next pass
+/// (or for `restore`).
+unsafe fn restore_entries(saved: Vec<SavedProp>) -> Vec<SavedProp> {
+    let mut unwritten = Vec::new();
+    for sp in saved {
+        let key_cf = sp.key as *const c_void;
+        let key = nsstring_to_rust(sp.key);
+        let ok = if sp.existed_before {
+            let value = if key == KEY_LINEAR_SCALING {
+                system_linear_flag()
+            } else {
+                system_acceleration_raw(&key)
+            };
+            let n = nsnumber(value);
+            let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, n as *mut c_void);
+            log_debug!(
+                "[pointer] restored system value for {} (value={}, ok={})",
+                key,
+                value,
+                ok
+            );
+            ok
+        } else {
+            // We created this key -> remove the property instead of writing 0. Writing 0
+            // fabricates a "slowest/no-acceleration" state out of nothing: the old version did
+            // exactly that for HIDPointerAcceleration, leaving a never-effective 0 on the
+            // device that the settings page then read back as the "live" device value (0.00).
+            let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, std::ptr::null_mut());
+            log_debug!("[pointer] removed property we created: {} (ok={})", key, ok);
+            ok
+        };
+        if ok {
+            release_record(sp);
+        } else {
+            unwritten.push(sp);
+        }
+    }
+    unwritten
+}
+
+fn restore_locked(guard: &mut Option<PointerState>) {
     let Some(state) = guard.take() else {
         return;
     };
     unsafe {
-        for sp in state.saved {
-            let key_cf = sp.key as *const c_void;
-            let key = nsstring_to_rust(sp.key);
-            if sp.existed_before {
-                let value = if key == KEY_LINEAR_SCALING {
-                    system_linear_flag()
-                } else {
-                    system_acceleration_raw(&key)
-                };
-                let n = nsnumber(value);
-                let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, n as *mut c_void);
-                log_debug!(
-                    "[pointer] restored system value for {} (value={}, ok={})",
-                    key,
-                    value,
-                    ok
-                );
+        // A restore that fails keeps its record (and the array owning its service objects) so
+        // a later pass can retry -- a runtime disable that dropped them would leave the device
+        // at our applied values with nothing left to prove what it owed the restore.
+        let unwritten = restore_entries(state.saved);
+        let mut prior = Vec::new();
+        for batch in state.prior {
+            let left = restore_entries(batch.props);
+            if left.is_empty() {
+                CFRelease(batch.services as *const c_void);
             } else {
-                // We created this key -> remove the property instead of writing 0. Writing 0
-                // fabricates a "slowest/no-acceleration" state out of nothing: the old version did
-                // exactly that for HIDPointerAcceleration, leaving a never-effective 0 on the
-                // device that the settings page then read back as the "live" device value (0.00).
-                let ok = IOHIDServiceClientSetProperty(sp.service, key_cf, std::ptr::null_mut());
-                log_debug!("[pointer] removed property we created: {} (ok={})", key, ok);
+                prior.push(SavedBatch {
+                    services: batch.services,
+                    props: left,
+                });
             }
-            CFRelease(key_cf);
         }
-        CFRelease(state.services as *const c_void);
-        CFRelease(state.client as *const c_void);
+        if unwritten.is_empty() && prior.is_empty() {
+            if !state.services.is_null() {
+                CFRelease(state.services as *const c_void);
+            }
+        } else {
+            let owed = unwritten.len() + prior.iter().map(|batch| batch.props.len()).sum::<usize>();
+            log_info!(
+                "[pointer] {} restore write(s) did not take; record(s) kept for retry",
+                owed
+            );
+            // `saved`'s records point into this generation's array; `prior` carries the
+            // survivors' own arrays, so a `services` kept only for an empty `saved` is
+            // released rather than pinned. The array can be null already (a kept state whose
+            // records all lived in `prior`), and CFRelease requires a non-null object.
+            if unwritten.is_empty() && !state.services.is_null() {
+                CFRelease(state.services as *const c_void);
+            }
+            *guard = Some(PointerState {
+                services: if unwritten.is_empty() {
+                    std::ptr::null_mut()
+                } else {
+                    state.services
+                },
+                saved: unwritten,
+                prior,
+            });
+        }
     }
     log_debug!("[pointer] restored system acceleration settings.");
 }
 
-/// Apply or restore pointer settings based on the current config. When enabled, disable()
-/// resolves per-device whether to disable acceleration; if no connected device asks for it,
-/// this is equivalent to restore (no device is touched).
-pub(crate) fn apply() {
+/// Re-point every record verified to belong to one of `targets` at that live handle, in
+/// place: the recorded object may already be dead (the lane replaced its enumeration), but
+/// the registry id still proves which live handle is the same HID service -- restoring
+/// through the stale object would leave the real device at its applied values. The record
+/// stays in its batch: `retarget` moves the record's own +1 onto the live handle, so adoption
+/// never splits a batch under repeated disable/enable cycles.
+unsafe fn adopt_onto(state: &mut PointerState, verified: &[(Option<u64>, *mut c_void)]) {
+    for props in std::iter::once(&mut state.saved)
+        .chain(state.prior.iter_mut().map(|batch| &mut batch.props))
+    {
+        for sp in props.iter_mut() {
+            if let Some(&(_, live)) = verified.iter().find(|&&(r, t)| record_verified(sp, r, t)) {
+                retarget(sp, live);
+            }
+        }
+    }
+}
+
+/// Restore with the lane's confirmed set as rebind targets: rebind verified records onto the
+/// live handles first so the restore writes reach objects that still exist, then restore.
+/// `backing` is the services array owning `targets` (+1 released here once adoption no longer
+/// needs the objects; re-pointed records retain their own handles). Null is fine -- records
+/// then keep their recorded handles.
+pub(crate) unsafe fn restore_adopted(targets: &[*mut c_void], backing: *mut c_void) {
+    {
+        let mut guard = POINTER_STATE.lock().unwrap();
+        if !backing.is_null() {
+            if let Some(state) = guard.as_mut() {
+                let verified: Vec<(Option<u64>, *mut c_void)> = targets
+                    .iter()
+                    .map(|&s| (crate::mouse::device::service_registry_id(s), s))
+                    .collect();
+                adopt_onto(state, &verified);
+            }
+            CFRelease(backing as *const c_void);
+        }
+        restore_locked(&mut guard);
+    }
+}
+
+/// Apply or restore pointer settings based on the current config. `targets` is the device
+/// lane's confirmed device set (the published list's service clients) and `backing` the
+/// services array owning them (+1, ownership transferred; null when the lane has no
+/// confirmed set). When enabled, `disable` writes to exactly that set -- the same devices
+/// the lane just published, not a second enumeration that could see a different one. When
+/// disabled the confirmed set is used to rebind stale records to live handles, then
+/// `restore` gives the applied state back.
+pub(crate) unsafe fn apply(targets: &[*mut c_void], backing: *mut c_void) {
     let enabled = CONFIG.read().map(|c| c.mouse.enabled).unwrap_or(false);
     if enabled {
-        // Restore saved originals first, then disable (so per-device decisions start clean).
-        restore();
-        unsafe { disable() }
+        disable(targets, backing)
     } else {
-        restore();
+        restore_adopted(targets, backing);
     }
 }
 
@@ -585,6 +934,167 @@ pub(crate) fn read_acceleration_from(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn record(rid: Option<u64>, service: *mut c_void) -> SavedProp {
+        SavedProp {
+            service,
+            key: std::ptr::null_mut(),
+            existed_before: true,
+            registry_id: rid,
+            // Fake pointers must never reach CFRetain/CFRelease.
+            service_owned: false,
+        }
+    }
+
+    /// Two same-model mice must never trade restore records: object identity and matching
+    /// registry ids are the only cross-enumeration proofs, a one-sided id is not an identity
+    /// match at all, and VID/PID alone (the test records all share one) never qualifies.
+    #[test]
+    fn record_verified_requires_verifiable_identity() {
+        let service_a = 0x1000usize as *mut c_void;
+        let service_b = 0x2000usize as *mut c_void;
+        // The same service object is the same device, whatever the ids say.
+        assert!(record_verified(&record(None, service_a), None, service_a));
+        assert!(record_verified(
+            &record(Some(7), service_a),
+            Some(8),
+            service_a
+        ));
+        // Registry ids match when both sides have one -- and only then.
+        assert!(record_verified(
+            &record(Some(7), service_a),
+            Some(7),
+            service_b
+        ));
+        assert!(!record_verified(
+            &record(Some(7), service_a),
+            Some(8),
+            service_b
+        ));
+        // An id on one side only is not proof: the known id may belong to the other unit.
+        for (saved_rid, new_rid) in [(Some(7), None), (None, Some(7))] {
+            assert!(!record_verified(
+                &record(saved_rid, service_a),
+                new_rid,
+                service_b
+            ));
+        }
+        // Both ids unknown on different objects: same VID/PID (the helper sets it) is NOT
+        // enough -- a same-model unit could claim the other unit's records, so the record
+        // stays recorded instead of being restored and consumed.
+        assert!(!record_verified(&record(None, service_a), None, service_b));
+    }
+
+    /// The commit decision must cover rescued debt, not just fresh writes: a pass whose only
+    /// work was adopting records (all restores and config writes failed) still commits the new
+    /// backing array so the adopted records never lose their owner.
+    #[test]
+    fn pass_commits_when_only_debt_was_rescued() {
+        let dead = 0x1000usize as *mut c_void;
+        let live = 0x2000usize as *mut c_void;
+        // No writes, no rescued records: the pass keeps the old state as-is.
+        assert!(!pass_commits(&[], &[]));
+        // A rescued record alone (restore failed after adoption) forces the commit: restoring
+        // the old state and releasing the new array would orphan the re-pointed handle.
+        assert!(pass_commits(&[], &[record(Some(7), live)]));
+        assert!(pass_commits(
+            &[record(Some(7), live)],
+            &[record(Some(8), live)]
+        ));
+        let _ = dead;
+    }
+
+    /// Ownership accounting needs REAL CF objects: `retarget` must move the record's own +1
+    /// (retain the live handle, release the stale one) and `release_record` must drop it --
+    /// exactly once each. Real CFStrings stand in for service clients so the retain/release
+    /// path actually runs.
+    #[test]
+    fn owned_record_moves_its_retain_on_retarget_and_releases_on_drop() {
+        extern "C" {
+            fn CFGetRetainCount(cf: *const c_void) -> isize;
+        }
+        unsafe {
+            let stale = make_nsstring("stale-service") as *mut c_void;
+            let live = make_nsstring("live-service") as *mut c_void;
+            // The +1 the record holds on its handle, as `write_and_record` leaves it.
+            CFRetain(stale as *const c_void);
+            let mut sp = SavedProp {
+                service: stale,
+                key: make_nsstring("key") as *mut _,
+                existed_before: true,
+                registry_id: Some(7),
+                service_owned: true,
+            };
+            retarget(&mut sp, live);
+            assert_eq!(sp.service, live);
+            // The +1 moved: `live` gained it, `stale` lost it.
+            assert_eq!(CFGetRetainCount(live as *const c_void), 2);
+            assert_eq!(CFGetRetainCount(stale as *const c_void), 1);
+            release_record(sp);
+            // Dropping the record drops its service +1 too -- exactly once.
+            assert_eq!(CFGetRetainCount(live as *const c_void), 1);
+            CFRelease(stale as *const c_void);
+            CFRelease(live as *const c_void);
+        }
+    }
+
+    /// Adoption re-points verified records at the live handle that proved them; records with
+    /// no verifiable identity stay where they are.
+    #[test]
+    fn adopt_records_repoints_only_verified_records() {
+        let dead = 0x1000usize as *mut c_void;
+        let live = 0x2000usize as *mut c_void;
+        let mut props = vec![
+            record(Some(7), dead), // verified by registry id -> adopted onto `live`
+            record(Some(8), dead), // a different id: not this device -> stays
+            record(None, dead),    // no id, different object -> stays
+            record(None, live),    // already the live object -> adopted (no-op re-point)
+        ];
+        let adopted = unsafe { adopt_records(&mut props, &[(Some(7), live)]) };
+        assert_eq!(adopted.len(), 2);
+        assert!(adopted.iter().all(|sp| sp.service == live));
+        assert_eq!(props.len(), 2);
+        assert!(props.iter().all(|sp| sp.service == dead));
+    }
+
+    /// The projected slot count is a fixed point over the whole target set: a batch frees its
+    /// slot when every record it holds is claimable, whichever order devices are visited in.
+    #[test]
+    fn projected_slots_are_visit_order_independent() {
+        let stale = 0x1000usize as *mut c_void;
+        let state = PointerState {
+            services: std::ptr::null_mut(),
+            saved: Vec::new(),
+            prior: vec![
+                SavedBatch {
+                    services: std::ptr::null_mut(),
+                    props: vec![record(Some(7), stale)],
+                },
+                SavedBatch {
+                    services: std::ptr::null_mut(),
+                    props: vec![record(Some(8), stale), record(Some(9), stale)],
+                },
+            ],
+        };
+        let a = 0x2000usize as *mut c_void;
+        let b = 0x3000usize as *mut c_void;
+        // Both orders admit the same verdict: batch 1 is fully claimable but batch 2 holds an
+        // unclaimable record, so exactly one slot is still occupied.
+        for verified in [
+            vec![(Some(7), a), (Some(8), b)],
+            vec![(Some(8), b), (Some(7), a)],
+        ] {
+            assert_eq!(
+                projected_batch_slots(&state, &verified),
+                PRIOR_BATCH_CAP - 1
+            );
+        }
+        // Every record claimable -> both batches free -> the whole cap is open.
+        assert_eq!(
+            projected_batch_slots(&state, &[(Some(7), a), (Some(8), b), (Some(9), b)]),
+            PRIOR_BATCH_CAP
+        );
+    }
 
     #[test]
     fn iofixed_roundtrip() {
