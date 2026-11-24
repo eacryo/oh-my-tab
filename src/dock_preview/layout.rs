@@ -80,8 +80,8 @@ pub(crate) const CARD_RADIUS: f64 = 10.0;
 /// than the shared `hover_bg` (0xFFFFFF1A) so it reads as a brighter card against the glass, and
 /// the hairline rim is white rather than `accent` -- the design's "Windows-style" selected state
 /// (a little brighter than the unselected card) instead of a blue selection.
-pub(crate) const HOVER_PLATE_FILL: u32 = 0xFFFFFF4A;
-pub(crate) const HOVER_PLATE_BORDER: u32 = 0xFFFFFF8C;
+pub(crate) const HOVER_PLATE_FILL: u32 = 0xFFFFFF8C;
+pub(crate) const HOVER_PLATE_BORDER: u32 = 0xFFFFFFE6;
 pub(crate) const THUMB_RADIUS: f64 = 6.0;
 pub(crate) const MAX_COLUMNS: usize = 4;
 pub(crate) const MAX_ROWS: usize = 4;
