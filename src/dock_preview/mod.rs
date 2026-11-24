@@ -232,8 +232,12 @@ pub(crate) fn click_card(index: usize) {
     let _ = std::thread::Builder::new()
         .name("com.eacryo.oh-my-tab.dock-preview-activate".to_string())
         .spawn(move || {
-            let ok = windows::process_identity_matches(identity.0, &identity.1, identity.2)
-                && windows::window_presence(pid, wid) == decisions::WindowPresence::Present;
+            let identity_ok = windows::process_identity_matches(identity.0, &identity.1, identity.2);
+            let presence = windows::window_presence(pid, wid);
+            let ok = identity_ok && presence == decisions::WindowPresence::Present;
+            log_debug!(
+                "[dock-preview] activation check pid={pid} wid={wid} identity={identity_ok} presence={presence:?}"
+            );
             ACTIVATE_RESULTS.lock().unwrap().push((
                 request,
                 pid,

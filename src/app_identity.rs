@@ -291,6 +291,72 @@ pub(crate) unsafe fn bundle_id_of(app: *mut AnyObject) -> Option<String> {
 /// filename-safe) > hashed executable path > `pid_{pid}` fallback. Fingerprint is the
 /// executable mtime; an app update gets a new mtime -> forces re-extract. The clipboard
 /// reuses this identity when recording a source (the same key/fallback chain as the switcher).
+/// `proc_bsdinfo` from `sys/proc_info.h`, with the fixed-width fields this crate reads. The
+/// trailing `pbi_start_tvsec`/`pbi_start_tvusec` are the process start time; the full struct is
+/// 136 bytes and `proc_pidinfo` rejects a short buffer.
+#[repr(C)]
+struct ProcBsdInfo {
+    pbi_flags: u32,
+    pbi_status: u32,
+    pbi_xstatus: u32,
+    pbi_pid: u32,
+    pbi_ppid: u32,
+    pbi_uid: u32,
+    pbi_gid: u32,
+    pbi_ruid: u32,
+    pbi_rgid: u32,
+    pbi_svuid: u32,
+    pbi_svgid: u32,
+    rfu_1: u32,
+    pbi_comm: [u8; 16],
+    pbi_name: [u8; 32],
+    pbi_nfiles: u32,
+    pbi_pgid: u32,
+    pbi_pjobc: u32,
+    e_tdev: u32,
+    e_tpgid: u32,
+    pbi_nice: i32,
+    pbi_start_tvsec: u64,
+    pbi_start_tvusec: u64,
+}
+
+// libproc (part of libSystem): the only public source of a process start time that also works for
+// processes NSRunningApplication cannot describe, such as Finder.
+extern "C" {
+    fn proc_pidinfo(pid: i32, flavor: i32, arg: u64, buffer: *mut c_void, buffersize: i32) -> i32;
+}
+
+/// The process start time from libproc, in microseconds since the UNIX epoch.
+fn proc_start_time_us(pid: i32) -> Option<u64> {
+    const PROC_PIDTBSDINFO: i32 = 3;
+    if pid <= 0 {
+        return None;
+    }
+    let mut info = std::mem::MaybeUninit::<ProcBsdInfo>::zeroed();
+    let size = std::mem::size_of::<ProcBsdInfo>() as i32;
+    let written = unsafe {
+        proc_pidinfo(
+            pid,
+            PROC_PIDTBSDINFO,
+            0,
+            info.as_mut_ptr() as *mut c_void,
+            size,
+        )
+    };
+    if written < size {
+        return None;
+    }
+    let info = unsafe { info.assume_init() };
+    if info.pbi_start_tvsec == 0 && info.pbi_start_tvusec == 0 {
+        return None;
+    }
+    Some(
+        info.pbi_start_tvsec
+            .saturating_mul(1_000_000)
+            .saturating_add(info.pbi_start_tvusec),
+    )
+}
+
 pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
     let app: *mut AnyObject =
         msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
@@ -314,12 +380,16 @@ pub(crate) unsafe fn identity_of_app(app: *mut AnyObject, pid: i32) -> AppIdenti
 
     let process_start_time_us = {
         let launch_date: *mut AnyObject = msg_send![app, launchDate];
-        if launch_date.is_null() {
+        let from_app = if launch_date.is_null() {
             None
         } else {
             let seconds: f64 = msg_send![launch_date, timeIntervalSince1970];
             (seconds.is_finite() && seconds >= 0.0).then_some((seconds * 1_000_000.0) as u64)
-        }
+        };
+        // Finder and a few system applications report no launchDate through NSRunningApplication;
+        // libproc still knows when their process started, so identity can distinguish instances for
+        // them too instead of refusing every action as "unverified".
+        from_app.or_else(|| proc_start_time_us(pid))
     };
 
     let bid_obj: *mut AnyObject = msg_send![app, bundleIdentifier];
@@ -369,6 +439,18 @@ mod tests {
     ///
     /// Asserted against the real machine only in the shape that is true everywhere: the list is
     /// sorted, deduplicated by bundle identifier, and never offers an entry without an identifier.
+    /// A process start time must be readable without NSRunningApplication: Finder reports no
+    /// `launchDate`, and before this fallback every dock-preview activation of a Finder window was
+    /// refused as "identity unverified".
+    #[test]
+    fn the_process_start_time_is_readable_from_libproc() {
+        let pid = std::process::id() as i32;
+        let first = super::proc_start_time_us(pid).expect("this process has a start time");
+        let second = super::proc_start_time_us(pid).expect("this process has a start time");
+        assert!(first > 0, "a start time must be a real epoch timestamp");
+        assert_eq!(first, second, "the start time of a process cannot change");
+    }
+
     #[test]
     fn installed_applications_are_deduplicated_and_sorted() {
         let apps = super::installed_application_bundles();
