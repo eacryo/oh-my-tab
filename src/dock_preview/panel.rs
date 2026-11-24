@@ -16,7 +16,7 @@ use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 
-use crate::dock_preview::layout::{self, DockEdge, PointerZone, Rect, CARD_RADIUS, CLOSE_SIZE};
+use crate::dock_preview::layout::{self, DockEdge, PointerZone, Rect, CLOSE_SIZE};
 use crate::dock_preview::windows::{self, PreviewWindow};
 use crate::ffi::{
     hex_to_cg_color, hex_to_ns_color, layer_set_background, layer_set_border, layer_set_contents,
@@ -714,17 +714,36 @@ fn rebuild_cards(state: &mut PanelState, request: &PanelRequest, epoch: u64, tic
         state.window_ids = request.windows.iter().map(|window| window.wid).collect();
         state.total_windows = request.windows.len();
         let icon = crate::app_identity::icon_for_bundle_id(&request.bundle, layout::CARD_ICON);
+        let (panel_w, panel_h) = grid.panel_size();
+        let mut row = 0usize;
+        let mut column = 0usize;
+        let mut row_len = grid.row_lengths.first().copied().unwrap_or(1).max(1);
         for (index, window) in request.windows.iter().take(rects.len()).enumerate() {
-            let rect = rects[index];
+            if column >= row_len {
+                row += 1;
+                column = 0;
+                row_len = grid.row_lengths.get(row).copied().unwrap_or(row_len).max(1);
+            }
+            let card_rect = rects[index];
+            let (plate_rect, plate_radius) = layout::hover_plate_rect(
+                card_rect,
+                row,
+                column,
+                row_len,
+                grid.rows,
+                (panel_w, panel_h),
+            );
+            column += 1;
+            let rect = card_rect;
             let palette = theme::ui_palette();
             // The cards themselves do not paint: the panel's material is the surface between and
             // inside them (the switcher's own rule). A hovered card draws the switcher's selection
             // plate -- `selection_plate_bg` wash plus an `accent` rim -- instead of changing a
             // filled tile.
-            let plate = passthrough_view(rect);
+            let plate = passthrough_view(plate_rect);
             let plate_layer: *mut AnyObject = msg_send![plate, layer];
             layer_set_background(plate_layer, hex_to_cg_color(layout::HOVER_PLATE_FILL));
-            let _: () = msg_send![plate_layer, setCornerRadius: CARD_RADIUS];
+            let _: () = msg_send![plate_layer, setCornerRadius: plate_radius];
             let _: () = msg_send![plate_layer, setBorderWidth: 1.0f64];
             layer_set_border(plate_layer, hex_to_cg_color(layout::HOVER_PLATE_BORDER));
             let _: () = msg_send![plate, setHidden: true];

@@ -240,6 +240,51 @@ pub(crate) fn card_rects(grid: &Grid) -> Vec<Rect> {
     rects
 }
 
+/// The hovered card's plate: the card rect grown out to the panel edge on the sides it touches.
+///
+/// The plate covers the tile, not just the thumbnail: a bare card rect leaves the panel's padding
+/// visible as a glass ring above/below every card (and beside the first/last one), which read as a
+/// selection that stops short of the card. The grown plate also takes the panel's corner radius when
+/// it reaches an edge, so it follows the glass instead of leaving a sliver in the corner.
+pub(crate) fn hover_plate_rect(
+    card: Rect,
+    row: usize,
+    column: usize,
+    row_len: usize,
+    grid_rows: usize,
+    panel: (f64, f64),
+) -> (Rect, f64) {
+    let (panel_w, panel_h) = panel;
+    let mut plate = card;
+    let top_edge = row == 0;
+    let bottom_edge = row + 1 >= grid_rows;
+    let left_edge = column == 0;
+    let right_edge = column + 1 >= row_len;
+    if top_edge {
+        plate.y = 0.0;
+        plate.h += PANEL_PAD;
+    }
+    if bottom_edge {
+        plate.h += PANEL_PAD;
+    }
+    if left_edge {
+        plate.x = 0.0;
+        plate.w += PANEL_PAD;
+    }
+    if right_edge {
+        plate.w += PANEL_PAD;
+    }
+    // Clamp so an odd measurement can never push the plate outside the panel.
+    plate.w = plate.w.min(panel_w - plate.x);
+    plate.h = plate.h.min(panel_h - plate.y);
+    let radius = if top_edge || bottom_edge || left_edge || right_edge {
+        PANEL_RADIUS
+    } else {
+        CARD_RADIUS
+    };
+    (plate, radius)
+}
+
 /// The card's header band: the icon, the title and the close-slot live here.
 pub(crate) fn header_rect(card: Rect) -> Rect {
     Rect::new(card.x, card.y, card.w, HEADER_H + CARD_PAD)
@@ -528,6 +573,42 @@ mod tests {
 
     fn visible() -> Rect {
         Rect::new(0.0, 24.0, 1470.0, 862.0)
+    }
+
+    #[test]
+    fn the_hover_plate_covers_the_tile_out_to_the_panel_edge() {
+        // A single card owns the whole panel: the plate is the panel's full rect and follows its
+        // corner radius, so no glass ring is left around the selection.
+        let panel = width_one_card();
+        let card = Rect::new(PANEL_PAD, PANEL_PAD, CARD_W, CARD_H);
+        let (plate, radius) = hover_plate_rect(card, 0, 0, 1, 1, panel);
+        assert_eq!(plate, Rect::new(0.0, 0.0, panel.0, panel.1));
+        assert_eq!(radius, PANEL_RADIUS);
+
+        // In a row of three the middle card grows to the panel's top and bottom edges but keeps its
+        // own width: the selection must not bleed sideways into a neighbour.
+        let panel = (PANEL_PAD * 2.0 + 3.0 * CARD_W, PANEL_PAD * 2.0 + CARD_H);
+        let middle = Rect::new(PANEL_PAD + CARD_W, PANEL_PAD, CARD_W, CARD_H);
+        let (plate, radius) = hover_plate_rect(middle, 0, 1, 3, 1, panel);
+        assert_eq!(plate.x, middle.x);
+        assert_eq!(plate.w, middle.w);
+        assert_eq!(plate.y, 0.0);
+        assert!((plate.h - (CARD_H + PANEL_PAD * 2.0)).abs() < 0.001);
+        assert_eq!(radius, PANEL_RADIUS);
+
+        // An interior card (cards above, below and beside it) keeps the card rect and card radius.
+        let panel = (
+            PANEL_PAD * 2.0 + 3.0 * CARD_W,
+            PANEL_PAD * 2.0 + 3.0 * CARD_H,
+        );
+        let mid_row = Rect::new(PANEL_PAD + CARD_W, PANEL_PAD + CARD_H, CARD_W, CARD_H);
+        let (plate, radius) = hover_plate_rect(mid_row, 1, 1, 3, 3, panel);
+        assert_eq!(plate, mid_row);
+        assert_eq!(radius, CARD_RADIUS);
+    }
+
+    fn width_one_card() -> (f64, f64) {
+        (CARD_W + PANEL_PAD * 2.0, CARD_H + PANEL_PAD * 2.0)
     }
 
     #[test]
