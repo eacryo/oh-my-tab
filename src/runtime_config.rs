@@ -81,9 +81,24 @@ struct ChangeFlags {
     menu_bar_icon: bool,
     // The Dock previews switch: start/stop the observer, hide the panel, refresh the settings row.
     dock_preview: bool,
+    // The row/list threshold: an open panel was laid out with the old one, so it is hidden and the
+    // next hover opens with the new threshold. Independent of the on/off switch.
+    dock_cards_per_row: bool,
     // Any Finder Menu field changed. The extension renders a model the main app pushes, so it has
     // to be broadcast; an open Settings page has to follow in place like any other section.
     finder_menu: bool,
+}
+
+/// Smoke entry: install `new` and run the real apply path, so the runner exercises the same
+/// dispatch a settings change does rather than calling the Dock module directly. Returns whether the
+/// runtime reported a threshold change.
+pub(crate) fn smoke_apply_threshold(old: &Config, new: &Config) -> bool {
+    if let Ok(mut config) = crate::config::CONFIG.write() {
+        *config = new.clone();
+    }
+    let flags = change_flags(old, new, ConfigChangeSource::Settings);
+    apply_config_change(old, new, ConfigChangeSource::Settings);
+    flags.dock_cards_per_row
 }
 
 /// Test entry: does this config change make an already-open settings window re-read its
@@ -123,6 +138,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.key_bindings
         || flags.finder_menu
         || flags.dock_preview
+        || flags.dock_cards_per_row
 }
 
 /// The pages the in-place refresh writes when the settings window is open.
@@ -177,6 +193,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         startup: startup || old.startup.launch_at_login != new.startup.launch_at_login,
         menu_bar_icon: startup || old.startup.hide_menu_bar_icon != new.startup.hide_menu_bar_icon,
         dock_preview: old.dock_preview.enabled != new.dock_preview.enabled,
+        dock_cards_per_row: old.dock_preview.cards_per_row != new.dock_preview.cards_per_row,
         logging: startup || old.logging.level != new.logging.level,
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
@@ -444,10 +461,18 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     if flags.menu_bar_icon {
         crate::menu::set_status_item_visible(!new.startup.hide_menu_bar_icon);
     }
-    if flags.dock_preview || matches!(source, ConfigChangeSource::Startup) {
+    if flags.dock_preview
+        || flags.dock_cards_per_row
+        || matches!(source, ConfigChangeSource::Startup)
+    {
         // Startup seeds the observer's on/off state from the stored switch; a live change starts or
-        // stops it. Stopping hides the panel and its tooltip before the observer goes away.
+        // stops it. Stopping hides the panel and its tooltip before the observer goes away. A
+        // threshold change keeps the observer running but drops the open panel: it was laid out
+        // from the old count, and the next hover must open with the new one.
         crate::dock_preview::apply_config_change(new.dock_preview.enabled);
+        if flags.dock_cards_per_row && new.dock_preview.enabled {
+            crate::dock_preview::hide_for_layout_change();
+        }
     }
     if flags.logging {
         let level = match new.logging.level.as_str() {

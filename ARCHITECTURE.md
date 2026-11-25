@@ -234,10 +234,31 @@ never becomes the key or main window, so the app the pointer came from keeps foc
   point, so the open that follows is still recognized as the press's. `--e2e-state` publishes the
   monotonic `press_dismissals` counter with the dock preview, which is what lets a scenario prove a
   press, rather than a hover-leave, closed a panel.
+- The panel has two layouts, chosen by the window count ALONE. At or under `[dock_preview]
+  cards_per_row` (1..=6, default 5) it is a single row of thumbnail cards; above it, a scrolling list
+  of compact rows (icon, one line of 14pt title, a close slot that appears on the row's hover). Screen
+  space decides how much of that layout is visible and how much can scroll, never which layout is
+  used: a budget too small for a card row hides the panel, and a laptop screen showing a list scrolls
+  it. The space chain is one derivation -- `space_budget` (towards the direction the panel grows,
+  less `PANEL_MARGIN`) -> the glass area -> the viewport (the one `PANEL_PAD` subtraction) -> the row
+  boxes -- and the minimum sizes are derived from the controls each layout must draw.
+- Both layouts live in `container -> viewport (masksToBounds) -> content -> rows/cards`. Rows are
+  created once at fixed content positions and a scroll moves the CONTENT view only, so a row can never
+  be left drawn at an old position; the viewport is the single clipping boundary, which is why a
+  half-clipped row is hit exactly where it is drawn. `pointer_zone` therefore bounds rows and close
+  slots by the viewport but leaves the anchor tile, the transition band and the panel's own padding
+  with their old meaning: resting on the icon, or crossing from it into the panel, is still "inside".
+- A click resolves to a `HitTarget` (window identity plus the request epoch) in one panel read, and
+  the dispatch runs after that read is released: the module re-enters itself for the app it belongs
+  to. The closing state is judged in that same read, so a row whose window is already disappearing
+  refuses both activation and its close slot.
 - The feature is gated by `[dock_preview] enabled` (default true). Disabling it through the settings
   switch stops the observer, hides the panel and its tooltip, and is exercised by the
-  `--smoke-dock-preview` M2 runner; `--show-dock-preview=<bundle|pid>` opens the panel without a real
-  hover for review and screenshots.
+  `--smoke-dock-preview` M2 runner; a change to `cards_per_row` hides an open panel through the same
+  runtime path, and the next hover opens with the new threshold.
+  `--show-dock-preview=<bundle|pid>` opens the panel without a real hover for review and screenshots,
+  and `--smoke-dock-room-h=<pt>` shrinks the room above a bottom tile so the runner can construct a
+  list that must scroll instead of hoping one happens.
 
 ## Thumbnails
 

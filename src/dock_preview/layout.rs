@@ -5,9 +5,22 @@
 //! layout can be asserted headlessly. The AppKit boundary converts once per view: the card host is
 //! a flipped view, so its subviews take these rectangles unchanged.
 //!
-//! The panel shape follows the design document's token set rather than the reference screenshot's
-//! pixels: card padding, header height, gaps and radii are stated here once and every caller reads
-//! them, so the measured layout, the drawn frames and the e2e answer cannot disagree.
+//! The panel has two modes, both chosen from the window count alone (never from the space left on
+//! screen): a single row of thumbnail cards while the count is at or under `cards_per_row`, and a
+//! scrolling list of compact rows above it. Screen space decides how much of that one layout is
+//! visible and how much can scroll, not which layout is used.
+//!
+//! The size derivation runs in one chain and each step subtracts only its own allowance:
+//!
+//! ```text
+//! space_budget(anchor, edge, visible)  -> the largest glass area the Dock leaves room for
+//! panel_size(...)                      -> the glass area itself (never larger than the budget)
+//! viewport                             -> glass minus PANEL_PAD on each side (the one padding step)
+//! row_boxes(row_w)                     -> icon, close slot, then whatever is left for the title
+//! ```
+//!
+//! `CARD_H`, the header height and the thumbnail height are derived here so every caller reads the
+//! same numbers and the measured layout, the drawn frames and the e2e answer cannot disagree.
 
 /// One rectangle in top-left coordinates.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -34,6 +47,14 @@ impl Rect {
     pub(crate) fn contains(self, point: (f64, f64)) -> bool {
         point.0 >= self.x && point.0 < self.max_x() && point.1 >= self.y && point.1 < self.max_y()
     }
+
+    /// Whether two rectangles share any positive area. Touching edges do not count.
+    pub(crate) fn overlaps(self, other: Rect) -> bool {
+        self.x < other.max_x()
+            && other.x < self.max_x()
+            && self.y < other.max_y()
+            && other.y < self.max_y()
+    }
 }
 
 /// Which edge of the screen the Dock sits on. macOS offers left, bottom and right; the top variant
@@ -57,6 +78,10 @@ impl DockEdge {
         }
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------------------------
 
 // Card metrics: one 4pt-grid stack of padding / header / thumbnail. Sizes are points. The padding
 // is deliberately the small step: the cards have no fill of their own (the panel material is the
@@ -86,11 +111,15 @@ pub(crate) const CARD_RADIUS: f64 = 6.0;
 pub(crate) const HOVER_PLATE_FILL: u32 = 0xFFFFFF8C;
 pub(crate) const HOVER_PLATE_BORDER: u32 = 0xFFFFFFE6;
 pub(crate) const THUMB_RADIUS: f64 = 4.0;
-pub(crate) const MAX_COLUMNS: usize = 4;
-pub(crate) const MAX_ROWS: usize = 4;
-/// The most window cards one panel shows. Beyond it the tail windows have no direct entry; the
-/// e2e/state answer carries `hidden_window_count` so the limitation is observable instead of silent.
-pub(crate) const MAX_CARDS: usize = MAX_COLUMNS * MAX_ROWS;
+/// The narrowest a single-row card may be compressed to: a 120pt thumbnail plus its padding, which
+/// is what keeps a truncated title and the close slot readable side by side. Compressing past this
+/// switches the row to horizontal scrolling instead.
+pub(crate) const CARD_MIN_W: f64 = 120.0 + CARD_PAD * 2.0;
+
+/// The gap between the glass and the edge of the visible frame. It is what keeps the panel off a
+/// permanent Dock, which `visible_frame_of` does not carve out (it reserves the menu bar only, and
+/// an auto-hidden Dock parks itself outside the screen).
+pub(crate) const PANEL_MARGIN: f64 = 8.0;
 /// Distance between the Dock tile and the panel's facing edge.
 ///
 /// Zero, not a positive gap: the Dock draws its app-name tooltip above the tile, and the tooltip's
@@ -106,8 +135,190 @@ pub(crate) const TOOLTIP_PAD: f64 = 10.0;
 /// the panel stays inside it.
 pub(crate) const TRANSITION_SLACK: f64 = 24.0;
 
-/// The width of each card in a panel, from its window's aspect ratio: the fixed card height and
-/// each window's own shape decide the width (see [`card_width_for`]).
+// List metrics. One row is the settings' single-line rhythm (a 32pt control band), which is what a
+// taskbar jump list reads as: an icon, one line of title, and room for the close slot.
+pub(crate) const ROW_H: f64 = 32.0;
+pub(crate) const ROW_PAD: f64 = 8.0;
+pub(crate) const ROW_ICON: f64 = 16.0;
+pub(crate) const ROW_GAP: f64 = 8.0;
+/// The list's fixed width: a narrow panel rather than one that grows with the widest window title.
+pub(crate) const LIST_W: f64 = 304.0;
+/// Below this the list is drawn in the compact arrangement instead: the title band shrinks to what
+/// is left after the fixed pieces, and may disappear entirely (the row body then carries the
+/// tooltip).
+pub(crate) const LIST_W_MIN: f64 = 240.0;
+/// The narrowest title band that is still worth drawing; under it the title gives up its space.
+pub(crate) const MIN_TITLE_W: f64 = 32.0;
+/// The fade drawn at a viewport edge that has more content beyond it.
+pub(crate) const LIST_FADE_H: f64 = 12.0;
+/// The smallest space in which the panel is still operable at all; below either of these it is not
+/// shown, and the mode is NOT changed to fit (the mode follows the window count).
+///
+/// Each is derived from the controls that mode has to draw, not picked:
+/// - width: a row's fixed pieces (padding, icon, two gaps, close slot) plus a one-point title band,
+///   plus the glass padding both sides, since the budget is measured against the glass. A native
+///   macOS Dock is usually 44-70pt thick, so anything narrower is not a Dock at all; the compact row
+///   is what makes a narrow-but-real case still work.
+/// - height: half a list row, which is the smallest viewport that can still scroll towards the rest.
+///   The single-row layout is far taller (`CARD_H`), and its own minimum is checked after this one:
+///   a budget that cannot hold a card row does not silently become a list, it hides the panel.
+pub(crate) const MIN_INTERACTIVE_W: f64 = ROW_FIXED_W + 1.0 + PANEL_PAD * 2.0;
+pub(crate) const MIN_INTERACTIVE_H: f64 = ROW_H / 2.0 + PANEL_PAD * 2.0;
+
+/// One card's fixed pieces on a list row, before the remainder is handed to the title.
+const ROW_FIXED_W: f64 = ROW_PAD + ROW_ICON + ROW_GAP + CLOSE_SIZE + ROW_GAP + ROW_PAD;
+
+// ---------------------------------------------------------------------------------------------
+// Mode and space
+// ---------------------------------------------------------------------------------------------
+
+/// Which of the two layouts the panel uses. Chosen from the window count alone.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PanelMode {
+    /// One row of thumbnail cards, as wide as their windows' shapes make them.
+    Row,
+    /// A vertical list of compact rows, scrolling inside its viewport.
+    List,
+}
+
+impl PanelMode {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Row => "row",
+            Self::List => "list",
+        }
+    }
+}
+
+/// Whether the count exceeds the configured threshold. `cards_per_row` is the user's setting; a
+/// threshold of 0 or 1 is legal (one window stays a row, two already need the list).
+pub(crate) fn mode_for(card_count: usize, cards_per_row: usize) -> PanelMode {
+    if card_count > cards_per_row {
+        PanelMode::List
+    } else {
+        PanelMode::Row
+    }
+}
+
+/// The room the Dock leaves for the panel, already reduced by [`PANEL_MARGIN`].
+///
+/// `visible` is the screen's visible frame as the Dock preview computes it: the menu bar is carved
+/// out, a permanent Dock is not, and an auto-hidden one is outside the screen. The budget therefore
+/// measures from the anchor tile towards the opposite edge, which is the direction the panel grows
+/// in; it never measures the side the tile itself occupies.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct SpaceBudget {
+    /// The widest glass area the anchor leaves.
+    pub(crate) inner_w: f64,
+    /// The tallest glass area the anchor leaves.
+    pub(crate) inner_h: f64,
+}
+
+pub(crate) fn space_budget(anchor: Rect, edge: DockEdge, visible: Rect) -> SpaceBudget {
+    let margin = PANEL_MARGIN;
+    match edge {
+        DockEdge::Bottom => SpaceBudget {
+            inner_w: (visible.w - margin * 2.0).max(0.0),
+            inner_h: (anchor.y - visible.y - margin).max(0.0),
+        },
+        DockEdge::Top => SpaceBudget {
+            inner_w: (visible.w - margin * 2.0).max(0.0),
+            inner_h: (visible.max_y() - anchor.max_y() - margin).max(0.0),
+        },
+        // A left-hand Dock grows the panel to the RIGHT of the tile.
+        DockEdge::Left => SpaceBudget {
+            inner_w: (visible.max_x() - anchor.max_x() - margin).max(0.0),
+            inner_h: (visible.h - margin * 2.0).max(0.0),
+        },
+        DockEdge::Right => SpaceBudget {
+            inner_w: (anchor.x - visible.x - margin).max(0.0),
+            inner_h: (visible.h - margin * 2.0).max(0.0),
+        },
+    }
+}
+
+/// Which axis a single-row panel scrolls along.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RowAxis {
+    None,
+    Horizontal,
+}
+
+impl RowAxis {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Horizontal => "horizontal",
+        }
+    }
+}
+
+/// One scrolling axis, as `scroll_axis_for` names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Axis {
+    X,
+    Y,
+}
+
+/// The card rectangles of a single-row panel, in content coordinates.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct RowLayout {
+    pub(crate) cards: Vec<Rect>,
+    pub(crate) axis: RowAxis,
+    pub(crate) content_w: f64,
+    pub(crate) content_h: f64,
+}
+
+/// One list row's box in content coordinates.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct RowSlot {
+    pub(crate) row: Rect,
+    pub(crate) icon: Rect,
+    pub(crate) title: Rect,
+    pub(crate) close: Rect,
+    /// The title band is too narrow to draw; the whole row body carries the tooltip instead.
+    pub(crate) title_hidden: bool,
+}
+
+/// The list layout inside its viewport.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct ListLayout {
+    pub(crate) content_w: f64,
+    pub(crate) content_h: f64,
+    pub(crate) viewport_h: f64,
+    /// Rows that fit entirely inside the viewport. Zero is legal: the viewport then shows part of
+    /// a row and scrolling still reaches it.
+    pub(crate) full_rows: usize,
+    pub(crate) max_scroll: f64,
+    pub(crate) compact: bool,
+}
+
+/// Everything the panel needs to place itself and its content for one request.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct PanelLayout {
+    /// The glass area in screen coordinates (the window frame adds the elevation insets).
+    pub(crate) panel: Rect,
+    /// The scrolling viewport, in panel-local coordinates.
+    pub(crate) viewport: Rect,
+    pub(crate) mode: PanelMode,
+    pub(crate) row: Option<RowLayout>,
+    pub(crate) list: Option<ListLayout>,
+}
+
+/// The card width one window takes in a single row: the card's height is fixed, so the thumbnail
+/// keeps its height and the width follows the window -- the same rule the app switcher uses, at
+/// this module's smaller scale. A missing/degenerate aspect falls back to the design width. The
+/// clamp keeps an ultra-wide or portrait window from producing an unusable card.
+pub(crate) fn card_width_for(aspect: Option<f64>) -> f64 {
+    let Some(aspect) = aspect.filter(|aspect| aspect.is_finite() && *aspect > 0.05) else {
+        return CARD_W;
+    };
+    let thumb_w = (THUMB_H * aspect)
+        .round()
+        .clamp(CARD_MIN_W - CARD_PAD * 2.0, 360.0);
+    thumb_w + CARD_PAD * 2.0
+}
+
 pub(crate) fn widths_for_aspects(aspects: &[Option<f64>]) -> Vec<f64> {
     aspects
         .iter()
@@ -115,132 +326,294 @@ pub(crate) fn widths_for_aspects(aspects: &[Option<f64>]) -> Vec<f64> {
         .collect()
 }
 
-/// The width one card takes for a window's aspect ratio: the card's height is fixed, so the
-/// thumbnail keeps its height and the width follows the window -- the same rule the app switcher
-/// uses, at this module's smaller scale. A missing/degenerate aspect falls back to the design
-/// width. The clamp keeps an ultra-wide or portrait window from producing an unusable card.
-pub(crate) fn card_width_for(aspect: Option<f64>) -> f64 {
-    let Some(aspect) = aspect.filter(|aspect| aspect.is_finite() && *aspect > 0.05) else {
-        return CARD_W;
-    };
-    let thumb_w = (THUMB_H * aspect).round().clamp(120.0, 360.0);
-    thumb_w + CARD_PAD * 2.0
-}
-
-/// The card grid the panel can fit: at most [`MAX_COLUMNS`] columns and [`MAX_ROWS`] rows.
-///
-/// Cards are not one width: each one is as wide as its own thumbnail (see [`card_width_for`]), so
-/// the grid records every visible width and how many cards each row holds. The panel is as wide as
-/// its widest row, which keeps a row of mixed portrait/landscape windows from leaving empty space
-/// at the right of the shorter cards.
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) struct Grid {
-    pub(crate) columns: usize,
-    pub(crate) rows: usize,
-    pub(crate) visible_cards: usize,
-    /// The width of every visible card, row-major.
-    pub(crate) widths: Vec<f64>,
-    /// How many cards each row holds; `sum(row_lengths) == visible_cards`.
-    pub(crate) row_lengths: Vec<usize>,
-}
-
-impl Grid {
-    pub(crate) fn panel_size(&self) -> (f64, f64) {
-        let mut widest = 0.0f64;
-        let mut start = 0;
-        for &length in &self.row_lengths {
-            let row: f64 = self.widths[start..start + length].iter().sum::<f64>()
-                + (length.saturating_sub(1)) as f64 * CARD_GAP;
-            widest = widest.max(row);
-            start += length;
-        }
-        let h = PANEL_PAD * 2.0
-            + self.rows as f64 * CARD_H
-            + (self.rows.saturating_sub(1)) as f64 * CARD_GAP;
-        (PANEL_PAD * 2.0 + widest, h)
+/// The full layout for one request, or `None` when the Dock leaves no operable space at all.
+pub(crate) fn layout_for(
+    mode: PanelMode,
+    aspects: &[Option<f64>],
+    card_count: usize,
+    anchor: Rect,
+    edge: DockEdge,
+    visible: Rect,
+) -> Option<PanelLayout> {
+    let budget = space_budget(anchor, edge, visible);
+    if budget.inner_w < MIN_INTERACTIVE_W || budget.inner_h < MIN_INTERACTIVE_H {
+        return None;
+    }
+    match mode {
+        // A row of cards is a fixed 164pt tall plus its padding; under that it cannot be drawn, and
+        // the panel hides rather than switching to the other layout.
+        PanelMode::Row if budget.inner_h < CARD_H + PANEL_PAD * 2.0 + PANEL_MARGIN => None,
+        PanelMode::Row => row_panel(aspects, card_count, anchor, edge, visible, budget),
+        PanelMode::List => list_panel(card_count, anchor, edge, visible, budget),
     }
 }
 
-/// Pack card widths into rows, preserving order: a card joins the current row while the row stays
-/// within the usable width and [`MAX_COLUMNS`], otherwise it starts a new row. Greedy is enough for
-/// at most four cards per row and keeps the MRU order the caller gave.
-pub(crate) fn pack_rows(widths: &[f64], usable_w: f64) -> Vec<Vec<f64>> {
-    let usable_w = usable_w.max(1.0);
-    let mut rows: Vec<Vec<f64>> = Vec::new();
-    let mut row: Vec<f64> = Vec::new();
-    let mut row_w = 0.0;
-    for &width in widths {
-        let added = if row.is_empty() {
-            width
-        } else {
-            row_w + CARD_GAP + width
-        };
-        if !row.is_empty() && (row.len() >= MAX_COLUMNS || added > usable_w + 0.001) {
-            rows.push(std::mem::take(&mut row));
-            row_w = 0.0;
-        }
-        row_w = if row.is_empty() {
-            width
-        } else {
-            row_w + CARD_GAP + width
-        };
-        row.push(width);
+fn row_panel(
+    aspects: &[Option<f64>],
+    card_count: usize,
+    anchor: Rect,
+    edge: DockEdge,
+    visible: Rect,
+    budget: SpaceBudget,
+) -> Option<PanelLayout> {
+    let mut widths = widths_for_aspects(&aspects[..aspects.len().min(card_count)]);
+    if widths.is_empty() {
+        widths.push(CARD_W);
     }
-    if !row.is_empty() {
-        rows.push(row);
-    }
-    rows
-}
-
-/// The grid for `widths` cards inside an available area. A narrow screen wraps into more rows;
-/// beyond [`MAX_ROWS`] the tail cards are not shown, and `visible_cards` says how many are.
-pub(crate) fn grid_for(widths: &[f64], available_w: f64, available_h: f64) -> Grid {
-    let widths = &widths[..widths.len().min(MAX_CARDS)];
-    let narrowest = widths.iter().copied().fold(CARD_W, f64::min).max(1.0);
-    let usable_w = (available_w - PANEL_PAD * 2.0).max(narrowest);
-    let usable_h = (available_h - PANEL_PAD * 2.0).max(CARD_H);
-    let max_rows = (((usable_h + CARD_GAP) / (CARD_H + CARD_GAP))
-        .floor()
-        .max(1.0) as usize)
-        .clamp(1, MAX_ROWS);
-
-    let mut rows = pack_rows(widths, usable_w);
-    rows.truncate(max_rows);
-    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
-    let row_lengths: Vec<usize> = rows.iter().map(Vec::len).collect();
-    let visible_cards: usize = row_lengths.iter().sum();
-    let flat: Vec<f64> = rows.iter().flatten().copied().collect();
-    Grid {
-        columns,
-        rows: row_lengths.len().max(1),
-        visible_cards,
-        widths: flat,
-        row_lengths: if row_lengths.is_empty() {
-            vec![0]
-        } else {
-            row_lengths
-        },
-    }
-}
-
-/// The card rectangles in panel-local coordinates, row-major from the top-left.
-pub(crate) fn card_rects(grid: &Grid) -> Vec<Rect> {
-    let mut rects = Vec::with_capacity(grid.visible_cards);
-    let mut index = 0;
-    for (row, &length) in grid.row_lengths.iter().enumerate() {
+    let usable = (budget.inner_w - PANEL_PAD * 2.0).max(1.0);
+    let natural: f64 =
+        widths.iter().sum::<f64>() + (widths.len().saturating_sub(1)) as f64 * CARD_GAP;
+    // The GLASS is never wider than the budget, whatever the cards need: an overflowing row scrolls
+    // inside its viewport rather than growing the panel past the screen or the dock's own side.
+    let (cards, axis, content_w) = if natural <= usable + 0.001 {
         let mut x = PANEL_PAD;
-        for &width in &grid.widths[index..index + length] {
-            rects.push(Rect::new(
-                x,
-                PANEL_PAD + row as f64 * (CARD_H + CARD_GAP),
-                width,
-                CARD_H,
-            ));
-            x += width + CARD_GAP;
-        }
-        index += length;
+        let rects = widths
+            .iter()
+            .map(|&w| {
+                let rect = Rect::new(x, PANEL_PAD, w, CARD_H);
+                x += w + CARD_GAP;
+                rect
+            })
+            .collect::<Vec<_>>();
+        (rects, RowAxis::None, natural + PANEL_PAD * 2.0)
+    } else {
+        // Compress proportionally, but never under `CARD_MIN_W`; past that the row scrolls.
+        let minimum =
+            CARD_MIN_W * widths.len() as f64 + (widths.len().saturating_sub(1)) as f64 * CARD_GAP;
+        let compressed: Vec<f64> = if minimum <= usable {
+            let scale = (usable - (widths.len().saturating_sub(1)) as f64 * CARD_GAP) / natural;
+            widths.iter().map(|w| (w * scale).max(CARD_MIN_W)).collect()
+        } else {
+            widths.iter().map(|_| CARD_MIN_W).collect()
+        };
+        let total: f64 =
+            compressed.iter().sum::<f64>() + (compressed.len().saturating_sub(1)) as f64 * CARD_GAP;
+        let scrolls = total > usable + 0.001;
+        // Without scrolling the cards start at the glass padding; when the row scrolls, the content
+        // starts at 0 so the viewport itself is the clipping window over it.
+        let start = if scrolls { 0.0 } else { PANEL_PAD };
+        let mut x = start;
+        let rects = compressed
+            .iter()
+            .map(|&w| {
+                let rect = Rect::new(x, PANEL_PAD, w, CARD_H);
+                x += w + CARD_GAP;
+                rect
+            })
+            .collect::<Vec<_>>();
+        (
+            rects,
+            if scrolls {
+                RowAxis::Horizontal
+            } else {
+                RowAxis::None
+            },
+            if scrolls {
+                total
+            } else {
+                total + PANEL_PAD * 2.0
+            },
+        )
+    };
+    let content_h = CARD_H + PANEL_PAD * 2.0;
+    let panel_h = content_h;
+    let panel_w = content_w.min(budget.inner_w).max(MIN_INTERACTIVE_W);
+    let panel = panel_frame(anchor, (panel_w, panel_h), edge, visible);
+    let viewport = Rect::new(
+        PANEL_PAD,
+        PANEL_PAD,
+        (panel_w - PANEL_PAD * 2.0).max(1.0),
+        CARD_H,
+    );
+    Some(PanelLayout {
+        panel,
+        viewport,
+        mode: PanelMode::Row,
+        row: Some(RowLayout {
+            cards,
+            axis,
+            content_w,
+            content_h,
+        }),
+        list: None,
+    })
+}
+
+fn list_panel(
+    card_count: usize,
+    anchor: Rect,
+    edge: DockEdge,
+    visible: Rect,
+    budget: SpaceBudget,
+) -> Option<PanelLayout> {
+    let compact = budget.inner_w < LIST_W_MIN;
+    let width = budget.inner_w.clamp(1.0, LIST_W);
+    let content_h = (card_count.max(1) as f64 * ROW_H).max(ROW_H);
+    let glass_h = budget.inner_h.min(content_h + PANEL_PAD * 2.0);
+    let viewport_h = (glass_h - PANEL_PAD * 2.0).max(0.0);
+    if viewport_h < ROW_H / 2.0 {
+        // Part of a row has to be visible, or there is nothing to scroll towards.
+        return None;
     }
-    rects
+    let full_rows = (viewport_h / ROW_H).floor() as usize;
+    Some(PanelLayout {
+        panel: panel_frame(anchor, (width, glass_h), edge, visible),
+        viewport: Rect::new(PANEL_PAD, PANEL_PAD, width - PANEL_PAD * 2.0, viewport_h),
+        mode: PanelMode::List,
+        row: None,
+        list: Some(ListLayout {
+            content_w: width - PANEL_PAD * 2.0,
+            content_h,
+            viewport_h,
+            full_rows,
+            max_scroll: (content_h - viewport_h).max(0.0),
+            compact,
+        }),
+    })
+}
+
+/// The fixed pieces of one list row and the title band between them.
+pub(crate) fn row_boxes(row_w: f64) -> RowSlot {
+    let row = Rect::new(0.0, 0.0, row_w, ROW_H);
+    let icon = Rect::new(ROW_PAD, (ROW_H - ROW_ICON) / 2.0, ROW_ICON, ROW_ICON);
+    let close = Rect::new(
+        row_w - ROW_PAD - CLOSE_SIZE,
+        (ROW_H - CLOSE_SIZE) / 2.0,
+        CLOSE_SIZE,
+        CLOSE_SIZE,
+    );
+    let title_x = icon.max_x() + ROW_GAP;
+    let title_w = (close.x - ROW_GAP - title_x).max(0.0);
+    let title_hidden = title_w < MIN_TITLE_W;
+    let title = if title_hidden {
+        Rect::new(title_x, icon.y, 0.0, icon.h)
+    } else {
+        Rect::new(title_x, icon.y, title_w, icon.h)
+    };
+    RowSlot {
+        row,
+        icon,
+        title,
+        close,
+        title_hidden,
+    }
+}
+
+/// The screen x-offset at which a row of `index` starts inside the content view.
+pub(crate) fn row_top(index: usize) -> f64 {
+    index as f64 * ROW_H
+}
+
+/// Strictly clamp a scroll offset so no part of the content leaves its viewport.
+pub(crate) fn scroll_offset(current: f64, delta: f64, max_scroll: f64) -> f64 {
+    if !current.is_finite() || !delta.is_finite() || max_scroll <= 0.0 {
+        return 0.0;
+    }
+    (current + delta).clamp(0.0, max_scroll)
+}
+
+/// Which axis a wheel or trackpad gesture scrolls, and by how much.
+///
+/// The absolute value only selects the axis (a trackpad reports both deltas and the horizontal one
+/// may be tiny); the delta that reaches [`scroll_offset`] keeps its sign, so the two wheel
+/// directions still travel to opposite ends.
+pub(crate) fn scroll_axis_for(
+    mode: PanelMode,
+    row_axis: RowAxis,
+    pointer_in_viewport: bool,
+    max_scroll: f64,
+    dx: f64,
+    dy: f64,
+) -> Option<(Axis, f64)> {
+    if !pointer_in_viewport || max_scroll <= 0.0 {
+        return None;
+    }
+    match (mode, row_axis) {
+        (PanelMode::Row, RowAxis::Horizontal) => {
+            if dx.abs() >= 1.0 {
+                Some((Axis::X, dx))
+            } else if dy.abs() >= 1.0 {
+                Some((Axis::X, dy))
+            } else {
+                None
+            }
+        }
+        (PanelMode::List, _) => (dy.abs() >= 1.0).then_some((Axis::Y, dy)),
+        _ => None,
+    }
+}
+
+/// Which viewport edges have content beyond them.
+pub(crate) fn edge_fades(scroll: f64, max_scroll: f64) -> (bool, bool) {
+    if max_scroll <= 0.0 {
+        return (false, false);
+    }
+    (scroll > 0.5, scroll < max_scroll - 0.5)
+}
+
+/// Whether a panel-local point lies inside the viewport.
+pub(crate) fn pointer_in_viewport(point: (f64, f64), viewport: Rect) -> bool {
+    viewport.contains(point)
+}
+
+/// The content view's origin inside the viewport: the scroll offset and nothing else.
+///
+/// The content is a child of the viewport, so its own coordinates already start at the viewport's
+/// origin. Adding that origin again would shift everything by the padding a second time -- the
+/// defect that made a drawn close button and its hit area disagree.
+pub(crate) fn content_origin(scroll: (f64, f64)) -> (f64, f64) {
+    (-scroll.0, -scroll.1)
+}
+
+// ---------------------------------------------------------------------------------------------
+// Cards inside a row
+// ---------------------------------------------------------------------------------------------
+
+/// The card's header band: the icon, the title and the close-slot live here.
+pub(crate) fn header_rect(card: Rect) -> Rect {
+    Rect::new(card.x, card.y, card.w, HEADER_H + CARD_PAD)
+}
+
+/// The app-icon slot, vertically centred in the header.
+pub(crate) fn icon_rect(card: Rect) -> Rect {
+    let header = header_rect(card);
+    Rect::new(
+        card.x + CARD_PAD,
+        header.y + (header.h - CARD_ICON) / 2.0,
+        CARD_ICON,
+        CARD_ICON,
+    )
+}
+
+/// The close slot. It is reserved whether or not the button is visible, so showing the button on
+/// hover never moves the title; a hidden slot is not part of hit-testing (see `hit`).
+pub(crate) fn close_rect(card: Rect) -> Rect {
+    let header = header_rect(card);
+    Rect::new(
+        card.max_x() - CARD_PAD - CLOSE_SIZE,
+        header.y + (header.h - CLOSE_SIZE) / 2.0,
+        CLOSE_SIZE,
+        CLOSE_SIZE,
+    )
+}
+
+/// The single-line title's box: from after the icon to just before the close slot. The slot is
+/// reserved whether or not the button is visible, so a hover never reflows the title.
+pub(crate) fn title_rect(card: Rect) -> Rect {
+    let icon = icon_rect(card);
+    let close = close_rect(card);
+    let x = icon.max_x() + CARD_ICON_GAP;
+    Rect::new(x, icon.y, (close.x - CLOSE_MARGIN - x).max(1.0), icon.h)
+}
+
+/// The thumbnail box below the header.
+pub(crate) fn thumb_rect(card: Rect) -> Rect {
+    Rect::new(
+        card.x + CARD_PAD,
+        card.y + CARD_PAD + HEADER_H,
+        (card.w - CARD_PAD * 2.0).max(1.0),
+        THUMB_H,
+    )
 }
 
 /// The hovered card's plate: the card rect grown out to the panel edge on the sides it touches.
@@ -288,72 +661,41 @@ pub(crate) fn hover_plate_rect(
     (plate, radius)
 }
 
-/// The hover plate for every visible card, in card order. Kept next to [`hover_plate_rect`] so
-/// every call site (initial build, anchor follow, post-close reflow) derives the same geometry:
-/// a reflow that placed the plate back at the plain card rect was exactly the defect this prevents.
-pub(crate) fn plates_for_rects(grid: &Grid, rects: &[Rect]) -> Vec<(Rect, f64)> {
-    let panel = grid.panel_size();
-    let mut plates = Vec::with_capacity(rects.len());
-    let mut index = 0;
-    for (row, &length) in grid.row_lengths.iter().enumerate() {
-        for column in 0..length {
-            let Some(card) = rects.get(index).copied() else {
-                return plates;
-            };
-            plates.push(hover_plate_rect(
-                card, row, column, length, grid.rows, panel,
-            ));
-            index += 1;
+/// The plates for one single row of cards. A row of `n` cards has one row, so every card touches
+/// the panel's top and bottom edges and only the first/last touch a side.
+pub(crate) fn plates_for_row(cards: &[Rect], panel: (f64, f64)) -> Vec<(Rect, f64)> {
+    cards
+        .iter()
+        .enumerate()
+        .map(|(column, card)| hover_plate_rect(*card, 0, column, cards.len(), 1, panel))
+        .collect()
+}
+
+/// The title and close boxes of one item, in CONTENT coordinates.
+///
+/// One function for both layouts, used by the drawing code and by the hit test: two boxes computed
+/// in two places is how a click on a visible close button ended up charging the activate path.
+pub(crate) fn boxes_for(mode: PanelMode, item: Rect) -> RowSlot {
+    match mode {
+        PanelMode::Row => RowSlot {
+            row: item,
+            icon: icon_rect(item),
+            title: title_rect(item),
+            close: close_rect(item),
+            title_hidden: false,
+        },
+        PanelMode::List => {
+            let boxes = row_boxes(item.w);
+            let offset = |rect: Rect| Rect::new(rect.x + item.x, rect.y + item.y, rect.w, rect.h);
+            RowSlot {
+                row: item,
+                icon: offset(boxes.icon),
+                title: offset(boxes.title),
+                close: offset(boxes.close),
+                title_hidden: boxes.title_hidden,
+            }
         }
     }
-    plates
-}
-
-/// The card's header band: the icon, the title and the close-slot live here.
-pub(crate) fn header_rect(card: Rect) -> Rect {
-    Rect::new(card.x, card.y, card.w, HEADER_H + CARD_PAD)
-}
-
-/// The app-icon slot, vertically centred in the header.
-pub(crate) fn icon_rect(card: Rect) -> Rect {
-    let header = header_rect(card);
-    Rect::new(
-        card.x + CARD_PAD,
-        header.y + (header.h - CARD_ICON) / 2.0,
-        CARD_ICON,
-        CARD_ICON,
-    )
-}
-
-/// The close slot. It is reserved whether or not the button is visible, so showing the button on
-/// hover never moves the title; a hidden slot is not part of hit-testing (see `hit`).
-pub(crate) fn close_rect(card: Rect) -> Rect {
-    let header = header_rect(card);
-    Rect::new(
-        card.max_x() - CARD_PAD - CLOSE_SIZE,
-        header.y + (header.h - CLOSE_SIZE) / 2.0,
-        CLOSE_SIZE,
-        CLOSE_SIZE,
-    )
-}
-
-/// The single-line title's box: from after the icon to just before the close slot. The slot is
-/// reserved whether or not the button is visible, so a hover never reflows the title.
-pub(crate) fn title_rect(card: Rect) -> Rect {
-    let icon = icon_rect(card);
-    let close = close_rect(card);
-    let x = icon.max_x() + CARD_ICON_GAP;
-    Rect::new(x, icon.y, (close.x - CLOSE_MARGIN - x).max(1.0), icon.h)
-}
-
-/// The thumbnail box below the header.
-pub(crate) fn thumb_rect(card: Rect) -> Rect {
-    Rect::new(
-        card.x + CARD_PAD,
-        card.y + CARD_PAD + HEADER_H,
-        (card.w - CARD_PAD * 2.0).max(1.0),
-        THUMB_H,
-    )
 }
 
 /// Whether a single-line title is wider than its box (and therefore needs the full-title tooltip).
@@ -533,14 +875,19 @@ pub(crate) fn tooltip_size_for(measured: (f64, f64), wrap_w: f64) -> (f64, f64) 
     (w, measured.1 + TOOLTIP_PAD * 2.0)
 }
 
+const _: () = assert!(
+    ROW_FIXED_W <= LIST_W_MIN,
+    "a compact row still has to fit its icon and close slot"
+);
+
 /// What the pointer is over, in the panel's own terms. Decision code only reads this.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum PointerZone {
-    /// Over a card's close slot (and the slot is visible).
+    /// Over a row's or card's close slot (and the slot is visible).
     Close(usize),
-    /// Over a card's title box.
+    /// Over a card's title box, or a row whose title band is too narrow to carry it.
     Title(usize),
-    /// Over a card, outside its title box.
+    /// Over a card or row, outside its title box.
     Card(usize),
     /// Over the panel but not over a card (the panel padding / gaps).
     Panel,
@@ -551,42 +898,68 @@ pub(crate) enum PointerZone {
     Outside,
 }
 
-/// Classify a pointer point against the panel, its cards, the transition band and the anchor tile.
+/// The hit geometry of one panel, as the decision code reads it.
 ///
-/// `close_visible` is the card whose close slot is currently shown; a hidden slot is not hit, so a
-/// click where the button would be falls through to the card body (the documented behaviour).
-pub(crate) fn pointer_zone(
-    point: (f64, f64),
-    panel: Rect,
-    cards: &[Rect],
-    anchor: Rect,
-    band: Rect,
-    close_visible: Option<usize>,
-) -> PointerZone {
-    for (index, card) in cards.iter().enumerate() {
-        if !card.contains(point) {
-            continue;
+/// The viewport bounds what can be hit *through a row or a card*: a row clipped by the viewport edge
+/// is only hit inside what is actually drawn. Every other class (the panel's own padding, the
+/// transition band, the anchor tile) keeps its meaning, so a pointer resting on the Dock icon or
+/// crossing between it and the panel never reads as "left".
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HitGeometry<'a> {
+    pub(crate) panel: Rect,
+    pub(crate) viewport: Rect,
+    /// How far the content view is scrolled (x, y), in points.
+    pub(crate) scroll: (f64, f64),
+    /// The rows/cards in content coordinates.
+    pub(crate) items: &'a [Rect],
+    pub(crate) anchor: Rect,
+    pub(crate) band: Rect,
+    /// The index whose close slot is currently shown.
+    pub(crate) close_visible: Option<usize>,
+    /// Which layout the items belong to: a card's boxes are not a row's, and drawing and hit
+    /// testing have to ask the same function for both.
+    pub(crate) mode: PanelMode,
+    /// Indices whose title band is too narrow to draw: the row body carries the tooltip.
+    pub(crate) body_is_title: &'a [usize],
+}
+
+/// Classify a pointer point against the panel, its rows/cards, the transition band and the anchor.
+pub(crate) fn pointer_zone(point: (f64, f64), geometry: HitGeometry<'_>) -> PointerZone {
+    if geometry.viewport.contains(point) {
+        let local = (
+            point.0 - geometry.viewport.x + geometry.scroll.0,
+            point.1 - geometry.viewport.y + geometry.scroll.1,
+        );
+        for (index, item) in geometry.items.iter().enumerate() {
+            if !item.contains(local) {
+                continue;
+            }
+            // The SAME boxes the drawing uses for this mode, so a click lands on the control it
+            // looks like it is on (a card's close slot is not where a row's would be).
+            let boxes = boxes_for(geometry.mode, *item);
+            if geometry.close_visible == Some(index) && boxes.close.contains(local) {
+                return PointerZone::Close(index);
+            }
+            if geometry.body_is_title.contains(&index) {
+                return PointerZone::Title(index);
+            }
+            if boxes.title.contains(local) {
+                return PointerZone::Title(index);
+            }
+            return PointerZone::Card(index);
         }
-        if close_visible == Some(index) && close_rect(*card).contains(point) {
-            return PointerZone::Close(index);
-        }
-        if title_rect(*card).contains(point) {
-            return PointerZone::Title(index);
-        }
-        return PointerZone::Card(index);
     }
-    if panel.contains(point) {
+    if geometry.panel.contains(point) {
         return PointerZone::Panel;
     }
-    if band.contains(point) {
+    if geometry.band.contains(point) {
         return PointerZone::Transition;
     }
-    if anchor.contains(point) {
+    if geometry.anchor.contains(point) {
         return PointerZone::Anchor;
     }
     PointerZone::Outside
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -597,6 +970,470 @@ mod tests {
 
     fn visible() -> Rect {
         Rect::new(0.0, 24.0, 1470.0, 862.0)
+    }
+
+    /// A 56pt tile sitting on a bottom Dock, top edge at the visible frame's bottom.
+    fn bottom_anchor() -> Rect {
+        Rect::new(700.0, 830.0, 44.0, 56.0)
+    }
+
+    fn geometry(_point: (f64, f64), items: &[Rect], viewport: Rect) -> HitGeometry<'_> {
+        HitGeometry {
+            panel: Rect::new(0.0, 0.0, 300.0, 200.0),
+            viewport,
+            scroll: (0.0, 0.0),
+            mode: PanelMode::List,
+            items,
+            // Below the panel and over the tile's own rectangle: the tile hangs under a bottom Dock.
+            anchor: Rect::new(200.0, 400.0, 44.0, 56.0),
+            band: Rect::new(100.0, 200.0, 150.0, 200.0),
+            close_visible: Some(0),
+            body_is_title: &[],
+        }
+    }
+
+    #[test]
+    fn the_mode_follows_the_window_count_only() {
+        assert_eq!(mode_for(0, 5), PanelMode::Row);
+        assert_eq!(mode_for(5, 5), PanelMode::Row);
+        assert_eq!(mode_for(6, 5), PanelMode::List);
+        // Threshold 1: one window is a row, two already need the list.
+        assert_eq!(mode_for(1, 1), PanelMode::Row);
+        assert_eq!(mode_for(2, 1), PanelMode::List);
+    }
+
+    #[test]
+    fn the_budget_measures_towards_the_direction_the_panel_grows() {
+        let visible = visible();
+        // A bottom tile: the room is above it.
+        let bottom = space_budget(
+            Rect::new(700.0, 830.0, 44.0, 56.0),
+            DockEdge::Bottom,
+            visible,
+        );
+        assert!((bottom.inner_h - (830.0 - 24.0 - PANEL_MARGIN)).abs() < 0.001);
+        assert!((bottom.inner_w - (visible.w - 2.0 * PANEL_MARGIN)).abs() < 0.001);
+
+        // A left tile grows RIGHT: the room is to its right. (The v3 formula measured leftwards and
+        // returned a negative number for an ordinary side Dock; this is that regression.)
+        let left_tile = Rect::new(0.0, 400.0, 60.0, 44.0);
+        let left = space_budget(left_tile, DockEdge::Left, visible);
+        assert!(left.inner_w > 0.0, "a left Dock leaves room to the right");
+        assert!((left.inner_w - (visible.max_x() - 60.0 - PANEL_MARGIN)).abs() < 0.001);
+        assert!((left.inner_h - (visible.h - 2.0 * PANEL_MARGIN)).abs() < 0.001);
+
+        let right_tile = Rect::new(1410.0, 400.0, 60.0, 44.0);
+        let right = space_budget(right_tile, DockEdge::Right, visible);
+        assert!((right.inner_w - (1410.0 - visible.x - PANEL_MARGIN)).abs() < 0.001);
+
+        let top_tile = Rect::new(700.0, 24.0, 44.0, 56.0);
+        let top = space_budget(top_tile, DockEdge::Top, visible);
+        assert!((top.inner_h - (visible.max_y() - 80.0 - PANEL_MARGIN)).abs() < 0.001);
+    }
+
+    #[test]
+    fn padding_is_subtracted_once_between_the_glass_and_the_viewport() {
+        // A budget of exactly two rows plus the glass padding must yield a two-row viewport. A
+        // second padding subtraction (v5's mistake) would leave 56 and report a single full row.
+        let room_h = 2.0 * ROW_H + PANEL_PAD * 2.0;
+        // `room_h` is the distance from the visible frame's top to the tile's TOP edge, less the
+        // margin; the tile then hangs 56pt below that edge.
+        let anchor = Rect::new(700.0, 24.0 + room_h + PANEL_MARGIN, 44.0, 56.0);
+        let visible = Rect::new(0.0, 24.0, 1470.0, anchor.max_y() + 200.0 - 24.0);
+        let budget = space_budget(anchor, DockEdge::Bottom, visible);
+        assert!(
+            (budget.inner_h - room_h).abs() < 0.001,
+            "budget {budget:?} visible {visible:?}"
+        );
+        let layout = layout_for(PanelMode::List, &[], 7, anchor, DockEdge::Bottom, visible)
+            .expect("two rows still fit");
+        let list = layout.list.expect("list mode");
+        assert!(
+            (layout.panel.h - room_h).abs() < 0.001,
+            "the glass is the budget"
+        );
+        assert!((list.viewport_h - 2.0 * ROW_H).abs() < 0.001);
+        assert_eq!(list.full_rows, 2);
+        assert!((list.max_scroll - (7.0 * ROW_H - 2.0 * ROW_H)).abs() < 0.001);
+    }
+
+    #[test]
+    fn a_low_screen_keeps_the_list_and_reports_how_much_of_it_fits() {
+        // A 40pt budget leaves a 32pt viewport: exactly one row, because the glass padding is what
+        // this budget has to give up. The mode stays the list -- it is chosen by the window count,
+        // never by the space left -- and the rest is reached by scrolling.
+        let anchor = Rect::new(700.0, 24.0 + 40.0 + PANEL_MARGIN, 44.0, 56.0);
+        let visible = Rect::new(0.0, 24.0, 1470.0, anchor.max_y() + 200.0 - 24.0);
+        assert_eq!(
+            space_budget(anchor, DockEdge::Bottom, visible).inner_h,
+            40.0
+        );
+        let layout =
+            layout_for(PanelMode::List, &[], 7, anchor, DockEdge::Bottom, visible).expect("fits");
+        let list = layout.list.expect("list mode");
+        assert_eq!(layout.mode, PanelMode::List);
+        assert_eq!(list.full_rows, 1);
+        assert!((list.viewport_h - ROW_H).abs() < 0.001);
+        assert!((list.max_scroll - 6.0 * ROW_H).abs() < 0.001);
+
+        // Half a row less: still the list, still scrollable, and no complete row is claimed.
+        let anchor = Rect::new(700.0, 24.0 + 36.0 + PANEL_MARGIN, 44.0, 56.0);
+        let visible = Rect::new(0.0, 24.0, 1470.0, anchor.max_y() + 200.0 - 24.0);
+        let layout =
+            layout_for(PanelMode::List, &[], 7, anchor, DockEdge::Bottom, visible).expect("fits");
+        let list = layout.list.expect("list mode");
+        assert_eq!(list.full_rows, 0);
+        assert!(
+            list.max_scroll > 0.0,
+            "the rest is still reachable by scrolling"
+        );
+        assert!(list.viewport_h < ROW_H);
+    }
+
+    #[test]
+    fn too_little_space_hides_the_panel_instead_of_changing_its_mode() {
+        let visible = visible();
+        // Under the minimum height for either mode.
+        let low = Rect::new(700.0, visible.y + 20.0, 44.0, 56.0);
+        assert!(layout_for(PanelMode::List, &[], 9, low, DockEdge::Bottom, visible).is_none());
+        assert!(layout_for(PanelMode::Row, &[], 2, low, DockEdge::Bottom, visible).is_none());
+        // Under the minimum width for either mode: a row cannot fit its icon and close slot.
+        let narrow = Rect::new(10.0, visible.max_y() - 56.0, 44.0, 56.0);
+        let narrower_than_a_row =
+            Rect::new(0.0, 24.0, MIN_INTERACTIVE_W + PANEL_MARGIN - 1.0, 900.0);
+        assert!(layout_for(
+            PanelMode::List,
+            &[],
+            9,
+            narrow,
+            DockEdge::Bottom,
+            narrower_than_a_row
+        )
+        .is_none());
+        // Just wide enough: the compact row is what makes that legal, and it still fits.
+        let just_a_row = Rect::new(0.0, 24.0, MIN_INTERACTIVE_W + PANEL_MARGIN + 8.0, 900.0);
+        let layout = layout_for(
+            PanelMode::List,
+            &[],
+            9,
+            narrow,
+            DockEdge::Bottom,
+            just_a_row,
+        )
+        .expect("fits");
+        assert!(layout.list.expect("list mode").compact);
+    }
+
+    #[test]
+    fn the_row_is_always_one_row_and_never_drops_a_card() {
+        let visible = visible();
+        for count in 1..=6usize {
+            let aspects = vec![Some(1.6); count];
+            let layout = layout_for(
+                PanelMode::Row,
+                &aspects,
+                count,
+                bottom_anchor(),
+                DockEdge::Bottom,
+                visible,
+            )
+            .expect("a row fits");
+            let row = layout.row.expect("row mode");
+            assert_eq!(row.cards.len(), count, "every window keeps its card");
+            let ys: Vec<f64> = row.cards.iter().map(|card| card.y).collect();
+            assert!(ys.windows(2).all(|pair| pair[0] == pair[1]), "one row");
+            assert!((layout.panel.h - (CARD_H + PANEL_PAD * 2.0)).abs() < 0.001);
+        }
+    }
+
+    #[test]
+    fn a_wide_row_compresses_before_it_scrolls_and_never_past_the_floor() {
+        let visible = Rect::new(0.0, 24.0, 900.0, 862.0);
+        let aspects = vec![Some(1.6); 4];
+        let layout = layout_for(
+            PanelMode::Row,
+            &aspects,
+            4,
+            bottom_anchor(),
+            DockEdge::Bottom,
+            visible,
+        )
+        .expect("a row fits");
+        let row = layout.row.expect("row mode");
+        assert_eq!(row.axis, RowAxis::None);
+        assert!(row.cards.iter().all(|card| card.w >= CARD_MIN_W));
+        assert!(layout.panel.w <= 900.0 - 2.0 * PANEL_MARGIN + 0.001);
+
+        // Nine cards at the floor need 1152pt, more than the 840pt a 900pt screen offers: the row
+        // scrolls instead of compressing under the floor.
+        let aspects = vec![Some(1.6); 9];
+        let layout = layout_for(
+            PanelMode::Row,
+            &aspects,
+            9,
+            bottom_anchor(),
+            DockEdge::Bottom,
+            visible,
+        )
+        .expect("a row fits");
+        let row = layout.row.expect("row mode");
+        assert_eq!(row.axis, RowAxis::Horizontal);
+        assert!(row.content_w > layout.viewport.w);
+        assert!(row
+            .cards
+            .iter()
+            .all(|card| (card.w - CARD_MIN_W).abs() < 0.001));
+    }
+
+    #[test]
+    fn the_row_boxes_leave_the_remainder_to_the_title_and_hide_it_when_empty() {
+        let wide = row_boxes(LIST_W - PANEL_PAD * 2.0);
+        assert!(!wide.title_hidden);
+        assert!((wide.icon.w - ROW_ICON).abs() < 0.001);
+        assert!((wide.close.w - CLOSE_SIZE).abs() < 0.001);
+        assert!(wide.title.x > wide.icon.max_x());
+        assert!(wide.title.max_x() < wide.close.x);
+
+        // Just wide enough for a 32pt title band.
+        let exact = row_boxes(ROW_FIXED_W + MIN_TITLE_W);
+        assert!(!exact.title_hidden);
+        assert!((exact.title.w - MIN_TITLE_W).abs() < 0.001);
+
+        // One point narrower: the title gives up its band, and the row body carries the tooltip.
+        let tight = row_boxes(ROW_FIXED_W + MIN_TITLE_W - 1.0);
+        assert!(tight.title_hidden);
+        assert!((tight.title.w).abs() < 0.001);
+        assert!(tight.close.max_x() <= ROW_FIXED_W + MIN_TITLE_W - 1.0 + 0.001);
+    }
+
+    #[test]
+    fn a_scroll_offset_is_clamped_and_keeps_its_sign() {
+        assert_eq!(scroll_offset(0.0, -40.0, 200.0), 0.0);
+        assert_eq!(scroll_offset(0.0, 40.0, 200.0), 40.0);
+        assert_eq!(scroll_offset(180.0, 40.0, 200.0), 200.0);
+        assert_eq!(scroll_offset(10.0, 40.0, 0.0), 0.0, "nothing to scroll");
+        assert_eq!(scroll_offset(f64::NAN, 40.0, 200.0), 0.0);
+    }
+
+    #[test]
+    fn the_axis_is_chosen_by_magnitude_but_the_delta_keeps_its_sign() {
+        // A trackpad reports a tiny vertical delta during a horizontal swipe.
+        assert_eq!(
+            scroll_axis_for(PanelMode::Row, RowAxis::Horizontal, true, 100.0, 30.0, 0.2),
+            Some((Axis::X, 30.0))
+        );
+        // A plain mouse wheel on a horizontal row drives the row, both directions.
+        assert_eq!(
+            scroll_axis_for(PanelMode::Row, RowAxis::Horizontal, true, 100.0, 0.0, 8.0),
+            Some((Axis::X, 8.0))
+        );
+        assert_eq!(
+            scroll_axis_for(PanelMode::Row, RowAxis::Horizontal, true, 100.0, 0.0, -8.0),
+            Some((Axis::X, -8.0))
+        );
+        // A list never scrolls sideways.
+        assert_eq!(
+            scroll_axis_for(PanelMode::List, RowAxis::None, true, 100.0, 30.0, 0.0),
+            None
+        );
+        assert_eq!(
+            scroll_axis_for(PanelMode::List, RowAxis::None, true, 100.0, 0.0, -8.0),
+            Some((Axis::Y, -8.0))
+        );
+        // Nothing to scroll, or the pointer outside the viewport: not consumed.
+        assert_eq!(
+            scroll_axis_for(PanelMode::List, RowAxis::None, true, 0.0, 0.0, 8.0),
+            None
+        );
+        assert_eq!(
+            scroll_axis_for(PanelMode::List, RowAxis::None, false, 100.0, 0.0, 8.0),
+            None
+        );
+        // A row that does not scroll consumes nothing.
+        assert_eq!(
+            scroll_axis_for(PanelMode::Row, RowAxis::None, true, 100.0, 0.0, 8.0),
+            None
+        );
+    }
+
+    #[test]
+    fn the_edge_fades_follow_the_scroll_position() {
+        assert_eq!(edge_fades(0.0, 100.0), (false, true));
+        assert_eq!(edge_fades(50.0, 100.0), (true, true));
+        assert_eq!(edge_fades(100.0, 100.0), (true, false));
+        assert_eq!(edge_fades(0.0, 0.0), (false, false));
+    }
+
+    #[test]
+    fn the_content_origin_is_the_scroll_and_nothing_else() {
+        // The content view is a CHILD of the viewport, so its origin is the scroll offset inside
+        // that viewport. Adding the viewport's own origin (the padding) again shifted every row by
+        // PANEL_PAD against everything that placed it -- the drawn box and the hit box disagreed.
+        assert_eq!(content_origin((0.0, 0.0)), (0.0, 0.0));
+        assert_eq!(content_origin((0.0, 32.0)), (0.0, -32.0));
+        assert_eq!(content_origin((16.0, 0.0)), (-16.0, 0.0));
+    }
+
+    #[test]
+    fn a_cards_close_slot_is_hit_where_it_is_drawn() {
+        // Row mode: the close box comes from `close_rect`, the same function the card is drawn
+        // with. Asking a row's boxes about a card made a click on the visible × charge the card.
+        let viewport = Rect::new(0.0, 0.0, CARD_W + 8.0, CARD_H + 8.0);
+        let card = Rect::new(PANEL_PAD, PANEL_PAD, CARD_W, CARD_H);
+        let items = vec![card];
+        let drawn_close = close_rect(card);
+        let hit = pointer_zone(
+            (
+                drawn_close.x + drawn_close.w / 2.0,
+                drawn_close.y + drawn_close.h / 2.0,
+            ),
+            HitGeometry {
+                panel: Rect::new(0.0, 0.0, viewport.w, viewport.h),
+                viewport,
+                scroll: (0.0, 0.0),
+                mode: PanelMode::Row,
+                items: &items,
+                anchor: Rect::new(500.0, 500.0, 44.0, 56.0),
+                band: Rect::new(0.0, 0.0, 0.0, 0.0),
+                close_visible: Some(0),
+                body_is_title: &[],
+            },
+        );
+        assert_eq!(
+            hit,
+            PointerZone::Close(0),
+            "the visible × must answer Close"
+        );
+
+        let drawn_title = title_rect(card);
+        let hit = pointer_zone(
+            (drawn_title.x + 4.0, drawn_title.y + 4.0),
+            HitGeometry {
+                panel: Rect::new(0.0, 0.0, viewport.w, viewport.h),
+                viewport,
+                scroll: (0.0, 0.0),
+                mode: PanelMode::Row,
+                items: &items,
+                anchor: Rect::new(500.0, 500.0, 44.0, 56.0),
+                band: Rect::new(0.0, 0.0, 0.0, 0.0),
+                close_visible: Some(0),
+                body_is_title: &[],
+            },
+        );
+        assert_eq!(hit, PointerZone::Title(0));
+    }
+
+    #[test]
+    fn an_overflowing_row_keeps_its_panel_inside_the_budget() {
+        // The glass never grows past the room the Dock leaves, whatever the cards need: an
+        // overflowing row is clipped by a viewport that is itself inside the budget.
+        let visible = Rect::new(0.0, 24.0, 900.0, 862.0);
+        let aspects = vec![Some(1.6); 9];
+        let layout = layout_for(
+            PanelMode::Row,
+            &aspects,
+            9,
+            bottom_anchor(),
+            DockEdge::Bottom,
+            visible,
+        )
+        .expect("a row fits");
+        let budget = space_budget(bottom_anchor(), DockEdge::Bottom, visible);
+        assert!(layout.panel.w <= budget.inner_w + 0.001, "panel width");
+        assert!(layout.viewport.w <= layout.panel.w - PANEL_PAD * 2.0 + 0.001);
+        let row = layout.row.expect("row mode");
+        assert_eq!(row.axis, RowAxis::Horizontal);
+        // The scroll range covers the CARDS, not the glass padding: content minus viewport.
+        let cards_right = row.cards.last().expect("cards").max_x();
+        assert!(cards_right - layout.viewport.w > 0.0);
+        assert!(
+            cards_right > layout.viewport.w,
+            "the last card is beyond the viewport"
+        );
+        // And the first card starts at the content's origin so nothing is cut off on the left.
+        assert_eq!(row.cards[0].x, 0.0);
+    }
+
+    #[test]
+    fn the_minimum_width_leaves_room_for_the_row_and_its_padding() {
+        // The minimum is measured against the GLASS budget, so it has to include the padding both
+        // sides; otherwise a budget at the minimum yields a viewport narrower than a row's fixed
+        // pieces and the close slot is drawn outside it.
+        let viewport_w = MIN_INTERACTIVE_W - PANEL_PAD * 2.0;
+        assert!(
+            viewport_w > ROW_FIXED_W,
+            "the row fits inside a minimum viewport"
+        );
+        let boxes = row_boxes(viewport_w);
+        assert!(boxes.close.max_x() <= viewport_w + 0.001);
+        assert!(boxes.icon.x >= 0.0);
+    }
+
+    #[test]
+    fn a_row_clipped_by_the_viewport_is_only_hit_where_it_is_drawn() {
+        let viewport = Rect::new(PANEL_PAD, PANEL_PAD, 200.0, 64.0);
+        let items = vec![
+            Rect::new(0.0, 0.0, 200.0, ROW_H),
+            Rect::new(0.0, ROW_H, 200.0, ROW_H),
+            Rect::new(0.0, 2.0 * ROW_H, 200.0, ROW_H),
+        ];
+        // Fully inside the viewport: the first row answers.
+        let zone = pointer_zone(
+            (viewport.x + 100.0, viewport.y + 10.0),
+            geometry((0.0, 0.0), &items, viewport),
+        );
+        assert!(matches!(zone, PointerZone::Title(0) | PointerZone::Card(0)));
+
+        // The third row lies beyond the viewport: the same local point is panel, not a row.
+        let zone = pointer_zone(
+            (viewport.x + 100.0, viewport.y + 10.0),
+            HitGeometry {
+                scroll: (0.0, 64.0),
+                ..geometry((0.0, 0.0), &items, viewport)
+            },
+        );
+        // Scrolled to 64pt the third row's top sits at the viewport's top edge.
+        assert!(matches!(zone, PointerZone::Title(2) | PointerZone::Card(2)));
+
+        // Below the viewport, still inside the panel: never a row, even if a row overlaps it.
+        let short = Rect::new(PANEL_PAD, PANEL_PAD, 200.0, 20.0);
+        let zone = pointer_zone(
+            (short.x + 100.0, short.max_y() + 4.0),
+            geometry((0.0, 0.0), &items, short),
+        );
+        assert_eq!(zone, PointerZone::Panel);
+    }
+
+    #[test]
+    fn the_anchor_and_the_band_keep_their_meaning_outside_the_viewport() {
+        // A pointer resting on the Dock tile, and one crossing from the tile to the panel, must not
+        // read as "left the panel": that is what the close grace would otherwise act on.
+        let viewport = Rect::new(PANEL_PAD, PANEL_PAD, 200.0, 64.0);
+        let items = vec![Rect::new(0.0, 0.0, 200.0, ROW_H)];
+        let on_anchor = pointer_zone((210.0, 420.0), geometry((0.0, 0.0), &items, viewport));
+        // The helper's anchor is at (200, 400); the point above is inside it, below the panel.
+        assert_eq!(on_anchor, PointerZone::Anchor);
+        let in_band = pointer_zone((150.0, 300.0), geometry((0.0, 0.0), &items, viewport));
+        assert_eq!(in_band, PointerZone::Transition);
+        // Not in the panel (which ends at y = 200), the band or the tile: the one point that still
+        // means "left".
+        let outside = pointer_zone((280.0, 205.0), geometry((0.0, 0.0), &items, viewport));
+        assert_eq!(outside, PointerZone::Outside);
+    }
+
+    #[test]
+    fn a_row_without_a_title_band_answers_with_the_title_zone() {
+        let viewport = Rect::new(PANEL_PAD, PANEL_PAD, ROW_FIXED_W + 4.0, 64.0);
+        let items = vec![Rect::new(0.0, 0.0, ROW_FIXED_W + 4.0, ROW_H)];
+        let body_is_title = [0usize];
+        let zone = pointer_zone(
+            (viewport.x + 40.0, viewport.y + 10.0),
+            HitGeometry {
+                body_is_title: &body_is_title,
+                ..geometry((0.0, 0.0), &items, viewport)
+            },
+        );
+        assert_eq!(zone, PointerZone::Title(0));
     }
 
     #[test]
@@ -619,48 +1456,22 @@ mod tests {
         assert_eq!(plate.y, 0.0);
         assert!((plate.h - (CARD_H + PANEL_PAD * 2.0)).abs() < 0.001);
         assert_eq!(radius, PANEL_RADIUS);
-
-        // An interior card (cards above, below and beside it) keeps the card rect and card radius.
-        let panel = (
-            PANEL_PAD * 2.0 + 3.0 * CARD_W,
-            PANEL_PAD * 2.0 + 3.0 * CARD_H,
-        );
-        let mid_row = Rect::new(PANEL_PAD + CARD_W, PANEL_PAD + CARD_H, CARD_W, CARD_H);
-        let (plate, radius) = hover_plate_rect(mid_row, 1, 1, 3, 3, panel);
-        assert_eq!(plate, mid_row);
-        assert_eq!(radius, CARD_RADIUS);
     }
 
     #[test]
-    fn plate_layout_comes_from_the_grid_so_a_reflow_cannot_shrink_it_back() {
-        // Every placement path asks this one function for the plates. It must give the same
-        // geometry as the initial build (the defect was a reflow placing the plain card rect,
-        // leaving the panel's 4pt padding visible as a ring around the hovered card).
-        let widths = widths_for_aspects(&[Some(1.5)]);
-        let grid = grid_for(&widths, 1200.0, 900.0);
-        let rects = card_rects(&grid);
-        let (panel_w, panel_h) = grid.panel_size();
-        let plates = plates_for_rects(&grid, &rects);
-        assert_eq!(plates.len(), 1);
-        assert_eq!(
-            plates[0].0,
-            Rect::new(0.0, 0.0, panel_w, panel_h),
-            "a single card's plate is the whole panel"
-        );
-        assert_eq!(plates[0].1, PANEL_RADIUS);
-
-        let widths = widths_for_aspects(&[Some(1.5), Some(1.5), Some(1.5)]);
-        let grid = grid_for(&widths, 1200.0, 900.0);
-        let rects = card_rects(&grid);
-        let plates = plates_for_rects(&grid, &rects);
+    fn plates_come_from_the_row_so_a_reflow_cannot_shrink_them_back() {
+        let cards: Vec<Rect> = (0..3)
+            .map(|index| Rect::new(PANEL_PAD + index as f64 * CARD_W, PANEL_PAD, CARD_W, CARD_H))
+            .collect();
+        let panel = (PANEL_PAD * 2.0 + 3.0 * CARD_W, PANEL_PAD * 2.0 + CARD_H);
+        let plates = plates_for_row(&cards, panel);
         assert_eq!(plates.len(), 3);
-        for (plate, card) in plates.iter().zip(&rects) {
+        for (plate, card) in plates.iter().zip(&cards) {
             assert!(plate.0.x <= card.x + 0.001 && plate.0.max_x() >= card.max_x() - 0.001);
             assert!(plate.0.y <= card.y + 0.001 && plate.0.max_y() >= card.max_y() - 0.001);
         }
-        // The row's edge cards cover the panel's left/right padding; the middle one does not.
         assert_eq!(plates[0].0.x, 0.0);
-        assert!((plates[2].0.max_x() - grid.panel_size().0).abs() < 0.001);
+        assert!((plates[2].0.max_x() - panel.0).abs() < 0.001);
         assert!(plates[1].0.x > 0.0);
     }
 
@@ -693,37 +1504,6 @@ mod tests {
     }
 
     #[test]
-    fn one_card_panel_fits_the_card_and_its_padding() {
-        let widths = widths_for_aspects(&[Some(1.5)]);
-        let grid = grid_for(&widths, 1000.0, 800.0);
-        assert_eq!(grid.columns, 1);
-        assert_eq!(grid.rows, 1);
-        assert_eq!(grid.visible_cards, 1);
-        assert_eq!(
-            grid.panel_size(),
-            (widths[0] + PANEL_PAD * 2.0, CARD_H + PANEL_PAD * 2.0)
-        );
-    }
-
-    #[test]
-    fn cards_sit_edge_to_edge_with_no_gutter() {
-        let widths = vec![CARD_W; 2];
-        let grid = grid_for(&widths, 1000.0, 800.0);
-        let rects = card_rects(&grid);
-        assert_eq!(rects.len(), 2);
-        assert!(
-            (rects[1].x - rects[0].max_x()).abs() < 0.001,
-            "adjacent cards share an edge: {} vs {}",
-            rects[1].x,
-            rects[0].max_x()
-        );
-        assert_eq!(
-            grid.panel_size(),
-            (PANEL_PAD * 2.0 + 2.0 * CARD_W, PANEL_PAD * 2.0 + CARD_H)
-        );
-    }
-
-    #[test]
     fn every_card_takes_its_own_window_aspect_so_there_is_no_letterbox() {
         // Fixed card height, width follows the window aspect -- the app switcher's rule. A mixed
         // row (portrait / 16:10 / ultra-wide) must keep each thumbnail's aspect and leave no
@@ -737,60 +1517,15 @@ mod tests {
                 "thumbnail {thumb_w}x{THUMB_H} must keep aspect {aspect}"
             );
         }
-        let grid = grid_for(&widths, 2000.0, 800.0);
-        let rects = card_rects(&grid);
-        assert_eq!(rects.len(), 3);
-        for (rect, width) in rects.iter().zip(&widths) {
-            assert_eq!(rect.w, *width);
-        }
-        let expected: f64 =
-            widths.iter().sum::<f64>() + (widths.len() - 1) as f64 * CARD_GAP + PANEL_PAD * 2.0;
-        assert!((grid.panel_size().0 - expected).abs() < 0.001);
-        // A missing aspect falls back to the design width, and a portrait window is clamped to the
-        // smallest card that can still hold the header (120pt thumbnail).
+        // A missing aspect falls back to the design width, and a portrait window is floored at the
+        // smallest card that still holds the header.
         assert_eq!(card_width_for(None), CARD_W);
-        assert_eq!(card_width_for(Some(0.4)), 120.0 + CARD_PAD * 2.0);
-    }
-
-    #[test]
-    fn cards_wrap_at_four_columns_and_the_panel_grows_down() {
-        let widths = vec![CARD_W; 7];
-        let grid = grid_for(&widths, 1300.0, 900.0);
-        assert_eq!(grid.columns, 4);
-        assert_eq!(grid.rows, 2);
-        let (w, h) = grid.panel_size();
-        assert!((w - (PANEL_PAD * 2.0 + 4.0 * CARD_W + 3.0 * CARD_GAP)).abs() < 0.001);
-        assert!((h - (PANEL_PAD * 2.0 + 2.0 * CARD_H + CARD_GAP)).abs() < 0.001);
-        let rects = card_rects(&grid);
-        assert_eq!(rects.len(), 7);
-        // The fourth card starts the second row at the panel's left padding.
-        assert!((rects[4].x - PANEL_PAD).abs() < 0.001);
-        assert!((rects[4].y - (PANEL_PAD + CARD_H + CARD_GAP)).abs() < 0.001);
-    }
-
-    #[test]
-    fn a_narrow_screen_degrades_to_fewer_columns() {
-        let widths = vec![CARD_W; 6];
-        let grid = grid_for(&widths, 260.0, 900.0);
-        assert_eq!(grid.columns, 1);
-        assert_eq!(grid.visible_cards, 4, "four rows at most");
-        let (w, _) = grid.panel_size();
-        assert!(w <= 260.0 + 0.001);
-    }
-
-    #[test]
-    fn more_windows_than_the_panel_can_show_are_counted_not_dropped_silently() {
-        let widths = vec![CARD_W; 20];
-        let grid = grid_for(&widths, 1300.0, 900.0);
-        assert_eq!(grid.visible_cards, MAX_CARDS);
-        assert!(grid.visible_cards < 20);
-        assert_eq!(card_rects(&grid).len(), MAX_CARDS);
+        assert_eq!(card_width_for(Some(0.3)), CARD_MIN_W);
     }
 
     #[test]
     fn card_children_sit_inside_the_card_without_overlap() {
-        let widths = vec![CARD_W; 2];
-        let card = card_rects(&grid_for(&widths, 1000.0, 800.0))[0];
+        let card = Rect::new(PANEL_PAD, PANEL_PAD, CARD_W, CARD_H);
         let icon = icon_rect(card);
         let title = title_rect(card);
         let close = close_rect(card);
@@ -912,87 +1647,6 @@ mod tests {
     }
 
     #[test]
-    fn pointer_zones_prefer_the_close_slot_then_the_title_then_the_card() {
-        let panel = Rect::new(100.0, 100.0, 240.0, 180.0);
-        let card = Rect::new(108.0, 108.0, CARD_W, CARD_H);
-        let cards = vec![card];
-        let anchor = Rect::new(180.0, 300.0, 44.0, 56.0);
-        let band = transition_band(DockEdge::Bottom, anchor, panel);
-        let close = close_rect(card);
-        let title = title_rect(card);
-        let thumb = thumb_rect(card);
-
-        assert_eq!(
-            pointer_zone(
-                (close.x + 1.0, close.y + 1.0),
-                panel,
-                &cards,
-                anchor,
-                band,
-                Some(0)
-            ),
-            PointerZone::Close(0)
-        );
-        // Hidden slot: the same point is the card body.
-        assert_eq!(
-            pointer_zone(
-                (close.x + 1.0, close.y + 1.0),
-                panel,
-                &cards,
-                anchor,
-                band,
-                None
-            ),
-            PointerZone::Card(0)
-        );
-        assert_eq!(
-            pointer_zone(
-                (title.x + 1.0, title.y + 1.0),
-                panel,
-                &cards,
-                anchor,
-                band,
-                Some(0)
-            ),
-            PointerZone::Title(0)
-        );
-        assert_eq!(
-            pointer_zone(
-                (thumb.x + 1.0, thumb.y + 1.0),
-                panel,
-                &cards,
-                anchor,
-                band,
-                Some(0)
-            ),
-            PointerZone::Card(0)
-        );
-        assert_eq!(
-            pointer_zone(
-                (panel.x + 1.0, panel.max_y() - 1.0),
-                panel,
-                &cards,
-                anchor,
-                band,
-                None
-            ),
-            PointerZone::Panel
-        );
-        assert_eq!(
-            pointer_zone((200.0, 290.0), panel, &cards, anchor, band, None),
-            PointerZone::Transition
-        );
-        assert_eq!(
-            pointer_zone((200.0, 320.0), panel, &cards, anchor, band, None),
-            PointerZone::Anchor
-        );
-        assert_eq!(
-            pointer_zone((0.0, 0.0), panel, &cards, anchor, band, None),
-            PointerZone::Outside
-        );
-    }
-
-    #[test]
     fn truncation_is_a_width_comparison_and_ignores_unmeasurable_text() {
         assert!(!title_is_truncated(100.0, 152.0));
         assert!(title_is_truncated(152.5, 152.0));
@@ -1011,5 +1665,12 @@ mod tests {
         let near_top = Rect::new(500.0, 30.0, 300.0, 180.0);
         let flipped = tooltip_frame(near_top, (200.0, 60.0), DockEdge::Bottom, screen(), visible);
         assert!(flipped.y >= near_top.max_y() - 0.001);
+    }
+
+    #[test]
+    fn the_mode_name_is_stable_for_e2e() {
+        assert_eq!(PanelMode::Row.name(), "row");
+        assert_eq!(PanelMode::List.name(), "list");
+        assert_eq!(RowAxis::Horizontal.name(), "horizontal");
     }
 }

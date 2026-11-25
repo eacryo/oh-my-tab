@@ -576,6 +576,9 @@ Markdown 更新说明的一级标题使用 `sidebar-title` 粗体，二级标题
 | 行上方分隔线的间距 | 0 | `SEPARATOR_ABOVE_ROW_GAP` |
 | 卡片动作带 | 高取行高 56、控件取 `CONTROL_H`（32），因此上下各 12；整宽（卡片左右各 16） | `SettingsRow::action_band` |
 | 滑杆读数 | 宽 44，间距 8 | `SLIDER_READOUT_*` |
+| Dock 预览：单行卡片 | 宽 216 × 高 164，内边距 4，标题带 32；卡片宽度跟随窗口宽高比 | `dock_preview/layout.rs`（`CARD_W`、`CARD_H`、`CARD_PAD`、`HEADER_H`） |
+| Dock 预览：列表行 | 高 32，内边距 8，图标 16，间距 8，关闭槽 20，标题 14pt `row-label` | `dock_preview/layout.rs`（`ROW_H`、`ROW_PAD`、`ROW_ICON`、`ROW_GAP`、`CLOSE_SIZE`）；复现命令 `rg -n 'ROW_H|ROW_PAD|LIST_W|LIST_W_MIN|LIST_FADE_H|PANEL_MARGIN|MIN_TITLE_W|CARD_MIN_W' src/dock_preview/layout.rs` |
+| Dock 预览：列表面板 | 宽 304（下限 240），视口边缘还有内容时 12pt 渐隐，距屏幕边缘 8 | `dock_preview/layout.rs`（`LIST_W`、`LIST_W_MIN`、`LIST_FADE_H`、`PANEL_MARGIN`） |
 
 经验法则：**相关元素 8，分组之间 24，页面边缘 32–72。** 需要紧凑用小的那一档，需要分隔用大的那一档；
 同一种间距绝不允许一会儿 12 一会儿 14。

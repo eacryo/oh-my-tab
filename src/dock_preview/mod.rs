@@ -47,6 +47,12 @@ static RESULTS: LazyLock<Mutex<Vec<CollectorResult>>> = LazyLock::new(|| Mutex::
 static PENDING_OPEN: LazyLock<Mutex<Option<PendingOpen>>> = LazyLock::new(|| Mutex::new(None));
 static CURRENT_APP: LazyLock<Mutex<Option<CurrentApp>>> = LazyLock::new(|| Mutex::new(None));
 static CLOSE_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+
+/// Whether a smoke case has switched the controlled room on (see `visible_frame_of`).
+static SMOKE_ROOM_H: AtomicBool = AtomicBool::new(false);
+/// The room the next development case opens with, when a smoke case set one (see `set_case_room`).
+static CASE_ROOM_H: Mutex<Option<f64>> = Mutex::new(None);
+static CASE_ROOM_W: Mutex<Option<f64>> = Mutex::new(None);
 /// The Dock tile the observer last reported. A collector result is applied only while this still
 /// names the same app: a slow Accessibility pass must not open a preview the pointer has left.
 static DOCK_SELECTION: LazyLock<Mutex<Option<(i32, bool)>>> = LazyLock::new(|| Mutex::new(None));
@@ -243,32 +249,57 @@ pub(crate) fn handle_app_terminated(pid: i32) {
     }
 }
 
+/// Drop an open panel because its layout settings changed (the row/list threshold). The observer
+/// keeps running: the next hover opens the panel again with the new layout.
+pub(crate) fn hide_for_layout_change() {
+    if panel::is_visible() {
+        hide_panel();
+        panel::flush_records();
+    }
+}
+
 pub(crate) fn handle_screen_params_changed() {
     if is_enabled() {
         hide_panel();
     }
 }
 
-/// A card's body was clicked: activate its window, then leave. Identity and window presence are
+/// The configured threshold: the most windows a single row shows before the panel becomes a list.
+pub(crate) fn cards_per_row() -> usize {
+    crate::config::CONFIG
+        .read()
+        .map(|config| config.dock_preview.cards_per_row as usize)
+        .unwrap_or(crate::config::DOCK_CARDS_PER_ROW_DEFAULT as usize)
+}
+
+/// The app the open panel belongs to, with the identity and request its targets are checked against.
+fn current_identity() -> Option<(i32, String, Option<u64>)> {
+    let app = CURRENT_APP.lock().unwrap().clone()?;
+    Some((app.pid, app.identity_key, app.process_start_time_us))
+}
+
+/// A row's body was clicked: activate its window, then leave. Identity and window presence are
 /// verified on a worker: both need Accessibility for some windows, and the main thread must not
 /// block on a target that does not answer.
-pub(crate) fn click_card(index: usize) {
-    let Some(window) = panel::card_window(index) else {
-        return;
-    };
-    let app = CURRENT_APP.lock().unwrap().clone();
-    let Some(app) = app else {
+///
+/// The target is the one resolved under the panel lock (`panel::hit_target`), never an index: a
+/// scroll or a removal between the click and this call would otherwise pick another row.
+pub(crate) fn activate_target(target: panel::HitTarget) {
+    let Some((app_pid, identity_key, start_time_us)) = current_identity() else {
         hide_panel();
         return;
     };
-    if window.pid != app.pid {
+    if target.pid != app_pid {
         hide_panel();
         return;
     }
-    let request = REQUEST.load(Ordering::Acquire);
-    let (pid, wid) = (window.pid, window.wid);
+    let Some(window) = panel::item_window(target.pid, target.wid) else {
+        return;
+    };
+    let (pid, wid) = (target.pid, target.wid);
     let (minimized, other_desktop) = (window.minimized, window.other_desktop);
-    let identity = (app.pid, app.identity_key, app.process_start_time_us);
+    let identity = (app_pid, identity_key, start_time_us);
+    let request = target.request;
     let _ = std::thread::Builder::new()
         .name("com.eacryo.oh-my-tab.dock-preview-activate".to_string())
         .spawn(move || {
@@ -308,26 +339,23 @@ fn drain_activate_results() {
     }
 }
 
-/// A card's close button was clicked/// A card's close button was clicked: ask the system to close that window and keep the card until
+/// A row's close button was clicked: ask the system to close that window and keep the row until
 /// the window is confirmed gone (a save dialog, or a failed query, keeps it).
-pub(crate) fn click_close(index: usize) {
-    let Some(window) = panel::card_window(index) else {
+pub(crate) fn close_target(target: panel::HitTarget) {
+    let Some((app_pid, identity_key, start_time_us)) = current_identity() else {
         return;
     };
-    let app = CURRENT_APP.lock().unwrap().clone();
-    let Some(app) = app else {
-        return;
-    };
-    if window.pid != app.pid {
+    if target.pid != app_pid {
         return;
     }
-    // The card stops taking clicks now; the AX call and its checks run on a worker, so a target
-    // that does not answer cannot stall the pointer, the tick or the menu bar.
-    panel::begin_close_pending(index);
+    let (pid, wid) = (target.pid, target.wid);
+    // The row stops taking clicks now; a second press on the same generation is refused here.
+    if !panel::begin_close_pending(pid, wid) {
+        return;
+    }
     panel::flush_records();
-    let request = REQUEST.load(Ordering::Acquire);
-    let (pid, wid) = (window.pid, window.wid);
-    let identity = (app.pid, app.identity_key, app.process_start_time_us);
+    let identity = (app_pid, identity_key, start_time_us);
+    let request = target.request;
     let spawn = std::thread::Builder::new()
         .name("com.eacryo.oh-my-tab.dock-preview-close".to_string())
         .spawn(move || {
@@ -343,7 +371,7 @@ pub(crate) fn click_close(index: usize) {
             post_event_to_main();
         });
     if spawn.is_err() {
-        // No worker means no AX call: give the card back instead of leaving it stuck pending.
+        // No worker means no AX call: give the row back instead of leaving it stuck pending.
         panel::cancel_close_matching(pid, wid);
         panel::flush_records();
     }
@@ -558,6 +586,123 @@ fn hide_panel() {
     }
 }
 
+/// Synthetic entries for the development entries: the window ids are distinct and non-zero so a
+/// scenario can tell one row from another, but nothing behind them exists, so a click on one is
+/// refused by the identity check exactly like a stale real target.
+pub(crate) fn synthetic_windows(titles: &[&str]) -> Vec<windows::PreviewWindow> {
+    let pid = std::process::id() as i32;
+    titles
+        .iter()
+        .enumerate()
+        .map(|(index, title)| windows::PreviewWindow {
+            pid,
+            wid: 900_001 + index as u32,
+            title: (*title).to_string(),
+            minimized: false,
+            app_hidden: false,
+            other_desktop: false,
+            active: index == 0,
+            aspect: Some(1.6),
+            may_capture: false,
+        })
+        .collect()
+}
+
+/// Development entry: show the panel for an explicit window list, so the list layout and its
+/// scrolling can be driven without an app that happens to have that many windows.
+pub(crate) fn dev_show_windows(titles: &[&str], edge: DockEdge) -> bool {
+    if !is_enabled() {
+        return false;
+    }
+    let screen = primary_screen_bounds_cg();
+    // The smoke CONSTRUCTS the budget it needs instead of depending on the display: the tile sits
+    // on the visible frame's bottom edge, and that frame is exactly the requested room tall and
+    // wide, so the layout's budget is the requested room (minus its own margin). A real run uses
+    // the display's own visible frame.
+    let visible = match SMOKE_ROOM_H.load(Ordering::Acquire) {
+        true => {
+            let room = |slot: &Mutex<Option<f64>>, name: &str, fallback: f64| {
+                slot.lock()
+                    .ok()
+                    .and_then(|room| *room)
+                    .or_else(|| {
+                        crate::dev_flags::value(name)
+                            .and_then(|value| value.trim().parse::<f64>().ok())
+                            .filter(|room| room.is_finite() && *room > 0.0)
+                    })
+                    .unwrap_or(fallback)
+            };
+            // The flags state the BUDGET, which is what reaches the layout: a bottom Dock measures
+            // from the tile's top edge to the visible frame's top and subtracts `PANEL_MARGIN` ONCE.
+            // The frame therefore ends at the tile's top edge, not `PANEL_MARGIN` above it, and the
+            // height is the budget plus that single margin -- adding it twice left the viewport 8pt
+            // taller than the two rows the case claims.
+            let room_h = room(&CASE_ROOM_H, "smoke-dock-room-h", 400.0);
+            // A card row needs `CARD_H` plus its padding; a narrower fallback would make the
+            // horizontal case impossible to construct on any display.
+            let room_w = room(
+                &CASE_ROOM_W,
+                "smoke-dock-room-w",
+                layout::CARD_W + layout::PANEL_PAD * 4.0,
+            );
+            // Height and width compensate DIFFERENTLY, because `space_budget` measures them
+            // differently: a bottom Dock measures width across the screen (a margin on each side)
+            // and height from the tile's top edge (one margin, where the frame ends).
+            Rect::new(
+                screen.x,
+                screen.y,
+                (room_w + layout::PANEL_MARGIN * 2.0).min(screen.w),
+                (room_h + layout::PANEL_MARGIN).min(screen.h),
+            )
+        }
+        false => visible_frame_of(screen),
+    };
+    // The controlled room is measured to the tile's TOP edge, which is what the layout budget
+    // measures: the anchor's own height hangs below that edge.
+    let bottom = visible.max_y();
+    let anchor = match edge {
+        DockEdge::Bottom => Rect::new(screen.x + screen.w / 2.0 - 22.0, bottom, 44.0, 56.0),
+        DockEdge::Top => Rect::new(screen.x + screen.w / 2.0 - 22.0, screen.y, 44.0, 56.0),
+        DockEdge::Left => Rect::new(screen.x, screen.y + screen.h / 2.0 - 22.0, 56.0, 44.0),
+        DockEdge::Right => Rect::new(
+            screen.max_x() - 56.0,
+            screen.y + screen.h / 2.0 - 22.0,
+            56.0,
+            44.0,
+        ),
+    };
+    let pid = std::process::id() as i32;
+    let request = REQUEST.fetch_add(1, Ordering::AcqRel) + 1;
+    let ticket = crate::thumbnail::begin_dock_capture_epoch();
+    let shown = panel::show(
+        panel::PanelRequest {
+            pid,
+            thumbnail_generation: crate::thumbnail::pid_generation_now(pid),
+            bundle: String::new(),
+            identity_key: String::new(),
+            process_start_time_us: None,
+            windows: synthetic_windows(titles),
+            anchor,
+            edge,
+            visible,
+        },
+        request,
+        ticket,
+    );
+    if shown {
+        *CURRENT_APP.lock().unwrap() = Some(CurrentApp {
+            pid,
+            identity_key: String::new(),
+            process_start_time_us: None,
+            anchor,
+            edge,
+            request,
+        });
+        *CLOSE_AT.lock().unwrap() = None;
+    }
+    shown
+}
+
 /// Development entry: show the panel with a synthetic window list, so the panel's own views and
 /// geometry can be asserted without depending on which app happens to have windows. The cards
 /// carry no real window ids; this path is presentation-only and no click is driven through it.
@@ -574,21 +719,7 @@ pub(crate) fn dev_show_synthetic(titles: &[&str]) -> bool {
         56.0,
     );
     let pid = std::process::id() as i32;
-    let windows: Vec<windows::PreviewWindow> = titles
-        .iter()
-        .enumerate()
-        .map(|(index, title)| windows::PreviewWindow {
-            pid,
-            wid: 0,
-            title: (*title).to_string(),
-            minimized: false,
-            app_hidden: false,
-            other_desktop: false,
-            active: index == 0,
-            aspect: None,
-            may_capture: false,
-        })
-        .collect();
+    let windows = synthetic_windows(titles);
     let request = REQUEST.fetch_add(1, Ordering::AcqRel) + 1;
     let ticket = crate::thumbnail::begin_dock_capture_epoch();
     let app = CurrentApp {
@@ -847,7 +978,13 @@ fn handle_event(event: DockEvent) {
                 && decisions::switch_decision(current_pid, pid) == SwitchDecision::Keep
             {
                 if let Some(visible) = event.screen_frame.map(visible_frame_of) {
-                    panel::update_anchor(icon, edge, visible);
+                    if !panel::update_anchor(icon, edge, visible) {
+                        // The tile moved somewhere the panel no longer fits: hide it instead of
+                        // leaving a stale frame behind.
+                        log_debug!("[dock-preview] tile moved past the room the panel needs");
+                        hide_panel();
+                        return;
+                    }
                     update_dock_reveal_keeper(icon, edge);
                     if let Some(app) = CURRENT_APP.lock().unwrap().as_mut() {
                         app.anchor = icon;
@@ -918,12 +1055,34 @@ fn handle_event(event: DockEvent) {
 fn visible_frame_of(screen: Rect) -> Rect {
     // The menu bar is the only reserved band the preview has to respect: the Dock either hides
     // itself or is already excluded by the anchor's edge.
-    Rect::new(
+    let visible = Rect::new(
         screen.x,
         screen.y + 24.0,
         screen.w,
         (screen.h - 24.0).max(1.0),
-    )
+    );
+    // `--smoke-dock-room-h=<pt>` shrinks the room ABOVE a bottom tile so a scrolling case can be
+    // CONSTRUCTED instead of hoped for (a full-height screen fits every window list a test can
+    // reasonably open). It is read only while a smoke case has switched it on: the ordinary smoke
+    // previews run with the screen's own room, so the room cannot make them disappear.
+    match SMOKE_ROOM_H
+        .load(Ordering::Acquire)
+        .then(|| crate::dev_flags::value("smoke-dock-room-h"))
+        .flatten()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|room| room.is_finite() && *room > 0.0)
+    {
+        Some(room) => {
+            let bottom = screen.max_y();
+            Rect::new(
+                visible.x,
+                (bottom - room).max(visible.y),
+                visible.w,
+                (bottom - (bottom - room).max(visible.y)).max(1.0),
+            )
+        }
+        None => visible,
+    }
 }
 
 fn tick() {
@@ -1298,6 +1457,8 @@ pub(crate) enum SmokeFailure {
 /// The switch value the smoke found, restored on cleanup so the run cannot leave the in-memory
 /// configuration flipped for whatever follows it.
 static SMOKE_ORIGINAL_DOCK_ENABLED: Mutex<Option<bool>> = Mutex::new(None);
+/// The threshold the smoke found, restored on cleanup on the same rule.
+static SMOKE_ORIGINAL_THRESHOLD: Mutex<Option<u32>> = Mutex::new(None);
 
 /// Drive the real panel for this process and assert the facts it owns. Runs inside the smoke child
 /// (a real NSApplication on the main thread). Returns the number of checks that held.
@@ -1314,13 +1475,23 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     // Establish a real false -> true (and later true -> false) transition for this process: the
     // `Settings` source only acts on a changed value, so the in-memory configuration has to be the
     // one the runtime entry reads. The original value is restored on cleanup.
-    let original = crate::config::CONFIG
+    //
+    // The threshold is pinned for the run as well: a two-window row case is a row only while the
+    // threshold is at least 2, and a user whose configuration says 1 must not turn it into a list.
+    let (original, original_threshold) = crate::config::CONFIG
         .read()
-        .map(|config| config.dock_preview.enabled)
-        .unwrap_or(true);
+        .map(|config| {
+            (
+                config.dock_preview.enabled,
+                config.dock_preview.cards_per_row,
+            )
+        })
+        .unwrap_or((true, crate::config::DOCK_CARDS_PER_ROW_DEFAULT));
     *SMOKE_ORIGINAL_DOCK_ENABLED.lock().unwrap() = Some(original);
+    *SMOKE_ORIGINAL_THRESHOLD.lock().unwrap() = Some(original_threshold);
     if let Ok(mut config) = crate::config::CONFIG.write() {
         config.dock_preview.enabled = false;
+        config.dock_preview.cards_per_row = crate::config::DOCK_CARDS_PER_ROW_DEFAULT;
     }
     // The switch is exercised through the runtime entry the settings row reaches, not by calling
     // the module directly: the same flags, the same startup/stop path, the same UI refresh.
@@ -1458,6 +1629,10 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
         ));
     }
     checks += 1;
+    // The list and the threshold run BEFORE the disable below: turning the feature off leaves it
+    // off for the rest of the process, and every later case has to re-enable it to show anything.
+    checks += smoke_list_mode()?;
+    checks += smoke_threshold_change()?;
     // Turning the feature off through the same runtime entry must tear both panels down.
     if !dev_show_synthetic(&[long_title, "Second window"]) {
         return Err(SmokeFailure::Failed(
@@ -1496,6 +1671,320 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     Ok(checks)
 }
 
+/// The eight titles the list case opens with (distinct, so a row can be told from its neighbour).
+const LIST_ROW_TITLES: [&str; 8] = [
+    "list row one",
+    "list row two",
+    "list row three",
+    "list row four",
+    "list row five",
+    "list row six",
+    "list row seven",
+    "list row eight",
+];
+
+/// Construct a scrolling case and assert the evidence for it.
+///
+/// The overflow is CONSTRUCTED, not hoped for: the controlled room is switched on here (and only
+/// here, so the ordinary smoke previews keep the screen's own room), `max_scroll > 0` is asserted
+/// before any behaviour is read from it, and the case is a six-window row at the minimum threshold
+/// as well as a list.
+fn smoke_list_mode() -> Result<u32, SmokeFailure> {
+    if crate::dev_flags::value("smoke-dock-room-h").is_none()
+        || crate::dev_flags::value("smoke-dock-room-w").is_none()
+        || crate::dev_flags::value("smoke-dock-row-room-h").is_none()
+    {
+        return Err(SmokeFailure::NotRun(
+            "--smoke-dock-room-h/-w and --smoke-dock-row-room-h were not all given, so at least one \
+             case has no controlled overflow"
+                .into(),
+        ));
+    }
+    let mut checks = 0;
+    SMOKE_ROOM_H.store(true, Ordering::Release);
+    // Each case states its own budget: a short, wide room for the list, a tall, narrow one for the
+    // horizontal row. Measuring both from the display made the list fit on an ordinary screen and
+    // the row fit on a wide one.
+    set_case_room("smoke-dock-room-h", "smoke-dock-room-w");
+    checks += smoke_list_scroll()?;
+    set_case_room("smoke-dock-row-room-h", "smoke-dock-room-w");
+    checks += smoke_horizontal_row()?;
+    SMOKE_ROOM_H.store(false, Ordering::Release);
+    hide_panel();
+    Ok(checks)
+}
+
+/// The room the NEXT development case is opened with.
+///
+/// `dev_show_windows` reads these two statics, so one runner can drive cases with different budgets
+/// without re-launching: its argv is the process's only configuration channel and cannot change
+/// mid-run.
+fn set_case_room(height_flag: &str, width_flag: &str) {
+    let parse = |flag: &str| {
+        crate::dev_flags::value(flag)
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|room| room.is_finite() && *room > 0.0)
+    };
+    *CASE_ROOM_H.lock().unwrap() = parse(height_flag);
+    *CASE_ROOM_W.lock().unwrap() = parse(width_flag);
+}
+
+/// The list layout: eight windows, a two-row viewport, and the three facts that make the layout
+/// work -- a real overflow, AppKit's own clipping, and a scroll that moves only the content view.
+fn smoke_list_scroll() -> Result<u32, SmokeFailure> {
+    let titles: Vec<&str> = (1..=8).map(|index| LIST_ROW_TITLES[index - 1]).collect();
+    if !dev_show_windows(&titles, DockEdge::Bottom) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not open for the list check".into(),
+        ));
+    }
+    pump(Duration::from_millis(120));
+    let mut checks = 0;
+    let facts = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the open panel published no layout facts".into()))?;
+    if facts.mode != layout::PanelMode::List {
+        return Err(SmokeFailure::Failed(format!(
+            "eight windows with a threshold of {} opened as {:?}, not a list",
+            crate::dock_preview::cards_per_row(),
+            facts.mode
+        )));
+    }
+    checks += 1;
+    // The proof that the case is a real overflow, before any behaviour is read from it, and that
+    // the budget produced the viewport it promised: exactly two rows (a third would be the padding
+    // allowance leaking back in, and would still "pass" a bare max_scroll check).
+    if facts.max_scroll <= 0.0 || facts.full_rows != 2 {
+        return Err(SmokeFailure::Failed(format!(
+            "the controlled room produced max_scroll={} and full_rows={}, expected 2 complete rows \
+             over a scrollable list",
+            facts.max_scroll, facts.full_rows
+        )));
+    }
+    // `full_rows` rounds down, so it hides a viewport a few points taller than two rows (which
+    // would show a sliver of the third). Assert the height itself.
+    let expected_viewport = 2.0 * crate::dock_preview::layout::ROW_H;
+    let viewport_h = facts.viewport.h;
+    if (viewport_h - expected_viewport).abs() > 0.5 {
+        return Err(SmokeFailure::Failed(format!(
+            "the controlled room produced a {viewport_h}pt viewport, expected exactly {expected_viewport}pt"
+        )));
+    }
+    checks += 1;
+    let (row_frame, viewport_frame, clipped) =
+        panel::clip_evidence(0).map_err(SmokeFailure::Failed)?;
+    let close_enough = |a: Rect, b: Rect| {
+        (a.x - b.x).abs() <= 0.5
+            && (a.y - b.y).abs() <= 0.5
+            && (a.w - b.w).abs() <= 0.5
+            && (a.h - b.h).abs() <= 0.5
+    };
+    if !close_enough(row_frame, facts.item_screen[0])
+        || !close_enough(viewport_frame, facts.viewport)
+    {
+        return Err(SmokeFailure::Failed(format!(
+            "AppKit reports row {row_frame:?} / viewport {viewport_frame:?}, the panel published {:?} / {:?}",
+            facts.item_screen[0], facts.viewport
+        )));
+    }
+    if !clipped {
+        return Err(SmokeFailure::Failed(
+            "the row's clipping ancestor is not masksToBounds".into(),
+        ));
+    }
+    checks += 1;
+    let before = facts.scroll;
+    panel::scroll_by(layout::Axis::Y, layout::ROW_H);
+    panel::flush_records();
+    let after = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the panel facts vanished after a scroll".into()))?;
+    if after.scroll <= before {
+        return Err(SmokeFailure::Failed(format!(
+            "a downward step did not scroll the list ({before} -> {})",
+            after.scroll
+        )));
+    }
+    checks += 1;
+    panel::scroll_by(layout::Axis::Y, 10_000.0);
+    panel::flush_records();
+    let end = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the panel facts vanished at the end".into()))?;
+    if (end.scroll - end.max_scroll).abs() > 0.5 {
+        return Err(SmokeFailure::Failed(format!(
+            "the scroll is not clamped to the maximum ({} vs {})",
+            end.scroll, end.max_scroll
+        )));
+    }
+    let last = *end
+        .item_screen
+        .last()
+        .ok_or_else(|| SmokeFailure::Failed("the list has no rows".into()))?;
+    if !last.overlaps(end.viewport) {
+        return Err(SmokeFailure::Failed(format!(
+            "the last row {last:?} is outside the viewport {:?} at the end",
+            end.viewport
+        )));
+    }
+    checks += 1;
+    hide_panel();
+    Ok(checks)
+}
+
+/// The horizontal case: a single row that does not fit is clipped by a viewport no wider than the
+/// screen, and scrolling it moves the content on x only.
+fn smoke_horizontal_row() -> Result<u32, SmokeFailure> {
+    let original = crate::config::CONFIG.read().unwrap().clone();
+    let mut narrow = original.clone();
+    narrow.dock_preview.cards_per_row = crate::config::DOCK_CARDS_PER_ROW_MAX;
+    let _ = crate::runtime_config::smoke_apply_threshold(&original, &narrow);
+    let titles = [
+        "wide one",
+        "wide two",
+        "wide three",
+        "wide four",
+        "wide five",
+        "wide six",
+    ];
+    // The horizontal case runs under a SHORT height and a NARROW width from the runner; a row that
+    // still fits would prove nothing, so a card row is required to exist and to overflow its
+    // viewport.
+    let restore = |original: &crate::config::Config| {
+        let current = crate::config::CONFIG.read().unwrap().clone();
+        let _ = crate::runtime_config::smoke_apply_threshold(&current, original);
+    };
+    if !dev_show_windows(&titles, DockEdge::Bottom) {
+        restore(&original);
+        return Err(SmokeFailure::Failed(format!(
+            "the panel did not open for the horizontal check (room {}pt)",
+            crate::dev_flags::value("smoke-dock-room-h").unwrap_or_default()
+        )));
+    }
+    pump(Duration::from_millis(80));
+    let facts = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the row panel published no facts".into()))?;
+    let screen = primary_screen_bounds_cg();
+    let mut checks = 0;
+    if facts.mode != layout::PanelMode::Row {
+        return Err(SmokeFailure::Failed(
+            "six windows at the maximum threshold should be a single row".into(),
+        ));
+    }
+    // The panel never grows past the screen, however wide the cards need to be.
+    if facts.viewport.x < screen.x - 1.0 || facts.viewport.max_x() > screen.max_x() + 1.0 {
+        return Err(SmokeFailure::Failed(format!(
+            "the row's viewport {:?} leaves the screen {screen:?}",
+            facts.viewport
+        )));
+    }
+    checks += 1;
+    // Six cards at the minimum width need more than the screen offers, so the row MUST scroll; a
+    // case that does not overflow would only prove that nothing happened.
+    if facts.max_scroll <= 0.0 {
+        return Err(SmokeFailure::Failed(format!(
+            "six cards fit the row without scrolling (max_scroll={}), so the horizontal case proves nothing",
+            facts.max_scroll
+        )));
+    }
+    {
+        let before = facts.scroll;
+        panel::scroll_by(layout::Axis::X, layout::CARD_MIN_W);
+        panel::flush_records();
+        let after = panel::list_facts()
+            .ok_or_else(|| SmokeFailure::Failed("the row lost its facts".into()))?;
+        if after.scroll <= before {
+            return Err(SmokeFailure::Failed(
+                "a horizontal step did not scroll the row".into(),
+            ));
+        }
+        // Past the end: clamped, and the last card becomes reachable.
+        panel::scroll_by(layout::Axis::X, 10_000.0);
+        panel::flush_records();
+        let end = panel::list_facts()
+            .ok_or_else(|| SmokeFailure::Failed("the row lost its facts".into()))?;
+        if (end.scroll - end.max_scroll).abs() > 0.5 {
+            return Err(SmokeFailure::Failed(
+                "the horizontal scroll is not clamped".into(),
+            ));
+        }
+        let last = *end
+            .item_screen
+            .last()
+            .ok_or_else(|| SmokeFailure::Failed("the row has no cards".into()))?;
+        if !last.overlaps(end.viewport) {
+            return Err(SmokeFailure::Failed(
+                "the last card is unreachable at the end of the row".into(),
+            ));
+        }
+    }
+    checks += 1;
+    hide_panel();
+    let current = crate::config::CONFIG.read().unwrap().clone();
+    let _ = crate::runtime_config::smoke_apply_threshold(&current, &original);
+    Ok(checks)
+}
+
+/// A threshold change while the panel is on screen: the real runtime entry hides the panel, and
+/// the same windows re-open with the other layout.
+fn smoke_threshold_change() -> Result<u32, SmokeFailure> {
+    hide_panel();
+    if !dev_show_synthetic(&["threshold one", "threshold two"]) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not open for the threshold check".into(),
+        ));
+    }
+    pump(Duration::from_millis(80));
+    let row_case = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the row panel published no facts".into()))?;
+    if row_case.mode != layout::PanelMode::Row {
+        return Err(SmokeFailure::Failed(
+            "two windows did not open as a row".into(),
+        ));
+    }
+    let original = crate::config::CONFIG.read().unwrap().clone();
+    let mut changed = original.clone();
+    changed.dock_preview.cards_per_row = crate::config::DOCK_CARDS_PER_ROW_MIN;
+    let mut checks = 0;
+    // The capture epoch has to advance: a frame still in flight for the old layout must not land
+    // in a panel built for the new one.
+    let epoch_before = crate::thumbnail::current_dock_capture_epoch();
+    let hidden = crate::runtime_config::smoke_apply_threshold(&original, &changed);
+    pump(Duration::from_millis(120));
+    let epoch_after = crate::thumbnail::current_dock_capture_epoch();
+    if epoch_after <= epoch_before {
+        return Err(SmokeFailure::Failed(
+            "the panel was hidden but the capture epoch did not advance".into(),
+        ));
+    }
+    checks += 1;
+    if !hidden || panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel stayed open after the threshold changed under it".into(),
+        ));
+    }
+    checks += 1;
+    // The same two windows now need the list: the threshold is re-read when the panel opens.
+    if !dev_show_synthetic(&["threshold one", "threshold two"]) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not reopen after the threshold change".into(),
+        ));
+    }
+    pump(Duration::from_millis(80));
+    let reopened = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the reopened panel published no facts".into()))?;
+    if reopened.mode != layout::PanelMode::List {
+        return Err(SmokeFailure::Failed(format!(
+            "with a threshold of {} two windows should open as a list, got {:?}",
+            crate::config::DOCK_CARDS_PER_ROW_MIN,
+            reopened.mode
+        )));
+    }
+    checks += 1;
+    // Restore what the run found, so a failure cannot leave the threshold at its minimum.
+    let current = crate::config::CONFIG.read().unwrap().clone();
+    let _ = crate::runtime_config::smoke_apply_threshold(&current, &original);
+    hide_panel();
+    Ok(checks)
+}
+
 /// Flip the switch through `runtime_config::apply_config_change`, the path the settings dispatch
 /// uses, so the smoke covers the real enable/disable wiring rather than the module's own toggle.
 fn set_switch_through_runtime(
@@ -1525,6 +2014,11 @@ pub(crate) fn smoke_cleanup() {
     if let Some(original) = SMOKE_ORIGINAL_DOCK_ENABLED.lock().unwrap().take() {
         if let Ok(mut config) = crate::config::CONFIG.write() {
             config.dock_preview.enabled = original;
+        }
+    }
+    if let Some(threshold) = SMOKE_ORIGINAL_THRESHOLD.lock().unwrap().take() {
+        if let Ok(mut config) = crate::config::CONFIG.write() {
+            config.dock_preview.cards_per_row = threshold;
         }
     }
 }
@@ -1615,7 +2109,32 @@ mod smoke_tests {
     #[ignore]
     fn dock_preview_smoke() {
         smoke_runner!("dock_preview_smoke", 1, {
-            crate::smoke_verdict::run_smoke_child("dock_preview_smoke", &["--smoke-dock-preview"]);
+            // Both budgets are CONSTRUCTED, so neither case depends on the display. The list needs a
+            // two-row viewport (`2*ROW_H` plus the glass padding plus the layout margin), reached by
+            // scrolling. The horizontal case needs a row that cannot fit: a tall enough room for a
+            // card row, and a width under six cards at their floor width (`6*CARD_MIN_W`).
+            // Exactly a two-row viewport: the glass the layout makes is the budget, and only its
+            // padding comes off the viewport, so the budget is `2*ROW_H + 2*PAD`.
+            let room_h = format!(
+                "--smoke-dock-room-h={}",
+                2.0 * crate::dock_preview::layout::ROW_H
+                    + 2.0 * crate::dock_preview::layout::PANEL_PAD
+            );
+            let room_w = format!(
+                "--smoke-dock-room-w={}",
+                4.0 * crate::dock_preview::layout::CARD_MIN_W
+                    + crate::dock_preview::layout::PANEL_MARGIN
+            );
+            let row_h = format!(
+                "--smoke-dock-row-room-h={}",
+                crate::dock_preview::layout::CARD_H
+                    + crate::dock_preview::layout::PANEL_PAD * 4.0
+                    + crate::dock_preview::layout::PANEL_MARGIN
+            );
+            crate::smoke_verdict::run_smoke_child(
+                "dock_preview_smoke",
+                &["--smoke-dock-preview", &room_h, &room_w, &row_h],
+            );
         });
     }
 }

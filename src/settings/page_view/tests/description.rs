@@ -864,7 +864,8 @@ fn dock_page_view_owns_the_preview_switch() {
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
-    assert_eq!(view.rows.len(), 1);
+    // The switch, and the threshold that only means anything while it is on.
+    assert_eq!(view.rows.len(), 2);
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
     assert_eq!(view.rows[0].label_key, "settings.row_dock_preview_enabled");
     assert_eq!(
@@ -878,4 +879,27 @@ fn dock_page_view_owns_the_preview_switch() {
         t("settings.row_dock_preview_enabled")
     );
     assert_eq!(view.banner, None);
+
+    // The threshold is a POPUP with one option per legal value: its index is the value minus the
+    // range's first entry, so an illegal value cannot be expressed and no numeric field is needed.
+    let threshold = &view.rows[1];
+    assert_eq!(threshold.label_key, "settings.row_dock_cards_per_row");
+    assert_eq!(
+        threshold.caption_key,
+        Some("settings.desc_dock_cards_per_row")
+    );
+    assert!(
+        matches!(threshold.control, ControlKind::Popup { .. }),
+        "the threshold is a popup, not a text field"
+    );
+    assert_eq!(
+        threshold.field(),
+        Some(ControlField::DockCardsPerRow),
+        "the popup is wired to the threshold field"
+    );
+    assert_eq!(
+        threshold.value,
+        Value::Index(4),
+        "the default of 5 is the fifth option"
+    );
 }

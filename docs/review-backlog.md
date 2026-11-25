@@ -718,3 +718,15 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 - **device lane 合批回归测试只覆盖"是否创建"判定，未覆盖整批行为**（device lane 恢复重构，评审 LOW 提出，**延后**）。`the_create_budget_shares_the_enumerations_own_predicate` 验证了 `enumeration_would_create` 的四臂（reuse/rebuild/null/distrusted），但若调用方将来漏查批次额度，或把 `client_distrusted` 的置位从 `run_batch` 顶部移回复查分支内，现有断言仍可能通过——无法捕获"强制复查 + 插拔 + 设置查询合批时创建两次 client"或"新 client 读失败后仍发布 Ready"这类整批回归。
   **为什么这次不补：** 整批序列断言需要可注入的枚举结果（让 `enumerate_locked`/`IOHIDEventSystemClientCreate`/`CopyServices` 的返回值可控），当前纯函数层做不到；`lane_harness` 只支撑批次级 hold/finish 信号，不足以驱动"第一次 create+读失败、第二次成功"的受控序列。
   **重新审视的触发条件：** 下一次扩展 `lane_harness` 或把枚举结果做成可注入（trait/seam）时，补一个合批测试：强制复查 + 插拔 + 设置查询进同一批，断言新 client 读失败后本批只创建一次、最终快照仍为 `Failed` 且保留上次列表。
+
+- **Dock 预览两种布局（单行 / 列表）：真实事件路径仍缺 M 级证据**（2026-11-24，Dock 预览单行+列表轮，第 3 轮复审提出，**延后**：未跑覆盖）。M1 已覆盖纯几何、配置回退、绘制与命中同源（`layout::boxes_for`）、最小尺寸、溢出与滚动夹紧；`--smoke-dock-preview` 的列表/横向/阈值用例已按受控预算构造（短而宽的 room 给列表、高而窄的给横向行），但**本轮没有运行 M2**（需要用户授权 `--full`）。仍缺的三项都要真实输入或真实窗口：① 滚动后点击可见关闭槽必须派发 `Close` 且 `wid` 正确——目前只有纯函数级断言；② `CGEvent` 滚轮真实投递到非激活面板、且前台应用不变；③ 滚动后立即点击真实窗口，断言激活/关闭了**哪一个**窗口（合成 wid 会被身份校验拒绝，无法用于此项）。
+  **为什么延后：** 未跑覆盖（不是产品缺陷）：M2 需要焦点授权与替换实例授权，本轮的授权范围内不能执行；写一个从未跑过的场景还会让 `--full` 因场景自身缺陷而不稳。
+  **重新审视的触发条件：** 下一次改动 `dock_preview/` 的命中、滚动或关闭路径时必须补这三项并在 `--include-focus` 下运行；或发布前需要 M 级证据时。
+
+- **Dock 预览列表：`apply_resize` 的重建路径缺整链路回归**（同上，第 3 轮复审新增发现的修复，**延后**：测试仪器）。关闭一扇窗口导致玻璃尺寸变化时，`apply_resize` 现在保留窗口集合、模式、滚动偏移（夹紧）、`close_pending`/`closing_since`/`last_probe`，并保留 bundle 供图标重建。这些行为只能通过真实 NSPanel 重建验证（`build`/`destroy` 都要真 AppKit），M1 无法覆盖；`--smoke-dock-preview` 也未加入“连关两扇窗口、第二扇在重建后仍拒绝点击”的用例。
+  **为什么延后：** 需要真实面板生命周期，属 M2 覆盖。
+  **重新审视的触发条件：** 下一次改动 `panel::apply_resize` 或 `relayout_content` 时，在 `--smoke-dock-preview` 里加该用例。
+
+- **Dock 预览列表：关闭失败恢复与重建路径的整链路回归（第 4–6 轮复审后仍缺，**延后**：测试仪器）**。`apply_resize`（尺寸变化时的重建）与 `cancel_close_matching` / 超时恢复现在都通过 `set_item_close_visible` + `apply_hover` 单一规则决定关闭按钮可见性，并保留 `(pid, wid)` 的关闭阶段。能验证它的只有真实 NSPanel 的重建（`build`/`destroy` 都要真 AppKit）：连续关闭两扇窗口、第二扇在重建后仍拒绝点击、超时恢复后未悬停项不显示按钮。`--smoke-dock-preview` 目前没有这三条用例。
+  **为什么延后：** 需要真实面板生命周期（M2）。
+  **重新审视的触发条件：** 下一次改动 `panel::apply_resize`、`cancel_close_matching` 或 `apply_hover` 时，在 `--smoke-dock-preview` 里补上。

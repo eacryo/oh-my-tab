@@ -21,6 +21,8 @@ pub(super) enum ControlField {
     LaunchAtLogin,
     HideMenuBarIcon,
     DockPreviewEnabled,
+    /// The Dock preview row/list threshold (a popup: one option per legal value).
+    DockCardsPerRow,
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
@@ -914,6 +916,19 @@ fn apply_control_field(field: ControlField) {
                 ControlField::DockPreviewEnabled => {
                     let state: isize = msg_send![u.dock_preview_enabled, state];
                     cfg.dock_preview.enabled = state == 1;
+                    // The threshold below the switch is only meaningful while previews are on.
+                    if !u.dock_cards_per_row.is_null() {
+                        SettingsRow::set_enabled_with_tooltip(
+                            u.dock_cards_per_row,
+                            cfg.dock_preview.enabled,
+                            &t("settings.tooltip_dock_preview_disabled"),
+                        );
+                    }
+                }
+                ControlField::DockCardsPerRow => {
+                    let idx: isize = msg_send![u.dock_cards_per_row, indexOfSelectedItem];
+                    cfg.dock_preview.cards_per_row =
+                        super::page_view::cards_per_row_for_index(idx.max(0) as usize);
                 }
                 ControlField::WindowsEnabled => {
                     let state: isize = msg_send![u.windows_enabled, state];
@@ -1346,46 +1361,63 @@ fn write_selected_profile(cfg: &mut Config, f: impl FnOnce(&mut MouseProfile)) {
     f(&mut cfg.mouse.profiles[idx]);
 }
 
-/// The entry limit's uncommitted draft, exactly as typed.
+/// The numeric text-field ids. They are separate from `ControlField` because they use notification
+/// callbacks rather than target/action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TextField {
+    ClipboardMaxEntries,
+}
+
+/// One numeric field's uncommitted draft, exactly as typed.
 ///
 /// The value is applied on end editing (blur / Enter) or when the settings window closes. A content
 /// rebuild replaces the control first, so the draft lives here rather than in the view: the rebuilt
 /// field shows it again, and the commit still happens exactly once. Keeping the draft OUT of the
 /// config is what makes the commit a real change: `apply_config_change` compares the committed value
 /// with the new one, and while typing the poll keeps reading the committed limit.
+///
+/// The entry limit is destructive to lower (every digit on the way to `500` is itself a valid
+/// number), which is why the draft is committed once rather than per keystroke.
 static MAX_ENTRIES_DRAFT: Mutex<Option<String>> = Mutex::new(None);
 
-/// The text the entry-limit field must show: the uncommitted draft when the user is typing in it,
+/// The text a numeric field must show: the uncommitted draft when the user is typing in it,
 /// otherwise the committed value. A page build, a rebuild and a reload all ask for this, so none of
 /// them can silently replace what the user typed with the older committed number.
 pub(super) fn max_entries_field_text() -> String {
-    match MAX_ENTRIES_DRAFT.lock().unwrap().clone() {
+    let draft = MAX_ENTRIES_DRAFT.lock().unwrap().clone();
+    match draft {
         Some(draft) => draft,
         None => CONFIG.read().unwrap().clipboard.max_entries.to_string(),
     }
 }
 
-fn set_max_entries_draft(raw: &str) {
-    *MAX_ENTRIES_DRAFT.lock().unwrap() = Some(raw.to_string());
+fn set_draft(field: TextField, raw: &str) {
+    match field {
+        TextField::ClipboardMaxEntries => {
+            *MAX_ENTRIES_DRAFT.lock().unwrap() = Some(raw.to_string())
+        }
+    }
 }
 
-fn take_max_entries_draft() -> Option<String> {
-    MAX_ENTRIES_DRAFT.lock().unwrap().take()
+fn take_draft(field: TextField) -> Option<String> {
+    match field {
+        TextField::ClipboardMaxEntries => MAX_ENTRIES_DRAFT.lock().unwrap().take(),
+    }
 }
 
-/// Whether the user has typed an entry limit that has not been committed yet. A content rebuild
-/// clears the per-field edit bit (it belongs to the old control), so this is what still says the
-/// value in the rebuilt field is the user's own.
-fn has_max_entries_draft() -> bool {
-    MAX_ENTRIES_DRAFT.lock().unwrap().is_some()
+/// Whether the user has typed into `field` and that text has not been committed yet. A content
+/// rebuild clears the per-field edit bit (it belongs to the old control), so this is what still says
+/// the value in the rebuilt field is the user's own.
+pub(super) fn has_draft(field: TextField) -> bool {
+    match field {
+        TextField::ClipboardMaxEntries => MAX_ENTRIES_DRAFT.lock().unwrap().is_some(),
+    }
 }
 
-/// The change a typed draft produces against the committed limit: `None` when the text is not a
-/// number, is out of range, or does not change the limit.
+/// The change a typed draft produces against the committed value: `None` when the text is not a
+/// number, is out of range, or does not change anything.
 ///
-/// Pure, so the rule the commit depends on is assertable: a typed `20` over a committed `50` IS a
-/// change (the flag that trims the history must fire at commit), while an out-of-range draft applies
-/// nothing and an unchanged one must not rewrite the file.
+/// Pure, so the rule the commit depends on is assertable.
 fn committed_limit_change(committed: u32, draft: &str) -> Option<u32> {
     let parsed = parse_usize(draft).ok()?;
     if !(crate::config::CLIPBOARD_MAX_ENTRIES_MIN as usize
@@ -1398,14 +1430,14 @@ fn committed_limit_change(committed: u32, draft: &str) -> Option<u32> {
     (value != committed).then_some(value)
 }
 
-/// Apply the entry limit the user typed as a draft when it is a valid change, and persist now.
+/// Apply the value the user typed as a draft when it is a valid change, and persist now.
 /// Returns whether a change was applied.
 ///
 /// Reads the draft, not the field: the commit must work even when the control was rebuilt under it.
 /// The draft is the LATEST text, valid or not (the keystroke handler stores it before validating),
 /// so closing the window can never commit an older, half-validated number.
-unsafe fn commit_max_entries_draft() -> bool {
-    let Some(draft) = take_max_entries_draft() else {
+unsafe fn commit_draft(field: TextField) -> bool {
+    let Some(draft) = take_draft(field) else {
         return false;
     };
     let committed = CONFIG.read().unwrap().clipboard.max_entries;
@@ -1414,32 +1446,36 @@ unsafe fn commit_max_entries_draft() -> bool {
         log_debug!("[settings] numeric draft {draft:?} commits no change");
         return false;
     };
-    write_text_field_config(TextField::ClipboardMaxEntries, value);
+    write_text_field_config(field, value);
     persist_config_now();
-    log_debug!("[settings] entry limit committed as {value}");
+    log_debug!("[settings] {field:?} committed as {value}");
     true
 }
 
 /// Show the committed value again after a draft was rejected (invalid, out of range, unchanged).
-unsafe fn restore_max_entries_field() {
+unsafe fn restore_numeric_field(_field: TextField) {
     let text = CONFIG.read().unwrap().clipboard.max_entries.to_string();
     with_settings_ui(|ui| {
         if let Some(u) = ui.as_ref() {
-            set_field(u.clipboard_max_entries, text);
+            if !u.clipboard_max_entries.is_null() {
+                set_field(u.clipboard_max_entries, &text);
+            }
         }
     });
 }
 
-/// Commit a typed entry limit when the settings window is closing: AppKit's end-editing is what
-/// normally does this, but a hide must not depend on it having fired first.
-pub(super) fn commit_pending_max_entries_edit() {
-    let edited = take_edited_field(&EDITED_TEXT_FIELDS, TextField::ClipboardMaxEntries);
-    if !edited && !has_max_entries_draft() {
-        return;
+/// Commit a typed value when the settings window is closing: AppKit's end-editing is what normally
+/// does this, but a hide must not depend on it having fired first.
+pub(super) fn commit_pending_numeric_edits() {
+    for field in [TextField::ClipboardMaxEntries] {
+        let edited = take_edited_field(&EDITED_TEXT_FIELDS, field);
+        if !edited && !has_draft(field) {
+            continue;
+        }
+        callback_guard::void("commit_pending_numeric_edits", || unsafe {
+            let _ = commit_draft(field);
+        });
     }
-    callback_guard::void("commit_pending_max_entries_edit", || unsafe {
-        let _ = commit_max_entries_draft();
-    });
 }
 
 /// While typing in a numeric text field (NSControlTextDidChange): keep the typed value as a DRAFT.
@@ -1466,7 +1502,7 @@ pub(crate) extern "C" fn on_control_text_did_change(
             return;
         };
         EDITED_TEXT_FIELDS.fetch_or(text_field_bit(field), Ordering::SeqCst);
-        set_max_entries_draft(&raw);
+        set_draft(field, &raw);
         log_debug!("[settings] numeric field {field:?} kept as a draft until commit");
     });
 }
@@ -1489,15 +1525,15 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
             // bit alone is not enough: a content rebuild clears it with the old control, while the
             // draft survives and still holds the newest text.
             let edited = take_edited_field(&EDITED_TEXT_FIELDS, field);
-            if !edited && !has_max_entries_draft() {
+            if !edited && !has_draft(field) {
                 log_debug!(
                     "[settings] numeric field {field:?} untouched on end editing; not persisted"
                 );
                 return;
             }
-            if !commit_max_entries_draft() {
+            if !commit_draft(field) {
                 // Invalid, out of range or unchanged: never commit it; show the committed value.
-                restore_max_entries_field();
+                restore_numeric_field(field);
             }
             log_debug!(
                 "[settings] numeric field {:?} finished on end editing",
@@ -1505,13 +1541,6 @@ pub(crate) extern "C" fn on_control_text_did_end_editing(
             );
         }
     });
-}
-
-/// Numeric text-field ids (separate from ControlField: they use notification callbacks, not
-/// target/action).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TextField {
-    ClipboardMaxEntries,
 }
 
 /// The numeric field's text as typed, whatever it holds (a null control -> None).
@@ -2284,10 +2313,18 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             let recording = *REC_STAGE.lock().unwrap() != RecStage::Idle
                 && *REC_MODE.lock().unwrap() == RecMode::ClipboardShortcut;
             set_clipboard_shortcut_capture_state(u, &cfg.clipboard.shortcut, recording);
-            set_field(
-                u.clipboard_max_entries,
-                cfg.clipboard.max_entries.to_string(),
-            );
+            // A field the user is typing in keeps the draft: a reload must not overwrite text
+            // that has not been committed yet (the same rule the field's own page build follows).
+            set_field(u.clipboard_max_entries, max_entries_field_text());
+            if !u.dock_cards_per_row.is_null() {
+                // The popup's VALUE is written by the described rows above (its index comes from
+                // the update description); only its freeze under the master switch is settled here.
+                SettingsRow::set_enabled_with_tooltip(
+                    u.dock_cards_per_row,
+                    cfg.dock_preview.enabled,
+                    &t("settings.tooltip_dock_preview_disabled"),
+                );
+            }
             // The Finder Menu page's rows come from the shared update description above; only its
             // master-switch freeze has no described value, so it is settled here. The extension's
             // status line is process state, not config, and has no field to refill.
@@ -3452,9 +3489,9 @@ mod tests {
     }
 
     use super::{
-        checked_ids, clipboard_delete_dependent_visibility_from_config, committed_limit_change,
-        max_entries_field_text, push_excluded_entry, remove_excluded_entry, set_max_entries_draft,
-        smooth_slider_display, smooth_slider_value, take_edited_field, take_max_entries_draft,
+        cards_per_row_for_index, checked_ids, clipboard_delete_dependent_visibility_from_config,
+        committed_limit_change, max_entries_field_text, push_excluded_entry, remove_excluded_entry,
+        set_draft, smooth_slider_display, smooth_slider_value, take_draft, take_edited_field,
         text_field_bit, Config, Ordering, TextField,
     };
 
@@ -3570,11 +3607,40 @@ mod tests {
         // 500 -> delete a digit (50, valid) -> type 1 (501, invalid): closing the window must not
         // commit the older 50 and trim the history to it. The draft holds the LATEST text, so the
         // commit sees an invalid value and applies nothing.
-        set_max_entries_draft("50");
-        set_max_entries_draft("501");
+        set_draft(TextField::ClipboardMaxEntries, "50");
+        set_draft(TextField::ClipboardMaxEntries, "501");
         assert_eq!(max_entries_field_text(), "501");
         assert_eq!(committed_limit_change(500, "501"), None);
-        let _ = take_max_entries_draft();
+        let _ = take_draft(TextField::ClipboardMaxEntries);
+    }
+
+    /// The Dock threshold's popup: its index IS the value minus the range's first entry, and an
+    /// out-of-range stored value falls back to the nearest legal one instead of a dead selection.
+    #[test]
+    fn the_cards_per_row_popup_maps_its_index_to_the_value() {
+        use crate::settings::page_view::{cards_per_row_index, cards_per_row_options};
+        assert_eq!(
+            cards_per_row_options().len(),
+            (crate::config::DOCK_CARDS_PER_ROW_MAX - crate::config::DOCK_CARDS_PER_ROW_MIN + 1)
+                as usize
+        );
+        // Every legal value round-trips through the popup's index.
+        let mut checks = 0;
+        for value in crate::config::DOCK_CARDS_PER_ROW_MIN..=crate::config::DOCK_CARDS_PER_ROW_MAX {
+            let index = cards_per_row_index(value);
+            assert_eq!(cards_per_row_for_index(index), value);
+            checks += 1;
+        }
+        assert!(checks >= 6);
+        // Off the ends: the popup shows a legal neighbour rather than nothing.
+        assert_eq!(
+            cards_per_row_for_index(cards_per_row_index(0)),
+            crate::config::DOCK_CARDS_PER_ROW_MIN
+        );
+        assert_eq!(
+            cards_per_row_for_index(cards_per_row_index(99)),
+            crate::config::DOCK_CARDS_PER_ROW_MAX
+        );
     }
 
     /// The Finder Menu's vec-backed fields keep the catalog order however the boxes were ticked:

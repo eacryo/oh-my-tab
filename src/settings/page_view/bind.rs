@@ -69,6 +69,7 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::LaunchAtLogin => &mut ui.launch_at_login,
         ControlField::HideMenuBarIcon => &mut ui.hide_menu_bar_icon,
         ControlField::DockPreviewEnabled => &mut ui.dock_preview_enabled,
+        ControlField::DockCardsPerRow => &mut ui.dock_cards_per_row,
         ControlField::WindowsEnabled => &mut ui.windows_enabled,
         ControlField::ShowMinimized => &mut ui.show_minimized,
         ControlField::ShowHiddenAppWindows => &mut ui.show_hidden_app_windows,
@@ -252,6 +253,7 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::LaunchAtLogin
             | ControlField::HideMenuBarIcon
             | ControlField::DockPreviewEnabled
+            | ControlField::DockCardsPerRow
             | ControlField::WindowsEnabled
             | ControlField::ShowMinimized
             | ControlField::ShowHiddenAppWindows

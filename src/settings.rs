@@ -584,7 +584,8 @@ pub(super) struct SettingsUi {
     log_level: *mut AnyObject, // NSPopUpButton: trace / debug / info / warn / error
     launch_at_login: *mut AnyObject, // launch at login
     hide_menu_bar_icon: *mut AnyObject, // hide the menu-bar status item
-    dock_preview_enabled: *mut AnyObject, // General page: show Dock preview thumbnails
+    dock_preview_enabled: *mut AnyObject, // Dock page: show Dock preview thumbnails
+    dock_cards_per_row: *mut AnyObject, // Dock page: the row/list threshold (numeric field)
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject, // enable mouse control
     gestures_enabled: *mut AnyObject,

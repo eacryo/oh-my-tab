@@ -67,7 +67,10 @@ use about::about_page_view;
 pub(super) use about::AboutHooks;
 use clipboard::clipboard_page_view;
 pub(super) use clipboard::ClipboardHooks;
+pub(super) use dock::cards_per_row_for_index;
 use dock::dock_page_view;
+#[cfg(test)]
+pub(in crate::settings) use dock::{cards_per_row_index, cards_per_row_options};
 #[cfg(test)]
 pub(super) use excluded_apps::looks_like_bundle_id;
 pub(in crate::settings) use excluded_apps::refresh_known_app_names;

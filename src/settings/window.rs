@@ -956,9 +956,10 @@ pub(super) fn close_floating_editors() {
 }
 
 pub(super) fn hide_settings() {
-    // A typed entry limit is a draft: the field's value is applied on end editing, but a hide must
-    // not depend on that notification having fired first. Commit while the control still exists.
-    dispatch::commit_pending_max_entries_edit();
+    // A typed numeric value (the entry limit, the Dock preview threshold) is a draft: it is applied
+    // on end editing, but a hide must not depend on that notification having fired first. Commit
+    // while the controls still exist.
+    dispatch::commit_pending_numeric_edits();
     // The panel size preview belongs to a live drag on this window: closing Settings must take it
     // down (and restore the panel's window level) even if the drag never produced its mouse-up.
     dispatch::end_max_extent_preview();
@@ -4151,6 +4152,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             launch_at_login: std::ptr::null_mut(),
             hide_menu_bar_icon: std::ptr::null_mut(),
             dock_preview_enabled: std::ptr::null_mut(),
+            dock_cards_per_row: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
             gestures_enabled: std::ptr::null_mut(),

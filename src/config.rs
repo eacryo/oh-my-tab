@@ -890,21 +890,38 @@ pub(crate) const FINDER_MENU_TERMINALS: [&str; 7] = [
     "net.kovidgoyal.kitty",
     "org.alacritty",
 ];
+/// The threshold's bounds. The config validation, the settings field's accepted range and the
+/// layout all read these, so the three cannot disagree about what a legal threshold is.
+///
+/// The lower bound is 1 rather than 2: with 1 a single window is still a row and two windows already
+/// need the list, which is a meaningful choice rather than a degenerate one.
+pub(crate) const DOCK_CARDS_PER_ROW_MIN: u32 = 1;
+pub(crate) const DOCK_CARDS_PER_ROW_MAX: u32 = 6;
+/// The default threshold: six cards is the widest row that still fits a typical screen at the
+/// cards' natural widths, and one more window than that is where the list starts.
+pub(crate) const DOCK_CARDS_PER_ROW_DEFAULT: u32 = 5;
+
 /// Dock previews: hovering an app's Dock icon shows thumbnails of all its windows.
 ///
-/// A single switch, on by default: it is the feature the Dock side of the app exists for, and it
-/// can still be turned off for a machine that wants no thumbnail work near the Dock. The runtime
+/// Enabled is on by default: it is the feature the Dock side of the app exists for, and it can
+/// still be turned off for a machine that wants no thumbnail work near the Dock. The runtime
 /// consumption belongs to the dock-preview module, not to the settings layer.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct DockPreviewSection {
-    /// Whether hovering an app in the Dock shows its window thumbnails. Default true.
+    /// Whether hovering an app in the Dock shows its window previews. Default true.
     pub enabled: bool,
+    /// The most windows a single row of previews shows. At or under it the panel is one row of
+    /// thumbnail cards; above it the panel becomes a scrolling list. 1..=6, default 5.
+    pub cards_per_row: u32,
 }
 
 impl Default for DockPreviewSection {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            cards_per_row: DOCK_CARDS_PER_ROW_DEFAULT,
+        }
     }
 }
 
@@ -1656,6 +1673,14 @@ impl Config {
                 &[("value", &self.appearance.panel_material)],
             ));
         }
+        if !(DOCK_CARDS_PER_ROW_MIN..=DOCK_CARDS_PER_ROW_MAX)
+            .contains(&self.dock_preview.cards_per_row)
+        {
+            errs.push(tf(
+                "errors.dock_preview_cards_per_row_invalid",
+                &[("value", &self.dock_preview.cards_per_row.to_string())],
+            ));
+        }
         if self.appearance.corner_radius < 0.0 {
             errs.push(tf(
                 "errors.appearance_corner_radius_invalid",
@@ -2250,8 +2275,15 @@ impl Config {
         self.finder_menu = other.finder_menu;
         self.normalize_finder_menu();
 
-        // dock preview: a single boolean, always valid, so it is adopted unconditionally.
-        self.dock_preview = other.dock_preview;
+        // dock preview: the switch is a boolean and always valid, so it is adopted
+        // unconditionally; the threshold is a number and falls back on its own.
+        self.dock_preview.enabled = other.dock_preview.enabled;
+        if !errs
+            .iter()
+            .any(|e| e.starts_with("dock_preview.cards_per_row"))
+        {
+            self.dock_preview.cards_per_row = other.dock_preview.cards_per_row;
+        }
 
         // clipboard (enabled always valid; max_entries is validated)
         self.clipboard.enabled = other.clipboard.enabled;
@@ -2716,6 +2748,22 @@ fn sanitize_config_value(
             // Omitted, so Serde takes the field's own default: the layer becomes the wildcard
             // matcher's shape only when the whole layer is dropped below, never a wider match.
             None
+        };
+    }
+
+    // A threshold outside `u32` (a negative or oversized TOML integer, a float, a string) passes a
+    // type check and then fails the WHOLE document's deserialization, which is the failure this
+    // sanitiser exists to prevent. The business range (1..=6) is left to `validate`, so an
+    // out-of-range number still reaches the field-by-field fallback with its own error.
+    if path == "dock_preview.cards_per_row" {
+        let ok = actual
+            .as_integer()
+            .is_some_and(|number| (0..=u32::MAX as i64).contains(&number));
+        return if ok {
+            Some(actual.clone())
+        } else {
+            errors.push(type_error(path, actual, schema));
+            fallback.cloned()
         };
     }
 
@@ -4213,6 +4261,86 @@ enabled = true
             !merged.dock_preview.enabled,
             "a per-field fallback elsewhere must not reset this switch"
         );
+    }
+
+    /// `dock_preview.cards_per_row` is additive and defaults to 5: a file written before the
+    /// threshold existed must load as five, and its value must survive a round trip and a sibling
+    /// field's own fallback.
+    #[test]
+    fn the_dock_cards_per_row_defaults_and_falls_back_on_its_own() {
+        assert_eq!(
+            Config::default().dock_preview.cards_per_row,
+            DOCK_CARDS_PER_ROW_DEFAULT
+        );
+
+        // An old file has no key for it.
+        let (old, _, _) = parse_config_content("[dock_preview]\nenabled = true\n").unwrap();
+        assert_eq!(old.dock_preview.cards_per_row, DOCK_CARDS_PER_ROW_DEFAULT);
+
+        // An explicit value survives serialization.
+        let mut cfg = Config::default();
+        cfg.dock_preview.cards_per_row = 2;
+        let text = toml::to_string(&cfg).unwrap();
+        let back: Config = toml::from_str(&text).unwrap();
+        assert_eq!(back.dock_preview.cards_per_row, 2);
+
+        // Out of range is refused by `validate`, and the sibling switch is still adopted.
+        let (parsed, errors, _) =
+            parse_config_content("[dock_preview]\nenabled = false\ncards_per_row = 9\n").unwrap();
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("dock_preview.cards_per_row")),
+            "an out-of-range threshold must report its own error: {errors:?}"
+        );
+        assert!(
+            !parsed.dock_preview.enabled,
+            "the sibling switch still applies"
+        );
+        assert_eq!(
+            parsed.dock_preview.cards_per_row,
+            DOCK_CARDS_PER_ROW_DEFAULT
+        );
+
+        // A value the field cannot represent at all is caught BEFORE deserialization, so the rest
+        // of the document still loads instead of the whole file being refused.
+        for bad in [
+            "cards_per_row = -1",
+            "cards_per_row = 5000000000",
+            "cards_per_row = \"5\"",
+            "cards_per_row = 5.5",
+        ] {
+            let text = format!("[dock_preview]\nenabled = false\n{bad}\n");
+            let (parsed, errors, _) = parse_config_content(&text)
+                .unwrap_or_else(|e| panic!("{bad} must not refuse the document: {e:?}"));
+            assert!(!parsed.dock_preview.enabled, "{bad}: sibling switch lost");
+            assert_eq!(
+                parsed.dock_preview.cards_per_row, DOCK_CARDS_PER_ROW_DEFAULT,
+                "{bad}: threshold must fall back to its default"
+            );
+            assert!(
+                errors
+                    .iter()
+                    .any(|e| e.contains("dock_preview.cards_per_row")),
+                "{bad}: must be reported: {errors:?}"
+            );
+        }
+
+        // The bounds themselves are inclusive.
+        for value in [DOCK_CARDS_PER_ROW_MIN, DOCK_CARDS_PER_ROW_MAX] {
+            let mut cfg = Config::default();
+            cfg.dock_preview.cards_per_row = value;
+            assert!(cfg.validate().is_empty(), "{value} must be accepted");
+        }
+        for value in [DOCK_CARDS_PER_ROW_MIN - 1, DOCK_CARDS_PER_ROW_MAX + 1] {
+            let mut cfg = Config::default();
+            cfg.dock_preview.cards_per_row = value;
+            assert_eq!(
+                cfg.validate().len(),
+                1,
+                "{value} must be refused on its own"
+            );
+        }
     }
 
     #[test]

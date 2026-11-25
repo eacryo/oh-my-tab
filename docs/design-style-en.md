@@ -725,6 +725,9 @@ against.
 | Divider above a row | 0 below the previous row's content | `SEPARATOR_ABOVE_ROW_GAP` |
 | Card action band | A row's height (56) with a `CONTROL_H` (32) control, so 12 above and below; full card width minus 16 each side | `SettingsRow::action_band` |
 | Slider readout | 44 wide, 8 gap | `SLIDER_READOUT_*` |
+| Dock preview: single-row card | 216 wide × 164 tall, 4 padding, 32 header; width follows the window's aspect | `dock_preview/layout.rs` (`CARD_W`, `CARD_H`, `CARD_PAD`, `HEADER_H`) |
+| Dock preview: list row | 32 tall, 8 padding, 16 icon, 8 gaps, 20 close slot, 14pt `row-label` title | `dock_preview/layout.rs` (`ROW_H`, `ROW_PAD`, `ROW_ICON`, `ROW_GAP`, `CLOSE_SIZE`); reproduce with `rg -n 'ROW_H|ROW_PAD|LIST_W|LIST_W_MIN|LIST_FADE_H|PANEL_MARGIN|MIN_TITLE_W|CARD_MIN_W' src/dock_preview/layout.rs` |
+| Dock preview: list panel | 304 wide (240 floor), 12pt fade at a viewport edge with content beyond it, 8 from the screen's edge | `dock_preview/layout.rs` (`LIST_W`, `LIST_W_MIN`, `LIST_FADE_H`, `PANEL_MARGIN`) |
 
 Rule of thumb: **related things 8, groups 24, page edges 32–72.** Use the smaller step for internal
 density and the larger one to separate sections; never mix `12` and `14` for the same kind of gap.

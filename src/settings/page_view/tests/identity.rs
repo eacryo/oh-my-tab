@@ -254,6 +254,10 @@ fn every_described_field_of_every_page_has_a_settings_ui_slot() {
         SettingsPageId::Gestures,
         SettingsPageId::KeyBindings,
         SettingsPageId::Mouse,
+        // The Dock page was outside this list while it had one switch, and the popup added to it
+        // later was never bound: the page drew a popup that the dispatcher could not resolve, so
+        // the click was dropped as an unknown sender and the settings view snapped back.
+        SettingsPageId::Dock,
     ] {
         let view = view_for(page, &input);
         for row in &view.rows {
