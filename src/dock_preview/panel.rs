@@ -72,6 +72,8 @@ struct CardEntry {
     close_hot: bool,
     title_truncated: bool,
     has_frame: bool,
+    /// The captured image's pixel dimensions; only its aspect matters for the centred fit.
+    image_size: Option<(f64, f64)>,
     requested_at: Option<Instant>,
     closing_since: Option<Instant>,
     /// The close worker is still talking to the target's Accessibility API.
@@ -1172,7 +1174,12 @@ fn place_viewport(state: &mut PanelState) {
         let layer: *mut AnyObject = msg_send![state.viewport, layer];
         let _: () =
             msg_send![layer, setCornerRadius: (layout::PANEL_RADIUS - layout::PANEL_PAD).max(0.0)];
-        let _: () = msg_send![layer, setMasksToBounds: true];
+        // Clip only when the content can scroll: the clip is what scrolling needs, but it also
+        // cuts the hover plate at the viewport edge, which is what left the padding ring around a
+        // hovered card unhighlighted. With nowhere to scroll the content never moves, so the
+        // plate may draw its one-padding-step overhang out to the glass edge.
+        let clips = state.geometry.max_scroll > 0.0;
+        let _: () = msg_send![layer, setMasksToBounds: clips];
         // The content is a CHILD of the viewport: its origin is the scroll offset inside it, not a
         // position in the panel. Adding the viewport origin here shifted every row by the padding.
         let origin = layout::content_origin(state.geometry.scroll);
@@ -1742,8 +1749,6 @@ unsafe fn build_cards(state: &mut PanelState, request: &PanelRequest) {
         let plate_layer: *mut AnyObject = msg_send![plate, layer];
         layer_set_background(plate_layer, hex_to_cg_color(layout::HOVER_PLATE_FILL));
         let _: () = msg_send![plate_layer, setCornerRadius: plate_radius];
-        let _: () = msg_send![plate_layer, setBorderWidth: 1.0f64];
-        layer_set_border(plate_layer, hex_to_cg_color(layout::HOVER_PLATE_BORDER));
         let _: () = msg_send![plate, setHidden: true];
 
         let thumb_rect = layout::thumb_rect(*rect);
@@ -1826,6 +1831,7 @@ unsafe fn build_cards(state: &mut PanelState, request: &PanelRequest) {
             close_hot: false,
             title_truncated: truncated,
             has_frame: false,
+            image_size: None,
             requested_at: None,
             closing_since: None,
             close_pending: false,
@@ -2028,7 +2034,12 @@ fn place_cards(state: &PanelState) {
             place_view(card.plate, plate_rect);
             let layer: *mut AnyObject = msg_send![card.plate, layer];
             let _: () = msg_send![layer, setCornerRadius: radius];
-            place_view(card.thumbnail, layout::thumb_rect(rect));
+            let thumb = layout::thumb_rect(rect);
+            let frame = card
+                .image_size
+                .map(|(w, h)| layout::centered_thumb_frame(w, h, thumb))
+                .unwrap_or(thumb);
+            place_view(card.thumbnail, frame);
             place_view(card.placeholder, layout::thumb_rect(rect));
             place_placeholder_icon(card.placeholder_icon, layout::thumb_rect(rect));
             place_view(card.header_icon, layout::icon_rect(rect));
@@ -2345,13 +2356,21 @@ fn fill_thumbnails(state: &mut PanelState, now: Instant) {
         }
     };
     let target_px = crate::thumbnail::target_px_height(layout::THUMB_H, scale);
-    for card in state.cards.iter_mut() {
+    for (index, card) in state.cards.iter_mut().enumerate() {
         if card.has_frame || card.window.wid == 0 {
             continue;
         }
         if let Some((pointer, width, height)) =
             crate::thumbnail::lookup_retained(card.window.pid, card.window.wid)
         {
+            card.image_size = Some((width as f64, height as f64));
+            // Centre the freshly fitted frame inside the thumbnail box right away; the box alone
+            // is only correct while the aspect is unknown (see `centered_thumb_frame`).
+            if let Some(rect) = state.geometry.items.get(index).copied() {
+                let thumb = layout::thumb_rect(rect);
+                let frame = layout::centered_thumb_frame(width as f64, height as f64, thumb);
+                unsafe { place_view(card.thumbnail, frame) };
+            }
             unsafe {
                 let layer: *mut AnyObject = msg_send![card.thumbnail, layer];
                 layer_set_contents(layer, pointer as *mut c_void);
@@ -2359,7 +2378,6 @@ fn fill_thumbnails(state: &mut PanelState, now: Instant) {
                 let _: () = msg_send![card.thumbnail, setHidden: false];
                 let _: () = msg_send![card.placeholder, setHidden: true];
             }
-            let _ = (width, height);
             unsafe { crate::ffi::CFRelease(pointer) };
             card.has_frame = true;
             continue;

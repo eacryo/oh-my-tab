@@ -107,12 +107,12 @@ pub(crate) const GRID_ROW_GAP: f64 = 8.0;
 // control step) rather than the rounder panel shape its glass can carry.
 pub(crate) const PANEL_RADIUS: f64 = 8.0;
 pub(crate) const CARD_RADIUS: f64 = 6.0;
-/// The hovered card's plate: brightness only, no accent fill. The wash is deliberately stronger
-/// than the shared `hover_bg` (0xFFFFFF1A) so it reads as a brighter card against the glass, and
-/// the hairline rim is white rather than `accent` -- the design's "Windows-style" selected state
-/// (a little brighter than the unselected card) instead of a blue selection.
+/// The hovered card's plate: brightness only, no accent fill and no rim. The wash is deliberately
+/// stronger than the shared `hover_bg` (0xFFFFFF1A) so it reads as a brighter card against the
+/// glass -- the design's "Windows-style" selected state (a little brighter than the unselected
+/// card) instead of a blue selection. It draws no border: the whole card brightens as one piece,
+/// and a hairline around it read as a separate outlined box rather than the card's own state.
 pub(crate) const HOVER_PLATE_FILL: u32 = 0xFFFFFF8C;
-pub(crate) const HOVER_PLATE_BORDER: u32 = 0xFFFFFFE6;
 pub(crate) const THUMB_RADIUS: f64 = 4.0;
 /// The narrowest a single-row card may be compressed to: a 120pt thumbnail plus its padding, which
 /// is what keeps a truncated title and the close slot readable side by side. Compressing past this
@@ -420,25 +420,28 @@ fn row_panel(
         .collect();
     let natural_w = row_width.iter().copied().fold(0.0, f64::max);
     let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
-    // The content starts at 0 when it scrolls, so the viewport itself is the clipping window; with
-    // no scroll it starts at the glass padding.
-    let content_h = row_count as f64 * CARD_H
-        + (row_count.saturating_sub(1)) as f64 * GRID_ROW_GAP
-        + PANEL_PAD * 2.0;
-    let scrolls_down = content_h > budget.inner_h + 0.001;
+    // Content coordinates are viewport-relative, exactly like the list layout's rows: the first
+    // card starts at 0 and the glass padding comes solely from the viewport's own inset. Baking
+    // the padding into the card positions as well shifted the whole row one padding step right and
+    // down -- the leftover strip read wider on the left, which is what an off-centre thumbnail
+    // actually was.
+    let content_h = row_count as f64 * CARD_H + (row_count.saturating_sub(1)) as f64 * GRID_ROW_GAP;
+    let scrolls_down = content_h + PANEL_PAD * 2.0 > budget.inner_h + 0.001;
     let scrolls_sideways = natural_w > usable + 0.001;
-    let content_w = natural_w + PANEL_PAD * 2.0;
+    let content_w = natural_w;
     let mut cards: Vec<Rect> = Vec::with_capacity(widths.len());
     for (row, indices) in rows.iter().enumerate() {
-        let mut x = if scrolls_sideways { 0.0 } else { PANEL_PAD };
-        let y = PANEL_PAD + row as f64 * (CARD_H + GRID_ROW_GAP);
+        let mut x = 0.0;
+        let y = row as f64 * (CARD_H + GRID_ROW_GAP);
         for &index in indices {
             cards.push(Rect::new(x, y, widths[index], CARD_H));
             x += widths[index] + CARD_GAP;
         }
     }
-    let panel_w = content_w.min(budget.inner_w).max(MIN_INTERACTIVE_W);
-    let panel_h = content_h.min(budget.inner_h);
+    let panel_w = (content_w + PANEL_PAD * 2.0)
+        .min(budget.inner_w)
+        .max(MIN_INTERACTIVE_W);
+    let panel_h = (content_h + PANEL_PAD * 2.0).min(budget.inner_h);
     let viewport_h = (panel_h - PANEL_PAD * 2.0).max(1.0);
     let axis = if scrolls_down {
         RowAxis::Vertical
@@ -646,6 +649,29 @@ pub(crate) fn thumb_rect(card: Rect) -> Rect {
     )
 }
 
+/// The frame a captured image takes inside its thumbnail box: scaled down to fit with its aspect
+/// kept, then centred on the box on both axes.
+///
+/// The panel positions the image view itself instead of relying on `resizeAspect` layer gravity,
+/// because that is the one thing the gravity does not guarantee in a layer-backed view -- measured
+/// on macOS 26 the contents sat several points off centre, so the leftover space around a
+/// thumbnail read wider on one side. Doing the fit here makes the centring exact by construction,
+/// the same answer the switcher's `fit_size` placement arrives at.
+pub(crate) fn centered_thumb_frame(content_w: f64, content_h: f64, thumb: Rect) -> Rect {
+    if content_w <= 0.0 || content_h <= 0.0 || thumb.w <= 0.0 || thumb.h <= 0.0 {
+        return thumb;
+    }
+    let scale = (thumb.w / content_w).min(thumb.h / content_h);
+    let w = content_w * scale;
+    let h = content_h * scale;
+    Rect::new(
+        thumb.x + (thumb.w - w) / 2.0,
+        thumb.y + (thumb.h - h) / 2.0,
+        w,
+        h,
+    )
+}
+
 /// The hovered card's plate: the card rect grown out to the panel edge on the sides it touches.
 ///
 /// The plate covers the tile, not just the thumbnail: a bare card rect leaves the panel's padding
@@ -666,23 +692,29 @@ pub(crate) fn hover_plate_rect(
     let bottom_edge = row + 1 >= grid_rows;
     let left_edge = column == 0;
     let right_edge = column + 1 >= row_len;
+    // Content coordinates are viewport-relative, so the glass edge sits one PANEL_PAD beyond the
+    // content origin: an edge card's plate grows that one step outward and the wash reaches the
+    // glass instead of stopping at the viewport, which is what left an unhighlighted ring around
+    // the hovered card. The plate can only draw there because the viewport stops clipping when
+    // the panel does not scroll; a scrolling panel keeps the clip and the wash ends at the
+    // viewport as before.
     if top_edge {
-        plate.y = 0.0;
+        plate.y = -PANEL_PAD;
         plate.h += PANEL_PAD;
     }
     if bottom_edge {
         plate.h += PANEL_PAD;
     }
     if left_edge {
-        plate.x = 0.0;
+        plate.x = -PANEL_PAD;
         plate.w += PANEL_PAD;
     }
     if right_edge {
         plate.w += PANEL_PAD;
     }
-    // Clamp so an odd measurement can never push the plate outside the panel.
-    plate.w = plate.w.min(panel_w - plate.x);
-    plate.h = plate.h.min(panel_h - plate.y);
+    // Clamp so an odd measurement can never push the plate outside the glass.
+    plate.w = plate.w.min(panel_w - PANEL_PAD - plate.x);
+    plate.h = plate.h.min(panel_h - PANEL_PAD - plate.y);
     let radius = if top_edge || bottom_edge || left_edge || right_edge {
         PANEL_RADIUS
     } else {
@@ -1398,9 +1430,11 @@ mod tests {
         // The scroll range covers the CARDS, not the glass padding: content minus viewport.
         assert!(row.content_h > layout.viewport.h);
         assert!(row.cards.last().expect("cards").max_y() > layout.viewport.h);
-        // The first row starts at the glass padding, so nothing is cut off at the top when the
-        // grid is at scroll 0.
-        assert!((row.cards[0].y - PANEL_PAD).abs() < 0.001);
+        // The first row starts at the content origin, so nothing is cut off at the top when the
+        // grid is at scroll 0: the glass padding is the viewport's own inset, not a baked offset
+        // (which used to double-count it and shift the whole grid one padding step right and down).
+        assert!(row.cards[0].y.abs() < 0.001);
+        assert!(row.cards[0].x.abs() < 0.001);
     }
 
     #[test]
@@ -1487,22 +1521,23 @@ mod tests {
 
     #[test]
     fn the_hover_plate_covers_the_tile_out_to_the_panel_edge() {
-        // A single card owns the whole panel: the plate is the panel's full rect and follows its
-        // corner radius, so no glass ring is left around the selection.
+        // A single card owns the whole panel: the plate covers the glass end to end (the content
+        // origin sits one padding step inside it) and follows its corner radius, so no glass ring
+        // is left around the selection.
         let panel = width_one_card();
-        let card = Rect::new(PANEL_PAD, PANEL_PAD, CARD_W, CARD_H);
+        let card = Rect::new(0.0, 0.0, CARD_W, CARD_H);
         let (plate, radius) = hover_plate_rect(card, 0, 0, 1, 1, panel);
-        assert_eq!(plate, Rect::new(0.0, 0.0, panel.0, panel.1));
+        assert_eq!(plate, Rect::new(-PANEL_PAD, -PANEL_PAD, panel.0, panel.1));
         assert_eq!(radius, PANEL_RADIUS);
 
         // In a row of three the middle card grows to the panel's top and bottom edges but keeps its
         // own width: the selection must not bleed sideways into a neighbour.
         let panel = (PANEL_PAD * 2.0 + 3.0 * CARD_W, PANEL_PAD * 2.0 + CARD_H);
-        let middle = Rect::new(PANEL_PAD + CARD_W, PANEL_PAD, CARD_W, CARD_H);
+        let middle = Rect::new(CARD_W, 0.0, CARD_W, CARD_H);
         let (plate, radius) = hover_plate_rect(middle, 0, 1, 3, 1, panel);
         assert_eq!(plate.x, middle.x);
         assert_eq!(plate.w, middle.w);
-        assert_eq!(plate.y, 0.0);
+        assert_eq!(plate.y, -PANEL_PAD);
         assert!((plate.h - (CARD_H + PANEL_PAD * 2.0)).abs() < 0.001);
         assert_eq!(radius, PANEL_RADIUS);
     }
@@ -1510,7 +1545,7 @@ mod tests {
     #[test]
     fn plates_come_from_the_row_so_a_reflow_cannot_shrink_them_back() {
         let cards: Vec<Rect> = (0..3)
-            .map(|index| Rect::new(PANEL_PAD + index as f64 * CARD_W, PANEL_PAD, CARD_W, CARD_H))
+            .map(|index| Rect::new(index as f64 * CARD_W, 0.0, CARD_W, CARD_H))
             .collect();
         let panel = (PANEL_PAD * 2.0 + 3.0 * CARD_W, PANEL_PAD * 2.0 + CARD_H);
         let plates = plates_for_grid(&cards, cards.len(), panel);
@@ -1519,8 +1554,10 @@ mod tests {
             assert!(plate.0.x <= card.x + 0.001 && plate.0.max_x() >= card.max_x() - 0.001);
             assert!(plate.0.y <= card.y + 0.001 && plate.0.max_y() >= card.max_y() - 0.001);
         }
-        assert_eq!(plates[0].0.x, 0.0);
-        assert!((plates[2].0.max_x() - panel.0).abs() < 0.001);
+        // The leading card's plate reaches one padding step past the content origin: that is the
+        // glass edge in viewport-relative coordinates, so the wash covers the padding ring too.
+        assert_eq!(plates[0].0.x, -PANEL_PAD);
+        assert!((plates[2].0.max_x() - (panel.0 - PANEL_PAD)).abs() < 0.001);
         assert!(plates[1].0.x > 0.0);
     }
 
@@ -1531,25 +1568,42 @@ mod tests {
     #[test]
     fn the_hover_plate_is_a_brightness_wash_not_an_accent_selection() {
         // Windows-style selected state: the plate is a white wash that reads brighter than the
-        // unselected glass, and the rim is white too. Any blue channel bias would make it an
-        // accent selection again, which is the style this replaced.
-        for color in [HOVER_PLATE_FILL, HOVER_PLATE_BORDER] {
-            let (r, g, b, alpha) = (
-                (color >> 24) & 0xFF,
-                (color >> 16) & 0xFF,
-                (color >> 8) & 0xFF,
-                color & 0xFF,
-            );
-            assert_eq!((r, g, b), (0xFF, 0xFF, 0xFF), "the plate is pure white");
-            assert!(
-                alpha > 0x1A,
-                "the wash must be stronger than the shared hover_bg to read as brighter"
-            );
-        }
-        assert!(
-            HOVER_PLATE_BORDER & 0xFF > HOVER_PLATE_FILL & 0xFF,
-            "the hairline rim stays visible over the wash"
+        // unselected glass. Any blue channel bias would make it an accent selection again, which
+        // is the style this replaced; and it carries no rim, because a hairline around the wash
+        // read as a separate outlined box instead of the card's own hover state.
+        let (r, g, b, alpha) = (
+            (HOVER_PLATE_FILL >> 24) & 0xFF,
+            (HOVER_PLATE_FILL >> 16) & 0xFF,
+            (HOVER_PLATE_FILL >> 8) & 0xFF,
+            HOVER_PLATE_FILL & 0xFF,
         );
+        assert_eq!((r, g, b), (0xFF, 0xFF, 0xFF), "the plate is pure white");
+        assert!(
+            alpha > 0x1A,
+            "the wash must be stronger than the shared hover_bg to read as brighter"
+        );
+    }
+
+    #[test]
+    fn the_centered_thumb_frame_shares_the_leftover_space_evenly() {
+        // A 1:2 portrait image in a wide box: the horizontal leftover is split evenly, and the
+        // vertical fit touches both ends. An off-centre frame is what made thumbnails read
+        // shifted inside their cards.
+        let thumb = Rect::new(10.0, 20.0, 200.0, 100.0);
+        let frame = centered_thumb_frame(50.0, 100.0, thumb);
+        assert!((frame.h - 100.0).abs() < 0.001);
+        assert!((frame.w - 50.0).abs() < 0.001);
+        assert!((frame.x - (10.0 + 75.0)).abs() < 0.001);
+        assert_eq!(frame.y, 20.0);
+        // A wide image in the same box fits by width instead, centring the vertical leftover.
+        let frame = centered_thumb_frame(400.0, 100.0, thumb);
+        assert!((frame.w - 200.0).abs() < 0.001);
+        assert!((frame.h - 50.0).abs() < 0.001);
+        assert_eq!(frame.x, 10.0);
+        assert!((frame.y - (20.0 + 25.0)).abs() < 0.001);
+        // An exact fit is the box itself, and degenerate input never moves the box.
+        assert_eq!(centered_thumb_frame(200.0, 100.0, thumb), thumb);
+        assert_eq!(centered_thumb_frame(0.0, 100.0, thumb), thumb);
     }
 
     #[test]
