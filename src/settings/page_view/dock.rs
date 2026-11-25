@@ -94,7 +94,6 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
         )
         .caption("settings.desc_dock_peek_on_hover")
         .wide_caption()
-        .group(RowGroup::DockPeek)
         .into_spec(),
     );
     w.push(

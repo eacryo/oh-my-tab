@@ -321,7 +321,6 @@ fn the_description_groups_are_the_ones_the_renderer_registers() {
     for (page, expected) in [
         (SettingsPageId::Switcher, vec![RowGroup::ThumbnailOnly]),
         (SettingsPageId::General, vec![RowGroup::GlassStyle]),
-        (SettingsPageId::Dock, vec![RowGroup::DockPeek]),
     ] {
         let view = view_for(page, &input());
         assert_eq!(description_groups(&view), expected, "{page:?}");
@@ -946,15 +945,15 @@ fn dock_page_view_owns_the_preview_switches() {
         "the default of 6 is the sixth option"
     );
 
-    // The peek is the fourth row: a switch that acts on the preview's own cards, on by default, in
-    // the conditional group its master switch settles.
+    // The peek is the fourth row: a switch that acts on the preview's own cards. It stays visible
+    // when previews are off so the user can inspect or change the preference; the control is only frozen.
     let peek = &view.rows[3];
     assert_eq!(peek.section, "settings.header_dock_preview_options");
     assert_eq!(peek.label_key, "settings.row_dock_peek_on_hover");
     assert_eq!(peek.caption_key, Some("settings.desc_dock_peek_on_hover"));
     assert_eq!(peek.copy, RowCopy::Captioned);
     assert_eq!(peek.value, Value::Switch(true));
-    assert_eq!(peek.group, Some(RowGroup::DockPeek));
+    assert_eq!(peek.group, None);
     assert_eq!(peek.field(), Some(ControlField::DockPeekOnHover));
 
     // Click-hide is the fifth row. It is deliberately opt-in: the native Dock click keeps its

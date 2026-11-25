@@ -1747,16 +1747,14 @@ pub(crate) unsafe fn update_dock_preview_controls_enabled(ui: &SettingsUi) {
     if !ui.dock_cards_per_row.is_null() {
         SettingsRow::set_enabled_with_tooltip(ui.dock_cards_per_row, on, &tooltip);
     }
-    // The peek switch acts on the preview's cards, so it freezes with the master switch and hides
-    // with it: with no previews there is no card to rest on.
+    // The peek switch acts on the preview's cards, so it freezes with the master switch. The row
+    // itself stays visible: a frozen preference is inspectable and can be changed before enabling previews.
     if !ui.dock_peek_on_hover.is_null() {
         SettingsRow::set_enabled_with_tooltip(ui.dock_peek_on_hover, on, &tooltip);
     }
     if !ui.dock_hide_frontmost_on_icon_click.is_null() {
         SettingsRow::set_enabled_with_tooltip(ui.dock_hide_frontmost_on_icon_click, on, &tooltip);
     }
-    ui.page_canvases[crate::settings::settings_page_index(crate::settings::SettingsPageId::Dock)]
-        .set_group_visible(RowGroup::DockPeek, on);
 }
 
 /// Freeze the clipboard-history options below the clipboard master switch.
@@ -2122,8 +2120,7 @@ pub(super) unsafe fn update_conditional_rows(ui: &SettingsUi) {
     update_clipboard_delete_dependent_visibility(ui);
     update_panel_material_dependent_visibility(ui);
     // Every described group is hidden when its page is built, so a group that is not settled here
-    // is invisible the first time its page opens: the Dock page's peek switch used to be missing
-    // from this list, and users saw no way to turn the peek off.
+    // is invisible the first time its page opens.
     update_dock_preview_controls_enabled(ui);
 }
 
@@ -3757,8 +3754,7 @@ mod tests {
     ///
     /// The renderer hides every described group when its page is built, so a group that no helper
     /// called from `update_conditional_rows` settles is invisible the first time its page opens --
-    /// the page looks like it never had the row. The Dock page's peek switch was exactly that: the
-    /// row existed, the switch was wired, and users could not see it.
+    /// the page looks like it never had the row.
     ///
     /// Asserted on the source: the pass and the bodies of the helpers it calls are read together, and
     /// the set of groups they mention is compared with the set the pages describe.
@@ -3790,10 +3786,7 @@ mod tests {
                 groups.push(name);
             }
         }
-        assert!(
-            groups.len() >= 2 && groups.iter().any(|g| g == "DockPeek"),
-            "the enum must parse and contain the Dock peek group: {groups:?}"
-        );
+        assert!(groups.len() >= 2, "the enum must parse: {groups:?}");
 
         // The pass, plus the body of every helper it calls in this file.
         let dispatch = read("src/settings/dispatch.rs");
