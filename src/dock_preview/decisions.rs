@@ -7,9 +7,18 @@ use std::time::{Duration, Instant};
 /// How long the pointer must rest on a Dock tile before the panel opens. Short enough to feel
 /// immediate, long enough that crossing the Dock on the way somewhere else does not flash panels.
 pub(crate) const OPEN_DELAY: Duration = Duration::from_millis(200);
-/// How long the panel survives after the pointer leaves it and the Dock tile, so a small overshoot
-/// while moving towards a card does not dismiss it.
+/// How long the panel survives while the pointer is still on the Dock but off the panel and the
+/// anchor tile. The trip from the icon towards the cards is often diagonal and spends more than
+/// one 50ms sample inside the Dock's list, so this crossing keeps the wide grace it always had.
 pub(crate) const CLOSE_GRACE: Duration = Duration::from_millis(250);
+/// How long the panel survives once the pointer has really left -- off the panel, the crossing and
+/// the Dock entirely. This is only a sampling safeguard, so one stray read cannot flash the panel
+/// away; the close itself then starts almost at once instead of after the crossing's grace.
+pub(crate) const CLOSE_PROTECT: Duration = Duration::from_millis(50);
+/// The close is a fade, not a one-frame cut: once the protection or the grace decides, the panel
+/// dissolves over this long. Windows takes 167-250ms; the shorter end keeps the snappy feel the
+/// open delay already has. Under Reduce Motion the close stays instant.
+pub(crate) const FADE_DURATION: Duration = Duration::from_millis(150);
 /// How long the pointer must rest on a truncated title before its full text is shown.
 pub(crate) const TOOLTIP_DELAY: Duration = Duration::from_millis(450);
 /// How often the main-thread tick runs while a Dock interaction is in progress.
@@ -53,76 +62,72 @@ pub(crate) fn switch_decision(current_pid: Option<i32>, hovered_pid: i32) -> Swi
     }
 }
 
+/// Where the close of a visible panel stands. The two phases are distinct because the first is
+/// cancellable protection while the second is already playing out: `Armed` carries the instant the
+/// pointer first went outside (not a deadline, so the duration it is measured against can follow
+/// where the pointer currently is), `Fading` the instant the dissolve began.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ClosePhase {
+    Armed(Instant),
+    Fading(Instant),
+}
+
 /// What the close timer should do, given where the real pointer is now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum CloseDecision {
     /// Pointer still over the panel, its cards, the crossing or the anchor tile: keep it open and
-    /// cancel any pending close.
+    /// cancel any pending close, including a fade that already started.
     Keep,
-    /// Pointer is elsewhere and a close is already scheduled: wait for its deadline. This is
-    /// distinct from `Keep` because the caller cancels on `Keep`; folding the two together made
-    /// every tick cancel the deadline the previous tick had just scheduled, so the panel never
-    /// closed after the pointer left.
+    /// Pointer is elsewhere and a phase is already running: wait for it. This is distinct from
+    /// `Keep` because the caller cancels on `Keep`; folding the two together made every tick
+    /// cancel the deadline the previous tick had just scheduled, so the panel never closed after
+    /// the pointer left.
     Wait,
-    /// Pointer is elsewhere: schedule a close at this instant.
-    Schedule(Instant),
-    /// The grace period has elapsed: hide now.
+    /// The pointer just went outside: arm the protection at this instant.
+    Arm(Instant),
+    /// The protection or the grace has elapsed: begin the fade.
+    Fade,
+    /// The fade has run its course: hide now.
     HideNow,
-}
-
-pub(crate) fn close_decision(
-    zone: PointerZone,
-    now: Instant,
-    scheduled: Option<Instant>,
-) -> CloseDecision {
-    match zone {
-        PointerZone::Close(_)
-        | PointerZone::Title(_)
-        | PointerZone::Card(_)
-        | PointerZone::Panel
-        | PointerZone::Transition
-        | PointerZone::Anchor => CloseDecision::Keep,
-        PointerZone::Outside => match scheduled {
-            Some(deadline) if now >= deadline => CloseDecision::HideNow,
-            Some(_) => CloseDecision::Wait,
-            None => CloseDecision::Schedule(now + CLOSE_GRACE),
-        },
-    }
 }
 
 /// The close decision for one tick of a visible panel.
 ///
-/// `on_other_tile` is the geometric verdict from [`pointer_is_on_other_dock_tile`]: the real pointer
-/// has left the anchored icon and is inside a neighbouring Dock tile's column. That is a departure,
-/// not a dismissal. The trip from the icon towards the cards is often diagonal and spends more than
-/// one 50ms sample over a neighbour's column, and the panel's bottom edge sits on the icon's top
-/// edge, so the whole upward move happens while the pointer is still inside the Dock's list. The
-/// verdict therefore takes the same leave grace as a pointer that left the Dock: reaching the panel
-/// cancels it, and a pointer that really rests on another tile still ends the preview when the grace
-/// expires (the Dock sends no selection change for a tile whose app is not running, which is why the
-/// geometric verdict exists at all).
-pub(crate) fn tick_decision(
+/// `on_dock` splits the two departures the old single grace lumped together. A pointer still on
+/// the Dock's list is plausibly on its way to the cards -- the trip is often diagonal and the
+/// panel's bottom edge sits on the icon's top edge, so the whole upward move happens inside the
+/// Dock -- and keeps the wide [`CLOSE_GRACE`], which is also how a rest on a tile whose app is not
+/// running still ends the preview (the Dock sends no selection change there). A pointer off the
+/// Dock entirely has really left, and only gets [`CLOSE_PROTECT`], the one sampling period that
+/// keeps a stray read from flashing the panel away. Either way the close itself is then a fade of
+/// [`FADE_DURATION`], never a one-frame cut.
+pub(crate) fn close_decision(
     zone: PointerZone,
-    on_other_tile: bool,
+    on_dock: bool,
     now: Instant,
-    scheduled: Option<Instant>,
+    phase: Option<ClosePhase>,
 ) -> CloseDecision {
-    let zone = match (on_other_tile, zone) {
-        // The verdict is coarse: it reads the Dock's list frame and the anchor's column only. Where
-        // it and the panel's own hit test disagree, the hit test wins — a pointer on a card, a
-        // title or the glass is aiming at that item, not settling on a tile.
-        (
-            true,
-            PointerZone::Close(_)
-            | PointerZone::Title(_)
-            | PointerZone::Card(_)
-            | PointerZone::Panel
-            | PointerZone::Anchor,
-        ) => zone,
-        (true, _) => PointerZone::Outside,
-        (false, zone) => zone,
-    };
-    close_decision(zone, now, scheduled)
+    if !matches!(zone, PointerZone::Outside) {
+        return CloseDecision::Keep;
+    }
+    match phase {
+        None => CloseDecision::Arm(now),
+        Some(ClosePhase::Armed(since)) => {
+            let allowance = if on_dock { CLOSE_GRACE } else { CLOSE_PROTECT };
+            if now.saturating_duration_since(since) >= allowance {
+                CloseDecision::Fade
+            } else {
+                CloseDecision::Wait
+            }
+        }
+        Some(ClosePhase::Fading(started)) => {
+            if now.saturating_duration_since(started) >= FADE_DURATION {
+                CloseDecision::HideNow
+            } else {
+                CloseDecision::Wait
+            }
+        }
+    }
 }
 
 /// Whether a press on the Dock must keep `tile`'s preview closed.
@@ -208,38 +213,6 @@ pub(crate) fn released_by_pointer(
         press
     };
     (latched_now, press_now)
-}
-
-/// Whether the real pointer is resting on the Dock but over a different tile than the one the
-/// open panel is anchored to.
-///
-/// The observer's selected-tile notification is not enough on its own: hovering a Dock tile whose
-/// application is not running can leave the previously selected tile in place, and the panel would
-/// then keep describing an app the pointer has already left.
-///
-/// Only the tile axis counts. A horizontal Dock's tiles are separated along x, so a pointer still
-/// within the anchored icon's x-span is on that icon's tile even when it has moved above the icon
-/// top (the 6pt strip between the icon and the list edge that every trip towards the cards crosses);
-/// comparing both axes made that strip read as "another tile" and dismissed the panel on the way up.
-pub(crate) fn pointer_is_on_other_dock_tile(
-    dock_list: Rect,
-    anchor: Rect,
-    pointer: (f64, f64),
-) -> bool {
-    if !dock_list.contains(pointer) {
-        return false;
-    }
-    if dock_list.w >= dock_list.h {
-        // Only the icon row counts as a tile. A pointer above the icon's top is the strip towards
-        // the cards: it stays "the same hover" even when the path drifts sideways, because the
-        // panel is wider than the icon and the trip to a card is often diagonal.
-        let in_tile_row = pointer.1 >= anchor.y;
-        in_tile_row && (pointer.0 < anchor.x || pointer.0 > anchor.max_x())
-    } else {
-        // A side Dock stacks its tiles vertically; beside the column is the way to the cards.
-        let in_tile_column = pointer.0 <= anchor.max_x();
-        in_tile_column && (pointer.1 < anchor.y || pointer.1 > anchor.max_y())
-    }
 }
 
 /// What the title-hover tooltip should do.
@@ -349,7 +322,7 @@ mod tests {
     }
 
     #[test]
-    fn the_panel_survives_the_crossing_and_closes_after_the_grace_period() {
+    fn the_panel_survives_the_crossing_and_fades_after_the_grace_period() {
         let now = at(0);
         for zone in [
             PointerZone::Panel,
@@ -359,25 +332,73 @@ mod tests {
             PointerZone::Title(0),
             PointerZone::Close(0),
         ] {
-            assert_eq!(close_decision(zone, now, None), CloseDecision::Keep);
+            assert_eq!(close_decision(zone, true, now, None), CloseDecision::Keep);
             assert_eq!(
-                close_decision(zone, now, Some(now - CLOSE_GRACE)),
+                close_decision(zone, true, now, Some(ClosePhase::Fading(now))),
                 CloseDecision::Keep,
-                "a scheduled close is cancelled while the pointer stays inside"
+                "a fade already running is cancelled while the pointer comes back inside"
             );
         }
+        // The first outside sample only arms the protection.
         assert_eq!(
-            close_decision(PointerZone::Outside, now, None),
-            CloseDecision::Schedule(now + CLOSE_GRACE)
+            close_decision(PointerZone::Outside, false, now, None),
+            CloseDecision::Arm(now)
         );
-        let scheduled = now + CLOSE_GRACE;
+        // Off the Dock entirely, the protection is the single sampling period; on the Dock the
+        // crossing's grace still decides, measured from the same first sample.
         assert_eq!(
-            close_decision(PointerZone::Outside, now + CLOSE_GRACE / 2, Some(scheduled)),
+            close_decision(
+                PointerZone::Outside,
+                false,
+                now + CLOSE_PROTECT,
+                Some(ClosePhase::Armed(now))
+            ),
+            CloseDecision::Fade,
+            "really gone: the fade starts right after the protection"
+        );
+        assert_eq!(
+            close_decision(
+                PointerZone::Outside,
+                true,
+                now + CLOSE_PROTECT,
+                Some(ClosePhase::Armed(now))
+            ),
             CloseDecision::Wait,
-            "outside with a pending deadline must not be reported as the cancelling Keep"
+            "still on the Dock: the grace is much wider than the protection"
         );
         assert_eq!(
-            close_decision(PointerZone::Outside, now + CLOSE_GRACE, Some(scheduled)),
+            close_decision(
+                PointerZone::Outside,
+                true,
+                now + CLOSE_GRACE,
+                Some(ClosePhase::Armed(now))
+            ),
+            CloseDecision::Fade
+        );
+        assert_eq!(
+            close_decision(
+                PointerZone::Outside,
+                false,
+                now + CLOSE_PROTECT / 2,
+                Some(ClosePhase::Armed(now))
+            ),
+            CloseDecision::Wait,
+            "inside the protection nothing is decided yet"
+        );
+        // The fade takes its time and only then hides.
+        let fading = ClosePhase::Fading(now + CLOSE_PROTECT);
+        assert_eq!(
+            close_decision(
+                PointerZone::Outside,
+                false,
+                now + CLOSE_PROTECT,
+                Some(fading)
+            ),
+            CloseDecision::Wait
+        );
+        let done = now + CLOSE_PROTECT + FADE_DURATION;
+        assert_eq!(
+            close_decision(PointerZone::Outside, false, done, Some(fading)),
             CloseDecision::HideNow
         );
     }
@@ -461,129 +482,6 @@ mod dock_tile_tests {
 
     fn anchor() -> Rect {
         Rect::new(268.0, 894.0, 44.0, 56.0)
-    }
-
-    #[test]
-    fn the_neighbouring_tile_ends_the_preview() {
-        // One tile to the right: still inside the Dock's list, outside the hovered icon.
-        assert!(pointer_is_on_other_dock_tile(
-            list(),
-            anchor(),
-            (336.0, 922.0)
-        ));
-    }
-
-    #[test]
-    fn the_hovered_tile_and_the_crossing_keep_it() {
-        assert!(!pointer_is_on_other_dock_tile(
-            list(),
-            anchor(),
-            (290.0, 922.0)
-        ));
-        // Above the icon but still in its column: the strip between the icon top and the Dock's
-        // list edge. This is the path every trip from the icon towards the cards takes, so it must
-        // not end the preview.
-        assert!(!pointer_is_on_other_dock_tile(
-            list(),
-            anchor(),
-            (290.0, 891.0)
-        ));
-        // A diagonal trip to a card drifts sideways while crossing that strip: still the same hover.
-        assert!(!pointer_is_on_other_dock_tile(
-            list(),
-            anchor(),
-            (350.0, 891.0)
-        ));
-        // In the icon row, a neighbouring tile still ends it.
-        assert!(pointer_is_on_other_dock_tile(
-            list(),
-            anchor(),
-            (336.0, 900.0)
-        ));
-        // Above the Dock, on the way to the cards.
-        assert!(!pointer_is_on_other_dock_tile(
-            list(),
-            anchor(),
-            (290.0, 850.0)
-        ));
-        // Somewhere else on the desktop.
-        assert!(!pointer_is_on_other_dock_tile(
-            list(),
-            anchor(),
-            (290.0, 400.0)
-        ));
-    }
-
-    /// The real geometry of a bottom Dock: the panel's bottom edge sits on the icon's top edge
-    /// (`ANCHOR_GAP = 0`), so the whole upward trip happens inside the Dock's list.
-    fn panel_above_anchor() -> crate::dock_preview::layout::HitGeometry<'static> {
-        use crate::dock_preview::layout::{HitGeometry, PanelMode};
-        HitGeometry {
-            panel: Rect::new(0.0, 600.0, 600.0, 290.0),
-            viewport: Rect::new(0.0, 600.0, 600.0, 290.0),
-            scroll: (0.0, 0.0),
-            items: &[],
-            anchor: anchor(),
-            band: Rect::new(0.0, 890.0, 600.0, 0.0),
-            close_visible: None,
-            mode: PanelMode::Row,
-            body_is_title: &[],
-        }
-    }
-
-    #[test]
-    fn slipping_onto_a_neighbouring_tile_takes_the_leave_grace() {
-        use crate::dock_preview::layout::pointer_zone;
-        let now = Instant::now();
-        let point = (336.0, 922.0);
-        assert!(pointer_is_on_other_dock_tile(list(), anchor(), point));
-        let zone = pointer_zone(point, panel_above_anchor());
-        assert_eq!(zone, PointerZone::Outside);
-        // The first sample arms the grace; it never dismisses the panel on its own, so a diagonal
-        // trip that crosses a neighbour's column reaches the panel.
-        assert_eq!(
-            tick_decision(zone, true, now, None),
-            CloseDecision::Schedule(now + CLOSE_GRACE)
-        );
-        // A pointer that stays there is still dismissed when the grace expires.
-        assert_eq!(
-            tick_decision(zone, true, now + CLOSE_GRACE, Some(now + CLOSE_GRACE)),
-            CloseDecision::HideNow
-        );
-    }
-
-    #[test]
-    fn reaching_the_panel_cancels_the_grace_on_the_same_tick() {
-        let now = Instant::now();
-        let deadline = now + CLOSE_GRACE;
-        assert_eq!(
-            tick_decision(PointerZone::Panel, false, now, Some(deadline)),
-            CloseDecision::Keep
-        );
-        assert_eq!(
-            tick_decision(PointerZone::Card(0), false, now, Some(deadline)),
-            CloseDecision::Keep
-        );
-        // On the icon itself, before the panel: the anchor is still the same hover.
-        assert_eq!(
-            tick_decision(PointerZone::Anchor, false, now, Some(deadline)),
-            CloseDecision::Keep
-        );
-    }
-
-    #[test]
-    fn a_panel_surface_outranks_the_other_tile_verdict() {
-        // The rule, not a layout: wherever the coarse verdict and the panel's own hit test
-        // disagree, the panel's answer stands.
-        let now = Instant::now();
-        assert_eq!(
-            tick_decision(PointerZone::Card(0), true, now, None),
-            CloseDecision::Keep
-        );
-        assert_eq!(
-            tick_decision(PointerZone::Panel, true, now, None),
-            CloseDecision::Keep
-        );
     }
 
     #[test]
@@ -693,29 +591,5 @@ mod dock_tile_tests {
             released_by_pointer(None, press, (290.0, 922.0), Some(true)),
             (None, press)
         );
-    }
-
-    #[test]
-    fn a_side_dock_compares_the_tile_axis_vertically() {
-        let side_list = Rect::new(0.0, 100.0, 56.0, 800.0);
-        let side_anchor = Rect::new(0.0, 400.0, 56.0, 44.0);
-        // Another tile above the anchored icon.
-        assert!(pointer_is_on_other_dock_tile(
-            side_list,
-            side_anchor,
-            (28.0, 300.0)
-        ));
-        // Same icon, beside it on the way to the cards.
-        assert!(!pointer_is_on_other_dock_tile(
-            side_list,
-            side_anchor,
-            (60.0, 420.0)
-        ));
-        // Same tile column, same icon row: still the hovered tile.
-        assert!(!pointer_is_on_other_dock_tile(
-            side_list,
-            side_anchor,
-            (28.0, 420.0)
-        ));
     }
 }

@@ -733,9 +733,6 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
   **为什么延后：** 需要真实面板生命周期（M2）。
   **重新审视的触发条件：** 下一次改动 `panel::apply_resize`、`cancel_close_matching` 或 `apply_hover` 时，在 `--smoke-dock-preview` 里补上。
 
-- **擦过"正在运行"的邻居图标仍会结束预览（离场宽限只覆盖几何路径）**（dock-preview-corridor，2026-11-25，两轮设计评审后按用户选定的范围落地小步；评审的第二轮 HIGH 保留为此条，**延后**）。2026-11-25 的改动把「指针在图标行里 x 出了锚定图标 → `hide_panel()`」改成走既有的 250 ms 离场宽限（`decisions::tick_decision`），所以斜着走向卡片时擦过邻居不再立即消失。两条残留：(a) 擦过**正在运行**的应用图标时，Dock 自己会改 selection，observer 立刻发 `Switch`，旧面板被换成那个应用的预览——失败方式从"消失"变成"闪切"；(b) 超过 250 ms 的极慢穿越仍会消失。
-  **为什么延后：** 用户报告的那条走廊两侧是 Launchpad（非应用 tile）与 ego lite（未运行，Dock 上无运行点），(a) 在其实际路径上不可达；而做对 (a)(b) 需要一个有截止时间的过渡状态机（过渡起点 + 轨迹判定 + 候选缓冲 + 单动作优先级），两轮设计评审给出的规格约 200 行并需要独立评审轮次，与小步方案的成本不在一个量级。本轮按用户选定的范围只做小步，不做这个状态机。
-  **重新审视的触发条件：** 收到「指针擦过运行中的应用图标时预览被结束/换了应用」的报告时；或下一次改动 `dock_preview` 的 tick / 关闭 / 切换路径时（`decisions::tick_decision` 就是这类改动的接缝），按设计轮 v2 的规格补上过渡状态机，并把 `PATH_MIN_STEP`、`SWITCH_CONFIRM` 的实际取值做成可复现的实测。
 - **悬停 peek:取消后已入队的 raiser 任务无法撤回**(Dock 预览悬停 peek 实现轮,R1 HIGH 的后半;R2/R3/R4/R5/R6 连续五轮标为 UNRESOLVED;2026-11-25,**仍然延后,理由见下**)。peek 的抬起走既有的 `overlay::activate_and_raise`,它在非 other-desktop 分支里同步做一次精确窗口落定,随后把剩余工作交给 raiser 线程;raisr 的任务用 `raise_intent_current(generation)` 判断是否已作废,而 bump generation 的只有**下一次** raise。所以"peek 被 forget/restore,但之后没有新的 raise"的时间窗内,已经入队的激活/重试仍可能执行并把一个正在离开的窗口重新抬到前台。
   **为什么延后:** 要修得让 raiser 接受一个"可撤销的外部授权"(peek 代次),它牵动 `window_collector/raiser.rs` 的授权模型——那是切换器自己依赖的共享子系统,应与 dock 预览的改动分开评审;窗口本身很短(一次 AX 落定 + 两次 8/20ms 重试),且 `drain_peek_restores` 的 `peek::restore_step` 会在还原前复核前台归属(含焦点窗口),最坏结果是多一次短暂抬升,不会把用户拽走后不回。
   **重新审视的触发条件:** 收到"悬停后移开,窗口又跳上来一次"的报告时;或下一次改动 `window_collector/raiser.rs` 的 generation/授权语义时,把 peek 代次作为第二个失效来源接进去,并在 M2 场景里断言"移开后不再有新的 raise"。

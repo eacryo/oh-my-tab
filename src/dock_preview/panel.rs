@@ -227,6 +227,9 @@ struct PanelState {
     last_fill: Instant,
     /// When the panel was last positioned; the tooltip follows it.
     shown_at: Instant,
+    /// The close fade is playing: the panel is still on screen but already on its way out, so it
+    /// must not answer clicks, hovers or scrolls any more.
+    fading: bool,
 }
 
 static PANEL: MainThreadSlot<Option<PanelState>> = unsafe { MainThreadSlot::new(None) };
@@ -262,15 +265,6 @@ pub(crate) fn panel_frame() -> Option<Rect> {
         .ok()?
         .as_ref()
         .map(|state| state.geometry.panel)
-}
-
-/// The hovered tile rectangle and Dock edge the open panel is anchored to.
-pub(crate) fn anchor_rect() -> Option<(Rect, DockEdge)> {
-    PANEL
-        .lock()
-        .ok()?
-        .as_ref()
-        .map(|state| (state.geometry.anchor, state.geometry.edge))
 }
 
 pub(crate) fn is_visible() -> bool {
@@ -370,6 +364,9 @@ pub(crate) fn show(request: PanelRequest, request_epoch: u64, ticket: u64) -> bo
     state.title_hover_since = None;
     state.pointer = None;
     state.last_zone = PointerZone::Outside;
+    // A rebuild can land while a close fade is still playing (the observer switched the content
+    // for a new hover): the new content must open whole, not mid-dissolve.
+    reset_fade(state);
     hide_tooltip(state);
     place_window(state);
     place_viewport(state);
@@ -420,6 +417,9 @@ pub(crate) fn hide() {
     let Some(state) = slot.as_mut() else {
         return;
     };
+    // A hide that lands mid-fade still owes the next showing a fully opaque panel: the layer's
+    // model opacity is 0 from the fade, and nothing else would restore it.
+    reset_fade(state);
     hide_tooltip(state);
     let _: () = unsafe { msg_send![state.panel, orderOut: std::ptr::null::<AnyObject>()] };
     for card in state.cards.drain(..) {
@@ -434,6 +434,111 @@ pub(crate) fn hide() {
     state.window_ids.clear();
     state.total_windows = 0;
     state.request = 0;
+}
+
+/// The animation key of the close fade, so a cancel removes exactly it and nothing else.
+const FADE_ANIMATION_KEY: &str = "dock-preview-close-fade";
+
+/// The one layer subtree the visible panel is drawn in: the window's content view holds the
+/// backdrop carrier, the shadow and every row, so fading it fades the whole panel as one piece.
+/// Fading the WINDOW instead was rejected for the toast long ago (the material keeps reasserting
+/// its own fill and the surface vanishes in two steps); the same applies here.
+unsafe fn root_layer(state: &PanelState) -> *mut AnyObject {
+    let host: *mut AnyObject = msg_send![state.panel, contentView];
+    if host.is_null() {
+        return std::ptr::null_mut();
+    }
+    msg_send![host, layer]
+}
+
+/// Restore the full opacity and drop a running fade, wherever the fade had progressed to. Cheap
+/// enough to call on every cancelling tick: it is a no-op unless the panel is fading.
+fn reset_fade(state: &mut PanelState) {
+    if !state.fading {
+        return;
+    }
+    state.fading = false;
+    unsafe {
+        let layer = root_layer(state);
+        if layer.is_null() {
+            return;
+        }
+        let key = make_nsstring(FADE_ANIMATION_KEY);
+        let _: () = msg_send![layer, removeAnimationForKey: key];
+        crate::ffi::CFRelease(key as *const c_void);
+        let _: () = msg_send![layer, setOpacity: 1.0f32];
+    }
+}
+
+/// Whether the close fade is playing. A fading panel is still visible but no longer interactive.
+pub(crate) fn is_fading() -> bool {
+    PANEL
+        .lock()
+        .ok()
+        .and_then(|slot| slot.as_ref().map(|state| state.fading))
+        .unwrap_or(false)
+}
+
+/// Begin the close fade: the panel dissolves over `decisions::FADE_DURATION` instead of being cut
+/// in one frame. The caller's tick owns the timing (it hides the panel when the duration has
+/// passed); the animation itself is fire-and-forget on the render server, so it stays smooth
+/// however the tick lands. The tooltip goes first -- a fading panel must not keep a fully opaque
+/// annotation floating next to it.
+pub(crate) fn begin_fade() {
+    let Ok(mut slot) = PANEL.lock() else {
+        return;
+    };
+    let Some(state) = slot.as_mut() else {
+        return;
+    };
+    if state.fading {
+        return;
+    }
+    state.fading = true;
+    hide_tooltip(state);
+    // Hover washes belong to interaction: a panel on its way out shows none.
+    apply_hover(state, None);
+    state.hovered = None;
+    unsafe {
+        let layer = root_layer(state);
+        if layer.is_null() {
+            return;
+        }
+        // The select popup's recipe, for the same reason: a CALayer is not animatable through
+        // `animator`, so the model value is set and one explicit animation carries the property
+        // there. The tick's hide is what orders the panel out when the duration has passed.
+        let fade = crate::dock_preview::decisions::FADE_DURATION.as_secs_f64();
+        let _: () = msg_send![layer, setOpacity: 0.0f32];
+        let key_path = make_nsstring("opacity");
+        let animation: *mut AnyObject = msg_send![
+            class!(CABasicAnimation),
+            animationWithKeyPath: key_path
+        ];
+        crate::ffi::CFRelease(key_path as *const c_void);
+        let from_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 1.0f64];
+        let to_value: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: 0.0f64];
+        let _: () = msg_send![animation, setFromValue: from_value];
+        let _: () = msg_send![animation, setToValue: to_value];
+        let _: () = msg_send![animation, setDuration: fade];
+        let timing = crate::theme::ease_standard_timing_function();
+        if !timing.is_null() {
+            let _: () = msg_send![animation, setTimingFunction: timing];
+        }
+        let key = make_nsstring(FADE_ANIMATION_KEY);
+        let _: () = msg_send![layer, addAnimation: animation, forKey: key];
+        crate::ffi::CFRelease(key as *const c_void);
+    }
+}
+
+/// Cancel a running close fade: the pointer came back, so the panel is restored whole instead of
+/// vanishing under it.
+pub(crate) fn cancel_fade() {
+    let Ok(mut slot) = PANEL.lock() else {
+        return;
+    };
+    if let Some(state) = slot.as_mut() {
+        reset_fade(state);
+    }
 }
 
 /// Put the panel back above a window that just came forward.
@@ -934,6 +1039,11 @@ pub(crate) enum HitKind {
 pub(crate) fn hit_target(local: (f64, f64)) -> Option<HitTarget> {
     let slot = PANEL.lock().ok()?;
     let state = slot.as_ref()?;
+    // A fading panel is already on its way out: a click must not land on a card that is
+    // disappearing under it.
+    if state.fading {
+        return None;
+    }
     let zone = zone_at(state, local);
     let (index, kind) = match zone {
         PointerZone::Close(index) => (index, HitKind::Close),
@@ -1155,7 +1265,12 @@ fn reclassify(state: &mut PanelState) {
         pointer.1 - state.geometry.panel.y,
     );
     let zone = zone_at(state, local);
+    // The zone is still tracked while fading -- the close decision reads it to cancel the fade
+    // when the pointer comes back -- but a panel on its way out shows no hover and no tooltip.
     state.last_zone = zone;
+    if state.fading {
+        return;
+    }
     update_hover(state, zone);
     update_tooltip(state, Instant::now());
 }
@@ -1625,6 +1740,7 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
             fill_deadline: Instant::now(),
             last_fill: Instant::now(),
             shown_at: Instant::now(),
+            fading: false,
         })
     }
 }
@@ -2733,6 +2849,9 @@ extern "C" fn container_mouse_down(_self: *mut AnyObject, _cmd: Sel, event: *mut
 /// Dock like any other wheel event.
 extern "C" fn container_scroll_wheel(_self: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     crate::callback_guard::void("dock_preview_scroll_wheel", || unsafe {
+        if is_fading() {
+            return;
+        }
         let Some((mode, row_axis, max_scroll, viewport)) = scroll_context() else {
             return;
         };

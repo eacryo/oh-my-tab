@@ -18,7 +18,7 @@ use objc2::runtime::AnyObject;
 use objc2::{class, msg_send, sel};
 
 use crate::dock_preview::decisions::{CloseDecision, SwitchDecision, TICK_INTERVAL};
-use crate::dock_preview::layout::{DockEdge, Rect};
+use crate::dock_preview::layout::{DockEdge, PointerZone, Rect};
 use crate::dock_preview::observer::{DockEvent, Selection};
 use crate::dock_preview::peek::{
     ClearReason, Frontmost, Mod, PeekDecision, PeekInput, PeekTarget, PeekWatch,
@@ -50,7 +50,8 @@ type CollectorResult = (u64, Option<CollectedWindows>);
 static RESULTS: LazyLock<Mutex<Vec<CollectorResult>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 static PENDING_OPEN: LazyLock<Mutex<Option<PendingOpen>>> = LazyLock::new(|| Mutex::new(None));
 static CURRENT_APP: LazyLock<Mutex<Option<CurrentApp>>> = LazyLock::new(|| Mutex::new(None));
-static CLOSE_AT: LazyLock<Mutex<Option<Instant>>> = LazyLock::new(|| Mutex::new(None));
+static CLOSE_PHASE: LazyLock<Mutex<Option<decisions::ClosePhase>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Whether a smoke case has switched the controlled room on (see `visible_frame_of`).
 static SMOKE_ROOM_H: AtomicBool = AtomicBool::new(false);
@@ -253,7 +254,7 @@ pub(crate) fn stop() {
     SESSION.fetch_add(1, Ordering::AcqRel);
     REQUEST.fetch_add(1, Ordering::AcqRel);
     PENDING_OPEN.lock().unwrap().take();
-    *CLOSE_AT.lock().unwrap() = None;
+    *CLOSE_PHASE.lock().unwrap() = None;
     *CURRENT_APP.lock().unwrap() = None;
     stop_dock_reveal_keeper();
     stop_dock_click_watcher();
@@ -2052,7 +2053,7 @@ fn hide_panel() {
     stop_dock_reveal_keeper();
     panel::hide();
     panel::flush_records();
-    *CLOSE_AT.lock().unwrap() = None;
+    *CLOSE_PHASE.lock().unwrap() = None;
     *CURRENT_APP.lock().unwrap() = None;
     PENDING_OPEN.lock().unwrap().take();
     REQUEST.fetch_add(1, Ordering::AcqRel);
@@ -2178,7 +2179,7 @@ pub(crate) fn dev_show_windows(titles: &[&str], edge: DockEdge) -> bool {
             edge,
             request,
         });
-        *CLOSE_AT.lock().unwrap() = None;
+        *CLOSE_PHASE.lock().unwrap() = None;
     }
     shown
 }
@@ -2227,7 +2228,7 @@ pub(crate) fn dev_show_synthetic(titles: &[&str]) -> bool {
     );
     if shown {
         *CURRENT_APP.lock().unwrap() = Some(app);
-        *CLOSE_AT.lock().unwrap() = None;
+        *CLOSE_PHASE.lock().unwrap() = None;
     }
     shown
 }
@@ -2552,7 +2553,14 @@ fn handle_event(event: DockEvent) {
                 *DISMISSED_TILE.lock().unwrap() = Some((pid, icon));
                 return;
             }
-            hide_panel();
+            // A panel already on screen is NOT cut away here: brushing a running neighbour tile
+            // on the way to the cards reaches this same path, and hiding first made every such
+            // crossing flash the preview away. The panel stays until the replacement is ready to
+            // take over inside the same window (`panel::show` rebuilds in place), and the close
+            // grace remains the one judge of a real departure.
+            if !panel::is_visible() {
+                hide_panel();
+            }
             // A press can land inside the open delay, when no panel exists yet: the watcher has to
             // be listening before the panel is, or that press would show a preview afterwards.
             start_dock_click_watcher();
@@ -2621,21 +2629,15 @@ fn tick() {
     // the dismissed tile is what makes the next hover able to open a preview again.
     release_dismiss_state(pointer);
     if panel::is_visible() {
-        // Moving along the Dock from the previewed icon onto a different tile (including a tile
-        // whose app is not running, where the observer's selection event never arrives) ends the
-        // preview, but not on the tick it is first seen: the trip towards the cards is often
-        // diagonal and the pointer is inside the Dock's list for all of it, because the panel's
-        // bottom edge sits on the icon's top edge. The verdict takes the leave grace instead, so a
-        // crossing is cancelled by the panel and a real hover still ends the preview.
-        let other_tile = {
-            let dock = *DOCK_STATE.lock().unwrap();
-            match (dock.list, panel::anchor_rect()) {
-                (Some(list), Some((anchor, _))) => {
-                    decisions::pointer_is_on_other_dock_tile(list, anchor, pointer)
-                }
-                _ => false,
-            }
-        };
+        // A pointer still on the Dock's list is plausibly on its way to the cards -- the trip is
+        // often diagonal and the whole upward move happens inside the Dock, because the panel's
+        // bottom edge sits on the icon's top edge -- so it keeps the wide grace. Off the Dock
+        // entirely it has really left: one sampling period of protection, then the close starts.
+        let on_dock = DOCK_STATE
+            .lock()
+            .unwrap()
+            .list
+            .is_some_and(|list| list.contains(pointer));
         let outcome = panel::tick(now, pointer);
         panel::flush_records();
         if outcome == panel::TickOutcome::Empty {
@@ -2643,19 +2645,53 @@ fn tick() {
             return;
         }
         let zone = panel::current_pointer_zone();
-        let scheduled = *CLOSE_AT.lock().unwrap();
-        match decisions::tick_decision(zone, other_tile, now, scheduled) {
-            CloseDecision::Keep => *CLOSE_AT.lock().unwrap() = None,
+        // A hover switch is in flight while the pointer rests on the tile it targets: the
+        // replacement opens inside this same window in a few hundred milliseconds, so for the
+        // close timer that tile counts as the panel's own ground. Without this the switch raced
+        // the grace -- 200ms of open delay plus the collection sits exactly on the 250ms the
+        // grace allows -- and the panel faded an instant before its replacement arrived.
+        // The two locks are taken in sequence, never nested: the rest of this module only ever
+        // holds one of them at a time, and keeping it that way leaves no ordering to audit.
+        let pending_tile = PENDING_OPEN.lock().unwrap().as_ref().map(|open| open.icon);
+        let switch_tile = pending_tile.or_else(|| {
+            COLLECT_CONTEXT
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|context| context.anchor)
+        });
+        let settling = switch_tile.is_some_and(|tile| tile.contains(pointer));
+        let close_zone = if settling && matches!(zone, PointerZone::Outside) {
+            PointerZone::Anchor
+        } else {
+            zone
+        };
+        let phase = *CLOSE_PHASE.lock().unwrap();
+        match decisions::close_decision(close_zone, on_dock, now, phase) {
+            CloseDecision::Keep => {
+                // A fade already playing out is cancelled here: the panel is the user's again,
+                // so it comes back whole rather than vanishing under the pointer.
+                panel::cancel_fade();
+                *CLOSE_PHASE.lock().unwrap() = None;
+            }
             CloseDecision::Wait => {}
-            CloseDecision::Schedule(at) => {
-                // Logged where the grace is armed, not on every sample: a pointer the panel itself
-                // claims keeps the verdict true without ever starting a close.
-                if other_tile {
+            CloseDecision::Arm(at) => {
+                if on_dock {
                     log_debug!(
                         "[dock-preview] pointer left the anchor tile; the leave grace decides"
                     );
                 }
-                *CLOSE_AT.lock().unwrap() = Some(at);
+                *CLOSE_PHASE.lock().unwrap() = Some(decisions::ClosePhase::Armed(at));
+            }
+            CloseDecision::Fade => {
+                // Reduce Motion keeps the old instant close: a dissolve is exactly the motion it
+                // asks to be spared.
+                if crate::theme::reduce_motion_enabled() {
+                    hide_panel();
+                } else {
+                    panel::begin_fade();
+                    *CLOSE_PHASE.lock().unwrap() = Some(decisions::ClosePhase::Fading(now));
+                }
             }
             CloseDecision::HideNow => hide_panel(),
         }
@@ -2717,7 +2753,13 @@ fn tick() {
                 state.revealed,
                 open.icon
             );
-            hide_panel();
+            // A cancel whose only cause is the pointer having moved on must not cut a panel
+            // that is still on screen: the pointer is crossing, and the close grace owns that
+            // panel's fate. The other causes -- the feature toggled off, the Dock hiding, the
+            // switcher taking the screen -- end the preview immediately as they always did.
+            if !panel::is_visible() || !enabled_now || !state.revealed || other_panel {
+                hide_panel();
+            }
             return;
         }
         let visible = visible_frame_of(screen);
@@ -2796,6 +2838,11 @@ fn drain_results() {
         let bundle = context.bundle.clone();
         PENDING_OPEN.lock().unwrap().take();
         let ticket = crate::thumbnail::begin_dock_capture_epoch();
+        // The panel the replacement lands in may be one that stayed on screen through the hover
+        // switch: every card a peek could still refer to is about to be rebuilt away, so the
+        // front and the hold are released here for the same reason `hide_panel` releases them.
+        restore_peek();
+        peek_session_reset();
         let app = CurrentApp {
             pid: collected.pid,
             identity_key: collected.identity_key.clone(),
@@ -2817,7 +2864,7 @@ fn drain_results() {
         };
         if panel::show(panel_request, request, ticket) {
             *CURRENT_APP.lock().unwrap() = Some(app);
-            *CLOSE_AT.lock().unwrap() = None;
+            *CLOSE_PHASE.lock().unwrap() = None;
             if !context.dev {
                 start_dock_reveal_keeper(anchor, edge);
             }
