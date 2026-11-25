@@ -26,7 +26,7 @@ use crate::dock_preview::layout::{
 };
 use crate::dock_preview::windows::{self, PreviewWindow};
 use crate::ffi::{
-    hex_to_cg_color, hex_to_ns_color, layer_set_background, layer_set_border, layer_set_contents,
+    hex_to_cg_color, hex_to_ns_color, layer_set_background, layer_set_contents,
     layer_set_contents_scale, make_nsstring, release_obj, MainThreadSlot,
 };
 use crate::glass;
@@ -195,6 +195,7 @@ struct PanelState {
     fade_trail: *mut AnyObject,
     tooltip_panel: *mut AnyObject,
     tooltip_label: *mut AnyObject,
+    tooltip_backdrop: glass::InstalledBackdrop,
     geometry: Geometry,
     /// The current viewport height, in points (the clip and the layout agree on it).
     request: u64,
@@ -1577,15 +1578,22 @@ fn primary_screen_height() -> f64 {
 /// The preview never becomes key, so it shares the keystroke HUD's passive-panel recipe: the same
 /// compensation veil (transparent under clear glass), the native glass edge and the high elevation.
 /// What stays its own is the 8pt corner radius -- the deliberately squarish taskbar-preview shape.
-fn backdrop_options() -> glass::BackdropOptions {
+fn material_backdrop_options() -> glass::BackdropOptions {
     let tint = glass::passive_glass_compensation_tint(
         &crate::config::effective_glass_style(),
         theme::resolved_is_dark(),
     );
-    glass::BackdropOptions::new(Some(tint & 0xFF))
-        .with_compensation_tint(tint)
+    glass::BackdropOptions::new(Some(tint & 0xFF)).with_compensation_tint(tint)
+}
+
+fn backdrop_options() -> glass::BackdropOptions {
+    material_backdrop_options()
         .with_elevation(Some(theme::ELEVATION_HIGH))
         .with_native_glass_edge()
+}
+
+fn tooltip_backdrop_options() -> glass::BackdropOptions {
+    material_backdrop_options()
 }
 // ---------------------------------------------------------------------------------------------
 // Construction
@@ -1701,6 +1709,7 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
             fade_trail,
             tooltip_panel: tooltip_panel.0,
             tooltip_label: tooltip_panel.1,
+            tooltip_backdrop: tooltip_panel.2,
             geometry: Geometry {
                 panel: Rect::new(0.0, 0.0, 1.0, 1.0),
                 viewport: Rect::new(0.0, 0.0, 1.0, 1.0),
@@ -1747,7 +1756,7 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
 
 /// The tooltip is a passive panel: it never accepts a click and never becomes key.
 /// The tooltip is a passive panel: it never accepts a click and never becomes key.
-unsafe fn build_tooltip_panel() -> (*mut AnyObject, *mut AnyObject) {
+unsafe fn build_tooltip_panel() -> (*mut AnyObject, *mut AnyObject, glass::InstalledBackdrop) {
     let panel: *mut AnyObject = msg_send![panel_class(), alloc];
     let panel: *mut AnyObject = msg_send![
         panel,
@@ -1766,6 +1775,13 @@ unsafe fn build_tooltip_panel() -> (*mut AnyObject, *mut AnyObject) {
     let _: () = msg_send![panel, setLevel: 26isize];
     let behavior: usize = (1 << 0) | (1 << 3) | (1 << 6) | (1 << 8) | (1 << 18);
     let _: () = msg_send![panel, setCollectionBehavior: behavior];
+    let appearance_name = make_nsstring(glass::vibrant_appearance_name(theme::resolved_is_dark()));
+    let appearance: *mut AnyObject =
+        msg_send![class!(NSAppearance), appearanceNamed: appearance_name];
+    crate::ffi::CFRelease(appearance_name as *const c_void);
+    if !appearance.is_null() {
+        let _: () = msg_send![panel, setAppearance: appearance];
+    }
 
     let view: *mut AnyObject = msg_send![passthrough_view_class(), alloc];
     let view: *mut AnyObject = msg_send![view, initWithFrame: NSRect::new(
@@ -1773,14 +1789,18 @@ unsafe fn build_tooltip_panel() -> (*mut AnyObject, *mut AnyObject) {
         NSSize::new(1.0, 1.0)
     )];
     let _: () = msg_send![view, setWantsLayer: true];
-    let palette = theme::ui_palette();
-    layer_set_background(msg_send![view, layer], hex_to_cg_color(palette.window_bg));
-    let view_layer: *mut AnyObject = msg_send![view, layer];
-    let _: () = msg_send![view_layer, setCornerRadius: layout::THUMB_RADIUS];
-    let _: () = msg_send![view_layer, setBorderWidth: 1.0f64];
-    layer_set_border(msg_send![view, layer], hex_to_cg_color(palette.card_border));
+    let _: () = msg_send![view, setAutoresizingMask: 18u64];
     let _: () = msg_send![panel, setContentView: view];
-    release_obj(view);
+
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, 1.0));
+    let mut backdrop = glass::install_embedded_backdrop(
+        view,
+        bounds,
+        layout::THUMB_RADIUS,
+        tooltip_backdrop_options(),
+    );
+    glass::finish_embedded_backdrop(backdrop, layout::THUMB_RADIUS);
+    backdrop.outline_view = glass::install_panel_outline(&backdrop, layout::THUMB_RADIUS);
 
     let label: *mut AnyObject = msg_send![passthrough_label_class(), alloc];
     let label: *mut AnyObject = msg_send![label, initWithFrame: NSRect::new(
@@ -1790,10 +1810,11 @@ unsafe fn build_tooltip_panel() -> (*mut AnyObject, *mut AnyObject) {
     style_label(label, theme::FONT_CAPTION);
     let _: () = msg_send![label, setUsesSingleLineMode: false];
     let _: () = msg_send![label, setLineBreakMode: 0isize]; // word wrapping
-    let _: () = msg_send![label, setTextColor: hex_to_ns_color(palette.primary_text)];
-    let _: () = msg_send![view, addSubview: label];
+    let _: () = msg_send![label, setTextColor: glass::panel_ink(theme::ui_palette().primary_text, glass::PanelInk::Primary)];
+    let _: () = msg_send![backdrop.content_parent, addSubview: label];
     release_obj(label);
-    (panel, label)
+    release_obj(view);
+    (panel, label, backdrop)
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -2733,6 +2754,7 @@ unsafe fn show_tooltip(state: &PanelState, item: Rect, text: &str) {
         NSPoint::new(0.0, 0.0),
         NSSize::new(size.0, size.1)
     )];
+    glass::apply_live_properties(state.tooltip_backdrop, tooltip_backdrop_options());
     let _: () = msg_send![state.tooltip_panel, orderFrontRegardless];
 }
 
@@ -2969,10 +2991,21 @@ fn passthrough_label_class() -> *mut AnyObject {
                     passthrough_hit_test
                         as unsafe extern "C" fn(*mut AnyObject, Sel, NSPoint) -> *mut AnyObject,
                 );
+                builder.add_method::<AnyObject, _>(
+                    sel!(allowsVibrancy),
+                    passthrough_label_allows_vibrancy
+                        as unsafe extern "C" fn(*mut AnyObject, Sel) -> Bool,
+                );
             },
         )
     })
     .0 as *mut AnyObject
+}
+
+extern "C" fn passthrough_label_allows_vibrancy(_self: *mut AnyObject, _cmd: Sel) -> Bool {
+    crate::callback_guard::value("dock_preview_label_allows_vibrancy", Bool::YES, || {
+        Bool::YES
+    })
 }
 
 extern "C" fn passthrough_hit_test(
@@ -3642,6 +3675,18 @@ mod shell_reuse_tests {
         assert!(shell_reuse_allowed(size, built, size, built));
         // A different size rebuilds whatever the surface says.
         assert!(!shell_reuse_allowed(size, built, (656.0, 200.0), built));
+    }
+
+    #[test]
+    fn the_tooltip_shares_the_material_but_not_the_panel_chrome() {
+        let panel = backdrop_options();
+        let tooltip = tooltip_backdrop_options();
+        assert_eq!(panel.compensation_alpha, tooltip.compensation_alpha);
+        assert_eq!(panel.compensation_tint, tooltip.compensation_tint);
+        assert_eq!(panel.frost_material, tooltip.frost_material);
+        assert_eq!(panel.material, tooltip.material);
+        assert_eq!(tooltip.elevation, None);
+        assert!(!tooltip.native_glass_edge);
     }
 }
 
