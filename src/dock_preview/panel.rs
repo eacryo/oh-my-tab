@@ -1941,7 +1941,8 @@ unsafe fn build_rows(state: &mut PanelState, request: &PanelRequest) {
             .get(index)
             .copied()
             .unwrap_or(Rect::new(0.0, layout::row_top(index), row_w, layout::ROW_H));
-        let plate = row_plate(item);
+        let plate_rect = layout::list_plate_rect(item, index, request.windows.len());
+        let plate = row_plate(plate_rect);
         let icon_view = image_view_at(
             Rect::new(
                 item.x + boxes.icon.x,
@@ -2012,13 +2013,15 @@ unsafe fn build_rows(state: &mut PanelState, request: &PanelRequest) {
     }
 }
 
-/// The hover plate of one row: the row grown to the content's sides and, for the first and last
-/// row, to the content's top and bottom, so the wash follows the panel rather than floating inside.
-unsafe fn row_plate(item: Rect) -> *mut AnyObject {
-    let plate = passthrough_view(item);
+/// The hover plate of one row: a strip across the whole glass width, grown one padding step
+/// towards the glass top for the first row and bottom for the last, so the wash follows the panel
+/// rather than floating inside it. Every corner takes the panel's own radius: the strip's ends
+/// then echo the glass shape instead of reading as a square cut at the edge.
+unsafe fn row_plate(rect: Rect) -> *mut AnyObject {
+    let plate = passthrough_view(rect);
     let layer: *mut AnyObject = msg_send![plate, layer];
     layer_set_background(layer, hex_to_cg_color(layout::HOVER_PLATE_FILL));
-    let _: () = msg_send![layer, setCornerRadius: layout::CARD_RADIUS];
+    let _: () = msg_send![layer, setCornerRadius: layout::PANEL_RADIUS];
     let _: () = msg_send![plate, setHidden: true];
     plate
 }
@@ -2139,8 +2142,11 @@ fn place_rows(state: &PanelState) {
             .get(index)
             .copied()
             .unwrap_or(Rect::new(0.0, layout::row_top(index), row_w, layout::ROW_H));
+        // The plate follows the same growth the build gave it: a relayout that reverted it to the
+        // bare row would shrink the wash back off the glass edge.
+        let plate_rect = layout::list_plate_rect(item, index, state.rows.len());
         unsafe {
-            place_view(row.plate, item);
+            place_view(row.plate, plate_rect);
             place_view(
                 row.icon,
                 Rect::new(

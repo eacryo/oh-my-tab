@@ -16,7 +16,9 @@
 //! ```text
 //! space_budget(anchor, edge, visible)  -> the largest glass area the Dock leaves room for
 //! panel_size(...)                      -> the glass area itself (never larger than the budget)
-//! viewport                             -> glass minus PANEL_PAD on each side (the one padding step)
+//! viewport                             -> glass minus PANEL_PAD on each side for the cards; the
+//!                                           list keeps only the vertical padding, so its rows
+//!                                           (and their hover wash) span the full glass width
 //! row_boxes(row_w)                     -> icon, close slot, then whatever is left for the title
 //! ```
 //!
@@ -499,13 +501,14 @@ fn list_panel(
     list_title_w: Option<f64>,
 ) -> Option<PanelLayout> {
     let compact = budget.inner_w < LIST_W_MIN;
-    // The width follows the widest measured title (fixed pieces plus the title band, plus the
-    // glass padding), capped at the legacy fixed width: rows of short titles no longer leave a
-    // blank tail, and long titles truncate exactly as before. `None` keeps the legacy fixed
-    // width; pure layout tests use it since they have no AppKit text measurement.
+    // The width follows the widest measured title (the fixed pieces plus the title band: a row
+    // spans the full glass width, so no glass padding is added on top), capped at the legacy
+    // fixed width: rows of short titles no longer leave a blank tail, and long titles truncate
+    // exactly as before. `None` keeps the legacy fixed width; pure layout tests use it since
+    // they have no AppKit text measurement.
     let width = match list_title_w {
         Some(title_w) if title_w.is_finite() && title_w >= 0.0 => {
-            let natural = ROW_FIXED_W + title_w + PANEL_PAD * 2.0;
+            let natural = ROW_FIXED_W + title_w;
             natural.min(LIST_W).min(budget.inner_w).max(1.0)
         }
         _ => budget.inner_w.clamp(1.0, LIST_W),
@@ -518,13 +521,17 @@ fn list_panel(
         return None;
     }
     let full_rows = (viewport_h / ROW_H).floor() as usize;
+    // The list's viewport spans the glass edge to edge horizontally: rows never scroll sideways,
+    // so the horizontal clip is never needed, and a row (and its hover plate) can run the full
+    // width instead of floating one padding step inside the glass. Vertically the padding stays:
+    // it is what the scroll clip needs.
     Some(PanelLayout {
         panel: panel_frame(anchor, (width, glass_h), edge, visible),
-        viewport: Rect::new(PANEL_PAD, PANEL_PAD, width - PANEL_PAD * 2.0, viewport_h),
+        viewport: Rect::new(0.0, PANEL_PAD, width, viewport_h),
         mode: PanelMode::List,
         row: None,
         list: Some(ListLayout {
-            content_w: width - PANEL_PAD * 2.0,
+            content_w: width,
             content_h,
             viewport_h,
             full_rows,
@@ -752,6 +759,28 @@ pub(crate) fn hover_plate_rect(
         CARD_RADIUS
     };
     (plate, radius)
+}
+
+/// The hovered row's plate in the list layout.
+///
+/// Horizontally the row already spans the glass edge to edge (the list's viewport is the full
+/// glass width), so the strip needs no sideways growth. Vertically the first row grows the one
+/// padding step up to the glass top and the last row down to the glass bottom, exactly like an
+/// edge card's plate: the wash then follows the panel instead of floating one padding step inside
+/// it.
+///
+/// When the list scrolls the clip cuts the overhang at the viewport edge, as it does for the
+/// cards; the growth is still correct at scroll 0, and harmless when it is clipped away.
+pub(crate) fn list_plate_rect(item: Rect, index: usize, count: usize) -> Rect {
+    let mut plate = item;
+    if index == 0 {
+        plate.y -= PANEL_PAD;
+        plate.h += PANEL_PAD;
+    }
+    if index + 1 >= count.max(1) {
+        plate.h += PANEL_PAD;
+    }
+    plate
 }
 
 /// The plates for the card layout, which may be a single row or several wrapped ones.
@@ -1900,7 +1929,8 @@ mod tests {
     fn list_width_follows_the_widest_title_up_to_the_cap() {
         let visible = Rect::new(0.0, 0.0, 1400.0, 900.0);
         let anchor = Rect::new(600.0, 880.0, 48.0, 20.0);
-        // A short title: the panel shrinks to the fixed pieces plus the measured band.
+        // A short title: the panel shrinks to the fixed pieces plus the measured band. A row
+        // spans the full glass width, so no glass padding is added on top of the band.
         let narrow = layout_for(
             PanelMode::List,
             &[],
@@ -1911,7 +1941,7 @@ mod tests {
             Some(40.0),
         )
         .expect("fits");
-        let want = ROW_FIXED_W + 40.0 + PANEL_PAD * 2.0;
+        let want = ROW_FIXED_W + 40.0;
         assert!(
             (narrow.panel.w - want).abs() < 0.001,
             "narrow titles: width {} != {want}",
@@ -1945,5 +1975,56 @@ mod tests {
         )
         .expect("fits");
         assert!((legacy.panel.w - LIST_W).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_list_viewport_spans_the_full_glass_width() {
+        // Rows never scroll sideways, so horizontal clipping is never needed: the viewport is the
+        // glass edge to edge horizontally, and a row (and its hover wash) can run the full width
+        // instead of floating one padding step inside the glass. Vertically the padding stays --
+        // it is what the scroll clip needs.
+        let visible = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let anchor = Rect::new(600.0, 880.0, 48.0, 20.0);
+        let layout = layout_for(
+            PanelMode::List,
+            &[],
+            3,
+            anchor,
+            DockEdge::Bottom,
+            visible,
+            None,
+        )
+        .expect("fits");
+        assert!(layout.viewport.x.abs() < 0.001);
+        assert!((layout.viewport.w - layout.panel.w).abs() < 0.001);
+        assert!((layout.viewport.y - PANEL_PAD).abs() < 0.001);
+        let list = layout.list.expect("list mode");
+        assert!((list.content_w - layout.panel.w).abs() < 0.001);
+    }
+
+    #[test]
+    fn the_list_plate_grows_to_the_glass_at_the_contents_ends() {
+        // A middle row is the row itself, edge to edge.
+        let row = Rect::new(0.0, ROW_H, 300.0, ROW_H);
+        assert_eq!(list_plate_rect(row, 1, 3), row);
+
+        // The first row grows the one padding step up to the glass top, the last down to the glass
+        // bottom -- the same overhang an edge card's plate draws.
+        let first = Rect::new(0.0, 0.0, 300.0, ROW_H);
+        assert_eq!(
+            list_plate_rect(first, 0, 3),
+            Rect::new(0.0, -PANEL_PAD, 300.0, ROW_H + PANEL_PAD)
+        );
+        let last = Rect::new(0.0, 2.0 * ROW_H, 300.0, ROW_H);
+        assert_eq!(
+            list_plate_rect(last, 2, 3),
+            Rect::new(0.0, 2.0 * ROW_H, 300.0, ROW_H + PANEL_PAD)
+        );
+
+        // A single row is both ends at once.
+        assert_eq!(
+            list_plate_rect(first, 0, 1),
+            Rect::new(0.0, -PANEL_PAD, 300.0, ROW_H + PANEL_PAD * 2.0)
+        );
     }
 }
