@@ -90,6 +90,41 @@ pub(crate) fn close_decision(
     }
 }
 
+/// The close decision for one tick of a visible panel.
+///
+/// `on_other_tile` is the geometric verdict from [`pointer_is_on_other_dock_tile`]: the real pointer
+/// has left the anchored icon and is inside a neighbouring Dock tile's column. That is a departure,
+/// not a dismissal. The trip from the icon towards the cards is often diagonal and spends more than
+/// one 50ms sample over a neighbour's column, and the panel's bottom edge sits on the icon's top
+/// edge, so the whole upward move happens while the pointer is still inside the Dock's list. The
+/// verdict therefore takes the same leave grace as a pointer that left the Dock: reaching the panel
+/// cancels it, and a pointer that really rests on another tile still ends the preview when the grace
+/// expires (the Dock sends no selection change for a tile whose app is not running, which is why the
+/// geometric verdict exists at all).
+pub(crate) fn tick_decision(
+    zone: PointerZone,
+    on_other_tile: bool,
+    now: Instant,
+    scheduled: Option<Instant>,
+) -> CloseDecision {
+    let zone = match (on_other_tile, zone) {
+        // The verdict is coarse: it reads the Dock's list frame and the anchor's column only. Where
+        // it and the panel's own hit test disagree, the hit test wins — a pointer on a card, a
+        // title or the glass is aiming at that item, not settling on a tile.
+        (
+            true,
+            PointerZone::Close(_)
+            | PointerZone::Title(_)
+            | PointerZone::Card(_)
+            | PointerZone::Panel
+            | PointerZone::Anchor,
+        ) => zone,
+        (true, _) => PointerZone::Outside,
+        (false, zone) => zone,
+    };
+    close_decision(zone, now, scheduled)
+}
+
 /// Whether a press on the Dock must keep `tile`'s preview closed.
 ///
 /// A press dismisses the preview, but the pointer stays on the icon it just pressed and the Dock
@@ -477,6 +512,78 @@ mod dock_tile_tests {
             anchor(),
             (290.0, 400.0)
         ));
+    }
+
+    /// The real geometry of a bottom Dock: the panel's bottom edge sits on the icon's top edge
+    /// (`ANCHOR_GAP = 0`), so the whole upward trip happens inside the Dock's list.
+    fn panel_above_anchor() -> crate::dock_preview::layout::HitGeometry<'static> {
+        use crate::dock_preview::layout::{HitGeometry, PanelMode};
+        HitGeometry {
+            panel: Rect::new(0.0, 600.0, 600.0, 290.0),
+            viewport: Rect::new(0.0, 600.0, 600.0, 290.0),
+            scroll: (0.0, 0.0),
+            items: &[],
+            anchor: anchor(),
+            band: Rect::new(0.0, 890.0, 600.0, 0.0),
+            close_visible: None,
+            mode: PanelMode::Row,
+            body_is_title: &[],
+        }
+    }
+
+    #[test]
+    fn slipping_onto_a_neighbouring_tile_takes_the_leave_grace() {
+        use crate::dock_preview::layout::pointer_zone;
+        let now = Instant::now();
+        let point = (336.0, 922.0);
+        assert!(pointer_is_on_other_dock_tile(list(), anchor(), point));
+        let zone = pointer_zone(point, panel_above_anchor());
+        assert_eq!(zone, PointerZone::Outside);
+        // The first sample arms the grace; it never dismisses the panel on its own, so a diagonal
+        // trip that crosses a neighbour's column reaches the panel.
+        assert_eq!(
+            tick_decision(zone, true, now, None),
+            CloseDecision::Schedule(now + CLOSE_GRACE)
+        );
+        // A pointer that stays there is still dismissed when the grace expires.
+        assert_eq!(
+            tick_decision(zone, true, now + CLOSE_GRACE, Some(now + CLOSE_GRACE)),
+            CloseDecision::HideNow
+        );
+    }
+
+    #[test]
+    fn reaching_the_panel_cancels_the_grace_on_the_same_tick() {
+        let now = Instant::now();
+        let deadline = now + CLOSE_GRACE;
+        assert_eq!(
+            tick_decision(PointerZone::Panel, false, now, Some(deadline)),
+            CloseDecision::Keep
+        );
+        assert_eq!(
+            tick_decision(PointerZone::Card(0), false, now, Some(deadline)),
+            CloseDecision::Keep
+        );
+        // On the icon itself, before the panel: the anchor is still the same hover.
+        assert_eq!(
+            tick_decision(PointerZone::Anchor, false, now, Some(deadline)),
+            CloseDecision::Keep
+        );
+    }
+
+    #[test]
+    fn a_panel_surface_outranks_the_other_tile_verdict() {
+        // The rule, not a layout: wherever the coarse verdict and the panel's own hit test
+        // disagree, the panel's answer stands.
+        let now = Instant::now();
+        assert_eq!(
+            tick_decision(PointerZone::Card(0), true, now, None),
+            CloseDecision::Keep
+        );
+        assert_eq!(
+            tick_decision(PointerZone::Panel, true, now, None),
+            CloseDecision::Keep
+        );
     }
 
     #[test]

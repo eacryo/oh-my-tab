@@ -1113,10 +1113,12 @@ fn tick() {
     // the dismissed tile is what makes the next hover able to open a preview again.
     release_dismiss_state(pointer);
     if panel::is_visible() {
-        // Moving along the Dock from the previewed icon to a different tile (including a tile
-        // whose app is not running) ends the preview immediately: the observer's selection event
-        // can lag or not change at all for a non-running tile, and a panel describing the previous
-        // app must never outlive the hover.
+        // Moving along the Dock from the previewed icon onto a different tile (including a tile
+        // whose app is not running, where the observer's selection event never arrives) ends the
+        // preview, but not on the tick it is first seen: the trip towards the cards is often
+        // diagonal and the pointer is inside the Dock's list for all of it, because the panel's
+        // bottom edge sits on the icon's top edge. The verdict takes the leave grace instead, so a
+        // crossing is cancelled by the panel and a real hover still ends the preview.
         let other_tile = {
             let dock = *DOCK_STATE.lock().unwrap();
             match (dock.list, panel::anchor_rect()) {
@@ -1126,10 +1128,6 @@ fn tick() {
                 _ => false,
             }
         };
-        if other_tile {
-            hide_panel();
-            return;
-        }
         let outcome = panel::tick(now, pointer);
         panel::flush_records();
         if outcome == panel::TickOutcome::Empty {
@@ -1138,10 +1136,19 @@ fn tick() {
         }
         let zone = panel::current_pointer_zone();
         let scheduled = *CLOSE_AT.lock().unwrap();
-        match decisions::close_decision(zone, now, scheduled) {
+        match decisions::tick_decision(zone, other_tile, now, scheduled) {
             CloseDecision::Keep => *CLOSE_AT.lock().unwrap() = None,
             CloseDecision::Wait => {}
-            CloseDecision::Schedule(at) => *CLOSE_AT.lock().unwrap() = Some(at),
+            CloseDecision::Schedule(at) => {
+                // Logged where the grace is armed, not on every sample: a pointer the panel itself
+                // claims keeps the verdict true without ever starting a close.
+                if other_tile {
+                    log_debug!(
+                        "[dock-preview] pointer left the anchor tile; the leave grace decides"
+                    );
+                }
+                *CLOSE_AT.lock().unwrap() = Some(at);
+            }
             CloseDecision::HideNow => hide_panel(),
         }
     }
