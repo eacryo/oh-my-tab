@@ -15,7 +15,7 @@
 
 use std::ffi::c_void;
 use std::sync::{LazyLock, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use objc2::runtime::{AnyObject, Bool, Sel};
 use objc2::{class, msg_send, sel};
@@ -98,6 +98,33 @@ struct RowEntry {
     last_probe: Instant,
 }
 
+/// What a visible tooltip was placed against: the item's screen rect, the panel's, and the
+/// placement context the frame is derived from.
+///
+/// The frame depends on the item's HORIZONTAL span (it is centred on the item), on the panel's rect
+/// (the vertical reference and the flip decision) and on the edge and visible frame (which side the
+/// tooltip goes to and how it is clamped) -- never on the item's own y. Keeping all of it is what
+/// lets a list scroll vertically without re-typesetting the tooltip while a panel that moved, a
+/// Dock that changed sides or a visible frame that narrowed still moves the window.
+#[derive(Clone, Copy, PartialEq)]
+struct TooltipAnchor {
+    item: Rect,
+    panel: Rect,
+    edge: DockEdge,
+    visible: Rect,
+}
+
+impl TooltipAnchor {
+    /// Whether a tooltip placed at `self` is already where the current placement puts it.
+    fn same_place(self, item: Rect, panel: Rect, edge: DockEdge, visible: Rect) -> bool {
+        self.panel == panel
+            && self.edge == edge
+            && self.visible == visible
+            && self.item.x == item.x
+            && self.item.w == item.w
+    }
+}
+
 struct Geometry {
     /// The glass area in screen coordinates (the window frame adds the elevation insets).
     panel: Rect,
@@ -158,6 +185,9 @@ struct PanelState {
     title_hover_since: Option<Instant>,
     tooltip_visible: bool,
     tooltip_text: String,
+    /// What the visible tooltip was placed against. A scroll can move the item under a resting
+    /// pointer, and the tooltip has to move with it.
+    tooltip_anchor: Option<TooltipAnchor>,
     fill_deadline: Instant,
     last_fill: Instant,
     /// When the panel was last positioned; the tooltip follows it.
@@ -385,7 +415,7 @@ pub(crate) fn tick(now: Instant, pointer: (f64, f64)) -> TickOutcome {
         fill_thumbnails(state, now);
     }
     if confirm_pending_closes(state, now) {
-        match relayout_content(state) {
+        match relayout_content(state, true) {
             ContentFit::Placed => {}
             ContentFit::Resized(size, scroll) => {
                 // The slot has to be released before the rebuild can take it again.
@@ -1244,7 +1274,12 @@ pub(crate) enum ContentFit {
 ///
 /// This is the only re-layout entry: a removal that only moved frames would leave the content
 /// height and the scroll range describing rows that are gone, and a user could scroll into them.
-fn relayout_content(state: &mut PanelState) -> ContentFit {
+///
+/// `items_changed` says whether the ITEMS are different (a removal re-indexed them) rather than
+/// the panel having only moved: an anchor move must keep a tooltip that still names the title under
+/// the pointer, while a removal must drop it (and its rest timer, which would otherwise hand the
+/// new item at that index a tooltip at once).
+fn relayout_content(state: &mut PanelState, items_changed: bool) -> ContentFit {
     let count = match state.mode {
         PanelMode::List => state.rows.len(),
         PanelMode::Row => state.cards.len(),
@@ -1297,7 +1332,13 @@ fn relayout_content(state: &mut PanelState) -> ContentFit {
         state.hovered = None;
     }
     apply_hover(state, state.hovered);
-    hide_tooltip(state);
+    if items_changed {
+        // A removal re-indexes the items: the tooltip may now name a window that is no longer
+        // here, and the rest that started on the old item must not count towards whatever now
+        // sits under the pointer. The reclassification below re-arms the timer from scratch.
+        hide_tooltip(state);
+        state.title_hover_since = None;
+    }
     reclassify(state);
     ContentFit::Placed
 }
@@ -1462,6 +1503,7 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
             title_hover_since: None,
             tooltip_visible: false,
             tooltip_text: String::new(),
+            tooltip_anchor: None,
             fill_deadline: Instant::now(),
             last_fill: Instant::now(),
             shown_at: Instant::now(),
@@ -2301,20 +2343,50 @@ fn update_tooltip(state: &mut PanelState, now: Instant) {
     );
     match decision {
         crate::dock_preview::decisions::TooltipDecision::Show => {
-            if state.tooltip_visible {
-                return;
-            }
             let Some(index) = truncated_item else {
                 return;
             };
+            // The anchor is resolved before the title: a visible tooltip only has to be re-placed
+            // when what the window is placed against moved -- the item's HORIZONTAL span (it is
+            // centred on the item, and the item's y never reaches the window) or the
+            // panel/edge/visible context (the vertical reference, the side and the clamp). At the
+            // same index the text is the one already shown, so a list scrolling up and down costs
+            // nothing. A show that cannot place the item must not commit `tooltip_visible`,
+            // because the next tick reads a visible tooltip and never retries.
+            let Some(item) = state.geometry.items.get(index).copied() else {
+                return;
+            };
+            let item = content_to_screen(state, item);
+            let anchor = TooltipAnchor {
+                item,
+                panel: state.geometry.panel,
+                edge: state.geometry.edge,
+                visible: state.geometry.visible,
+            };
+            if state.tooltip_visible {
+                if state.tooltip_anchor.is_some_and(|placed| {
+                    placed.same_place(item, anchor.panel, anchor.edge, anchor.visible)
+                }) {
+                    return;
+                }
+                let Some((text, _)) = item_title(state, index) else {
+                    return;
+                };
+                unsafe {
+                    show_tooltip(state, item, &text);
+                }
+                state.tooltip_anchor = Some(anchor);
+                return;
+            }
             let Some((text, _)) = item_title(state, index) else {
                 return;
             };
             unsafe {
-                show_tooltip_above(state, &text);
+                show_tooltip(state, item, &text);
             }
             state.tooltip_visible = true;
             state.tooltip_text = text;
+            state.tooltip_anchor = Some(anchor);
             defer_record("dock_preview_tooltip");
         }
         crate::dock_preview::decisions::TooltipDecision::Hide => {
@@ -2339,7 +2411,7 @@ fn item_title(state: &PanelState, index: usize) -> Option<(String, bool)> {
         })
 }
 
-unsafe fn show_tooltip_above(state: &mut PanelState, text: &str) {
+unsafe fn show_tooltip(state: &PanelState, item: Rect, text: &str) {
     let content: *mut AnyObject = msg_send![state.tooltip_panel, contentView];
     let label = state.tooltip_label;
     let string = make_nsstring(text);
@@ -2355,10 +2427,10 @@ unsafe fn show_tooltip_above(state: &mut PanelState, text: &str) {
     let text_h = measured.height.max(theme::FONT_CAPTION + 4.0);
     let size = layout::tooltip_size_for((text_w, text_h), 40.0);
     let frame = layout::tooltip_frame(
+        item,
         state.geometry.panel,
         size,
         state.geometry.edge,
-        state.geometry.visible,
         state.geometry.visible,
     );
     let appkit = cg_rect_to_appkit(frame);
@@ -2385,6 +2457,7 @@ fn hide_tooltip(state: &mut PanelState) {
     let was_visible = state.tooltip_visible;
     state.tooltip_visible = false;
     state.tooltip_text.clear();
+    state.tooltip_anchor = None;
     if was_visible {
         defer_record("dock_preview_tooltip_hide");
     }
@@ -2641,7 +2714,7 @@ pub(crate) fn update_anchor(anchor: Rect, edge: DockEdge, visible: Rect) -> bool
     state.geometry.anchor = anchor;
     state.geometry.edge = edge;
     state.geometry.visible = visible;
-    match relayout_content(state) {
+    match relayout_content(state, false) {
         ContentFit::Placed => true,
         ContentFit::Resized(size, scroll) => {
             drop(slot);
@@ -2794,6 +2867,64 @@ pub(crate) fn tooltip_window_visible() -> bool {
     };
     let visible: Bool = unsafe { msg_send![state.tooltip_panel, isVisible] };
     visible == Bool::YES
+}
+
+/// The item rectangle the visible tooltip was placed against, for the smoke runner. The window's own
+/// frame is clamped by the visible frame, so a constructed room (which pins the panel to a corner)
+/// asserts the anchor it was given rather than the clamped frame.
+pub(crate) fn tooltip_anchor_for_smoke() -> Option<Rect> {
+    let slot = PANEL.lock().ok()?;
+    let state = slot.as_ref()?;
+    state.tooltip_anchor.map(|placed| placed.item)
+}
+
+/// The tooltip window's screen rectangle, for the smoke runner.
+pub(crate) fn tooltip_frame_for_smoke() -> Option<Rect> {
+    let slot = PANEL.lock().ok()?;
+    let state = slot.as_ref()?;
+    let frame: NSRect = unsafe { msg_send![state.tooltip_panel, frame] };
+    let height = primary_screen_height();
+    Some(Rect::new(
+        frame.origin.x,
+        height - frame.origin.y - frame.size.height,
+        frame.size.width,
+        frame.size.height,
+    ))
+}
+
+/// Re-apply the panel's current anchor, edge and visible frame, for the smoke runner's check that a
+/// geometry refresh for the same Dock item keeps a visible tooltip. This is the entry the
+/// observer's Dock notification reaches, not a private shortcut.
+pub(crate) fn refresh_anchor_for_smoke() -> bool {
+    let Ok(slot) = PANEL.lock() else {
+        return false;
+    };
+    let Some(state) = slot.as_ref() else {
+        return false;
+    };
+    let (anchor, edge, visible) = (
+        state.geometry.anchor,
+        state.geometry.edge,
+        state.geometry.visible,
+    );
+    drop(slot);
+    update_anchor(anchor, edge, visible)
+}
+
+/// Backdate the title rest timer, for a smoke case that has to drive a geometry change while the
+/// pointer still rests on a title. The alternative is a real wait, and during one the panel's own
+/// tick would read the REAL pointer (which the smoke cannot park) and change the hover. Geometry and
+/// the tooltip's visibility are untouched: only the rest clock is moved.
+pub(crate) fn dev_age_title_hover_for_smoke(age: Duration) {
+    let Ok(mut slot) = PANEL.lock() else {
+        return;
+    };
+    let Some(state) = slot.as_mut() else {
+        return;
+    };
+    if state.title_hover_since.is_some() {
+        state.title_hover_since = Some(Instant::now() - age);
+    }
 }
 
 /// The tooltip panel's current visibility and text, for the smoke runner.
@@ -3057,8 +3188,22 @@ pub(crate) fn e2e_json() -> String {
             )
         }
     };
+    // The tooltip window's own screen rect while it is up: a scenario compares it with the hovered
+    // item and with what the WindowServer reports for the same window.
+    let tooltip_rect = if state.tooltip_visible {
+        let window: NSRect = unsafe { msg_send![state.tooltip_panel, frame] };
+        let primary = primary_screen_height();
+        json_rect(Rect::new(
+            window.origin.x,
+            primary - window.origin.y - window.size.height,
+            window.size.width,
+            window.size.height,
+        ))
+    } else {
+        "null".to_string()
+    };
     format!(
-        "{{\"visible\": true, \"pid\": {}, \"bundle\": {}, \"edge\": {}, \"mode\": {}, \"row_axis\": {}, \"panel\": {}, \"viewport\": {}, \"layout\": {{\"row_h\": {:.1}, \"full_rows\": {}, \"max_scroll\": {:.1}, \"content_h\": {:.1}, \"columns\": {}, \"card_rows\": {}}}, \"scroll\": {:.1}, \"content_origin\": {}, \"rows\": [{}], \"cards\": [{}], \"hovered\": {}, \"tooltip_visible\": {}, \"tooltip\": {}, \"total_windows\": {}, \"hidden_windows\": {}}}",
+        "{{\"visible\": true, \"pid\": {}, \"bundle\": {}, \"edge\": {}, \"mode\": {}, \"row_axis\": {}, \"panel\": {}, \"viewport\": {}, \"layout\": {{\"row_h\": {:.1}, \"full_rows\": {}, \"max_scroll\": {:.1}, \"content_h\": {:.1}, \"columns\": {}, \"card_rows\": {}}}, \"scroll\": {:.1}, \"content_origin\": {}, \"rows\": [{}], \"cards\": [{}], \"hovered\": {}, \"tooltip_visible\": {}, \"tooltip\": {}, \"tooltip_rect\": {}, \"total_windows\": {}, \"hidden_windows\": {}}}",
         state.pid,
         json_string(&state.bundle),
         json_string(state.geometry.edge.name()),
@@ -3085,6 +3230,7 @@ pub(crate) fn e2e_json() -> String {
         },
         state.tooltip_visible,
         json_string(&state.tooltip_text),
+        tooltip_rect,
         state.total_windows,
         state
             .total_windows
@@ -3166,4 +3312,44 @@ fn json_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod tooltip_anchor_tests {
+    use super::*;
+
+    /// The placement of a visible tooltip: three cards in one row, the third one hovered, above a
+    /// bottom Dock.
+    fn placed() -> TooltipAnchor {
+        TooltipAnchor {
+            item: Rect::new(936.0, 504.0, 216.0, 164.0),
+            panel: Rect::new(500.0, 500.0, 656.0, 172.0),
+            edge: DockEdge::Bottom,
+            visible: Rect::new(0.0, 24.0, 1470.0, 862.0),
+        }
+    }
+
+    #[test]
+    fn a_visible_tooltip_is_replaced_only_when_its_placement_changed() {
+        let anchor = placed();
+        let (item, panel, edge, visible) = (anchor.item, anchor.panel, anchor.edge, anchor.visible);
+        assert!(anchor.same_place(item, panel, edge, visible));
+
+        // A list scrolling vertically moves the item's y alone: the tooltip's y is the panel's, so
+        // the window does not move and its label is not measured again.
+        let scrolled = Rect::new(item.x, item.y - 32.0, item.w, item.h);
+        assert!(anchor.same_place(scrolled, panel, edge, visible));
+
+        // A horizontal scroll does move it.
+        let sideways = Rect::new(item.x - 20.0, item.y, item.w, item.h);
+        assert!(!anchor.same_place(sideways, panel, edge, visible));
+
+        // So do a moved panel, a Dock on another edge and a narrowed visible frame: the frame
+        // derives its side and its clamp from those, even when the item and the panel are unchanged.
+        let moved = Rect::new(panel.x + 10.0, panel.y, panel.w, panel.h);
+        assert!(!anchor.same_place(item, moved, edge, visible));
+        assert!(!anchor.same_place(item, panel, DockEdge::Top, visible));
+        let narrowed = Rect::new(0.0, 24.0, 1200.0, 862.0);
+        assert!(!anchor.same_place(item, panel, edge, narrowed));
+    }
 }

@@ -795,17 +795,24 @@ pub(crate) fn panel_frame(anchor: Rect, size: (f64, f64), edge: DockEdge, visibl
     clamp_inside(raw, visible)
 }
 
-/// The full-title tooltip's screen rectangle: centred over the panel, above it, and flipped below
-/// when the top of the screen has no room.
+/// The full-title tooltip's screen rectangle: centred over the hovered item, above the panel, and
+/// flipped below when the top of the screen has no room.
+///
+/// `item` is the hovered card (or list row) in screen coordinates, and it is the horizontal anchor
+/// -- the panel is only the vertical reference. A row of three cards centred the tooltip over the
+/// panel's middle, so hovering the third card showed the tooltip above the second one and it read
+/// as that card's full title. Vertically the panel's facing edge stays the reference because it is
+/// above every card even when the row has wrapped into a grid; with a single row it is above the
+/// hovered card itself.
 pub(crate) fn tooltip_frame(
+    item: Rect,
     panel: Rect,
     tooltip: (f64, f64),
     edge: DockEdge,
-    _screen: Rect,
     visible: Rect,
 ) -> Rect {
     let (w, h) = tooltip;
-    let x = panel.x + panel.w / 2.0 - w / 2.0;
+    let x = item.x + item.w / 2.0 - w / 2.0;
     let above = Rect::new(x, panel.y - TOOLTIP_GAP - h, w, h);
     let below = Rect::new(x, panel.max_y() + TOOLTIP_GAP, w, h);
     // Above is the default and the only option for a Dock on the bottom or the two sides. A top
@@ -1697,16 +1704,58 @@ mod tests {
     }
 
     #[test]
-    fn the_tooltip_sits_above_the_panel_and_flips_below_near_the_screen_top() {
+    fn the_tooltip_is_centred_over_the_hovered_item_not_the_panel() {
+        let visible = visible();
+        // Three equal cards: the panel's centre is the SECOND card's centre, so the old formula put
+        // the tooltip exactly above the card next to the hovered one.
+        let panel = Rect::new(
+            500.0,
+            500.0,
+            PANEL_PAD * 2.0 + CARD_W * 3.0,
+            CARD_H + PANEL_PAD * 2.0,
+        );
+        let third = Rect::new(500.0 + PANEL_PAD + CARD_W * 2.0, 504.0, CARD_W, CARD_H);
+        let above = tooltip_frame(third, panel, (200.0, 60.0), DockEdge::Bottom, visible);
+        assert!((above.x + above.w / 2.0 - third.x - third.w / 2.0).abs() < 0.001);
+        assert!((above.x + above.w / 2.0 - panel.x - panel.w / 2.0).abs() > CARD_W / 2.0);
+        assert!(above.max_y() <= panel.y);
+    }
+
+    #[test]
+    fn the_tooltip_follows_the_dock_edge_and_flips_inside_the_visible_frame() {
         let visible = visible();
         let panel = Rect::new(500.0, 500.0, 300.0, 180.0);
-        let above = tooltip_frame(panel, (200.0, 60.0), DockEdge::Bottom, screen(), visible);
+        let item = Rect::new(596.0, 504.0, 120.0, CARD_H);
+        // A bottom Dock keeps the tooltip above the panel.
+        let above = tooltip_frame(item, panel, (200.0, 60.0), DockEdge::Bottom, visible);
         assert!(above.max_y() <= panel.y);
-        assert!((above.x + above.w / 2.0 - panel.x - panel.w / 2.0).abs() < 0.001);
-
+        // A top Dock puts it under the panel even when the space above would fit.
+        let under = tooltip_frame(item, panel, (200.0, 60.0), DockEdge::Top, visible);
+        assert!(under.y >= panel.max_y() - 0.001);
+        // A panel near the screen top flips it below; the item moves with the panel.
         let near_top = Rect::new(500.0, 30.0, 300.0, 180.0);
-        let flipped = tooltip_frame(near_top, (200.0, 60.0), DockEdge::Bottom, screen(), visible);
+        let flipped = tooltip_frame(
+            Rect::new(596.0, 34.0, 120.0, CARD_H),
+            near_top,
+            (200.0, 60.0),
+            DockEdge::Bottom,
+            visible,
+        );
         assert!(flipped.y >= near_top.max_y() - 0.001);
+        assert!(flipped.max_y() <= visible.max_y() + 0.001);
+    }
+
+    #[test]
+    fn a_tooltip_on_an_edge_item_is_clamped_inside_the_visible_frame() {
+        let visible = visible();
+        // The item sits near the right edge, and the tooltip is wider than the room left of it: the
+        // clamp wins over centring, but the tooltip stays wholly on screen.
+        let panel = Rect::new(1000.0, 500.0, 460.0, CARD_H + PANEL_PAD * 2.0);
+        let item = Rect::new(1330.0, 504.0, 120.0, CARD_H);
+        let frame = tooltip_frame(item, panel, (360.0, 60.0), DockEdge::Bottom, visible);
+        assert!(frame.x >= visible.x - 0.001);
+        assert!(frame.max_x() <= visible.max_x() + 0.001);
+        assert!((frame.max_x() - visible.max_x()).abs() < 0.001);
     }
 
     #[test]

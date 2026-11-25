@@ -106,6 +106,9 @@ static DOCK_PRESS: LazyLock<Mutex<Option<DockPress>>> = LazyLock::new(|| Mutex::
 /// Presses that dismissed a preview. `--e2e-state` publishes it as a delta so a scenario can tell a
 /// press-dismissal from a hover-leave one instead of reading a single overwritten event name.
 static PRESS_DISMISSALS: AtomicU64 = AtomicU64::new(0);
+/// How many previews were shown, monotonic: a scenario that clicks the Dock icon asserts this does not
+/// move across the click, so a reopen shorter than any sampling interval cannot hide between samples.
+static PREVIEW_OPENS: AtomicU64 = AtomicU64::new(0);
 
 /// Whether hovering a preview card may bring its window forward (`[dock_preview] peek_on_hover`).
 /// Mirrored from the config so the tick does not take the config read lock twenty times a second.
@@ -2132,7 +2135,8 @@ pub(crate) fn e2e_json() -> String {
         )
     };
     let dock_json = format!(
-        "{{\"revealed\": {}, \"edge\": {}, \"list\": {}, \"screen\": {}, \"items\": [{}]}}",
+        "{{\"enabled\": {}, \"revealed\": {}, \"edge\": {}, \"list\": {}, \"screen\": {}, \"items\": [{}]}}",
+        is_enabled(),
         dock.revealed,
         dock.edge
             .map(|edge| json_string(edge.name()))
@@ -2149,6 +2153,7 @@ pub(crate) fn e2e_json() -> String {
     // Monotonic, so a scenario asserts a delta across its injected press instead of reading a
     // single event name that the next write would overwrite.
     let press_dismissals = PRESS_DISMISSALS.load(Ordering::Relaxed);
+    let preview_opens = PREVIEW_OPENS.load(Ordering::Relaxed);
     // The peek, as a scenario reads it: the two monotonic counters (a raise without its restore is
     // the failure this feature is judged on), what is armed or up right now, and the front the peek
     // will give back.
@@ -2174,11 +2179,11 @@ pub(crate) fn e2e_json() -> String {
     );
     if preview == "null" {
         format!(
-            "{{\"visible\": false, \"dock\": {dock_json}, \"press_dismissals\": {press_dismissals}, \"peek\": {peek_json}}}"
+            "{{\"visible\": false, \"dock\": {dock_json}, \"press_dismissals\": {press_dismissals}, \"preview_opens\": {preview_opens}, \"peek\": {peek_json}}}"
         )
     } else {
         format!(
-            "{{\"panel\": {preview}, \"dock\": {dock_json}, \"press_dismissals\": {press_dismissals}, \"peek\": {peek_json}}}"
+            "{{\"panel\": {preview}, \"dock\": {dock_json}, \"press_dismissals\": {press_dismissals}, \"preview_opens\": {preview_opens}, \"peek\": {peek_json}}}"
         )
     }
 }
@@ -2632,6 +2637,7 @@ fn drain_results() {
             if !context.dev {
                 start_dock_reveal_keeper(anchor, edge);
             }
+            PREVIEW_OPENS.fetch_add(1, Ordering::AcqRel);
             log_info!("[dock-preview] panel shown for pid={}", collected.pid);
             crate::e2e_state::record("dock_preview_show");
         }
@@ -2929,10 +2935,31 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     checks += 1;
     // The title tooltip: a truncated title, the pointer resting on its own box, then the pointer
     // leaving it. This is the real tooltip panel and the real decision path, driven by a position
-    // the way the tick reads one.
+    // the way the tick reads one. Three cards, because with three the panel's centre is the SECOND
+    // card's centre: a panel-centred tooltip lands on the neighbour, which is the defect the
+    // position assertion below pins.
+    let tooltip_titles = [long_title, "Second window", "Third window"];
+    if !dev_show_synthetic(&tooltip_titles) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not show three cards for the tooltip checks".into(),
+        ));
+    }
+    pump(Duration::from_millis(80));
+    if visible_card_count() != 3 {
+        return Err(SmokeFailure::Failed(format!(
+            "the tooltip case got {} cards instead of three",
+            visible_card_count()
+        )));
+    }
     if !panel::title_is_truncated(0) {
         return Err(SmokeFailure::Failed(
             "the long title was not detected as truncated; the tooltip check cannot decide".into(),
+        ));
+    }
+    if panel::title_is_truncated(1) {
+        return Err(SmokeFailure::Failed(
+            "the short neighbour was detected as truncated; the negative check cannot decide"
+                .into(),
         ));
     }
     let Some(title_rect) = panel::title_rect_for_smoke(0) else {
@@ -2943,6 +2970,15 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     let title_center = (
         title_rect.x + title_rect.w / 2.0,
         title_rect.y + title_rect.h / 2.0,
+    );
+    let Some(short_rect) = panel::title_rect_for_smoke(1) else {
+        return Err(SmokeFailure::Failed(
+            "the neighbour's title box has no screen rectangle".into(),
+        ));
+    };
+    let short_center = (
+        short_rect.x + short_rect.w / 2.0,
+        short_rect.y + short_rect.h / 2.0,
     );
     let t0 = Instant::now();
     let _ = panel::tick(t0, title_center);
@@ -2958,8 +2994,115 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
         ));
     }
     checks += 1;
+    // The window sits over the CARD that owns the title, not over the panel. The panel rectangle is
+    // re-read here: the two-card panel measured earlier is not this three-card one.
+    let Some(panel_now) = panel_rect() else {
+        return Err(SmokeFailure::Failed(
+            "the tooltip case's panel has no rectangle".into(),
+        ));
+    };
+    let Some(card_rect) = panel::list_facts().and_then(|facts| facts.item_screen.first().copied())
+    else {
+        return Err(SmokeFailure::Failed(
+            "the tooltip case published no card rectangle".into(),
+        ));
+    };
+    let Some(tooltip_rect) = panel::tooltip_frame_for_smoke() else {
+        return Err(SmokeFailure::Failed(
+            "the tooltip window has no screen rectangle".into(),
+        ));
+    };
+    let visible = visible_frame_of(screen);
+    if tooltip_rect.x < visible.x - 0.5
+        || tooltip_rect.max_x() > visible.max_x() + 0.5
+        || tooltip_rect.y < visible.y - 0.5
+        || tooltip_rect.max_y() > visible.max_y() + 0.5
+    {
+        return Err(SmokeFailure::Failed(format!(
+            "the tooltip is outside the visible frame: {tooltip_rect:?} in {visible:?}"
+        )));
+    }
+    // The one horizontal position the window can have: centred on the hovered card, clamped into
+    // the visible frame when the tooltip is wider than the room beside it.
+    let centred_x = card_rect.x + card_rect.w / 2.0 - tooltip_rect.w / 2.0;
+    let expected_x = centred_x.clamp(visible.x, (visible.max_x() - tooltip_rect.w).max(visible.x));
+    if (tooltip_rect.x - expected_x).abs() > 1.0 {
+        return Err(SmokeFailure::Failed(format!(
+            "the tooltip is not centred over the hovered card: {tooltip_rect:?} vs {card_rect:?}"
+        )));
+    }
+    // Above the panel, or below it when the space above does not fit; never across the cards.
+    let above = tooltip_rect.max_y() <= panel_now.y + 0.5;
+    let below = tooltip_rect.y >= panel_now.max_y() - 0.5;
+    if !above && !below {
+        return Err(SmokeFailure::Failed(format!(
+            "the tooltip overlaps the panel: {tooltip_rect:?} vs {panel_now:?}"
+        )));
+    }
+    checks += 1;
+    // A geometry refresh for the SAME Dock item must keep the tooltip where it is (the observer may
+    // publish the same item twice); hiding it here is the regression this pins. The rest clock is
+    // aged first, because the refresh re-decides with the real clock while the ticks above used
+    // constructed times.
+    panel::dev_age_title_hover_for_smoke(
+        crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(100),
+    );
+    if !panel::refresh_anchor_for_smoke() {
+        return Err(SmokeFailure::Failed(
+            "the geometry refresh for the same anchor was refused".into(),
+        ));
+    }
+    panel::flush_records();
+    let Some(refreshed) = panel::tooltip_frame_for_smoke() else {
+        return Err(SmokeFailure::Failed(
+            "the geometry refresh took the tooltip window down".into(),
+        ));
+    };
+    if !panel::tooltip_window_visible()
+        || (refreshed.x - tooltip_rect.x).abs() > 0.5
+        || (refreshed.y - tooltip_rect.y).abs() > 0.5
+    {
+        return Err(SmokeFailure::Failed(format!(
+            "a same-anchor refresh moved or hid the tooltip: {tooltip_rect:?} -> {refreshed:?}"
+        )));
+    }
+    checks += 1;
+    // Moving onto a COMPLETE title takes the tooltip down at once and keeps it down past the delay.
+    // Both halves matter: "not yet" alone would pass an implementation that shows every title late.
+    let t1 = Instant::now();
+    let _ = panel::tick(t1, short_center);
+    panel::flush_records();
+    if panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "the tooltip stayed up over a complete title".into(),
+        ));
+    }
     let _ = panel::tick(
-        t0 + Duration::from_secs(2),
+        t1 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
+        short_center,
+    );
+    panel::flush_records();
+    if panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "a complete title showed a tooltip after the full delay".into(),
+        ));
+    }
+    checks += 1;
+    // Back onto the truncated title, then away: the tooltip returns and then goes.
+    let t2 = Instant::now();
+    let _ = panel::tick(t2, title_center);
+    let _ = panel::tick(
+        t2 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
+        title_center,
+    );
+    panel::flush_records();
+    if !panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "the tooltip did not come back on the truncated title".into(),
+        ));
+    }
+    let _ = panel::tick(
+        t2 + Duration::from_secs(2),
         (screen.x + 5.0, screen.y + 5.0),
     );
     panel::flush_records();
@@ -2972,7 +3115,7 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     // A press on the Dock dismisses the preview on the press itself. The check drives the entry the
     // Dock tap calls, so the panel's teardown is asserted without a real Dock click; the pump stays
     // well inside the pointer-left close grace, so only the press can explain a hidden panel.
-    if !dev_show_synthetic(&[long_title, "Second window"]) {
+    if !dev_show_synthetic(&tooltip_titles) {
         return Err(SmokeFailure::Failed(
             "the panel did not reappear for the Dock-press check".into(),
         ));
@@ -3008,7 +3151,7 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     checks += smoke_list_mode()?;
     checks += smoke_threshold_change()?;
     // Turning the feature off through the same runtime entry must tear both panels down.
-    if !dev_show_synthetic(&[long_title, "Second window"]) {
+    if !dev_show_synthetic(&tooltip_titles) {
         return Err(SmokeFailure::Failed(
             "the panel did not reappear for the disable check".into(),
         ));
@@ -3083,6 +3226,7 @@ fn smoke_list_mode() -> Result<u32, SmokeFailure> {
     checks += smoke_list_scroll()?;
     set_case_room("smoke-dock-row-room-h", "smoke-dock-room-w");
     checks += smoke_wrapped_rows()?;
+    checks += smoke_tooltip_cases()?;
     SMOKE_ROOM_H.store(false, Ordering::Release);
     hide_panel();
     Ok(checks)
@@ -3308,6 +3452,219 @@ fn smoke_wrapped_rows() -> Result<u32, SmokeFailure> {
     let current = crate::config::CONFIG.read().unwrap().clone();
     let _ = crate::runtime_config::smoke_apply_threshold(&current, &original);
     Ok(checks)
+}
+
+/// Tooltip cases that need a constructed room: a sideways scroll, and a removal inside a scrolling
+/// list. Both are driven through the panel's own entries (the wheel's `scroll_by` and the close
+/// confirmation's tick), not through a private shortcut.
+fn smoke_tooltip_cases() -> Result<u32, SmokeFailure> {
+    let mut checks = 0;
+    checks += smoke_tooltip_follows_a_sideways_scroll()?;
+    checks += smoke_tooltip_waits_after_a_removal()?;
+    hide_panel();
+    Ok(checks)
+}
+
+/// Two long titles, alternating: every row in the removal case must be truncatable, and the row
+/// that takes index 0 afterwards has to be a DIFFERENT title so the check can tell it was re-read.
+const REMOVAL_FIRST_TITLE: &str =
+    "first row of the removal case, deliberately wider than the whole list row can show";
+const REMOVAL_SECOND_TITLE: &str =
+    "second row of the removal case, deliberately wider than the whole list row can show";
+
+/// One card in a room narrower than the card's floor width: the row scrolls sideways, so a scroll
+/// moves the tooltip's anchor while the hovered title stays under the pointer.
+fn smoke_tooltip_follows_a_sideways_scroll() -> Result<u32, SmokeFailure> {
+    *CASE_ROOM_H.lock().unwrap() =
+        Some(layout::CARD_H + layout::PANEL_PAD * 4.0 + layout::PANEL_MARGIN);
+    *CASE_ROOM_W.lock().unwrap() = Some(layout::CARD_MIN_W - 8.0);
+    let title = "sideways scroll title that is deliberately far wider than the card can show";
+    if !dev_show_windows(&[title], DockEdge::Bottom) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not open for the sideways tooltip check".into(),
+        ));
+    }
+    pump(Duration::from_millis(120));
+    let facts = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the sideways panel published no facts".into()))?;
+    if facts.mode != layout::PanelMode::Row || facts.max_scroll <= 0.0 {
+        return Err(SmokeFailure::Failed(format!(
+            "the constructed room did not make a sideways-scrolling row (mode {:?}, max_scroll {})",
+            facts.mode, facts.max_scroll
+        )));
+    }
+    if !panel::title_is_truncated(0) {
+        return Err(SmokeFailure::Failed(
+            "the sideways title was not detected as truncated; the follow check cannot decide"
+                .into(),
+        ));
+    }
+    let Some(title_rect) = panel::title_rect_for_smoke(0) else {
+        return Err(SmokeFailure::Failed(
+            "the sideways title box has no screen rectangle".into(),
+        ));
+    };
+    let center = (
+        title_rect.x + title_rect.w / 2.0,
+        title_rect.y + title_rect.h / 2.0,
+    );
+    let t0 = Instant::now();
+    let _ = panel::tick(t0, center);
+    let _ = panel::tick(
+        t0 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
+        center,
+    );
+    panel::flush_records();
+    let Some(before) = panel::tooltip_anchor_for_smoke() else {
+        return Err(SmokeFailure::Failed(
+            "the sideways tooltip never appeared".into(),
+        ));
+    };
+    if !panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "the sideways tooltip window is not visible".into(),
+        ));
+    }
+    // Small enough that the pointer stays inside the same title box, which is what makes this a
+    // "same hovered item, moved anchor" case rather than a hover change. The rest clock is aged
+    // first, because the scroll re-decides with the real clock while the ticks above did not.
+    panel::dev_age_title_hover_for_smoke(
+        crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(100),
+    );
+    panel::scroll_by(layout::Axis::X, 8.0);
+    panel::flush_records();
+    let scrolled = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the scrolled panel published no facts".into()))?;
+    if (scrolled.scroll - 8.0).abs() > 0.01 {
+        return Err(SmokeFailure::Failed(format!(
+            "the sideways step did not scroll the row (scroll {})",
+            scrolled.scroll
+        )));
+    }
+    // The room needed for a sideways row is narrow, so the panel sits at the screen's corner and the
+    // tooltip itself is clamped there: the anchor is what proves the window was re-placed against
+    // the scrolled item rather than left where the item used to be.
+    let Some(after) = panel::tooltip_anchor_for_smoke() else {
+        return Err(SmokeFailure::Failed(
+            "the scroll took the tooltip down".into(),
+        ));
+    };
+    if !panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "the tooltip window is not visible after the scroll".into(),
+        ));
+    }
+    if (before.x - after.x - 8.0).abs() > 0.6 {
+        return Err(SmokeFailure::Failed(format!(
+            "the tooltip's anchor did not follow the sideways scroll: {before:?} -> {after:?}"
+        )));
+    }
+    Ok(1)
+}
+
+/// A scrolling list whose glass is sized by the budget rather than by its rows: closing one row
+/// re-lays the SAME panel, which is the path where a stale rest timer could hand the row that takes
+/// index 0 an instant tooltip. The row is removed through the close confirmation the tick runs.
+fn smoke_tooltip_waits_after_a_removal() -> Result<u32, SmokeFailure> {
+    *CASE_ROOM_H.lock().unwrap() = Some(2.0 * layout::ROW_H + layout::PANEL_PAD * 2.0);
+    *CASE_ROOM_W.lock().unwrap() = Some(layout::LIST_W);
+    // One more window than the default threshold, so the count alone forces the list.
+    let titles = [
+        REMOVAL_FIRST_TITLE,
+        REMOVAL_SECOND_TITLE,
+        REMOVAL_FIRST_TITLE,
+        REMOVAL_SECOND_TITLE,
+        REMOVAL_FIRST_TITLE,
+        REMOVAL_SECOND_TITLE,
+        REMOVAL_FIRST_TITLE,
+    ];
+    if !dev_show_windows(&titles, DockEdge::Bottom) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not open for the removal tooltip check".into(),
+        ));
+    }
+    pump(Duration::from_millis(120));
+    let facts = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the removal panel published no facts".into()))?;
+    if facts.mode != layout::PanelMode::List {
+        return Err(SmokeFailure::Failed(format!(
+            "the removal case did not build a list (mode {:?})",
+            facts.mode
+        )));
+    }
+    if !panel::title_is_truncated(0) || !panel::title_is_truncated(1) {
+        return Err(SmokeFailure::Failed(
+            "the removal case's rows are not truncated; the check cannot decide".into(),
+        ));
+    }
+    let Some(title_rect) = panel::title_rect_for_smoke(0) else {
+        return Err(SmokeFailure::Failed(
+            "the first row's title box has no screen rectangle".into(),
+        ));
+    };
+    let center = (
+        title_rect.x + title_rect.w / 2.0,
+        title_rect.y + title_rect.h / 2.0,
+    );
+    let t0 = Instant::now();
+    let _ = panel::tick(t0, center);
+    let _ = panel::tick(
+        t0 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
+        center,
+    );
+    panel::flush_records();
+    if !panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "the list tooltip never appeared".into(),
+        ));
+    }
+    // Age the rest clock until the tooltip's delay has REALLY elapsed: the ticks above used
+    // constructed times, so without this the old timer would still be young here and the check
+    // below could pass even if a removal inherited it.
+    panel::dev_age_title_hover_for_smoke(
+        crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(100),
+    );
+    let pid = std::process::id() as i32;
+    // The synthetic windows carry ids that no WindowServer entry has, so the probe the close
+    // confirmation runs answers Gone and the row is removed exactly as a closed window's would be.
+    if !panel::begin_close_pending(pid, 900_001) {
+        return Err(SmokeFailure::Failed(
+            "the close was refused for the first row".into(),
+        ));
+    }
+    panel::confirm_close_matching(pid, 900_001);
+    let removed_at = Instant::now();
+    let _ = panel::tick(removed_at, center);
+    panel::flush_records();
+    if panel::visible_card_count() != 6 {
+        return Err(SmokeFailure::Failed(format!(
+            "the closed row was not removed ({} items left)",
+            panel::visible_card_count()
+        )));
+    }
+    if panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "the removal left the removed row's tooltip up".into(),
+        ));
+    }
+    let _ = panel::tick(removed_at + Duration::from_millis(60), center);
+    if panel::tooltip_window_visible() {
+        return Err(SmokeFailure::Failed(
+            "the row that took the same index inherited the old rest timer".into(),
+        ));
+    }
+    let _ = panel::tick(
+        removed_at + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
+        center,
+    );
+    panel::flush_records();
+    let (visible, text) = panel::tooltip_state();
+    if !visible || text != REMOVAL_SECOND_TITLE {
+        return Err(SmokeFailure::Failed(format!(
+            "the next row's tooltip did not appear after the full delay (visible {visible}, text {text:?})"
+        )));
+    }
+    Ok(1)
 }
 
 /// A threshold change while the panel is on screen: the real runtime entry hides the panel, and
