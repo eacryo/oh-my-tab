@@ -91,6 +91,7 @@ pub(super) fn dedicated_selector(field: Option<ControlField>) -> Sel {
     // following it.
     match field {
         Some(ControlField::WindowsEnabled) => sel!(handleWindowsEnabledToggle:),
+        Some(ControlField::DockPreviewEnabled) => sel!(handleDockPreviewEnabledToggle:),
         Some(ControlField::MouseEnabled) => sel!(handleEnableMouseToggle:),
         Some(ControlField::MappingEnabled) => sel!(handleMappingEnabledChanged:),
         Some(ControlField::ClipboardEnabled) => sel!(handleClipboardEnabledToggle:),

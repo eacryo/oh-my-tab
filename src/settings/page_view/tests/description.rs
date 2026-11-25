@@ -7,8 +7,8 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
     assert_eq!(view.page, SettingsPageId::Switcher);
     assert_eq!(
         view.rows.len(),
-        19,
-        "17 settings rows plus the exclusion card's add and empty-state rows"
+        20,
+        "18 settings rows plus the exclusion card's add and empty-state rows"
     );
     // Every declared row carries a label key and an identity; the copy keys are the ones the
     // page's own labels used before the migration.
@@ -17,9 +17,10 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
     assert_eq!(labels[1], "settings.row_show_minimized");
     assert_eq!(labels[4], "settings.row_window_display_mode");
     assert_eq!(labels[8], "settings.row_card_text_size");
-    assert_eq!(labels[16], "settings.row_switcher_excluded_add");
-    assert_eq!(labels[17], "settings.row_switcher_excluded_empty");
-    assert_eq!(labels[18], "settings.row_modifier");
+    assert_eq!(labels[16], "settings.row_quit_on_last_window_close");
+    assert_eq!(labels[17], "settings.row_switcher_excluded_add");
+    assert_eq!(labels[18], "settings.row_switcher_excluded_empty");
+    assert_eq!(labels[19], "settings.row_modifier");
     // The field order is the page's own order: a reorder is a visible change, not a detail.
     assert_eq!(
         fields(&view),
@@ -40,6 +41,7 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
             ControlField::PanelMinimizeEnabled,
             ControlField::PanelHideEnabled,
             ControlField::PanelQuitEnabled,
+            ControlField::QuitOnLastWindowClose,
             ControlField::Modifier,
         ]
     );
@@ -53,13 +55,14 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
     assert_eq!(sections[0], "settings.header_windows");
     assert_eq!(sections[1], "settings.header_window_options");
     assert_eq!(sections[12], "settings.header_window_options");
-    assert_eq!(sections[16], "settings.header_switcher_excluded");
+    assert_eq!(sections[16], "settings.header_window_options");
     assert_eq!(sections[17], "settings.header_switcher_excluded");
-    assert_eq!(sections[18], "settings.header_keyboard");
+    assert_eq!(sections[18], "settings.header_switcher_excluded");
+    assert_eq!(sections[19], "settings.header_keyboard");
     assert_eq!(view.rows[0].card, 0);
     assert_eq!(view.rows[1].card, 1);
-    assert_eq!(view.rows[16].card, 2);
-    assert_eq!(view.rows[18].card, 3);
+    assert_eq!(view.rows[17].card, 2);
+    assert_eq!(view.rows[19].card, 3);
     // The first row of every card has no divider above it; every later row in the card does.
     for (index, row) in view.rows.iter().enumerate() {
         let first_of_card = index == 0 || view.rows[index - 1].card != row.card;
@@ -85,6 +88,16 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
         view.rows[5].caption_key,
         Some("settings.desc_focused_thumbnail_prewarm")
     );
+    // The close-then-quit switch sits with the window options and says what it promises beside it.
+    assert_eq!(
+        view.rows[16].label_key,
+        "settings.row_quit_on_last_window_close"
+    );
+    assert_eq!(
+        view.rows[16].caption_key,
+        Some("settings.desc_quit_on_last_window_close")
+    );
+    assert_eq!(view.rows[16].value, Value::Switch(false));
 }
 
 /// The Switcher page's exclusion card: one row per entry, the invalid count, the empty state and
@@ -857,15 +870,16 @@ fn a_description_reads_only_its_input_and_capture_reads_the_config_once() {
 }
 
 #[test]
-fn dock_page_view_owns_the_preview_switch() {
+fn dock_page_view_owns_the_preview_switches() {
     // The Dock feature has its own page: one card, one captioned switch, and the copy that says
     // exactly what it does. The switch must not appear on another page (General pins its own rows
     // above), so the page boundary is asserted here.
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
-    // The switch, and the threshold that only means anything while it is on.
-    assert_eq!(view.rows.len(), 2);
+    // The switch, the promise it makes about closes made here, and the threshold: all three only
+    // mean something while the switch above the other two is on.
+    assert_eq!(view.rows.len(), 3);
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
     assert_eq!(view.rows[0].label_key, "settings.row_dock_preview_enabled");
     assert_eq!(
@@ -878,11 +892,25 @@ fn dock_page_view_owns_the_preview_switch() {
         view.rows[0].search.label,
         t("settings.row_dock_preview_enabled")
     );
+    // The second switch is the close-then-quit promise for this surface, off by default, in the
+    // same card and with its own copy: it governs the preview panel's close button only.
+    assert_eq!(view.rows[1].section, "settings.header_dock_preview");
+    assert_eq!(
+        view.rows[1].label_key,
+        "settings.row_dock_quit_on_last_window_close"
+    );
+    assert_eq!(
+        view.rows[1].caption_key,
+        Some("settings.desc_dock_quit_on_last_window_close")
+    );
+    assert_eq!(view.rows[1].value, Value::Switch(false));
+    assert!(t("settings.desc_dock_quit_on_last_window_close").contains("Dock"));
     assert_eq!(view.banner, None);
 
     // The threshold is a POPUP with one option per legal value: its index is the value minus the
     // range's first entry, so an illegal value cannot be expressed and no numeric field is needed.
-    let threshold = &view.rows[1];
+    let threshold = &view.rows[2];
+    assert_eq!(threshold.section, "settings.header_dock_preview");
     assert_eq!(threshold.label_key, "settings.row_dock_cards_per_row");
     assert_eq!(
         threshold.caption_key,

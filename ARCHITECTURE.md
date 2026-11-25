@@ -168,6 +168,17 @@ lib.rs (run)                                                      wiring + run l
   to its legacy policy instead of failing; `raise_diagnostics.rs` holds the pure decisions (which activation API,
   whether the target desktop was reached, how a raise ended); `space_state_probe.rs` is the state-matrix
   instrument and `window_state.rs` the pure decode of one window's state evidence.
+- `window_collector/last_window.rs` owns "quit the app when this close was its last window". It is the one
+  place that decides what counts as proof: a bounded pre-check before the close (the target is the app's
+  only *user* window, where a user window is one shown on screen or reported minimized by Accessibility),
+  and two fresh readings afterwards (the target is no longer on screen, no other user window is left).
+  "User window" means shown on screen, reported minimized by Accessibility, or placed by the window
+  server on another desktop (the up-front Space query); an app's own hidden surfaces are not user
+  windows -- that is what lets an app which hides its window on close still quit, the same rule the
+  reference implementations use. A hidden application and unreadable Space evidence both decline. Anything unreadable is `Unknown` and
+  never quits; the quit itself is a normal `terminate` request to the retained, verified instance, sent
+  from a worker after both surfaces published their own result. Both close surfaces call
+  `close_and_maybe_quit`, so neither owns its own copy of the ordering.
 - `[windows] excluded_apps` is enforced where candidates are PUBLISHED (`collect.rs`: the CG loop, the
   AX backfill and the directed refresh), never by pruning the AX query -- the AX maps carry the
   fullscreen evidence `native_fullscreen_cg_window_ids` needs. A change to the list is a

@@ -354,21 +354,38 @@ pub(crate) fn close_target(target: panel::HitTarget) {
         return;
     }
     panel::flush_records();
-    let identity = (app_pid, identity_key, start_time_us);
+    let identity = (app_pid, identity_key.clone(), start_time_us);
     let request = target.request;
+    // Captured here, where the close starts: the panel may hide (and advance its request
+    // generation) while the close is still being confirmed, and that must not cancel the quit.
+    let quit_target = crate::window_collector::last_window::target_for_dock_close(
+        pid,
+        wid,
+        identity_key,
+        start_time_us,
+    );
     let spawn = std::thread::Builder::new()
         .name("com.eacryo.oh-my-tab.dock-preview-close".to_string())
         .spawn(move || {
             let verified = windows::process_identity_matches(identity.0, &identity.1, identity.2)
                 && windows::window_presence(pid, wid) == decisions::WindowPresence::Present;
-            let accepted = verified && crate::window_collector::close_ax_window(pid, wid);
-            CLOSE_RESULTS.lock().unwrap().push(CloseOutcome {
-                request,
-                pid,
-                wid,
-                accepted,
-            });
-            post_event_to_main();
+            // The whole close runs through the shared transaction: the enabled switch's pre-check
+            // happens before the close, the outcome is published to the panel right after it, and
+            // the evidence work that may request a quit stays independent of the panel's own
+            // request generation (the panel can hide while this is still being confirmed).
+            crate::window_collector::last_window::close_and_maybe_quit(
+                quit_target,
+                || verified && crate::window_collector::close_ax_window(pid, wid),
+                |accepted| {
+                    CLOSE_RESULTS.lock().unwrap().push(CloseOutcome {
+                        request,
+                        pid,
+                        wid,
+                        accepted,
+                    });
+                    post_event_to_main();
+                },
+            );
         });
     if spawn.is_err() {
         // No worker means no AX call: give the row back instead of leaving it stuck pending.

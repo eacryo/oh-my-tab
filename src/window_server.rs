@@ -482,7 +482,7 @@ pub(crate) fn ax_focus_backstop_allowed(pid: i32) -> bool {
 
 /// Update WindowServer subscriptions and retain both PID -> many windows and CGWindowID -> PID
 /// indexes.
-pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
+pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) -> bool {
     let registry = registry_from_subscriptions(subscriptions);
     let mut ids: Vec<u32> = registry.by_window.keys().copied().collect();
     {
@@ -495,10 +495,10 @@ pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
     *WINDOW_REGISTRY.lock().unwrap() = registry;
 
     let Some(connection) = *MAIN_CONNECTION else {
-        return;
+        return false;
     };
     let Some(request) = *REQUEST_NOTIFICATIONS else {
-        return;
+        return false;
     };
     ids.sort_unstable();
     let (window_ptr, window_count) = if ids.is_empty() {
@@ -523,6 +523,7 @@ pub(crate) fn update_subscriptions(subscriptions: &[(u32, i32)]) {
         );
         SUBSCRIPTION_FAILURE_LOGGED.store(false, Ordering::Relaxed);
     }
+    result == 0
 }
 
 pub(crate) fn owner_for_window(window_id: u32) -> Option<i32> {

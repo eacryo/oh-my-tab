@@ -357,6 +357,26 @@ fn proc_start_time_us(pid: i32) -> Option<u64> {
     )
 }
 
+/// Whether the process at `pid` is still the instance described by `key` and its start time.
+///
+/// The one implementation of "same instance" for every caller that acts on another application: a
+/// PID alone is not identity (PIDs are reused), and an unreadable start time is not proof either, so
+/// a caller that cannot establish identity is refused rather than allowed.
+pub(crate) fn is_same_instance(
+    pid: i32,
+    expected_key: &str,
+    expected_start_time_us: Option<u64>,
+) -> bool {
+    if pid <= 0 || expected_key.is_empty() {
+        return false;
+    }
+    let Some(expected_start_time_us) = expected_start_time_us else {
+        return false;
+    };
+    let current = unsafe { resolve_app_identity(pid) };
+    current.key == expected_key && current.process_start_time_us == Some(expected_start_time_us)
+}
+
 pub(crate) unsafe fn resolve_app_identity(pid: i32) -> AppIdentity {
     let app: *mut AnyObject =
         msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];

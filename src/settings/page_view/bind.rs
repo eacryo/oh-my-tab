@@ -70,6 +70,7 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::HideMenuBarIcon => &mut ui.hide_menu_bar_icon,
         ControlField::DockPreviewEnabled => &mut ui.dock_preview_enabled,
         ControlField::DockCardsPerRow => &mut ui.dock_cards_per_row,
+        ControlField::DockQuitOnLastWindowClose => &mut ui.dock_quit_on_last_window_close,
         ControlField::WindowsEnabled => &mut ui.windows_enabled,
         ControlField::ShowMinimized => &mut ui.show_minimized,
         ControlField::ShowHiddenAppWindows => &mut ui.show_hidden_app_windows,
@@ -86,6 +87,7 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::PanelMinimizeEnabled => &mut ui.panel_minimize_enabled,
         ControlField::PanelHideEnabled => &mut ui.panel_hide_enabled,
         ControlField::PanelQuitEnabled => &mut ui.panel_quit_enabled,
+        ControlField::QuitOnLastWindowClose => &mut ui.quit_on_last_window_close,
         ControlField::Modifier => &mut ui.modifier,
         ControlField::KeystrokeDisplayEnabled => &mut ui.keystroke_display_enabled,
         ControlField::KeystrokeDisplayMode => &mut ui.keystroke_display_mode,
@@ -254,6 +256,7 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::HideMenuBarIcon
             | ControlField::DockPreviewEnabled
             | ControlField::DockCardsPerRow
+            | ControlField::DockQuitOnLastWindowClose
             | ControlField::WindowsEnabled
             | ControlField::ShowMinimized
             | ControlField::ShowHiddenAppWindows
@@ -270,6 +273,7 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::PanelMinimizeEnabled
             | ControlField::PanelHideEnabled
             | ControlField::PanelQuitEnabled
+            | ControlField::QuitOnLastWindowClose
             | ControlField::Modifier
             | ControlField::KeystrokeDisplayEnabled
             | ControlField::KeystrokeDisplayMode

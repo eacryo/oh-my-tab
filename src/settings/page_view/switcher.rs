@@ -178,6 +178,21 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
     ] {
         w.push(switch(label_key, field, on).desc(desc_key).into_spec());
     }
+    // The close-then-quit promise sits beside the action keys because that is where a user looks
+    // for what closing a window from here does. It is NOT gated by them: the card's close button and
+    // Backspace close a window whatever those four switches say, and this switch decides what
+    // happens once the window is gone.
+    w.push(
+        switch(
+            "settings.row_quit_on_last_window_close",
+            ControlField::QuitOnLastWindowClose,
+            cfg.windows.quit_on_last_window_close,
+        )
+        // A caption, not a search-only description: the promise's limit ("only closes made here
+        // count") has to be readable on the page, not just findable in search.
+        .caption("settings.desc_quit_on_last_window_close")
+        .into_spec(),
+    );
     // Applications whose windows never appear in the switcher. Same card shape as the Gestures
     // page's exclusion list (one description, two pages): its own copy, actions and row identities.
     push_excluded_apps_card(

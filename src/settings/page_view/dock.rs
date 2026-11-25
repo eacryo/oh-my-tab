@@ -56,6 +56,17 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
         .wide_caption()
         .into_spec(),
     );
+    // The panel's cards own the close button, so this row lives with the feature it belongs to and
+    // is frozen by `update_dock_preview_controls_enabled` when the switch above it is off.
+    w.push(
+        switch(
+            "settings.row_dock_quit_on_last_window_close",
+            ControlField::DockQuitOnLastWindowClose,
+            cfg.dock_preview.quit_on_last_window_close,
+        )
+        .caption("settings.desc_dock_quit_on_last_window_close")
+        .into_spec(),
+    );
     // The threshold sits under the switch because it only means anything while previews are on,
     // and the switch freezes it.
     w.push(

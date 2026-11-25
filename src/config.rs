@@ -770,6 +770,11 @@ pub struct WindowsSection {
     pub panel_minimize_enabled: bool,
     pub panel_hide_enabled: bool,
     pub panel_quit_enabled: bool,
+    // Quit the target application when a window closed from the switcher was its last one.
+    // Defaults off: the action is destructive (another app's terminate), and the close itself must
+    // never wait for it -- the close commits exactly as before, and the quit is a separate request
+    // made only when the evidence proves the app has no window left.
+    pub quit_on_last_window_close: bool,
     // Overlay display position: "active_window" = follow the active window's screen,
     // "main" = always on the main screen. Defaults to following the active window.
     pub overlay_position: String,
@@ -790,6 +795,7 @@ impl Default for WindowsSection {
             panel_minimize_enabled: false,
             panel_hide_enabled: false,
             panel_quit_enabled: false,
+            quit_on_last_window_close: false,
             overlay_position: "active_window".to_string(),
             activation_mode: "hover".to_string(),
         }
@@ -901,11 +907,13 @@ pub(crate) const DOCK_CARDS_PER_ROW_MAX: u32 = 6;
 /// cards' natural widths, and one more window than that is where the list starts.
 pub(crate) const DOCK_CARDS_PER_ROW_DEFAULT: u32 = 5;
 
-/// Dock previews: hovering an app's Dock icon shows thumbnails of all its windows.
+/// Dock previews: hovering an app's Dock icon shows that app's windows.
 ///
-/// Enabled is on by default: it is the feature the Dock side of the app exists for, and it can
-/// still be turned off for a machine that wants no thumbnail work near the Dock. The runtime
-/// consumption belongs to the dock-preview module, not to the settings layer.
+/// The master switch is on by default: it is the feature the Dock side of the app exists for, and
+/// it can still be turned off for a machine that wants no preview work near the Dock. The other
+/// two fields shape it -- how many windows a single row shows before the panel becomes a list, and
+/// whether a close made from the panel may quit the app. The runtime consumption belongs to the
+/// dock-preview module, not to the settings layer.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct DockPreviewSection {
@@ -914,6 +922,10 @@ pub struct DockPreviewSection {
     /// The most windows a single row of previews shows. At or under it the panel is one row of
     /// thumbnail cards; above it the panel becomes a scrolling list. 1..=6, default 5.
     pub cards_per_row: u32,
+    /// Quit the target application when a window closed from the preview panel was its last one.
+    /// Default false, and only consulted while `enabled` is on: the panel is where the close button
+    /// lives, so the switch has nothing to govern without the feature.
+    pub quit_on_last_window_close: bool,
 }
 
 impl Default for DockPreviewSection {
@@ -921,6 +933,7 @@ impl Default for DockPreviewSection {
         Self {
             enabled: true,
             cards_per_row: DOCK_CARDS_PER_ROW_DEFAULT,
+            quit_on_last_window_close: false,
         }
     }
 }
@@ -2165,6 +2178,7 @@ impl Config {
             self.windows.panel_minimize_enabled = other.windows.panel_minimize_enabled;
             self.windows.panel_hide_enabled = other.windows.panel_hide_enabled;
             self.windows.panel_quit_enabled = other.windows.panel_quit_enabled;
+            self.windows.quit_on_last_window_close = other.windows.quit_on_last_window_close;
             if !errs
                 .iter()
                 .any(|e| e.starts_with("windows.overlay_position"))
@@ -2275,9 +2289,10 @@ impl Config {
         self.finder_menu = other.finder_menu;
         self.normalize_finder_menu();
 
-        // dock preview: the switch is a boolean and always valid, so it is adopted
-        // unconditionally; the threshold is a number and falls back on its own.
+        // dock preview: the two booleans are always valid, so they are adopted unconditionally;
+        // the threshold is a number and falls back on its own.
         self.dock_preview.enabled = other.dock_preview.enabled;
+        self.dock_preview.quit_on_last_window_close = other.dock_preview.quit_on_last_window_close;
         if !errs
             .iter()
             .any(|e| e.starts_with("dock_preview.cards_per_row"))
@@ -4263,6 +4278,24 @@ enabled = true
         );
     }
 
+    /// The Dock preview section is merged FIELD BY FIELD, so every field has to be adopted on its
+    /// own: a section-wide assignment (the shape this replaced) would have hidden a field that a
+    /// later change added, and a field the merge forgets is silently reset on every reload.
+    #[test]
+    fn the_dock_preview_merge_adopts_every_field() {
+        let mut other = Config::default();
+        other.dock_preview.enabled = false;
+        other.dock_preview.cards_per_row = 2;
+        other.dock_preview.quit_on_last_window_close = true;
+        let mut merged = Config::default();
+        assert!(merged.dock_preview.enabled && !merged.dock_preview.quit_on_last_window_close);
+        // An error in a SIBLING section: every field of this section still follows.
+        merged.merge_valid(other, &["appearance.theme: invalid value".to_string()]);
+        assert!(!merged.dock_preview.enabled);
+        assert_eq!(merged.dock_preview.cards_per_row, 2);
+        assert!(merged.dock_preview.quit_on_last_window_close);
+    }
+
     /// `dock_preview.cards_per_row` is additive and defaults to 5: a file written before the
     /// threshold existed must load as five, and its value must survive a round trip and a sibling
     /// field's own fallback.
@@ -4341,6 +4374,48 @@ enabled = true
                 "{value} must be refused on its own"
             );
         }
+    }
+
+    /// The two quit-on-last-window switches are additive and default OFF: quitting an application
+    /// is destructive, so an old file without the keys must not arm it, an explicit `true` must
+    /// survive a round trip, and a per-field fallback in a sibling must not reset either switch.
+    #[test]
+    fn the_quit_on_last_window_close_switches_default_off_and_round_trip() {
+        let defaults = Config::default();
+        assert!(!defaults.windows.quit_on_last_window_close);
+        assert!(!defaults.dock_preview.quit_on_last_window_close);
+
+        // An old file has neither key; the fields must load as off rather than being armed.
+        let legacy: Config =
+            toml::from_str("[windows]\nshow_minimized = true\n[dock_preview]\nenabled = false\n")
+                .unwrap();
+        assert!(!legacy.windows.quit_on_last_window_close);
+        assert!(!legacy.dock_preview.quit_on_last_window_close);
+        assert!(legacy.windows.show_minimized, "the sibling still loads");
+
+        // Both survive serialization, independently.
+        let mut cfg = Config::default();
+        cfg.windows.quit_on_last_window_close = true;
+        cfg.dock_preview.quit_on_last_window_close = false;
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.windows.quit_on_last_window_close);
+        assert!(!back.dock_preview.quit_on_last_window_close);
+        cfg.dock_preview.quit_on_last_window_close = true;
+        let back: Config = toml::from_str(&toml::to_string(&cfg).unwrap()).unwrap();
+        assert!(back.dock_preview.quit_on_last_window_close);
+
+        // A fallback on a sibling field in the same section keeps the switch: a boolean cannot fail
+        // validation, so it is adopted unconditionally like the other switches there.
+        let mut other = Config::default();
+        other.windows.quit_on_last_window_close = true;
+        other.dock_preview.quit_on_last_window_close = true;
+        let mut merged = Config::default();
+        merged.merge_valid(
+            other,
+            &["windows.show_minimized: invalid value".to_string()],
+        );
+        assert!(merged.windows.quit_on_last_window_close);
+        assert!(merged.dock_preview.quit_on_last_window_close);
     }
 
     #[test]

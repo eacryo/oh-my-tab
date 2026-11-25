@@ -25,6 +25,7 @@ use crate::skylight;
 use crate::{log_debug, log_info};
 
 mod collect;
+pub(crate) mod last_window;
 mod raise;
 mod raise_diagnostics;
 mod raiser;
@@ -54,7 +55,7 @@ pub(crate) use raise::{
     activate_pid, ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
     clear_ax_window_cache_for_window, close_ax_window, focused_window_cgwid,
     forget_non_normal_window, hide_application, raise_window_fast, set_ax_minimized,
-    terminate_application,
+    terminate_application, terminate_application_verified,
 };
 pub(crate) use raiser::{begin_raise, note_focused_window};
 pub(crate) use raiser::{

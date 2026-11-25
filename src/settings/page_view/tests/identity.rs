@@ -289,6 +289,10 @@ fn every_described_field_of_every_page_has_a_settings_ui_slot() {
 fn every_field_with_a_dedicated_handler_still_has_one() {
     let dedicated = [
         (ControlField::WindowsEnabled, "handleWindowsEnabledToggle:"),
+        (
+            ControlField::DockPreviewEnabled,
+            "handleDockPreviewEnabledToggle:",
+        ),
         (ControlField::MouseEnabled, "handleEnableMouseToggle:"),
         (ControlField::MappingEnabled, "handleMappingEnabledChanged:"),
         (
