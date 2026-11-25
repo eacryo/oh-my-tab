@@ -28,6 +28,9 @@ struct ChangeFlags {
     /// flips it has to reach that page's controls like `dock_preview` does.
     dock_peek: bool,
     dock_hide_click: bool,
+    /// The Dock preview's list-only presentation: it decides the panel's mode, so a flip reshapes
+    /// the panel exactly the way a threshold change does.
+    dock_list_mode: bool,
     show_app_name_in_cards: bool,
     // The footer title's visibility changed. That switch also decides whether the footer band exists,
     // and the band is summon-time geometry (card viewport, document, scroller, panel height), so a
@@ -150,6 +153,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.dock_cards_per_row
         || flags.dock_peek
         || flags.dock_hide_click
+        || flags.dock_list_mode
 }
 
 /// The pages the in-place refresh writes when the settings window is open.
@@ -208,6 +212,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         dock_peek: old.dock_preview.peek_on_hover != new.dock_preview.peek_on_hover,
         dock_hide_click: old.dock_preview.hide_frontmost_on_icon_click
             != new.dock_preview.hide_frontmost_on_icon_click,
+        dock_list_mode: old.dock_preview.list_mode != new.dock_preview.list_mode,
         logging: startup || old.logging.level != new.logging.level,
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
@@ -481,14 +486,17 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     }
     if flags.dock_preview
         || flags.dock_cards_per_row
+        || flags.dock_list_mode
         || matches!(source, ConfigChangeSource::Startup)
     {
         // Startup seeds the observer's on/off state from the stored switch; a live change starts or
         // stops it. Stopping hides the panel and its tooltip before the observer goes away. A
         // threshold change keeps the observer running but drops the open panel: it was laid out
-        // from the old count, and the next hover must open with the new one.
+        // from the old count, and the next hover must open with the new one. The list-mode switch
+        // is the same kind of change: it decides the panel's mode, so the standing panel was laid
+        // out for a presentation the config no longer wants.
         crate::dock_preview::apply_config_change(new.dock_preview.enabled);
-        if flags.dock_cards_per_row && new.dock_preview.enabled {
+        if (flags.dock_cards_per_row || flags.dock_list_mode) && new.dock_preview.enabled {
             crate::dock_preview::hide_for_layout_change();
         }
     }
@@ -1340,6 +1348,19 @@ mod tests {
         new.dock_preview.hide_frontmost_on_icon_click = true;
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.dock_hide_click);
+        assert!(!flags.dock_preview && !flags.dock_peek && !flags.dock_cards_per_row);
+        assert!(needs_in_place_control_sync(&flags));
+    }
+
+    #[test]
+    fn the_dock_list_mode_change_flags_the_layout_drop_and_the_settings_sync() {
+        // The list-mode switch decides the panel's mode: like the threshold, a flip must reach the
+        // layout-drop path and the open settings window, and nothing else.
+        let old = Config::default();
+        let mut new = old.clone();
+        new.dock_preview.list_mode = true;
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.dock_list_mode);
         assert!(!flags.dock_preview && !flags.dock_peek && !flags.dock_cards_per_row);
         assert!(needs_in_place_control_sync(&flags));
     }

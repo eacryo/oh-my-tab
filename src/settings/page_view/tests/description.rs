@@ -882,9 +882,10 @@ fn dock_page_view_owns_the_preview_switches() {
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
-    // The switch, the promise it makes about closes made here, the threshold, the peek and the
-    // click-hide child switch: all five only mean something while the switch above them is on.
-    assert_eq!(view.rows.len(), 5);
+    // The switch, the promise it makes about closes made here, the list presentation, the
+    // threshold, the peek and the click-hide child switch: all six only mean something while the
+    // switch above them is on.
+    assert_eq!(view.rows.len(), 6);
     // The master switch is its own card, and every option it governs is the next one: a switch never
     // shares a card with the switches it governs (the App Switcher page's overlay/options split).
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
@@ -921,9 +922,19 @@ fn dock_page_view_owns_the_preview_switches() {
     assert!(t("settings.desc_dock_quit_on_last_window_close").contains("Dock"));
     assert_eq!(view.banner, None);
 
+    // The list presentation is the second options row: it governs the threshold below it, so it
+    // sits ahead of it. Off by default — the cards are the feature's shape.
+    let list_mode = &view.rows[2];
+    assert_eq!(list_mode.section, "settings.header_dock_preview_options");
+    assert_eq!(list_mode.label_key, "settings.row_dock_list_mode");
+    assert_eq!(list_mode.caption_key, Some("settings.desc_dock_list_mode"));
+    assert_eq!(list_mode.copy, RowCopy::Captioned);
+    assert_eq!(list_mode.value, Value::Switch(false));
+    assert_eq!(list_mode.field(), Some(ControlField::DockListMode));
+
     // The threshold is a POPUP with one option per legal value: its index is the value minus the
     // range's first entry, so an illegal value cannot be expressed and no numeric field is needed.
-    let threshold = &view.rows[2];
+    let threshold = &view.rows[3];
     assert_eq!(threshold.section, "settings.header_dock_preview_options");
     assert_eq!(threshold.label_key, "settings.row_dock_cards_per_row");
     assert_eq!(
@@ -945,9 +956,9 @@ fn dock_page_view_owns_the_preview_switches() {
         "the default of 6 is the sixth option"
     );
 
-    // The peek is the fourth row: a switch that acts on the preview's own cards. It stays visible
+    // The peek is the fifth row: a switch that acts on the preview's own cards. It stays visible
     // when previews are off so the user can inspect or change the preference; the control is only frozen.
-    let peek = &view.rows[3];
+    let peek = &view.rows[4];
     assert_eq!(peek.section, "settings.header_dock_preview_options");
     assert_eq!(peek.label_key, "settings.row_dock_peek_on_hover");
     assert_eq!(peek.caption_key, Some("settings.desc_dock_peek_on_hover"));
@@ -956,9 +967,9 @@ fn dock_page_view_owns_the_preview_switches() {
     assert_eq!(peek.group, None);
     assert_eq!(peek.field(), Some(ControlField::DockPeekOnHover));
 
-    // Click-hide is the fifth row. It is deliberately opt-in: the native Dock click keeps its
+    // Click-hide is the sixth row. It is deliberately opt-in: the native Dock click keeps its
     // activation meaning, and this child switch adds the Windows-like second meaning only when asked.
-    let hide = &view.rows[4];
+    let hide = &view.rows[5];
     assert_eq!(hide.section, "settings.header_dock_preview_options");
     assert_eq!(
         hide.label_key,

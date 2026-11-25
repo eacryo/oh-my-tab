@@ -593,8 +593,9 @@ pub(super) struct SettingsUi {
     dock_quit_on_last_window_close: *mut AnyObject,
     dock_peek_on_hover: *mut AnyObject, // Dock page: hovering a thumbnail brings its window forward
     dock_hide_frontmost_on_icon_click: *mut AnyObject, // Dock page: clicking a frontmost app's icon hides it
-    reverse_scroll: *mut AnyObject,                    // reverse scrolling
-    enable_mouse: *mut AnyObject,                      // enable mouse control
+    dock_list_mode: *mut AnyObject, // Dock page: always present the preview as a window list
+    reverse_scroll: *mut AnyObject, // reverse scrolling
+    enable_mouse: *mut AnyObject,   // enable mouse control
     gestures_enabled: *mut AnyObject,
     gesture_trigger_button: *mut AnyObject, // NSPopUpButton: the one button gestures start on
     gesture_show_trail: *mut AnyObject,
@@ -2273,6 +2274,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         "dock_preview.hide_frontmost_on_icon_click",
         old.dock_preview.hide_frontmost_on_icon_click,
         new.dock_preview.hide_frontmost_on_icon_click
+    );
+    changed!(
+        "dock_preview.list_mode",
+        old.dock_preview.list_mode,
+        new.dock_preview.list_mode
     );
     changed!(
         "updates.automatically_check",

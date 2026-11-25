@@ -402,6 +402,14 @@ pub(crate) fn cards_per_row() -> usize {
         .unwrap_or(crate::config::DOCK_CARDS_PER_ROW_DEFAULT as usize)
 }
 
+/// Whether the user asked for the list presentation regardless of what the count would allow.
+pub(crate) fn list_mode() -> bool {
+    crate::config::CONFIG
+        .read()
+        .map(|config| config.dock_preview.list_mode)
+        .unwrap_or(false)
+}
+
 /// The app the open panel belongs to, with the identity and request its targets are checked against.
 fn current_identity() -> Option<(i32, String, Option<u64>)> {
     let app = CURRENT_APP.lock().unwrap().clone()?;
@@ -3015,6 +3023,8 @@ pub(crate) enum SmokeFailure {
 static SMOKE_ORIGINAL_DOCK_ENABLED: Mutex<Option<bool>> = Mutex::new(None);
 /// The threshold the smoke found, restored on cleanup on the same rule.
 static SMOKE_ORIGINAL_THRESHOLD: Mutex<Option<u32>> = Mutex::new(None);
+/// The list-mode switch the smoke found, restored on cleanup on the same rule.
+static SMOKE_ORIGINAL_LIST_MODE: Mutex<Option<bool>> = Mutex::new(None);
 
 /// Drive the real panel for this process and assert the facts it owns. Runs inside the smoke child
 /// (a real NSApplication on the main thread). Returns the number of checks that held.
@@ -3034,20 +3044,26 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     //
     // The threshold is pinned for the run as well: a two-window row case is a row only while the
     // threshold is at least 2, and a user whose configuration says 1 must not turn it into a list.
-    let (original, original_threshold) = crate::config::CONFIG
+    // The list-mode switch is pinned off for the same reason: the card cases below assert the
+    // row presentation, and a user who keeps the list presentation on must not turn them into a
+    // false failure -- the product is then correctly showing the list they asked for.
+    let (original, original_threshold, original_list_mode) = crate::config::CONFIG
         .read()
         .map(|config| {
             (
                 config.dock_preview.enabled,
                 config.dock_preview.cards_per_row,
+                config.dock_preview.list_mode,
             )
         })
-        .unwrap_or((true, crate::config::DOCK_CARDS_PER_ROW_DEFAULT));
+        .unwrap_or((true, crate::config::DOCK_CARDS_PER_ROW_DEFAULT, false));
     *SMOKE_ORIGINAL_DOCK_ENABLED.lock().unwrap() = Some(original);
     *SMOKE_ORIGINAL_THRESHOLD.lock().unwrap() = Some(original_threshold);
+    *SMOKE_ORIGINAL_LIST_MODE.lock().unwrap() = Some(original_list_mode);
     if let Ok(mut config) = crate::config::CONFIG.write() {
         config.dock_preview.enabled = false;
         config.dock_preview.cards_per_row = crate::config::DOCK_CARDS_PER_ROW_DEFAULT;
+        config.dock_preview.list_mode = false;
     }
     // The switch is exercised through the runtime entry the settings row reaches, not by calling
     // the module directly: the same flags, the same startup/stop path, the same UI refresh.
@@ -3058,6 +3074,19 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     if !is_enabled() {
         return Err(SmokeFailure::Failed(
             "the Dock preview observer did not start".into(),
+        ));
+    }
+    // The list-mode degradation runs first and in every environment: it needs no capture
+    // permission, and the card cases below depend on the presentation it verifies being correct.
+    let mut checks = smoke_list_mode_switch()?;
+    // Every card case after this point asserts the row presentation, which a missing Screen
+    // Recording permission makes unreachable by design (the panel degrades to the list). On such
+    // a host the product is correct and the cases cannot decide, so the run is NOT RUN rather
+    // than a false failure.
+    if !crate::thumbnail::capture_allowed() {
+        return Err(SmokeFailure::NotRun(
+            "no Screen Recording permission: the card cases assert a presentation the panel              correctly never shows without it"
+                .into(),
         ));
     }
     let window = unsafe { control_window("Dock preview smoke target") };
@@ -3072,7 +3101,6 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
         ));
     }
     pump(Duration::from_millis(120));
-    let mut checks: u32 = 0;
     if !panel_is_visible() {
         return Err(SmokeFailure::Failed(
             "the panel reported invisible right after it appeared".into(),
@@ -3361,6 +3389,99 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
         let _: () = msg_send![window, orderOut: std::ptr::null::<AnyObject>()];
         crate::ffi::release_obj(window);
     }
+    Ok(checks)
+}
+
+/// The list-mode degradation driven through the runtime entry: an open panel must drop when the
+/// switch flips (it was laid out for the other presentation), the same windows must reopen as a
+/// list while the switch is on, and flipping it back must restore the presentation the count and
+/// the capture permission decide. The case is permission-independent: the expected mode after the
+/// restore is computed from the same inputs the panel uses.
+fn smoke_list_mode_switch() -> Result<u32, SmokeFailure> {
+    let mut checks = 0;
+    let titles = ["list-mode switch one", "list-mode switch two"];
+    if !dev_show_synthetic(&titles) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not open for the list-mode switch case".into(),
+        ));
+    }
+    pump(Duration::from_millis(120));
+    if !panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel was not visible before the list-mode flip".into(),
+        ));
+    }
+    checks += 1;
+    // The flip must drop the open panel through the runtime entry's layout-change path: it was
+    // laid out for a presentation the configuration no longer wants. The hide is synchronous
+    // inside the apply (`hide_for_layout_change` calls `hide_panel` directly), so the assertion
+    // runs before the run loop advances: waiting any longer would let the pointer-away close
+    // grace pass it even if the invalidation never fired.
+    set_list_mode_through_runtime(true, crate::runtime_config::ConfigChangeSource::Settings)?;
+    if panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel stayed open after the list-mode switch flipped on".into(),
+        ));
+    }
+    checks += 1;
+    // The same two windows -- a count the pinned threshold would show as cards -- must now open
+    // as a list.
+    if !dev_show_synthetic(&titles) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not reopen after the list-mode flip".into(),
+        ));
+    }
+    pump(Duration::from_millis(120));
+    if !panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel was not visible after reopening in list mode".into(),
+        ));
+    }
+    let facts = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the reopened panel published no facts".into()))?;
+    if facts.mode != layout::PanelMode::List {
+        return Err(SmokeFailure::Failed(format!(
+            "two windows with the list-mode switch on opened as {:?}, not a list",
+            facts.mode
+        )));
+    }
+    checks += 2;
+    // Flipping back drops the list panel too, and the reopen follows the count and the capture
+    // permission again: cards only while the permission allows them.
+    set_list_mode_through_runtime(false, crate::runtime_config::ConfigChangeSource::Settings)?;
+    if panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel stayed open after the list-mode switch flipped back off".into(),
+        ));
+    }
+    checks += 1;
+    if !dev_show_synthetic(&titles) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not reopen after the switch flipped back".into(),
+        ));
+    }
+    pump(Duration::from_millis(120));
+    if !panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "the panel was not visible after reopening with the switch restored".into(),
+        ));
+    }
+    let facts = panel::list_facts()
+        .ok_or_else(|| SmokeFailure::Failed("the restored panel published no facts".into()))?;
+    let expected = if crate::thumbnail::capture_allowed() {
+        layout::PanelMode::Row
+    } else {
+        layout::PanelMode::List
+    };
+    if facts.mode != expected {
+        return Err(SmokeFailure::Failed(format!(
+            "two windows after the restore opened as {:?}, expected {expected:?}",
+            facts.mode
+        )));
+    }
+    checks += 2;
+    hide_panel();
+    pump(Duration::from_millis(60));
     Ok(checks)
 }
 
@@ -3908,6 +4029,33 @@ fn smoke_threshold_change() -> Result<u32, SmokeFailure> {
 
 /// Flip the switch through `runtime_config::apply_config_change`, the path the settings dispatch
 /// uses, so the smoke covers the real enable/disable wiring rather than the module's own toggle.
+/// Flip the list-mode switch through the same runtime entry the settings row reaches, so the
+/// degradation case exercises the change flags, the layout drop and the in-place sync, not just
+/// the module's own functions.
+fn set_list_mode_through_runtime(
+    list_mode: bool,
+    source: crate::runtime_config::ConfigChangeSource,
+) -> Result<(), SmokeFailure> {
+    let old = match crate::config::CONFIG.read() {
+        Ok(config) => config.clone(),
+        Err(_) => {
+            return Err(SmokeFailure::Failed(
+                "the configuration could not be read for the list-mode switch".into(),
+            ))
+        }
+    };
+    let mut new = old.clone();
+    new.dock_preview.list_mode = list_mode;
+    // Publish before applying, in the threshold smoke's commit order: the apply path reads the
+    // live configuration for everything except the flag diff itself, so a panel that reopens
+    // after the layout drop must already see the new value.
+    if let Ok(mut config) = crate::config::CONFIG.write() {
+        config.dock_preview.list_mode = list_mode;
+    }
+    crate::runtime_config::apply_config_change(&old, &new, source);
+    Ok(())
+}
+
 fn set_switch_through_runtime(
     enabled: bool,
     source: crate::runtime_config::ConfigChangeSource,
@@ -3940,6 +4088,11 @@ pub(crate) fn smoke_cleanup() {
     if let Some(threshold) = SMOKE_ORIGINAL_THRESHOLD.lock().unwrap().take() {
         if let Ok(mut config) = crate::config::CONFIG.write() {
             config.dock_preview.cards_per_row = threshold;
+        }
+    }
+    if let Some(list_mode) = SMOKE_ORIGINAL_LIST_MODE.lock().unwrap().take() {
+        if let Ok(mut config) = crate::config::CONFIG.write() {
+            config.dock_preview.list_mode = list_mode;
         }
     }
 }

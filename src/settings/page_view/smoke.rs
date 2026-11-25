@@ -102,6 +102,7 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         dock_quit_on_last_window_close: std::ptr::null_mut(),
         dock_peek_on_hover: std::ptr::null_mut(),
         dock_hide_frontmost_on_icon_click: std::ptr::null_mut(),
+        dock_list_mode: std::ptr::null_mut(),
         reverse_scroll: std::ptr::null_mut(),
         enable_mouse: std::ptr::null_mut(),
         gestures_enabled: std::ptr::null_mut(),

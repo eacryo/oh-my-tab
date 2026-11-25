@@ -751,3 +751,7 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 - **悬停 peek:连续点击的暂停请求归属**(Dock 预览悬停 peek 实现轮,R8–R9 两轮提出,2026-11-25,**部分处理**)。已修:较早点击不能抢先提交(intent 比对);新点击会把旧暂停请求的所有权转移给自己。未完全解决:当第一次点击的结果被判过期、第二次点击校验又失败时,请求的回收路径依赖 `PARKED_RESTORES` 与 `hide_panel` 的先后顺序,缺少"旧结果被跳过 + 最新结果失败 + 指针离开"这条端到端断言。
   **为什么延后:** 这需要在 `dock_preview` 里注入一个可控的点击校验结果序列,现有的 `MainThreadSlot` + 静态队列结构不支持;补它等于给这块引入一个测试缝,而该缝的形态取决于上面那条调度重构。
   **重新审视的触发条件:** 为 dock 预览引入可注入的激活校验时(M2 场景框架本就要求 `--e2e-state` 暴露这些状态);或收到"连续快速点两张卡后窗口留在前台"的报告时。
+
+- **Dock 预览 list_mode：设置页阈值控件冻结/解冻的自动化断言**（dock-list-mode 轮，R1 MEDIUM 的控件半边，2026-11-25，**延后**：测试仪器）。`update_dock_preview_controls_enabled` 通过 `msg_send` 读真实控件状态（主开关、list_mode 开关）再写回冻结，无头环境无法实例化这套控件；`MainThreadSlot` 之外的设置 UI 测试缝不存在。面板行为半边（翻开隐藏面板、重开进列表、翻回恢复）已由 `smoke_list_mode_switch` 覆盖（M2），冻结/解冻已人工视觉验证（弹窗变灰）。
+  **为什么延后：** 需要真实设置窗口（M2）或一个新的控件测试缝；视觉验证已确认行为正确。
+  **重新审视的触发条件：** 下一次改动 `update_dock_preview_controls_enabled` 或设置页冻结体系时；或 M2 场景框架支持读取控件 enabled 状态时，补一条自动化断言。

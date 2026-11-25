@@ -942,6 +942,11 @@ pub struct DockPreviewSection {
     /// Hide the already-frontmost application when its Dock icon is clicked again. Default false:
     /// this adds a second meaning to a native Dock click, so it is opt-in.
     pub hide_frontmost_on_icon_click: bool,
+    /// Always present the preview as a window list instead of thumbnail cards. Default false:
+    /// the cards are the feature's shape, and the list is its overflow and its no-permission
+    /// fallback. The switch exists so both presentations can be checked without needing a
+    /// many-window application or a missing Screen Recording grant.
+    pub list_mode: bool,
 }
 
 impl Default for DockPreviewSection {
@@ -952,6 +957,7 @@ impl Default for DockPreviewSection {
             quit_on_last_window_close: false,
             peek_on_hover: true,
             hide_frontmost_on_icon_click: false,
+            list_mode: false,
         }
     }
 }
@@ -2314,6 +2320,7 @@ impl Config {
         self.dock_preview.peek_on_hover = other.dock_preview.peek_on_hover;
         self.dock_preview.hide_frontmost_on_icon_click =
             other.dock_preview.hide_frontmost_on_icon_click;
+        self.dock_preview.list_mode = other.dock_preview.list_mode;
         if !errs
             .iter()
             .any(|e| e.starts_with("dock_preview.cards_per_row"))
@@ -3090,7 +3097,54 @@ fn config_path() -> std::path::PathBuf {
     if cfg!(test) {
         return config_path_in(&test_config_home().to_string_lossy());
     }
+    // A smoke child is the release-style binary, so the test redirect above does not reach it;
+    // the harness passes an isolated file through argv instead (AGENTS.md: the running app takes
+    // its configuration from argv only). Without it a smoke that clicks a real control would
+    // queue a full-config persist and overwrite the user's real `config.toml` with test values.
+    if let Some(path) = config_file_arg_override() {
+        return path;
+    }
+    // A smoke process launched directly (a developer typing the flag by hand rather than through
+    // the harness) carries no `--config-file`; it must still never reach the user's real config,
+    // because control-driving runners queue full-config persists filled with test values. Fall
+    // back to a process-scoped temporary file on the same isolation rule as the clipboard smoke
+    // session in `run`.
+    if crate::dev_flags::any_prefix("--smoke-") {
+        static SMOKE_CONFIG: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        return SMOKE_CONFIG
+            .get_or_init(|| {
+                // The nanosecond component keeps every launch's directory distinct: a reused PID
+                // must never read the test values a previous manual smoke persisted. `$TMPDIR` is
+                // the system's own cleaned location, so the small leftovers expire on their own.
+                let unique = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|since| since.as_nanos())
+                    .unwrap_or(0);
+                let dir = std::env::temp_dir().join(format!(
+                    "oh-my-tab-smoke-autoconf-{}-{unique}",
+                    std::process::id()
+                ));
+                let _ = std::fs::create_dir_all(&dir);
+                dir.join("config.toml")
+            })
+            .clone();
+    }
     config_path_in(&std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()))
+}
+
+/// The `--config-file=<path>` argv override, parsed once. Exists for the smoke harness; the
+/// running app never documents it because a user who needs a second configuration needs a second
+/// installation, not a flag.
+fn config_file_arg_override() -> Option<std::path::PathBuf> {
+    static OVERRIDE: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
+    OVERRIDE
+        .get_or_init(|| {
+            std::env::args().find_map(|arg| {
+                arg.strip_prefix("--config-file=")
+                    .map(std::path::PathBuf::from)
+            })
+        })
+        .clone()
 }
 
 fn test_config_home() -> std::path::PathBuf {
@@ -4284,6 +4338,10 @@ enabled = true
             old.dock_preview.peek_on_hover,
             "a file written before the peek switch existed must load with the peek on"
         );
+        assert!(
+            !old.dock_preview.list_mode,
+            "a file written before the list-mode switch existed must load with the cards on"
+        );
 
         // Explicitly off survives serialization.
         let mut cfg = Config::default();
@@ -4313,6 +4371,7 @@ enabled = true
         other.dock_preview.cards_per_row = 2;
         other.dock_preview.quit_on_last_window_close = true;
         other.dock_preview.hide_frontmost_on_icon_click = true;
+        other.dock_preview.list_mode = true;
         let mut merged = Config::default();
         assert!(merged.dock_preview.enabled && !merged.dock_preview.quit_on_last_window_close);
         // An error in a SIBLING section: every field of this section still follows.
@@ -4321,6 +4380,7 @@ enabled = true
         assert_eq!(merged.dock_preview.cards_per_row, 2);
         assert!(merged.dock_preview.quit_on_last_window_close);
         assert!(merged.dock_preview.hide_frontmost_on_icon_click);
+        assert!(merged.dock_preview.list_mode);
     }
 
     /// `dock_preview.cards_per_row` is additive and defaults to 5: a file written before the

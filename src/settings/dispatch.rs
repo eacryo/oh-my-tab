@@ -26,6 +26,8 @@ pub(super) enum ControlField {
     DockQuitOnLastWindowClose,
     DockPeekOnHover,
     DockHideFrontmostOnIconClick,
+    /// Always present the preview as a window list instead of thumbnail cards.
+    DockListMode,
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
@@ -807,6 +809,10 @@ unsafe fn refresh_dependent_control_visibility(field: ControlField) {
                 // The App Switcher page's layout owner shows/hides the pair and settles the page.
                 update_display_mode_dependent_visibility(ui);
             }
+            ControlField::DockListMode => {
+                // The list-mode switch freezes the cards-per-row threshold below it.
+                update_dock_preview_controls_enabled(ui);
+            }
             ControlField::FinderMenuEnabled => {
                 // The page's options are meaningless while the menu is off, like every other
                 // master switch on this page family.
@@ -930,6 +936,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::DockHideFrontmostOnIconClick => {
                     let state: isize = msg_send![u.dock_hide_frontmost_on_icon_click, state];
                     cfg.dock_preview.hide_frontmost_on_icon_click = state == 1;
+                }
+                ControlField::DockListMode => {
+                    let state: isize = msg_send![u.dock_list_mode, state];
+                    cfg.dock_preview.list_mode = state == 1;
                 }
                 ControlField::DockCardsPerRow => {
                     let idx: isize = msg_send![u.dock_cards_per_row, indexOfSelectedItem];
@@ -1744,8 +1754,30 @@ pub(crate) unsafe fn update_dock_preview_controls_enabled(ui: &SettingsUi) {
     let on = state == 1;
     let tooltip = t("settings.tooltip_dock_preview_disabled");
     SettingsRow::set_enabled_with_tooltip(ui.dock_quit_on_last_window_close, on, &tooltip);
+    if !ui.dock_list_mode.is_null() {
+        SettingsRow::set_enabled_with_tooltip(ui.dock_list_mode, on, &tooltip);
+    }
+    // The threshold only means something while the cards exist: an always-list preview never
+    // draws them, so the row freezes with the list-mode switch as well as with the master switch.
+    let list_state: isize = if ui.dock_list_mode.is_null() {
+        0
+    } else {
+        msg_send![ui.dock_list_mode, state]
+    };
+    let threshold_on = on && list_state != 1;
     if !ui.dock_cards_per_row.is_null() {
-        SettingsRow::set_enabled_with_tooltip(ui.dock_cards_per_row, on, &tooltip);
+        // The tooltip names the cause: the master switch when the feature is off, the list
+        // presentation when the cards simply do not exist.
+        let threshold_tooltip = if !on {
+            tooltip.clone()
+        } else {
+            t("settings.tooltip_dock_threshold_in_list_mode")
+        };
+        SettingsRow::set_enabled_with_tooltip(
+            ui.dock_cards_per_row,
+            threshold_on,
+            &threshold_tooltip,
+        );
     }
     // The peek switch acts on the preview's cards, so it freezes with the master switch. The row
     // itself stays visible: a frozen preference is inspectable and can be changed before enabling previews.

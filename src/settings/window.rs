@@ -3122,6 +3122,8 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         cfg.keystroke_display.display_position = "caret".into();
         cfg.keystroke_display.initial_position = "bottom".into();
         cfg.clipboard.separate_clear_all = true;
+        cfg.dock_preview.enabled = true;
+        cfg.dock_preview.list_mode = false;
         if let Ok(mut current) = CONFIG.write() {
             *current = cfg.clone();
         }
@@ -3234,6 +3236,79 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
         let mut reloaded_on = reloaded_off.clone();
         reloaded_on.clipboard.separate_clear_all = true;
         let switch_on = clear_switch_after_reload(&reloaded_off, reloaded_on);
+
+        // The Dock page's row/list threshold only means something while the cards exist: an
+        // always-list preview never draws them, so the popup must freeze while the list-mode
+        // switch is on and thaw when it flips back. Drive the switch through its real click
+        // callback -- the same dispatch a user's click reaches -- and read the freeze off the
+        // real controls. The Dock page is sidebar index 1 in `SETTINGS_PAGES`.
+        select_sidebar(1);
+        let dock_controls = with_settings_ui(|ui| {
+            let ui = ui.as_ref()?;
+            if ui.dock_cards_per_row.is_null() || ui.dock_list_mode.is_null() {
+                return None;
+            }
+            Some((ui.dock_cards_per_row, ui.dock_list_mode))
+        });
+        let dock_freeze_verdict = (|| {
+            let (threshold_popup, list_switch) = dock_controls?;
+            // `performClick:` dispatches the action without the state toggle this custom switch
+            // performs in `mouseDown:` (see `click_clipboard_delete_switch`), so the clicks here
+            // are real left-mouse-down events on the same rule.
+            let mouse_down = |switch: *mut AnyObject| -> bool {
+                let event: *mut AnyObject = msg_send![
+                    class!(NSEvent),
+                    mouseEventWithType: 1isize,
+                    location: NSPoint::new(1.0, 1.0),
+                    modifierFlags: 0u64,
+                    timestamp: 0.0f64,
+                    windowNumber: 0isize,
+                    context: std::ptr::null_mut::<AnyObject>(),
+                    eventNumber: 0isize,
+                    clickCount: 1isize,
+                    pressure: 1.0f32
+                ];
+                if event.is_null() {
+                    return false;
+                }
+                let _: () = msg_send![switch, mouseDown: event];
+                true
+            };
+            let initial_enabled: bool = msg_send![threshold_popup, isEnabled];
+            if !mouse_down(list_switch) {
+                return None;
+            }
+            let frozen_enabled: bool = msg_send![threshold_popup, isEnabled];
+            let list_state_on: isize = msg_send![list_switch, state];
+            let config_followed = CONFIG
+                .read()
+                .map(|config| config.dock_preview.list_mode)
+                .unwrap_or(false);
+            if !mouse_down(list_switch) {
+                return None;
+            }
+            let thawed_enabled: bool = msg_send![threshold_popup, isEnabled];
+            let list_state_off: isize = msg_send![list_switch, state];
+            let config_restored = CONFIG
+                .read()
+                .map(|config| !config.dock_preview.list_mode)
+                .unwrap_or(false);
+            Some(
+                initial_enabled
+                    && list_state_on == 1
+                    && config_followed
+                    && !frozen_enabled
+                    && thawed_enabled
+                    && list_state_off == 0
+                    && config_restored,
+            )
+        })();
+        let dock_freeze_matches = dock_freeze_verdict == Some(true);
+        if !dock_freeze_matches {
+            log_info!(
+                "[smoke-settings-state-sync] dock list-mode freeze mismatch: {dock_freeze_verdict:?}"
+            );
+        }
         hide_settings();
 
         let rebuilt_matches = states
@@ -3273,7 +3348,11 @@ pub(crate) fn settings_state_sync_smoke_runner() -> bool {
                 "[smoke-settings-state-sync] rebuilt switch final state mismatch: {rebuilt_switch_final_state:?}"
             );
         }
-        rebuilt_matches && refreshed_matches && switch_follows_reload && switch_final_state_matches
+        rebuilt_matches
+            && refreshed_matches
+            && switch_follows_reload
+            && switch_final_state_matches
+            && dock_freeze_matches
     }
 }
 
@@ -4157,6 +4236,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             dock_quit_on_last_window_close: std::ptr::null_mut(),
             dock_peek_on_hover: std::ptr::null_mut(),
             dock_hide_frontmost_on_icon_click: std::ptr::null_mut(),
+            dock_list_mode: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
             gestures_enabled: std::ptr::null_mut(),

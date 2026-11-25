@@ -291,7 +291,15 @@ pub(crate) fn is_visible() -> bool {
 /// Returns false when the Dock leaves no operable space at all: the panel is not shown, and the
 /// caller keeps its normal "nothing appeared" path. The mode is never changed to make something fit.
 pub(crate) fn show(request: PanelRequest, request_epoch: u64, ticket: u64) -> bool {
-    let mode = layout::mode_for(request.windows.len(), crate::dock_preview::cards_per_row());
+    // The list is forced by the user's switch or by a missing Screen Recording permission: the
+    // cards would be permanent empty placeholders without it, so the panel degrades to the list
+    // rather than presenting its loading state as the design.
+    let force_list = crate::dock_preview::list_mode() || !crate::thumbnail::capture_allowed();
+    let mode = layout::presentation_mode(
+        request.windows.len(),
+        crate::dock_preview::cards_per_row(),
+        force_list,
+    );
     let aspects: Vec<Option<f64>> = request.windows.iter().map(|window| window.aspect).collect();
     let Some(layout_out) = layout::layout_for(
         mode,
@@ -2335,13 +2343,11 @@ fn fill_thumbnails(state: &mut PanelState, now: Instant) {
         return;
     }
     // No permission, no work: the shared cache and the capture call are both gated, and a panel
-    // built for a replaced process instance must not capture its successor's windows.
-    let thumbnails_enabled = crate::config::CONFIG
-        .read()
-        .map(|config| config.layout.thumbnails_enabled)
-        .unwrap_or(false);
-    if !thumbnails_enabled
-        || !crate::thumbnail::capture_allowed()
+    // built for a replaced process instance must not capture its successor's windows. The
+    // switcher overlay's own display mode does NOT gate this: the dock preview's cards are its
+    // feature's shape, so they capture whenever the permission allows, even while the overlay
+    // presents icons only.
+    if !crate::thumbnail::capture_allowed()
         || crate::thumbnail::pid_generation_now(state.pid) != state.thumbnail_generation
     {
         return;

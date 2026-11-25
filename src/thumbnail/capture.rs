@@ -2267,9 +2267,12 @@ fn run_capture_job(job: CaptureJob) -> CaptureJobResult {
         return CaptureJobResult::GeometryDeferred;
     }
     // Re-preflight per job: silently skip while unauthorized (auto-resumes once
-    // granted mid-run).
+    // granted mid-run). The overlay's display mode gates only its own jobs: a Dock-preview
+    // request (one carrying a dock ticket) is admitted by the preview's own rules, because the
+    // preview's cards are its feature's shape and capture whenever the permission allows, even
+    // while the overlay presents icons only.
     let allowed = capture_allowed();
-    let enabled = crate::theme::thumbnails_enabled_setting();
+    let enabled = crate::theme::thumbnails_enabled_setting() || job.dock_ticket.is_some();
     if !allowed || !enabled {
         log_debug!(
             "[thumb] job skipped (allowed={}, enabled={})",

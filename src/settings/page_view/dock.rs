@@ -72,6 +72,17 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
         .caption("settings.desc_dock_quit_on_last_window_close")
         .into_spec(),
     );
+    // The list presentation sits ahead of the threshold because it governs it: while every
+    // preview is a list, the cards the threshold counts never exist and the popup freezes.
+    w.push(
+        switch(
+            "settings.row_dock_list_mode",
+            ControlField::DockListMode,
+            cfg.dock_preview.list_mode,
+        )
+        .caption("settings.desc_dock_list_mode")
+        .into_spec(),
+    );
     // The threshold sits under the switch because it only means anything while previews are on,
     // and the switch freezes it.
     w.push(

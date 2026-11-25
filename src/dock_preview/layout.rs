@@ -5,10 +5,11 @@
 //! layout can be asserted headlessly. The AppKit boundary converts once per view: the card host is
 //! a flipped view, so its subviews take these rectangles unchanged.
 //!
-//! The panel has two modes, both chosen from the window count alone (never from the space left on
-//! screen): a single row of thumbnail cards while the count is at or under `cards_per_row`, and a
-//! scrolling list of compact rows above it. Screen space decides how much of that one layout is
-//! visible and how much can scroll, not which layout is used.
+//! The panel has two modes: a single row of thumbnail cards while the count is at or under
+//! `cards_per_row`, and a scrolling list of compact rows above it. Two overrides force the list
+//! regardless of count: the list-mode switch, and a missing Screen Recording permission (the cards
+//! would have no thumbnails to show). Neither mode is ever chosen from the space left on screen:
+//! screen space decides how much of that one layout is visible and how much can scroll.
 //!
 //! The size derivation runs in one chain and each step subtracts only its own allowance:
 //!
@@ -200,6 +201,23 @@ pub(crate) fn mode_for(card_count: usize, cards_per_row: usize) -> PanelMode {
         PanelMode::List
     } else {
         PanelMode::Row
+    }
+}
+
+/// The mode the panel actually presents, after the two overrides that force the list. The count
+/// threshold decides cards vs list on its own, but only when the cards have something to show:
+/// the user can ask for the list directly (the list-mode switch), and without the Screen
+/// Recording permission there are no thumbnails to fill the cards with, so the panel degrades to
+/// the same list rather than staying a row of empty placeholders.
+pub(crate) fn presentation_mode(
+    card_count: usize,
+    cards_per_row: usize,
+    force_list: bool,
+) -> PanelMode {
+    if force_list {
+        PanelMode::List
+    } else {
+        mode_for(card_count, cards_per_row)
     }
 }
 
@@ -1081,6 +1099,13 @@ mod tests {
         // Threshold 1: one window is a row, two already need the list.
         assert_eq!(mode_for(1, 1), PanelMode::Row);
         assert_eq!(mode_for(2, 1), PanelMode::List);
+        // The overrides force the list regardless of what the count would allow: the user's
+        // list-mode switch and a missing Screen Recording permission share one force_list input,
+        // and a count that would be cards without it becomes the list.
+        assert_eq!(presentation_mode(1, 5, false), PanelMode::Row);
+        assert_eq!(presentation_mode(1, 5, true), PanelMode::List);
+        assert_eq!(presentation_mode(6, 5, false), PanelMode::List);
+        assert_eq!(presentation_mode(6, 5, true), PanelMode::List);
     }
 
     #[test]

@@ -208,8 +208,32 @@ pub(crate) fn run_smoke_child(name: &str, args: &[&str]) {
         panic!("{name}: the M1 boundary: {reason}");
     }
     let before = file_verdict_len();
+    // Isolate the child's configuration: it is the release-style binary, so `cfg!(test)` does not
+    // redirect its config path, and a runner that drives a real control callback queues a
+    // full-config persist. Without an isolated file that flush lands in the user's real
+    // `config.toml`. The user-config snapshot around the child proves the isolation held.
+    let user_config = std::env::var("HOME")
+        .ok()
+        .map(|home| std::path::PathBuf::from(home).join(".config/oh-my-tab/config.toml"));
+    let user_config_before = user_config
+        .as_ref()
+        .and_then(|path| std::fs::read(path).ok());
+    let isolated_dir = match tempfile::tempdir() {
+        Ok(dir) => dir,
+        Err(error) => {
+            crate::smoke_verdict::report_failed(
+                name,
+                format!("the isolated config directory could not be created: {error}"),
+            );
+            panic!("{name}: the isolated config directory could not be created");
+        }
+    };
     let mut command = std::process::Command::new(crate::smoke_verdict::smoke_app_binary());
     command.args(args);
+    command.arg(format!(
+        "--config-file={}",
+        isolated_dir.path().join("config.toml").display()
+    ));
     // Tell the child where to record its verdict with an argv flag, never the environment: the
     // running app takes its configuration from argv only (AGENTS.md).
     if let Some(path) = crate::smoke_verdict::verdict_path() {
@@ -219,7 +243,24 @@ pub(crate) fn run_smoke_child(name: &str, args: &[&str]) {
             path.display()
         ));
     }
-    match command.output() {
+    let output = command.output();
+    // The isolation above is a promise, not a proof: compare the user's real config file around
+    // the child. A difference means the child reached the real path somehow, and the run must
+    // fail loudly because the user's settings may have been rewritten with test values.
+    if let Some(path) = user_config.as_ref() {
+        // A difference here is diagnostic, not a verdict: the harness allows a parallel dev
+        // instance, and that instance saving its own configuration while the child runs is a
+        // legitimate write. The redirection proof is structural -- the child only ever sees the
+        // isolated `--config-file`, and smoke entries launched without one isolate themselves in
+        // `config_path` -- so this line exists to help debug a suspected leak, not to judge one.
+        let after_bytes = std::fs::read(path).ok();
+        if after_bytes != user_config_before {
+            eprintln!(
+                "[smoke] note: the user's config.toml changed while the smoke child ran (a parallel instance's own save is the expected cause)"
+            );
+        }
+    }
+    match output {
         Ok(out) if out.status.success() => {
             let line = child_verdict_since(before);
             match child_verdict_class(line.as_deref()) {

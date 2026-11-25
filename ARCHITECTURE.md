@@ -269,10 +269,17 @@ front after each peek so it stays visible over the window it just raised.
   dismissal tap rather than disabling previews. The press still latches the tile (`DISMISSED_TILE`)
   until the pointer leaves it or another app is reported, and `--e2e-state` publishes the monotonic
   `press_dismissals` counter with the dock preview.
-- The panel has two layouts, chosen by the window count ALONE. At or under `[dock_preview]
+- The panel has two layouts. At or under `[dock_preview]
   cards_per_row` (1..=16, default 6) it shows thumbnail cards, which WRAP into as many rows as the
   width needs: one row while they fit, more when they do not. Above the threshold it is a scrolling
   list of compact rows (icon, one line of 14pt title, a close slot that appears on the row's hover).
+  Two overrides force the list regardless of count, both ahead of the threshold in priority:
+  `[dock_preview] list_mode` (default false) is the user's explicit choice, and a missing Screen
+  Recording permission degrades the panel to the same list because the cards would have no
+  thumbnails to show. The capture pipeline admits the preview's jobs by their dock ticket rather
+  than by the overlay's own display mode, so the cards capture whenever the permission allows even
+  while the switcher overlay presents icons only. Flipping the switch drops the open panel through
+  the same layout-change path a threshold edit uses, and the next hover recomputes the mode.
   Screen space decides how much of that layout is visible and how much can scroll, never which layout
   is used: a budget too small for a card row hides the panel, a wrapped card stack taller than the
   room under the Dock scrolls downwards, and a laptop screen showing a list scrolls it. The space
