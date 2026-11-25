@@ -25,6 +25,7 @@ pub(super) enum ControlField {
     DockCardsPerRow,
     DockQuitOnLastWindowClose,
     DockPeekOnHover,
+    DockHideFrontmostOnIconClick,
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
@@ -926,6 +927,10 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.dock_peek_on_hover, state];
                     cfg.dock_preview.peek_on_hover = state == 1;
                 }
+                ControlField::DockHideFrontmostOnIconClick => {
+                    let state: isize = msg_send![u.dock_hide_frontmost_on_icon_click, state];
+                    cfg.dock_preview.hide_frontmost_on_icon_click = state == 1;
+                }
                 ControlField::DockCardsPerRow => {
                     let idx: isize = msg_send![u.dock_cards_per_row, indexOfSelectedItem];
                     cfg.dock_preview.cards_per_row =
@@ -1746,6 +1751,9 @@ pub(crate) unsafe fn update_dock_preview_controls_enabled(ui: &SettingsUi) {
     // with it: with no previews there is no card to rest on.
     if !ui.dock_peek_on_hover.is_null() {
         SettingsRow::set_enabled_with_tooltip(ui.dock_peek_on_hover, on, &tooltip);
+    }
+    if !ui.dock_hide_frontmost_on_icon_click.is_null() {
+        SettingsRow::set_enabled_with_tooltip(ui.dock_hide_frontmost_on_icon_click, on, &tooltip);
     }
     ui.page_canvases[crate::settings::settings_page_index(crate::settings::SettingsPageId::Dock)]
         .set_group_visible(RowGroup::DockPeek, on);

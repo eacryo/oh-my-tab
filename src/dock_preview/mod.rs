@@ -120,6 +120,15 @@ static PEEK_PRESSED: AtomicBool = AtomicBool::new(false);
 /// been restored, replaced or forgotten.
 static PEEK_GENERATION: AtomicU64 = AtomicU64::new(0);
 
+/// The Dock click-hide child switch, mirrored so the tap owner does not read the config lock.
+static HIDE_CLICK_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Bumped by every Dock press and by every mode/session invalidation. A hide worker may commit only
+/// while no newer press has arrived: rapid clicks make the newest press the user's choice.
+static HIDE_INPUT_GENERATION: AtomicU64 = AtomicU64::new(0);
+type HideCandidateResult = (u64, dock_click::HideCandidate);
+static HIDE_CANDIDATES: LazyLock<Mutex<Vec<HideCandidateResult>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+
 /// The front a peek took the window from.
 #[derive(Clone, Debug)]
 struct Origin {
@@ -198,6 +207,15 @@ pub(crate) fn start() {
             .unwrap_or(false),
         Ordering::Release,
     );
+    HIDE_CLICK_ENABLED.store(
+        crate::config::CONFIG
+            .read()
+            .map(|config| {
+                config.dock_preview.enabled && config.dock_preview.hide_frontmost_on_icon_click
+            })
+            .unwrap_or(false),
+        Ordering::Release,
+    );
     let session = SESSION.fetch_add(1, Ordering::AcqRel) + 1;
     crate::assert_main_thread("dock_preview::start");
     *DISMISSED_TILE.lock().unwrap() = None;
@@ -242,6 +260,8 @@ pub(crate) fn stop() {
     DOCK_CLICK_PENDING.store(0, Ordering::Release);
     *DISMISSED_TILE.lock().unwrap() = None;
     *DOCK_PRESS.lock().unwrap() = None;
+    HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    HIDE_CANDIDATES.lock().unwrap().clear();
     // The peek is torn down through the same path as a hidden panel. `stop()` used to call
     // `panel::hide()` directly, which left a peeked window in front after the feature was turned
     // off, and left a raise prepared by a worker able to commit after the feature was gone. The
@@ -635,7 +655,7 @@ fn start_dock_click_watcher() {
         *slot = Some(dock_click::spawn());
     }
     if let Some(handle) = slot.as_ref() {
-        handle.start(pid, session);
+        handle.start(pid, session, HIDE_CLICK_ENABLED.load(Ordering::Acquire));
     }
 }
 
@@ -651,6 +671,7 @@ pub(crate) fn note_dock_click(point: (f64, f64), session: u64) {
     if session == 0 {
         return;
     }
+    HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
     *DOCK_PRESS.lock().unwrap() = Some(DockPress {
         session,
         at: Instant::now(),
@@ -660,6 +681,117 @@ pub(crate) fn note_dock_click(point: (f64, f64), session: u64) {
     // main thread judges its session when it runs.
     DOCK_CLICK_PENDING.store(session, Ordering::Release);
     post_event_to_main();
+}
+
+/// A click candidate whose pre-click evidence was gathered by the active pass-through tap.
+/// Called on the watcher thread; the main thread owns the decision and the delayed worker.
+pub(crate) fn note_dock_hide_candidate(candidate: dock_click::HideCandidate) {
+    if candidate.session == 0 || !HIDE_CLICK_ENABLED.load(Ordering::Acquire) {
+        return;
+    }
+    let generation = HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut queue = HIDE_CANDIDATES.lock().unwrap();
+    // An ordinary click commits at most once. If several mouse-ups are reported before the main
+    // thread drains them, the newest press is the user's choice and replaces an older candidate.
+    queue.retain(|(_, old)| old.pid != candidate.pid || old.session != candidate.session);
+    queue.push((generation, candidate));
+    post_event_to_main();
+}
+
+/// The child switch changed. Its value is part of the tap installation identity, so re-pointing the
+/// watcher rebuilds passive<->active mode; pending gestures and hide requests never cross that edge.
+pub(crate) fn apply_hide_click_config_change(enabled: bool) {
+    HIDE_CLICK_ENABLED.store(enabled, Ordering::Release);
+    HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    HIDE_CANDIDATES.lock().unwrap().clear();
+    if is_enabled() {
+        start_dock_click_watcher();
+    }
+}
+
+fn peek_occupies_front_for_hide() -> bool {
+    let Ok(slot) = PEEK.lock() else {
+        return true;
+    };
+    slot.raising.is_some() || slot.model.peeked().is_some() || slot.model.armed().is_some()
+}
+
+fn drain_hide_candidates() {
+    let candidates: Vec<HideCandidateResult> = {
+        let mut queue = HIDE_CANDIDATES.lock().unwrap();
+        std::mem::take(&mut *queue)
+    };
+    for (generation, candidate) in candidates {
+        if !is_enabled()
+            || !HIDE_CLICK_ENABLED.load(Ordering::Acquire)
+            || candidate.session != SESSION.load(Ordering::Acquire)
+            || generation != HIDE_INPUT_GENERATION.load(Ordering::Acquire)
+            || peek_occupies_front_for_hide()
+        {
+            log_debug!(
+                "[dock-preview] Dock click candidate dropped before worker: pid={} enabled={} hide_enabled={} session={}/{} generation={}/{} peek={}",
+                candidate.pid,
+                is_enabled(),
+                HIDE_CLICK_ENABLED.load(Ordering::Acquire),
+                candidate.session,
+                SESSION.load(Ordering::Acquire),
+                generation,
+                HIDE_INPUT_GENERATION.load(Ordering::Acquire),
+                peek_occupies_front_for_hide()
+            );
+            continue;
+        }
+        log_debug!(
+            "[dock-preview] Dock click candidate worker started: pid={} anchor={}",
+            candidate.pid,
+            candidate.anchor_window
+        );
+        let session = candidate.session;
+        let spawn = std::thread::Builder::new()
+            .name("com.eacryo.oh-my-tab.dock-click-hide".to_string())
+            .spawn(move || {
+                // Native Dock behavior owns activation/unhide. Waiting one short turn lets the
+                // pass-through click finish that work; hiding earlier could be undone by the click.
+                std::thread::sleep(Duration::from_millis(120));
+                if generation != HIDE_INPUT_GENERATION.load(Ordering::Acquire)
+                    || session != SESSION.load(Ordering::Acquire)
+                    || !HIDE_CLICK_ENABLED.load(Ordering::Acquire)
+                    || !ENABLED.load(Ordering::Acquire)
+                {
+                    return;
+                }
+                let frontmost =
+                    objc2::rc::autoreleasepool(|_| unsafe { crate::app_identity::frontmost_pid() });
+                if frontmost != Some(candidate.pid) {
+                    log_debug!(
+                        "[dock-preview] Dock click hide cancelled: pid={} is not frontmost",
+                        candidate.pid
+                    );
+                    return;
+                }
+                let hidden = crate::window_collector::hide_application_verified(
+                    candidate.pid,
+                    &candidate.identity_key,
+                    candidate.process_start_time_us,
+                );
+                if hidden {
+                    log_info!(
+                        "[dock-preview] hid frontmost app after Dock icon click: pid={} bundle={}",
+                        candidate.pid,
+                        candidate.bundle
+                    );
+                    crate::e2e_state::record("dock_preview_click_hide");
+                } else {
+                    log_debug!(
+                        "[dock-preview] Dock click hide refused by verified identity: pid={}",
+                        candidate.pid
+                    );
+                }
+            });
+        if spawn.is_err() {
+            log_debug!("[dock-preview] Dock click hide worker could not start");
+        }
+    }
 }
 
 /// A press on the Dock closes the preview on the press itself, the way the Windows taskbar closes
@@ -2217,6 +2349,7 @@ extern "C" fn on_event(_self: *mut AnyObject, _cmd: objc2::runtime::Sel, _arg: *
             dismiss_for_dock_click(press_session);
         }
         drain_events();
+        drain_hide_candidates();
         drain_results();
         drain_close_results();
         drain_activate_results();
@@ -2233,6 +2366,7 @@ extern "C" fn on_tick(_self: *mut AnyObject, _cmd: objc2::runtime::Sel, _timer: 
         if press_session != 0 {
             dismiss_for_dock_click(press_session);
         }
+        drain_hide_candidates();
         if is_enabled() {
             tick();
         }

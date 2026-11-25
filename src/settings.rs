@@ -592,8 +592,9 @@ pub(super) struct SettingsUi {
     // Dock page: the same promise for closes made from the preview panel's cards.
     dock_quit_on_last_window_close: *mut AnyObject,
     dock_peek_on_hover: *mut AnyObject, // Dock page: hovering a thumbnail brings its window forward
-    reverse_scroll: *mut AnyObject,     // reverse scrolling
-    enable_mouse: *mut AnyObject,       // enable mouse control
+    dock_hide_frontmost_on_icon_click: *mut AnyObject, // Dock page: clicking a frontmost app's icon hides it
+    reverse_scroll: *mut AnyObject,                    // reverse scrolling
+    enable_mouse: *mut AnyObject,                      // enable mouse control
     gestures_enabled: *mut AnyObject,
     gesture_trigger_button: *mut AnyObject, // NSPopUpButton: the one button gestures start on
     gesture_show_trail: *mut AnyObject,
@@ -2267,6 +2268,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         "dock_preview.quit_on_last_window_close",
         old.dock_preview.quit_on_last_window_close,
         new.dock_preview.quit_on_last_window_close
+    );
+    changed!(
+        "dock_preview.hide_frontmost_on_icon_click",
+        old.dock_preview.hide_frontmost_on_icon_click,
+        new.dock_preview.hide_frontmost_on_icon_click
     );
     changed!(
         "updates.automatically_check",

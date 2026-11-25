@@ -54,8 +54,8 @@ pub(crate) use raise::activate_pid_with_api;
 pub(crate) use raise::{
     activate_pid, ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
     clear_ax_window_cache_for_window, close_ax_window, focused_window_cgwid,
-    forget_non_normal_window, hide_application, raise_window_fast, set_ax_minimized,
-    terminate_application, terminate_application_verified,
+    forget_non_normal_window, hide_application, hide_application_verified, raise_window_fast,
+    set_ax_minimized, terminate_application, terminate_application_verified,
 };
 pub(crate) use raiser::{begin_raise, note_focused_window};
 pub(crate) use raiser::{
@@ -388,6 +388,82 @@ pub(crate) fn ordinary_onscreen_window_bounds() -> Vec<(u32, (f64, f64, f64, f64
         });
         windows.truncate(3);
         windows
+    }
+}
+
+/// Verify one already-identified window as a visible ordinary layer-0 window of `pid`.
+///
+/// This is the input-hot-path counterpart of `visible_ordinary_window_ids_for_pid`: the Dock click
+/// probe cannot afford to enumerate every on-screen window, but it can afford the WindowServer's
+/// single-window query. `None` means the query itself failed; `Some(false)` is a successful answer
+/// that the window is absent or no longer visible/ordinary/owned by that process.
+pub(crate) fn visible_ordinary_window_now(pid: i32, window_id: u32) -> Option<bool> {
+    if pid <= 0 || window_id == 0 {
+        return Some(false);
+    }
+    unsafe {
+        let array =
+            CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_INCLUDING_WINDOW, window_id);
+        if array.is_null() {
+            return None;
+        }
+        let answer = if CFArrayGetCount(array) <= 0 {
+            Some(false)
+        } else {
+            let dict = CFArrayGetValueAtIndex(array, 0);
+            if dict.is_null() {
+                None
+            } else {
+                let bounds = cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or_default();
+                Some(
+                    cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0) == window_id
+                        && cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1) == pid
+                        && cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999) == 0
+                        && cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(0.0) > 0.0
+                        && cf_dict_get_bool(dict, CgKey::IsOnscreen).unwrap_or(false)
+                        && bounds.2 > 0.0
+                        && bounds.3 > 0.0,
+                )
+            }
+        };
+        CFRelease(array);
+        answer
+    }
+}
+
+/// Enumerate the target process's visible ordinary layer-0 windows for the Dock click toggle.
+///
+/// `None` means the CG enumeration itself failed; `Some(vec![])` is a successful empty answer.
+/// This deliberately has no minimum size and keeps every match: unlike the Show Desktop probe,
+/// a small utility window is still a window the user can see.
+pub(crate) fn visible_ordinary_window_ids_for_pid(pid: i32) -> Option<Vec<u32>> {
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    const EXCLUDE_DESKTOP_ELEMENTS: u32 = 1 << 4;
+    unsafe {
+        let array = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY | EXCLUDE_DESKTOP_ELEMENTS, 0);
+        if array.is_null() {
+            return None;
+        }
+        let count = CFArrayGetCount(array);
+        let mut windows = Vec::new();
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(array, i);
+            if dict.is_null()
+                || cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1) != pid
+                || cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999) != 0
+                || cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(0.0) <= 0.0
+                || !cf_dict_get_bool(dict, CgKey::IsOnscreen).unwrap_or(false)
+            {
+                continue;
+            }
+            let window_id = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
+            let bounds = cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or_default();
+            if window_id != 0 && bounds.2 > 0.0 && bounds.3 > 0.0 {
+                windows.push(window_id);
+            }
+        }
+        CFRelease(array);
+        Some(windows)
     }
 }
 

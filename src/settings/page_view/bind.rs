@@ -72,6 +72,7 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::DockCardsPerRow => &mut ui.dock_cards_per_row,
         ControlField::DockQuitOnLastWindowClose => &mut ui.dock_quit_on_last_window_close,
         ControlField::DockPeekOnHover => &mut ui.dock_peek_on_hover,
+        ControlField::DockHideFrontmostOnIconClick => &mut ui.dock_hide_frontmost_on_icon_click,
         ControlField::WindowsEnabled => &mut ui.windows_enabled,
         ControlField::ShowMinimized => &mut ui.show_minimized,
         ControlField::ShowHiddenAppWindows => &mut ui.show_hidden_app_windows,
@@ -259,6 +260,7 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::DockCardsPerRow
             | ControlField::DockQuitOnLastWindowClose
             | ControlField::DockPeekOnHover
+            | ControlField::DockHideFrontmostOnIconClick
             | ControlField::WindowsEnabled
             | ControlField::ShowMinimized
             | ControlField::ShowHiddenAppWindows

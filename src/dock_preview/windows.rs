@@ -84,6 +84,19 @@ pub(crate) fn collect(pid: i32) -> Option<CollectedWindows> {
         })
         .collect();
     sort_windows(&mut windows);
+    let anchor = windows
+        .iter()
+        .find(|window| !window.minimized && !window.app_hidden && !window.other_desktop)
+        .or_else(|| windows.first())
+        .map(|window| window.wid);
+    if let Some(anchor) = anchor {
+        super::dock_click::note_click_window_seed(
+            pid,
+            identity.key.clone(),
+            identity.process_start_time_us,
+            anchor,
+        );
+    }
     Some(CollectedWindows {
         pid,
         identity_key: identity.key,

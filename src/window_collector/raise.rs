@@ -892,6 +892,58 @@ pub(crate) fn terminate_application_verified(
     })
 }
 
+/// Hide a verified application instance (`NSRunningApplication hide`, the ⌘H semantic).
+///
+/// The application object is resolved once, verified, and sent `hide` as that same object: resolving
+/// again would reopen the PID-reuse window. Finder is refused by the callers rather than special-cased
+/// here because the Dock toggle documents that exclusion as a user-visible rule.
+pub(crate) fn hide_application_verified(
+    pid: i32,
+    identity_key: &str,
+    process_start_time_us: Option<u64>,
+) -> bool {
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            return false;
+        }
+        let identity = crate::app_identity::identity_of_app(app, pid);
+        if identity.key != identity_key
+            || identity.process_start_time_us != process_start_time_us
+            || process_start_time_us.is_none()
+        {
+            crate::log_debug!(
+                "[raise] verified hide identity mismatch: pid={} key_expected={} key_current={} start_expected={:?} start_current={:?}",
+                pid,
+                identity_key,
+                identity.key,
+                process_start_time_us,
+                identity.process_start_time_us
+            );
+            return false;
+        }
+        let accepted: bool = msg_send![app, hide];
+        if accepted {
+            return true;
+        }
+        // macOS can report false even when the hide request is delivered and acted on (observed
+        // with Calculator on macOS 26). The caller is already on a worker after the native Dock
+        // activation turn, so spend a short bounded wait confirming the state rather than reporting
+        // a successful hide as a refusal.
+        for _ in 0..6 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            let hidden: bool = msg_send![app, isHidden];
+            if hidden {
+                return true;
+            }
+        }
+        false
+    })
+}
+
 /// First half of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
 /// establishes the key window. Normal windows call it at commit time; minimized windows call it
 /// from the background raiser after being restored.

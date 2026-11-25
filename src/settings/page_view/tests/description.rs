@@ -883,9 +883,9 @@ fn dock_page_view_owns_the_preview_switches() {
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
-    // The switch, the promise it makes about closes made here, the threshold and the peek: all four
-    // only mean something while the switch above them is on.
-    assert_eq!(view.rows.len(), 4);
+    // The switch, the promise it makes about closes made here, the threshold, the peek and the
+    // click-hide child switch: all five only mean something while the switch above them is on.
+    assert_eq!(view.rows.len(), 5);
     // The master switch is its own card, and every option it governs is the next one: a switch never
     // shares a card with the switches it governs (the App Switcher page's overlay/options split).
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
@@ -956,4 +956,23 @@ fn dock_page_view_owns_the_preview_switches() {
     assert_eq!(peek.value, Value::Switch(true));
     assert_eq!(peek.group, Some(RowGroup::DockPeek));
     assert_eq!(peek.field(), Some(ControlField::DockPeekOnHover));
+
+    // Click-hide is the fifth row. It is deliberately opt-in: the native Dock click keeps its
+    // activation meaning, and this child switch adds the Windows-like second meaning only when asked.
+    let hide = &view.rows[4];
+    assert_eq!(hide.section, "settings.header_dock_preview_options");
+    assert_eq!(
+        hide.label_key,
+        "settings.row_dock_hide_frontmost_on_icon_click"
+    );
+    assert_eq!(
+        hide.caption_key,
+        Some("settings.desc_dock_hide_frontmost_on_icon_click")
+    );
+    assert_eq!(hide.copy, RowCopy::Captioned);
+    assert_eq!(hide.value, Value::Switch(false));
+    assert_eq!(
+        hide.field(),
+        Some(ControlField::DockHideFrontmostOnIconClick)
+    );
 }

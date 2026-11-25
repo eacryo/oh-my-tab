@@ -11,7 +11,7 @@
 //! invalidated (a Dock rebuild drops the notification silently), and a low-frequency poll re-reads
 //! the selection so a missed notification still surfaces.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
@@ -100,6 +100,80 @@ pub(crate) struct DockSnapshot {
 static SNAPSHOT: LazyLock<Mutex<DockSnapshot>> =
     LazyLock::new(|| Mutex::new(DockSnapshot::default()));
 static ACTIVE: AtomicBool = AtomicBool::new(false);
+
+/// Click-toggle evidence about the tile the Dock currently reports. Unlike the preview event
+/// queue, this is refreshed even when the selection signature is unchanged: a resting pointer can
+/// click at any time, so the evidence must not go stale merely because nothing visible changed.
+#[derive(Clone, Debug)]
+pub(crate) struct ClickTileEvidence {
+    pub(crate) pid: i32,
+    pub(crate) bundle: String,
+    pub(crate) icon: Rect,
+    pub(crate) edge: DockEdge,
+    pub(crate) revealed: bool,
+    pub(crate) sample_started_uptime_ns: u64,
+    pub(crate) sample_completed_uptime_ns: u64,
+    pub(crate) established_completed_uptime_ns: u64,
+    pub(crate) generation: u64,
+}
+
+static CLICK_TILE_EVIDENCE: LazyLock<Mutex<Option<ClickTileEvidence>>> =
+    LazyLock::new(|| Mutex::new(None));
+static CLICK_TILE_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn click_tile_evidence() -> Option<ClickTileEvidence> {
+    CLICK_TILE_EVIDENCE.lock().unwrap().clone()
+}
+
+fn refresh_click_tile_evidence(
+    selection: &Selection,
+    revealed: bool,
+    sample_started_uptime_ns: u64,
+) {
+    let completed = crate::event_tap::uptime_ns();
+    let mut slot = CLICK_TILE_EVIDENCE.lock().unwrap();
+    let Selection::App {
+        pid,
+        bundle,
+        icon,
+        edge,
+        ..
+    } = selection
+    else {
+        *slot = None;
+        return;
+    };
+    let changed = slot.as_ref().is_none_or(|old| {
+        old.pid != *pid
+            || old.bundle != *bundle
+            || old.icon != *icon
+            || old.edge != *edge
+            || old.revealed != revealed
+    });
+    let generation = if changed {
+        CLICK_TILE_GENERATION.fetch_add(1, Ordering::AcqRel) + 1
+    } else {
+        slot.as_ref().map(|old| old.generation).unwrap_or(0)
+    };
+    let established_completed_uptime_ns = if changed {
+        completed
+    } else {
+        slot.as_ref()
+            .map(|old| old.established_completed_uptime_ns)
+            .unwrap_or(completed)
+    };
+    *slot = Some(ClickTileEvidence {
+        pid: *pid,
+        bundle: bundle.clone(),
+        icon: *icon,
+        edge: *edge,
+        revealed,
+        sample_started_uptime_ns,
+        sample_completed_uptime_ns: completed,
+        established_completed_uptime_ns,
+        generation,
+    });
+}
 
 /// The latest Dock geometry, for `--e2e-state`.
 pub(crate) fn current_snapshot() -> DockSnapshot {
@@ -412,6 +486,7 @@ impl ObserverContext {
         // Stamped before the first Accessibility read: every value in this event belongs to a
         // sample that started no earlier than this instant.
         let sampled_at = Instant::now();
+        let sample_started_uptime_ns = crate::event_tap::uptime_ns();
         let Some(list) = self.list else {
             return;
         };
@@ -449,6 +524,7 @@ impl ObserverContext {
                 );
             }
         }
+        refresh_click_tile_evidence(&selection, revealed, sample_started_uptime_ns);
         let signature = signature_of(&selection, revealed);
         if !force && self.last_signature == Some(signature) {
             return;

@@ -254,19 +254,21 @@ front after each peek so it stays visible over the window it just raised.
   synthetic events; with the Dock pinned (auto-hide off) the keeper is not started at all.
 - `dock_preview/dock_click.rs` closes the preview on the press that starts a switch, the way the
   Windows taskbar closes its thumbnail flyout. The panel sits above the tile without covering it, so
-  the press belongs to the Dock; a listen-only per-PID tap on the Dock reports `leftMouseDown` and
-  `rightMouseDown` to the main thread, which dismisses the panel on the press itself rather than
-  waiting for the switch. The tap is passive, so it cannot order that dismissal against the
-  activation the Dock performs; what it guarantees is that no switch is waited for. The tap lives
-  for the enabled session, not for one panel, because a press often falls inside the hover's open
-  delay. It injects nothing, so the Dock still performs the click. A press latches the tile
-  (`DISMISSED_TILE`, with the app it belonged to) until the pointer leaves it or a notification for
-  another app arrives: the Dock keeps reporting the pressed tile as selected, and neither its
-  notifications nor a collector result already in flight may re-open the preview the press closed. A
-  press that reaches the main thread before the tile's own hover notification is matched by its
-  point, so the open that follows is still recognized as the press's. `--e2e-state` publishes the
-  monotonic `press_dismissals` counter with the dock preview, which is what lets a scenario prove a
-  press, rather than a hover-leave, closed a panel.
+  the press belongs to the Dock. With `[dock_preview] hide_frontmost_on_icon_click` off the per-PID
+  tap is listen-only and only reports `leftMouseDown`/`rightMouseDown` for that dismissal. With the
+  child switch on the installation becomes an ACTIVE pass-through tap: it still returns every event
+  unchanged and injects nothing, but because the callback runs before delivery to the Dock it can
+  capture pre-click evidence through a bounded worker probe (frontmost pid plus one visible ordinary anchor window)
+  inside a 3ms budget. Only an unmodified left down/up pair on the same tile, within a small travel
+  and a 500ms bound, with the same anchor window still visible, becomes a hide candidate. Anything
+  ambiguous, stale, timed out or Finder-owned leaves the native click alone. The main thread delays
+  the commit briefly so the Dock's own activation/unhide completes, then a worker resolves one
+  `NSRunningApplication`, verifies that same object by identity key and process start time, and
+  sends `hide` to it; a newer Dock press, a settings change, a feature stop or a target that is no
+  longer frontmost cancels the request. Active-tap installation failure falls back to the passive
+  dismissal tap rather than disabling previews. The press still latches the tile (`DISMISSED_TILE`)
+  until the pointer leaves it or another app is reported, and `--e2e-state` publishes the monotonic
+  `press_dismissals` counter with the dock preview.
 - The panel has two layouts, chosen by the window count ALONE. At or under `[dock_preview]
   cards_per_row` (1..=16, default 6) it shows thumbnail cards, which WRAP into as many rows as the
   width needs: one row while they fit, more when they do not. Above the threshold it is a scrolling
@@ -291,8 +293,8 @@ front after each peek so it stays visible over the window it just raised.
   refuses both activation and its close slot.
 - The feature is gated by `[dock_preview] enabled` (default true). Disabling it through the settings
   switch stops the observer, hides the panel and its tooltip, and is exercised by the
-  `--smoke-dock-preview` M2 runner; a change to `cards_per_row` hides an open panel through the same
-  runtime path, and the next hover opens with the new threshold.
+  `--smoke-dock-preview` M2 runner; the child switch is frozen with it. A change to `cards_per_row`
+  hides an open panel through the same runtime path, and the next hover opens with the new threshold.
   `--show-dock-preview=<bundle|pid>` opens the panel without a real hover for review and screenshots,
   and `--smoke-dock-room-h=<pt>` shrinks the room above a bottom tile so the runner can construct a
   list that must scroll instead of hoping one happens.

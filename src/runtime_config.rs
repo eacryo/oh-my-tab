@@ -27,6 +27,7 @@ struct ChangeFlags {
     /// The Dock preview's hover peek. It shares the Dock page's switch group, so a reload that only
     /// flips it has to reach that page's controls like `dock_preview` does.
     dock_peek: bool,
+    dock_hide_click: bool,
     show_app_name_in_cards: bool,
     // The footer title's visibility changed. That switch also decides whether the footer band exists,
     // and the band is summon-time geometry (card viewport, document, scroller, panel height), so a
@@ -148,6 +149,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.dock_preview
         || flags.dock_cards_per_row
         || flags.dock_peek
+        || flags.dock_hide_click
 }
 
 /// The pages the in-place refresh writes when the settings window is open.
@@ -204,6 +206,8 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         dock_preview: old.dock_preview.enabled != new.dock_preview.enabled,
         dock_cards_per_row: old.dock_preview.cards_per_row != new.dock_preview.cards_per_row,
         dock_peek: old.dock_preview.peek_on_hover != new.dock_preview.peek_on_hover,
+        dock_hide_click: old.dock_preview.hide_frontmost_on_icon_click
+            != new.dock_preview.hide_frontmost_on_icon_click,
         logging: startup || old.logging.level != new.logging.level,
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
@@ -492,6 +496,13 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // Switching the peek off while it holds a window in front gives the front back first: the
         // switch would otherwise strand an activation whose card the user can no longer see.
         crate::dock_preview::apply_peek_config_change(new.dock_preview.peek_on_hover);
+    }
+    if flags.dock_hide_click {
+        // This child switch chooses which kind of Dock tap is installed. Retire every gesture and
+        // pending hide first, then let the watcher move between passive dismissal and active evidence.
+        crate::dock_preview::apply_hide_click_config_change(
+            new.dock_preview.enabled && new.dock_preview.hide_frontmost_on_icon_click,
+        );
     }
     if flags.logging {
         let level = match new.logging.level.as_str() {
@@ -1320,6 +1331,17 @@ mod tests {
             !needs_in_place_control_sync(&ChangeFlags::default()),
             "an empty change set must not resync anything"
         );
+    }
+
+    #[test]
+    fn the_dock_click_hide_change_flags_the_tap_mode_and_the_settings_sync() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.dock_preview.hide_frontmost_on_icon_click = true;
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.dock_hide_click);
+        assert!(!flags.dock_preview && !flags.dock_peek && !flags.dock_cards_per_row);
+        assert!(needs_in_place_control_sync(&flags));
     }
 
     #[test]

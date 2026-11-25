@@ -939,6 +939,9 @@ pub struct DockPreviewSection {
     /// lift another application's window without making it active first (measured 2026-11-24), so the
     /// switch exists for machines whose applications react to being activated.
     pub peek_on_hover: bool,
+    /// Hide the already-frontmost application when its Dock icon is clicked again. Default false:
+    /// this adds a second meaning to a native Dock click, so it is opt-in.
+    pub hide_frontmost_on_icon_click: bool,
 }
 
 impl Default for DockPreviewSection {
@@ -948,6 +951,7 @@ impl Default for DockPreviewSection {
             cards_per_row: DOCK_CARDS_PER_ROW_DEFAULT,
             quit_on_last_window_close: false,
             peek_on_hover: true,
+            hide_frontmost_on_icon_click: false,
         }
     }
 }
@@ -2308,6 +2312,8 @@ impl Config {
         self.dock_preview.enabled = other.dock_preview.enabled;
         self.dock_preview.quit_on_last_window_close = other.dock_preview.quit_on_last_window_close;
         self.dock_preview.peek_on_hover = other.dock_preview.peek_on_hover;
+        self.dock_preview.hide_frontmost_on_icon_click =
+            other.dock_preview.hide_frontmost_on_icon_click;
         if !errs
             .iter()
             .any(|e| e.starts_with("dock_preview.cards_per_row"))
@@ -4306,6 +4312,7 @@ enabled = true
         other.dock_preview.enabled = false;
         other.dock_preview.cards_per_row = 2;
         other.dock_preview.quit_on_last_window_close = true;
+        other.dock_preview.hide_frontmost_on_icon_click = true;
         let mut merged = Config::default();
         assert!(merged.dock_preview.enabled && !merged.dock_preview.quit_on_last_window_close);
         // An error in a SIBLING section: every field of this section still follows.
@@ -4313,6 +4320,7 @@ enabled = true
         assert!(!merged.dock_preview.enabled);
         assert_eq!(merged.dock_preview.cards_per_row, 2);
         assert!(merged.dock_preview.quit_on_last_window_close);
+        assert!(merged.dock_preview.hide_frontmost_on_icon_click);
     }
 
     /// `dock_preview.cards_per_row` is additive and defaults to 5: a file written before the
@@ -4428,6 +4436,7 @@ enabled = true
         let mut other = Config::default();
         other.windows.quit_on_last_window_close = true;
         other.dock_preview.quit_on_last_window_close = true;
+        other.dock_preview.hide_frontmost_on_icon_click = true;
         let mut merged = Config::default();
         merged.merge_valid(
             other,

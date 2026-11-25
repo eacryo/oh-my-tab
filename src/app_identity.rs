@@ -275,6 +275,41 @@ pub(crate) unsafe fn frontmost_bundle_id() -> Option<String> {
     let identifier: *mut AnyObject = msg_send![app, bundleIdentifier];
     read_nsstring(identifier).filter(|id| !id.is_empty())
 }
+
+/// The process start time using the same precedence as `identity_of_app`:
+/// `NSRunningApplication.launchDate` first, libproc as the fallback for processes that do not
+/// publish one. Callers that later verify through `identity_of_app` must sample this value, not
+/// libproc directly, or the same process fails its own identity check.
+pub(crate) unsafe fn identity_process_start_time_us(pid: i32) -> Option<u64> {
+    let app: *mut AnyObject =
+        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    if app.is_null() {
+        return None;
+    }
+    let launch_date: *mut AnyObject = msg_send![app, launchDate];
+    if !launch_date.is_null() {
+        let seconds: f64 = msg_send![launch_date, timeIntervalSince1970];
+        if seconds.is_finite() && seconds >= 0.0 {
+            return Some((seconds * 1_000_000.0) as u64);
+        }
+    }
+    proc_start_time_us(pid)
+}
+
+/// The pid of the application that is frontmost right now, from the same property read as
+/// `frontmost_bundle_id`. The Dock click toggle compares pids because two copies can share a bundle id.
+pub(crate) unsafe fn frontmost_pid() -> Option<i32> {
+    let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+    if workspace.is_null() {
+        return None;
+    }
+    let app: *mut AnyObject = msg_send![workspace, frontmostApplication];
+    if app.is_null() {
+        return None;
+    }
+    let pid: i32 = msg_send![app, processIdentifier];
+    (pid > 0).then_some(pid)
+}
 /// The bundle identifier of an `NSRunningApplication` object the caller already holds.
 ///
 /// Separate from `bundle_id_for_pid` so a caller that needed the object anyway (to prove the PID is
@@ -327,7 +362,7 @@ extern "C" {
 }
 
 /// The process start time from libproc, in microseconds since the UNIX epoch.
-fn proc_start_time_us(pid: i32) -> Option<u64> {
+pub(crate) fn proc_start_time_us(pid: i32) -> Option<u64> {
     const PROC_PIDTBSDINFO: i32 = 3;
     if pid <= 0 {
         return None;

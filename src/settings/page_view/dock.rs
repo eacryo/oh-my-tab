@@ -97,5 +97,15 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
         .group(RowGroup::DockPeek)
         .into_spec(),
     );
+    w.push(
+        switch(
+            "settings.row_dock_hide_frontmost_on_icon_click",
+            ControlField::DockHideFrontmostOnIconClick,
+            cfg.dock_preview.hide_frontmost_on_icon_click,
+        )
+        .caption("settings.desc_dock_hide_frontmost_on_icon_click")
+        .wide_caption()
+        .into_spec(),
+    );
     w.finish()
 }

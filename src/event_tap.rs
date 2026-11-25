@@ -6,7 +6,7 @@ use crate::ffi::has_accessibility_permission;
 use crate::log_info;
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -224,6 +224,7 @@ extern "C" {
     #[allow(dead_code)]
     pub(crate) fn CGEventSetDoubleValueField(event: CGEventRef, field: i32, value: f64);
     pub(crate) fn CGEventGetFlags(event: CGEventRef) -> CGEventFlags;
+    pub(crate) fn CGEventGetTimestamp(event: CGEventRef) -> u64;
     pub(crate) fn CGEventKeyboardGetUnicodeString(
         event: CGEventRef,
         max_string_length: u32,
@@ -744,4 +745,28 @@ mod tests {
         assert!(!flag.load(Ordering::SeqCst));
         assert!(!control.is_stopping());
     }
+}
+
+/// Nanoseconds since system startup on the same monotonic uptime scale Quartz uses for
+/// `CGEventGetTimestamp`. Used only for ordering input events against local evidence.
+pub(crate) fn uptime_ns() -> u64 {
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
+    }
+    unsafe extern "C" {
+        fn mach_absolute_time() -> u64;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> i32;
+    }
+    static TIMEBASE: OnceLock<(u64, u64)> = OnceLock::new();
+    let (numer, denom) = *TIMEBASE.get_or_init(|| unsafe {
+        let mut info = MachTimebaseInfo { numer: 1, denom: 1 };
+        if mach_timebase_info(&mut info) != 0 || info.denom == 0 {
+            return (1, 1);
+        }
+        (info.numer as u64, info.denom as u64)
+    });
+    let absolute = unsafe { mach_absolute_time() } as u128;
+    ((absolute * numer as u128) / denom.max(1) as u128).min(u64::MAX as u128) as u64
 }
