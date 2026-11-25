@@ -14,18 +14,21 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
     // page's own labels used before the migration.
     let labels: Vec<&str> = view.rows.iter().map(|row| row.label_key).collect();
     assert_eq!(labels[0], "settings.row_windows_enabled");
-    assert_eq!(labels[1], "settings.row_show_minimized");
-    assert_eq!(labels[4], "settings.row_window_display_mode");
-    assert_eq!(labels[8], "settings.row_card_text_size");
-    assert_eq!(labels[16], "settings.row_quit_on_last_window_close");
-    assert_eq!(labels[17], "settings.row_switcher_excluded_add");
-    assert_eq!(labels[18], "settings.row_switcher_excluded_empty");
-    assert_eq!(labels[19], "settings.row_modifier");
+    // The modifier is the second row: it is how the switcher is summoned, so it sits under the
+    // switch that turns the switcher on.
+    assert_eq!(labels[1], "settings.row_modifier");
+    assert_eq!(labels[2], "settings.row_show_minimized");
+    assert_eq!(labels[5], "settings.row_window_display_mode");
+    assert_eq!(labels[9], "settings.row_card_text_size");
+    assert_eq!(labels[17], "settings.row_quit_on_last_window_close");
+    assert_eq!(labels[18], "settings.row_switcher_excluded_add");
+    assert_eq!(labels[19], "settings.row_switcher_excluded_empty");
     // The field order is the page's own order: a reorder is a visible change, not a detail.
     assert_eq!(
         fields(&view),
         vec![
             ControlField::WindowsEnabled,
+            ControlField::Modifier,
             ControlField::ShowMinimized,
             ControlField::ShowHiddenAppWindows,
             ControlField::ShowOtherDesktops,
@@ -42,27 +45,27 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
             ControlField::PanelHideEnabled,
             ControlField::PanelQuitEnabled,
             ControlField::QuitOnLastWindowClose,
-            ControlField::Modifier,
         ]
     );
     // The control kinds are presentation only; the identity above is what the dispatcher uses.
     assert!(matches!(view.rows[0].control, ControlKind::Switch));
-    assert!(matches!(view.rows[4].control, ControlKind::Popup { .. }));
-    assert!(matches!(view.rows[8].control, ControlKind::Slider { .. }));
-    // The cards are the inline builder's three, in its order: the overlay switch alone, then
-    // every other window setting, then the keyboard row.
+    assert!(matches!(view.rows[1].control, ControlKind::Popup { .. }));
+    assert!(matches!(view.rows[5].control, ControlKind::Popup { .. }));
+    assert!(matches!(view.rows[9].control, ControlKind::Slider { .. }));
+    // The cards, in the page's order: the overlay switch alone, then the keyboard row (second,
+    // directly under the switch), then every other window setting, then the exclusion card.
     let sections: Vec<&str> = view.rows.iter().map(|row| row.section).collect();
     assert_eq!(sections[0], "settings.header_windows");
-    assert_eq!(sections[1], "settings.header_window_options");
-    assert_eq!(sections[12], "settings.header_window_options");
-    assert_eq!(sections[16], "settings.header_window_options");
-    assert_eq!(sections[17], "settings.header_switcher_excluded");
+    assert_eq!(sections[1], "settings.header_keyboard");
+    assert_eq!(sections[2], "settings.header_window_options");
+    assert_eq!(sections[13], "settings.header_window_options");
+    assert_eq!(sections[17], "settings.header_window_options");
     assert_eq!(sections[18], "settings.header_switcher_excluded");
-    assert_eq!(sections[19], "settings.header_keyboard");
+    assert_eq!(sections[19], "settings.header_switcher_excluded");
     assert_eq!(view.rows[0].card, 0);
     assert_eq!(view.rows[1].card, 1);
-    assert_eq!(view.rows[17].card, 2);
-    assert_eq!(view.rows[19].card, 3);
+    assert_eq!(view.rows[2].card, 2);
+    assert_eq!(view.rows[18].card, 3);
     // The first row of every card has no divider above it; every later row in the card does.
     for (index, row) in view.rows.iter().enumerate() {
         let first_of_card = index == 0 || view.rows[index - 1].card != row.card;
@@ -80,24 +83,24 @@ fn switcher_page_view_describes_every_row_with_its_identity_and_copy() {
         .filter(|(_, row)| row.group == Some(RowGroup::ThumbnailOnly))
         .map(|(index, _)| index)
         .collect();
-    assert_eq!(grouped, vec![5, 6, 7]);
+    assert_eq!(grouped, vec![6, 7, 8]);
     // The prewarm switch's label only names the mechanism; the row's caption is where the page
     // says what it is for and that it is worth leaving on. A caption, not a search-only desc: this
     // one has to be readable on the page.
     assert_eq!(
-        view.rows[5].caption_key,
+        view.rows[6].caption_key,
         Some("settings.desc_focused_thumbnail_prewarm")
     );
     // The close-then-quit switch sits with the window options and says what it promises beside it.
     assert_eq!(
-        view.rows[16].label_key,
+        view.rows[17].label_key,
         "settings.row_quit_on_last_window_close"
     );
     assert_eq!(
-        view.rows[16].caption_key,
+        view.rows[17].caption_key,
         Some("settings.desc_quit_on_last_window_close")
     );
-    assert_eq!(view.rows[16].value, Value::Switch(false));
+    assert_eq!(view.rows[17].value, Value::Switch(false));
 }
 
 /// The Switcher page's exclusion card: one row per entry, the invalid count, the empty state and
@@ -268,7 +271,7 @@ fn page_view_reads_only_its_input() {
         Some((0x1234, 0x5678)),
         crate::theme::ThemeInput::current(),
     ));
-    assert_eq!(view.rows[1].value, Value::Switch(true));
+    assert_eq!(view.rows[2].value, Value::Switch(true));
     // ... and a changed field changes the description's value, not its shape.
     config.keyboard.modifier = "control".to_string();
     let other = switcher_page_view(&PageInput::from_config(
@@ -305,7 +308,7 @@ fn page_view_search_entries_are_values_not_side_effects() {
     );
     assert_eq!(view.rows[0].search.section, t("settings.header_windows"));
     // A dropdown's choices are part of what the search matches.
-    let thumbnail_size = &view.rows[7];
+    let thumbnail_size = &view.rows[8];
     assert!(!thumbnail_size.search.options.is_empty());
     assert!(matches!(thumbnail_size.control, ControlKind::Popup { .. }));
 }

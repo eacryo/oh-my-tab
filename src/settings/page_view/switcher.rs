@@ -19,9 +19,28 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
         .desc("settings.desc_windows_enabled")
         .into_spec(),
     );
-    // The overlay switch is its own card; every remaining window setting is the next one. The
-    // inline builder split here (\`canvas.card(header_windows)\` then \`next_section()\`), and a
-    // description that opens the second card at the end puts every row under the first heading.
+    // The modifier is the second row on the page: it is how the switcher is summoned, so it sits
+    // directly under the switch that turns the switcher on. It keeps its own "Keyboard" card -- a
+    // keyboard setting must not appear under a window-options heading -- the card just comes second
+    // instead of last.
+    w.card("settings.header_keyboard");
+    let modifiers = vec![
+        t("settings.modifier_option"),
+        t("settings.modifier_command"),
+        t("settings.modifier_control"),
+    ];
+    w.push(
+        popup(
+            "settings.row_modifier",
+            &modifiers,
+            ControlField::Modifier,
+            crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier),
+        )
+        .into_spec(),
+    );
+    // Every remaining window setting is this card. The inline builder split here
+    // (\`canvas.card(header_windows)\` then \`next_section()\`), and a description that opens the
+    // next card at the end puts every row under the previous heading.
     w.card("settings.header_window_options");
     w.push(
         switch(
@@ -200,24 +219,6 @@ pub(super) fn switcher_page_view(input: &PageInput) -> PageView {
         &switcher_excluded_card(),
         &cfg.windows.excluded_apps,
         &input.known_app_names,
-    );
-    // The modifier popup lives in a THIRD card with its own heading ("Keyboard"), not at the tail
-    // of Window Options: the inline builder opened a section for it after closing the options card,
-    // and merging the two put a keyboard setting under a window-options heading.
-    w.card("settings.header_keyboard");
-    let modifiers = vec![
-        t("settings.modifier_option"),
-        t("settings.modifier_command"),
-        t("settings.modifier_control"),
-    ];
-    w.push(
-        popup(
-            "settings.row_modifier",
-            &modifiers,
-            ControlField::Modifier,
-            crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier),
-        )
-        .into_spec(),
     );
     w.finish()
 }
