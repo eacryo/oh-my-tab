@@ -301,6 +301,8 @@ pub(crate) fn show(request: PanelRequest, request_epoch: u64, ticket: u64) -> bo
         force_list,
     );
     let aspects: Vec<Option<f64>> = request.windows.iter().map(|window| window.aspect).collect();
+    let list_title_w =
+        unsafe { max_list_title_width(request.windows.iter().map(|window| window.title.as_str())) };
     let Some(layout_out) = layout::layout_for(
         mode,
         &aspects,
@@ -308,6 +310,7 @@ pub(crate) fn show(request: PanelRequest, request_epoch: u64, ticket: u64) -> bo
         request.anchor,
         request.edge,
         request.visible,
+        list_title_w,
     ) else {
         log_debug!(
             "[dock-preview] not enough room beside the tile for a {mode:?} panel; not showing"
@@ -1027,9 +1030,17 @@ pub(crate) fn apply_resize(size: (f64, f64), scroll: (f64, f64)) -> bool {
     state.ticket = ticket;
     state.content_size = size;
     let aspects: Vec<Option<f64>> = request.windows.iter().map(|window| window.aspect).collect();
-    let Some(layout_out) =
-        layout::layout_for(mode, &aspects, request.windows.len(), anchor, edge, visible)
-    else {
+    let list_title_w =
+        unsafe { max_list_title_width(request.windows.iter().map(|window| window.title.as_str())) };
+    let Some(layout_out) = layout::layout_for(
+        mode,
+        &aspects,
+        request.windows.len(),
+        anchor,
+        edge,
+        visible,
+        list_title_w,
+    ) else {
         destroy(state);
         return false;
     };
@@ -1358,8 +1369,25 @@ fn relayout_content(state: &mut PanelState, items_changed: bool) -> ContentFit {
     let anchor = state.geometry.anchor;
     let edge = state.geometry.edge;
     let visible = state.geometry.visible;
-    let Some(layout_out) = layout::layout_for(state.mode, &aspects, count, anchor, edge, visible)
-    else {
+    let list_title_w = unsafe {
+        match state.mode {
+            PanelMode::List => {
+                max_list_title_width(state.rows.iter().map(|row| row.window.title.as_str()))
+            }
+            PanelMode::Row => {
+                max_list_title_width(state.cards.iter().map(|card| card.window.title.as_str()))
+            }
+        }
+    };
+    let Some(layout_out) = layout::layout_for(
+        state.mode,
+        &aspects,
+        count,
+        anchor,
+        edge,
+        visible,
+        list_title_w,
+    ) else {
         return ContentFit::Gone;
     };
     let scroll = state.geometry.scroll;
@@ -1727,12 +1755,49 @@ unsafe fn shared_row_icon(state: &mut PanelState, bundle: &str) {
         .unwrap_or(std::ptr::null_mut());
 }
 
+/// The width a row's label needs to draw `text` untruncated at the control font. The raw font
+/// measurement underestimates it: the text field's cell keeps a few points for itself, so a label
+/// exactly as wide as the glyphs still truncates -- and because the ellipsis itself is wide, a
+/// shortfall of a few points erases several characters (measured: "Downloads" at the control font
+/// is 71.3pt of glyphs, while the field asks for 75.5pt once it holds the string). The width is
+/// therefore the larger of the font's own measurement and what a scratch field reports, the same
+/// rule the toast bubble measures by. Main-thread only.
+unsafe fn list_title_width(text: &str) -> f64 {
+    let font_width = glass::measure_single_line_text(text, theme::FONT_CONTROL).width;
+    let field: *mut AnyObject = msg_send![class!(NSTextField), alloc];
+    let field: *mut AnyObject = msg_send![
+        field,
+        initWithFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1.0, layout::ROW_H))
+    ];
+    if field.is_null() {
+        return font_width;
+    }
+    style_label(field, theme::FONT_CONTROL);
+    let string = make_nsstring(text);
+    let _: () = msg_send![field, setStringValue: string];
+    release_obj(string);
+    let _: () = msg_send![field, sizeToFit];
+    let frame: NSRect = msg_send![field, frame];
+    release_obj(field);
+    font_width.max(frame.size.width)
+}
+
+/// The widest list-row title at the row font, measured on the spot: the list's width follows
+/// its content, so the measurement has to happen before layout, not during content build.
+/// Main-thread only (AppKit text measurement).
+unsafe fn max_list_title_width<'a>(titles: impl Iterator<Item = &'a str>) -> Option<f64> {
+    let max = titles
+        .map(|title| list_title_width(title))
+        .fold(0.0f64, f64::max);
+    Some(max)
+}
+
 /// The measured width of `text`, measured once per content build.
 unsafe fn measured_title(state: &mut PanelState, text: &str) -> f64 {
     if let Some(width) = state.title_measurements.get(text) {
         return *width;
     }
-    let width = glass::measure_single_line_text(text, theme::FONT_CONTROL).width;
+    let width = list_title_width(text);
     state.title_measurements.insert(text.to_string(), width);
     width
 }
@@ -1997,9 +2062,9 @@ unsafe fn rebind_row(
     let measured = match measurements.get(&window.title) {
         Some(width) => *width,
         None => {
-            let size = glass::measure_single_line_text(&window.title, theme::FONT_CONTROL);
-            measurements.insert(window.title.clone(), size.width);
-            size.width
+            let width = list_title_width(&window.title);
+            measurements.insert(window.title.clone(), width);
+            width
         }
     };
     row.title_truncated = layout::title_is_truncated(measured, frame.size.width);

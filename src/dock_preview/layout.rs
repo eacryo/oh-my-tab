@@ -145,7 +145,8 @@ pub(crate) const ROW_H: f64 = 32.0;
 pub(crate) const ROW_PAD: f64 = 8.0;
 pub(crate) const ROW_ICON: f64 = 16.0;
 pub(crate) const ROW_GAP: f64 = 8.0;
-/// The list's fixed width: a narrow panel rather than one that grows with the widest window title.
+/// The list's maximum width: the panel follows the widest measured title up to this cap, so short
+/// titles no longer leave a blank tail and long ones truncate exactly as they did at the fixed width.
 pub(crate) const LIST_W: f64 = 304.0;
 /// Below this the list is drawn in the compact arrangement instead: the title band shrinks to what
 /// is left after the fixed pieces, and may disappear entirely (the row body then carries the
@@ -366,6 +367,7 @@ pub(crate) fn layout_for(
     anchor: Rect,
     edge: DockEdge,
     visible: Rect,
+    list_title_w: Option<f64>,
 ) -> Option<PanelLayout> {
     let budget = space_budget(anchor, edge, visible);
     if budget.inner_w < MIN_INTERACTIVE_W || budget.inner_h < MIN_INTERACTIVE_H {
@@ -376,7 +378,7 @@ pub(crate) fn layout_for(
         // the panel hides rather than switching to the other layout.
         PanelMode::Row if budget.inner_h < CARD_H + PANEL_PAD * 2.0 + PANEL_MARGIN => None,
         PanelMode::Row => row_panel(aspects, card_count, anchor, edge, visible, budget),
-        PanelMode::List => list_panel(card_count, anchor, edge, visible, budget),
+        PanelMode::List => list_panel(card_count, anchor, edge, visible, budget, list_title_w),
     }
 }
 
@@ -494,9 +496,20 @@ fn list_panel(
     edge: DockEdge,
     visible: Rect,
     budget: SpaceBudget,
+    list_title_w: Option<f64>,
 ) -> Option<PanelLayout> {
     let compact = budget.inner_w < LIST_W_MIN;
-    let width = budget.inner_w.clamp(1.0, LIST_W);
+    // The width follows the widest measured title (fixed pieces plus the title band, plus the
+    // glass padding), capped at the legacy fixed width: rows of short titles no longer leave a
+    // blank tail, and long titles truncate exactly as before. `None` keeps the legacy fixed
+    // width; pure layout tests use it since they have no AppKit text measurement.
+    let width = match list_title_w {
+        Some(title_w) if title_w.is_finite() && title_w >= 0.0 => {
+            let natural = ROW_FIXED_W + title_w + PANEL_PAD * 2.0;
+            natural.min(LIST_W).min(budget.inner_w).max(1.0)
+        }
+        _ => budget.inner_w.clamp(1.0, LIST_W),
+    };
     let content_h = (card_count.max(1) as f64 * ROW_H).max(ROW_H);
     let glass_h = budget.inner_h.min(content_h + PANEL_PAD * 2.0);
     let viewport_h = (glass_h - PANEL_PAD * 2.0).max(0.0);
@@ -1151,8 +1164,16 @@ mod tests {
             (budget.inner_h - room_h).abs() < 0.001,
             "budget {budget:?} visible {visible:?}"
         );
-        let layout = layout_for(PanelMode::List, &[], 7, anchor, DockEdge::Bottom, visible)
-            .expect("two rows still fit");
+        let layout = layout_for(
+            PanelMode::List,
+            &[],
+            7,
+            anchor,
+            DockEdge::Bottom,
+            visible,
+            None,
+        )
+        .expect("two rows still fit");
         let list = layout.list.expect("list mode");
         assert!(
             (layout.panel.h - room_h).abs() < 0.001,
@@ -1174,8 +1195,16 @@ mod tests {
             space_budget(anchor, DockEdge::Bottom, visible).inner_h,
             40.0
         );
-        let layout =
-            layout_for(PanelMode::List, &[], 7, anchor, DockEdge::Bottom, visible).expect("fits");
+        let layout = layout_for(
+            PanelMode::List,
+            &[],
+            7,
+            anchor,
+            DockEdge::Bottom,
+            visible,
+            None,
+        )
+        .expect("fits");
         let list = layout.list.expect("list mode");
         assert_eq!(layout.mode, PanelMode::List);
         assert_eq!(list.full_rows, 1);
@@ -1185,8 +1214,16 @@ mod tests {
         // Half a row less: still the list, still scrollable, and no complete row is claimed.
         let anchor = Rect::new(700.0, 24.0 + 36.0 + PANEL_MARGIN, 44.0, 56.0);
         let visible = Rect::new(0.0, 24.0, 1470.0, anchor.max_y() + 200.0 - 24.0);
-        let layout =
-            layout_for(PanelMode::List, &[], 7, anchor, DockEdge::Bottom, visible).expect("fits");
+        let layout = layout_for(
+            PanelMode::List,
+            &[],
+            7,
+            anchor,
+            DockEdge::Bottom,
+            visible,
+            None,
+        )
+        .expect("fits");
         let list = layout.list.expect("list mode");
         assert_eq!(list.full_rows, 0);
         assert!(
@@ -1201,8 +1238,17 @@ mod tests {
         let visible = visible();
         // Under the minimum height for either mode.
         let low = Rect::new(700.0, visible.y + 20.0, 44.0, 56.0);
-        assert!(layout_for(PanelMode::List, &[], 9, low, DockEdge::Bottom, visible).is_none());
-        assert!(layout_for(PanelMode::Row, &[], 2, low, DockEdge::Bottom, visible).is_none());
+        assert!(layout_for(
+            PanelMode::List,
+            &[],
+            9,
+            low,
+            DockEdge::Bottom,
+            visible,
+            None
+        )
+        .is_none());
+        assert!(layout_for(PanelMode::Row, &[], 2, low, DockEdge::Bottom, visible, None).is_none());
         // Under the minimum width for either mode: a row cannot fit its icon and close slot.
         let narrow = Rect::new(10.0, visible.max_y() - 56.0, 44.0, 56.0);
         let narrower_than_a_row =
@@ -1213,7 +1259,8 @@ mod tests {
             9,
             narrow,
             DockEdge::Bottom,
-            narrower_than_a_row
+            narrower_than_a_row,
+            None,
         )
         .is_none());
         // Just wide enough: the compact row is what makes that legal, and it still fits.
@@ -1225,6 +1272,7 @@ mod tests {
             narrow,
             DockEdge::Bottom,
             just_a_row,
+            None,
         )
         .expect("fits");
         assert!(layout.list.expect("list mode").compact);
@@ -1242,6 +1290,7 @@ mod tests {
                 bottom_anchor(),
                 DockEdge::Bottom,
                 visible,
+                None,
             )
             .expect("a row fits");
             let row = layout.row.expect("row mode");
@@ -1263,6 +1312,7 @@ mod tests {
             bottom_anchor(),
             DockEdge::Bottom,
             visible,
+            None,
         )
         .expect("a row fits");
         let row = layout.row.expect("row mode");
@@ -1281,6 +1331,7 @@ mod tests {
             bottom_anchor(),
             DockEdge::Bottom,
             visible,
+            None,
         )
         .expect("the cards fit");
         let row = layout.row.expect("row mode");
@@ -1445,6 +1496,7 @@ mod tests {
             anchor,
             DockEdge::Bottom,
             visible,
+            None,
         )
         .expect("the cards fit");
         let budget = space_budget(anchor, DockEdge::Bottom, visible);
@@ -1842,5 +1894,56 @@ mod tests {
         assert_eq!(PanelMode::Row.name(), "row");
         assert_eq!(PanelMode::List.name(), "list");
         assert_eq!(RowAxis::Horizontal.name(), "horizontal");
+    }
+
+    #[test]
+    fn list_width_follows_the_widest_title_up_to_the_cap() {
+        let visible = Rect::new(0.0, 0.0, 1400.0, 900.0);
+        let anchor = Rect::new(600.0, 880.0, 48.0, 20.0);
+        // A short title: the panel shrinks to the fixed pieces plus the measured band.
+        let narrow = layout_for(
+            PanelMode::List,
+            &[],
+            2,
+            anchor,
+            DockEdge::Bottom,
+            visible,
+            Some(40.0),
+        )
+        .expect("fits");
+        let want = ROW_FIXED_W + 40.0 + PANEL_PAD * 2.0;
+        assert!(
+            (narrow.panel.w - want).abs() < 0.001,
+            "narrow titles: width {} != {want}",
+            narrow.panel.w
+        );
+        // A huge title: the legacy fixed width is the cap.
+        let wide = layout_for(
+            PanelMode::List,
+            &[],
+            2,
+            anchor,
+            DockEdge::Bottom,
+            visible,
+            Some(10000.0),
+        )
+        .expect("fits");
+        assert!(
+            (wide.panel.w - LIST_W).abs() < 0.001,
+            "huge title: width {} != {LIST_W}",
+            wide.panel.w
+        );
+        // No measurement keeps the legacy fixed width.
+        let legacy = layout_for(
+            PanelMode::List,
+            &[],
+            2,
+            anchor,
+            DockEdge::Bottom,
+            visible,
+            None,
+        )
+        .expect("fits");
+        assert!((legacy.panel.w - LIST_W).abs() < 0.001);
     }
 }
