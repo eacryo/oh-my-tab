@@ -177,6 +177,11 @@ struct ObserverContext {
     notification: Option<*const std::ffi::c_void>,
     last_poll: Instant,
     last_health: Instant,
+    /// Rate limits for the hover diagnostics: the poll runs every 500ms, so an unthrottled line per
+    /// sample would flood the log. All three are DEBUG and throttled by the intervals in `emit`/`setup`.
+    last_notify_log: Instant,
+    last_selection_log: Instant,
+    last_health_log: Instant,
     /// Parked by `Pause`: no subscription, no polling, no health rebuild until `Rebuild`.
     paused: bool,
     last_signature: Option<(u8, i32, i8, bool)>,
@@ -199,6 +204,9 @@ impl ObserverContext {
             notification: None,
             last_poll: Instant::now(),
             last_health: Instant::now(),
+            last_notify_log: Instant::now(),
+            last_selection_log: Instant::now(),
+            last_health_log: Instant::now(),
             paused: false,
             last_signature: None,
             selection_notification: cf_string_new(SELECTION_CHANGED),
@@ -279,9 +287,11 @@ impl ObserverContext {
         unsafe {
             let app = AXUIElementCreateApplication(dock_pid);
             if app.is_null() {
+                log_debug!("[dock-preview] the Dock's AX application element is null");
                 return;
             }
             let Some(children) = copy_attribute(app, "AXChildren") else {
+                log_debug!("[dock-preview] the Dock's AX tree has no AXChildren");
                 CFRelease(app);
                 return;
             };
@@ -298,6 +308,7 @@ impl ObserverContext {
                 }
             }
             let Some(list) = list else {
+                log_debug!("[dock-preview] the Dock's AX tree has no AXList");
                 CFRelease(children);
                 CFRelease(app);
                 return;
@@ -307,16 +318,22 @@ impl ObserverContext {
             CFRetain(list);
             CFRelease(children);
             let mut observer: AxObserverRef = std::ptr::null_mut();
-            if AXObserverCreate(dock_pid, selection_changed, &mut observer) != 0
-                || observer.is_null()
-            {
+            let create_status = AXObserverCreate(dock_pid, selection_changed, &mut observer);
+            if create_status != 0 || observer.is_null() {
+                log_debug!(
+                    "[dock-preview] AXObserverCreate failed for the Dock (status {create_status})"
+                );
                 CFRelease(list);
                 CFRelease(app);
                 return;
             }
             let notify = self.selection_notification;
             let refcon = self as *mut ObserverContext as *mut std::ffi::c_void;
-            if AXObserverAddNotification(observer, list, notify, refcon) != 0 {
+            let add_status = AXObserverAddNotification(observer, list, notify, refcon);
+            if add_status != 0 {
+                log_debug!(
+                    "[dock-preview] AXObserverAddNotification failed for the Dock list (status {add_status})"
+                );
                 CFRelease(observer);
                 CFRelease(list);
                 CFRelease(app);
@@ -328,6 +345,9 @@ impl ObserverContext {
             self.observer = Some(observer);
             self.notification = Some(notify);
             CFRelease(app);
+            log_debug!(
+                "[dock-preview] observer subscribed to the Dock (pid {dock_pid}, AXSelectedChildrenChanged)"
+            );
         }
         self.emit(true);
         self.refresh_snapshot();
@@ -376,6 +396,12 @@ impl ObserverContext {
             log_debug!("[dock-preview] Dock subscription stale; rebuilding");
             self.teardown();
             self.setup(self.session);
+        } else {
+            let now = Instant::now();
+            if now.duration_since(self.last_health_log) >= Duration::from_secs(30) {
+                self.last_health_log = now;
+                log_debug!("[dock-preview] observer healthy: Dock subscription valid");
+            }
         }
     }
 
@@ -403,6 +429,26 @@ impl ObserverContext {
                 None => Selection::None,
             }
         };
+        // The hover diagnostics: the Dock's own answer (app / non-app / none) with the pointer, and the
+        // "inside the Dock but nothing selected" case that makes a hover look like it did nothing.
+        let now = Instant::now();
+        if now.duration_since(self.last_selection_log) >= Duration::from_secs(1) {
+            let pointer = crate::dock_preview::pointer_in_cg();
+            let inside_list = pointer.is_some_and(|point| list_frame.contains(point));
+            let described = match &selection {
+                Selection::App {
+                    pid, bundle, title, ..
+                } => format!("app pid={pid} bundle={bundle} title={title:?}"),
+                Selection::NonApp => "another Dock tile (non-app)".to_string(),
+                Selection::None => "no selected tile".to_string(),
+            };
+            if !matches!(selection, Selection::None) || inside_list {
+                self.last_selection_log = now;
+                log_debug!(
+                    "[dock-preview] Dock reports {described} (pointer {pointer:?}, inside list {inside_list}, revealed {revealed})"
+                );
+            }
+        }
         let signature = signature_of(&selection, revealed);
         if !force && self.last_signature == Some(signature) {
             return;
@@ -477,6 +523,11 @@ unsafe extern "C" fn selection_changed(
             return;
         }
         let context = &mut *(refcon as *mut ObserverContext);
+        let now = Instant::now();
+        if now.duration_since(context.last_notify_log) >= Duration::from_millis(200) {
+            context.last_notify_log = now;
+            log_debug!("[dock-preview] Dock notification: AXSelectedChildrenChanged");
+        }
         context.emit(true);
     });
 }

@@ -2265,6 +2265,19 @@ fn handle_event(event: DockEvent) {
             state.edge = Some(*edge);
         }
     }
+    if let Selection::App {
+        pid, bundle, icon, ..
+    } = &event.selection
+    {
+        // The hover that opens a preview: the app the Dock reports and the tile it names, with the
+        // pointer the open decision will compare against it.
+        if let Some(pointer) = pointer_in_cg() {
+            log_debug!(
+                "[dock-preview] Dock selection: pid={pid} bundle={bundle} tile={icon:?} pointer={pointer:?} inside={}",
+                icon.contains(pointer)
+            );
+        }
+    }
     let selection_pid = match &event.selection {
         Selection::App { pid, .. } => Some(*pid),
         Selection::NonApp | Selection::None => None,
@@ -2524,15 +2537,25 @@ fn tick() {
         // An unreadable pointer is not a hover: only a pointer that is actually inside the tile may
         // open a preview, or a notification that lagged behind a slide to the neighbouring tile
         // would still open this one.
-        let pointer_near_tile = pointer_in_cg().is_some_and(|point| open.icon.contains(point));
+        let pointer = pointer_in_cg();
+        let pointer_near_tile = pointer.is_some_and(|point| open.icon.contains(point));
+        let enabled_now = is_enabled();
+        let other_panel = other_panel_visible();
         if !decisions::should_open(
-            is_enabled(),
+            enabled_now,
             state.revealed,
             pointer_near_tile,
             true,
-            other_panel_visible(),
+            other_panel,
         ) {
-            log_debug!("[dock-preview] open cancelled: the pointer is no longer on the tile");
+            // The predicate values, not just a verdict: "the pointer is no longer on the tile" was the
+            // only line, so a hover that opened nothing could not be told from a Dock that never
+            // reported it.
+            log_debug!(
+                "[dock-preview] open cancelled (enabled {enabled_now}, revealed {}, pointer {pointer:?} on tile {:?} ({pointer_near_tile}), other panel {other_panel})",
+                state.revealed,
+                open.icon
+            );
             hide_panel();
             return;
         }
