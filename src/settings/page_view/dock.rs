@@ -69,7 +69,6 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
             ControlField::DockQuitOnLastWindowClose,
             cfg.dock_preview.quit_on_last_window_close,
         )
-        .caption("settings.desc_dock_quit_on_last_window_close")
         .into_spec(),
     );
     // The list presentation sits ahead of the threshold because it governs it: while every

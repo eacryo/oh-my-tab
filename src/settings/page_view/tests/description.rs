@@ -875,10 +875,10 @@ fn a_description_reads_only_its_input_and_capture_reads_the_config_once() {
 #[test]
 fn dock_page_view_owns_the_preview_switches() {
     // The Dock feature has its own page: the previews switch in its own card, then a card with the
-    // options that switch governs (close-then-quit, the row/list threshold, the hover peek), each
-    // carrying the copy that says what it does. None of them may appear on another page (General
-    // pins its own rows
-    // above), so the page boundary is asserted here.
+    // options that switch governs (close-then-quit, the row/list threshold, the hover peek), with
+    // captions only where the label does not already say the whole behavior. None of them may
+    // appear on another page (General pins its own rows above), so the page boundary is asserted
+    // here.
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
@@ -907,19 +907,16 @@ fn dock_page_view_owns_the_preview_switches() {
         view.rows[0].search.label,
         t("settings.row_dock_preview_enabled")
     );
-    // The second switch is the close-then-quit promise for this surface, off by default, in the
-    // same card and with its own copy: it governs the preview panel's close button only.
+    // The second switch is the close-then-quit promise for this surface, off by default and plain:
+    // its label already carries the whole condition, so it draws no caption.
     assert_eq!(view.rows[1].section, "settings.header_dock_preview_options");
     assert_eq!(
         view.rows[1].label_key,
         "settings.row_dock_quit_on_last_window_close"
     );
-    assert_eq!(
-        view.rows[1].caption_key,
-        Some("settings.desc_dock_quit_on_last_window_close")
-    );
+    assert_eq!(view.rows[1].caption_key, None);
+    assert_eq!(view.rows[1].copy, RowCopy::Plain);
     assert_eq!(view.rows[1].value, Value::Switch(false));
-    assert!(t("settings.desc_dock_quit_on_last_window_close").contains("Dock"));
     assert_eq!(view.banner, None);
 
     // The list presentation is the second options row: it governs the threshold below it, so it
