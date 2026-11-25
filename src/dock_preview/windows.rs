@@ -146,8 +146,44 @@ pub(crate) fn window_presence_fast(pid: i32, wid: u32) -> WindowPresence {
     }
 }
 
+/// Whether the window is still something a peek may show, with "could not tell" kept apart from
+/// "no longer there".
+///
+/// `window_presence_fast` answers "does the WindowServer still list it, owned by this process", which
+/// a MINIMIZED window also satisfies: it is listed, it is just not on screen any more. So the
+/// on-screen field is read as well. The three answers matter separately: a query that failed is not
+/// evidence that the peek is over, and treating it as one discarded the origin in the middle of a
+/// peek, which is the window a later restore has to give the front back to.
+pub(crate) fn previewability_now(pid: i32, wid: u32) -> Previewability {
+    match window_presence_fast(pid, wid) {
+        WindowPresence::Gone => Previewability::Gone,
+        WindowPresence::Unknown => Previewability::Unknown,
+        WindowPresence::Present => match window_collector::window_presence_now(wid) {
+            Some((false, _)) => Previewability::Gone,
+            // Listed, but no longer on screen: minimized, or on another Space now.
+            Some((true, Some(false))) => Previewability::Gone,
+            Some((true, Some(true))) => Previewability::Present,
+            // Listed without an on-screen field: it exists, but "is it on the desktop the peek would
+            // raise it on" is not answered. A live peek keeps its state on that; a commit waits for a
+            // positive answer rather than raising a window it cannot see.
+            Some((true, None)) | None => Previewability::Unknown,
+        },
+    }
+}
+
+/// What a window's current state says about showing it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Previewability {
+    /// It can be shown now.
+    Present,
+    /// It cannot, and that is confirmed: closed, minimized or moved off this Space.
+    Gone,
+    /// The query failed or could not answer. Not evidence either way.
+    Unknown,
+}
+
 /// Whether the PID currently names a live application process.
-fn process_is_running(pid: i32) -> bool {
+pub(crate) fn process_is_running(pid: i32) -> bool {
     unsafe {
         let app: *mut objc2::runtime::AnyObject = objc2::msg_send![
             objc2::class!(NSRunningApplication),

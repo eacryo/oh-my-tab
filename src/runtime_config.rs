@@ -24,6 +24,9 @@ struct ChangeFlags {
     windows_disabled: bool,
     thumbnails: bool,
     focused_thumbnail_prewarm: bool,
+    /// The Dock preview's hover peek. It shares the Dock page's switch group, so a reload that only
+    /// flips it has to reach that page's controls like `dock_preview` does.
+    dock_peek: bool,
     show_app_name_in_cards: bool,
     // The footer title's visibility changed. That switch also decides whether the footer band exists,
     // and the band is summon-time geometry (card viewport, document, scroller, panel height), so a
@@ -144,6 +147,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.quit_on_last_window_close
         || flags.dock_preview
         || flags.dock_cards_per_row
+        || flags.dock_peek
 }
 
 /// The pages the in-place refresh writes when the settings window is open.
@@ -199,6 +203,7 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         menu_bar_icon: startup || old.startup.hide_menu_bar_icon != new.startup.hide_menu_bar_icon,
         dock_preview: old.dock_preview.enabled != new.dock_preview.enabled,
         dock_cards_per_row: old.dock_preview.cards_per_row != new.dock_preview.cards_per_row,
+        dock_peek: old.dock_preview.peek_on_hover != new.dock_preview.peek_on_hover,
         logging: startup || old.logging.level != new.logging.level,
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
@@ -482,6 +487,11 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         if flags.dock_cards_per_row && new.dock_preview.enabled {
             crate::dock_preview::hide_for_layout_change();
         }
+    }
+    if flags.dock_peek {
+        // Switching the peek off while it holds a window in front gives the front back first: the
+        // switch would otherwise strand an activation whose card the user can no longer see.
+        crate::dock_preview::apply_peek_config_change(new.dock_preview.peek_on_hover);
     }
     if flags.logging {
         let level = match new.logging.level.as_str() {

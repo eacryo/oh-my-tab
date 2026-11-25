@@ -318,6 +318,7 @@ fn the_description_groups_are_the_ones_the_renderer_registers() {
     for (page, expected) in [
         (SettingsPageId::Switcher, vec![RowGroup::ThumbnailOnly]),
         (SettingsPageId::General, vec![RowGroup::GlassStyle]),
+        (SettingsPageId::Dock, vec![RowGroup::DockPeek]),
     ] {
         let view = view_for(page, &input());
         assert_eq!(description_groups(&view), expected, "{page:?}");
@@ -871,15 +872,16 @@ fn a_description_reads_only_its_input_and_capture_reads_the_config_once() {
 
 #[test]
 fn dock_page_view_owns_the_preview_switches() {
-    // The Dock feature has its own page: one card, one captioned switch, and the copy that says
-    // exactly what it does. The switch must not appear on another page (General pins its own rows
+    // The Dock feature has its own page: one card with the switches that act on its panel and the
+    // row/list threshold, each carrying the copy that says what it does. None of them may appear on
+    // another page (General pins its own rows
     // above), so the page boundary is asserted here.
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
-    // The switch, the promise it makes about closes made here, and the threshold: all three only
-    // mean something while the switch above the other two is on.
-    assert_eq!(view.rows.len(), 3);
+    // The switch, the promise it makes about closes made here, the threshold and the peek: all four
+    // only mean something while the switch above them is on.
+    assert_eq!(view.rows.len(), 4);
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
     assert_eq!(view.rows[0].label_key, "settings.row_dock_preview_enabled");
     assert_eq!(
@@ -930,4 +932,15 @@ fn dock_page_view_owns_the_preview_switches() {
         Value::Index(4),
         "the default of 5 is the fifth option"
     );
+
+    // The peek is the fourth row: a switch that acts on the preview's own cards, on by default, in
+    // the conditional group its master switch settles.
+    let peek = &view.rows[3];
+    assert_eq!(peek.section, "settings.header_dock_preview");
+    assert_eq!(peek.label_key, "settings.row_dock_peek_on_hover");
+    assert_eq!(peek.caption_key, Some("settings.desc_dock_peek_on_hover"));
+    assert_eq!(peek.copy, RowCopy::Captioned);
+    assert_eq!(peek.value, Value::Switch(true));
+    assert_eq!(peek.group, Some(RowGroup::DockPeek));
+    assert_eq!(peek.field(), Some(ControlField::DockPeekOnHover));
 }

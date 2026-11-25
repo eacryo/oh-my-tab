@@ -840,6 +840,9 @@ fn on_app_activated_inner(notification: *mut c_void) {
         let policy: i64 = msg_send![app, activationPolicy];
         let pid: i32 = msg_send![app, processIdentifier];
         clipboard::note_external_app_activated(pid, policy);
+        // The Dock preview's peek holds the front for as long as the pointer rests on a card; any
+        // activation that is not the peek's own means the user is somewhere else now.
+        dock_preview::handle_app_activation(pid);
         if policy != 0 {
             return;
         }

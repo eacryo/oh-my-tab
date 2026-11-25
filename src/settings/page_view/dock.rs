@@ -39,7 +39,8 @@ pub(in crate::settings) fn cards_per_row_for_index(index: usize) -> u32 {
     first + index.min(span.saturating_sub(1)) as u32
 }
 
-/// The Dock page's description: the Dock preview feature, its behaviour switch and its threshold.
+/// The Dock page's description: the Dock preview feature, the behaviour switches that act on its
+/// panel (the hover peek and quit-on-last-close), and the row/list threshold.
 pub(super) fn dock_page_view(input: &PageInput) -> PageView {
     let cfg = &input.config;
     let mut w = RowWriter::new(SettingsPageId::Dock, t("settings.sidebar_dock"));
@@ -77,6 +78,19 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
             cards_per_row_index(cfg.dock_preview.cards_per_row),
         )
         .caption("settings.desc_dock_cards_per_row")
+        .into_spec(),
+    );
+    // The peek acts on the preview's cards too, so it sits with them. Its caption carries the whole
+    // promise because every peek activates another application for real.
+    w.push(
+        switch(
+            "settings.row_dock_peek_on_hover",
+            ControlField::DockPeekOnHover,
+            cfg.dock_preview.peek_on_hover,
+        )
+        .caption("settings.desc_dock_peek_on_hover")
+        .wide_caption()
+        .group(RowGroup::DockPeek)
         .into_spec(),
     );
     w.finish()

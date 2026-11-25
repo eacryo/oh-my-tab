@@ -342,6 +342,32 @@ pub(crate) fn hide() {
     state.request = 0;
 }
 
+/// Put the panel back above a window that just came forward.
+///
+/// The panel is a non-activating panel and never becomes key, but a peek brings another application
+/// to the front and its windows are ordered in its own activation: the preview must stay visible
+/// over the application it is previewing, or the pointer would be resting on a panel the user
+/// cannot see. Ordering it front does not take key or main, so the peeked window keeps the focus it
+/// was just given.
+pub(crate) fn order_front() {
+    let Ok(slot) = PANEL.lock() else {
+        return;
+    };
+    let Some(state) = slot.as_ref() else {
+        return;
+    };
+    let visible: Bool = unsafe { msg_send![state.panel, isVisible] };
+    if visible != Bool::YES {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![state.panel, orderFrontRegardless];
+        if state.tooltip_visible {
+            let _: () = msg_send![state.tooltip_panel, orderFrontRegardless];
+        }
+    }
+}
+
 /// Main-thread tick: fill thumbnails, confirm pending window closes, update the tooltip.
 pub(crate) fn tick(now: Instant, pointer: (f64, f64)) -> TickOutcome {
     let Ok(mut slot) = PANEL.lock() else {
@@ -2664,7 +2690,64 @@ pub(crate) fn current_pointer_zone() -> PointerZone {
         .unwrap_or(PointerZone::Outside)
 }
 
-/// The title box of one item in screen top-left coordinates, for the smoke runner's tooltip check.
+/// The item index a pointer zone names when the zone is that item's BODY.
+///
+/// A card's title box is not a body: it owns the tooltip. A list row whose title band is too narrow
+/// to draw ("body is title") is a body everywhere except its close slot, so it counts.
+pub(crate) fn peek_body_index(zone: PointerZone) -> Option<usize> {
+    let slot = PANEL.lock().ok()?;
+    let state = slot.as_ref()?;
+    match zone {
+        PointerZone::Card(index) => Some(index),
+        PointerZone::Title(index) if state.geometry.body_is_title.contains(&index) => Some(index),
+        _ => None,
+    }
+}
+
+/// The window an item index names, for code that already resolved a pointer zone and needs the
+/// window behind it (the peek's own target checks).
+pub(crate) fn window_at_index(index: usize) -> Option<(i32, u32)> {
+    let slot = PANEL.lock().ok()?;
+    let state = slot.as_ref()?;
+    let window = state
+        .cards
+        .get(index)
+        .map(|card| card.window.clone())
+        .or_else(|| state.rows.get(index).map(|row| row.window.clone()))?;
+    Some((window.pid, window.wid))
+}
+
+/// The item a panel-local point hits, ignoring the close slot: the window under the REAL cursor
+/// right now, hit against the panel's current geometry and scroll.
+///
+/// `current_pointer_zone` answers with the zone the last tick sampled, which is up to one frame old.
+/// A decision that lands between two ticks (a worker coming back) must not act on a stale pointer,
+/// so it hits the cursor itself instead. An item whose close is in flight is not a target: the tick
+/// treats it as the panel's background, and a stale hover result landing on it would raise a window
+/// the user just asked to close.
+pub(crate) fn window_under_pointer() -> Option<(i32, u32)> {
+    let pointer = crate::dock_preview::pointer_in_cg()?;
+    let slot = PANEL.lock().ok()?;
+    let state = slot.as_ref()?;
+    let local = (
+        pointer.0 - state.geometry.panel.x,
+        pointer.1 - state.geometry.panel.y,
+    );
+    let index = match zone_at(state, local) {
+        PointerZone::Card(index) | PointerZone::Title(index) => index,
+        _ => return None,
+    };
+    if item_is_closing(state, index) {
+        return None;
+    }
+    let window = state
+        .cards
+        .get(index)
+        .map(|card| card.window.clone())
+        .or_else(|| state.rows.get(index).map(|row| row.window.clone()))?;
+    Some((window.pid, window.wid))
+}
+
 pub(crate) fn title_rect_for_smoke(index: usize) -> Option<Rect> {
     let slot = PANEL.lock().ok()?;
     let state = slot.as_ref()?;

@@ -591,8 +591,9 @@ pub(super) struct SettingsUi {
     dock_cards_per_row: *mut AnyObject, // Dock page: the row/list threshold (a popup)
     // Dock page: the same promise for closes made from the preview panel's cards.
     dock_quit_on_last_window_close: *mut AnyObject,
-    reverse_scroll: *mut AnyObject, // reverse scrolling
-    enable_mouse: *mut AnyObject,   // enable mouse control
+    dock_peek_on_hover: *mut AnyObject, // Dock page: hovering a thumbnail brings its window forward
+    reverse_scroll: *mut AnyObject,     // reverse scrolling
+    enable_mouse: *mut AnyObject,       // enable mouse control
     gestures_enabled: *mut AnyObject,
     gesture_trigger_button: *mut AnyObject, // NSPopUpButton: the one button gestures start on
     gesture_show_trail: *mut AnyObject,

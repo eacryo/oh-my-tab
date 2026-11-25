@@ -911,9 +911,10 @@ pub(crate) const DOCK_CARDS_PER_ROW_DEFAULT: u32 = 5;
 ///
 /// The master switch is on by default: it is the feature the Dock side of the app exists for, and
 /// it can still be turned off for a machine that wants no preview work near the Dock. The other
-/// two fields shape it -- how many windows a single row shows before the panel becomes a list, and
-/// whether a close made from the panel may quit the app. The runtime consumption belongs to the
-/// dock-preview module, not to the settings layer.
+/// three fields shape it -- how many windows a single row shows before the panel becomes a list,
+/// whether a close made from the panel may quit the app, and whether resting on a card brings that
+/// window to the front. The runtime consumption belongs to the dock-preview module, not to the
+/// settings layer.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct DockPreviewSection {
@@ -926,6 +927,13 @@ pub struct DockPreviewSection {
     /// Default false, and only consulted while `enabled` is on: the panel is where the close button
     /// lives, so the switch has nothing to govern without the feature.
     pub quit_on_last_window_close: bool,
+    /// Whether resting the pointer on a preview card brings its window to the front, and leaving the
+    /// panel puts the application that was in front back. Default true.
+    ///
+    /// This is a real activation of the target application and a second one back: macOS has no way to
+    /// lift another application's window without making it active first (measured 2026-11-24), so the
+    /// switch exists for machines whose applications react to being activated.
+    pub peek_on_hover: bool,
 }
 
 impl Default for DockPreviewSection {
@@ -934,6 +942,7 @@ impl Default for DockPreviewSection {
             enabled: true,
             cards_per_row: DOCK_CARDS_PER_ROW_DEFAULT,
             quit_on_last_window_close: false,
+            peek_on_hover: true,
         }
     }
 }
@@ -2289,10 +2298,11 @@ impl Config {
         self.finder_menu = other.finder_menu;
         self.normalize_finder_menu();
 
-        // dock preview: the two booleans are always valid, so they are adopted unconditionally;
-        // the threshold is a number and falls back on its own.
+        // dock preview: the booleans are always valid, so they are adopted unconditionally; the
+        // threshold is a number and falls back on its own.
         self.dock_preview.enabled = other.dock_preview.enabled;
         self.dock_preview.quit_on_last_window_close = other.dock_preview.quit_on_last_window_close;
+        self.dock_preview.peek_on_hover = other.dock_preview.peek_on_hover;
         if !errs
             .iter()
             .any(|e| e.starts_with("dock_preview.cards_per_row"))
@@ -4258,6 +4268,10 @@ enabled = true
         assert!(
             old.dock_preview.enabled,
             "an absent section must load as enabled"
+        );
+        assert!(
+            old.dock_preview.peek_on_hover,
+            "a file written before the peek switch existed must load with the peek on"
         );
 
         // Explicitly off survives serialization.

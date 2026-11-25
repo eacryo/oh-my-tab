@@ -35,6 +35,7 @@ src/
 │   ├── windows.rs               # directed window collection, identity checks, sorting
 │   ├── layout.rs                # pure card/panel/tooltip/transition geometry
 │   ├── decisions.rs             # pure hover/close/tooltip/capture/press decisions
+│   ├── peek.rs                  # pure hover-peek decisions: when to peek, and when NOT to restore
 │   ├── dock_click.rs            # per-PID Dock press tap: dismiss on the press that starts a switch
 │   └── reveal.rs                # keeps an auto-hidden Dock revealed while the panel is open
 ├── e2e_state.rs                 # --e2e-state JSON snapshot of internal state for tier M2
@@ -191,7 +192,24 @@ lib.rs (run)                                                      wiring + run l
 
 Optional (on by default) and independent of the switcher: hovering an application tile in the Dock
 shows that app's windows as thumbnail cards above the Dock. The feature has no keyboard surface and
-never becomes the key or main window, so the app the pointer came from keeps focus.
+the panel never becomes the key or main window.
+
+The one exception is the **hover peek** (`[dock_preview] peek_on_hover`, on by default): resting the
+pointer on a card's body brings that window to the front, and leaving the PANEL gives the front back
+to the application it was taken from. Moving between cards inside the panel re-targets the peek
+instead of restoring first: the earlier rule ("leaving the card restores") made a slide from one
+thumbnail to the next flash the application the user came from, which the user reported from a real
+session on 2026-11-25. A re-target keeps the origin and only changes the raised window, so the same
+application switches windows in place and a different one is activated directly. This cannot be a z-order trick. Measured on macOS 26 with a
+probe outside this app (2026-11-24): the SLPS front-switch and the synthetic key click reorder
+nothing while the target application is not active, and a window only comes above another
+application once that application is ACTIVE. So a peek is one real app activation and the restore is
+a second one, and every rule that keeps that safe is a pure decision in `dock_preview/peek.rs`:
+what may be peeked (a body, not the title box or the close slot; not a minimized, hidden or
+other-desktop window; never the application that is already in front), and above all when NOT to
+restore (the user switched away themselves, our own window came forward, either end quit), because
+a restore that runs after the user has moved on drags them back. The panel is re-ordered to the
+front after each peek so it stays visible over the window it just raised.
 
 - `dock_preview/observer.rs` owns every Accessibility call for the Dock on one dedicated run-loop
   thread: it subscribes to `AXSelectedChildrenChanged` on the Dock's list element, reads the hovered
@@ -203,7 +221,11 @@ never becomes the key or main window, so the app the pointer came from keeps foc
   observer's events, runs one 50ms tick (open delay, close grace, pointer zone, collector results),
   and keeps two generations — the observer session and the per-hover request. Every asynchronous
   result (collected windows, capture fills, animation completions) is validated against them before
-  it may touch the panel.
+  it may touch the panel. The peek adds a third: its raise runs on a worker and a fourth
+  (`PEEK_GENERATION`) invalidates a raise whose peek was restored, replaced or forgotten meanwhile.
+  The origin the peek took the front from is sampled on the main thread BEFORE that worker starts,
+  and the switch itself goes through `overlay::activate_and_raise` — the same call the switcher's
+  cards use.
 - `dock_preview/windows.rs` collects one app's windows on a worker thread through
   `window_collector::collect_windows_for_dock_preview` (the switcher's admission policy widened to
   minimized, hidden and other-desktop windows, still honoring `[windows] excluded_apps`). Each card
