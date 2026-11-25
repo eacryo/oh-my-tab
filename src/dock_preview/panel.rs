@@ -116,6 +116,8 @@ struct Geometry {
     mode: PanelMode,
     row_axis: RowAxis,
     max_scroll: f64,
+    /// Cards on the widest row of the card layout; 0 for the list.
+    columns: usize,
 }
 
 struct PanelState {
@@ -751,13 +753,16 @@ fn geometry_from(
         .as_ref()
         .map(|list| list.max_scroll)
         .or_else(|| {
-            layout_out.row.as_ref().and_then(|row| {
-                (row.axis == RowAxis::Horizontal)
-                    .then(|| (row.content_w - layout_out.viewport.w).max(0.0))
+            layout_out.row.as_ref().and_then(|row| match row.axis {
+                RowAxis::Horizontal => Some((row.content_w - layout_out.viewport.w).max(0.0)),
+                RowAxis::Vertical => Some((row.content_h - layout_out.viewport.h).max(0.0)),
+                RowAxis::None => None,
             })
         })
         .unwrap_or(0.0);
+    let columns = layout_out.row.as_ref().map(|row| row.columns).unwrap_or(0);
     Geometry {
+        columns,
         band: layout::transition_band(edge, anchor, layout_out.panel),
         panel: layout_out.panel,
         viewport: layout_out.viewport,
@@ -962,6 +967,7 @@ pub(crate) fn apply_resize(size: (f64, f64), scroll: (f64, f64)) -> bool {
             mode,
             row_axis: RowAxis::None,
             max_scroll: 0.0,
+            columns: 1,
         },
     );
     rebuild_content(&mut state, &request, geometry);
@@ -1207,15 +1213,18 @@ fn content_extent(state: &PanelState) -> (f64, f64) {
     let viewport = state.geometry.viewport;
     let w = match state.geometry.row_axis {
         RowAxis::Horizontal => viewport.w + state.geometry.max_scroll,
-        RowAxis::None => viewport.w,
+        RowAxis::None | RowAxis::Vertical => viewport.w,
     };
-    let h = state
-        .geometry
-        .items
-        .last()
-        .map(|item| item.max_y())
-        .unwrap_or(viewport.h)
-        .max(viewport.h);
+    let h = match state.geometry.row_axis {
+        RowAxis::Vertical => viewport.h + state.geometry.max_scroll,
+        _ => state
+            .geometry
+            .items
+            .last()
+            .map(|item| item.max_y())
+            .unwrap_or(viewport.h)
+            .max(viewport.h),
+    };
     (w, h)
 }
 
@@ -1431,6 +1440,7 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
                 mode: PanelMode::Row,
                 row_axis: RowAxis::None,
                 max_scroll: 0.0,
+                columns: 1,
             },
             request: 0,
             ticket: 0,
@@ -1599,7 +1609,7 @@ unsafe fn build_cards(state: &mut PanelState, request: &PanelRequest) {
     let rects: Vec<Rect> = state.geometry.items.clone();
     let icon = crate::app_identity::icon_for_bundle_id(&request.bundle, layout::CARD_ICON);
     let panel = (state.geometry.panel.w, state.geometry.panel.h);
-    let plates = layout::plates_for_row(&rects, panel);
+    let plates = layout::plates_for_grid(&rects, state.geometry.columns.max(1), panel);
     let palette = theme::ui_palette();
     for (index, rect) in rects.iter().enumerate() {
         let Some(window) = request.windows.get(index) else {
@@ -1888,7 +1898,7 @@ fn remove_single_row(row: &RowEntry) {
 fn place_cards(state: &PanelState) {
     let rects = &state.geometry.items;
     let panel = (state.geometry.panel.w, state.geometry.panel.h);
-    let plates = layout::plates_for_row(rects, panel);
+    let plates = layout::plates_for_grid(rects, state.geometry.columns.max(1), panel);
     for (index, card) in state.cards.iter().enumerate() {
         let Some(rect) = rects.get(index).copied() else {
             break;
@@ -2803,10 +2813,14 @@ pub(crate) struct ListFacts {
     pub(crate) viewport: Rect,
     pub(crate) scroll: f64,
     pub(crate) max_scroll: f64,
-    /// Rows that fit entirely inside the viewport.
+    /// Rows that fit entirely inside the viewport: list rows, or wrapped card rows.
     pub(crate) full_rows: usize,
     /// Every item in screen coordinates.
     pub(crate) item_screen: Vec<Rect>,
+    /// Cards on the widest row of the card layout (0 for the list).
+    pub(crate) columns: usize,
+    /// Rows of cards the card layout wrapped into (0 for the list).
+    pub(crate) card_rows: usize,
 }
 
 pub(crate) fn list_facts() -> Option<ListFacts> {
@@ -2819,7 +2833,23 @@ pub(crate) fn list_facts() -> Option<ListFacts> {
         .iter()
         .map(|item| content_to_screen(state, *item))
         .collect();
+    let card_rows = {
+        let mut ys: Vec<i64> = state
+            .geometry
+            .items
+            .iter()
+            .map(|item| item.y.round() as i64)
+            .collect();
+        ys.dedup();
+        if state.geometry.mode == PanelMode::Row {
+            ys.len().max(1)
+        } else {
+            0
+        }
+    };
     Some(ListFacts {
+        columns: state.geometry.columns,
+        card_rows,
         mode: state.geometry.mode,
         viewport: to_screen(
             panel,
@@ -2988,12 +3018,29 @@ pub(crate) fn e2e_json() -> String {
     } else {
         String::new()
     };
+    // The card layout may be several wrapped rows: report the real content height, the row count and
+    // the width of the widest row, so a scenario can assert the wrap instead of guessing from rects.
+    let card_rows = {
+        let mut ys: Vec<f64> = state
+            .geometry
+            .items
+            .iter()
+            .map(|item| item.y.round() as i64 as f64)
+            .collect();
+        ys.dedup();
+        ys.len().max(1)
+    };
     let (row_h, full_rows, max_scroll, content_h) = match state.geometry.mode {
         PanelMode::Row => (
             layout::CARD_H,
-            state.geometry.items.len(),
+            card_rows,
             state.geometry.max_scroll,
-            layout::CARD_H,
+            state
+                .geometry
+                .items
+                .last()
+                .map(|item| item.max_y())
+                .unwrap_or(layout::CARD_H),
         ),
         PanelMode::List => {
             let viewport_h = state.geometry.viewport.h;
@@ -3011,7 +3058,7 @@ pub(crate) fn e2e_json() -> String {
         }
     };
     format!(
-        "{{\"visible\": true, \"pid\": {}, \"bundle\": {}, \"edge\": {}, \"mode\": {}, \"row_axis\": {}, \"panel\": {}, \"viewport\": {}, \"layout\": {{\"row_h\": {:.1}, \"full_rows\": {}, \"max_scroll\": {:.1}, \"content_h\": {:.1}}}, \"scroll\": {:.1}, \"content_origin\": {}, \"rows\": [{}], \"cards\": [{}], \"hovered\": {}, \"tooltip_visible\": {}, \"tooltip\": {}, \"total_windows\": {}, \"hidden_windows\": {}}}",
+        "{{\"visible\": true, \"pid\": {}, \"bundle\": {}, \"edge\": {}, \"mode\": {}, \"row_axis\": {}, \"panel\": {}, \"viewport\": {}, \"layout\": {{\"row_h\": {:.1}, \"full_rows\": {}, \"max_scroll\": {:.1}, \"content_h\": {:.1}, \"columns\": {}, \"card_rows\": {}}}, \"scroll\": {:.1}, \"content_origin\": {}, \"rows\": [{}], \"cards\": [{}], \"hovered\": {}, \"tooltip_visible\": {}, \"tooltip\": {}, \"total_windows\": {}, \"hidden_windows\": {}}}",
         state.pid,
         json_string(&state.bundle),
         json_string(state.geometry.edge.name()),
@@ -3023,6 +3070,8 @@ pub(crate) fn e2e_json() -> String {
         full_rows,
         max_scroll,
         content_h,
+        state.geometry.columns,
+        card_rows,
         state.geometry.scroll.0.max(state.geometry.scroll.1),
         json_origin(
             panel.x + state.geometry.viewport.x + layout::content_origin(state.geometry.scroll).0,

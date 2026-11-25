@@ -268,17 +268,21 @@ front after each peek so it stays visible over the window it just raised.
   monotonic `press_dismissals` counter with the dock preview, which is what lets a scenario prove a
   press, rather than a hover-leave, closed a panel.
 - The panel has two layouts, chosen by the window count ALONE. At or under `[dock_preview]
-  cards_per_row` (1..=6, default 5) it is a single row of thumbnail cards; above it, a scrolling list
-  of compact rows (icon, one line of 14pt title, a close slot that appears on the row's hover). Screen
-  space decides how much of that layout is visible and how much can scroll, never which layout is
-  used: a budget too small for a card row hides the panel, and a laptop screen showing a list scrolls
-  it. The space chain is one derivation -- `space_budget` (towards the direction the panel grows,
-  less `PANEL_MARGIN`) -> the glass area -> the viewport (the one `PANEL_PAD` subtraction) -> the row
+  cards_per_row` (1..=16, default 6) it shows thumbnail cards, which WRAP into as many rows as the
+  width needs: one row while they fit, more when they do not. Above the threshold it is a scrolling
+  list of compact rows (icon, one line of 14pt title, a close slot that appears on the row's hover).
+  Screen space decides how much of that layout is visible and how much can scroll, never which layout
+  is used: a budget too small for a card row hides the panel, a wrapped card stack taller than the
+  room under the Dock scrolls downwards, and a laptop screen showing a list scrolls it. The space
+  chain is one derivation -- `space_budget` (towards the direction the panel grows, less
+  `PANEL_MARGIN`) -> the glass area -> the viewport (the one `PANEL_PAD` subtraction) -> the row/card
   boxes -- and the minimum sizes are derived from the controls each layout must draw.
-- Both layouts live in `container -> viewport (masksToBounds) -> content -> rows/cards`. Rows are
-  created once at fixed content positions and a scroll moves the CONTENT view only, so a row can never
-  be left drawn at an old position; the viewport is the single clipping boundary, which is why a
-  half-clipped row is hit exactly where it is drawn. `pointer_zone` therefore bounds rows and close
+- Both layouts live in `container -> viewport (masksToBounds) -> content -> rows/cards`. Rows and
+  wrapped card rows are created once at fixed content positions and a scroll moves the CONTENT view
+  only, so an item can never be left drawn at an old position; the viewport is the single clipping
+  boundary, which is why a half-clipped row or card row is hit exactly where it is drawn. A wrapped
+  grid's scroll axis is vertical; sideways scrolling survives only for the pathological room where a
+  single card cannot fit the width at its minimum. `pointer_zone` therefore bounds rows and close
   slots by the viewport but leaves the anchor tile, the transition band and the panel's own padding
   with their old meaning: resting on the icon, or crossing from it into the panel, is still "inside".
 - A click resolves to a `HitTarget` (window identity plus the request epoch) in one panel read, and

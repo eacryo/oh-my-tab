@@ -899,13 +899,17 @@ pub(crate) const FINDER_MENU_TERMINALS: [&str; 7] = [
 /// The threshold's bounds. The config validation, the settings field's accepted range and the
 /// layout all read these, so the three cannot disagree about what a legal threshold is.
 ///
-/// The lower bound is 1 rather than 2: with 1 a single window is still a row and two windows already
-/// need the list, which is a meaningful choice rather than a degenerate one.
+/// The lower bound is 1 rather than 2: with 1 a single window still gets cards and two windows
+/// already need the list, which is a meaningful choice rather than a degenerate one.
+///
+/// The upper bound is what one panel may show as cards at all: up to it the cards wrap into as many
+/// rows as the width needs and the panel scrolls when the stack is taller than the room under the
+/// Dock; above it the scrolling list takes over.
 pub(crate) const DOCK_CARDS_PER_ROW_MIN: u32 = 1;
-pub(crate) const DOCK_CARDS_PER_ROW_MAX: u32 = 6;
-/// The default threshold: six cards is the widest row that still fits a typical screen at the
-/// cards' natural widths, and one more window than that is where the list starts.
-pub(crate) const DOCK_CARDS_PER_ROW_DEFAULT: u32 = 5;
+pub(crate) const DOCK_CARDS_PER_ROW_MAX: u32 = 16;
+/// The default threshold: six cards fit one row on a typical screen at the cards' natural widths,
+/// and a wider window count wraps instead of collapsing into the list.
+pub(crate) const DOCK_CARDS_PER_ROW_DEFAULT: u32 = 6;
 
 /// Dock previews: hovering an app's Dock icon shows that app's windows.
 ///
@@ -920,8 +924,9 @@ pub(crate) const DOCK_CARDS_PER_ROW_DEFAULT: u32 = 5;
 pub struct DockPreviewSection {
     /// Whether hovering an app in the Dock shows its window previews. Default true.
     pub enabled: bool,
-    /// The most windows a single row of previews shows. At or under it the panel is one row of
-    /// thumbnail cards; above it the panel becomes a scrolling list. 1..=6, default 5.
+    /// The most windows the panel shows as thumbnail cards. At or under it the cards wrap into as
+    /// many rows as the width needs (and the panel scrolls down when the stack is taller than the
+    /// room under the Dock); above it the panel becomes a scrolling list. 1..=16, default 6.
     pub cards_per_row: u32,
     /// Quit the target application when a window closed from the preview panel was its last one.
     /// Default false, and only consulted while `enabled` is on: the panel is where the close button
@@ -4333,7 +4338,7 @@ enabled = true
 
         // Out of range is refused by `validate`, and the sibling switch is still adopted.
         let (parsed, errors, _) =
-            parse_config_content("[dock_preview]\nenabled = false\ncards_per_row = 9\n").unwrap();
+            parse_config_content("[dock_preview]\nenabled = false\ncards_per_row = 17\n").unwrap();
         assert!(
             errors
                 .iter()

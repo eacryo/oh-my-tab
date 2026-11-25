@@ -942,8 +942,8 @@ fn dock_page_view_owns_the_preview_switches() {
     );
     assert_eq!(
         threshold.value,
-        Value::Index(4),
-        "the default of 5 is the fifth option"
+        Value::Index(5),
+        "the default of 6 is the sixth option"
     );
 
     // The peek is the fourth row: a switch that acts on the preview's own cards, on by default, in

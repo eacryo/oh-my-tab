@@ -99,6 +99,9 @@ pub(crate) const PANEL_PAD: f64 = 4.0;
 /// Cards sit edge to edge, like the reference: the panel's material is the surface, and a card is
 /// a header plus its thumbnail rather than a separate filled tile with a gutter around it.
 pub(crate) const CARD_GAP: f64 = 0.0;
+/// The gap between two ROWS of cards. The panel's own surface shows through it, so cards in
+/// different rows do not read as one tall card.
+pub(crate) const GRID_ROW_GAP: f64 = 8.0;
 // Nearly square corners: the reference taskbar preview's own corner is a few pixels on a card
 // several hundred wide, so the Dock panel keeps only a hint of rounding (the switcher's 8pt
 // control step) rather than the rounder panel shape its glass can carry.
@@ -237,11 +240,15 @@ pub(crate) fn space_budget(anchor: Rect, edge: DockEdge, visible: Rect) -> Space
     }
 }
 
-/// Which axis a single-row panel scrolls along.
+/// Which axis the card layout scrolls along.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum RowAxis {
+    /// Everything fits: no scrolling.
     None,
+    /// One row of cards is wider than the panel, and it scrolls sideways.
     Horizontal,
+    /// Cards wrapped into rows that are taller than the panel, and it scrolls down.
+    Vertical,
 }
 
 impl RowAxis {
@@ -249,6 +256,7 @@ impl RowAxis {
         match self {
             Self::None => "none",
             Self::Horizontal => "horizontal",
+            Self::Vertical => "vertical",
         }
     }
 }
@@ -260,13 +268,19 @@ pub(crate) enum Axis {
     Y,
 }
 
-/// The card rectangles of a single-row panel, in content coordinates.
+/// The card rectangles of the card layout, in content coordinates.
+///
+/// Cards wrap into as many rows as the panel's width needs: one row while they fit, more when they
+/// do not. `columns` is the number of cards on the widest row, which is what the hover plates need
+/// to know which edges of a card are interior.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RowLayout {
     pub(crate) cards: Vec<Rect>,
     pub(crate) axis: RowAxis,
     pub(crate) content_w: f64,
     pub(crate) content_h: f64,
+    /// Cards on the widest row (at least 1).
+    pub(crate) columns: usize,
 }
 
 /// One list row's box in content coordinates.
@@ -348,6 +362,12 @@ pub(crate) fn layout_for(
     }
 }
 
+/// The card layout: cards in a row, wrapping into more rows when the width needs it.
+///
+/// One row is the common case and is laid out exactly as before (natural widths, compressed
+/// proportionally only when the widest row would overflow). What changed is the overflow: instead
+/// of scrolling a single row sideways, cards that do not fit wrap onto another row, and only a
+/// grid taller than the room under the Dock scrolls -- downwards.
 fn row_panel(
     aspects: &[Option<f64>],
     card_count: usize,
@@ -361,79 +381,87 @@ fn row_panel(
         widths.push(CARD_W);
     }
     let usable = (budget.inner_w - PANEL_PAD * 2.0).max(1.0);
-    let natural: f64 =
-        widths.iter().sum::<f64>() + (widths.len().saturating_sub(1)) as f64 * CARD_GAP;
-    // The GLASS is never wider than the budget, whatever the cards need: an overflowing row scrolls
-    // inside its viewport rather than growing the panel past the screen or the dock's own side.
-    let (cards, axis, content_w) = if natural <= usable + 0.001 {
-        let mut x = PANEL_PAD;
-        let rects = widths
-            .iter()
-            .map(|&w| {
-                let rect = Rect::new(x, PANEL_PAD, w, CARD_H);
-                x += w + CARD_GAP;
-                rect
-            })
-            .collect::<Vec<_>>();
-        (rects, RowAxis::None, natural + PANEL_PAD * 2.0)
-    } else {
-        // Compress proportionally, but never under `CARD_MIN_W`; past that the row scrolls.
-        let minimum =
-            CARD_MIN_W * widths.len() as f64 + (widths.len().saturating_sub(1)) as f64 * CARD_GAP;
-        let compressed: Vec<f64> = if minimum <= usable {
-            let scale = (usable - (widths.len().saturating_sub(1)) as f64 * CARD_GAP) / natural;
-            widths.iter().map(|w| (w * scale).max(CARD_MIN_W)).collect()
-        } else {
-            widths.iter().map(|_| CARD_MIN_W).collect()
-        };
-        let total: f64 =
-            compressed.iter().sum::<f64>() + (compressed.len().saturating_sub(1)) as f64 * CARD_GAP;
-        let scrolls = total > usable + 0.001;
-        // Without scrolling the cards start at the glass padding; when the row scrolls, the content
-        // starts at 0 so the viewport itself is the clipping window over it.
-        let start = if scrolls { 0.0 } else { PANEL_PAD };
-        let mut x = start;
-        let rects = compressed
-            .iter()
-            .map(|&w| {
-                let rect = Rect::new(x, PANEL_PAD, w, CARD_H);
-                x += w + CARD_GAP;
-                rect
-            })
-            .collect::<Vec<_>>();
-        (
-            rects,
-            if scrolls {
-                RowAxis::Horizontal
+    // A card wider than the whole usable width is squeezed to it, and never under the minimum. When
+    // even the minimum does not fit, the row keeps its cards at the minimum and scrolls sideways:
+    // that is the only case where this layout still scrolls horizontally.
+    let widths: Vec<f64> = widths
+        .into_iter()
+        .map(|width| {
+            if width > usable {
+                width.max(CARD_MIN_W).min(usable.max(CARD_MIN_W))
             } else {
-                RowAxis::None
-            },
-            if scrolls {
-                total
-            } else {
-                total + PANEL_PAD * 2.0
-            },
-        )
-    };
-    let content_h = CARD_H + PANEL_PAD * 2.0;
-    let panel_h = content_h;
+                width
+            }
+        })
+        .collect();
+    // Wrap greedily: a card joins the current row while it still fits, otherwise it starts the next.
+    let mut rows: Vec<Vec<usize>> = Vec::new();
+    let mut current: Vec<usize> = Vec::new();
+    let mut current_w = 0.0;
+    for (index, width) in widths.iter().enumerate() {
+        let gap = if current.is_empty() { 0.0 } else { CARD_GAP };
+        if !current.is_empty() && current_w + gap + width > usable + 0.001 {
+            rows.push(std::mem::take(&mut current));
+            current_w = 0.0;
+        }
+        current_w += if current.is_empty() { 0.0 } else { CARD_GAP } + width;
+        current.push(index);
+    }
+    if !current.is_empty() {
+        rows.push(current);
+    }
+    let row_count = rows.len().max(1);
+    let row_width: Vec<f64> = rows
+        .iter()
+        .map(|row| {
+            row.iter().map(|&index| widths[index]).sum::<f64>()
+                + (row.len().saturating_sub(1)) as f64 * CARD_GAP
+        })
+        .collect();
+    let natural_w = row_width.iter().copied().fold(0.0, f64::max);
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(1).max(1);
+    // The content starts at 0 when it scrolls, so the viewport itself is the clipping window; with
+    // no scroll it starts at the glass padding.
+    let content_h = row_count as f64 * CARD_H
+        + (row_count.saturating_sub(1)) as f64 * GRID_ROW_GAP
+        + PANEL_PAD * 2.0;
+    let scrolls_down = content_h > budget.inner_h + 0.001;
+    let scrolls_sideways = natural_w > usable + 0.001;
+    let content_w = natural_w + PANEL_PAD * 2.0;
+    let mut cards: Vec<Rect> = Vec::with_capacity(widths.len());
+    for (row, indices) in rows.iter().enumerate() {
+        let mut x = if scrolls_sideways { 0.0 } else { PANEL_PAD };
+        let y = PANEL_PAD + row as f64 * (CARD_H + GRID_ROW_GAP);
+        for &index in indices {
+            cards.push(Rect::new(x, y, widths[index], CARD_H));
+            x += widths[index] + CARD_GAP;
+        }
+    }
     let panel_w = content_w.min(budget.inner_w).max(MIN_INTERACTIVE_W);
-    let panel = panel_frame(anchor, (panel_w, panel_h), edge, visible);
-    let viewport = Rect::new(
-        PANEL_PAD,
-        PANEL_PAD,
-        (panel_w - PANEL_PAD * 2.0).max(1.0),
-        CARD_H,
-    );
+    let panel_h = content_h.min(budget.inner_h);
+    let viewport_h = (panel_h - PANEL_PAD * 2.0).max(1.0);
+    let axis = if scrolls_down {
+        RowAxis::Vertical
+    } else if scrolls_sideways {
+        RowAxis::Horizontal
+    } else {
+        RowAxis::None
+    };
     Some(PanelLayout {
-        panel,
-        viewport,
+        panel: panel_frame(anchor, (panel_w, panel_h), edge, visible),
+        viewport: Rect::new(
+            PANEL_PAD,
+            PANEL_PAD,
+            (panel_w - PANEL_PAD * 2.0).max(1.0),
+            viewport_h,
+        ),
         mode: PanelMode::Row,
         row: Some(RowLayout {
             cards,
             axis,
             content_w,
             content_h,
+            columns,
         }),
         list: None,
     })
@@ -538,6 +566,8 @@ pub(crate) fn scroll_axis_for(
                 None
             }
         }
+        // A wrapped grid scrolls down, and the wheel's vertical delta is the one that drives it.
+        (PanelMode::Row, RowAxis::Vertical) => (dy.abs() >= 1.0).then_some((Axis::Y, dy)),
         (PanelMode::List, _) => (dy.abs() >= 1.0).then_some((Axis::Y, dy)),
         _ => None,
     }
@@ -661,13 +691,25 @@ pub(crate) fn hover_plate_rect(
     (plate, radius)
 }
 
-/// The plates for one single row of cards. A row of `n` cards has one row, so every card touches
-/// the panel's top and bottom edges and only the first/last touch a side.
-pub(crate) fn plates_for_row(cards: &[Rect], panel: (f64, f64)) -> Vec<(Rect, f64)> {
+/// The plates for the card layout, which may be a single row or several wrapped ones.
+///
+/// `columns` is the number of cards on the widest row: the plate of a card grows towards the
+/// panel's edge only when the card sits on that edge (the first/last column, the first/last row),
+/// so a wrapped grid keeps the same "the tile owns the strip out to the edge" look as one row.
+pub(crate) fn plates_for_grid(
+    cards: &[Rect],
+    columns: usize,
+    panel: (f64, f64),
+) -> Vec<(Rect, f64)> {
+    let columns = columns.max(1);
+    let rows = cards.len().div_ceil(columns).max(1);
     cards
         .iter()
         .enumerate()
-        .map(|(column, card)| hover_plate_rect(*card, 0, column, cards.len(), 1, panel))
+        .map(|(index, card)| {
+            let (row, column) = (index / columns, index % columns);
+            hover_plate_rect(*card, row, column, columns, rows, panel)
+        })
         .collect()
 }
 
@@ -1164,8 +1206,9 @@ mod tests {
         assert!(row.cards.iter().all(|card| card.w >= CARD_MIN_W));
         assert!(layout.panel.w <= 900.0 - 2.0 * PANEL_MARGIN + 0.001);
 
-        // Nine cards at the floor need 1152pt, more than the 840pt a 900pt screen offers: the row
-        // scrolls instead of compressing under the floor.
+        // Nine cards are wider than the 840pt a 900pt screen offers, so they WRAP instead of
+        // compressing under the floor: no card is squeezed below the minimum, and the extra cards
+        // move to a second row rather than pushing the row sideways.
         let aspects = vec![Some(1.6); 9];
         let layout = layout_for(
             PanelMode::Row,
@@ -1175,14 +1218,14 @@ mod tests {
             DockEdge::Bottom,
             visible,
         )
-        .expect("a row fits");
+        .expect("the cards fit");
         let row = layout.row.expect("row mode");
-        assert_eq!(row.axis, RowAxis::Horizontal);
-        assert!(row.content_w > layout.viewport.w);
-        assert!(row
-            .cards
-            .iter()
-            .all(|card| (card.w - CARD_MIN_W).abs() < 0.001));
+        assert!(row.cards.iter().all(|card| card.w >= CARD_MIN_W - 0.001));
+        let mut ys: Vec<f64> = row.cards.iter().map(|card| card.y).collect();
+        ys.dedup();
+        assert!(ys.len() > 1, "the cards wrapped into more than one row");
+        assert_eq!(row.axis, RowAxis::None, "two rows still fit under the Dock");
+        assert!(layout.panel.w <= 900.0 - 2.0 * PANEL_MARGIN + 0.001);
     }
 
     #[test]
@@ -1324,34 +1367,33 @@ mod tests {
     }
 
     #[test]
-    fn an_overflowing_row_keeps_its_panel_inside_the_budget() {
-        // The glass never grows past the room the Dock leaves, whatever the cards need: an
-        // overflowing row is clipped by a viewport that is itself inside the budget.
-        let visible = Rect::new(0.0, 24.0, 900.0, 862.0);
-        let aspects = vec![Some(1.6); 9];
+    fn a_tall_grid_keeps_its_panel_inside_the_budget_and_scrolls_down() {
+        // The glass never grows past the room the Dock leaves, whatever the cards need: a grid
+        // taller than that is clipped by a viewport that is itself inside the budget, and scrolls.
+        // A short screen: the same grid that fits a 862pt-tall visible frame is taller than this.
+        let visible = Rect::new(0.0, 24.0, 900.0, 400.0);
+        let anchor = Rect::new(700.0, 400.0 - 56.0, 44.0, 56.0);
+        let aspects = vec![Some(1.6); 16];
         let layout = layout_for(
             PanelMode::Row,
             &aspects,
-            9,
-            bottom_anchor(),
+            16,
+            anchor,
             DockEdge::Bottom,
             visible,
         )
-        .expect("a row fits");
-        let budget = space_budget(bottom_anchor(), DockEdge::Bottom, visible);
+        .expect("the cards fit");
+        let budget = space_budget(anchor, DockEdge::Bottom, visible);
         assert!(layout.panel.w <= budget.inner_w + 0.001, "panel width");
-        assert!(layout.viewport.w <= layout.panel.w - PANEL_PAD * 2.0 + 0.001);
+        assert!(layout.panel.h <= budget.inner_h + 0.001, "panel height");
         let row = layout.row.expect("row mode");
-        assert_eq!(row.axis, RowAxis::Horizontal);
+        assert_eq!(row.axis, RowAxis::Vertical);
         // The scroll range covers the CARDS, not the glass padding: content minus viewport.
-        let cards_right = row.cards.last().expect("cards").max_x();
-        assert!(cards_right - layout.viewport.w > 0.0);
-        assert!(
-            cards_right > layout.viewport.w,
-            "the last card is beyond the viewport"
-        );
-        // And the first card starts at the content's origin so nothing is cut off on the left.
-        assert_eq!(row.cards[0].x, 0.0);
+        assert!(row.content_h > layout.viewport.h);
+        assert!(row.cards.last().expect("cards").max_y() > layout.viewport.h);
+        // The first row starts at the glass padding, so nothing is cut off at the top when the
+        // grid is at scroll 0.
+        assert!((row.cards[0].y - PANEL_PAD).abs() < 0.001);
     }
 
     #[test]
@@ -1464,7 +1506,7 @@ mod tests {
             .map(|index| Rect::new(PANEL_PAD + index as f64 * CARD_W, PANEL_PAD, CARD_W, CARD_H))
             .collect();
         let panel = (PANEL_PAD * 2.0 + 3.0 * CARD_W, PANEL_PAD * 2.0 + CARD_H);
-        let plates = plates_for_row(&cards, panel);
+        let plates = plates_for_grid(&cards, cards.len(), panel);
         assert_eq!(plates.len(), 3);
         for (plate, card) in plates.iter().zip(&cards) {
             assert!(plate.0.x <= card.x + 0.001 && plate.0.max_x() >= card.max_x() - 0.001);

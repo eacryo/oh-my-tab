@@ -3076,13 +3076,13 @@ fn smoke_list_mode() -> Result<u32, SmokeFailure> {
     }
     let mut checks = 0;
     SMOKE_ROOM_H.store(true, Ordering::Release);
-    // Each case states its own budget: a short, wide room for the list, a tall, narrow one for the
-    // horizontal row. Measuring both from the display made the list fit on an ordinary screen and
-    // the row fit on a wide one.
+    // Each case states its own budget: a short, wide room for the list, a narrow one for the card
+    // grid. Measuring both from the display made the list fit on an ordinary screen and the cards
+    // fit on a wide one.
     set_case_room("smoke-dock-room-h", "smoke-dock-room-w");
     checks += smoke_list_scroll()?;
     set_case_room("smoke-dock-row-room-h", "smoke-dock-room-w");
-    checks += smoke_horizontal_row()?;
+    checks += smoke_wrapped_rows()?;
     SMOKE_ROOM_H.store(false, Ordering::Release);
     hide_panel();
     Ok(checks)
@@ -3203,13 +3203,16 @@ fn smoke_list_scroll() -> Result<u32, SmokeFailure> {
     Ok(checks)
 }
 
-/// The horizontal case: a single row that does not fit is clipped by a viewport no wider than the
-/// screen, and scrolling it moves the content on x only.
-fn smoke_horizontal_row() -> Result<u32, SmokeFailure> {
+/// The wrapped case: cards that do not fit one row wrap onto more rows, and a stack taller than the
+/// room under the Dock scrolls downwards.
+///
+/// This replaced the old "one row scrolls sideways" case. With wrapping, a narrow room makes the row
+/// wrap first; the sideways scroll is only reachable when a single card cannot fit the width at all.
+fn smoke_wrapped_rows() -> Result<u32, SmokeFailure> {
     let original = crate::config::CONFIG.read().unwrap().clone();
-    let mut narrow = original.clone();
-    narrow.dock_preview.cards_per_row = crate::config::DOCK_CARDS_PER_ROW_MAX;
-    let _ = crate::runtime_config::smoke_apply_threshold(&original, &narrow);
+    let mut roomy = original.clone();
+    roomy.dock_preview.cards_per_row = crate::config::DOCK_CARDS_PER_ROW_MAX;
+    let _ = crate::runtime_config::smoke_apply_threshold(&original, &roomy);
     let titles = [
         "wide one",
         "wide two",
@@ -3218,9 +3221,6 @@ fn smoke_horizontal_row() -> Result<u32, SmokeFailure> {
         "wide five",
         "wide six",
     ];
-    // The horizontal case runs under a SHORT height and a NARROW width from the runner; a row that
-    // still fits would prove nothing, so a card row is required to exist and to overflow its
-    // viewport.
     let restore = |original: &crate::config::Config| {
         let current = crate::config::CONFIG.read().unwrap().clone();
         let _ = crate::runtime_config::smoke_apply_threshold(&current, original);
@@ -3228,64 +3228,78 @@ fn smoke_horizontal_row() -> Result<u32, SmokeFailure> {
     if !dev_show_windows(&titles, DockEdge::Bottom) {
         restore(&original);
         return Err(SmokeFailure::Failed(format!(
-            "the panel did not open for the horizontal check (room {}pt)",
-            crate::dev_flags::value("smoke-dock-room-h").unwrap_or_default()
+            "the panel did not open for the wrapped check (room {}pt)",
+            crate::dev_flags::value("smoke-dock-row-room-h").unwrap_or_default()
         )));
     }
     pump(Duration::from_millis(80));
     let facts = panel::list_facts()
-        .ok_or_else(|| SmokeFailure::Failed("the row panel published no facts".into()))?;
+        .ok_or_else(|| SmokeFailure::Failed("the card panel published no facts".into()))?;
     let screen = primary_screen_bounds_cg();
     let mut checks = 0;
     if facts.mode != layout::PanelMode::Row {
         return Err(SmokeFailure::Failed(
-            "six windows at the maximum threshold should be a single row".into(),
+            "six windows at the maximum threshold should be cards, not a list".into(),
         ));
     }
-    // The panel never grows past the screen, however wide the cards need to be.
+    // The whole point of the case: the room is narrower than six cards, so they MUST have wrapped.
+    if facts.card_rows < 2 {
+        return Err(SmokeFailure::Failed(format!(
+            "six cards in the controlled room opened as {} row(s), so the case proves nothing",
+            facts.card_rows
+        )));
+    }
+    if facts.columns == 0 || facts.columns >= titles.len() {
+        return Err(SmokeFailure::Failed(format!(
+            "the wrapped grid reports {} columns for {} cards",
+            facts.columns,
+            titles.len()
+        )));
+    }
+    // The panel never grows past the screen, however many rows the cards need.
     if facts.viewport.x < screen.x - 1.0 || facts.viewport.max_x() > screen.max_x() + 1.0 {
         return Err(SmokeFailure::Failed(format!(
-            "the row's viewport {:?} leaves the screen {screen:?}",
+            "the grid's viewport {:?} leaves the screen {screen:?}",
             facts.viewport
         )));
     }
     checks += 1;
-    // Six cards at the minimum width need more than the screen offers, so the row MUST scroll; a
-    // case that does not overflow would only prove that nothing happened.
+    // The controlled room is shorter than the wrapped stack, so the grid MUST scroll; a case that
+    // does not overflow would only prove that nothing happened.
     if facts.max_scroll <= 0.0 {
-        return Err(SmokeFailure::Failed(format!(
-            "six cards fit the row without scrolling (max_scroll={}), so the horizontal case proves nothing",
-            facts.max_scroll
-        )));
+        return Err(SmokeFailure::Failed(
+            "the wrapped grid fits the controlled room without scrolling, so the case proves nothing"
+                .into(),
+        ));
     }
     {
         let before = facts.scroll;
-        panel::scroll_by(layout::Axis::X, layout::CARD_MIN_W);
+        panel::scroll_by(layout::Axis::Y, layout::CARD_H);
         panel::flush_records();
         let after = panel::list_facts()
-            .ok_or_else(|| SmokeFailure::Failed("the row lost its facts".into()))?;
+            .ok_or_else(|| SmokeFailure::Failed("the grid lost its facts".into()))?;
         if after.scroll <= before {
             return Err(SmokeFailure::Failed(
-                "a horizontal step did not scroll the row".into(),
+                "a vertical step did not scroll the wrapped grid".into(),
             ));
         }
-        // Past the end: clamped, and the last card becomes reachable.
-        panel::scroll_by(layout::Axis::X, 10_000.0);
+        // Past the end: clamped, and the last row becomes reachable.
+        panel::scroll_by(layout::Axis::Y, 10_000.0);
         panel::flush_records();
         let end = panel::list_facts()
-            .ok_or_else(|| SmokeFailure::Failed("the row lost its facts".into()))?;
+            .ok_or_else(|| SmokeFailure::Failed("the grid lost its facts".into()))?;
         if (end.scroll - end.max_scroll).abs() > 0.5 {
             return Err(SmokeFailure::Failed(
-                "the horizontal scroll is not clamped".into(),
+                "the vertical scroll is not clamped".into(),
             ));
         }
         let last = *end
             .item_screen
             .last()
-            .ok_or_else(|| SmokeFailure::Failed("the row has no cards".into()))?;
+            .ok_or_else(|| SmokeFailure::Failed("the grid has no cards".into()))?;
         if !last.overlaps(end.viewport) {
             return Err(SmokeFailure::Failed(
-                "the last card is unreachable at the end of the row".into(),
+                "the last card is unreachable at the end of the grid".into(),
             ));
         }
     }
@@ -3485,8 +3499,8 @@ mod smoke_tests {
         smoke_runner!("dock_preview_smoke", 1, {
             // Both budgets are CONSTRUCTED, so neither case depends on the display. The list needs a
             // two-row viewport (`2*ROW_H` plus the glass padding plus the layout margin), reached by
-            // scrolling. The horizontal case needs a row that cannot fit: a tall enough room for a
-            // card row, and a width under six cards at their floor width (`6*CARD_MIN_W`).
+            // scrolling. The card case needs a width under six cards at their floor width
+            // (`4*CARD_MIN_W`) so they wrap, and a room shorter than the wrapped stack so it scrolls.
             // Exactly a two-row viewport: the glass the layout makes is the budget, and only its
             // padding comes off the viewport, so the budget is `2*ROW_H + 2*PAD`.
             let room_h = format!(
@@ -3499,6 +3513,7 @@ mod smoke_tests {
                 4.0 * crate::dock_preview::layout::CARD_MIN_W
                     + crate::dock_preview::layout::PANEL_MARGIN
             );
+            // Shorter than two wrapped card rows: the grid has to scroll to be complete.
             let row_h = format!(
                 "--smoke-dock-row-room-h={}",
                 crate::dock_preview::layout::CARD_H
