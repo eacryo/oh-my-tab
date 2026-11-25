@@ -6,7 +6,7 @@
 
 use super::*;
 
-/// The Dock page's description: the Dock preview feature and its behaviour switch.
+/// The Dock page's description: the Dock preview feature and its two behaviour switches.
 pub(super) fn dock_page_view(input: &PageInput) -> PageView {
     let cfg = &input.config;
     let mut w = RowWriter::new(SettingsPageId::Dock, t("settings.sidebar_dock"));
@@ -21,6 +21,19 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
         // The copy is two lines in the label column; the wide text block is the design's shape for
         // a caption that carries a full promise beside the control.
         .wide_caption()
+        .into_spec(),
+    );
+    w.push(
+        switch(
+            "settings.row_dock_peek_on_hover",
+            ControlField::DockPeekOnHover,
+            cfg.dock_preview.peek_on_hover,
+        )
+        .caption("settings.desc_dock_peek_on_hover")
+        // A real activation of another application happens on every hover, so the caption has to
+        // carry the whole promise; the same wide block the previews switch uses.
+        .wide_caption()
+        .group(RowGroup::DockPeek)
         .into_spec(),
     );
     w.finish()

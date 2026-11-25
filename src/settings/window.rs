@@ -4151,6 +4151,7 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
             launch_at_login: std::ptr::null_mut(),
             hide_menu_bar_icon: std::ptr::null_mut(),
             dock_preview_enabled: std::ptr::null_mut(),
+            dock_peek_on_hover: std::ptr::null_mut(),
             reverse_scroll: std::ptr::null_mut(),
             enable_mouse: std::ptr::null_mut(),
             gestures_enabled: std::ptr::null_mut(),

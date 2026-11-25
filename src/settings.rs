@@ -585,6 +585,7 @@ pub(super) struct SettingsUi {
     launch_at_login: *mut AnyObject, // launch at login
     hide_menu_bar_icon: *mut AnyObject, // hide the menu-bar status item
     dock_preview_enabled: *mut AnyObject, // General page: show Dock preview thumbnails
+    dock_peek_on_hover: *mut AnyObject, // Dock page: hovering a thumbnail brings its window forward
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject, // enable mouse control
     gestures_enabled: *mut AnyObject,

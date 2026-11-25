@@ -718,3 +718,19 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 - **device lane 合批回归测试只覆盖"是否创建"判定，未覆盖整批行为**（device lane 恢复重构，评审 LOW 提出，**延后**）。`the_create_budget_shares_the_enumerations_own_predicate` 验证了 `enumeration_would_create` 的四臂（reuse/rebuild/null/distrusted），但若调用方将来漏查批次额度，或把 `client_distrusted` 的置位从 `run_batch` 顶部移回复查分支内，现有断言仍可能通过——无法捕获"强制复查 + 插拔 + 设置查询合批时创建两次 client"或"新 client 读失败后仍发布 Ready"这类整批回归。
   **为什么这次不补：** 整批序列断言需要可注入的枚举结果（让 `enumerate_locked`/`IOHIDEventSystemClientCreate`/`CopyServices` 的返回值可控），当前纯函数层做不到；`lane_harness` 只支撑批次级 hold/finish 信号，不足以驱动"第一次 create+读失败、第二次成功"的受控序列。
   **重新审视的触发条件：** 下一次扩展 `lane_harness` 或把枚举结果做成可注入（trait/seam）时，补一个合批测试：强制复查 + 插拔 + 设置查询进同一批，断言新 client 读失败后本批只创建一次、最终快照仍为 `Failed` 且保留上次列表。
+
+- **悬停 peek:取消后已入队的 raiser 任务无法撤回**(Dock 预览悬停 peek 实现轮,R1 HIGH 的后半;R2/R3/R4/R5/R6 连续五轮标为 UNRESOLVED;2026-11-25,**仍然延后,理由见下**)。peek 的抬起走既有的 `overlay::activate_and_raise`,它在非 other-desktop 分支里同步做一次精确窗口落定,随后把剩余工作交给 raiser 线程;raisr 的任务用 `raise_intent_current(generation)` 判断是否已作废,而 bump generation 的只有**下一次** raise。所以"peek 被 forget/restore,但之后没有新的 raise"的时间窗内,已经入队的激活/重试仍可能执行并把一个正在离开的窗口重新抬到前台。
+  **为什么延后:** 要修得让 raiser 接受一个"可撤销的外部授权"(peek 代次),它牵动 `window_collector/raiser.rs` 的授权模型——那是切换器自己依赖的共享子系统,应与 dock 预览的改动分开评审;窗口本身很短(一次 AX 落定 + 两次 8/20ms 重试),且 `drain_peek_restores` 的 `peek::restore_step` 会在还原前复核前台归属(含焦点窗口),最坏结果是多一次短暂抬升,不会把用户拽走后不回。
+  **重新审视的触发条件:** 收到"悬停后移开,窗口又跳上来一次"的报告时;或下一次改动 `window_collector/raiser.rs` 的 generation/授权语义时,把 peek 代次作为第二个失效来源接进去,并在 M2 场景里断言"移开后不再有新的 raise"。
+
+- **悬停 peek:"前台暂时读不到"时不还原的语义缺 M 级证据**(Dock 预览悬停 peek 实现轮,R1 HIGH#5 的附带项,2026-11-25,**延后**)。`peek::restore_step` 在 `Frontmost::Unknown` 时选择**不**还原(理由写在函数注释里:漏还原最多让窗口多留一帧,错还原会把用户刚选的应用拽走且不可见)。这条选择没有自动化断言,因为它需要"前台读取失败"的受控注入,现有 E2E 能力做不到。
+  **为什么延后:** 造这个状态要 mock `NSWorkspace.frontmostApplication`,属于新的测试缝,不在本次改动的范围内;纯函数层的 `watch_peek` 已覆盖 `Unknown → Keep`。
+  **重新审视的触发条件:** 提供前台读取的注入缝时;或 M2 场景框架支持"某次前台读取返回失败"时,补一条断言。
+
+- **悬停 peek:还原定时调度的采样点与退出路径收尾**(Dock 预览悬停 peek 实现轮,R6–R9 连续四轮提出,2026-11-25,**延后**)。`schedule_peek_restore_settle()` 现在按窗口的 1/(N+1) 步长采样并把最后一次投递放在 `deadline - 120ms`,但:**(a)** 当同步查询很快返回 `Unknown` 时,循环剩下的时间可能为零,最后一次投递会紧跟第四轮,约 500ms 才恢复可读的前台仍可能漏掉;**(b)** 应用退出路径(菜单 Quit / 登出)安排了这个异步回调之后不保证它执行完。
+  **为什么延后:** 这是一条只在"停用 Dock 预览的同时恰好有还原待办、且前台在 480–600ms 才可读"这条窄带上成立的问题;正确做法是给还原队列引入按绝对 deadline 的最小堆 + 一个主线程 timer,而那套调度器与 (b) 的退出收尾是同一件事,应在一次"重做 dock_preview 定时器"的小改动里一起做。继续在同一个 50ms 轮询 + sleep 线程的结构上打补丁,只会持续产生这一类"差 50ms"的发现。
+  **重新审视的触发条件:** 收到"关掉 Dock 预览后窗口还留在前台"的报告时;或下一次改动 `dock_preview` 的定时器结构时;或 M2 观察到还原在退出时丢失时。
+
+- **悬停 peek:连续点击的暂停请求归属**(Dock 预览悬停 peek 实现轮,R8–R9 两轮提出,2026-11-25,**部分处理**)。已修:较早点击不能抢先提交(intent 比对);新点击会把旧暂停请求的所有权转移给自己。未完全解决:当第一次点击的结果被判过期、第二次点击校验又失败时,请求的回收路径依赖 `PARKED_RESTORES` 与 `hide_panel` 的先后顺序,缺少"旧结果被跳过 + 最新结果失败 + 指针离开"这条端到端断言。
+  **为什么延后:** 这需要在 `dock_preview` 里注入一个可控的点击校验结果序列,现有的 `MainThreadSlot` + 静态队列结构不支持;补它等于给这块引入一个测试缝,而该缝的形态取决于上面那条调度重构。
+  **重新审视的触发条件:** 为 dock 预览引入可注入的激活校验时(M2 场景框架本就要求 `--e2e-state` 暴露这些状态);或收到"连续快速点两张卡后窗口留在前台"的报告时。

@@ -305,6 +305,7 @@ fn the_description_groups_are_the_ones_the_renderer_registers() {
     for (page, expected) in [
         (SettingsPageId::Switcher, vec![RowGroup::ThumbnailOnly]),
         (SettingsPageId::General, vec![RowGroup::GlassStyle]),
+        (SettingsPageId::Dock, vec![RowGroup::DockPeek]),
     ] {
         let view = view_for(page, &input());
         assert_eq!(description_groups(&view), expected, "{page:?}");
@@ -857,14 +858,25 @@ fn a_description_reads_only_its_input_and_capture_reads_the_config_once() {
 }
 
 #[test]
-fn dock_page_view_owns_the_preview_switch() {
-    // The Dock feature has its own page: one card, one captioned switch, and the copy that says
-    // exactly what it does. The switch must not appear on another page (General pins its own rows
+fn dock_page_view_owns_the_preview_switches() {
+    // The Dock feature has its own page: one card, two captioned switches, and the copy that says
+    // exactly what each does. They must not appear on another page (General pins its own rows
     // above), so the page boundary is asserted here.
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
-    assert_eq!(view.rows.len(), 1);
+    assert_eq!(view.rows.len(), 2);
+    // The second switch is the peek: it acts on the preview's own cards, so it belongs under the
+    // preview switch in the same card and carries its full promise in the caption.
+    assert_eq!(view.rows[1].section, "settings.header_dock_preview");
+    assert_eq!(view.rows[1].label_key, "settings.row_dock_peek_on_hover");
+    assert_eq!(
+        view.rows[1].caption_key,
+        Some("settings.desc_dock_peek_on_hover")
+    );
+    assert_eq!(view.rows[1].copy, RowCopy::Captioned);
+    assert_eq!(view.rows[1].value, Value::Switch(true));
+    assert_eq!(view.rows[1].group, Some(RowGroup::DockPeek));
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
     assert_eq!(view.rows[0].label_key, "settings.row_dock_preview_enabled");
     assert_eq!(

@@ -97,6 +97,7 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         launch_at_login: std::ptr::null_mut(),
         hide_menu_bar_icon: std::ptr::null_mut(),
         dock_preview_enabled: std::ptr::null_mut(),
+        dock_peek_on_hover: std::ptr::null_mut(),
         reverse_scroll: std::ptr::null_mut(),
         enable_mouse: std::ptr::null_mut(),
         gestures_enabled: std::ptr::null_mut(),

@@ -21,6 +21,7 @@ pub(super) enum ControlField {
     LaunchAtLogin,
     HideMenuBarIcon,
     DockPreviewEnabled,
+    DockPeekOnHover,
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
@@ -914,6 +915,12 @@ fn apply_control_field(field: ControlField) {
                 ControlField::DockPreviewEnabled => {
                     let state: isize = msg_send![u.dock_preview_enabled, state];
                     cfg.dock_preview.enabled = state == 1;
+                    // The peek is this switch's child: it freezes (and hides) with it.
+                    update_dock_preview_controls_enabled(u);
+                }
+                ControlField::DockPeekOnHover => {
+                    let state: isize = msg_send![u.dock_peek_on_hover, state];
+                    cfg.dock_preview.peek_on_hover = state == 1;
                 }
                 ControlField::WindowsEnabled => {
                     let state: isize = msg_send![u.windows_enabled, state];
@@ -1689,6 +1696,21 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
     }
 }
 
+/// Freeze the Dock page's peek switch under the Dock previews master switch, and show or hide it
+/// with that switch: the peek acts on the preview's cards, so with no previews there is no card to
+/// rest on.
+pub(super) unsafe fn update_dock_preview_controls_enabled(ui: &SettingsUi) {
+    if ui.dock_preview_enabled.is_null() || ui.dock_peek_on_hover.is_null() {
+        return;
+    }
+    let state: isize = msg_send![ui.dock_preview_enabled, state];
+    let on = state == 1;
+    let tooltip = t("settings.tooltip_dock_preview_disabled");
+    SettingsRow::set_enabled_with_tooltip(ui.dock_peek_on_hover, on, &tooltip);
+    ui.page_canvases[crate::settings::settings_page_index(crate::settings::SettingsPageId::Dock)]
+        .set_group_visible(RowGroup::DockPeek, on);
+}
+
 /// Freeze the clipboard-history options below the clipboard master switch.
 /// Re-read the pause switch from the live configuration. Used by the menu item and by the apply
 /// pass when a resume could not establish its baseline and the intent was forced back to paused.
@@ -2051,6 +2073,10 @@ pub(super) unsafe fn update_conditional_rows(ui: &SettingsUi) {
     update_display_mode_dependent_visibility(ui);
     update_clipboard_delete_dependent_visibility(ui);
     update_panel_material_dependent_visibility(ui);
+    // Every described group is hidden when its page is built, so a group that is not settled here
+    // is invisible the first time its page opens: the Dock page's peek switch used to be missing
+    // from this list, and users saw no way to turn the peek off.
+    update_dock_preview_controls_enabled(ui);
 }
 
 /// Show the glass-style sub-option only while Liquid Glass is the selected material. It is the only
@@ -2294,6 +2320,10 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
             update_finder_menu_controls_enabled(u);
             // The display mode may have just changed: recompute the thumbnail-only pair.
             update_display_mode_dependent_visibility(u);
+            // The Dock page's peek switch is frozen under its previews switch; a reload that flipped
+            // the master has to re-settle it, or the child stays clickable while nothing it acts on
+            // exists.
+            update_dock_preview_controls_enabled(u);
             // Key bindings: an external change (a menu toggle, a reloaded file) has to reach the
             // list. The sync rebuilds the rows only when the list's shape changed, so flipping a
             // row's switch from its own action does not destroy the control mid-action.
@@ -3622,6 +3652,98 @@ mod tests {
     /// matches the enum by hand, so a field can be added to one and not the other with nothing failing
     /// -- the setting then shows, animates and writes nothing (`on_control_changed` logs "unknown sender"
     /// and returns). The pointer table is invisible to the type system, which is exactly why the
+    /// Every conditionally described group must be settled by the one shared visibility pass.
+    ///
+    /// The renderer hides every described group when its page is built, so a group that no helper
+    /// called from `update_conditional_rows` settles is invisible the first time its page opens --
+    /// the page looks like it never had the row. The Dock page's peek switch was exactly that: the
+    /// row existed, the switch was wired, and users could not see it.
+    ///
+    /// Asserted on the source: the pass and the bodies of the helpers it calls are read together, and
+    /// the set of groups they mention is compared with the set the pages describe.
+    #[test]
+    fn every_described_group_is_settled_by_the_conditional_row_pass() {
+        fn read(relative: &str) -> String {
+            std::fs::read_to_string(format!("{}/{}", env!("CARGO_MANIFEST_DIR"), relative))
+                .unwrap_or_else(|_| panic!("{relative} must be readable"))
+        }
+
+        // Every group the pages describe, from the enum's own declaration.
+        let canvas = read("src/settings/page_canvas.rs");
+        let enum_start = canvas.find("pub(super) enum RowGroup {").expect("RowGroup");
+        let enum_end = canvas[enum_start..].find('}').expect("end") + enum_start;
+        let mut groups: Vec<String> = Vec::new();
+        for line in canvas[enum_start + 1..enum_end].lines() {
+            let line = line.trim();
+            if line.is_empty() || line.starts_with("//") {
+                continue;
+            }
+            let name: String = line
+                .chars()
+                .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                .collect();
+            if !name.is_empty()
+                && name.starts_with(|c: char| c.is_ascii_uppercase())
+                && line[name.len()..].trim_start().starts_with(',')
+            {
+                groups.push(name);
+            }
+        }
+        assert!(
+            groups.len() >= 2 && groups.iter().any(|g| g == "DockPeek"),
+            "the enum must parse and contain the Dock peek group: {groups:?}"
+        );
+
+        // The pass, plus the body of every helper it calls in this file.
+        let dispatch = read("src/settings/dispatch.rs");
+        let pass_start = dispatch
+            .find("pub(super) unsafe fn update_conditional_rows(")
+            .expect("the shared conditional-row pass");
+        let pass_end = dispatch[pass_start..].find("\n}").expect("end") + pass_start;
+        let pass = &dispatch[pass_start..pass_end];
+        let mut settled = String::new();
+        // Two levels: the pass calls `update_*`, and several of those call a `set_*` that holds the
+        // `set_group_visible` itself. Both kinds are collected, from the pass's own body first.
+        let mut frontier: Vec<String> = pass
+            .split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .filter(|call| !call.is_empty())
+            .map(str::to_string)
+            .collect();
+        settled.push_str(pass);
+        let mut seen: Vec<String> = Vec::new();
+        while let Some(call) = frontier.pop() {
+            if seen.contains(&call) {
+                continue;
+            }
+            seen.push(call.clone());
+            let header = format!("fn {call}(");
+            let Some(at) = dispatch.find(&header) else {
+                continue;
+            };
+            let body_end = dispatch[at..]
+                .find("\n}")
+                .map_or(dispatch.len(), |e| at + e);
+            let body = &dispatch[at..body_end];
+            settled.push_str(body);
+            frontier.extend(
+                body.split(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+                    .filter(|callee| {
+                        !callee.is_empty()
+                            && dispatch.contains(&format!("fn {callee}("))
+                            && callee.contains('_')
+                    })
+                    .map(str::to_string),
+            );
+        }
+        for group in &groups {
+            assert!(
+                settled.contains(&format!("RowGroup::{group}")),
+                "RowGroup::{group} is described by a page, but no helper called from \
+                 update_conditional_rows settles it -- its row would stay hidden on first open"
+            );
+        }
+    }
+
     /// settings checklist exists; this makes its step 10/11 machine-checked.
     #[test]
     fn every_control_field_is_wired_in_both_directions() {

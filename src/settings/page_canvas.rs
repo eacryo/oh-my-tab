@@ -33,6 +33,9 @@ pub(super) enum RowGroup {
     ClipboardDeleteChild,
     /// The Liquid-Glass-only "glass style" sub-option on the General page.
     GlassStyle,
+    /// "Bring a window forward while hovering it" on the Dock page: only meaningful while Dock
+    /// previews are on, because it acts on the preview's cards.
+    DockPeek,
 }
 
 /// How a row re-places the views the canvas captured for it.

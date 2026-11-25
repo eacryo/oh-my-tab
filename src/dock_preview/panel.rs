@@ -248,6 +248,32 @@ pub(crate) fn hide() {
     state.request = 0;
 }
 
+/// Put the panel back above a window that just came forward.
+///
+/// The panel is a non-activating panel and never becomes key, but a peek brings another application
+/// to the front and its windows are ordered in its own activation: the preview must stay visible
+/// over the application it is previewing, or the pointer would be resting on a panel the user
+/// cannot see. Ordering it front does not take key or main, so the peeked window keeps the focus it
+/// was just given.
+pub(crate) fn order_front() {
+    let Ok(slot) = PANEL.lock() else {
+        return;
+    };
+    let Some(state) = slot.as_ref() else {
+        return;
+    };
+    let visible: Bool = unsafe { msg_send![state.panel, isVisible] };
+    if visible != Bool::YES {
+        return;
+    }
+    unsafe {
+        let _: () = msg_send![state.panel, orderFrontRegardless];
+        if state.tooltip_visible {
+            let _: () = msg_send![state.tooltip_panel, orderFrontRegardless];
+        }
+    }
+}
+
 /// Main-thread tick: fill thumbnails, confirm pending window closes, update the tooltip.
 pub(crate) fn tick(now: Instant, pointer: (f64, f64)) -> TickOutcome {
     let Ok(mut slot) = PANEL.lock() else {
@@ -1459,6 +1485,55 @@ pub(crate) fn current_pointer_zone() -> PointerZone {
     slot.as_ref()
         .map(|state| state.last_zone)
         .unwrap_or(PointerZone::Outside)
+}
+
+/// The card under the REAL cursor right now, hit against the panel's current geometry.
+///
+/// `current_pointer_zone` answers with the zone the last tick sampled, which is up to one frame old.
+/// A decision that lands between two ticks (a worker coming back) must not act on a stale pointer,
+/// so it hits the cursor itself instead.
+pub(crate) fn card_under_pointer() -> Option<usize> {
+    let pointer = crate::dock_preview::pointer_in_cg()?;
+    let Ok(slot) = PANEL.lock() else {
+        return None;
+    };
+    let state = slot.as_ref()?;
+    let local = (
+        pointer.0 - state.geometry.panel.x,
+        pointer.1 - state.geometry.panel.y,
+    );
+    let zone = layout::pointer_zone(
+        local,
+        Rect::new(0.0, 0.0, state.geometry.panel.w, state.geometry.panel.h),
+        &state.geometry.cards,
+        Rect::new(
+            state.geometry.anchor.x - state.geometry.panel.x,
+            state.geometry.anchor.y - state.geometry.panel.y,
+            state.geometry.anchor.w,
+            state.geometry.anchor.h,
+        ),
+        Rect::new(
+            state.geometry.band.x - state.geometry.panel.x,
+            state.geometry.band.y - state.geometry.panel.y,
+            state.geometry.band.w,
+            state.geometry.band.h,
+        ),
+        state.hovered,
+    );
+    match zone {
+        // A card that is being closed is the panel's background to the tick as well: a window whose
+        // close was requested is waiting for its Accessibility answer, and a stale hover result
+        // landing on it would raise a window the user just asked to close.
+        PointerZone::Card(index)
+            if !state
+                .cards
+                .get(index)
+                .is_some_and(|card| card.closing_since.is_some() || card.close_pending) =>
+        {
+            Some(index)
+        }
+        _ => None,
+    }
 }
 
 /// The title box of one card in screen top-left coordinates, for the smoke runner's tooltip check.

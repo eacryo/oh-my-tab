@@ -892,19 +892,29 @@ pub(crate) const FINDER_MENU_TERMINALS: [&str; 7] = [
 ];
 /// Dock previews: hovering an app's Dock icon shows thumbnails of all its windows.
 ///
-/// A single switch, on by default: it is the feature the Dock side of the app exists for, and it
-/// can still be turned off for a machine that wants no thumbnail work near the Dock. The runtime
-/// consumption belongs to the dock-preview module, not to the settings layer.
+/// On by default: it is the feature the Dock side of the app exists for, and it can still be turned
+/// off for a machine that wants no thumbnail work near the Dock. The runtime consumption belongs to
+/// the dock-preview module, not to the settings layer.
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
 #[serde(default)]
 pub struct DockPreviewSection {
     /// Whether hovering an app in the Dock shows its window thumbnails. Default true.
     pub enabled: bool,
+    /// Whether resting the pointer on a thumbnail in that preview brings its window to the front,
+    /// and leaving the thumbnail puts the application that was in front back. Default true.
+    ///
+    /// This is a real activation of the target application and a second one back: macOS has no way
+    /// to lift another application's window without making it active first (measured 2026-11-24),
+    /// so the switch exists for machines whose applications react to being activated.
+    pub peek_on_hover: bool,
 }
 
 impl Default for DockPreviewSection {
     fn default() -> Self {
-        Self { enabled: true }
+        Self {
+            enabled: true,
+            peek_on_hover: true,
+        }
     }
 }
 
@@ -2250,7 +2260,7 @@ impl Config {
         self.finder_menu = other.finder_menu;
         self.normalize_finder_menu();
 
-        // dock preview: a single boolean, always valid, so it is adopted unconditionally.
+        // dock preview: two booleans, both always valid, so they are adopted unconditionally.
         self.dock_preview = other.dock_preview;
 
         // clipboard (enabled always valid; max_entries is validated)
@@ -4195,6 +4205,10 @@ enabled = true
         assert!(
             old.dock_preview.enabled,
             "an absent section must load as enabled"
+        );
+        assert!(
+            old.dock_preview.peek_on_hover,
+            "a file written before the peek switch existed must load with the peek on"
         );
 
         // Explicitly off survives serialization.
