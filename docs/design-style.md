@@ -315,9 +315,14 @@ tint 使用 `RRGGBBAA`；alpha 控制中性色染色，文字和控件保持完�
 
 | 材质 | 它的表面 | 墨 |
 | --- | --- | --- |
-| `liquid-glass` | 系统玻璃，渲染值远离 `window_bg`（深色模式落在中灰） | 动态系统标签色 |
+| `liquid-glass` | 系统玻璃，渲染值远离 `window_bg`（深色模式落在中灰） | 调色板 token（见下） |
 | `frost` | 磨砂材质（深色模式约 `#868585`） | 动态系统标签色 |
 | `opaque` | **就是** `window_bg` | 调色板 token（与它假设的表面完全一致） |
+
+液态玻璃是动态规则的**实测例外**：`NSGlassEffectView` 不是 `NSVisualEffectView`， vibrant 外观下没有为动态色做
+对比度补偿的提供方，动态标签色在它的表面上实测比调色板 token 更差（深色模式下对调色板自身墨色仅 1.20:1），
+所以这一档用确定性的调色板 token——既可读又可预期。frost 有 `NSVisualEffectView` 提供方，保持动态规则不变
+（`glass::panel_ink` 按材质分支实现两者）。
 
 只有 `opaque` 仍适用上面的对比度表。两种半透明表面做不到：材质的色调按定义就偏离 `window_bg`，没有任何
 墨色能在其上达到 12:1 / 7:1。它们按下面浮窗那一档验收。

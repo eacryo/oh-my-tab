@@ -20,6 +20,28 @@ pub(crate) const PANEL_CORNER_RADIUS: f64 = 16.0;
 pub(crate) const CLIPBOARD_PANEL_RADIUS: f64 = 32.0;
 /// AppKit darkens Liquid Glass in passive panels; this alpha matches the clipboard detail panel.
 pub(crate) const INACTIVE_GLASS_COMPENSATION_ALPHA: u32 = 0x99;
+
+/// The regular look's veil strength for a passive panel: enough to keep the bare panel from the
+/// passive murk, translucent enough that the glass still reads.
+pub(crate) const PASSIVE_REGULAR_COMPENSATION_ALPHA: u32 = 0x60;
+
+/// The compensation veil for a panel that never becomes key (the keystroke HUD, the Dock preview):
+/// passive glass renders dimmer than the key window's, and the veil lifts it back toward the active
+/// surface. Clear glass must remain translucent, so its veil carries no alpha; regular keeps the
+/// tint's RGB at a partial lift -- full strength covered the panel in an opaque fill, which is what
+/// read as "no glass".
+pub(crate) fn passive_glass_compensation_tint(style: &str, dark: bool) -> u32 {
+    let tint = if dark {
+        crate::theme::HUD_GLASS_COMPENSATION_DARK
+    } else {
+        crate::theme::HUD_GLASS_COMPENSATION_LIGHT
+    };
+    if glass_style_index(style) == 1 {
+        tint & 0xFFFF_FF00
+    } else {
+        (tint & 0xFFFF_FF00) | PASSIVE_REGULAR_COMPENSATION_ALPHA
+    }
+}
 /// How a panel holds the contrast table for the text it draws.
 ///
 /// Panels sit on the user's material, so their ink is the **system's vibrant label color** rather than

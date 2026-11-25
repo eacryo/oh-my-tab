@@ -29,6 +29,11 @@ pub(crate) fn apply_theme_and_locale_refresh() {
         // or the gear keeps the previous language and palette after a switch.
         crate::keystroke_display::refresh_cached_controls();
     }
+    // The Dock preview's panel is cached across hovers with its surface baked in at build time,
+    // so a material, glass-style or theme change would never reach it. Dropping the cache makes
+    // the next hover build with the current surface -- the transient panel's form of the swap the
+    // standing panels do above.
+    crate::dock_preview::drop_cached_panel();
     // The guide re-renders its current step with the new palette and re-asserts the
     // window appearance; a no-op when the guide is not on screen.
     crate::onboarding::apply_window_appearance();

@@ -168,7 +168,7 @@ static PANEL_EDGE: MainThreadSlot<Option<crate::ffi::ObjPtr>> =
 
 /// The HUD never becomes key; compensate its passive glass to match the active clipboard surface.
 pub(crate) fn hud_backdrop_options() -> crate::glass::BackdropOptions {
-    let tint = hud_compensation_tint(
+    let tint = crate::glass::passive_glass_compensation_tint(
         &crate::config::effective_glass_style(),
         crate::theme::resolved_is_dark(),
     );
@@ -177,26 +177,6 @@ pub(crate) fn hud_backdrop_options() -> crate::glass::BackdropOptions {
         .with_elevation(Some(crate::theme::ELEVATION_HIGH))
         .with_native_glass_edge()
 }
-
-fn hud_compensation_tint(style: &str, dark: bool) -> u32 {
-    let tint = if dark {
-        crate::theme::HUD_GLASS_COMPENSATION_DARK
-    } else {
-        crate::theme::HUD_GLASS_COMPENSATION_LIGHT
-    };
-    // Clear glass must remain translucent, and the regular look only needs a partial lift:
-    // the full-strength veil covered the panel in an opaque fill, which is what read as "no
-    // glass" -- half strength brightens the passive dim while the material still shows through.
-    if crate::glass::glass_style_index(style) == 1 {
-        tint & 0xFFFF_FF00
-    } else {
-        (tint & 0xFFFF_FF00) | HUD_REGULAR_COMPENSATION_ALPHA
-    }
-}
-
-/// The regular look's veil strength: enough to keep the bare panel from the passive murk,
-/// translucent enough that the glass still reads.
-const HUD_REGULAR_COMPENSATION_ALPHA: u32 = 0x60;
 
 // Layout and dragging already clamp the visible panel to its screen. AppKit must not clamp the
 // larger, transparent shadow window again: doing so moves a saved panel away from the screen edge.
@@ -4250,12 +4230,18 @@ mod tests {
             (true, crate::theme::HUD_GLASS_COMPENSATION_DARK),
         ] {
             // Regular keeps the tint's RGB but thins the alpha to the glass-preserving lift.
-            let regular_tint = super::hud_compensation_tint("regular", dark);
-            assert_eq!(regular_tint & 0xFF, super::HUD_REGULAR_COMPENSATION_ALPHA);
-            assert_eq!(regular_tint >> 8, regular >> 8);
-            assert_eq!(super::hud_compensation_tint("clear", dark) & 0xFF, 0);
+            let regular_tint = crate::glass::passive_glass_compensation_tint("regular", dark);
             assert_eq!(
-                super::hud_compensation_tint("clear", dark) >> 8,
+                regular_tint & 0xFF,
+                crate::glass::PASSIVE_REGULAR_COMPENSATION_ALPHA
+            );
+            assert_eq!(regular_tint >> 8, regular >> 8);
+            assert_eq!(
+                crate::glass::passive_glass_compensation_tint("clear", dark) & 0xFF,
+                0
+            );
+            assert_eq!(
+                crate::glass::passive_glass_compensation_tint("clear", dark) >> 8,
                 regular >> 8
             );
         }

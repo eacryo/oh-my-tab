@@ -147,9 +147,42 @@ struct Geometry {
     columns: usize,
 }
 
+/// The surface facts baked into the panel shell at build time: the effective material (Reduce
+/// Transparency included), the glass style and the resolved mode. The compensation veil, the glass
+/// tint, the frost material, the vibrant appearance and the bevel are all chosen from these three
+/// when the hierarchy is built, so a reuse across a change of any of them would keep the old shell
+/// behind freshly drawn content.
+#[derive(Clone, Copy, PartialEq)]
+struct SurfaceTag {
+    material: glass::PanelMaterial,
+    glass_style: i64,
+    dark: bool,
+}
+
+fn surface_tag() -> SurfaceTag {
+    SurfaceTag {
+        material: glass::PanelMaterial::effective(),
+        glass_style: glass::glass_style_index(&crate::config::effective_glass_style()),
+        dark: theme::resolved_is_dark(),
+    }
+}
+
+/// Whether the cached shell can serve the next open. The size shapes the view tree, and the
+/// surface tag is everything the shell baked in -- a same-size reopen after a material, style or
+/// mode change must still rebuild. Pure so the reuse rule is assertable without a panel.
+fn shell_reuse_allowed(
+    cached_size: (f64, f64),
+    cached_surface: SurfaceTag,
+    needed: (f64, f64),
+    surface: SurfaceTag,
+) -> bool {
+    cached_size == needed && cached_surface == surface
+}
+
 struct PanelState {
     panel: *mut AnyObject,
     content_size: (f64, f64),
+    surface: SurfaceTag,
     container: *mut AnyObject,
     /// The clipping viewport: the only boundary that decides what part of a row is drawn or hit.
     viewport: *mut AnyObject,
@@ -275,9 +308,13 @@ pub(crate) fn show(request: PanelRequest, request_epoch: u64, ticket: u64) -> bo
     let Ok(mut slot) = PANEL.lock() else {
         return false;
     };
-    let needs_rebuild = slot
-        .as_ref()
-        .is_some_and(|state| state.content_size != needed);
+    // A same-size reopen after a material, glass-style or mode change (a config edit, the system
+    // appearance under the auto theme, a Reduce Transparency toggle) must rebuild too, or the new
+    // content draws on the previous mode's veil and rim.
+    let surface = surface_tag();
+    let needs_rebuild = slot.as_ref().is_some_and(|state| {
+        !shell_reuse_allowed(state.content_size, state.surface, needed, surface)
+    });
     if needs_rebuild {
         if let Some(old) = slot.take() {
             destroy(old);
@@ -347,6 +384,18 @@ fn destroy(state: PanelState) {
         if !state.shared_icon.is_null() {
             release_obj(state.shared_icon);
         }
+    }
+}
+
+/// Drop the cached panel so the next open builds it with the current material, glass style and
+/// palette. The panel is built once and reused across hovers, and its surface is baked at build
+/// time, so a visual change would otherwise never reach it.
+pub(crate) fn drop_cached_panel() {
+    let Ok(mut slot) = PANEL.lock() else {
+        return;
+    };
+    if let Some(old) = slot.take() {
+        destroy(old);
     }
 }
 
@@ -1367,9 +1416,18 @@ fn primary_screen_height() -> f64 {
     }
 }
 
+/// The preview never becomes key, so it shares the keystroke HUD's passive-panel recipe: the same
+/// compensation veil (transparent under clear glass), the native glass edge and the high elevation.
+/// What stays its own is the 8pt corner radius -- the deliberately squarish taskbar-preview shape.
 fn backdrop_options() -> glass::BackdropOptions {
-    glass::BackdropOptions::new(Some(glass::INACTIVE_GLASS_COMPENSATION_ALPHA))
+    let tint = glass::passive_glass_compensation_tint(
+        &crate::config::effective_glass_style(),
+        theme::resolved_is_dark(),
+    );
+    glass::BackdropOptions::new(Some(tint & 0xFF))
+        .with_compensation_tint(tint)
         .with_elevation(Some(theme::ELEVATION_HIGH))
+        .with_native_glass_edge()
 }
 // ---------------------------------------------------------------------------------------------
 // Construction
@@ -1401,6 +1459,17 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
         let _: () = msg_send![panel, setHasShadow: false];
         let _: () = msg_send![panel, setHidesOnDeactivate: false];
         let _: () = msg_send![panel, setAcceptsMouseMovedEvents: true];
+        // Vibrant, not plain: the labels are drawn on the user's material, so under frost they use
+        // the system's dynamic label colors and AppKit resolves them against the live backdrop
+        // (design-style §3, "the ink adapts"). Liquid Glass reads its absolute tokens either way.
+        let appearance_name =
+            make_nsstring(glass::vibrant_appearance_name(theme::resolved_is_dark()));
+        let appearance: *mut AnyObject =
+            msg_send![class!(NSAppearance), appearanceNamed: appearance_name];
+        crate::ffi::CFRelease(appearance_name as *const c_void);
+        if !appearance.is_null() {
+            let _: () = msg_send![panel, setAppearance: appearance];
+        }
         let level = 25isize; // NSStatusWindowLevel: above the Dock, below the switcher overlay.
         let _: () = msg_send![panel, setLevel: level];
         let behavior: usize = (1 << 0) | (1 << 3) | (1 << 6) | (1 << 8) | (1 << 18);
@@ -1421,6 +1490,11 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
             layout::PANEL_RADIUS,
             options,
         );
+        // The HUD's bevel, not the active panels': a passive panel's native specular rim is dimmed
+        // with the rest of the glass, so clear mode needs the stronger drawn rim to read as glass
+        // at all. Inert on frost and opaque (the draw returns early off Liquid Glass). The view
+        // hierarchy owns it, so nothing here has to keep the pointer.
+        let _ = glass::install_hud_bevel(&backdrop, layout::PANEL_RADIUS);
         let container: *mut AnyObject = msg_send![container_class(), alloc];
         let container: *mut AnyObject = msg_send![container, initWithFrame: NSRect::new(
             NSPoint::new(0.0, 0.0),
@@ -1461,6 +1535,7 @@ fn build(panel_w: f64, panel_h: f64) -> Option<PanelState> {
         Some(PanelState {
             panel,
             content_size: (panel_w, panel_h),
+            surface: surface_tag(),
             container,
             viewport,
             content,
@@ -1652,7 +1727,6 @@ unsafe fn build_cards(state: &mut PanelState, request: &PanelRequest) {
     let icon = crate::app_identity::icon_for_bundle_id(&request.bundle, layout::CARD_ICON);
     let panel = (state.geometry.panel.w, state.geometry.panel.h);
     let plates = layout::plates_for_grid(&rects, state.geometry.columns.max(1), panel);
-    let palette = theme::ui_palette();
     for (index, rect) in rects.iter().enumerate() {
         let Some(window) = request.windows.get(index) else {
             break;
@@ -1677,9 +1751,10 @@ unsafe fn build_cards(state: &mut PanelState, request: &PanelRequest) {
         let thumb_layer: *mut AnyObject = msg_send![thumbnail, layer];
         let _: () = msg_send![thumb_layer, setCornerRadius: layout::THUMB_RADIUS];
         let _: () = msg_send![thumb_layer, setMasksToBounds: true];
-        let _: () = msg_send![thumb_layer, setBorderWidth: 1.0f64];
-        layer_set_background(thumb_layer, hex_to_cg_color(palette.field_bg));
-        layer_set_border(thumb_layer, hex_to_cg_color(palette.card_border));
+        // Transparent and borderless like the switcher's preview container: leftover space around
+        // a thumbnail shows the panel's glass directly instead of a flat plate that hides it.
+        let _: () = msg_send![thumb_layer, setBorderWidth: 0.0f64];
+        layer_set_background(thumb_layer, std::ptr::null_mut());
         let gravity = make_nsstring("resizeAspect");
         let _: () = msg_send![thumb_layer, setContentsGravity: gravity];
         release_obj(gravity);
@@ -1808,7 +1883,7 @@ unsafe fn build_rows(state: &mut PanelState, request: &PanelRequest) {
             );
             let label = passthrough_label(rect, &window.title);
             style_label(label, theme::FONT_CONTROL);
-            let _: () = msg_send![label, setTextColor: hex_to_ns_color(palette.primary_text)];
+            let _: () = msg_send![label, setTextColor: glass::panel_ink(palette.primary_text, glass::PanelInk::Primary)];
             let measured = measured_title(state, &window.title);
             (
                 label,
@@ -2043,7 +2118,7 @@ unsafe fn close_cross_view(rect: Rect) -> *mut AnyObject {
     let _: () = msg_send![cross, setAlignment: 2isize]; // centered
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: theme::FONT_CAPTION];
     let _: () = msg_send![cross, setFont: font];
-    let _: () = msg_send![cross, setTextColor: hex_to_ns_color(palette.muted_text)];
+    let _: () = msg_send![cross, setTextColor: glass::panel_ink(palette.muted_text, glass::PanelInk::Muted)];
     cross
 }
 
@@ -2088,7 +2163,7 @@ unsafe fn passthrough_label_at(frame: NSRect, text: &str) -> *mut AnyObject {
     let string = make_nsstring(text);
     let _: () = msg_send![label, setStringValue: string];
     release_obj(string);
-    let _: () = msg_send![label, setTextColor: hex_to_ns_color(theme::ui_palette().primary_text)];
+    let _: () = msg_send![label, setTextColor: glass::panel_ink(theme::ui_palette().primary_text, glass::PanelInk::Primary)];
     label
 }
 
@@ -2177,13 +2252,13 @@ fn set_row_close_style(row: &RowEntry, hot: bool) {
 
 fn emphasize_close(close: *mut AnyObject, cross: *mut AnyObject, hot: bool) {
     let palette = theme::ui_palette();
-    let tint = if hot {
-        palette.destructive
-    } else {
-        palette.muted_text
-    };
     unsafe {
-        let _: () = msg_send![cross, setTextColor: hex_to_ns_color(tint)];
+        let color = if hot {
+            hex_to_ns_color(palette.destructive)
+        } else {
+            glass::panel_ink(palette.muted_text, glass::PanelInk::Muted)
+        };
+        let _: () = msg_send![cross, setTextColor: color];
         let layer: *mut AnyObject = msg_send![close, layer];
         if hot {
             layer_set_background(
@@ -3312,6 +3387,48 @@ fn json_string(value: &str) -> String {
     }
     out.push('"');
     out
+}
+
+#[cfg(test)]
+mod shell_reuse_tests {
+    use super::*;
+
+    fn tag(material: glass::PanelMaterial, glass_style: i64, dark: bool) -> SurfaceTag {
+        SurfaceTag {
+            material,
+            glass_style,
+            dark,
+        }
+    }
+
+    #[test]
+    fn a_same_size_reopen_with_a_changed_surface_rebuilds() {
+        let size = (656.0, 172.0);
+        let built = tag(glass::PanelMaterial::LiquidGlass, 1, false);
+        // The pre-fix rule compared only the size: every one of these reused the old shell.
+        assert!(!shell_reuse_allowed(
+            size,
+            built,
+            size,
+            tag(glass::PanelMaterial::Opaque, 1, false)
+        ));
+        assert!(!shell_reuse_allowed(
+            size,
+            built,
+            size,
+            tag(glass::PanelMaterial::LiquidGlass, 0, false)
+        ));
+        assert!(!shell_reuse_allowed(
+            size,
+            built,
+            size,
+            tag(glass::PanelMaterial::LiquidGlass, 1, true)
+        ));
+        // The same size with the same surface is the reuse the cache exists for.
+        assert!(shell_reuse_allowed(size, built, size, built));
+        // A different size rebuilds whatever the surface says.
+        assert!(!shell_reuse_allowed(size, built, (656.0, 200.0), built));
+    }
 }
 
 #[cfg(test)]

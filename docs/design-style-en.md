@@ -386,9 +386,16 @@ glass makes.
 
 | Material | Its surface | Ink |
 | --- | --- | --- |
-| `liquid-glass` | the system's glass, which renders away from `window_bg` (mid-grey in dark mode) | dynamic system label colours |
+| `liquid-glass` | the system's glass, which renders away from `window_bg` (mid-grey in dark mode) | the palette token (see below) |
 | `frost` | the frost material (around `#868585` in dark mode) | dynamic system label colours |
 | `opaque` | `window_bg` itself | the palette token, which is exactly the surface it assumes |
+
+Liquid glass is the dynamic rule's **measured exception**: `NSGlassEffectView` is not an
+`NSVisualEffectView`, so a vibrant appearance has no provider applying the contrast-preserving
+treatment to the dynamic colours, and they measured worse than the palette token on its surface
+(1.20:1 against the palette's own ink in dark mode). The deterministic palette token is both better
+and predictable there. Frost keeps the dynamic rule because `NSVisualEffectView` is such a provider
+(`glass::panel_ink` branches the two per material).
 
 Only `opaque` still answers the floors above. The two translucent surfaces cannot: the material's tone sits
 away from `window_bg` by construction, and no ink colour reaches 12:1 / 7:1 there. They are held to the panel

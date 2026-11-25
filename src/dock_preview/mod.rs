@@ -412,6 +412,25 @@ fn current_identity() -> Option<(i32, String, Option<u64>)> {
 /// verified on a worker: both need Accessibility for some windows, and the main thread must not
 /// block on a target that does not answer.
 ///
+/// Material, glass style, theme and palette are baked into the cached panel when it is built, and
+/// the panel is reused across hovers. A visual refresh drops the cache; the next open rebuilds with
+/// the current surface. Unlike the other floating panels the preview is transient, so retiring the
+/// cache is its form of the live material swap.
+pub(crate) fn drop_cached_panel() {
+    // A VISIBLE preview goes through the full close flow first, not a bare destroy: the reveal
+    // keeper, the preview's identity and the capture tickets all retire with it -- otherwise an
+    // auto-hidden Dock can stay held on screen after its preview is gone. An invisible one must
+    // not: the close flow would also cancel a pending open whose collection is still in flight,
+    // and the observer dedupes the unchanged hover signature, so a pointer resting on the same
+    // tile would never see the preview it already waited for. That open is safe to keep: when its
+    // result lands, `panel::show` builds the shell from the current surface facts (and the reuse
+    // check would refuse a stale one anyway).
+    if panel::is_visible() {
+        hide_panel();
+    }
+    panel::drop_cached_panel();
+}
+
 /// The target is the one resolved under the panel lock (`panel::hit_target`), never an index: a
 /// scroll or a removal between the click and this call would otherwise pick another row.
 pub(crate) fn activate_target(target: panel::HitTarget) {

@@ -1472,6 +1472,10 @@ pub(crate) fn apply_system_appearance_refresh() {
         keystroke_display::apply_glass_properties();
     }
     overlay::apply_theme();
+    // The Dock preview's shell is baked at build time and cached across hovers; retiring the cache
+    // makes the next hover build with the new mode's material, veil and rim. Its reuse check also
+    // compares the baked surface facts, so this covers a visible panel and a hidden cached one.
+    crate::dock_preview::drop_cached_panel();
 }
 
 /// Callback for screen-parameter changes (NSApplicationDidChangeScreenParametersNotification:
