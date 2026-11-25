@@ -225,7 +225,8 @@ pub(super) unsafe fn build_general_page(
         ),
     }
 }
-/// Build the Dock page from its description (one card with the previews switch).
+/// Build the Dock page from its description (the previews switch in its own card, then the
+/// options card the switch governs).
 pub(super) unsafe fn build_dock_page(
     context: &SettingsPageBuildContext,
     dock_view: *mut AnyObject,

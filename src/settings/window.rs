@@ -4322,7 +4322,8 @@ fn create_settings_window_for(existing_window: Option<*mut AnyObject>) {
         // path), so its provisional height is generous before the first re-flow settles it.
         let finder_menu_doc_h = 1180.0;
         let about_doc_h = 1300.0;
-        // The Dock page: one card with the previews switch.
+        // The Dock page: the previews switch in its own card, then the options card (the
+        // close-then-quit switch, the row/list threshold and the hover peek).
         let dock_doc_h = 1000.0;
 
         // One page per identity, in `SETTINGS_PAGES` order. The provisional height is looked up by

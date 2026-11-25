@@ -872,9 +872,10 @@ fn a_description_reads_only_its_input_and_capture_reads_the_config_once() {
 
 #[test]
 fn dock_page_view_owns_the_preview_switches() {
-    // The Dock feature has its own page: one card with the switches that act on its panel and the
-    // row/list threshold, each carrying the copy that says what it does. None of them may appear on
-    // another page (General pins its own rows
+    // The Dock feature has its own page: the previews switch in its own card, then a card with the
+    // options that switch governs (close-then-quit, the row/list threshold, the hover peek), each
+    // carrying the copy that says what it does. None of them may appear on another page (General
+    // pins its own rows
     // above), so the page boundary is asserted here.
     let view = dock();
     assert_eq!(view.page, SettingsPageId::Dock);
@@ -882,6 +883,15 @@ fn dock_page_view_owns_the_preview_switches() {
     // The switch, the promise it makes about closes made here, the threshold and the peek: all four
     // only mean something while the switch above them is on.
     assert_eq!(view.rows.len(), 4);
+    // The master switch is its own card, and every option it governs is the next one: a switch never
+    // shares a card with the switches it governs (the App Switcher page's overlay/options split).
+    assert_eq!(view.rows[0].section, "settings.header_dock_preview");
+    for options in &view.rows[1..] {
+        assert_eq!(
+            options.section, "settings.header_dock_preview_options",
+            "every governed option lives in the options card"
+        );
+    }
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
     assert_eq!(view.rows[0].label_key, "settings.row_dock_preview_enabled");
     assert_eq!(
@@ -896,7 +906,7 @@ fn dock_page_view_owns_the_preview_switches() {
     );
     // The second switch is the close-then-quit promise for this surface, off by default, in the
     // same card and with its own copy: it governs the preview panel's close button only.
-    assert_eq!(view.rows[1].section, "settings.header_dock_preview");
+    assert_eq!(view.rows[1].section, "settings.header_dock_preview_options");
     assert_eq!(
         view.rows[1].label_key,
         "settings.row_dock_quit_on_last_window_close"
@@ -912,7 +922,7 @@ fn dock_page_view_owns_the_preview_switches() {
     // The threshold is a POPUP with one option per legal value: its index is the value minus the
     // range's first entry, so an illegal value cannot be expressed and no numeric field is needed.
     let threshold = &view.rows[2];
-    assert_eq!(threshold.section, "settings.header_dock_preview");
+    assert_eq!(threshold.section, "settings.header_dock_preview_options");
     assert_eq!(threshold.label_key, "settings.row_dock_cards_per_row");
     assert_eq!(
         threshold.caption_key,
@@ -936,7 +946,7 @@ fn dock_page_view_owns_the_preview_switches() {
     // The peek is the fourth row: a switch that acts on the preview's own cards, on by default, in
     // the conditional group its master switch settles.
     let peek = &view.rows[3];
-    assert_eq!(peek.section, "settings.header_dock_preview");
+    assert_eq!(peek.section, "settings.header_dock_preview_options");
     assert_eq!(peek.label_key, "settings.row_dock_peek_on_hover");
     assert_eq!(peek.caption_key, Some("settings.desc_dock_peek_on_hover"));
     assert_eq!(peek.copy, RowCopy::Captioned);

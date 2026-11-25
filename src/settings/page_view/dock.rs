@@ -57,6 +57,10 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
         .wide_caption()
         .into_spec(),
     );
+    // The master switch is its own card, and every option that only means something while it is on
+    // is the next one -- the same split the App Switcher page makes between its overlay switch and
+    // its window options, so one switch never shares a card with the switches it governs.
+    w.card("settings.header_dock_preview_options");
     // The panel's cards own the close button, so this row lives with the feature it belongs to and
     // is frozen by `update_dock_preview_controls_enabled` when the switch above it is off.
     w.push(
