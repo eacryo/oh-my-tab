@@ -21,6 +21,7 @@ pub(super) enum ControlField {
     LaunchAtLogin,
     HideMenuBarIcon,
     DockPreviewEnabled,
+    DockQuitOnLastWindowClose,
     WindowsEnabled,
     ShowMinimized,
     ShowHiddenAppWindows,
@@ -37,6 +38,7 @@ pub(super) enum ControlField {
     PanelMinimizeEnabled,
     PanelHideEnabled,
     PanelQuitEnabled,
+    QuitOnLastWindowClose,
     Modifier,
     KeystrokeDisplayEnabled,
     KeystrokeDisplayMode,
@@ -915,6 +917,10 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.dock_preview_enabled, state];
                     cfg.dock_preview.enabled = state == 1;
                 }
+                ControlField::DockQuitOnLastWindowClose => {
+                    let state: isize = msg_send![u.dock_quit_on_last_window_close, state];
+                    cfg.dock_preview.quit_on_last_window_close = state == 1;
+                }
                 ControlField::WindowsEnabled => {
                     let state: isize = msg_send![u.windows_enabled, state];
                     cfg.windows.enabled = state == 1;
@@ -989,6 +995,10 @@ fn apply_control_field(field: ControlField) {
                 ControlField::PanelQuitEnabled => {
                     let state: isize = msg_send![u.panel_quit_enabled, state];
                     cfg.windows.panel_quit_enabled = state == 1;
+                }
+                ControlField::QuitOnLastWindowClose => {
+                    let state: isize = msg_send![u.quit_on_last_window_close, state];
+                    cfg.windows.quit_on_last_window_close = state == 1;
                 }
                 ControlField::Modifier => {
                     let idx: isize = msg_send![u.modifier, indexOfSelectedItem];
@@ -1682,11 +1692,24 @@ pub(super) unsafe fn update_windows_controls_enabled(ui: &SettingsUi) {
         ui.panel_close_enabled,
         ui.panel_minimize_enabled,
         ui.panel_hide_enabled,
+        ui.quit_on_last_window_close,
         ui.panel_quit_enabled,
         ui.modifier,
     ] {
         SettingsRow::set_enabled_with_tooltip(ctrl, on, &tooltip);
     }
+}
+
+/// Freeze the Dock preview options below the Dock-preview master switch.
+///
+/// The quit switch only governs closes made from the preview panel's cards, so with the feature
+/// off there is no close for it to act on: leaving it live would promise an effect nothing can
+/// produce.
+pub(crate) unsafe fn update_dock_preview_controls_enabled(ui: &SettingsUi) {
+    let state: isize = msg_send![ui.dock_preview_enabled, state];
+    let on = state == 1;
+    let tooltip = t("settings.tooltip_dock_preview_disabled");
+    SettingsRow::set_enabled_with_tooltip(ui.dock_quit_on_last_window_close, on, &tooltip);
 }
 
 /// Freeze the clipboard-history options below the clipboard master switch.
@@ -2100,6 +2123,24 @@ pub(crate) extern "C" fn handle_windows_enabled_toggle(
     });
 }
 
+/// Callback for the Dock-preview master switch: apply it, then freeze the quit switch below it.
+pub(crate) extern "C" fn handle_dock_preview_enabled_toggle(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_dock_preview_enabled_toggle", || {
+        apply_control_field(ControlField::DockPreviewEnabled);
+        unsafe {
+            with_settings_ui(|ui| {
+                if let Some(u) = ui.as_ref() {
+                    update_dock_preview_controls_enabled(u);
+                }
+            });
+        }
+    });
+}
+
 /// Callback for the clipboard-history master switch: apply immediately, then freeze/unfreeze
 /// the history options below.
 pub(crate) extern "C" fn handle_clipboard_enabled_toggle(
@@ -2157,6 +2198,7 @@ pub(crate) fn refresh_service_controls_from_config() {
             }
             update_windows_controls_enabled(u);
             update_mouse_controls_enabled(u);
+            update_dock_preview_controls_enabled(u);
             update_clipboard_controls_enabled(u);
             super::bindings::update_binding_controls_enabled(u);
         });
@@ -2236,6 +2278,11 @@ pub(crate) fn refresh_switcher_keystroke_and_mouse_controls_from_config() {
                     &crate::runtime_config::IN_PLACE_REFRESH_PAGES,
                 );
             }
+
+            // The Dock page's quit switch is frozen by the master switch above it, and a reload or a
+            // defaults restore can move that master switch: refill the row above, then restate the
+            // freeze, or the page shows a live control for a feature that is off.
+            update_dock_preview_controls_enabled(u);
 
             let modifier_idx =
                 crate::config::switcher_modifier_index_of(&cfg.keyboard.modifier) as isize;

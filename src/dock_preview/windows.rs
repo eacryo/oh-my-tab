@@ -109,14 +109,8 @@ pub(crate) fn process_identity_matches(
     expected_key: &str,
     expected_start_time_us: Option<u64>,
 ) -> bool {
-    if pid <= 0 || expected_key.is_empty() || !process_is_running(pid) {
-        return false;
-    }
-    let Some(expected_start_time_us) = expected_start_time_us else {
-        return false;
-    };
-    let current = unsafe { app_identity::resolve_app_identity(pid) };
-    current.key == expected_key && current.process_start_time_us == Some(expected_start_time_us)
+    process_is_running(pid)
+        && app_identity::is_same_instance(pid, expected_key, expected_start_time_us)
 }
 
 /// Whether the window still exists and still belongs to `pid`.

@@ -81,6 +81,10 @@ struct ChangeFlags {
     menu_bar_icon: bool,
     // The Dock previews switch: start/stop the observer, hide the panel, refresh the settings row.
     dock_preview: bool,
+    // Either quit-on-last-window switch changed. Neither drives runtime state -- the switch is read
+    // from the live configuration when a close starts -- so this exists only so an open Settings
+    // page follows a reload or a defaults restore instead of showing the replaced value.
+    quit_on_last_window_close: bool,
     // Any Finder Menu field changed. The extension renders a model the main app pushes, so it has
     // to be broadcast; an open Settings page has to follow in place like any other section.
     finder_menu: bool,
@@ -122,6 +126,7 @@ fn needs_in_place_control_sync(flags: &ChangeFlags) -> bool {
         || flags.gestures
         || flags.key_bindings
         || flags.finder_menu
+        || flags.quit_on_last_window_close
         || flags.dock_preview
 }
 
@@ -229,6 +234,10 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
             || old.windows.panel_quit_enabled != new.windows.panel_quit_enabled,
         // Not tied to `startup`: the main app's startup path already owns the first broadcast, and
         // the comparison is what makes an edit, a reload and a defaults restore reach the extension.
+        quit_on_last_window_close: old.windows.quit_on_last_window_close
+            != new.windows.quit_on_last_window_close
+            || old.dock_preview.quit_on_last_window_close
+                != new.dock_preview.quit_on_last_window_close,
         finder_menu: old.finder_menu != new.finder_menu,
     }
 }

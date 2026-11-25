@@ -858,6 +858,40 @@ pub(crate) fn terminate_application(pid: i32) -> bool {
     }
 }
 
+/// Ask a verified instance to quit.
+///
+/// The `NSRunningApplication` object this resolves is the one the request goes to; the instance is
+/// checked between resolving it and sending, so a caller cannot verify one process and terminate
+/// another by re-resolving the PID. `terminate` is still a REQUEST: a save sheet, a cancelled quit or
+/// a hung event loop leave the app running, and callers must not derive state from the return value.
+pub(crate) fn terminate_application_verified(
+    pid: i32,
+    identity_key: &str,
+    process_start_time_us: Option<u64>,
+) -> bool {
+    // The worker that runs this is not a run-loop thread: every autoreleased object this function
+    // makes (the application handle, the identity's strings) drains here, not at thread exit.
+    objc2::rc::autoreleasepool(|_| unsafe {
+        // Resolve ONCE, verify THAT object, and send to the same object: resolving a second time
+        // would leave a window in which the PID names another process.
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            return false;
+        }
+        let identity = crate::app_identity::identity_of_app(app, pid);
+        if identity.key != identity_key
+            || identity.process_start_time_us != process_start_time_us
+            || process_start_time_us.is_none()
+        {
+            return false;
+        }
+        msg_send![app, terminate]
+    })
+}
+
 /// First half of the raise: WindowServer-level raise (SLPS) plus the synthetic click that
 /// establishes the key window. Normal windows call it at commit time; minimized windows call it
 /// from the background raiser after being restored.

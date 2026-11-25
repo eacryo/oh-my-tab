@@ -574,6 +574,9 @@ pub(super) struct SettingsUi {
     panel_minimize_enabled: *mut AnyObject,
     panel_hide_enabled: *mut AnyObject,
     panel_quit_enabled: *mut AnyObject,
+    // App Switcher page: quit the target application when the window closed from the switcher
+    // was its last one.
+    quit_on_last_window_close: *mut AnyObject,
     keystroke_display_enabled: *mut AnyObject,
     keystroke_display_mode: *mut AnyObject,
     keystroke_display_tap_level: *mut AnyObject,
@@ -585,8 +588,10 @@ pub(super) struct SettingsUi {
     launch_at_login: *mut AnyObject, // launch at login
     hide_menu_bar_icon: *mut AnyObject, // hide the menu-bar status item
     dock_preview_enabled: *mut AnyObject, // General page: show Dock preview thumbnails
+    // Dock page: the same promise for closes made from the preview panel's cards.
+    dock_quit_on_last_window_close: *mut AnyObject,
     reverse_scroll: *mut AnyObject, // reverse scrolling
-    enable_mouse: *mut AnyObject, // enable mouse control
+    enable_mouse: *mut AnyObject,   // enable mouse control
     gestures_enabled: *mut AnyObject,
     gesture_trigger_button: *mut AnyObject, // NSPopUpButton: the one button gestures start on
     gesture_show_trail: *mut AnyObject,
@@ -1344,12 +1349,12 @@ pub(crate) use dispatch::{
     announce_gestures_shadowed_by_switcher, end_max_extent_preview,
     handle_clipboard_enabled_toggle, handle_clipboard_excluded_add,
     handle_clipboard_excluded_remove, handle_clipboard_excluded_restore, handle_device_changed,
-    handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
-    handle_export_settings_ready, handle_gesture_excluded_choose, handle_gesture_excluded_remove,
-    handle_gesture_record_cancel, handle_gesture_record_start, handle_gesture_row_delete,
-    handle_gesture_row_trigger, handle_gesture_trigger_learn, handle_gesture_trigger_line,
-    handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
-    handle_pause_recording_toggle, handle_rebuild_settings_content,
+    handle_dock_preview_enabled_toggle, handle_enable_mouse_toggle, handle_export_logs,
+    handle_export_settings, handle_export_settings_ready, handle_gesture_excluded_choose,
+    handle_gesture_excluded_remove, handle_gesture_record_cancel, handle_gesture_record_start,
+    handle_gesture_row_delete, handle_gesture_row_trigger, handle_gesture_trigger_learn,
+    handle_gesture_trigger_line, handle_import_settings, handle_import_settings_ready,
+    handle_key_bindings_toggle, handle_pause_recording_toggle, handle_rebuild_settings_content,
     handle_settings_search_began_editing, handle_settings_search_changed,
     handle_settings_search_clear, handle_settings_search_ended_editing,
     handle_switcher_excluded_choose, handle_switcher_excluded_remove, handle_unknown_page_action,
@@ -1358,6 +1363,7 @@ pub(crate) use dispatch::{
     refresh_clipboard_unavailable_notice, refresh_device_popup_if_open,
     refresh_service_controls_from_config,
     refresh_switcher_keystroke_and_mouse_controls_from_config,
+    update_dock_preview_controls_enabled,
 };
 pub(crate) use window::{
     close_settings_from_switcher, e2e_presented_page, invalidate_settings_window,
@@ -2180,6 +2186,11 @@ fn log_config_changes(old: &Config, new: &Config) {
     changed!("i18n.locale", old.i18n.locale, new.i18n.locale);
     changed!("windows.enabled", old.windows.enabled, new.windows.enabled);
     changed!(
+        "windows.quit_on_last_window_close",
+        old.windows.quit_on_last_window_close,
+        new.windows.quit_on_last_window_close
+    );
+    changed!(
         "windows.show_minimized",
         old.windows.show_minimized,
         new.windows.show_minimized
@@ -2249,6 +2260,11 @@ fn log_config_changes(old: &Config, new: &Config) {
         "dock_preview.enabled",
         old.dock_preview.enabled,
         new.dock_preview.enabled
+    );
+    changed!(
+        "dock_preview.quit_on_last_window_close",
+        old.dock_preview.quit_on_last_window_close,
+        new.dock_preview.quit_on_last_window_close
     );
     changed!(
         "updates.automatically_check",
@@ -2673,6 +2689,10 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
                 ),
                 (ui.panel_hide_enabled, cfg.windows.panel_hide_enabled),
                 (ui.panel_quit_enabled, cfg.windows.panel_quit_enabled),
+                (
+                    ui.quit_on_last_window_close,
+                    cfg.windows.quit_on_last_window_close,
+                ),
             ] {
                 let _: () = msg_send![control, setState: if on { 1isize } else { 0isize }];
             }
@@ -2690,6 +2710,7 @@ fn load_settings_from(cfg: &Config, requested_page: Option<usize>) {
             // The About page's two update switches are described rows: the shared update
             // description above already wrote them.
             update_windows_controls_enabled(ui);
+            update_dock_preview_controls_enabled(ui);
 
             // Mouse page: filled only when it is the page being opened, or when it is the page on screen
             // and its data is stale. Everything else in this function is a cheap control assignment; this

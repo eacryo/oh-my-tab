@@ -611,6 +611,67 @@ default: quitting an app is destructive and hiding one changes what the user is 
   on the main thread (`keycode_for_character`), with that action's ANSI position as a per-action
   fallback, so one unresolvable key never disables the other three.
 
+## Quit on last window close
+
+Two independent switches, both off by default, make a close performed *from this app* also quit the
+application when that window was its last one: `windows.quit_on_last_window_close` (App Switcher page)
+for the switcher's close button, Backspace and a configured panel Command+W, and
+`dock_preview.quit_on_last_window_close` (Dock page, frozen while the Dock previews are off) for the
+preview panel's close button. Closing the last window from inside the target application still leaves it
+running: the narrow scope is the point -- a system-wide version needs a permanent per-application AX
+observer, the machinery the reference utilities (DockDoor, vorssaint) built, and this app keeps to the
+closes it initiates.
+
+`window_collector/last_window.rs` owns the decision. A close starts a transaction:
+
+1. **What a "user window" is.** A window the screen shows (CG `IsOnscreen`), a window Accessibility
+   reports as minimized (`AXMinimized`) -- the screen does not show a minimized window, but the user can
+   restore it, so it keeps the app alive -- and a window the window server places on ANOTHER desktop.
+   The last one needs the Space query: such a window is off screen and invisible to AX (the list is
+   Space-filtered), so the CG pass asks SkyLight for the window's Space memberships (the same evidence
+   the switcher's admission policy uses) and blocks the quit for a window on another desktop or a
+   fullscreen Space. A window with NO Space at all is an internal surface, and Space evidence that
+   cannot be read makes the transaction decline. The app's own off-screen surfaces are NOT windows the
+   user has: the window it just hid on close (TextEdit hides instead of destroying; several document
+   apps do), and the untitled helper strips TextEdit keeps off screen. Counting those made the feature
+   never fire for a plain document app and made a second close of the same app unjudgeable, which is why
+   the rule is measured this way -- the same way both reference implementations do it. The AX list is
+   read raw (no collector cache, no display filter).
+2. **Pre-check, before the close.** The target must be a user window and the app's ONLY user window.
+   This is the causal link: only a close that empties the app may schedule a quit, so a close of A cannot
+   be credited with emptying an app whose B was closed inside the application. A pre-check that cannot
+   prove this only disqualifies the auto-quit; the close itself is unchanged. Its budget is 250ms and the
+   AX enumeration respects it.
+3. **Two delayed readings.** 500ms after the close, and again 500ms later: the target is no longer on
+   screen and no other user window is left. Two readings because Office apps and Chrome PWAs destroy and
+   recreate windows during view transitions (DockDoor #1463). The whole transaction has a 2s budget and a
+   late result may never request a quit.
+4. **Commit.** A newer close replaces a pending candidate, but a request already in flight keeps its
+   registration: one instance gets one request per overlapping close. Generation, deadline and "not
+   already committed" are checked in one critical section. The `NSRunningApplication` is resolved and
+   verified (`Retained`, so the object stays alive) BEFORE the ticket is spent, and the send goes to that
+   same object.
+5. **Nothing is required to be destroyed.** A WindowServer `Destroyed` notification is not part of the
+   proof: an app that hides on close destroys nothing, and requiring it disabled the feature for those
+   apps entirely. The two fresh readings absorb the transient-absence case the notification was meant to
+   catch.
+
+Exclusions: this process, Finder (its Quit is disabled in the system UI), and non-regular applications
+(no Dock icon to reopen). A hidden application is never quit: every one of its windows is off screen, so
+the reading would call it "closed". Known limits, documented rather than papered over: when the Space
+query cannot say where an off-screen window lives, the transaction declines rather than guessing (so a
+machine where that private query is unavailable simply never auto-quits); a save sheet or a cancelled
+quit leaves the app running, and nothing removes its cards on the strength of a request; apps that keep
+working after closing their last window (a screen recorder that closes its picker when capture starts) are
+quit, which is what the switch promises.
+
+The M2 runner `--smoke-last-window-quit` (`SMOKE_CELL=M2`, `SMOKE_DISTURBS=focus`) drives the real
+transaction against TextEdit in a child process, binding the target by this run's document name and
+cleaning up by instance identity. Three cases: both switches off (the window closes, the app stays);
+the switcher on and the Dock switch off, then on (each surface reads its own switch); and one instance
+with TWO windows, where closing the first must not quit and closing the last must. It refuses to run
+when a user instance of TextEdit is already open.
+
 ## Settings pages: description, layout and rendering are three stages
 
 `settings/page_view/` is pure over `PageInput` (`Config` + `ThemeInput` + the selected mouse

@@ -2674,6 +2674,12 @@ fn menu_target_class() -> StaticClass {
             );
             class_addMethod(
                 cls,
+                sel!(handleDockPreviewEnabledToggle:),
+                handle_dock_preview_enabled_toggle as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
                 sel!(handleClipboardEnabledToggle:),
                 handle_clipboard_enabled_toggle as *mut c_void,
                 types.as_ptr(),
@@ -3529,6 +3535,7 @@ pub fn run() {
             || arg == "--smoke-toast"
             || arg == "--smoke-offscreen-capture"
             || arg == "--smoke-dock-preview"
+            || arg == "--smoke-last-window-quit"
     });
     let _instance_guard = if is_gui_smoke_process {
         None
@@ -3881,6 +3888,45 @@ pub fn run() {
                     "dock_preview_smoke",
                     crate::smoke_verdict::Verdict::NotRun(reason),
                 );
+                std::process::exit(1);
+            }
+        }
+    }
+
+    // Smoke-test entry (--smoke-last-window-quit): run the real close-and-quit transaction against a
+    // controlled document app, once with the switch off (the window closes and the app stays) and
+    // once with it on (the same close quits the app once the evidence proves the window is gone).
+    if crate::dev_flags::present("smoke-last-window-quit") {
+        eprintln!(
+            "[probe] smoke-last-window-quit block reached; argv={:?}",
+            std::env::args().collect::<Vec<_>>()
+        );
+        unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let _: () = msg_send![nsapp, finishLaunching];
+        }
+        match crate::window_collector::last_window::smoke_runner() {
+            Ok(checks) => {
+                log_info!("[smoke-last-window-quit] {checks} checks passed");
+                crate::smoke_verdict::report(
+                    "last_window_quit_smoke",
+                    crate::smoke_verdict::Verdict::Passed { checks },
+                );
+                crate::smoke_verdict::record_for_child(&format!("PASSED {checks}"));
+                std::process::exit(0);
+            }
+            Err(crate::window_collector::last_window::SmokeFailure::NotRun(reason)) => {
+                eprintln!("[smoke-last-window-quit] NOT RUN: {reason}");
+                crate::smoke_verdict::report(
+                    "last_window_quit_smoke",
+                    crate::smoke_verdict::Verdict::NotRun(reason),
+                );
+                std::process::exit(0);
+            }
+            Err(crate::window_collector::last_window::SmokeFailure::Failed(reason)) => {
+                // A failed assertion is a FAILURE, not an environment limit: exit non-zero without a
+                // verdict so the parent classifies the child as failed rather than as "not run".
+                eprintln!("[smoke-last-window-quit] FAILED: {reason}");
                 std::process::exit(1);
             }
         }

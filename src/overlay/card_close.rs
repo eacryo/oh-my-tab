@@ -462,22 +462,34 @@ pub(super) fn start_async_ax_close(key: WindowKey) {
         });
         return;
     }
+    // The switch and the instance identity are captured here, where the close starts; the bounded
+    // pre-check and the evidence reads run on the worker. A switch that is off costs nothing: the
+    // target is `None` and the close below is exactly the one this app always performed.
+    let quit_target = crate::window_collector::last_window::target_for_switcher_close(key.0, key.1);
     std::thread::spawn(move || {
-        let result = crate::window_collector::close_ax_window(key.0, key.1);
-        // Publish only a value result; the main-thread callback validates the key and merges it
-        // into the animation state.
-        *CARD_CLOSE_AX_RESULT.lock().unwrap() = Some((key, result));
-        unsafe {
-            let Some(controller) = *crate::CONTROLLER.lock().unwrap() else {
-                return;
-            };
-            let _: () = msg_send![
-                controller.0,
-                performSelectorOnMainThread: sel!(handleCardCloseAXResult:),
-                withObject: std::ptr::null::<AnyObject>(),
-                waitUntilDone: false
-            ];
-        }
+        // The transaction proves the window is this app's only one before the close, so a quit can
+        // be attributed to this close; failing that only disqualifies the auto-quit, and the close
+        // proceeds either way. `publish` runs before the evidence work, so the card commit and its
+        // animation never wait for the two delayed readings.
+        crate::window_collector::last_window::close_and_maybe_quit(
+            quit_target,
+            || crate::window_collector::close_ax_window(key.0, key.1),
+            |result| {
+                // Publish only a value result; the main-thread callback validates the key and
+                // merges it into the animation state.
+                *CARD_CLOSE_AX_RESULT.lock().unwrap() = Some((key, result));
+                if let Some(controller) = *crate::CONTROLLER.lock().unwrap() {
+                    unsafe {
+                        let _: () = msg_send![
+                            controller.0,
+                            performSelectorOnMainThread: sel!(handleCardCloseAXResult:),
+                            withObject: std::ptr::null::<AnyObject>(),
+                            waitUntilDone: false
+                        ];
+                    }
+                }
+            },
+        );
     });
 }
 
