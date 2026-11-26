@@ -61,7 +61,8 @@ static CASE_ROOM_W: Mutex<Option<f64>> = Mutex::new(None);
 /// The Dock tile the observer last reported. A collector result is applied only while this still
 /// names the same app: a slow Accessibility pass must not open a preview the pointer has left.
 static DOCK_SELECTION: LazyLock<Mutex<Option<(i32, bool)>>> = LazyLock::new(|| Mutex::new(None));
-/// AX close attempts launched off the main thread: (request epoch, card index, close accepted).
+/// AX close attempts launched off the main thread. The epoch is the owning panel's generation, not
+/// merely the global hover epoch: a neighbour hover may allocate the latter while this panel stays.
 static CLOSE_RESULTS: LazyLock<Mutex<Vec<CloseOutcome>>> = LazyLock::new(|| Mutex::new(Vec::new()));
 /// Activation checks that had to run off the main thread: (request epoch, pid, wid, ok, minimized,
 /// other desktop).
@@ -647,10 +648,12 @@ fn drain_activate_results() {
         std::mem::take(&mut *queue)
     };
     for (request, intent, pid, wid, ok, minimized, other_desktop) in results {
-        if !decisions::event_is_current(request, REQUEST.load(Ordering::Acquire)) {
-            // The hover this click belonged to is gone: the parked restore comes back (unless a
-            // later click already decided the front), so a window the peek raised cannot be left in
-            // front with nobody to answer for it.
+        if !decisions::event_is_current(request, REQUEST.load(Ordering::Acquire))
+            || panel::current_request() != Some(request)
+        {
+            // The hover or panel this click belonged to is gone: the parked restore comes back
+            // (unless a later click already decided the front), so a window the peek raised cannot
+            // be left in front with nobody to answer for it.
             requeue_paused_restores(unpark_restores(intent));
             continue;
         }
@@ -683,8 +686,8 @@ fn drain_activate_results() {
     }
 }
 
-/// A row's close button was clicked: ask the system to close that window and keep the row until
-/// the window is confirmed gone (a save dialog, or a failed query, keeps it).
+/// A row's close button was clicked: ask the system to close that window. As in the switcher, an
+/// accepted AX close removes the row immediately; only a refused close restores it.
 pub(crate) fn close_target(target: panel::HitTarget) {
     let Some((app_pid, identity_key, start_time_us)) = current_identity() else {
         return;
@@ -733,7 +736,7 @@ pub(crate) fn close_target(target: panel::HitTarget) {
         });
     if spawn.is_err() {
         // No worker means no AX call: give the row back instead of leaving it stuck pending.
-        panel::cancel_close_matching(pid, wid);
+        panel::cancel_close_if_pending(request, pid, wid);
         panel::flush_records();
     }
 }
@@ -744,14 +747,20 @@ fn drain_close_results() {
         std::mem::take(&mut *queue)
     };
     for outcome in results {
-        if !decisions::event_is_current(outcome.request, REQUEST.load(Ordering::Acquire)) {
-            continue;
-        }
         if outcome.accepted {
-            panel::confirm_close_matching(outcome.pid, outcome.wid);
-        } else {
+            match panel::commit_close_if_pending(outcome.request, outcome.pid, outcome.wid) {
+                Some(panel::ContentFit::Placed) => {}
+                Some(panel::ContentFit::Resized(size, scroll)) => {
+                    if !panel::apply_resize(size, scroll) {
+                        hide_panel_after_close_commit();
+                    }
+                }
+                Some(panel::ContentFit::Gone) => hide_panel_after_close_commit(),
+                // A replacement panel owns this epoch now, or the item was never/ no longer pending.
+                None => continue,
+            }
+        } else if panel::cancel_close_if_pending(outcome.request, outcome.pid, outcome.wid) {
             log_debug!("[dock-preview] AX close refused; returning the card to normal");
-            panel::cancel_close_matching(outcome.pid, outcome.wid);
         }
         panel::flush_records();
     }
@@ -2455,7 +2464,7 @@ fn drain_peek_restores_once() -> bool {
     // too, and `RESTORE_RETRY_WINDOW` bounds how long that can go on.
 }
 
-fn hide_panel() {
+fn hide_panel_with_open_invalidation(invalidate_open: bool) {
     let was_visible = panel::is_visible();
     // A peek whose panel is gone has no card left to return to: give the front back before the
     // panel and its state disappear. The hold is then dropped as well -- it describes a card of a
@@ -2468,8 +2477,10 @@ fn hide_panel() {
     panel::flush_records();
     *CLOSE_PHASE.lock().unwrap() = None;
     *CURRENT_APP.lock().unwrap() = None;
-    PENDING_OPEN.lock().unwrap().take();
-    REQUEST.fetch_add(1, Ordering::AcqRel);
+    if invalidate_open {
+        PENDING_OPEN.lock().unwrap().take();
+        REQUEST.fetch_add(1, Ordering::AcqRel);
+    }
     // The press latch is not cleared here: hide_panel also runs for a queued notification that can
     // predate the press, and the tick's pointer sample is what releases the latch.
     // Invalidate every capture request the closed panel queued: a hidden preview must not keep
@@ -2478,6 +2489,17 @@ fn hide_panel() {
     if was_visible {
         crate::e2e_state::record("dock_preview_hide");
     }
+}
+
+fn hide_panel() {
+    hide_panel_with_open_invalidation(true);
+}
+
+/// Hide the empty panel left behind by a close commit. This is not a departure or a Dock press:
+/// the pointer may already rest on the next tile, whose pending open or in-flight collection stays
+/// valid and must not be cancelled merely because the previous panel became empty.
+fn hide_panel_after_close_commit() {
+    hide_panel_with_open_invalidation(false);
 }
 
 /// Synthetic entries for the development entries: the window ids are distinct and non-zero so a
@@ -3053,12 +3075,8 @@ fn tick() {
             .unwrap()
             .list
             .is_some_and(|list| list.contains(pointer));
-        let outcome = panel::tick(now, pointer);
+        panel::tick(now, pointer);
         panel::flush_records();
-        if outcome == panel::TickOutcome::Empty {
-            hide_panel();
-            return;
-        }
         let zone = panel::current_pointer_zone();
         // A hover switch is in flight while the pointer rests on the tile it targets: the
         // replacement opens inside this same window in a few hundred milliseconds, so for the
@@ -3654,8 +3672,8 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
         short_rect.y + short_rect.h / 2.0,
     );
     let t0 = Instant::now();
-    let _ = panel::tick(t0, title_center);
-    let _ = panel::tick(
+    panel::tick(t0, title_center);
+    panel::tick(
         t0 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
         title_center,
     );
@@ -3743,14 +3761,14 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     // Moving onto a COMPLETE title takes the tooltip down at once and keeps it down past the delay.
     // Both halves matter: "not yet" alone would pass an implementation that shows every title late.
     let t1 = Instant::now();
-    let _ = panel::tick(t1, short_center);
+    panel::tick(t1, short_center);
     panel::flush_records();
     if panel::tooltip_window_visible() {
         return Err(SmokeFailure::Failed(
             "the tooltip stayed up over a complete title".into(),
         ));
     }
-    let _ = panel::tick(
+    panel::tick(
         t1 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
         short_center,
     );
@@ -3763,8 +3781,8 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     checks += 1;
     // Back onto the truncated title, then away: the tooltip returns and then goes.
     let t2 = Instant::now();
-    let _ = panel::tick(t2, title_center);
-    let _ = panel::tick(
+    panel::tick(t2, title_center);
+    panel::tick(
         t2 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
         title_center,
     );
@@ -3774,7 +3792,7 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
             "the tooltip did not come back on the truncated title".into(),
         ));
     }
-    let _ = panel::tick(
+    panel::tick(
         t2 + Duration::from_secs(2),
         (screen.x + 5.0, screen.y + 5.0),
     );
@@ -3832,8 +3850,8 @@ pub(crate) fn smoke_runner() -> Result<u32, SmokeFailure> {
     pump(Duration::from_millis(120));
     // Put the tooltip back on screen before the disable check: the earlier assertion took it down
     // by moving the pointer away, so a teardown that forgot the tooltip would go unnoticed.
-    let _ = panel::tick(t0 + Duration::from_secs(3), title_center);
-    let _ = panel::tick(
+    panel::tick(t0 + Duration::from_secs(3), title_center);
+    panel::tick(
         t0 + Duration::from_secs(3) + Duration::from_millis(100),
         title_center,
     );
@@ -3993,6 +4011,8 @@ fn smoke_list_mode() -> Result<u32, SmokeFailure> {
     set_case_room("smoke-dock-row-room-h", "smoke-dock-room-w");
     checks += smoke_wrapped_rows()?;
     checks += smoke_tooltip_cases()?;
+    checks += smoke_close_results_follow_panel_generation()?;
+    checks += smoke_close_empty_preserves_next_hover()?;
     SMOKE_ROOM_H.store(false, Ordering::Release);
     hide_panel();
     Ok(checks)
@@ -4220,9 +4240,356 @@ fn smoke_wrapped_rows() -> Result<u32, SmokeFailure> {
     Ok(checks)
 }
 
+/// The request owning the smoke's current development panel.
+fn close_smoke_request() -> Result<u64, SmokeFailure> {
+    panel::current_request()
+        .filter(|request| *request != 0)
+        .ok_or_else(|| SmokeFailure::Failed("the close smoke has no current panel request".into()))
+}
+
+fn smoke_neighbour_selection(pid: i32, icon: Rect) -> Selection {
+    Selection::App {
+        pid: pid + 10_000,
+        bundle: "dev.oh-my-tab.smoke-neighbour".to_string(),
+        path: "/Applications/SmokeNeighbour.app".to_string(),
+        title: "Smoke Neighbour".to_string(),
+        icon,
+        edge: DockEdge::Bottom,
+    }
+}
+
+/// Hand one controlled Dock observation to the production event handler. The smoke deliberately
+/// does not use the observer's queue: a real Dock notification must not interleave between the
+/// controlled hover and its cancellation.
+fn deliver_dock_selection_for_smoke(selection: Selection) -> Result<(), SmokeFailure> {
+    let session = SESSION.load(Ordering::Acquire);
+    if session == 0 {
+        return Err(SmokeFailure::Failed(
+            "the close-generation smoke has no observer session".into(),
+        ));
+    }
+    let screen = primary_screen_bounds_cg();
+    handle_event(DockEvent {
+        session,
+        sampled_at: Instant::now(),
+        selection,
+        list_frame: Some(Rect::new(screen.x, screen.max_y() - 64.0, screen.w, 64.0)),
+        screen_frame: Some(screen),
+        revealed: true,
+    });
+    Ok(())
+}
+
+/// Publish a controlled close outcome through the same queue and drain entry the worker uses. The
+/// synthetic window never reaches a real AX worker, but every result-state transition after that
+/// boundary is the production one.
+fn deliver_close_outcome_for_smoke(request: u64, pid: i32, wid: u32, accepted: bool) {
+    CLOSE_RESULTS.lock().unwrap().push(CloseOutcome {
+        request,
+        pid,
+        wid,
+        accepted,
+    });
+    drain_close_results();
+}
+
+/// Close results belong to the panel generation that started them, not to the global hover epoch:
+/// brushing a neighbour tile may allocate an epoch while this panel intentionally stays on screen,
+/// while a real replacement must retire them. The resize case also proves that another item's
+/// pending close survives the rebuild and cannot be clicked again.
+fn smoke_close_results_follow_panel_generation() -> Result<u32, SmokeFailure> {
+    let mut checks = 0;
+    *CASE_ROOM_H.lock().unwrap() = Some(7.0 * layout::ROW_H + layout::PANEL_PAD * 2.0 + 16.0);
+    *CASE_ROOM_W.lock().unwrap() = Some(layout::LIST_W);
+    let longest = "close generation resize row, deliberately far wider than every other row in this case so removing it shrinks the list";
+    let titles = [
+        "close generation one",
+        "close generation two",
+        "close generation three",
+        "close generation four",
+        "close generation five",
+        longest,
+        "close generation seven",
+    ];
+    if !dev_show_windows(&titles, DockEdge::Bottom) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not open for the close-generation case".into(),
+        ));
+    }
+    pump(Duration::from_millis(120));
+    let facts = panel::list_facts().ok_or_else(|| {
+        SmokeFailure::Failed("the close-generation panel published no facts".into())
+    })?;
+    if facts.mode != layout::PanelMode::List {
+        return Err(SmokeFailure::Failed(format!(
+            "the close-generation case did not build a list (mode {:?})",
+            facts.mode
+        )));
+    }
+    checks += 1;
+    let item_local = |index: usize| -> Result<(f64, f64), SmokeFailure> {
+        let facts = panel::list_facts().ok_or_else(|| {
+            SmokeFailure::Failed("the close-generation panel lost its facts".into())
+        })?;
+        let panel = panel::panel_frame().ok_or_else(|| {
+            SmokeFailure::Failed("the close-generation panel lost its frame".into())
+        })?;
+        let item = facts.item_screen.get(index).copied().ok_or_else(|| {
+            SmokeFailure::Failed(format!("the close-generation panel has no item {index}"))
+        })?;
+        Ok((
+            item.x + item.w / 2.0 - panel.x,
+            item.y + item.h / 2.0 - panel.y,
+        ))
+    };
+    if panel::hit_target(item_local(0)?).is_none() {
+        return Err(SmokeFailure::Failed(
+            "the first row did not resolve as a click target before its close".into(),
+        ));
+    }
+    checks += 1;
+
+    let pid = std::process::id() as i32;
+    let request = close_smoke_request()?;
+    if !panel::begin_close_pending(pid, 900_001) {
+        return Err(SmokeFailure::Failed(
+            "the first close-generation row would not arm".into(),
+        ));
+    }
+    // A neighbour hover allocates a global request while the current panel is deliberately kept
+    // on screen. Cancelling that neighbour hover must not invalidate this panel's close result,
+    // because the PANEL's generation never changed.
+    let screen = primary_screen_bounds_cg();
+    deliver_dock_selection_for_smoke(smoke_neighbour_selection(
+        pid,
+        Rect::new(screen.x + 20.0, screen.max_y() - 56.0, 44.0, 56.0),
+    ))?;
+    if PENDING_OPEN.lock().unwrap().is_none() {
+        return Err(SmokeFailure::Failed(
+            "the neighbour hover did not allocate a pending open".into(),
+        ));
+    }
+    deliver_dock_selection_for_smoke(Selection::None)?;
+    if PENDING_OPEN.lock().unwrap().is_some() {
+        return Err(SmokeFailure::Failed(
+            "the cancelled neighbour hover kept its pending open".into(),
+        ));
+    }
+    deliver_close_outcome_for_smoke(request, pid, 900_001, true);
+    if panel::visible_card_count() != 6 {
+        return Err(SmokeFailure::Failed(format!(
+            "a neighbour hover's epoch made the current panel drop its close result ({} items left)",
+            panel::visible_card_count()
+        )));
+    }
+    checks += 1;
+
+    if !panel::begin_close_pending(pid, 900_002) {
+        return Err(SmokeFailure::Failed(
+            "the refusal row would not arm after the first removal".into(),
+        ));
+    }
+    deliver_close_outcome_for_smoke(request, pid, 900_002, false);
+    if panel::visible_card_count() != 6
+        || panel::close_pending_matching(pid, 900_002) != Some(false)
+    {
+        return Err(SmokeFailure::Failed(format!(
+            "a refused close was not restored ({} items, pending {:?})",
+            panel::visible_card_count(),
+            panel::close_pending_matching(pid, 900_002)
+        )));
+    }
+    checks += 1;
+
+    let before = panel::panel_frame().ok_or_else(|| {
+        SmokeFailure::Failed("the close-generation panel had no frame before the resize".into())
+    })?;
+    if !panel::begin_close_pending(pid, 900_002) || !panel::begin_close_pending(pid, 900_006) {
+        return Err(SmokeFailure::Failed(
+            "the two rows for the resize case would not arm".into(),
+        ));
+    }
+    deliver_close_outcome_for_smoke(request, pid, 900_006, true);
+    let after = panel::panel_frame().ok_or_else(|| {
+        SmokeFailure::Failed("the close-generation panel had no frame after the resize".into())
+    })?;
+    let shrunk = after.w < before.w - 1.0 || after.h < before.h - 1.0;
+    if panel::visible_card_count() != 5 || !shrunk {
+        return Err(SmokeFailure::Failed(format!(
+            "the long row's removal did not shrink the panel ({} items, {before:?} -> {after:?})",
+            panel::visible_card_count()
+        )));
+    }
+    if panel::close_pending_matching(pid, 900_002) != Some(true) {
+        return Err(SmokeFailure::Failed(format!(
+            "the surviving row lost its pending close across the resize ({:?})",
+            panel::close_pending_matching(pid, 900_002)
+        )));
+    }
+    checks += 2;
+    if panel::hit_target(item_local(0)?).is_some() {
+        return Err(SmokeFailure::Failed(
+            "the surviving pending row accepted another click after the resize".into(),
+        ));
+    }
+    checks += 1;
+
+    // A real replacement owns a new panel generation. Results tagged with the old one must be
+    // discarded even when the synthetic window identity happens to reappear in the new content.
+    if !dev_show_windows(&titles, DockEdge::Bottom) {
+        return Err(SmokeFailure::Failed(
+            "the replacement panel did not open for the close-generation case".into(),
+        ));
+    }
+    pump(Duration::from_millis(80));
+    let replacement_request = close_smoke_request()?;
+    if replacement_request == request {
+        return Err(SmokeFailure::Failed(
+            "the replacement kept the panel generation it was supposed to retire".into(),
+        ));
+    }
+    if !panel::begin_close_pending(pid, 900_002) {
+        return Err(SmokeFailure::Failed(
+            "the replacement row would not arm".into(),
+        ));
+    }
+    deliver_close_outcome_for_smoke(request, pid, 900_002, true);
+    if panel::visible_card_count() != 7 || panel::close_pending_matching(pid, 900_002) != Some(true)
+    {
+        return Err(SmokeFailure::Failed(format!(
+            "a stale accepted close reached the replacement panel ({} items, pending {:?})",
+            panel::visible_card_count(),
+            panel::close_pending_matching(pid, 900_002)
+        )));
+    }
+    deliver_close_outcome_for_smoke(request, pid, 900_002, false);
+    if panel::close_pending_matching(pid, 900_002) != Some(true) {
+        return Err(SmokeFailure::Failed(
+            "a stale refusal restored the replacement panel's close".into(),
+        ));
+    }
+    deliver_close_outcome_for_smoke(replacement_request, pid, 900_002, false);
+    if panel::close_pending_matching(pid, 900_002) != Some(false) {
+        return Err(SmokeFailure::Failed(
+            "the replacement panel's own refusal did not restore its close".into(),
+        ));
+    }
+    checks += 3;
+    hide_panel();
+    Ok(checks)
+}
+
+/// Closing the last card hides only the panel that became empty. If the pointer is already on the
+/// next tile, both phases of that tile's open survive: the not-yet-due pending entry, and the
+/// in-flight collection after the pending entry has been consumed.
+fn smoke_close_empty_preserves_next_hover() -> Result<u32, SmokeFailure> {
+    let mut checks = 0;
+    *CASE_ROOM_H.lock().unwrap() = Some(layout::CARD_H + layout::PANEL_PAD * 4.0 + 16.0);
+    *CASE_ROOM_W.lock().unwrap() = Some(layout::CARD_W + layout::PANEL_PAD * 4.0);
+    let pointer = pointer_in_cg().ok_or_else(|| {
+        SmokeFailure::NotRun("the close-empty smoke could not read the pointer".into())
+    })?;
+    let hover_icon = Rect::new(pointer.0 - 100.0, pointer.1 - 100.0, 200.0, 200.0);
+    let pid = std::process::id() as i32;
+
+    // Phase one: B is still inside its open delay when A's last card is committed away.
+    if !dev_show_windows(&["close empty pending phase"], DockEdge::Bottom) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not open for the pending-open preservation case".into(),
+        ));
+    }
+    pump(Duration::from_millis(80));
+    let request = close_smoke_request()?;
+    deliver_dock_selection_for_smoke(smoke_neighbour_selection(pid, hover_icon))?;
+    let pending_request = PENDING_OPEN
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|open| open.request)
+        .ok_or_else(|| SmokeFailure::Failed("the next tile did not enter its open delay".into()))?;
+    let global_before = REQUEST.load(Ordering::Acquire);
+    if !panel::begin_close_pending(pid, 900_001) {
+        return Err(SmokeFailure::Failed(
+            "the only card would not arm for the pending-open case".into(),
+        ));
+    }
+    deliver_close_outcome_for_smoke(request, pid, 900_001, true);
+    if panel_is_visible() {
+        return Err(SmokeFailure::Failed(
+            "closing the only card left the empty panel visible".into(),
+        ));
+    }
+    let pending_after = PENDING_OPEN
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|open| open.request);
+    if pending_after != Some(pending_request) || REQUEST.load(Ordering::Acquire) != global_before {
+        return Err(SmokeFailure::Failed(format!(
+            "the empty close cancelled the next tile's pending open ({pending_after:?}, request {} -> {})",
+            global_before,
+            REQUEST.load(Ordering::Acquire)
+        )));
+    }
+    checks += 2;
+    // Retire this phase through the normal invalidating hide before constructing the next one.
+    hide_panel();
+
+    // Phase two: B's open delay has already become an in-flight collection when A empties.
+    if !dev_show_windows(&["close empty collection phase"], DockEdge::Bottom) {
+        return Err(SmokeFailure::Failed(
+            "the panel did not reopen for the collection preservation case".into(),
+        ));
+    }
+    pump(Duration::from_millis(80));
+    let request = close_smoke_request()?;
+    deliver_dock_selection_for_smoke(smoke_neighbour_selection(pid, hover_icon))?;
+    {
+        let mut pending = PENDING_OPEN.lock().unwrap();
+        let Some(open) = pending.as_mut() else {
+            return Err(SmokeFailure::Failed(
+                "the next tile did not enter its collection-phase open delay".into(),
+            ));
+        };
+        open.at = Instant::now() - Duration::from_millis(1);
+    }
+    // `tick` consumes the pending entry and starts the collector, but does not drain that worker's
+    // result. The collection is therefore observably in flight at the moment the close commits.
+    tick();
+    let collect_request = COLLECT_CONTEXT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|context| context.request)
+        .ok_or_else(|| SmokeFailure::Failed("the next tile's collection did not start".into()))?;
+    let global_before = REQUEST.load(Ordering::Acquire);
+    if !panel::begin_close_pending(pid, 900_001) {
+        return Err(SmokeFailure::Failed(
+            "the only card would not arm for the collection case".into(),
+        ));
+    }
+    deliver_close_outcome_for_smoke(request, pid, 900_001, true);
+    let collect_after = COLLECT_CONTEXT
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|context| context.request);
+    if collect_after != Some(collect_request) || REQUEST.load(Ordering::Acquire) != global_before {
+        return Err(SmokeFailure::Failed(format!(
+            "the empty close invalidated the next tile's collection ({collect_after:?}, request {} -> {})",
+            global_before,
+            REQUEST.load(Ordering::Acquire)
+        )));
+    }
+    checks += 2;
+    COLLECT_CONTEXT.lock().unwrap().take();
+    hide_panel();
+    Ok(checks)
+}
+
 /// Tooltip cases that need a constructed room: a sideways scroll, and a removal inside a scrolling
 /// list. Both are driven through the panel's own entries (the wheel's `scroll_by` and the close
-/// confirmation's tick), not through a private shortcut.
+/// result queue), not through a private shortcut.
 fn smoke_tooltip_cases() -> Result<u32, SmokeFailure> {
     let mut checks = 0;
     checks += smoke_tooltip_follows_a_sideways_scroll()?;
@@ -4275,8 +4642,8 @@ fn smoke_tooltip_follows_a_sideways_scroll() -> Result<u32, SmokeFailure> {
         title_rect.y + title_rect.h / 2.0,
     );
     let t0 = Instant::now();
-    let _ = panel::tick(t0, center);
-    let _ = panel::tick(
+    panel::tick(t0, center);
+    panel::tick(
         t0 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
         center,
     );
@@ -4330,7 +4697,7 @@ fn smoke_tooltip_follows_a_sideways_scroll() -> Result<u32, SmokeFailure> {
 
 /// A scrolling list whose glass is sized by the budget rather than by its rows: closing one row
 /// re-lays the SAME panel, which is the path where a stale rest timer could hand the row that takes
-/// index 0 an instant tooltip. The row is removed through the close confirmation the tick runs.
+/// index 0 an instant tooltip. The row is removed through the same immediate close commit production uses.
 fn smoke_tooltip_waits_after_a_removal() -> Result<u32, SmokeFailure> {
     *CASE_ROOM_H.lock().unwrap() = Some(2.0 * layout::ROW_H + layout::PANEL_PAD * 2.0);
     *CASE_ROOM_W.lock().unwrap() = Some(layout::LIST_W);
@@ -4373,8 +4740,8 @@ fn smoke_tooltip_waits_after_a_removal() -> Result<u32, SmokeFailure> {
         title_rect.y + title_rect.h / 2.0,
     );
     let t0 = Instant::now();
-    let _ = panel::tick(t0, center);
-    let _ = panel::tick(
+    panel::tick(t0, center);
+    panel::tick(
         t0 + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
         center,
     );
@@ -4391,16 +4758,21 @@ fn smoke_tooltip_waits_after_a_removal() -> Result<u32, SmokeFailure> {
         crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(100),
     );
     let pid = std::process::id() as i32;
-    // The synthetic windows carry ids that no WindowServer entry has, so the probe the close
-    // confirmation runs answers Gone and the row is removed exactly as a closed window's would be.
+    let request = close_smoke_request()?;
     if !panel::begin_close_pending(pid, 900_001) {
         return Err(SmokeFailure::Failed(
             "the close was refused for the first row".into(),
         ));
     }
-    panel::confirm_close_matching(pid, 900_001);
+    deliver_close_outcome_for_smoke(request, pid, 900_001, true);
+    if panel::visible_card_count() != 6 {
+        return Err(SmokeFailure::Failed(format!(
+            "the accepted close was not committed before the next tick ({} items left)",
+            panel::visible_card_count()
+        )));
+    }
     let removed_at = Instant::now();
-    let _ = panel::tick(removed_at, center);
+    panel::tick(removed_at, center);
     panel::flush_records();
     if panel::visible_card_count() != 6 {
         return Err(SmokeFailure::Failed(format!(
@@ -4413,13 +4785,13 @@ fn smoke_tooltip_waits_after_a_removal() -> Result<u32, SmokeFailure> {
             "the removal left the removed row's tooltip up".into(),
         ));
     }
-    let _ = panel::tick(removed_at + Duration::from_millis(60), center);
+    panel::tick(removed_at + Duration::from_millis(60), center);
     if panel::tooltip_window_visible() {
         return Err(SmokeFailure::Failed(
             "the row that took the same index inherited the old rest timer".into(),
         ));
     }
-    let _ = panel::tick(
+    panel::tick(
         removed_at + crate::dock_preview::decisions::TOOLTIP_DELAY + Duration::from_millis(40),
         center,
     );

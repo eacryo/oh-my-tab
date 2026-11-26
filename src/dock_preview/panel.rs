@@ -24,7 +24,7 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 use crate::dock_preview::layout::{
     self, DockEdge, HitGeometry, PanelLayout, PanelMode, PointerZone, Rect, RowAxis, CLOSE_SIZE,
 };
-use crate::dock_preview::windows::{self, PreviewWindow};
+use crate::dock_preview::windows::PreviewWindow;
 use crate::ffi::{
     hex_to_cg_color, hex_to_ns_color, layer_set_background, layer_set_contents,
     layer_set_contents_scale, make_nsstring, release_obj, MainThreadSlot,
@@ -44,15 +44,6 @@ pub(crate) struct PanelRequest {
     pub(crate) anchor: Rect,
     pub(crate) edge: DockEdge,
     pub(crate) visible: Rect,
-}
-
-/// What a main-thread tick decided about the panel.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum TickOutcome {
-    /// Nothing changed.
-    Idle,
-    /// The panel became empty and must be hidden by the caller.
-    Empty,
 }
 
 /// One thumbnail card of the single-row layout.
@@ -75,10 +66,8 @@ struct CardEntry {
     /// The captured image's pixel dimensions; only its aspect matters for the centred fit.
     image_size: Option<(f64, f64)>,
     requested_at: Option<Instant>,
-    closing_since: Option<Instant>,
     /// The close worker is still talking to the target's Accessibility API.
     close_pending: bool,
-    last_probe: Instant,
 }
 
 /// One compact row of the list layout. Rows live at fixed positions inside the content view;
@@ -95,9 +84,7 @@ struct RowEntry {
     /// Whether the title view exists (a row with no room for a title band has none).
     has_title: bool,
     title_truncated: bool,
-    closing_since: Option<Instant>,
     close_pending: bool,
-    last_probe: Instant,
 }
 
 /// What a visible tooltip was placed against: the item's screen rect, the panel's, and the
@@ -568,40 +555,19 @@ pub(crate) fn order_front() {
     }
 }
 
-/// Main-thread tick: fill thumbnails, confirm pending window closes, update the tooltip.
-pub(crate) fn tick(now: Instant, pointer: (f64, f64)) -> TickOutcome {
+/// Main-thread tick: fill thumbnails and update hover and tooltip state.
+pub(crate) fn tick(now: Instant, pointer: (f64, f64)) {
     let Ok(mut slot) = PANEL.lock() else {
-        return TickOutcome::Idle;
+        return;
     };
     let Some(state) = slot.as_mut() else {
-        return TickOutcome::Idle;
+        return;
     };
     if !visible_now(state) {
-        return TickOutcome::Idle;
+        return;
     }
     if state.mode == PanelMode::Row {
         fill_thumbnails(state, now);
-    }
-    if confirm_pending_closes(state, now) {
-        match relayout_content(state, true) {
-            ContentFit::Placed => {}
-            ContentFit::Resized(size, scroll) => {
-                // The slot has to be released before the rebuild can take it again.
-                drop(slot);
-                if !apply_resize(size, scroll) {
-                    crate::dock_preview::hide_panel();
-                }
-                return TickOutcome::Idle;
-            }
-            ContentFit::Gone => {
-                hide_tooltip(state);
-                return TickOutcome::Empty;
-            }
-        }
-        if state.cards.is_empty() && state.rows.is_empty() {
-            hide_tooltip(state);
-            return TickOutcome::Empty;
-        }
     }
     // Hover and tooltip are driven by the real pointer position read once per tick: AppKit does
     // not promise mouseMoved delivery to a passive, inactive panel, and a panel that only reacts to
@@ -623,81 +589,6 @@ pub(crate) fn tick(now: Instant, pointer: (f64, f64)) -> TickOutcome {
     state.last_zone = zone;
     update_hover(state, zone);
     update_tooltip(state, now);
-    TickOutcome::Idle
-}
-
-/// Probe every row whose accepted close is waiting for its window to disappear. Returns whether any
-/// row was removed.
-fn confirm_pending_closes(state: &mut PanelState, now: Instant) -> bool {
-    use crate::dock_preview::decisions::{close_confirmation, CloseConfirmation, TICK_INTERVAL};
-    let mut removed = false;
-    // A close that did not take puts its item back to "not closing": the button rule is re-derived
-    // ONCE for the whole pass, not once per timed-out item.
-    let mut restored = false;
-    let mut index = 0;
-    while index < state.cards.len() {
-        let Some(started) = state.cards[index].closing_since else {
-            index += 1;
-            continue;
-        };
-        if now.duration_since(state.cards[index].last_probe) < TICK_INTERVAL {
-            index += 1;
-            continue;
-        }
-        state.cards[index].last_probe = now;
-        let presence = windows::window_presence_fast(
-            state.cards[index].window.pid,
-            state.cards[index].window.wid,
-        );
-        match close_confirmation(presence, now.duration_since(started)) {
-            CloseConfirmation::Remove => {
-                let card = state.cards.remove(index);
-                remove_card_views(&card);
-                state.total_windows = state.total_windows.saturating_sub(1);
-                removed = true;
-            }
-            CloseConfirmation::Keep => {
-                state.cards[index].closing_since = None;
-                restored = true;
-                index += 1;
-            }
-            CloseConfirmation::Wait => index += 1,
-        }
-    }
-    let mut index = 0;
-    while index < state.rows.len() {
-        let Some(started) = state.rows[index].closing_since else {
-            index += 1;
-            continue;
-        };
-        if now.duration_since(state.rows[index].last_probe) < TICK_INTERVAL {
-            index += 1;
-            continue;
-        }
-        state.rows[index].last_probe = now;
-        let presence = windows::window_presence_fast(
-            state.rows[index].window.pid,
-            state.rows[index].window.wid,
-        );
-        match close_confirmation(presence, now.duration_since(started)) {
-            CloseConfirmation::Remove => {
-                let row = state.rows.remove(index);
-                remove_single_row(&row);
-                state.total_windows = state.total_windows.saturating_sub(1);
-                removed = true;
-            }
-            CloseConfirmation::Keep => {
-                state.rows[index].closing_since = None;
-                restored = true;
-                index += 1;
-            }
-            CloseConfirmation::Wait => index += 1,
-        }
-    }
-    if restored {
-        apply_hover(state, state.hovered);
-    }
-    removed
 }
 
 /// The window behind the item at `index` (used by tests and by the smoke runner).
@@ -719,8 +610,7 @@ pub(crate) fn item_window(pid: i32, wid: u32) -> Option<PreviewWindow> {
 }
 
 /// A close was requested and the worker is about to ask the target's Accessibility API. The item
-/// stops taking clicks immediately, but the bounded "wait until the window disappears" clock starts
-/// only when the AX call is accepted (`confirm_close_matching`).
+/// stops taking clicks immediately; an accepted close removes it (`commit_close_if_pending`).
 ///
 /// Returns false when the item is already closing, so a second click on the same row in the same
 /// generation is refused here rather than reaching the target's Accessibility API twice.
@@ -749,13 +639,8 @@ pub(crate) fn begin_close_pending(pid: i32, wid: u32) -> bool {
     let closing = state
         .cards
         .get(index)
-        .map(|card| card.close_pending || card.closing_since.is_some())
-        .or_else(|| {
-            state
-                .rows
-                .get(index)
-                .map(|row| row.close_pending || row.closing_since.is_some())
-        })
+        .map(|card| card.close_pending)
+        .or_else(|| state.rows.get(index).map(|row| row.close_pending))
         .unwrap_or(false);
     if closing {
         return false;
@@ -770,57 +655,71 @@ pub(crate) fn begin_close_pending(pid: i32, wid: u32) -> bool {
     true
 }
 
-/// Navigate by window identity, never by index: rows can disappear while a close result is in
-/// flight, so the index that started the close may now name another row.
-pub(crate) fn confirm_close_matching(pid: i32, wid: u32) {
+/// Commit an accepted close by window identity, never by index: rows can disappear while a close
+/// result is in flight, so the index that started the close may now name another row.
+///
+/// The panel generation and the item's pending bit are judged in this same panel read. The global
+/// hover epoch is deliberately NOT the judge: brushing a neighbour tile allocates a replacement
+/// epoch while this panel intentionally stays on screen, and that replacement may never open. The
+/// caller performs any resize or hide after the panel lock has been released.
+pub(crate) fn commit_close_if_pending(request: u64, pid: i32, wid: u32) -> Option<ContentFit> {
     let Ok(mut slot) = PANEL.lock() else {
-        return;
+        return None;
     };
-    let Some(state) = slot.as_mut() else {
-        return;
-    };
-    let now = Instant::now();
-    let started_at = now - crate::dock_preview::decisions::TICK_INTERVAL;
+    let state = slot.as_mut()?;
+    if state.request != request {
+        return None;
+    }
     if let Some(index) = state
         .cards
         .iter()
         .position(|card| card.window.pid == pid && card.window.wid == wid)
     {
-        let card = &mut state.cards[index];
-        card.close_pending = false;
-        card.closing_since = Some(now);
-        card.last_probe = started_at;
-        set_item_close_visible(state, index, false);
-        return;
+        if !state.cards[index].close_pending {
+            return None;
+        }
+        let card = state.cards.remove(index);
+        remove_card_views(&card);
+        state.total_windows = state.total_windows.saturating_sub(1);
+        return Some(relayout_content(state, true));
     }
     if let Some(index) = state
         .rows
         .iter()
         .position(|row| row.window.pid == pid && row.window.wid == wid)
     {
-        let row = &mut state.rows[index];
-        row.close_pending = false;
-        row.closing_since = Some(now);
-        row.last_probe = started_at;
-        set_item_close_visible(state, index, false);
+        if !state.rows[index].close_pending {
+            return None;
+        }
+        let row = state.rows.remove(index);
+        remove_single_row(&row);
+        state.total_windows = state.total_windows.saturating_sub(1);
+        return Some(relayout_content(state, true));
     }
+    None
 }
 
-/// The AX close was refused or failed: put the identified item back into its normal state.
-pub(crate) fn cancel_close_matching(pid: i32, wid: u32) {
+/// The AX close was refused or failed: put the identified item back into its normal state. As with
+/// the commit, the generation and pending bit are validated while the panel is locked.
+pub(crate) fn cancel_close_if_pending(request: u64, pid: i32, wid: u32) -> bool {
     let Ok(mut slot) = PANEL.lock() else {
-        return;
+        return false;
     };
     let Some(state) = slot.as_mut() else {
-        return;
+        return false;
     };
+    if state.request != request {
+        return false;
+    }
     let mut item = None;
     if let Some(index) = state
         .cards
         .iter()
         .position(|card| card.window.pid == pid && card.window.wid == wid)
     {
-        state.cards[index].closing_since = None;
+        if !state.cards[index].close_pending {
+            return false;
+        }
         state.cards[index].close_pending = false;
         item = Some(index);
     } else if let Some(index) = state
@@ -828,16 +727,37 @@ pub(crate) fn cancel_close_matching(pid: i32, wid: u32) {
         .iter()
         .position(|row| row.window.pid == pid && row.window.wid == wid)
     {
-        state.rows[index].closing_since = None;
+        if !state.rows[index].close_pending {
+            return false;
+        }
         state.rows[index].close_pending = false;
         item = Some(index);
     }
-    if let Some(index) = item {
+    if item.is_some() {
         // Back to normal: the button follows the hover again, it is not shown unconditionally.
-        let hovered = state.hovered == Some(index);
-        let _ = hovered;
         apply_hover(state, state.hovered);
+        true
+    } else {
+        false
     }
+}
+
+/// Whether the identified item is waiting for its close worker, for the smoke runner's assertions.
+pub(crate) fn close_pending_matching(pid: i32, wid: u32) -> Option<bool> {
+    let slot = PANEL.lock().ok()?;
+    let state = slot.as_ref()?;
+    state
+        .cards
+        .iter()
+        .find(|card| card.window.pid == pid && card.window.wid == wid)
+        .map(|card| card.close_pending)
+        .or_else(|| {
+            state
+                .rows
+                .iter()
+                .find(|row| row.window.pid == pid && row.window.wid == wid)
+                .map(|row| row.close_pending)
+        })
 }
 
 /// The pointer hover state, recomputed from the real pointer once per tick and after every scroll.
@@ -1004,16 +924,18 @@ fn zone_at(state: &PanelState, local: (f64, f64)) -> PointerZone {
     )
 }
 
-/// Whether an item is waiting for a close (its AX call is in flight or its window is disappearing).
+/// The generation of the content the panel currently shows.
+pub(crate) fn current_request() -> Option<u64> {
+    PANEL.lock().ok()?.as_ref().map(|state| state.request)
+}
+
+/// Whether an item is waiting for its close worker's Accessibility call.
 fn item_is_closing(state: &PanelState, index: usize) -> bool {
     let card = state
         .cards
         .get(index)
-        .is_some_and(|card| card.closing_since.is_some() || card.close_pending);
-    let row = state
-        .rows
-        .get(index)
-        .is_some_and(|row| row.closing_since.is_some() || row.close_pending);
+        .is_some_and(|card| card.close_pending);
+    let row = state.rows.get(index).is_some_and(|row| row.close_pending);
     card || row
 }
 
@@ -1069,9 +991,8 @@ pub(crate) fn hit_target(local: (f64, f64)) -> Option<HitTarget> {
 
 /// One window's identity across a rebuild.
 type WindowKey = (i32, u32);
-/// A window's close state across a rebuild: when the close was accepted, whether it is in flight,
-/// and when the probe last looked.
-type CloseState = (Option<Instant>, bool, Instant);
+/// A window's close state across a rebuild: only the in-flight AX call survives one.
+type CloseState = bool;
 
 /// Rebuild the panel at a new glass size, keeping its windows, its mode and its (clamped) scroll.
 ///
@@ -1108,23 +1029,17 @@ pub(crate) fn apply_resize(size: (f64, f64), scroll: (f64, f64)) -> bool {
     let ticket = old.ticket;
     let epoch = old.request;
     // A rebuild replaces every view, but not the close state: a window whose close is already in
-    // flight must keep that state across the rebuild, or it becomes clickable again and the probe
-    // that waits for it to disappear stops.
+    // flight must keep that state across the rebuild, or it becomes clickable again before its
+    // AX result arrives.
     let close_states: Vec<(WindowKey, CloseState)> = old
         .cards
         .iter()
-        .map(|card| {
-            (
-                (card.window.pid, card.window.wid),
-                (card.closing_since, card.close_pending, card.last_probe),
-            )
-        })
-        .chain(old.rows.iter().map(|row| {
-            (
-                (row.window.pid, row.window.wid),
-                (row.closing_since, row.close_pending, row.last_probe),
-            )
-        }))
+        .map(|card| ((card.window.pid, card.window.wid), card.close_pending))
+        .chain(
+            old.rows
+                .iter()
+                .map(|row| ((row.window.pid, row.window.wid), row.close_pending)),
+        )
         .collect();
     // The old card/row views belong to the material that is about to be released.
     destroy(old);
@@ -1182,16 +1097,14 @@ pub(crate) fn apply_resize(size: (f64, f64), scroll: (f64, f64)) -> bool {
         },
     );
     rebuild_content(&mut state, &request, geometry);
-    for (key, (closing_since, close_pending, last_probe)) in close_states {
+    for (key, close_pending) in close_states {
         for card in state
             .cards
             .iter_mut()
             .filter(|card| card.window.pid == key.0 && card.window.wid == key.1)
         {
-            card.closing_since = closing_since;
             card.close_pending = close_pending;
-            card.last_probe = last_probe;
-            if close_pending || closing_since.is_some() {
+            if close_pending {
                 unsafe { set_close_enabled(card, false) };
             }
         }
@@ -1200,10 +1113,8 @@ pub(crate) fn apply_resize(size: (f64, f64), scroll: (f64, f64)) -> bool {
             .iter_mut()
             .filter(|row| row.window.pid == key.0 && row.window.wid == key.1)
         {
-            row.closing_since = closing_since;
             row.close_pending = close_pending;
-            row.last_probe = last_probe;
-            if close_pending || closing_since.is_some() {
+            if close_pending {
                 unsafe { set_close_enabled(row, false) };
             }
         }
@@ -2043,9 +1954,7 @@ unsafe fn build_cards(state: &mut PanelState, request: &PanelRequest) {
             has_frame: false,
             image_size: None,
             requested_at: None,
-            closing_since: None,
             close_pending: false,
-            last_probe: Instant::now(),
         });
         release_obj(plate);
         release_obj(thumbnail);
@@ -2143,9 +2052,7 @@ unsafe fn build_rows(state: &mut PanelState, request: &PanelRequest) {
             close_hot: false,
             has_title,
             title_truncated: truncated,
-            closing_since: None,
             close_pending: false,
-            last_probe: Instant::now(),
         });
     }
 }
@@ -2408,8 +2315,7 @@ unsafe fn style_label(label: *mut AnyObject, size: f64) {
 fn apply_hover(state: &mut PanelState, hovered: Option<usize>) {
     for index in 0..state.cards.len() {
         let active = hovered == Some(index);
-        let closing =
-            state.cards[index].close_pending || state.cards[index].closing_since.is_some();
+        let closing = state.cards[index].close_pending;
         {
             let card = &state.cards[index];
             unsafe {
@@ -2427,7 +2333,7 @@ fn apply_hover(state: &mut PanelState, hovered: Option<usize>) {
     }
     for index in 0..state.rows.len() {
         let active = hovered == Some(index);
-        let closing = state.rows[index].close_pending || state.rows[index].closing_since.is_some();
+        let closing = state.rows[index].close_pending;
         {
             let row = &state.rows[index];
             unsafe {
@@ -2447,7 +2353,7 @@ fn apply_hover(state: &mut PanelState, hovered: Option<usize>) {
 /// Show or hide one item's close button from the ONE rule every path uses: a button is visible
 /// only while the pointer is on its own item and that item is not already closing.
 ///
-/// A refused or timed-out close used to show the button unconditionally, so a row the pointer was
+/// A refused close used to show the button unconditionally, so a row the pointer was
 /// no longer on kept a close button that the hit test would not accept -- and the next tick, finding
 /// the hovered index unchanged, had no reason to correct it.
 fn set_item_close_visible(state: &PanelState, index: usize, visible: bool) {
@@ -3428,7 +3334,7 @@ pub(crate) fn e2e_json() -> String {
                             card.window.title.clone(),
                             card.title_truncated,
                             card.has_frame,
-                            card.closing_since.is_some() || card.close_pending,
+                            card.close_pending,
                         )
                     })
                     .unwrap_or((0, String::new(), false, false, false)),
@@ -3441,7 +3347,7 @@ pub(crate) fn e2e_json() -> String {
                             row.window.title.clone(),
                             row.title_truncated,
                             true,
-                            row.closing_since.is_some() || row.close_pending,
+                            row.close_pending,
                         )
                     })
                     .unwrap_or((0, String::new(), false, false, false)),

@@ -28,9 +28,6 @@ pub(crate) const THUMB_FILL_TIMEOUT: Duration = Duration::from_millis(2000);
 /// Dock-preview capture requests allowed in flight at once. Chosen low on purpose: the shared
 /// capture queue also serves the switcher, and a request paints the system recording indicator.
 pub(crate) const MAX_CAPTURE_IN_FLIGHT: usize = 4;
-/// How long a close request waits for the window to disappear before the card is kept.
-pub(crate) const CLOSE_CONFIRM_TIMEOUT: Duration = Duration::from_millis(1500);
-
 /// Whether a Dock tile hover should open (or replace) the panel.
 ///
 /// `pointer_on_tile` is re-read from the real pointer right before the decision: an auto-hidden Dock
@@ -252,29 +249,6 @@ pub(crate) enum WindowPresence {
     Unknown,
 }
 
-/// What a close request does with its probe result. A card is removed only on `Gone`; a window that
-/// shows a save dialog, or a failed query, keeps its card and re-enables the button after the
-/// bounded wait.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum CloseConfirmation {
-    Remove,
-    Keep,
-    Wait,
-}
-
-pub(crate) fn close_confirmation(presence: WindowPresence, elapsed: Duration) -> CloseConfirmation {
-    match presence {
-        WindowPresence::Gone => CloseConfirmation::Remove,
-        WindowPresence::Present | WindowPresence::Unknown => {
-            if elapsed >= CLOSE_CONFIRM_TIMEOUT {
-                CloseConfirmation::Keep
-            } else {
-                CloseConfirmation::Wait
-            }
-        }
-    }
-}
-
 /// Whether another card may ask the capture queue for a frame: a small in-flight budget, and never
 /// more requests than the panel has cards.
 pub(crate) fn may_request_capture(in_flight: usize, cards_awaiting: usize) -> bool {
@@ -434,30 +408,6 @@ mod tests {
     }
 
     #[test]
-    fn a_closing_card_is_removed_only_once_its_window_is_gone() {
-        assert_eq!(
-            close_confirmation(WindowPresence::Gone, Duration::ZERO),
-            CloseConfirmation::Remove
-        );
-        assert_eq!(
-            close_confirmation(WindowPresence::Present, Duration::from_millis(100)),
-            CloseConfirmation::Wait
-        );
-        assert_eq!(
-            close_confirmation(WindowPresence::Unknown, Duration::from_millis(100)),
-            CloseConfirmation::Wait
-        );
-        assert_eq!(
-            close_confirmation(WindowPresence::Present, CLOSE_CONFIRM_TIMEOUT),
-            CloseConfirmation::Keep
-        );
-        assert_eq!(
-            close_confirmation(WindowPresence::Unknown, CLOSE_CONFIRM_TIMEOUT),
-            CloseConfirmation::Keep
-        );
-    }
-
-    #[test]
     fn capture_requests_are_bounded() {
         assert!(may_request_capture(0, 1));
         assert!(may_request_capture(MAX_CAPTURE_IN_FLIGHT - 1, 1));
@@ -475,10 +425,6 @@ mod tests {
 #[cfg(test)]
 mod dock_tile_tests {
     use super::*;
-
-    fn list() -> Rect {
-        Rect::new(37.0, 890.0, 1396.0, 56.0)
-    }
 
     fn anchor() -> Rect {
         Rect::new(268.0, 894.0, 44.0, 56.0)

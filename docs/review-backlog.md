@@ -756,3 +756,7 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 - **Dock 图标点击动作缺真实输入的 M2 覆盖**（2026-11-26，dock-icon-actions 第 3 轮前主动分诊，MEDIUM——**延后**：未跑覆盖/测试仪器）。M1 已覆盖配置迁移、点击动作优先级、提交锁、纯 hide 跳过窗口扫描、AX 读取失败/发现不完整不等于“0 个最小化窗口”等纯逻辑；`--e2e-state` 也已暴露工作线程结果。仍缺真实 Dock 输入链路：active tap 的 pre-delivery 顺序、普通左键恢复/hide/minimize、Command+右键 quit/force-quit，以及设置改变恰好落在按下与抬起之间时的原生菜单不被误吞。
   **为什么延后：** 这些场景需要真实 Dock、真实目标应用和受控 victim app；quit/force-quit 本身有破坏性，不能在未授权的 M1 中做。当前补齐的是最便宜的充分断言层，不是产品行为的替代证据。
   **重新审视的触发条件：** 下一次改动 `dock_preview/dock_click.rs`、Dock 点击工作线程或 `--e2e-state` 场景框架时；或用户授权 `--full`/专门 victim-app 场景时，补真实输入断言。
+
+- **Dock 关闭 smoke 的在途收集上下文归属**（2026-11-26，dock-close-commit 第 3 轮 LOW，**延后**：测试仪器）。`smoke_close_empty_preserves_next_hover` 在 `tick()` 后读取 `COLLECT_CONTEXT`，但目前只断言它仍是同一个值，没有先证明本轮 `PENDING_OPEN` 确实被消费、也没有断言上下文代际等于该 pending 请求的代际；若受控收集没有启动而槽里恰有旧上下文，用例可能误通过。
+  **为什么延后：** 这是 smoke 证据严谨性问题，不影响产品行为；第三轮审查已 PASS，且本轮的三轮审查预算已用完。最小补法是在 `tick()` 前保存 pending 请求的代际，`tick()` 后同时断言 pending 已消费且 `COLLECT_CONTEXT` 正是该代际。
+  **重新审视的触发条件：** 下一次改动 `smoke_close_empty_preserves_next_hover`、Dock 预览收集启动路径或 close-empty teardown 时补上该断言。

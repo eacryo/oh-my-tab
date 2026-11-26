@@ -222,9 +222,12 @@ front after each peek so it stays visible over the window it just raised.
   subscription the Dock dropped (a Dock restart or UI rebuild invalidates the element silently).
 - `dock_preview/mod.rs` is the only owner of the panel's lifetime on the main thread: it merges the
   observer's events, runs one 50ms tick (open delay, close grace, pointer zone, collector results),
-  and keeps two generations — the observer session and the per-hover request. Every asynchronous
-  result (collected windows, capture fills, animation completions) is validated against them before
-  it may touch the panel. The peek adds a third: its raise runs on a worker and a fourth
+  and keeps two generations — the observer session and the per-hover request. Collection, capture
+  fills and animation completions are validated against those generations before they may touch the
+  panel. Close results are the deliberate exception: they are validated against the generation
+  stored in the visible panel, because brushing a neighbour tile allocates a replacement hover
+  request while the current panel intentionally stays on screen. The peek adds a third: its raise
+  runs on a worker and a fourth
   (`PEEK_GENERATION`) invalidates a raise whose peek was restored, replaced or forgotten meanwhile.
   The origin the peek took the front from is sampled on the main thread BEFORE that worker starts,
   and the switch itself goes through `overlay::activate_and_raise` — the same call the switcher's
@@ -313,8 +316,15 @@ front after each peek so it stays visible over the window it just raised.
   with their old meaning: resting on the icon, or crossing from it into the panel, is still "inside".
 - A click resolves to a `HitTarget` (window identity plus the request epoch) in one panel read, and
   the dispatch runs after that read is released: the module re-enters itself for the app it belongs
-  to. The closing state is judged in that same read, so a row whose window is already disappearing
-  refuses both activation and its close slot.
+  to. The close-in-flight state is judged in that same read, so a row whose close worker is already
+  talking to its application refuses both activation and its close slot. As in the switcher, an
+  accepted AX close removes the row or card immediately and only a refused close restores it. The
+  commit or restore is applied only when the visible panel still owns the close's generation and the
+  identified item is still pending, both checked in one panel read; a resize rebuild carries that
+  pending state across the new view tree. When the commit empties the panel, that teardown is not
+  treated as a departure or a Dock press: a pending open or in-flight collection for the tile the
+  pointer has already moved to keeps its request generation. Window destruction evidence belongs to
+  `window_collector/last_window.rs`'s quit decision, not to the panel's commit.
 - The feature is gated by `[dock_preview] enabled` (default true). Disabling it through the settings
   switch stops the observer, hides the panel and its tooltip, and is exercised by the
   `--smoke-dock-preview` M2 runner; the child switches are frozen with it. A change to `cards_per_row`
