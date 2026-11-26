@@ -84,7 +84,7 @@ src/
 ├── ui/                          # shared UI mechanics used by more than one surface
 │   ├── mod.rs
 │   ├── corner_glyph.rs          # the corner-glyph button family (footer gear, picker header glyphs)
-│   └── toast.rs                 # transient non-activating message (Finder menu copy results)
+│   └── toast.rs                 # transient non-activating message shared by Finder-menu and settings feedback, with owned working-message restoration
 ├── update_notice.rs             # post-install "update installed" notification
 ├── updater.rs                   # Sparkle 2 integration, loaded dynamically
 ├── version_consistency.rs       # workspace release-version agreement (root Cargo.toml vs every member)

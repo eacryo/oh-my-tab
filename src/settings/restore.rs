@@ -120,11 +120,7 @@ fn show_restore_success(page_only: bool) {
     } else {
         t("settings.toast_all_defaults_restored")
     };
-    let window =
-        with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window)).unwrap_or(std::ptr::null_mut());
-    unsafe {
-        tooltip::SettingsTooltip::show_success_bubble(window, &text);
-    }
+    crate::ui::toast::show_done(&text);
 }
 
 /// Collapse both restore confirmation cards (page switch / window hide).

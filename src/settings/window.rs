@@ -285,8 +285,8 @@ pub(super) fn select_sidebar(idx: usize) {
             unsafe { rebuild_settings_content_now_keeping_scroll(SettingsPageId::Gestures, None) };
         }
     }
-    // Dismiss the previous page's disabled hint so the bubble cannot remain across tabs.
-    unsafe { tooltip::SettingsTooltip::dismiss() };
+    // The disabled-control hint is the shared floating toast now; it times itself out, so page
+    // navigation has nothing to dismiss here.
     unsafe { widgets::clear_sidebar_hover() };
     SIDEBAR_SELECTED.swap(idx, Ordering::SeqCst);
     unsafe {

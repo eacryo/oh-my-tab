@@ -170,7 +170,7 @@ fn start_sha256(paths: Vec<String>, with_name: bool) {
     if started.is_err() {
         // The failed spawn dropped the closure, and the claim guard went with it.
         log_info!("[finder-menu] could not start the sha256 worker");
-        crate::ui::toast::show_refused(&t("finder_menu.sha256_error"));
+        crate::ui::toast::complete_working_refused(&t("finder_menu.sha256_error"));
     }
 }
 
@@ -265,7 +265,7 @@ fn finish_sha256(pending: PendingSha256) {
         // The claim is held by the pattern binding until the end of the arm, so it outlives the
         // message the arm shows and is released on unwind as well.
         PendingSha256::Failed { flight: _flight } => {
-            crate::ui::toast::show_refused(&t("finder_menu.sha256_error"));
+            crate::ui::toast::complete_working_refused(&t("finder_menu.sha256_error"));
         }
         PendingSha256::Ready {
             batched,
@@ -285,19 +285,19 @@ fn commit_sha256(batched: hash::Batched, with_name: bool) {
             "[finder-menu] sha256: no regular file in the selection ({} skipped)",
             batched.skipped
         );
-        crate::ui::toast::show_refused(&t("finder_menu.sha256_failed"));
+        crate::ui::toast::complete_working_refused(&t("finder_menu.sha256_failed"));
     } else {
         let text = crate::finder_menu::format::digests_text(&batched.entries, with_name);
-        if copy_text(&text) {
+        if let Some(change_count) = copy_text(&text) {
             let message = sha256_message(copied, batched.skipped);
             log_info!(
                 "[finder-menu] sha256 copied ({copied} item(s), {} skipped)",
                 batched.skipped
             );
-            crate::ui::toast::show_done(&message);
+            crate::ui::toast::complete_working_done_for_pasteboard(&message, change_count);
         } else {
             log_info!("[finder-menu] sha256 could not reach the pasteboard");
-            crate::ui::toast::show_refused(&t("finder_menu.sha256_unavailable"));
+            crate::ui::toast::complete_working_refused(&t("finder_menu.sha256_unavailable"));
         }
     }
 }
@@ -326,16 +326,17 @@ fn sha256_message(copied: usize, skipped: usize) -> String {
     }
 }
 
-/// Put `text` on the general pasteboard. Returns whether the write succeeded: reporting "copied"
-/// for a failed write is worse than saying nothing, and the bubble's badge would lie.
-fn copy_text(text: &str) -> bool {
+/// Put `text` on the general pasteboard and return the write's change count. Reporting "copied"
+/// for a failed write is worse than saying nothing, and the bubble's badge would lie; the count lets
+/// a delayed confirmation verify that the write it confirms is still what the user would paste.
+fn copy_text(text: &str) -> Option<i64> {
     unsafe {
         use crate::ffi::{make_nsstring, release_obj};
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
         let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
         if pasteboard.is_null() {
-            return false;
+            return None;
         }
         let _: isize = msg_send![pasteboard, clearContents];
         let value = make_nsstring(text);
@@ -343,7 +344,10 @@ fn copy_text(text: &str) -> bool {
         let written: bool = msg_send![pasteboard, setString: value, forType: kind];
         release_obj(value);
         release_obj(kind);
-        written
+        if !written {
+            return None;
+        }
+        Some(msg_send![pasteboard, changeCount])
     }
 }
 
@@ -379,7 +383,7 @@ fn copy_paths_and_report(paths: &[String], layout: PathLayout) {
     } else {
         t_count("finder_menu.paths_copied", paths.len())
     };
-    if copy_text(&text) {
+    if copy_text(&text).is_some() {
         log_info!("[finder-menu] {} path(s) copied", paths.len());
         crate::ui::toast::show_done(&message);
     } else {
@@ -472,6 +476,50 @@ mod tests {
             !flag.load(Ordering::SeqCst),
             "the claim must be released by the guard, not by the last line of the commit"
         );
+    }
+
+    /// The SHA-256 terminal states belong to the persistent working message. Reporting them through
+    /// ordinary transient feedback would let them erase (or be erased without completing) the owned
+    /// progress state the toast flow keeps for the run.
+    #[test]
+    fn sha256_terminal_feedback_completes_the_owned_working_toast() {
+        let production = include_str!("actions.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .expect("the production source precedes the test module");
+        for call in [
+            "complete_working_done_for_pasteboard(&message, change_count)",
+            "complete_working_refused(&t(\"finder_menu.sha256_failed\"))",
+            "complete_working_refused(&t(\"finder_menu.sha256_unavailable\"))",
+        ] {
+            assert!(
+                production.contains(call),
+                "the SHA-256 terminal feedback call is missing: {call}"
+            );
+        }
+        // The spawn-failure and worker-failure branches use the same copy. Pin each branch by its
+        // context so one cannot silently regress while the other keeps a broad contains() green.
+        for (context, branch) in [
+            (
+                "could not start the sha256 worker",
+                "the spawn-failure branch",
+            ),
+            (
+                "PendingSha256::Failed { flight: _flight }",
+                "the worker-failure branch",
+            ),
+        ] {
+            let position = production
+                .find(context)
+                .unwrap_or_else(|| panic!("missing context for {branch}"));
+            let branch_source =
+                &production[position..position + 320.min(production.len() - position)];
+            assert!(
+                branch_source
+                    .contains("complete_working_refused(&t(\"finder_menu.sha256_error\"))"),
+                "{branch} must complete the owned working toast: {branch_source}"
+            );
+        }
     }
 
     /// The guard releases on a normal return too, which is the path every batch takes.

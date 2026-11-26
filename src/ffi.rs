@@ -1673,10 +1673,6 @@ mod dynamic_class_tests {
             },
             ConvertedGetter {
                 file: "settings/tooltip.rs",
-                getter: "tooltip_bubble_view_class",
-            },
-            ConvertedGetter {
-                file: "settings/tooltip.rs",
                 getter: "disabled_cursor_target",
             },
             ConvertedGetter {

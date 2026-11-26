@@ -1,9 +1,16 @@
 //! A transient, non-activating message at the bottom of the screen.
 //!
-//! The Finder menu's "Copy Path" and "Copy SHA-256" both report through it. SHA-256 runs on a worker
-//! thread and takes as long as the file is big, so the app has to say something between the click and the
-//! clipboard. The settings window's success bubble cannot do that job: it is scoped to that window, which
-//! usually does not exist while the user is working in Finder.
+//! The Finder menu's "Copy Path" and "Copy SHA-256" both report through it, and settings actions use
+//! the same surface for transient success/refusal feedback. SHA-256 runs on a worker thread and takes
+//! as long as the file is big, so the app has to say something between the click and the clipboard.
+//! A settings-window-scoped bubble cannot do either job: the settings window usually does not exist
+//! while the user is working in Finder, and feedback for one action should not change shape just
+//! because another surface happened to be open.
+//!
+//! One long-running task may own the bubble while ordinary feedback is shown: settings feedback may borrow the
+//! surface for its normal lifetime, but expiry restores progress that is still running, and a task result that
+//! arrives during ordinary feedback waits for that feedback rather than cutting it off. Closing progress dismisses
+//! only the progress display; the task's final result is still reported.
 //!
 //! The surface follows the same material every other floating panel uses (`glass::install_backdrop`, the
 //! shared elevated corner radius and shadow), so it reads as part of the app rather than as a bare grey
@@ -105,11 +112,213 @@ pub(crate) enum ToastKind {
     Error,
 }
 
+impl ToastKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            ToastKind::Success => "success",
+            ToastKind::Error => "error",
+        }
+    }
+}
+
+/// What the one visible bubble is currently speaking for.
+///
+/// A working message is persistent state rather than a timed notification: a transient setting may
+/// borrow the surface for its two seconds, but doing so must not delete the task's progress. A task
+/// result that arrives while that transient is up likewise waits for the transient instead of cutting
+/// it off, and is presented when the transient ends. This is the smallest ownership rule that keeps
+/// the SHA-256 run and ordinary action feedback from erasing each other.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PresentedToast {
+    #[default]
+    None,
+    Working,
+    Timed,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct WorkingToast {
+    text: String,
+    /// Closing the progress chip dismisses only the progress display. The run still owns its final
+    /// result, but the progress text must not reappear after an unrelated transient.
+    user_dismissed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct QueuedOutcome {
+    text: String,
+    kind: ToastKind,
+    /// The pasteboard generation a successful copy belonged to. A queued confirmation is meaningful
+    /// only while that generation is still current; otherwise it would announce content the user no
+    /// longer pastes.
+    pasteboard_change_count: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct ToastFlow {
+    working: Option<WorkingToast>,
+    presented: PresentedToast,
+    /// The finished task's result while a timed message owns the surface. At most one task runs at a
+    /// time, so one slot cannot grow without bound.
+    queued_outcome: Option<QueuedOutcome>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum FlowEffect {
+    Present {
+        text: String,
+        kind: ToastKind,
+        dismiss_after: Option<Duration>,
+    },
+    /// The current presentation stays exactly as it is (a result queued behind it).
+    Keep,
+    Hide,
+}
+
+impl ToastFlow {
+    fn present(text: &str, kind: ToastKind, dismiss_after: Option<Duration>) -> FlowEffect {
+        FlowEffect::Present {
+            text: text.to_string(),
+            kind,
+            dismiss_after,
+        }
+    }
+
+    fn show_working(&mut self, text: &str) -> FlowEffect {
+        self.working = Some(WorkingToast {
+            text: text.to_string(),
+            user_dismissed: false,
+        });
+        // A result already queued behind timed feedback belongs to the task that finished, not to
+        // this new run. Starting the next run must not delete it. Present it first; when it ends,
+        // the new run's progress is restored by the ordinary dismissal rule below. This deliberate
+        // ordering may cut short the timed feedback currently on screen: the alternative -- settings
+        // feedback, then the previous result, then this run's progress -- could leave a newly started
+        // long task without visible acknowledgement for several seconds.
+        if let Some(outcome) = self.queued_outcome.take() {
+            self.presented = PresentedToast::Timed;
+            return Self::present(&outcome.text, outcome.kind, Some(TOAST_VISIBLE));
+        }
+        self.presented = PresentedToast::Working;
+        Self::present(text, ToastKind::Success, None)
+    }
+
+    fn show_transient(
+        &mut self,
+        text: &str,
+        kind: ToastKind,
+        dismiss_after: Option<Duration>,
+    ) -> FlowEffect {
+        self.presented = PresentedToast::Timed;
+        Self::present(text, kind, dismiss_after)
+    }
+
+    /// Finish the owned working message. If a transient currently owns the surface, the result is
+    /// kept for the transient's end rather than cutting that direct feedback off halfway.
+    fn finish_working_for_pasteboard(
+        &mut self,
+        text: &str,
+        kind: ToastKind,
+        pasteboard_change_count: Option<i64>,
+    ) -> FlowEffect {
+        if self.working.take().is_none() {
+            // A completion without a matching working message is outside the product flow. Treat it
+            // as ordinary feedback rather than dropping it silently.
+            self.presented = PresentedToast::Timed;
+            return Self::present(text, kind, Some(TOAST_VISIBLE));
+        }
+        let outcome = QueuedOutcome {
+            text: text.to_string(),
+            kind,
+            pasteboard_change_count,
+        };
+        if self.presented == PresentedToast::Timed {
+            self.queued_outcome = Some(outcome);
+            return FlowEffect::Keep;
+        }
+        self.presented = PresentedToast::Timed;
+        Self::present(text, kind, Some(TOAST_VISIBLE))
+    }
+
+    /// Drop a queued copy confirmation when the pasteboard no longer contains the write it confirms.
+    /// `None` means the current generation could not be verified, which is not proof enough to make
+    /// a possibly false "copied" claim.
+    fn drop_stale_queued_outcome(&mut self, current_pasteboard_change_count: Option<i64>) {
+        let stale = self
+            .queued_outcome
+            .as_ref()
+            .and_then(|outcome| outcome.pasteboard_change_count)
+            .is_some_and(|expected| current_pasteboard_change_count != Some(expected));
+        if stale {
+            self.queued_outcome = None;
+        }
+    }
+
+    /// The visible message ended, by its timer or by the close button. Timed feedback yields first
+    /// to a queued task result, then to still-active progress the user did not dismiss.
+    fn dismiss_presented(&mut self, user_initiated: bool) -> FlowEffect {
+        match self.presented {
+            PresentedToast::Working => {
+                if user_initiated {
+                    if let Some(working) = self.working.as_mut() {
+                        working.user_dismissed = true;
+                    }
+                }
+                self.presented = PresentedToast::None;
+            }
+            PresentedToast::Timed => {
+                self.presented = PresentedToast::None;
+            }
+            PresentedToast::None => return FlowEffect::Hide,
+        }
+        if let Some(outcome) = self.queued_outcome.take() {
+            self.presented = PresentedToast::Timed;
+            return Self::present(&outcome.text, outcome.kind, Some(TOAST_VISIBLE));
+        }
+        let restore = self
+            .working
+            .as_ref()
+            .and_then(|working| (!working.user_dismissed).then(|| working.text.clone()));
+        if let Some(text) = restore {
+            self.presented = PresentedToast::Working;
+            return Self::present(&text, ToastKind::Success, None);
+        }
+        FlowEffect::Hide
+    }
+
+    fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
 /// Which badge the NEXT presentation draws. The badge view paints through `drawRect:`, which takes
 /// no argument of ours, so the kind travels as process state and every presentation sets it before
 /// invalidating the view. One bubble exists per slot and presentations are serialised on the main
 /// thread, so a single value is enough.
 static BADGE_KIND: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn badge_kind() -> ToastKind {
+    match BADGE_KIND.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => ToastKind::Error,
+        _ => ToastKind::Success,
+    }
+}
+
+/// The general pasteboard's current generation, read on the main thread. `None` means the generation
+/// cannot be verified, so a queued confirmation tied to a pasteboard write must not be presented.
+unsafe fn current_pasteboard_change_count() -> Option<i64> {
+    let pasteboard: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+    if pasteboard.is_null() {
+        None
+    } else {
+        Some(msg_send![pasteboard, changeCount])
+    }
+}
+
+fn drop_stale_queued_outcome(state: &mut State) {
+    let current = unsafe { current_pasteboard_change_count() };
+    state.flow.drop_stale_queued_outcome(current);
+}
 
 struct State {
     /// Which bubble this is (see `SLOTS`); the close button carries it in its tag.
@@ -132,6 +341,8 @@ struct State {
     generation: u64,
     /// The pending auto-dismiss, cleared whenever the text changes or the panel is hidden.
     timer: *mut AnyObject,
+    /// Which message owns the bubble, and what must be restored when timed feedback ends.
+    flow: ToastFlow,
 }
 
 impl Default for State {
@@ -148,6 +359,7 @@ impl Default for State {
             bevel: None,
             generation: 0,
             timer: std::ptr::null_mut(),
+            flow: ToastFlow::default(),
         }
     }
 }
@@ -160,47 +372,111 @@ thread_local! {
 
 /// Show `text` and keep it until `dismiss_after` elapses.
 ///
-/// `dismiss_after: None` means "keep it up": that is the computing state, where any deadline would
-/// expire before the work does on a large file, leaving the user unable to tell whether it is
-/// still running. A later call replaces both the text and any pending timer.
+/// `dismiss_after: None` starts the owned working state: it has no deadline because a large file can
+/// outlive any fixed timeout. A timed message borrows the surface and then yields according to the
+/// flow above rather than simply deleting that working state.
 pub(crate) fn show(text: &str, dismiss_after: Option<Duration>) {
     show_kind(text, ToastKind::Success, dismiss_after);
 }
 
 fn show_kind(text: &str, kind: ToastKind, dismiss_after: Option<Duration>) {
     crate::debug_assert_main_thread();
-    BADGE_KIND.store(
-        match kind {
-            ToastKind::Success => 0,
-            ToastKind::Error => 1,
-        },
-        std::sync::atomic::Ordering::SeqCst,
-    );
     let shown = SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         if slots.is_empty() {
             slots.push(State::default());
         }
-        unsafe { show_in(&mut slots[0], text, 0.0, dismiss_after) }
+        let state = &mut slots[0];
+        drop_stale_queued_outcome(state);
+        let previous_flow = state.flow.clone();
+        let effect = if dismiss_after.is_some() {
+            state.flow.show_transient(text, kind, dismiss_after)
+        } else {
+            state.flow.show_working(text)
+        };
+        let shown = unsafe { apply_flow_effect(state, effect) };
+        if !shown {
+            // The ownership state describes what is on screen. If AppKit could not put this message
+            // there, keeping the mutation would make a later result wait behind a timer that was
+            // never installed.
+            state.flow = previous_flow;
+        }
+        shown
     });
-    // The badge paints through drawRect: and reads the kind from the process state, so it has to be
-    // invalidated on EVERY presentation: a bubble reused for an error after a success would
-    // otherwise keep drawing the tick.
-    if shown {
-        SLOTS.with(|slots| {
-            let mut slots = slots.borrow_mut();
-            if let Some(state) = slots.first_mut() {
-                if !state.badge.is_null() {
-                    unsafe {
-                        let yes = objc2::runtime::Bool::YES;
-                        let _: () = msg_send![state.badge, setNeedsDisplay: yes];
-                    }
-                }
-            }
-        });
-    }
     if !shown {
         crate::log_info!("[toast] could not present a message");
+    }
+}
+
+/// Finish the persistent working message with a successful pasteboard write. The write's change
+/// count travels with a queued confirmation, so the bubble cannot later claim content is pasteable
+/// after another copy has replaced it.
+pub(crate) fn complete_working_done_for_pasteboard(text: &str, change_count: i64) {
+    finish_working_kind(text, ToastKind::Success, Some(change_count));
+}
+
+/// Finish the persistent working message with a refusal/error result.
+pub(crate) fn complete_working_refused(text: &str) {
+    finish_working_kind(text, ToastKind::Error, None);
+}
+
+fn finish_working_kind(text: &str, kind: ToastKind, pasteboard_change_count: Option<i64>) {
+    crate::debug_assert_main_thread();
+    let shown = SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        if slots.is_empty() {
+            slots.push(State::default());
+        }
+        let state = &mut slots[0];
+        drop_stale_queued_outcome(state);
+        let previous_flow = state.flow.clone();
+        let effect = state
+            .flow
+            .finish_working_for_pasteboard(text, kind, pasteboard_change_count);
+        let shown = unsafe { apply_flow_effect(state, effect) };
+        if !shown {
+            state.flow = previous_flow;
+        }
+        shown
+    });
+    if !shown {
+        crate::log_info!("[toast] could not present a message");
+    }
+}
+
+/// Apply the ownership decision to the real bubble. Returns false only when AppKit could not build
+/// or present the surface.
+unsafe fn apply_flow_effect(state: &mut State, effect: FlowEffect) -> bool {
+    match effect {
+        FlowEffect::Present {
+            text,
+            kind,
+            dismiss_after,
+        } => {
+            BADGE_KIND.store(
+                match kind {
+                    ToastKind::Success => 0,
+                    ToastKind::Error => 1,
+                },
+                std::sync::atomic::Ordering::SeqCst,
+            );
+            let shown = unsafe { show_in(state, &text, 0.0, dismiss_after) };
+            // The badge paints through drawRect: and reads the kind from the process state, so it has
+            // to be invalidated on EVERY presentation: a bubble reused for an error after a success
+            // would otherwise keep drawing the tick.
+            if shown && !state.badge.is_null() {
+                unsafe {
+                    let yes = objc2::runtime::Bool::YES;
+                    let _: () = msg_send![state.badge, setNeedsDisplay: yes];
+                }
+            }
+            shown
+        }
+        FlowEffect::Keep => true,
+        FlowEffect::Hide => {
+            unsafe { hide_in(state) };
+            true
+        }
     }
 }
 
@@ -211,6 +487,7 @@ pub(crate) fn hide() {
     SLOTS.with(|slots| {
         let mut slots = slots.borrow_mut();
         if let Some(state) = slots.first_mut() {
+            state.flow.reset();
             unsafe { hide_in(state) }
         }
     })
@@ -772,7 +1049,9 @@ unsafe extern "C" fn close_pressed(_this: *mut AnyObject, _cmd: Sel, sender: *mu
             let Some(state) = slots.iter_mut().find(|state| state.close == sender) else {
                 return;
             };
-            hide_in(state);
+            drop_stale_queued_outcome(state);
+            let effect = state.flow.dismiss_presented(true);
+            apply_flow_effect(state, effect);
         });
     });
 }
@@ -1138,9 +1417,11 @@ unsafe extern "C" fn dismiss_toast(_this: *mut AnyObject, _cmd: Sel, _timer: *mu
                 return;
             };
             // The timer that fired is the one this state scheduled; clear the handle first so
-            // `hide_in` does not invalidate a timer that has already fired.
+            // the effect's own hide does not invalidate a timer that has already fired.
             state.timer = std::ptr::null_mut();
-            unsafe { hide_in(state) }
+            drop_stale_queued_outcome(state);
+            let effect = state.flow.dismiss_presented(false);
+            apply_flow_effect(state, effect);
         });
     });
 }
@@ -1241,7 +1522,7 @@ pub(crate) fn show_refused(text: &str) {
     show_kind(text, ToastKind::Error, Some(TOAST_VISIBLE));
 }
 
-/// The bubble the smoke scenario reads: its message, its laid-out width, the shared panel outline it carries
+/// The bubble the smoke scenario reads: its message, badge kind, laid-out width, the shared panel outline it carries
 /// (width and whether its colour is the palette's token), whether the shadow carrier is really installed, and the
 /// elevation level.
 ///
@@ -1251,6 +1532,7 @@ pub(crate) fn show_refused(text: &str) {
 /// which surface the pixels are those of.
 pub(crate) struct ToastSnapshot {
     pub(crate) text: String,
+    pub(crate) kind: ToastKind,
     pub(crate) width: f64,
     pub(crate) outline_width: f64,
     pub(crate) outline_matches_palette: bool,
@@ -1278,6 +1560,7 @@ unsafe fn snapshot_of(state: &State) -> Option<ToastSnapshot> {
         crate::glass::outline_state(&backdrop).unwrap_or((0.0, false));
     Some(ToastSnapshot {
         text,
+        kind: badge_kind(),
         width: bounds.size.width,
         outline_width,
         outline_matches_palette,
@@ -1303,8 +1586,9 @@ pub(crate) fn e2e_json() -> String {
     // The height is the constant rather than the panel's frame, so a scenario knows which rect to cut from
     // without measuring: every bubble has it.
     format!(
-        "{{\"text\": {}, \"width\": {:.1}, \"height\": {:.1}, \"outline_width\": {:.1}, \"outline_matches_palette\": {}, \"shadow_installed\": {}, \"elevation\": {}}}",
+        "{{\"text\": {}, \"kind\": {}, \"width\": {:.1}, \"height\": {:.1}, \"outline_width\": {:.1}, \"outline_matches_palette\": {}, \"shadow_installed\": {}, \"elevation\": {}}}",
         crate::e2e_state::json_string(&snapshot.text),
+        crate::e2e_state::json_string(snapshot.kind.as_str()),
         snapshot.width,
         TOAST_HEIGHT,
         snapshot.outline_width,
@@ -1551,6 +1835,215 @@ unsafe fn swap_for_material(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_present(
+        effect: FlowEffect,
+        text: &str,
+        kind: ToastKind,
+        dismiss_after: Option<Duration>,
+    ) {
+        assert_eq!(
+            effect,
+            FlowEffect::Present {
+                text: text.to_string(),
+                kind,
+                dismiss_after,
+            }
+        );
+    }
+
+    /// A transient setting may borrow the surface while a task runs, but its expiry must bring the
+    /// still-running progress message back instead of leaving the user with no state at all.
+    #[test]
+    fn transient_feedback_restores_still_running_work() {
+        let mut flow = ToastFlow::default();
+        assert_present(
+            flow.show_working("working"),
+            "working",
+            ToastKind::Success,
+            None,
+        );
+        assert_present(
+            flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE)),
+            "settings",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+        assert_present(
+            flow.dismiss_presented(false),
+            "working",
+            ToastKind::Success,
+            None,
+        );
+    }
+
+    /// The other ordering: when the task finishes during the transient, the result waits for that
+    /// transient's full lifetime and then owns the surface for its own full lifetime.
+    #[test]
+    fn a_task_result_waits_behind_active_transient_feedback() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        assert_eq!(
+            flow.finish_working_for_pasteboard("done", ToastKind::Success, None),
+            FlowEffect::Keep
+        );
+        assert_present(
+            flow.dismiss_presented(false),
+            "done",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+    }
+
+    /// Without a transient in the way, completion replaces progress immediately: that is the normal
+    /// SHA-256 path and must not gain an artificial two-second delay.
+    #[test]
+    fn a_task_result_replaces_visible_progress_immediately() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        assert_present(
+            flow.finish_working_for_pasteboard("done", ToastKind::Success, None),
+            "done",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+    }
+
+    /// Closing progress is an explicit dismissal of the progress display, not of the task. It must
+    /// not reappear after unrelated feedback, but the final result still has to be reported.
+    #[test]
+    fn dismissed_progress_is_not_restored_while_its_result_is_still_reported() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        assert_eq!(flow.dismiss_presented(true), FlowEffect::Hide);
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        assert_eq!(
+            flow.finish_working_for_pasteboard("done", ToastKind::Success, None),
+            FlowEffect::Keep
+        );
+        assert_present(
+            flow.dismiss_presented(false),
+            "done",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+    }
+
+    /// If no result has arrived yet, dismissed progress stays dismissed after transient feedback.
+    #[test]
+    fn dismissed_progress_does_not_reappear_after_transient_feedback() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        assert_eq!(flow.dismiss_presented(true), FlowEffect::Hide);
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        assert_eq!(flow.dismiss_presented(false), FlowEffect::Hide);
+    }
+
+    /// Replacing one transient with a newer one must not drop the task result queued behind it.
+    #[test]
+    fn replacing_transient_feedback_keeps_the_queued_task_result() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        flow.show_transient("first", ToastKind::Success, Some(TOAST_VISIBLE));
+        assert_eq!(
+            flow.finish_working_for_pasteboard("done", ToastKind::Success, None),
+            FlowEffect::Keep
+        );
+        flow.show_transient("second", ToastKind::Error, Some(TOAST_VISIBLE));
+        assert_present(
+            flow.dismiss_presented(false),
+            "done",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+    }
+
+    /// A result queued behind settings feedback is the finished run's property. Starting the next
+    /// run presents that result first, then restores the new run's progress when the result ends.
+    #[test]
+    fn a_new_run_does_not_drop_the_previous_runs_queued_result() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("first working");
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        assert_eq!(
+            flow.finish_working_for_pasteboard("first done", ToastKind::Success, None),
+            FlowEffect::Keep
+        );
+        assert_present(
+            flow.show_working("second working"),
+            "first done",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+        assert_present(
+            flow.dismiss_presented(false),
+            "second working",
+            ToastKind::Success,
+            None,
+        );
+    }
+
+    /// If the next run itself finishes while the previous result is visible, its result queues
+    /// behind that result rather than cutting it off.
+    #[test]
+    fn consecutive_run_results_keep_their_order() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("first working");
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        flow.finish_working_for_pasteboard("first done", ToastKind::Success, None);
+        flow.show_working("second working");
+        assert_eq!(
+            flow.finish_working_for_pasteboard("second done", ToastKind::Success, None),
+            FlowEffect::Keep
+        );
+        assert_present(
+            flow.dismiss_presented(false),
+            "second done",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+    }
+
+    /// A copy confirmation queued behind other feedback is valid only while the pasteboard still
+    /// holds that copy. Once another write owns the pasteboard, showing it would claim the wrong
+    /// contents are pasteable.
+    #[test]
+    fn a_stale_queued_copy_confirmation_is_withdrawn() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        assert_eq!(
+            flow.finish_working_for_pasteboard("copied", ToastKind::Success, Some(10)),
+            FlowEffect::Keep
+        );
+        flow.drop_stale_queued_outcome(Some(11));
+        assert_eq!(flow.dismiss_presented(false), FlowEffect::Hide);
+    }
+
+    /// The same confirmation still appears when its pasteboard generation is current; an
+    /// unverifiable generation is treated as stale rather than as permission to make the claim.
+    #[test]
+    fn a_current_queued_copy_confirmation_is_presented() {
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        flow.finish_working_for_pasteboard("copied", ToastKind::Success, Some(10));
+        flow.drop_stale_queued_outcome(Some(10));
+        assert_present(
+            flow.dismiss_presented(false),
+            "copied",
+            ToastKind::Success,
+            Some(TOAST_VISIBLE),
+        );
+
+        let mut flow = ToastFlow::default();
+        flow.show_working("working");
+        flow.show_transient("settings", ToastKind::Success, Some(TOAST_VISIBLE));
+        flow.finish_working_for_pasteboard("copied", ToastKind::Success, Some(10));
+        flow.drop_stale_queued_outcome(None);
+        assert_eq!(flow.dismiss_presented(false), FlowEffect::Hide);
+    }
 
     /// The two kinds must not collapse into one badge: a refusal shown in the success green would say
     /// the action worked while its own text says it did not.

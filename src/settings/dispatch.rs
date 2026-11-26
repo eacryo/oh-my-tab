@@ -2838,7 +2838,7 @@ pub(crate) extern "C" fn handle_export_settings_ready(
         match outcome {
             Ok(destination) => {
                 log_info!("[settings] exported configuration to {}", destination);
-                show_settings_toast(&t("settings.toast_settings_exported"));
+                show_settings_success(&t("settings.toast_settings_exported"));
             }
             Err(reason) => show_alert(
                 &t("settings.export_settings_failed_title"),
@@ -3001,7 +3001,7 @@ pub(crate) extern "C" fn handle_import_settings_ready(
                         &t("settings.import_settings_partial_msg"),
                     );
                 } else {
-                    show_settings_toast(&t("settings.toast_settings_imported"));
+                    show_settings_success(&t("settings.toast_settings_imported"));
                 }
             }
         }
@@ -3124,14 +3124,14 @@ pub(crate) fn apply_imported_runtime(old: &Config, next: &Config) {
     }
 }
 
-/// Show a transient success bubble in whichever settings window is open.
-fn show_settings_toast(text: &str) {
-    let window =
-        with_settings_ui(|ui| ui.as_ref().map(|ui| ui.window)).unwrap_or(std::ptr::null_mut());
-    if window.is_null() {
-        return;
-    }
-    unsafe { tooltip::SettingsTooltip::show_success_bubble(window, text) };
+/// Show transient action feedback in the app's shared toast.
+fn show_settings_success(text: &str) {
+    crate::ui::toast::show_done(text);
+}
+
+/// Show a refused action in the same toast: the red badge is what separates it from a success.
+fn show_settings_refusal(text: &str) {
+    crate::ui::toast::show_refused(text);
 }
 
 #[cfg(test)]
@@ -4103,15 +4103,19 @@ pub(crate) extern "C" fn handle_gesture_record_start(
         // set below says "a settings callback is running", not "the recorder is".
         let was_recording = crate::mouse::gesture::recording::is_recording();
         // Every step a recording can stop at says so in the same shape: the log gets the reason and
-        // the window gets one line. A recorder that answers a click with nothing reads as a dead
+        // the shared toast gets one line. A recorder that answers a click with nothing reads as a dead
         // button even while it is working.
-        fn notice(reason: &str, text: &str) {
+        enum NoticeKind {
+            Success,
+            Refusal,
+        }
+        fn notice(reason: &str, text: &str, kind: NoticeKind) {
             crate::log_info!("[gesture] {reason}");
-            // The bubble is a nice-to-have: a toast that cannot be drawn (no opaque surface on this
-            // machine, a window that is mid-rebuild) must not take the action down with it -- a
-            // panic here is caught, and everything after it would silently not run.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                show_settings_toast(text)
+            // The toast is a nice-to-have: a message that cannot be drawn must not take the action
+            // down with it -- a panic here is caught, and everything after it would silently not run.
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| match kind {
+                NoticeKind::Success => show_settings_success(text),
+                NoticeKind::Refusal => show_settings_refusal(text),
             }));
         }
         // One row, one action: the same button starts a recording and cancels the running one.
@@ -4121,6 +4125,7 @@ pub(crate) extern "C" fn handle_gesture_record_start(
             notice(
                 "recording cancelled",
                 &t("settings.gestures_record_cancelled"),
+                NoticeKind::Success,
             );
             return;
         }
@@ -4130,6 +4135,7 @@ pub(crate) extern "C" fn handle_gesture_record_start(
             notice(
                 "recording not started: the mouse tap is not running",
                 &t("settings.gestures_record_needs_tap"),
+                NoticeKind::Refusal,
             );
             return;
         }
@@ -4143,6 +4149,7 @@ pub(crate) extern "C" fn handle_gesture_record_start(
             notice(
                 "recording not started: the feature is off",
                 &t("settings.gestures_record_needs_feature"),
+                NoticeKind::Refusal,
             );
             return;
         }
@@ -4165,6 +4172,7 @@ pub(crate) extern "C" fn handle_gesture_record_start(
         notice(
             "recording waiting for a press",
             &t("settings.gestures_record_started"),
+            NoticeKind::Success,
         );
         drop(busy);
     });
