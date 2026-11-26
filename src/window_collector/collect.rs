@@ -257,17 +257,58 @@ pub(crate) fn collect_windows_for_capture(
 /// minimized windows and Command+H-hidden apps. Other desktops are included too: the cards show a
 /// title (a capture is impossible off the current Space) and activating one follows the Dock's own
 /// Space-switching behaviour. The switcher's exclusion list still applies -- a user who keeps an app
-/// out of the switcher does not want its windows previewed from the Dock either.
+/// out of the switcher does not want its windows previewed from the Dock either -- and
+/// `dock_preview.excluded_apps` adds the Dock-only refusal on top.
 pub(crate) fn collect_windows_for_dock_preview(
     mru: &mut MruMap,
     pid: i32,
     focused_cgwid: u32,
 ) -> Option<FocusedCollection> {
-    let mut policy = DirectedCollectionPolicy::from_config(None);
-    policy.show_minimized = true;
-    policy.show_hidden_app_windows = true;
-    policy.show_other_desktops = true;
+    // One configuration snapshot for the whole pass. Building this from `from_config` and then
+    // reading CONFIG again for the Dock list could mix two edits: the policy exists precisely so a
+    // pass cannot combine two configurations.
+    let policy = {
+        let cfg = CONFIG.read().unwrap();
+        DirectedCollectionPolicy {
+            show_minimized: true,
+            show_hidden_app_windows: true,
+            show_other_desktops: true,
+            excluded_apps: dock_preview_exclusion_list(
+                &cfg.windows.excluded_apps,
+                &cfg.dock_preview.excluded_apps,
+            ),
+        }
+    };
     collect_windows_for_pid_with_policy(mru, pid, focused_cgwid, policy)
+}
+
+/// The exclusion list one Dock-preview directed pass enforces: the switcher's presentation refusal
+/// first, then the Dock-only list. Duplicates are harmless to the exact-match predicate and are not
+/// worth normalizing away on every hover.
+fn dock_preview_exclusion_list(switcher: &[String], dock: &[String]) -> Vec<String> {
+    let mut excluded = Vec::with_capacity(switcher.len() + dock.len());
+    excluded.extend(switcher.iter().cloned());
+    excluded.extend(dock.iter().cloned());
+    excluded
+}
+
+#[cfg(test)]
+mod dock_preview_policy_tests {
+    /// Dock-only exclusions are additive to the switcher's own presentation refusal, in one stable
+    /// policy list. The exact-match predicate is tested independently; this pins what the Dock pass
+    /// feeds it.
+    #[test]
+    fn the_dock_preview_exclusion_list_adds_the_dock_list_to_the_switchers() {
+        let switcher = vec!["com.example.Switcher".to_string()];
+        let dock = vec!["com.example.Dock".to_string()];
+        assert_eq!(
+            super::dock_preview_exclusion_list(&switcher, &dock),
+            vec![
+                "com.example.Switcher".to_string(),
+                "com.example.Dock".to_string()
+            ]
+        );
+    }
 }
 
 fn collect_windows_for_pid_with_policy(
@@ -2964,6 +3005,8 @@ mod tab_group_fold_tests {
             cgwid,
             title: title.to_string(),
             minimized,
+            minimized_read_failed: false,
+            discovery_incomplete: false,
             is_main: false,
             is_fullscreen: Some(false),
             is_custom_root: false,
@@ -3695,6 +3738,8 @@ mod space_gate_tests {
             cgwid,
             title: "window".to_string(),
             minimized: false,
+            minimized_read_failed: false,
+            discovery_incomplete: false,
             is_main: false,
             is_fullscreen,
             is_custom_root: false,

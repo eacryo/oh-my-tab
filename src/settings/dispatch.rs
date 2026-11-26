@@ -25,7 +25,9 @@ pub(super) enum ControlField {
     DockCardsPerRow,
     DockQuitOnLastWindowClose,
     DockPeekOnHover,
-    DockHideFrontmostOnIconClick,
+    DockFrontmostIconClickAction,
+    DockRestoreMinimizedOnIconClick,
+    DockCmdRightClickQuit,
     /// Always present the preview as a window list instead of thumbnail cards.
     DockListMode,
     WindowsEnabled,
@@ -933,9 +935,20 @@ fn apply_control_field(field: ControlField) {
                     let state: isize = msg_send![u.dock_peek_on_hover, state];
                     cfg.dock_preview.peek_on_hover = state == 1;
                 }
-                ControlField::DockHideFrontmostOnIconClick => {
-                    let state: isize = msg_send![u.dock_hide_frontmost_on_icon_click, state];
-                    cfg.dock_preview.hide_frontmost_on_icon_click = state == 1;
+                ControlField::DockFrontmostIconClickAction => {
+                    let idx: isize =
+                        msg_send![u.dock_frontmost_icon_click_action, indexOfSelectedItem];
+                    cfg.dock_preview.frontmost_icon_click_action =
+                        crate::config::dock_frontmost_click_value_at(idx.max(0) as usize)
+                            .to_string();
+                }
+                ControlField::DockRestoreMinimizedOnIconClick => {
+                    let state: isize = msg_send![u.dock_restore_minimized_on_icon_click, state];
+                    cfg.dock_preview.restore_minimized_on_icon_click = state == 1;
+                }
+                ControlField::DockCmdRightClickQuit => {
+                    let state: isize = msg_send![u.dock_cmd_right_click_quit, state];
+                    cfg.dock_preview.cmd_right_click_quit = state == 1;
                 }
                 ControlField::DockListMode => {
                     let state: isize = msg_send![u.dock_list_mode, state];
@@ -1784,8 +1797,18 @@ pub(crate) unsafe fn update_dock_preview_controls_enabled(ui: &SettingsUi) {
     if !ui.dock_peek_on_hover.is_null() {
         SettingsRow::set_enabled_with_tooltip(ui.dock_peek_on_hover, on, &tooltip);
     }
-    if !ui.dock_hide_frontmost_on_icon_click.is_null() {
-        SettingsRow::set_enabled_with_tooltip(ui.dock_hide_frontmost_on_icon_click, on, &tooltip);
+    if !ui.dock_frontmost_icon_click_action.is_null() {
+        SettingsRow::set_enabled_with_tooltip(ui.dock_frontmost_icon_click_action, on, &tooltip);
+    }
+    if !ui.dock_restore_minimized_on_icon_click.is_null() {
+        SettingsRow::set_enabled_with_tooltip(
+            ui.dock_restore_minimized_on_icon_click,
+            on,
+            &tooltip,
+        );
+    }
+    if !ui.dock_cmd_right_click_quit.is_null() {
+        SettingsRow::set_enabled_with_tooltip(ui.dock_cmd_right_click_quit, on, &tooltip);
     }
 }
 
@@ -4273,6 +4296,83 @@ pub(crate) extern "C" fn handle_gesture_excluded_remove(
         // currently dispatching to.
         crate::settings::rebuild_settings_content_deferred_keeping_scroll(SettingsPageId::Gestures);
     });
+}
+
+/// The Dock page's "Add an application": the same system chooser, writing the Dock preview's own
+/// exclusion list. The list is additive to the switcher's at collection time.
+pub(crate) extern "C" fn handle_dock_excluded_choose(
+    _self: *mut c_void,
+    _cmd: Sel,
+    _sender: *mut c_void,
+) {
+    callback_guard::void("handle_dock_excluded_choose", || {
+        let Some((bundle_id, _name)) = choose_application_from_disk() else {
+            return;
+        };
+        if add_dock_excluded_application(&bundle_id) {
+            crate::settings::rebuild_settings_content_deferred_keeping_scroll(SettingsPageId::Dock);
+        }
+    });
+}
+
+/// Remove the Dock exclusion entry whose Remove button was pressed. The bundle id recorded on the
+/// row at build time is the entry's identity, never the row index.
+pub(crate) extern "C" fn handle_dock_excluded_remove(
+    _self: *mut c_void,
+    _cmd: Sel,
+    sender: *mut c_void,
+) {
+    callback_guard::void("handle_dock_excluded_remove", || {
+        let Some(bundle) = (unsafe { action_bundle_of_sender(sender as *mut AnyObject) }) else {
+            return;
+        };
+        if remove_dock_excluded_application(&bundle) {
+            crate::settings::rebuild_settings_content_deferred_keeping_scroll(SettingsPageId::Dock);
+        }
+    });
+}
+
+/// Add one bundle id to the Dock preview's exclusion list if it is not already there, using the
+/// same normalization and duplicate rules as the other shared exclusion cards.
+pub(crate) fn add_dock_excluded_application(bundle_id: &str) -> bool {
+    let Ok(old) = CONFIG.read().map(|cfg| cfg.clone()) else {
+        return false;
+    };
+    let mut updated = old.clone();
+    if !push_excluded_entry(&mut updated.dock_preview.excluded_apps, bundle_id) {
+        return false;
+    }
+    if let Ok(mut config) = CONFIG.write() {
+        *config = updated.clone();
+    }
+    crate::settings::schedule_config_persist();
+    crate::runtime_config::apply_config_change(
+        &old,
+        &updated,
+        crate::runtime_config::ConfigChangeSource::Settings,
+    );
+    true
+}
+
+/// Remove exactly the Dock exclusion entry the row was built for, one entry per click.
+pub(crate) fn remove_dock_excluded_application(bundle_id: &str) -> bool {
+    let Ok(old) = CONFIG.read().map(|cfg| cfg.clone()) else {
+        return false;
+    };
+    let mut updated = old.clone();
+    if !remove_excluded_entry(&mut updated.dock_preview.excluded_apps, bundle_id) {
+        return false;
+    }
+    if let Ok(mut config) = CONFIG.write() {
+        *config = updated.clone();
+    }
+    crate::settings::schedule_config_persist();
+    crate::runtime_config::apply_config_change(
+        &old,
+        &updated,
+        crate::runtime_config::ConfigChangeSource::Settings,
+    );
+    true
 }
 
 /// The Switcher page's "Add an application": the same system chooser, writing the switcher's own

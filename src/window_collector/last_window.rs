@@ -970,6 +970,7 @@ impl StartedTarget {
                 self.pid,
                 &self.identity_key,
                 self.process_start_time_us,
+                &|| true,
             );
         }
     }

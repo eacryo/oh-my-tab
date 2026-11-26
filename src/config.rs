@@ -911,6 +911,24 @@ pub(crate) const DOCK_CARDS_PER_ROW_MAX: u32 = 16;
 /// and a wider window count wraps instead of collapsing into the list.
 pub(crate) const DOCK_CARDS_PER_ROW_DEFAULT: u32 = 6;
 
+/// What a second click on the already-frontmost app's Dock icon does, in settings-dropdown order.
+pub(crate) const DOCK_FRONTMOST_CLICK_VALUES: [&str; 3] = ["off", "hide", "minimize"];
+
+/// The dropdown index for a stored frontmost-click action, or `None` when validation rejects it.
+pub(crate) fn dock_frontmost_click_index_of(value: &str) -> Option<usize> {
+    DOCK_FRONTMOST_CLICK_VALUES
+        .iter()
+        .position(|candidate| *candidate == value)
+}
+
+/// The stored frontmost-click action for a dropdown index; the first item is the fallback.
+pub(crate) fn dock_frontmost_click_value_at(index: usize) -> &'static str {
+    DOCK_FRONTMOST_CLICK_VALUES
+        .get(index)
+        .copied()
+        .unwrap_or(DOCK_FRONTMOST_CLICK_VALUES[0])
+}
+
 /// Dock previews: hovering an app's Dock icon shows that app's windows.
 ///
 /// The master switch is on by default: it is the feature the Dock side of the app exists for, and
@@ -939,9 +957,29 @@ pub struct DockPreviewSection {
     /// lift another application's window without making it active first (measured 2026-11-24), so the
     /// switch exists for machines whose applications react to being activated.
     pub peek_on_hover: bool,
-    /// Hide the already-frontmost application when its Dock icon is clicked again. Default false:
-    /// this adds a second meaning to a native Dock click, so it is opt-in.
-    pub hide_frontmost_on_icon_click: bool,
+    /// What a click on the already-frontmost application's Dock icon does: "off", "hide" or
+    /// "minimize". Default off: this adds a second meaning to a native Dock click, so it is opt-in.
+    pub frontmost_icon_click_action: String,
+    /// Restore every minimized window of the clicked application after the Dock's own activation.
+    /// Default false: restoring many windows is a visible change beyond the native click.
+    pub restore_minimized_on_icon_click: bool,
+    /// Let Command+right-click on a Dock icon quit the application; adding Option force-quits it.
+    /// Default false because the gesture is destructive even though it is explicit.
+    pub cmd_right_click_quit: bool,
+    /// Applications that never answer a Dock-icon hover with a preview, by bundle identifier.
+    /// Empty by default. This list is Dock-specific and additive: the switcher's own exclusion
+    /// list still applies to the preview because it is already a window-presentation refusal.
+    /// Entries follow the switcher list's matching and repair rules -- user data, matched
+    /// case-insensitively after trimming, malformed elements dropped one at a time.
+    pub excluded_apps: Vec<String>,
+    /// Formerly `dock_preview.hide_frontmost_on_icon_click`. Accepted only so a file written before
+    /// the three-way action can be migrated; never written while it is None.
+    #[serde(
+        rename = "hide_frontmost_on_icon_click",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub(crate) hide_frontmost_on_icon_click_legacy: Option<bool>,
     /// Always present the preview as a window list instead of thumbnail cards. Default false:
     /// the cards are the feature's shape, and the list is its overflow and its no-permission
     /// fallback. The switch exists so both presentations can be checked without needing a
@@ -956,7 +994,11 @@ impl Default for DockPreviewSection {
             cards_per_row: DOCK_CARDS_PER_ROW_DEFAULT,
             quit_on_last_window_close: false,
             peek_on_hover: true,
-            hide_frontmost_on_icon_click: false,
+            frontmost_icon_click_action: "off".into(),
+            restore_minimized_on_icon_click: false,
+            cmd_right_click_quit: false,
+            excluded_apps: Vec::new(),
+            hide_frontmost_on_icon_click_legacy: None,
             list_mode: false,
         }
     }
@@ -1718,6 +1760,14 @@ impl Config {
                 &[("value", &self.dock_preview.cards_per_row.to_string())],
             ));
         }
+        if !DOCK_FRONTMOST_CLICK_VALUES
+            .contains(&self.dock_preview.frontmost_icon_click_action.as_str())
+        {
+            errs.push(tf(
+                "errors.dock_frontmost_icon_click_action_invalid",
+                &[("value", &self.dock_preview.frontmost_icon_click_action)],
+            ));
+        }
         if self.appearance.corner_radius < 0.0 {
             errs.push(tf(
                 "errors.appearance_corner_radius_invalid",
@@ -2318,9 +2368,20 @@ impl Config {
         self.dock_preview.enabled = other.dock_preview.enabled;
         self.dock_preview.quit_on_last_window_close = other.dock_preview.quit_on_last_window_close;
         self.dock_preview.peek_on_hover = other.dock_preview.peek_on_hover;
-        self.dock_preview.hide_frontmost_on_icon_click =
-            other.dock_preview.hide_frontmost_on_icon_click;
+        self.dock_preview.restore_minimized_on_icon_click =
+            other.dock_preview.restore_minimized_on_icon_click;
+        self.dock_preview.cmd_right_click_quit = other.dock_preview.cmd_right_click_quit;
         self.dock_preview.list_mode = other.dock_preview.list_mode;
+        // User data already repaired element by element by the loader. A sibling Dock setting's
+        // fallback must not silently discard it.
+        self.dock_preview.excluded_apps = other.dock_preview.excluded_apps;
+        if !errs
+            .iter()
+            .any(|e| e.starts_with("dock_preview.frontmost_icon_click_action"))
+        {
+            self.dock_preview.frontmost_icon_click_action =
+                other.dock_preview.frontmost_icon_click_action;
+        }
         if !errs
             .iter()
             .any(|e| e.starts_with("dock_preview.cards_per_row"))
@@ -2610,6 +2671,19 @@ fn config_type_schema() -> toml::Value {
         );
     }
 
+    // `dock_preview.hide_frontmost_on_icon_click` is skipped during serialization for the same
+    // reason as the clipboard legacy key: it is read only for migration into the three-way action.
+    if let Some(dock_preview) = value
+        .as_table_mut()
+        .and_then(|root| root.get_mut("dock_preview"))
+        .and_then(toml::Value::as_table_mut)
+    {
+        dock_preview.insert(
+            "hide_frontmost_on_icon_click".into(),
+            toml::Value::Boolean(false),
+        );
+    }
+
     // Gesture layers are described explicitly: the sanitizer walks an array element-by-element
     // against the schema's FIRST element, so without one a single mistyped field inside one mouse's
     // layer would fail the whole document. The element states the layer's own identity fields (the
@@ -2837,13 +2911,13 @@ fn sanitize_config_value(
         return Some(toml::Value::Table(sanitized));
     }
 
-    // The switcher's exclusion list is user data too, and has no required key: each element must be
-    // a bundle-identifier string. A non-string element, or one that is only whitespace, is dropped
+    // The switcher and Dock exclusion lists are user data too, and have no required key: each
+    // element must be a bundle-identifier string. A non-string element, or one that is only whitespace, is dropped
     // on its own (with an error) instead of failing the whole document; surrounding whitespace is
     // not part of an identifier, so entries are trimmed. Without this branch the empty default
     // array's schema would carry no element type, the sanitizer would accept ANY array and Serde
     // would then reject the whole file -- the opposite of the per-field tolerance invariant.
-    if path == "windows.excluded_apps" {
+    if path == "windows.excluded_apps" || path == "dock_preview.excluded_apps" {
         let Some(array) = actual.as_array() else {
             errors.push(type_error(path, actual, schema));
             return fallback.cloned();
@@ -3054,6 +3128,11 @@ pub(crate) fn parse_config_content(
         .and_then(toml::Value::as_table)
         .is_some_and(|table| table.contains_key("picker_placement"));
     needs_persist |= loaded.migrate_picker_position(placement_was_explicit);
+    let frontmost_action_was_explicit = actual
+        .get("dock_preview")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|table| table.contains_key("frontmost_icon_click_action"));
+    needs_persist |= loaded.migrate_dock_frontmost_click_action(frontmost_action_was_explicit);
     needs_persist |= loaded.mouse.migrate_legacy();
     needs_persist |= loaded.migrate_card_text_style();
     // Presence is read off the raw document: Serde cannot tell a missing table (or a missing
@@ -3290,6 +3369,23 @@ impl Config {
             _ => "cursor",
         }
         .to_string();
+        true
+    }
+
+    /// Fold the retired hide-only Dock-click switch into the three-way frontmost-click action. An
+    /// explicit new key wins when a hand-written file contains both; otherwise the legacy boolean
+    /// carries the user's old choice exactly (`true` -> `hide`, `false` -> `off`).
+    pub(crate) fn migrate_dock_frontmost_click_action(
+        &mut self,
+        action_was_explicit: bool,
+    ) -> bool {
+        let Some(legacy) = self.dock_preview.hide_frontmost_on_icon_click_legacy.take() else {
+            return false;
+        };
+        if !action_was_explicit {
+            self.dock_preview.frontmost_icon_click_action =
+                if legacy { "hide".into() } else { "off".into() };
+        }
         true
     }
 
@@ -4249,7 +4345,6 @@ enabled = true
         );
     }
 
-    #[test]
     /// Switching back to a standard entry replaces a learned trigger, and a learned one survives a
     /// round trip: the page must never show one thing and store another.
     #[test]
@@ -4370,8 +4465,11 @@ enabled = true
         other.dock_preview.enabled = false;
         other.dock_preview.cards_per_row = 2;
         other.dock_preview.quit_on_last_window_close = true;
-        other.dock_preview.hide_frontmost_on_icon_click = true;
+        other.dock_preview.frontmost_icon_click_action = "minimize".into();
+        other.dock_preview.restore_minimized_on_icon_click = true;
+        other.dock_preview.cmd_right_click_quit = true;
         other.dock_preview.list_mode = true;
+        other.dock_preview.excluded_apps = vec!["com.example.DockOnly".into()];
         let mut merged = Config::default();
         assert!(merged.dock_preview.enabled && !merged.dock_preview.quit_on_last_window_close);
         // An error in a SIBLING section: every field of this section still follows.
@@ -4379,8 +4477,87 @@ enabled = true
         assert!(!merged.dock_preview.enabled);
         assert_eq!(merged.dock_preview.cards_per_row, 2);
         assert!(merged.dock_preview.quit_on_last_window_close);
-        assert!(merged.dock_preview.hide_frontmost_on_icon_click);
+        assert_eq!(merged.dock_preview.frontmost_icon_click_action, "minimize");
+        assert!(merged.dock_preview.restore_minimized_on_icon_click);
+        assert!(merged.dock_preview.cmd_right_click_quit);
         assert!(merged.dock_preview.list_mode);
+        assert_eq!(
+            merged.dock_preview.excluded_apps,
+            vec!["com.example.DockOnly".to_string()]
+        );
+    }
+
+    /// The Dock exclusion list is additive user data: old files load with it empty, valid entries
+    /// are preserved, malformed entries are repaired one at a time, and a sibling Dock field's
+    /// fallback cannot discard the repaired list.
+    #[test]
+    fn dock_excluded_apps_defaults_repairs_and_survives_sibling_fallback() {
+        assert!(Config::default().dock_preview.excluded_apps.is_empty());
+        let legacy: Config = toml::from_str("[dock_preview]\nlist_mode = true\n").unwrap();
+        assert!(legacy.dock_preview.excluded_apps.is_empty());
+        assert!(legacy.dock_preview.list_mode);
+
+        let content = "[dock_preview]\ncards_per_row = 4\nexcluded_apps = [\"  com.example.good  \", 42, \"   \", \"com.example.also\"]\n";
+        let (config, errors, needs_persist) = parse_config_content(content).unwrap();
+        assert_eq!(config.dock_preview.cards_per_row, 4);
+        assert_eq!(
+            config.dock_preview.excluded_apps,
+            vec![
+                "com.example.good".to_string(),
+                "com.example.also".to_string()
+            ]
+        );
+        assert!(errors
+            .iter()
+            .any(|e| e.contains("dock_preview.excluded_apps")));
+        assert!(needs_persist);
+
+        let mut other = Config::default();
+        other.dock_preview.excluded_apps = vec!["com.example.DockOnly".into()];
+        let mut merged = Config::default();
+        merged.merge_valid(other, &["dock_preview.cards_per_row: invalid".to_string()]);
+        assert_eq!(
+            merged.dock_preview.excluded_apps,
+            vec!["com.example.DockOnly".to_string()]
+        );
+    }
+
+    /// The retired hide-only Dock click switch folds into the three-way action exactly once, and an
+    /// explicit new key wins when both are present. The legacy key is not written back.
+    #[test]
+    fn the_dock_frontmost_click_action_migrates_from_the_hide_switch() {
+        let (migrated, errors, persist) = parse_config_content(
+            "[dock_preview]
+hide_frontmost_on_icon_click = true
+",
+        )
+        .unwrap();
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(persist, "the retired key must not outlive the migration");
+        assert_eq!(migrated.dock_preview.frontmost_icon_click_action, "hide");
+        let written = toml::to_string(&migrated).unwrap();
+        assert!(!written.contains("hide_frontmost_on_icon_click"));
+        assert!(written.contains("frontmost_icon_click_action"));
+
+        let (off, _, _) =
+            parse_config_content("[dock_preview]\nhide_frontmost_on_icon_click = false\n").unwrap();
+        assert_eq!(off.dock_preview.frontmost_icon_click_action, "off");
+
+        let (explicit, _, _) = parse_config_content(
+            "[dock_preview]\nhide_frontmost_on_icon_click = true\nfrontmost_icon_click_action = \"minimize\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            explicit.dock_preview.frontmost_icon_click_action,
+            "minimize"
+        );
+
+        let mut invalid = Config::default();
+        invalid.dock_preview.frontmost_icon_click_action = "close".into();
+        assert!(invalid
+            .validate()
+            .iter()
+            .any(|error| error.starts_with("dock_preview.frontmost_icon_click_action")));
     }
 
     /// `dock_preview.cards_per_row` is additive and defaults to 5: a file written before the
@@ -4496,7 +4673,7 @@ enabled = true
         let mut other = Config::default();
         other.windows.quit_on_last_window_close = true;
         other.dock_preview.quit_on_last_window_close = true;
-        other.dock_preview.hide_frontmost_on_icon_click = true;
+        other.dock_preview.frontmost_icon_click_action = "hide".into();
         let mut merged = Config::default();
         merged.merge_valid(
             other,

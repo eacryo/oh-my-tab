@@ -91,6 +91,9 @@ struct ChangeFlags {
     // The row/list threshold: an open panel was laid out with the old one, so it is hidden and the
     // next hover opens with the new threshold. Independent of the on/off switch.
     dock_cards_per_row: bool,
+    // The Dock preview's own exclusion list. A standing panel was collected before the refusal,
+    // so it is dropped; the next hover collects under the new additive policy.
+    dock_excluded_apps: bool,
     // Either quit-on-last-window switch changed. Neither drives runtime state -- the switch is read
     // from the live configuration when a close starts -- so this exists only so an open Settings
     // page follows a reload or a defaults restore instead of showing the replaced value.
@@ -210,9 +213,13 @@ fn change_flags(old: &Config, new: &Config, source: ConfigChangeSource) -> Chang
         dock_preview: old.dock_preview.enabled != new.dock_preview.enabled,
         dock_cards_per_row: old.dock_preview.cards_per_row != new.dock_preview.cards_per_row,
         dock_peek: old.dock_preview.peek_on_hover != new.dock_preview.peek_on_hover,
-        dock_hide_click: old.dock_preview.hide_frontmost_on_icon_click
-            != new.dock_preview.hide_frontmost_on_icon_click,
+        dock_hide_click: old.dock_preview.frontmost_icon_click_action
+            != new.dock_preview.frontmost_icon_click_action
+            || old.dock_preview.restore_minimized_on_icon_click
+                != new.dock_preview.restore_minimized_on_icon_click
+            || old.dock_preview.cmd_right_click_quit != new.dock_preview.cmd_right_click_quit,
         dock_list_mode: old.dock_preview.list_mode != new.dock_preview.list_mode,
+        dock_excluded_apps: old.dock_preview.excluded_apps != new.dock_preview.excluded_apps,
         logging: startup || old.logging.level != new.logging.level,
         windows_disabled: !new.windows.enabled
             && (startup || old.windows.enabled != new.windows.enabled),
@@ -487,6 +494,8 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
     if flags.dock_preview
         || flags.dock_cards_per_row
         || flags.dock_list_mode
+        || flags.dock_excluded_apps
+        || flags.switcher_excluded_apps
         || matches!(source, ConfigChangeSource::Startup)
     {
         // Startup seeds the observer's on/off state from the stored switch; a live change starts or
@@ -494,10 +503,17 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         // threshold change keeps the observer running but drops the open panel: it was laid out
         // from the old count, and the next hover must open with the new one. The list-mode switch
         // is the same kind of change: it decides the panel's mode, so the standing panel was laid
-        // out for a presentation the config no longer wants.
+        // out for a presentation the config no longer wants. An exclusion-list edit also drops it:
+        // it may already be showing an application the new policy refuses.
         crate::dock_preview::apply_config_change(new.dock_preview.enabled);
         if (flags.dock_cards_per_row || flags.dock_list_mode) && new.dock_preview.enabled {
             crate::dock_preview::hide_for_layout_change();
+        }
+        if (flags.dock_excluded_apps || flags.switcher_excluded_apps) && new.dock_preview.enabled {
+            // The Dock pass enforces the union of both lists, so either edit invalidates every
+            // preview collected under the previous pair. This does not make the Dock-only list a
+            // switcher-policy change: `switcher_excluded_apps` remains false for it below.
+            crate::dock_preview::hide_for_policy_change();
         }
     }
     if flags.dock_peek {
@@ -506,10 +522,13 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::dock_preview::apply_peek_config_change(new.dock_preview.peek_on_hover);
     }
     if flags.dock_hide_click {
-        // This child switch chooses which kind of Dock tap is installed. Retire every gesture and
-        // pending hide first, then let the watcher move between passive dismissal and active evidence.
-        crate::dock_preview::apply_hide_click_config_change(
-            new.dock_preview.enabled && new.dock_preview.hide_frontmost_on_icon_click,
+        // These click settings choose which kind of Dock tap is installed. Retire every gesture and
+        // pending action first, then let the watcher move between passive dismissal and active evidence.
+        crate::dock_preview::apply_dock_click_config_change(
+            new.dock_preview.enabled,
+            &new.dock_preview.frontmost_icon_click_action,
+            new.dock_preview.restore_minimized_on_icon_click,
+            new.dock_preview.cmd_right_click_quit,
         );
     }
     if flags.logging {
@@ -675,7 +694,7 @@ pub(crate) fn apply_config_change(old: &Config, new: &Config, source: ConfigChan
         crate::settings::refresh_clipboard_pause_switch_from_config();
     }
     if rebuilds_settings_for_list_change(
-        flags.clipboard_excluded_apps || flags.switcher_excluded_apps,
+        flags.clipboard_excluded_apps || flags.switcher_excluded_apps || flags.dock_excluded_apps,
         source,
     ) {
         // The list card is laid out from the list, so a change from an edited config file has to
@@ -1342,14 +1361,79 @@ mod tests {
     }
 
     #[test]
-    fn the_dock_click_hide_change_flags_the_tap_mode_and_the_settings_sync() {
+    fn the_dock_click_action_change_flags_the_tap_mode_and_the_settings_sync() {
         let old = Config::default();
         let mut new = old.clone();
-        new.dock_preview.hide_frontmost_on_icon_click = true;
+        new.dock_preview.frontmost_icon_click_action = "hide".into();
         let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
         assert!(flags.dock_hide_click);
         assert!(!flags.dock_preview && !flags.dock_peek && !flags.dock_cards_per_row);
         assert!(needs_in_place_control_sync(&flags));
+    }
+
+    #[test]
+    fn the_dock_exclusion_change_drops_the_panel_and_rebuilds_the_settings_list() {
+        let old = Config::default();
+        let mut new = old.clone();
+        new.dock_preview.excluded_apps = vec!["com.example.DockOnly".into()];
+        let flags = change_flags(&old, &new, ConfigChangeSource::Settings);
+        assert!(flags.dock_excluded_apps);
+        assert!(
+            !flags.switcher_excluded_apps,
+            "the Dock-only list must not invalidate switcher candidates"
+        );
+        assert!(!flags.dock_preview && !flags.dock_peek && !flags.dock_cards_per_row);
+        assert!(!needs_in_place_control_sync(&flags));
+        assert!(!rebuilds_settings_for_list_change(
+            flags.dock_excluded_apps,
+            ConfigChangeSource::Settings
+        ));
+        assert!(rebuilds_settings_for_list_change(
+            flags.dock_excluded_apps,
+            ConfigChangeSource::Reload
+        ));
+        assert!(!rebuilds_settings_for_list_change(
+            flags.dock_excluded_apps,
+            ConfigChangeSource::Startup
+        ));
+
+        // The flag alone would not invalidate a collection already in flight: the apply branch has
+        // to take the policy-change path, which advances the preview request epoch even when no
+        // panel is visible yet. Scan the source because exercising that epoch requires AppKit.
+        let source = include_str!("runtime_config.rs");
+        let body_start = source
+            .find("pub(crate) fn apply_config_change")
+            .expect("apply_config_change is in this file");
+        let body = &source[body_start..];
+        let body_end = body
+            .find(
+                "
+#[cfg(test)]",
+            )
+            .unwrap_or(body.len());
+        assert!(
+            body[..body_end].contains("hide_for_policy_change"),
+            "the Dock exclusion flag must invalidate in-flight preview collections"
+        );
+        assert!(
+            body[..body_end].contains("flags.dock_excluded_apps || flags.switcher_excluded_apps"),
+            "either list feeding the Dock pass must invalidate in-flight preview collections"
+        );
+        assert!(
+            body[..body_end].contains(
+                "|| flags.switcher_excluded_apps
+        || matches!(source, ConfigChangeSource::Startup)"
+            ),
+            "a switcher-list-only edit must reach the Dock apply branch"
+        );
+
+        // The switcher list is part of the same directed Dock policy too. Editing it still has its
+        // own switcher-candidate invalidation; the Dock hide is additive, not a replacement.
+        let mut inherited = old.clone();
+        inherited.windows.excluded_apps = vec!["com.example.Switcher".into()];
+        let inherited_flags = change_flags(&old, &inherited, ConfigChangeSource::Settings);
+        assert!(inherited_flags.switcher_excluded_apps);
+        assert!(!inherited_flags.dock_excluded_apps);
     }
 
     #[test]

@@ -1,8 +1,9 @@
 //! The excluded-applications card, shared by every page that owns a bundle-id exclusion list.
 //!
-//! Two pages present the same card -- the Gestures page ("Applications where no gesture fires") and
-//! the Switcher page ("Excluded from the switcher") -- so its shape lives here once: an "Add an
-//! application" command that opens the system chooser, a line stating entries that can never match,
+//! Three pages present the same card -- the Gestures page ("Applications where no gesture fires"),
+//! the Switcher page ("Excluded from the switcher") and the Dock page ("Applications excluded from
+//! previews") -- so its shape lives here once: an "Add an application" command that opens the
+//! system chooser, a line stating entries that can never match,
 //! the empty state, one row per entry (its icon, its name, its Remove action), and a "+N" row for
 //! the entries past [`MAX_SHOWN_EXCLUDED`] that are edited in the config file. The pages differ only
 //! in copy keys, action ids and the static row identities their control table addresses.

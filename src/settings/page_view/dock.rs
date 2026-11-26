@@ -39,6 +39,24 @@ pub(in crate::settings) fn cards_per_row_for_index(index: usize) -> u32 {
     first + index.min(span.saturating_sub(1)) as u32
 }
 
+/// The frontmost-click popup options, in the same order as `DOCK_FRONTMOST_CLICK_VALUES`.
+fn frontmost_click_options() -> Vec<String> {
+    crate::config::DOCK_FRONTMOST_CLICK_VALUES
+        .iter()
+        .map(|value| {
+            t(match *value {
+                "hide" => "settings.dock_frontmost_click_option_hide",
+                "minimize" => "settings.dock_frontmost_click_option_minimize",
+                _ => "settings.dock_frontmost_click_option_off",
+            })
+        })
+        .collect()
+}
+
+fn frontmost_click_index(value: &str) -> usize {
+    crate::config::dock_frontmost_click_index_of(value).unwrap_or(0)
+}
+
 /// The Dock page's description: the Dock preview feature, the behaviour switches that act on its
 /// panel (the hover peek and quit-on-last-close), and the row/list threshold.
 pub(super) fn dock_page_view(input: &PageInput) -> PageView {
@@ -107,14 +125,80 @@ pub(super) fn dock_page_view(input: &PageInput) -> PageView {
         .into_spec(),
     );
     w.push(
-        switch(
-            "settings.row_dock_hide_frontmost_on_icon_click",
-            ControlField::DockHideFrontmostOnIconClick,
-            cfg.dock_preview.hide_frontmost_on_icon_click,
+        popup(
+            "settings.row_dock_frontmost_icon_click_action",
+            &frontmost_click_options(),
+            ControlField::DockFrontmostIconClickAction,
+            frontmost_click_index(&cfg.dock_preview.frontmost_icon_click_action),
         )
-        .caption("settings.desc_dock_hide_frontmost_on_icon_click")
-        .wide_caption()
+        .caption("settings.desc_dock_frontmost_icon_click_action")
         .into_spec(),
     );
+    w.push(
+        switch(
+            "settings.row_dock_restore_minimized_on_icon_click",
+            ControlField::DockRestoreMinimizedOnIconClick,
+            cfg.dock_preview.restore_minimized_on_icon_click,
+        )
+        .caption("settings.desc_dock_restore_minimized_on_icon_click")
+        .into_spec(),
+    );
+    w.push(
+        switch(
+            "settings.row_dock_cmd_right_click_quit",
+            ControlField::DockCmdRightClickQuit,
+            cfg.dock_preview.cmd_right_click_quit,
+        )
+        .caption("settings.desc_dock_cmd_right_click_quit")
+        .into_spec(),
+    );
+    // The Dock list is separate from the switcher's, but both are admitted through the same card.
+    // Its entries are additive at collection time: a switcher exclusion still refuses a preview.
+    push_excluded_apps_card(
+        &mut w,
+        &dock_excluded_card(),
+        &cfg.dock_preview.excluded_apps,
+        &input.known_app_names,
+    );
     w.finish()
+}
+
+/// The Dock page's exclusion card: same shared shape as the switcher's, with Dock-specific copy,
+/// actions and stable row identities.
+fn dock_excluded_card() -> ExcludedAppsCardSpec {
+    static IDENTITIES: [&str; MAX_SHOWN_EXCLUDED] = [
+        "dock_excluded_a",
+        "dock_excluded_b",
+        "dock_excluded_c",
+        "dock_excluded_d",
+        "dock_excluded_e",
+        "dock_excluded_f",
+        "dock_excluded_g",
+        "dock_excluded_h",
+        "dock_excluded_i",
+        "dock_excluded_j",
+        "dock_excluded_k",
+        "dock_excluded_l",
+        "dock_excluded_m",
+        "dock_excluded_n",
+        "dock_excluded_o",
+        "dock_excluded_p",
+    ];
+    ExcludedAppsCardSpec {
+        header_key: "settings.header_dock_excluded",
+        desc_key: "settings.desc_dock_excluded",
+        add_row_key: "settings.row_dock_excluded_add",
+        add_action_id: "dock_excluded_choose",
+        add_action_key: "settings.dock_excluded_choose_action",
+        invalid_key: "settings.row_dock_excluded_invalid",
+        invalid_identity: "dock_excluded_invalid",
+        empty_key: "settings.row_dock_excluded_empty",
+        empty_identity: "dock_excluded_empty",
+        row_label_key: "settings.row_dock_excluded",
+        remove_action_id: "dock_excluded_remove",
+        remove_action_key: "settings.dock_excluded_remove",
+        more_key: "settings.row_dock_excluded_more",
+        more_identity: "dock_excluded_more",
+        identities: &IDENTITIES,
+    }
 }

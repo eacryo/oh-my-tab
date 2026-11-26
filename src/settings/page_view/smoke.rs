@@ -101,7 +101,9 @@ pub(crate) unsafe fn headless_settings_ui() -> SettingsUi {
         dock_cards_per_row: std::ptr::null_mut(),
         dock_quit_on_last_window_close: std::ptr::null_mut(),
         dock_peek_on_hover: std::ptr::null_mut(),
-        dock_hide_frontmost_on_icon_click: std::ptr::null_mut(),
+        dock_frontmost_icon_click_action: std::ptr::null_mut(),
+        dock_restore_minimized_on_icon_click: std::ptr::null_mut(),
+        dock_cmd_right_click_quit: std::ptr::null_mut(),
         dock_list_mode: std::ptr::null_mut(),
         reverse_scroll: std::ptr::null_mut(),
         enable_mouse: std::ptr::null_mut(),
@@ -206,6 +208,7 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
         SettingsPageId::Gestures,
         SettingsPageId::KeyBindings,
         SettingsPageId::Mouse,
+        SettingsPageId::Dock,
     ] {
         let document: *mut AnyObject = msg_send![class!(NSView), alloc];
         let document: *mut AnyObject = msg_send![
@@ -227,6 +230,12 @@ pub(crate) unsafe fn migrated_pages_smoke_runner() -> bool {
             }
             SettingsPageId::Gestures => {
                 config.mouse.gesture_excluded_apps = vec![
+                    "com.apple.Safari".into(),
+                    "com.example.not-installed-anywhere".into(),
+                ];
+            }
+            SettingsPageId::Dock => {
+                config.dock_preview.excluded_apps = vec![
                     "com.apple.Safari".into(),
                     "com.example.not-installed-anywhere".into(),
                 ];

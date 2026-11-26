@@ -883,18 +883,20 @@ fn dock_page_view_owns_the_preview_switches() {
     assert_eq!(view.page, SettingsPageId::Dock);
     assert_eq!(view.title_key, "settings.sidebar_dock");
     // The switch, the promise it makes about closes made here, the list presentation, the
-    // threshold, the peek and the click-hide child switch: all six only mean something while the
-    // switch above them is on.
-    assert_eq!(view.rows.len(), 6);
+    // threshold, the peek and the three click interactions, then the exclusion card's add and
+    // empty-state rows.
+    assert_eq!(view.rows.len(), 10);
     // The master switch is its own card, and every option it governs is the next one: a switch never
     // shares a card with the switches it governs (the App Switcher page's overlay/options split).
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
-    for options in &view.rows[1..] {
+    for options in &view.rows[1..8] {
         assert_eq!(
             options.section, "settings.header_dock_preview_options",
             "every governed option lives in the options card"
         );
     }
+    assert_eq!(view.rows[8].section, "settings.header_dock_excluded");
+    assert_eq!(view.rows[9].section, "settings.header_dock_excluded");
     assert_eq!(view.rows[0].section, "settings.header_dock_preview");
     assert_eq!(view.rows[0].label_key, "settings.row_dock_preview_enabled");
     assert_eq!(
@@ -964,22 +966,116 @@ fn dock_page_view_owns_the_preview_switches() {
     assert_eq!(peek.group, None);
     assert_eq!(peek.field(), Some(ControlField::DockPeekOnHover));
 
-    // Click-hide is the sixth row. It is deliberately opt-in: the native Dock click keeps its
-    // activation meaning, and this child switch adds the Windows-like second meaning only when asked.
-    let hide = &view.rows[5];
-    assert_eq!(hide.section, "settings.header_dock_preview_options");
+    // The frontmost-click action is a popup: off by default, with hide and minimize as explicit
+    // choices. A popup cannot express an illegal fourth state the way a hand-edited string can.
+    let action = &view.rows[5];
+    assert_eq!(action.section, "settings.header_dock_preview_options");
     assert_eq!(
-        hide.label_key,
-        "settings.row_dock_hide_frontmost_on_icon_click"
+        action.label_key,
+        "settings.row_dock_frontmost_icon_click_action"
     );
     assert_eq!(
-        hide.caption_key,
-        Some("settings.desc_dock_hide_frontmost_on_icon_click")
+        action.caption_key,
+        Some("settings.desc_dock_frontmost_icon_click_action")
     );
-    assert_eq!(hide.copy, RowCopy::Captioned);
-    assert_eq!(hide.value, Value::Switch(false));
+    assert!(matches!(action.control, ControlKind::Popup { .. }));
+    assert_eq!(action.value, Value::Index(0));
     assert_eq!(
-        hide.field(),
-        Some(ControlField::DockHideFrontmostOnIconClick)
+        action.field(),
+        Some(ControlField::DockFrontmostIconClickAction)
+    );
+
+    let restore = &view.rows[6];
+    assert_eq!(
+        restore.label_key,
+        "settings.row_dock_restore_minimized_on_icon_click"
+    );
+    assert_eq!(restore.value, Value::Switch(false));
+    assert_eq!(
+        restore.field(),
+        Some(ControlField::DockRestoreMinimizedOnIconClick)
+    );
+
+    let quick_quit = &view.rows[7];
+    assert_eq!(
+        quick_quit.label_key,
+        "settings.row_dock_cmd_right_click_quit"
+    );
+    assert_eq!(quick_quit.value, Value::Switch(false));
+    assert_eq!(
+        quick_quit.field(),
+        Some(ControlField::DockCmdRightClickQuit)
+    );
+}
+
+/// The Dock exclusion card reuses the shared application-exclusion shape, but writes Dock-specific
+/// copy, actions and row identities. Each Remove carries the bundle id it was built for rather than
+/// a row index.
+#[test]
+fn the_dock_exclusion_card_lists_its_independent_entries() {
+    let mut config = Config::default();
+    config.dock_preview.excluded_apps = vec![
+        "com.apple.Safari".into(),
+        "not a bundle id".into(),
+        "com.apple.Notes".into(),
+    ];
+    let mut input = PageInput::from_config(config, None, crate::theme::ThemeInput::current());
+    input.known_app_names = std::sync::Arc::new(
+        [
+            ("com.apple.Safari".to_string(), "Safari".to_string()),
+            ("com.apple.Notes".to_string(), "Notes".to_string()),
+        ]
+        .into_iter()
+        .collect(),
+    );
+    let view = dock_page_view(&input);
+
+    let excluded: Vec<&RowSpec> = view
+        .rows
+        .iter()
+        .filter(|row| row.label_key == "settings.row_dock_excluded")
+        .collect();
+    assert_eq!(excluded.len(), 3, "one row per Dock exclusion");
+    let labels: Vec<Option<&str>> = excluded
+        .iter()
+        .map(|row| row.label_text.as_deref())
+        .collect();
+    assert_eq!(
+        labels,
+        vec![Some("Safari"), Some("not a bundle id"), Some("Notes")],
+        "a known application is labelled with its name; an unknown entry keeps its text"
+    );
+    assert_eq!(
+        excluded[0].action_bundle.as_deref(),
+        Some("com.apple.Safari"),
+        "the Remove action must carry its bundle id"
+    );
+
+    let actions: Vec<&str> = view
+        .rows
+        .iter()
+        .filter_map(|row| match row.id {
+            ControlId::Action(action) => Some(action),
+            ControlId::Field(_) => None,
+        })
+        .filter(|action| action.starts_with("dock_excluded"))
+        .collect();
+    assert_eq!(
+        actions,
+        vec![
+            "dock_excluded_choose",
+            "dock_excluded_invalid",
+            "dock_excluded_a",
+            "dock_excluded_b",
+            "dock_excluded_c",
+        ],
+        "the add command, the invalid line and one Remove per entry"
+    );
+    assert!(
+        !view
+            .rows
+            .iter()
+            .any(|row| row.label_key == "settings.row_dock_excluded_empty"),
+        "the empty state is not drawn beside entries"
     );
 }

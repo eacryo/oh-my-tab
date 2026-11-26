@@ -72,7 +72,11 @@ fn settings_ui_slot(ui: &mut SettingsUi, field: ControlField) -> Option<&mut *mu
         ControlField::DockCardsPerRow => &mut ui.dock_cards_per_row,
         ControlField::DockQuitOnLastWindowClose => &mut ui.dock_quit_on_last_window_close,
         ControlField::DockPeekOnHover => &mut ui.dock_peek_on_hover,
-        ControlField::DockHideFrontmostOnIconClick => &mut ui.dock_hide_frontmost_on_icon_click,
+        ControlField::DockFrontmostIconClickAction => &mut ui.dock_frontmost_icon_click_action,
+        ControlField::DockRestoreMinimizedOnIconClick => {
+            &mut ui.dock_restore_minimized_on_icon_click
+        }
+        ControlField::DockCmdRightClickQuit => &mut ui.dock_cmd_right_click_quit,
         ControlField::DockListMode => &mut ui.dock_list_mode,
         ControlField::WindowsEnabled => &mut ui.windows_enabled,
         ControlField::ShowMinimized => &mut ui.show_minimized,
@@ -261,7 +265,9 @@ pub(super) fn settings_ui_slot_present(field: ControlField) -> bool {
             | ControlField::DockCardsPerRow
             | ControlField::DockQuitOnLastWindowClose
             | ControlField::DockPeekOnHover
-            | ControlField::DockHideFrontmostOnIconClick
+            | ControlField::DockFrontmostIconClickAction
+            | ControlField::DockRestoreMinimizedOnIconClick
+            | ControlField::DockCmdRightClickQuit
             | ControlField::DockListMode
             | ControlField::WindowsEnabled
             | ControlField::ShowMinimized

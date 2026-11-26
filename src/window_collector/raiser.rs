@@ -1366,9 +1366,23 @@ unsafe fn ax_boolean_attribute(element: AXUIElementRef, key: *const c_void) -> O
     if value.is_null() {
         return None;
     }
-    let boolean = (result == K_AX_SUCCESS).then(|| CFBooleanGetValue(value));
-    CFRelease(value);
-    boolean
+    let value = super::space_membership::OwnedCf(value);
+    (result == K_AX_SUCCESS && CFGetTypeID(value.0) == CFBooleanGetTypeID())
+        .then(|| CFBooleanGetValue(value.0))
+}
+
+/// Copy a string-valued AX attribute while transferring ownership immediately. If AX throws,
+/// the already-returned CF object still has a Rust owner at the exception boundary.
+unsafe fn ax_string_attribute_owned(element: AXUIElementRef, key: *const c_void) -> Option<String> {
+    let mut value: *const c_void = std::ptr::null();
+    if AXUIElementCopyAttributeValue(element, key, &mut value) != K_AX_SUCCESS || value.is_null() {
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        return None;
+    }
+    let value = super::space_membership::OwnedCf(value);
+    cf_to_rust_string(value.0)
 }
 
 // The substantial custom-window boundary. Standard windows and titled dialogs do not use this
@@ -1525,18 +1539,130 @@ pub(super) fn remember_non_normal_cg_windows_for_process(
     }
 }
 
+/// The click action's full AX window-state answer: id, title, minimized, whether that minimized
+/// read failed, and whether discovery of the whole set was incomplete.
+pub(crate) type AxWindowStateTuple = (u32, String, bool, bool, bool);
+
+/// A fresh click-time window scan. The scan-level bit matters even when `windows` is empty: an
+/// empty vector can mean either "the complete scan found no windows" or "the scan broke down before
+/// it could know", and a click action must never turn the second answer into a confirmed zero.
+pub(crate) struct AxWindowStateScan {
+    pub(crate) windows: Vec<AxWindowStateTuple>,
+    pub(crate) discovery_incomplete: bool,
+}
+
+struct AxWindowQuery {
+    windows: Vec<AxWindowInfo>,
+    discovery_incomplete: bool,
+}
+
 /// All standard AX windows for a PID: (cgwid, title, minimized). Shared between
 /// collect_windows and the thumbnail module's startup pre-generation.
 pub(crate) fn get_ax_windows_for_pid(pid: i32) -> Option<Vec<(u32, String, bool)>> {
+    get_ax_windows_for_pid_with_cache(pid).map(|windows| {
+        windows
+            .into_iter()
+            .map(|(cgwid, title, minimized, _, _)| (cgwid, title, minimized))
+            .collect()
+    })
+}
+
+/// The same window set, bypassing the short snapshot cache and preserving both per-window
+/// minimized-read failures and scan-level completeness. Click actions need the state after the
+/// Dock's own activation turn, not a pre-click snapshot that may be up to 750ms old; a transport
+/// failure is unknown, not confirmed-visible.
+pub(crate) fn get_ax_windows_for_pid_fresh(pid: i32) -> Option<AxWindowStateScan> {
     let process_start_time_us = unsafe { resolve_app_identity(pid).process_start_time_us };
-    get_ax_windows_for_pid_with_identity(pid, process_start_time_us, &HashSet::new()).map(
-        |windows| {
-            windows
-                .into_iter()
-                .map(|window| (window.cgwid, window.title, window.minimized))
-                .collect()
-        },
+    let cg_layer0 = cg_layer0_window_ids_for_pid(pid);
+    let cg_evidence_available = cg_layer0.is_some();
+    let cg_layer0 = cg_layer0.unwrap_or_default();
+    query_ax_window_info(
+        pid,
+        process_start_time_us,
+        &cg_layer0,
+        false,
+        true,
+        cg_evidence_available,
     )
+    .map(|query| AxWindowStateScan {
+        windows: query
+            .windows
+            .into_iter()
+            .map(|window| {
+                (
+                    window.cgwid,
+                    window.title,
+                    window.minimized,
+                    window.minimized_read_failed,
+                    window.discovery_incomplete,
+                )
+            })
+            .collect(),
+        discovery_incomplete: query.discovery_incomplete,
+    })
+}
+
+/// Every layer-0 CG window owned by this process, including off-screen windows. The AX widening
+/// rule compares its published IDs with this evidence before deciding whether AXChildren may carry
+/// additional real windows.
+fn cg_layer0_window_ids_for_pid(pid: i32) -> Option<HashSet<u32>> {
+    let mut ids = HashSet::new();
+    unsafe {
+        let array = CGWindowListCopyWindowInfo(K_C_G_WINDOW_LIST_OPTION_ALL, 0);
+        if array.is_null() {
+            return None;
+        }
+        let count = CFArrayGetCount(array);
+        for index in 0..count {
+            let dict = CFArrayGetValueAtIndex(array, index);
+            if dict.is_null() {
+                continue;
+            }
+            if cf_dict_get_i32(dict, CgKey::OwnerPid) == Some(pid)
+                && cf_dict_get_i32(dict, CgKey::Layer) == Some(0)
+                && cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(0.0) > 0.0
+            {
+                let bounds = cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or_default();
+                if let Some(cgwid) = cf_dict_get_u32(dict, CgKey::Number) {
+                    if cgwid != 0 && bounds.2 > 0.0 && bounds.3 > 0.0 {
+                        ids.insert(cgwid);
+                    }
+                }
+            }
+        }
+        CFRelease(array);
+    }
+    Some(ids)
+}
+
+fn get_ax_windows_for_pid_with_cache(pid: i32) -> Option<Vec<AxWindowStateTuple>> {
+    let process_start_time_us = unsafe { resolve_app_identity(pid).process_start_time_us };
+    // Cached thumbnail/presence callers keep their old cheaper read and do not pay for the click
+    // path's whole-process CG evidence.
+    let no_window_server_evidence = HashSet::new();
+    query_ax_window_info(
+        pid,
+        process_start_time_us,
+        &no_window_server_evidence,
+        true,
+        false,
+        false,
+    )
+    .map(|query| {
+        query
+            .windows
+            .into_iter()
+            .map(|window| {
+                (
+                    window.cgwid,
+                    window.title,
+                    window.minimized,
+                    window.minimized_read_failed,
+                    window.discovery_incomplete,
+                )
+            })
+            .collect()
+    })
 }
 
 /// kAXValueAXErrorType: the placeholder type a batch read uses for an attribute the app did
@@ -1564,6 +1690,16 @@ pub(super) const K_AX_ERROR_NOTIFICATION_UNSUPPORTED: i32 = -25207;
 pub(super) const K_AX_ERROR_NOT_IMPLEMENTED: i32 = -25208;
 pub(super) const K_AX_ERROR_NO_VALUE: i32 = -25212;
 pub(super) const K_AX_ERROR_PARAMETERIZED_ATTRIBUTE_UNSUPPORTED: i32 = -25213;
+
+/// Whether one AXMinimized read failed in a way that must remain unknown to destructive actions.
+/// Unsupported/no-value answers keep the legacy false semantics; success with a null value and
+/// transport/dead-element errors do not.
+fn minimized_read_failed(err: i32, value_present: bool) -> bool {
+    if err == K_AX_SUCCESS {
+        return !value_present;
+    }
+    !ax_error_means_no_answer(err)
+}
 
 /// Whether an attribute-level AXError means "the app answered, and has no value for this attribute"
 /// as opposed to a failed read. A batch read without stopOnError reports both the same way -- as an
@@ -1628,13 +1764,42 @@ fn ax_sources_may_be_incomplete(published_cgwids: &[u32], cg_layer0: &HashSet<u3
     !cg_layer0.is_subset(&published_ids)
 }
 
+/// Whether discovery of the app's full window set remained incomplete. This predicate is
+/// deliberately scan-level: once the WindowServer proves a window exists that neither the published
+/// list nor any fallback source accounted for, no per-window minimized bit can make the scan complete.
+pub(super) fn ax_discovery_incomplete(
+    children_needed: bool,
+    children_source_available: bool,
+    has_unexplained_cg_window: bool,
+) -> bool {
+    children_needed && (!children_source_available || has_unexplained_cg_window)
+}
+
+/// The click action's stricter completeness rule. Ordinary collection may use partial recovered
+/// windows as evidence, but a click that needs to know whether there are zero minimized windows may
+/// confirm zero only when the authoritative `AXWindows` read succeeded, the WindowServer query
+/// succeeded, and every CG layer-0 window was accounted for. A valid AXChildren array can RECOVER
+/// windows; it is not proof that no further windows exist.
+pub(super) fn click_ax_discovery_incomplete(
+    primary_windows_available: bool,
+    cg_evidence_available: bool,
+    children_needed: bool,
+    children_source_available: bool,
+    has_unexplained_cg_window: bool,
+) -> bool {
+    !primary_windows_available
+        || !cg_evidence_available
+        || (children_needed && !children_source_available)
+        || has_unexplained_cg_window
+}
+
 /// Whether the four-source read learned nothing usable: no window element came back from any
 /// source AND some read failed. `ax_read_is_incomplete` decides the slot part; children are
 /// OR'd in here because a failed key/main read must not discard windows the app exposed through
 /// its children. The two directions are deliberately asymmetric: children can rescue an
-/// otherwise-incomplete read, but a failed children read never turns a good published answer
-/// into an incomplete one -- that decision is made from the three slots alone, so an app that
-/// published windows keeps them whatever the children read did.
+/// otherwise-incomplete slot read. Whether a failed children read also makes window-set
+/// discovery incomplete is a separate scan-level question decided from the WindowServer's
+/// expectations, not from this "did we learn anything" predicate.
 ///
 /// An app that answered with no windows at all (`window_elements == 0` with complete reads)
 /// stays complete, which is the Stats shape documented on `ax_read_is_incomplete`: it answered,
@@ -1863,59 +2028,79 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
     process_start_time_us: Option<u64>,
     cg_layer0_windows: &HashSet<u32>,
 ) -> Option<Vec<AxWindowInfo>> {
-    if let Some(windows) = cached_ax_snapshot(pid, process_start_time_us) {
-        return Some(windows);
+    query_ax_window_info(
+        pid,
+        process_start_time_us,
+        cg_layer0_windows,
+        true,
+        false,
+        true,
+    )
+    .map(|query| query.windows)
+}
+
+fn query_ax_window_info(
+    pid: i32,
+    process_start_time_us: Option<u64>,
+    cg_layer0_windows: &HashSet<u32>,
+    use_cache: bool,
+    strict_click_scan: bool,
+    cg_evidence_available: bool,
+) -> Option<AxWindowQuery> {
+    if use_cache {
+        if let Some(windows) = cached_ax_snapshot(pid, process_start_time_us) {
+            return Some(AxWindowQuery {
+                windows,
+                discovery_incomplete: false,
+            });
+        }
     }
 
     unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
+        let app = super::space_membership::OwnedCf(AXUIElementCreateApplication(pid));
+        if app.0.is_null() {
             return None;
         }
 
         // Set a 50ms messaging timeout: AX queries on slow/unresponsive apps fail fast instead
         // of hitting the default 10s timeout (which would push the app to the CG fallback path
         // and let invisible windows through).
-        AXUIElementSetMessagingTimeout(app, 0.05);
+        AXUIElementSetMessagingTimeout(app.0 as AXUIElementRef, 0.05);
 
         // One batched read of the four attributes (rationale and merge rules in
         // candidate_window_elements). AXChildren rides along in the same round trip: an app
         // that answers kAXWindows normally pays one extra key, not a second IPC.
-        let windows_key = cf_string_new("AXWindows");
-        let focused_window_key = cf_string_new("AXFocusedWindow");
-        let main_window_key = cf_string_new("AXMainWindow");
-        let children_key = cf_string_new("AXChildren");
+        let windows_key = super::space_membership::OwnedCf(cf_string_new("AXWindows"));
+        let focused_window_key = super::space_membership::OwnedCf(cf_string_new("AXFocusedWindow"));
+        let main_window_key = super::space_membership::OwnedCf(cf_string_new("AXMainWindow"));
+        let children_key = super::space_membership::OwnedCf(cf_string_new("AXChildren"));
         let keys = [
-            windows_key,
-            focused_window_key,
-            main_window_key,
-            children_key,
+            windows_key.0,
+            focused_window_key.0,
+            main_window_key.0,
+            children_key.0,
         ];
         // callbacks = null: the array is only a synchronous input to this call; `keys` keeps the
         // strings alive for its duration.
-        let keys_array = CFArrayCreate(
+        let keys_array = super::space_membership::OwnedCf(CFArrayCreate(
             std::ptr::null(),
             keys.as_ptr(),
             keys.len() as isize,
             std::ptr::null(),
-        );
-        if keys_array.is_null() {
-            for key in keys {
-                CFRelease(key);
-            }
-            CFRelease(app);
+        ));
+        if keys_array.0.is_null() {
             return None;
         }
         let mut slots: *const c_void = std::ptr::null();
-        let err = AXUIElementCopyMultipleAttributeValues(app, keys_array, 0, &mut slots);
-        CFRelease(keys_array);
-        for key in keys {
-            CFRelease(key);
-        }
+        let err = AXUIElementCopyMultipleAttributeValues(
+            app.0 as AXUIElementRef,
+            keys_array.0,
+            0,
+            &mut slots,
+        );
         // `app` stays alive until the end of this function: the children walk below reads
         // through it, and the slot arrays it owns do not keep it alive.
         if err != K_AX_SUCCESS || slots.is_null() {
-            CFRelease(app);
             return None;
         }
         // Caller-owned: the guard releases it on every exit path below, including the early
@@ -1964,12 +2149,30 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
         // not windows.
         let mut children: Vec<(u32, AXUIElementRef)> = Vec::new();
         let published_cgwids: Vec<u32> = published.iter().map(|(cgwid, _)| *cgwid).collect();
-        if ax_sources_may_be_incomplete(&published_cgwids, cg_layer0_windows) {
-            if let AxSlotOutcome::Value(array) = ax_slot_outcome(slots, 3) {
-                if CFGetTypeID(array) == CFArrayGetTypeID() {
+        let children_needed = if strict_click_scan && cg_evidence_available {
+            // In the strict click read an empty CG set is a successful empty answer, not absent
+            // evidence: nothing needs recovery. The ordinary paths cannot make that distinction
+            // because some of them pass an empty set precisely when they have no CG evidence.
+            let published_ids: HashSet<u32> = published_cgwids
+                .iter()
+                .copied()
+                .filter(|cgwid| *cgwid != 0)
+                .collect();
+            !cg_layer0_windows.is_subset(&published_ids)
+        } else {
+            ax_sources_may_be_incomplete(&published_cgwids, cg_layer0_windows)
+        };
+        let children_outcome = ax_slot_outcome(slots, 3);
+        let children_array = match children_outcome {
+            AxSlotOutcome::Value(array) if CFGetTypeID(array) == CFArrayGetTypeID() => Some(array),
+            _ => None,
+        };
+        if children_needed {
+            if let Some(array) = children_array {
+                {
                     let count = CFArrayGetCount(array).max(0);
-                    let role_key = cf_string_new("AXRole");
-                    if !role_key.is_null() {
+                    let role_key = super::space_membership::OwnedCf(cf_string_new("AXRole"));
+                    if !role_key.0.is_null() {
                         for i in 0..count {
                             let element = CFArrayGetValueAtIndex(array, i);
                             if element.is_null() || CFGetTypeID(element) != AXUIElementGetTypeID() {
@@ -1980,17 +2183,9 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                             // ("no subrole means standard window"), which is right for an entry
                             // kAXWindows named and wrong for an arbitrary child.
                             AXUIElementSetMessagingTimeout(element, AX_WINDOW_MESSAGING_TIMEOUT);
-                            let mut role_value: *const c_void = std::ptr::null();
-                            let is_window =
-                                AXUIElementCopyAttributeValue(element, role_key, &mut role_value)
-                                    == K_AX_SUCCESS
-                                    && !role_value.is_null()
-                                    && {
-                                        let role = cf_to_rust_string(role_value);
-                                        CFRelease(role_value);
-                                        role.as_deref() == Some("AXWindow")
-                                    };
-                            if !is_window {
+                            if ax_string_attribute_owned(element, role_key.0).as_deref()
+                                != Some("AXWindow")
+                            {
                                 continue;
                             }
                             let cgwid = ax_window_cgwid(element);
@@ -2000,7 +2195,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                                 children.push((cgwid, element));
                             }
                         }
-                        CFRelease(role_key);
                     }
                 }
             }
@@ -2023,7 +2217,6 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             any_slot_failed,
             children.len(),
         ) {
-            CFRelease(app);
             return None;
         }
 
@@ -2033,14 +2226,37 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             focused_window.map(|element| (ax_window_cgwid(element).unwrap_or(0), element)),
             main_window.map(|element| (ax_window_cgwid(element).unwrap_or(0), element)),
         );
+        let discovered_cgwids: HashSet<u32> = candidates
+            .iter()
+            .map(|(cgwid, _, _)| *cgwid)
+            .filter(|cgwid| *cgwid != 0)
+            .collect();
+        let has_unexplained_cg_window = cg_layer0_windows
+            .iter()
+            .any(|cgwid| !discovered_cgwids.contains(cgwid));
+        let discovery_incomplete = if strict_click_scan {
+            click_ax_discovery_incomplete(
+                windows_array.is_some(),
+                cg_evidence_available,
+                children_needed,
+                children_array.is_some(),
+                has_unexplained_cg_window,
+            )
+        } else {
+            ax_discovery_incomplete(
+                children_needed,
+                children_array.is_some(),
+                has_unexplained_cg_window,
+            )
+        };
 
         let candidate_count = candidates.len();
-        let title_key = cf_string_new("AXTitle");
-        let role_key = cf_string_new("AXRole");
-        let subrole_key = cf_string_new("AXSubrole");
-        let minimized_key = cf_string_new("AXMinimized");
-        let fullscreen_key = cf_string_new("AXFullScreen");
-        let main_key = cf_string_new("AXMain");
+        let title_key = super::space_membership::OwnedCf(cf_string_new("AXTitle"));
+        let role_key = super::space_membership::OwnedCf(cf_string_new("AXRole"));
+        let subrole_key = super::space_membership::OwnedCf(cf_string_new("AXSubrole"));
+        let minimized_key = super::space_membership::OwnedCf(cf_string_new("AXMinimized"));
+        let fullscreen_key = super::space_membership::OwnedCf(cf_string_new("AXFullScreen"));
+        let main_key = super::space_membership::OwnedCf(cf_string_new("AXMain"));
         let mut results = Vec::with_capacity(candidates.len());
 
         for (cgwid, element, origin) in candidates {
@@ -2052,46 +2268,17 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
             // Keep standard windows, titled dialogs, and titled AXUnknown elements whose
             // role is AXWindow (ordinary windows in apps such as Xcode); filter popups,
             // panels, and other non-standard elements.
-            let mut subrole_value: *const c_void = std::ptr::null();
-            let subrole = if AXUIElementCopyAttributeValue(element, subrole_key, &mut subrole_value)
-                == K_AX_SUCCESS
-                && !subrole_value.is_null()
-            {
-                let s = cf_to_rust_string(subrole_value);
-                CFRelease(subrole_value);
-                s
-            } else {
-                None
-            };
+            let subrole = ax_string_attribute_owned(element, subrole_key.0);
             let kept = if subrole.is_some() {
-                let mut role_value: *const c_void = std::ptr::null();
-                let role = if AXUIElementCopyAttributeValue(element, role_key, &mut role_value)
-                    == K_AX_SUCCESS
-                    && !role_value.is_null()
-                {
-                    let role = cf_to_rust_string(role_value);
-                    CFRelease(role_value);
-                    role
-                } else {
-                    None
-                };
+                let role = ax_string_attribute_owned(element, role_key.0);
                 // AXDialog/AXUnknown/AXFloatingWindow require a non-empty title; untitled elements
                 // stay filtered as popups/invisible windows.
                 let titled = if matches!(
                     subrole.as_deref(),
                     Some("AXDialog") | Some("AXUnknown") | Some("AXFloatingWindow")
                 ) {
-                    let mut title_value: *const c_void = std::ptr::null();
-                    if AXUIElementCopyAttributeValue(element, title_key, &mut title_value)
-                        == K_AX_SUCCESS
-                        && !title_value.is_null()
-                    {
-                        let t = cf_to_rust_string(title_value);
-                        CFRelease(title_value);
-                        t.is_some_and(|t| !t.is_empty())
-                    } else {
-                        false
-                    }
+                    ax_string_attribute_owned(element, title_key.0)
+                        .is_some_and(|title| !title.is_empty())
                 } else {
                     false
                 };
@@ -2104,29 +2291,28 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 continue;
             }
 
-            let mut title_value: *const c_void = std::ptr::null();
-            let title = if AXUIElementCopyAttributeValue(element, title_key, &mut title_value)
-                == K_AX_SUCCESS
-                && !title_value.is_null()
-            {
-                let t = cf_to_rust_string(title_value);
-                CFRelease(title_value);
-                t.unwrap_or_default()
-            } else {
-                String::new()
-            };
-            // AXMinimized: whether the window is minimized. Absent attribute (some apps) -> false.
-            let minimized = {
-                let mut min_value: *const c_void = std::ptr::null();
-                if AXUIElementCopyAttributeValue(element, minimized_key, &mut min_value)
-                    == K_AX_SUCCESS
-                    && !min_value.is_null()
+            let title = ax_string_attribute_owned(element, title_key.0).unwrap_or_default();
+            // AXMinimized: whether the window is minimized. An attribute the app does not publish
+            // still means false here, as before; a transport/dead-element failure is carried
+            // separately so destructive click decisions can treat it as unknown instead of false.
+            let (minimized, minimized_read_failed) = {
+                let mut raw_min_value: *const c_void = std::ptr::null();
+                let err =
+                    AXUIElementCopyAttributeValue(element, minimized_key.0, &mut raw_min_value);
+                let min_value = super::space_membership::OwnedCf(raw_min_value);
+                if err == K_AX_SUCCESS
+                    && !min_value.0.is_null()
+                    && CFGetTypeID(min_value.0) == CFBooleanGetTypeID()
                 {
-                    let m = CFBooleanGetValue(min_value);
-                    CFRelease(min_value);
-                    m
+                    (CFBooleanGetValue(min_value.0), false)
                 } else {
-                    false
+                    let wrong_type = err == K_AX_SUCCESS
+                        && !min_value.0.is_null()
+                        && CFGetTypeID(min_value.0) != CFBooleanGetTypeID();
+                    (
+                        false,
+                        wrong_type || minimized_read_failed(err, !min_value.0.is_null()),
+                    )
                 }
             };
             // The native tab bar is read only for a minimized window of a multi-window app:
@@ -2139,18 +2325,19 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 None
             };
             let is_main = {
-                let mut main_value: *const c_void = std::ptr::null();
-                if AXUIElementCopyAttributeValue(element, main_key, &mut main_value) == K_AX_SUCCESS
-                    && !main_value.is_null()
-                {
-                    let value = CFBooleanGetValue(main_value);
-                    CFRelease(main_value);
-                    value
-                } else {
+                let mut raw_main_value: *const c_void = std::ptr::null();
+                let result =
+                    AXUIElementCopyAttributeValue(element, main_key.0, &mut raw_main_value);
+                if raw_main_value.is_null() {
                     false
+                } else {
+                    let main_value = super::space_membership::OwnedCf(raw_main_value);
+                    result == K_AX_SUCCESS
+                        && CFGetTypeID(main_value.0) == CFBooleanGetTypeID()
+                        && CFBooleanGetValue(main_value.0)
                 }
             };
-            let fullscreen_attribute = ax_boolean_attribute(element, fullscreen_key);
+            let fullscreen_attribute = ax_boolean_attribute(element, fullscreen_key.0);
             let is_fullscreen =
                 ax_fullscreen_from_attributes(subrole.as_deref(), fullscreen_attribute);
             // cgwid was resolved while merging the candidates (private API, used to pair with
@@ -2162,6 +2349,8 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 cgwid,
                 title,
                 minimized,
+                minimized_read_failed,
+                discovery_incomplete,
                 is_main,
                 is_fullscreen,
                 is_custom_root: subrole.as_deref() == Some("AXUnknown"),
@@ -2170,15 +2359,19 @@ pub(super) fn get_ax_windows_for_pid_with_identity(
                 tab_group,
             });
         }
-        CFRelease(title_key);
-        CFRelease(subrole_key);
-        CFRelease(minimized_key);
-        CFRelease(fullscreen_key);
-        CFRelease(main_key);
-        CFRelease(app);
 
-        cache_ax_snapshot(pid, process_start_time_us, &results);
-        Some(results)
+        // A partial answer may be used by this caller with its incompleteness marker, but it must
+        // not become the shared snapshot that later callers treat as the app's whole window set.
+        // Crucially, an empty partial answer is still returned as empty: ordinary collection has
+        // always distinguished "AX answered with zero windows" from a transport failure by Some/None,
+        // and making strict click evidence stricter must not change that older contract.
+        if !discovery_incomplete {
+            cache_ax_snapshot(pid, process_start_time_us, &results);
+        }
+        Some(AxWindowQuery {
+            windows: results,
+            discovery_incomplete,
+        })
     }
 }
 
@@ -2329,6 +2522,39 @@ mod raise_match_tests {
     }
 
     #[test]
+    fn missing_window_server_evidence_plus_a_children_failure_is_incomplete_discovery() {
+        assert!(super::ax_discovery_incomplete(true, false, false));
+        assert!(super::ax_discovery_incomplete(true, true, true));
+        assert!(!super::ax_discovery_incomplete(true, true, false));
+        assert!(!super::ax_discovery_incomplete(false, false, false));
+    }
+
+    #[test]
+    fn click_scans_do_not_let_fallback_evidence_hide_a_failed_primary_list() {
+        // AXWindows timed out, focused window and AXChildren both named the only CG window: the
+        // fallback evidence may recover that window, but it cannot prove that no other window
+        // exists. A click therefore still treats the minimized count as unknown.
+        assert!(super::click_ax_discovery_incomplete(
+            false, true, true, true, false
+        ));
+        // A failed/unavailable WindowServer query is likewise not an authoritative empty set.
+        assert!(super::click_ax_discovery_incomplete(
+            true, false, false, false, false
+        ));
+        // Once both primary evidence sources succeeded and every CG window is explained, a zero
+        // count is genuinely confirmed.
+        assert!(!super::click_ax_discovery_incomplete(
+            true, true, false, false, false
+        ));
+        assert!(super::click_ax_discovery_incomplete(
+            true, true, true, false, false
+        ));
+        assert!(super::click_ax_discovery_incomplete(
+            true, true, false, false, true
+        ));
+    }
+
+    #[test]
     fn children_rescue_an_otherwise_incomplete_read() {
         // Every slot failed and nothing was published, but AXChildren answered with a window:
         // the read learned something, so it must not be thrown away as a failed query.
@@ -2353,5 +2579,27 @@ mod raise_match_tests {
     #[test]
     fn nothing_from_any_source_and_a_failed_read_is_incomplete() {
         assert!(ax_read_learned_nothing(0, false, false, true, 0));
+    }
+
+    #[test]
+    fn minimized_timeouts_are_unknown_but_unsupported_attributes_are_not() {
+        assert!(super::minimized_read_failed(
+            super::K_AX_ERROR_CANNOT_COMPLETE,
+            false
+        ));
+        assert!(super::minimized_read_failed(
+            super::K_AX_ERROR_INVALID_UI_ELEMENT,
+            false
+        ));
+        assert!(super::minimized_read_failed(0, false));
+        assert!(!super::minimized_read_failed(
+            super::K_AX_ERROR_ATTRIBUTE_UNSUPPORTED,
+            false
+        ));
+        assert!(!super::minimized_read_failed(
+            super::K_AX_ERROR_NO_VALUE,
+            false
+        ));
+        assert!(!super::minimized_read_failed(0, true));
     }
 }

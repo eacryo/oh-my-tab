@@ -2553,6 +2553,20 @@ fn menu_target_class() -> StaticClass {
                 crate::settings::handle_switcher_excluded_remove as *mut c_void,
                 types.as_ptr(),
             );
+            // The Dock page's exclusion list writes its own config field, so it needs its own
+            // handlers even though the chooser and row shape are shared.
+            class_addMethod(
+                cls,
+                sel!(handleDockExcludedChoose:),
+                crate::settings::handle_dock_excluded_choose as *mut c_void,
+                types.as_ptr(),
+            );
+            class_addMethod(
+                cls,
+                sel!(handleDockExcludedRemove:),
+                crate::settings::handle_dock_excluded_remove as *mut c_void,
+                types.as_ptr(),
+            );
             class_addMethod(
                 cls,
                 sel!(handleGestureRecordStart:),

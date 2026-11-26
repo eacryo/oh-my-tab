@@ -26,7 +26,7 @@ use crate::ffi::{
     AXObserverGetRunLoopSource, AXObserverRemoveNotification, AXUIElementCopyAttributeValue,
     AXUIElementCreateApplication, AXUIElementRef, AXValueGetValue, AxObserverRef, CFArrayGetCount,
     CFArrayGetValueAtIndex, CFGetTypeID, CFRelease, CFRetain, CFRunLoopRemoveSource,
-    CFRunLoopRunInMode, CFRunLoopWakeUp, RunLoopHandle,
+    CFRunLoopRunInMode, CFRunLoopWakeUp, RetainedCf, RunLoopHandle,
 };
 use crate::log_debug;
 use crate::window_collector::cf_string_new;
@@ -59,6 +59,9 @@ pub(crate) enum Selection {
     App {
         pid: i32,
         bundle: String,
+        /// Application bundle path behind the tile. It is the freshest identity a hit test can
+        /// compare without resolving an NSBundle again.
+        path: String,
         title: String,
         icon: Rect,
         edge: DockEdge,
@@ -108,6 +111,7 @@ static ACTIVE: AtomicBool = AtomicBool::new(false);
 pub(crate) struct ClickTileEvidence {
     pub(crate) pid: i32,
     pub(crate) bundle: String,
+    pub(crate) path: String,
     pub(crate) icon: Rect,
     pub(crate) edge: DockEdge,
     pub(crate) revealed: bool,
@@ -135,6 +139,7 @@ fn refresh_click_tile_evidence(
     let Selection::App {
         pid,
         bundle,
+        path,
         icon,
         edge,
         ..
@@ -146,6 +151,7 @@ fn refresh_click_tile_evidence(
     let changed = slot.as_ref().is_none_or(|old| {
         old.pid != *pid
             || old.bundle != *bundle
+            || old.path != *path
             || old.icon != *icon
             || old.edge != *edge
             || old.revealed != revealed
@@ -165,6 +171,7 @@ fn refresh_click_tile_evidence(
     *slot = Some(ClickTileEvidence {
         pid: *pid,
         bundle: bundle.clone(),
+        path: path.clone(),
         icon: *icon,
         edge: *edge,
         revealed,
@@ -632,28 +639,29 @@ unsafe fn dock_pid() -> Option<i32> {
 }
 
 /// One attribute, +1 (caller releases).
-unsafe fn copy_attribute(element: AXUIElementRef, name: &str) -> Option<*const std::ffi::c_void> {
+pub(crate) unsafe fn copy_attribute(
+    element: AXUIElementRef,
+    name: &str,
+) -> Option<*const std::ffi::c_void> {
     if element.is_null() {
         return None;
     }
-    let key = cf_string_new(name);
+    let key = unsafe { RetainedCf::from_retained(cf_string_new(name)) };
     let mut value: *const std::ffi::c_void = std::ptr::null();
-    let error = AXUIElementCopyAttributeValue(element, key, &mut value);
-    CFRelease(key);
+    let error = AXUIElementCopyAttributeValue(element, key.ptr, &mut value);
     (error == 0 && !value.is_null()).then_some(value)
 }
 
 /// A string attribute's value.
-unsafe fn read_string(element: AXUIElementRef, name: &str) -> Option<String> {
+pub(crate) unsafe fn read_string(element: AXUIElementRef, name: &str) -> Option<String> {
     let value = copy_attribute(element, name)?;
-    let is_string = CFGetTypeID(value) == crate::ffi::CFStringGetTypeID();
-    let text = if is_string {
-        cf_string_value(value)
+    let value = unsafe { RetainedCf::from_retained(value) };
+    let is_string = CFGetTypeID(value.ptr) == crate::ffi::CFStringGetTypeID();
+    if is_string {
+        cf_string_value(value.ptr)
     } else {
         None
-    };
-    CFRelease(value);
-    text
+    }
 }
 
 unsafe fn cf_string_value(value: *const std::ffi::c_void) -> Option<String> {
@@ -747,12 +755,13 @@ unsafe fn read_selected_tile(list: AXUIElementRef, edge: Option<DockEdge>) -> Op
     } else if read_string(tile, "AXSubrole").as_deref() != Some("AXApplicationDockItem") {
         Selection::NonApp
     } else {
-        match (tile_bundle(tile), element_frame(tile), edge) {
-            (Some(bundle), Some(icon), Some(edge)) => {
+        match (tile_identity(tile), element_frame(tile), edge) {
+            (Some((bundle, path)), Some(icon), Some(edge)) => {
                 match running_pid_for_bundle(&bundle) {
                     Some(pid) => Selection::App {
                         pid,
                         bundle,
+                        path,
                         title: read_string(tile, "AXTitle").unwrap_or_default(),
                         icon,
                         edge,
@@ -768,32 +777,44 @@ unsafe fn read_selected_tile(list: AXUIElementRef, edge: Option<DockEdge>) -> Op
     Some(result)
 }
 
+/// The bundle identifier and application path behind an application Dock tile, from one AXURL read.
+pub(crate) unsafe fn tile_identity(tile: AXUIElementRef) -> Option<(String, String)> {
+    objc2::rc::autoreleasepool(|_| {
+        let path = tile_path(tile)?;
+        let ns_path = make_nsstring(&path);
+        let bundle: *mut AnyObject = msg_send![class!(NSBundle), bundleWithPath: ns_path];
+        release_obj(ns_path);
+        if bundle.is_null() {
+            return None;
+        }
+        let identifier: *mut AnyObject = msg_send![bundle, bundleIdentifier];
+        if identifier.is_null() {
+            None
+        } else {
+            Some((nsstring_to_rust(identifier), path))
+        }
+    })
+}
+
+/// The application path carried by a Dock tile's AXURL.
+pub(crate) unsafe fn tile_path(tile: AXUIElementRef) -> Option<String> {
+    objc2::rc::autoreleasepool(|_| {
+        let url = copy_attribute(tile, "AXURL")?;
+        let url = unsafe { RetainedCf::from_retained(url) };
+        let path: *mut AnyObject = msg_send![url.ptr as *mut AnyObject, path];
+        let path = if path.is_null() {
+            None
+        } else {
+            Some(nsstring_to_rust(path))
+        };
+        let path = path?;
+        (!path.is_empty()).then_some(path)
+    })
+}
+
 /// The bundle identifier behind an application Dock tile.
 unsafe fn tile_bundle(tile: AXUIElementRef) -> Option<String> {
-    let url = copy_attribute(tile, "AXURL")?;
-    let path: *mut AnyObject = msg_send![url as *mut AnyObject, path];
-    let path = if path.is_null() {
-        None
-    } else {
-        Some(nsstring_to_rust(path))
-    };
-    CFRelease(url);
-    let path = path?;
-    if path.is_empty() {
-        return None;
-    }
-    let ns_path = make_nsstring(&path);
-    let bundle: *mut AnyObject = msg_send![class!(NSBundle), bundleWithPath: ns_path];
-    release_obj(ns_path);
-    if bundle.is_null() {
-        return None;
-    }
-    let identifier: *mut AnyObject = msg_send![bundle, bundleIdentifier];
-    if identifier.is_null() {
-        None
-    } else {
-        Some(nsstring_to_rust(identifier))
-    }
+    tile_identity(tile).map(|(bundle, _)| bundle)
 }
 
 unsafe fn running_pid_for_bundle(bundle: &str) -> Option<i32> {

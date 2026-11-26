@@ -112,6 +112,9 @@ pub(super) fn action_selector(action: &str) -> Sel {
         // The Switcher page's excluded-application list: the same commands, its own list.
         "switcher_excluded_remove" => sel!(handleSwitcherExcludedRemove:),
         "switcher_excluded_choose" => sel!(handleSwitcherExcludedChoose:),
+        // The Dock page's independent exclusion list.
+        "dock_excluded_remove" => sel!(handleDockExcludedRemove:),
+        "dock_excluded_choose" => sel!(handleDockExcludedChoose:),
         // A gesture row's Delete. It rebuilds the page itself.
         action if crate::settings::page_view::delete_row_index(action).is_some() => {
             sel!(handleGestureRowDelete:)

@@ -90,12 +90,7 @@ pub(crate) fn collect(pid: i32) -> Option<CollectedWindows> {
         .or_else(|| windows.first())
         .map(|window| window.wid);
     if let Some(anchor) = anchor {
-        super::dock_click::note_click_window_seed(
-            pid,
-            identity.key.clone(),
-            identity.process_start_time_us,
-            anchor,
-        );
+        super::dock_click::note_click_window_seed(pid, identity.process_start_time_us, anchor);
     }
     Some(CollectedWindows {
         pid,

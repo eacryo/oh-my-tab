@@ -752,3 +752,7 @@ Gate: `scripts/gate.sh --offline` -> 75 (INCOMPLETE), six headless tiers PASSED.
 - **Dock 预览 list_mode：设置页阈值控件冻结/解冻的自动化断言**（dock-list-mode 轮，R1 MEDIUM 的控件半边，2026-11-25，**延后**：测试仪器）。`update_dock_preview_controls_enabled` 通过 `msg_send` 读真实控件状态（主开关、list_mode 开关）再写回冻结，无头环境无法实例化这套控件；`MainThreadSlot` 之外的设置 UI 测试缝不存在。面板行为半边（翻开隐藏面板、重开进列表、翻回恢复）已由 `smoke_list_mode_switch` 覆盖（M2），冻结/解冻已人工视觉验证（弹窗变灰）。
   **为什么延后：** 需要真实设置窗口（M2）或一个新的控件测试缝；视觉验证已确认行为正确。
   **重新审视的触发条件：** 下一次改动 `update_dock_preview_controls_enabled` 或设置页冻结体系时；或 M2 场景框架支持读取控件 enabled 状态时，补一条自动化断言。
+
+- **Dock 图标点击动作缺真实输入的 M2 覆盖**（2026-11-26，dock-icon-actions 第 3 轮前主动分诊，MEDIUM——**延后**：未跑覆盖/测试仪器）。M1 已覆盖配置迁移、点击动作优先级、提交锁、纯 hide 跳过窗口扫描、AX 读取失败/发现不完整不等于“0 个最小化窗口”等纯逻辑；`--e2e-state` 也已暴露工作线程结果。仍缺真实 Dock 输入链路：active tap 的 pre-delivery 顺序、普通左键恢复/hide/minimize、Command+右键 quit/force-quit，以及设置改变恰好落在按下与抬起之间时的原生菜单不被误吞。
+  **为什么延后：** 这些场景需要真实 Dock、真实目标应用和受控 victim app；quit/force-quit 本身有破坏性，不能在未授权的 M1 中做。当前补齐的是最便宜的充分断言层，不是产品行为的替代证据。
+  **重新审视的触发条件：** 下一次改动 `dock_preview/dock_click.rs`、Dock 点击工作线程或 `--e2e-state` 场景框架时；或用户授权 `--full`/专门 victim-app 场景时，补真实输入断言。

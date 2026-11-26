@@ -26,6 +26,8 @@ fn exclusion_actions_route_to_their_own_handlers() {
             "gesture_excluded_choose",
             sel!(handleGestureExcludedChoose:),
         ),
+        ("dock_excluded_remove", sel!(handleDockExcludedRemove:)),
+        ("dock_excluded_choose", sel!(handleDockExcludedChoose:)),
     ] {
         assert_eq!(
             super::super::render::action_selector(action),

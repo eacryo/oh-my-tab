@@ -592,7 +592,9 @@ pub(super) struct SettingsUi {
     // Dock page: the same promise for closes made from the preview panel's cards.
     dock_quit_on_last_window_close: *mut AnyObject,
     dock_peek_on_hover: *mut AnyObject, // Dock page: hovering a thumbnail brings its window forward
-    dock_hide_frontmost_on_icon_click: *mut AnyObject, // Dock page: clicking a frontmost app's icon hides it
+    dock_frontmost_icon_click_action: *mut AnyObject, // NSPopUpButton: off / hide / minimize
+    dock_restore_minimized_on_icon_click: *mut AnyObject, // Dock page: clicking an icon restores minimized windows
+    dock_cmd_right_click_quit: *mut AnyObject, // Dock page: Command+right-click quits the app
     dock_list_mode: *mut AnyObject, // Dock page: always present the preview as a window list
     reverse_scroll: *mut AnyObject, // reverse scrolling
     enable_mouse: *mut AnyObject,   // enable mouse control
@@ -1353,12 +1355,13 @@ pub(crate) use dispatch::{
     announce_gestures_shadowed_by_switcher, end_max_extent_preview,
     handle_clipboard_enabled_toggle, handle_clipboard_excluded_add,
     handle_clipboard_excluded_remove, handle_clipboard_excluded_restore, handle_device_changed,
-    handle_dock_preview_enabled_toggle, handle_enable_mouse_toggle, handle_export_logs,
-    handle_export_settings, handle_export_settings_ready, handle_gesture_excluded_choose,
-    handle_gesture_excluded_remove, handle_gesture_record_cancel, handle_gesture_record_start,
-    handle_gesture_row_delete, handle_gesture_row_trigger, handle_gesture_trigger_learn,
-    handle_gesture_trigger_line, handle_import_settings, handle_import_settings_ready,
-    handle_key_bindings_toggle, handle_pause_recording_toggle, handle_rebuild_settings_content,
+    handle_dock_excluded_choose, handle_dock_excluded_remove, handle_dock_preview_enabled_toggle,
+    handle_enable_mouse_toggle, handle_export_logs, handle_export_settings,
+    handle_export_settings_ready, handle_gesture_excluded_choose, handle_gesture_excluded_remove,
+    handle_gesture_record_cancel, handle_gesture_record_start, handle_gesture_row_delete,
+    handle_gesture_row_trigger, handle_gesture_trigger_learn, handle_gesture_trigger_line,
+    handle_import_settings, handle_import_settings_ready, handle_key_bindings_toggle,
+    handle_pause_recording_toggle, handle_rebuild_settings_content,
     handle_settings_search_began_editing, handle_settings_search_changed,
     handle_settings_search_clear, handle_settings_search_ended_editing,
     handle_switcher_excluded_choose, handle_switcher_excluded_remove, handle_unknown_page_action,
@@ -2271,15 +2274,32 @@ fn log_config_changes(old: &Config, new: &Config) {
         new.dock_preview.quit_on_last_window_close
     );
     changed!(
-        "dock_preview.hide_frontmost_on_icon_click",
-        old.dock_preview.hide_frontmost_on_icon_click,
-        new.dock_preview.hide_frontmost_on_icon_click
+        "dock_preview.frontmost_icon_click_action",
+        old.dock_preview.frontmost_icon_click_action,
+        new.dock_preview.frontmost_icon_click_action
+    );
+    changed!(
+        "dock_preview.restore_minimized_on_icon_click",
+        old.dock_preview.restore_minimized_on_icon_click,
+        new.dock_preview.restore_minimized_on_icon_click
+    );
+    changed!(
+        "dock_preview.cmd_right_click_quit",
+        old.dock_preview.cmd_right_click_quit,
+        new.dock_preview.cmd_right_click_quit
     );
     changed!(
         "dock_preview.list_mode",
         old.dock_preview.list_mode,
         new.dock_preview.list_mode
     );
+    if old.dock_preview.excluded_apps != new.dock_preview.excluded_apps {
+        crate::log_info!(
+            "[settings] dock_preview.excluded_apps: {} -> {} entries",
+            old.dock_preview.excluded_apps.len(),
+            new.dock_preview.excluded_apps.len()
+        );
+    }
     changed!(
         "updates.automatically_check",
         old.updates.automatically_check,

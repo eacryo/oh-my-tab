@@ -13,8 +13,8 @@ use crate::ffi::{
     AXUIElementCopyMultipleAttributeValues, AXUIElementCreateApplication, AXUIElementGetTypeID,
     AXUIElementPerformAction, AXUIElementRef, AXUIElementSetAttributeValue,
     AXUIElementSetMessagingTimeout, AXValueGetType, AXValueGetTypeID, AXValueGetValue,
-    CFArrayCreate, CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFBooleanGetValue,
-    CFDictionaryGetValue, CFGetTypeID, CFNumberGetValue, CFRelease, CFRetain,
+    CFArrayCreate, CFArrayGetCount, CFArrayGetTypeID, CFArrayGetValueAtIndex, CFBooleanGetTypeID,
+    CFBooleanGetValue, CFDictionaryGetValue, CFGetTypeID, CFNumberGetValue, CFRelease, CFRetain,
     CFStringCreateWithCString, CFStringGetCString, CGDisplayBounds, CGGetActiveDisplayList,
     CGWindowListCopyWindowInfo, K_AX_CANNOT_COMPLETE, K_AX_INVALID_UI_ELEMENT, K_AX_SUCCESS,
 };
@@ -54,12 +54,14 @@ pub(crate) use raise::activate_pid_with_api;
 pub(crate) use raise::{
     activate_pid, ax_window_cgwid, cf_string_new, clear_ax_window_cache_for_pid,
     clear_ax_window_cache_for_window, close_ax_window, focused_window_cgwid,
-    forget_non_normal_window, hide_application, hide_application_verified, raise_window_fast,
-    set_ax_minimized, terminate_application, terminate_application_verified,
+    force_terminate_application_verified, forget_non_normal_window, hide_application,
+    hide_application_verified, raise_window_fast, set_ax_minimized, set_ax_minimized_with_identity,
+    terminate_application, terminate_application_verified,
 };
 pub(crate) use raiser::{begin_raise, note_focused_window};
 pub(crate) use raiser::{
-    cf_to_rust_string, get_ax_windows_for_pid, handle_ax_raise_main, raise_window_ax_async,
+    cf_to_rust_string, get_ax_windows_for_pid, get_ax_windows_for_pid_fresh, handle_ax_raise_main,
+    raise_window_ax_async, AxWindowStateScan,
 };
 static SLPS_GET_PROCESS_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SLPS_SET_FRONT_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -859,6 +861,12 @@ struct AxWindowInfo {
     cgwid: u32,
     title: String,
     minimized: bool,
+    /// True when the minimized read itself failed (timeout/dead element/communication). Apps that
+    /// simply do not publish the attribute still use `minimized=false`; a transport failure must not.
+    minimized_read_failed: bool,
+    /// True when the discovery phase itself could not account for every CG layer-0 window. This is
+    /// scan-level evidence duplicated onto every entry so the click path does not need a side channel.
+    discovery_incomplete: bool,
     is_main: bool,
     /// Positive AXSubrole/AXFullScreen evidence; false or unavailable still permits the CG bounds fallback.
     is_fullscreen: Option<bool>,
@@ -1834,6 +1842,8 @@ mod tests {
                 cgwid: 1,
                 title: title.to_string(),
                 minimized: false,
+                minimized_read_failed: false,
+                discovery_incomplete: false,
                 is_main: false,
                 is_fullscreen: Some(false),
                 is_custom_root: false,

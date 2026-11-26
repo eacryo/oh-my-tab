@@ -10,7 +10,7 @@
 //! main thread with one `performSelectorOnMainThread:` hop; a run-loop tick then makes every
 //! decision, so the panel and its timers have exactly one owner.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -121,14 +121,143 @@ static PEEK_PRESSED: AtomicBool = AtomicBool::new(false);
 /// been restored, replaced or forgotten.
 static PEEK_GENERATION: AtomicU64 = AtomicU64::new(0);
 
-/// The Dock click-hide child switch, mirrored so the tap owner does not read the config lock.
-static HIDE_CLICK_ENABLED: AtomicBool = AtomicBool::new(false);
-/// Bumped by every Dock press and by every mode/session invalidation. A hide worker may commit only
+/// Whether any Dock click interaction needs the active evidence tap, mirrored so the tap owner does
+/// not read the config lock. The name is narrower than the meaning for historical reasons.
+static CLICK_INTERACTIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+/// The frontmost-click action: 0 = off, 1 = hide, 2 = minimize. Mirrored for the input path.
+static FRONTMOST_CLICK_ACTION: AtomicU8 = AtomicU8::new(0);
+static RESTORE_MINIMIZED_CLICK_ENABLED: AtomicBool = AtomicBool::new(false);
+static LEFT_CLICK_ACTIONS_ENABLED: AtomicBool = AtomicBool::new(false);
+static QUICK_QUIT_ENABLED: AtomicBool = AtomicBool::new(false);
+/// Bumped by every Dock press and by every mode/session invalidation. A click worker may commit only
 /// while no newer press has arrived: rapid clicks make the newest press the user's choice.
-static HIDE_INPUT_GENERATION: AtomicU64 = AtomicU64::new(0);
-type HideCandidateResult = (u64, dock_click::HideCandidate);
-static HIDE_CANDIDATES: LazyLock<Mutex<Vec<HideCandidateResult>>> =
+static CLICK_INPUT_GENERATION: AtomicU64 = AtomicU64::new(0);
+/// Incremented whenever any Dock-click setting changes, including an active-tap -> active-tap
+/// transition that does not rebuild the watcher. Down evidence carries this value so it cannot be
+/// completed under a different action setting.
+static CLICK_SETTINGS_GENERATION: AtomicU64 = AtomicU64::new(0);
+type ClickCandidateResult = (u64, dock_click::DockClickCandidate);
+static CLICK_CANDIDATES: LazyLock<Mutex<Vec<ClickCandidateResult>>> =
     LazyLock::new(|| Mutex::new(Vec::new()));
+/// Serializes settings invalidation with the one input commit that can suppress a native event.
+/// The lock is held only around atomics and queue mutation, never around AX/AppKit work.
+static CLICK_COMMIT_LOCK: Mutex<()> = Mutex::new(());
+
+fn frontmost_click_value(value: &str) -> u8 {
+    match value {
+        "hide" => 1,
+        "minimize" => 2,
+        _ => 0,
+    }
+}
+
+fn left_click_actions_enabled(
+    feature_enabled: bool,
+    frontmost_action: &str,
+    restore_minimized: bool,
+) -> bool {
+    feature_enabled && (frontmost_click_value(frontmost_action) != 0 || restore_minimized)
+}
+
+fn click_interactions_enabled(
+    feature_enabled: bool,
+    frontmost_action: &str,
+    restore_minimized: bool,
+    quick_quit: bool,
+) -> bool {
+    feature_enabled
+        && (left_click_actions_enabled(feature_enabled, frontmost_action, restore_minimized)
+            || quick_quit)
+}
+
+pub(crate) fn left_click_actions_enabled_now() -> bool {
+    LEFT_CLICK_ACTIONS_ENABLED.load(Ordering::Acquire)
+}
+
+pub(crate) fn quick_quit_enabled() -> bool {
+    QUICK_QUIT_ENABLED.load(Ordering::Acquire)
+}
+
+/// Whether a callback installed for `session` still belongs to the live feature instance. An old
+/// tap can survive for a few run-loop slices after `stop()`; it must fall back to pass-through in
+/// that interval rather than swallowing a right-click whose quit commit validation would reject.
+pub(crate) fn click_session_active(session: u64) -> bool {
+    is_enabled() && SESSION.load(Ordering::Acquire) == session
+}
+
+pub(crate) fn dock_click_settings_generation() -> u64 {
+    CLICK_SETTINGS_GENERATION.load(Ordering::Acquire)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ClickActionPlan {
+    None,
+    RestoreMinimized,
+    HideFrontmost,
+    MinimizeFrontmost,
+}
+
+/// The one precedence rule of Dock click actions: restoration is the click's first job whenever the
+/// target still has minimized windows; only a click with nothing to restore may hide or minimize the
+/// already-frontmost app.
+fn window_state_scan_needed(restore_enabled: bool, frontmost_action: u8) -> bool {
+    restore_enabled || frontmost_action == 2
+}
+
+fn ax_window_scan_complete(scan: Option<&crate::window_collector::AxWindowStateScan>) -> bool {
+    scan.is_some_and(|scan| {
+        !scan.discovery_incomplete
+            && !scan
+                .windows
+                .iter()
+                .any(|(_, _, _, read_failed, discovery_incomplete)| {
+                    *read_failed || *discovery_incomplete
+                })
+    })
+}
+
+/// AX implementations can throw Objective-C exceptions. On a click worker that must degrade to
+/// "evidence unavailable" rather than taking down the whole process; the ordinary collector uses
+/// the same boundary around its enumeration entry point.
+fn catch_click_ax<T: Default>(label: &str, pid: i32, work: impl FnOnce() -> T) -> T {
+    match objc2::exception::catch(std::panic::AssertUnwindSafe(work)) {
+        Ok(value) => value,
+        Err(exception) => {
+            log_info!(
+                "[dock-preview] click AX {} exception: pid={} {:?}",
+                label,
+                pid,
+                exception
+            );
+            T::default()
+        }
+    }
+}
+
+fn click_action_plan(
+    was_frontmost: bool,
+    frontmost_action: u8,
+    restore_enabled: bool,
+    minimized_count: Option<usize>,
+) -> ClickActionPlan {
+    if restore_enabled {
+        match minimized_count {
+            Some(count) if count > 0 => return ClickActionPlan::RestoreMinimized,
+            // Unknown is not "nothing to restore". A failed AX enumeration must not turn the same
+            // click into hiding/minimizing the very windows the user asked to restore first.
+            None => return ClickActionPlan::None,
+            _ => {}
+        }
+    }
+    if !was_frontmost {
+        return ClickActionPlan::None;
+    }
+    match frontmost_action {
+        1 => ClickActionPlan::HideFrontmost,
+        2 => ClickActionPlan::MinimizeFrontmost,
+        _ => ClickActionPlan::None,
+    }
+}
 
 /// The front a peek took the window from.
 #[derive(Clone, Debug)]
@@ -208,15 +337,14 @@ pub(crate) fn start() {
             .unwrap_or(false),
         Ordering::Release,
     );
-    HIDE_CLICK_ENABLED.store(
-        crate::config::CONFIG
-            .read()
-            .map(|config| {
-                config.dock_preview.enabled && config.dock_preview.hide_frontmost_on_icon_click
-            })
-            .unwrap_or(false),
-        Ordering::Release,
-    );
+    if let Ok(config) = crate::config::CONFIG.read() {
+        store_dock_click_config(
+            config.dock_preview.enabled,
+            &config.dock_preview.frontmost_icon_click_action,
+            config.dock_preview.restore_minimized_on_icon_click,
+            config.dock_preview.cmd_right_click_quit,
+        );
+    }
     let session = SESSION.fetch_add(1, Ordering::AcqRel) + 1;
     crate::assert_main_thread("dock_preview::start");
     *DISMISSED_TILE.lock().unwrap() = None;
@@ -251,7 +379,15 @@ pub(crate) fn stop() {
         return;
     }
     crate::assert_main_thread("dock_preview::stop");
-    SESSION.fetch_add(1, Ordering::AcqRel);
+    {
+        // Stopping the feature is the same kind of commit as changing click settings: a quick-quit
+        // callback must either commit while the old session is wholly alive or fail validation and
+        // leave the native click alone, never swallow for a session that is already being retired.
+        let _commit = CLICK_COMMIT_LOCK.lock().unwrap();
+        SESSION.fetch_add(1, Ordering::AcqRel);
+        CLICK_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        CLICK_CANDIDATES.lock().unwrap().clear();
+    }
     REQUEST.fetch_add(1, Ordering::AcqRel);
     PENDING_OPEN.lock().unwrap().take();
     *CLOSE_PHASE.lock().unwrap() = None;
@@ -261,8 +397,6 @@ pub(crate) fn stop() {
     DOCK_CLICK_PENDING.store(0, Ordering::Release);
     *DISMISSED_TILE.lock().unwrap() = None;
     *DOCK_PRESS.lock().unwrap() = None;
-    HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
-    HIDE_CANDIDATES.lock().unwrap().clear();
     // The peek is torn down through the same path as a hidden panel. `stop()` used to call
     // `panel::hide()` directly, which left a peeked window in front after the feature was turned
     // off, and left a raise prepared by a worker able to commit after the feature was gone. The
@@ -387,6 +521,13 @@ pub(crate) fn hide_for_layout_change() {
         hide_panel();
         panel::flush_records();
     }
+}
+
+/// Drop every piece of preview state because the admission policy changed. Unlike a layout change,
+/// an in-flight collection cannot be allowed to finish under the pre-edit policy and then open just
+/// after the edit: `hide_panel` advances the request epoch even when no panel has appeared yet.
+pub(crate) fn hide_for_policy_change() {
+    hide_panel();
 }
 
 pub(crate) fn handle_screen_params_changed() {
@@ -683,7 +824,11 @@ fn start_dock_click_watcher() {
         *slot = Some(dock_click::spawn());
     }
     if let Some(handle) = slot.as_ref() {
-        handle.start(pid, session, HIDE_CLICK_ENABLED.load(Ordering::Acquire));
+        handle.start(
+            pid,
+            session,
+            CLICK_INTERACTIONS_ENABLED.load(Ordering::Acquire),
+        );
     }
 }
 
@@ -696,10 +841,10 @@ fn stop_dock_click_watcher() {
 /// A press landed on the Dock at `point`, reported by the tap installed for `session`. Called on the
 /// watcher thread: record the fact and wake the main thread, which owns the panel.
 pub(crate) fn note_dock_click(point: (f64, f64), session: u64) {
-    if session == 0 {
+    if session == 0 || !click_session_active(session) {
         return;
     }
-    HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+    CLICK_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
     *DOCK_PRESS.lock().unwrap() = Some(DockPress {
         session,
         at: Instant::now(),
@@ -711,113 +856,381 @@ pub(crate) fn note_dock_click(point: (f64, f64), session: u64) {
     post_event_to_main();
 }
 
+fn store_dock_click_config(
+    feature_enabled: bool,
+    frontmost_action: &str,
+    restore_minimized: bool,
+    quick_quit: bool,
+) {
+    FRONTMOST_CLICK_ACTION.store(frontmost_click_value(frontmost_action), Ordering::Release);
+    RESTORE_MINIMIZED_CLICK_ENABLED.store(restore_minimized, Ordering::Release);
+    LEFT_CLICK_ACTIONS_ENABLED.store(
+        left_click_actions_enabled(feature_enabled, frontmost_action, restore_minimized),
+        Ordering::Release,
+    );
+    QUICK_QUIT_ENABLED.store(quick_quit, Ordering::Release);
+    CLICK_INTERACTIONS_ENABLED.store(
+        click_interactions_enabled(
+            feature_enabled,
+            frontmost_action,
+            restore_minimized,
+            quick_quit,
+        ),
+        Ordering::Release,
+    );
+}
+
 /// A click candidate whose pre-click evidence was gathered by the active pass-through tap.
 /// Called on the watcher thread; the main thread owns the decision and the delayed worker.
-pub(crate) fn note_dock_hide_candidate(candidate: dock_click::HideCandidate) {
-    if candidate.session == 0 || !HIDE_CLICK_ENABLED.load(Ordering::Acquire) {
-        return;
+fn commit_click_candidate(candidate: dock_click::DockClickCandidate) -> bool {
+    // Validation, invalidation and enqueue are one commit. Without this lock a settings update can
+    // increment its generation after validation but before enqueue, leaving a candidate tagged with
+    // the old settings in the new configuration's queue.
+    let _commit = CLICK_COMMIT_LOCK.lock().unwrap();
+    if candidate.session == 0
+        || !CLICK_INTERACTIONS_ENABLED.load(Ordering::Acquire)
+        || candidate.settings_generation != CLICK_SETTINGS_GENERATION.load(Ordering::Acquire)
+    {
+        return false;
     }
-    let generation = HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    let mut queue = HIDE_CANDIDATES.lock().unwrap();
+    let generation = CLICK_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut queue = CLICK_CANDIDATES.lock().unwrap();
     // An ordinary click commits at most once. If several mouse-ups are reported before the main
     // thread drains them, the newest press is the user's choice and replaces an older candidate.
     queue.retain(|(_, old)| old.pid != candidate.pid || old.session != candidate.session);
     queue.push((generation, candidate));
-    post_event_to_main();
+    true
 }
 
-/// The child switch changed. Its value is part of the tap installation identity, so re-pointing the
-/// watcher rebuilds passive<->active mode; pending gestures and hide requests never cross that edge.
-pub(crate) fn apply_hide_click_config_change(enabled: bool) {
-    HIDE_CLICK_ENABLED.store(enabled, Ordering::Release);
-    HIDE_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
-    HIDE_CANDIDATES.lock().unwrap().clear();
+pub(crate) fn note_dock_click_candidate(candidate: dock_click::DockClickCandidate) {
+    if commit_click_candidate(candidate) {
+        post_event_to_main();
+    }
+}
+
+/// The click settings changed. Their combined value is part of the tap installation identity, so
+/// re-pointing the watcher rebuilds passive<->active mode; pending gestures and actions never cross
+/// that edge.
+pub(crate) fn apply_dock_click_config_change(
+    feature_enabled: bool,
+    frontmost_action: &str,
+    restore_minimized: bool,
+    quick_quit: bool,
+) {
+    {
+        let _commit = CLICK_COMMIT_LOCK.lock().unwrap();
+        CLICK_SETTINGS_GENERATION.fetch_add(1, Ordering::AcqRel);
+        store_dock_click_config(
+            feature_enabled,
+            frontmost_action,
+            restore_minimized,
+            quick_quit,
+        );
+        CLICK_INPUT_GENERATION.fetch_add(1, Ordering::AcqRel);
+        CLICK_CANDIDATES.lock().unwrap().clear();
+    }
     if is_enabled() {
         start_dock_click_watcher();
     }
 }
 
-fn peek_occupies_front_for_hide() -> bool {
+fn quick_quit_commit_within_deadline(now_uptime_ns: u64, deadline_uptime_ns: u64) -> bool {
+    now_uptime_ns <= deadline_uptime_ns
+}
+
+/// A verified quick-quit gesture reported by the active tap. Called on the watcher thread.
+///
+/// Acceptance is a real commit because the active tap suppresses the Dock's menu on the strength of
+/// it. Once committed, the quit belongs to the execution worker: later ordinary Dock presses, click
+/// setting edits or feature retirement must not leave the interaction with neither menu nor quit.
+pub(crate) fn note_dock_quick_quit_candidate(
+    candidate: dock_click::QuickQuitCandidate,
+    commit_deadline_uptime_ns: u64,
+) -> bool {
+    let accepted = {
+        let _commit = CLICK_COMMIT_LOCK.lock().unwrap();
+        candidate.session != 0
+            && quick_quit_enabled()
+            && click_session_active(candidate.session)
+            && candidate.settings_generation == CLICK_SETTINGS_GENERATION.load(Ordering::Acquire)
+            && quick_quit_commit_within_deadline(
+                crate::event_tap::uptime_ns(),
+                commit_deadline_uptime_ns,
+            )
+    };
+    accepted && spawn_quick_quit_worker(candidate)
+}
+
+fn spawn_quick_quit_worker(candidate: dock_click::QuickQuitCandidate) -> bool {
+    std::thread::Builder::new()
+        .name("com.eacryo.oh-my-tab.dock-quick-quit".to_string())
+        .spawn(move || {
+            // The gesture was committed before its native menu was suppressed. There is deliberately
+            // no later feature/input-generation cancellation here; the verified terminate functions
+            // still re-check the exact process incarnation immediately before delivering the request.
+            let committed = || true;
+            let accepted = if candidate.force {
+                crate::window_collector::force_terminate_application_verified(
+                    candidate.pid,
+                    &candidate.identity_key,
+                    candidate.process_start_time_us,
+                    &committed,
+                )
+            } else {
+                crate::window_collector::terminate_application_verified(
+                    candidate.pid,
+                    &candidate.identity_key,
+                    candidate.process_start_time_us,
+                    &committed,
+                )
+            };
+            if accepted {
+                log_info!(
+                    "[dock-preview] {} application after Dock quick quit: pid={} bundle={}",
+                    if candidate.force {
+                        "force-terminated"
+                    } else {
+                        "terminated"
+                    },
+                    candidate.pid,
+                    candidate.bundle
+                );
+                crate::e2e_state::record_from_worker(if candidate.force {
+                    "dock_preview_quick_force_quit"
+                } else {
+                    "dock_preview_quick_quit"
+                });
+            }
+        })
+        .map(|_| true)
+        .unwrap_or_else(|_| {
+            log_debug!("[dock-preview] Dock quick-quit worker could not start");
+            false
+        })
+}
+
+fn peek_occupies_front_for_click_action() -> bool {
     let Ok(slot) = PEEK.lock() else {
         return true;
     };
     slot.raising.is_some() || slot.model.peeked().is_some() || slot.model.armed().is_some()
 }
 
-fn drain_hide_candidates() {
-    let candidates: Vec<HideCandidateResult> = {
-        let mut queue = HIDE_CANDIDATES.lock().unwrap();
+fn drain_click_candidates() {
+    let candidates: Vec<ClickCandidateResult> = {
+        let mut queue = CLICK_CANDIDATES.lock().unwrap();
         std::mem::take(&mut *queue)
     };
     for (generation, candidate) in candidates {
         if !is_enabled()
-            || !HIDE_CLICK_ENABLED.load(Ordering::Acquire)
+            || !CLICK_INTERACTIONS_ENABLED.load(Ordering::Acquire)
             || candidate.session != SESSION.load(Ordering::Acquire)
-            || generation != HIDE_INPUT_GENERATION.load(Ordering::Acquire)
-            || peek_occupies_front_for_hide()
+            || generation != CLICK_INPUT_GENERATION.load(Ordering::Acquire)
+            || candidate.settings_generation != CLICK_SETTINGS_GENERATION.load(Ordering::Acquire)
+            || peek_occupies_front_for_click_action()
         {
-            log_debug!(
-                "[dock-preview] Dock click candidate dropped before worker: pid={} enabled={} hide_enabled={} session={}/{} generation={}/{} peek={}",
-                candidate.pid,
-                is_enabled(),
-                HIDE_CLICK_ENABLED.load(Ordering::Acquire),
-                candidate.session,
-                SESSION.load(Ordering::Acquire),
-                generation,
-                HIDE_INPUT_GENERATION.load(Ordering::Acquire),
-                peek_occupies_front_for_hide()
-            );
             continue;
         }
-        log_debug!(
-            "[dock-preview] Dock click candidate worker started: pid={} anchor={}",
-            candidate.pid,
-            candidate.anchor_window
-        );
         let session = candidate.session;
         let spawn = std::thread::Builder::new()
-            .name("com.eacryo.oh-my-tab.dock-click-hide".to_string())
+            .name("com.eacryo.oh-my-tab.dock-click-action".to_string())
             .spawn(move || {
                 // Native Dock behavior owns activation/unhide. Waiting one short turn lets the
-                // pass-through click finish that work; hiding earlier could be undone by the click.
+                // pass-through click finish that work; acting earlier could be undone by the click.
                 std::thread::sleep(Duration::from_millis(120));
-                if generation != HIDE_INPUT_GENERATION.load(Ordering::Acquire)
+                if generation != CLICK_INPUT_GENERATION.load(Ordering::Acquire)
                     || session != SESSION.load(Ordering::Acquire)
-                    || !HIDE_CLICK_ENABLED.load(Ordering::Acquire)
+                    || !CLICK_INTERACTIONS_ENABLED.load(Ordering::Acquire)
                     || !ENABLED.load(Ordering::Acquire)
                 {
                     return;
                 }
-                let frontmost =
-                    objc2::rc::autoreleasepool(|_| unsafe { crate::app_identity::frontmost_pid() });
-                if frontmost != Some(candidate.pid) {
-                    log_debug!(
-                        "[dock-preview] Dock click hide cancelled: pid={} is not frontmost",
-                        candidate.pid
-                    );
-                    return;
-                }
-                let hidden = crate::window_collector::hide_application_verified(
+                if !crate::app_identity::is_same_instance(
                     candidate.pid,
                     &candidate.identity_key,
                     candidate.process_start_time_us,
-                );
-                if hidden {
-                    log_info!(
-                        "[dock-preview] hid frontmost app after Dock icon click: pid={} bundle={}",
-                        candidate.pid,
-                        candidate.bundle
-                    );
-                    crate::e2e_state::record("dock_preview_click_hide");
+                ) {
+                    return;
+                }
+
+                let restore_enabled = RESTORE_MINIMIZED_CLICK_ENABLED.load(Ordering::Acquire);
+                let frontmost_action = FRONTMOST_CLICK_ACTION.load(Ordering::Acquire);
+                // A pure hide needs no window-state scan at all: the pre-click anchor and process
+                // identity are its evidence. Restore/minimize do need AX because it distinguishes a
+                // minimized window from one merely living on another Space.
+                let needs_window_states = window_state_scan_needed(restore_enabled, frontmost_action);
+                let scan = if needs_window_states {
+                    catch_click_ax("window scan", candidate.pid, || {
+                        crate::window_collector::get_ax_windows_for_pid_fresh(candidate.pid)
+                    })
                 } else {
-                    log_debug!(
-                        "[dock-preview] Dock click hide refused by verified identity: pid={}",
-                        candidate.pid
-                    );
+                    None
+                };
+                let windows = scan.as_ref().map(|scan| scan.windows.as_slice());
+                let minimized: Vec<u32> = windows
+                    .unwrap_or(&[])
+                    .iter()
+                    .filter(|(_, _, minimized, _, _)| *minimized)
+                    .map(|(wid, _, _, _, _)| *wid)
+                    .collect();
+
+                let wait_for_front = || {
+                    for attempt in 0..8 {
+                        if generation != CLICK_INPUT_GENERATION.load(Ordering::Acquire) {
+                            return false;
+                        }
+                        let frontmost = objc2::rc::autoreleasepool(|_| unsafe {
+                            crate::app_identity::frontmost_pid()
+                        });
+                        if frontmost == Some(candidate.pid) {
+                            return true;
+                        }
+                        if attempt == 7 {
+                            return false;
+                        }
+                        std::thread::sleep(Duration::from_millis(50));
+                    }
+                    false
+                };
+
+                // The AX enumeration above can outlive the click it describes. Revalidate the input
+                // generation after it; otherwise a fast second Dock click could still receive the
+                // first click's hide/minimize/restore batch.
+                if generation != CLICK_INPUT_GENERATION.load(Ordering::Acquire) {
+                    return;
+                }
+                let click_still_current = || {
+                    generation == CLICK_INPUT_GENERATION.load(Ordering::Acquire)
+                        && session == SESSION.load(Ordering::Acquire)
+                        && CLICK_INTERACTIONS_ENABLED.load(Ordering::Acquire)
+                        && ENABLED.load(Ordering::Acquire)
+                };
+
+                let window_scan_complete = ax_window_scan_complete(scan.as_ref());
+                if frontmost_action == 2 && !window_scan_complete {
+                    return;
+                }
+                let minimized_count = if window_scan_complete {
+                    Some(minimized.len())
+                } else {
+                    None
+                };
+                let plan = click_action_plan(
+                    candidate.was_frontmost,
+                    frontmost_action,
+                    restore_enabled,
+                    minimized_count,
+                );
+                if plan == ClickActionPlan::RestoreMinimized {
+                    if !wait_for_front()
+                        || !crate::app_identity::is_same_instance(
+                            candidate.pid,
+                            &candidate.identity_key,
+                            candidate.process_start_time_us,
+                        )
+                    {
+                        return;
+                    }
+                    let mut restored = 0usize;
+                    for wid in minimized {
+                        if generation != CLICK_INPUT_GENERATION.load(Ordering::Acquire) {
+                            return;
+                        }
+                        if catch_click_ax("restore write", candidate.pid, || {
+                            crate::window_collector::set_ax_minimized_with_identity(
+                                candidate.pid,
+                                &candidate.identity_key,
+                                candidate.process_start_time_us,
+                                wid,
+                                false,
+                                &click_still_current,
+                            )
+                        }) {
+                            restored += 1;
+                        }
+                    }
+                    if restored > 0 {
+                        log_info!(
+                            "[dock-preview] restored minimized windows after Dock icon click: pid={} count={}",
+                            candidate.pid,
+                            restored
+                        );
+                        crate::e2e_state::record_from_worker("dock_preview_click_restore_minimized");
+                    }
+                    return;
+                }
+
+                match plan {
+                    ClickActionPlan::HideFrontmost => {
+                        // Hide keeps the old strict anchor rule: without a visible window there is
+                        // nothing user-visible to hide, and the anchor is part of the evidence that
+                        // this was really a frontmost-window click.
+                        if candidate.anchor_window.is_none() || !wait_for_front() {
+                            return;
+                        }
+                        let hidden = crate::window_collector::hide_application_verified(
+                            candidate.pid,
+                            &candidate.identity_key,
+                            candidate.process_start_time_us,
+                            &click_still_current,
+                        );
+                        if hidden {
+                            log_info!(
+                                "[dock-preview] hid frontmost app after Dock icon click: pid={} bundle={}",
+                                candidate.pid,
+                                candidate.bundle
+                            );
+                            crate::e2e_state::record_from_worker("dock_preview_click_hide");
+                        }
+                    }
+                    ClickActionPlan::MinimizeFrontmost => {
+                        if !wait_for_front()
+                            || !crate::app_identity::is_same_instance(
+                                candidate.pid,
+                                &candidate.identity_key,
+                                candidate.process_start_time_us,
+                            )
+                        {
+                            return;
+                        }
+                        let visible: Vec<u32> = windows
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(|(_, _, minimized, read_failed, _)| !*minimized && !*read_failed)
+                            .map(|(wid, _, _, _, _)| *wid)
+                            .collect();
+                        let mut minimized_count = 0usize;
+                        for wid in visible {
+                            if generation != CLICK_INPUT_GENERATION.load(Ordering::Acquire) {
+                                return;
+                            }
+                            if catch_click_ax("minimize write", candidate.pid, || {
+                                crate::window_collector::set_ax_minimized_with_identity(
+                                    candidate.pid,
+                                    &candidate.identity_key,
+                                    candidate.process_start_time_us,
+                                    wid,
+                                    true,
+                                    &click_still_current,
+                                )
+                            }) {
+                                minimized_count += 1;
+                            }
+                        }
+                        if minimized_count > 0 {
+                            log_info!(
+                                "[dock-preview] minimized frontmost app windows after Dock icon click: pid={} count={}",
+                                candidate.pid,
+                                minimized_count
+                            );
+                            crate::e2e_state::record_from_worker("dock_preview_click_minimize");
+                        }
+                    }
+                    _ => {}
                 }
             });
         if spawn.is_err() {
-            log_debug!("[dock-preview] Dock click hide worker could not start");
+            log_debug!("[dock-preview] Dock click action worker could not start");
         }
     }
 }
@@ -2377,7 +2790,8 @@ extern "C" fn on_event(_self: *mut AnyObject, _cmd: objc2::runtime::Sel, _arg: *
             dismiss_for_dock_click(press_session);
         }
         drain_events();
-        drain_hide_candidates();
+        crate::e2e_state::drain_worker_records();
+        drain_click_candidates();
         drain_results();
         drain_close_results();
         drain_activate_results();
@@ -2394,7 +2808,8 @@ extern "C" fn on_tick(_self: *mut AnyObject, _cmd: objc2::runtime::Sel, _timer: 
         if press_session != 0 {
             dismiss_for_dock_click(press_session);
         }
-        drain_hide_candidates();
+        crate::e2e_state::drain_worker_records();
+        drain_click_candidates();
         if is_enabled() {
             tick();
         }
@@ -2654,10 +3069,12 @@ fn tick() {
         // holds one of them at a time, and keeping it that way leaves no ordering to audit.
         let pending_tile = PENDING_OPEN.lock().unwrap().as_ref().map(|open| open.icon);
         let switch_tile = pending_tile.or_else(|| {
+            let current_request = REQUEST.load(Ordering::Acquire);
             COLLECT_CONTEXT
                 .lock()
                 .unwrap()
                 .as_ref()
+                .filter(|context| decisions::event_is_current(context.request, current_request))
                 .map(|context| context.anchor)
         });
         let settling = switch_tile.is_some_and(|tile| tile.contains(pointer));
@@ -2787,6 +3204,14 @@ fn spawn_collector(request: u64, pid: i32, bundle: String) {
         });
 }
 
+fn take_collect_context(request: u64) -> Option<CollectContext> {
+    let mut slot = COLLECT_CONTEXT.lock().unwrap();
+    match slot.as_ref() {
+        Some(context) if context.request == request => slot.take(),
+        _ => None,
+    }
+}
+
 fn drain_results() {
     let results: Vec<CollectorResult> = {
         let mut queue = RESULTS.lock().unwrap();
@@ -2796,6 +3221,10 @@ fn drain_results() {
         if !decisions::event_is_current(request, REQUEST.load(Ordering::Acquire)) {
             continue;
         }
+        // A result ENDS its collection whether it carries windows, carries none (an excluded or
+        // windowless app), or failed. Leaving the context behind made the close logic treat the
+        // finished pass as an in-flight hover switch forever.
+        let context = take_collect_context(request);
         let Some(collected) = collected else {
             log_debug!("[dock-preview] collection returned nothing");
             continue;
@@ -2804,13 +3233,6 @@ fn drain_results() {
             log_debug!("[dock-preview] app has no previewable windows");
             continue;
         }
-        let context = {
-            let mut slot = COLLECT_CONTEXT.lock().unwrap();
-            match slot.as_ref() {
-                Some(context) if context.request == request => slot.take(),
-                _ => None,
-            }
-        };
         let Some(context) = context else {
             continue;
         };
@@ -4216,6 +4638,183 @@ fn primary_screen_bounds_cg() -> Rect {
             frame.size.width,
             frame.size.height,
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        ax_window_scan_complete, click_action_plan, commit_click_candidate,
+        quick_quit_commit_within_deadline, store_dock_click_config, take_collect_context,
+        window_state_scan_needed, ClickActionPlan,
+    };
+    use crate::dock_preview::dock_click::DockClickCandidate;
+    use crate::dock_preview::layout::{DockEdge, Rect};
+    use crate::window_collector::AxWindowStateScan;
+
+    #[test]
+    fn restoration_takes_precedence_over_the_frontmost_action() {
+        assert_eq!(
+            click_action_plan(true, 1, true, Some(2)),
+            ClickActionPlan::RestoreMinimized
+        );
+        assert_eq!(
+            click_action_plan(false, 2, true, Some(1)),
+            ClickActionPlan::RestoreMinimized
+        );
+        assert_eq!(
+            click_action_plan(true, 1, true, Some(0)),
+            ClickActionPlan::HideFrontmost
+        );
+        assert_eq!(
+            click_action_plan(true, 2, false, Some(0)),
+            ClickActionPlan::MinimizeFrontmost
+        );
+        assert_eq!(
+            click_action_plan(false, 2, false, Some(0)),
+            ClickActionPlan::None
+        );
+    }
+
+    #[test]
+    fn window_state_scans_are_skipped_for_a_pure_hide_but_required_for_restore_or_minimize() {
+        assert!(!window_state_scan_needed(false, 1));
+        assert!(!window_state_scan_needed(false, 0));
+        assert!(window_state_scan_needed(true, 0));
+        assert!(window_state_scan_needed(false, 2));
+    }
+
+    #[test]
+    fn candidate_validation_and_enqueue_are_one_settings_commit() {
+        store_dock_click_config(true, "hide", false, false);
+        let settings_generation =
+            super::CLICK_SETTINGS_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+        let candidate = DockClickCandidate {
+            session: 1,
+            pid: 4242,
+            bundle: "test.bundle".to_string(),
+            identity_key: "test.bundle".to_string(),
+            process_start_time_us: Some(1),
+            anchor_window: Some(7),
+            was_frontmost: true,
+            tile_generation: 1,
+            settings_generation,
+            down_timestamp_ns: 1,
+        };
+        super::CLICK_CANDIDATES.lock().unwrap().clear();
+
+        // Hold the commit mutex and enqueue from another thread. If validation/enqueue ever leaves
+        // that mutex again, this candidate lands while a settings invalidation may be in progress --
+        // exactly the torn commit this regression test pins. The helper is used directly so the test
+        // never posts an AppKit event from a headless test process.
+        let commit_guard = super::CLICK_COMMIT_LOCK.lock().unwrap();
+        let worker = std::thread::spawn(move || commit_click_candidate(candidate));
+        std::thread::sleep(std::time::Duration::from_millis(30));
+        assert!(super::CLICK_CANDIDATES.lock().unwrap().is_empty());
+        drop(commit_guard);
+        assert!(worker.join().unwrap());
+        assert_eq!(super::CLICK_CANDIDATES.lock().unwrap().len(), 1);
+
+        super::apply_dock_click_config_change(false, "off", false, false);
+        assert!(super::CLICK_CANDIDATES.lock().unwrap().is_empty());
+        store_dock_click_config(false, "off", false, false);
+    }
+
+    #[test]
+    fn a_finished_collection_consumes_only_its_own_context() {
+        let context = |request| super::CollectContext {
+            request,
+            bundle: "com.example.App".to_string(),
+            anchor: Rect::new(1.0, 2.0, 3.0, 4.0),
+            edge: DockEdge::Bottom,
+            visible: Rect::new(0.0, 0.0, 100.0, 100.0),
+            dev: false,
+            pid: 42,
+        };
+        *super::COLLECT_CONTEXT.lock().unwrap() = Some(context(7));
+        assert!(take_collect_context(8).is_none());
+        assert!(super::COLLECT_CONTEXT.lock().unwrap().is_some());
+        assert_eq!(take_collect_context(7).map(|context| context.pid), Some(42));
+        assert!(super::COLLECT_CONTEXT.lock().unwrap().is_none());
+
+        // The ordering is the regression itself: the context must be consumed before either early
+        // result path, or an excluded/windowless app leaves it behind as a permanent "switch" tile.
+        let source = include_str!("mod.rs");
+        let drain = source
+            .split("fn drain_results()")
+            .nth(1)
+            .expect("drain_results exists");
+        let drain_end = drain
+            .find(
+                "
+}
+",
+            )
+            .expect("drain_results ends")
+            + 3;
+        let drain = &drain[..drain_end];
+        let consume = drain
+            .find("take_collect_context(request)")
+            .expect("the result consumes its context");
+        let failed = drain
+            .find("collection returned nothing")
+            .expect("the failure path exists");
+        let empty = drain
+            .find("app has no previewable windows")
+            .expect("the empty path exists");
+        assert!(consume < failed && consume < empty);
+
+        // A newer hover retires a still-running collection's tile as close-grace ground. Otherwise
+        // sliding from one icon to the next can keep the old panel alive on the previous collection's
+        // anchor even though its result can no longer be applied.
+        let tick = source.split("fn tick()").nth(1).expect("tick exists");
+        assert!(
+            tick.contains("event_is_current(context.request, current_request)"),
+            "the close exception must only follow the current collection"
+        );
+    }
+
+    #[test]
+    fn quick_quit_commit_deadline_is_revalidated_after_the_commit_lock() {
+        assert!(quick_quit_commit_within_deadline(3_000_000, 3_000_000));
+        assert!(!quick_quit_commit_within_deadline(3_000_001, 3_000_000));
+    }
+
+    #[test]
+    fn incomplete_ax_discovery_is_unknown_not_zero_minimized_windows() {
+        let scan = |windows, discovery_incomplete| AxWindowStateScan {
+            windows,
+            discovery_incomplete,
+        };
+        let complete = scan(
+            vec![(7u32, "window".to_string(), false, false, false)],
+            false,
+        );
+        assert!(ax_window_scan_complete(Some(&complete)));
+
+        let read_failed = scan(
+            vec![(7u32, "window".to_string(), false, true, false)],
+            false,
+        );
+        assert!(!ax_window_scan_complete(Some(&read_failed)));
+
+        // The scan-level case: the WindowServer named a window no AX source accounted for, or
+        // AXChildren failed while it was needed. Even when the entries that did come back have
+        // valid minimized bits, the missing window means the count is unknown rather than zero.
+        let incomplete_discovery = scan(
+            vec![(7u32, "window".to_string(), false, false, true)],
+            false,
+        );
+        assert!(!ax_window_scan_complete(Some(&incomplete_discovery)));
+
+        // Empty is not self-describing: the scan-level bit is what separates a confirmed zero from
+        // a scan that broke down before it could know. This is why the click path carries a scan
+        // result rather than only a vector of windows.
+        let confirmed_zero = scan(Vec::new(), false);
+        assert!(ax_window_scan_complete(Some(&confirmed_zero)));
+        let unknown_zero = scan(Vec::new(), true);
+        assert!(!ax_window_scan_complete(Some(&unknown_zero)));
+        assert!(!ax_window_scan_complete(None));
     }
 }
 

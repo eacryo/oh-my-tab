@@ -148,6 +148,12 @@ pub(crate) const K_AX_CANNOT_COMPLETE: AXError = -25204;
 extern "C" {
     pub(crate) fn AXIsProcessTrusted() -> bool;
     pub(crate) fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    pub(crate) fn AXUIElementCopyElementAtPosition(
+        element: AXUIElementRef,
+        x: f32,
+        y: f32,
+        result: *mut AXUIElementRef,
+    ) -> AXError;
     pub(crate) fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> i32;
     pub(crate) fn AXUIElementCopyAttributeValue(
         element: AXUIElementRef,

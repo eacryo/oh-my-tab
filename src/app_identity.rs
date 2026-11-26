@@ -276,13 +276,13 @@ pub(crate) unsafe fn frontmost_bundle_id() -> Option<String> {
     read_nsstring(identifier).filter(|id| !id.is_empty())
 }
 
-/// The process start time using the same precedence as `identity_of_app`:
-/// `NSRunningApplication.launchDate` first, libproc as the fallback for processes that do not
-/// publish one. Callers that later verify through `identity_of_app` must sample this value, not
-/// libproc directly, or the same process fails its own identity check.
-pub(crate) unsafe fn identity_process_start_time_us(pid: i32) -> Option<u64> {
-    let app: *mut AnyObject =
-        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+/// The process start time of an application object the caller already holds, using the same
+/// precedence as `identity_of_app`: `launchDate` first, libproc as the fallback for processes that
+/// do not publish one. Unlike the full identity resolver this reads no executable metadata.
+pub(crate) unsafe fn identity_process_start_time_of_app(
+    app: *mut AnyObject,
+    pid: i32,
+) -> Option<u64> {
     if app.is_null() {
         return None;
     }
@@ -294,6 +294,23 @@ pub(crate) unsafe fn identity_process_start_time_us(pid: i32) -> Option<u64> {
         }
     }
     proc_start_time_us(pid)
+}
+
+/// The bundle identifier and process start time from ONE `NSRunningApplication` lookup.
+///
+/// Evidence built from two independent lookups can describe two different process instances when a
+/// pid is reused between them. The start time uses the same launchDate/libproc precedence as
+/// `identity_of_app`, so a candidate carrying it still agrees with the final `is_same_instance`
+/// re-check.
+pub(crate) unsafe fn bundle_id_and_process_start_time_us(
+    pid: i32,
+) -> (Option<String>, Option<u64>) {
+    let app: *mut AnyObject =
+        msg_send![class!(NSRunningApplication), runningApplicationWithProcessIdentifier: pid];
+    (
+        bundle_id_of(app),
+        identity_process_start_time_of_app(app, pid),
+    )
 }
 
 /// The pid of the application that is frontmost right now, from the same property read as
@@ -433,19 +450,10 @@ pub(crate) unsafe fn identity_of_app(app: *mut AnyObject, pid: i32) -> AppIdenti
         };
     }
 
-    let process_start_time_us = {
-        let launch_date: *mut AnyObject = msg_send![app, launchDate];
-        let from_app = if launch_date.is_null() {
-            None
-        } else {
-            let seconds: f64 = msg_send![launch_date, timeIntervalSince1970];
-            (seconds.is_finite() && seconds >= 0.0).then_some((seconds * 1_000_000.0) as u64)
-        };
-        // Finder and a few system applications report no launchDate through NSRunningApplication;
-        // libproc still knows when their process started, so identity can distinguish instances for
-        // them too instead of refusing every action as "unverified".
-        from_app.or_else(|| proc_start_time_us(pid))
-    };
+    // Finder and a few system applications report no launchDate through NSRunningApplication;
+    // libproc still knows when their process started, so identity can distinguish instances for
+    // them too instead of refusing every action as "unverified".
+    let process_start_time_us = identity_process_start_time_of_app(app, pid);
 
     let bid_obj: *mut AnyObject = msg_send![app, bundleIdentifier];
     let bundle_id = read_nsstring(bid_obj);

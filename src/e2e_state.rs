@@ -538,6 +538,27 @@ pub(crate) fn record(event: &str) {
     write(event, None);
 }
 
+static WORKER_EVENTS: LazyLock<Mutex<Vec<&'static str>>> = LazyLock::new(|| Mutex::new(Vec::new()));
+
+/// Queue a success fact from a non-main worker. Writing the snapshot itself touches AppKit state,
+/// so workers only name the fact; the normal main-thread drain publishes it.
+pub(crate) fn record_from_worker(event: &'static str) {
+    if is_enabled() {
+        WORKER_EVENTS.lock().unwrap().push(event);
+    }
+}
+
+/// Publish queued worker facts. Main thread only.
+pub(crate) fn drain_worker_records() {
+    if !is_enabled() {
+        return;
+    }
+    let events = std::mem::take(&mut *WORKER_EVENTS.lock().unwrap());
+    for event in events {
+        write(event, None);
+    }
+}
+
 /// Writes a frame when the app's Space context changed since the last published frame, even when
 /// the candidate set did not. Called after a refresh is applied, so the frame's cards are the set
 /// computed for the context it reports.

@@ -318,6 +318,25 @@ being read as "nothing is admissible". The settings card lists at most 16 entrie
 as "+N", edited in the config file -- the same bound and overflow shape as the Gestures page's
 exclusion card, which shares its description (`settings/page_view/excluded_apps.rs`).
 
+
+### Applications excluded from Dock previews
+
+`[dock_preview] excluded_apps` is the same shape of bundle-identifier list, but it belongs only to
+Dock-hover previews: a matched application never answers a Dock-icon hover, while its visibility in
+the app switcher is unchanged. The filter is additive -- a Dock-preview collection combines
+`windows.excluded_apps` with this Dock-only list into one directed policy, because the switcher list
+is already a window-presentation refusal. The converse does not hold: the Dock list does not affect
+the switcher.
+
+This list only changes admission at the next collection, so no switcher candidate enumeration has to
+be invalidated for it. A standing panel may already be showing a newly excluded application, though,
+and an in-flight collection may still be carrying the pre-edit policy. The runtime therefore drops the
+panel through the policy-change path and advances the preview request epoch, so the in-flight result
+cannot be applied. Because the Dock policy also contains `windows.excluded_apps`, editing the
+switcher's list invalidates the standing Dock preview through the same path in addition to discarding
+the switcher's own candidates. The settings page reuses the shared exclusion card
+(`settings/page_view/excluded_apps.rs`) with Dock-specific copy, action ids and stable row identities.
+
 ## Thumbnail card sizing
 
 The overlay's thumbnail grid gives every card **one** height. The user pins it with the App Switcher

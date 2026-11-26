@@ -448,9 +448,13 @@ pub(super) unsafe fn cached_ax_window_element(
         process_start_time_us: process_start_time_us?,
         cgwid,
     };
-    let cached = AX_WINDOW_CACHE.lock().unwrap().get(&key).copied()?;
+    let cache = AX_WINDOW_CACHE.lock().unwrap();
+    let cached = cache.get(&key).copied()?;
+    // Retain while the cache lock is still held: replacing or clearing the entry releases the old
+    // element, so copying the bare pointer first and retaining after the temporary lock would race.
     // The caller owns this temporary retain and must CFRelease it after the AX operations.
     CFRetain(cached.0);
+    drop(cache);
     Some(cached.0)
 }
 
@@ -786,40 +790,127 @@ pub(crate) fn close_ax_window(pid: i32, cgwid: u32) -> bool {
 /// the write; the caller must not treat that as "the window is now minimized", since the state is
 /// observable only through a later scan.
 pub(crate) fn set_ax_minimized(pid: i32, cgwid: u32, minimized: bool) -> bool {
+    set_ax_minimized_scanned(pid, cgwid, minimized, &|| true)
+}
+
+fn set_ax_minimized_scanned(
+    pid: i32,
+    cgwid: u32,
+    minimized: bool,
+    should_write: &dyn Fn() -> bool,
+) -> bool {
+    if !should_write() {
+        return false;
+    }
     unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
+        let app = super::space_membership::OwnedCf(AXUIElementCreateApplication(pid));
+        if app.0.is_null() {
             return false;
         }
-        AXUIElementSetMessagingTimeout(app, 0.5);
-        let windows_key = cf_string_new("AXWindows");
-        let mut windows_array: *const c_void = std::ptr::null();
-        let err = AXUIElementCopyAttributeValue(app, windows_key, &mut windows_array);
-        CFRelease(windows_key);
-        CFRelease(app);
-        if err != K_AX_SUCCESS || windows_array.is_null() {
+        AXUIElementSetMessagingTimeout(app.0 as AXUIElementRef, 0.5);
+        let windows_key = super::space_membership::OwnedCf(cf_string_new("AXWindows"));
+        let mut raw_windows_array: *const c_void = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(
+            app.0 as AXUIElementRef,
+            windows_key.0,
+            &mut raw_windows_array,
+        );
+        if err != K_AX_SUCCESS || raw_windows_array.is_null() {
+            if !raw_windows_array.is_null() {
+                CFRelease(raw_windows_array);
+            }
             return false;
         }
-        let minimized_key = cf_string_new("AXMinimized");
+        let windows_array = super::space_membership::OwnedCf(raw_windows_array);
+        let minimized_key = super::space_membership::OwnedCf(cf_string_new("AXMinimized"));
         let mut ok = false;
-        let count = CFArrayGetCount(windows_array);
+        let count = CFArrayGetCount(windows_array.0);
         for i in 0..count {
-            let element = CFArrayGetValueAtIndex(windows_array, i);
+            let element = CFArrayGetValueAtIndex(windows_array.0, i);
             if element.is_null() || ax_window_cgwid(element) != Some(cgwid) {
                 continue;
+            }
+            if !should_write() {
+                break;
             }
             let target = if minimized {
                 kCFBooleanTrue
             } else {
                 kCFBooleanFalse
             };
-            ok = AXUIElementSetAttributeValue(element, minimized_key, target) == K_AX_SUCCESS;
+            ok = AXUIElementSetAttributeValue(element, minimized_key.0, target) == K_AX_SUCCESS;
             break;
         }
-        CFRelease(minimized_key);
-        CFRelease(windows_array);
         ok
     }
+}
+
+/// The three facts that may authorize an identity-verified write. Splitting them keeps the
+/// cancellation-after-identity rule visible in a pure test instead of hiding it inside a closure.
+fn identity_action_allowed(
+    continue_before_identity: bool,
+    identity_matches: bool,
+    continue_after_identity: bool,
+) -> bool {
+    continue_before_identity && identity_matches && continue_after_identity
+}
+
+/// Set one window's minimized state with the process incarnation the caller already verified.
+///
+/// The Dock click worker has just enumerated the app's full AX window set, including windows the
+/// Space-filtered `AXWindows` list does not publish. That enumeration caches the exact element; using
+/// it here is what lets restore reach a minimized window on another Space. A stale cache write falls
+/// back to the ordinary re-enumeration rather than being treated as proof either way.
+pub(crate) fn set_ax_minimized_with_identity(
+    pid: i32,
+    identity_key: &str,
+    process_start_time_us: Option<u64>,
+    cgwid: u32,
+    minimized: bool,
+    should_continue: &dyn Fn() -> bool,
+) -> bool {
+    let verified = || {
+        // Identity resolution can read executable metadata and block longer than the click that
+        // authorized the write. Cancellation is therefore part of both ends of the identity check:
+        // a stop or newer click that lands while metadata is being read still prevents the write.
+        let continue_before_identity = should_continue();
+        let identity_matches = continue_before_identity
+            && crate::app_identity::is_same_instance(pid, identity_key, process_start_time_us);
+        identity_action_allowed(
+            continue_before_identity,
+            identity_matches,
+            should_continue(),
+        )
+    };
+    if !verified() {
+        return false;
+    }
+    unsafe {
+        if let Some(element) = cached_ax_window_element(pid, process_start_time_us, cgwid) {
+            let element = super::space_membership::OwnedCf(element);
+            if !verified() {
+                return false;
+            }
+            AXUIElementSetMessagingTimeout(element.0 as AXUIElementRef, 0.5);
+            let minimized_key = super::space_membership::OwnedCf(cf_string_new("AXMinimized"));
+            let target = if minimized {
+                kCFBooleanTrue
+            } else {
+                kCFBooleanFalse
+            };
+            let ok = verified()
+                && !minimized_key.0.is_null()
+                && AXUIElementSetAttributeValue(
+                    element.0 as AXUIElementRef,
+                    minimized_key.0,
+                    target,
+                ) == K_AX_SUCCESS;
+            if ok {
+                return true;
+            }
+        }
+    }
+    set_ax_minimized_scanned(pid, cgwid, minimized, &verified)
 }
 
 /// Hide a running application (`NSRunningApplication hide`), the same call `command+H` makes.
@@ -868,7 +959,11 @@ pub(crate) fn terminate_application_verified(
     pid: i32,
     identity_key: &str,
     process_start_time_us: Option<u64>,
+    should_continue: &dyn Fn() -> bool,
 ) -> bool {
+    if !should_continue() {
+        return false;
+    }
     // The worker that runs this is not a run-loop thread: every autoreleased object this function
     // makes (the application handle, the identity's strings) drains here, not at thread exit.
     objc2::rc::autoreleasepool(|_| unsafe {
@@ -885,23 +980,31 @@ pub(crate) fn terminate_application_verified(
         if identity.key != identity_key
             || identity.process_start_time_us != process_start_time_us
             || process_start_time_us.is_none()
+            || !should_continue()
         {
+            return false;
+        }
+        if !should_continue() {
             return false;
         }
         msg_send![app, terminate]
     })
 }
 
-/// Hide a verified application instance (`NSRunningApplication hide`, the ⌘H semantic).
+/// Force-quit a verified application instance (`NSRunningApplication forceTerminate`).
 ///
-/// The application object is resolved once, verified, and sent `hide` as that same object: resolving
-/// again would reopen the PID-reuse window. Finder is refused by the callers rather than special-cased
-/// here because the Dock toggle documents that exclusion as a user-visible rule.
-pub(crate) fn hide_application_verified(
+/// This is reserved for the user's explicit Option+Command+right-click gesture. The same one-object
+/// verification rule as `terminate_application_verified` applies: a PID is never enough identity for
+/// a destructive request.
+pub(crate) fn force_terminate_application_verified(
     pid: i32,
     identity_key: &str,
     process_start_time_us: Option<u64>,
+    should_continue: &dyn Fn() -> bool,
 ) -> bool {
+    if !should_continue() {
+        return false;
+    }
     objc2::rc::autoreleasepool(|_| unsafe {
         let app: *mut AnyObject = msg_send![
             class!(NSRunningApplication),
@@ -914,6 +1017,44 @@ pub(crate) fn hide_application_verified(
         if identity.key != identity_key
             || identity.process_start_time_us != process_start_time_us
             || process_start_time_us.is_none()
+            || !should_continue()
+        {
+            return false;
+        }
+        if !should_continue() {
+            return false;
+        }
+        msg_send![app, forceTerminate]
+    })
+}
+
+/// Hide a verified application instance (`NSRunningApplication hide`, the ⌘H semantic).
+///
+/// The application object is resolved once, verified, and sent `hide` as that same object: resolving
+/// again would reopen the PID-reuse window. Finder is refused by the callers rather than special-cased
+/// here because the Dock toggle documents that exclusion as a user-visible rule.
+pub(crate) fn hide_application_verified(
+    pid: i32,
+    identity_key: &str,
+    process_start_time_us: Option<u64>,
+    should_continue: &dyn Fn() -> bool,
+) -> bool {
+    if !should_continue() {
+        return false;
+    }
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if app.is_null() {
+            return false;
+        }
+        let identity = crate::app_identity::identity_of_app(app, pid);
+        if identity.key != identity_key
+            || identity.process_start_time_us != process_start_time_us
+            || process_start_time_us.is_none()
+            || !should_continue()
         {
             crate::log_debug!(
                 "[raise] verified hide identity mismatch: pid={} key_expected={} key_current={} start_expected={:?} start_current={:?}",
@@ -923,6 +1064,9 @@ pub(crate) fn hide_application_verified(
                 process_start_time_us,
                 identity.process_start_time_us
             );
+            return false;
+        }
+        if !should_continue() {
             return false;
         }
         let accepted: bool = msg_send![app, hide];
@@ -1141,5 +1285,16 @@ mod cg_key_tests {
         for (index, key) in ordered.iter().enumerate() {
             assert_eq!(key.index(), index, "{key:?} must index its own slot");
         }
+    }
+}
+
+#[cfg(test)]
+mod identity_write_tests {
+    #[test]
+    fn cancellation_during_identity_resolution_blocks_the_write() {
+        assert!(!super::identity_action_allowed(true, true, false));
+        assert!(!super::identity_action_allowed(false, true, true));
+        assert!(!super::identity_action_allowed(true, false, true));
+        assert!(super::identity_action_allowed(true, true, true));
     }
 }

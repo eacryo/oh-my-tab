@@ -211,9 +211,12 @@ restore (the user switched away themselves, our own window came forward, either 
 a restore that runs after the user has moved on drags them back. The panel is re-ordered to the
 front after each peek so it stays visible over the window it just raised.
 
-- `dock_preview/observer.rs` owns every Accessibility call for the Dock on one dedicated run-loop
-  thread: it subscribes to `AXSelectedChildrenChanged` on the Dock's list element, reads the hovered
-  tile (bundle, title, frame) and the list/screen frames, and publishes plain `DockEvent`s. An
+- `dock_preview/observer.rs` owns the Dock's passive Accessibility subscription and tile sampling on
+  one dedicated run-loop thread: it subscribes to `AXSelectedChildrenChanged` on the Dock's list
+  element, reads the hovered tile (bundle, title, frame) and the list/screen frames, and publishes
+  plain `DockEvent`s. The click action's bounded fresh hit-test in `dock_click.rs` is the one
+  deliberate exception; it runs on a probe worker because it must answer inside the active tap's input
+  budget. An
   auto-hidden Dock parks its list outside the screen, so the revealed state and the edge are part of
   the event; a 500ms re-read covers a missed notification, and a 2s health check rebuilds a
   subscription the Dock dropped (a Dock restart or UI rebuild invalidates the element silently).
@@ -228,7 +231,8 @@ front after each peek so it stays visible over the window it just raised.
   cards use.
 - `dock_preview/windows.rs` collects one app's windows on a worker thread through
   `window_collector::collect_windows_for_dock_preview` (the switcher's admission policy widened to
-  minimized, hidden and other-desktop windows, still honoring `[windows] excluded_apps`). Each card
+  minimized, hidden and other-desktop windows, enforcing the union of `[windows] excluded_apps` and
+  `[dock_preview] excluded_apps`). Each card
   carries the process identity (start time + identity key) so activation and close re-check that the
   target is still the app instance that was hovered.
 - `dock_preview/panel.rs` builds one borderless non-activating `NSPanel` (status level, joins all
@@ -254,21 +258,34 @@ front after each peek so it stays visible over the window it just raised.
   synthetic events; with the Dock pinned (auto-hide off) the keeper is not started at all.
 - `dock_preview/dock_click.rs` closes the preview on the press that starts a switch, the way the
   Windows taskbar closes its thumbnail flyout. The panel sits above the tile without covering it, so
-  the press belongs to the Dock. With `[dock_preview] hide_frontmost_on_icon_click` off the per-PID
-  tap is listen-only and only reports `leftMouseDown`/`rightMouseDown` for that dismissal. With the
-  child switch on the installation becomes an ACTIVE pass-through tap: it still returns every event
-  unchanged and injects nothing, but because the callback runs before delivery to the Dock it can
-  capture pre-click evidence through a bounded worker probe (frontmost pid plus one visible ordinary anchor window)
-  inside a 3ms budget. Only an unmodified left down/up pair on the same tile, within a small travel
-  and a 500ms bound, with the same anchor window still visible, becomes a hide candidate. Anything
-  ambiguous, stale, timed out or Finder-owned leaves the native click alone. The main thread delays
-  the commit briefly so the Dock's own activation/unhide completes, then a worker resolves one
-  `NSRunningApplication`, verifies that same object by identity key and process start time, and
-  sends `hide` to it; a newer Dock press, a settings change, a feature stop or a target that is no
-  longer frontmost cancels the request. Active-tap installation failure falls back to the passive
-  dismissal tap rather than disabling previews. The press still latches the tile (`DISMISSED_TILE`)
-  until the pointer leaves it or another app is reported, and `--e2e-state` publishes the monotonic
-  `press_dismissals` counter with the dock preview.
+  the press belongs to the Dock. When none of the click actions is enabled the per-PID tap is
+  listen-only and only reports `leftMouseDown`/`rightMouseDown` for that dismissal. When
+  `frontmost_icon_click_action` is not `off`, `restore_minimized_on_icon_click` is on, or
+  `cmd_right_click_quit` is on, the installation becomes an ACTIVE tap whose callback runs before
+  delivery to the Dock. It still injects nothing and passes ordinary events through, but it may
+  swallow one accepted Command+right-click so the Dock menu does not flash before the quit it was
+  meant to replace. Pre-click evidence is gathered on shared probe workers inside a 3ms input
+  budget; expired queued probes do not start AX IPC, Dock AX objects use bounded messaging timeouts,
+  and a passive-tap fallback is used only for press dismissal, never for action evidence. Only an
+  unmodified left down/up pair on the same tile, within a small travel and a 500ms bound, with the
+  same anchor window still visible and the same click-settings generation, becomes a candidate. The
+  main thread delays the commit briefly so the Dock's own activation/unhide completes, then a worker
+  re-reads minimized state freshly (per-window transport failures are unknown, not false), restores
+  minimized windows first when that switch is on, or hides/minimizes only a verified still-frontmost
+  instance. Quick quit compares a fresh AX hit-test at the press position with the tile's application
+  path, requires exactly one running instance of that bundle, verifies that instance's `bundleURL`,
+  pid and process start time, excludes Finder, and only then suppresses the menu; timeout or
+  ambiguity leaves the native click alone. Ordinary left-click actions remain cancellable by a
+  newer Dock press, a settings change, a feature stop or an instance identity mismatch. Quick quit
+  is different once its validation has committed: because the native menu has already been
+  suppressed, the execution worker owns the request and later input/settings invalidation must not
+  leave the interaction with neither menu nor quit; the verified terminate call still re-checks the
+  exact process incarnation immediately before delivery. AX evidence and writes added for these
+  actions run inside the same Objective-C exception boundary style as ordinary collection, with
+  caller-owned CF objects held by guards so an exception degrades to missing evidence rather than a
+  process crash or a leak. The press still latches the tile (`DISMISSED_TILE`) until the pointer
+  leaves it or another app is reported, and `--e2e-state` publishes worker action results after they
+  are marshalled back to the main thread.
 - The panel has two layouts. At or under `[dock_preview]
   cards_per_row` (1..=16, default 6) it shows thumbnail cards, which WRAP into as many rows as the
   width needs: one row while they fit, more when they do not. Above the threshold it is a scrolling
@@ -300,7 +317,7 @@ front after each peek so it stays visible over the window it just raised.
   refuses both activation and its close slot.
 - The feature is gated by `[dock_preview] enabled` (default true). Disabling it through the settings
   switch stops the observer, hides the panel and its tooltip, and is exercised by the
-  `--smoke-dock-preview` M2 runner; the child switch is frozen with it. A change to `cards_per_row`
+  `--smoke-dock-preview` M2 runner; the child switches are frozen with it. A change to `cards_per_row`
   hides an open panel through the same runtime path, and the next hover opens with the new threshold.
   `--show-dock-preview=<bundle|pid>` opens the panel without a real hover for review and screenshots,
   and `--smoke-dock-room-h=<pt>` shrinks the room above a bottom tile so the runner can construct a
@@ -387,9 +404,9 @@ clipboard/
   page-scoped buffer that fills the table only after the whole page built). The rendering half is
   AppKit; the description and layout halves are pure. **One
   file per page** sits beside those (`switcher.rs`, `general.rs`, `mouse.rs`, `clipboard.rs`, `gestures.rs`,
-  `about.rs`, `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`), so a page can be written on its own.
-  `excluded_apps.rs` is the one card two pages share (the Gestures and Switcher exclusion lists), so
-  their rows, copy rules and Remove semantics cannot drift apart.
+  `about.rs`, `keystroke_display.rs`, `finder_menu.rs`, `key_bindings.rs`, `dock.rs`), so a page can be written on its own.
+  `excluded_apps.rs` is the one card three pages share (the Gestures, Switcher and Dock exclusion
+  lists), so their rows, copy rules and Remove semantics cannot drift apart.
 - **Every settings page is described.** `page_builder.rs` is now one ~20-line entry point per page: it
   captures a `PageInput`, calls `build_page` and publishes (or falls back to `empty_page`). A page that
   needs something the description cannot carry states it in `PageHooks`: `before_page` for a page-drawn
