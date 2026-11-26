@@ -326,7 +326,7 @@ for name in "${runners[@]}"; do
     outcome=${recorded#*$(printf "\t")}
     if [ "$status" -ne 0 ]; then
         echo "smoke: $name FAILED (exit $status)"
-        tail -5 "$log" | sed "s/^/    /"
+        tail -40 "$log" | sed "s/^/    /"
         failed=$((failed + 1))
     elif [ -z "$recorded" ]; then
         # No verdict: the runner returned without saying what it checked. Silence is not a pass.

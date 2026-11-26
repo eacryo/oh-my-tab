@@ -3386,7 +3386,7 @@ pub(crate) fn settings_mouse_profile_callback_smoke_runner() -> bool {
         }
 
         show_settings();
-        select_sidebar(2);
+        select_sidebar(settings_page_index(SettingsPageId::Mouse));
         let controls = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             Some((
@@ -3444,20 +3444,40 @@ pub(crate) fn settings_mouse_profile_callback_smoke_runner() -> bool {
                 resolve_selected_from(&cfg)
             };
 
+            let click_switch = |switch: *mut AnyObject| {
+                let event: *mut AnyObject = msg_send![
+                    class!(NSEvent),
+                    mouseEventWithType: 1isize,
+                    location: NSPoint::new(1.0, 1.0),
+                    modifierFlags: 0u64,
+                    timestamp: 0.0f64,
+                    windowNumber: 0isize,
+                    context: std::ptr::null_mut::<AnyObject>(),
+                    eventNumber: 0isize,
+                    clickCount: 1isize,
+                    pressure: 1.0f32
+                ];
+                if event.is_null() {
+                    return false;
+                }
+                let _: () = msg_send![switch, mouseDown: event];
+                true
+            };
             let initial_reverse: isize = msg_send![reverse_switch, state];
-            let _: () = msg_send![reverse_switch, performClick: std::ptr::null::<AnyObject>()];
+            let first_click = click_switch(reverse_switch);
             let toggled_reverse = {
                 let cfg = CONFIG.read().unwrap();
                 resolve_selected_from(&cfg).reverse_scroll
             };
             let toggled_reverse_state: isize = msg_send![reverse_switch, state];
-            let _: () = msg_send![reverse_switch, performClick: std::ptr::null::<AnyObject>()];
+            let second_click = click_switch(reverse_switch);
             let restored_reverse = {
                 let cfg = CONFIG.read().unwrap();
                 resolve_selected_from(&cfg).reverse_scroll
             };
+            let restored_reverse_state: isize = msg_send![reverse_switch, state];
 
-            initially_line == Some((true, true, true))
+            let verdict = initially_line == Some((true, true, true))
                 && line_to_smooth_dispatched
                 && smooth_state == Some((true, false, false, true))
                 && smooth_config.scroll_mode == crate::mouse::scrolling::ScrollMode::Smooth
@@ -3469,9 +3489,19 @@ pub(crate) fn settings_mouse_profile_callback_smoke_runner() -> bool {
                 && line_config.scroll_mode == crate::mouse::scrolling::ScrollMode::Line
                 && line_config.line_count == 7
                 && (line_config.smooth_scrolling.response - 1.37).abs() < 1e-9
+                && first_click
+                && initial_reverse == 0
                 && toggled_reverse == (toggled_reverse_state == 1)
                 && toggled_reverse != (initial_reverse == 1)
+                && second_click
                 && !restored_reverse
+                && restored_reverse_state == 0;
+            if !verdict {
+                eprintln!(
+                    "[smoke-settings-mouse-profile-callback] initially={initially_line:?} smooth_dispatch={line_to_smooth_dispatched} smooth_state={smooth_state:?} smooth_config={smooth_config:?} line_dispatch={smooth_to_line_dispatched} line_state={line_state:?} line_config={line_config:?} reverse initial={initial_reverse} first_click={first_click} toggled={toggled_reverse} toggled_state={toggled_reverse_state} second_click={second_click} restored={restored_reverse} restored_state={restored_reverse_state}"
+                );
+            }
+            verdict
         })();
 
         if let Ok(mut current) = CONFIG.write() {
@@ -3672,7 +3702,7 @@ pub(crate) fn settings_collapsible_row_smoke_runner() -> bool {
         // The Mouse page owns two row groups in two cards. Collapsing both and reopening only the
         // upper one must leave the lower one hidden and size the document for exactly the rows that
         // are visible.
-        select_sidebar(2);
+        select_sidebar(settings_page_index(SettingsPageId::Mouse));
         let mouse_before = with_settings_ui(|ui| {
             let ui = ui.as_ref()?;
             let document: *mut AnyObject =
