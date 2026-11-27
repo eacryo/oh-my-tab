@@ -1691,6 +1691,35 @@ pub(crate) fn settings_window_ptr() -> *mut AnyObject {
     })
 }
 
+/// The settings window's CGWindowID while it is visible. `NSWindow.windowNumber` is the
+/// WindowServer id for the process's own windows despite Apple's older documentation warning
+/// otherwise; the Dock hover peek uses it as the precise restore target.
+pub(crate) fn visible_settings_window_cgwid() -> Option<u32> {
+    with_settings_ui(|ui| {
+        ui.as_ref().and_then(|ui| unsafe {
+            let visible: bool = msg_send![ui.window, isVisible];
+            if !visible {
+                return None;
+            }
+            let number: isize = msg_send![ui.window, windowNumber];
+            u32::try_from(number).ok().filter(|number| *number != 0)
+        })
+    })
+}
+
+/// The settings window's CGWindowID when that exact window is key, or `None` when another window
+/// of ours owns key focus.
+pub(crate) fn key_settings_window_cgwid() -> Option<u32> {
+    let wid = visible_settings_window_cgwid()?;
+    with_settings_ui(|ui| {
+        ui.as_ref().and_then(|ui| unsafe {
+            let nsapp: *mut AnyObject = msg_send![class!(NSApplication), sharedApplication];
+            let key_window: *mut AnyObject = msg_send![nsapp, keyWindow];
+            (key_window == ui.window).then_some(wid)
+        })
+    })
+}
+
 /// Landing point of the update-notification click: open the settings window, jump to the
 /// About page, and start an inline check. Once the settings window exists, its host view
 /// is registered, so the "update found" UI renders INLINE in the About page (see

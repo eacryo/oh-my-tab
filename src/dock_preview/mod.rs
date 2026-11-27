@@ -260,6 +260,20 @@ fn click_action_plan(
     }
 }
 
+/// The external application that sat below the settings window when a settings-origin peek began.
+/// The peeked application is only a transient activation: restoring the settings window must not
+/// leave it ahead of the application the user had been using before opening settings.
+#[derive(Clone, Copy, Debug)]
+struct Underlay {
+    pid: i32,
+    /// The exact window that sat below settings. Re-fronting it is also what repairs the visual
+    /// stack, not only the app activation order.
+    wid: u32,
+    /// PID reuse guard captured with the pid. A replacement process is never activated on the
+    /// strength of a window ordering its predecessor owned.
+    process_start_time_us: u64,
+}
+
 /// The front a peek took the window from.
 #[derive(Clone, Debug)]
 struct Origin {
@@ -267,6 +281,47 @@ struct Origin {
     /// The front application's focused window, so a restore puts back the window the user was
     /// actually looking at rather than whichever one ends up first.
     focused_window: Option<u32>,
+    /// Only a settings-window origin carries this: settings itself is the front being restored,
+    /// while this is the external application that must sit underneath it again.
+    underlay: Option<Underlay>,
+}
+
+/// The activation-order repair owed before a settings restore, if the captured process is still the
+/// same instance. A peeked application never needs to be put underneath itself, and an external
+/// origin already IS the application whose order the restore reinstates.
+fn underlay_activation_target(
+    origin: i32,
+    own_pid: i32,
+    peeked: PeekTarget,
+    underlay: Option<Underlay>,
+    current_start_time_us: Option<u64>,
+) -> Option<(i32, u32)> {
+    if origin != own_pid {
+        return None;
+    }
+    let underlay = underlay?;
+    if (underlay.pid, underlay.wid) == (peeked.pid, peeked.wid)
+        || current_start_time_us != Some(underlay.process_start_time_us)
+    {
+        return None;
+    }
+    Some((underlay.pid, underlay.wid))
+}
+
+/// Whether the settings window captured as a first peek's origin is still the exact key window.
+/// PID equality cannot answer this: the switcher can own key focus while the same process remains
+/// frontmost. Retargets are exempt because their expected front is the already-peeked application,
+/// not settings.
+fn settings_origin_still_key(
+    retarget: bool,
+    origin_pid: i32,
+    own_pid: i32,
+    origin_window: Option<u32>,
+    current_settings_key_window: Option<u32>,
+) -> bool {
+    retarget
+        || origin_pid != own_pid
+        || matches!(origin_window, Some(wid) if current_settings_key_window == Some(wid))
 }
 
 #[derive(Clone, Copy)]
@@ -458,14 +513,24 @@ pub(crate) fn handle_app_activation(pid: i32) {
     if !is_enabled() {
         return;
     }
+    if let Ok(mut queue) = PEEK_RESTORES_READY.lock() {
+        for restore in queue.iter_mut() {
+            if restore.peeked.pid == pid {
+                restore.target_was_front = true;
+            }
+        }
+    }
     // A restore that could not read the front is retried here first: this notification is exactly
     // the moment the front becomes readable, and it can arrive after the peek's own tick is gone.
     if is_main_thread() {
         drain_peek_restores();
     }
-    let Ok(slot) = PEEK.lock() else {
+    let Ok(mut slot) = PEEK.lock() else {
         return;
     };
+    if slot.model.peeked().is_some_and(|target| target.pid == pid) {
+        slot.target_was_front = true;
+    }
     // A raise is still being prepared: the peek is not up yet, but the pointer may already have
     // been abandoned, so the prepared switch is retired and the card held until the pointer leaves.
     if slot.raising.is_some() && slot.model.peeked().is_none() {
@@ -1348,6 +1413,10 @@ struct PeekState {
     /// The model's `armed` is cleared when the worker starts, so this is the only thing that can tell
     /// a tick whether the pointer still rests on the card the raise belongs to.
     raising: Option<(u64, PeekTarget, bool)>,
+    /// Whether this exact target has already been observed holding the front. A restore may wait
+    /// through the activation transit only before that first observation; afterwards the origin
+    /// holding the front is the user's own switch back.
+    target_was_front: bool,
 }
 
 impl PeekState {
@@ -1356,6 +1425,7 @@ impl PeekState {
         armed_at: None,
         origin: None,
         raising: None,
+        target_was_front: false,
     };
 }
 
@@ -1384,6 +1454,20 @@ struct PeekRestore {
     peeked: PeekTarget,
     origin: i32,
     focused_window: Option<u32>,
+    /// The external application a settings-origin restore must place underneath the settings
+    /// window again. `None` for ordinary external origins, which already carry that order in
+    /// their own pid.
+    underlay: Option<Underlay>,
+    /// When the intermediate underlay front-switch was issued. Settings is restored only after that
+    /// switch is observed (or a short timeout expires), or the two activations can race and leave
+    /// the peeked application underneath settings again.
+    underlay_started_at: Option<Instant>,
+    /// When the exact AX ordering repair was posted for the underlay. `AXUIElementPerformAction`
+    /// returns after posting the action, not after the target application has processed it, so the
+    /// settings restore waits one short bounded beat before taking the front back.
+    underlay_settled_at: Option<Instant>,
+    /// Whether the target activation was observed before the restore was requested.
+    target_was_front: bool,
     /// When the restore was requested. A restore that cannot confirm the front keeps its request
     /// for a bounded window and then gives up, so an unreadable front can neither strand the peek
     /// nor let the restore run long after the user moved on.
@@ -1400,14 +1484,24 @@ static PEEK_RESTORES_READY: LazyLock<Mutex<Vec<PeekRestore>>> =
 const RESTORE_SETTLE_ATTEMPTS: usize = 4;
 /// One live settle schedule at a time (see `schedule_peek_restore_settle`).
 static RESTORE_SETTLE_ACTIVE: AtomicBool = AtomicBool::new(false);
+static RESTORE_SETTLE_CALLBACK_PENDING: AtomicBool = AtomicBool::new(false);
+static PEEK_RESTORE_DRAINING: AtomicBool = AtomicBool::new(false);
+static UNDERLAY_AX_PREPARATIONS: LazyLock<Mutex<std::collections::HashSet<(i32, u32, u64)>>> =
+    LazyLock::new(|| Mutex::new(std::collections::HashSet::new()));
 /// Room left before the deadline for the main-thread hop and one Accessibility read.
 const RESTORE_SETTLE_MARGIN: Duration = Duration::from_millis(120);
+/// How long a settings restore waits for the intermediate underlay front-switch to be observed.
+/// The activation notification normally drains this queue much sooner; the timeout only keeps a
+/// failed underlay activation from stranding the settings restore itself.
+const UNDERLAY_ACTIVATION_WAIT: Duration = Duration::from_millis(160);
 
 /// Peeks committed since launch. A scenario asserts the delta, not the value.
 static PEEK_RAISES: AtomicU64 = AtomicU64::new(0);
 /// Restores performed since launch. The counter next to the raises: a raise without a restore is
 /// exactly the failure mode that leaves a window in front for good.
 static PEEK_RESTORES: AtomicU64 = AtomicU64::new(0);
+/// The exact origin window the newest restore was issued for, for e2e assertion. Zero means none.
+static LAST_RESTORE_EXPECTED_WID: AtomicU64 = AtomicU64::new(0);
 
 /// Whether the peek is switched on. Read by the tick, the e2e report and the settings page.
 pub(crate) fn peek_is_enabled() -> bool {
@@ -1431,7 +1525,7 @@ fn peek_frontmost() -> Frontmost {
         return Frontmost::Unknown;
     }
     if pid == std::process::id() as i32 {
-        return Frontmost::Own;
+        return Frontmost::Own { pid };
     }
     Frontmost::Other {
         pid,
@@ -1500,13 +1594,11 @@ fn step_peek(now: Instant, zone: layout::PointerZone) {
         // origin the later restore needs.
         let target_alive = windows::process_is_running(target.pid)
             && windows::previewability_now(target.pid, target.wid) != windows::Previewability::Gone;
-        match peek::watch_peek(
-            target,
-            origin,
-            origin_running,
-            target_alive,
-            peek_frontmost(),
-        ) {
+        let front_now = peek_frontmost();
+        if matches!(front_now, Frontmost::Other { pid, .. } if pid == target.pid) {
+            state.target_was_front = true;
+        }
+        match peek::watch_peek(target, origin, origin_running, target_alive, front_now) {
             // A live peek continues into the SAME pointer decision the rest of this function
             // makes: the pointer leaving its card is what ends a peek, and an early return here
             // was what kept a peek up forever after the pointer had moved to the title box, the
@@ -1558,12 +1650,21 @@ fn step_peek(now: Instant, zone: layout::PointerZone) {
         pid: window.pid,
         wid: window.wid,
     });
+    let frontmost = peek_frontmost();
+    // The settings window is a real user-facing baseline, unlike the switcher and preview panels.
+    // Its identity is read only while a body hover could start a NEW peek; a live peek's watch does
+    // not need this sample, and reading it on every tick would put AppKit queries on the hot path.
+    let own_front_is_settings = state.model.peeked().is_none()
+        && matches!(frontmost, Frontmost::Own { .. })
+        && hovered.is_some()
+        && crate::settings::key_settings_window_cgwid().is_some();
     let input = PeekInput {
         enabled: peek_is_enabled() && is_enabled(),
         zone,
         hovered,
         hovered_previewable: peek_refusal_for(hovered_window.as_ref()),
-        frontmost: peek_frontmost(),
+        frontmost,
+        own_front_is_settings,
         press_pending: false,
         armed_at: state.armed_at,
         now,
@@ -1647,12 +1748,71 @@ fn step_peek(now: Instant, zone: layout::PointerZone) {
     }
 }
 
+/// Prepare an underlay's exact AX element on a worker, bounded to one retry. This runs outside the
+/// target validation path so a slow underlay application cannot delay the preview itself.
+fn prepare_underlay_ax_element(underlay: Underlay) {
+    let key = (underlay.pid, underlay.wid, underlay.process_start_time_us);
+    {
+        let mut preparations = UNDERLAY_AX_PREPARATIONS.lock().unwrap();
+        if !preparations.insert(key) {
+            return;
+        }
+    }
+    let spawned = std::thread::Builder::new()
+        .name("com.eacryo.oh-my-tab.dock-preview-underlay-ax".to_string())
+        .spawn(move || {
+            objc2::rc::autoreleasepool(|_pool| {
+                let prepared =
+                    crate::window_collector::prepare_window_ax_element(underlay.pid, underlay.wid);
+                if !prepared {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = crate::window_collector::prepare_window_ax_element(
+                        underlay.pid,
+                        underlay.wid,
+                    );
+                }
+            });
+            UNDERLAY_AX_PREPARATIONS.lock().unwrap().remove(&key);
+        });
+    if spawned.is_err() {
+        UNDERLAY_AX_PREPARATIONS.lock().unwrap().remove(&key);
+    }
+}
+
+/// Our own front as a peek origin, but only when it is the settings window itself. The switcher
+/// and preview panels are transient surfaces: restoring them would re-enter the interface the user
+/// was leaving, while restoring settings returns to the window they were actually using.
+fn own_settings_origin() -> Option<Origin> {
+    let wid = crate::settings::key_settings_window_cgwid()?;
+    let own_pid = std::process::id() as i32;
+    let underlay = crate::window_collector::first_regular_window_below(wid, own_pid).and_then(
+        |(pid, underlay_wid)| {
+            crate::app_identity::proc_start_time_us(pid).map(|process_start_time_us| Underlay {
+                pid,
+                wid: underlay_wid,
+                process_start_time_us,
+            })
+        },
+    );
+    if let Some(underlay) = underlay {
+        prepare_underlay_ax_element(underlay);
+    }
+    Some(Origin {
+        pid: std::process::id() as i32,
+        focused_window: Some(wid),
+        underlay,
+    })
+}
+
 /// The front an activation would take the window from, or `None` when there is nothing sensible to
-/// give the front back to (no front, ourselves, or the card's own application).
+/// give the front back to (no front, an own transient surface, or the card's own application).
 fn peek_origin_now() -> Option<Origin> {
     let front = crate::ffi::frontmost_app_info().1;
-    if front <= 0 || front == std::process::id() as i32 {
+    if front <= 0 {
         return None;
+    }
+    if front == std::process::id() as i32 {
+        return own_settings_origin();
     }
     Some(Origin {
         pid: front,
@@ -1660,6 +1820,7 @@ fn peek_origin_now() -> Option<Origin> {
         // activation: a restore should put back the window the user was looking at, not whichever
         // window of that application ends up first.
         focused_window: unsafe { crate::window_collector::focused_window_cgwid(front) },
+        underlay: None,
     })
 }
 
@@ -1684,6 +1845,12 @@ fn start_peek_raise(
                     && windows::window_presence(target.pid, target.wid)
                         == decisions::WindowPresence::Present
             });
+            // A settings-origin restore may need this exact underlay element moments later. Preparing
+            // it here keeps the AX enumeration off the main thread and populates the same cache the
+            // synchronous ordering repair uses.
+            if let Some(underlay) = origin.underlay {
+                let _ = crate::window_collector::get_ax_windows_for_pid_fresh(underlay.pid);
+            }
             if !verified {
                 log_debug!(
                     "[dock-preview] peek target not confirmed pid={} wid={}",
@@ -1763,19 +1930,32 @@ fn drain_peek_raises() {
         let front_now = peek_frontmost();
         // A first raise expects the front to still be the origin. A RETARGET expects it to still be
         // the application whose window is currently peeked: that is the switch this one continues.
-        let front_ok = match front_now {
-            Frontmost::Other { pid, .. } => {
-                if retarget {
-                    state.model.peeked().map(|peeked| peeked.pid) == Some(pid)
-                } else {
-                    pid == raise.origin.pid
-                }
-            }
-            _ => false,
+        let front_pid = match front_now {
+            Frontmost::Other { pid, .. } | Frontmost::Own { pid } => Some(pid),
+            Frontmost::Unknown => None,
         };
+        let own_pid = std::process::id() as i32;
+        let current_settings_key = if !retarget && raise.origin.pid == own_pid {
+            crate::settings::key_settings_window_cgwid()
+        } else {
+            None
+        };
+        let origin_key_ok = settings_origin_still_key(
+            retarget,
+            raise.origin.pid,
+            own_pid,
+            raise.origin.focused_window,
+            current_settings_key,
+        );
+        let front_ok = origin_key_ok
+            && match front_pid {
+                Some(pid) if retarget => state.model.peeked().map(|peeked| peeked.pid) == Some(pid),
+                Some(pid) => pid == raise.origin.pid,
+                None => false,
+            };
         if !still_hovered || !still_pokeable || !front_ok {
             log_debug!(
-                "[dock-preview] peek raise dropped: hovered={still_hovered} pokeable={still_pokeable} front_ok={front_ok} retarget={retarget}"
+                "[dock-preview] peek raise dropped: hovered={still_hovered} pokeable={still_pokeable} front_ok={front_ok} origin_key={origin_key_ok} retarget={retarget}"
             );
             state.armed_at = None;
             // A retarget that cannot land leaves the previous peek up, so the origin stays owned.
@@ -1786,6 +1966,7 @@ fn drain_peek_raises() {
             continue;
         }
         state.model.commit(target);
+        state.target_was_front = false;
         drop(slot);
         if retarget {
             log_debug!(
@@ -1889,13 +2070,15 @@ fn json_target(target: PeekTarget) -> String {
 /// This is the collection half of the teardown: `restore_peek` would drain immediately, which is the
 /// second synchronous AX pass this function exists to avoid.
 fn collect_peek_then_park_restores() {
-    let (target, origin) = {
+    let (target, origin, target_was_front) = {
         let Ok(mut slot) = PEEK.lock() else {
             return;
         };
         let state = &mut *slot;
         let target = state.model.forget();
-        (target, state.origin.take())
+        let target_was_front = state.target_was_front;
+        state.target_was_front = false;
+        (target, state.origin.take(), target_was_front)
     };
     if let (Some(target), Some(origin)) = (target, origin) {
         PEEK_RESTORES_READY.lock().unwrap().push(PeekRestore {
@@ -1903,6 +2086,10 @@ fn collect_peek_then_park_restores() {
             peeked: target,
             origin: origin.pid,
             focused_window: origin.focused_window,
+            underlay: origin.underlay,
+            underlay_started_at: None,
+            underlay_settled_at: None,
+            target_was_front,
             requested_at: Instant::now(),
         });
     }
@@ -1941,6 +2128,7 @@ fn schedule_peek_restore_settle() {
         .map(|q| q.is_empty())
         .unwrap_or(true)
     {
+        RESTORE_SETTLE_ACTIVE.store(false, Ordering::Release);
         return;
     }
     // The schedule follows the OLDEST request's own deadline rather than a fixed number of polls. A
@@ -1949,11 +2137,7 @@ fn schedule_peek_restore_settle() {
     // reason. The last attempt lands just before `RESTORE_RETRY_WINDOW` closes.
     let deadline = PEEK_RESTORES_READY
         .lock()
-        .map(|q| {
-            q.iter()
-                .map(|restore| restore.requested_at + peek::RESTORE_RETRY_WINDOW)
-                .min()
-        })
+        .map(|q| q.iter().map(restore_deadline).min())
         .ok()
         .flatten();
     let Some(deadline) = deadline else {
@@ -1968,8 +2152,7 @@ fn schedule_peek_restore_settle() {
             for _ in 0..RESTORE_SETTLE_ATTEMPTS {
                 let remaining = deadline.saturating_duration_since(Instant::now());
                 if remaining.is_zero() {
-                    RESTORE_SETTLE_ACTIVE.store(false, Ordering::Release);
-                    return;
+                    break;
                 }
                 // A step derived from the WHOLE window, not from what is left: dividing each round's
                 // remaining time by the attempt count shortened every sleep and finished the schedule
@@ -1990,6 +2173,12 @@ fn schedule_peek_restore_settle() {
                     .map(|q| q.is_empty())
                     .unwrap_or(true)
                 {
+                    if RESTORE_SETTLE_CALLBACK_PENDING.load(Ordering::Acquire)
+                        || PEEK_RESTORE_DRAINING.load(Ordering::Acquire)
+                    {
+                        std::thread::sleep(Duration::from_millis(50));
+                        continue;
+                    }
                     RESTORE_SETTLE_ACTIVE.store(false, Ordering::Release);
                     return;
                 }
@@ -2005,11 +2194,14 @@ fn schedule_peek_restore_settle() {
             expire_stale_restores();
             RESTORE_SETTLE_ACTIVE.store(false, Ordering::Release);
             // A request that arrived while this schedule was running deserves its own window.
-            if PEEK_RESTORES_READY
-                .lock()
-                .map(|q| !q.is_empty())
-                .unwrap_or(false)
+            if RESTORE_SETTLE_CALLBACK_PENDING.load(Ordering::Acquire)
+                || PEEK_RESTORE_DRAINING.load(Ordering::Acquire)
+                || PEEK_RESTORES_READY
+                    .lock()
+                    .map(|q| !q.is_empty())
+                    .unwrap_or(false)
             {
+                std::thread::sleep(Duration::from_millis(50));
                 schedule_peek_restore_settle();
             }
         });
@@ -2029,12 +2221,25 @@ extern "C" fn on_peek_restore_settle(
 ) {
     crate::callback_guard::void("dock_preview_peek_restore_settle", || {
         settle_peek_restores_on_main();
+        RESTORE_SETTLE_CALLBACK_PENDING.store(false, Ordering::Release);
+        if !is_enabled()
+            && PEEK_RESTORES_READY
+                .lock()
+                .map(|q| !q.is_empty())
+                .unwrap_or(false)
+        {
+            schedule_peek_restore_settle();
+        }
     });
 }
 
 fn settle_peek_restores_on_main() {
     if !is_main_thread() {
-        // Hop, never call across threads: the drain reads AppKit.
+        // Hop, never call across threads: the drain reads AppKit. At most one callback may be in
+        // flight; a busy main thread must not accumulate a queue of identical drains.
+        if RESTORE_SETTLE_CALLBACK_PENDING.swap(true, Ordering::AcqRel) {
+            return;
+        }
         crate::callback_guard::void("dock_preview_peek_restore_settle_hop", || unsafe {
             let target = controller_target();
             let _: () = msg_send![
@@ -2139,6 +2344,10 @@ fn pause_peek_for_click() -> Vec<PeekRestore> {
                     peeked: target,
                     origin: origin.pid,
                     focused_window: origin.focused_window,
+                    underlay: origin.underlay,
+                    underlay_started_at: None,
+                    underlay_settled_at: None,
+                    target_was_front: state.target_was_front,
                     requested_at: Instant::now(),
                 });
             }
@@ -2193,7 +2402,7 @@ fn expire_stale_restores() {
     if let Ok(mut queue) = PEEK_RESTORES_READY.lock() {
         let before = queue.len();
         queue.retain(|restore| {
-            now.duration_since(restore.requested_at) <= peek::RESTORE_RETRY_WINDOW
+            restore.underlay_started_at.is_some() || now <= restore_deadline(restore)
         });
         if queue.len() != before {
             log_debug!(
@@ -2227,16 +2436,18 @@ fn supersede_pending_restores(why: &str) {
 
 /// Give the front back to the application the peek took it from.
 fn restore_peek() {
-    let (target, origin) = {
+    let (target, origin, target_was_front) = {
         let Ok(mut slot) = PEEK.lock() else {
             return;
         };
         let state = &mut *slot;
         let target = state.model.forget();
+        let target_was_front = state.target_was_front;
+        state.target_was_front = false;
         let origin = state.origin.take();
         state.armed_at = None;
         state.raising = None;
-        (target, origin)
+        (target, origin, target_was_front)
     };
     let Some(target) = target else {
         return;
@@ -2254,6 +2465,10 @@ fn restore_peek() {
         peeked: target,
         origin: origin.pid,
         focused_window: origin.focused_window,
+        underlay: origin.underlay,
+        underlay_started_at: None,
+        underlay_settled_at: None,
+        target_was_front,
         requested_at: Instant::now(),
     });
     // A queued hop is lost when the run loop is busy or the controller is not up yet (an early quit,
@@ -2339,7 +2554,19 @@ fn drain_peek_restores_inner(_max_rounds: usize) {
     // One pass, always: every request gets at most one Accessibility attempt per callback. Requests
     // that could not be read are re-queued and retried by the tick or the settle schedule, never in a
     // loop on the caller's thread.
+    PEEK_RESTORE_DRAINING.store(true, Ordering::Release);
     drain_peek_restores_once();
+    PEEK_RESTORE_DRAINING.store(false, Ordering::Release);
+}
+
+/// The deadline for one restore. Before the intermediate underlay switch it is the original retry
+/// window; once that switch has been issued, the switch itself owns a shorter bounded finish so a
+/// request cannot be stranded by the original clock having almost expired.
+fn restore_deadline(restore: &PeekRestore) -> Instant {
+    restore.underlay_started_at.map_or_else(
+        || restore.requested_at + peek::RESTORE_RETRY_WINDOW,
+        |started| started + UNDERLAY_ACTIVATION_WAIT + Duration::from_millis(120),
+    )
 }
 
 /// One pass over the queue. Returns whether anything was requeued.
@@ -2349,7 +2576,7 @@ fn drain_peek_restores_once() -> bool {
         std::mem::take(&mut *queue)
     };
     let mut requeued: Vec<PeekRestore> = Vec::new();
-    for restore in restores {
+    for mut restore in restores {
         if !windows::process_is_running(restore.origin) {
             log_debug!(
                 "[dock-preview] peek restore skipped: origin pid={} is gone",
@@ -2364,7 +2591,7 @@ fn drain_peek_restores_once() -> bool {
         // application they switched to.
         // An expired request is dropped before the Accessibility read: its window has closed, and a
         // round trip on its behalf would only block the main thread for an answer nobody uses.
-        if Instant::now().duration_since(restore.requested_at) > peek::RESTORE_RETRY_WINDOW {
+        if restore.underlay_started_at.is_none() && Instant::now() > restore_deadline(&restore) {
             log_debug!(
                 "[dock-preview] peek restore expired before its read: pid={}",
                 restore.peeked.pid
@@ -2374,9 +2601,21 @@ fn drain_peek_restores_once() -> bool {
         if restore.tried_in_this_callback {
             // Already attempted in this callback (the teardown drains once, but a request can come
             // back through this function twice): carry it to the next one without another AX read.
-            let mut restore = restore;
             restore.tried_in_this_callback = false;
             requeued.push(restore);
+            continue;
+        }
+        // A settings-window origin is owed only while that exact window still exists visibly. If the
+        // user closed settings during the peek, activating our now-accessory process would not put a
+        // meaningful window back; dropping the restore is the safe answer.
+        if restore.origin == std::process::id() as i32
+            && restore.focused_window != crate::settings::visible_settings_window_cgwid()
+        {
+            log_debug!(
+                "[dock-preview] peek restore skipped: the settings origin wid={:?} is gone",
+                restore.focused_window
+            );
+            crate::e2e_state::record("dock_preview_peek_restore_skipped");
             continue;
         }
         let front_before = peek_frontmost();
@@ -2387,17 +2626,13 @@ fn drain_peek_restores_once() -> bool {
             _ => None,
         };
         let front = match peek_frontmost() {
-            Frontmost::Other { pid, .. } => Some(peek::FrontNow {
+            Frontmost::Other { pid, .. } | Frontmost::Own { pid } => Some(peek::FrontNow {
                 pid,
                 focused_window: if pid == restore.peeked.pid {
                     focused_from_peeked
                 } else {
                     None
                 },
-            }),
-            Frontmost::Own => Some(peek::FrontNow {
-                pid: std::process::id() as i32,
-                focused_window: None,
             }),
             Frontmost::Unknown => None,
         };
@@ -2410,35 +2645,251 @@ fn drain_peek_restores_once() -> bool {
             crate::e2e_state::record("dock_preview_peek_restore_skipped");
             continue;
         }
-        match peek::restore_step(
-            restore.requested_at,
-            Instant::now(),
-            restore.peeked,
+        let own_pid = std::process::id() as i32;
+        let underlay_start = restore
+            .underlay
+            .and_then(|underlay| crate::app_identity::proc_start_time_us(underlay.pid));
+        let underlay_target = underlay_activation_target(
             restore.origin,
-            front,
-        ) {
-            peek::RestoreStep::Proceed => {}
-            peek::RestoreStep::Retry => {
-                // The front could not be read, or it is already where the restore would put it.
-                // Keep the request for the rest of its window instead of dropping it on one
-                // unreadable sample.
-                requeued.push(restore);
-                continue;
+            own_pid,
+            restore.peeked,
+            restore.underlay,
+            underlay_start,
+        );
+        // An underlay front-switch is the intentional intermediate step of a settings restore, not
+        // a user switch to a third application. Once it is observed, the ordinary pid rule would
+        // abandon the restore, so this stage is decided here instead.
+        let mut proceed = false;
+        if let Some((underlay_pid, underlay_wid)) = underlay_target {
+            if let Some(started_at) = restore.underlay_started_at {
+                let front_pid = front.map(|front| front.pid);
+                if front_pid == Some(underlay_pid) {
+                    let focused_underlay =
+                        unsafe { crate::window_collector::focused_window_cgwid(underlay_pid) };
+                    let front_after_focus = peek_frontmost();
+                    let front_after_pid = match front_after_focus {
+                        Frontmost::Other { pid, .. } | Frontmost::Own { pid } => Some(pid),
+                        Frontmost::Unknown => None,
+                    };
+                    if front_after_pid != Some(underlay_pid) {
+                        if front_after_pid.is_some() || Instant::now() > restore_deadline(&restore)
+                        {
+                            log_debug!(
+                                "[dock-preview] peek restore abandoned: the front changed during the underlay focus read"
+                            );
+                            crate::e2e_state::record("dock_preview_peek_restore_skipped");
+                            continue;
+                        }
+                        requeued.push(restore);
+                        continue;
+                    }
+                    let phase_expired = Instant::now() > restore_deadline(&restore);
+                    match focused_underlay {
+                        Some(focused) if focused == underlay_wid => {}
+                        Some(focused)
+                            if underlay_pid == restore.peeked.pid
+                                && focused == restore.peeked.wid =>
+                        {
+                            // The exact front-switch has made the application frontmost, but focus
+                            // is still leaving the previewed sibling. That is handoff, not a user
+                            // choice; keep waiting through the bounded phase. At its end settings is
+                            // still restored because the focused window is exactly the peek we own.
+                            if !phase_expired {
+                                requeued.push(restore);
+                                continue;
+                            }
+                            proceed = true;
+                        }
+                        Some(focused) => {
+                            log_debug!(
+                                "[dock-preview] peek restore abandoned: the user selected wid={} in the underlay app instead of wid={}",
+                                focused,
+                                underlay_wid
+                            );
+                            crate::e2e_state::record("dock_preview_peek_restore_skipped");
+                            continue;
+                        }
+                        None if !phase_expired => {
+                            requeued.push(restore);
+                            continue;
+                        }
+                        None => {
+                            log_debug!(
+                                "[dock-preview] peek restore abandoned: the underlay focus stayed unknown"
+                            );
+                            crate::e2e_state::record("dock_preview_peek_restore_skipped");
+                            continue;
+                        }
+                    }
+                    if !proceed {
+                        if let Some(settled_at) = restore.underlay_settled_at {
+                            if settled_at.elapsed() < Duration::from_millis(30) {
+                                requeued.push(restore);
+                                continue;
+                            }
+                            proceed = true;
+                        } else {
+                            // The first front-switch only makes the underlay application active. macOS
+                            // does not let that activation reorder its window above the peeked
+                            // application by itself (the same constraint that makes a peek a real
+                            // activation); now that the application IS active, AXRaise is what repairs
+                            // the physical window stack. The action is asynchronous inside the target,
+                            // so settings is restored on the next short bounded pass rather than in the
+                            // same burst.
+                            let ax_raised = unsafe {
+                                crate::window_collector::raise_cached_window_ax_now(
+                                    underlay_pid,
+                                    underlay_wid,
+                                )
+                            };
+                            log_debug!(
+                                "[dock-preview] peek restore underlay settled: pid={} wid={} ax={}",
+                                underlay_pid,
+                                underlay_wid,
+                                ax_raised
+                            );
+                            let front_after_ax = match peek_frontmost() {
+                                Frontmost::Other { pid, .. } | Frontmost::Own { pid } => Some(pid),
+                                Frontmost::Unknown => None,
+                            };
+                            let focused_after_ax = unsafe {
+                                crate::window_collector::focused_window_cgwid(underlay_pid)
+                            };
+                            let front_after_ax_focus = match peek_frontmost() {
+                                Frontmost::Other { pid, .. } | Frontmost::Own { pid } => Some(pid),
+                                Frontmost::Unknown => None,
+                            };
+                            if front_after_ax == Some(underlay_pid)
+                                && front_after_ax_focus == Some(underlay_pid)
+                                && focused_after_ax.is_none()
+                                && !phase_expired
+                            {
+                                requeued.push(restore);
+                                continue;
+                            }
+                            if front_after_ax != Some(underlay_pid)
+                                || front_after_ax_focus != Some(underlay_pid)
+                                || focused_after_ax != Some(underlay_wid)
+                            {
+                                log_debug!(
+                                    "[dock-preview] peek restore abandoned: the exact underlay focus changed during the AXRaise"
+                                );
+                                crate::e2e_state::record("dock_preview_peek_restore_skipped");
+                                continue;
+                            }
+                            if ax_raised {
+                                restore.underlay_settled_at = Some(Instant::now());
+                                requeued.push(restore);
+                                continue;
+                            }
+                            if !phase_expired {
+                                if let Some(underlay) = restore.underlay {
+                                    prepare_underlay_ax_element(underlay);
+                                }
+                                requeued.push(restore);
+                                continue;
+                            }
+                            proceed = true;
+                        }
+                    }
+                } else if started_at.elapsed() < UNDERLAY_ACTIVATION_WAIT
+                    && (front.is_none() || front_pid == Some(restore.peeked.pid))
+                {
+                    requeued.push(restore);
+                    continue;
+                } else if started_at.elapsed() >= UNDERLAY_ACTIVATION_WAIT
+                    && (front.is_none() || front_pid == Some(restore.peeked.pid))
+                {
+                    log_debug!(
+                        "[dock-preview] peek restore underlay timed out: pid={} wid={}; finishing the settings restore",
+                        underlay_pid,
+                        restore.underlay.map(|underlay| underlay.wid).unwrap_or(0)
+                    );
+                    proceed = matches!(front, Some(peek::FrontNow { pid, focused_window: Some(wid) }) if pid == restore.peeked.pid && wid == restore.peeked.wid);
+                }
             }
-            peek::RestoreStep::Abandon => {
-                log_debug!(
-                    "[dock-preview] peek restore abandoned: pid={} wid={}",
-                    restore.peeked.pid,
-                    restore.peeked.wid
-                );
-                crate::e2e_state::record("dock_preview_peek_restore_skipped");
-                continue;
+        }
+        if !proceed {
+            match peek::restore_step(
+                restore.requested_at,
+                Instant::now(),
+                restore.peeked,
+                restore.origin,
+                front,
+            ) {
+                peek::RestoreStep::Proceed => {}
+                peek::RestoreStep::Retry => {
+                    if restore.target_was_front
+                        && matches!(front, Some(peek::FrontNow { pid, .. }) if pid == restore.origin)
+                    {
+                        // The target HAD landed. If the origin is in front now, the user came back
+                        // themselves; keeping the request alive would undo a later deliberate switch
+                        // to the same target inside the retry window.
+                        log_debug!(
+                            "[dock-preview] peek restore abandoned: the user returned to origin pid={}",
+                            restore.origin
+                        );
+                        crate::e2e_state::record("dock_preview_peek_restore_skipped");
+                        continue;
+                    }
+                    // The front could not be read, or the target activation is still in flight.
+                    // Keep the request for the rest of its window instead of dropping it on one
+                    // unreadable sample.
+                    requeued.push(restore);
+                    continue;
+                }
+                peek::RestoreStep::Abandon => {
+                    log_debug!(
+                        "[dock-preview] peek restore abandoned: pid={} wid={}",
+                        restore.peeked.pid,
+                        restore.peeked.wid
+                    );
+                    crate::e2e_state::record("dock_preview_peek_restore_skipped");
+                    continue;
+                }
+            }
+        }
+        if let Some((underlay_pid, underlay_wid)) = underlay_target {
+            if restore.underlay_started_at.is_none() {
+                // Settings was put in front of this exact window before the transient peek. Front
+                // it once more before restoring settings, so both the activation order and the
+                // visual stack end as settings over the application the user came from. Settings
+                // is restored only after this intermediate switch is observed; issuing both in the
+                // same instant lets the second front-switch win before the first one is committed.
+                if crate::window_collector::visible_ordinary_window_now(underlay_pid, underlay_wid)
+                    == Some(true)
+                {
+                    let (slps, click) =
+                        crate::window_collector::raise_window_fast(underlay_pid, underlay_wid);
+                    log_debug!(
+                        "[dock-preview] peek restore underlay -> pid={} wid={} slps={} click={} fallback=false",
+                        underlay_pid,
+                        underlay_wid,
+                        slps,
+                        click
+                    );
+                    if slps && click {
+                        restore.underlay_started_at = Some(Instant::now());
+                        requeued.push(restore);
+                        continue;
+                    }
+                } else {
+                    log_debug!(
+                        "[dock-preview] peek restore underlay skipped: pid={} wid={} is no longer visible",
+                        underlay_pid,
+                        underlay_wid
+                    );
+                }
             }
         }
         log_debug!(
             "[dock-preview] peek restore -> pid={} wid={:?}",
             restore.origin,
             restore.focused_window
+        );
+        LAST_RESTORE_EXPECTED_WID.store(
+            restore.focused_window.unwrap_or(0) as u64,
+            Ordering::Release,
         );
         match restore.focused_window {
             // The origin's own focused window, when it was readable: the switch lands that window
@@ -2762,8 +3213,21 @@ pub(crate) fn e2e_json() -> String {
             )
         })
         .unwrap_or((None, None, None));
+    let front_pid_before = crate::ffi::frontmost_app_info().1;
+    let focused_read = if front_pid_before > 0 {
+        unsafe { crate::window_collector::focused_window_cgwid(front_pid_before) }
+    } else {
+        None
+    };
+    let front_pid_after = crate::ffi::frontmost_app_info().1;
+    let focus_pair_consistent = front_pid_before == front_pid_after && front_pid_before > 0;
+    let front_focused_wid = if focus_pair_consistent {
+        focused_read.unwrap_or(0)
+    } else {
+        0
+    };
     let peek_json = format!(
-        "{{\"enabled\": {}, \"armed\": {}, \"peeked\": {}, \"origin\": {}, \"raises\": {}, \"restores\": {}, \"pressed\": {}}}",
+        "{{\"enabled\": {}, \"armed\": {}, \"peeked\": {}, \"origin\": {}, \"raises\": {}, \"restores\": {}, \"pressed\": {}, \"restore_expected_wid\": {}, \"front_focused_pid\": {}, \"front_focused_wid\": {}}}",
         peek_is_enabled(),
         peek_armed.map_or("null".to_string(), json_target),
         peeked.map_or("null".to_string(), json_target),
@@ -2771,6 +3235,9 @@ pub(crate) fn e2e_json() -> String {
         PEEK_RAISES.load(Ordering::Relaxed),
         PEEK_RESTORES.load(Ordering::Relaxed),
         PEEK_PRESSED.load(Ordering::Relaxed),
+        LAST_RESTORE_EXPECTED_WID.load(Ordering::Relaxed),
+        if focus_pair_consistent { front_pid_before as u64 } else { 0 },
+        u64::from(front_focused_wid),
     );
     if preview == "null" {
         format!(
@@ -5017,12 +5484,95 @@ fn primary_screen_bounds_cg() -> Rect {
 mod tests {
     use super::{
         ax_window_scan_complete, click_action_plan, commit_click_candidate,
-        quick_quit_commit_within_deadline, store_dock_click_config, take_collect_context,
-        window_state_scan_needed, ClickActionPlan,
+        quick_quit_commit_within_deadline, settings_origin_still_key, store_dock_click_config,
+        take_collect_context, underlay_activation_target, window_state_scan_needed,
+        ClickActionPlan, PeekTarget, Underlay,
     };
     use crate::dock_preview::dock_click::DockClickCandidate;
     use crate::dock_preview::layout::{DockEdge, Rect};
     use crate::window_collector::AxWindowStateScan;
+
+    #[test]
+    fn a_settings_origin_must_still_be_the_exact_key_window_before_a_first_peek() {
+        // External origins and retargets do not depend on the settings key state.
+        assert!(settings_origin_still_key(false, 20, 99, Some(200), None));
+        assert!(settings_origin_still_key(true, 99, 99, Some(300), None));
+        // The same own PID is not enough: the exact captured settings window must still be key.
+        assert!(settings_origin_still_key(
+            false,
+            99,
+            99,
+            Some(300),
+            Some(300)
+        ));
+        assert!(!settings_origin_still_key(
+            false,
+            99,
+            99,
+            Some(300),
+            Some(301)
+        ));
+        assert!(!settings_origin_still_key(false, 99, 99, Some(300), None));
+        assert!(!settings_origin_still_key(false, 99, 99, None, None));
+    }
+
+    #[test]
+    fn only_the_same_live_underlay_instance_is_reactivated_before_settings() {
+        let peeked = PeekTarget { pid: 10, wid: 11 };
+        let underlay = Underlay {
+            pid: 20,
+            wid: 21,
+            process_start_time_us: 777,
+        };
+        assert_eq!(
+            underlay_activation_target(99, 99, peeked, Some(underlay), Some(777)),
+            Some((20, 21))
+        );
+        // Ordinary external origins already restore their own place in the order.
+        assert_eq!(
+            underlay_activation_target(20, 99, peeked, Some(underlay), Some(777)),
+            None
+        );
+        // The exact same window needs no repair. Another window of the same application still
+        // does: activation equality does not restore the ordering between two sibling windows.
+        assert_eq!(
+            underlay_activation_target(
+                99,
+                99,
+                peeked,
+                Some(Underlay {
+                    pid: 10,
+                    wid: 11,
+                    ..underlay
+                }),
+                Some(777)
+            ),
+            None
+        );
+        assert_eq!(
+            underlay_activation_target(
+                99,
+                99,
+                peeked,
+                Some(Underlay {
+                    pid: 10,
+                    wid: 21,
+                    ..underlay
+                }),
+                Some(777)
+            ),
+            Some((10, 21))
+        );
+        // PID reuse or a restarted process is not the instance that owned the captured ordering.
+        assert_eq!(
+            underlay_activation_target(99, 99, peeked, Some(underlay), Some(778)),
+            None
+        );
+        assert_eq!(
+            underlay_activation_target(99, 99, peeked, Some(underlay), None),
+            None
+        );
+    }
 
     #[test]
     fn restoration_takes_precedence_over_the_frontmost_action() {

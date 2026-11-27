@@ -99,6 +99,64 @@ pub(crate) fn note_focused_window(window_id: u32, owner_pid: i32, captured_at: I
     }
 }
 
+/// Perform one bounded AXRaise through the cached exact window element, synchronously on the
+/// caller's thread. This is deliberately small in scope: the Dock peek's settings restore already
+/// knows the target application is active and needs the physical window ordering repaired at that
+/// exact moment. Callers must be on the AppKit main thread; unlike the normal raise path this is a
+/// synchronous intermediate step, so it does not enter the generation-guarded async queue.
+/// Prepare the exact window's AX element off the main thread and report whether the cache now
+/// holds it. The scan itself populates the cache as a side effect; the boolean lets a caller retry
+/// boundedly instead of mistaking "the app answered" for "this window was found".
+pub(crate) fn prepare_window_ax_element(pid: i32, cgwid: u32) -> bool {
+    let process_start_time_us = unsafe { resolve_app_identity(pid).process_start_time_us };
+    if let Some(element) = unsafe { cached_ax_window_element(pid, process_start_time_us, cgwid) } {
+        unsafe { CFRelease(element) };
+        return true;
+    }
+    let _ = get_ax_windows_for_pid_fresh(pid);
+    if let Some(element) = unsafe { cached_ax_window_element(pid, process_start_time_us, cgwid) } {
+        unsafe { CFRelease(element) };
+        true
+    } else {
+        false
+    }
+}
+
+pub(crate) unsafe fn raise_cached_window_ax_now(pid: i32, cgwid: u32) -> bool {
+    let process_start_time_us = resolve_app_identity(pid).process_start_time_us;
+    let Some(element) = cached_ax_window_element(pid, process_start_time_us, cgwid) else {
+        return false;
+    };
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        CFRelease(element);
+        return false;
+    }
+    AXUIElementSetMessagingTimeout(app, 0.05);
+    AXUIElementSetMessagingTimeout(element, 0.05);
+    let raise_key = cf_string_new("AXRaise");
+    let err = if raise_key.is_null() {
+        K_AX_INVALID_UI_ELEMENT
+    } else {
+        AXUIElementPerformAction(element, raise_key)
+    };
+    log_debug!(
+        "[raise] AXRaise direct cached: pid={} cgwid={} err={}",
+        pid,
+        cgwid,
+        err
+    );
+    if err == K_AX_INVALID_UI_ELEMENT {
+        invalidate_cached_ax_window_element(pid, process_start_time_us, cgwid, element);
+    }
+    if !raise_key.is_null() {
+        CFRelease(raise_key);
+    }
+    CFRelease(element);
+    CFRelease(app);
+    err == K_AX_SUCCESS
+}
+
 /// The generation whose exact window was last *observed* focused (see `delivery_from_record`).
 /// Written on the main thread, read where a task is queued.
 static EXACT_DELIVERY: Mutex<Option<u64>> = Mutex::new(None);

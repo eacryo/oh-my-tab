@@ -61,7 +61,8 @@ pub(crate) use raise::{
 pub(crate) use raiser::{begin_raise, note_focused_window};
 pub(crate) use raiser::{
     cf_to_rust_string, get_ax_windows_for_pid, get_ax_windows_for_pid_fresh, handle_ax_raise_main,
-    raise_window_ax_async, AxWindowStateScan,
+    prepare_window_ax_element, raise_cached_window_ax_now, raise_window_ax_async,
+    AxWindowStateScan,
 };
 static SLPS_GET_PROCESS_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
 static SLPS_SET_FRONT_MISSING_LOGGED: AtomicBool = AtomicBool::new(false);
@@ -390,6 +391,58 @@ pub(crate) fn ordinary_onscreen_window_bounds() -> Vec<(u32, (f64, f64, f64, f64
         });
         windows.truncate(3);
         windows
+    }
+}
+
+/// The first visible ordinary window below `anchor_wid` in the WindowServer's front-to-back order,
+/// excluding this process. This is visual evidence, not activation-history inference: a settings
+/// window that is fronted over application A can use it to remember which exact window was directly
+/// underneath before a transient third application was raised.
+pub(crate) fn first_regular_window_below(anchor_wid: u32, own_pid: i32) -> Option<(i32, u32)> {
+    const ON_SCREEN_ONLY: u32 = 1 << 0;
+    if anchor_wid == 0 {
+        return None;
+    }
+    unsafe {
+        let array = CGWindowListCopyWindowInfo(ON_SCREEN_ONLY, 0);
+        if array.is_null() {
+            return None;
+        }
+        let mut anchor_seen = false;
+        let mut answer = None;
+        let count = CFArrayGetCount(array);
+        for i in 0..count {
+            let dict = CFArrayGetValueAtIndex(array, i);
+            if dict.is_null() {
+                continue;
+            }
+            let window_id = cf_dict_get_u32(dict, CgKey::Number).unwrap_or(0);
+            if window_id == anchor_wid {
+                anchor_seen = true;
+                continue;
+            }
+            if !anchor_seen {
+                continue;
+            }
+            let pid = cf_dict_get_i32(dict, CgKey::OwnerPid).unwrap_or(-1);
+            let bounds = cf_dict_get_bounds(dict, CgKey::Bounds).unwrap_or_default();
+            if pid <= 0
+                || pid == own_pid
+                || window_id == 0
+                || cf_dict_get_i32(dict, CgKey::Layer).unwrap_or(999) != 0
+                || cf_dict_get_f64(dict, CgKey::Alpha).unwrap_or(0.0) <= 0.0
+                || !cf_dict_get_bool(dict, CgKey::IsOnscreen).unwrap_or(false)
+                || bounds.2 <= 0.0
+                || bounds.3 <= 0.0
+                || !is_regular_running_app(pid)
+            {
+                continue;
+            }
+            answer = Some((pid, window_id));
+            break;
+        }
+        CFRelease(array);
+        answer
     }
 }
 

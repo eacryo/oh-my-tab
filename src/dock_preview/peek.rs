@@ -206,6 +206,9 @@ pub(crate) struct PeekInput {
     pub hovered_previewable: Option<PeekRefusal>,
     /// The frontmost application, and the card that already belongs to it.
     pub frontmost: Frontmost,
+    /// Whether the own front window is the settings window, the one window of ours a peek may
+    /// take the front from and later give it back to.
+    pub own_front_is_settings: bool,
     /// Whether a Dock press is still waiting to be answered.
     pub press_pending: bool,
     /// The arming deadline, if one was scheduled. The caller owns it because it is the only clock in
@@ -222,8 +225,9 @@ pub(crate) struct PeekInput {
 /// What the front application's presence means to the peek.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Frontmost {
-    /// The front application is one of ours: a peek has nothing to give back to.
-    Own,
+    /// The front application is this process. Whether its window is a valid origin is a decision
+    /// input: only the settings window is, while the switcher and preview panels are not.
+    Own { pid: i32 },
     /// The front application is a normal one; `focused_window` is its focused window when known.
     Other {
         pid: i32,
@@ -295,7 +299,7 @@ pub(crate) fn peek_decision(mod_: &Mod, input: &PeekInput) -> PeekDecision {
         Some(PeekRefusal::NotOnCardBody)
     } else if input.press_pending {
         Some(PeekRefusal::PressPending)
-    } else if matches!(input.frontmost, Frontmost::Own) {
+    } else if matches!(input.frontmost, Frontmost::Own { .. }) && !input.own_front_is_settings {
         Some(PeekRefusal::AlreadyFrontmost)
     } else if input.frontmost == Frontmost::Unknown {
         // An unreadable baseline is a refusal for the same reason it is not a `Frontmost`: there is
@@ -314,13 +318,15 @@ pub(crate) fn peek_decision(mod_: &Mod, input: &PeekInput) -> PeekDecision {
         return PeekDecision::Idle;
     };
     // The card of the application that is already in front needs no activation at all.
-    if let Frontmost::Other { pid, .. } = input.frontmost {
-        if pid == target.pid {
-            return match mod_.armed() {
-                Some(_) => PeekDecision::Forget,
-                None => PeekDecision::Idle,
-            };
-        }
+    let front_pid = match input.frontmost {
+        Frontmost::Other { pid, .. } | Frontmost::Own { pid } => Some(pid),
+        Frontmost::Unknown => None,
+    };
+    if front_pid == Some(target.pid) {
+        return match mod_.armed() {
+            Some(_) => PeekDecision::Forget,
+            None => PeekDecision::Idle,
+        };
     }
 
     // 3. A resting pointer: arm on the first tick, hold while the deadline runs, peek after it. The
@@ -366,9 +372,9 @@ pub(crate) enum PeekWatch {
 ///
 /// `front` is read on the main thread right before this decision. The restore is only ever issued
 /// while the peeked application is still in front: a front that changed to a third application
-/// means the user switched themselves, and a front that is ours means one of our own windows came
-/// forward. Both make the restore wrong, and the rule is kept here rather than at the call site so
-/// a new teardown path cannot forget it.
+/// means the user switched themselves. A front that is ours means one of our own windows came
+/// forward, except when the settings window is this peek's own origin: the target activation is
+/// asynchronous, so the origin still holding the front for a moment is not a user switch.
 pub(crate) fn watch_peek(
     peeked: PeekTarget,
     origin: Option<i32>,
@@ -380,7 +386,15 @@ pub(crate) fn watch_peek(
         return PeekWatch::Forget(ClearReason::TargetGone);
     }
     match front {
-        Frontmost::Own => PeekWatch::Forget(ClearReason::OwnFront),
+        Frontmost::Own { pid } => {
+            if Some(pid) == origin && origin_running {
+                PeekWatch::Keep
+            } else if Some(pid) == origin {
+                PeekWatch::Forget(ClearReason::OriginGone)
+            } else {
+                PeekWatch::Forget(ClearReason::OwnFront)
+            }
+        }
         Frontmost::Unknown => PeekWatch::Keep,
         Frontmost::Other { pid, .. } => {
             if pid == peeked.pid {
@@ -435,9 +449,12 @@ pub(crate) struct FrontNow {
 /// user can switch to another window of the previewed application themselves, and restoring then
 /// would take them back to where the peek took the front from, undoing their own choice.
 ///
-/// A front that is already the origin means nothing is owed: either the restore landed or the user
-/// came back themselves. A third application is the user's own switch. An unreadable front is no
-/// evidence at all, so the request survives for the rest of its window.
+/// A front that is already the origin is ambiguous rather than proof that nothing is owed: the
+/// target's activation is asynchronous, so the pointer may have left while that activation is still
+/// in flight. The request therefore survives for the rest of its bounded window; if the target does
+/// take the front, the restore still undoes our switch, and if it never does the request expires
+/// without activating anything. A third application is the user's own switch. An unreadable front
+/// is no evidence at all, so the request likewise survives for the rest of its window.
 pub(crate) fn restore_step(
     requested_at: Instant,
     now: Instant,
@@ -449,7 +466,7 @@ pub(crate) fn restore_step(
         return RestoreStep::Abandon;
     }
     match front {
-        Some(FrontNow { pid, .. }) if pid == origin => RestoreStep::Abandon,
+        Some(FrontNow { pid, .. }) if pid == origin => RestoreStep::Retry,
         Some(FrontNow {
             pid,
             focused_window,
@@ -509,8 +526,8 @@ mod restore_tests {
         );
         assert_eq!(
             step(10, 20, Some(front(20, None))),
-            RestoreStep::Abandon,
-            "already back"
+            RestoreStep::Retry,
+            "the origin still holding the front can mean the target activation is still in flight"
         );
         assert_eq!(
             step(10, 20, Some(front(30, None))),
@@ -522,6 +539,18 @@ mod restore_tests {
             step(10, 20, Some(front(10, None))),
             RestoreStep::Retry,
             "the right application, but its focused window could not be read"
+        );
+    }
+
+    /// The leave-before-activation race: the first sample can still be the origin, but that sample
+    /// must not retire the request. When the asynchronous target activation lands inside the same
+    /// bounded window, the next sample is allowed to undo it.
+    #[test]
+    fn an_in_flight_target_activation_does_not_retire_the_restore() {
+        assert_eq!(step(10, 20, Some(front(20, Some(200)))), RestoreStep::Retry);
+        assert_eq!(
+            step(100, 20, Some(front(10, Some(11)))),
+            RestoreStep::Proceed
         );
     }
 
@@ -563,6 +592,7 @@ mod tests {
                 pid: 20,
                 focused_window: Some(200),
             },
+            own_front_is_settings: false,
             press_pending: false,
             armed_at: None,
             now,
@@ -673,7 +703,7 @@ mod tests {
             ),
             (
                 PeekInput {
-                    frontmost: Frontmost::Own,
+                    frontmost: Frontmost::Own { pid: 99 },
                     ..input(PointerZone::Card(0), Some(target(1)), now)
                 },
                 "our own window is in front",
@@ -722,6 +752,28 @@ mod tests {
             },
         );
         assert_eq!(decision, PeekDecision::Idle);
+    }
+
+    /// The settings window is a real baseline: when the caller has identified it as the key own
+    /// window, hovering another application's card arms exactly like it does from an external app.
+    #[test]
+    fn a_key_settings_window_can_be_the_peek_origin() {
+        let now = at(0);
+        let decision = peek_decision(
+            &Mod::default(),
+            &PeekInput {
+                frontmost: Frontmost::Own { pid: 99 },
+                own_front_is_settings: true,
+                ..input(PointerZone::Card(0), Some(target(1)), now)
+            },
+        );
+        assert_eq!(
+            decision,
+            PeekDecision::Arm {
+                target: target(1),
+                at: now + PEEK_DELAY,
+            }
+        );
     }
 
     /// The rule the user's own testing changed: while the peek is up, moving between cards INSIDE the
@@ -893,8 +945,18 @@ mod tests {
             PeekWatch::Forget(ClearReason::UserSwitched)
         );
         assert_eq!(
-            watch_peek(peeked, Some(20), true, true, Frontmost::Own),
+            watch_peek(peeked, Some(20), true, true, Frontmost::Own { pid: 99 }),
             PeekWatch::Forget(ClearReason::OwnFront)
+        );
+        // When the settings window itself is the recorded origin, our pid still being in front is
+        // the activation's transit state, not a user switch: the target activation is asynchronous.
+        assert_eq!(
+            watch_peek(peeked, Some(99), true, true, Frontmost::Own { pid: 99 }),
+            PeekWatch::Keep
+        );
+        assert_eq!(
+            watch_peek(peeked, Some(99), false, true, Frontmost::Own { pid: 99 }),
+            PeekWatch::Forget(ClearReason::OriginGone)
         );
         assert_eq!(
             watch_peek(
