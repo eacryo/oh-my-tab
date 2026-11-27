@@ -40,6 +40,8 @@ fast = false
 reasoning_effort = "high"
 
 [pi]
-provider = "command code"
-model = "deepseek/deepseek-v4.1-flash"
+# provider = "command code"
+# model = "deepseek/deepseek-v4.1-flash"
+provider = "opencode-go"
+model = "glm-5.3"
 thinking = "high"
