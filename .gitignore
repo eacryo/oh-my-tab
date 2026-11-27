@@ -14,3 +14,6 @@ dist/
 __pycache__/
 
 liquid-glass-rs/
+
+# Promo video assets, recordings, intermediates, and exports.
+docs/videos/
