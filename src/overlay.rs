@@ -461,11 +461,12 @@ pub(crate) use hover::{container_mouse_moved, on_deferred_scroll_hover};
 pub(crate) use callbacks::{
     commit_first_summon, container_accepts_first_responder, container_key_down,
     container_mouse_entered, container_mouse_exited, container_scroll_wheel,
-    on_cmd_shift_tab_pressed, on_cmd_tab_pressed, on_first_summon_timeout,
-    overlay_window_can_become_key, show_first_summon, thumbnail_scroller_accepts_first_mouse,
-    thumbnail_scroller_draw_rect, thumbnail_scroller_geometry, thumbnail_scroller_mouse_down,
-    thumbnail_scroller_mouse_dragged, thumbnail_scroller_mouse_entered,
-    thumbnail_scroller_mouse_exited, thumbnail_scroller_mouse_moved, thumbnail_scroller_mouse_up,
+    navigate_visible_switcher_vertical, on_cmd_shift_tab_pressed, on_cmd_tab_pressed,
+    on_first_summon_timeout, overlay_window_can_become_key, show_first_summon,
+    step_visible_switcher, thumbnail_scroller_accepts_first_mouse, thumbnail_scroller_draw_rect,
+    thumbnail_scroller_geometry, thumbnail_scroller_mouse_down, thumbnail_scroller_mouse_dragged,
+    thumbnail_scroller_mouse_entered, thumbnail_scroller_mouse_exited,
+    thumbnail_scroller_mouse_moved, thumbnail_scroller_mouse_up,
 };
 pub(crate) use cancel::{
     apply_backdrop_material, apply_theme, close_window_at, extract_uncached_icons,
@@ -2119,6 +2120,57 @@ pub(crate) fn update_status_label(input: &crate::theme::ThemeInput) {
         // shrunk panel would otherwise clip it.
         footer_settings::layout_and_repaint(input, NSSize::new(container_w, panel_h));
     }
+}
+
+/// Whether the switcher state considers the panel interactively visible. This is the semantic
+/// session flag (rather than AppKit's transient `isVisible`, which stays true during order-out).
+pub(crate) fn switcher_session_is_visible() -> bool {
+    with_tab_state(|state_opt| state_opt.as_ref().is_some_and(|state| state.visible))
+}
+
+/// Whether a switcher summon is active, including the asynchronous first snapshot before the panel
+/// reaches the screen. Demo open uses this rather than AppKit's transient visibility, which can
+/// still be true for the delayed order-out of a session that has already semantically ended.
+pub(crate) fn switcher_session_is_active() -> bool {
+    with_tab_state(|state_opt| {
+        state_opt
+            .as_ref()
+            .is_some_and(|state| state.visible || state.pending_first_show)
+    })
+}
+
+/// Commit the currently selected switcher target. This is the explicit semantic command used by
+/// demo playback rather than a simulation of modifier release: sticky state cannot veto it, but it
+/// still shares the production commit path and therefore has the real focus-changing side effect.
+pub(crate) fn commit_switcher_selection() -> bool {
+    crate::debug_assert_main_thread();
+    if !switcher_session_is_visible() {
+        return false;
+    }
+    commit_selected_window(true);
+    true
+}
+
+/// Cancel the current switcher session without committing its selection. Unlike `hide_overlay`,
+/// which assumes the session state was already retired by the input path, this semantic entry clears
+/// both a visible summon and a first summon whose window snapshot is still pending. Returns whether
+/// there was a session to cancel.
+pub(crate) fn cancel_switcher_session() -> bool {
+    crate::debug_assert_main_thread();
+    let had_session = with_tab_state(|state_opt| {
+        let Some(state) = state_opt.as_mut() else {
+            return false;
+        };
+        let had_session = state.visible || state.pending_first_show;
+        state.visible = false;
+        state.pending_first_show = false;
+        state.pending_first_release = false;
+        had_session
+    });
+    if had_session {
+        hide_overlay();
+    }
+    had_session
 }
 
 pub(crate) fn hide_overlay() {

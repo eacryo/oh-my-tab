@@ -3826,14 +3826,16 @@ pub(super) extern "C" fn delete_entry_cb(_self: *mut c_void, _cmd: Sel, sender: 
 
 /// Paste the entry at display `idx` (mapped through FILTERED): close the picker + write back
 /// to the pasteboard + synthesize Cmd+V.
-fn paste_at(idx: usize) {
-    paste_at_ex(idx, false);
+fn paste_at(idx: usize) -> bool {
+    paste_at_ex(idx, false)
 }
 
 /// The burn-after-paste variant of paste_at: on a successful paste the entry is removed
 /// from the history right away (Option+Enter/click, one-shot paste). Removal goes through
 /// delete_entry (the image cache file goes too); pinned entries burn all the same.
-fn paste_at_ex(idx: usize, delete_after: bool) {
+/// Returns true only when the write-back succeeded and a paste send was either posted or
+/// successfully armed for the pinned hand-back; synchronous refusals return false.
+fn paste_at_ex(idx: usize, delete_after: bool) -> bool {
     // These guards are unreachable in practice; they still follow the pinned rule rather than
     // hiding a panel the user is holding open (design decision R3).
     let Some(h_idx) = mapped_index(idx) else {
@@ -3841,7 +3843,7 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
         if !is_pinned() {
             hide_picker();
         }
-        return;
+        return false;
     };
     let entry = {
         let hist = CLIP_HISTORY.lock().unwrap();
@@ -3852,7 +3854,7 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
         if !is_pinned() {
             hide_picker();
         }
-        return;
+        return false;
     };
     // An image whose bytes cannot be produced pastes nothing at all: say so while the picker is
     // still on screen (the toast lives inside it), then leave it visible so the user reads why.
@@ -3864,7 +3866,7 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
             image_bytes_available(img.hash),
         ) {
             show_toast(&t("clipboard.toast_image_unavailable"));
-            return;
+            return false;
         }
     }
     // Effective = gesture AND setting: with the toggle off, Option falls back to a plain
@@ -3903,7 +3905,7 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
             // On a failed write-back (e.g. cache miss) skip the synthesized Cmd+V, so the
             // OLD pasteboard content is not pasted.
             if ok {
-                finish_paste(&entry, burn, pinned);
+                return finish_paste(&entry, burn, pinned);
             } else {
                 // A failed write-back means nothing was written: disarm so the suppression
                 // cannot swallow the next genuine copy, and keep the entry (never lose the
@@ -3917,13 +3919,15 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
             // re-captured as a fresh copy that reorders the history).
             let ok = write_pasteboard_text(&entry.text, true);
             if ok {
-                finish_paste(&entry, burn, pinned);
-            } else if burn {
+                return finish_paste(&entry, burn, pinned);
+            }
+            if burn {
                 log_info!("[clip] paste-and-delete skipped: text write-back failed");
                 disarm_paste_delete_suppression();
             }
         }
     }
+    false
 }
 
 /// The send half of a paste, after the write-back succeeded.
@@ -3931,21 +3935,22 @@ fn paste_at_ex(idx: usize, delete_after: bool) {
 /// The two modes differ only in WHEN the keystroke is sent: a hidden panel sends immediately (the
 /// key window has already returned to the target), while a pinned panel arms the bounded hand-back,
 /// which targets the selected process after activation settles.
-unsafe fn finish_paste(entry: &ClipEntry, burn: bool, pinned: bool) {
+unsafe fn finish_paste(entry: &ClipEntry, burn: bool, pinned: bool) -> bool {
     if pinned {
         // A missing change count means the hand-back cannot prove its own write is still the one on
         // the pasteboard, so it must not arm at all - and the burn token must not be left behind for
-        // a send that is never going to happen.
-        match pasteboard_version().map(|v| super::paste_handback::begin(entry, v, burn)) {
-            Some(true) => {}
+        // a send that is never going to happen. `begin` success means the bounded hand-back is
+        // armed; its later asynchronous refusal remains the target app's paste-time outcome.
+        return match pasteboard_version().map(|v| super::paste_handback::begin(entry, v, burn)) {
+            Some(true) => true,
             _ => {
                 show_toast(&t("clipboard.toast_paste_no_target"));
                 if burn {
                     disarm_paste_delete_suppression();
                 }
+                false
             }
-        }
-        return;
+        };
     }
     let pasted = synthesize_paste();
     if burn && pasted {
@@ -3957,6 +3962,7 @@ unsafe fn finish_paste(entry: &ClipEntry, burn: bool, pinned: bool) {
         log_info!("[clip] paste-and-delete skipped: Cmd+V event creation failed");
         disarm_paste_delete_suppression();
     }
+    pasted
 }
 
 /// The pasteboard's change count, which the hand-back uses to prove its own write is still the one
@@ -4106,6 +4112,81 @@ pub(super) fn clamp_selection(sel: usize, len: usize) -> usize {
     sel.min(len - 1)
 }
 
+/// Arrow-key list navigation, shared by the container key handler and the development demo player.
+/// `keycode` is the real key code (126 up / 125 down) so the edge behaviour stays identical to the
+/// keyboard path: moving up from the first row returns focus to the search field.
+pub(super) unsafe fn navigate_list_selection(keycode: u16) {
+    unsafe {
+        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
+        let sel = picker_selection();
+        // Up (126): at the first list entry (or no selection), jump focus back to the
+        // search field; clear the selection BEFORE entering so the highlight goes away
+        // (the controlTextDidBeginEditing: delegate also clears - belt and braces).
+        if keycode == 126 && (sel == 0 || sel == NO_SELECTION) {
+            if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
+                // Clear only the previously selected row's highlight (incremental);
+                // do not rebuild the whole list.
+                set_picker_selection(NO_SELECTION);
+                refresh_selection(sel, NO_SELECTION);
+                if detail_visible() {
+                    refresh_detail_action_visuals();
+                }
+                let window = match *PICKER_WINDOW.lock().unwrap() {
+                    Some(w) => w.0,
+                    None => return,
+                };
+                // makeFirstResponder: returns BOOL ('B').
+                let _: bool = msg_send![window, makeFirstResponder: f.0];
+                return;
+            }
+        }
+        let previous = sel;
+        let idx = if let Some(next) = nav_arrow(keycode, sel, display_len) {
+            set_picker_selection(next);
+            next
+        } else {
+            sel
+        };
+        refresh_selection(previous, idx);
+        // scroll the selection into view.
+        if let Some(container) = picker_container_ptr() {
+            scroll_selection_into_view(container, idx);
+        }
+        // The detail panel follows the selection live while open (Quick-Look-style
+        // browsing).
+        if detail_visible() {
+            show_detail_for_sel();
+        }
+    }
+}
+
+/// Toggle the selected row's detail exactly as the Right key does: Right closes an open detail,
+/// otherwise it opens the current selection. Shared by the keyboard branch and demo playback.
+pub(super) unsafe fn toggle_detail_for_selection() {
+    unsafe {
+        if detail_visible() {
+            hide_detail();
+            return;
+        }
+        let idx = picker_selection();
+        if idx == NO_SELECTION {
+            return;
+        }
+        show_detail_for_sel();
+    }
+}
+
+/// Paste the current selection through the same path as Enter. Returns false when no row is
+/// selected or when the selected entry cannot be written/sent; the paste itself reports the
+/// user-facing refusal/toast.
+pub(super) unsafe fn paste_selection() -> bool {
+    let idx = picker_selection();
+    if idx == NO_SELECTION {
+        return false;
+    }
+    paste_at(idx)
+}
+
 /// Keyboard navigation: Tab cycles filters; up/down select, left pins, right expands
 /// details (with the detail open, right closes it), Enter pastes, Esc closes.
 /// Panic boundary for the C callback: a panic cannot unwind through an `extern "C"` frame (it
@@ -4224,9 +4305,6 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 }
             }
         }
-        // The selectable range is the current display list (post-filter; scrolling reveals
-        // the rest).
-        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
         let sel = picker_selection();
         match keycode {
             48 => {
@@ -4270,55 +4348,10 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
             124 => {
                 // Right: closes the detail panel when it is open (same as ←); otherwise
                 // expands the selected entry's details (full text / large image).
-                if detail_visible() {
-                    hide_detail();
-                    return;
-                }
-                let idx = sel;
-                if idx == NO_SELECTION {
-                    return;
-                }
-                show_detail_for_sel();
+                toggle_detail_for_selection();
             }
             126 | 125 => {
-                // Up (126): at the first list entry (or no selection), jump focus back to the
-                // search field; clear the selection BEFORE entering so the highlight goes away
-                // (the controlTextDidBeginEditing: delegate also clears - belt and braces).
-                if keycode == 126 && (sel == 0 || sel == NO_SELECTION) {
-                    if let Some(f) = *SEARCH_FIELD.lock().unwrap() {
-                        // Clear only the previously selected row's highlight (incremental);
-                        // do not rebuild the whole list.
-                        set_picker_selection(NO_SELECTION);
-                        refresh_selection(sel, NO_SELECTION);
-                        if detail_visible() {
-                            refresh_detail_action_visuals();
-                        }
-                        let window = match *PICKER_WINDOW.lock().unwrap() {
-                            Some(w) => w.0,
-                            None => return,
-                        };
-                        // makeFirstResponder: returns BOOL ('B').
-                        let _: bool = msg_send![window, makeFirstResponder: f.0];
-                        return;
-                    }
-                }
-                let previous = sel;
-                let idx = if let Some(next) = nav_arrow(keycode, sel, display_len) {
-                    set_picker_selection(next);
-                    next
-                } else {
-                    sel
-                };
-                refresh_selection(previous, idx);
-                // scroll the selection into view.
-                if let Some(container) = picker_container_ptr() {
-                    scroll_selection_into_view(container, idx);
-                }
-                // The detail panel follows the selection live while open (Quick-Look-style
-                // browsing).
-                if detail_visible() {
-                    show_detail_for_sel();
-                }
+                navigate_list_selection(keycode);
             }
             36 => {
                 // Enter; Option+Enter (when the setting is on) = paste and delete (one-shot
@@ -4328,7 +4361,7 @@ unsafe fn container_key_down_inner(_self: *mut c_void, _cmd: Sel, event: *mut c_
                 if (mods & 0x0008_0000) != 0 {
                     paste_at_ex(idx, true);
                 } else {
-                    paste_at(idx);
+                    paste_selection();
                 }
             }
             51 => {

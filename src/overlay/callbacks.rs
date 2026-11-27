@@ -83,7 +83,26 @@ pub(crate) fn show_overlay_for_development() {
     schedule_first_summon_timeout();
 }
 
-fn step_switcher(backward: bool) {
+/// Horizontal navigation for an already-visible switcher. Unlike `step_switcher`, this semantic
+/// entry never interprets the request as a first hotkey press: it reports false when there is no
+/// visible session to navigate.
+pub(crate) fn step_visible_switcher(backward: bool) -> bool {
+    crate::debug_assert_main_thread();
+    let can_step = with_tab_state(|state_opt| {
+        state_opt.as_ref().is_some_and(|state| {
+            state.visible && !state.pending_first_show && !state.windows.is_empty()
+        })
+    });
+    if !can_step {
+        return false;
+    }
+    // The main thread cannot re-enter between the check and this call, so `step_switcher` takes
+    // its repeated-Tab branch rather than the first-summon branch.
+    step_switcher(backward);
+    true
+}
+
+pub(crate) fn step_switcher(backward: bool) {
     let (pending, first_show) = with_tab_state(|state_opt| {
         let state = state_opt.as_ref().unwrap();
         (
@@ -326,7 +345,7 @@ pub(super) fn edge_row_nav_index(
 
 /// Vertical navigation for both layouts uses the complete document and a stable horizontal
 /// anchor; crossing the viewport only moves clip bounds.
-unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool) {
+unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool) -> bool {
     let selected = with_tab_state(|state_opt| {
         let state = state_opt.as_mut()?;
         if !state.visible || state.windows.is_empty() {
@@ -343,13 +362,37 @@ unsafe fn navigate_thumbnail_vertical(rects: &[(usize, f64, f64, f64)], up: bool
         mark_user_picked(state);
         Some(index)
     });
-    if let Some(index) = selected {
-        if ensure_thumbnail_selection_visible(index) {
-            apply_thumbnail_scroll_offset();
-        }
-        refresh_highlight();
-        // A key callback is an independent entry: one snapshot for this reaction.
-        update_status_label(&crate::theme::ThemeInput::current());
+    let Some(index) = selected else {
+        return false;
+    };
+    if ensure_thumbnail_selection_visible(index) {
+        apply_thumbnail_scroll_offset();
+    }
+    refresh_highlight();
+    // A key callback is an independent entry: one snapshot for this reaction.
+    update_status_label(&crate::theme::ThemeInput::current());
+    true
+}
+
+/// Vertical navigation for an already-visible switcher. Returns false when there is no visible
+/// session to navigate, or when the current row has no adjacent row in that direction (the same
+/// edge no-op as the keyboard path).
+pub(crate) unsafe fn navigate_visible_switcher_vertical(up: bool) -> bool {
+    crate::debug_assert_main_thread();
+    // The same guard as step_visible_switcher: a session whose first snapshot is still pending
+    // is not navigable in any direction, or an overlay.up right after overlay.open would walk a
+    // window list the user never saw.
+    let can_navigate = with_tab_state(|state_opt| {
+        state_opt.as_ref().is_some_and(|state| {
+            state.visible && !state.pending_first_show && !state.windows.is_empty()
+        })
+    });
+    if !can_navigate {
+        return false;
+    }
+    unsafe {
+        let rects = collect_card_rects();
+        navigate_thumbnail_vertical(&rects, up)
     }
 }
 
@@ -435,7 +478,9 @@ pub(crate) extern "C" fn container_key_down(_self: *mut c_void, _cmd: Sel, event
                     reset_thumbnail_nav_anchor();
                     refresh_after_selection_change(false);
                 }
-                KeyAction::Vertical(up) => navigate_thumbnail_vertical(&nav_rects, up),
+                KeyAction::Vertical(up) => {
+                    navigate_thumbnail_vertical(&nav_rects, up);
+                }
                 KeyAction::Close(idx) => {
                     // Backspace: close the selected card's window; the overlay stays open.
                     let card = card_document().and_then(|document| {

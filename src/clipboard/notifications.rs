@@ -2240,6 +2240,62 @@ fn picker_rows_are_current() -> bool {
 /// field editor (an NSTextView) -- key events never reach the search field's keyDown:. The
 /// editor translates ↓ into a moveDown: command and forwards it to the field's delegate via
 /// control:textView:doCommandBySelector: -- the official way to intercept keys on text controls.
+/// Move from the search field into the list. This is the semantic half of the field editor's
+/// moveDown:/moveUp: command, extracted so demo playback follows the same cross-focus path instead
+/// of replaying the container's arrow-key branch while the search editor owns the keyboard.
+pub(super) unsafe fn navigate_from_search_field(up: bool) {
+    unsafe {
+        // The query/filter stays; only focus and the selection move to the list.
+        // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
+        // scrolled into view afterwards).
+        let display_len = with_clipboard_ui(|ui| ui.filtered.len());
+        let sel = if up {
+            // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
+            display_len.saturating_sub(1)
+        } else {
+            0
+        };
+        let previous = picker_selection();
+        set_picker_selection(sel);
+        // When the rows already match the query, update only the two rows' highlights; right
+        // after a query change (the debounced refresh has not landed yet) a full rebuild is
+        // still required, otherwise the new list index is applied to stale rows.
+        if picker_rows_are_current() {
+            refresh_selection(previous, sel);
+        } else {
+            rebuild_rows();
+        }
+        // With the detail open, its filled action icon must follow the new selection.
+        if detail_visible() {
+            refresh_detail_action_visuals();
+        }
+        // With ↑ the tail is selected while the viewport is still at the top: use the
+        // deterministic offset calculation to bring the selected row into view.
+        if let Some(container) = picker_container_ptr() {
+            scroll_selection_into_view(container, sel);
+        }
+        if let Some(container) = picker_container_ptr() {
+            let window = match *PICKER_WINDOW.lock().unwrap() {
+                Some(w) => w.0,
+                None => return,
+            };
+            // makeFirstResponder: returns BOOL ('B').
+            let _: bool = msg_send![window, makeFirstResponder: container];
+        }
+    }
+}
+
+/// Whether the search field currently owns a live field editor.
+pub(super) unsafe fn search_field_is_editing() -> bool {
+    unsafe {
+        let Some(field) = *SEARCH_FIELD.lock().unwrap() else {
+            return false;
+        };
+        let editor: *mut AnyObject = msg_send![field.0, currentEditor];
+        !editor.is_null()
+    }
+}
+
 pub(super) extern "C" fn search_field_do_command(
     _self: *mut c_void,
     _cmd: Sel,
@@ -2252,43 +2308,7 @@ pub(super) extern "C" fn search_field_do_command(
             return false;
         }
         unsafe {
-            // The query/filter stays; only focus and the selection move to the list.
-            // ↓ = the newest entry (first row); ↑ = the oldest (the display list's tail,
-            // scrolled into view afterwards).
-            let display_len = with_clipboard_ui(|ui| ui.filtered.len());
-            let sel = if command_selector == sel!(moveUp:) {
-                // Empty list: 0 (no row to select, no highlight; saturating_sub guards).
-                display_len.saturating_sub(1)
-            } else {
-                0
-            };
-            let previous = picker_selection();
-            set_picker_selection(sel);
-            // When the rows already match the query, update only the two rows' highlights; right
-            // after a query change (the debounced refresh has not landed yet) a full rebuild is
-            // still required, otherwise the new list index is applied to stale rows.
-            if picker_rows_are_current() {
-                refresh_selection(previous, sel);
-            } else {
-                rebuild_rows();
-            }
-            // With the detail open, its filled action icon must follow the new selection.
-            if detail_visible() {
-                refresh_detail_action_visuals();
-            }
-            // With ↑ the tail is selected while the viewport is still at the top: use the
-            // deterministic offset calculation to bring the selected row into view.
-            if let Some(container) = picker_container_ptr() {
-                scroll_selection_into_view(container, sel);
-            }
-            if let Some(container) = picker_container_ptr() {
-                let window = match *PICKER_WINDOW.lock().unwrap() {
-                    Some(w) => w.0,
-                    None => return true,
-                };
-                // makeFirstResponder: returns BOOL ('B').
-                let _: bool = msg_send![window, makeFirstResponder: container];
-            }
+            navigate_from_search_field(command_selector == sel!(moveUp:));
         }
         true
     })

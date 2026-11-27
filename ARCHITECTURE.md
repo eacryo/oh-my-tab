@@ -26,6 +26,7 @@ src/
 │   └── clipboard/               # (see "Clipboard subsystem" below)
 ├── clipboard_highlight.rs       # clipboard text classification, code wrapping, display mapping
 ├── config.rs                    # Config: the TOML schema, per-field defaults, debounced persistence
+├── demo.rs                      # dev-only ordered semantic-action playback (--demo=<TOML script>)
 ├── dev_backdrop.rs              # dev-only controlled backdrops for M2 pixel instruments
 ├── dev_flags.rs                 # argv-only development switches (never the environment)
 ├── dock_preview/                # Dock hover window previews (see below)

@@ -2159,6 +2159,164 @@ pub(crate) fn picker_is_visible() -> bool {
     }
 }
 
+/// Whether the detail surface is open. Published for demo playback waits; the state itself remains
+/// owned here and is only mutated on the main thread.
+pub(crate) fn picker_detail_is_visible() -> bool {
+    detail_visible()
+}
+
+/// Whether a demo clipboard fixture is installed. While it is, capture records nothing (the poll
+/// only advances the baseline) and persistence writes nothing, so a demo can neither leak real
+/// copies into its playback nor write fixture rows into the encrypted store.
+static DEMO_FIXTURE_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// The real in-memory history parked while a demo fixture stands in its place. Restored verbatim
+/// when playback ends; nothing that happens to the fixture rows survives.
+static DEMO_FIXTURE_PARKED: Mutex<Option<Vec<ClipEntry>>> = Mutex::new(None);
+
+pub(crate) fn demo_fixture_active() -> bool {
+    DEMO_FIXTURE_ACTIVE.load(Ordering::SeqCst)
+}
+
+/// A declarative clipboard entry for demo playback. Text only: image entries live in the content
+/// cache, and a fixture must never write there.
+pub(crate) struct DemoFixtureEntry {
+    pub(crate) text: String,
+    pub(crate) pinned: bool,
+    pub(crate) source_app: String,
+}
+
+/// Build the fixture's history rows. Pinned entries hoist to the top (stable, as recorded history
+/// always keeps them ahead of unpinned ones), and every entry is stamped with the install time so
+/// auto-expiry cannot remove one mid-playback.
+fn demo_fixture_entries(specs: &[DemoFixtureEntry], now: u64) -> Vec<ClipEntry> {
+    let mut entries: Vec<ClipEntry> = specs
+        .iter()
+        .map(|spec| ClipEntry {
+            text: spec.text.clone(),
+            image: None,
+            pinned: spec.pinned,
+            source_app: spec.source_app.clone(),
+            source_key: String::new(),
+            copied_at: Some(now),
+        })
+        .collect();
+    entries.sort_by_key(|entry| !entry.pinned);
+    entries
+}
+
+/// Swap the in-memory history for the fixture rows, parking the real one in memory only. The
+/// active flag rises before the swap so a persistence write in between is suppressed rather than
+/// handed fixture rows; nothing is ever written to disk for the swap itself.
+pub(crate) fn install_demo_fixture(specs: Vec<DemoFixtureEntry>) {
+    crate::debug_assert_main_thread();
+    if DEMO_FIXTURE_ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    let entries = demo_fixture_entries(&specs, now_secs());
+    DEMO_FIXTURE_ACTIVE.store(true, Ordering::SeqCst);
+    let parked = {
+        let mut history = CLIP_HISTORY.lock().unwrap();
+        std::mem::replace(&mut *history, entries)
+    };
+    *DEMO_FIXTURE_PARKED.lock().unwrap() = Some(parked);
+    bump_history_revision();
+    schedule_picker_refresh();
+}
+
+/// Restore the parked history. The rows go back BEFORE the active flag falls: lowering it first
+/// would let a persistence write in between carry fixture rows into the encrypted store.
+pub(crate) fn remove_demo_fixture() {
+    crate::debug_assert_main_thread();
+    if !DEMO_FIXTURE_ACTIVE.load(Ordering::SeqCst) {
+        return;
+    }
+    if let Some(parked) = DEMO_FIXTURE_PARKED.lock().unwrap().take() {
+        *CLIP_HISTORY.lock().unwrap() = parked;
+    }
+    DEMO_FIXTURE_ACTIVE.store(false, Ordering::SeqCst);
+    bump_history_revision();
+    schedule_picker_refresh();
+}
+
+/// Open the picker through the same rules as the global shortcut, but idempotently: an already
+/// visible panel is success, while a disabled module or a pinned panel is reported rather than
+/// silently doing nothing. Demo playback uses this semantic entry instead of synthesizing Option+V.
+pub(crate) fn open_picker_for_demo() -> Result<bool, String> {
+    crate::debug_assert_main_thread();
+    if !CONFIG.read().unwrap().clipboard.enabled {
+        return Err("clipboard history is disabled in the configuration".to_string());
+    }
+    if picker_is_visible() {
+        return Ok(false);
+    }
+    if is_pinned() {
+        return Err("the clipboard panel is pinned; the shortcut open path is a no-op".to_string());
+    }
+    show_picker_with_fresh_selection();
+    Ok(true)
+}
+
+/// Close the picker if it is visible. Returns whether this call changed the UI.
+pub(crate) fn close_picker_for_demo() -> Result<bool, String> {
+    crate::debug_assert_main_thread();
+    if !picker_is_visible() {
+        return Ok(false);
+    }
+    if is_pinned() {
+        return Err("the clipboard panel is pinned; close would have to clear the pin".to_string());
+    }
+    hide_picker();
+    Ok(true)
+}
+
+/// Move the picker selection through the exact arrow-key path. `down=true` is Down, otherwise Up.
+/// When the search editor owns the keyboard this is the field-editor moveDown/moveUp path rather
+/// than the list container's keyDown branch, matching what the user sees key by key.
+pub(crate) fn move_selection_for_demo(down: bool) -> Result<bool, String> {
+    crate::debug_assert_main_thread();
+    if !picker_is_visible() {
+        return Err("the clipboard picker is not visible".to_string());
+    }
+    let before = picker_selection();
+    unsafe {
+        if search_field_is_editing() {
+            navigate_from_search_field(!down);
+        } else {
+            detail::navigate_list_selection(if down {
+                keyboard::VK_DOWN
+            } else {
+                keyboard::VK_UP
+            });
+        }
+    }
+    Ok(before != picker_selection())
+}
+
+/// Toggle the current row's detail through the same semantic branch as the Right key.
+pub(crate) fn toggle_detail_for_demo() -> Result<bool, String> {
+    crate::debug_assert_main_thread();
+    if !picker_is_visible() {
+        return Err("the clipboard picker is not visible".to_string());
+    }
+    let before = detail_visible();
+    unsafe { detail::toggle_detail_for_selection() };
+    Ok(before != detail_visible())
+}
+
+/// Paste the current selection. This is an explicit demo action because it writes the system
+/// pasteboard and synthesizes Cmd+V into the target application.
+pub(crate) fn paste_selection_for_demo() -> Result<bool, String> {
+    crate::debug_assert_main_thread();
+    if !picker_is_visible() {
+        return Err("the clipboard picker is not visible".to_string());
+    }
+    if unsafe { detail::paste_selection() } {
+        Ok(true)
+    } else {
+        Err("the selected clipboard entry could not be pasted".to_string())
+    }
+}
+
 /// The detail panel's content container (hosts the text scroll view / the image view;
 /// clicking anywhere on the panel dismisses it).
 static DETAIL_CONTENT: MainThreadSlot<Option<ObjPtr>> = unsafe { MainThreadSlot::new(None) };
@@ -2236,6 +2394,47 @@ mod tests {
             !markers.contains(&"com.apple.is-remote-clipboard"),
             "Handoff content is a user-intended copy and must still be recorded"
         );
+    }
+
+    /// The fixture builder: pinned rows hoist to the top in stable order (recorded history keeps
+    /// pinned entries ahead), every row carries the install timestamp so auto-expiry cannot reap
+    /// it mid-playback, and rows are text-only with no icon identity.
+    #[test]
+    fn demo_fixture_entries_hoist_pinned_rows_stably() {
+        let specs = vec![
+            super::DemoFixtureEntry {
+                text: "first plain".to_string(),
+                pinned: false,
+                source_app: "Safari".to_string(),
+            },
+            super::DemoFixtureEntry {
+                text: "pinned one".to_string(),
+                pinned: true,
+                source_app: String::new(),
+            },
+            super::DemoFixtureEntry {
+                text: "second plain".to_string(),
+                pinned: false,
+                source_app: String::new(),
+            },
+            super::DemoFixtureEntry {
+                text: "pinned two".to_string(),
+                pinned: true,
+                source_app: String::new(),
+            },
+        ];
+        let entries = super::demo_fixture_entries(&specs, 1_700_000_000);
+        let texts: Vec<&str> = entries.iter().map(|entry| entry.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec!["pinned one", "pinned two", "first plain", "second plain"]
+        );
+        for entry in &entries {
+            assert_eq!(entry.copied_at, Some(1_700_000_000));
+            assert!(entry.image.is_none());
+            assert!(entry.source_key.is_empty());
+        }
+        assert_eq!(entries[2].source_app, "Safari");
     }
 
     /// A recovery request survives an unreadable pasteboard: clearing it on mere observation would

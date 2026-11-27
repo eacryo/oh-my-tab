@@ -670,12 +670,19 @@ pub(crate) extern "C" fn on_clipboard_toggle(_self: *mut c_void, _cmd: Sel, _arg
             hide_picker();
             return;
         }
-        PICKER_VISIBLE.store(false, Ordering::SeqCst);
-        // Show the picker even with an empty history (the empty-state hint lives in
-        // rebuild_rows' empty branch).
-        set_picker_selection(0);
-        show_picker();
+        show_picker_with_fresh_selection();
     });
+}
+
+/// Open the picker as a fresh summon: the intent flag is reset before the synchronous show and the
+/// selection starts on the newest row. Shared by the global shortcut and semantic demo playback so
+/// the two cannot drift on ordering.
+pub(crate) fn show_picker_with_fresh_selection() {
+    PICKER_VISIBLE.store(false, Ordering::SeqCst);
+    // Show the picker even with an empty history (the empty-state hint lives in rebuild_rows'
+    // empty branch).
+    set_picker_selection(0);
+    show_picker();
 }
 
 /// Show the picker for the `--show-clipboard` development switch. Identical to the hotkey path

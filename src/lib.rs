@@ -4,6 +4,7 @@ mod callback_guard;
 mod clipboard;
 mod clipboard_highlight;
 mod config;
+mod demo;
 mod dev_backdrop;
 mod dev_flags;
 mod dock_preview;
@@ -611,6 +612,18 @@ extern "C" fn on_dev_show_clipboard_detail(_this: *mut c_void, _cmd: Sel, _sende
     });
 }
 
+extern "C" fn on_demo_start(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    callback_guard::void("on_demo_start", || {
+        demo::start_pending_script();
+    });
+}
+
+extern "C" fn on_demo_invoke(_this: *mut c_void, _cmd: Sel, _sender: *mut c_void) {
+    callback_guard::void("on_demo_invoke", || {
+        demo::invoke_pending_on_main();
+    });
+}
+
 pub(crate) fn schedule_dev_blank_text(delay: std::time::Duration) {
     std::thread::spawn(move || {
         std::thread::sleep(delay);
@@ -665,6 +678,18 @@ extern "C" fn on_global_input_drain(_self: *mut c_void, _cmd: Sel, _arg: *mut c_
     });
 }
 
+/// Whether one drained global-input batch contains an actual user/gesture action. The batching
+/// channel also carries internal keystroke-display wakeups, which are deliberately absent here:
+/// those wakeups can be caused by the app's own synthetic paste and must not cancel a demo.
+fn global_input_batch_has_user_input(
+    tab_step_count: usize,
+    clipboard_pending: bool,
+    other_count: usize,
+    release_pending: bool,
+) -> bool {
+    tab_step_count != 0 || clipboard_pending || other_count != 0 || release_pending
+}
+
 fn on_global_input_drain_inner() {
     let Some(pending) = PENDING_GLOBAL_INPUT.get() else {
         return;
@@ -688,6 +713,15 @@ fn on_global_input_drain_inner() {
             release_pending,
         )
     };
+
+    if global_input_batch_has_user_input(
+        tab_steps.len(),
+        clipboard_pending,
+        other.len(),
+        release_pending,
+    ) {
+        demo::cancel_for_user_input();
+    }
 
     let had_tab_steps = !tab_steps.is_empty();
     // Each step decides its own ownership: the gesture's opener keeps the claim, any other step is
@@ -2210,6 +2244,18 @@ fn controller_class() -> StaticClass {
             cls,
             sel!(handleDevShowClipboardDetail:),
             on_dev_show_clipboard_detail as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDemoStart:),
+            on_demo_start as *mut c_void,
+            types_v_obj.as_ptr(),
+        );
+        class_addMethod(
+            cls,
+            sel!(handleDemoInvoke:),
+            on_demo_invoke as *mut c_void,
             types_v_obj.as_ptr(),
         );
         class_addMethod(
@@ -4630,6 +4676,9 @@ pub fn run() {
         if crate::dev_flags::present("show-keystroke-display") {
             crate::keystroke_display::show_for_development();
         }
+        // Development demo playback: the script driver owns ordering off the main thread; every
+        // action it invokes re-enters through the controller on the AppKit main thread.
+        demo::start_from_dev_flag();
         // Warm the settings window before the run loop takes over (see `schedule_settings_prewarm`).
         // Smoke processes assert launch-time state and exit through their runner, so they skip it.
         if !is_smoke_process {
@@ -4684,9 +4733,21 @@ pub fn run_relaunch_helper_if_requested(args: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        orderly_exit_count, overlay_hover_dequantize, overlay_hover_quantize,
-        settings_prewarm_step, SettingsPrewarmStep, SETTINGS_PREWARM_MAX_ATTEMPTS,
+        global_input_batch_has_user_input, orderly_exit_count, overlay_hover_dequantize,
+        overlay_hover_quantize, settings_prewarm_step, SettingsPrewarmStep,
+        SETTINGS_PREWARM_MAX_ATTEMPTS,
     };
+
+    /// A keystroke-display wake is internal bookkeeping, not the user taking over. Every real
+    /// action category in the same global-input batch still counts as input.
+    #[test]
+    fn global_input_batch_separates_internal_wakes_from_user_input() {
+        assert!(!global_input_batch_has_user_input(0, false, 0, false));
+        assert!(global_input_batch_has_user_input(1, false, 0, false));
+        assert!(global_input_batch_has_user_input(0, true, 0, false));
+        assert!(global_input_batch_has_user_input(0, false, 1, false));
+        assert!(global_input_batch_has_user_input(0, false, 0, true));
+    }
 
     /// A pointer position survives the trip between the tap thread and the main thread.
     ///

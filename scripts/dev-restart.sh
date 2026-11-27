@@ -41,6 +41,7 @@
 # 根据脚本自身位置定位项目根目录,不依赖调用者当前所在的目录。
 script_dir="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
 repo_dir="$(dirname -- "$script_dir")"
+source "$repo_dir/scripts/lib/demo-path.sh"
 
 # 可选参数解析:决定构建 profile,以及透传给应用的 argv。
 # Optional flag parsing: chooses the build profile, plus the argv forwarded to the app.
@@ -110,6 +111,14 @@ for arg in "$@"; do
                     ;;
             esac
             ;;
+        --demo=*)
+            # LaunchServices does not give the app the caller's working directory, so a relative
+            # demo script would be resolved against whatever cwd the app happens to receive.
+            # Resolve it at this forwarding boundary while the typed relative path is still known;
+            # the helper preserves its components instead of canonicalizing through shell `cd`.
+            demo_spec="${arg#--demo=}"
+            app_args+=("--demo=$(demo_path_for_launch "$demo_spec")")
+            ;;
         -h|--help)
             echo "Usage: scripts/dev-restart.sh [--opt] [--require-stable-signing] [--allow-signing-fallback] [--no-onboarding] [-- <app args>...]"
             echo "  (no flag)  debug build: fast iteration, complete debug assertions"
@@ -141,6 +150,8 @@ for arg in "$@"; do
             echo "             --pseudo-locale, --layout-debug, --test-update-notice[=available],"
             echo "             --smoke-update-prompts (opens 12 key windows and takes focus; run only with consent),"
             echo "             --show-clipboard (open the clipboard picker without its hotkey),"
+            echo "             --demo=<path.toml> (ordered semantic-action demo; relative paths resolve"
+            echo "             against the caller's cwd before launchd forwarding),"
             echo "             --no-settings-prewarm (skip the startup settings warm-up; the cold-open"
             echo "             counter-example for scripts/e2e/settings-open-latency.sh),"
             echo "             --e2e-state=<path> (JSON state snapshots for scripts/e2e/*.sh)"

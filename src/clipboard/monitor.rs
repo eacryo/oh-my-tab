@@ -42,6 +42,17 @@ pub(super) fn poll_clipboard() {
         }
         return;
     }
+    // A demo clipboard fixture stands in for the real history: copies observed during playback
+    // (including the paste-back of a fixture row) advance the baseline without being recorded, so
+    // nothing a demo does or shows can leak into the real history.
+    if demo_fixture_active() {
+        if advance_baseline() {
+            log_debug!(
+                "[clip] change observed during demo playback: baseline advanced, nothing recorded"
+            );
+        }
+        return;
+    }
     // A recovery from an unavailable or blocked storage adopts a fresh baseline: the copy made while
     // nothing could be recorded must not be recorded now (the same promise the pause makes). A failed
     // baseline leaves the request pending and keeps recording off.

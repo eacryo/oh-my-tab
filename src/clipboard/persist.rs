@@ -580,7 +580,34 @@ pub(super) fn restore_loaded_entry(entry: ClipEntry) -> Option<ClipEntry> {
 /// Save the current history to disk (sealed, atomic temp+rename, mode 600). Skipped entirely
 /// unless the session may write: `Unavailable` / `Blocked` must never write, and a skipped save
 /// is logged once per session (invariant R4).
+/// Count of saves dropped by the demo-fixture suppression, exposed to tests so the guard's
+/// presence in both save paths can be asserted without racing the generation counter.
+#[cfg(test)]
+static SAVE_SUPPRESSED_FOR_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+/// The shared fixture guard for both save paths. A demo fixture's rows are memory-only: writing
+/// them would clobber the encrypted store with content the user never copied. Mutation paths
+/// reachable during playback (a key dispatching alongside the input monitor's cancellation)
+/// still mutate the in-memory fixture, but the write must not follow.
+fn save_suppressed_for_fixture() -> bool {
+    if !demo_fixture_active() {
+        return false;
+    }
+    #[cfg(test)]
+    SAVE_SUPPRESSED_FOR_FIXTURE.fetch_add(1, Ordering::Relaxed);
+    log_debug!("[clip] save skipped: a demo clipboard fixture is installed");
+    true
+}
+
+#[cfg(test)]
+pub(super) fn save_suppressed_for_fixture_count() -> u64 {
+    SAVE_SUPPRESSED_FOR_FIXTURE.load(Ordering::Relaxed)
+}
+
 pub(super) fn save_history() {
+    if save_suppressed_for_fixture() {
+        return;
+    }
     if !storage::writable() {
         log_save_skipped_once();
         return;
@@ -607,6 +634,9 @@ pub(super) fn save_history() {
 /// save action reads the selection. A caller that hands over a snapshot has already settled which
 /// records exist.
 pub(super) fn save_history_snapshot(entries: Vec<ClipEntry>) {
+    if save_suppressed_for_fixture() {
+        return;
+    }
     if !storage::writable() {
         log_save_skipped_once();
         return;
@@ -2125,6 +2155,32 @@ mod encryption_tests {
         let guard = storage::test_lock();
         storage::set_ready(keyring::test_key());
         guard
+    }
+
+    /// Both save paths must hit the fixture suppression while a demo fixture is installed:
+    /// the encrypted store would otherwise be rewritten with rows the user never copied. The
+    /// assertion is a delta over the suppression counter rather than the persist generation, so
+    /// a concurrent test's own save activity can never fail it in either direction.
+    #[test]
+    fn both_save_paths_are_suppressed_while_a_demo_fixture_is_installed() {
+        let _guard = storage::test_lock();
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::clipboard::DEMO_FIXTURE_ACTIVE.store(false, Ordering::SeqCst);
+            }
+        }
+        let _reset = Reset;
+        crate::clipboard::DEMO_FIXTURE_ACTIVE.store(true, Ordering::SeqCst);
+        let before = super::save_suppressed_for_fixture_count();
+        super::save_history();
+        super::save_history_snapshot(Vec::new());
+        let delta = super::save_suppressed_for_fixture_count() - before;
+        crate::clipboard::DEMO_FIXTURE_ACTIVE.store(false, Ordering::SeqCst);
+        assert!(
+            delta >= 2,
+            "both save paths must hit the fixture suppression (delta {delta})"
+        );
     }
 
     fn clean_disk() {
